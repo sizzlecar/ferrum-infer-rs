@@ -52,9 +52,10 @@ from a runner-only artifact toward a Rust startup control-plane surface.
   inputs such as `--kv-dtype` and `--profile-*` into the startup
   `effective_config.json` snapshot with `source=cli`.
 - `ferrum.toml` now has a narrow `[runtime]` config surface for `kv_dtype`.
-  `ferrum serve` applies it as the effective KV dtype when `--kv-dtype` is
-  absent, records it with `source=config_file`, and lets the CLI flag override
-  it with `source=cli`.
+  `ferrum serve` applies it as the effective KV dtype when `--kv-dtype` and
+  `FERRUM_KV_DTYPE` are absent, records it with `source=config_file`, and uses
+  an explicit `CLI > env > config_file > default` precedence rule for both
+  runtime behavior and startup artifacts.
 - The runner artifact validator now schema-checks server-written
   `effective_config.json` entries, including sorted `FERRUM_*` keys,
   non-empty `affects`, allowed source/effect values, and decision parity with
@@ -102,8 +103,9 @@ Evidence:
   the Rust selector unless explicitly overridden.
 - `ferrum-types` runtime-config tests passed: `6 passed`, including stable
   upsert/override behavior for CLI-sourced entries.
-- `ferrum-cli` serve tests passed: `1 passed`, covering CLI-sourced runtime
-  entries for `--kv-dtype` and profile sink arguments.
+- `ferrum-cli` serve tests passed: `5 passed`, covering CLI-sourced runtime
+  entries for `--kv-dtype` and profile sink arguments plus explicit runtime
+  source precedence for config-file, env, and CLI inputs.
 - `ferrum-cli` config tests passed: `3 passed`, including config-file
   `kv_dtype` source attribution and missing `[runtime]` backwards
   compatibility.

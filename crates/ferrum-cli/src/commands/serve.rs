@@ -206,7 +206,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
 
     let host = host.unwrap_or_else(|| config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
-    let effective_kv_dtype = kv_dtype.as_deref().or(config.runtime.kv_dtype.as_deref());
+    let env_kv_dtype = std::env::var("FERRUM_KV_DTYPE").ok();
+    let effective_kv_dtype = resolve_effective_kv_dtype(
+        kv_dtype.as_deref(),
+        env_kv_dtype.as_deref(),
+        config.runtime.kv_dtype.as_deref(),
+    );
     let config_runtime_entries = config.runtime.runtime_config_entries();
 
     let source: ferrum_models::source::ResolvedModelSource = if let Some(p) = gguf_path.clone() {
@@ -304,8 +309,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let arch_for_dispatch = model_definition
         .as_ref()
         .map(|model_def| model_def.architecture);
-    let mut startup_runtime_entries = config_runtime_entries;
-    startup_runtime_entries.extend(serve_cli_runtime_entries(
+    let startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
         profile_jsonl.as_ref(),
         profile_commit_sha.as_deref(),
@@ -313,12 +317,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_model.as_deref(),
         profile_concurrency,
         profile_runtime_flags_json.as_deref(),
-    ));
+    );
     let startup_auto_config = startup_auto_config(
         &device,
         arch_for_dispatch,
         model_definition.as_ref(),
-        startup_runtime_entries,
+        config_runtime_entries,
+        startup_cli_runtime_entries,
     )?;
     write_startup_config_artifacts(
         &startup_auto_config,
@@ -535,12 +540,14 @@ fn startup_auto_config(
     device: &ferrum_types::Device,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
+    config_runtime_entries: Vec<RuntimeConfigEntry>,
     cli_runtime_entries: Vec<RuntimeConfigEntry>,
 ) -> Result<ResolvedFerrumConfig> {
-    let mut runtime_config = RuntimeConfigSnapshot::capture_current();
-    for entry in cli_runtime_entries {
-        runtime_config.upsert_entry(entry);
-    }
+    let runtime_config = merge_runtime_config_sources(
+        config_runtime_entries,
+        RuntimeConfigSnapshot::capture_current(),
+        cli_runtime_entries,
+    );
     let model = model_definition
         .map(model_capabilities_from_definition)
         .unwrap_or_else(ModelCapabilities::unknown);
@@ -557,6 +564,21 @@ fn startup_auto_config(
         .with_workload_profile(workload)
         .resolve()
         .map_err(|err| ferrum_types::FerrumError::config(format!("invalid auto config: {err}")))
+}
+
+fn merge_runtime_config_sources(
+    config_file_entries: Vec<RuntimeConfigEntry>,
+    env_snapshot: RuntimeConfigSnapshot,
+    cli_entries: Vec<RuntimeConfigEntry>,
+) -> RuntimeConfigSnapshot {
+    let mut runtime_config = RuntimeConfigSnapshot::from_entries(config_file_entries);
+    for entry in env_snapshot.entries {
+        runtime_config.upsert_entry(entry);
+    }
+    for entry in cli_entries {
+        runtime_config.upsert_entry(entry);
+    }
+    runtime_config
 }
 
 fn serve_cli_runtime_entries(
@@ -597,6 +619,14 @@ fn serve_cli_runtime_entries(
         profile_runtime_flags_json,
     );
     entries
+}
+
+fn resolve_effective_kv_dtype<'a>(
+    cli_arg: Option<&'a str>,
+    env_value: Option<&'a str>,
+    config_file_value: Option<&'a str>,
+) -> Option<&'a str> {
+    cli_arg.or(env_value).or(config_file_value)
 }
 
 fn push_cli_runtime_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<&str>) {
@@ -942,21 +972,18 @@ mod tests {
 
     #[test]
     fn serve_runtime_snapshot_prefers_cli_over_config_file() {
-        let mut entries = crate::config::RuntimeCliConfig {
+        let config_entries = crate::config::RuntimeCliConfig {
             kv_dtype: Some("fp16".to_string()),
         }
         .runtime_config_entries();
-        entries.extend(serve_cli_runtime_entries(
-            Some("int8"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ));
+        let cli_entries =
+            serve_cli_runtime_entries(Some("int8"), None, None, None, None, None, None);
 
-        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
+        let snapshot = merge_runtime_config_sources(
+            config_entries,
+            RuntimeConfigSnapshot::default(),
+            cli_entries,
+        );
         let kv = snapshot
             .entries
             .iter()
@@ -964,5 +991,64 @@ mod tests {
             .unwrap();
         assert_eq!(kv.effective_value, "int8");
         assert_eq!(kv.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn serve_runtime_snapshot_prefers_env_over_config_file() {
+        let config_entries = crate::config::RuntimeCliConfig {
+            kv_dtype: Some("fp16".to_string()),
+        }
+        .runtime_config_entries();
+        let env_snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            "FERRUM_KV_DTYPE",
+            "int8",
+            RuntimeConfigSource::Env,
+        )]);
+
+        let snapshot = merge_runtime_config_sources(config_entries, env_snapshot, Vec::new());
+        let kv = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_KV_DTYPE")
+            .unwrap();
+        assert_eq!(kv.effective_value, "int8");
+        assert_eq!(kv.source, RuntimeConfigSource::Env);
+    }
+
+    #[test]
+    fn serve_runtime_snapshot_prefers_cli_over_env() {
+        let env_snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            "FERRUM_KV_DTYPE",
+            "int8",
+            RuntimeConfigSource::Env,
+        )]);
+        let cli_entries =
+            serve_cli_runtime_entries(Some("bf16"), None, None, None, None, None, None);
+
+        let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
+        let kv = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_KV_DTYPE")
+            .unwrap();
+        assert_eq!(kv.effective_value, "bf16");
+        assert_eq!(kv.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn effective_kv_dtype_precedence_is_cli_env_config() {
+        assert_eq!(
+            resolve_effective_kv_dtype(Some("bf16"), Some("int8"), Some("fp16")),
+            Some("bf16")
+        );
+        assert_eq!(
+            resolve_effective_kv_dtype(None, Some("int8"), Some("fp16")),
+            Some("int8")
+        );
+        assert_eq!(
+            resolve_effective_kv_dtype(None, None, Some("fp16")),
+            Some("fp16")
+        );
+        assert_eq!(resolve_effective_kv_dtype(None, None, None), None);
     }
 }
