@@ -330,9 +330,12 @@ impl FerrumConfigBuilder {
 
     pub fn resolve(self) -> Result<ResolvedFerrumConfig, AutoConfigError> {
         let mut decisions = Vec::new();
+        let cuda_backend = self.is_cuda_backend();
         let use_vllm_paged_attn = self.bool_value(
             "FERRUM_USE_VLLM_PAGED_ATTN",
-            self.workload.is_m3_preset() && self.hardware.compiled_features.vllm_paged_attn,
+            self.workload.is_m3_preset()
+                && cuda_backend
+                && self.hardware.compiled_features.vllm_paged_attn,
             AutoConfigSource::WorkloadPreset,
         )?;
         let fa_layout =
@@ -355,7 +358,9 @@ impl FerrumConfigBuilder {
         )?;
         let vllm_moe = self.bool_value(
             "FERRUM_VLLM_MOE",
-            self.workload.is_m3_preset() && self.hardware.compiled_features.vllm_moe_marlin,
+            self.workload.is_m3_preset()
+                && cuda_backend
+                && self.hardware.compiled_features.vllm_moe_marlin,
             AutoConfigSource::WorkloadPreset,
         )?;
         let device_route = self.bool_value(
@@ -378,7 +383,9 @@ impl FerrumConfigBuilder {
         )?;
         let greedy = self.bool_value(
             "FERRUM_GREEDY_ARGMAX",
-            self.workload.is_m3_preset() && self.hardware.compiled_features.greedy_argmax,
+            self.workload.is_m3_preset()
+                && cuda_backend
+                && self.hardware.compiled_features.greedy_argmax,
             AutoConfigSource::WorkloadPreset,
         )?;
         let prefix_cache = self.bool_value(
@@ -428,6 +435,7 @@ impl FerrumConfigBuilder {
             max_model_len.as_ref().map(|value| value.value),
         )?;
         self.validate_dtypes()?;
+        self.validate_sampling(greedy.value)?;
 
         decisions.push(self.attention_prefill_decision(
             use_vllm_paged_attn.clone(),
@@ -498,6 +506,16 @@ impl FerrumConfigBuilder {
         self.entry(key)
             .map(|entry| auto_config_source_from_runtime(entry.source))
             .unwrap_or(default_source)
+    }
+
+    fn is_cuda_backend(&self) -> bool {
+        self.hardware.backend.eq_ignore_ascii_case("cuda")
+    }
+
+    fn cuda_compute_capability_at_least(&self, major: u32, minor: u32) -> Option<bool> {
+        let (actual_major, actual_minor) =
+            parse_compute_capability(self.hardware.compute_capability.as_deref()?)?;
+        Some((actual_major, actual_minor) >= (major, minor))
     }
 
     fn bool_value(
@@ -584,6 +602,12 @@ impl FerrumConfigBuilder {
                 "vLLM paged attention is not compiled",
             );
         }
+        if use_vllm_paged_attn && !self.is_cuda_backend() {
+            return self.invalid(
+                "FERRUM_USE_VLLM_PAGED_ATTN",
+                "vLLM paged attention requires CUDA backend",
+            );
+        }
         if fa_layout && !use_vllm_paged_attn {
             return self.invalid(
                 "FERRUM_FA_LAYOUT_VARLEN",
@@ -596,10 +620,34 @@ impl FerrumConfigBuilder {
                 "source-built FA2 support is not compiled",
             );
         }
+        if fa2_source && !self.is_cuda_backend() {
+            return self.invalid(
+                "FERRUM_FA2_SOURCE",
+                "source-built FA2 requires CUDA backend",
+            );
+        }
+        if fa2_source && self.cuda_compute_capability_at_least(8, 0) == Some(false) {
+            return self.invalid(
+                "FERRUM_FA2_SOURCE",
+                "source-built FA2 requires CUDA compute capability >= 8.0",
+            );
+        }
         if fa2_direct_ffi && !self.hardware.compiled_features.fa2_direct_ffi {
             return self.invalid(
                 "FERRUM_FA2_DIRECT_FFI",
                 "direct FA2 FFI shim support is not compiled",
+            );
+        }
+        if fa2_direct_ffi && !self.is_cuda_backend() {
+            return self.invalid(
+                "FERRUM_FA2_DIRECT_FFI",
+                "direct FA2 FFI shim requires CUDA backend",
+            );
+        }
+        if fa2_direct_ffi && self.cuda_compute_capability_at_least(8, 0) == Some(false) {
+            return self.invalid(
+                "FERRUM_FA2_DIRECT_FFI",
+                "direct FA2 FFI shim requires CUDA compute capability >= 8.0",
             );
         }
         if fa2_direct_ffi && !shim_present {
@@ -632,6 +680,9 @@ impl FerrumConfigBuilder {
     ) -> Result<(), AutoConfigError> {
         if vllm_moe && !self.hardware.compiled_features.vllm_moe_marlin {
             return self.invalid("FERRUM_VLLM_MOE", "vLLM Marlin MoE is not compiled");
+        }
+        if vllm_moe && !self.is_cuda_backend() {
+            return self.invalid("FERRUM_VLLM_MOE", "vLLM Marlin MoE requires CUDA backend");
         }
         if device_route && !vllm_moe {
             return self.invalid(
@@ -666,6 +717,16 @@ impl FerrumConfigBuilder {
                 "moe_graph_policy",
                 "model MoE path is not marked graph-safe",
             );
+        }
+        Ok(())
+    }
+
+    fn validate_sampling(&self, greedy: bool) -> Result<(), AutoConfigError> {
+        if greedy && !self.hardware.compiled_features.greedy_argmax {
+            return self.invalid("FERRUM_GREEDY_ARGMAX", "GPU argmax is not compiled");
+        }
+        if greedy && !self.is_cuda_backend() {
+            return self.invalid("FERRUM_GREEDY_ARGMAX", "GPU argmax requires CUDA backend");
         }
         Ok(())
     }
@@ -1111,6 +1172,15 @@ struct ResolvedValue<T> {
     source_key: Option<String>,
 }
 
+fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (major, minor) = value.split_once('.').unwrap_or((value, "0"));
+    Some((major.trim().parse().ok()?, minor.trim().parse().ok()?))
+}
+
 fn auto_config_source_from_runtime(source: RuntimeConfigSource) -> AutoConfigSource {
     match source {
         RuntimeConfigSource::Default => AutoConfigSource::Default,
@@ -1151,6 +1221,16 @@ mod tests {
             .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
     }
 
+    fn m3_with_hardware(
+        vars: &[(&str, &str)],
+        hardware: HardwareCapabilities,
+    ) -> FerrumConfigBuilder {
+        FerrumConfigBuilder::new(snapshot(vars))
+            .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
+    }
+
     fn expect_invalid_key(vars: &[(&str, &str)], key: &str) {
         expect_invalid_key_with_features(
             vars,
@@ -1164,12 +1244,30 @@ mod tests {
         key: &str,
         features: CompiledKernelFeatures,
     ) {
-        let err = m3(vars, features)
+        expect_invalid_key_with_hardware(vars, key, HardwareCapabilities::rtx4090_cuda(features));
+    }
+
+    fn expect_invalid_key_with_hardware(
+        vars: &[(&str, &str)],
+        key: &str,
+        hardware: HardwareCapabilities,
+    ) {
+        let err = m3_with_hardware(vars, hardware)
             .resolve()
             .expect_err("override should fail");
         match err {
             AutoConfigError::InvalidOverride { key: actual, .. } => assert_eq!(actual, key),
             other => panic!("expected invalid override for {key}, got {other:?}"),
+        }
+    }
+
+    fn cpu_hardware_with_features(features: CompiledKernelFeatures) -> HardwareCapabilities {
+        HardwareCapabilities {
+            backend: "cpu".to_string(),
+            supported_dtypes: vec!["fp32".to_string()],
+            supported_kv_dtypes: vec!["fp16".to_string()],
+            compiled_features: features,
+            ..HardwareCapabilities::unknown()
         }
     }
 
@@ -1219,6 +1317,69 @@ mod tests {
             .unwrap();
         assert_eq!(prefill.selected, "fa2_source");
         expect_invalid_key(&[("FERRUM_FA2_SOURCE", "1")], "FERRUM_FA2_SOURCE");
+    }
+
+    #[test]
+    fn hardware_capabilities_keep_m3_preset_on_compatible_backend_paths() {
+        let resolved = m3_with_hardware(
+            &[],
+            cpu_hardware_with_features(CompiledKernelFeatures::m3_fast_path_with_source_fa2()),
+        )
+        .resolve()
+        .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+
+        assert_eq!(
+            decisions["attention_prefill_mixed_backend"],
+            "legacy_paged_varlen"
+        );
+        assert_eq!(decisions["attention_decode_backend"], "legacy_paged_decode");
+        assert_eq!(decisions["moe_implementation"], "legacy_moe");
+        assert_eq!(decisions["moe_graph_policy"], "graph_disabled");
+        assert_eq!(decisions["sampling_readback_path"], "logits_readback");
+    }
+
+    #[test]
+    fn hardware_incompatible_attention_and_sampling_overrides_are_rejected() {
+        let cpu =
+            cpu_hardware_with_features(CompiledKernelFeatures::m3_fast_path_with_source_fa2());
+        expect_invalid_key_with_hardware(
+            &[("FERRUM_USE_VLLM_PAGED_ATTN", "1")],
+            "FERRUM_USE_VLLM_PAGED_ATTN",
+            cpu.clone(),
+        );
+        expect_invalid_key_with_hardware(
+            &[("FERRUM_VLLM_MOE", "1")],
+            "FERRUM_VLLM_MOE",
+            cpu.clone(),
+        );
+        expect_invalid_key_with_hardware(
+            &[("FERRUM_GREEDY_ARGMAX", "1")],
+            "FERRUM_GREEDY_ARGMAX",
+            cpu.clone(),
+        );
+        expect_invalid_key_with_hardware(&[("FERRUM_FA2_SOURCE", "1")], "FERRUM_FA2_SOURCE", cpu);
+
+        let mut old_cuda = HardwareCapabilities::rtx4090_cuda(
+            CompiledKernelFeatures::m3_fast_path_with_source_fa2(),
+        );
+        old_cuda.compute_capability = Some("7.5".to_string());
+        expect_invalid_key_with_hardware(
+            &[("FERRUM_FA2_SOURCE", "1")],
+            "FERRUM_FA2_SOURCE",
+            old_cuda,
+        );
+    }
+
+    #[test]
+    fn compute_capability_parser_accepts_major_minor_and_major_only() {
+        assert_eq!(parse_compute_capability("8.9"), Some((8, 9)));
+        assert_eq!(parse_compute_capability("9"), Some((9, 0)));
+        assert_eq!(parse_compute_capability("N/A"), None);
     }
 
     #[test]
