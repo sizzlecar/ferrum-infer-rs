@@ -49,6 +49,11 @@ VALIDATION_CHANGE_TYPES = {
     "api_only",
     "build_loop",
 }
+LOG_SNIPPET_PROFILE_KEYS = {
+    "snippet_regex",
+    "required_patterns",
+    "required_any_patterns",
+}
 
 
 def now_iso() -> str:
@@ -135,7 +140,6 @@ class RunPaths:
     health_json: Path
     effective_config_json: Path
     decision_trace_jsonl: Path
-    profile_snippets: Path
     profile_jsonl: Path
 
 
@@ -163,7 +167,17 @@ class Runner:
         preset = self.config.get("preset")
         if preset and preset not in RUNTIME_PRESET_ENV:
             raise SystemExit(f"unknown runtime preset: {preset}")
-        profile_env_cases = self.config.get("profile", {}).get("profile_env_cases", [])
+        profile = self.config.get("profile", {})
+        if profile and not isinstance(profile, dict):
+            raise SystemExit("profile must be an object when set")
+        log_profile_keys = sorted(key for key in LOG_SNIPPET_PROFILE_KEYS if key in profile)
+        if log_profile_keys:
+            raise SystemExit(
+                "text-log profile matching is not supported in m3_ab_runner configs; "
+                f"remove {log_profile_keys} and use profile.structured=true with "
+                "required_events/required_any_events"
+            )
+        profile_env_cases = profile.get("profile_env_cases", [])
         if profile_env_cases and not isinstance(profile_env_cases, list):
             raise SystemExit("profile.profile_env_cases must be a list when set")
         self.validate_verdict(str(self.config.get("artifact_verdict", "pass")), "config")
@@ -430,7 +444,6 @@ class Runner:
             health_json=case_dir / "health.json",
             effective_config_json=case_dir / "effective_config.json",
             decision_trace_jsonl=case_dir / "decision_trace.jsonl",
-            profile_snippets=case_dir / "profile_snippets.log",
             profile_jsonl=case_dir / "profile.jsonl",
         )
 
@@ -1011,46 +1024,15 @@ class Runner:
         with paths.bench_log.open("w") as log:
             subprocess.run(cmd, text=True, stdout=log, stderr=subprocess.STDOUT, check=True)
 
-    def collect_profile_snippets(self, paths: RunPaths) -> dict[str, Any]:
+    def collect_profile(self, paths: RunPaths) -> dict[str, Any]:
         profile = self.config.get("profile", {})
         if profile.get("structured"):
             return self.collect_structured_profile(paths)
 
-        regex = profile.get("snippet_regex")
-        required = profile.get("required_patterns", [])
-        required_any = profile.get("required_any_patterns", [])
-        if not regex and not required and not required_any:
-            return {
-                "enabled": False,
-                "profile_jsonl": profile.get("profile_jsonl"),
-            }
-
-        text = paths.server_log.read_text(errors="ignore").splitlines()
-        pattern = re.compile(regex or "|".join(re.escape(p) for p in required))
-        matched = [line for line in text if pattern.search(line)]
-        paths.profile_snippets.write_text("\n".join(matched) + ("\n" if matched else ""))
-
-        missing = [p for p in required if not any(p in line for line in matched)]
-        missing_any = [
-            group
-            for group in required_any
-            if not any(any(pattern in line for pattern in group) for line in matched)
-        ]
-        result = {
-            "enabled": True,
-            "mode": "log_snippet_derived",
-            "profile_jsonl": str(paths.profile_jsonl),
-            "source_log": str(paths.server_log),
-            "snippets": str(paths.profile_snippets),
-            "matched_lines": len(matched),
-            "required_patterns": required,
-            "required_any_patterns": required_any,
-            "missing_patterns": missing,
-            "missing_any_patterns": missing_any,
-            "ok": not missing and not missing_any,
+        return {
+            "enabled": False,
+            "profile_jsonl": profile.get("profile_jsonl"),
         }
-        self.write_profile_jsonl(paths, matched)
-        return result
 
     def collect_structured_profile(self, paths: RunPaths) -> dict[str, Any]:
         profile = self.config.get("profile", {})
@@ -1095,56 +1077,6 @@ class Runner:
             "errors": errors,
             "ok": not errors and not missing and not missing_any,
         }
-
-    def profile_event_name(self, line: str) -> str | None:
-        for needle, event in (
-            ("MOE_DUMP", "moe_dump"),
-            ("vllm-moe-config", "vllm_moe_config"),
-            ("unified-layer-prof", "unified_layer_prof"),
-            ("unified-prof", "unified_prof"),
-            ("iter-prof", "iter_prof"),
-            ("batched-decode-prof", "batched_decode_prof"),
-            ("bucket-prof", "bucket_prof"),
-            ("graph-prof", "graph_prof"),
-        ):
-            if needle in line:
-                return event
-        return None
-
-    def parse_profile_fields(self, line: str) -> dict[str, float | int]:
-        fields: dict[str, float | int] = {}
-        for key, value in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=(-?\d+(?:\.\d+)?)", line):
-            fields[key] = float(value) if "." in value else int(value)
-        return fields
-
-    def write_profile_jsonl(self, paths: RunPaths, lines: list[str]) -> None:
-        case_manifest = load_json(paths.manifest)
-        runtime_snapshot = case_manifest.get("runtime_config_snapshot", {})
-        effective_env = case_manifest.get("effective_env", {})
-        events = []
-        for line in lines:
-            event = self.profile_event_name(line)
-            if event is None:
-                continue
-            fields = self.parse_profile_fields(line)
-            events.append(
-                {
-                    "event": event,
-                    "commit_sha": case_manifest.get("git_head"),
-                    "env_hash": case_manifest.get("env_hash"),
-                    "model": self.hf_model,
-                    "concurrency": int(self.config.get("concurrency", 32)),
-                    "shape": fields,
-                    "stage_us": fields,
-                    "graph_enabled": effective_env.get("FERRUM_MOE_GRAPH") == "1",
-                    "runtime_flags": runtime_snapshot,
-                    "source": "server_log",
-                    "source_line": line,
-                }
-            )
-        with paths.profile_jsonl.open("w") as handle:
-            for event in events:
-                handle.write(canonical_json(event) + "\n")
 
     def extract_metrics(self, bench_path: Path) -> dict[str, Any]:
         if not bench_path.exists():
@@ -1264,7 +1196,7 @@ class Runner:
                 correctness_gates=manifest["correctness_gates"],
                 metrics=manifest["metrics"],
             )
-            manifest["profile"] = self.collect_profile_snippets(paths)
+            manifest["profile"] = self.collect_profile(paths)
             if manifest["profile"].get("ok") is False:
                 missing = [
                     *manifest["profile"].get("missing_patterns", []),
@@ -1533,8 +1465,6 @@ def self_test() -> None:
         assert metrics["throughput_mean"] == 1.0
         assert metrics["completed"] == 6
         assert metrics["errored"] == 0
-        assert runner.profile_event_name("[unified-prof] total=1.0 model=2") == "unified_prof"
-        assert runner.parse_profile_fields("[x] a=1 b=2.5") == {"a": 1, "b": 2.5}
         paths = RunPaths(
             case_dir=root / "case",
             server_log=root / "case" / "server.log",
@@ -1544,7 +1474,6 @@ def self_test() -> None:
             health_json=root / "case" / "health.json",
             effective_config_json=root / "case" / "effective_config.json",
             decision_trace_jsonl=root / "case" / "decision_trace.jsonl",
-            profile_snippets=root / "case" / "profile_snippets.log",
             profile_jsonl=root / "case" / "profile.jsonl",
         )
         decision_selections = [
@@ -1629,10 +1558,18 @@ def self_test() -> None:
                 "runtime_config_snapshot": snapshot,
             },
         )
-        runner.write_profile_jsonl(paths, ["[unified-prof] total=1.0 model=2"])
-        events = [json.loads(line) for line in paths.profile_jsonl.read_text().splitlines()]
-        assert events[0]["event"] == "unified_prof"
-        assert events[0]["graph_enabled"] is True
+        profile_event = {
+            "event": "unified_prof",
+            "commit_sha": "abc",
+            "env_hash": "sha256:test",
+            "model": runner.hf_model,
+            "concurrency": 32,
+            "shape": {},
+            "stage_us": {"total": 1.0, "model": 2.0},
+            "graph_enabled": True,
+            "runtime_flags": {},
+        }
+        paths.profile_jsonl.write_text(canonical_json(profile_event) + "\n")
         runner.config["profile"] = {
             "structured": True,
             "required_events": ["unified_prof"],
@@ -1646,20 +1583,22 @@ def self_test() -> None:
         ]
         assert "--profile-env-hash" not in profile_args
         assert "--profile-runtime-flags-json" not in profile_args
-        structured = runner.collect_profile_snippets(paths)
+        structured = runner.collect_profile(paths)
         assert structured["ok"]
         assert structured["mode"] == "structured_jsonl"
         assert structured["source"] == "server_profile_sink"
         assert structured["event_count"] == 1
-        paths.server_log.write_text("[unified-prof] total=1.0 model=2\n")
-        runner.config["profile"] = {
+        bad_profile_cfg = dict(cfg)
+        bad_profile_cfg["profile"] = {
             "snippet_regex": "unified-prof",
             "required_patterns": ["unified-prof"],
         }
-        log_profile = runner.collect_profile_snippets(paths)
-        assert log_profile["ok"]
-        assert log_profile["mode"] == "log_snippet_derived"
-        assert "source_log" in log_profile
+        bad_runner = Runner(bad_profile_cfg)
+        try:
+            bad_runner.validate()
+            raise AssertionError("log-snippet profile config should fail validation")
+        except SystemExit as exc:
+            assert "text-log profile matching" in str(exc)
         runner.config["profile"] = {"profile_env_cases": ["a"]}
         case_profile_args = runner.profile_server_args(paths, cfg["cases"][0])
         assert "--profile-jsonl" in case_profile_args

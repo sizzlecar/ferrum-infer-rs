@@ -41,10 +41,14 @@ validators, a native JSONL sink, and the first Rust/C++ profile emitters.
   `profile.jsonl` contents, so a missing `moe_dump`, `vllm_moe_config`, or
   equivalent required event group cannot pass by manifest metadata alone.
 - Runner profile manifests now record explicit mode. `mode=structured_jsonl`
-  marks native/server profile sink data; `mode=log_snippet_derived` marks the
-  transitional server-log snippet bridge. The artifact validator rejects any
+  marks native/server profile sink data. The artifact validator still
+  recognizes historical `mode=log_snippet_derived` artifacts, but rejects any
   profile manifest that declares structured `required_events` or
   `required_any_events` without `mode=structured_jsonl`.
+- New runner configs now reject text-log profile matching keys
+  (`snippet_regex`, `required_patterns`, and `required_any_patterns`) at
+  validation time. M3 profile gates for new artifacts must use native
+  structured JSONL events from the server profile sink.
 - `ferrum-bench-core::profile::ProfileJsonlWriter` writes native JSONL events
   from a typed `ProfileSinkConfig`. `ferrum serve --profile-*` initializes the
   Rust writer directly and passes the same typed sink to native kernel bridges.
@@ -222,9 +226,9 @@ Evidence:
 
 ## Remaining B Gaps
 
-- Some remaining runtime profile wrappers still consume text logs; the primary
-  route/unified and graph-runtime profile wrappers now require native
-  structured JSONL events.
+- No migrated M3 profile wrapper consumes text-log required profile patterns;
+  route/unified and graph-runtime profile wrappers require native structured
+  JSONL events.
 - Profile sink overhead now has c32 N=3 same-binary evidence within noise, but
   full diagnostic producer overhead is still intentionally excluded from this
   low-intrusion bound.
