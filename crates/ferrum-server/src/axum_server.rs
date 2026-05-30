@@ -2445,6 +2445,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_models_lists_loaded_stub_model() {
+        let response = get(router_with_stub("ok"), "/v1/models").await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["object"], "list");
+        let data = body["data"].as_array().expect("models data array");
+        assert_eq!(data.len(), 1, "body: {body}");
+        assert_eq!(data[0]["id"], "stub-model");
+        assert_eq!(data[0]["object"], "model");
+        assert_eq!(data[0]["owned_by"], "ferrum");
+        assert!(data[0]["created"].as_u64().unwrap_or_default() > 0);
+        assert!(data[0]["permission"].as_array().unwrap().is_empty());
+        assert!(data[0]["root"].is_null());
+        assert!(data[0]["parent"].is_null());
+    }
+
+    #[tokio::test]
+    async fn route_models_without_engine_returns_empty_list() {
+        let response = get(router_without_llm(), "/v1/models").await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["object"], "list");
+        assert!(body["data"].as_array().unwrap().is_empty(), "body: {body}");
+    }
+
+    #[tokio::test]
     async fn route_basic_chat_contract_uses_stub_engine() {
         let response = post_json(
             router_with_stub("hello"),
