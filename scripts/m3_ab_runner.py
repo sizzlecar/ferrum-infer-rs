@@ -295,6 +295,8 @@ class Runner:
 
     def validation_performance_required(self) -> bool:
         validation = self.validation_config()
+        if self.validation_change_type() == "default_path":
+            return True
         if "performance_regression_required" in validation:
             return bool(validation["performance_regression_required"])
         return bool(self.config.get("baseline_case"))

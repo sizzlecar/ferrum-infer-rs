@@ -583,6 +583,10 @@ def validate_validation_checklist(
         raise ValidationError(
             f"{where}.validation_checklist.performance_regression_required must be boolean"
         )
+    if publishable and checklist["change_type"] == "default_path" and not perf_required:
+        raise ValidationError(
+            f"{where}.validation_checklist default_path requires performance regression gate"
+        )
     baseline_case = checklist["baseline_case"]
     if baseline_case is not None and not isinstance(baseline_case, str):
         raise ValidationError(f"{where}.validation_checklist.baseline_case must be null or string")
@@ -1401,6 +1405,18 @@ def self_test() -> None:
             assert "touched_areas invalid" in str(exc)
         else:
             raise AssertionError("unknown touched area unexpectedly passed")
+        write_json(case_dir / "manifest.json", case_manifest)
+
+        bad_checklist = load_json(case_dir / "manifest.json")
+        bad_checklist["validation_checklist"]["change_type"] = "default_path"
+        bad_checklist["validation_checklist"]["performance_regression_required"] = False
+        write_json(case_dir / "manifest.json", bad_checklist)
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=False)
+        except ValidationError as exc:
+            assert "default_path requires performance regression gate" in str(exc)
+        else:
+            raise AssertionError("publishable default-path artifact without perf gate passed")
         write_json(case_dir / "manifest.json", case_manifest)
 
         for missing_key in sorted(PROFILE_REQUIRED):
