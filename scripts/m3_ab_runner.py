@@ -1038,7 +1038,9 @@ class Runner:
         ]
         result = {
             "enabled": True,
+            "mode": "log_snippet_derived",
             "profile_jsonl": str(paths.profile_jsonl),
+            "source_log": str(paths.server_log),
             "snippets": str(paths.profile_snippets),
             "matched_lines": len(matched),
             "required_patterns": required,
@@ -1083,6 +1085,7 @@ class Runner:
             "enabled": True,
             "mode": "structured_jsonl",
             "profile_jsonl": str(paths.profile_jsonl),
+            "source": "server_profile_sink",
             "event_count": len(events),
             "events": sorted(set(event_names)),
             "required_events": required,
@@ -1646,7 +1649,17 @@ def self_test() -> None:
         structured = runner.collect_profile_snippets(paths)
         assert structured["ok"]
         assert structured["mode"] == "structured_jsonl"
+        assert structured["source"] == "server_profile_sink"
         assert structured["event_count"] == 1
+        paths.server_log.write_text("[unified-prof] total=1.0 model=2\n")
+        runner.config["profile"] = {
+            "snippet_regex": "unified-prof",
+            "required_patterns": ["unified-prof"],
+        }
+        log_profile = runner.collect_profile_snippets(paths)
+        assert log_profile["ok"]
+        assert log_profile["mode"] == "log_snippet_derived"
+        assert "source_log" in log_profile
         runner.config["profile"] = {"profile_env_cases": ["a"]}
         case_profile_args = runner.profile_server_args(paths, cfg["cases"][0])
         assert "--profile-jsonl" in case_profile_args

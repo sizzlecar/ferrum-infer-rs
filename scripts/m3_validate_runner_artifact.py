@@ -678,6 +678,9 @@ def validate_profile_manifest(
         return
     if profile.get("ok") is not True:
         raise ValidationError(f"{case_name}: profile manifest reports failure: {profile!r}")
+    mode = profile.get("mode")
+    if mode is not None and mode not in {"structured_jsonl", "log_snippet_derived"}:
+        raise ValidationError(f"{case_name}: profile.mode invalid: {mode!r}")
     if "event_count" in profile:
         event_count = profile["event_count"]
         if not isinstance(event_count, int) or isinstance(event_count, bool):
@@ -716,6 +719,10 @@ def validate_profile_manifest(
             raise ValidationError(
                 f"{case_name}: profile missing one of required event group: {group}"
             )
+    if (required or required_any) and mode != "structured_jsonl":
+        raise ValidationError(
+            f"{case_name}: profile required_events require mode=structured_jsonl"
+        )
 
     for key in ("missing_events", "missing_any_events", "errors"):
         value = profile.get(key, [])
@@ -1326,6 +1333,17 @@ def self_test() -> None:
         else:
             raise AssertionError("missing required profile event unexpectedly passed")
         case_manifest["profile"]["required_events"] = ["unified_prof"]
+        write_json(case_dir / "manifest.json", case_manifest)
+
+        case_manifest["profile"]["mode"] = "log_snippet_derived"
+        write_json(case_dir / "manifest.json", case_manifest)
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=True)
+        except ValidationError as exc:
+            assert "mode=structured_jsonl" in str(exc)
+        else:
+            raise AssertionError("log-derived profile satisfied structured events")
+        case_manifest["profile"]["mode"] = "structured_jsonl"
         write_json(case_dir / "manifest.json", case_manifest)
 
         effective_config = load_json(case_dir / "effective_config.json")

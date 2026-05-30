@@ -40,6 +40,11 @@ validators, a native JSONL sink, and the first Rust/C++ profile emitters.
   gates (`required_events` and `required_any_events`) against the actual
   `profile.jsonl` contents, so a missing `moe_dump`, `vllm_moe_config`, or
   equivalent required event group cannot pass by manifest metadata alone.
+- Runner profile manifests now record explicit mode. `mode=structured_jsonl`
+  marks native/server profile sink data; `mode=log_snippet_derived` marks the
+  transitional server-log snippet bridge. The artifact validator rejects any
+  profile manifest that declares structured `required_events` or
+  `required_any_events` without `mode=structured_jsonl`.
 - `ferrum-bench-core::profile::ProfileJsonlWriter` writes native JSONL events
   from a typed `ProfileSinkConfig`. `ferrum serve --profile-*` initializes the
   Rust writer directly and passes the same typed sink to native kernel bridges.
@@ -77,6 +82,8 @@ cargo check -q -p ferrum-cli
 python3 -m py_compile scripts/m3_validate_runner_artifact.py scripts/m3_ab_runner.py
 python3 scripts/m3_validate_runner_artifact.py --self-test
 python3 scripts/m3_ab_runner.py --self-test
+VALIDATE_ONLY=1 MODEL_DIR=/tmp BIN=/bin/echo OUT_ROOT=/tmp/m3-route-validate-profile-mode \
+  bash scripts/m3_route_unified_profile.sh
 VALIDATE_ONLY=1 MODEL_DIR=/tmp BIN=/bin/echo OUT_ROOT=/tmp/m3-route-validate \
   bash scripts/m3_route_unified_profile.sh
 VALIDATE_ONLY=1 MODEL_DIR=/tmp BIN=/bin/echo OUT_ROOT=/tmp/m3-graph-runtime-validate \
