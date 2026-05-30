@@ -4074,6 +4074,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_speech_streaming_contract_uses_stub_engine() {
+        let response = post_json(
+            router_with_stub_tts(),
+            "/v1/audio/speech",
+            json!({
+                "model": "stub-tts",
+                "input": "hello",
+                "voice": "default",
+                "response_format": "wav",
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/wav"
+        );
+        assert_eq!(
+            response.headers().get(header::TRANSFER_ENCODING).unwrap(),
+            "chunked"
+        );
+        let body = response_bytes(response).await;
+        assert!(body.len() > 44, "streaming WAV should include audio bytes");
+        assert_eq!(&body[0..4], b"RIFF");
+        assert_eq!(&body[8..12], b"WAVE");
+    }
+
+    #[tokio::test]
     async fn route_speech_pcm_response_format_returns_raw_pcm() {
         let response = post_json(
             router_with_stub_tts(),
