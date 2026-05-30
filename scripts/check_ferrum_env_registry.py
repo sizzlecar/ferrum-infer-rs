@@ -65,6 +65,9 @@ FERRUM_TOKEN_RE = re.compile(r"FERRUM_[A-Z0-9_]+")
 DIRECT_ENV_READ_RE = re.compile(
     r"(?P<call>std::env::var_os|std::env::var|env::var_os|env::var|std::getenv|getenv)\s*\("
 )
+PROCESS_ENV_WRITE_RE = re.compile(
+    r"(?P<call>std::env::set_var|env::set_var|std::env::remove_var|env::remove_var)\s*\("
+)
 
 HOT_DIRECT_ENV_READ_CLASSIFICATIONS = (
     {
@@ -99,6 +102,39 @@ HOT_DIRECT_ENV_READ_CLASSIFICATIONS = (
         "classification": "ignored_manual_metal_capture_test",
         "read_phase": "test-only",
         "reason": "ignored manual GPU capture test guard, not a product runtime Ferrum knob",
+    },
+)
+
+PROCESS_ENV_WRITE_CLASSIFICATIONS = (
+    {
+        "path": "crates/ferrum-cli/src/runtime_env.rs",
+        "call": "std::env::set_var",
+        "expected_count": 1,
+        "classification": "runtime_config_compatibility_bridge",
+        "reason": (
+            "centralized CLI bridge materializing typed RuntimeConfigEntry "
+            "defaults for backend paths that still consume process env"
+        ),
+    },
+    {
+        "path": "crates/ferrum-bench-core/src/profile.rs",
+        "call": "std::env::set_var",
+        "expected_count": 6,
+        "classification": "profile_sink_compatibility_bridge",
+        "reason": (
+            "backwards-compatible FERRUM_PROFILE_* process-env materialization; "
+            "normal server profile wiring uses typed --profile-* arguments"
+        ),
+    },
+    {
+        "path": "crates/ferrum-bench-core/src/profile.rs",
+        "call": "std::env::remove_var",
+        "expected_count": 1,
+        "classification": "profile_sink_compatibility_bridge",
+        "reason": (
+            "backwards-compatible FERRUM_PROFILE_* process-env cleanup; normal "
+            "server profile wiring uses typed --profile-* arguments"
+        ),
     },
 )
 
@@ -190,6 +226,17 @@ def source_line_for_offset(text: str, offset: int) -> str:
     return text[line_start:line_end].strip()
 
 
+def is_test_env_write_context(rel: str, text: str, offset: int) -> bool:
+    if "/tests/" in rel or rel.endswith("_test.rs") or rel.endswith("_tests.rs"):
+        return True
+
+    prefix = text[:offset]
+    last_cfg_test = prefix.rfind("#[cfg(test)]")
+    if last_cfg_test == -1:
+        return False
+    return "mod tests" in prefix[last_cfg_test:]
+
+
 def parse_string_literal_argument(text: str, offset: int) -> str | None:
     i = offset
     while i < len(text) and text[i].isspace():
@@ -224,6 +271,19 @@ def direct_env_read_occurrence(rel: str, text: str, match: re.Match[str]) -> dic
         "call": match.group("call"),
         "env_name": parse_string_literal_argument(text, match.end()),
         "source": source_line_for_offset(text, match.start()),
+    }
+
+
+def process_env_write_occurrence(rel: str, text: str, match: re.Match[str]) -> dict[str, Any]:
+    line, column = line_col_for_offset(text, match.start())
+    return {
+        "path": rel,
+        "line": line,
+        "column": column,
+        "call": match.group("call"),
+        "env_name": parse_string_literal_argument(text, match.end()),
+        "source": source_line_for_offset(text, match.start()),
+        "test_context": is_test_env_write_context(rel, text, match.start()),
     }
 
 
@@ -292,14 +352,84 @@ def classify_hot_direct_env_reads(
     }
 
 
+def classify_process_env_writes(
+    occurrences: list[dict[str, Any]],
+) -> dict[str, Any]:
+    remaining = [
+        {
+            **classification,
+            "remaining": int(classification.get("expected_count", 1)),
+        }
+        for classification in PROCESS_ENV_WRITE_CLASSIFICATIONS
+    ]
+    classified: list[dict[str, Any]] = []
+    unclassified: list[dict[str, Any]] = []
+
+    for occurrence in occurrences:
+        if occurrence.get("test_context"):
+            classified.append(
+                {
+                    **occurrence,
+                    "classification": "test_only_env_mutation",
+                    "reason": "test fixture setup/cleanup outside product runtime paths",
+                }
+            )
+            continue
+
+        matched_index: int | None = None
+        for index, classification in enumerate(remaining):
+            if classification["remaining"] <= 0:
+                continue
+            if occurrence["path"] != classification["path"]:
+                continue
+            if occurrence["call"] != classification["call"]:
+                continue
+            matched_index = index
+            break
+
+        if matched_index is None:
+            unclassified.append(occurrence)
+            continue
+
+        classification = remaining[matched_index]
+        classification["remaining"] -= 1
+        classified.append(
+            {
+                **occurrence,
+                "classification": classification["classification"],
+                "reason": classification["reason"],
+            }
+        )
+
+    unused = [
+        {
+            key: value
+            for key, value in classification.items()
+            if key != "remaining"
+        }
+        | {"unused_count": classification["remaining"]}
+        for classification in remaining
+        if classification["remaining"] > 0
+    ]
+    return {
+        "classified_count": len(classified),
+        "unclassified_count": len(unclassified),
+        "classified": classified,
+        "unclassified": unclassified,
+        "unused_classifications": unused,
+    }
+
+
 def scan_sources(roots: tuple[str, ...]) -> dict[str, Any]:
     token_paths: dict[str, set[str]] = defaultdict(set)
     embedded_token_paths: dict[str, set[str]] = defaultdict(set)
     hot_token_paths: dict[str, set[str]] = defaultdict(set)
     direct_reads_by_file: Counter[str] = Counter()
     hot_direct_reads_by_file: Counter[str] = Counter()
+    process_env_writes_by_file: Counter[str] = Counter()
     token_count_by_file: Counter[str] = Counter()
     hot_direct_occurrences: list[dict[str, Any]] = []
+    process_env_write_occurrences: list[dict[str, Any]] = []
 
     files = iter_source_files(roots)
     for path in files:
@@ -329,11 +459,22 @@ def scan_sources(roots: tuple[str, ...]) -> dict[str, Any]:
                     for match in direct_read_matches
                 )
 
+        process_env_write_matches = list(PROCESS_ENV_WRITE_RE.finditer(text))
+        if process_env_write_matches:
+            process_env_writes_by_file[rel] = len(process_env_write_matches)
+            process_env_write_occurrences.extend(
+                process_env_write_occurrence(rel, text, match)
+                for match in process_env_write_matches
+            )
+
     unique_tokens = sorted(token_paths)
     hot_tokens = sorted(hot_token_paths)
     embedded_tokens = sorted(embedded_token_paths)
     standalone_tokens = sorted(set(unique_tokens) - set(embedded_tokens))
     hot_direct_classification = classify_hot_direct_env_reads(hot_direct_occurrences)
+    process_env_write_classification = classify_process_env_writes(
+        process_env_write_occurrences
+    )
 
     return {
         "scan_roots": list(roots),
@@ -342,6 +483,11 @@ def scan_sources(roots: tuple[str, ...]) -> dict[str, Any]:
         "unique_ferrum_env_candidates": len(standalone_tokens),
         "embedded_ferrum_tokens": embedded_tokens,
         "direct_env_reads": sum(direct_reads_by_file.values()),
+        "process_env_writes": sum(process_env_writes_by_file.values()),
+        "process_env_writes_classified": process_env_write_classification["classified_count"],
+        "process_env_writes_unclassified": process_env_write_classification[
+            "unclassified_count"
+        ],
         "hot_unique_ferrum_tokens": len(hot_tokens),
         "hot_direct_env_reads": sum(hot_direct_reads_by_file.values()),
         "hot_direct_env_reads_classified": hot_direct_classification["classified_count"],
@@ -351,8 +497,10 @@ def scan_sources(roots: tuple[str, ...]) -> dict[str, Any]:
         "hot_unique_names": hot_tokens,
         "name_paths": {name: sorted(paths) for name, paths in sorted(token_paths.items())},
         "top_direct_env_read_files": top_counter(direct_reads_by_file),
+        "top_process_env_write_files": top_counter(process_env_writes_by_file),
         "hot_top_direct_env_read_files": top_counter(hot_direct_reads_by_file),
         "hot_direct_env_read_classification": hot_direct_classification,
+        "process_env_write_classification": process_env_write_classification,
         "top_ferrum_token_files": top_counter(token_count_by_file),
     }
 
@@ -614,6 +762,48 @@ def run_self_test() -> None:
             "errors"
         ]
 
+        product_write_text = "fn main() { std::env::set_var(\"FERRUM_TEST_FLAG\", \"1\"); }"
+        product_write = [
+            process_env_write_occurrence("crates/ferrum-cli/src/main.rs", product_write_text, match)
+            for match in PROCESS_ENV_WRITE_RE.finditer(product_write_text)
+        ]
+        product_classification = classify_process_env_writes(product_write)
+        assert product_classification["unclassified_count"] == 1, product_classification
+
+        test_write_text = "\n".join(
+            [
+                "#[cfg(test)]",
+                "mod tests {",
+                "    fn env_fixture() {",
+                "        std::env::set_var(\"FERRUM_TEST_FLAG\", \"1\");",
+                "    }",
+                "}",
+            ]
+        )
+        test_write = [
+            process_env_write_occurrence(
+                "crates/ferrum-cli/src/some_module.rs", test_write_text, match
+            )
+            for match in PROCESS_ENV_WRITE_RE.finditer(test_write_text)
+        ]
+        test_classification = classify_process_env_writes(test_write)
+        assert test_classification["unclassified_count"] == 0, test_classification
+        assert test_classification["classified"][0]["classification"] == "test_only_env_mutation"
+
+        bridge_write_text = "fn bridge() { std::env::set_var(&entry.key, &entry.effective_value); }"
+        bridge_write = [
+            process_env_write_occurrence(
+                "crates/ferrum-cli/src/runtime_env.rs", bridge_write_text, match
+            )
+            for match in PROCESS_ENV_WRITE_RE.finditer(bridge_write_text)
+        ]
+        bridge_classification = classify_process_env_writes(bridge_write)
+        assert bridge_classification["unclassified_count"] == 0, bridge_classification
+        assert (
+            bridge_classification["classified"][0]["classification"]
+            == "runtime_config_compatibility_bridge"
+        )
+
     print("check_ferrum_env_registry self-test ok")
 
 
@@ -667,6 +857,9 @@ def render_human(report: dict[str, Any]) -> str:
         f"  unique_ferrum_tokens: {report['unique_ferrum_tokens']}",
         f"  unique_ferrum_env_candidates: {report['unique_ferrum_env_candidates']}",
         f"  direct_env_reads: {report['direct_env_reads']}",
+        f"  process_env_writes: {report['process_env_writes']}",
+        f"  process_env_writes_classified: {report['process_env_writes_classified']}",
+        f"  process_env_writes_unclassified: {report['process_env_writes_unclassified']}",
         f"  hot_unique_ferrum_tokens: {report['hot_unique_ferrum_tokens']}",
         f"  hot_direct_env_reads: {report['hot_direct_env_reads']}",
         f"  hot_direct_env_reads_classified: {report['hot_direct_env_reads_classified']}",
@@ -685,6 +878,18 @@ def render_human(report: dict[str, Any]) -> str:
                 env=occurrence["env_name"] or "?",
             )
             for occurrence in classification["unclassified"]
+        )
+    write_classification = report.get("process_env_write_classification")
+    if write_classification and write_classification["unclassified"]:
+        lines.append("  unclassified_process_env_writes:")
+        lines.extend(
+            "    - {path}:{line}: {call}({env})".format(
+                path=occurrence["path"],
+                line=occurrence["line"],
+                call=occurrence["call"],
+                env=occurrence["env_name"] or "?",
+            )
+            for occurrence in write_classification["unclassified"]
         )
 
     registry = report.get("registry")
@@ -828,6 +1033,7 @@ def main() -> int:
         or comparison["missing_count"]
         or comparison["extra_count"]
         or scan["hot_direct_env_reads_unclassified"]
+        or scan["process_env_writes_unclassified"]
         or scan["product_config_surface"]["errors"]
     ):
         return 1

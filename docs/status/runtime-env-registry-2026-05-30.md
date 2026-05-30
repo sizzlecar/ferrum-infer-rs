@@ -27,6 +27,11 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   classification. The current residual hot direct reads are all classified as
   diagnostic/startup/test-only exceptions rather than hidden by file-level
   counts.
+- The same static gate now audits process-wide env writes
+  (`std::env::set_var`, `env::set_var`, `std::env::remove_var`, and
+  `env::remove_var`). `--fail-on-registry-gap` fails on any unclassified
+  product/runtime env write, while test fixtures and the two remaining
+  compatibility bridges are explicitly classified.
 - `ferrum-types::RuntimeConfigSnapshot` captures stable sorted `FERRUM_*` overrides with source/effect metadata; `/health` and bench `Env` now include it.
 - `RuntimeConfigSnapshot` now supports explicit non-env entries and stable
   upserts. `ferrum serve` uses this for selected CLI runtime/profile inputs,
@@ -153,6 +158,9 @@ Current local scan:
 | unique `FERRUM_*` tokens | 153 |
 | unique standalone candidates | 152 |
 | direct env read calls | 94 |
+| process env write calls | 42 |
+| classified process env write calls | 42 |
+| unclassified process env write calls | 0 |
 | hot-path unique `FERRUM_*` tokens | 121 |
 | hot-path direct env read calls | 4 |
 | classified hot-path direct env read calls | 4 |
@@ -179,6 +187,19 @@ The classified residual hot-path direct-read call sites are:
   ignored manual Metal capture test reads `MTL_CAPTURE_ENABLED`.
 
 The scanner reports `FERRUM_2M` as an embedded token, not a standalone env candidate; it comes from a microbench label string rather than a real runtime knob.
+
+The classified process-env write call sites are:
+
+- `34` test-only fixture setup/cleanup calls in Rust test modules or
+  integration tests.
+- `7` profile sink compatibility bridge calls in
+  `crates/ferrum-bench-core/src/profile.rs`. Normal `ferrum serve`
+  structured-profile wiring uses typed `--profile-*` arguments; this bridge
+  remains for backwards-compatible `FERRUM_PROFILE_*` propagation.
+- `1` CLI runtime compatibility bridge call in
+  `crates/ferrum-cli/src/runtime_env.rs`, which materializes typed
+  `RuntimeConfigEntry` defaults only for backend paths that have not yet been
+  converted to typed config.
 
 ## Config Diff Artifact
 
