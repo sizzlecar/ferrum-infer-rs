@@ -1519,7 +1519,10 @@ async fn embeddings_handler(
     };
 
     if items.is_empty() {
-        return Err(ServerError::BadRequest("Empty input".to_string()));
+        return Err(ServerError::invalid_request(
+            "input must not be empty",
+            Some("input"),
+        ));
     }
 
     let mut data = Vec::with_capacity(items.len());
@@ -1541,8 +1544,9 @@ async fn embeddings_handler(
                 .await
                 .map_err(|e| ServerError::InternalError(format!("embed_text: {e}")))?
         } else {
-            return Err(ServerError::BadRequest(
-                "Each input must have either 'text' or 'image'".to_string(),
+            return Err(ServerError::invalid_request(
+                "each input item must have either text or image",
+                Some("input"),
             ));
         };
 
@@ -1599,7 +1603,7 @@ async fn transcriptions_handler(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| ServerError::BadRequest(format!("multipart: {e}")))?
+        .map_err(|e| ServerError::invalid_request(format!("multipart: {e}"), None))?
     {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
@@ -1608,7 +1612,9 @@ async fn transcriptions_handler(
                     field
                         .bytes()
                         .await
-                        .map_err(|e| ServerError::BadRequest(format!("read file: {e}")))?
+                        .map_err(|e| {
+                            ServerError::invalid_request(format!("read file: {e}"), Some("file"))
+                        })?
                         .to_vec(),
                 );
             }
@@ -1624,7 +1630,8 @@ async fn transcriptions_handler(
 
     validate_transcription_response_format(response_format.as_deref())?;
 
-    let data = file_data.ok_or_else(|| ServerError::BadRequest("missing 'file' field".into()))?;
+    let data = file_data
+        .ok_or_else(|| ServerError::invalid_request("missing file field", Some("file")))?;
 
     let engine = state.transcribe.as_ref().ok_or_else(|| {
         ServerError::NotImplemented("Transcribe engine not loaded; ASR unavailable".into())
@@ -3853,6 +3860,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_embeddings_rejects_empty_input_with_field_param() {
+        let response = post_json(
+            router_with_stub_embed(),
+            "/v1/embeddings",
+            json!({
+                "model": "stub-embed",
+                "input": []
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "input");
+    }
+
+    #[tokio::test]
+    async fn route_embeddings_rejects_empty_item_with_field_param() {
+        let response = post_json(
+            router_with_stub_embed(),
+            "/v1/embeddings",
+            json!({
+                "model": "stub-embed",
+                "input": [{}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "input");
+    }
+
+    #[tokio::test]
     async fn route_embeddings_invalid_json_maps_to_openai_error() {
         let response = post_raw_json(router_with_stub_embed(), "/v1/embeddings", "{").await;
         assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
@@ -3946,6 +3987,29 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "response_format");
+    }
+
+    #[tokio::test]
+    async fn route_transcriptions_rejects_missing_file_with_field_param() {
+        let boundary = "ferrum-test-boundary";
+        let body = concat!(
+            "--ferrum-test-boundary\r\n",
+            "Content-Disposition: form-data; name=\"language\"\r\n",
+            "\r\n",
+            "en\r\n",
+            "--ferrum-test-boundary--\r\n"
+        );
+        let response = post_multipart(
+            router_with_stub_transcribe(),
+            "/v1/audio/transcriptions",
+            boundary,
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "file");
     }
 
     #[tokio::test]
