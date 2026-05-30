@@ -34,6 +34,11 @@ summary lines.
   touch/content-change probe for N iterations, validates the same structured
   CUDA summary rows for every run, computes nearest-rank p50/p95 timing, and
   writes `build_boundary_manifest.json`.
+- CI now runs the lightweight self-tests for both CUDA build validation tools:
+  `scripts/validate_cuda_build_summary.py --self-test` and
+  `scripts/m3_cuda_build_boundary_probe.py --self-test`. This keeps the
+  parser and release-boundary probe manifest/summary validation logic checked
+  before spending GPU time on the full timing artifact.
 - `ferrum-kernels/build.rs` no longer registers core CUDA `.cu` inputs before
   the `cuda` feature check. CUDA builds still watch the same core PTX inputs in
   `compile_core_ptx`, but non-CUDA builds are no longer dirtied by unrelated
