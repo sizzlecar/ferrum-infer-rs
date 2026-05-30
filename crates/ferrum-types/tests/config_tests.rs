@@ -13,6 +13,53 @@ fn scheduler_config_default_sane() {
     let cfg = SchedulerConfig::default();
     assert!(matches!(cfg.policy, SchedulingPolicy::Priority));
     assert!(cfg.max_waiting_requests >= 1);
+    assert!(!cfg.prompt_token_estimate);
+    assert_eq!(cfg.prefill_first_until_active, None);
+    assert_eq!(cfg.active_decode_prefill_chunk, None);
+}
+
+#[test]
+fn scheduler_config_applies_runtime_snapshot() {
+    let snapshot = RuntimeConfigSnapshot::from_entries([
+        RuntimeConfigEntry::new(
+            "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
+            "1",
+            RuntimeConfigSource::Env,
+        ),
+        RuntimeConfigEntry::new(
+            "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+            "4",
+            RuntimeConfigSource::Env,
+        ),
+        RuntimeConfigEntry::new(
+            "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+            "64",
+            RuntimeConfigSource::Env,
+        ),
+        RuntimeConfigEntry::new("FERRUM_SCHED_NONE_PROF", "", RuntimeConfigSource::Env),
+    ]);
+    let mut cfg = SchedulerConfig::default();
+
+    cfg.apply_runtime_config_snapshot(&snapshot).unwrap();
+
+    assert!(cfg.prompt_token_estimate);
+    assert_eq!(cfg.prefill_first_until_active, Some(4));
+    assert_eq!(cfg.active_decode_prefill_chunk, Some(64));
+    assert!(cfg.scheduler_none_prof);
+}
+
+#[test]
+fn scheduler_config_rejects_invalid_runtime_snapshot() {
+    let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+        "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+        "not-a-number",
+        RuntimeConfigSource::Env,
+    )]);
+    let mut cfg = SchedulerConfig::default();
+
+    let err = cfg.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+
+    assert!(err.contains("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"));
 }
 
 #[test]

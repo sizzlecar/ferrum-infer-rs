@@ -30,11 +30,6 @@ use std::{
 };
 use tracing::{debug, info, warn};
 
-const PREFILL_FIRST_UNTIL_ACTIVE_ENV: &str = "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE";
-const ACTIVE_DECODE_PREFILL_CHUNK_ENV: &str = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
-const PROMPT_TOKEN_ESTIMATE_ENV: &str = "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE";
-const SCHED_NONE_PROF_ENV: &str = "FERRUM_SCHED_NONE_PROF";
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ContinuousBatchRuntimeConfig {
     prompt_token_estimate: bool,
@@ -44,21 +39,14 @@ struct ContinuousBatchRuntimeConfig {
 }
 
 impl ContinuousBatchRuntimeConfig {
-    fn from_env() -> Self {
+    fn from_scheduler_config(config: &SchedulerConfig) -> Self {
         Self {
-            prompt_token_estimate: std::env::var(PROMPT_TOKEN_ESTIMATE_ENV).as_deref() == Ok("1"),
-            prefill_first_until_active: parse_positive_usize_env(PREFILL_FIRST_UNTIL_ACTIVE_ENV),
-            active_decode_prefill_chunk: parse_positive_usize_env(ACTIVE_DECODE_PREFILL_CHUNK_ENV),
-            scheduler_none_prof: std::env::var(SCHED_NONE_PROF_ENV).is_ok(),
+            prompt_token_estimate: config.prompt_token_estimate,
+            prefill_first_until_active: config.prefill_first_until_active,
+            active_decode_prefill_chunk: config.active_decode_prefill_chunk,
+            scheduler_none_prof: config.scheduler_none_prof,
         }
     }
-}
-
-fn parse_positive_usize_env(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
 }
 
 /// Request phase in continuous batching
@@ -274,6 +262,7 @@ impl ContinuousBatchScheduler {
             "Creating continuous batch scheduler: max_prefill={}, max_decode={}",
             cb_config.max_prefill_batch, cb_config.max_decode_batch
         );
+        let runtime_config = ContinuousBatchRuntimeConfig::from_scheduler_config(&config);
 
         Self {
             config,
@@ -290,7 +279,7 @@ impl ContinuousBatchScheduler {
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
             cb_config,
-            runtime_config: ContinuousBatchRuntimeConfig::from_env(),
+            runtime_config,
         }
     }
 
@@ -1024,11 +1013,6 @@ mod tests {
         )
     }
 
-    fn prompt_estimate_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     fn enqueue_waiting(scheduler: &ContinuousBatchScheduler, request: InferenceRequest) {
         let request_id = request.id.clone();
         scheduler
@@ -1090,9 +1074,10 @@ mod tests {
 
     #[test]
     fn prompt_token_metadata_expands_prefill_admission() {
-        let _env_guard = prompt_estimate_env_lock().lock().unwrap();
-        std::env::set_var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE", "1");
-        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
 
         for _ in 0..16 {
             enqueue_waiting(
@@ -1117,13 +1102,10 @@ mod tests {
 
         let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(mixed_batch.requests.len(), 15);
-        std::env::remove_var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE");
     }
 
     #[test]
     fn prompt_token_metadata_is_opt_in_for_prefill_admission() {
-        let _env_guard = prompt_estimate_env_lock().lock().unwrap();
-        std::env::remove_var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE");
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
 
         for _ in 0..16 {
@@ -1146,11 +1128,13 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_env_config_is_captured_at_construction() {
-        let _env_guard = prompt_estimate_env_lock().lock().unwrap();
-        std::env::set_var(PROMPT_TOKEN_ESTIMATE_ENV, "1");
-        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
-        std::env::remove_var(PROMPT_TOKEN_ESTIMATE_ENV);
+    fn scheduler_runtime_config_is_captured_at_construction() {
+        let mut config = SchedulerConfig {
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        };
+        let scheduler = ContinuousBatchScheduler::new(config.clone());
+        config.prompt_token_estimate = false;
 
         for _ in 0..16 {
             enqueue_waiting(
@@ -1173,9 +1157,10 @@ mod tests {
 
     #[test]
     fn prefill_first_until_active_skips_early_decodes() {
-        let _env_guard = prompt_estimate_env_lock().lock().unwrap();
-        std::env::set_var(PREFILL_FIRST_UNTIL_ACTIVE_ENV, "4");
-        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prefill_first_until_active: Some(4),
+            ..SchedulerConfig::default()
+        });
 
         for _ in 0..8 {
             enqueue_waiting(&scheduler, create_test_request(Priority::Normal));
@@ -1209,17 +1194,15 @@ mod tests {
                 .all(|request| !first_ids.contains(&request.request.id)),
             "fill-first should schedule more prefills before decoding early requests"
         );
-
-        std::env::remove_var(PREFILL_FIRST_UNTIL_ACTIVE_ENV);
     }
 
     #[test]
     fn active_decode_prefill_chunk_only_caps_when_decode_is_active() {
-        let _env_guard = prompt_estimate_env_lock().lock().unwrap();
-        std::env::set_var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE", "1");
-        std::env::set_var(ACTIVE_DECODE_PREFILL_CHUNK_ENV, "64");
-
-        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            active_decode_prefill_chunk: Some(64),
+            ..SchedulerConfig::default()
+        });
         let hint = BatchHint {
             max_batch_size: 2,
             max_tokens: 512,
@@ -1247,9 +1230,6 @@ mod tests {
         let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(mixed_batch.requests.len(), 2);
         assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 64) * 16);
-
-        std::env::remove_var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE");
-        std::env::remove_var(ACTIVE_DECODE_PREFILL_CHUNK_ENV);
     }
 
     #[tokio::test]

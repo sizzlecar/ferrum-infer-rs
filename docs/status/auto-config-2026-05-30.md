@@ -214,6 +214,10 @@ Evidence:
   by the migrated runner. Server-written effective-config data now owns
   completed-run runtime snapshots, and the runner no longer has a parallel
   selector implementation.
+- Scheduler admission-policy overrides selected by the builder are now
+  consumed through typed `SchedulerConfig` fields in `ferrum run`,
+  `ferrum bench`, and `ferrum serve` instead of relying on the continuous
+  scheduler to read process env at construction time.
 - No new GPU performance claim is made by this checkpoint. Default-path
   equivalence for the Rust auto-config path still needs the Milestone I
   correctness and non-regression packet.

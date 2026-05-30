@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
-const ACTIVE_DECODE_PREFILL_CHUNK_ENV: &str = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
 const BATCH_DECODE_PROF_ENV: &str = "FERRUM_BATCH_DECODE_PROF";
 const CHUNKED_PREFILL_ENV: &str = "FERRUM_CHUNKED_PREFILL";
 const NEXT_BATCH_PROF_ENV: &str = "FERRUM_NEXT_BATCH_PROF";
@@ -54,11 +53,14 @@ struct ContinuousEngineRuntimeConfig {
 }
 
 impl ContinuousEngineRuntimeConfig {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
+    fn from_engine_config_and_env(config: &EngineConfig) -> Self {
+        Self::from_env_vars(
+            config.scheduler.active_decode_prefill_chunk,
+            std::env::vars(),
+        )
     }
 
-    fn from_env_vars<I, K, V>(vars: I) -> Self
+    fn from_env_vars<I, K, V>(active_decode_prefill_chunk: Option<usize>, vars: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
@@ -69,10 +71,7 @@ impl ContinuousEngineRuntimeConfig {
             .map(|(key, value)| (key.into(), value.into()))
             .collect();
         Self {
-            active_decode_prefill_chunk: parse_positive_usize_env(
-                &vars,
-                ACTIVE_DECODE_PREFILL_CHUNK_ENV,
-            ),
+            active_decode_prefill_chunk,
             batch_decode_prof: vars.contains_key(BATCH_DECODE_PROF_ENV),
             chunked_prefill_present: vars.contains_key(CHUNKED_PREFILL_ENV),
             chunked_prefill_size: parse_positive_usize_env(&vars, CHUNKED_PREFILL_ENV),
@@ -470,6 +469,7 @@ impl ContinuousBatchEngine {
             "Creating ContinuousBatchEngine (speculative_decoding={})",
             draft_executor.is_some() && spec_config.is_some()
         );
+        let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config_and_env(&config);
 
         Self {
             inner: Arc::new(EngineInner {
@@ -489,7 +489,7 @@ impl ContinuousBatchEngine {
                 work_notify: Notify::new(),
                 iteration_count: AtomicU64::new(0),
                 prefix_cache: PrefixCache::new(256, 2),
-                runtime_config: ContinuousEngineRuntimeConfig::from_env(),
+                runtime_config,
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
@@ -753,15 +753,17 @@ mod tests {
 
     #[test]
     fn continuous_engine_runtime_config_parses_env_snapshot() {
-        let cfg = ContinuousEngineRuntimeConfig::from_env_vars([
-            (ACTIVE_DECODE_PREFILL_CHUNK_ENV, "64"),
-            (BATCH_DECODE_PROF_ENV, "1"),
-            (CHUNKED_PREFILL_ENV, "128"),
-            (NEXT_BATCH_PROF_ENV, "1"),
-            (PREFIX_CACHE_ENV, "1"),
-            (RBD_PROF_ENV, "1"),
-            (UNIFIED_POST_PROF_ENV, "1"),
-        ]);
+        let cfg = ContinuousEngineRuntimeConfig::from_env_vars(
+            Some(64),
+            [
+                (BATCH_DECODE_PROF_ENV, "1"),
+                (CHUNKED_PREFILL_ENV, "128"),
+                (NEXT_BATCH_PROF_ENV, "1"),
+                (PREFIX_CACHE_ENV, "1"),
+                (RBD_PROF_ENV, "1"),
+                (UNIFIED_POST_PROF_ENV, "1"),
+            ],
+        );
 
         assert_eq!(cfg.active_decode_prefill_chunk, Some(64));
         assert!(cfg.batch_decode_prof);
@@ -777,10 +779,10 @@ mod tests {
 
     #[test]
     fn continuous_engine_runtime_config_keeps_invalid_chunk_presence() {
-        let cfg = ContinuousEngineRuntimeConfig::from_env_vars([
-            (CHUNKED_PREFILL_ENV, "invalid"),
-            (PREFIX_CACHE_ENV, "0"),
-        ]);
+        let cfg = ContinuousEngineRuntimeConfig::from_env_vars(
+            None,
+            [(CHUNKED_PREFILL_ENV, "invalid"), (PREFIX_CACHE_ENV, "0")],
+        );
 
         assert!(cfg.chunked_prefill_present);
         assert_eq!(cfg.chunked_prefill_size, None);

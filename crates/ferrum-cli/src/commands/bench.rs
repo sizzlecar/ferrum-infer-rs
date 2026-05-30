@@ -173,6 +173,10 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         serde_json::Value::String(engine_model_path),
     );
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
+    engine_config
+        .scheduler
+        .apply_runtime_config_snapshot(&runtime_config)
+        .map_err(ferrum_types::FerrumError::config)?;
     let effective_kv_dtype = cmd
         .kv_dtype
         .as_deref()

@@ -137,6 +137,13 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   `FERRUM_KV_DTYPE` through captured `RuntimeConfigSnapshot` data before
   applying the engine KV dtype override. The shared override helper now
   validates an already-resolved value instead of owning an env fallback.
+- `FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE`,
+  `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`,
+  `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK`, and `FERRUM_SCHED_NONE_PROF` are now
+  parsed into `SchedulerConfig` from the startup/runtime snapshot. The
+  continuous scheduler and engine consume typed scheduler fields instead of
+  reading those env vars directly, and scheduler unit tests no longer mutate
+  process env for these admission-policy cases.
 - CUDA MoE route dump, CUDA TP/rank collectives, FA2 direct-FFI shim path,
   Metal attention dispatch policy, Metal mmap/capture/dtype policy, Metal
   quant profiling, and the Qwen3-TTS Candle fallback now resolve their env
@@ -162,14 +169,14 @@ Current local scan:
 
 | metric | value |
 |---|---:|
-| files scanned | 580 |
+| files scanned | 581 |
 | unique `FERRUM_*` tokens | 152 |
 | unique standalone candidates | 151 |
-| direct env read calls | 90 |
-| process env write calls | 42 |
-| classified process env write calls | 42 |
+| direct env read calls | 87 |
+| process env write calls | 31 |
+| classified process env write calls | 31 |
 | unclassified process env write calls | 0 |
-| hot-path unique `FERRUM_*` tokens | 121 |
+| hot-path unique `FERRUM_*` tokens | 120 |
 | hot-path direct env read calls | 4 |
 | classified hot-path direct env read calls | 4 |
 | unclassified hot-path direct env read calls | 0 |
@@ -182,7 +189,7 @@ Current local scan:
 | product `ferrum.toml` raw `FERRUM_*` mentions | 0 |
 | product `ferrum.toml` surface errors | 0 |
 
-The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `90` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `152` token names, `151` standalone env candidates, and `146` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot. The removed `FERRUM_VLLM_VARLEN_SPLIT_K` registry entry was tied only to an archived negative-control script, not an active product/runtime path.
+The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `87` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `152` token names, `151` standalone env candidates, and `146` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot. The removed `FERRUM_VLLM_VARLEN_SPLIT_K` registry entry was tied only to an archived negative-control script, not an active product/runtime path.
 
 The classified residual hot-path direct-read call sites are:
 
@@ -198,7 +205,7 @@ The scanner reports `FERRUM_2M` as an embedded token, not a standalone env candi
 
 The classified process-env write call sites are:
 
-- `34` test-only fixture setup/cleanup calls in Rust test modules or
+- `23` test-only fixture setup/cleanup calls in Rust test modules or
   integration tests.
 - `7` profile sink compatibility bridge calls in
   `crates/ferrum-bench-core/src/profile.rs`. Normal `ferrum serve`

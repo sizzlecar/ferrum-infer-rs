@@ -499,6 +499,10 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
             engine_config.backend.device = device;
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
+            engine_config
+                .scheduler
+                .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
+                .map_err(ferrum_types::FerrumError::config)?;
             engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
             engine_config.backend.backend_options.insert(
                 "model_path".to_string(),

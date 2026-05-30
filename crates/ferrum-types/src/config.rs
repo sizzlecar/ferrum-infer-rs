@@ -1,6 +1,9 @@
 //! Configuration types for Ferrum components
 
-use crate::{DataType, Device, ModelId, ModelInfo, SamplingParams, SamplingPresets};
+use crate::{
+    parse_bool_env_value, parse_usize_env_value, DataType, Device, ModelId, ModelInfo,
+    RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
@@ -51,6 +54,18 @@ pub struct SchedulerConfig {
     pub fair_share_weights: HashMap<String, f32>,
     /// SLA enforcement enabled
     pub enable_sla_enforcement: bool,
+    /// Use prompt-token metadata for initial continuous-batch admission estimates.
+    #[serde(default)]
+    pub prompt_token_estimate: bool,
+    /// Prefer new prefills over early decodes until this many requests are active.
+    #[serde(default)]
+    pub prefill_first_until_active: Option<usize>,
+    /// Cap prefill admission chunks only while decode requests are already active.
+    #[serde(default)]
+    pub active_decode_prefill_chunk: Option<usize>,
+    /// Emit diagnostic scheduler None/SOME decisions.
+    #[serde(default)]
+    pub scheduler_none_prof: bool,
 }
 
 impl Default for SchedulerConfig {
@@ -63,7 +78,62 @@ impl Default for SchedulerConfig {
             enable_load_balancing: false,
             fair_share_weights: HashMap::new(),
             enable_sla_enforcement: false,
+            prompt_token_estimate: false,
+            prefill_first_until_active: None,
+            active_decode_prefill_chunk: None,
+            scheduler_none_prof: false,
         }
+    }
+}
+
+impl SchedulerConfig {
+    pub fn apply_runtime_config_snapshot(
+        &mut self,
+        snapshot: &RuntimeConfigSnapshot,
+    ) -> std::result::Result<(), String> {
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE") {
+            self.prompt_token_estimate = parse_bool_env_value(value)
+                .map_err(|reason| format!("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE: {reason}"))?;
+        }
+        if let Some(value) =
+            runtime_config_value(snapshot, "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+        {
+            self.prefill_first_until_active =
+                parse_optional_positive_usize("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE", value)?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK") {
+            self.active_decode_prefill_chunk =
+                parse_optional_positive_usize("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK", value)?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_NONE_PROF") {
+            self.scheduler_none_prof = parse_presence_bool(value)
+                .map_err(|reason| format!("FERRUM_SCHED_NONE_PROF: {reason}"))?;
+        }
+        Ok(())
+    }
+}
+
+fn runtime_config_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.effective_value.as_str())
+}
+
+fn parse_optional_positive_usize(
+    key: &str,
+    value: &str,
+) -> std::result::Result<Option<usize>, String> {
+    let parsed = parse_usize_env_value(value).map_err(|reason| format!("{key}: {reason}"))?;
+    Ok((parsed > 0).then_some(parsed))
+}
+
+fn parse_presence_bool(value: &str) -> std::result::Result<bool, String> {
+    if value.trim().is_empty() {
+        Ok(true)
+    } else {
+        parse_bool_env_value(value)
     }
 }
 
