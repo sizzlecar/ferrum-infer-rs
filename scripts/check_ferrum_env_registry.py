@@ -475,6 +475,15 @@ def scan_sources(roots: tuple[str, ...]) -> dict[str, Any]:
     process_env_write_classification = classify_process_env_writes(
         process_env_write_occurrences
     )
+    test_process_env_writes = sum(
+        1 for occurrence in process_env_write_occurrences if occurrence["test_context"]
+    )
+    non_test_process_env_writes = len(process_env_write_occurrences) - test_process_env_writes
+    non_test_process_env_writes_classified = sum(
+        1
+        for occurrence in process_env_write_classification["classified"]
+        if not occurrence.get("test_context")
+    )
 
     return {
         "scan_roots": list(roots),
@@ -484,8 +493,14 @@ def scan_sources(roots: tuple[str, ...]) -> dict[str, Any]:
         "embedded_ferrum_tokens": embedded_tokens,
         "direct_env_reads": sum(direct_reads_by_file.values()),
         "process_env_writes": sum(process_env_writes_by_file.values()),
+        "test_process_env_writes": test_process_env_writes,
+        "non_test_process_env_writes": non_test_process_env_writes,
         "process_env_writes_classified": process_env_write_classification["classified_count"],
+        "non_test_process_env_writes_classified": non_test_process_env_writes_classified,
         "process_env_writes_unclassified": process_env_write_classification[
+            "unclassified_count"
+        ],
+        "non_test_process_env_writes_unclassified": process_env_write_classification[
             "unclassified_count"
         ],
         "hot_unique_ferrum_tokens": len(hot_tokens),
@@ -807,6 +822,7 @@ def run_self_test() -> None:
         threshold_report = {
             "direct_env_reads": 3,
             "process_env_writes": 1,
+            "non_test_process_env_writes": 1,
             "hot_direct_env_reads": 0,
         }
         assert not threshold_errors(
@@ -814,6 +830,7 @@ def run_self_test() -> None:
             {
                 "direct_env_reads": 3,
                 "process_env_writes": 1,
+                "non_test_process_env_writes": 1,
                 "hot_direct_env_reads": 0,
             },
         )
@@ -822,9 +839,19 @@ def run_self_test() -> None:
             {
                 "direct_env_reads": 2,
                 "process_env_writes": None,
+                "non_test_process_env_writes": 1,
                 "hot_direct_env_reads": 0,
             },
         ) == ["direct_env_reads=3 exceeds limit 2"]
+        assert threshold_errors(
+            threshold_report,
+            {
+                "direct_env_reads": 3,
+                "process_env_writes": 1,
+                "non_test_process_env_writes": 0,
+                "hot_direct_env_reads": 0,
+            },
+        ) == ["non_test_process_env_writes=1 exceeds limit 0"]
 
     print("check_ferrum_env_registry self-test ok")
 
@@ -891,8 +918,12 @@ def render_human(report: dict[str, Any]) -> str:
         f"  unique_ferrum_env_candidates: {report['unique_ferrum_env_candidates']}",
         f"  direct_env_reads: {report['direct_env_reads']}",
         f"  process_env_writes: {report['process_env_writes']}",
+        f"  test_process_env_writes: {report['test_process_env_writes']}",
+        f"  non_test_process_env_writes: {report['non_test_process_env_writes']}",
         f"  process_env_writes_classified: {report['process_env_writes_classified']}",
+        f"  non_test_process_env_writes_classified: {report['non_test_process_env_writes_classified']}",
         f"  process_env_writes_unclassified: {report['process_env_writes_unclassified']}",
+        f"  non_test_process_env_writes_unclassified: {report['non_test_process_env_writes_unclassified']}",
         f"  hot_unique_ferrum_tokens: {report['hot_unique_ferrum_tokens']}",
         f"  hot_direct_env_reads: {report['hot_direct_env_reads']}",
         f"  hot_direct_env_reads_classified: {report['hot_direct_env_reads_classified']}",
@@ -1031,6 +1062,12 @@ def parse_args() -> argparse.Namespace:
         help="fail if total process env write calls exceed this value",
     )
     parser.add_argument(
+        "--max-non-test-process-env-writes",
+        type=int,
+        default=None,
+        help="fail if non-test process env write calls exceed this value",
+    )
+    parser.add_argument(
         "--max-hot-direct-env-reads",
         type=int,
         default=None,
@@ -1080,6 +1117,7 @@ def main() -> int:
         {
             "direct_env_reads": args.max_direct_env_reads,
             "process_env_writes": args.max_process_env_writes,
+            "non_test_process_env_writes": args.max_non_test_process_env_writes,
             "hot_direct_env_reads": args.max_hot_direct_env_reads,
         },
     )

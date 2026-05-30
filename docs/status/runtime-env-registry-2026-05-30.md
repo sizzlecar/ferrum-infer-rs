@@ -166,9 +166,11 @@ Milestone D is not complete. This checkpoint adds a repeatable audit tool and br
   checked against model metadata and KV token capacity. `/health` exposes this
   as `auto_config` next to the runtime config snapshot.
 - The registry checker now supports threshold gates for total direct env
-  reads, process env writes, and hot-path direct env reads. CPU CI pins the
-  current checkpoint limits at `75`, `31`, and `4` respectively, so new
-  call-site drift fails before it becomes another cleanup backlog.
+  reads, process env writes, non-test process env writes, and hot-path direct
+  env reads. CPU CI pins the current checkpoint limits at `75`, `31`, `8`, and
+  `4` respectively, so new call-site drift fails before it becomes another
+  cleanup backlog. The non-test write budget keeps product/bench compatibility
+  bridges separate from test fixture mutations.
 
 ## Current Audit
 
@@ -180,6 +182,7 @@ python3 scripts/check_ferrum_env_registry.py --self-test
 python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap \
   --max-direct-env-reads 75 \
   --max-process-env-writes 31 \
+  --max-non-test-process-env-writes 8 \
   --max-hot-direct-env-reads 4
 ```
 
@@ -187,13 +190,17 @@ Current local scan:
 
 | metric | value |
 |---|---:|
-| files scanned | 581 |
+| files scanned | 583 |
 | unique `FERRUM_*` tokens | 152 |
 | unique standalone candidates | 151 |
 | direct env read calls | 75 |
 | process env write calls | 31 |
+| test process env write calls | 23 |
+| non-test process env write calls | 8 |
 | classified process env write calls | 31 |
+| classified non-test process env write calls | 8 |
 | unclassified process env write calls | 0 |
+| unclassified non-test process env write calls | 0 |
 | hot-path unique `FERRUM_*` tokens | 120 |
 | hot-path direct env read calls | 4 |
 | classified hot-path direct env read calls | 4 |
