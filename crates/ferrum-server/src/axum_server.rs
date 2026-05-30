@@ -3,7 +3,12 @@
 //! This module provides a concrete implementation of the HttpServer trait
 //! using the Axum web framework, with OpenAI-shaped endpoint compatibility.
 
-use crate::{chat_template::render_chat_prompt, openai::*, traits::HttpServer, types::*};
+use crate::{
+    chat_template::{render_chat_prompt, render_chat_prompt_with_tools},
+    openai::*,
+    traits::HttpServer,
+    types::*,
+};
 use async_trait::async_trait;
 use axum::{
     extract::{rejection::JsonRejection, State},
@@ -655,7 +660,20 @@ async fn handle_chat_completions_sync(
 fn convert_chat_request(
     request: &ChatCompletionsRequest,
 ) -> ferrum_types::Result<InferenceRequest> {
-    let prompt = render_chat_prompt(&request.messages, &request.model);
+    let tools = request.tools.as_deref().unwrap_or_default();
+    let functions = request.functions.as_deref().unwrap_or_default();
+    let prompt = if tools.is_empty() && functions.is_empty() {
+        render_chat_prompt(&request.messages, &request.model)
+    } else {
+        render_chat_prompt_with_tools(
+            &request.messages,
+            &request.model,
+            tools,
+            request.tool_choice.as_ref(),
+            functions,
+            request.function_call.as_ref(),
+        )
+    };
     let mut metadata = HashMap::new();
     metadata.insert(
         "openai_messages".to_string(),
@@ -2806,6 +2824,12 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
 
         let request = engine.last_request();
+        assert!(request.prompt.contains("\"tools\":[{"));
+        assert!(request.prompt.contains("\"type\":\"function\""));
+        assert!(request.prompt.contains("\"name\":\"weather\""));
+        assert!(request.prompt.contains("<|im_start|>assistant\n{"));
+        assert!(request.prompt.contains("\"tool_calls\":[{"));
+        assert!(request.prompt.contains("\"id\":\"call_1\""));
         assert!(request.prompt.contains("<|im_start|>tool\nsunny<|im_end|>"));
         assert_eq!(
             request.metadata["openai_tools"][0]["function"]["name"],
@@ -3338,6 +3362,12 @@ mod tests {
 
         validate_chat_request(&request).expect("tool request validates");
         let internal = convert_chat_request(&request).expect("convert");
+        assert!(internal.prompt.contains("\"tools\":[{"));
+        assert!(internal.prompt.contains("\"type\":\"function\""));
+        assert!(internal.prompt.contains("\"name\":\"weather\""));
+        assert!(internal.prompt.contains("<|im_start|>assistant\n{"));
+        assert!(internal.prompt.contains("\"tool_calls\":[{"));
+        assert!(internal.prompt.contains("\"id\":\"call_1\""));
         assert!(internal
             .prompt
             .contains("<|im_start|>tool\nsunny<|im_end|>"));

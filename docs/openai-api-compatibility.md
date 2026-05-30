@@ -19,7 +19,7 @@ describes the current product contract for the always-on server path.
 | Field | Status | Behavior |
 |---|---|---|
 | `model` | Supported | Required by OpenAI clients; routed to the loaded Ferrum model. |
-| `messages` | Supported | `system`, `user`, `assistant`, `tool`, and legacy `function` roles parse into structured request data and are rendered by the chat-template layer. |
+| `messages` | Supported | `system`, `user`, `assistant`, `tool`, and legacy `function` roles parse into structured request data and are rendered by the chat-template layer. Assistant `tool_calls` / legacy `function_call` history is included in the rendered prompt for caller-owned tool-result loops. |
 | string `content` | Supported | Rendered through the model-family chat template layer. |
 | text content parts | Supported | `content: [{"type":"text","text":"..."}]` is accepted and concatenated. |
 | multimodal content parts | Rejected | Non-text parts return HTTP 400 instead of being silently dropped. |
@@ -33,7 +33,7 @@ describes the current product contract for the always-on server path.
 | `logit_bias` | Rejected | Non-empty maps return HTTP 400 with `param=logit_bias`. |
 | `logprobs` | Rejected | Returns HTTP 400 with `param=logprobs`. |
 | `top_logprobs` | Rejected | Values greater than zero return HTTP 400 with `param=top_logprobs`. |
-| `tools` | Partially supported | Function tool definitions parse and are carried through the structured request boundary. Engine output that emits matching tool-call JSON is returned as OpenAI `tool_calls` for non-streaming responses and streaming deltas; non-function tool types return HTTP 400 with `param=tools`. Tool execution is caller-owned, matching OpenAI/vLLM API semantics. |
+| `tools` | Partially supported | Function tool definitions parse, are carried through the structured request boundary, and are included in the rendered chat-template prompt. Engine output that emits matching tool-call JSON is returned as OpenAI `tool_calls` for non-streaming responses and streaming deltas; non-function tool types return HTTP 400 with `param=tools`. Tool execution is caller-owned, matching OpenAI/vLLM API semantics. |
 | `tool_choice=auto/none` | Supported | Parsed and carried through request metadata. |
 | forced `tool_choice` / `required` | Rejected | Forced selection is not implemented; automatic JSON tool-call parsing is supported only for `auto`. |
 | legacy `functions` / `function_call=auto/none` | Supported | Parsed for SDK compatibility and carried through structured request data. Assistant `function_call` responses serialize in the legacy OpenAI shape, including non-streaming responses and streaming deltas when engine output emits matching function-call JSON. |

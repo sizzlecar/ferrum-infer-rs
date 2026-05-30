@@ -18,7 +18,7 @@ explicit supported/rejected fields, usage accounting, error mapping, and the
 | Surface | Current behavior | Evidence |
 |---|---|---|
 | Basic chat | `/v1/chat/completions` returns OpenAI chat envelope with assistant message and usage | `route_basic_chat_contract_uses_stub_engine` |
-| Chat prompt rendering layer | HTTP handlers delegate model-family prompt rendering to `ferrum-server::chat_template`, preserving Qwen, Llama 3, and fallback templates | `qwen3_renders_chatml_with_think_marker`, `qwen2_renders_chatml_without_think`, `llama3_renders_header_format`, `unknown_model_uses_tinyllama_fallback` |
+| Chat prompt rendering layer | HTTP handlers delegate model-family prompt rendering to `ferrum-server::chat_template`, preserving Qwen, Llama 3, fallback templates, and tool-aware prompt context | `qwen3_renders_chatml_with_think_marker`, `qwen2_renders_chatml_without_think`, `llama3_renders_header_format`, `unknown_model_uses_tinyllama_fallback`, `qwen_renders_tool_definitions_and_assistant_tool_call_history` |
 | Token usage accounting | Chat/completions usage is populated from engine `TokenUsage`, not HTTP whitespace counts | `route_basic_chat_contract_uses_stub_engine`, `route_completions_contract_uses_stub_engine`, `chat_stream_options_include_usage_controls_stream_usage`, `streaming_chat_does_not_synthesize_whitespace_usage`, `streaming_completions_do_not_synthesize_whitespace_usage` |
 | Engine tokenizer usage fixture | Engine `TokenUsage.prompt_tokens` equals tokenizer-encoded prompt length, and `completion_tokens` equals generated/emitted token count | `non_streaming_usage_matches_tokenizer_and_generated_tokens`, `streaming_final_usage_matches_tokenizer_and_emitted_tokens` in `crates/ferrum-engine/tests/continuous_batch_test.rs`; `usage_counts_byte_tokenizer_prompt_tokens_not_words` in `crates/ferrum-engine/tests/regex_guided_test.rs` |
 | Streaming chat | SSE returns chat chunks and `[DONE]` | `route_streaming_chat_include_usage_contract` |
@@ -30,7 +30,7 @@ explicit supported/rejected fields, usage accounting, error mapping, and the
 | Structured internal API response | `InferenceResponse` and final `StreamChunk` can carry `api_response` for assistant tool-call responses without overloading text metadata | `inference_response_can_carry_structured_chat_tool_call`, `stream_chunk_can_carry_structured_chat_tool_call`, `route_chat_serializes_structured_tool_call_response`, `route_streaming_chat_prefers_chunk_api_response_for_tool_delta` |
 | `tools` request parsing | Function tools parse through `/v1/chat/completions` and are carried in structured `api_request` plus compatibility metadata | `route_tool_request_reaches_engine_structured_boundary`, `tool_requests_and_tool_messages_parse_into_structured_api_request` |
 | Non-function tools | Non-function tool types reject explicitly instead of being accepted and ignored | `route_rejects_non_function_tools_with_openai_error_param` |
-| Tool role messages | `role=tool` parses through `/v1/chat/completions`, is rendered into the chat template, and remains available in structured `api_request` | `route_tool_request_reaches_engine_structured_boundary`, `tool_requests_and_tool_messages_parse_into_structured_api_request` |
+| Tool prompt context | Function tool definitions, assistant `tool_calls`, and returned `role=tool` content are rendered into the chat-template prompt for caller-owned tool loops while remaining available in structured `api_request` | `qwen_renders_tool_definitions_and_assistant_tool_call_history`, `route_tool_request_reaches_engine_structured_boundary`, `tool_requests_and_tool_messages_parse_into_structured_api_request` |
 | Engine-generated tool calls | Shared API parsing converts model-emitted JSON matching declared function tools into `ApiResponse::Chat` with `finish_reason=tool_calls`; unmatched tools and `tool_choice=none` stay on the normal text path | `generated_tool_call_json_becomes_structured_chat_response`, `tool_choice_none_keeps_generated_text_unstructured`, `unregistered_tool_name_keeps_generated_text_unstructured` in `crates/ferrum-types/tests/requests_tests.rs` |
 | Streaming generated tool calls | Chat streaming consumes final `StreamChunk.api_response` when available, otherwise buffers tool-capable `auto` requests until final output and converts matching JSON into an OpenAI `delta.tool_calls[]` chunk with `index`; non-tool text falls back to normal content | `route_streaming_chat_prefers_chunk_api_response_for_tool_delta`, `route_streaming_chat_serializes_generated_tool_call_delta`, `route_streaming_chat_tool_request_falls_back_to_content_when_no_tool_call` |
 | Legacy `functions` / `function_call=auto` | Legacy function metadata parses and reaches the structured internal request | `route_tool_request_reaches_engine_structured_boundary`, `legacy_function_role_messages_parse_into_structured_api_request` |
@@ -103,9 +103,11 @@ manual GPU/Metal validation, not the always-on stub path.
   emitting a structured tool/function delta, so token-by-token tool-call delta
   assembly is not implemented.
 - Engines still consume `InferenceRequest.prompt` as the rendered model input;
-  `api_request` and final `api_response` now participate in tool/function
-  response shaping for non-streaming and streaming chat, but prompt rendering
-  is not yet fully owned by an engine-side structured chat boundary.
+  the server chat-template layer now renders tool definitions, assistant
+  tool/function-call history, and tool/function result messages into that
+  prompt. `api_request` and final `api_response` participate in
+  tool/function response shaping, but prompt rendering is still server-side
+  rather than fully owned by an engine-side structured chat boundary.
 - Strict schema validation is regex-subset based; strict-schema streaming now
   buffers content until final validation passes, so invalid partial deltas are
   not sent, but strict streaming no longer has token-by-token latency.
