@@ -20,6 +20,9 @@ validators, a native JSONL sink, and the first Rust/C++ profile emitters.
 - `parse_profile_event_value` checks required-field presence before
   deserialization, so `commit_sha: null` remains distinct from a missing
   `commit_sha` key.
+- `profile_event_rejects_every_missing_required_field` and the artifact
+  validator self-test now exercise every locked top-level required key rather
+  than only a representative missing field.
 - `parse_profile_jsonl_str` validates every non-blank JSONL line and preserves
   line numbers in validation errors.
 - `require_profile_event_groups` verifies profile artifacts contain expected

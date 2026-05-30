@@ -1375,6 +1375,21 @@ def self_test() -> None:
             raise AssertionError("unknown touched area unexpectedly passed")
         write_json(case_dir / "manifest.json", case_manifest)
 
+        for missing_key in sorted(PROFILE_REQUIRED):
+            bad_profile = dict(profile_event)
+            del bad_profile[missing_key]
+            (case_dir / "bad-profile.jsonl").write_text(
+                json.dumps(bad_profile, sort_keys=True) + "\n"
+            )
+            try:
+                validate_profile_jsonl(case_dir / "bad-profile.jsonl", require_events=True)
+            except ValidationError as exc:
+                assert f"missing keys: {missing_key}" in str(exc)
+            else:
+                raise AssertionError(
+                    f"missing profile field {missing_key} unexpectedly passed"
+                )
+
         bad_profile = dict(profile_event)
         bad_profile["runtime_flags"] = []
         (case_dir / "bad-profile.jsonl").write_text(

@@ -475,13 +475,18 @@ mod tests {
     }
 
     #[test]
-    fn profile_event_rejects_missing_required_field() {
-        let mut event = valid_event_value();
-        event.as_object_mut().unwrap().remove("runtime_flags");
-        let err = parse_profile_event_value(event).unwrap_err();
-        assert!(err
-            .message()
-            .contains("missing required field: runtime_flags"));
+    fn profile_event_rejects_every_missing_required_field() {
+        for key in REQUIRED_PROFILE_EVENT_FIELDS {
+            let mut event = valid_event_value();
+            event.as_object_mut().unwrap().remove(*key);
+            let err = parse_profile_event_value(event).unwrap_err();
+            assert!(
+                err.message()
+                    .contains(&format!("missing required field: {key}")),
+                "unexpected error for missing {key}: {}",
+                err.message()
+            );
+        }
     }
 
     #[test]
