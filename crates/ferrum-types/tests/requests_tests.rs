@@ -143,6 +143,43 @@ fn inference_response_can_carry_structured_chat_tool_call() {
     assert_eq!(chat.message.tool_calls[0].function.name, "weather");
 }
 
+#[test]
+fn stream_chunk_can_carry_structured_chat_tool_call() {
+    let chunk = StreamChunk {
+        request_id: RequestId::new(),
+        text: String::new(),
+        token: None,
+        finish_reason: Some(FinishReason::Stop),
+        usage: Some(TokenUsage::new(3, 0)),
+        created_at: chrono::Utc::now(),
+        metadata: Default::default(),
+        api_response: Some(ApiResponse::Chat(ApiChatResponse {
+            message: ApiChatMessage {
+                role: ApiMessageRole::Assistant,
+                content: String::new(),
+                name: None,
+                tool_calls: vec![ApiToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: ApiFunctionCall {
+                        name: "weather".to_string(),
+                        arguments: "{\"city\":\"Paris\"}".to_string(),
+                    },
+                }],
+                tool_call_id: None,
+                function_call: None,
+            },
+            finish_reason: Some("tool_calls".to_string()),
+        })),
+    };
+
+    let Some(ApiResponse::Chat(chat)) = chunk.api_response.as_ref() else {
+        panic!("expected structured chat response");
+    };
+    assert_eq!(chat.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(chat.message.tool_calls[0].id, "call_1");
+}
+
 fn chat_request_with_tool(tool_choice: Option<ApiToolChoice>) -> InferenceRequest {
     InferenceRequest::new("rendered prompt", "mock-model").with_api_request(ApiRequest::Chat(
         ApiChatRequest {

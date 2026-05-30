@@ -415,13 +415,17 @@ async fn handle_chat_completions_stream(
                                     let _ = tx.send(Ok(Event::default().data("[DONE]")));
                                     break;
                                 }
-                                let structured_chat_response = if buffer_structured_api_stream {
-                                    ferrum_types::chat_api_response_from_generated_text(
-                                        &stream_api_request,
-                                        &current_text,
-                                    )
-                                } else {
-                                    None
+                                let structured_chat_response = match chunk.api_response.as_ref() {
+                                    Some(ferrum_types::ApiResponse::Chat(response)) => {
+                                        Some(response.clone())
+                                    }
+                                    _ if buffer_structured_api_stream => {
+                                        ferrum_types::chat_api_response_from_generated_text(
+                                            &stream_api_request,
+                                            &current_text,
+                                        )
+                                    }
+                                    _ => None,
                                 };
 
                                 if let Some(chat_response) = structured_chat_response.as_ref() {
@@ -2146,6 +2150,7 @@ mod tests {
                 usage: self.stream_usage.clone(),
                 created_at: chrono::Utc::now(),
                 metadata: HashMap::new(),
+                api_response: self.api_response.clone(),
             };
             Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
         }
@@ -2213,6 +2218,7 @@ mod tests {
                 usage: Some(TokenUsage::new(9, 1)),
                 created_at: chrono::Utc::now(),
                 metadata: HashMap::new(),
+                api_response: None,
             };
             Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
         }
@@ -2483,6 +2489,60 @@ mod tests {
         assert!(
             !body.contains(r#""content":"{\"tool_calls\""#),
             "raw tool-call JSON should not be streamed as assistant content: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_prefers_chunk_api_response_for_tool_delta() {
+        let response = post_json(
+            router_with_stub_api_response(
+                "raw text that should not stream",
+                ferrum_types::ApiResponse::Chat(ferrum_types::ApiChatResponse {
+                    message: ferrum_types::ApiChatMessage {
+                        role: ferrum_types::ApiMessageRole::Assistant,
+                        content: String::new(),
+                        name: None,
+                        tool_calls: vec![ferrum_types::ApiToolCall {
+                            id: "call_1".to_string(),
+                            tool_type: "function".to_string(),
+                            function: ferrum_types::ApiFunctionCall {
+                                name: "weather".to_string(),
+                                arguments: "{\"city\":\"Paris\"}".to_string(),
+                            },
+                        }],
+                        tool_call_id: None,
+                        function_call: None,
+                    },
+                    finish_reason: Some("tool_calls".to_string()),
+                }),
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the weather tool."}],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""finish_reason":"tool_calls""#),
+            "stream should finish with tool_calls: {body}"
+        );
+        assert!(
+            body.contains(r#""tool_calls":[{"index":0,"id":"call_1""#),
+            "stream should emit tool_calls from chunk api_response: {body}"
+        );
+        assert!(
+            !body.contains("raw text that should not stream"),
+            "structured api_response should suppress raw generated text in tool-call stream: {body}"
         );
     }
 

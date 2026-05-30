@@ -460,6 +460,11 @@ pub struct StreamChunk {
     pub created_at: DateTime<Utc>,
     /// Chunk metadata
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Structured product/API response context for final streaming chunks.
+    /// This mirrors `InferenceResponse::api_response` so streaming endpoints
+    /// can return native tool/function-call payloads without reparsing text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_response: Option<ApiResponse>,
 }
 
 /// Batch request for processing multiple requests together

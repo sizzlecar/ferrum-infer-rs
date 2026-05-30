@@ -27,12 +27,12 @@ explicit supported/rejected fields, usage accounting, error mapping, and the
 | `stop` string or array | Chat and legacy completions accept `stop` as either one string or an array and strip a trailing stop suffix from returned text | `chat_accepts_stop_string_and_max_completion_tokens`, `stop_string_strips_chat_and_completion_suffixes` |
 | `n=2` | Rejected with HTTP 400, `type=invalid_request_error`, `param=n` | `chat_rejects_n_not_one_with_openai_error_param` |
 | Structured internal API request | `InferenceRequest` now carries `api_request` for chat/completion semantics alongside the rendered prompt | `inference_request_can_carry_structured_chat_api_request`, `route_tool_request_reaches_engine_structured_boundary`, `tool_requests_and_tool_messages_parse_into_structured_api_request` |
-| Structured internal API response | `InferenceResponse` can carry `api_response` for assistant tool-call responses without overloading text metadata | `inference_response_can_carry_structured_chat_tool_call`, `route_chat_serializes_structured_tool_call_response` |
+| Structured internal API response | `InferenceResponse` and final `StreamChunk` can carry `api_response` for assistant tool-call responses without overloading text metadata | `inference_response_can_carry_structured_chat_tool_call`, `stream_chunk_can_carry_structured_chat_tool_call`, `route_chat_serializes_structured_tool_call_response`, `route_streaming_chat_prefers_chunk_api_response_for_tool_delta` |
 | `tools` request parsing | Function tools parse through `/v1/chat/completions` and are carried in structured `api_request` plus compatibility metadata | `route_tool_request_reaches_engine_structured_boundary`, `tool_requests_and_tool_messages_parse_into_structured_api_request` |
 | Non-function tools | Non-function tool types reject explicitly instead of being accepted and ignored | `route_rejects_non_function_tools_with_openai_error_param` |
 | Tool role messages | `role=tool` parses through `/v1/chat/completions`, is rendered into the chat template, and remains available in structured `api_request` | `route_tool_request_reaches_engine_structured_boundary`, `tool_requests_and_tool_messages_parse_into_structured_api_request` |
 | Engine-generated tool calls | Shared API parsing converts model-emitted JSON matching declared function tools into `ApiResponse::Chat` with `finish_reason=tool_calls`; unmatched tools and `tool_choice=none` stay on the normal text path | `generated_tool_call_json_becomes_structured_chat_response`, `tool_choice_none_keeps_generated_text_unstructured`, `unregistered_tool_name_keeps_generated_text_unstructured` in `crates/ferrum-types/tests/requests_tests.rs` |
-| Streaming generated tool calls | Chat streaming buffers tool-capable `auto` requests until final output, converts matching JSON into an OpenAI `delta.tool_calls[]` chunk with `index`, then emits a final `finish_reason=tool_calls` chunk; non-tool text falls back to normal content | `route_streaming_chat_serializes_generated_tool_call_delta`, `route_streaming_chat_tool_request_falls_back_to_content_when_no_tool_call` |
+| Streaming generated tool calls | Chat streaming consumes final `StreamChunk.api_response` when available, otherwise buffers tool-capable `auto` requests until final output and converts matching JSON into an OpenAI `delta.tool_calls[]` chunk with `index`; non-tool text falls back to normal content | `route_streaming_chat_prefers_chunk_api_response_for_tool_delta`, `route_streaming_chat_serializes_generated_tool_call_delta`, `route_streaming_chat_tool_request_falls_back_to_content_when_no_tool_call` |
 | Legacy `functions` / `function_call=auto` | Legacy function metadata parses and reaches the structured internal request | `route_tool_request_reaches_engine_structured_boundary`, `legacy_function_role_messages_parse_into_structured_api_request` |
 | Legacy `role=function` messages | Legacy function result messages parse, render through the chat-template layer, and remain available in structured `api_request` | `legacy_function_role_messages_parse_into_structured_api_request`, `fallback_preserves_legacy_function_and_tool_roles` |
 | Assistant `tool_calls` serialization | Assistant message serializes OpenAI `tool_calls[]` shape; non-streaming chat responses can serialize structured internal tool-call responses | `assistant_tool_call_serializes_openai_shape`, `route_chat_serializes_structured_tool_call_response` |
@@ -103,9 +103,9 @@ manual GPU/Metal validation, not the always-on stub path.
   emitting a structured tool/function delta, so token-by-token tool-call delta
   assembly is not implemented.
 - Engines still consume `InferenceRequest.prompt` as the rendered model input;
-  `api_request` now participates in final tool/function response shaping, but
-  prompt rendering is not yet fully owned by an engine-side structured chat
-  boundary.
+  `api_request` and final `api_response` now participate in tool/function
+  response shaping for non-streaming and streaming chat, but prompt rendering
+  is not yet fully owned by an engine-side structured chat boundary.
 - Strict schema validation is regex-subset based; strict-schema streaming now
   buffers content until final validation passes, so invalid partial deltas are
   not sent, but strict streaming no longer has token-by-token latency.

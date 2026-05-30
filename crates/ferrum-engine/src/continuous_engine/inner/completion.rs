@@ -85,6 +85,7 @@ impl EngineInner {
                 usage: None,
                 created_at: chrono::Utc::now(),
                 metadata: HashMap::new(),
+                api_response: None,
             };
             let _ = tx.send(Ok(chunk)).await;
         }
@@ -172,6 +173,7 @@ impl EngineInner {
                 usage: Some(response.usage.clone()),
                 created_at: chrono::Utc::now(),
                 metadata: HashMap::new(),
+                api_response: response.api_response.clone(),
             };
             let _ = tx.send(Ok(final_chunk)).await;
         }
