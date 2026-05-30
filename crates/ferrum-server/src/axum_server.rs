@@ -53,7 +53,7 @@ pub fn init_prometheus_recorder() {
 /// Axum-based server implementation.
 ///
 /// The server is built around [`AppState`], which holds an optional
-/// engine per modality. Handlers fault to 501 when the modality they
+/// engine per modality. Handlers fault to 503 when the modality they
 /// need isn't loaded, instead of running stub error logic.
 pub struct AxumServer {
     state: AppState,
@@ -125,7 +125,7 @@ impl AxumServer {
 }
 
 /// Application state shared across handlers — one optional engine per
-/// modality. Handlers reach into the field they need and 501 when it's
+/// modality. Handlers reach into the field they need and 503 when it's
 /// not loaded.
 #[derive(Clone, Default)]
 pub struct AppState {
@@ -1878,9 +1878,9 @@ impl IntoResponse for ServerError {
                 None,
             ),
             ServerError::NotImplemented(msg) => (
-                AxumStatusCode::NOT_IMPLEMENTED,
+                AxumStatusCode::SERVICE_UNAVAILABLE,
                 msg,
-                "invalid_request_error",
+                "service_unavailable_error",
                 None,
             ),
             ServerError::ServiceUnavailable(msg) => (
@@ -2358,6 +2358,22 @@ mod tests {
                 .method("POST")
                 .uri(path)
                 .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+    }
+
+    async fn post_multipart(app: Router, path: &str, boundary: &str, body: &str) -> Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
                 .body(Body::from(body.to_string()))
                 .expect("request"),
         )
@@ -3442,6 +3458,65 @@ mod tests {
             json!({
                 "model": "stub-model",
                 "prompt": "complete me"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "service_unavailable_error");
+        assert_eq!(body["error"]["param"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn route_embeddings_engine_unavailable_maps_to_503() {
+        let response = post_json(
+            router_without_llm(),
+            "/v1/embeddings",
+            json!({
+                "model": "embed-model",
+                "input": "hello"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "service_unavailable_error");
+        assert_eq!(body["error"]["param"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn route_transcriptions_engine_unavailable_maps_to_503() {
+        let boundary = "ferrum-test-boundary";
+        let body = concat!(
+            "--ferrum-test-boundary\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
+            "Content-Type: audio/wav\r\n",
+            "\r\n",
+            "RIFFtest\r\n",
+            "--ferrum-test-boundary--\r\n"
+        );
+        let response = post_multipart(
+            router_without_llm(),
+            "/v1/audio/transcriptions",
+            boundary,
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "service_unavailable_error");
+        assert_eq!(body["error"]["param"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn route_speech_engine_unavailable_maps_to_503() {
+        let response = post_json(
+            router_without_llm(),
+            "/v1/audio/speech",
+            json!({
+                "model": "tts-model",
+                "input": "hello",
+                "voice": "default"
             }),
         )
         .await;
