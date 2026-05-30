@@ -70,6 +70,43 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Runtime env registry check
+        run: |
+          python3 -m py_compile scripts/check_ferrum_env_registry.py
+          python3 scripts/check_ferrum_env_registry.py --self-test
+          python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap
+
+      - name: CUDA build summary parser check
+        run: |
+          python3 -m py_compile scripts/validate_cuda_build_summary.py
+          python3 scripts/validate_cuda_build_summary.py --self-test
+
+      - name: Codebase shape check
+        run: cargo test -q -p ferrum-types --test codebase_shape_test -- --nocapture
+
+      - name: M3 runner artifact checks
+        run: |
+          python3 -m py_compile scripts/m3_ab_runner.py scripts/m3_validate_runner_artifact.py
+          python3 scripts/m3_ab_runner.py --self-test
+          python3 scripts/m3_validate_runner_artifact.py --self-test
+          bash -n scripts/m3_fa2_direct_ffi_ab.sh
+          bash -n scripts/m3_fa_layout_varlen_ab.sh
+          bash -n scripts/m3_route_unified_profile.sh
+          bash -n scripts/m3_prefill_first_ab.sh
+          bash -n scripts/m3_profile_sink_overhead_ab.sh
+          MODEL_DIR="$(mktemp -d)"
+          OUT_ROOT="$(mktemp -d)"
+          MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/fa-layout" BIN=/bin/echo \
+            VALIDATE_ONLY=1 bash scripts/m3_fa_layout_varlen_ab.sh
+          MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/fa2-source" BIN=/bin/echo \
+            FA2_SOURCE=1 VALIDATE_ONLY=1 bash scripts/m3_fa2_direct_ffi_ab.sh
+          MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/prefill-first" BIN=/bin/echo \
+            VALIDATE_ONLY=1 bash scripts/m3_prefill_first_ab.sh
+          MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/route-profile" BIN=/bin/echo \
+            VALIDATE_ONLY=1 bash scripts/m3_route_unified_profile.sh
+          MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/profile-sink" BIN=/bin/echo \
+            VALIDATE_ONLY=1 bash scripts/m3_profile_sink_overhead_ab.sh
+
       - name: Compile (workspace, all targets)
         run: cargo check --workspace --all-targets
 

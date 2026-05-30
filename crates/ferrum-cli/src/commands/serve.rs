@@ -3,9 +3,14 @@
 use crate::config::CliConfig;
 use clap::Args;
 use colored::*;
+use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
 use ferrum_models::source::ModelFormat;
 use ferrum_server::{AxumServer, HttpServer, ServerConfig};
-use ferrum_types::Result;
+use ferrum_types::{
+    CompiledKernelFeatures, FerrumConfigBuilder, HardwareCapabilities, ModelCapabilities,
+    MoeCapabilities, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
+    RuntimeConfigSource, WorkloadProfile,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
@@ -61,6 +66,38 @@ pub struct ServeCommand {
     /// Override via `FERRUM_KV_DTYPE` env var.
     #[arg(long, value_name = "DTYPE")]
     pub kv_dtype: Option<String>,
+
+    /// Write the startup effective runtime config JSON artifact.
+    #[arg(long, value_name = "PATH")]
+    pub effective_config_json: Option<PathBuf>,
+
+    /// Write the startup auto-config decision trace JSONL artifact.
+    #[arg(long, value_name = "PATH")]
+    pub decision_trace_jsonl: Option<PathBuf>,
+
+    /// Write native structured profile events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub profile_jsonl: Option<PathBuf>,
+
+    /// Git commit stamped into native structured profile events.
+    #[arg(long, value_name = "SHA")]
+    pub profile_commit_sha: Option<String>,
+
+    /// Runtime environment hash stamped into native structured profile events.
+    #[arg(long, value_name = "SHA256")]
+    pub profile_env_hash: Option<String>,
+
+    /// Model label stamped into native structured profile events.
+    #[arg(long, value_name = "MODEL")]
+    pub profile_model: Option<String>,
+
+    /// Concurrency stamped into native structured profile events.
+    #[arg(long, value_name = "N")]
+    pub profile_concurrency: Option<u32>,
+
+    /// Runtime flags/config JSON object embedded in native profile events.
+    #[arg(long, value_name = "JSON")]
+    pub profile_runtime_flags_json: Option<String>,
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
@@ -74,6 +111,14 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         spec_tokens,
         gpu_memory_utilization,
         kv_dtype,
+        effective_config_json,
+        decision_trace_jsonl,
+        profile_jsonl,
+        profile_commit_sha,
+        profile_env_hash,
+        profile_model,
+        profile_concurrency,
+        profile_runtime_flags_json,
     } = cmd;
 
     // Print banner
@@ -161,6 +206,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
 
     let host = host.unwrap_or_else(|| config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
+    let effective_kv_dtype = kv_dtype.as_deref().or(config.runtime.kv_dtype.as_deref());
+    let config_runtime_entries = config.runtime.runtime_config_entries();
 
     let source: ferrum_models::source::ResolvedModelSource = if let Some(p) = gguf_path.clone() {
         println!("{} {}", "Path:".dimmed(), p.display());
@@ -248,13 +295,48 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // and route directly to the continuous-batching LLM engine — the
     // engine's LlmExecutorFactory uses WeightFormat::detect() to route GGUF.
     println!();
-    let arch_for_dispatch: Option<ferrum_models::Architecture> = if gguf_path.is_some() {
+    let model_definition: Option<ferrum_models::ModelDefinition> = if gguf_path.is_some() {
         None
     } else {
         let mut config_manager = ferrum_models::ConfigManager::new();
-        let model_def = config_manager.load_from_path(&source.local_path).await?;
-        Some(model_def.architecture)
+        Some(config_manager.load_from_path(&source.local_path).await?)
     };
+    let arch_for_dispatch = model_definition
+        .as_ref()
+        .map(|model_def| model_def.architecture);
+    let mut startup_runtime_entries = config_runtime_entries;
+    startup_runtime_entries.extend(serve_cli_runtime_entries(
+        kv_dtype.as_deref(),
+        profile_jsonl.as_ref(),
+        profile_commit_sha.as_deref(),
+        profile_env_hash.as_deref(),
+        profile_model.as_deref(),
+        profile_concurrency,
+        profile_runtime_flags_json.as_deref(),
+    ));
+    let startup_auto_config = startup_auto_config(
+        &device,
+        arch_for_dispatch,
+        model_definition.as_ref(),
+        startup_runtime_entries,
+    )?;
+    write_startup_config_artifacts(
+        &startup_auto_config,
+        effective_config_json.as_deref(),
+        decision_trace_jsonl.as_deref(),
+    )?;
+    configure_profile_sink(
+        profile_jsonl,
+        ProfileSinkCliFields {
+            commit_sha: profile_commit_sha,
+            env_hash: profile_env_hash,
+            model: profile_model,
+            concurrency: profile_concurrency,
+            runtime_flags_json: profile_runtime_flags_json,
+        },
+        &startup_auto_config,
+        &model_id,
+    )?;
 
     let server = match arch_for_dispatch {
         Some(ferrum_models::Architecture::Clip) => {
@@ -335,12 +417,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             engine_config.backend.device = device;
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
             engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
-            super::run::apply_kv_dtype_override(&mut engine_config, kv_dtype.as_deref())?;
+            super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
             let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
                 Arc::from(ferrum_engine::create_default_engine(engine_config).await?);
             AxumServer::from_llm(engine)
         }
-    };
+    }
+    .with_auto_config(startup_auto_config);
 
     // Create server config
     let server_config = ServerConfig {
@@ -392,6 +475,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // TraceWriter's buffered events would be lost. Force-flush on
     // ctrl_c-driven shutdown (matches bench / bench-serve exit paths).
     ferrum_bench_core::trace::flush_global_trace();
+    ferrum_bench_core::flush_global_profile();
 
     Ok(())
 }
@@ -447,6 +531,337 @@ fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
     PathBuf::from(configured)
 }
 
+fn startup_auto_config(
+    device: &ferrum_types::Device,
+    architecture: Option<ferrum_models::Architecture>,
+    model_definition: Option<&ferrum_models::ModelDefinition>,
+    cli_runtime_entries: Vec<RuntimeConfigEntry>,
+) -> Result<ResolvedFerrumConfig> {
+    let mut runtime_config = RuntimeConfigSnapshot::capture_current();
+    for entry in cli_runtime_entries {
+        runtime_config.upsert_entry(entry);
+    }
+    let model = model_definition
+        .map(model_capabilities_from_definition)
+        .unwrap_or_else(ModelCapabilities::unknown);
+    let hardware = hardware_capabilities_for_device(device);
+    let workload = if is_m3_qwen3_30b_a3b(architecture, model_definition) {
+        WorkloadProfile::m3_qwen3_30b_a3b_int4()
+    } else {
+        WorkloadProfile::serving_default()
+    };
+
+    FerrumConfigBuilder::new(runtime_config)
+        .with_model_capabilities(model)
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .map_err(|err| ferrum_types::FerrumError::config(format!("invalid auto config: {err}")))
+}
+
+fn serve_cli_runtime_entries(
+    kv_dtype: Option<&str>,
+    profile_jsonl: Option<&PathBuf>,
+    profile_commit_sha: Option<&str>,
+    profile_env_hash: Option<&str>,
+    profile_model: Option<&str>,
+    profile_concurrency: Option<u32>,
+    profile_runtime_flags_json: Option<&str>,
+) -> Vec<RuntimeConfigEntry> {
+    let mut entries = Vec::new();
+    push_cli_runtime_entry(&mut entries, "FERRUM_KV_DTYPE", kv_dtype);
+    if let Some(path) = profile_jsonl {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PROFILE_JSONL",
+            path.to_string_lossy().to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_PROFILE_COMMIT_SHA",
+        profile_commit_sha,
+    );
+    push_cli_runtime_entry(&mut entries, "FERRUM_PROFILE_ENV_HASH", profile_env_hash);
+    push_cli_runtime_entry(&mut entries, "FERRUM_PROFILE_MODEL", profile_model);
+    if let Some(concurrency) = profile_concurrency {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PROFILE_CONCURRENCY",
+            concurrency.to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_PROFILE_RUNTIME_FLAGS_JSON",
+        profile_runtime_flags_json,
+    );
+    entries
+}
+
+fn push_cli_runtime_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            value.to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+}
+
+fn write_startup_config_artifacts(
+    auto_config: &ResolvedFerrumConfig,
+    effective_config_json: Option<&std::path::Path>,
+    decision_trace_jsonl: Option<&std::path::Path>,
+) -> Result<()> {
+    if let Some(path) = effective_config_json {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
+        }
+        let bytes = serde_json::to_vec_pretty(&auto_config.effective_config_document())
+            .map_err(|err| ferrum_types::FerrumError::serialization(err.to_string()))?;
+        std::fs::write(path, [bytes.as_slice(), b"\n"].concat())
+            .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
+    }
+    if let Some(path) = decision_trace_jsonl {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
+        }
+        let trace = auto_config
+            .decision_trace_jsonl()
+            .map_err(|err| ferrum_types::FerrumError::serialization(err.to_string()))?;
+        std::fs::write(path, trace)
+            .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
+    }
+    Ok(())
+}
+
+struct ProfileSinkCliFields {
+    commit_sha: Option<String>,
+    env_hash: Option<String>,
+    model: Option<String>,
+    concurrency: Option<u32>,
+    runtime_flags_json: Option<String>,
+}
+
+fn configure_profile_sink(
+    profile_jsonl: Option<PathBuf>,
+    fields: ProfileSinkCliFields,
+    auto_config: &ResolvedFerrumConfig,
+    model_id: &str,
+) -> Result<()> {
+    let Some(path) = profile_jsonl else {
+        return Ok(());
+    };
+
+    let runtime_flags = match fields.runtime_flags_json {
+        Some(json) => {
+            let value = serde_json::from_str::<serde_json::Value>(&json).map_err(|err| {
+                ferrum_types::FerrumError::config(format!(
+                    "invalid --profile-runtime-flags-json: {err}"
+                ))
+            })?;
+            if !value.is_object() {
+                return Err(ferrum_types::FerrumError::config(
+                    "--profile-runtime-flags-json must be a JSON object",
+                ));
+            }
+            value
+        }
+        None => auto_config.effective_config_document(),
+    };
+
+    let env_hash = match fields.env_hash {
+        Some(value) if value.starts_with("sha256:") => value,
+        Some(_) => {
+            return Err(ferrum_types::FerrumError::config(
+                "--profile-env-hash must start with sha256:",
+            ))
+        }
+        None => auto_config.runtime_env_hash(),
+    };
+
+    let metadata = ProfileMetadata {
+        commit_sha: fields.commit_sha.filter(|value| !value.trim().is_empty()),
+        env_hash,
+        model: fields
+            .model
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| model_id.to_string()),
+        concurrency: fields
+            .concurrency
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| auto_config.workload_profile.target_concurrency.max(1) as u32),
+        runtime_flags,
+    };
+    let profile_config = ProfileSinkConfig::enabled(path, metadata);
+    ferrum_bench_core::configure_global_profile(profile_config.clone())
+        .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
+    ferrum_kernels::configure_native_profile_sink(&profile_config)
+        .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
+    Ok(())
+}
+
+fn model_capabilities_from_definition(
+    definition: &ferrum_models::ModelDefinition,
+) -> ModelCapabilities {
+    let architecture = match definition.architecture {
+        ferrum_models::Architecture::Qwen3Moe => "qwen3_moe",
+        ferrum_models::Architecture::Qwen3 => "qwen3",
+        ferrum_models::Architecture::Qwen2 => "qwen2",
+        ferrum_models::Architecture::Llama => "llama",
+        ferrum_models::Architecture::Mistral => "mistral",
+        ferrum_models::Architecture::Phi => "phi",
+        ferrum_models::Architecture::GPT2 => "gpt2",
+        ferrum_models::Architecture::Bert => "bert",
+        ferrum_models::Architecture::Clip => "clip",
+        ferrum_models::Architecture::Whisper => "whisper",
+        ferrum_models::Architecture::Qwen3TTS => "qwen3_tts",
+        ferrum_models::Architecture::Unknown => "unknown",
+    }
+    .to_string();
+    let head_dim = definition
+        .extra_params
+        .get("head_dim")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .or_else(|| {
+            (definition.num_attention_heads > 0)
+                .then_some(definition.hidden_size / definition.num_attention_heads)
+        });
+    let moe = if definition.architecture == ferrum_models::Architecture::Qwen3Moe {
+        let num_experts = definition
+            .extra_params
+            .get("num_experts")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize;
+        let experts_per_token = definition
+            .extra_params
+            .get("num_experts_per_tok")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize;
+        Some(MoeCapabilities {
+            num_experts,
+            experts_per_token,
+            moe_intermediate_size: definition
+                .extra_params
+                .get("moe_intermediate_size")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize),
+        })
+    } else {
+        None
+    };
+
+    ModelCapabilities {
+        architecture,
+        quantization: quantization_from_definition(definition),
+        moe,
+        max_context_len: Some(definition.max_position_embeddings),
+        head_dim,
+        kv_heads: definition.num_key_value_heads,
+        supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
+        graph_safe_moe: definition.architecture == ferrum_models::Architecture::Qwen3Moe,
+    }
+}
+
+fn quantization_from_definition(definition: &ferrum_models::ModelDefinition) -> Option<String> {
+    let quant = definition.extra_params.get("quantization_config")?;
+    let method = quant
+        .get("quant_method")
+        .or_else(|| quant.get("type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("quantized");
+    let bits = quant.get("bits").and_then(|value| value.as_u64());
+    Some(match bits {
+        Some(bits) => format!("{method}_int{bits}"),
+        None => method.to_string(),
+    })
+}
+
+fn hardware_capabilities_for_device(device: &ferrum_types::Device) -> HardwareCapabilities {
+    let features = compiled_kernel_features();
+    match device {
+        ferrum_types::Device::CUDA(_) => HardwareCapabilities {
+            backend: "cuda".to_string(),
+            cuda_runtime: None,
+            compute_capability: None,
+            vram_bytes: None,
+            sm_count: None,
+            supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
+            supported_kv_dtypes: vec![
+                "fp16".to_string(),
+                "bf16".to_string(),
+                "int8".to_string(),
+                "fp8".to_string(),
+            ],
+            graph_support: cfg!(feature = "cuda"),
+            compiled_features: features,
+        },
+        ferrum_types::Device::ROCm(_) => HardwareCapabilities {
+            backend: "rocm".to_string(),
+            supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
+            supported_kv_dtypes: vec!["fp16".to_string()],
+            compiled_features: features,
+            ..HardwareCapabilities::unknown()
+        },
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        ferrum_types::Device::Metal => HardwareCapabilities {
+            backend: "metal".to_string(),
+            supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
+            supported_kv_dtypes: vec!["fp16".to_string()],
+            compiled_features: features,
+            ..HardwareCapabilities::unknown()
+        },
+        ferrum_types::Device::CPU => HardwareCapabilities {
+            backend: "cpu".to_string(),
+            supported_dtypes: vec!["fp32".to_string()],
+            supported_kv_dtypes: vec!["fp16".to_string()],
+            compiled_features: features,
+            ..HardwareCapabilities::unknown()
+        },
+    }
+}
+
+fn compiled_kernel_features() -> CompiledKernelFeatures {
+    CompiledKernelFeatures {
+        cuda: cfg!(feature = "cuda"),
+        vllm_paged_attn: cfg!(feature = "vllm-paged-attn-v2"),
+        vllm_moe_marlin: cfg!(feature = "vllm-moe-marlin"),
+        cuda_graph: cfg!(feature = "cuda"),
+        greedy_argmax: cfg!(feature = "cuda") || cfg!(feature = "metal"),
+        fa2_source: cfg!(feature = "fa2-source"),
+        fa2_direct_ffi: cfg!(feature = "cuda"),
+    }
+}
+
+fn is_m3_qwen3_30b_a3b(
+    architecture: Option<ferrum_models::Architecture>,
+    model_definition: Option<&ferrum_models::ModelDefinition>,
+) -> bool {
+    if architecture != Some(ferrum_models::Architecture::Qwen3Moe) {
+        return false;
+    }
+    let Some(definition) = model_definition else {
+        return false;
+    };
+    let num_experts = definition
+        .extra_params
+        .get("num_experts")
+        .and_then(|value| value.as_u64());
+    let experts_per_token = definition
+        .extra_params
+        .get("num_experts_per_tok")
+        .and_then(|value| value.as_u64());
+    definition.hidden_size == 2048
+        && definition.num_hidden_layers >= 40
+        && definition.num_key_value_heads == Some(4)
+        && num_experts == Some(128)
+        && experts_per_token == Some(8)
+}
+
 // `find_cached_model` and `detect_format` previously lived here as forks
 // of the `run.rs` versions. They moved to `crate::source_resolver` so the
 // HF cache walk + format detection have a single source of truth across
@@ -479,5 +894,75 @@ fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
             candle_core::Device::new_cuda(*id as usize).unwrap_or(candle_core::Device::Cpu)
         }
         _ => candle_core::Device::Cpu,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_cli_runtime_entries_are_cli_sourced_and_classified() {
+        let entries = serve_cli_runtime_entries(
+            Some("int8"),
+            Some(&PathBuf::from("/tmp/profile.jsonl")),
+            Some("abc123"),
+            Some("sha256:test"),
+            Some("Qwen/Qwen3-30B-A3B-GPTQ-Int4"),
+            Some(32),
+            Some("{\"schema_version\":1}"),
+        );
+        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
+        let entry = |key: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("FERRUM_KV_DTYPE").effective_value, "int8");
+        assert_eq!(entry("FERRUM_KV_DTYPE").source, RuntimeConfigSource::Cli);
+        assert!(entry("FERRUM_KV_DTYPE")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Correctness));
+        assert_eq!(
+            entry("FERRUM_PROFILE_JSONL").effective_value,
+            "/tmp/profile.jsonl"
+        );
+        assert_eq!(
+            entry("FERRUM_PROFILE_ENV_HASH").effective_value,
+            "sha256:test"
+        );
+        assert_eq!(entry("FERRUM_PROFILE_CONCURRENCY").effective_value, "32");
+        assert!(entry("FERRUM_PROFILE_JSONL")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Diagnostics));
+    }
+
+    #[test]
+    fn serve_runtime_snapshot_prefers_cli_over_config_file() {
+        let mut entries = crate::config::RuntimeCliConfig {
+            kv_dtype: Some("fp16".to_string()),
+        }
+        .runtime_config_entries();
+        entries.extend(serve_cli_runtime_entries(
+            Some("int8"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
+        let kv = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_KV_DTYPE")
+            .unwrap();
+        assert_eq!(kv.effective_value, "int8");
+        assert_eq!(kv.source, RuntimeConfigSource::Cli);
     }
 }

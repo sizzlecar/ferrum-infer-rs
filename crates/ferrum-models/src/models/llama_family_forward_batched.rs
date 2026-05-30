@@ -6,7 +6,7 @@
 //! `impl` block in a peer file (Rust allows multiple `impl` blocks for
 //! the same type across the crate).
 
-use std::sync::atomic::Ordering;
+use std::sync::{atomic::Ordering, OnceLock};
 
 use ferrum_interfaces::kv_dtype::KvFp16;
 use ferrum_kernels::backend::{
@@ -21,6 +21,96 @@ use super::llama_family::{
     BATCHED_GRAPH_REPLAY_COUNT, MATMUL_CALLS, MATMUL_TIME_US, NORM_CALLS, NORM_TIME_US,
     OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US, SINGLE_ITEM_GRAPH_KEY,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LlamaBatchedRuntimeConfig {
+    decode_op_profile: bool,
+    unified_graph: bool,
+    unified_profile: bool,
+    batched_graph: bool,
+    batched_trace: bool,
+    greedy_argmax: bool,
+}
+
+impl LlamaBatchedRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut config = Self {
+            decode_op_profile: false,
+            unified_graph: false,
+            unified_profile: false,
+            batched_graph: false,
+            batched_trace: false,
+            greedy_argmax: false,
+        };
+        for (name, value) in vars {
+            let value = value.as_ref();
+            match name.as_ref() {
+                "FERRUM_DECODE_OP_PROFILE" => config.decode_op_profile = true,
+                "FERRUM_UNIFIED_GRAPH" => config.unified_graph = value == "1",
+                "FERRUM_UNIFIED_PROFILE" => config.unified_profile = true,
+                "FERRUM_BATCHED_GRAPH" => config.batched_graph = value != "0",
+                "FERRUM_BATCHED_TRACE" => config.batched_trace = true,
+                "FERRUM_GREEDY_ARGMAX" => config.greedy_argmax = value == "1",
+                _ => {}
+            }
+        }
+        config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LlamaBatchedRuntimeConfig;
+
+    #[test]
+    fn llama_batched_runtime_config_parses_startup_knobs() {
+        let config = LlamaBatchedRuntimeConfig::from_env_vars([
+            ("FERRUM_DECODE_OP_PROFILE", "0"),
+            ("FERRUM_UNIFIED_GRAPH", "1"),
+            ("FERRUM_UNIFIED_PROFILE", ""),
+            ("FERRUM_BATCHED_GRAPH", "1"),
+            ("FERRUM_BATCHED_TRACE", "0"),
+            ("FERRUM_GREEDY_ARGMAX", "1"),
+        ]);
+
+        assert!(config.decode_op_profile);
+        assert!(config.unified_graph);
+        assert!(config.unified_profile);
+        assert!(config.batched_graph);
+        assert!(config.batched_trace);
+        assert!(config.greedy_argmax);
+    }
+
+    #[test]
+    fn llama_batched_runtime_config_preserves_opt_out_values() {
+        let config = LlamaBatchedRuntimeConfig::from_env_vars([
+            ("FERRUM_UNIFIED_GRAPH", "true"),
+            ("FERRUM_BATCHED_GRAPH", "0"),
+            ("FERRUM_GREEDY_ARGMAX", "true"),
+        ]);
+
+        assert!(!config.decode_op_profile);
+        assert!(!config.unified_graph);
+        assert!(!config.unified_profile);
+        assert!(!config.batched_graph);
+        assert!(!config.batched_trace);
+        assert!(!config.greedy_argmax);
+    }
+}
+
+fn llama_batched_runtime_config() -> &'static LlamaBatchedRuntimeConfig {
+    static CONFIG: OnceLock<LlamaBatchedRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(LlamaBatchedRuntimeConfig::from_env)
+}
 
 // Batched / unified-forward paths are FP16-only. Pinning the impl to
 // K = KvFp16 lets us access `KvCache<B, KvFp16>` fields directly without
@@ -53,7 +143,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
 
-        let _bp = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+        let _bp = llama_batched_runtime_config().decode_op_profile;
 
         // 1. rms_norm [M, H]  → norm_out
         let _t = if _bp {
@@ -832,7 +922,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let im = cfg.intermediate_size;
         let eps = cfg.rms_norm_eps;
         let layer = &self.layers[li];
-        let _bp = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+        let _bp = llama_batched_runtime_config().decode_op_profile;
 
         // 7. o_proj (GEMM m=M): attn_flat [M, Q] → o_proj_out [M, H]
         let _t = if _bp {
@@ -1125,9 +1215,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Bench (RTX 4090, Llama-3.1-8B GPTQ-INT4, c=16):
         //   varlen-only:     680 tok/s, TPOT 19.3 ms
         //   varlen + graph:  714 tok/s, TPOT 18.3 ms  (+5% / -5%)
-        let graph_enabled = std::env::var("FERRUM_UNIFIED_GRAPH")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let graph_enabled = llama_batched_runtime_config().unified_graph;
         let graph_key = crate::common::decoder_unified::unified_graph_key(m_total, num_seqs);
         let cache_has_key = self.unified_graph_keys_seen.contains(&graph_key);
 
@@ -1147,7 +1235,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // must be settled.
         B::sync(&mut ctx);
 
-        let unified_profile = std::env::var("FERRUM_UNIFIED_PROFILE").is_ok();
+        let unified_profile = llama_batched_runtime_config().unified_profile;
         let layer_t0 = if unified_profile {
             B::sync(&mut ctx);
             Some(std::time::Instant::now())
@@ -1228,7 +1316,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Drain per-op counters every 64 calls when DECODE_OP_PROFILE is on.
         // The op-profile macro inside unified_forward_layer adds to these
         // global atomics; without a swap the totals would just keep growing.
-        if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+        if llama_batched_runtime_config().decode_op_profile {
             static OP_DRAIN_CALLS: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = OP_DRAIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1400,7 +1488,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let dummy_w = &layer.input_ln_w;
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
-        let op_prof = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+        let op_prof = llama_batched_runtime_config().decode_op_profile;
 
         macro_rules! time_op {
             ($bucket_us:expr, $bucket_n:expr, $body:block) => {{
@@ -1747,9 +1835,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // ── Phase 4d: CUDA-graph replay path ─────────────────────────
         // gated on FERRUM_BATCHED_GRAPH=1; skipped on backends without
         // graph support (begin_graph_capture returns Err).
-        let graph_enabled = std::env::var("FERRUM_BATCHED_GRAPH")
-            .map(|v| v != "0")
-            .unwrap_or(false);
+        let graph_enabled = llama_batched_runtime_config().batched_graph;
         let m_padded = m.next_power_of_two();
         // Per-m_padded graph cache: each batch shape gets its own
         // captured graph instead of thrashing a single slot. Native
@@ -1808,7 +1894,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             // Trace mode (env): sync after each major op so that the
             // first panicking sync localises which kernel/section faulted.
             // Off by default (adds 32 syncs per token = pipeline serialisation).
-            let trace = std::env::var("FERRUM_BATCHED_TRACE").is_ok();
+            let trace = llama_batched_runtime_config().batched_trace;
             macro_rules! tracesync {
                 ($label:expr) => {
                     if trace {
@@ -1823,7 +1909,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             // pure replay short-circuits above and does not increment
             // the per-op counters since the wrapped ops aren't executed
             // by the Rust dispatch path).
-            let batched_profile = std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+            let batched_profile = llama_batched_runtime_config().decode_op_profile;
             let batched_iter_t0 = if batched_profile {
                 // Drain shared counters first so this iter's print isn't
                 // contaminated by prior prefill/single-decode contributions.
@@ -1959,9 +2045,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Saves ~5 ms / iter at c=32 on Qwen3 vocab=152064. Engine has a
         // matching size-1-Vec fast path in run_batch_decode that picks
         // `logits[0] as u32` and skips sample_with_processors entirely.
-        let greedy = std::env::var("FERRUM_GREEDY_ARGMAX")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let greedy = llama_batched_runtime_config().greedy_argmax;
         if greedy {
             let tokens = B::argmax_rows_f16(&mut ctx, &self.scratch.batch_logits, m, vocab)
                 .expect("argmax_rows_f16");

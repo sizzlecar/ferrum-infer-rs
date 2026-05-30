@@ -16,6 +16,7 @@
 //! - **Monitoring**: Built-in metrics and health checks
 
 pub mod axum_server;
+pub(crate) mod chat_template;
 pub mod middleware;
 pub mod openai;
 pub mod traits;
@@ -33,8 +34,10 @@ pub use types::{
 };
 
 pub use openai::{
-    ChatCompletionsRequest, ChatCompletionsResponse, ChatMessage, CompletionsRequest,
-    CompletionsResponse, ModelListResponse, OpenAiError, OpenAiErrorType, OpenAiResponseFormat,
+    ChatCompletionsRequest, ChatCompletionsResponse, ChatFunction, ChatFunctionCall, ChatMessage,
+    ChatTool, ChatToolCall, CompletionPrompt, CompletionsRequest, CompletionsResponse,
+    FunctionCallChoice, ModelListResponse, OpenAiError, OpenAiErrorType, OpenAiResponseFormat,
+    StreamOptions, ToolChoice,
 };
 
 pub use middleware::{

@@ -1,7 +1,46 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
+
+const CORE_PTX_KERNELS: &[&str] = &[
+    "kernels/fused_add_rms_norm.cu",
+    "kernels/fused_silu_mul.cu",
+    "kernels/rms_norm.cu",
+    "kernels/rope.cu",
+    "kernels/decode_attention.cu",
+    "kernels/residual_add.cu",
+    "kernels/flash_decode_attention.cu",
+    "kernels/paged_decode_attention.cu",
+    "kernels/paged_varlen_attention.cu",
+    "kernels/paged_varlen_attention_vllm.cu",
+    "kernels/dequant_int4.cu",
+    "kernels/batched_decode_attention.cu",
+    "kernels/softmax.cu",
+    "kernels/embedding_lookup.cu",
+    "kernels/flash_attn_full.cu",
+    "kernels/batched_flash_decode_attention.cu",
+    "kernels/qk_norm_rope.cu",
+    "kernels/split_qkv_norm_rope_into_paged_cache.cu",
+    "kernels/transpose.cu",
+    "kernels/kv_cache_append.cu",
+    "kernels/split_qkv.cu",
+    "kernels/add_bias.cu",
+    "kernels/layer_norm.cu",
+    "kernels/gelu.cu",
+    "kernels/decode_attention_hm.cu",
+    "kernels/gather_columns.cu",
+    "kernels/moe_combine.cu",
+    "kernels/moe_router.cu",
+    "kernels/moe_align_block_size.cu",
+    "kernels/moe_align_block_size_pair_ids.cu",
+    "kernels/moe_build_pairs.cu",
+    "kernels/int8_paged_decode_attention.cu",
+    "kernels/argmax_rows.cu",
+    "kernels/split_qkv_norm_rope_into_paged_cache_vllm.cu",
+];
+
+const CORE_PTX_HEADERS: &[&str] = &["kernels/common.cuh"];
 
 fn cuda_root_from_env() -> Option<PathBuf> {
     for key in [
@@ -30,6 +69,34 @@ fn file_fingerprint(path: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{path}:len={}:fnv1a64={hash:016x}", meta.len())
+}
+
+fn fnv1a64(input: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn signature_hash(signature: &str) -> String {
+    format!("fnv1a64:{:016x}", fnv1a64(signature))
+}
+
+fn emit_cuda_build_summary(
+    artifact: &str,
+    status: &str,
+    reason: &str,
+    elapsed: std::time::Duration,
+    signature: &str,
+) {
+    eprintln!(
+        "[cuda-build-summary] artifact={artifact} status={status} reason={reason} \
+elapsed_ms={} inputs_hash={}",
+        elapsed.as_millis(),
+        signature_hash(signature)
+    );
 }
 
 fn metadata_hash_file_fingerprint(path: &str) -> String {
@@ -87,21 +154,29 @@ fn metadata_static_lib_signature(label: &str, deps: &[&str], flags: &[String]) -
     lines.join("\n")
 }
 
-fn static_lib_is_fresh(
+enum CacheState {
+    Fresh(&'static str),
+    Stale(&'static str),
+}
+
+fn static_lib_cache_state(
     out_dir: &Path,
     lib_name: &str,
     signature: &str,
     migration_signatures: &[&str],
-) -> bool {
+) -> CacheState {
     let lib_file = out_dir.join(format!("lib{lib_name}.a"));
     let stamp_file = out_dir.join(format!("lib{lib_name}.stamp"));
-    if !lib_file.is_file() || !stamp_file.is_file() {
-        return false;
+    if !lib_file.is_file() {
+        return CacheState::Stale("missing-lib");
+    }
+    if !stamp_file.is_file() {
+        return CacheState::Stale("missing-stamp");
     }
     match fs::read_to_string(&stamp_file) {
         Ok(existing) if existing == signature => {
             eprintln!("[{lib_name}] cache hit: {}", lib_file.display());
-            true
+            CacheState::Fresh("signature-match")
         }
         Ok(existing) if migration_signatures.iter().any(|s| existing == **s) => {
             write_static_lib_stamp(out_dir, lib_name, signature);
@@ -109,9 +184,10 @@ fn static_lib_is_fresh(
                 "[{lib_name}] cache hit: {} (migrated stamp)",
                 lib_file.display()
             );
-            true
+            CacheState::Fresh("migrated-stamp")
         }
-        _ => false,
+        Ok(_) => CacheState::Stale("signature-changed"),
+        Err(_) => CacheState::Stale("stamp-read-error"),
     }
 }
 
@@ -189,64 +265,8 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set by cargo"));
-    let ptx_rs = out_dir.join("ptx.rs");
-
     let out_dir_clone = out_dir.clone();
-    let mut builder = bindgen_cuda::Builder::default()
-        .kernel_paths(vec![
-            "kernels/fused_add_rms_norm.cu",
-            "kernels/fused_silu_mul.cu",
-            "kernels/rms_norm.cu",
-            "kernels/rope.cu",
-            "kernels/decode_attention.cu",
-            "kernels/residual_add.cu",
-            "kernels/flash_decode_attention.cu",
-            "kernels/paged_decode_attention.cu",
-            "kernels/paged_varlen_attention.cu",
-            "kernels/paged_varlen_attention_vllm.cu",
-            "kernels/dequant_int4.cu",
-            "kernels/batched_decode_attention.cu",
-            "kernels/softmax.cu",
-            "kernels/embedding_lookup.cu",
-            "kernels/flash_attn_full.cu",
-            "kernels/batched_flash_decode_attention.cu",
-            "kernels/qk_norm_rope.cu",
-            "kernels/split_qkv_norm_rope_into_paged_cache.cu",
-            "kernels/transpose.cu",
-            "kernels/kv_cache_append.cu",
-            "kernels/split_qkv.cu",
-            "kernels/add_bias.cu",
-            "kernels/layer_norm.cu",
-            "kernels/gelu.cu",
-            "kernels/decode_attention_hm.cu",
-            "kernels/gather_columns.cu",
-            "kernels/moe_combine.cu",
-            "kernels/moe_router.cu",
-            "kernels/moe_align_block_size.cu",
-            "kernels/moe_align_block_size_pair_ids.cu",
-            "kernels/moe_build_pairs.cu",
-            "kernels/int8_paged_decode_attention.cu",
-            "kernels/argmax_rows.cu",
-            "kernels/split_qkv_norm_rope_into_paged_cache_vllm.cu",
-        ])
-        .out_dir(out_dir)
-        .arg("-Ikernels") // for common.cuh
-        .arg("--expt-relaxed-constexpr")
-        .arg("-std=c++17")
-        .arg("-O3")
-        .arg("--use_fast_math");
-
-    if let Some(cuda_root) = cuda_root_from_env() {
-        builder.cuda_root(cuda_root);
-    }
-
-    let bindings = builder
-        .build_ptx()
-        .expect("failed to compile ferrum CUDA kernels to PTX");
-
-    bindings
-        .write(&ptx_rs)
-        .expect("failed to write ferrum CUDA PTX bindings");
+    compile_core_ptx(&out_dir_clone);
 
     // Compile Marlin INT4xFP16 kernel separately (uses runtime API, not PTX).
     // Only when "marlin" feature is enabled. Requires SM >= 8.0 (Ampere).
@@ -284,6 +304,193 @@ fn main() {
     if env::var_os("CARGO_FEATURE_FA2_SOURCE").is_some() {
         compile_fa2_source(&out_dir_clone);
     }
+}
+
+fn detect_cuda_compute_cap() -> String {
+    println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
+    if let Ok(value) = env::var("CUDA_COMPUTE_CAP") {
+        println!("cargo:rustc-env=CUDA_COMPUTE_CAP={value}");
+        return value;
+    }
+
+    let output = std::process::Command::new("nvidia-smi")
+        .arg("--query-gpu=compute_cap")
+        .arg("--format=csv,noheader")
+        .output()
+        .expect("nvidia-smi failed while detecting CUDA compute capability");
+    if !output.status.success() {
+        panic!("nvidia-smi failed while detecting CUDA compute capability");
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let cap = stdout
+        .lines()
+        .next()
+        .expect("missing nvidia-smi compute_cap output")
+        .trim()
+        .replace('.', "");
+    if cap.is_empty() {
+        panic!("empty CUDA compute capability from nvidia-smi");
+    }
+    println!("cargo:rustc-env=CUDA_COMPUTE_CAP={cap}");
+    cap
+}
+
+fn core_ptx_signature(kernel: &str, flags: &[String]) -> String {
+    let mut lines = Vec::with_capacity(2 + flags.len() + CORE_PTX_HEADERS.len());
+    lines.push(format!("label=core-ptx"));
+    lines.push(format!("kernel={kernel}"));
+    lines.extend(flags.iter().map(|f| format!("flag={f}")));
+    lines.push(file_fingerprint(kernel));
+    lines.extend(CORE_PTX_HEADERS.iter().map(|p| file_fingerprint(p)));
+    lines.join("\n")
+}
+
+fn core_ptx_cache_state(out_dir: &Path, kernel: &str, signature: &str) -> CacheState {
+    let stem = Path::new(kernel)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("kernel filename");
+    let ptx = out_dir.join(format!("{stem}.ptx"));
+    let stamp = out_dir.join(format!("{stem}.ptx.stamp"));
+    if !ptx.is_file() {
+        return CacheState::Stale("missing-ptx");
+    }
+    if !stamp.is_file() {
+        return CacheState::Stale("missing-stamp");
+    }
+    match fs::read_to_string(&stamp) {
+        Ok(existing) if existing == signature => CacheState::Fresh("signature-match"),
+        Ok(_) => CacheState::Stale("signature-changed"),
+        Err(_) => CacheState::Stale("stamp-read-error"),
+    }
+}
+
+fn write_core_ptx_stamp(out_dir: &Path, kernel: &str, signature: &str) {
+    let stem = Path::new(kernel)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("kernel filename");
+    let stamp = out_dir.join(format!("{stem}.ptx.stamp"));
+    fs::write(&stamp, signature)
+        .unwrap_or_else(|e| panic!("[core-ptx] failed to write stamp {}: {e}", stamp.display()));
+}
+
+fn write_core_ptx_bindings(out_dir: &Path) {
+    let mut content = String::new();
+    for kernel in CORE_PTX_KERNELS {
+        let stem = Path::new(kernel)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("kernel filename");
+        content.push_str(&format!(
+            "pub const {}: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/{}.ptx\"));\n",
+            stem.to_uppercase().replace('.', "_"),
+            stem
+        ));
+    }
+    let ptx_rs = out_dir.join("ptx.rs");
+    if fs::read_to_string(&ptx_rs).ok().as_deref() != Some(content.as_str()) {
+        fs::write(&ptx_rs, content)
+            .unwrap_or_else(|e| panic!("[core-ptx] failed to write {}: {e}", ptx_rs.display()));
+    }
+}
+
+fn compile_core_ptx(out_dir: &Path) {
+    for path in CORE_PTX_KERNELS.iter().chain(CORE_PTX_HEADERS.iter()) {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
+
+    let cuda_root = cuda_root_from_env();
+    let cuda_include = cuda_root.as_ref().map(|root| root.join("include"));
+    if let Some(cuda_include) = &cuda_include {
+        println!(
+            "cargo:rustc-env=CUDA_INCLUDE_DIR={}",
+            cuda_include.display()
+        );
+    }
+    let nvcc = cuda_root
+        .as_ref()
+        .map(|r| r.join("bin").join("nvcc"))
+        .unwrap_or_else(|| PathBuf::from("nvcc"));
+    let compute_cap = detect_cuda_compute_cap();
+    let ccbin = env::var("NVCC_CCBIN").ok();
+    let mut flags = vec![
+        format!("nvcc={}", nvcc.display()),
+        format!("arch=sm_{compute_cap}"),
+        "-Ikernels".to_string(),
+        "--expt-relaxed-constexpr".to_string(),
+        "-std=c++17".to_string(),
+        "-O3".to_string(),
+        "--use_fast_math".to_string(),
+    ];
+    if let Some(cuda_include) = &cuda_include {
+        flags.push(format!("-I{}", cuda_include.display()));
+    }
+    if let Some(ccbin) = &ccbin {
+        flags.push(format!("ccbin={ccbin}"));
+    }
+
+    for kernel in CORE_PTX_KERNELS {
+        let start = Instant::now();
+        let signature = core_ptx_signature(kernel, &flags);
+        match core_ptx_cache_state(out_dir, kernel, &signature) {
+            CacheState::Fresh(reason) => {
+                emit_cuda_build_summary(
+                    &format!("core-ptx:{}", Path::new(kernel).display()),
+                    "cache_hit",
+                    reason,
+                    start.elapsed(),
+                    &signature,
+                );
+            }
+            CacheState::Stale(reason) => {
+                let mut command = std::process::Command::new(&nvcc);
+                command
+                    .arg(format!("--gpu-architecture=sm_{compute_cap}"))
+                    .arg("--ptx")
+                    .args(["--default-stream", "per-thread"])
+                    .args([
+                        "--output-directory",
+                        out_dir.to_str().expect("OUT_DIR utf8"),
+                    ])
+                    .arg("-Ikernels")
+                    .arg("--expt-relaxed-constexpr")
+                    .arg("-std=c++17")
+                    .arg("-O3")
+                    .arg("--use_fast_math");
+                if let Some(cuda_include) = &cuda_include {
+                    command.arg(format!("-I{}", cuda_include.display()));
+                }
+                if let Some(ccbin) = &ccbin {
+                    command
+                        .arg("-allow-unsupported-compiler")
+                        .args(["-ccbin", ccbin]);
+                }
+                command.arg(kernel);
+                let output = command
+                    .output()
+                    .unwrap_or_else(|e| panic!("[core-ptx] nvcc spawn failed for {kernel}: {e}"));
+                if !output.status.success() {
+                    panic!(
+                        "[core-ptx] nvcc failed compiling {kernel}: {:?}\n\n# stdout\n{}\n\n# stderr\n{}",
+                        command,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                write_core_ptx_stamp(out_dir, kernel, &signature);
+                emit_cuda_build_summary(
+                    &format!("core-ptx:{}", Path::new(kernel).display()),
+                    "built",
+                    reason,
+                    start.elapsed(),
+                    &signature,
+                );
+            }
+        }
+    }
+    write_core_ptx_bindings(out_dir);
 }
 
 fn find_cutlass_include_dir() -> Option<PathBuf> {
@@ -411,15 +618,27 @@ fn compile_fa2_source(out_dir: &PathBuf) {
     let signature = static_lib_signature("fa2-source", &deps, &flags);
     let metadata_hash_signature = metadata_hash_static_lib_signature("fa2-source", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("fa2-source", &deps, &flags);
-    if static_lib_is_fresh(
+    let build_start = Instant::now();
+    let cache_state = static_lib_cache_state(
         out_dir,
         "fa2_source",
         &signature,
         &[&metadata_hash_signature, &metadata_signature],
-    ) {
-        emit_cuda_static_link(out_dir, "fa2_source", cuda_root.as_ref(), true);
-        return;
-    }
+    );
+    let build_reason = match cache_state {
+        CacheState::Fresh(reason) => {
+            emit_cuda_build_summary(
+                "fa2_source",
+                "cache_hit",
+                reason,
+                build_start.elapsed(),
+                &signature,
+            );
+            emit_cuda_static_link(out_dir, "fa2_source", cuda_root.as_ref(), true);
+            return;
+        }
+        CacheState::Stale(reason) => reason,
+    };
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for src in &cu_files {
@@ -481,6 +700,13 @@ fn compile_fa2_source(out_dir: &PathBuf) {
     write_static_lib_stamp(out_dir, "fa2_source", &signature);
     emit_cuda_static_link(out_dir, "fa2_source", cuda_root.as_ref(), true);
     eprintln!("[fa2-source] static lib built: {}", lib_file.display());
+    emit_cuda_build_summary(
+        "fa2_source",
+        "built",
+        build_reason,
+        build_start.elapsed(),
+        &signature,
+    );
 }
 
 fn compile_vllm_paged_attn(out_dir: &PathBuf) {
@@ -531,15 +757,27 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
     let metadata_hash_signature =
         metadata_hash_static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("vllm-paged-attn-v2", &deps, &flags);
-    if static_lib_is_fresh(
+    let build_start = Instant::now();
+    let cache_state = static_lib_cache_state(
         out_dir,
         "vllm_paged_attn",
         &signature,
         &[&metadata_hash_signature, &metadata_signature],
-    ) {
-        emit_cuda_static_link(out_dir, "vllm_paged_attn", cuda_root.as_ref(), true);
-        return;
-    }
+    );
+    let build_reason = match cache_state {
+        CacheState::Fresh(reason) => {
+            emit_cuda_build_summary(
+                "vllm_paged_attn",
+                "cache_hit",
+                reason,
+                build_start.elapsed(),
+                &signature,
+            );
+            emit_cuda_static_link(out_dir, "vllm_paged_attn", cuda_root.as_ref(), true);
+            return;
+        }
+        CacheState::Stale(reason) => reason,
+    };
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for src in cu_files {
@@ -595,6 +833,13 @@ fn compile_vllm_paged_attn(out_dir: &PathBuf) {
     eprintln!(
         "[vllm-paged-attn-v2] static lib built: {}",
         lib_file.display()
+    );
+    emit_cuda_build_summary(
+        "vllm_paged_attn",
+        "built",
+        build_reason,
+        build_start.elapsed(),
+        &signature,
     );
 }
 
@@ -653,15 +898,27 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
     let metadata_hash_signature =
         metadata_hash_static_lib_signature("vllm-moe-marlin", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("vllm-moe-marlin", &deps, &flags);
-    if static_lib_is_fresh(
+    let build_start = Instant::now();
+    let cache_state = static_lib_cache_state(
         out_dir,
         "vllm_moe_marlin",
         &signature,
         &[&metadata_hash_signature, &metadata_signature],
-    ) {
-        emit_cuda_static_link(out_dir, "vllm_moe_marlin", cuda_root.as_ref(), true);
-        return;
-    }
+    );
+    let build_reason = match cache_state {
+        CacheState::Fresh(reason) => {
+            emit_cuda_build_summary(
+                "vllm_moe_marlin",
+                "cache_hit",
+                reason,
+                build_start.elapsed(),
+                &signature,
+            );
+            emit_cuda_static_link(out_dir, "vllm_moe_marlin", cuda_root.as_ref(), true);
+            return;
+        }
+        CacheState::Stale(reason) => reason,
+    };
 
     let mut object_files: Vec<PathBuf> = Vec::new();
     for src in cu_files {
@@ -724,6 +981,13 @@ fn compile_vllm_moe_marlin(out_dir: &PathBuf) {
     write_static_lib_stamp(out_dir, "vllm_moe_marlin", &signature);
     emit_cuda_static_link(out_dir, "vllm_moe_marlin", cuda_root.as_ref(), true);
     eprintln!("[vllm-moe-marlin] static lib built: {}", lib_file.display());
+    emit_cuda_build_summary(
+        "vllm_moe_marlin",
+        "built",
+        build_reason,
+        build_start.elapsed(),
+        &signature,
+    );
 }
 
 fn compile_vllm_marlin(out_dir: &PathBuf) {
@@ -808,15 +1072,27 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
     let signature = static_lib_signature("vllm-marlin", &deps, &flags);
     let metadata_hash_signature = metadata_hash_static_lib_signature("vllm-marlin", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("vllm-marlin", &deps, &flags);
-    if static_lib_is_fresh(
+    let build_start = Instant::now();
+    let cache_state = static_lib_cache_state(
         out_dir,
         "vllm_marlin",
         &signature,
         &[&metadata_hash_signature, &metadata_signature],
-    ) {
-        emit_cuda_static_link(out_dir, "vllm_marlin", cuda_root.as_ref(), true);
-        return;
-    }
+    );
+    let build_reason = match cache_state {
+        CacheState::Fresh(reason) => {
+            emit_cuda_build_summary(
+                "vllm_marlin",
+                "cache_hit",
+                reason,
+                build_start.elapsed(),
+                &signature,
+            );
+            emit_cuda_static_link(out_dir, "vllm_marlin", cuda_root.as_ref(), true);
+            return;
+        }
+        CacheState::Stale(reason) => reason,
+    };
 
     // Compile each .cu to its own .o
     let mut object_files: Vec<PathBuf> = Vec::new();
@@ -886,6 +1162,13 @@ fn compile_vllm_marlin(out_dir: &PathBuf) {
     write_static_lib_stamp(out_dir, "vllm_marlin", &signature);
     emit_cuda_static_link(out_dir, "vllm_marlin", cuda_root.as_ref(), true);
     eprintln!("[vllm-marlin] static lib built: {}", lib_file.display());
+    emit_cuda_build_summary(
+        "vllm_marlin",
+        "built",
+        build_reason,
+        build_start.elapsed(),
+        &signature,
+    );
 }
 
 fn compile_marlin(out_dir: &PathBuf) {
@@ -915,15 +1198,27 @@ fn compile_marlin(out_dir: &PathBuf) {
         metadata_hash_static_lib_signature("marlin", &["kernels/marlin_cuda_kernel.cu"], &flags);
     let metadata_signature =
         metadata_static_lib_signature("marlin", &["kernels/marlin_cuda_kernel.cu"], &flags);
-    if static_lib_is_fresh(
+    let build_start = Instant::now();
+    let cache_state = static_lib_cache_state(
         out_dir,
         "marlin",
         &signature,
         &[&metadata_hash_signature, &metadata_signature],
-    ) {
-        emit_cuda_static_link(out_dir, "marlin", cuda_root.as_ref(), false);
-        return;
-    }
+    );
+    let build_reason = match cache_state {
+        CacheState::Fresh(reason) => {
+            emit_cuda_build_summary(
+                "marlin",
+                "cache_hit",
+                reason,
+                build_start.elapsed(),
+                &signature,
+            );
+            emit_cuda_static_link(out_dir, "marlin", cuda_root.as_ref(), false);
+            return;
+        }
+        CacheState::Stale(reason) => reason,
+    };
 
     let obj_file = out_dir.join("marlin_cuda_kernel.o");
     let status = std::process::Command::new(&nvcc)
@@ -957,6 +1252,13 @@ fn compile_marlin(out_dir: &PathBuf) {
                     write_static_lib_stamp(out_dir, "marlin", &signature);
                     emit_cuda_static_link(out_dir, "marlin", cuda_root.as_ref(), false);
                     eprintln!("Marlin kernel compiled successfully (sm_{compute_cap})");
+                    emit_cuda_build_summary(
+                        "marlin",
+                        "built",
+                        build_reason,
+                        build_start.elapsed(),
+                        &signature,
+                    );
                     return;
                 }
             }

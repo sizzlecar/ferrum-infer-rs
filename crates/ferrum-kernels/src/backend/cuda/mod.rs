@@ -135,6 +135,51 @@ use half::f16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CudaBackendRuntimeEnv {
+    moe_streams: usize,
+    cuda_max_kv: Option<usize>,
+    cuda_device: usize,
+}
+
+impl CudaBackendRuntimeEnv {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut moe_streams = None;
+        let mut cuda_max_kv = None;
+        let mut cuda_device = None;
+
+        for (key, value) in vars {
+            let value = value.into();
+            match key.as_ref() {
+                "FERRUM_MOE_STREAMS" => moe_streams = value.parse::<usize>().ok(),
+                "FERRUM_CUDA_MAX_KV" => cuda_max_kv = value.parse::<usize>().ok(),
+                "FERRUM_CUDA_DEVICE" => cuda_device = value.parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+
+        Self {
+            moe_streams: moe_streams.unwrap_or(4).max(1),
+            cuda_max_kv,
+            cuda_device: cuda_device.unwrap_or(0),
+        }
+    }
+}
+
+fn cuda_backend_runtime_env() -> &'static CudaBackendRuntimeEnv {
+    static CONFIG: std::sync::OnceLock<CudaBackendRuntimeEnv> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(CudaBackendRuntimeEnv::from_env)
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Context
 // ────────────────────────────────────────────────────────────────────────
@@ -348,11 +393,7 @@ impl CudaState {
     /// multi-stream dispatch).
     pub fn moe_stream_pool(&mut self) -> &[Arc<CudaStream>] {
         if self.moe_streams.is_none() {
-            let n = std::env::var("FERRUM_MOE_STREAMS")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(4)
-                .max(1);
+            let n = cuda_backend_runtime_env().moe_streams;
             let mut pool = Vec::with_capacity(n);
             for _ in 0..n {
                 let s = self
@@ -941,9 +982,8 @@ impl Backend for CudaBackend {
             //   raise via FERRUM_CUDA_MAX_KV env (bumps dynamic shared beyond
             //   48 KB via CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES).
             const DECODE_MAX_KV_POS_DEFAULT: usize = 8192; // 32 KB
-            let env_cap = std::env::var("FERRUM_CUDA_MAX_KV")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
+            let env_cap = cuda_backend_runtime_env()
+                .cuda_max_kv
                 .unwrap_or(DECODE_MAX_KV_POS_DEFAULT);
             let max_kv_pos = capacity.min(env_cap as i32) as u32;
             let shared_mem = max_kv_pos * 4;
@@ -1957,10 +1997,7 @@ pub(super) fn default_stream() -> Arc<CudaStream> {
     }
     let mut w = stream_slot().write().expect("GLOBAL_STREAM poisoned");
     if w.is_none() {
-        let ordinal = std::env::var("FERRUM_CUDA_DEVICE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
+        let ordinal = cuda_backend_runtime_env().cuda_device;
         let ctx = CudaContext::new(ordinal).unwrap_or_else(|e| {
             panic!("CudaBackend: failed to init default context {ordinal}: {e}")
         });
@@ -2258,4 +2295,35 @@ pub(super) fn ensure_module(
 impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CudaBackend {
     type KvBuffer = <Self as crate::backend::Backend>::Buffer;
     type KvScales = ();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_backend_runtime_env_parses_values() {
+        let env = CudaBackendRuntimeEnv::from_env_vars([
+            ("FERRUM_MOE_STREAMS", "8"),
+            ("FERRUM_CUDA_MAX_KV", "16384"),
+            ("FERRUM_CUDA_DEVICE", "2"),
+        ]);
+
+        assert_eq!(env.moe_streams, 8);
+        assert_eq!(env.cuda_max_kv, Some(16384));
+        assert_eq!(env.cuda_device, 2);
+    }
+
+    #[test]
+    fn cuda_backend_runtime_env_defaults_invalid_values() {
+        let env = CudaBackendRuntimeEnv::from_env_vars([
+            ("FERRUM_MOE_STREAMS", "0"),
+            ("FERRUM_CUDA_MAX_KV", "invalid"),
+            ("FERRUM_CUDA_DEVICE", "invalid"),
+        ]);
+
+        assert_eq!(env.moe_streams, 1);
+        assert_eq!(env.cuda_max_kv, None);
+        assert_eq!(env.cuda_device, 0);
+    }
 }

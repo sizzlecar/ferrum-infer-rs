@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_kernels::backend::BackendQuantMarlin;
-use ferrum_models::moe::{moe_forward, moe_forward_bucketed, ExpertStack, MoeRouteScratch};
+use ferrum_models::moe::{
+    moe_forward, moe_forward_bucketed, ExpertStack, MoeForwardBucketedParams, MoeForwardParams,
+    MoeRouteScratch,
+};
 use ferrum_quantization::{Linear, StackedExpertLinear};
 
 /// Tiny PRNG (same as gptq_parity_test).
@@ -131,25 +134,25 @@ fn bucketed_matches_per_pair_dispatch() {
     let mut down_buf = vec![0.0f32; hidden];
     let zero_hidden = vec![0.0f32; hidden];
     let mut ctx_a = ();
-    moe_forward::<CpuBackend>(
-        &mut ctx_a,
-        &x,
-        &router_logits,
-        &mut out_a,
+    moe_forward::<CpuBackend>(MoeForwardParams {
+        ctx: &mut ctx_a,
+        x: &x,
+        router_logits: &router_logits,
+        out: &mut out_a,
         batch,
-        hidden,
-        inter,
+        hidden_size: hidden,
+        expert_intermediate: inter,
         num_experts,
         top_k,
-        true,
-        &experts,
-        &mut x_single,
-        &mut acc_buf,
-        &mut gate_up_buf,
-        &mut silu_buf,
-        &mut down_buf,
-        &zero_hidden,
-    )
+        norm_topk_prob: true,
+        experts: &experts,
+        x_single: &mut x_single,
+        acc_buf: &mut acc_buf,
+        gate_up_buf: &mut gate_up_buf,
+        silu_buf: &mut silu_buf,
+        down_buf: &mut down_buf,
+        zero_hidden: &zero_hidden,
+    })
     .expect("per-pair forward");
 
     // ── Path B: moe_forward_bucketed ───────────────────────────────────
@@ -161,25 +164,25 @@ fn bucketed_matches_per_pair_dispatch() {
     let mut down_packed = vec![0.0f32; total_pairs * hidden];
     let mut ctx_b = ();
     let mut route_scratch = MoeRouteScratch::new();
-    moe_forward_bucketed::<CpuBackend>(
-        &mut ctx_b,
-        &x,
-        &router_logits,
-        &mut out_b,
+    moe_forward_bucketed::<CpuBackend>(MoeForwardBucketedParams {
+        ctx: &mut ctx_b,
+        x: &x,
+        router_logits: &router_logits,
+        out: &mut out_b,
         batch,
-        hidden,
-        inter,
+        hidden_size: hidden,
+        expert_intermediate: inter,
         num_experts,
         top_k,
-        true,
-        &experts,
-        &mut x_packed,
-        &mut gate_up_packed,
-        &mut silu_packed,
-        &mut down_packed,
-        &mut route_scratch,
-        None,
-    )
+        norm_topk_prob: true,
+        experts: &experts,
+        x_packed: &mut x_packed,
+        gate_up_packed: &mut gate_up_packed,
+        silu_packed: &mut silu_packed,
+        down_packed: &mut down_packed,
+        route_scratch: &mut route_scratch,
+        device_route: None,
+    })
     .expect("bucketed forward");
 
     // ── Compare ────────────────────────────────────────────────────────

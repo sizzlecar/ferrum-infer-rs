@@ -38,6 +38,205 @@
 // compile time but simpler).
 #include "marlin_template.h"
 
+#include <mutex>
+#include <string>
+
+struct FerrumVllmMoeRuntimeEnv {
+  bool log_config;
+  int log_limit;
+  int log_min_pairs;
+  int log_max_pairs;
+  int force_thread_k;
+  int force_thread_n;
+  int force_blocks_per_sm;
+};
+
+static const char* ferrum_env_value(const char* name) {
+  return std::getenv(name);
+}
+
+static int ferrum_env_int(const char* name, int default_value) {
+  if (const char* value = ferrum_env_value(name)) {
+    return std::atoi(value);
+  }
+  return default_value;
+}
+
+struct FerrumVllmMoeProfileConfig {
+  bool configured = false;
+  std::string path;
+  std::string commit_sha;
+  std::string env_hash = "sha256:unknown";
+  std::string model = "unknown";
+  int concurrency = 1;
+  std::string runtime_flags_json = "{}";
+};
+
+static FerrumVllmMoeProfileConfig& ferrum_vllm_moe_profile_config() {
+  static FerrumVllmMoeProfileConfig config;
+  return config;
+}
+
+static std::mutex& ferrum_vllm_moe_profile_config_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+static std::string ferrum_cstr_or_empty(const char* value) {
+  return value == nullptr ? std::string() : std::string(value);
+}
+
+extern "C" void ferrum_vllm_marlin_moe_set_profile_config(
+    const char* path, const char* commit_sha, const char* env_hash,
+    const char* model, int concurrency, const char* runtime_flags_json) {
+  std::lock_guard<std::mutex> guard(ferrum_vllm_moe_profile_config_mutex());
+  auto& config = ferrum_vllm_moe_profile_config();
+  config.configured = path != nullptr && path[0] != '\0';
+  config.path = ferrum_cstr_or_empty(path);
+  config.commit_sha = ferrum_cstr_or_empty(commit_sha);
+  config.env_hash = ferrum_cstr_or_empty(env_hash);
+  if (config.env_hash.empty()) config.env_hash = "sha256:unknown";
+  config.model = ferrum_cstr_or_empty(model);
+  if (config.model.empty()) config.model = "unknown";
+  config.concurrency = concurrency > 0 ? concurrency : 1;
+  config.runtime_flags_json = ferrum_cstr_or_empty(runtime_flags_json);
+  if (config.runtime_flags_json.empty() || config.runtime_flags_json[0] != '{') {
+    config.runtime_flags_json = "{}";
+  }
+}
+
+extern "C" void ferrum_vllm_marlin_moe_clear_profile_config() {
+  std::lock_guard<std::mutex> guard(ferrum_vllm_moe_profile_config_mutex());
+  ferrum_vllm_moe_profile_config() = FerrumVllmMoeProfileConfig{};
+}
+
+static FerrumVllmMoeProfileConfig ferrum_vllm_moe_profile_config_snapshot() {
+  std::lock_guard<std::mutex> guard(ferrum_vllm_moe_profile_config_mutex());
+  return ferrum_vllm_moe_profile_config();
+}
+
+static void ferrum_json_write_string(FILE* file, const char* value) {
+  std::fputc('"', file);
+  if (value != nullptr) {
+    for (const char* p = value; *p != '\0'; ++p) {
+      unsigned char c = static_cast<unsigned char>(*p);
+      if (c == '"' || c == '\\') {
+        std::fputc('\\', file);
+        std::fputc(c, file);
+      } else if (c == '\n') {
+        std::fputs("\\n", file);
+      } else if (c == '\r') {
+        std::fputs("\\r", file);
+      } else if (c == '\t') {
+        std::fputs("\\t", file);
+      } else if (c < 0x20) {
+        std::fprintf(file, "\\u%04x", c);
+      } else {
+        std::fputc(c, file);
+      }
+    }
+  }
+  std::fputc('"', file);
+}
+
+static void ferrum_append_vllm_moe_config_profile(
+    int batch_x_topk, int prob_m, int prob_n, int prob_k, int moe_block_size,
+    int top_k, int thread_k, int thread_n, int num_threads, int blocks_per_sm,
+    int sh_cache_size, int max_shared_mem) {
+  FerrumVllmMoeProfileConfig profile = ferrum_vllm_moe_profile_config_snapshot();
+  const char* path = profile.configured
+      ? profile.path.c_str()
+      : ferrum_env_value("FERRUM_PROFILE_JSONL");
+  if (path == nullptr || path[0] == '\0') return;
+
+  FILE* file = std::fopen(path, "a");
+  if (file == nullptr) return;
+
+  const char* commit_sha = profile.configured
+      ? profile.commit_sha.c_str()
+      : ferrum_env_value("FERRUM_PROFILE_COMMIT_SHA");
+  const char* env_hash = profile.configured
+      ? profile.env_hash.c_str()
+      : ferrum_env_value("FERRUM_PROFILE_ENV_HASH");
+  if (env_hash == nullptr || env_hash[0] == '\0') env_hash = "sha256:unknown";
+  const char* model = profile.configured
+      ? profile.model.c_str()
+      : ferrum_env_value("FERRUM_PROFILE_MODEL");
+  if (model == nullptr || model[0] == '\0') model = "unknown";
+  const char* runtime_flags = profile.configured
+      ? profile.runtime_flags_json.c_str()
+      : ferrum_env_value("FERRUM_PROFILE_RUNTIME_FLAGS_JSON");
+  int concurrency = profile.configured
+      ? profile.concurrency
+      : ferrum_env_int("FERRUM_PROFILE_CONCURRENCY", 1);
+  if (concurrency <= 0) concurrency = 1;
+
+  std::fputs("{\"commit_sha\":", file);
+  if (commit_sha == nullptr || commit_sha[0] == '\0') {
+    std::fputs("null", file);
+  } else {
+    ferrum_json_write_string(file, commit_sha);
+  }
+  std::fprintf(file, ",\"concurrency\":%d,\"env_hash\":", concurrency);
+  ferrum_json_write_string(file, env_hash);
+  std::fputs(",\"event\":\"vllm_moe_config\",\"graph_enabled\":false,\"model\":", file);
+  ferrum_json_write_string(file, model);
+  std::fputs(",\"runtime_flags\":", file);
+  if (runtime_flags != nullptr && runtime_flags[0] == '{') {
+    std::fputs(runtime_flags, file);
+  } else {
+    std::fputs("{}", file);
+  }
+  std::fputs(",\"shape\":{", file);
+  std::fprintf(
+      file,
+      "\"batch_x_topk\":%d,\"block\":%d,\"blocks_per_sm\":%d,"
+      "\"max_shared\":%d,\"prob_k\":%d,\"prob_m\":%d,\"prob_n\":%d,"
+      "\"sh_cache\":%d,\"thread_k\":%d,\"thread_n\":%d,\"threads\":%d,"
+      "\"top_k\":%d",
+      batch_x_topk, moe_block_size, blocks_per_sm, max_shared_mem, prob_k,
+      prob_m, prob_n, sh_cache_size, thread_k, thread_n, num_threads, top_k);
+  std::fputs("},\"source\":\"native\",\"stage_us\":{}}\n", file);
+  std::fclose(file);
+}
+
+static const FerrumVllmMoeRuntimeEnv& ferrum_vllm_moe_runtime_env() {
+  static const FerrumVllmMoeRuntimeEnv env = [] {
+    int force_thread_k = ferrum_env_int("FERRUM_VLLM_MOE_THREAD_K", -1);
+    int force_thread_n = ferrum_env_int("FERRUM_VLLM_MOE_THREAD_N", -1);
+    if (force_thread_k <= 0 || force_thread_n <= 0) {
+      force_thread_k = -1;
+      force_thread_n = -1;
+    }
+
+    int force_blocks_per_sm =
+        ferrum_env_int("FERRUM_VLLM_MOE_BLOCKS_PER_SM", -1);
+    if (force_blocks_per_sm <= 0) force_blocks_per_sm = -1;
+
+    int log_limit = ferrum_env_int("FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT", 64);
+    if (log_limit <= 0) log_limit = 64;
+
+    int log_min_pairs =
+        ferrum_env_int("FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS", 0);
+    if (log_min_pairs <= 0) log_min_pairs = 0;
+
+    int log_max_pairs =
+        ferrum_env_int("FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS", 0);
+    if (log_max_pairs <= 0) log_max_pairs = 0;
+
+    return FerrumVllmMoeRuntimeEnv{
+        ferrum_env_value("FERRUM_VLLM_MOE_LOG_CONFIG") != nullptr,
+        log_limit,
+        log_min_pairs,
+        log_max_pairs,
+        force_thread_k,
+        force_thread_n,
+        force_blocks_per_sm,
+    };
+  }();
+  return env;
+}
+
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
                     std::is_same<scalar_t, nv_bfloat16>::value, \
@@ -677,26 +876,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       q_type, thread_m_blocks, thread_n_blocks, thread_k_blocks, m_block_size_8,
       has_act_order, has_zp, group_blocks, num_threads, is_zp_float);
 
-  if (std::getenv("FERRUM_VLLM_MOE_LOG_CONFIG") != nullptr) {
+  const auto& ferrum_env = ferrum_vllm_moe_runtime_env();
+  if (ferrum_env.log_config) {
     static int log_count = 0;
-    int log_limit = 64;
-    if (const char* v = std::getenv("FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT")) {
-      int parsed = std::atoi(v);
-      if (parsed > 0) log_limit = parsed;
-    }
-    int min_pairs = 0;
-    if (const char* v = std::getenv("FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS")) {
-      int parsed = std::atoi(v);
-      if (parsed > 0) min_pairs = parsed;
-    }
-    int max_pairs = 0;
-    if (const char* v = std::getenv("FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS")) {
-      int parsed = std::atoi(v);
-      if (parsed > 0) max_pairs = parsed;
-    }
     int batch_x_topk = prob_m * top_k;
-    bool within_max_pairs = max_pairs == 0 || batch_x_topk <= max_pairs;
-    if (log_count < log_limit && batch_x_topk >= min_pairs && within_max_pairs) {
+    bool within_max_pairs =
+        ferrum_env.log_max_pairs == 0 || batch_x_topk <= ferrum_env.log_max_pairs;
+    if (log_count < ferrum_env.log_limit &&
+        batch_x_topk >= ferrum_env.log_min_pairs && within_max_pairs) {
       int sh_cache_size = get_kernel_cache_size(
           thread_tfg, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
           num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float);
@@ -707,6 +894,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                    batch_x_topk, prob_m, prob_n, prob_k, moe_block_size, top_k,
                    thread_k, thread_n, num_threads, exec_cfg.blocks_per_sm, sh_cache_size,
                    max_shared_mem);
+      ferrum_append_vllm_moe_config_profile(
+          batch_x_topk, prob_m, prob_n, prob_k, moe_block_size, top_k,
+          thread_k, thread_n, num_threads, exec_cfg.blocks_per_sm, sh_cache_size,
+          max_shared_mem);
       log_count++;
     }
   }
@@ -778,23 +969,7 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
   // that here since our extern C entry point bypasses the wrapper.
   int sms = -1;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-  int force_thread_k = -1;
-  int force_thread_n = -1;
-  int force_blocks_per_sm = -1;
-  if (const char* v = std::getenv("FERRUM_VLLM_MOE_THREAD_K")) {
-    force_thread_k = std::atoi(v);
-  }
-  if (const char* v = std::getenv("FERRUM_VLLM_MOE_THREAD_N")) {
-    force_thread_n = std::atoi(v);
-  }
-  if (force_thread_k <= 0 || force_thread_n <= 0) {
-    force_thread_k = -1;
-    force_thread_n = -1;
-  }
-  if (const char* v = std::getenv("FERRUM_VLLM_MOE_BLOCKS_PER_SM")) {
-    force_blocks_per_sm = std::atoi(v);
-    if (force_blocks_per_sm <= 0) force_blocks_per_sm = -1;
-  }
+  const auto& ferrum_env = ferrum_vllm_moe_runtime_env();
   MARLIN_NAMESPACE_NAME::marlin_mm<half>(
       A, B, C, C_tmp,
       /*b_bias=*/nullptr,
@@ -817,7 +992,8 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
       /*is_k_full=*/true,
       /*has_zp=*/false,
       num_groups, group_size, dev, stream,
-      force_thread_k, force_thread_n, sms, force_blocks_per_sm,
+      ferrum_env.force_thread_k, ferrum_env.force_thread_n, sms,
+      ferrum_env.force_blocks_per_sm,
       use_atomic_add != 0, use_fp32_reduce != 0,
       /*is_zp_float=*/false);
   // marlin_mm aborts on bad inputs; if we reach here the launch was issued.

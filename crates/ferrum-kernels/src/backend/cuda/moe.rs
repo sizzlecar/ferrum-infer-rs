@@ -11,13 +11,40 @@
 //! `BackendQuantMarlin` and is in `cuda/quant.rs`.
 
 use cudarc::driver::{CudaStream, LaunchConfig, PushKernelArg};
+use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_types::{FerrumError, Result};
 use half::f16;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::CudaBackend;
 use crate::backend::{Backend, BackendMoeFused, CudaBuf};
 use crate::ptx;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MoeDumpRuntimeConfig {
+    enabled: bool,
+    batch_x_topk_filter: Option<usize>,
+}
+
+fn moe_dump_runtime_config() -> &'static MoeDumpRuntimeConfig {
+    static CONFIG: OnceLock<MoeDumpRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = MoeDumpRuntimeConfig {
+            enabled: false,
+            batch_x_topk_filter: None,
+        };
+        for (name, value) in std::env::vars() {
+            match name.as_str() {
+                "FERRUM_MOE_DUMP" => config.enabled = true,
+                "FERRUM_MOE_DUMP_BATCH_X_TOPK" => {
+                    config.batch_x_topk_filter = value.parse::<usize>().ok();
+                }
+                _ => {}
+            }
+        }
+        config
+    })
+}
 
 fn maybe_dump_moe_routing(
     kind: &str,
@@ -29,17 +56,15 @@ fn maybe_dump_moe_routing(
     num_experts: usize,
     block_size: usize,
 ) {
-    if std::env::var("FERRUM_MOE_DUMP").is_err() {
+    let config = moe_dump_runtime_config();
+    if !config.enabled {
         return;
     }
-    if let Ok(filter) = std::env::var("FERRUM_MOE_DUMP_BATCH_X_TOPK") {
-        if filter
-            .parse::<usize>()
-            .ok()
-            .is_some_and(|target| target != batch_x_topk)
-        {
-            return;
-        }
+    if config
+        .batch_x_topk_filter
+        .is_some_and(|target| target != batch_x_topk)
+    {
+        return;
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,6 +121,25 @@ fn maybe_dump_moe_routing(
         &st[..n_show]
     );
     eprintln!("[MOE_DUMP:{kind}] block_ids[0..{n_bi}] = {:?}", &bi[..n_bi]);
+    let profile = global_profile();
+    if profile.is_enabled() {
+        let _ = profile.push_event(
+            "moe_dump",
+            profile_fields_from_json(serde_json::json!({
+                "kind": kind,
+                "batch_x_topk": batch_x_topk,
+                "block_size": block_size,
+                "num_experts": num_experts,
+                "total_post_pad": total_post_pad,
+                "active_blocks": total_blocks,
+                "unique_experts": unique_experts,
+                "sorted_token_ids_preview": &st[..n_show],
+                "block_ids_preview": &bi[..n_bi],
+            })),
+            profile_fields_from_json(serde_json::json!({})),
+            false,
+        );
+    }
 }
 
 impl BackendMoeFused for CudaBackend {

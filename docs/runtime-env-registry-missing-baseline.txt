@@ -1,0 +1,4 @@
+# Current unregistered FERRUM_* names for the partial Milestone D registry.
+# Empty because docs/runtime-env-registry.tsv now covers every scanned env
+# candidate. Kept only so --fail-on-new-missing remains usable during any
+# transitional local workflows; CI uses --fail-on-registry-gap.

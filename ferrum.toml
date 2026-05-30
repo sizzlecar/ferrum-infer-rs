@@ -46,3 +46,7 @@ profile_memory = false
 profile_gpu = false
 mock_backends = false
 test_data_dir = "./test_data"
+
+[runtime]
+# Optional runtime config-file overrides. CLI flags still take precedence.
+# kv_dtype = "fp16"

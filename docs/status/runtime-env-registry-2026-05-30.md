@@ -1,0 +1,159 @@
+# Runtime Env Registry Status - 2026-05-30
+
+Milestone D is not complete. This checkpoint adds a repeatable audit tool and brings the static registry to 100% coverage for the current scanned `FERRUM_*` env candidates.
+
+## Added
+
+- `scripts/check_ferrum_env_registry.py` scans the product/build/bench source surface for Ferrum env tokens and direct env reads.
+- `docs/runtime-env-registry.tsv` is the stable registry path. It currently covers every scanned `FERRUM_*` env candidate.
+- `docs/runtime-env-registry-ignore.txt` allowlists scanned `FERRUM_*` symbols that are not environment variables.
+- `docs/runtime-env-registry-missing-baseline.txt` is now empty and kept only for transitional local workflows.
+- `.github/workflows/ci.yml` now runs the full static registry gate:
+  `python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap`.
+  This gate now also fails on any unclassified hot-path direct env read.
+- The registry checker now validates `type`, `scope`, `stability`, and
+  `read_phase` against controlled vocabularies, and rejects
+  `experimental`/`diagnostic`/`deprecated` entries that do not state a sunset
+  condition. Its `--self-test` covers valid rows plus invalid type, invalid
+  scope, and missing-sunset negative cases, and CI runs that self-test before
+  the repository scan.
+- The JSON report includes `name_paths` for every scanned token, so registry owner rows can be audited against source locations.
+- The JSON report also records hot-path direct env reads by individual call site
+  with source line, parsed env name when available, and an explicit
+  classification. The current residual hot direct reads are all classified as
+  diagnostic/startup/test-only exceptions rather than hidden by file-level
+  counts.
+- `ferrum-types::RuntimeConfigSnapshot` captures stable sorted `FERRUM_*` overrides with source/effect metadata; `/health` and bench `Env` now include it.
+- `RuntimeConfigSnapshot` now supports explicit non-env entries and stable
+  upserts. `ferrum serve` uses this for selected CLI runtime/profile inputs,
+  so `--kv-dtype` and `--profile-*` appear in startup config artifacts with
+  `source=cli`.
+- The CLI config file has an initial `[runtime] kv_dtype` knob. It is applied
+  by `ferrum serve`, recorded as `FERRUM_KV_DTYPE` with
+  `source=config_file`, and is overridden by `--kv-dtype` when both are set.
+- `ferrum-types::runtime_config` parser tests cover boolean, integer, path,
+  and tri-state default/forced-off/forced-on env values.
+- `ferrum-scheduler` now parses the prompt-token-estimate, prefill-first, active-decode-prefill-chunk, and scheduler-none-prof env switches once during `ContinuousBatchScheduler` construction; batch planning reads typed fields instead of calling env APIs.
+- `ferrum-engine::ContinuousBatchEngine` now parses its chunked-prefill, prefix-cache, active-prefill-chunk, and profiling env switches once during engine construction from a startup env snapshot; iteration, prefill, unified, and background-loop paths read typed fields.
+- `Qwen3MoeModel` now captures the Qwen/M3 runtime env surface once at model construction with parser tests. The core Qwen3-MoE Rust forward files now have no direct env calls in hot paths; `std::env::vars()` is used only for the startup snapshot.
+- `moe::dispatch` now captures MoE profiling, vLLM-MoE routing, pair-id, workspace-zeroing, load-trace, and block-size overrides in a typed runtime config. The hot bucketed dispatch path reads cached fields; block-size policy tests use explicit config inputs instead of mutating process env.
+- `moe::forward` now captures fused gate/up/SILU, host top-k, and direct-dispatch toggles in a typed runtime config. The stacked decode and batched prefill paths no longer call env APIs directly.
+- `LlamaFamilyModel` batched/unified forward now captures graph, profile, trace, and greedy-argmax toggles in a typed runtime config. The batched Llama hot path no longer has direct env reads beyond startup snapshot iteration.
+- `LlamaFamilyModel` single-item/prefill paths now capture KV capacity, paged-KV, paged max sequence, CUDA graph, decode profile, prefill profile, and decode-layer profile toggles in a typed runtime config.
+- CUDA paged attention now captures KV capacity, paged-flash, split count, split-K, and FA2-source toggles in a typed runtime config. The CUDA paged attention hot path no longer reads env directly beyond startup snapshot iteration.
+- The legacy CUDA decode runner now captures diagnostic flags, paged-KV enablement, and KV block count in a typed runtime config at runner construction.
+- CUDA quant/Marlin/graph wrappers now capture Triton/vLLM-Marlin/vLLM-MoE selection, Marlin tuning switches, MoE fused/multistream dispatch, graph replay diagnostics, and vLLM paged-attn short-context selection in typed runtime configs.
+- The engine builder and component registry now snapshot model-path, speculative decoding, dtype, and tensor-parallel env knobs once. Tokenizer/executor resolution and model factory setup no longer call env APIs directly.
+- TTS, HuggingFace download/source resolution, and LLM batch profile flags now use typed one-time env snapshots with parser tests.
+- Remaining CUDA module-level backend selectors (`FERRUM_MOE_STREAMS`, `FERRUM_CUDA_MAX_KV`, `FERRUM_CUDA_DEVICE`) and fused-attention CPU/Metal selectors now use cached runtime config.
+- The vLLM-MoE Marlin C++ bridge now reads its diagnostic logging and thread/block override env knobs through a single process-static runtime config helper instead of per-call `getenv` checks.
+- `scripts/m3_ab_runner.py` now owns the named runtime preset `m3_qwen3_30b_a3b_int4`, removing the common M3 env bundle from four migrated wrappers. The wrappers now add only case-specific or diagnostic overrides on top of the preset.
+- Native structured profile emission now uses typed runner/server
+  `ProfileSinkConfig` plumbing for Rust emitters and the vLLM-MoE C++ config
+  emitter through a typed C ABI sink. Registered `FERRUM_PROFILE_*` names remain
+  as a backwards-compatible fallback, but `ferrum serve --profile-*` no longer
+  exports them for the normal native profile path.
+- Runner summaries now include per-row `env_hash`,
+  `runtime_config_entry_count`, and a machine-readable
+  `runtime_config_diff_vs_baseline` object for A/B cases. The diff records
+  added/removed/changed runtime config entries with source and effect
+  classification.
+- Runner-side runtime config snapshots now contain only `FERRUM_*` entries.
+  Script-provided preset/base/case values use `source=script_case`, matching
+  the Milestone D source vocabulary instead of the earlier transitional
+  `preset`/`case` labels.
+- Runner cleanup artifacts now include global process hygiene status for
+  residual `ferrum`, `bench-serve`, `cargo`, `nvcc`, and `vllm` processes so
+  publishable artifacts can prove the post-run process state was clean.
+- The backend timer helper now takes an already-resolved boolean gate instead
+  of reading `FERRUM_DECODE_OP_PROFILE` inside token/layer probes. Qwen3-MoE
+  and MoE forward paths pass cached typed runtime config fields into the
+  timer.
+- CUDA MoE route dump, CUDA TP/rank collectives, FA2 direct-FFI shim path,
+  Metal attention dispatch policy, Metal mmap/capture/dtype policy, Metal
+  quant profiling, and the Qwen3-TTS Candle fallback now resolve their env
+  knobs once through cached startup/runtime helpers instead of per-call direct
+  env reads.
+- `ferrum-types::FerrumConfigBuilder` adds a typed selector decision trace
+  over the registered env surface. It now includes explicit
+  `FERRUM_MAX_MODEL_LEN` validation so requested serving length overrides are
+  checked against model metadata and KV token capacity. `/health` exposes this
+  as `auto_config` next to the runtime config snapshot.
+
+## Current Audit
+
+Run:
+
+```bash
+python3 scripts/check_ferrum_env_registry.py --json
+python3 scripts/check_ferrum_env_registry.py --self-test
+python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap
+```
+
+Current dirty-worktree scan:
+
+| metric | value |
+|---|---:|
+| files scanned | 580 |
+| unique `FERRUM_*` tokens | 153 |
+| unique standalone candidates | 152 |
+| direct env read calls | 105 |
+| hot-path unique `FERRUM_*` tokens | 121 |
+| hot-path direct env read calls | 4 |
+| classified hot-path direct env read calls | 4 |
+| unclassified hot-path direct env read calls | 0 |
+| ignored non-env symbols | 5 |
+| registry entries | 147 |
+| registry coverage | 147 / 147 env candidates |
+| unregistered baseline backlog | 0 |
+| new unregistered names versus baseline | 0 |
+
+The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `105` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `153` token names, `152` standalone env candidates, and `147` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot.
+
+The classified residual hot-path direct-read call sites are:
+
+- `crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu`: two diagnostic
+  `FERRUM_MARLIN_TILE` override reads in the legacy Marlin C++ path.
+- `crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu`: one process-static
+  helper uses `std::getenv` internally for the vLLM-MoE diagnostic/tuning
+  runtime config.
+- `crates/ferrum-kernels/src/backend/metal/q4_k_moe_id_gemv_batched.rs`: one
+  ignored manual Metal capture test reads `MTL_CAPTURE_ENABLED`.
+
+The scanner reports `FERRUM_2M` as an embedded token, not a standalone env candidate; it comes from a microbench label string rather than a real runtime knob.
+
+## Config Diff Artifact
+
+Remote smoke with the migrated FA-layout wrapper:
+
+```bash
+cd /workspace/ferrum-codex-clean
+OUT_ROOT=/workspace/m3-runner-config-diff-smoke2-20260530_003637 \
+  BUILD=0 CONCURRENCY=1 NUM_PROMPTS=1 WARMUP_REQUESTS=0 \
+  REPEATS=1 PORT_BASE=18780 \
+  bash scripts/m3_fa_layout_varlen_ab.sh
+python3 scripts/m3_validate_runner_artifact.py \
+  /workspace/m3-runner-config-diff-smoke2-20260530_003637
+```
+
+Evidence:
+
+- `summary.json.runtime_config_diff_vs_baseline.fa_layout.changed` identified
+  the only intended case diff: `FERRUM_FA_LAYOUT_VARLEN` from `0` to `1`,
+  source `script_case`, effect `performance`.
+- Summary rows included stable env hashes for both rows and
+  `runtime_config_entry_count=13`.
+- The runner and artifact validator self-tests cover the diff schema.
+
+## Remaining D Gaps
+
+- Continue typed config coverage for the remaining low-count hot-path surfaces
+  and non-hot CLI/build surfaces.
+- Extend first-class config-file runtime knobs and source attribution beyond
+  the initial `runtime.kv_dtype` field.
+- Replace the remaining classified C++ hot-path direct env reads with typed
+  launch parameters when those legacy/diagnostic paths become product-critical.
+- Remove the backwards-compatible `FERRUM_PROFILE_*` metadata fallback after any
+  external profile users have moved to `ferrum serve --profile-*` or another
+  typed configuration path.
+- Extend named presets beyond the initial M3 A/B runner surface and wire them into future artifact/config summaries.

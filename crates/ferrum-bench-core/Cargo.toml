@@ -7,6 +7,7 @@ license.workspace = true
 description = "Canonical bench schema + metric aggregation + variance + env_hash for ferrum's bench and bench-serve commands. Locked by docs/bench/PLAYBOOK.md § 7."
 
 [dependencies]
+ferrum-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }

@@ -20,7 +20,10 @@
 //! — same kernel ferrum already uses for dense Llama-family models.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 
 use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Result as CandleResult};
@@ -67,16 +70,89 @@ pub static MOE_BUCKET_GEMM3_US: AtomicU64 = AtomicU64::new(0);
 pub static MOE_BUCKET_COMBINE_US: AtomicU64 = AtomicU64::new(0);
 pub static MOE_BUCKET_LAYER_CALLS: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MoeDispatchRuntimeConfig {
+    moe_profile: bool,
+    decode_op_profile: bool,
+    vllm_moe_zero_ws: bool,
+    vllm_moe_pair_ids: bool,
+    moe_load_trace: bool,
+    moe_block_size: Option<usize>,
+    moe_large_m_block_size: Option<usize>,
+    moe_large_m_min_pairs: usize,
+    vllm_moe: bool,
+    moe_host_route: bool,
+}
+
+impl Default for MoeDispatchRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            moe_profile: false,
+            decode_op_profile: false,
+            vllm_moe_zero_ws: false,
+            vllm_moe_pair_ids: false,
+            moe_load_trace: false,
+            moe_block_size: None,
+            moe_large_m_block_size: None,
+            moe_large_m_min_pairs: 1024,
+            vllm_moe: false,
+            moe_host_route: false,
+        }
+    }
+}
+
+impl MoeDispatchRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut config = Self::default();
+        for (name, value) in vars {
+            let value = value.as_ref();
+            match name.as_ref() {
+                "FERRUM_MOE_PROFILE" => config.moe_profile = true,
+                "FERRUM_DECODE_OP_PROFILE" => config.decode_op_profile = true,
+                "FERRUM_VLLM_MOE_ZERO_WS" => config.vllm_moe_zero_ws = value == "1",
+                "FERRUM_VLLM_MOE_PAIR_IDS" => config.vllm_moe_pair_ids = value == "1",
+                "FERRUM_MOE_LOAD_TRACE" => config.moe_load_trace = true,
+                "FERRUM_MOE_BLOCK_SIZE" => {
+                    config.moe_block_size = parse_moe_block_size_value(value);
+                }
+                "FERRUM_MOE_LARGE_M_BLOCK_SIZE" => {
+                    config.moe_large_m_block_size = parse_moe_block_size_value(value);
+                }
+                "FERRUM_MOE_LARGE_M_MIN_PAIRS" => {
+                    config.moe_large_m_min_pairs = value.parse::<usize>().unwrap_or(1024);
+                }
+                "FERRUM_VLLM_MOE" => config.vllm_moe = value == "1",
+                "FERRUM_MOE_HOST_ROUTE" => config.moe_host_route = value == "1",
+                _ => {}
+            }
+        }
+        config
+    }
+}
+
+fn parse_moe_block_size_value(value: &str) -> Option<usize> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|bs| matches!(*bs, 8 | 16 | 32 | 48 | 64))
+}
+
+fn moe_dispatch_runtime_config() -> &'static MoeDispatchRuntimeConfig {
+    static CONFIG: OnceLock<MoeDispatchRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(MoeDispatchRuntimeConfig::from_env)
+}
+
 fn moe_profile_enabled() -> bool {
-    std::env::var("FERRUM_MOE_PROFILE").is_ok()
-}
-
-fn vllm_moe_zero_workspace_enabled() -> bool {
-    std::env::var("FERRUM_VLLM_MOE_ZERO_WS").map_or(false, |v| v == "1")
-}
-
-fn vllm_moe_pair_ids_enabled() -> bool {
-    std::env::var("FERRUM_VLLM_MOE_PAIR_IDS").map_or(false, |v| v == "1")
+    moe_dispatch_runtime_config().moe_profile
 }
 
 /// Per-layer expert weights, materialised as `[num_experts]`-long vectors
@@ -657,6 +733,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
         hidden_size: usize,
         expert_intermediate: usize,
     ) -> Result<Self> {
+        let runtime_config = moe_dispatch_runtime_config();
         if let Some(quant) = Self::try_load_quantised(
             gguf,
             layer_idx,
@@ -664,13 +741,13 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
             hidden_size,
             expert_intermediate,
         )? {
-            if std::env::var("FERRUM_MOE_LOAD_TRACE").is_ok() {
+            if runtime_config.moe_load_trace {
                 eprintln!("[moe-load] layer {layer_idx} → quantised expert path");
             }
             return Ok(quant);
         }
 
-        if std::env::var("FERRUM_MOE_LOAD_TRACE").is_ok() {
+        if runtime_config.moe_load_trace {
             eprintln!("[moe-load] layer {layer_idx} → eager fp32 dense fallback ⚠");
         }
 
@@ -946,26 +1023,48 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
 ///   write acc_buf back to out[b]). With top_k=8 and 48 layers, that's
 ///   8×5 + 2 = 42 dispatches/layer × 48 ≈ 2k/token (vs. ~3.5k in the
 ///   pre-PR scheme that round-tripped through `out` per pair).
-#[allow(clippy::too_many_arguments)]
+pub struct MoeForwardParams<'a, B: QuantLlmBackend + BackendMoeFused> {
+    pub ctx: &'a mut B::Context,
+    pub x: &'a B::Buffer,
+    pub router_logits: &'a B::Buffer,
+    pub out: &'a mut B::Buffer,
+    pub batch: usize,
+    pub hidden_size: usize,
+    pub expert_intermediate: usize,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub norm_topk_prob: bool,
+    pub experts: &'a ExpertStack<B>,
+    pub x_single: &'a mut B::Buffer,
+    pub acc_buf: &'a mut B::Buffer,
+    pub gate_up_buf: &'a mut B::Buffer,
+    pub silu_buf: &'a mut B::Buffer,
+    pub down_buf: &'a mut B::Buffer,
+    pub zero_hidden: &'a B::Buffer,
+}
+
 pub fn moe_forward<B: QuantLlmBackend + BackendMoeFused>(
-    ctx: &mut B::Context,
-    x: &B::Buffer,
-    router_logits: &B::Buffer,
-    out: &mut B::Buffer,
-    batch: usize,
-    hidden_size: usize,
-    expert_intermediate: usize,
-    num_experts: usize,
-    top_k: usize,
-    norm_topk_prob: bool,
-    experts: &ExpertStack<B>,
-    x_single: &mut B::Buffer,
-    acc_buf: &mut B::Buffer,
-    gate_up_buf: &mut B::Buffer,
-    silu_buf: &mut B::Buffer,
-    down_buf: &mut B::Buffer,
-    zero_hidden: &B::Buffer,
+    params: MoeForwardParams<'_, B>,
 ) -> Result<()> {
+    let MoeForwardParams {
+        ctx,
+        x,
+        router_logits,
+        out,
+        batch,
+        hidden_size,
+        expert_intermediate,
+        num_experts,
+        top_k,
+        norm_topk_prob,
+        experts,
+        x_single,
+        acc_buf,
+        gate_up_buf,
+        silu_buf,
+        down_buf,
+        zero_hidden,
+    } = params;
     let n_experts = experts.num_experts();
     if n_experts != num_experts {
         return Err(FerrumError::model(format!(
@@ -1114,14 +1213,23 @@ pub const MOE_BLOCK_SIZE_MAX: usize = 64;
 ///
 /// Device-routing path doesn't expose `plan` host-side; fall back to 16
 /// (no regression vs pre-PR behaviour).
-fn parse_moe_block_size_env(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|bs| matches!(*bs, 8 | 16 | 32 | 48 | 64))
+fn pick_moe_block_size(
+    plan: Option<&MoeBucketPlan>,
+    num_experts: usize,
+    use_device_route: bool,
+    total_pairs: usize,
+) -> usize {
+    pick_moe_block_size_with_config(
+        moe_dispatch_runtime_config(),
+        plan,
+        num_experts,
+        use_device_route,
+        total_pairs,
+    )
 }
 
-fn pick_moe_block_size(
+fn pick_moe_block_size_with_config(
+    config: &MoeDispatchRuntimeConfig,
     plan: Option<&MoeBucketPlan>,
     num_experts: usize,
     use_device_route: bool,
@@ -1132,16 +1240,12 @@ fn pick_moe_block_size(
                                       // Manual override (testing / autotuning): FERRUM_MOE_BLOCK_SIZE=8/16/32/48/64.
                                       // vLLM 0.20.2 often selects 8 for small-M MoE; keep it override-only
                                       // until full-model correctness + throughput beats the 16 default.
-    if let Some(bs) = parse_moe_block_size_env("FERRUM_MOE_BLOCK_SIZE") {
+    if let Some(bs) = config.moe_block_size {
         return bs;
     }
     if use_device_route {
-        if let Some(bs) = parse_moe_block_size_env("FERRUM_MOE_LARGE_M_BLOCK_SIZE") {
-            let min_pairs = std::env::var("FERRUM_MOE_LARGE_M_MIN_PAIRS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1024);
-            if total_pairs >= min_pairs {
+        if let Some(bs) = config.moe_large_m_block_size {
+            if total_pairs >= config.moe_large_m_min_pairs {
                 return bs;
             }
         }
@@ -1351,30 +1455,52 @@ pub struct DeviceRouteScratch<'a, B: crate::moe::dispatch::Backend> {
 /// `down_packed [total_pairs, hidden]` provisioned by the caller. The
 /// caller is responsible for sizing these to `batch * top_k` rows
 /// (worst-case all top_k pairs alive).
-#[allow(clippy::too_many_arguments)]
-pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
-    ctx: &mut B::Context,
-    x: &B::Buffer,
-    router_logits: &B::Buffer,
-    out: &mut B::Buffer,
-    batch: usize,
-    hidden_size: usize,
-    expert_intermediate: usize,
-    num_experts: usize,
-    top_k: usize,
-    norm_topk_prob: bool,
-    experts: &ExpertStack<B>,
-    x_packed: &mut B::Buffer,
-    gate_up_packed: &mut B::Buffer,
-    silu_packed: &mut B::Buffer,
-    down_packed: &mut B::Buffer,
-    route_scratch: &mut MoeRouteScratch,
+pub struct MoeForwardBucketedParams<'a, B: QuantLlmBackend + BackendMoeFused> {
+    pub ctx: &'a mut B::Context,
+    pub x: &'a B::Buffer,
+    pub router_logits: &'a B::Buffer,
+    pub out: &'a mut B::Buffer,
+    pub batch: usize,
+    pub hidden_size: usize,
+    pub expert_intermediate: usize,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub norm_topk_prob: bool,
+    pub experts: &'a ExpertStack<B>,
+    pub x_packed: &'a mut B::Buffer,
+    pub gate_up_packed: &'a mut B::Buffer,
+    pub silu_packed: &'a mut B::Buffer,
+    pub down_packed: &'a mut B::Buffer,
+    pub route_scratch: &'a mut MoeRouteScratch,
     // Optional device routing scratch — when Some AND
     // FERRUM_MOE_DEVICE_ROUTE=1 AND FERRUM_VLLM_MOE=1, runs the
     // graph-capturable device-routing branch. None / unset = legacy
     // host-mediated path (used by tests + non-vLLM path).
-    device_route: Option<DeviceRouteScratch<'_, B>>,
+    pub device_route: Option<DeviceRouteScratch<'a, B>>,
+}
+
+pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
+    params: MoeForwardBucketedParams<'_, B>,
 ) -> Result<()> {
+    let MoeForwardBucketedParams {
+        ctx,
+        x,
+        router_logits,
+        out,
+        batch,
+        hidden_size,
+        expert_intermediate,
+        num_experts,
+        top_k,
+        norm_topk_prob,
+        experts,
+        x_packed,
+        gate_up_packed,
+        silu_packed,
+        down_packed,
+        route_scratch,
+        device_route,
+    } = params;
     if experts.num_experts() != num_experts {
         return Err(FerrumError::model(format!(
             "moe_forward_bucketed: experts {} != num_experts {num_experts}",
@@ -1382,9 +1508,10 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         )));
     }
 
+    let runtime_config = moe_dispatch_runtime_config();
     // Bucket profiling fires on either FERRUM_MOE_PROFILE=1 (legacy)
     // or FERRUM_DECODE_OP_PROFILE=1 (the gate the print site uses).
-    let prof = moe_profile_enabled() || std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok();
+    let prof = runtime_config.moe_profile || runtime_config.decode_op_profile;
     if prof {
         MOE_BUCKET_LAYER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1402,7 +1529,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     //
     // This is the prerequisite for CUDA Graph capture over the MoE
     // layer loop in Qwen3MoeModel::decode_batch_internal.
-    let use_vllm_moe = std::env::var("FERRUM_VLLM_MOE").map_or(false, |v| v == "1");
+    let use_vllm_moe = runtime_config.vllm_moe;
     // Device-routing path: enabled whenever the caller passes
     // pre-allocated `DeviceRouteScratch` AND `FERRUM_VLLM_MOE=1` is on.
     // No separate env var — the device path is strictly faster than
@@ -1418,12 +1545,8 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     //
     // Callers that need to force the host path for diagnostics can set
     // FERRUM_MOE_HOST_ROUTE=1 (opt-out).
-    let use_device_route = device_route.is_some()
-        && use_vllm_moe
-        && !std::env::var("FERRUM_MOE_HOST_ROUTE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-    let use_vllm_pair_ids = use_device_route && vllm_moe_pair_ids_enabled();
+    let use_device_route = device_route.is_some() && use_vllm_moe && !runtime_config.moe_host_route;
+    let use_vllm_pair_ids = use_device_route && runtime_config.vllm_moe_pair_ids;
 
     // Run device-side routing kernels EARLY so `dr.packed_token_idx`
     // is available for the device-buffer gather (embedding_lookup_dev),
@@ -1590,7 +1713,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
              (load via Qwen3MoeModel::new_safetensors)",
         )
     })?;
-    let zero_marlin_workspace = !use_vllm_moe || vllm_moe_zero_workspace_enabled();
+    let zero_marlin_workspace = !use_vllm_moe || runtime_config.vllm_moe_zero_ws;
     if zero_marlin_workspace {
         let _ = gu_store.zero_workspace(ctx);
     }
@@ -1635,8 +1758,13 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // `Qwen3MoeScratch.route_sorted_tokens_dev` capacity is allocated
     // assuming this upper bound.
     let max_block_size: usize = 64;
-    let moe_block_size: usize =
-        pick_moe_block_size(plan, num_experts, use_device_route, total_pairs_active);
+    let moe_block_size: usize = pick_moe_block_size_with_config(
+        runtime_config,
+        plan,
+        num_experts,
+        use_device_route,
+        total_pairs_active,
+    );
     debug_assert!(
         moe_block_size <= max_block_size,
         "moe_block_size {moe_block_size} exceeds scratch worst-case {max_block_size}"
@@ -2123,38 +2251,80 @@ type _CandleResult<T> = CandleResult<T>;
 
 #[cfg(test)]
 mod tests {
-    use super::pick_moe_block_size;
+    use super::{pick_moe_block_size_with_config, MoeDispatchRuntimeConfig};
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    #[test]
+    fn moe_dispatch_runtime_config_parses_m3_startup_knobs() {
+        let config = MoeDispatchRuntimeConfig::from_env_vars([
+            ("FERRUM_MOE_PROFILE", "0"),
+            ("FERRUM_DECODE_OP_PROFILE", "true"),
+            ("FERRUM_VLLM_MOE_ZERO_WS", "1"),
+            ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
+            ("FERRUM_MOE_LOAD_TRACE", ""),
+            ("FERRUM_MOE_BLOCK_SIZE", "8"),
+            ("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "64"),
+            ("FERRUM_MOE_LARGE_M_MIN_PAIRS", "2048"),
+            ("FERRUM_VLLM_MOE", "1"),
+            ("FERRUM_MOE_HOST_ROUTE", "1"),
+        ]);
+
+        assert!(config.moe_profile);
+        assert!(config.decode_op_profile);
+        assert!(config.vllm_moe_zero_ws);
+        assert!(config.vllm_moe_pair_ids);
+        assert!(config.moe_load_trace);
+        assert_eq!(config.moe_block_size, Some(8));
+        assert_eq!(config.moe_large_m_block_size, Some(64));
+        assert_eq!(config.moe_large_m_min_pairs, 2048);
+        assert!(config.vllm_moe);
+        assert!(config.moe_host_route);
+    }
+
+    #[test]
+    fn moe_dispatch_runtime_config_bounds_invalid_block_values() {
+        let config = MoeDispatchRuntimeConfig::from_env_vars([
+            ("FERRUM_MOE_BLOCK_SIZE", "12"),
+            ("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "128"),
+            ("FERRUM_MOE_LARGE_M_MIN_PAIRS", "bad"),
+            ("FERRUM_VLLM_MOE_ZERO_WS", "true"),
+            ("FERRUM_MOE_HOST_ROUTE", "0"),
+        ]);
+
+        assert_eq!(config.moe_block_size, None);
+        assert_eq!(config.moe_large_m_block_size, None);
+        assert_eq!(config.moe_large_m_min_pairs, 1024);
+        assert!(!config.vllm_moe_zero_ws);
+        assert!(!config.moe_host_route);
     }
 
     #[test]
     fn device_route_large_m_block_size_is_thresholded() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::remove_var("FERRUM_MOE_BLOCK_SIZE");
-        std::env::set_var("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "64");
-        std::env::set_var("FERRUM_MOE_LARGE_M_MIN_PAIRS", "1024");
+        let config = MoeDispatchRuntimeConfig::from_env_vars([
+            ("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "64"),
+            ("FERRUM_MOE_LARGE_M_MIN_PAIRS", "1024"),
+        ]);
 
-        assert_eq!(pick_moe_block_size(None, 128, true, 256), 16);
-        assert_eq!(pick_moe_block_size(None, 128, true, 1024), 64);
-
-        std::env::remove_var("FERRUM_MOE_LARGE_M_BLOCK_SIZE");
-        std::env::remove_var("FERRUM_MOE_LARGE_M_MIN_PAIRS");
+        assert_eq!(
+            pick_moe_block_size_with_config(&config, None, 128, true, 256),
+            16
+        );
+        assert_eq!(
+            pick_moe_block_size_with_config(&config, None, 128, true, 1024),
+            64
+        );
     }
 
     #[test]
     fn global_moe_block_size_override_still_wins() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var("FERRUM_MOE_BLOCK_SIZE", "32");
-        std::env::set_var("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "64");
-        std::env::set_var("FERRUM_MOE_LARGE_M_MIN_PAIRS", "1024");
+        let config = MoeDispatchRuntimeConfig::from_env_vars([
+            ("FERRUM_MOE_BLOCK_SIZE", "32"),
+            ("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "64"),
+            ("FERRUM_MOE_LARGE_M_MIN_PAIRS", "1024"),
+        ]);
 
-        assert_eq!(pick_moe_block_size(None, 128, true, 2048), 32);
-
-        std::env::remove_var("FERRUM_MOE_BLOCK_SIZE");
-        std::env::remove_var("FERRUM_MOE_LARGE_M_BLOCK_SIZE");
-        std::env::remove_var("FERRUM_MOE_LARGE_M_MIN_PAIRS");
+        assert_eq!(
+            pick_moe_block_size_with_config(&config, None, 128, true, 2048),
+            32
+        );
     }
 }

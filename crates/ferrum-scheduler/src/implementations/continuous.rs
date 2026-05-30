@@ -15,10 +15,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use ferrum_interfaces::scheduler::SchedulerMetrics;
-use ferrum_types::SchedulerConfig;
 use ferrum_types::{
     BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
-    Result, PROMPT_TOKENS_METADATA_KEY,
+    Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
 };
 use parking_lot::RwLock;
 use std::{
@@ -33,16 +32,30 @@ use tracing::{debug, info, warn};
 
 const PREFILL_FIRST_UNTIL_ACTIVE_ENV: &str = "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE";
 const ACTIVE_DECODE_PREFILL_CHUNK_ENV: &str = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
+const PROMPT_TOKEN_ESTIMATE_ENV: &str = "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE";
+const SCHED_NONE_PROF_ENV: &str = "FERRUM_SCHED_NONE_PROF";
 
-fn prefill_first_until_active_target() -> Option<usize> {
-    std::env::var(PREFILL_FIRST_UNTIL_ACTIVE_ENV)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ContinuousBatchRuntimeConfig {
+    prompt_token_estimate: bool,
+    prefill_first_until_active: Option<usize>,
+    active_decode_prefill_chunk: Option<usize>,
+    scheduler_none_prof: bool,
 }
 
-fn active_decode_prefill_chunk_size() -> Option<usize> {
-    std::env::var(ACTIVE_DECODE_PREFILL_CHUNK_ENV)
+impl ContinuousBatchRuntimeConfig {
+    fn from_env() -> Self {
+        Self {
+            prompt_token_estimate: std::env::var(PROMPT_TOKEN_ESTIMATE_ENV).as_deref() == Ok("1"),
+            prefill_first_until_active: parse_positive_usize_env(PREFILL_FIRST_UNTIL_ACTIVE_ENV),
+            active_decode_prefill_chunk: parse_positive_usize_env(ACTIVE_DECODE_PREFILL_CHUNK_ENV),
+            scheduler_none_prof: std::env::var(SCHED_NONE_PROF_ENV).is_ok(),
+        }
+    }
+}
+
+fn parse_positive_usize_env(name: &str) -> Option<usize> {
+    std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
@@ -169,6 +182,9 @@ pub struct ContinuousBatchScheduler {
 
     /// Continuous batching specific config
     cb_config: ContinuousBatchConfig,
+
+    /// Runtime env-derived switches parsed once at scheduler construction.
+    runtime_config: ContinuousBatchRuntimeConfig,
 }
 
 /// Continuous batching specific configuration
@@ -274,6 +290,7 @@ impl ContinuousBatchScheduler {
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
             cb_config,
+            runtime_config: ContinuousBatchRuntimeConfig::from_env(),
         }
     }
 
@@ -346,7 +363,7 @@ impl ContinuousBatchScheduler {
     }
 
     fn initial_prefill_token_estimate(&self, req: &ContinuousBatchRequest) -> usize {
-        if std::env::var("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE").as_deref() != Ok("1") {
+        if !self.runtime_config.prompt_token_estimate {
             return self.cb_config.prefill_chunk_size;
         }
 
@@ -365,7 +382,7 @@ impl ContinuousBatchScheduler {
     }
 
     fn maybe_active_decode_prefill_chunk(&self, req: &ContinuousBatchRequest) -> Option<usize> {
-        let chunk = active_decode_prefill_chunk_size()?;
+        let chunk = self.runtime_config.active_decode_prefill_chunk?;
         if !req.chunked_prefill && self.decoding_count() == 0 {
             return None;
         }
@@ -417,7 +434,9 @@ impl ContinuousBatchScheduler {
 
         let mut batch_requests = Vec::new();
         let mut total_tokens = 0;
-        let prefill_first_target = prefill_first_until_active_target()
+        let prefill_first_target = self
+            .runtime_config
+            .prefill_first_until_active
             .map(|target| {
                 target
                     .min(hint.max_batch_size)
@@ -518,7 +537,7 @@ impl ContinuousBatchScheduler {
         }
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
-        if std::env::var("FERRUM_SCHED_NONE_PROF").is_ok() && !batch_requests.is_empty() {
+        if self.runtime_config.scheduler_none_prof && !batch_requests.is_empty() {
             use std::sync::atomic::AtomicU64;
             static SOME_PROF_N: AtomicU64 = AtomicU64::new(0);
             let n = SOME_PROF_N.fetch_add(1, Ordering::Relaxed);
@@ -538,7 +557,7 @@ impl ContinuousBatchScheduler {
         }
         if batch_requests.is_empty() {
             // FERRUM_SCHED_NONE_PROF=1: log why we returned None. Rate-limited.
-            if std::env::var("FERRUM_SCHED_NONE_PROF").is_ok() {
+            if self.runtime_config.scheduler_none_prof {
                 use std::sync::atomic::AtomicU64;
                 static NONE_PROF_N: AtomicU64 = AtomicU64::new(0);
                 let n = NONE_PROF_N.fetch_add(1, Ordering::Relaxed);
@@ -990,6 +1009,7 @@ mod tests {
             client_id: None,
             session_id: None,
             created_at: chrono::Utc::now(),
+            api_request: None,
             metadata: std::collections::HashMap::new(),
         }
     }
@@ -1123,6 +1143,32 @@ mod tests {
             })
             .unwrap();
         assert_eq!(batch.requests.len(), 4);
+    }
+
+    #[test]
+    fn scheduler_env_config_is_captured_at_construction() {
+        let _env_guard = prompt_estimate_env_lock().lock().unwrap();
+        std::env::set_var(PROMPT_TOKEN_ESTIMATE_ENV, "1");
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        std::env::remove_var(PROMPT_TOKEN_ESTIMATE_ENV);
+
+        for _ in 0..16 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 32,
+                max_tokens: 2048,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+        assert_eq!(batch.requests.len(), 8);
     }
 
     #[test]

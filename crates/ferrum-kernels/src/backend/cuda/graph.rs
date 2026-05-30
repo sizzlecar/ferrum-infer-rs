@@ -15,13 +15,55 @@
 //!   eviction helpers `invalidate_decode_graph` / `invalidate_all_decode_graphs`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::CudaStream;
+use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_types::{FerrumError, Result};
 
 use super::{decode_state_slot, CudaBackend};
 use crate::backend::{Backend, BackendGraph};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CudaGraphRuntimeConfig {
+    graph_prof: bool,
+    skip_upload: bool,
+    skip_sync: bool,
+}
+
+impl CudaGraphRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut config = Self {
+            graph_prof: false,
+            skip_upload: false,
+            skip_sync: false,
+        };
+        for (name, value) in vars {
+            let value = value.as_ref();
+            match name.as_ref() {
+                "FERRUM_GRAPH_PROF" => config.graph_prof = true,
+                "FERRUM_GRAPH_SKIP_UPLOAD" => config.skip_upload = value == "1",
+                "FERRUM_GRAPH_SKIP_SYNC" => config.skip_sync = value == "1",
+                _ => {}
+            }
+        }
+        config
+    }
+}
+
+fn cuda_graph_runtime_config() -> &'static CudaGraphRuntimeConfig {
+    static CONFIG: OnceLock<CudaGraphRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(CudaGraphRuntimeConfig::from_env)
+}
 
 impl BackendGraph for CudaBackend {
     fn set_decode_state(ctx: &mut Self::Context, token: u32, step: u32) {
@@ -147,7 +189,8 @@ impl BackendGraph for CudaBackend {
             .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
         with_decode_graph(key, |g_opt| {
             if let Some(g) = g_opt {
-                let prof = std::env::var("FERRUM_GRAPH_PROF").is_ok();
+                let runtime_config = cuda_graph_runtime_config();
+                let prof = runtime_config.graph_prof;
                 let t_pre = if prof {
                     Some(std::time::Instant::now())
                 } else {
@@ -158,9 +201,7 @@ impl BackendGraph for CudaBackend {
                 // graph instantiate-then-upload-once design didn't pan out
                 // empirically; keep the per-replay upload until we
                 // understand why removing it slows things down.
-                let skip_upload =
-                    std::env::var("FERRUM_GRAPH_SKIP_UPLOAD").map_or(false, |v| v == "1");
-                if !skip_upload {
+                if !runtime_config.skip_upload {
                     let st_up = unsafe { sys::cuGraphUpload(g.cu_graph_exec, cu_stream) };
                     if st_up != sys::CUresult::CUDA_SUCCESS {
                         return Err(FerrumError::unsupported(format!(
@@ -182,8 +223,7 @@ impl BackendGraph for CudaBackend {
                 } else {
                     None
                 };
-                let skip_sync = std::env::var("FERRUM_GRAPH_SKIP_SYNC").map_or(false, |v| v == "1");
-                if !skip_sync {
+                if !runtime_config.skip_sync {
                     let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
                     if st_sync != sys::CUresult::CUDA_SUCCESS {
                         return Err(FerrumError::unsupported(format!(
@@ -202,6 +242,22 @@ impl BackendGraph for CudaBackend {
                             "[graph-prof] call#{n} upload={upload}us launch={launch}us sync={sync}us total={}us",
                             t0.elapsed().as_micros()
                         );
+                        let profile = global_profile();
+                        if profile.is_enabled() {
+                            let _ = profile.push_event(
+                                "graph_prof",
+                                profile_fields_from_json(serde_json::json!({
+                                    "call": n,
+                                })),
+                                profile_fields_from_json(serde_json::json!({
+                                    "upload": upload,
+                                    "launch": launch,
+                                    "sync": sync,
+                                    "total": t0.elapsed().as_micros(),
+                                })),
+                                true,
+                            );
+                        }
                     }
                 }
                 Ok(true)
@@ -318,4 +374,34 @@ pub fn invalidate_all_decode_graphs() {
         .write()
         .expect("DECODE_GRAPHS poisoned")
         .clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CudaGraphRuntimeConfig;
+
+    #[test]
+    fn cuda_graph_runtime_config_parses_graph_knobs() {
+        let config = CudaGraphRuntimeConfig::from_env_vars([
+            ("FERRUM_GRAPH_PROF", "0"),
+            ("FERRUM_GRAPH_SKIP_UPLOAD", "1"),
+            ("FERRUM_GRAPH_SKIP_SYNC", "1"),
+        ]);
+
+        assert!(config.graph_prof);
+        assert!(config.skip_upload);
+        assert!(config.skip_sync);
+    }
+
+    #[test]
+    fn cuda_graph_runtime_config_keeps_default_replay_path() {
+        let config = CudaGraphRuntimeConfig::from_env_vars([
+            ("FERRUM_GRAPH_SKIP_UPLOAD", "true"),
+            ("FERRUM_GRAPH_SKIP_SYNC", "0"),
+        ]);
+
+        assert!(!config.graph_prof);
+        assert!(!config.skip_upload);
+        assert!(!config.skip_sync);
+    }
 }

@@ -3,7 +3,7 @@
 //! This module defines types that match the OpenAI API specification
 //! for chat completions, completions, and model management.
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Chat completions request (OpenAI compatible)
@@ -18,6 +18,11 @@ pub struct ChatCompletionsRequest {
     /// Maximum number of tokens to generate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+
+    /// Newer OpenAI chat field replacing `max_tokens` for completion budget.
+    /// When both are supplied, Ferrum uses this value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
 
     /// Temperature for sampling
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,6 +41,7 @@ pub struct ChatCompletionsRequest {
     pub stream: Option<bool>,
 
     /// Stop sequences
+    #[serde(default, deserialize_with = "deserialize_stop_sequences")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
 
@@ -51,6 +57,15 @@ pub struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logit_bias: Option<HashMap<String, f32>>,
 
+    /// Return log probabilities. Ferrum rejects this until implemented so
+    /// clients get an explicit OpenAI-style error instead of silent ignore.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+
+    /// Number of top log probabilities to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
+
     /// User identifier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -62,6 +77,80 @@ pub struct ChatCompletionsRequest {
     /// Response format constraint (e.g., `{"type": "json_object"}`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<OpenAiResponseFormat>,
+
+    /// OpenAI tool definitions. These are parsed and carried through request
+    /// metadata; forced tool-call generation is rejected until implemented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ChatTool>>,
+
+    /// OpenAI tool selection policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+
+    /// Streaming response options.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+
+    /// Legacy OpenAI functions compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions: Option<Vec<ChatFunction>>,
+
+    /// Legacy OpenAI function-call selector.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<FunctionCallChoice>,
+}
+
+/// OpenAI streaming options.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_usage: Option<bool>,
+}
+
+/// Tool definition in OpenAI chat-completion requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTool {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ChatFunction,
+}
+
+/// Function schema for `tools[].function` and legacy `functions[]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatFunction {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+/// OpenAI `tool_choice` accepts either a simple mode string or a specific
+/// function-tool selector object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(String),
+    Function {
+        #[serde(rename = "type")]
+        tool_type: String,
+        function: ToolChoiceFunction,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolChoiceFunction {
+    pub name: String,
+}
+
+/// Legacy `function_call` accepts a simple mode string or a named function.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FunctionCallChoice {
+    Mode(String),
+    Function { name: String },
 }
 
 /// OpenAI-compatible response format specifier.
@@ -87,10 +176,14 @@ pub struct OpenAiJsonSchema {
     pub name: Option<String>,
     /// The actual JSON Schema. Stored as raw JSON value so callers can pass
     /// any valid schema object; we re-serialise when forwarding to the
-    /// guided-decoding pipeline.
-    pub schema: serde_json::Value,
-    /// OpenAI's `strict` flag. Currently advisory — we always enforce when
-    /// we can translate the schema.
+    /// guided-decoding pipeline. Optional at deserialization time so the
+    /// HTTP layer can return an OpenAI-shaped `param` error for missing
+    /// schemas instead of Axum's generic JSON rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    /// OpenAI's `strict` flag. When true, Ferrum rejects schemas outside the
+    /// currently supported guided-decoding subset instead of silently falling
+    /// back to best-effort JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
 }
@@ -104,13 +197,43 @@ pub struct ChatMessage {
     /// Message content. Accepts either a plain string or the OpenAI
     /// "typed parts" array form (`[{"type":"text","text":"..."}]`)
     /// — both shapes deserialize into a single String. Non-text parts
-    /// are dropped (we don't support multimodal input here).
+    /// fail deserialization so multimodal input is rejected instead of
+    /// silently dropped.
+    #[serde(default)]
     #[serde(deserialize_with = "deserialize_message_content")]
     pub content: String,
 
     /// Message name (for function calls)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// Assistant tool calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatToolCall>>,
+
+    /// Tool response correlation id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+
+    /// Legacy assistant function call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<ChatFunctionCall>,
+}
+
+/// Assistant tool call in OpenAI responses and historical conversation input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ChatFunctionCall,
+}
+
+/// Function call payload. OpenAI serializes arguments as a JSON string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatFunctionCall {
+    pub name: String,
+    pub arguments: String,
 }
 
 /// Deserialize chat message content from either a plain string or the
@@ -122,28 +245,59 @@ fn deserialize_message_content<'de, D>(deserializer: D) -> Result<String, D::Err
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Repr {
-        Text(String),
-        Parts(Vec<ContentPart>),
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Array(parts) => {
+            let mut text_parts = Vec::with_capacity(parts.len());
+            for part in parts {
+                let ty = part
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| de::Error::custom("message content part missing type"))?;
+                if ty != "text" {
+                    return Err(de::Error::custom(format!(
+                        "unsupported message content part type `{ty}`"
+                    )));
+                }
+                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                    text_parts.push(text.to_string());
+                }
+            }
+            Ok(text_parts.join("\n"))
+        }
+        _ => Err(de::Error::custom(
+            "message content must be a string, null, or an array of text parts",
+        )),
     }
+}
 
-    #[derive(Deserialize)]
-    struct ContentPart {
-        #[serde(rename = "type")]
-        ty: String,
-        #[serde(default)]
-        text: Option<String>,
-    }
-
-    match Repr::deserialize(deserializer)? {
-        Repr::Text(s) => Ok(s),
-        Repr::Parts(parts) => Ok(parts
-            .into_iter()
-            .filter_map(|p| if p.ty == "text" { p.text } else { None })
-            .collect::<Vec<_>>()
-            .join("\n")),
+fn deserialize_stop_sequences<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(stop)) => Ok(Some(vec![stop])),
+        Some(serde_json::Value::Array(values)) => {
+            let mut stops = Vec::with_capacity(values.len());
+            for value in values {
+                match value {
+                    serde_json::Value::String(stop) => stops.push(stop),
+                    _ => {
+                        return Err(de::Error::custom(
+                            "stop must be a string or an array of strings",
+                        ))
+                    }
+                }
+            }
+            Ok(Some(stops))
+        }
+        _ => Err(de::Error::custom(
+            "stop must be a string or an array of strings",
+        )),
     }
 }
 
@@ -155,6 +309,7 @@ pub enum MessageRole {
     User,
     Assistant,
     Function,
+    Tool,
 }
 
 /// Chat completions response
@@ -205,8 +360,11 @@ pub struct CompletionsRequest {
     /// Model to use
     pub model: String,
 
-    /// Prompt text
-    pub prompt: String,
+    /// Prompt text. OpenAI's legacy completions endpoint also accepts prompt
+    /// arrays, but Ferrum currently supports only a single string and rejects
+    /// other shapes with `param=prompt`.
+    #[serde(default)]
+    pub prompt: CompletionPrompt,
 
     /// Maximum tokens
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,13 +378,52 @@ pub struct CompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
+    /// Number of completions to generate. Ferrum currently supports only
+    /// `n=1` and rejects larger values explicitly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+
     /// Stream responses
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
 
     /// Stop sequences
+    #[serde(default, deserialize_with = "deserialize_stop_sequences")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+
+    /// Legacy completions log probabilities. Explicitly rejected until
+    /// implemented so clients don't mistake a silent ignore for support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<u32>,
+
+    /// Logit bias.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<HashMap<String, f32>>,
+}
+
+/// Legacy completions prompt. Kept as a parsed enum so the HTTP layer can
+/// return an OpenAI-shaped field error instead of a generic JSON rejection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CompletionPrompt {
+    Text(String),
+    Unsupported(serde_json::Value),
+}
+
+impl Default for CompletionPrompt {
+    fn default() -> Self {
+        Self::Unsupported(serde_json::Value::Null)
+    }
+}
+
+impl CompletionPrompt {
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Unsupported(_) => None,
+        }
+    }
 }
 
 /// Completions response

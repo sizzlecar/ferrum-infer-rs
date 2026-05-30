@@ -67,8 +67,14 @@ fn dl_error_string() -> String {
     }
 }
 
+fn fa2_direct_ffi_shim_path_from_env() -> Option<String> {
+    std::env::vars()
+        .find(|(name, _)| name == "FERRUM_FA2_DIRECT_FFI_SHIM")
+        .map(|(_, value)| value)
+}
+
 fn load_fa2_shim() -> Result<Fa2Shim> {
-    let path = std::env::var("FERRUM_FA2_DIRECT_FFI_SHIM").map_err(|_| {
+    let path = fa2_direct_ffi_shim_path_from_env().ok_or_else(|| {
         FerrumError::unsupported(
             "FA2 direct FFI requires FERRUM_FA2_DIRECT_FFI_SHIM=/path/libferrum_fa2_shim.so",
         )

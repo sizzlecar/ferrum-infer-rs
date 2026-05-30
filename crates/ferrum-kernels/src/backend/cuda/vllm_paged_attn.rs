@@ -12,7 +12,7 @@
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use ferrum_types::{FerrumError, Result};
 use half::f16;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 extern "C" {
     fn ferrum_vllm_paged_attention_v1_f16_h128_b16(
@@ -78,15 +78,44 @@ struct PagedAttnCapacity {
 
 static PA_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<PagedAttnScratch>>> =
     std::sync::OnceLock::new();
-static PA_V1_SHORT_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VllmPagedAttnRuntimeConfig {
+    v1_short: bool,
+}
+
+impl VllmPagedAttnRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut config = Self { v1_short: true };
+        for (name, value) in vars {
+            if name.as_ref() == "FERRUM_VLLM_PAGED_ATTN_V1_SHORT" {
+                config.v1_short = value.as_ref() != "0";
+            }
+        }
+        config
+    }
+}
+
+fn vllm_paged_attn_runtime_config() -> &'static VllmPagedAttnRuntimeConfig {
+    static CONFIG: OnceLock<VllmPagedAttnRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(VllmPagedAttnRuntimeConfig::from_env)
+}
 
 fn pa_scratch_slot() -> &'static std::sync::RwLock<Option<PagedAttnScratch>> {
     PA_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
 }
 
 fn pa_v1_short_enabled() -> bool {
-    *PA_V1_SHORT_ENABLED
-        .get_or_init(|| std::env::var("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").as_deref() != Ok("0"))
+    vllm_paged_attn_runtime_config().v1_short
 }
 
 fn ensure_pa_scratch(
@@ -257,4 +286,22 @@ pub fn dispatch_paged_attention_v2(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VllmPagedAttnRuntimeConfig;
+
+    #[test]
+    fn vllm_paged_attn_runtime_config_defaults_short_v1_on() {
+        let config = VllmPagedAttnRuntimeConfig::from_env_vars(std::iter::empty::<(&str, &str)>());
+        assert!(config.v1_short);
+    }
+
+    #[test]
+    fn vllm_paged_attn_runtime_config_parses_short_v1_opt_out() {
+        let config =
+            VllmPagedAttnRuntimeConfig::from_env_vars([("FERRUM_VLLM_PAGED_ATTN_V1_SHORT", "0")]);
+        assert!(!config.v1_short);
+    }
 }

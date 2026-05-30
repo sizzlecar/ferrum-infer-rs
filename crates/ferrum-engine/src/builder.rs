@@ -15,8 +15,58 @@ use ferrum_interfaces::{
     Tokenizer,
 };
 use ferrum_types::{EngineConfig, FerrumError, Result, SchedulingPolicy};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, info};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EngineBuilderRuntimeEnv {
+    model_path: Option<String>,
+    spec_draft: Option<String>,
+    spec_n: usize,
+}
+
+impl EngineBuilderRuntimeEnv {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut model_path = None;
+        let mut spec_draft = None;
+        let mut spec_n = None;
+
+        for (key, value) in vars {
+            let value = value.into();
+            match key.as_ref() {
+                "FERRUM_MODEL_PATH" => model_path = Some(value),
+                "FERRUM_SPEC_DRAFT" if !value.is_empty() => spec_draft = Some(value),
+                "FERRUM_SPEC_DRAFT" => spec_draft = None,
+                "FERRUM_SPEC_N" => spec_n = value.parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+
+        Self {
+            model_path,
+            spec_draft,
+            spec_n: spec_n.unwrap_or(4),
+        }
+    }
+
+    fn has_model_path(&self) -> bool {
+        self.model_path.is_some()
+    }
+}
+
+fn engine_builder_runtime_env() -> &'static EngineBuilderRuntimeEnv {
+    static CONFIG: OnceLock<EngineBuilderRuntimeEnv> = OnceLock::new();
+    CONFIG.get_or_init(EngineBuilderRuntimeEnv::from_env)
+}
 
 /// Engine builder for creating inference engines with registry-based components
 pub struct EngineBuilder {
@@ -137,7 +187,7 @@ impl EngineBuilder {
         }
 
         // If model path is set, try huggingface first
-        if std::env::var("FERRUM_MODEL_PATH").is_ok() {
+        if engine_builder_runtime_env().has_model_path() {
             return "huggingface".to_string();
         }
 
@@ -190,7 +240,7 @@ impl EngineBuilder {
         }
 
         // If model path is set, try candle executor
-        if std::env::var("FERRUM_MODEL_PATH").is_ok() {
+        if engine_builder_runtime_env().has_model_path() {
             return "llm".to_string();
         }
 
@@ -213,7 +263,7 @@ impl EngineBuilder {
 
         let component_config = ComponentConfig::from_engine_config(&self.config);
         let has_model_path = component_config.get_string_option("model_path").is_some()
-            || std::env::var("FERRUM_MODEL_PATH").is_ok();
+            || engine_builder_runtime_env().has_model_path();
         let registry = self.registry.clone();
         let config = self.config;
 
@@ -345,17 +395,15 @@ impl EngineBuilder {
         // (absolute path to a HF snapshot dir) to load a second smaller
         // model as the draft. The draft must use the same tokenizer +
         // vocab as the target (same family e.g. Qwen3).
-        let (draft_executor, spec_config) = match std::env::var("FERRUM_SPEC_DRAFT").ok() {
-            Some(draft_path) if !draft_path.is_empty() => {
+        let runtime_env = engine_builder_runtime_env();
+        let (draft_executor, spec_config) = match runtime_env.spec_draft.as_ref() {
+            Some(draft_path) => {
                 info!("Speculative decoding: loading draft model from {draft_path}");
-                let n = std::env::var("FERRUM_SPEC_N")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(4);
+                let n = runtime_env.spec_n;
                 let mut draft_cfg = component_config.clone();
                 draft_cfg.component_options.insert(
                     "model_path".to_string(),
-                    serde_json::Value::String(draft_path.clone()),
+                    serde_json::Value::String(draft_path.to_string()),
                 );
                 match registry.create_executor(&executor_name, &draft_cfg).await {
                     Ok(draft) => (
@@ -427,6 +475,34 @@ mod tests {
         assert_eq!(builder.scheduler_name, Some("priority".to_string()));
         assert_eq!(builder.kv_cache_name, Some("paged".to_string()));
         assert_eq!(builder.executor_name, Some("custom_executor".to_string()));
+    }
+
+    #[test]
+    fn test_engine_builder_runtime_env_parses_model_and_spec() {
+        let env = EngineBuilderRuntimeEnv::from_env_vars([
+            ("FERRUM_MODEL_PATH", "/models/target"),
+            ("FERRUM_SPEC_DRAFT", "/models/draft"),
+            ("FERRUM_SPEC_N", "8"),
+        ]);
+
+        assert_eq!(env.model_path.as_deref(), Some("/models/target"));
+        assert_eq!(env.spec_draft.as_deref(), Some("/models/draft"));
+        assert_eq!(env.spec_n, 8);
+        assert!(env.has_model_path());
+    }
+
+    #[test]
+    fn test_engine_builder_runtime_env_defaults_and_ignores_empty_draft() {
+        let env = EngineBuilderRuntimeEnv::from_env_vars([
+            ("FERRUM_MODEL_PATH", ""),
+            ("FERRUM_SPEC_DRAFT", ""),
+            ("FERRUM_SPEC_N", "not-a-number"),
+        ]);
+
+        assert_eq!(env.model_path.as_deref(), Some(""));
+        assert_eq!(env.spec_draft, None);
+        assert_eq!(env.spec_n, 4);
+        assert!(env.has_model_path());
     }
 
     #[test]

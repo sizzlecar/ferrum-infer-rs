@@ -6,7 +6,7 @@
 //! external `crate::backend::metal::{MetalQuantStore, ...}` paths keep
 //! working without changes.
 
-use super::{slice_is_in_registered_mmap, st, MetalBackend};
+use super::{metal_mmap_trace_enabled, slice_is_in_registered_mmap, st, MetalBackend};
 use crate::backend::{Backend, GgufQuantType};
 use ferrum_types::{FerrumError, Result};
 use metal::MTLResourceOptions;
@@ -23,7 +23,7 @@ static QUANT_GEMM_LAST_K: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 fn debug_per_call_flush() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("FERRUM_METAL_QUANT_PROFILE").is_ok())
+    *FLAG.get_or_init(|| std::env::vars().any(|(name, _)| name == "FERRUM_METAL_QUANT_PROFILE"))
 }
 
 // ── MetalQuantStore (GGUF k-quant container) ──────────────────────────
@@ -130,7 +130,7 @@ unsafe impl Sync for MetalQuantStore {}
 /// that fit in one view, just at finer granularity).
 fn buffer_for_quant_bytes(bytes: &[u8]) -> (metal::Buffer, u64) {
     const PAGE: usize = 16384;
-    let trace = std::env::var("FERRUM_MMAP_TRACE").is_ok();
+    let trace = metal_mmap_trace_enabled();
     if slice_is_in_registered_mmap(bytes) {
         // Zero-copy: page-align the host range covering this tensor and
         // wrap it in an MTLBuffer. The keeper Arc on the registry entry

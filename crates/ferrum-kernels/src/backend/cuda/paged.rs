@@ -19,7 +19,7 @@
 //! All helpers stay private to this module; the trait impl is the
 //! only public surface.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
@@ -31,6 +31,111 @@ use half::f16;
 use super::{CudaBackend, CudaState, BATCHED_SCRATCH_CAP, HOST_STAGING_TOTAL};
 use crate::backend::{Backend, BackendPagedKv};
 use crate::ptx;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CudaPagedRuntimeConfig {
+    kv_capacity: usize,
+    paged_flash_splits: Option<usize>,
+    split_k_attn: Option<bool>,
+    fa2_source: bool,
+    paged_flash: bool,
+}
+
+impl CudaPagedRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut config = Self {
+            kv_capacity: 512,
+            paged_flash_splits: None,
+            split_k_attn: None,
+            fa2_source: false,
+            paged_flash: true,
+        };
+        for (name, value) in vars {
+            let value = value.as_ref();
+            match name.as_ref() {
+                "FERRUM_KV_CAPACITY" => {
+                    if let Ok(kv_capacity) = value.parse::<usize>() {
+                        config.kv_capacity = kv_capacity;
+                    }
+                }
+                "FERRUM_PAGED_FLASH_SPLITS" => {
+                    config.paged_flash_splits = value.parse::<usize>().ok();
+                }
+                "FERRUM_SPLIT_K_ATTN" => {
+                    config.split_k_attn = match value {
+                        "1" => Some(true),
+                        "0" => Some(false),
+                        _ => None,
+                    };
+                }
+                "FERRUM_FA2_SOURCE" => {
+                    config.fa2_source = matches!(value, "1" | "true" | "TRUE" | "on" | "ON");
+                }
+                "FERRUM_PAGED_FLASH" => config.paged_flash = value != "0",
+                _ => {}
+            }
+        }
+        config
+    }
+
+    fn shared_kv_for(&self, kv_len: usize) -> usize {
+        self.kv_capacity.max(kv_len).max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CudaPagedRuntimeConfig;
+
+    #[test]
+    fn cuda_paged_runtime_config_parses_startup_knobs() {
+        let config = CudaPagedRuntimeConfig::from_env_vars([
+            ("FERRUM_KV_CAPACITY", "4096"),
+            ("FERRUM_PAGED_FLASH_SPLITS", "4"),
+            ("FERRUM_SPLIT_K_ATTN", "1"),
+            ("FERRUM_FA2_SOURCE", "on"),
+            ("FERRUM_PAGED_FLASH", "0"),
+        ]);
+
+        assert_eq!(config.kv_capacity, 4096);
+        assert_eq!(config.paged_flash_splits, Some(4));
+        assert_eq!(config.split_k_attn, Some(true));
+        assert!(config.fa2_source);
+        assert!(!config.paged_flash);
+        assert_eq!(config.shared_kv_for(8192), 8192);
+    }
+
+    #[test]
+    fn cuda_paged_runtime_config_keeps_existing_defaults() {
+        let config = CudaPagedRuntimeConfig::from_env_vars([
+            ("FERRUM_KV_CAPACITY", "bad"),
+            ("FERRUM_PAGED_FLASH_SPLITS", "bad"),
+            ("FERRUM_SPLIT_K_ATTN", "auto"),
+            ("FERRUM_FA2_SOURCE", "trueish"),
+        ]);
+
+        assert_eq!(config.kv_capacity, 512);
+        assert_eq!(config.paged_flash_splits, None);
+        assert_eq!(config.split_k_attn, None);
+        assert!(!config.fa2_source);
+        assert!(config.paged_flash);
+        assert_eq!(config.shared_kv_for(128), 512);
+    }
+}
+
+fn cuda_paged_runtime_config() -> &'static CudaPagedRuntimeConfig {
+    static CONFIG: OnceLock<CudaPagedRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(CudaPagedRuntimeConfig::from_env)
+}
 
 // ────────────────────────────────────────────────────────────────────────
 // Paged-varlen split-K scratch + dispatch
@@ -273,9 +378,7 @@ fn paged_batched_flash_dispatch(
     //                          count, even when kv≤768; old "splits=2 +5%" claim was
     //                          measured under sync-instrumented bench).
     // Override via FERRUM_PAGED_FLASH_SPLITS for tuning.
-    let force_splits = std::env::var("FERRUM_PAGED_FLASH_SPLITS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
+    let force_splits = cuda_paged_runtime_config().paged_flash_splits;
     // 128 SMs on Ada/Hopper-class; conservative under-estimate.
     const SM_TARGET: usize = 128;
     let base_grid = num_seqs * num_heads;
@@ -384,10 +487,7 @@ fn paged_batched_flash_dispatch(
             b1.arg(&nsp);
             // Match graph-capture sizing rationale used elsewhere — size
             // shared to FERRUM_KV_CAPACITY ceiling, not current chunk.
-            let safe_kv: usize = std::env::var("FERRUM_KV_CAPACITY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(512);
+            let safe_kv = cuda_paged_runtime_config().kv_capacity;
             let safe_chunk = (safe_kv + num_splits - 1) / num_splits;
             let shmem1 = (safe_chunk.max(chunk).max(1) as u32) * 4;
             unsafe {
@@ -464,10 +564,7 @@ fn paged_batched_decode_single_pass(
     // builder so we can opt into the extended dynamic-shared limit if the
     // request exceeds the 48 KB default — without the opt-in cuLaunchKernel
     // returns CUDA_ERROR_INVALID_VALUE.
-    let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(512);
+    let safe_kv_max = cuda_paged_runtime_config().kv_capacity;
     let shared_kv = safe_kv_max.max(max_kv_len).max(1);
     let shared_bytes = (shared_kv as u32) * 4;
     if shared_bytes > 48 * 1024 {
@@ -667,11 +764,9 @@ impl BackendPagedKv for CudaBackend {
         // (4800 × 32 × 8 × 128 × 4 ≈ 628 MB). Skip split-K when the grid
         // is already well-occupied via q-tokens (>64) — the per-call
         // transient cost dominates any kernel win.
-        let split_k_force = std::env::var("FERRUM_SPLIT_K_ATTN").ok();
-        let use_split_k = match split_k_force.as_deref() {
-            Some("1") => true,
-            Some("0") => false,
-            _ => total_q_tokens <= 64 && (num_seqs <= 4 || max_kv_len >= 768),
+        let use_split_k = match cuda_paged_runtime_config().split_k_attn {
+            Some(force) => force,
+            None => total_q_tokens <= 64 && (num_seqs <= 4 || max_kv_len >= 768),
         };
 
         if use_split_k {
@@ -728,11 +823,7 @@ impl BackendPagedKv for CudaBackend {
         // kv_len=300 (shared=300*4) replays unchanged at kv_len=600 →
         // kernel writes scores[300..600] OOB into shared. Allocate the
         // worst-case kv slot length so any future replay is safe.
-        let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(512);
-        let shared_kv = safe_kv_max.max(max_kv_len).max(1);
+        let shared_kv = cuda_paged_runtime_config().shared_kv_for(max_kv_len);
         let shared_bytes = (shared_kv as u32) * 4;
         // If shared exceeds the default 48 KB per-block budget, opt into
         // the extended limit (sm_89/Hopper/Blackwell support up to
@@ -794,10 +885,7 @@ impl BackendPagedKv for CudaBackend {
         max_blocks_per_seq: usize,
     ) -> Result<()> {
         #[cfg(feature = "fa2-source")]
-        if matches!(
-            std::env::var("FERRUM_FA2_SOURCE").as_deref(),
-            Ok("1") | Ok("true") | Ok("TRUE") | Ok("on") | Ok("ON")
-        ) {
+        if cuda_paged_runtime_config().fa2_source {
             return super::fa2_source::paged_varlen_attention_fa2_source(
                 &ctx.stream,
                 q.as_f16(),
@@ -1027,7 +1115,7 @@ impl BackendPagedKv for CudaBackend {
         // saturates SMs at low kv. Bench M3 c=1/8/16/32 across +21% / +3% /
         // +3.5% / +10.8% over the single-pass kernel — every concurrency
         // wins. Set FERRUM_PAGED_FLASH=0 to opt out.
-        if std::env::var("FERRUM_PAGED_FLASH").map_or(true, |v| v != "0") {
+        if cuda_paged_runtime_config().paged_flash {
             return paged_batched_flash_dispatch(
                 ctx,
                 q.as_f16(),
@@ -1081,11 +1169,7 @@ impl BackendPagedKv for CudaBackend {
         // Same shared-mem sizing rationale as paged_varlen_attention
         // (graph capture freezes shared_mem_bytes; size to
         // FERRUM_KV_CAPACITY ceiling).
-        let safe_kv_max: usize = std::env::var("FERRUM_KV_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(512);
-        let shared_kv = safe_kv_max.max(max_kv_len).max(1);
+        let shared_kv = cuda_paged_runtime_config().shared_kv_for(max_kv_len);
         let shared_bytes = (shared_kv as u32) * 4;
         unsafe {
             b.launch(LaunchConfig {
@@ -1527,12 +1611,7 @@ impl BackendPagedKv for CudaBackend {
         );
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
         let stream = ctx.stream.clone();
-        let shared_kv = std::env::var("FERRUM_KV_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(512)
-            .max(final_kv_len)
-            .max(1);
+        let shared_kv = cuda_paged_runtime_config().shared_kv_for(final_kv_len);
         let shared_bytes = (shared_kv as u32) * 4;
         if shared_bytes > 48 * 1024 {
             let _ = func.set_attribute(
@@ -1623,12 +1702,7 @@ impl BackendPagedKv for CudaBackend {
         );
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
         let stream = ctx.stream.clone();
-        let shared_kv = std::env::var("FERRUM_KV_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(512)
-            .max(max_kv_len)
-            .max(1);
+        let shared_kv = cuda_paged_runtime_config().shared_kv_for(max_kv_len);
         let shared_bytes = (shared_kv as u32) * 4;
         if shared_bytes > 48 * 1024 {
             let _ = func.set_attribute(
@@ -1707,12 +1781,7 @@ impl BackendPagedKv for CudaBackend {
         );
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
         let stream = ctx.stream.clone();
-        let shared_kv = std::env::var("FERRUM_KV_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(512)
-            .max(max_kv_len)
-            .max(1);
+        let shared_kv = cuda_paged_runtime_config().shared_kv_for(max_kv_len);
         let shared_bytes = (4 * shared_kv as u32) * 4;
         if shared_bytes > 48 * 1024 {
             let _ = func.set_attribute(

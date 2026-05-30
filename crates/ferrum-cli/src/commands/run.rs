@@ -276,6 +276,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             client_id: None,
             session_id: None,
             created_at: Utc::now(),
+            api_request: None,
             metadata: HashMap::new(),
         };
         let mut stream = engine.infer_stream(request).await?;
@@ -425,6 +426,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     client_id: None,
                     session_id: None,
                     created_at: Utc::now(),
+                    api_request: None,
                     metadata: HashMap::new(),
                 };
 

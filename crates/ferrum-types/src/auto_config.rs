@@ -1,0 +1,1518 @@
+//! Startup auto-configuration and selector decision trace types.
+//!
+//! This is the typed control-plane surface for gradually replacing M3 shell
+//! env bundles with validated model/hardware/workload driven selections.
+
+use crate::{
+    parse_bool_env_value, parse_usize_env_value, RuntimeConfigEffect, RuntimeConfigEntry,
+    RuntimeConfigSnapshot, RuntimeConfigSource,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use thiserror::Error;
+
+pub const M3_QWEN3_30B_A3B_INT4_PRESET: &str = "m3_qwen3_30b_a3b_int4";
+const DEFAULT_KV_BLOCK_SIZE_TOKENS: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    pub architecture: String,
+    pub quantization: Option<String>,
+    pub moe: Option<MoeCapabilities>,
+    pub max_context_len: Option<usize>,
+    pub head_dim: Option<usize>,
+    pub kv_heads: Option<usize>,
+    pub supported_dtypes: Vec<String>,
+    pub graph_safe_moe: bool,
+}
+
+impl ModelCapabilities {
+    pub fn unknown() -> Self {
+        Self {
+            architecture: "unknown".to_string(),
+            quantization: None,
+            moe: None,
+            max_context_len: None,
+            head_dim: None,
+            kv_heads: None,
+            supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
+            graph_safe_moe: false,
+        }
+    }
+
+    pub fn qwen3_30b_a3b_gptq_int4() -> Self {
+        Self {
+            architecture: "qwen3_moe".to_string(),
+            quantization: Some("gptq_int4".to_string()),
+            moe: Some(MoeCapabilities {
+                num_experts: 128,
+                experts_per_token: 8,
+                moe_intermediate_size: Some(768),
+            }),
+            max_context_len: Some(40960),
+            head_dim: Some(128),
+            kv_heads: Some(4),
+            supported_dtypes: vec!["fp16".to_string()],
+            graph_safe_moe: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoeCapabilities {
+    pub num_experts: usize,
+    pub experts_per_token: usize,
+    pub moe_intermediate_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardwareCapabilities {
+    pub backend: String,
+    pub cuda_runtime: Option<String>,
+    pub compute_capability: Option<String>,
+    pub vram_bytes: Option<u64>,
+    pub sm_count: Option<u32>,
+    pub supported_dtypes: Vec<String>,
+    pub supported_kv_dtypes: Vec<String>,
+    pub graph_support: bool,
+    pub compiled_features: CompiledKernelFeatures,
+}
+
+impl HardwareCapabilities {
+    pub fn unknown() -> Self {
+        Self {
+            backend: "unknown".to_string(),
+            cuda_runtime: None,
+            compute_capability: None,
+            vram_bytes: None,
+            sm_count: None,
+            supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
+            supported_kv_dtypes: vec!["fp16".to_string()],
+            graph_support: false,
+            compiled_features: CompiledKernelFeatures::default(),
+        }
+    }
+
+    pub fn rtx4090_cuda(features: CompiledKernelFeatures) -> Self {
+        Self {
+            backend: "cuda".to_string(),
+            cuda_runtime: None,
+            compute_capability: Some("8.9".to_string()),
+            vram_bytes: Some(24 * 1024 * 1024 * 1024),
+            sm_count: Some(128),
+            supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
+            supported_kv_dtypes: vec!["fp16".to_string(), "int8".to_string()],
+            graph_support: true,
+            compiled_features: features,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledKernelFeatures {
+    pub cuda: bool,
+    pub vllm_paged_attn: bool,
+    pub vllm_moe_marlin: bool,
+    pub cuda_graph: bool,
+    pub greedy_argmax: bool,
+    pub fa2_source: bool,
+    pub fa2_direct_ffi: bool,
+}
+
+impl Default for CompiledKernelFeatures {
+    fn default() -> Self {
+        Self {
+            cuda: false,
+            vllm_paged_attn: false,
+            vllm_moe_marlin: false,
+            cuda_graph: false,
+            greedy_argmax: false,
+            fa2_source: false,
+            fa2_direct_ffi: false,
+        }
+    }
+}
+
+impl CompiledKernelFeatures {
+    pub fn m3_fast_path_without_fa2() -> Self {
+        Self {
+            cuda: true,
+            vllm_paged_attn: true,
+            vllm_moe_marlin: true,
+            cuda_graph: true,
+            greedy_argmax: true,
+            fa2_source: false,
+            fa2_direct_ffi: false,
+        }
+    }
+
+    pub fn m3_fast_path_with_source_fa2() -> Self {
+        Self {
+            fa2_source: true,
+            ..Self::m3_fast_path_without_fa2()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadProfile {
+    pub preset: Option<String>,
+    pub serving_mode: String,
+    pub target_concurrency: usize,
+    pub prompt_length_class: String,
+    pub output_length_class: String,
+    pub priority: WorkloadPriority,
+}
+
+impl WorkloadProfile {
+    pub fn serving_default() -> Self {
+        Self {
+            preset: None,
+            serving_mode: "openai_chat".to_string(),
+            target_concurrency: 1,
+            prompt_length_class: "unknown".to_string(),
+            output_length_class: "unknown".to_string(),
+            priority: WorkloadPriority::Balanced,
+        }
+    }
+
+    pub fn m3_qwen3_30b_a3b_int4() -> Self {
+        Self {
+            preset: Some(M3_QWEN3_30B_A3B_INT4_PRESET.to_string()),
+            serving_mode: "bench_serve".to_string(),
+            target_concurrency: 32,
+            prompt_length_class: "random_256".to_string(),
+            output_length_class: "random_128".to_string(),
+            priority: WorkloadPriority::Throughput,
+        }
+    }
+
+    fn is_m3_preset(&self) -> bool {
+        self.preset.as_deref() == Some(M3_QWEN3_30B_A3B_INT4_PRESET)
+    }
+}
+
+impl Default for WorkloadProfile {
+    fn default() -> Self {
+        Self::serving_default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadPriority {
+    Latency,
+    Throughput,
+    Balanced,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedFerrumConfig {
+    pub schema_version: u32,
+    pub preset: Option<String>,
+    pub runtime_config: RuntimeConfigSnapshot,
+    pub model_capabilities: ModelCapabilities,
+    pub hardware_capabilities: HardwareCapabilities,
+    pub workload_profile: WorkloadProfile,
+    pub decisions: Vec<AutoConfigDecision>,
+}
+
+impl ResolvedFerrumConfig {
+    pub fn effective_config_document(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "preset": self.preset,
+            "env_hash": self.runtime_env_hash(),
+            "entries": self.runtime_config.entries,
+            "decisions": self.decisions,
+        })
+    }
+
+    pub fn decision_trace_jsonl(&self) -> Result<String, serde_json::Error> {
+        let mut out = String::new();
+        for decision in &self.decisions {
+            out.push_str(&serde_json::to_string(decision)?);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    pub fn runtime_env_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let bytes = serde_json::to_vec(&self.runtime_config.entries).unwrap_or_default();
+        let digest = Sha256::digest(bytes);
+        format!("sha256:{digest:x}")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoConfigDecision {
+    pub schema_version: u32,
+    pub selection: String,
+    pub selected: String,
+    pub source: AutoConfigSource,
+    pub source_key: Option<String>,
+    pub candidates: Vec<String>,
+    pub rejected: Vec<RejectedCandidate>,
+    pub affects: Vec<RuntimeConfigEffect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedCandidate {
+    pub value: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoConfigSource {
+    Default,
+    Cli,
+    ConfigFile,
+    Env,
+    ScriptCase,
+    ModelMetadata,
+    HardwareCapability,
+    MemoryProfile,
+    WorkloadPreset,
+    CompiledFeature,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AutoConfigError {
+    #[error("{key}: invalid override: {reason}")]
+    InvalidOverride { key: String, reason: String },
+    #[error("{selection}: unsupported combination: {reason}")]
+    UnsupportedCombination { selection: String, reason: String },
+}
+
+pub struct FerrumConfigBuilder {
+    runtime_config: RuntimeConfigSnapshot,
+    model: ModelCapabilities,
+    hardware: HardwareCapabilities,
+    workload: WorkloadProfile,
+}
+
+impl FerrumConfigBuilder {
+    pub fn new(runtime_config: RuntimeConfigSnapshot) -> Self {
+        Self {
+            runtime_config,
+            model: ModelCapabilities::unknown(),
+            hardware: HardwareCapabilities::unknown(),
+            workload: WorkloadProfile::default(),
+        }
+    }
+
+    pub fn m3_qwen3_30b_a3b_int4(runtime_config: RuntimeConfigSnapshot) -> Self {
+        Self::new(runtime_config)
+            .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
+            .with_hardware_capabilities(HardwareCapabilities::rtx4090_cuda(
+                CompiledKernelFeatures::m3_fast_path_without_fa2(),
+            ))
+            .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
+    }
+
+    pub fn with_model_capabilities(mut self, model: ModelCapabilities) -> Self {
+        self.model = model;
+        self
+    }
+
+    pub fn with_hardware_capabilities(mut self, hardware: HardwareCapabilities) -> Self {
+        self.hardware = hardware;
+        self
+    }
+
+    pub fn with_workload_profile(mut self, workload: WorkloadProfile) -> Self {
+        self.workload = workload;
+        self
+    }
+
+    pub fn resolve(self) -> Result<ResolvedFerrumConfig, AutoConfigError> {
+        let mut decisions = Vec::new();
+        let use_vllm_paged_attn = self.bool_value(
+            "FERRUM_USE_VLLM_PAGED_ATTN",
+            self.workload.is_m3_preset() && self.hardware.compiled_features.vllm_paged_attn,
+            AutoConfigSource::WorkloadPreset,
+        )?;
+        let fa_layout =
+            self.bool_value("FERRUM_FA_LAYOUT_VARLEN", false, AutoConfigSource::Default)?;
+        let fa2_source = self.bool_value("FERRUM_FA2_SOURCE", false, AutoConfigSource::Default)?;
+        let shim_present = self.raw("FERRUM_FA2_DIRECT_FFI_SHIM").is_some();
+        let fa2_direct_ffi = self.bool_value(
+            "FERRUM_FA2_DIRECT_FFI",
+            shim_present,
+            if shim_present {
+                AutoConfigSource::Env
+            } else {
+                AutoConfigSource::Default
+            },
+        )?;
+        let vllm_v1_short = self.bool_value(
+            "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+            use_vllm_paged_attn.value,
+            AutoConfigSource::Default,
+        )?;
+        let vllm_moe = self.bool_value(
+            "FERRUM_VLLM_MOE",
+            self.workload.is_m3_preset() && self.hardware.compiled_features.vllm_moe_marlin,
+            AutoConfigSource::WorkloadPreset,
+        )?;
+        let device_route = self.bool_value(
+            "FERRUM_MOE_DEVICE_ROUTE",
+            self.workload.is_m3_preset() && vllm_moe.value,
+            AutoConfigSource::WorkloadPreset,
+        )?;
+        let pair_ids = self.bool_value(
+            "FERRUM_VLLM_MOE_PAIR_IDS",
+            vllm_moe.value,
+            AutoConfigSource::WorkloadPreset,
+        )?;
+        let graph = self.bool_value(
+            "FERRUM_MOE_GRAPH",
+            self.workload.is_m3_preset()
+                && vllm_moe.value
+                && self.hardware.graph_support
+                && self.hardware.compiled_features.cuda_graph,
+            AutoConfigSource::WorkloadPreset,
+        )?;
+        let greedy = self.bool_value(
+            "FERRUM_GREEDY_ARGMAX",
+            self.workload.is_m3_preset() && self.hardware.compiled_features.greedy_argmax,
+            AutoConfigSource::WorkloadPreset,
+        )?;
+        let prefix_cache = self.bool_value(
+            "FERRUM_PREFIX_CACHE",
+            false,
+            if self.workload.is_m3_preset() {
+                AutoConfigSource::WorkloadPreset
+            } else {
+                AutoConfigSource::Default
+            },
+        )?;
+        let kv_blocks = self.usize_value(
+            "FERRUM_KV_MAX_BLOCKS",
+            2048,
+            AutoConfigSource::WorkloadPreset,
+        )?;
+        let max_sequences = self.usize_value(
+            "FERRUM_PAGED_MAX_SEQS",
+            self.workload.target_concurrency.max(1),
+            AutoConfigSource::WorkloadPreset,
+        )?;
+        let max_batched_tokens = self.usize_value(
+            "FERRUM_MAX_BATCHED_TOKENS",
+            self.workload.target_concurrency.max(1) * 64,
+            AutoConfigSource::WorkloadPreset,
+        )?;
+        let max_model_len = self.optional_usize_value("FERRUM_MAX_MODEL_LEN")?;
+
+        self.validate_attention(
+            use_vllm_paged_attn.value,
+            fa_layout.value,
+            fa2_source.value,
+            fa2_direct_ffi.value,
+            shim_present,
+            vllm_v1_short.value,
+        )?;
+        self.validate_moe(
+            vllm_moe.value,
+            device_route.value,
+            pair_ids.value,
+            graph.value,
+        )?;
+        self.validate_memory(
+            kv_blocks.value,
+            max_sequences.value,
+            max_batched_tokens.value,
+            max_model_len.as_ref().map(|value| value.value),
+        )?;
+        self.validate_dtypes()?;
+
+        decisions.push(self.attention_prefill_decision(
+            use_vllm_paged_attn.clone(),
+            fa_layout,
+            fa2_source,
+            fa2_direct_ffi,
+        ));
+        decisions.push(self.attention_decode_decision(use_vllm_paged_attn, vllm_v1_short));
+        decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
+        decisions.push(self.graph_decision(graph));
+        decisions.push(self.scalar_decision(
+            "kv_block_count",
+            kv_blocks,
+            RuntimeConfigEffect::Memory,
+        ));
+        decisions.push(self.scalar_decision(
+            "max_sequences",
+            max_sequences,
+            RuntimeConfigEffect::Memory,
+        ));
+        decisions.push(self.scalar_decision(
+            "max_batched_tokens",
+            max_batched_tokens,
+            RuntimeConfigEffect::Performance,
+        ));
+        if let Some(max_model_len) = max_model_len {
+            decisions.push(self.scalar_decision(
+                "max_model_len",
+                max_model_len,
+                RuntimeConfigEffect::Memory,
+            ));
+        }
+        decisions.push(self.prefix_cache_decision(prefix_cache));
+        decisions.push(self.scheduler_decision()?);
+        decisions.push(self.sampling_decision(greedy));
+
+        Ok(ResolvedFerrumConfig {
+            schema_version: 1,
+            preset: self.workload.preset.clone(),
+            runtime_config: self.runtime_config.clone(),
+            model_capabilities: self.model.clone(),
+            hardware_capabilities: self.hardware.clone(),
+            workload_profile: self.workload.clone(),
+            decisions,
+        })
+    }
+
+    fn entries(&self) -> BTreeMap<&str, &str> {
+        self.runtime_config
+            .entries
+            .iter()
+            .map(|entry| (entry.key.as_str(), entry.effective_value.as_str()))
+            .collect()
+    }
+
+    fn raw(&self, key: &str) -> Option<&str> {
+        self.entry(key).map(|entry| entry.effective_value.as_str())
+    }
+
+    fn entry(&self, key: &str) -> Option<&RuntimeConfigEntry> {
+        self.runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+    }
+
+    fn source_for_key(&self, key: &str, default_source: AutoConfigSource) -> AutoConfigSource {
+        self.entry(key)
+            .map(|entry| auto_config_source_from_runtime(entry.source))
+            .unwrap_or(default_source)
+    }
+
+    fn bool_value(
+        &self,
+        key: &str,
+        default: bool,
+        default_source: AutoConfigSource,
+    ) -> Result<ResolvedValue<bool>, AutoConfigError> {
+        match self.entry(key) {
+            Some(entry) => Ok(ResolvedValue {
+                value: parse_bool_env_value(&entry.effective_value).map_err(|reason| {
+                    AutoConfigError::InvalidOverride {
+                        key: key.to_string(),
+                        reason,
+                    }
+                })?,
+                source: auto_config_source_from_runtime(entry.source),
+                source_key: Some(key.to_string()),
+            }),
+            None => Ok(ResolvedValue {
+                value: default,
+                source: default_source,
+                source_key: None,
+            }),
+        }
+    }
+
+    fn usize_value(
+        &self,
+        key: &str,
+        default: usize,
+        default_source: AutoConfigSource,
+    ) -> Result<ResolvedValue<usize>, AutoConfigError> {
+        match self.entry(key) {
+            Some(entry) => Ok(ResolvedValue {
+                value: parse_usize_env_value(&entry.effective_value).map_err(|reason| {
+                    AutoConfigError::InvalidOverride {
+                        key: key.to_string(),
+                        reason,
+                    }
+                })?,
+                source: auto_config_source_from_runtime(entry.source),
+                source_key: Some(key.to_string()),
+            }),
+            None => Ok(ResolvedValue {
+                value: default,
+                source: default_source,
+                source_key: None,
+            }),
+        }
+    }
+
+    fn optional_usize_value(
+        &self,
+        key: &str,
+    ) -> Result<Option<ResolvedValue<usize>>, AutoConfigError> {
+        match self.entry(key) {
+            Some(entry) => Ok(Some(ResolvedValue {
+                value: parse_usize_env_value(&entry.effective_value).map_err(|reason| {
+                    AutoConfigError::InvalidOverride {
+                        key: key.to_string(),
+                        reason,
+                    }
+                })?,
+                source: auto_config_source_from_runtime(entry.source),
+                source_key: Some(key.to_string()),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    fn validate_attention(
+        &self,
+        use_vllm_paged_attn: bool,
+        fa_layout: bool,
+        fa2_source: bool,
+        fa2_direct_ffi: bool,
+        shim_present: bool,
+        vllm_v1_short: bool,
+    ) -> Result<(), AutoConfigError> {
+        if use_vllm_paged_attn && !self.hardware.compiled_features.vllm_paged_attn {
+            return self.invalid(
+                "FERRUM_USE_VLLM_PAGED_ATTN",
+                "vLLM paged attention is not compiled",
+            );
+        }
+        if fa_layout && !use_vllm_paged_attn {
+            return self.invalid(
+                "FERRUM_FA_LAYOUT_VARLEN",
+                "FA layout requires vLLM paged attention layout",
+            );
+        }
+        if fa2_source && !self.hardware.compiled_features.fa2_source {
+            return self.invalid(
+                "FERRUM_FA2_SOURCE",
+                "source-built FA2 support is not compiled",
+            );
+        }
+        if fa2_direct_ffi && !self.hardware.compiled_features.fa2_direct_ffi {
+            return self.invalid(
+                "FERRUM_FA2_DIRECT_FFI",
+                "direct FA2 FFI shim support is not compiled",
+            );
+        }
+        if fa2_direct_ffi && !shim_present {
+            return self.invalid(
+                "FERRUM_FA2_DIRECT_FFI",
+                "requires FERRUM_FA2_DIRECT_FFI_SHIM",
+            );
+        }
+        if fa2_source && fa2_direct_ffi {
+            return self.unsupported(
+                "attention_prefill_mixed_backend",
+                "FA2 source and direct FFI shim cannot both own the prefill path",
+            );
+        }
+        if vllm_v1_short && !use_vllm_paged_attn {
+            return self.invalid(
+                "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+                "short-context v1 requires vLLM paged attention",
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_moe(
+        &self,
+        vllm_moe: bool,
+        device_route: bool,
+        pair_ids: bool,
+        graph: bool,
+    ) -> Result<(), AutoConfigError> {
+        if vllm_moe && !self.hardware.compiled_features.vllm_moe_marlin {
+            return self.invalid("FERRUM_VLLM_MOE", "vLLM Marlin MoE is not compiled");
+        }
+        if device_route && !vllm_moe {
+            return self.invalid(
+                "FERRUM_MOE_DEVICE_ROUTE",
+                "device route currently requires vLLM MoE",
+            );
+        }
+        if pair_ids && !vllm_moe {
+            return self.invalid(
+                "FERRUM_VLLM_MOE_PAIR_IDS",
+                "pair-id routing requires vLLM MoE",
+            );
+        }
+        let graph_relevant = self.model.moe.is_some() || self.workload.is_m3_preset();
+        if graph && graph_relevant && !self.hardware.graph_support {
+            return self.invalid(
+                "FERRUM_MOE_GRAPH",
+                "hardware/backend does not support CUDA graph replay",
+            );
+        }
+        if graph && graph_relevant && !self.hardware.compiled_features.cuda_graph {
+            return self.invalid("FERRUM_MOE_GRAPH", "CUDA graph support is not compiled");
+        }
+        if graph && graph_relevant && !vllm_moe {
+            return self.invalid(
+                "FERRUM_MOE_GRAPH",
+                "graph decode requires the graph-clean vLLM MoE path",
+            );
+        }
+        if graph && graph_relevant && self.model.moe.is_some() && !self.model.graph_safe_moe {
+            return self.unsupported(
+                "moe_graph_policy",
+                "model MoE path is not marked graph-safe",
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_memory(
+        &self,
+        kv_blocks: usize,
+        max_sequences: usize,
+        max_batched_tokens: usize,
+        requested_max_model_len: Option<usize>,
+    ) -> Result<(), AutoConfigError> {
+        if kv_blocks == 0 {
+            return self.invalid("FERRUM_KV_MAX_BLOCKS", "must be greater than zero");
+        }
+        if max_sequences == 0 {
+            return self.invalid("FERRUM_PAGED_MAX_SEQS", "must be greater than zero");
+        }
+        if max_batched_tokens < max_sequences {
+            return self.invalid(
+                "FERRUM_MAX_BATCHED_TOKENS",
+                "must be at least FERRUM_PAGED_MAX_SEQS",
+            );
+        }
+        if let Some(max_model_len) = requested_max_model_len {
+            if max_model_len == 0 {
+                return self.invalid("FERRUM_MAX_MODEL_LEN", "must be greater than zero");
+            }
+            if let Some(model_max) = self.model.max_context_len {
+                if max_model_len > model_max {
+                    return self.invalid(
+                        "FERRUM_MAX_MODEL_LEN",
+                        "exceeds model metadata max context length",
+                    );
+                }
+            }
+            let kv_token_capacity = kv_blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS);
+            if max_model_len > kv_token_capacity {
+                return self.invalid(
+                    "FERRUM_KV_MAX_BLOCKS",
+                    "KV cache token capacity is smaller than FERRUM_MAX_MODEL_LEN",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dtypes(&self) -> Result<(), AutoConfigError> {
+        if let Some(dtype) = self.raw("FERRUM_DTYPE") {
+            let dtype = dtype.to_ascii_lowercase();
+            if !self.hardware.supported_dtypes.iter().any(|d| d == &dtype) {
+                return self.invalid("FERRUM_DTYPE", "dtype is not supported by hardware profile");
+            }
+        }
+        if let Some(dtype) = self.raw("FERRUM_KV_DTYPE") {
+            let dtype = dtype.to_ascii_lowercase();
+            if !self
+                .hardware
+                .supported_kv_dtypes
+                .iter()
+                .any(|d| d == &dtype)
+            {
+                return self.invalid(
+                    "FERRUM_KV_DTYPE",
+                    "KV dtype is not supported by hardware profile",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn attention_prefill_decision(
+        &self,
+        use_vllm_paged_attn: ResolvedValue<bool>,
+        fa_layout: ResolvedValue<bool>,
+        fa2_source: ResolvedValue<bool>,
+        fa2_direct_ffi: ResolvedValue<bool>,
+    ) -> AutoConfigDecision {
+        let (selected, source, source_key) = if fa2_source.value {
+            ("fa2_source", fa2_source.source, fa2_source.source_key)
+        } else if fa2_direct_ffi.value {
+            (
+                "fa2_direct_ffi",
+                fa2_direct_ffi.source,
+                fa2_direct_ffi.source_key,
+            )
+        } else if fa_layout.value {
+            ("fa_layout_varlen", fa_layout.source, fa_layout.source_key)
+        } else if use_vllm_paged_attn.value {
+            (
+                "vllm_paged_varlen",
+                use_vllm_paged_attn.source,
+                use_vllm_paged_attn.source_key,
+            )
+        } else {
+            ("legacy_paged_varlen", AutoConfigSource::Default, None)
+        };
+        self.decision(
+            "attention_prefill_mixed_backend",
+            selected,
+            source,
+            source_key,
+            [
+                "fa2_source",
+                "fa2_direct_ffi",
+                "fa_layout_varlen",
+                "vllm_paged_varlen",
+                "legacy_paged_varlen",
+            ],
+            self.rejected_except(
+                selected,
+                [
+                    ("fa2_source", "source-built FA2 not selected"),
+                    ("fa2_direct_ffi", "diagnostic direct FFI shim not selected"),
+                    ("fa_layout_varlen", "FA-compatible layout not selected"),
+                    ("vllm_paged_varlen", "vLLM paged varlen bridge not selected"),
+                    (
+                        "legacy_paged_varlen",
+                        "a higher-priority attention path was selected",
+                    ),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Performance,
+                RuntimeConfigEffect::Memory,
+            ],
+        )
+    }
+
+    fn attention_decode_decision(
+        &self,
+        use_vllm_paged_attn: ResolvedValue<bool>,
+        vllm_v1_short: ResolvedValue<bool>,
+    ) -> AutoConfigDecision {
+        let (selected, source, source_key) = if use_vllm_paged_attn.value {
+            if vllm_v1_short.value {
+                (
+                    "vllm_paged_attn_v1_short",
+                    vllm_v1_short.source,
+                    vllm_v1_short.source_key,
+                )
+            } else {
+                (
+                    "vllm_paged_attn_v2",
+                    vllm_v1_short.source,
+                    vllm_v1_short.source_key,
+                )
+            }
+        } else {
+            ("legacy_paged_decode", use_vllm_paged_attn.source, None)
+        };
+        self.decision(
+            "attention_decode_backend",
+            selected,
+            source,
+            source_key,
+            [
+                "vllm_paged_attn_v1_short",
+                "vllm_paged_attn_v2",
+                "legacy_paged_decode",
+            ],
+            self.rejected_except(
+                selected,
+                [
+                    (
+                        "vllm_paged_attn_v1_short",
+                        "short-context v1 decode not selected",
+                    ),
+                    ("vllm_paged_attn_v2", "v2 decode not selected"),
+                    ("legacy_paged_decode", "legacy decode not selected"),
+                ],
+            ),
+            vec![RuntimeConfigEffect::Performance],
+        )
+    }
+
+    fn moe_decision(
+        &self,
+        vllm_moe: ResolvedValue<bool>,
+        device_route: ResolvedValue<bool>,
+        pair_ids: ResolvedValue<bool>,
+    ) -> AutoConfigDecision {
+        let selected = if vllm_moe.value && device_route.value && pair_ids.value {
+            "vllm_marlin_moe_device_route_pair_ids"
+        } else if vllm_moe.value && device_route.value {
+            "vllm_marlin_moe_device_route"
+        } else if vllm_moe.value {
+            "vllm_marlin_moe"
+        } else {
+            "legacy_moe"
+        };
+        self.decision(
+            "moe_implementation",
+            selected,
+            vllm_moe.source,
+            vllm_moe.source_key,
+            [
+                "vllm_marlin_moe_device_route_pair_ids",
+                "vllm_marlin_moe_device_route",
+                "vllm_marlin_moe",
+                "legacy_moe",
+            ],
+            self.rejected_except(
+                selected,
+                [
+                    (
+                        "vllm_marlin_moe_device_route_pair_ids",
+                        "pair-id device route not selected",
+                    ),
+                    (
+                        "vllm_marlin_moe_device_route",
+                        "device-route MoE not selected",
+                    ),
+                    ("vllm_marlin_moe", "vLLM Marlin MoE not selected"),
+                    ("legacy_moe", "legacy MoE not selected"),
+                ],
+            ),
+            vec![RuntimeConfigEffect::Performance],
+        )
+    }
+
+    fn graph_decision(&self, graph: ResolvedValue<bool>) -> AutoConfigDecision {
+        let selected = if graph.value {
+            "graph_clean_decode"
+        } else {
+            "graph_disabled"
+        };
+        self.decision(
+            "moe_graph_policy",
+            selected,
+            graph.source,
+            graph.source_key,
+            ["graph_clean_decode", "graph_disabled"],
+            self.rejected_except(
+                selected,
+                [
+                    ("graph_clean_decode", "graph decode not selected"),
+                    ("graph_disabled", "graph decode selected"),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Performance,
+                RuntimeConfigEffect::Correctness,
+            ],
+        )
+    }
+
+    fn scalar_decision(
+        &self,
+        selection: &str,
+        value: ResolvedValue<usize>,
+        effect: RuntimeConfigEffect,
+    ) -> AutoConfigDecision {
+        self.decision(
+            selection,
+            &value.value.to_string(),
+            value.source,
+            value.source_key,
+            [value.value.to_string()],
+            Vec::new(),
+            vec![effect],
+        )
+    }
+
+    fn scheduler_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+        let entries = self.entries();
+        let mut selected = "continuous_default".to_string();
+        let mut source_key = None;
+        if let Some(chunk) = entries.get("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK") {
+            parse_usize_env_value(chunk).map_err(|reason| AutoConfigError::InvalidOverride {
+                key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
+                reason,
+            })?;
+            selected = format!("active_decode_prefill_chunk:{chunk}");
+            source_key = Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string());
+        } else if let Some(until) = entries.get("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE") {
+            parse_usize_env_value(until).map_err(|reason| AutoConfigError::InvalidOverride {
+                key: "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE".to_string(),
+                reason,
+            })?;
+            selected = format!("prefill_first_until_active:{until}");
+            source_key = Some("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE".to_string());
+        } else if self
+            .bool_value(
+                "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
+                false,
+                AutoConfigSource::Default,
+            )?
+            .value
+        {
+            selected = "prompt_token_estimate".to_string();
+            source_key = Some("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE".to_string());
+        }
+        self.unsupported_if(
+            source_key.as_deref() == Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
+                && selected.ends_with(":0"),
+            "scheduler_admission_policy",
+            "active decode prefill chunk must be greater than zero",
+        )?;
+        Ok(self.decision(
+            "scheduler_admission_policy",
+            &selected,
+            source_key
+                .as_deref()
+                .map(|key| self.source_for_key(key, AutoConfigSource::Default))
+                .unwrap_or(AutoConfigSource::Default),
+            source_key,
+            [
+                "continuous_default",
+                "prompt_token_estimate",
+                "prefill_first_until_active",
+                "active_decode_prefill_chunk",
+            ],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn prefix_cache_decision(&self, prefix_cache: ResolvedValue<bool>) -> AutoConfigDecision {
+        let selected = if prefix_cache.value {
+            "prefix_cache_enabled"
+        } else {
+            "prefix_cache_disabled"
+        };
+        self.decision(
+            "prefix_cache_policy",
+            selected,
+            prefix_cache.source,
+            prefix_cache.source_key,
+            ["prefix_cache_enabled", "prefix_cache_disabled"],
+            self.rejected_except(
+                selected,
+                [
+                    ("prefix_cache_enabled", "prefix cache not selected"),
+                    ("prefix_cache_disabled", "prefix cache enabled"),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Correctness,
+                RuntimeConfigEffect::Performance,
+                RuntimeConfigEffect::Memory,
+            ],
+        )
+    }
+
+    fn sampling_decision(&self, greedy: ResolvedValue<bool>) -> AutoConfigDecision {
+        let selected = if greedy.value {
+            "gpu_greedy_argmax"
+        } else {
+            "logits_readback"
+        };
+        self.decision(
+            "sampling_readback_path",
+            selected,
+            greedy.source,
+            greedy.source_key,
+            ["gpu_greedy_argmax", "logits_readback"],
+            self.rejected_except(
+                selected,
+                [
+                    ("gpu_greedy_argmax", "GPU argmax not selected"),
+                    ("logits_readback", "logits readback not selected"),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Performance,
+                RuntimeConfigEffect::Correctness,
+            ],
+        )
+    }
+
+    fn decision<I, C>(
+        &self,
+        selection: &str,
+        selected: &str,
+        source: AutoConfigSource,
+        source_key: Option<String>,
+        candidates: I,
+        rejected: Vec<RejectedCandidate>,
+        affects: Vec<RuntimeConfigEffect>,
+    ) -> AutoConfigDecision
+    where
+        I: IntoIterator<Item = C>,
+        C: Into<String>,
+    {
+        AutoConfigDecision {
+            schema_version: 1,
+            selection: selection.to_string(),
+            selected: selected.to_string(),
+            source,
+            source_key,
+            candidates: candidates.into_iter().map(Into::into).collect(),
+            rejected,
+            affects,
+        }
+    }
+
+    fn rejected_except<I>(&self, selected: &str, candidates: I) -> Vec<RejectedCandidate>
+    where
+        I: IntoIterator<Item = (&'static str, &'static str)>,
+    {
+        candidates
+            .into_iter()
+            .filter(|(value, _)| *value != selected)
+            .map(|(value, reason)| RejectedCandidate {
+                value: value.to_string(),
+                reason: reason.to_string(),
+            })
+            .collect()
+    }
+
+    fn invalid<T>(&self, key: &str, reason: &str) -> Result<T, AutoConfigError> {
+        Err(AutoConfigError::InvalidOverride {
+            key: key.to_string(),
+            reason: reason.to_string(),
+        })
+    }
+
+    fn unsupported<T>(&self, selection: &str, reason: &str) -> Result<T, AutoConfigError> {
+        Err(AutoConfigError::UnsupportedCombination {
+            selection: selection.to_string(),
+            reason: reason.to_string(),
+        })
+    }
+
+    fn unsupported_if(
+        &self,
+        condition: bool,
+        selection: &str,
+        reason: &str,
+    ) -> Result<(), AutoConfigError> {
+        if condition {
+            self.unsupported(selection, reason)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedValue<T> {
+    value: T,
+    source: AutoConfigSource,
+    source_key: Option<String>,
+}
+
+fn auto_config_source_from_runtime(source: RuntimeConfigSource) -> AutoConfigSource {
+    match source {
+        RuntimeConfigSource::Default => AutoConfigSource::Default,
+        RuntimeConfigSource::ConfigFile => AutoConfigSource::ConfigFile,
+        RuntimeConfigSource::Cli => AutoConfigSource::Cli,
+        RuntimeConfigSource::Env => AutoConfigSource::Env,
+        RuntimeConfigSource::ScriptCase => AutoConfigSource::ScriptCase,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(vars: &[(&str, &str)]) -> RuntimeConfigSnapshot {
+        RuntimeConfigSnapshot::from_env_vars(vars.iter().copied())
+    }
+
+    fn snapshot_with_sources(vars: &[(&str, &str, RuntimeConfigSource)]) -> RuntimeConfigSnapshot {
+        let mut entries: Vec<_> = vars
+            .iter()
+            .map(|(key, effective_value, source)| RuntimeConfigEntry {
+                key: (*key).to_string(),
+                effective_value: (*effective_value).to_string(),
+                source: *source,
+                affects: vec![RuntimeConfigEffect::Performance],
+            })
+            .collect();
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        RuntimeConfigSnapshot { entries }
+    }
+
+    fn m3(vars: &[(&str, &str)], features: CompiledKernelFeatures) -> FerrumConfigBuilder {
+        FerrumConfigBuilder::new(snapshot(vars))
+            .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
+            .with_hardware_capabilities(HardwareCapabilities::rtx4090_cuda(features))
+            .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
+    }
+
+    fn expect_invalid_key(vars: &[(&str, &str)], key: &str) {
+        expect_invalid_key_with_features(
+            vars,
+            key,
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        );
+    }
+
+    fn expect_invalid_key_with_features(
+        vars: &[(&str, &str)],
+        key: &str,
+        features: CompiledKernelFeatures,
+    ) {
+        let err = m3(vars, features)
+            .resolve()
+            .expect_err("override should fail");
+        match err {
+            AutoConfigError::InvalidOverride { key: actual, .. } => assert_eq!(actual, key),
+            other => panic!("expected invalid override for {key}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m3_preset_selects_current_safe_fast_path_without_fa2() {
+        let resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
+            .resolve()
+            .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(
+            decisions["attention_prefill_mixed_backend"],
+            "vllm_paged_varlen"
+        );
+        assert_eq!(
+            decisions["attention_decode_backend"],
+            "vllm_paged_attn_v1_short"
+        );
+        assert_eq!(
+            decisions["moe_implementation"],
+            "vllm_marlin_moe_device_route_pair_ids"
+        );
+        assert_eq!(decisions["moe_graph_policy"], "graph_clean_decode");
+        assert_eq!(decisions["prefix_cache_policy"], "prefix_cache_disabled");
+        assert_eq!(decisions["sampling_readback_path"], "gpu_greedy_argmax");
+        assert_eq!(
+            resolved.preset.as_deref(),
+            Some(M3_QWEN3_30B_A3B_INT4_PRESET)
+        );
+    }
+
+    #[test]
+    fn source_fa2_selects_only_when_compiled() {
+        let resolved = m3(
+            &[("FERRUM_FA2_SOURCE", "1")],
+            CompiledKernelFeatures::m3_fast_path_with_source_fa2(),
+        )
+        .resolve()
+        .unwrap();
+        let prefill = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "attention_prefill_mixed_backend")
+            .unwrap();
+        assert_eq!(prefill.selected, "fa2_source");
+        expect_invalid_key(&[("FERRUM_FA2_SOURCE", "1")], "FERRUM_FA2_SOURCE");
+    }
+
+    #[test]
+    fn validates_invalid_override_matrix() {
+        expect_invalid_key(
+            &[("FERRUM_USE_VLLM_PAGED_ATTN", "maybe")],
+            "FERRUM_USE_VLLM_PAGED_ATTN",
+        );
+        expect_invalid_key(&[("FERRUM_PREFIX_CACHE", "maybe")], "FERRUM_PREFIX_CACHE");
+        expect_invalid_key(
+            &[
+                ("FERRUM_FA_LAYOUT_VARLEN", "1"),
+                ("FERRUM_USE_VLLM_PAGED_ATTN", "0"),
+            ],
+            "FERRUM_FA_LAYOUT_VARLEN",
+        );
+        expect_invalid_key(&[("FERRUM_FA2_DIRECT_FFI", "1")], "FERRUM_FA2_DIRECT_FFI");
+        expect_invalid_key_with_features(
+            &[("FERRUM_VLLM_MOE", "1")],
+            "FERRUM_VLLM_MOE",
+            CompiledKernelFeatures::default(),
+        );
+        expect_invalid_key(
+            &[("FERRUM_MOE_DEVICE_ROUTE", "1"), ("FERRUM_VLLM_MOE", "0")],
+            "FERRUM_MOE_DEVICE_ROUTE",
+        );
+        expect_invalid_key(
+            &[("FERRUM_VLLM_MOE_PAIR_IDS", "1"), ("FERRUM_VLLM_MOE", "0")],
+            "FERRUM_VLLM_MOE_PAIR_IDS",
+        );
+        expect_invalid_key(
+            &[("FERRUM_MOE_GRAPH", "1"), ("FERRUM_VLLM_MOE", "0")],
+            "FERRUM_MOE_GRAPH",
+        );
+        expect_invalid_key(&[("FERRUM_KV_MAX_BLOCKS", "0")], "FERRUM_KV_MAX_BLOCKS");
+        expect_invalid_key(&[("FERRUM_PAGED_MAX_SEQS", "0")], "FERRUM_PAGED_MAX_SEQS");
+        expect_invalid_key(
+            &[
+                ("FERRUM_PAGED_MAX_SEQS", "32"),
+                ("FERRUM_MAX_BATCHED_TOKENS", "16"),
+            ],
+            "FERRUM_MAX_BATCHED_TOKENS",
+        );
+        expect_invalid_key(&[("FERRUM_MAX_MODEL_LEN", "0")], "FERRUM_MAX_MODEL_LEN");
+        expect_invalid_key(&[("FERRUM_MAX_MODEL_LEN", "50000")], "FERRUM_MAX_MODEL_LEN");
+        expect_invalid_key(
+            &[
+                ("FERRUM_KV_MAX_BLOCKS", "16"),
+                ("FERRUM_MAX_MODEL_LEN", "1024"),
+            ],
+            "FERRUM_KV_MAX_BLOCKS",
+        );
+        expect_invalid_key(&[("FERRUM_DTYPE", "bf16")], "FERRUM_DTYPE");
+        expect_invalid_key(&[("FERRUM_KV_DTYPE", "fp8")], "FERRUM_KV_DTYPE");
+        expect_invalid_key(
+            &[
+                ("FERRUM_VLLM_PAGED_ATTN_V1_SHORT", "1"),
+                ("FERRUM_USE_VLLM_PAGED_ATTN", "0"),
+            ],
+            "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+        );
+    }
+
+    #[test]
+    fn requested_max_model_len_is_optional_and_reflected_when_valid() {
+        let default_resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
+            .resolve()
+            .unwrap();
+        assert!(!default_resolved
+            .decisions
+            .iter()
+            .any(|decision| decision.selection == "max_model_len"));
+
+        let resolved = m3(
+            &[
+                ("FERRUM_KV_MAX_BLOCKS", "64"),
+                ("FERRUM_MAX_MODEL_LEN", "1024"),
+            ],
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        )
+        .resolve()
+        .unwrap();
+        let max_model_len = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "max_model_len")
+            .unwrap();
+        assert_eq!(max_model_len.selected, "1024");
+        assert_eq!(
+            max_model_len.source_key.as_deref(),
+            Some("FERRUM_MAX_MODEL_LEN")
+        );
+    }
+
+    #[test]
+    fn graph_enabled_with_graph_unsafe_moe_is_rejected() {
+        let mut model = ModelCapabilities::qwen3_30b_a3b_gptq_int4();
+        model.graph_safe_moe = false;
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_MOE_GRAPH", "1")]))
+            .with_model_capabilities(model)
+            .with_hardware_capabilities(HardwareCapabilities::rtx4090_cuda(
+                CompiledKernelFeatures::m3_fast_path_without_fa2(),
+            ))
+            .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
+            .resolve()
+            .expect_err("graph unsafe MoE must fail");
+        assert!(matches!(
+            err,
+            AutoConfigError::UnsupportedCombination {
+                selection,
+                ..
+            } if selection == "moe_graph_policy"
+        ));
+    }
+
+    #[test]
+    fn scheduler_override_is_reflected_in_decision_trace() {
+        let resolved = m3(
+            &[("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK", "64")],
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        )
+        .resolve()
+        .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(scheduler.selected, "active_decode_prefill_chunk:64");
+        assert_eq!(
+            scheduler.source_key.as_deref(),
+            Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
+        );
+    }
+
+    #[test]
+    fn prefix_cache_override_is_reflected_in_decision_trace() {
+        let resolved = m3(
+            &[("FERRUM_PREFIX_CACHE", "1")],
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        )
+        .resolve()
+        .unwrap();
+        let prefix_cache = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "prefix_cache_policy")
+            .unwrap();
+        assert_eq!(prefix_cache.selected, "prefix_cache_enabled");
+        assert_eq!(
+            prefix_cache.source_key.as_deref(),
+            Some("FERRUM_PREFIX_CACHE")
+        );
+    }
+
+    #[test]
+    fn non_env_runtime_sources_are_preserved_in_decision_trace() {
+        let runtime_config = snapshot_with_sources(&[
+            (
+                "FERRUM_FA_LAYOUT_VARLEN",
+                "1",
+                RuntimeConfigSource::ConfigFile,
+            ),
+            ("FERRUM_PAGED_MAX_SEQS", "48", RuntimeConfigSource::Cli),
+            (
+                "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+                "32",
+                RuntimeConfigSource::ScriptCase,
+            ),
+        ]);
+        let resolved = FerrumConfigBuilder::new(runtime_config)
+            .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
+            .with_hardware_capabilities(HardwareCapabilities::rtx4090_cuda(
+                CompiledKernelFeatures::m3_fast_path_without_fa2(),
+            ))
+            .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
+            .resolve()
+            .unwrap();
+
+        let decision = |selection: &str| {
+            resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == selection)
+                .unwrap()
+        };
+        let attention = decision("attention_prefill_mixed_backend");
+        assert_eq!(attention.selected, "fa_layout_varlen");
+        assert_eq!(attention.source, AutoConfigSource::ConfigFile);
+        assert_eq!(
+            attention.source_key.as_deref(),
+            Some("FERRUM_FA_LAYOUT_VARLEN")
+        );
+
+        let max_sequences = decision("max_sequences");
+        assert_eq!(max_sequences.selected, "48");
+        assert_eq!(max_sequences.source, AutoConfigSource::Cli);
+        assert_eq!(
+            max_sequences.source_key.as_deref(),
+            Some("FERRUM_PAGED_MAX_SEQS")
+        );
+
+        let scheduler = decision("scheduler_admission_policy");
+        assert_eq!(scheduler.selected, "prefill_first_until_active:32");
+        assert_eq!(scheduler.source, AutoConfigSource::ScriptCase);
+        assert_eq!(
+            scheduler.source_key.as_deref(),
+            Some("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+        );
+    }
+
+    #[test]
+    fn renders_effective_config_and_decision_trace_artifacts() {
+        let resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
+            .resolve()
+            .unwrap();
+        let effective = resolved.effective_config_document();
+        assert_eq!(effective["schema_version"], 1);
+        assert!(effective["env_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(effective["entries"].is_array());
+        assert_eq!(
+            effective["decisions"].as_array().unwrap().len(),
+            resolved.decisions.len()
+        );
+        let trace = resolved.decision_trace_jsonl().unwrap();
+        assert_eq!(trace.lines().count(), resolved.decisions.len());
+        assert!(trace.contains("\"attention_prefill_mixed_backend\""));
+    }
+
+    #[test]
+    fn auto_config_artifacts_match_locked_schema_shape() {
+        let resolved = FerrumConfigBuilder::m3_qwen3_30b_a3b_int4(snapshot_with_sources(&[
+            (
+                "FERRUM_FA_LAYOUT_VARLEN",
+                "1",
+                RuntimeConfigSource::ScriptCase,
+            ),
+            ("FERRUM_PAGED_MAX_SEQS", "32", RuntimeConfigSource::Cli),
+        ]))
+        .resolve()
+        .unwrap();
+
+        let effective = resolved.effective_config_document();
+        assert_eq!(effective["schema_version"], 1);
+        assert!(effective["env_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+
+        let entries = effective["entries"].as_array().unwrap();
+        let keys: Vec<_> = entries
+            .iter()
+            .map(|entry| entry["key"].as_str().unwrap())
+            .collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort_unstable();
+        assert_eq!(keys, sorted_keys);
+        for entry in entries {
+            assert!(entry["key"].as_str().unwrap().starts_with("FERRUM_"));
+            assert!(entry["effective_value"].is_string());
+            assert!(matches!(
+                entry["source"].as_str().unwrap(),
+                "default" | "config_file" | "cli" | "env" | "script_case"
+            ));
+            assert!(!entry["affects"].as_array().unwrap().is_empty());
+        }
+
+        let trace = resolved.decision_trace_jsonl().unwrap();
+        let trace_decisions: Vec<AutoConfigDecision> = trace
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(trace_decisions, resolved.decisions);
+        assert_eq!(
+            serde_json::from_value::<Vec<AutoConfigDecision>>(effective["decisions"].clone())
+                .unwrap(),
+            trace_decisions
+        );
+
+        for decision in &trace_decisions {
+            assert_eq!(decision.schema_version, 1);
+            assert!(!decision.selection.trim().is_empty());
+            assert!(!decision.selected.trim().is_empty());
+            assert!(!decision.candidates.is_empty());
+            assert!(!decision.affects.is_empty());
+            if let Some(source_key) = &decision.source_key {
+                assert!(source_key.starts_with("FERRUM_"));
+            }
+            for rejected in &decision.rejected {
+                assert!(!rejected.value.trim().is_empty());
+                assert!(!rejected.reason.trim().is_empty());
+            }
+        }
+    }
+}

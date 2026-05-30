@@ -2,7 +2,7 @@
 //!
 //! Handles loading and parsing of configuration files for the CLI tool.
 
-use ferrum_types::Result;
+use ferrum_types::{Result, RuntimeConfigEntry, RuntimeConfigSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -25,6 +25,10 @@ pub struct CliConfig {
 
     /// Development configuration
     pub dev: DevConfig,
+
+    /// Runtime overrides loaded from the CLI config file.
+    #[serde(default)]
+    pub runtime: RuntimeCliConfig,
 }
 
 /// Server CLI configuration
@@ -152,6 +156,33 @@ pub struct DevConfig {
 
     /// Test data directory
     pub test_data_dir: String,
+}
+
+/// Runtime knobs that can be sourced from the CLI config file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeCliConfig {
+    /// KV cache dtype override, equivalent to `--kv-dtype` or
+    /// `FERRUM_KV_DTYPE`.
+    #[serde(default)]
+    pub kv_dtype: Option<String>,
+}
+
+impl RuntimeCliConfig {
+    pub fn runtime_config_entries(&self) -> Vec<RuntimeConfigEntry> {
+        let mut entries = Vec::new();
+        if let Some(kv_dtype) = self
+            .kv_dtype
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            entries.push(RuntimeConfigEntry::new(
+                "FERRUM_KV_DTYPE",
+                kv_dtype.to_string(),
+                RuntimeConfigSource::ConfigFile,
+            ));
+        }
+        entries
+    }
 }
 
 impl CliConfig {
@@ -324,5 +355,80 @@ impl Default for DevConfig {
             mock_backends: false,
             test_data_dir: "./test_data".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrum_types::RuntimeConfigEffect;
+
+    #[test]
+    fn runtime_cli_config_emits_config_file_source_entries() {
+        let runtime = RuntimeCliConfig {
+            kv_dtype: Some("int8".to_string()),
+        };
+        let entries = runtime.runtime_config_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "FERRUM_KV_DTYPE");
+        assert_eq!(entries[0].effective_value, "int8");
+        assert_eq!(entries[0].source, RuntimeConfigSource::ConfigFile);
+        assert!(entries[0]
+            .affects
+            .contains(&RuntimeConfigEffect::Correctness));
+    }
+
+    #[test]
+    fn runtime_cli_config_defaults_when_missing_from_toml() {
+        let config: CliConfig = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8000
+            config_path = "server.toml"
+            log_level = "info"
+            hot_reload = false
+
+            [models]
+            model_dir = "./models"
+            cache_dir = "./cache"
+
+            [models.aliases]
+
+            [models.download]
+            hf_cache_dir = "./hf_cache"
+            timeout_seconds = 300
+            max_concurrent = 4
+            retry_attempts = 3
+
+            [benchmark]
+            num_requests = 100
+            concurrency = 10
+            prompt_length = 512
+            max_tokens = 256
+            warmup_requests = 10
+            output_dir = "./benchmark_results"
+
+            [client]
+            base_url = "http://127.0.0.1:8000"
+            timeout_seconds = 30
+
+            [client.retry]
+            max_attempts = 3
+            initial_delay_ms = 100
+            max_delay_ms = 5000
+            backoff_multiplier = 2.0
+
+            [dev]
+            debug = false
+            profile_memory = false
+            profile_gpu = false
+            mock_backends = false
+            test_data_dir = "./test_data"
+            "#,
+        )
+        .unwrap();
+        assert!(config.runtime.kv_dtype.is_none());
+        assert!(config.runtime.runtime_config_entries().is_empty());
     }
 }

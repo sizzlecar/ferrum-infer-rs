@@ -12,6 +12,7 @@
 //! - [`MetricSet`] — p50/p75/p95/p99 of one latency metric
 //! - [`ScalarStats`] — `{mean, stddev, ci95_hw}` ([`stats`] module)
 //! - [`Env`] + [`EnvHash`] — apples-to-apples cell identity ([`env`] module)
+//! - [`ProfileEvent`] — locked structured profile JSONL envelope ([`profile`] module)
 //! - [`compute_metrics`] — the one aggregator both bench CLIs call
 //! - [`arrivals`] module — Poisson inter-arrival times for open-loop
 //!
@@ -24,11 +25,17 @@
 
 pub mod arrivals;
 pub mod env;
+pub mod profile;
 pub mod report;
 pub mod stats;
 pub mod trace;
 
 pub use env::{Env, EnvHash};
+pub use profile::{
+    configure_global_profile, flush_global_profile, global_profile, parse_profile_event_value,
+    parse_profile_jsonl_str, profile_fields_from_json, ProfileEvent, ProfileJsonlWriter,
+    ProfileMetadata, ProfileSinkConfig,
+};
 pub use stats::{ci95_half_width, percentile, student_t_975, PercentileStats, ScalarStats};
 
 use serde::{Deserialize, Serialize};

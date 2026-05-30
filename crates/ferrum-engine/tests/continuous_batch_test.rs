@@ -1,7 +1,7 @@
 //! Integration tests for ContinuousBatchEngine using mock components.
 //! Runs on any platform — no GPU required.
 
-use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine, Scheduler};
+use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine, Scheduler, Tokenizer};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
@@ -83,6 +83,53 @@ async fn streaming_produces_chunks() {
     assert!(
         last.finish_reason.is_some(),
         "Final chunk should have finish_reason"
+    );
+}
+
+#[tokio::test]
+async fn non_streaming_usage_matches_tokenizer_and_generated_tokens() {
+    let engine = make_engine();
+    let tokenizer = MockTokenizer::new(VOCAB_SIZE);
+    let prompt = "usage fixture prompt";
+    let expected_prompt_tokens = tokenizer.encode(prompt, true).unwrap().len();
+
+    let response = engine.infer(make_request(prompt)).await.unwrap();
+
+    assert_eq!(response.usage.prompt_tokens, expected_prompt_tokens);
+    assert_eq!(response.usage.completion_tokens, response.tokens.len());
+    assert_eq!(
+        response.usage.total_tokens,
+        response.usage.prompt_tokens + response.usage.completion_tokens
+    );
+}
+
+#[tokio::test]
+async fn streaming_final_usage_matches_tokenizer_and_emitted_tokens() {
+    use futures::StreamExt;
+
+    let engine = make_engine();
+    let tokenizer = MockTokenizer::new(VOCAB_SIZE);
+    let prompt = "stream usage fixture";
+    let expected_prompt_tokens = tokenizer.encode(prompt, true).unwrap().len();
+
+    let stream = engine.infer_stream(make_request(prompt)).await.unwrap();
+    let chunks: Vec<_> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let emitted_tokens = chunks.iter().filter(|chunk| chunk.token.is_some()).count();
+    let final_usage = chunks
+        .last()
+        .and_then(|chunk| chunk.usage.as_ref())
+        .expect("final stream chunk should include usage");
+
+    assert_eq!(final_usage.prompt_tokens, expected_prompt_tokens);
+    assert_eq!(final_usage.completion_tokens, emitted_tokens);
+    assert_eq!(
+        final_usage.total_tokens,
+        final_usage.prompt_tokens + final_usage.completion_tokens
     );
 }
 
