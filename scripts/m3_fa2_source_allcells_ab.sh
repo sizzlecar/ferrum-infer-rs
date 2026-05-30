@@ -25,7 +25,7 @@ echo "WARMUP_REQUESTS=$WARMUP_REQUESTS"
 echo "CONCURRENCIES=$CONCURRENCIES"
 
 {
-    echo "date=$(date -Is)"
+    echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "host=$(hostname)"
     echo "repo=$(pwd)"
     echo "git_head=$(git rev-parse HEAD 2>/dev/null || true)"

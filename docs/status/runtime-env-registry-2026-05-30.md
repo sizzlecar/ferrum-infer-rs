@@ -162,9 +162,9 @@ Current local scan:
 
 | metric | value |
 |---|---:|
-| files scanned | 582 |
-| unique `FERRUM_*` tokens | 153 |
-| unique standalone candidates | 152 |
+| files scanned | 580 |
+| unique `FERRUM_*` tokens | 152 |
+| unique standalone candidates | 151 |
 | direct env read calls | 90 |
 | process env write calls | 42 |
 | classified process env write calls | 42 |
@@ -174,15 +174,15 @@ Current local scan:
 | classified hot-path direct env read calls | 4 |
 | unclassified hot-path direct env read calls | 0 |
 | ignored non-env symbols | 5 |
-| registry entries | 147 |
-| registry coverage | 147 / 147 env candidates |
+| registry entries | 146 |
+| registry coverage | 146 / 146 env candidates |
 | unregistered baseline backlog | 0 |
 | new unregistered names versus baseline | 0 |
 | product `ferrum.toml` runtime sample keys | `kv_dtype`, `kv_max_blocks`, `max_batched_tokens`, `moe_graph`, `paged_max_seqs`, `prefix_cache` |
 | product `ferrum.toml` raw `FERRUM_*` mentions | 0 |
 | product `ferrum.toml` surface errors | 0 |
 
-The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `90` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `153` token names, `152` standalone env candidates, and `147` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot.
+The hot-path name count is above the original `116`-name snapshot because the structured profile metadata bridge adds diagnostic `FERRUM_PROFILE_*` names in Rust and the vLLM-MoE C++ bridge. The direct-read scanner now requires an actual function call and excludes `std::env::vars()` snapshot iteration, so the current counts are `90` direct reads whole-tree and `4` in hot paths. The hot-path direct-read count is well below the Milestone D quantitative target of `<=26`. The whole-tree token counts are now `152` token names, `151` standalone env candidates, and `146` registered env candidates after explicit non-env ignores because recent local work added FA2/API/profile development scripts, runtime gates, and explicit requested max-model-len validation after the original `143`-name snapshot. The removed `FERRUM_VLLM_VARLEN_SPLIT_K` registry entry was tied only to an archived negative-control script, not an active product/runtime path.
 
 The classified residual hot-path direct-read call sites are:
 
