@@ -1,0 +1,20 @@
+ferrum bench-serve — dataset=random num_prompts=128 warmup=10 n_repeats=5
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/5 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 10.0s
+  cell closed_loop c=32 — repeat 2/5 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 9.9s
+  cell closed_loop c=32 — repeat 3/5 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 9.9s
+  cell closed_loop c=32 — repeat 4/5 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 9.8s
+  cell closed_loop c=32 — repeat 5/5 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 9.9s
+    summary c=32 (n_repeats=5, ± = ci95_hw)
+      TTFT_ms  p50=180.0±16.7  p95=563.9±45.8  p99=660.9±62.3
+      TPOT_ms  p50=17.9±0.1  p95=19.0±0.1  p99=19.6±0.7
+      ITL_ms   p50=15.1±0.2  p95=47.7±0.5  p99=64.2±0.2
+      throughput      1641.9 ± 4.8 tok/s
+      goodput         12.91 ± 0.08 req/s
+
+→ wrote /workspace/m3-fa2-direct-ffi-confirm-n5-20260530/c32_n5.json

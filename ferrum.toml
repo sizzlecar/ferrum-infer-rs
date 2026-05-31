@@ -46,3 +46,15 @@ profile_memory = false
 profile_gpu = false
 mock_backends = false
 test_data_dir = "./test_data"
+
+[runtime]
+# Optional startup runtime overrides. Precedence is CLI > env > config file.
+# Keep product-facing config small; advanced M3/FA2/debug selectors are accepted
+# by the config schema for benchmark artifacts, but are intentionally not
+# listed here as normal user settings.
+# kv_dtype = "fp16"
+# kv_max_blocks = 2048
+# paged_max_seqs = 32
+# max_batched_tokens = 2048
+# prefix_cache = false
+# moe_graph = true

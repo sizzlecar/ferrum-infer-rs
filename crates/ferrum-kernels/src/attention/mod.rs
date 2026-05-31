@@ -5,6 +5,8 @@
 
 #![allow(dead_code, unused_imports, unused_variables, unused_mut, unused_parens)]
 
+use std::sync::OnceLock;
+
 pub mod cpu;
 
 #[cfg(feature = "metal")]
@@ -15,6 +17,46 @@ pub mod metal;
 pub type GpuBuffer = ::metal::Buffer;
 #[cfg(not(feature = "metal"))]
 pub type GpuBuffer = Vec<f32>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttentionRuntimeEnv {
+    fused_cpu: bool,
+    fused_metal: bool,
+}
+
+impl AttentionRuntimeEnv {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut fused_cpu = false;
+        let mut fused_metal = false;
+
+        for (key, value) in vars {
+            match key.as_ref() {
+                "FERRUM_FUSED_CPU" => fused_cpu = value.as_ref() == "1",
+                "FERRUM_FUSED_METAL" => fused_metal = value.as_ref() == "1",
+                _ => {}
+            }
+        }
+
+        Self {
+            fused_cpu,
+            fused_metal,
+        }
+    }
+}
+
+fn attention_runtime_env() -> &'static AttentionRuntimeEnv {
+    static CONFIG: OnceLock<AttentionRuntimeEnv> = OnceLock::new();
+    CONFIG.get_or_init(AttentionRuntimeEnv::from_env)
+}
 
 /// Attention configuration.
 #[derive(Clone, Debug, Default)]
@@ -151,9 +193,10 @@ impl FusedTransformer {
         //   FERRUM_FUSED_CPU=1  → force CPU
         //   FERRUM_FUSED_METAL=1 → force Metal
         //   otherwise → auto: Metal for large models (28-layer talker), CPU for small (SubTalker/vocoder)
-        let use_cpu = if std::env::var("FERRUM_FUSED_CPU").as_deref() == Ok("1") {
+        let runtime_env = attention_runtime_env();
+        let use_cpu = if runtime_env.fused_cpu {
             true
-        } else if std::env::var("FERRUM_FUSED_METAL").as_deref() == Ok("1") {
+        } else if runtime_env.fused_metal {
             false
         } else {
             // Metal for talker (28) + vocoder (8), CPU for SubTalker (5) only
@@ -834,5 +877,32 @@ impl FusedTransformer {
                 kv.reset();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attention_runtime_env_parses_forced_backends() {
+        let env = AttentionRuntimeEnv::from_env_vars([
+            ("FERRUM_FUSED_CPU", "1"),
+            ("FERRUM_FUSED_METAL", "0"),
+        ]);
+
+        assert!(env.fused_cpu);
+        assert!(!env.fused_metal);
+    }
+
+    #[test]
+    fn attention_runtime_env_only_accepts_one() {
+        let env = AttentionRuntimeEnv::from_env_vars([
+            ("FERRUM_FUSED_CPU", "true"),
+            ("FERRUM_FUSED_METAL", "1"),
+        ]);
+
+        assert!(!env.fused_cpu);
+        assert!(env.fused_metal);
     }
 }

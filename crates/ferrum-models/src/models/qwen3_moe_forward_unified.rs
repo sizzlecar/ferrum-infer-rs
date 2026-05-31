@@ -16,10 +16,139 @@
 //! Returns one `Option<Vec<f32>>` per item: `Some(logits)` only for
 //! items whose `is_final_chunk = true`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_interfaces::kv_dtype::KvDtypeKind;
 use ferrum_kernels::backend::{Backend, BackendPagedKv, MoeLlmBackend};
 
 use super::qwen3_moe::Qwen3MoeModel;
+use super::qwen3_moe_forward_unified_layer::UnifiedLayerParams;
+
+#[derive(Default)]
+pub(crate) struct UnifiedLayerProfile {
+    pub(super) input_norm_us: u64,
+    pub(super) qkv_us: u64,
+    pub(super) split_cache_us: u64,
+    pub(super) attn_us: u64,
+    pub(super) o_proj_us: u64,
+    pub(super) post_norm_us: u64,
+    pub(super) router_us: u64,
+    pub(super) moe_us: u64,
+    pub(super) residual_add_us: u64,
+    pub(super) final_norm_us: u64,
+    pub(super) sample_gather_us: u64,
+    pub(super) lm_head_us: u64,
+    pub(super) readback_us: u64,
+}
+
+static UNIFIED_LAYER_PROF_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn unified_stage_start<B: Backend>(
+    ctx: &mut B::Context,
+    enabled: bool,
+) -> Option<Instant> {
+    if enabled {
+        B::sync(ctx);
+        Some(Instant::now())
+    } else {
+        None
+    }
+}
+
+pub(super) fn unified_stage_finish<B: Backend>(
+    ctx: &mut B::Context,
+    start: Option<Instant>,
+) -> u64 {
+    if let Some(start) = start {
+        B::sync(ctx);
+        start.elapsed().as_micros() as u64
+    } else {
+        0
+    }
+}
+
+fn log_unified_layer_profile(
+    prof: &UnifiedLayerProfile,
+    m_total: usize,
+    num_seqs: usize,
+    num_sampled: usize,
+    num_layers: usize,
+    every: u64,
+) {
+    let call = UNIFIED_LAYER_PROF_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if call > 8 && call % every != 0 {
+        return;
+    }
+
+    let layer_sum = prof.input_norm_us
+        + prof.qkv_us
+        + prof.split_cache_us
+        + prof.attn_us
+        + prof.o_proj_us
+        + prof.post_norm_us
+        + prof.router_us
+        + prof.moe_us
+        + prof.residual_add_us;
+    let final_sum = prof.final_norm_us + prof.sample_gather_us + prof.lm_head_us + prof.readback_us;
+    eprintln!(
+        "[unified-layer-prof] call#{} m={} seqs={} sampled={} layers={} layer_sum={}us final_sum={}us \
+         input_norm={} qkv={} split_cache={} attn={} o_proj={} post_norm={} router={} moe={} residual_add={} \
+         final_norm={} sample_gather={} lm_head={} readback={} (us)",
+        call,
+        m_total,
+        num_seqs,
+        num_sampled,
+        num_layers,
+        layer_sum,
+        final_sum,
+        prof.input_norm_us,
+        prof.qkv_us,
+        prof.split_cache_us,
+        prof.attn_us,
+        prof.o_proj_us,
+        prof.post_norm_us,
+        prof.router_us,
+        prof.moe_us,
+        prof.residual_add_us,
+        prof.final_norm_us,
+        prof.sample_gather_us,
+        prof.lm_head_us,
+        prof.readback_us,
+    );
+    let profile = global_profile();
+    if profile.is_enabled() {
+        let _ = profile.push_event(
+            "unified_layer_prof",
+            profile_fields_from_json(serde_json::json!({
+                "call": call,
+                "m": m_total,
+                "seqs": num_seqs,
+                "sampled": num_sampled,
+                "layers": num_layers,
+            })),
+            profile_fields_from_json(serde_json::json!({
+                "layer_sum": layer_sum,
+                "final_sum": final_sum,
+                "input_norm": prof.input_norm_us,
+                "qkv": prof.qkv_us,
+                "split_cache": prof.split_cache_us,
+                "attn": prof.attn_us,
+                "o_proj": prof.o_proj_us,
+                "post_norm": prof.post_norm_us,
+                "router": prof.router_us,
+                "moe": prof.moe_us,
+                "residual_add": prof.residual_add_us,
+                "final_norm": prof.final_norm_us,
+                "sample_gather": prof.sample_gather_us,
+                "lm_head": prof.lm_head_us,
+                "readback": prof.readback_us,
+            })),
+            false,
+        );
+    }
+}
 
 impl<B, K> Qwen3MoeModel<B, K>
 where
@@ -38,6 +167,12 @@ where
         let (q_lens, cu_seqlens_q, m_total) =
             crate::common::decoder_unified::compute_cu_seqlens_q(items);
         let pos_offsets = crate::common::decoder_unified::compute_pos_offsets(items);
+        let seq_lens: Vec<u32> = pos_offsets
+            .iter()
+            .zip(q_lens.iter())
+            .map(|(&pos, &q_len)| pos + q_len as u32)
+            .collect();
+        let max_q_len = q_lens.iter().copied().max().unwrap_or(0);
         let max_kv_len = crate::common::decoder_unified::compute_max_kv_len(items);
         let num_seqs = items.len();
         let final_indices =
@@ -109,6 +244,14 @@ where
                 .expect("unified_pos_offsets missing");
             B::write_typed::<u32>(&mut ctx, po, &pos_offsets);
         }
+        {
+            let sl = self
+                .scratch
+                .unified_seq_lens
+                .as_mut()
+                .expect("unified_seq_lens missing");
+            B::write_typed::<u32>(&mut ctx, sl, &seq_lens);
+        }
         let stacked =
             crate::common::decoder_unified::stack_block_tables(items, max_blocks_per_seq, |cid| {
                 self.kv_caches
@@ -126,19 +269,55 @@ where
             B::write_typed::<u32>(&mut ctx, bt, &stacked);
         }
 
+        let use_vllm_tiled_q4 =
+            self.use_vllm_paged_attn && self.runtime_env.vllm_varlen_tiled_q4 && m_total > num_seqs;
+        let mut tile_q4_count = 0usize;
+        if use_vllm_tiled_q4 {
+            let mut tile_seqs = Vec::with_capacity(m_total);
+            let mut tile_starts = Vec::with_capacity(m_total);
+            for (seq_idx, &q_len) in q_lens.iter().enumerate() {
+                for start in (0..q_len).step_by(4) {
+                    tile_seqs.push(seq_idx as u32);
+                    tile_starts.push(start as u32);
+                }
+            }
+            tile_q4_count = tile_seqs.len();
+            let tile_seqs_buf = self
+                .scratch
+                .unified_tile_q4_seqs
+                .as_mut()
+                .expect("unified_tile_q4_seqs missing");
+            B::write_typed::<u32>(&mut ctx, tile_seqs_buf, &tile_seqs);
+            let tile_starts_buf = self
+                .scratch
+                .unified_tile_q4_starts
+                .as_mut()
+                .expect("unified_tile_q4_starts missing");
+            B::write_typed::<u32>(&mut ctx, tile_starts_buf, &tile_starts);
+        }
+
         // Pre-grow Marlin gather scratch for worst-case GEMM input m.
         let max_marlin_required = m_total * inter;
         B::pregrow_marlin_gather_scratch(&mut ctx, max_marlin_required);
         B::sync(&mut ctx);
 
         // ── 6. Layer loop ──
+        let mut layer_prof = if self
+            .runtime_env
+            .unified_layer_prof_selected(m_total, num_seqs)
+        {
+            Some(UnifiedLayerProfile::default())
+        } else {
+            None
+        };
         for li in 0..num_layers {
-            self.unified_forward_layer(
-                &mut ctx,
+            self.unified_forward_layer(UnifiedLayerParams {
+                ctx: &mut ctx,
                 li,
-                &mut residual,
+                residual: &mut residual,
                 m_total,
                 num_seqs,
+                max_q_len,
                 max_kv_len,
                 max_blocks_per_seq,
                 block_size,
@@ -152,10 +331,15 @@ where
                 top_k,
                 n_exp,
                 norm_topk_prob,
-            );
+                use_vllm_tiled_q4,
+                tile_q4_count,
+                prof: layer_prof.as_mut(),
+            });
         }
 
         // ── 7. Final rms_norm + lm_head on per-item last tokens ──
+        let prof_enabled = layer_prof.is_some();
+        let t_final_norm = unified_stage_start::<B>(&mut ctx, prof_enabled);
         B::rms_norm(
             &mut ctx,
             &residual,
@@ -165,6 +349,9 @@ where
             m_total,
             h,
         );
+        if let Some(prof) = layer_prof.as_mut() {
+            prof.final_norm_us += unified_stage_finish::<B>(&mut ctx, t_final_norm);
+        }
 
         if num_sampled > 0 {
             let packed_normed = self
@@ -172,6 +359,7 @@ where
                 .unified_packed_normed
                 .as_mut()
                 .expect("unified_packed_normed missing");
+            let t_sample_gather = unified_stage_start::<B>(&mut ctx, prof_enabled);
             for (j, &(_, global)) in final_indices.iter().enumerate() {
                 B::copy_slice(
                     &mut ctx,
@@ -182,16 +370,24 @@ where
                     h,
                 );
             }
+            if let Some(prof) = layer_prof.as_mut() {
+                prof.sample_gather_us += unified_stage_finish::<B>(&mut ctx, t_sample_gather);
+            }
             let packed_logits = self
                 .scratch
                 .unified_packed_logits
                 .as_mut()
                 .expect("unified_packed_logits missing");
+            let t_lm_head = unified_stage_start::<B>(&mut ctx, prof_enabled);
             self.lm_head
                 .forward(&mut ctx, packed_normed, packed_logits, num_sampled);
+            if let Some(prof) = layer_prof.as_mut() {
+                prof.lm_head_us += unified_stage_finish::<B>(&mut ctx, t_lm_head);
+            }
         }
 
         // ── 8. Sync + readback per-item logits ──
+        let t_readback = unified_stage_start::<B>(&mut ctx, prof_enabled);
         B::sync(&mut ctx);
         let mut out: Vec<Option<Vec<f32>>> = (0..items.len()).map(|_| None).collect();
         if num_sampled > 0 {
@@ -200,11 +396,30 @@ where
                 .unified_packed_logits
                 .as_ref()
                 .expect("unified_packed_logits missing");
-            let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
-            for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
-                let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
-                out[orig_idx] = Some(row);
+            if self.runtime_env.unified_greedy_argmax {
+                let tokens = B::argmax_rows_f16(&mut ctx, packed_logits, num_sampled, vocab)
+                    .expect("Qwen3Moe unified: argmax_rows_f16");
+                for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                    out[orig_idx] = Some(vec![tokens[j] as f32]);
+                }
+            } else {
+                let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
+                for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                    let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
+                    out[orig_idx] = Some(row);
+                }
             }
+        }
+        if let Some(prof) = layer_prof.as_mut() {
+            prof.readback_us += unified_stage_finish::<B>(&mut ctx, t_readback);
+            log_unified_layer_profile(
+                prof,
+                m_total,
+                num_seqs,
+                num_sampled,
+                num_layers,
+                self.runtime_env.unified_layer_prof_every,
+            );
         }
 
         // ── 9. Bump cache.len per item ──
@@ -222,217 +437,5 @@ where
         self.scratch.residual = Some(residual);
 
         out
-    }
-
-    /// One transformer layer for the unified forward. Mirrors Llama's
-    /// `unified_forward_layer` for steps 1-6 (shared attention path) and
-    /// dispatches MoE via `moe_forward_bucketed` for the FFN block.
-    /// Uses LEGACY scratch fields (sized for `max_tokens`) — no per-call
-    /// realloc, no buffer duplication.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn unified_forward_layer(
-        &mut self,
-        ctx: &mut B::Context,
-        li: usize,
-        residual: &mut B::Buffer,
-        m_total: usize,
-        num_seqs: usize,
-        max_kv_len: usize,
-        max_blocks_per_seq: usize,
-        block_size: usize,
-        nh: usize,
-        nkv: usize,
-        hd: usize,
-        h: usize,
-        inter: usize,
-        eps: f32,
-        qk_mode: i32,
-        top_k: usize,
-        n_exp: usize,
-        norm_topk_prob: bool,
-    ) {
-        let attn_layer = &self.attn_layers[li];
-        let moe_layer = &self.moe_layers[li];
-        let dummy_w = &attn_layer.input_ln_w;
-        let q_norm_w = attn_layer.q_norm_w.as_ref().unwrap_or(dummy_w);
-        let k_norm_w = attn_layer.k_norm_w.as_ref().unwrap_or(dummy_w);
-
-        // 1. Input rms_norm [m_total, h] → scratch.norm_out
-        B::rms_norm(
-            ctx,
-            residual,
-            &attn_layer.input_ln_w,
-            eps,
-            &mut self.scratch.norm_out,
-            m_total,
-            h,
-        );
-
-        // 2. qkv_proj GEMM (m = M_total): norm_out → qkv_out
-        attn_layer.qkv_proj.forward(
-            ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.qkv_out,
-            m_total,
-        );
-
-        // 3. varlen split_qkv_norm_rope_into_paged_cache
-        let pools = self
-            .paged_pools
-            .as_mut()
-            .expect("unified_forward_layer requires paged_pools");
-        let pool_ptr = (
-            &mut pools[li].0 as *mut B::Buffer,
-            &mut pools[li].1 as *mut B::Buffer,
-        );
-        // SAFETY: pools allocated once, no concurrent mutation.
-        let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
-
-        {
-            let cu_seqlens_buf = self
-                .scratch
-                .unified_cu_seqlens_q
-                .as_ref()
-                .expect("unified_cu_seqlens_q missing");
-            let pos_offsets_buf = self
-                .scratch
-                .unified_pos_offsets
-                .as_ref()
-                .expect("unified_pos_offsets missing");
-            let bt_buf = self
-                .scratch
-                .unified_block_tables
-                .as_ref()
-                .expect("unified_block_tables missing");
-            B::split_qkv_norm_rope_into_paged_cache_varlen(
-                ctx,
-                &self.scratch.qkv_out,
-                q_norm_w,
-                k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
-                &mut self.scratch.q_head_major,
-                pool_k,
-                pool_v,
-                cu_seqlens_buf,
-                pos_offsets_buf,
-                bt_buf,
-                num_seqs,
-                m_total,
-                nh,
-                nkv,
-                hd,
-                eps,
-                qk_mode,
-                block_size,
-                max_blocks_per_seq,
-            )
-            .expect("Qwen3Moe unified: split_qkv_norm_rope_into_paged_cache_varlen");
-        }
-
-        // 4. paged_varlen_attention
-        {
-            let cu_seqlens_buf = self
-                .scratch
-                .unified_cu_seqlens_q
-                .as_ref()
-                .expect("unified_cu_seqlens_q missing");
-            let pos_offsets_buf = self
-                .scratch
-                .unified_pos_offsets
-                .as_ref()
-                .expect("unified_pos_offsets missing");
-            let bt_buf = self
-                .scratch
-                .unified_block_tables
-                .as_ref()
-                .expect("unified_block_tables missing");
-            B::paged_varlen_attention(
-                ctx,
-                &self.scratch.q_head_major,
-                pool_k,
-                pool_v,
-                &mut self.scratch.attn_head_major_out,
-                cu_seqlens_buf,
-                pos_offsets_buf,
-                bt_buf,
-                num_seqs,
-                m_total,
-                max_kv_len,
-                nh,
-                nkv,
-                hd,
-                block_size,
-                max_blocks_per_seq,
-            )
-            .expect("Qwen3Moe unified: paged_varlen_attention");
-        }
-
-        // 5. o_proj (m = M_total): attn_head_major_out → o_proj_out
-        attn_layer.o_proj.forward(
-            ctx,
-            &self.scratch.attn_head_major_out,
-            &mut self.scratch.o_proj_out,
-            m_total,
-        );
-
-        // 6. fused_add_rms_norm: residual += o_proj_out; norm → scratch.norm_out
-        //    (reusing scratch.norm_out as the MoE input — the legacy MoE
-        //    forward also reads scratch.norm_out, so this naturally
-        //    feeds the next step.)
-        B::fused_add_rms_norm(
-            ctx,
-            residual,
-            &self.scratch.o_proj_out,
-            &attn_layer.post_ln_w,
-            eps,
-            &mut self.scratch.norm_out,
-            m_total,
-            h,
-        );
-
-        // 7. Router GEMM: norm_out → router_logits
-        moe_layer.router.forward(
-            ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.router_logits,
-            m_total,
-        );
-
-        // 8. MoE forward (bucketed CUDA path).
-        //    Reads scratch.norm_out + scratch.router_logits. Writes scratch.moe_out.
-        //    M = m_total; MoE routes each token independently (no per-request boundary).
-        crate::moe::moe_forward_bucketed::<B>(
-            ctx,
-            &self.scratch.norm_out,
-            &self.scratch.router_logits,
-            &mut self.scratch.moe_out,
-            m_total,
-            h,
-            inter,
-            n_exp,
-            top_k,
-            norm_topk_prob,
-            &moe_layer.experts,
-            &mut self.scratch.x_packed_bucket,
-            &mut self.scratch.gate_up_packed_bucket,
-            &mut self.scratch.silu_stacked,
-            &mut self.scratch.down_out_stacked,
-            &mut self.scratch.moe_route_scratch,
-            Some(crate::moe::dispatch::DeviceRouteScratch {
-                selected_ids: &mut self.scratch.selected_ids_buf,
-                pair_weights: &mut self.scratch.route_pair_weights_dev,
-                pairs_by_token: &mut self.scratch.route_pairs_dev,
-                packed_token_idx: &mut self.scratch.route_packed_idx_dev,
-                expert_offsets: &mut self.scratch.route_expert_offsets_dev,
-                sorted_tokens: &mut self.scratch.route_sorted_tokens_dev,
-                block_ids: &mut self.scratch.route_block_ids_dev,
-                total_post_pad: &mut self.scratch.route_total_post_pad_dev,
-            }),
-        )
-        .expect("Qwen3Moe unified: moe_forward_bucketed");
-
-        // 9. residual += moe_out
-        B::add_inplace(ctx, residual, &self.scratch.moe_out, m_total * h);
     }
 }

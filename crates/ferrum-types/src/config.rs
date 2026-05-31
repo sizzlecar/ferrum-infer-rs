@@ -1,6 +1,9 @@
 //! Configuration types for Ferrum components
 
-use crate::{DataType, Device, ModelId, ModelInfo, SamplingParams, SamplingPresets};
+use crate::{
+    parse_bool_env_value, parse_usize_env_value, DataType, Device, ModelId, ModelInfo,
+    RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
@@ -15,6 +18,24 @@ pub struct EngineConfig {
     pub memory: MemoryConfig,
     pub batching: BatchConfig,
     pub monitoring: MonitoringConfig,
+}
+
+impl EngineConfig {
+    pub fn apply_runtime_config_snapshot(
+        &mut self,
+        snapshot: &RuntimeConfigSnapshot,
+    ) -> std::result::Result<(), String> {
+        self.scheduler.apply_runtime_config_snapshot(snapshot)?;
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_KV_MAX_BLOCKS") {
+            self.kv_cache.max_blocks =
+                parse_required_positive_usize("FERRUM_KV_MAX_BLOCKS", value)?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_MAX_BATCHED_TOKENS") {
+            self.batching.max_num_batched_tokens =
+                parse_required_positive_usize("FERRUM_MAX_BATCHED_TOKENS", value)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +72,18 @@ pub struct SchedulerConfig {
     pub fair_share_weights: HashMap<String, f32>,
     /// SLA enforcement enabled
     pub enable_sla_enforcement: bool,
+    /// Use prompt-token metadata for initial continuous-batch admission estimates.
+    #[serde(default)]
+    pub prompt_token_estimate: bool,
+    /// Prefer new prefills over early decodes until this many requests are active.
+    #[serde(default)]
+    pub prefill_first_until_active: Option<usize>,
+    /// Cap prefill admission chunks only while decode requests are already active.
+    #[serde(default)]
+    pub active_decode_prefill_chunk: Option<usize>,
+    /// Emit diagnostic scheduler None/SOME decisions.
+    #[serde(default)]
+    pub scheduler_none_prof: bool,
 }
 
 impl Default for SchedulerConfig {
@@ -63,7 +96,71 @@ impl Default for SchedulerConfig {
             enable_load_balancing: false,
             fair_share_weights: HashMap::new(),
             enable_sla_enforcement: false,
+            prompt_token_estimate: false,
+            prefill_first_until_active: None,
+            active_decode_prefill_chunk: None,
+            scheduler_none_prof: false,
         }
+    }
+}
+
+impl SchedulerConfig {
+    pub fn apply_runtime_config_snapshot(
+        &mut self,
+        snapshot: &RuntimeConfigSnapshot,
+    ) -> std::result::Result<(), String> {
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE") {
+            self.prompt_token_estimate = parse_bool_env_value(value)
+                .map_err(|reason| format!("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE: {reason}"))?;
+        }
+        if let Some(value) =
+            runtime_config_value(snapshot, "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+        {
+            self.prefill_first_until_active =
+                parse_optional_positive_usize("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE", value)?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK") {
+            self.active_decode_prefill_chunk =
+                parse_optional_positive_usize("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK", value)?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_NONE_PROF") {
+            self.scheduler_none_prof = parse_presence_bool(value)
+                .map_err(|reason| format!("FERRUM_SCHED_NONE_PROF: {reason}"))?;
+        }
+        Ok(())
+    }
+}
+
+fn runtime_config_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.effective_value.as_str())
+}
+
+fn parse_optional_positive_usize(
+    key: &str,
+    value: &str,
+) -> std::result::Result<Option<usize>, String> {
+    let parsed = parse_usize_env_value(value).map_err(|reason| format!("{key}: {reason}"))?;
+    Ok((parsed > 0).then_some(parsed))
+}
+
+fn parse_required_positive_usize(key: &str, value: &str) -> std::result::Result<usize, String> {
+    let parsed = parse_usize_env_value(value).map_err(|reason| format!("{key}: {reason}"))?;
+    if parsed == 0 {
+        Err(format!("{key}: must be greater than zero"))
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn parse_presence_bool(value: &str) -> std::result::Result<bool, String> {
+    if value.trim().is_empty() {
+        Ok(true)
+    } else {
+        parse_bool_env_value(value)
     }
 }
 
@@ -117,19 +214,13 @@ impl Default for KvCacheConfig {
     fn default() -> Self {
         // 2048 blocks covers c=32 ShareGPT prompts (~32×500/16 = 1000
         // blocks). The previous 1024 floor crashed at c≥16 on real
-        // workloads with "Block pool exhausted". `FERRUM_KV_MAX_BLOCKS`
-        // is set by the GPU autosizer (`ferrum-cli::gpu_mem_autosize`)
-        // before engine construction; honour it here so the autosizer
-        // is the single source of truth for memory-budgeted runs.
-        let max_blocks = std::env::var("FERRUM_KV_MAX_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2048);
+        // workloads with "Block pool exhausted". Runtime overrides are
+        // applied through EngineConfig::apply_runtime_config_snapshot.
         Self {
             cache_type: KvCacheType::Contiguous,
             dtype: KvCacheDtype::default(),
             block_size: 16,
-            max_blocks,
+            max_blocks: 2048,
             enable_compression: false,
             compression_ratio: 0.5,
             enable_multi_level: true,
@@ -441,22 +532,16 @@ pub struct BatchConfig {
     /// vLLM-style per-iteration token budget. The scheduler emits a
     /// mixed prefill+decode batch summing to at most this many Q
     /// tokens (decode = 1 each, prefill chunk = its chunk size).
-    /// Default 4096 — large enough that the Qwen3MoE unified path
-    /// activates for typical cohort prefills (c=32 × 128 tokens ≈
-    /// 4 K) without pushing scratch past the 4 GB reserve carved by
-    /// `gpu_mem_autosize`. `FERRUM_MAX_BATCHED_TOKENS` (set by the
-    /// autosizer for `serve` / chat profile) overrides; users
-    /// should not set it by hand.
+    /// Default 2048. Runtime snapshots can override this with
+    /// `FERRUM_MAX_BATCHED_TOKENS`, usually from the GPU autosizer or a
+    /// named workload preset rather than a user hand-written env bundle.
     #[serde(default = "BatchConfig::default_max_num_batched_tokens")]
     pub max_num_batched_tokens: usize,
 }
 
 impl BatchConfig {
     fn default_max_num_batched_tokens() -> usize {
-        std::env::var("FERRUM_MAX_BATCHED_TOKENS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2048)
+        2048
     }
 }
 

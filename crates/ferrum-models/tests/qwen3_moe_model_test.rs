@@ -261,6 +261,7 @@ static MOE_GRAPH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct MoeGraphEnvGuard {
     prev_graph: Option<String>,
     prev_threshold: Option<String>,
+    prev_vllm_moe: Option<String>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -273,14 +274,21 @@ impl MoeGraphEnvGuard {
             .unwrap_or_else(|p| p.into_inner());
         let prev_graph = std::env::var("FERRUM_MOE_GRAPH").ok();
         let prev_threshold = std::env::var("FERRUM_MOE_BATCH_THRESHOLD").ok();
+        let prev_vllm_moe = std::env::var("FERRUM_VLLM_MOE").ok();
         // SAFETY: the lock above serializes env-var access across tests.
         unsafe {
             std::env::set_var("FERRUM_MOE_GRAPH", graph_value);
             std::env::set_var("FERRUM_MOE_BATCH_THRESHOLD", "2");
+            if graph_value == "1" {
+                std::env::set_var("FERRUM_VLLM_MOE", "1");
+            } else {
+                std::env::remove_var("FERRUM_VLLM_MOE");
+            }
         }
         Self {
             prev_graph,
             prev_threshold,
+            prev_vllm_moe,
             _lock: lock,
         }
     }
@@ -298,6 +306,11 @@ impl Drop for MoeGraphEnvGuard {
                 std::env::set_var("FERRUM_MOE_BATCH_THRESHOLD", v);
             } else {
                 std::env::remove_var("FERRUM_MOE_BATCH_THRESHOLD");
+            }
+            if let Some(ref v) = self.prev_vllm_moe {
+                std::env::set_var("FERRUM_VLLM_MOE", v);
+            } else {
+                std::env::remove_var("FERRUM_VLLM_MOE");
             }
         }
     }

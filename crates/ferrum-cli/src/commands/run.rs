@@ -5,7 +5,10 @@ use chrono::Utc;
 use clap::{Args, ValueEnum};
 use colored::*;
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
-use ferrum_types::{FinishReason, InferenceRequest, Priority, RequestId, Result, SamplingParams};
+use ferrum_types::{
+    FinishReason, InferenceRequest, Priority, RequestId, Result, RuntimeConfigSnapshot,
+    SamplingParams,
+};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -175,11 +178,16 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
-    // Default-ON `FERRUM_MOE_GRAPH=1`. Independent of the autosizer
-    // run below — autosize early-returns when the user has set
-    // KV_MAX_BLOCKS + PAGED_MAX_SEQS, skipping the MOE_GRAPH setter
-    // that used to follow.
-    crate::gpu_mem_autosize::apply_moe_graph_default();
+    // Resolve graph-clean Qwen3-MoE defaults as typed entries first, then
+    // materialize them only for legacy backend readers.
+    let moe_graph_defaults = crate::runtime_env::moe_graph_default_entries(
+        &ferrum_types::RuntimeConfigSnapshot::capture_current(),
+        ferrum_types::RuntimeConfigSource::Default,
+    );
+    crate::runtime_env::materialize_runtime_env_defaults(&moe_graph_defaults);
+    crate::runtime_env::warn_if_moe_graph_needs_unbuilt_vllm_moe(
+        &ferrum_types::RuntimeConfigSnapshot::capture_current(),
+    );
 
     // Resolve the model through the central source resolver. Handles
     // .gguf paths, local model dirs, HF cache hits, and HF download in
@@ -204,14 +212,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let model_id = source.original.clone();
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 
-    // Set model path for engine
-    // NOTE: std::env::set_var is unsafe on Rust 2024; keep it minimal and explicit.
-    unsafe {
-        std::env::set_var(
-            "FERRUM_MODEL_PATH",
-            source.local_path.to_string_lossy().to_string(),
-        );
-    }
+    let engine_model_path = source.local_path.to_string_lossy().to_string();
 
     // Select device
     let device = select_device(&cmd.backend);
@@ -230,7 +231,19 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let mut engine_config = ferrum_types::EngineConfig::default();
     engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
     engine_config.backend.device = device;
-    apply_kv_dtype_override(&mut engine_config, cmd.kv_dtype.as_deref())?;
+    engine_config.backend.backend_options.insert(
+        "model_path".to_string(),
+        serde_json::Value::String(engine_model_path),
+    );
+    let runtime_config = RuntimeConfigSnapshot::capture_current();
+    engine_config
+        .apply_runtime_config_snapshot(&runtime_config)
+        .map_err(ferrum_types::FerrumError::config)?;
+    let effective_kv_dtype = cmd
+        .kv_dtype
+        .as_deref()
+        .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
+    apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
     let engine = ferrum_engine::create_default_engine(engine_config).await?;
     eprintln!(
         "{}",
@@ -276,6 +289,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             client_id: None,
             session_id: None,
             created_at: Utc::now(),
+            api_request: None,
             metadata: HashMap::new(),
         };
         let mut stream = engine.infer_stream(request).await?;
@@ -425,6 +439,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     client_id: None,
                     session_id: None,
                     created_at: Utc::now(),
+                    api_request: None,
                     metadata: HashMap::new(),
                 };
 
@@ -848,23 +863,20 @@ fn build_chat_prompt(
     }
 }
 
-/// Apply the `--kv-dtype` CLI flag (or `FERRUM_KV_DTYPE` env override)
-/// to an engine config, validating early. Default is FP16 (the
-/// production-validated path on every backend); selecting INT8 / FP8
-/// is rejected with a helpful message until model integration ships.
+/// Apply the resolved `--kv-dtype` / runtime-config override to an engine
+/// config, validating early. Default is FP16 (the production-validated path on
+/// every backend); selecting INT8 / FP8 is rejected with a helpful message
+/// until model integration ships.
 pub fn apply_kv_dtype_override(
     engine_config: &mut ferrum_types::EngineConfig,
-    cli_arg: Option<&str>,
+    raw: Option<&str>,
 ) -> ferrum_types::Result<()> {
     use ferrum_types::KvCacheDtype;
-    let raw = cli_arg
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("FERRUM_KV_DTYPE").ok());
     let Some(raw) = raw else {
         // No override → keep config default (FP16).
         return Ok(());
     };
-    let parsed = KvCacheDtype::parse(&raw).ok_or_else(|| {
+    let parsed = KvCacheDtype::parse(raw).ok_or_else(|| {
         ferrum_types::FerrumError::config(format!(
             "Unknown --kv-dtype value '{}'. Accepts: fp16, bf16, int8, fp8.",
             raw

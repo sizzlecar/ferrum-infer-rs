@@ -15,6 +15,7 @@ ferrum-bench-core = { workspace = true }
 candle-core = { workspace = true }
 half = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
 rayon = { workspace = true }
 cudarc = { version = "0.19", default-features = false, features = ["driver", "cublas", "f16", "nvrtc", "cuda-version-from-build-system"], optional = true }
 metal = { version = "0.31", optional = true }
@@ -46,6 +47,12 @@ vllm-paged-attn-v2 = ["cuda"]  # vLLM paged_attention_v2 port (2026-05-12).
                         # PTX kernel which writes the vLLM K/V layout vLLM v2
                         # expects (`[blocks, heads, head/x, block, x]` K).
                         # Runtime selection via `FERRUM_USE_VLLM_PAGED_ATTN=1`.
+fa2-source = ["cuda"]  # Source-built FlashAttention-2 paged-varlen bridge.
+                        # Opt-in prototype for Qwen3 M3 shape (HEAD=128,
+                        # BLOCK=16, FP16). Builds FA2 forward templates from a
+                        # source checkout and links them into ferrum-kernels so
+                        # runtime does not depend on vLLM/Torch/Python.
+                        # Runtime selection via `FERRUM_FA2_SOURCE=1`.
 tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files

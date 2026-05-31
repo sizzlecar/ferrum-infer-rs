@@ -15,7 +15,7 @@ use ferrum_types::Result;
 
 use crate::models::qwen3_moe::{Qwen3MoeLayerState, Qwen3MoeScratch};
 
-use crate::models::qwen3_moe::{
+use crate::models::qwen3_moe_profile::{
     DEC_DOWN_US, DEC_GATE_US, DEC_ROUTE_US, DEC_SILU_US, DEC_UP_US, DEC_WSUM_US,
     MOE_BATCHED_DECODE_DOWN_US, MOE_BATCHED_DECODE_GATE_US, MOE_BATCHED_DECODE_ROUTE_US,
     MOE_BATCHED_DECODE_SILU_US, MOE_BATCHED_DECODE_UP_US, MOE_BATCHED_DECODE_WSUM_US,
@@ -26,6 +26,52 @@ use crate::models::qwen3_moe::{
 };
 use std::sync::atomic::AtomicU64;
 use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MoeForwardRuntimeConfig {
+    decode_op_profile: bool,
+    fused_gate_up_silu_disabled: bool,
+    moe_host_topk: bool,
+    moe_direct_dispatch: bool,
+}
+
+impl MoeForwardRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut config = Self {
+            decode_op_profile: false,
+            fused_gate_up_silu_disabled: false,
+            moe_host_topk: false,
+            moe_direct_dispatch: false,
+        };
+        for (name, value) in vars {
+            let value = value.as_ref();
+            match name.as_ref() {
+                "FERRUM_DECODE_OP_PROFILE" => config.decode_op_profile = true,
+                "FERRUM_MOE_FUSED_GATE_UP_SILU" => {
+                    config.fused_gate_up_silu_disabled = value == "0";
+                }
+                "FERRUM_MOE_HOST_TOPK" => config.moe_host_topk = value == "1",
+                "FERRUM_MOE_DIRECT_DISPATCH" => config.moe_direct_dispatch = value == "1",
+                _ => {}
+            }
+        }
+        config
+    }
+}
+
+fn moe_forward_runtime_config() -> &'static MoeForwardRuntimeConfig {
+    static CONFIG: OnceLock<MoeForwardRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(MoeForwardRuntimeConfig::from_env)
+}
 
 /// Batched MoE FFN — decode (m=1) and per-token-prefill (m>1 looped).
 ///
@@ -67,10 +113,11 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
     // start: CUDA event record (no sync); stop: event record + sync once,
     // then read elapsed_ms. Also pushes chrome-trace events when
     // FERRUM_TRACE_OUT is set (Phase 1.5).
-    use ferrum_kernels::backend::timer::{finish_probe_timer_traced, start_probe_timer};
+    use ferrum_kernels::backend::timer::{finish_probe_timer_traced, start_probe_timer_if};
     use ferrum_kernels::backend::Backend;
+    let decode_op_profile = moe_forward_runtime_config().decode_op_profile;
     let stage_t0 = |ctx: &mut B::Context| -> Option<<B as Backend>::Timer> {
-        start_probe_timer::<B>("FERRUM_DECODE_OP_PROFILE", ctx)
+        start_probe_timer_if::<B>(decode_op_profile, ctx)
     };
     let stage_end =
         |t: Option<<B as Backend>::Timer>, ctx: &mut B::Context, name: &str, c: &AtomicU64| {
@@ -118,11 +165,7 @@ pub(crate) fn moe_forward_stacked_decode_impl<B: QuantLlmBackend + BackendMoeFus
         // Opt-out: `FERRUM_MOE_FUSED_GATE_UP_SILU=0` forces the legacy
         // 3-dispatch path. Used for A/B benchmarking and as a kill switch
         // if the fused kernel ever produces divergent outputs.
-        // Cache the env-flag read once per process — the decode hot
-        // path calls this fn ~48 layers × ~steps_per_run times.
-        static FUSED_DISABLED: OnceLock<bool> = OnceLock::new();
-        let fused_disabled = *FUSED_DISABLED
-            .get_or_init(|| std::env::var("FERRUM_MOE_FUSED_GATE_UP_SILU").as_deref() == Ok("0"));
+        let fused_disabled = moe_forward_runtime_config().fused_gate_up_silu_disabled;
         let use_fused = B::supports_fused_moe_gate_up_silu() && !fused_disabled;
 
         if use_fused {
@@ -249,10 +292,11 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
     tokens: usize,
 ) -> Result<()> {
     // PLAYBOOK § 1.2 — migrated. Two-counter close (us + calls) for prefill probes.
-    use ferrum_kernels::backend::timer::{finish_probe_timer_traced, start_probe_timer};
+    use ferrum_kernels::backend::timer::{finish_probe_timer_traced, start_probe_timer_if};
     use ferrum_kernels::backend::Backend;
+    let decode_op_profile = moe_forward_runtime_config().decode_op_profile;
     let stage_t0 = |ctx: &mut B::Context| -> Option<<B as Backend>::Timer> {
-        start_probe_timer::<B>("FERRUM_DECODE_OP_PROFILE", ctx)
+        start_probe_timer_if::<B>(decode_op_profile, ctx)
     };
     let stage_end = |t: Option<<B as Backend>::Timer>,
                      ctx: &mut B::Context,
@@ -282,9 +326,9 @@ pub(crate) fn moe_forward_batched_prefill_impl<B: QuantLlmBackend + BackendMoeFu
     // `FERRUM_MOE_DIRECT_DISPATCH=1`  → GPU topk but worst-case GEMM grid
     // (default)                       → GPU topk + indirect-dispatched GEMM
     //                                    (grid sized from max(tpe[e]))
-    let use_gpu_topk = std::env::var("FERRUM_MOE_HOST_TOPK").as_deref() != Ok("1");
-    let use_indirect_dispatch =
-        use_gpu_topk && std::env::var("FERRUM_MOE_DIRECT_DISPATCH").as_deref() != Ok("1");
+    let runtime_config = moe_forward_runtime_config();
+    let use_gpu_topk = !runtime_config.moe_host_topk;
+    let use_indirect_dispatch = use_gpu_topk && !runtime_config.moe_direct_dispatch;
     let max_per_expert = if use_gpu_topk {
         let t0 = stage_t0(ctx);
         B::route_topk_softmax(
@@ -476,10 +520,11 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
     tokens: usize,
 ) -> Result<()> {
     // PLAYBOOK § 1.2 — migrated (batched-decode variant).
-    use ferrum_kernels::backend::timer::{finish_probe_timer_traced, start_probe_timer};
+    use ferrum_kernels::backend::timer::{finish_probe_timer_traced, start_probe_timer_if};
     use ferrum_kernels::backend::Backend;
+    let decode_op_profile = moe_forward_runtime_config().decode_op_profile;
     let stage_t0 = |ctx: &mut B::Context| -> Option<<B as Backend>::Timer> {
-        start_probe_timer::<B>("FERRUM_DECODE_OP_PROFILE", ctx)
+        start_probe_timer_if::<B>(decode_op_profile, ctx)
     };
     let stage_end =
         |t: Option<<B as Backend>::Timer>, ctx: &mut B::Context, name: &str, c: &AtomicU64| {
@@ -595,4 +640,35 @@ pub(crate) fn moe_forward_batched_decode_impl<B: QuantLlmBackend + BackendMoeFus
     stage_end(t0, ctx, "wsum", &MOE_BATCHED_DECODE_WSUM_US);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MoeForwardRuntimeConfig;
+
+    #[test]
+    fn moe_forward_runtime_config_parses_startup_knobs() {
+        let config = MoeForwardRuntimeConfig::from_env_vars([
+            ("FERRUM_MOE_FUSED_GATE_UP_SILU", "0"),
+            ("FERRUM_MOE_HOST_TOPK", "1"),
+            ("FERRUM_MOE_DIRECT_DISPATCH", "1"),
+        ]);
+
+        assert!(config.fused_gate_up_silu_disabled);
+        assert!(config.moe_host_topk);
+        assert!(config.moe_direct_dispatch);
+    }
+
+    #[test]
+    fn moe_forward_runtime_config_keeps_default_fast_paths() {
+        let config = MoeForwardRuntimeConfig::from_env_vars([
+            ("FERRUM_MOE_FUSED_GATE_UP_SILU", "1"),
+            ("FERRUM_MOE_HOST_TOPK", "0"),
+            ("FERRUM_MOE_DIRECT_DISPATCH", "0"),
+        ]);
+
+        assert!(!config.fused_gate_up_silu_disabled);
+        assert!(!config.moe_host_topk);
+        assert!(!config.moe_direct_dispatch);
+    }
 }

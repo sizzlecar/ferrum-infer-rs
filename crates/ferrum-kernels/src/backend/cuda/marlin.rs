@@ -9,15 +9,43 @@ use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CudaMarlinRuntimeConfig {
+    skip_ws_zero: bool,
+}
+
+impl CudaMarlinRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut config = Self {
+            skip_ws_zero: false,
+        };
+        for (name, value) in vars {
+            if name.as_ref() == "FERRUM_MARLIN_SKIP_WS_ZERO" {
+                config.skip_ws_zero = value.as_ref() == "1";
+            }
+        }
+        config
+    }
+}
+
+fn cuda_marlin_runtime_config() -> &'static CudaMarlinRuntimeConfig {
+    static CONFIG: OnceLock<CudaMarlinRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(CudaMarlinRuntimeConfig::from_env)
+}
+
 /// Cached `FERRUM_MARLIN_SKIP_WS_ZERO=1` flag. Read once on first
 /// access, cheap for hot paths (called per Marlin GEMM dispatch).
 fn skip_ws_zero() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("FERRUM_MARLIN_SKIP_WS_ZERO")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+    cuda_marlin_runtime_config().skip_ws_zero
 }
 
 // FFI declaration for the Marlin CUDA kernel.
@@ -82,6 +110,17 @@ extern "C" {
 // `vllm-moe-marlin` feature is built in.
 #[cfg(feature = "vllm-moe-marlin")]
 extern "C" {
+    fn ferrum_vllm_marlin_moe_set_profile_config(
+        path: *const std::ffi::c_char,
+        commit_sha: *const std::ffi::c_char,
+        env_hash: *const std::ffi::c_char,
+        model: *const std::ffi::c_char,
+        concurrency: i32,
+        runtime_flags_json: *const std::ffi::c_char,
+    );
+
+    fn ferrum_vllm_marlin_moe_clear_profile_config();
+
     fn ferrum_vllm_marlin_moe_f16(
         a: *const std::ffi::c_void,        // [size_m, size_k] fp16
         b: *const std::ffi::c_void,        // [num_experts, k/16, n*pack/16] i32 marlin-packed
@@ -106,6 +145,64 @@ extern "C" {
         use_atomic_add: i32,
         use_fp32_reduce: i32,
     ) -> i32;
+}
+
+#[cfg(feature = "vllm-moe-marlin")]
+pub fn configure_vllm_moe_profile_sink(
+    config: &ferrum_bench_core::ProfileSinkConfig,
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+
+    let Some(path) = &config.jsonl_path else {
+        unsafe { ferrum_vllm_marlin_moe_clear_profile_config() };
+        return Ok(());
+    };
+
+    let path = CString::new(path.as_os_str().to_string_lossy().into_owned()).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("profile path contains NUL byte: {err}"),
+        )
+    })?;
+    let commit_sha = CString::new(
+        config
+            .metadata
+            .commit_sha
+            .as_deref()
+            .unwrap_or_default()
+            .to_string(),
+    )
+    .map_err(profile_cstring_error("profile commit_sha"))?;
+    let env_hash = CString::new(config.metadata.env_hash.clone())
+        .map_err(profile_cstring_error("env_hash"))?;
+    let model =
+        CString::new(config.metadata.model.clone()).map_err(profile_cstring_error("model"))?;
+    let runtime_flags_json =
+        serde_json::to_string(&config.metadata.runtime_flags).unwrap_or_else(|_| "{}".to_string());
+    let runtime_flags_json =
+        CString::new(runtime_flags_json).map_err(profile_cstring_error("runtime_flags_json"))?;
+
+    unsafe {
+        ferrum_vllm_marlin_moe_set_profile_config(
+            path.as_ptr(),
+            commit_sha.as_ptr(),
+            env_hash.as_ptr(),
+            model.as_ptr(),
+            config.metadata.concurrency.min(i32::MAX as u32) as i32,
+            runtime_flags_json.as_ptr(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vllm-moe-marlin")]
+fn profile_cstring_error(field: &'static str) -> impl FnOnce(std::ffi::NulError) -> std::io::Error {
+    move |err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{field} contains NUL byte: {err}"),
+        )
+    }
 }
 
 /// Check if Marlin kernel is available at compile time.
@@ -982,4 +1079,22 @@ fn build_marlin_perm() -> Vec<usize> {
     }
 
     perm_interleaved
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CudaMarlinRuntimeConfig;
+
+    #[test]
+    fn cuda_marlin_runtime_config_parses_skip_ws_zero() {
+        let config = CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "1")]);
+        assert!(config.skip_ws_zero);
+    }
+
+    #[test]
+    fn cuda_marlin_runtime_config_defaults_to_zero_workspace() {
+        let config =
+            CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "true")]);
+        assert!(!config.skip_ws_zero);
+    }
 }

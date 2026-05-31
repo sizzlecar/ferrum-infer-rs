@@ -8,6 +8,11 @@
 mod traits;
 pub use traits::*;
 
+mod types;
+pub use types::*;
+
+mod capabilities;
+
 mod kv_layer;
 pub use kv_layer::*;
 

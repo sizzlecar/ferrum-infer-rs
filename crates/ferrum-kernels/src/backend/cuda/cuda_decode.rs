@@ -40,18 +40,105 @@ struct DiagConfig {
 }
 
 impl DiagConfig {
-    fn from_env() -> Self {
-        let all = std::env::var("FERRUM_DIAG").map_or(false, |v| v == "1");
-        Self {
-            shapes: all || std::env::var("FERRUM_DIAG_SHAPES").map_or(false, |v| v == "1"),
-            attn: all || std::env::var("FERRUM_DIAG_ATTN").map_or(false, |v| v == "1"),
-            timing: all || std::env::var("FERRUM_DIAG_TIMING").map_or(false, |v| v == "1"),
-            numerical: all || std::env::var("FERRUM_DIAG_NUMERICAL").map_or(false, |v| v == "1"),
-        }
-    }
-
     fn any_enabled(self) -> bool {
         self.shapes || self.attn || self.timing || self.numerical
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CudaDecodeRuntimeConfig;
+
+    #[test]
+    fn cuda_decode_runtime_config_parses_diag_and_paged_kv() {
+        let config = CudaDecodeRuntimeConfig::from_env_vars([
+            ("FERRUM_DIAG_SHAPES", "1"),
+            ("FERRUM_DIAG_ATTN", "0"),
+            ("FERRUM_DIAG_TIMING", "1"),
+            ("FERRUM_DIAG_NUMERICAL", "0"),
+            ("FERRUM_PAGED_KV", "1"),
+            ("FERRUM_KV_BLOCKS", "2048"),
+        ]);
+
+        assert!(config.diag.shapes);
+        assert!(!config.diag.attn);
+        assert!(config.diag.timing);
+        assert!(!config.diag.numerical);
+        assert!(config.diag.any_enabled());
+        assert!(config.use_paged_kv);
+        assert_eq!(config.kv_blocks, 2048);
+    }
+
+    #[test]
+    fn cuda_decode_runtime_config_diag_all_wins_and_defaults_hold() {
+        let config = CudaDecodeRuntimeConfig::from_env_vars([
+            ("FERRUM_DIAG", "1"),
+            ("FERRUM_KV_BLOCKS", "bad"),
+        ]);
+
+        assert!(config.diag.shapes);
+        assert!(config.diag.attn);
+        assert!(config.diag.timing);
+        assert!(config.diag.numerical);
+        assert!(!config.use_paged_kv);
+        assert_eq!(config.kv_blocks, 1024);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CudaDecodeRuntimeConfig {
+    diag: DiagConfig,
+    use_paged_kv: bool,
+    kv_blocks: usize,
+}
+
+impl CudaDecodeRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut diag_all = false;
+        let mut diag_shapes = false;
+        let mut diag_attn = false;
+        let mut diag_timing = false;
+        let mut diag_numerical = false;
+        let mut use_paged_kv = false;
+        let mut kv_blocks = 1024;
+
+        for (name, value) in vars {
+            let value = value.as_ref();
+            match name.as_ref() {
+                "FERRUM_DIAG" => diag_all = value == "1",
+                "FERRUM_DIAG_SHAPES" => diag_shapes = value == "1",
+                "FERRUM_DIAG_ATTN" => diag_attn = value == "1",
+                "FERRUM_DIAG_TIMING" => diag_timing = value == "1",
+                "FERRUM_DIAG_NUMERICAL" => diag_numerical = value == "1",
+                "FERRUM_PAGED_KV" => use_paged_kv = value == "1",
+                "FERRUM_KV_BLOCKS" => {
+                    if let Ok(blocks) = value.parse::<usize>() {
+                        kv_blocks = blocks;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Self {
+            diag: DiagConfig {
+                shapes: diag_all || diag_shapes,
+                attn: diag_all || diag_attn,
+                timing: diag_all || diag_timing,
+                numerical: diag_all || diag_numerical,
+            },
+            use_paged_kv,
+            kv_blocks,
+        }
     }
 }
 
@@ -143,14 +230,12 @@ impl CudaDecodeRunner {
         let buffers = DecodeBuffers::new(dims.clone(), &stream)
             .map_err(|e| candle_core::Error::Msg(format!("DecodeBuffers alloc: {e}")))?;
 
-        let diag = DiagConfig::from_env();
-        let use_paged_kv = std::env::var("FERRUM_PAGED_KV").map_or(false, |v| v == "1");
+        let runtime_config = CudaDecodeRuntimeConfig::from_env();
+        let diag = runtime_config.diag;
+        let use_paged_kv = runtime_config.use_paged_kv;
 
         let (kv_pool, next_block_id) = if use_paged_kv {
-            let max_blocks: usize = std::env::var("FERRUM_KV_BLOCKS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1024);
+            let max_blocks = runtime_config.kv_blocks;
             let block_size: usize = 16;
             let pool = crate::gpu_paged_kv::GpuPagedKvPool::new(
                 crate::gpu_paged_kv::GpuPagedKvConfig {

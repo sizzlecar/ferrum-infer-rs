@@ -10,6 +10,7 @@
 //! - `config.json` not parseable: keep static defaults.
 //! - User explicitly set `FERRUM_KV_MAX_BLOCKS`: respect their override.
 
+use ferrum_types::{RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource};
 use std::path::Path;
 
 /// Bytes reserved for everything that's NOT weights or KV pool: cuBLAS
@@ -157,36 +158,6 @@ pub enum AutoSizeProfile {
     Chat,
 }
 
-/// Default-ON `FERRUM_MOE_GRAPH=1` for Qwen3-MoE. Read only by
-/// `qwen3_moe.rs::decode_batch_internal`; ignored by every other
-/// model so safe to set unconditionally. Empirically measured at c=32
-/// on RTX 4090 post-moe_align fix:
-///   FERRUM_MOE_GRAPH=0 = 872 tok/s
-///   FERRUM_MOE_GRAPH=1 = 1006 tok/s  (+15.5%)
-///
-/// Standalone (not gated on autosizer running) because:
-///  1. The `apply_auto_size` early-returns when the user sets both
-///     `FERRUM_KV_MAX_BLOCKS` + `FERRUM_PAGED_MAX_SEQS` (apples bench
-///     does this — see sweep_bottleneck.sh), skipping the MOE_GRAPH
-///     setter that follows.
-///  2. `serve` only calls `apply_auto_size` when `--model` is a local
-///     directory; HF repo names (`Qwen/Qwen3-30B-A3B-GPTQ-Int4`)
-///     short-circuit before the autosizer runs.
-///
-/// Both cases left users on `FERRUM_MOE_GRAPH=0` despite the PR #217
-/// default-on intent. Extracting the setter and calling it from
-/// `serve` / `run` unconditionally restores it.
-pub fn apply_moe_graph_default() {
-    let moe_graph_overridden = std::env::var("FERRUM_MOE_GRAPH").is_ok();
-    if !moe_graph_overridden {
-        // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
-        unsafe {
-            std::env::set_var("FERRUM_MOE_GRAPH", "1");
-        }
-        eprintln!("[auto-size] MOE_GRAPH=1 (default-on for Qwen3-MoE)");
-    }
-}
-
 /// Apply auto-sizing: read CLI flag, query nvidia-smi, set env vars.
 /// Sets BOTH `FERRUM_KV_MAX_BLOCKS` (engine-side BlockPool) and
 /// `FERRUM_PAGED_MAX_SEQS` (model-side paged_pools — sizes the GPU
@@ -210,9 +181,12 @@ pub fn apply_auto_size(model_dir: &Path, gpu_util: f32) {
 /// the CLI REPL only ever has one active sequence and multi-turn
 /// dialogues blow past the default 512-token cap fast.
 pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: AutoSizeProfile) {
-    let kv_overridden = std::env::var("FERRUM_KV_MAX_BLOCKS").is_ok();
-    let max_seqs_overridden = std::env::var("FERRUM_PAGED_MAX_SEQS").is_ok();
-    let max_batched_tokens_overridden = std::env::var("FERRUM_MAX_BATCHED_TOKENS").is_ok();
+    let current = RuntimeConfigSnapshot::capture_current();
+    let kv_overridden = snapshot_value(&current, "FERRUM_KV_MAX_BLOCKS").is_some();
+    let max_seqs_overridden = snapshot_value(&current, "FERRUM_PAGED_MAX_SEQS").is_some();
+    let max_batched_tokens_overridden =
+        snapshot_value(&current, "FERRUM_MAX_BATCHED_TOKENS").is_some();
+    let mut entries = Vec::new();
     // ALL three knobs covered by the user — nothing to set.
     if kv_overridden && max_seqs_overridden && max_batched_tokens_overridden {
         return;
@@ -232,19 +206,22 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
             AutoSizeProfile::Server => 2048,
             AutoSizeProfile::Chat => 2048,
         };
-        // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
-        unsafe {
-            std::env::set_var("FERRUM_MAX_BATCHED_TOKENS", mbt.to_string());
-        }
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_MAX_BATCHED_TOKENS",
+            mbt.to_string(),
+            RuntimeConfigSource::MemoryProfile,
+        ));
         eprintln!(
             "[auto-size] MAX_BATCHED_TOKENS={} (profile={:?})",
             mbt, profile
         );
     }
     if kv_overridden && max_seqs_overridden {
+        crate::runtime_env::materialize_runtime_env_defaults(&entries);
         return;
     }
     let Some(result) = auto_size_kv_blocks(model_dir, gpu_util) else {
+        crate::runtime_env::materialize_runtime_env_defaults(&entries);
         return;
     };
     result.print_summary();
@@ -297,24 +274,34 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         }
     };
 
-    let kv_capacity_overridden = std::env::var("FERRUM_KV_CAPACITY").is_ok();
-    // SAFETY: set_var is unsafe on Rust 2024; runs once before threads spawn.
+    let kv_capacity_overridden = snapshot_value(&current, "FERRUM_KV_CAPACITY").is_some();
     // MAX_BATCHED_TOKENS already set above (it's independent of the KV pool
     // sizing logic, runs even when the user overrode KV_MAX_BLOCKS + SEQS).
-    // FERRUM_MOE_GRAPH is set by `apply_moe_graph_default()` at the CLI
-    // entry — moved out of here so it lands even when this function
+    // FERRUM_MOE_GRAPH is resolved as a typed CLI startup default and
+    // materialized outside the autosizer so it lands even when this function
     // early-returns on full-override.
-    unsafe {
-        if !kv_overridden {
-            std::env::set_var("FERRUM_KV_MAX_BLOCKS", result.max_blocks.to_string());
-        }
-        if !max_seqs_overridden {
-            std::env::set_var("FERRUM_PAGED_MAX_SEQS", max_seqs_clamped.to_string());
-        }
-        if kv_capacity > 0 && !kv_capacity_overridden {
-            std::env::set_var("FERRUM_KV_CAPACITY", kv_capacity.to_string());
-        }
+    if !kv_overridden {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_KV_MAX_BLOCKS",
+            result.max_blocks.to_string(),
+            RuntimeConfigSource::MemoryProfile,
+        ));
     }
+    if !max_seqs_overridden {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PAGED_MAX_SEQS",
+            max_seqs_clamped.to_string(),
+            RuntimeConfigSource::MemoryProfile,
+        ));
+    }
+    if kv_capacity > 0 && !kv_capacity_overridden {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_KV_CAPACITY",
+            kv_capacity.to_string(),
+            RuntimeConfigSource::MemoryProfile,
+        ));
+    }
+    crate::runtime_env::materialize_runtime_env_defaults(&entries);
     eprintln!(
         "[auto-size] KV_MAX_BLOCKS={} PAGED_MAX_SEQS={} KV_CAPACITY={}",
         if kv_overridden {
@@ -335,4 +322,12 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
             "<default>".to_string()
         },
     );
+}
+
+fn snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.effective_value.as_str())
 }

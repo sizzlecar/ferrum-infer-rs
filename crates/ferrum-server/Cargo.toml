@@ -13,6 +13,7 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-engine = { workspace = true }
 ferrum-scheduler = { workspace = true }
+ferrum-sampler = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
@@ -21,6 +22,7 @@ pin-project = "1.1"
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+regex-lite = "0.1"
 
 # Error handling
 anyhow = { workspace = true }
@@ -33,7 +35,7 @@ mime = "0.3"
 
 # Web framework for MVP server implementation
 axum = { version = "0.7", features = ["ws", "multipart"] }
-tower = "0.4"
+tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 hyper = "1.0"
 tokio-stream = "0.1"

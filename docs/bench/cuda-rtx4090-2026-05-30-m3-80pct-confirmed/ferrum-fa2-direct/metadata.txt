@@ -1,0 +1,16 @@
+date=2026-05-29T17:30:24+00:00
+repo=/workspace/ferrum-codex-clean
+git_head=20ab7983b6cde3860ce887e94b1637c5ed525dd4
+git_status_short_begin
+git_status_short_end
+model_dir=/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441
+hf_model=Qwen/Qwen3-30B-A3B-GPTQ-Int4
+bin=./target/release/ferrum
+port=18490
+num_prompts=128
+warmup_requests=10
+n_repeats=5
+concurrency=1,4,16,32
+fa2_shim=/workspace/libferrum_fa2_shim.so
+torch_lib=/workspace/vllm-venv/lib/python3.12/site-packages/torch/lib
+fa2_dir=/workspace/vllm-venv/lib/python3.12/site-packages/vllm/vllm_flash_attn
