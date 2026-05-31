@@ -2,7 +2,7 @@
 //!
 //! Handles loading and parsing of configuration files for the CLI tool.
 
-use ferrum_types::Result;
+use ferrum_types::{Result, RuntimeConfigEntry, RuntimeConfigSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -25,6 +25,10 @@ pub struct CliConfig {
 
     /// Development configuration
     pub dev: DevConfig,
+
+    /// Runtime overrides loaded from the CLI config file.
+    #[serde(default)]
+    pub runtime: RuntimeCliConfig,
 }
 
 /// Server CLI configuration
@@ -152,6 +156,177 @@ pub struct DevConfig {
 
     /// Test data directory
     pub test_data_dir: String,
+}
+
+/// Runtime knobs that can be sourced from the CLI config file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeCliConfig {
+    /// Named startup/runtime preset. Presets provide product-owned default
+    /// bundles and can still be overridden by explicit runtime keys below,
+    /// environment variables, or CLI flags.
+    #[serde(default)]
+    pub preset: Option<String>,
+
+    /// KV cache dtype override, equivalent to `--kv-dtype` or
+    /// `FERRUM_KV_DTYPE`.
+    #[serde(default)]
+    pub kv_dtype: Option<String>,
+
+    /// KV block budget, equivalent to `FERRUM_KV_MAX_BLOCKS`.
+    #[serde(default)]
+    pub kv_max_blocks: Option<usize>,
+
+    /// Maximum paged-KV sequence count, equivalent to
+    /// `FERRUM_PAGED_MAX_SEQS`.
+    #[serde(default)]
+    pub paged_max_seqs: Option<usize>,
+
+    /// Scheduler/model max batched-token budget, equivalent to
+    /// `FERRUM_MAX_BATCHED_TOKENS`.
+    #[serde(default)]
+    pub max_batched_tokens: Option<usize>,
+
+    /// Prefix cache opt-in, equivalent to `FERRUM_PREFIX_CACHE`.
+    #[serde(default)]
+    pub prefix_cache: Option<bool>,
+
+    /// MoE CUDA graph policy override, equivalent to `FERRUM_MOE_GRAPH`.
+    #[serde(default)]
+    pub moe_graph: Option<bool>,
+
+    /// vLLM paged attention policy, equivalent to
+    /// `FERRUM_USE_VLLM_PAGED_ATTN`.
+    #[serde(default)]
+    pub use_vllm_paged_attn: Option<bool>,
+
+    /// Short-context vLLM paged-attention v1 policy, equivalent to
+    /// `FERRUM_VLLM_PAGED_ATTN_V1_SHORT`.
+    #[serde(default)]
+    pub vllm_paged_attn_v1_short: Option<bool>,
+
+    /// vLLM-Marlin MoE dispatch policy, equivalent to `FERRUM_VLLM_MOE`.
+    #[serde(default)]
+    pub vllm_moe: Option<bool>,
+
+    /// vLLM-MoE pair-id route layout policy, equivalent to
+    /// `FERRUM_VLLM_MOE_PAIR_IDS`.
+    #[serde(default)]
+    pub vllm_moe_pair_ids: Option<bool>,
+
+    /// GPU greedy argmax readback policy, equivalent to
+    /// `FERRUM_GREEDY_ARGMAX`.
+    #[serde(default)]
+    pub greedy_argmax: Option<bool>,
+
+    /// FA-compatible varlen K/V layout policy, equivalent to
+    /// `FERRUM_FA_LAYOUT_VARLEN`.
+    #[serde(default)]
+    pub fa_layout_varlen: Option<bool>,
+
+    /// Source-linked FA2 policy, equivalent to `FERRUM_FA2_SOURCE`.
+    #[serde(default)]
+    pub fa2_source: Option<bool>,
+
+    /// Runtime-loaded FA2 direct FFI policy, equivalent to
+    /// `FERRUM_FA2_DIRECT_FFI`.
+    #[serde(default)]
+    pub fa2_direct_ffi: Option<bool>,
+
+    /// Runtime-loaded FA2 direct FFI shim path, equivalent to
+    /// `FERRUM_FA2_DIRECT_FFI_SHIM`.
+    #[serde(default)]
+    pub fa2_direct_ffi_shim: Option<String>,
+
+    /// Requested max model length, equivalent to `FERRUM_MAX_MODEL_LEN`.
+    #[serde(default)]
+    pub max_model_len: Option<usize>,
+
+    /// Minimum MoE batch size for the batched expert path, equivalent to
+    /// `FERRUM_MOE_BATCH_THRESHOLD`.
+    #[serde(default)]
+    pub moe_batch_threshold: Option<usize>,
+}
+
+impl RuntimeCliConfig {
+    pub fn runtime_config_entries(&self) -> Vec<RuntimeConfigEntry> {
+        let mut entries = Vec::new();
+        push_string_entry(&mut entries, "FERRUM_KV_DTYPE", self.kv_dtype.as_deref());
+        push_usize_entry(&mut entries, "FERRUM_KV_MAX_BLOCKS", self.kv_max_blocks);
+        push_usize_entry(&mut entries, "FERRUM_PAGED_MAX_SEQS", self.paged_max_seqs);
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_MAX_BATCHED_TOKENS",
+            self.max_batched_tokens,
+        );
+        push_bool_entry(&mut entries, "FERRUM_PREFIX_CACHE", self.prefix_cache);
+        push_bool_entry(&mut entries, "FERRUM_MOE_GRAPH", self.moe_graph);
+        push_bool_entry(
+            &mut entries,
+            "FERRUM_USE_VLLM_PAGED_ATTN",
+            self.use_vllm_paged_attn,
+        );
+        push_bool_entry(
+            &mut entries,
+            "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+            self.vllm_paged_attn_v1_short,
+        );
+        push_bool_entry(&mut entries, "FERRUM_VLLM_MOE", self.vllm_moe);
+        push_bool_entry(
+            &mut entries,
+            "FERRUM_VLLM_MOE_PAIR_IDS",
+            self.vllm_moe_pair_ids,
+        );
+        push_bool_entry(&mut entries, "FERRUM_GREEDY_ARGMAX", self.greedy_argmax);
+        push_bool_entry(
+            &mut entries,
+            "FERRUM_FA_LAYOUT_VARLEN",
+            self.fa_layout_varlen,
+        );
+        push_bool_entry(&mut entries, "FERRUM_FA2_SOURCE", self.fa2_source);
+        push_bool_entry(&mut entries, "FERRUM_FA2_DIRECT_FFI", self.fa2_direct_ffi);
+        push_string_entry(
+            &mut entries,
+            "FERRUM_FA2_DIRECT_FFI_SHIM",
+            self.fa2_direct_ffi_shim.as_deref(),
+        );
+        push_usize_entry(&mut entries, "FERRUM_MAX_MODEL_LEN", self.max_model_len);
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_MOE_BATCH_THRESHOLD",
+            self.moe_batch_threshold,
+        );
+        entries
+    }
+}
+
+fn push_string_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            value.to_string(),
+            RuntimeConfigSource::ConfigFile,
+        ));
+    }
+}
+
+fn push_usize_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<usize>) {
+    if let Some(value) = value {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            value.to_string(),
+            RuntimeConfigSource::ConfigFile,
+        ));
+    }
+}
+
+fn push_bool_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<bool>) {
+    if let Some(value) = value {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            if value { "1" } else { "0" },
+            RuntimeConfigSource::ConfigFile,
+        ));
+    }
 }
 
 impl CliConfig {
@@ -324,5 +499,129 @@ impl Default for DevConfig {
             mock_backends: false,
             test_data_dir: "./test_data".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrum_types::RuntimeConfigEffect;
+
+    #[test]
+    fn runtime_cli_config_emits_config_file_source_entries() {
+        let runtime = RuntimeCliConfig {
+            preset: Some("m3_qwen3_30b_a3b_int4".to_string()),
+            kv_dtype: Some("int8".to_string()),
+            kv_max_blocks: Some(4096),
+            paged_max_seqs: Some(64),
+            max_batched_tokens: Some(2048),
+            prefix_cache: Some(false),
+            moe_graph: Some(true),
+            use_vllm_paged_attn: Some(true),
+            vllm_paged_attn_v1_short: Some(false),
+            vllm_moe: Some(true),
+            vllm_moe_pair_ids: Some(true),
+            greedy_argmax: Some(true),
+            fa_layout_varlen: Some(true),
+            fa2_source: Some(true),
+            fa2_direct_ffi: Some(false),
+            fa2_direct_ffi_shim: Some("/tmp/libferrum_fa2_shim.so".to_string()),
+            max_model_len: Some(4096),
+            moe_batch_threshold: Some(4),
+            ..Default::default()
+        };
+        let entries = runtime.runtime_config_entries();
+        assert_eq!(entries.len(), 17);
+        let entry = |key: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        assert_eq!(entry("FERRUM_KV_DTYPE").effective_value, "int8");
+        assert_eq!(
+            entry("FERRUM_KV_DTYPE").source,
+            RuntimeConfigSource::ConfigFile
+        );
+        assert!(entry("FERRUM_KV_DTYPE")
+            .affects
+            .contains(&RuntimeConfigEffect::Correctness));
+        assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
+        assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
+        assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
+        assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
+        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
+        assert_eq!(entry("FERRUM_USE_VLLM_PAGED_ATTN").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
+            "0"
+        );
+        assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
+        assert_eq!(entry("FERRUM_VLLM_MOE_PAIR_IDS").effective_value, "1");
+        assert_eq!(entry("FERRUM_GREEDY_ARGMAX").effective_value, "1");
+        assert_eq!(entry("FERRUM_FA_LAYOUT_VARLEN").effective_value, "1");
+        assert_eq!(entry("FERRUM_FA2_SOURCE").effective_value, "1");
+        assert_eq!(entry("FERRUM_FA2_DIRECT_FFI").effective_value, "0");
+        assert_eq!(
+            entry("FERRUM_FA2_DIRECT_FFI_SHIM").effective_value,
+            "/tmp/libferrum_fa2_shim.so"
+        );
+        assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
+        assert_eq!(entry("FERRUM_MOE_BATCH_THRESHOLD").effective_value, "4");
+    }
+
+    #[test]
+    fn runtime_cli_config_defaults_when_missing_from_toml() {
+        let config: CliConfig = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8000
+            config_path = "server.toml"
+            log_level = "info"
+            hot_reload = false
+
+            [models]
+            model_dir = "./models"
+            cache_dir = "./cache"
+
+            [models.aliases]
+
+            [models.download]
+            hf_cache_dir = "./hf_cache"
+            timeout_seconds = 300
+            max_concurrent = 4
+            retry_attempts = 3
+
+            [benchmark]
+            num_requests = 100
+            concurrency = 10
+            prompt_length = 512
+            max_tokens = 256
+            warmup_requests = 10
+            output_dir = "./benchmark_results"
+
+            [client]
+            base_url = "http://127.0.0.1:8000"
+            timeout_seconds = 30
+
+            [client.retry]
+            max_attempts = 3
+            initial_delay_ms = 100
+            max_delay_ms = 5000
+            backoff_multiplier = 2.0
+
+            [dev]
+            debug = false
+            profile_memory = false
+            profile_gpu = false
+            mock_backends = false
+            test_data_dir = "./test_data"
+            "#,
+        )
+        .unwrap();
+        assert!(config.runtime.preset.is_none());
+        assert!(config.runtime.kv_dtype.is_none());
+        assert!(config.runtime.runtime_config_entries().is_empty());
     }
 }

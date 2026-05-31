@@ -4,9 +4,52 @@ use ferrum_types::{FerrumError, ModelSource, Result};
 use hf_hub::api::tokio::{Api, ApiBuilder, ApiRepo};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelSourceRuntimeEnv {
+    hf_home: Option<String>,
+    hf_token: Option<String>,
+}
+
+impl ModelSourceRuntimeEnv {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut hf_home = None;
+        let mut hf_token = None;
+        let mut hf_hub_token = None;
+
+        for (key, value) in vars {
+            let value = value.into();
+            match key.as_ref() {
+                "HF_HOME" => hf_home = Some(value),
+                "HF_TOKEN" => hf_token = Some(value),
+                "HUGGING_FACE_HUB_TOKEN" => hf_hub_token = Some(value),
+                _ => {}
+            }
+        }
+
+        Self {
+            hf_home,
+            hf_token: hf_token.or(hf_hub_token),
+        }
+    }
+}
+
+fn model_source_runtime_env() -> &'static ModelSourceRuntimeEnv {
+    static CONFIG: OnceLock<ModelSourceRuntimeEnv> = OnceLock::new();
+    CONFIG.get_or_init(ModelSourceRuntimeEnv::from_env)
+}
 
 /// Configuration for model source resolution
 #[derive(Debug, Clone)]
@@ -22,8 +65,9 @@ pub struct ModelSourceConfig {
 impl Default for ModelSourceConfig {
     fn default() -> Self {
         // Use HuggingFace standard cache directory
-        let default_cache = std::env::var("HF_HOME")
-            .ok()
+        let default_cache = model_source_runtime_env()
+            .hf_home
+            .clone()
             .or_else(|| {
                 dirs::home_dir()
                     .map(|h| h.join(".cache/huggingface"))
@@ -44,9 +88,7 @@ impl Default for ModelSourceConfig {
 
 impl ModelSourceConfig {
     pub fn get_hf_token() -> Option<String> {
-        std::env::var("HF_TOKEN")
-            .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
-            .ok()
+        model_source_runtime_env().hf_token.clone()
     }
 }
 
@@ -472,5 +514,30 @@ impl ModelSourceResolver for DefaultModelSourceResolver {
         }
 
         self.resolve_huggingface(id, revision).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_source_runtime_env_parses_hf_cache_and_token() {
+        let env = ModelSourceRuntimeEnv::from_env_vars([
+            ("HF_HOME", "/tmp/hf"),
+            ("HF_TOKEN", "primary"),
+            ("HUGGING_FACE_HUB_TOKEN", "fallback"),
+        ]);
+
+        assert_eq!(env.hf_home.as_deref(), Some("/tmp/hf"));
+        assert_eq!(env.hf_token.as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn model_source_runtime_env_uses_hub_token_fallback() {
+        let env = ModelSourceRuntimeEnv::from_env_vars([("HUGGING_FACE_HUB_TOKEN", "fallback")]);
+
+        assert_eq!(env.hf_home, None);
+        assert_eq!(env.hf_token.as_deref(), Some("fallback"));
     }
 }

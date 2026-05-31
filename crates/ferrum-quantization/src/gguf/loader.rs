@@ -31,6 +31,32 @@ use crate::gguf::names::{ferrum_to_gguf, gate_up_split_parts, qkv_split_parts};
 use crate::loader::WeightLoader;
 use crate::traits::Linear;
 
+const GGUF_LOAD_TRACE_ENV: &str = "FERRUM_GGUF_LOAD_TRACE";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GgufLoaderRuntimeConfig {
+    load_trace: bool,
+}
+
+impl GgufLoaderRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        Self {
+            load_trace: vars
+                .into_iter()
+                .any(|(name, _value)| name.into() == GGUF_LOAD_TRACE_ENV),
+        }
+    }
+}
+
 /// Backend-generic weight loader for GGUF files.
 ///
 /// Build with [`GgufLoader::open`]. The underlying file stays mmap'd for
@@ -43,6 +69,7 @@ pub struct GgufLoader<B: Backend + BackendQuantGguf + BackendQuantMarlin> {
     /// backend's preferred memory. Going through Metal/CUDA candle paths
     /// would add a cross-allocator hop with no benefit (Phase 1D revisits).
     decode_device: Device,
+    runtime_config: GgufLoaderRuntimeConfig,
     _marker: std::marker::PhantomData<B>,
 }
 
@@ -54,6 +81,7 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
         Ok(Self {
             gguf: Arc::new(gguf),
             decode_device: Device::Cpu,
+            runtime_config: GgufLoaderRuntimeConfig::from_env(),
             _marker: std::marker::PhantomData,
         })
     }
@@ -64,6 +92,7 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
         Self {
             gguf,
             decode_device: Device::Cpu,
+            runtime_config: GgufLoaderRuntimeConfig::from_env(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -144,18 +173,18 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
     /// transformers; bias-bearing fusions (rare) take the eager hit.
     fn load_fused(&self, parts: &[String]) -> Result<Box<dyn Linear<B>>> {
         if let Some(fast) = self.try_load_fused_q4k(parts)? {
-            if std::env::var("FERRUM_GGUF_LOAD_TRACE").is_ok() {
+            if self.runtime_config.load_trace {
                 eprintln!("[gguf-load] {:?} → fused-Q4 (homogeneous)", parts);
             }
             return Ok(fast);
         }
         if let Some(multi) = self.try_load_fused_multi_quant(parts)? {
-            if std::env::var("FERRUM_GGUF_LOAD_TRACE").is_ok() {
+            if self.runtime_config.load_trace {
                 eprintln!("[gguf-load] {:?} → MultiQuant (mixed dtype)", parts);
             }
             return Ok(multi);
         }
-        if std::env::var("FERRUM_GGUF_LOAD_TRACE").is_ok() {
+        if self.runtime_config.load_trace {
             eprintln!("[gguf-load] {:?} → eager fp32 fallback ⚠", parts);
         }
         self.load_fused_eager(parts)
@@ -507,4 +536,19 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> WeightLoader<B> for Ggu
 
 fn candle_to_ferrum(e: candle_core::Error) -> FerrumError {
     FerrumError::model(format!("candle: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gguf_loader_runtime_config_parses_load_trace_presence() {
+        let cfg =
+            GgufLoaderRuntimeConfig::from_env_vars([(GGUF_LOAD_TRACE_ENV, ""), ("OTHER", "1")]);
+        assert!(cfg.load_trace);
+
+        let cfg = GgufLoaderRuntimeConfig::from_env_vars([("OTHER", "1")]);
+        assert!(!cfg.load_trace);
+    }
 }

@@ -1,0 +1,13 @@
+server_ready_after=42s
+== vllm bench c=1 ==
+RESULT c=1 throughput=183.88252565616474 ci95=0.20133111763703382 completed=[128, 128, 128, 128, 128] errored=[0, 0, 0, 0, 0] file=/workspace/m3-vllm0202-baseline-full-n5-20260530/c1_n5.json
+== vllm bench c=4 ==
+RESULT c=4 throughput=512.5173632241509 ci95=2.8138717512946427 completed=[128, 128, 128, 128, 128] errored=[0, 0, 0, 0, 0] file=/workspace/m3-vllm0202-baseline-full-n5-20260530/c4_n5.json
+== vllm bench c=16 ==
+RESULT c=16 throughput=1331.8955194159662 ci95=5.656617679538381 completed=[128, 128, 128, 128, 128] errored=[0, 0, 0, 0, 0] file=/workspace/m3-vllm0202-baseline-full-n5-20260530/c16_n5.json
+== vllm bench c=32 ==
+RESULT c=32 throughput=1972.9266080933237 ci95=18.635240173186723 completed=[128, 128, 128, 128, 128] errored=[0, 0, 0, 0, 0] file=/workspace/m3-vllm0202-baseline-full-n5-20260530/c32_n5.json
+SUMMARY c=1: vllm=183.9 ± 0.20133111763703382 tok/s tpot_p50=4.80 ttft_p50=88.1
+SUMMARY c=4: vllm=512.5 ± 2.8138717512946427 tok/s tpot_p50=6.69 ttft_p50=149.8
+SUMMARY c=16: vllm=1331.9 ± 5.656617679538381 tok/s tpot_p50=10.50 ttft_p50=208.4
+SUMMARY c=32: vllm=1972.9 ± 18.635240173186723 tok/s tpot_p50=13.99 ttft_p50=270.9

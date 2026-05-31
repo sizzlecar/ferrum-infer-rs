@@ -19,7 +19,8 @@ pub mod layer;
 pub mod router;
 
 pub use dispatch::{
-    moe_forward, moe_forward_bucketed, moe_forward_cpu, ExpertStack, MoeBucketPlan, MoeRouteScratch,
+    moe_forward, moe_forward_bucketed, moe_forward_cpu, ExpertStack, MoeBucketPlan,
+    MoeForwardBucketedParams, MoeForwardParams, MoeRouteScratch,
 };
 pub use layer::Qwen3MoeLayer;
 pub use router::{route, route_into, RouterOutput};

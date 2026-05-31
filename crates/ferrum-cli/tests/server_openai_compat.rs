@@ -14,12 +14,19 @@
 //!     ferrum pull qwen3:0.6b
 //!     cargo test --release -p ferrum-cli --features metal --test server_openai_compat \
 //!       -- --ignored --test-threads=1
+//!
+//! The Python SDK smoke additionally requires:
+//!
+//!     python3 -m pip install openai
+//!     # optionally: FERRUM_PYTHON=python3.12
 
 use async_openai::{
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs, ResponseFormat,
+        ChatCompletionStreamOptions, ChatCompletionToolArgs, ChatCompletionToolChoiceOption,
+        CreateChatCompletionRequestArgs, FunctionObjectArgs, ResponseFormat,
+        ResponseFormatJsonSchema,
     },
     Client,
 };
@@ -53,6 +60,12 @@ fn ferrum_bin() -> PathBuf {
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local_addr").port()
+}
+
+fn python_bin() -> String {
+    std::env::var("FERRUM_PYTHON")
+        .or_else(|_| std::env::var("PYTHON"))
+        .unwrap_or_else(|_| "python3".to_string())
 }
 
 /// Same fixture as `server_smoke.rs`; duplicated rather than shared via
@@ -193,6 +206,84 @@ async fn test_openai_client_chat_streaming() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "loads real model"]
+async fn test_openai_client_tools_stream_options_include_usage() {
+    // Exercises async-openai's typed request fields for tools, tool_choice,
+    // and stream_options.include_usage. Ferrum does not implement tool-call
+    // generation yet, but it must accept the SDK request shape, stream valid
+    // chat chunks, and expose the final usage chunk.
+    let fx = ServerFixture::spawn(SMOKE_MODEL).await;
+    let client = fx.client();
+    let weather_tool = ChatCompletionToolArgs::default()
+        .function(
+            FunctionObjectArgs::default()
+                .name("get_weather")
+                .description("Return a short weather summary for a city.")
+                .parameters(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"}
+                    },
+                    "required": ["city"]
+                }))
+                .build()
+                .expect("build function object"),
+        )
+        .build()
+        .expect("build tool");
+
+    let request = CreateChatCompletionRequestArgs::default()
+        .model(SMOKE_MODEL)
+        .messages([ChatCompletionRequestUserMessageArgs::default()
+            .content("Say hi in one short sentence. Do not call a tool.")
+            .build()
+            .expect("build user msg")
+            .into()])
+        .max_tokens(50u32)
+        .temperature(0.0)
+        .stream(true)
+        .stream_options(ChatCompletionStreamOptions {
+            include_usage: true,
+        })
+        .tools([weather_tool])
+        .tool_choice(ChatCompletionToolChoiceOption::Auto)
+        .build()
+        .expect("build tools streaming request");
+
+    let mut stream = client
+        .chat()
+        .create_stream(request)
+        .await
+        .expect("open tools stream");
+
+    let mut content = String::new();
+    let mut chunk_count = 0usize;
+    let mut usage_seen = false;
+    while let Some(result) = stream.next().await {
+        let chunk = result.expect("parse tools stream chunk");
+        chunk_count += 1;
+        if let Some(usage) = &chunk.usage {
+            usage_seen = usage.total_tokens > 0;
+        }
+        if let Some(choice) = chunk.choices.first() {
+            if let Some(delta) = &choice.delta.content {
+                content.push_str(delta);
+            }
+        }
+    }
+
+    assert!(chunk_count > 0, "no stream chunks parsed");
+    assert!(
+        !content.trim().is_empty(),
+        "concatenated stream content empty"
+    );
+    assert!(
+        usage_seen,
+        "stream_options.include_usage did not produce final SDK usage"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "loads real model"]
 async fn test_openai_client_response_format_json_object() {
     // `response_format = json_object` activates ferrum's `JsonModeProcessor`
     // (continuous_engine.rs:148) which constrains the sampler to emit
@@ -234,6 +325,60 @@ async fn test_openai_client_response_format_json_object() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "loads real model"]
+async fn test_openai_client_strict_json_schema_20_runs() {
+    // Milestone G real-model smoke: a simple strict object schema should
+    // succeed repeatedly at temperature 0. The server validates before
+    // returning, so any hard-mask/validation failure surfaces as an SDK
+    // request error or non-JSON content.
+    let fx = ServerFixture::spawn(SMOKE_MODEL).await;
+    let client = fx.client();
+    let response_format = ResponseFormat::JsonSchema {
+        json_schema: ResponseFormatJsonSchema {
+            description: Some("A short answer object.".to_string()),
+            name: "answer_object".to_string(),
+            schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string"}
+                },
+                "required": ["answer"]
+            })),
+            strict: Some(true),
+        },
+    };
+
+    for run in 0..20 {
+        let request = CreateChatCompletionRequestArgs::default()
+            .model(SMOKE_MODEL)
+            .messages([ChatCompletionRequestUserMessageArgs::default()
+                .content("Return an object with one string field named answer.")
+                .build()
+                .expect("build user msg")
+                .into()])
+            .max_tokens(64u32)
+            .temperature(0.0)
+            .response_format(response_format.clone())
+            .build()
+            .expect("build strict schema request");
+
+        let response = client
+            .chat()
+            .create(request)
+            .await
+            .unwrap_or_else(|e| panic!("strict schema run {run} request failed: {e}"));
+        let content = response.choices[0].message.content.as_deref().unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(content).unwrap_or_else(|e| {
+            panic!("strict schema run {run} returned invalid JSON: {e}; content={content:?}")
+        });
+        assert!(
+            parsed.get("answer").and_then(|v| v.as_str()).is_some(),
+            "strict schema run {run} missing string answer: {parsed}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "loads real model"]
 async fn test_openai_client_multi_turn() {
     // Verify that messages constructed via async-openai's typed builders
     // (User / Assistant / Function variants) tokenize correctly server-side.
@@ -270,5 +415,86 @@ async fn test_openai_client_multi_turn() {
     assert!(
         content.to_lowercase().contains("xiaoming"),
         "expected recall of 'XiaoMing' via async-openai message builders; got: {content:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "loads real model and requires the Python `openai` package"]
+async fn test_python_openai_sdk_chat_and_stream_smoke() {
+    // Exercises the official Python OpenAI SDK against Ferrum's local
+    // OpenAI-compatible server. This catches client-side schema/SSE
+    // incompatibilities outside Rust's async-openai type model.
+    let fx = ServerFixture::spawn(SMOKE_MODEL).await;
+    let script = r#"
+import os
+import sys
+
+try:
+    from openai import OpenAI
+except Exception as exc:
+    raise SystemExit(
+        "Python package `openai` is required for this ignored smoke: "
+        "python3 -m pip install openai\n"
+        f"import error: {exc}"
+    )
+
+base_url = os.environ["FERRUM_OPENAI_BASE_URL"]
+model = os.environ["FERRUM_OPENAI_MODEL"]
+client = OpenAI(base_url=f"{base_url}/v1", api_key="dummy-key-not-checked")
+
+response = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "Say hi in one short sentence."}],
+    max_tokens=50,
+    temperature=0,
+)
+content = response.choices[0].message.content or ""
+if not content.strip():
+    raise SystemExit("empty non-streaming Python SDK chat content")
+
+stream = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "Say hi in one short sentence."}],
+    max_tokens=50,
+    temperature=0,
+    stream=True,
+    stream_options={"include_usage": True},
+)
+chunks = 0
+stream_content = []
+usage_seen = False
+for chunk in stream:
+    chunks += 1
+    if chunk.choices:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            stream_content.append(delta)
+    if getattr(chunk, "usage", None) is not None:
+        usage_seen = True
+
+if chunks == 0:
+    raise SystemExit("Python SDK stream yielded no chunks")
+if not "".join(stream_content).strip():
+    raise SystemExit("empty streaming Python SDK chat content")
+if not usage_seen:
+    raise SystemExit("Python SDK stream_options.include_usage did not expose usage")
+"#;
+
+    let output = Command::new(python_bin())
+        .arg("-c")
+        .arg(script)
+        .env("FERRUM_OPENAI_BASE_URL", &fx.base_url)
+        .env("FERRUM_OPENAI_MODEL", SMOKE_MODEL)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn Python OpenAI SDK smoke");
+
+    assert!(
+        output.status.success(),
+        "Python OpenAI SDK smoke failed\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }

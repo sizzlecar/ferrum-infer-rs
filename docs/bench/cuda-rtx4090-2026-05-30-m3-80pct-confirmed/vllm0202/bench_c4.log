@@ -1,0 +1,20 @@
+ferrum bench-serve — dataset=random num_prompts=128 warmup=10 n_repeats=5
+→ closed_loop c=4
+  cell closed_loop c=4 — repeat 1/5 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 32.1s
+  cell closed_loop c=4 — repeat 2/5 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 32.1s
+  cell closed_loop c=4 — repeat 3/5 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 32.2s
+  cell closed_loop c=4 — repeat 4/5 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 32.4s
+  cell closed_loop c=4 — repeat 5/5 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 32.3s
+    summary c=4 (n_repeats=5, ± = ci95_hw)
+      TTFT_ms  p50=149.8±2.0  p95=155.7±1.9  p99=162.0±5.4
+      TPOT_ms  p50=6.7±0.0  p95=6.9±0.1  p99=7.0±0.1
+      ITL_ms   p50=6.9±0.0  p95=7.5±0.0  p99=7.7±0.0
+      throughput      512.5 ± 2.8 tok/s
+      goodput         3.97 ± 0.02 req/s
+
+→ wrote /workspace/m3-vllm0202-baseline-full-n5-20260530/c4_n5.json

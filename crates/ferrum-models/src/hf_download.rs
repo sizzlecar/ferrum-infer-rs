@@ -13,7 +13,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
@@ -29,6 +29,52 @@ const MODEL_FILES: &[&str] = &[
     "pytorch_model.bin.index.json",
 ];
 const TOKENIZER_FILES: &[&str] = &["tokenizer.json", "tokenizer.model", "tokenizer_config.json"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HfDownloaderRuntimeEnv {
+    proxy_url: Option<String>,
+}
+
+impl HfDownloaderRuntimeEnv {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut https_proxy = None;
+        let mut https_proxy_lower = None;
+        let mut all_proxy = None;
+        let mut all_proxy_lower = None;
+
+        for (key, value) in vars {
+            let value = value.into();
+            match key.as_ref() {
+                "HTTPS_PROXY" => https_proxy = Some(value),
+                "https_proxy" => https_proxy_lower = Some(value),
+                "ALL_PROXY" => all_proxy = Some(value),
+                "all_proxy" => all_proxy_lower = Some(value),
+                _ => {}
+            }
+        }
+
+        Self {
+            proxy_url: https_proxy
+                .or(https_proxy_lower)
+                .or(all_proxy)
+                .or(all_proxy_lower),
+        }
+    }
+}
+
+fn hf_downloader_runtime_env() -> &'static HfDownloaderRuntimeEnv {
+    static CONFIG: OnceLock<HfDownloaderRuntimeEnv> = OnceLock::new();
+    CONFIG.get_or_init(HfDownloaderRuntimeEnv::from_env)
+}
 
 /// HuggingFace file metadata from API
 #[derive(Debug, Deserialize)]
@@ -55,14 +101,10 @@ impl HfDownloader {
             .connect_timeout(std::time::Duration::from_secs(30));
 
         // Check for proxy environment variables
-        if let Ok(proxy_url) = std::env::var("HTTPS_PROXY")
-            .or_else(|_| std::env::var("https_proxy"))
-            .or_else(|_| std::env::var("ALL_PROXY"))
-            .or_else(|_| std::env::var("all_proxy"))
-        {
+        if let Some(proxy_url) = hf_downloader_runtime_env().proxy_url.as_deref() {
             if !proxy_url.is_empty() {
                 eprintln!("🌐 Using proxy: {}", proxy_url);
-                let proxy = reqwest::Proxy::all(&proxy_url)
+                let proxy = reqwest::Proxy::all(proxy_url)
                     .map_err(|e| FerrumError::config(format!("Invalid proxy URL: {}", e)))?;
                 builder = builder.proxy(proxy);
             }
@@ -668,5 +710,31 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hf_downloader_runtime_env_uses_proxy_priority() {
+        let env = HfDownloaderRuntimeEnv::from_env_vars([
+            ("HTTPS_PROXY", "http://upper"),
+            ("https_proxy", "http://lower"),
+            ("ALL_PROXY", "socks5://all"),
+        ]);
+
+        assert_eq!(env.proxy_url.as_deref(), Some("http://upper"));
+    }
+
+    #[test]
+    fn hf_downloader_runtime_env_empty_high_priority_suppresses_fallback() {
+        let env = HfDownloaderRuntimeEnv::from_env_vars([
+            ("HTTPS_PROXY", ""),
+            ("ALL_PROXY", "socks5://all"),
+        ]);
+
+        assert_eq!(env.proxy_url.as_deref(), Some(""));
     }
 }

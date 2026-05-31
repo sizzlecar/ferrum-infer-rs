@@ -218,3 +218,28 @@ async fn unconstrained_decode_emits_biased_token() {
         resp.text
     );
 }
+
+#[tokio::test]
+async fn usage_counts_byte_tokenizer_prompt_tokens_not_words() {
+    let engine = make_engine();
+    let tokenizer = ByteTokenizer::new();
+    let prompt = "abc def";
+    let expected_prompt_tokens = tokenizer.encode(prompt, true).expect("encode").len();
+    assert_ne!(
+        expected_prompt_tokens,
+        prompt.split_whitespace().count(),
+        "fixture must distinguish tokenizer accounting from whitespace counting"
+    );
+
+    let mut req = InferenceRequest::new(prompt, "mock-model");
+    req.sampling_params.max_tokens = 3;
+    req.sampling_params.temperature = 0.0;
+
+    let resp = engine.infer(req).await.expect("infer");
+    assert_eq!(resp.usage.prompt_tokens, expected_prompt_tokens);
+    assert_eq!(resp.usage.completion_tokens, resp.tokens.len());
+    assert_eq!(
+        resp.usage.total_tokens,
+        resp.usage.prompt_tokens + resp.usage.completion_tokens
+    );
+}

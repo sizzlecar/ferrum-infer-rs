@@ -16,6 +16,62 @@
 #include "attention_kernels.cuh"
 #include <cuda_runtime.h>
 
+extern "C" void ferrum_vllm_paged_attention_v1_f16_h128_b16(
+    __half* __restrict__ out,           // [num_seqs, num_heads, 128]
+    const __half* __restrict__ query,   // [num_seqs, num_heads, 128]
+    const __half* __restrict__ key_cache,
+    const __half* __restrict__ value_cache,
+    const int num_kv_heads,
+    const float scale,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int num_seqs,
+    const int num_heads,
+    const int max_num_blocks_per_seq,
+    const int q_stride,                 // query.stride(0)
+    const int kv_block_stride,          // key_cache.stride(0)
+    const int kv_head_stride,           // key_cache.stride(1)
+    const int max_seq_len,
+    cudaStream_t stream
+) {
+    constexpr int HEAD_SIZE = 128;
+    constexpr int BLOCK_SIZE = 16;
+    constexpr int NUM_THREADS = 128;
+    constexpr bool IS_BLOCK_SPARSE = false;
+    constexpr vllm::Fp8KVCacheDataType KV_DTYPE = vllm::Fp8KVCacheDataType::kAuto;
+    const float* k_scale_ptr = nullptr;
+    const float* v_scale_ptr = nullptr;
+    const int tp_rank = 0;
+    const int blocksparse_local_blocks = 0;
+    const int blocksparse_vert_stride = 0;
+    const int blocksparse_block_size = 0;
+    const int blocksparse_head_sliding_step = 0;
+    const float* alibi_slopes_ptr = nullptr;
+
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    int padded_max_seq_len = ((max_seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    int logits_size = padded_max_seq_len * sizeof(float);
+    int outputs_size = (NUM_WARPS / 2) * HEAD_SIZE * sizeof(float);
+    int shared_mem_size =
+        logits_size > outputs_size ? logits_size : outputs_size;
+
+    dim3 grid(num_heads, num_seqs, 1);
+    dim3 block(NUM_THREADS);
+    vllm::paged_attention_v1_kernel<
+        uint16_t, uint16_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, KV_DTYPE,
+        IS_BLOCK_SPARSE>
+        <<<grid, block, shared_mem_size, stream>>>(
+            reinterpret_cast<uint16_t*>(out),
+            reinterpret_cast<const uint16_t*>(query),
+            reinterpret_cast<const uint16_t*>(key_cache),
+            reinterpret_cast<const uint16_t*>(value_cache), num_kv_heads,
+            scale, block_tables, seq_lens, max_num_blocks_per_seq,
+            alibi_slopes_ptr, q_stride, kv_block_stride, kv_head_stride,
+            k_scale_ptr, v_scale_ptr, tp_rank, blocksparse_local_blocks,
+            blocksparse_vert_stride, blocksparse_block_size,
+            blocksparse_head_sliding_step);
+}
+
 extern "C" void ferrum_vllm_paged_attention_v2_f16_h128_b16(
     __half* __restrict__ out,           // [num_seqs, num_heads, 128]
     float* __restrict__ exp_sums,       // [num_seqs, num_heads, max_partitions]

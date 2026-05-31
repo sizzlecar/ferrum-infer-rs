@@ -555,6 +555,7 @@ mod tests {
             client_id: None,
             session_id: None,
             created_at: chrono::Utc::now(),
+            api_request: None,
             metadata: std::collections::HashMap::new(),
         }
     }
@@ -845,6 +846,7 @@ mod tests {
             latency_ms: 100,
             created_at: chrono::Utc::now(),
             metadata: std::collections::HashMap::new(),
+            api_response: None,
         };
 
         let result = scheduler.complete(request_id, &response).await;

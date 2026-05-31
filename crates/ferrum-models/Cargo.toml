@@ -11,6 +11,7 @@ readme = "../../README.md"
 # Core dependencies - New architecture
 ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
+ferrum-bench-core = { workspace = true }
 
 # Optional runtime dependency for loading weights
 

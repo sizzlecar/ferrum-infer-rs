@@ -25,7 +25,9 @@
 use std::path::{Path, PathBuf};
 
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
-use ferrum_types::{FerrumError, Result};
+use ferrum_types::{
+    FerrumError, Result, RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource,
+};
 
 use crate::gpu_mem_autosize::{apply_auto_size_with_profile, AutoSizeProfile};
 
@@ -58,9 +60,9 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
         && p.is_file()
 }
 
-/// Chat-profile env-var defaults for `ferrum run`. Sniffs the arch
+/// Chat-profile runtime defaults for `ferrum run`. Sniffs the arch
 /// (dense vs MoE — works for both GGUF files and safetensors snapshot
-/// dirs) and sets:
+/// dirs) and materializes missing compatibility env vars for:
 ///
 ///   - `FERRUM_KV_CAPACITY`     — 8192 dense / 512 MoE
 ///   - `FERRUM_METAL_PAGED_KV`  — 0 dense GGUF / 1 dense safetensors / 1 MoE.
@@ -90,32 +92,50 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
 /// a `max_tokens=2048` chat — manifesting as a `KV cache overflow on
 /// layer 0` panic mid-response.
 pub fn apply_chat_profile_env(snapshot_path: &Path) {
+    let entries = chat_profile_runtime_entries(
+        snapshot_path,
+        &RuntimeConfigSnapshot::capture_current(),
+        RuntimeConfigSource::Default,
+    );
+    crate::runtime_env::materialize_runtime_env_defaults(&entries);
+}
+
+pub fn chat_profile_runtime_entries(
+    snapshot_path: &Path,
+    current: &RuntimeConfigSnapshot,
+    source: RuntimeConfigSource,
+) -> Vec<RuntimeConfigEntry> {
     let is_gguf = snapshot_path.is_file()
         && snapshot_path
             .extension()
             .map(|e| e.eq_ignore_ascii_case("gguf"))
             .unwrap_or(false);
     let is_moe = detect_moe_arch(snapshot_path);
+    let mut entries = Vec::new();
 
-    // SAFETY: std::env::set_var is unsafe on Rust 2024+. We only call
-    // this once at CLI startup before any other thread spawns.
-    if std::env::var_os("FERRUM_KV_CAPACITY").is_none() {
-        std::env::set_var("FERRUM_KV_CAPACITY", if is_moe { "512" } else { "8192" });
-    }
-    if std::env::var_os("FERRUM_METAL_PAGED_KV").is_none() {
-        // Dense GGUF: contig path works, no need to allocate the pool.
-        // Dense safetensors + MoE: paged required for correctness on Metal.
-        let need_paged = is_moe || !is_gguf;
-        std::env::set_var("FERRUM_METAL_PAGED_KV", if need_paged { "1" } else { "0" });
-    }
+    push_missing_entry(
+        &mut entries,
+        current,
+        "FERRUM_KV_CAPACITY",
+        if is_moe { "512" } else { "8192" },
+        source,
+    );
+    // Dense GGUF: contig path works, no need to allocate the pool.
+    // Dense safetensors + MoE: paged required for correctness on Metal.
+    let need_paged = is_moe || !is_gguf;
+    push_missing_entry(
+        &mut entries,
+        current,
+        "FERRUM_METAL_PAGED_KV",
+        if need_paged { "1" } else { "0" },
+        source,
+    );
     // Single-user REPL pool sizing — both safetensors dense (avoids
     // 30 GB pool at default max_seqs=32) and MoE (per published bench
     // tuning). Skipped for GGUF dense which doesn't allocate a pool.
     if !is_gguf || is_moe {
         for (k, v) in [("FERRUM_PAGED_MAX_SEQS", "2"), ("FERRUM_MAX_BATCH", "1")] {
-            if std::env::var_os(k).is_none() {
-                std::env::set_var(k, v);
-            }
+            push_missing_entry(&mut entries, current, k, v, source);
         }
     }
     if is_moe {
@@ -124,11 +144,30 @@ pub fn apply_chat_profile_env(snapshot_path: &Path) {
             ("FERRUM_MOE_BATCHED_DECODE", "1"),
             ("FERRUM_MOE_BATCH_THRESHOLD", "2"),
         ] {
-            if std::env::var_os(k).is_none() {
-                std::env::set_var(k, v);
-            }
+            push_missing_entry(&mut entries, current, k, v, source);
         }
     }
+    entries
+}
+
+fn push_missing_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    current: &RuntimeConfigSnapshot,
+    key: &str,
+    value: &str,
+    source: RuntimeConfigSource,
+) {
+    if snapshot_value(current, key).is_none() {
+        entries.push(RuntimeConfigEntry::new(key, value, source));
+    }
+}
+
+fn snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.effective_value.as_str())
 }
 
 /// Detect whether `path` is a Mixture-of-Experts model. Handles both a
@@ -357,4 +396,106 @@ pub async fn resolve_model_source(
         },
         autosized,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_model_dir(name: &str, config_json: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrum-source-resolver-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), config_json).unwrap();
+        dir
+    }
+
+    fn value(entries: &[RuntimeConfigEntry], key: &str) -> Option<String> {
+        entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.effective_value.clone())
+    }
+
+    #[test]
+    fn chat_profile_defaults_dense_safetensors_as_typed_entries() {
+        let dir = temp_model_dir(
+            "dense",
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+        );
+        let entries = chat_profile_runtime_entries(
+            &dir,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
+            Some("8192")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
+            Some("2")
+        );
+        assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("1"));
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_profile_defaults_moe_safetensors_as_typed_entries() {
+        let dir = temp_model_dir(
+            "moe",
+            r#"{"architectures":["Qwen3MoeForCausalLM"],"model_type":"qwen3_moe"}"#,
+        );
+        let entries = chat_profile_runtime_entries(
+            &dir,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
+            Some("512")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("1")
+        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
+        assert_eq!(
+            value(&entries, "FERRUM_MOE_BATCH_THRESHOLD").as_deref(),
+            Some("2")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_profile_defaults_preserve_existing_snapshot_values() {
+        let dir = temp_model_dir(
+            "override",
+            r#"{"architectures":["Qwen3MoeForCausalLM"],"model_type":"qwen3_moe"}"#,
+        );
+        let current = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "1234", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_MOE_BATCH_THRESHOLD", "7", RuntimeConfigSource::Env),
+        ]);
+        let entries = chat_profile_runtime_entries(&dir, &current, RuntimeConfigSource::Default);
+
+        assert_eq!(value(&entries, "FERRUM_KV_CAPACITY"), None);
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCH_THRESHOLD"), None);
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

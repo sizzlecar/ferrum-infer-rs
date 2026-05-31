@@ -126,6 +126,10 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+The OpenAI-shaped endpoint contract, explicit rejections, tool-field status,
+usage accounting, and structured-output limits are documented in
+[docs/openai-api-compatibility.md](docs/openai-api-compatibility.md).
+
 ## Supported Models
 
 | Architecture | Apple Silicon | CUDA | INT4 (GPTQ) | Tensor Parallel |
@@ -210,7 +214,7 @@ What works today:
 - INT4 GPTQ with Marlin fused kernel (Blackwell + Ampere); also Triton w4a16
 - Tensor parallelism (multi-GPU NCCL, persistent per-rank threads)
 - Speculative decoding (`--spec-draft <MODEL>` DeepMind accept/reject)
-- Structured output (`response_format: json_object` + `json_schema` with DFA-guided masking)
+- Structured output (`json_object` best-effort plus strict `json_schema` validation for the supported schema subset)
 - Whisper ASR (Metal-accelerated forward pass) + Qwen3-TTS (voice clone, streaming)
 - Top-k / top-p / temperature / repetition penalty
 

@@ -16,6 +16,7 @@ ferrum-interfaces = { workspace = true }
 ferrum-scheduler = { workspace = true }
 ferrum-tokenizer = { workspace = true }
 ferrum-sampler = { workspace = true }
+ferrum-bench-core = { workspace = true }
 ferrum-kv = { workspace = true }
 ferrum-kernels = { workspace = true }
 ferrum-quantization = { workspace = true }

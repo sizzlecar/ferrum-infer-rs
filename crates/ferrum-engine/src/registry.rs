@@ -17,7 +17,7 @@ use ferrum_interfaces::{
 use ferrum_types::{Device, EngineConfig, FerrumError, Result};
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, info};
 
 // ============================================================================
@@ -107,6 +107,92 @@ fn cpu_cuda_and_optional_metal_devices() -> Vec<Device> {
     {
         vec![Device::CPU, Device::CUDA(0)]
     }
+}
+
+fn parse_executor_dtype(s: &str) -> Option<candle_core::DType> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "fp16" | "f16" | "float16" => Some(candle_core::DType::F16),
+        "fp32" | "f32" | "float32" => Some(candle_core::DType::F32),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryRuntimeEnv {
+    model_path: Option<String>,
+    metal_dtype: Option<String>,
+    dtype: Option<String>,
+    tp: usize,
+}
+
+impl RegistryRuntimeEnv {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut model_path = None;
+        let mut metal_dtype = None;
+        let mut dtype = None;
+        let mut tp = None;
+
+        for (key, value) in vars {
+            let value = value.into();
+            match key.as_ref() {
+                "FERRUM_MODEL_PATH" => model_path = Some(value),
+                "FERRUM_METAL_DTYPE" => metal_dtype = Some(value),
+                "FERRUM_DTYPE" => dtype = Some(value),
+                "FERRUM_TP" => tp = value.parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+
+        Self {
+            model_path,
+            metal_dtype,
+            dtype,
+            tp: tp.unwrap_or(0),
+        }
+    }
+
+    fn model_path(&self) -> Option<String> {
+        self.model_path.clone()
+    }
+
+    fn dtype_for_device(&self, device: &Device) -> candle_core::DType {
+        match device {
+            Device::CPU => candle_core::DType::F32,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Device::Metal => self
+                .metal_dtype
+                .as_deref()
+                .and_then(parse_executor_dtype)
+                .or_else(|| self.dtype.as_deref().and_then(parse_executor_dtype))
+                .unwrap_or(candle_core::DType::F32),
+            Device::CUDA(_) | Device::ROCm(_) => self
+                .dtype
+                .as_deref()
+                .and_then(parse_executor_dtype)
+                .unwrap_or(candle_core::DType::F16),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn metal_dtype_hint(&self) -> String {
+        self.metal_dtype
+            .clone()
+            .unwrap_or_else(|| "f32".to_string())
+    }
+}
+
+fn registry_runtime_env() -> &'static RegistryRuntimeEnv {
+    static CONFIG: OnceLock<RegistryRuntimeEnv> = OnceLock::new();
+    CONFIG.get_or_init(RegistryRuntimeEnv::from_env)
 }
 
 // ============================================================================
@@ -443,7 +529,7 @@ impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizer
         // Try to find tokenizer path from config or environment
         let tokenizer_path = config
             .get_string_option("tokenizer_path")
-            .or_else(|| std::env::var("FERRUM_MODEL_PATH").ok());
+            .or_else(|| registry_runtime_env().model_path());
 
         if let Some(model_path) = tokenizer_path {
             let path = std::path::Path::new(&model_path);
@@ -905,7 +991,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         // Try to load model from path
         let model_path = config
             .get_string_option("model_path")
-            .or_else(|| std::env::var("FERRUM_MODEL_PATH").ok());
+            .or_else(|| registry_runtime_env().model_path());
 
         let model_path = match model_path {
             Some(path) => path,
@@ -974,31 +1060,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         // can explicitly opt-in via env:
         // - FERRUM_METAL_DTYPE=fp16|fp32 (takes precedence on Metal)
         // - FERRUM_DTYPE=fp16|fp32 (global override for non-CPU)
-        fn parse_dtype(s: &str) -> Option<DType> {
-            match s.trim().to_ascii_lowercase().as_str() {
-                "fp16" | "f16" | "float16" => Some(DType::F16),
-                "fp32" | "f32" | "float32" => Some(DType::F32),
-                _ => None,
-            }
-        }
-
-        let dtype = match &config.device {
-            Device::CPU => DType::F32,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            Device::Metal => std::env::var("FERRUM_METAL_DTYPE")
-                .ok()
-                .and_then(|v| parse_dtype(&v))
-                .or_else(|| {
-                    std::env::var("FERRUM_DTYPE")
-                        .ok()
-                        .and_then(|v| parse_dtype(&v))
-                })
-                .unwrap_or(DType::F32),
-            Device::CUDA(_) | Device::ROCm(_) => std::env::var("FERRUM_DTYPE")
-                .ok()
-                .and_then(|v| parse_dtype(&v))
-                .unwrap_or(DType::F16),
-        };
+        let dtype: DType = registry_runtime_env().dtype_for_device(&config.device);
 
         // Create model based on architecture
         info!("Building model...");
@@ -1018,10 +1080,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 // pre-Architecture-v2 CandleBackend and hasn't been ported
                 // to the Backend<B> trait stack. Reject explicitly so users
                 // don't get a silent single-GPU fallback.
-                let tp_size: usize = std::env::var("FERRUM_TP")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
+                let tp_size = registry_runtime_env().tp;
                 if tp_size > 1 {
                     return Err(FerrumError::unsupported(
                         "FERRUM_TP>1 not supported on the Backend<B> path. \
@@ -1112,8 +1171,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                 // FERRUM_METAL_DTYPE=f16 toggles fp16 weight storage
                                 // inside MetalBackend. Halves big-tensor RAM;
                                 // recommended for 4B+ models on 16 GB Macs.
-                                let dtype_hint = std::env::var("FERRUM_METAL_DTYPE")
-                                    .unwrap_or_else(|_| "f32".to_string());
+                                let dtype_hint = registry_runtime_env().metal_dtype_hint();
                                 info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
                                 build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
                                     arch,
@@ -1341,8 +1399,6 @@ impl Tokenizer for StubTokenizer {
 // Global Registry
 // ============================================================================
 
-use std::sync::OnceLock;
-
 /// Global registry instance
 static GLOBAL_REGISTRY: OnceLock<Arc<ComponentRegistry>> = OnceLock::new();
 
@@ -1403,6 +1459,52 @@ mod tests {
             Some("test_value".to_string())
         );
         assert!(config.get_string_option("missing").is_none());
+    }
+
+    #[test]
+    fn test_registry_runtime_env_parses_model_dtype_and_tp() {
+        let env = RegistryRuntimeEnv::from_env_vars([
+            ("FERRUM_MODEL_PATH", "/models/qwen"),
+            ("FERRUM_METAL_DTYPE", "fp16"),
+            ("FERRUM_DTYPE", "fp32"),
+            ("FERRUM_TP", "4"),
+        ]);
+
+        assert_eq!(env.model_path.as_deref(), Some("/models/qwen"));
+        assert_eq!(env.metal_dtype.as_deref(), Some("fp16"));
+        assert_eq!(env.dtype.as_deref(), Some("fp32"));
+        assert_eq!(env.tp, 4);
+    }
+
+    #[test]
+    fn test_registry_runtime_env_defaults_invalid_tp_and_cuda_dtype() {
+        let env = RegistryRuntimeEnv::from_env_vars([
+            ("FERRUM_DTYPE", "not-a-dtype"),
+            ("FERRUM_TP", "not-a-number"),
+        ]);
+
+        assert_eq!(env.model_path(), None);
+        assert_eq!(env.tp, 0);
+        assert_eq!(
+            env.dtype_for_device(&Device::CUDA(0)),
+            candle_core::DType::F16
+        );
+        assert_eq!(env.dtype_for_device(&Device::CPU), candle_core::DType::F32);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn test_registry_runtime_env_metal_dtype_precedence() {
+        let env = RegistryRuntimeEnv::from_env_vars([
+            ("FERRUM_METAL_DTYPE", "fp16"),
+            ("FERRUM_DTYPE", "fp32"),
+        ]);
+
+        assert_eq!(
+            env.dtype_for_device(&Device::Metal),
+            candle_core::DType::F16
+        );
+        assert_eq!(env.metal_dtype_hint(), "fp16");
     }
 
     #[test]

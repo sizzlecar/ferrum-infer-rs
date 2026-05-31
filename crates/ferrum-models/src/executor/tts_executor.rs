@@ -6,7 +6,7 @@
 #![allow(dead_code, unused_imports, unused_variables, unused_mut, unused_parens)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use candle_core::{DType, Device as CandleDevice, Tensor};
@@ -59,18 +59,69 @@ const TEMPERATURE: f32 = 0.9;
 const TOP_K: usize = 50;
 const REPETITION_PENALTY: f32 = 1.05;
 
+#[derive(Debug, Clone, PartialEq)]
+struct TtsRuntimeEnv {
+    tts_temperature: f32,
+    st_temperature: Option<f32>,
+    ref_pcm: Option<String>,
+    ref_codes: Option<String>,
+    min_frames: Option<usize>,
+}
+
+impl TtsRuntimeEnv {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut tts_temperature = None;
+        let mut st_temperature = None;
+        let mut ref_pcm = None;
+        let mut ref_codes = None;
+        let mut min_frames = None;
+
+        for (key, value) in vars {
+            let value = value.into();
+            match key.as_ref() {
+                "FERRUM_TTS_TEMP" => tts_temperature = value.parse::<f32>().ok(),
+                "FERRUM_ST_TEMP" => st_temperature = value.parse::<f32>().ok(),
+                "FERRUM_REF_PCM" => ref_pcm = Some(value),
+                "FERRUM_REF_CODES" => ref_codes = Some(value),
+                "FERRUM_TTS_MIN_FRAMES" => min_frames = value.parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+
+        Self {
+            tts_temperature: tts_temperature.unwrap_or(TEMPERATURE),
+            st_temperature,
+            ref_pcm,
+            ref_codes,
+            min_frames,
+        }
+    }
+
+    fn st_temperature(&self) -> f32 {
+        self.st_temperature.unwrap_or(self.tts_temperature)
+    }
+}
+
+fn tts_runtime_env() -> &'static TtsRuntimeEnv {
+    static CONFIG: OnceLock<TtsRuntimeEnv> = OnceLock::new();
+    CONFIG.get_or_init(TtsRuntimeEnv::from_env)
+}
+
 fn tts_temperature() -> f32 {
-    std::env::var("FERRUM_TTS_TEMP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(TEMPERATURE)
+    tts_runtime_env().tts_temperature
 }
 
 fn st_temperature() -> f32 {
-    std::env::var("FERRUM_ST_TEMP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(tts_temperature())
+    tts_runtime_env().st_temperature()
 }
 
 /// Qwen3-TTS executor: text-to-speech synthesis.
@@ -920,7 +971,7 @@ impl TtsModelExecutor {
         let device = self.talker.device().clone();
 
         // Step 1: Load and process reference audio at 24kHz
-        let ref_pcm = if let Ok(path) = std::env::var("FERRUM_REF_PCM") {
+        let ref_pcm = if let Some(path) = tts_runtime_env().ref_pcm.as_deref() {
             let data = std::fs::read(&path)
                 .map_err(|e| FerrumError::model(format!("read ref pcm: {e}")))?;
             let pcm: Vec<f32> = data
@@ -969,7 +1020,7 @@ impl TtsModelExecutor {
             .as_ref()
             .ok_or_else(|| FerrumError::model("speech tokenizer encoder not loaded"))?;
         // Allow pre-computed codec tokens for debugging (FERRUM_REF_CODES=/path/to/codes.bin)
-        let ref_codes = if let Ok(path) = std::env::var("FERRUM_REF_CODES") {
+        let ref_codes = if let Some(path) = tts_runtime_env().ref_codes.as_deref() {
             let data = std::fs::read(&path)
                 .map_err(|e| FerrumError::model(format!("read ref codes: {e}")))?;
             let u32s: Vec<u32> = data
@@ -1266,9 +1317,8 @@ impl TtsModelExecutor {
             // min_new_tokens: suppress EOS until we've generated a minimum
             // number of frames. Reference Python uses sentence-length heuristic.
             // FERRUM_TTS_MIN_FRAMES env lets us tune without rebuilding.
-            let min_frames: usize = std::env::var("FERRUM_TTS_MIN_FRAMES")
-                .ok()
-                .and_then(|v| v.parse().ok())
+            let min_frames = tts_runtime_env()
+                .min_frames
                 .unwrap_or_else(|| text_content_ids.len() * ICL_FRAMES_PER_TOKEN);
             if step < min_frames {
                 if let Some(v) = logits_vec.get_mut(codec_eos as usize) {
@@ -1763,5 +1813,40 @@ impl ModelExecutor for TtsModelExecutor {
 
     fn status(&self) -> ferrum_interfaces::model_executor::ExecutorStatus {
         common::default_executor_status()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tts_runtime_env_parses_overrides() {
+        let env = TtsRuntimeEnv::from_env_vars([
+            ("FERRUM_TTS_TEMP", "0.7"),
+            ("FERRUM_ST_TEMP", "0.2"),
+            ("FERRUM_REF_PCM", "/tmp/ref.pcm"),
+            ("FERRUM_REF_CODES", "/tmp/ref.codes"),
+            ("FERRUM_TTS_MIN_FRAMES", "128"),
+        ]);
+
+        assert_eq!(env.tts_temperature, 0.7);
+        assert_eq!(env.st_temperature(), 0.2);
+        assert_eq!(env.ref_pcm.as_deref(), Some("/tmp/ref.pcm"));
+        assert_eq!(env.ref_codes.as_deref(), Some("/tmp/ref.codes"));
+        assert_eq!(env.min_frames, Some(128));
+    }
+
+    #[test]
+    fn tts_runtime_env_defaults_invalid_values() {
+        let env = TtsRuntimeEnv::from_env_vars([
+            ("FERRUM_TTS_TEMP", "invalid"),
+            ("FERRUM_ST_TEMP", "invalid"),
+            ("FERRUM_TTS_MIN_FRAMES", "invalid"),
+        ]);
+
+        assert_eq!(env.tts_temperature, TEMPERATURE);
+        assert_eq!(env.st_temperature(), TEMPERATURE);
+        assert_eq!(env.min_frames, None);
     }
 }

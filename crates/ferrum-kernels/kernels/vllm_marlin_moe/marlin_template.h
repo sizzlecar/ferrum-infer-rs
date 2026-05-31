@@ -430,9 +430,9 @@ __global__ void Marlin(
   int4* sh_block_topk_weights_int4 =
       sh_rd_block_sorted_ids_int4 + moe_block_size / 4;
   // sh_block_topk_weights_int4 only need (moe_block_size / 4);
-  // but we pad to align to 256 bytes
-  int4* sh_new =
-      sh_block_topk_weights_int4 + moe_block_size / 2 + moe_block_size;
+  // but we pad to align to 256 bytes. Keep this layout byte-for-byte
+  // compatible with vLLM 0.20.2: ids + rd_ids + topk = moe_block_size int4s.
+  int4* sh_new = sh_block_topk_weights_int4 + moe_block_size / 2;
   int32_t* sh_block_sorted_ids =
       reinterpret_cast<int*>(sh_block_sorted_ids_int4);
   int32_t* sh_rd_block_sorted_ids =

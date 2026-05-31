@@ -88,7 +88,7 @@ namespace MARLIN_NAMESPACE_NAME {
   _INSTANTIATE(SCALAR_T, W_TYPE, S_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 8,      \
                NUM_THREADS, false)
 
-// Mirror of ops.cu COMMON_GET_IF(W_TYPE) — instantiate all 40 configs.
+// Mirror of ops.cu COMMON_GET_IF(W_TYPE) — instantiate all tile configs.
 #define _COMMON_INSTANTIATE(SCALAR_T, W_TYPE, S_TYPE)                          \
   _COMMON_INSTANTIATE_M1(SCALAR_T, W_TYPE, S_TYPE, 8, 8, 256)                  \
   _COMMON_INSTANTIATE_M1(SCALAR_T, W_TYPE, S_TYPE, 8, 4, 128)                  \

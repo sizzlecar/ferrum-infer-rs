@@ -6,6 +6,7 @@
 //! every cell carries one `Env` block and its `env_hash`. Two cells
 //! with the same hash are guaranteed comparable.
 
+use ferrum_types::RuntimeConfigSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -45,6 +46,10 @@ pub struct Env {
 
     /// Selected `FERRUM_*` env vars affecting runtime (sorted by BTreeMap).
     pub ferrum_env: BTreeMap<String, String>,
+
+    /// Stable sorted runtime config snapshot for non-default `FERRUM_*` values.
+    #[serde(default)]
+    pub runtime_config: RuntimeConfigSnapshot,
 
     /// `vllm serve` effective args, populated only for vLLM cells. None
     /// for ferrum cells — used by the config-parity report block.
@@ -103,6 +108,7 @@ impl Env {
             gpu_persistence_mode: detect_gpu_persistence(),
             gpu_auto_boost: None,
             ferrum_env: capture_ferrum_env(),
+            runtime_config: RuntimeConfigSnapshot::capture_current(),
             vllm_args: None,
         }
     }
@@ -259,6 +265,7 @@ mod tests {
             gpu_persistence_mode: Some(true),
             gpu_auto_boost: Some(false),
             ferrum_env,
+            runtime_config: RuntimeConfigSnapshot::default(),
             vllm_args: None,
         }
     }

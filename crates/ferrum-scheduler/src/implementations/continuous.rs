@@ -15,10 +15,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use ferrum_interfaces::scheduler::SchedulerMetrics;
-use ferrum_types::SchedulerConfig;
 use ferrum_types::{
     BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
-    Result,
+    Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
 };
 use parking_lot::RwLock;
 use std::{
@@ -30,6 +29,25 @@ use std::{
     time::Instant,
 };
 use tracing::{debug, info, warn};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ContinuousBatchRuntimeConfig {
+    prompt_token_estimate: bool,
+    prefill_first_until_active: Option<usize>,
+    active_decode_prefill_chunk: Option<usize>,
+    scheduler_none_prof: bool,
+}
+
+impl ContinuousBatchRuntimeConfig {
+    fn from_scheduler_config(config: &SchedulerConfig) -> Self {
+        Self {
+            prompt_token_estimate: config.prompt_token_estimate,
+            prefill_first_until_active: config.prefill_first_until_active,
+            active_decode_prefill_chunk: config.active_decode_prefill_chunk,
+            scheduler_none_prof: config.scheduler_none_prof,
+        }
+    }
+}
 
 /// Request phase in continuous batching
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +170,9 @@ pub struct ContinuousBatchScheduler {
 
     /// Continuous batching specific config
     cb_config: ContinuousBatchConfig,
+
+    /// Runtime env-derived switches parsed once at scheduler construction.
+    runtime_config: ContinuousBatchRuntimeConfig,
 }
 
 /// Continuous batching specific configuration
@@ -241,6 +262,7 @@ impl ContinuousBatchScheduler {
             "Creating continuous batch scheduler: max_prefill={}, max_decode={}",
             cb_config.max_prefill_batch, cb_config.max_decode_batch
         );
+        let runtime_config = ContinuousBatchRuntimeConfig::from_scheduler_config(&config);
 
         Self {
             config,
@@ -257,6 +279,7 @@ impl ContinuousBatchScheduler {
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
             cb_config,
+            runtime_config,
         }
     }
 
@@ -328,6 +351,71 @@ impl ContinuousBatchScheduler {
         }
     }
 
+    fn initial_prefill_token_estimate(&self, req: &ContinuousBatchRequest) -> usize {
+        if !self.runtime_config.prompt_token_estimate {
+            return self.cb_config.prefill_chunk_size;
+        }
+
+        self.prompt_token_estimate(req)
+            .unwrap_or(self.cb_config.prefill_chunk_size)
+    }
+
+    fn prompt_token_estimate(&self, req: &ContinuousBatchRequest) -> Option<usize> {
+        req.inner
+            .request
+            .metadata
+            .get(PROMPT_TOKENS_METADATA_KEY)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .filter(|&v| v > 0)
+    }
+
+    fn maybe_active_decode_prefill_chunk(&self, req: &ContinuousBatchRequest) -> Option<usize> {
+        let chunk = self.runtime_config.active_decode_prefill_chunk?;
+        if !req.chunked_prefill && self.decoding_count() == 0 {
+            return None;
+        }
+        Some(chunk)
+    }
+
+    fn chunked_prefill_budget_tokens(&self, req: &ContinuousBatchRequest, chunk: usize) -> usize {
+        let remaining = if req.prefill_tokens == 0 {
+            self.prompt_token_estimate(req)
+                .unwrap_or(self.cb_config.prefill_chunk_size)
+        } else {
+            req.prefill_tokens.saturating_sub(req.prefill_chunk_offset)
+        };
+        chunk.min(remaining).max(1)
+    }
+
+    fn initial_prefill_token_estimate_capped(&self, estimated_tokens: usize) -> usize {
+        if self.cb_config.enable_chunked_prefill {
+            estimated_tokens
+                .min(self.cb_config.prefill_chunk_size)
+                .max(1)
+        } else {
+            estimated_tokens.max(1)
+        }
+    }
+
+    fn prefill_budget_tokens(&self, req: &ContinuousBatchRequest) -> usize {
+        if let Some(chunk) = self.maybe_active_decode_prefill_chunk(req) {
+            return self.chunked_prefill_budget_tokens(req, chunk);
+        }
+
+        if req.prefill_tokens == 0 {
+            let estimated = self.initial_prefill_token_estimate(req);
+            return self.initial_prefill_token_estimate_capped(estimated);
+        }
+
+        let remaining = req.prefill_tokens.saturating_sub(req.prefill_chunk_offset);
+        if self.cb_config.enable_chunked_prefill {
+            self.cb_config.prefill_chunk_size.min(remaining)
+        } else {
+            remaining
+        }
+    }
+
     /// Create batch plan for current iteration
     fn create_iteration_batch(&self, hint: BatchHint) -> Option<BatchPlan> {
         let iteration = self.current_iteration.fetch_add(1, Ordering::Relaxed);
@@ -335,23 +423,40 @@ impl ContinuousBatchScheduler {
 
         let mut batch_requests = Vec::new();
         let mut total_tokens = 0;
+        let prefill_first_target = self
+            .runtime_config
+            .prefill_first_until_active
+            .map(|target| {
+                target
+                    .min(hint.max_batch_size)
+                    .min(self.cb_config.max_decode_batch)
+            })
+            .unwrap_or(0);
+        let skip_decode_for_prefill_first = prefill_first_target > 0
+            && self.decoding_count() < prefill_first_target
+            && (self.prefilling_count() > 0 || self.waiting_count() > 0);
 
-        // First, collect decode requests (they have priority)
-        let decode_queue = self.decode_queue.read();
-        for (_, req) in decode_queue.iter() {
-            if batch_requests.len() >= hint.max_batch_size {
-                break;
-            }
+        // First, collect decode requests (they have priority). The opt-in
+        // fill-first experiment skips decodes until the active decode cohort
+        // reaches the requested target, reducing early mixed prefill+decode
+        // spikes in c=32 closed-loop runs.
+        if !skip_decode_for_prefill_first {
+            let decode_queue = self.decode_queue.read();
+            for (_, req) in decode_queue.iter() {
+                if batch_requests.len() >= hint.max_batch_size {
+                    break;
+                }
 
-            // Each decode step is 1 token per request
-            if total_tokens < hint.max_tokens {
-                let mut scheduled = req.inner.clone();
-                scheduled.tokens_processed = req.total_tokens();
-                batch_requests.push(scheduled);
-                total_tokens += 1;
+                // Each decode step is 1 token per request
+                if total_tokens < hint.max_tokens {
+                    let mut scheduled = req.inner.clone();
+                    scheduled.tokens_processed = req.total_tokens();
+                    batch_requests.push(scheduled);
+                    total_tokens += 1;
+                }
             }
+            drop(decode_queue);
         }
-        drop(decode_queue);
 
         // Then, add prefill requests up to the per-iter token budget.
         // Phase 3: `max_prefill_batch=8` no longer caps the count —
@@ -366,19 +471,7 @@ impl ContinuousBatchScheduler {
         if prefill_remaining > 0 {
             let prefill_queue = self.prefill_queue.read();
             for req in prefill_queue.iter().take(prefill_remaining) {
-                let prefill_chunk_tokens = if self.cb_config.enable_chunked_prefill {
-                    if req.prefill_tokens == 0 {
-                        // Total unknown yet (engine hasn't reported it) —
-                        // reserve one chunk's worth so we don't over-commit.
-                        self.cb_config.prefill_chunk_size
-                    } else {
-                        self.cb_config
-                            .prefill_chunk_size
-                            .min(req.prefill_tokens.saturating_sub(req.prefill_chunk_offset))
-                    }
-                } else {
-                    req.prefill_tokens
-                };
+                let prefill_chunk_tokens = self.prefill_budget_tokens(req);
                 // Skip fully-prefilled requests that are still in the queue
                 // (they'll be promoted by mark_prefill_chunk_processed on the
                 // next iteration boundary).
@@ -418,18 +511,7 @@ impl ContinuousBatchScheduler {
         if batch_requests.is_empty() {
             let prefill_queue = self.prefill_queue.read();
             for req in prefill_queue.iter().take(hint.max_batch_size) {
-                let prefill_chunk_tokens = if self.cb_config.enable_chunked_prefill {
-                    if req.prefill_tokens == 0 {
-                        self.cb_config.prefill_chunk_size
-                    } else {
-                        self.cb_config
-                            .prefill_chunk_size
-                            .min(req.prefill_tokens.saturating_sub(req.prefill_chunk_offset))
-                    }
-                } else {
-                    // For new requests, prefill_tokens might be 0, use a default
-                    req.inner.request.sampling_params.max_tokens.min(512)
-                };
+                let prefill_chunk_tokens = self.prefill_budget_tokens(req);
                 if prefill_chunk_tokens == 0 {
                     continue;
                 }
@@ -444,7 +526,7 @@ impl ContinuousBatchScheduler {
         }
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
-        if std::env::var("FERRUM_SCHED_NONE_PROF").is_ok() && !batch_requests.is_empty() {
+        if self.runtime_config.scheduler_none_prof && !batch_requests.is_empty() {
             use std::sync::atomic::AtomicU64;
             static SOME_PROF_N: AtomicU64 = AtomicU64::new(0);
             let n = SOME_PROF_N.fetch_add(1, Ordering::Relaxed);
@@ -464,7 +546,7 @@ impl ContinuousBatchScheduler {
         }
         if batch_requests.is_empty() {
             // FERRUM_SCHED_NONE_PROF=1: log why we returned None. Rate-limited.
-            if std::env::var("FERRUM_SCHED_NONE_PROF").is_ok() {
+            if self.runtime_config.scheduler_none_prof {
                 use std::sync::atomic::AtomicU64;
                 static NONE_PROF_N: AtomicU64 = AtomicU64::new(0);
                 let n = NONE_PROF_N.fetch_add(1, Ordering::Relaxed);
@@ -916,8 +998,31 @@ mod tests {
             client_id: None,
             session_id: None,
             created_at: chrono::Utc::now(),
+            api_request: None,
             metadata: std::collections::HashMap::new(),
         }
+    }
+
+    fn create_test_request_with_prompt_tokens(
+        priority: Priority,
+        prompt_tokens: usize,
+    ) -> InferenceRequest {
+        create_test_request(priority).with_metadata(
+            PROMPT_TOKENS_METADATA_KEY,
+            serde_json::Value::from(prompt_tokens as u64),
+        )
+    }
+
+    fn enqueue_waiting(scheduler: &ContinuousBatchScheduler, request: InferenceRequest) {
+        let request_id = request.id.clone();
+        scheduler
+            .waiting_queue
+            .write()
+            .push_back(ContinuousBatchRequest::new(request));
+        scheduler
+            .request_index
+            .write()
+            .insert(request_id, RequestPhase::Waiting);
     }
 
     #[tokio::test]
@@ -965,6 +1070,166 @@ mod tests {
 
         // Requests should have been promoted
         assert!(scheduler.prefilling_count() > 0 || scheduler.decoding_count() > 0);
+    }
+
+    #[test]
+    fn prompt_token_metadata_expands_prefill_admission() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..16 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let hint = BatchHint {
+            max_batch_size: 32,
+            max_tokens: 2048,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 8);
+
+        for request in first_batch.requests {
+            scheduler.mark_prefill_complete(&request.request.id, 256);
+        }
+
+        let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(mixed_batch.requests.len(), 15);
+    }
+
+    #[test]
+    fn prompt_token_metadata_is_opt_in_for_prefill_admission() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+
+        for _ in 0..16 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 32,
+                max_tokens: 2048,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+        assert_eq!(batch.requests.len(), 4);
+    }
+
+    #[test]
+    fn scheduler_runtime_config_is_captured_at_construction() {
+        let mut config = SchedulerConfig {
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        };
+        let scheduler = ContinuousBatchScheduler::new(config.clone());
+        config.prompt_token_estimate = false;
+
+        for _ in 0..16 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 32,
+                max_tokens: 2048,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+        assert_eq!(batch.requests.len(), 8);
+    }
+
+    #[test]
+    fn prefill_first_until_active_skips_early_decodes() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prefill_first_until_active: Some(4),
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..8 {
+            enqueue_waiting(&scheduler, create_test_request(Priority::Normal));
+        }
+
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 2);
+        let first_ids: Vec<RequestId> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for id in &first_ids {
+            scheduler.mark_prefill_complete(id, 512);
+        }
+        assert_eq!(scheduler.decoding_count(), 2);
+
+        let second_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(second_batch.requests.len(), 2);
+        assert!(
+            second_batch
+                .requests
+                .iter()
+                .all(|request| !first_ids.contains(&request.request.id)),
+            "fill-first should schedule more prefills before decoding early requests"
+        );
+    }
+
+    #[test]
+    fn active_decode_prefill_chunk_only_caps_when_decode_is_active() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            active_decode_prefill_chunk: Some(64),
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 2,
+            max_tokens: 512,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let first = create_test_request_with_prompt_tokens(Priority::Normal, 256);
+        let first_id = first.id.clone();
+        enqueue_waiting(&scheduler, first);
+        let initial_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(initial_batch.requests.len(), 1);
+        assert_eq!(initial_batch.resource_requirements.gpu_memory, 256 * 16);
+        scheduler.mark_prefill_complete(&first_id, 256);
+
+        enqueue_waiting(
+            &scheduler,
+            create_test_request_with_prompt_tokens(Priority::Normal, 256),
+        );
+        let decode_only_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(decode_only_batch.requests.len(), 1);
+        assert_eq!(decode_only_batch.resource_requirements.gpu_memory, 16);
+
+        let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(mixed_batch.requests.len(), 2);
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 64) * 16);
     }
 
     #[tokio::test]

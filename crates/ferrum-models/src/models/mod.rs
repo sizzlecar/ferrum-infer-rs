@@ -17,8 +17,11 @@
 
 pub mod llama_family;
 pub mod qwen3_moe;
+pub mod qwen3_moe_profile;
+pub mod qwen3_moe_runtime;
 
 pub use llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
 pub use qwen3_moe::Qwen3MoeModel;
 pub mod llama_family_forward_batched;
 pub mod qwen3_moe_forward_unified;
+pub mod qwen3_moe_forward_unified_layer;

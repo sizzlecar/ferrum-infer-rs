@@ -11,7 +11,7 @@
 //! drop candle from the hot path.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use tracing::debug;
@@ -28,6 +28,45 @@ use ferrum_types::{DataType, FerrumError, ModelInfo, Result};
 use crate::common::DecoderOnlyLLM;
 
 use super::common::{self, GenericKvCacheHandle};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LlmExecutorRuntimeEnv {
+    batch_prefill_prof: bool,
+    batch_decode_prof: bool,
+}
+
+impl LlmExecutorRuntimeEnv {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+    {
+        let mut batch_prefill_prof = false;
+        let mut batch_decode_prof = false;
+
+        for (key, _) in vars {
+            match key.as_ref() {
+                "FERRUM_BATCH_PREFILL_PROF" => batch_prefill_prof = true,
+                "FERRUM_BATCH_DECODE_PROF" => batch_decode_prof = true,
+                _ => {}
+            }
+        }
+
+        Self {
+            batch_prefill_prof,
+            batch_decode_prof,
+        }
+    }
+}
+
+fn llm_executor_runtime_env() -> &'static LlmExecutorRuntimeEnv {
+    static CONFIG: OnceLock<LlmExecutorRuntimeEnv> = OnceLock::new();
+    CONFIG.get_or_init(LlmExecutorRuntimeEnv::from_env)
+}
 
 /// Map a `ferrum_types::Device` to the matching `candle_core::Device`.
 /// Used when materialising KV cache handles so downstream readers see
@@ -221,7 +260,7 @@ impl ModelExecutor for LlmExecutor {
             .map(|((cid, toks), &prior)| (cid.clone(), toks.clone(), prior, true))
             .collect();
 
-        let nb_prof = std::env::var("FERRUM_BATCH_PREFILL_PROF").is_ok();
+        let nb_prof = llm_executor_runtime_env().batch_prefill_prof;
         let bp_t0 = if nb_prof {
             Some(std::time::Instant::now())
         } else {
@@ -435,7 +474,7 @@ impl ModelExecutor for LlmExecutor {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let prof = std::env::var("FERRUM_BATCH_DECODE_PROF").is_ok();
+        let prof = llm_executor_runtime_env().batch_decode_prof;
         let t0 = if prof {
             Some(std::time::Instant::now())
         } else {
@@ -708,5 +747,29 @@ impl ModelExecutor for LlmExecutor {
 
     fn status(&self) -> ExecutorStatus {
         common::default_executor_status()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llm_executor_runtime_env_parses_profile_flags_by_presence() {
+        let env = LlmExecutorRuntimeEnv::from_env_vars([
+            ("FERRUM_BATCH_PREFILL_PROF", ""),
+            ("FERRUM_BATCH_DECODE_PROF", "0"),
+        ]);
+
+        assert!(env.batch_prefill_prof);
+        assert!(env.batch_decode_prof);
+    }
+
+    #[test]
+    fn llm_executor_runtime_env_defaults_profile_flags_off() {
+        let env = LlmExecutorRuntimeEnv::from_env_vars([("UNRELATED", "1")]);
+
+        assert!(!env.batch_prefill_prof);
+        assert!(!env.batch_decode_prof);
     }
 }

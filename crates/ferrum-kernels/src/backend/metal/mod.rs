@@ -115,6 +115,42 @@ pub(crate) fn st() -> &'static MetalState {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetalRuntimeConfig {
+    mmap_trace: bool,
+    capture_path: Option<String>,
+    mtl_capture_enabled: bool,
+    prefer_f16_weights: bool,
+}
+
+fn metal_runtime_config() -> &'static MetalRuntimeConfig {
+    static CONFIG: OnceLock<MetalRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = MetalRuntimeConfig {
+            mmap_trace: false,
+            capture_path: None,
+            mtl_capture_enabled: false,
+            prefer_f16_weights: false,
+        };
+        for (name, value) in std::env::vars() {
+            match name.as_str() {
+                "FERRUM_MMAP_TRACE" => config.mmap_trace = true,
+                "FERRUM_METAL_CAPTURE" => config.capture_path = Some(value),
+                "FERRUM_METAL_DTYPE" => {
+                    config.prefer_f16_weights = value.eq_ignore_ascii_case("f16")
+                }
+                "MTL_CAPTURE_ENABLED" => config.mtl_capture_enabled = true,
+                _ => {}
+            }
+        }
+        config
+    })
+}
+
+pub(crate) fn metal_mmap_trace_enabled() -> bool {
+    metal_runtime_config().mmap_trace
+}
+
 /// Register a host-memory region (typically the full mmap of a GGUF file)
 /// so subsequent `load_quant*` calls whose input slice lives inside this
 /// range can use the shared zero-copy `MTLBuffer` instead of allocating a
@@ -147,7 +183,7 @@ pub fn register_gguf_mmap(
             "register_gguf_mmap: base pointer 0x{base_addr:x} not page-aligned (need {PAGE})"
         )));
     }
-    let trace = std::env::var("FERRUM_MMAP_TRACE").is_ok();
+    let trace = metal_mmap_trace_enabled();
     if trace {
         eprintln!(
             "[mmap] register file at 0x{base_addr:x} len={} ({:.2} GB)",
@@ -216,10 +252,10 @@ pub(crate) fn slice_is_in_registered_mmap(bytes: &[u8]) -> bool {
 /// capture failed (in which case stderr explains).
 pub fn maybe_begin_frame_capture() -> bool {
     use metal::{CaptureDescriptor, CaptureManager, MTLCaptureDestination};
-    let Ok(out_path) = std::env::var("FERRUM_METAL_CAPTURE") else {
+    let Some(out_path) = metal_runtime_config().capture_path.as_deref() else {
         return false;
     };
-    if std::env::var("MTL_CAPTURE_ENABLED").is_err() {
+    if !metal_runtime_config().mtl_capture_enabled {
         eprintln!(
             "[capture] FERRUM_METAL_CAPTURE set but MTL_CAPTURE_ENABLED is not — Metal will reject. Re-launch with MTL_CAPTURE_ENABLED=1."
         );
@@ -398,12 +434,7 @@ impl MetalContext {
 // Cached on first read so each tensor load doesn't re-parse env.
 
 fn prefer_f16_weights() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("FERRUM_METAL_DTYPE")
-            .map(|v| v.eq_ignore_ascii_case("f16"))
-            .unwrap_or(false)
-    })
+    metal_runtime_config().prefer_f16_weights
 }
 
 /// Element-count threshold above which a weight tensor goes to F16 storage

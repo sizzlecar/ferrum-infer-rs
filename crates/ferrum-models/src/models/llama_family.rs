@@ -17,7 +17,7 @@
 //! sees a uniform `qkv_proj` / `gate_up_proj` Linear.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::{atomic::AtomicU64, OnceLock};
 
 use ferrum_interfaces::kv_dtype::{KvFp16, KvInt8};
 use ferrum_kernels::backend::{
@@ -48,6 +48,76 @@ use ferrum_quantization::{Linear, WeightLoader};
 use ferrum_types::Result;
 
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
+
+const DEFAULT_KV_CAPACITY: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LlamaFamilyRuntimeEnv {
+    kv_capacity: Option<usize>,
+    metal_paged_kv: Option<bool>,
+    paged_max_seqs: usize,
+    decode_op_profile: bool,
+    prefill_op_profile: bool,
+    cuda_graph: bool,
+    decode_layer_profile: bool,
+}
+
+impl LlamaFamilyRuntimeEnv {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut config = Self {
+            kv_capacity: None,
+            metal_paged_kv: None,
+            paged_max_seqs: 32,
+            decode_op_profile: false,
+            prefill_op_profile: false,
+            cuda_graph: false,
+            decode_layer_profile: false,
+        };
+        for (name, value) in vars {
+            let value = value.as_ref();
+            match name.as_ref() {
+                "FERRUM_KV_CAPACITY" => config.kv_capacity = value.parse::<usize>().ok(),
+                "FERRUM_METAL_PAGED_KV" => config.metal_paged_kv = Some(value != "0"),
+                "FERRUM_PAGED_MAX_SEQS" => {
+                    if let Ok(max_seqs) = value.parse::<usize>() {
+                        config.paged_max_seqs = max_seqs;
+                    }
+                }
+                "FERRUM_DECODE_OP_PROFILE" => config.decode_op_profile = true,
+                "FERRUM_PREFILL_OP_PROFILE" => config.prefill_op_profile = true,
+                "FERRUM_CUDA_GRAPH" => config.cuda_graph = true,
+                "FERRUM_DECODE_LAYER_PROFILE" => config.decode_layer_profile = true,
+                _ => {}
+            }
+        }
+        config
+    }
+
+    fn kv_capacity_for_model(&self, model_max: usize) -> usize {
+        self.kv_capacity
+            .map(|cap| cap.min(model_max))
+            .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY))
+    }
+
+    fn paged_kv_enabled<B: BackendPagedKv>(&self) -> bool {
+        self.metal_paged_kv
+            .unwrap_or_else(|| B::supports_paged_kv())
+    }
+}
+
+fn llama_family_runtime_env() -> &'static LlamaFamilyRuntimeEnv {
+    static CONFIG: OnceLock<LlamaFamilyRuntimeEnv> = OnceLock::new();
+    CONFIG.get_or_init(LlamaFamilyRuntimeEnv::from_env)
+}
 
 /// Full Qwen3 architecture config (everything the model code needs, not just
 /// the engine-facing subset in `LlmRuntimeConfig`).
@@ -837,12 +907,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // ~3 GB on Qwen3-30B-A3B Q4_K_M leaves 18 GB weights + 3 GB pool
         // = 21 GB, fits comfortably on a 32 GB Mac. Long-context users
         // can `FERRUM_KV_CAPACITY=4096` and accept lower max_seqs.
-        const DEFAULT_KV_CAPACITY: usize = 512;
-        let max = std::env::var("FERRUM_KV_CAPACITY")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|cap| cap.min(model_max))
-            .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY));
+        let runtime_env = llama_family_runtime_env();
+        let max = runtime_env.kv_capacity_for_model(model_max);
 
         // Paged-KV mode: `FERRUM_METAL_PAGED_KV=1` switches every cache
         // for this model into block-table-indirect layout. Kernels from
@@ -859,9 +925,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // opt-in pre-0.7.2; flipping the default so default `ferrum
         // serve` matches the bench-quality numbers without requiring
         // env-var knowledge.
-        let paged = std::env::var("FERRUM_METAL_PAGED_KV")
-            .map(|v| v != "0")
-            .unwrap_or_else(|_| B::supports_paged_kv());
+        let paged = runtime_env.paged_kv_enabled::<B>();
         const PAGED_BLOCK_SIZE: usize = 16;
 
         // Phase 4 shared-pool sizing. The pool sees ALL concurrent
@@ -871,10 +935,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // use. Pool memory is `max_seqs × max_blocks_per_seq` total
         // blocks — we lowered DEFAULT_KV_CAPACITY to 2048 so this 2× max_seqs
         // bump keeps the pool footprint identical to the pre-0.7.2 default.
-        let max_seqs = std::env::var("FERRUM_PAGED_MAX_SEQS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(32);
+        let max_seqs = runtime_env.paged_max_seqs;
         let max_blocks_per_seq = max.div_ceil(PAGED_BLOCK_SIZE);
         let total_pool_blocks = max_seqs * max_blocks_per_seq;
 
@@ -1017,7 +1078,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let kv_dim = nkv * hd;
 
         // 1. Input RMSNorm
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+        let _t0 = if llama_family_runtime_env().decode_op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -1042,7 +1103,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
 
         // 2. Fused QKV projection (Linear dispatches to Dense/GPTQ/AWQ/GGUF)
-        let _t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+        let _t0 = if llama_family_runtime_env().decode_op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -1179,7 +1240,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // Non-paged (contig) path. INT8 path doesn't reach here:
         // KvInt8::alloc_contig panics in ensure_kv.
-        let _qkr_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+        let _qkr_t0 = if llama_family_runtime_env().decode_op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -1220,7 +1281,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         K::set_len(&mut caches[li], new_len);
         let kv_stride = cache_capacity;
 
-        let _attn_t0 = if std::env::var("FERRUM_DECODE_OP_PROFILE").is_ok() {
+        let _attn_t0 = if llama_family_runtime_env().decode_op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -1458,7 +1519,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .expect("prefill_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
 
-        let prefill_profile = std::env::var("FERRUM_PREFILL_OP_PROFILE").is_ok();
+        let prefill_profile = llama_family_runtime_env().prefill_op_profile;
         let prefill_t0 = if prefill_profile {
             B::sync(&mut ctx);
             Some(std::time::Instant::now())
@@ -1569,7 +1630,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // docs/phase-e-cuda-status.md). In pure eager mode, we skip the
         // per-step device-state memcpy_htod trio entirely.
         const GRAPH_WARMUP: usize = 3;
-        let graph_enabled = std::env::var("FERRUM_CUDA_GRAPH").is_ok();
+        let graph_enabled = llama_family_runtime_env().cuda_graph;
 
         if graph_enabled {
             // Refresh device-side dynamic state (token/pos/kv_len) before
@@ -1619,7 +1680,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // Per-layer wall-time profile (env-gated, off by default — adds
         // a B::sync between layers which serializes the pipeline). Helps
         // localise non-matmul bottlenecks during perf work.
-        let layer_profile = std::env::var("FERRUM_DECODE_LAYER_PROFILE").is_ok();
+        let layer_profile = llama_family_runtime_env().decode_layer_profile;
         let mut layer_times = if layer_profile {
             Some(Vec::with_capacity(self.cfg.num_layers))
         } else {
@@ -1974,13 +2035,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
     }
 
     fn kv_capacity(&self) -> usize {
-        let model_max = self.cfg.max_seq_len;
-        const DEFAULT_KV_CAPACITY: usize = 512;
-        std::env::var("FERRUM_KV_CAPACITY")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|cap| cap.min(model_max))
-            .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY))
+        llama_family_runtime_env().kv_capacity_for_model(self.cfg.max_seq_len)
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
@@ -2112,13 +2167,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
     }
 
     fn kv_capacity(&self) -> usize {
-        let model_max = self.cfg.max_seq_len;
-        const DEFAULT_KV_CAPACITY: usize = 512;
-        std::env::var("FERRUM_KV_CAPACITY")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|cap| cap.min(model_max))
-            .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY))
+        llama_family_runtime_env().kv_capacity_for_model(self.cfg.max_seq_len)
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
@@ -2199,5 +2248,49 @@ fn build_rope_cache<B: QuantLlmBackend + BackendMoeFused>(cfg: &LlamaFamilyConfi
     RopeCache {
         cos: B::from_slice(&cos),
         sin: B::from_slice(&sin),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LlamaFamilyRuntimeEnv, DEFAULT_KV_CAPACITY};
+
+    #[test]
+    fn llama_family_runtime_env_parses_startup_knobs() {
+        let env = LlamaFamilyRuntimeEnv::from_env_vars([
+            ("FERRUM_KV_CAPACITY", "4096"),
+            ("FERRUM_METAL_PAGED_KV", "0"),
+            ("FERRUM_PAGED_MAX_SEQS", "64"),
+            ("FERRUM_DECODE_OP_PROFILE", "0"),
+            ("FERRUM_PREFILL_OP_PROFILE", ""),
+            ("FERRUM_CUDA_GRAPH", ""),
+            ("FERRUM_DECODE_LAYER_PROFILE", "false"),
+        ]);
+
+        assert_eq!(env.kv_capacity, Some(4096));
+        assert_eq!(env.metal_paged_kv, Some(false));
+        assert_eq!(env.paged_max_seqs, 64);
+        assert!(env.decode_op_profile);
+        assert!(env.prefill_op_profile);
+        assert!(env.cuda_graph);
+        assert!(env.decode_layer_profile);
+        assert_eq!(env.kv_capacity_for_model(2048), 2048);
+    }
+
+    #[test]
+    fn llama_family_runtime_env_uses_defaults_for_invalid_values() {
+        let env = LlamaFamilyRuntimeEnv::from_env_vars([
+            ("FERRUM_KV_CAPACITY", "bad"),
+            ("FERRUM_PAGED_MAX_SEQS", "bad"),
+            ("FERRUM_METAL_PAGED_KV", "1"),
+        ]);
+
+        assert_eq!(env.kv_capacity, None);
+        assert_eq!(env.metal_paged_kv, Some(true));
+        assert_eq!(env.paged_max_seqs, 32);
+        assert_eq!(
+            env.kv_capacity_for_model(DEFAULT_KV_CAPACITY * 2),
+            DEFAULT_KV_CAPACITY
+        );
     }
 }

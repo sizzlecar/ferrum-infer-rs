@@ -40,12 +40,12 @@
 
 use crate::backend::Backend;
 
-/// Start a timer iff `env_var` is set in the environment — `None` is
-/// the disabled state. Pair with [`finish_probe_timer`] at the end of
-/// the scope. PLAYBOOK § 1.2 — the migration target for sites that
-/// previously did `let t0 = if env(X) { B::sync(ctx); Some(Instant::now()) }`.
-pub fn start_probe_timer<B: Backend>(env_var: &str, ctx: &mut B::Context) -> Option<B::Timer> {
-    if std::env::var(env_var).is_ok() {
+/// Start a timer iff `enabled` is true — `None` is the disabled state.
+/// Pair with [`finish_probe_timer`] at the end of the scope. The env/config
+/// gate is intentionally resolved by the caller so hot probes do not read
+/// process env while a token/layer loop is running.
+pub fn start_probe_timer_if<B: Backend>(enabled: bool, ctx: &mut B::Context) -> Option<B::Timer> {
+    if enabled {
         let mut t = B::make_timer();
         t.record_start(ctx);
         Some(t)

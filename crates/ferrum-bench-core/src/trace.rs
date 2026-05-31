@@ -32,6 +32,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+const TRACE_OUT_ENV: &str = "FERRUM_TRACE_OUT";
+
 /// Global TraceWriter — lazy-initialized from `FERRUM_TRACE_OUT` env
 /// on first access. Returns a disabled writer when env is unset, so
 /// callers can unconditionally `global_trace().push(...)` without a
@@ -121,10 +123,23 @@ impl TraceWriter {
     /// Construct from env var `FERRUM_TRACE_OUT`. If unset or empty,
     /// returns a disabled writer whose `push` is a no-op.
     pub fn from_env() -> Self {
-        match std::env::var("FERRUM_TRACE_OUT") {
-            Ok(p) if !p.is_empty() => Self::enabled(PathBuf::from(p)),
-            _ => Self::disabled(),
-        }
+        Self::from_env_vars(std::env::vars())
+    }
+
+    pub fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let out_path = vars.into_iter().find_map(|(name, value)| {
+            (name.into() == TRACE_OUT_ENV)
+                .then(|| value.into())
+                .filter(|value: &String| !value.is_empty())
+        });
+        out_path
+            .map(|path| Self::enabled(PathBuf::from(path)))
+            .unwrap_or_else(Self::disabled)
     }
 
     pub fn enabled(out_path: PathBuf) -> Self {
@@ -230,6 +245,15 @@ mod tests {
         w.push("rms_norm", "norm", 1.0, 0);
         assert!(!w.is_enabled());
         w.flush().unwrap(); // no-op
+    }
+
+    #[test]
+    fn trace_writer_parses_env_snapshot() {
+        let disabled = TraceWriter::from_env_vars([(TRACE_OUT_ENV, ""), ("OTHER", "1")]);
+        assert!(!disabled.is_enabled());
+
+        let enabled = TraceWriter::from_env_vars([(TRACE_OUT_ENV, "/tmp/ferrum-trace.json")]);
+        assert!(enabled.is_enabled());
     }
 
     #[test]

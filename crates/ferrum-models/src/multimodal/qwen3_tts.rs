@@ -17,6 +17,7 @@ use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder};
 use ferrum_types::{FerrumError, Result};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use tracing::info;
 
 use super::repeat_kv;
@@ -763,7 +764,7 @@ impl Qwen3TTSTalker {
     /// Forward through transformer layers. Uses fused path by default,
     /// set FERRUM_USE_CANDLE=1 to use candle's native ops (for precision testing).
     pub fn forward_step(&mut self, input_embeds: &Tensor) -> Result<Tensor> {
-        let use_candle = std::env::var("FERRUM_USE_CANDLE").as_deref() == Ok("1");
+        let use_candle = qwen3_tts_use_candle();
 
         // If a Backend<B> override is installed, use it. Returns post-norm
         // hidden so semantics match `fused.forward`.
@@ -864,6 +865,13 @@ impl Qwen3TTSTalker {
     pub fn device(&self) -> &CandleDevice {
         &self.device
     }
+}
+
+fn qwen3_tts_use_candle() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::vars().any(|(name, value)| name == "FERRUM_USE_CANDLE" && value == "1")
+    })
 }
 
 // ── SubTalker (Code Predictor) ──────────────────────────────────────────

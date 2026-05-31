@@ -23,7 +23,7 @@
 //! preserve the historical `crate::backend::cuda::*` paths used by
 //! `quant_linear::cuda_marlin` and parity tests.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
@@ -70,7 +70,7 @@ pub type GptqStoreCuda = crate::marlin::MarlinWeight;
 /// Read `FERRUM_TRITON_INT4` once. Returns true iff `=1`. Anything else
 /// (unset, `0`, empty, garbage) → false.
 fn use_triton_int4() -> bool {
-    std::env::var("FERRUM_TRITON_INT4").map_or(false, |v| v == "1")
+    cuda_quant_runtime_config().triton_int4
 }
 
 /// Read `FERRUM_VLLM_MOE` once. Returns true iff `=1`. Selects the
@@ -78,7 +78,73 @@ fn use_triton_int4() -> bool {
 /// weights (load + dispatch pair must be enabled together).
 #[cfg(feature = "vllm-moe-marlin")]
 pub(crate) fn use_vllm_moe() -> bool {
-    std::env::var("FERRUM_VLLM_MOE").map_or(false, |v| v == "1")
+    cuda_quant_runtime_config().vllm_moe
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CudaQuantRuntimeConfig {
+    triton_int4: bool,
+    vllm_moe: bool,
+    vllm_marlin: bool,
+    vllm_marlin_sms: i32,
+    vllm_atomic_add: bool,
+    vllm_fp32_reduce: bool,
+    moe_fused: bool,
+    moe_streams: usize,
+}
+
+impl CudaQuantRuntimeConfig {
+    fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut config = Self {
+            triton_int4: false,
+            vllm_moe: false,
+            vllm_marlin: false,
+            vllm_marlin_sms: 128,
+            vllm_atomic_add: false,
+            vllm_fp32_reduce: false,
+            moe_fused: true,
+            moe_streams: 4,
+        };
+
+        for (name, value) in vars {
+            let value = value.as_ref();
+            match name.as_ref() {
+                "FERRUM_TRITON_INT4" => config.triton_int4 = value == "1",
+                "FERRUM_VLLM_MOE" => config.vllm_moe = value == "1",
+                "FERRUM_VLLM_MARLIN" => config.vllm_marlin = value == "1",
+                "FERRUM_VLLM_MARLIN_SMS" => {
+                    if let Ok(sms) = value.parse::<i32>() {
+                        config.vllm_marlin_sms = sms;
+                    }
+                }
+                "FERRUM_VLLM_ATOMIC_ADD" => config.vllm_atomic_add = value == "1",
+                "FERRUM_VLLM_FP32_REDUCE" => config.vllm_fp32_reduce = value == "1",
+                "FERRUM_MOE_FUSED" => config.moe_fused = value != "0",
+                "FERRUM_MOE_STREAMS" => {
+                    if let Ok(streams) = value.parse::<usize>() {
+                        config.moe_streams = streams.max(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        config
+    }
+}
+
+fn cuda_quant_runtime_config() -> &'static CudaQuantRuntimeConfig {
+    static CONFIG: OnceLock<CudaQuantRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(CudaQuantRuntimeConfig::from_env)
 }
 // ────────────────────────────────────────────────────────────────────────
 // Perm-aware Marlin GEMM (desc_act=true GPTQ act-order)
@@ -306,7 +372,7 @@ pub fn marlin_gemm_with_perm(
     out: &mut CudaSlice<f16>,
     m: usize,
 ) -> Result<()> {
-    let use_vllm = std::env::var("FERRUM_VLLM_MARLIN").map_or(false, |v| v == "1");
+    let use_vllm = cuda_quant_runtime_config().vllm_marlin;
 
     if let Some(perm) = weight.perm.as_ref() {
         let k = weight.k;
@@ -392,13 +458,11 @@ pub fn launch_vllm_marlin(
     let group_size = weight.group_size;
     let num_groups = if group_size > 0 { k / group_size } else { 1 };
     // RTX 4090 = 128 SMs. TODO: query CudaDevice attribute.
-    let sms = std::env::var("FERRUM_VLLM_MARLIN_SMS")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(128);
+    let runtime_config = cuda_quant_runtime_config();
+    let sms = runtime_config.vllm_marlin_sms;
     // vLLM perf knobs — try toggling via env to see if either helps.
-    let use_atomic_add = std::env::var("FERRUM_VLLM_ATOMIC_ADD").map_or(false, |v| v == "1");
-    let use_fp32_reduce = std::env::var("FERRUM_VLLM_FP32_REDUCE").map_or(false, |v| v == "1");
+    let use_atomic_add = runtime_config.vllm_atomic_add;
+    let use_fp32_reduce = runtime_config.vllm_fp32_reduce;
 
     unsafe {
         crate::vllm_marlin::launch_marlin_mm_f16_u4b8(
@@ -829,7 +893,8 @@ pub(crate) fn moe_gemm_phase_batched_impl(
     // instead of 100. Bench: +25% c=32, +35% c=16, +48% c=8 over
     // the multi-stream per-expert path. Set FERRUM_MOE_FUSED=0 to
     // opt out (fall back to multi-stream pool).
-    if std::env::var("FERRUM_MOE_FUSED").map_or(true, |v| v != "0") {
+    let runtime_config = cuda_quant_runtime_config();
+    if runtime_config.moe_fused {
         return moe_gemm_phase_fused_impl(
             ctx,
             input.as_f16(),
@@ -844,11 +909,7 @@ pub(crate) fn moe_gemm_phase_batched_impl(
     // n_streams=1: serial dispatch on the DEFAULT context stream
     // (avoids the cross-stream sync overhead and matches the
     // pre-multi-stream path bit-for-bit).
-    let n_streams = std::env::var("FERRUM_MOE_STREAMS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(4)
-        .max(1);
+    let n_streams = runtime_config.moe_streams;
     if n_streams == 1 {
         let default_stream = ctx.stream.clone();
         for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
@@ -994,3 +1055,49 @@ pub(crate) fn moe_gemm_phase_vllm_impl(
 }
 // CUDA does not ship GGUF k-quant kernels; inherit unsupported defaults.
 impl BackendQuantGguf for CudaBackend {}
+
+#[cfg(test)]
+mod tests {
+    use super::CudaQuantRuntimeConfig;
+
+    #[test]
+    fn cuda_quant_runtime_config_parses_marlin_and_moe_knobs() {
+        let config = CudaQuantRuntimeConfig::from_env_vars([
+            ("FERRUM_TRITON_INT4", "1"),
+            ("FERRUM_VLLM_MOE", "1"),
+            ("FERRUM_VLLM_MARLIN", "1"),
+            ("FERRUM_VLLM_MARLIN_SMS", "132"),
+            ("FERRUM_VLLM_ATOMIC_ADD", "1"),
+            ("FERRUM_VLLM_FP32_REDUCE", "1"),
+            ("FERRUM_MOE_FUSED", "0"),
+            ("FERRUM_MOE_STREAMS", "0"),
+        ]);
+
+        assert!(config.triton_int4);
+        assert!(config.vllm_moe);
+        assert!(config.vllm_marlin);
+        assert_eq!(config.vllm_marlin_sms, 132);
+        assert!(config.vllm_atomic_add);
+        assert!(config.vllm_fp32_reduce);
+        assert!(!config.moe_fused);
+        assert_eq!(config.moe_streams, 1);
+    }
+
+    #[test]
+    fn cuda_quant_runtime_config_keeps_existing_defaults() {
+        let config = CudaQuantRuntimeConfig::from_env_vars([
+            ("FERRUM_TRITON_INT4", "true"),
+            ("FERRUM_VLLM_MARLIN_SMS", "bad"),
+            ("FERRUM_MOE_STREAMS", "bad"),
+        ]);
+
+        assert!(!config.triton_int4);
+        assert!(!config.vllm_moe);
+        assert!(!config.vllm_marlin);
+        assert_eq!(config.vllm_marlin_sms, 128);
+        assert!(!config.vllm_atomic_add);
+        assert!(!config.vllm_fp32_reduce);
+        assert!(config.moe_fused);
+        assert_eq!(config.moe_streams, 4);
+    }
+}

@@ -1,0 +1,8 @@
+# Scanned FERRUM_* tokens that are intentionally not environment variables.
+# Keep this list small; real runtime/build/test knobs belong in
+# docs/runtime-env-registry.tsv instead.
+FERRUM_GEMM_NR0
+FERRUM_GEMM_NR1
+FERRUM_IDS_TPE_NSG
+FERRUM_IDS_TPE_THREADS
+FERRUM_VLLM_MOE_BF16

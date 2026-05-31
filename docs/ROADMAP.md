@@ -110,7 +110,7 @@ paged-KV with batched flash attention, fused norms. See
 | Tensor Parallelism | Multi-GPU via NCCL | **Done** — persistent per-rank threads + NCCL all-reduce | Closed (PCIe-bound; NVLink machines see real wins) |
 | Apple Silicon | Not supported | **Done** — full Metal backend, beats llama.cpp at c=16 on Group A | n/a (we cover this, vLLM doesn't) |
 | Model Support | Dozens | LLaMA-3.x, Qwen3, Qwen2/2.5, Mistral, Qwen3-MoE; plus Whisper, Qwen3-TTS, BERT/CLIP/SigLIP | Medium |
-| Structured Output | JSON mode / grammar-guided | **Done** — `json_object` + `json_schema` with DFA-guided hard masking | Partial (full grammar-guided future) |
+| Structured Output | JSON mode / grammar-guided | **Done** — `json_object` best-effort plus strict `json_schema` validation for the supported subset | Partial (full grammar-guided future) |
 | Speculative Decoding | Yes | **Done** — `--spec-draft <MODEL>` DeepMind accept/reject | Closed |
 | Benchmarking | Comprehensive | **Done** — sequential, concurrent, long-context, plus per-engine continuous-batching harness vs llama.cpp/mistralrs | Closed |
 
@@ -253,7 +253,7 @@ Without this, performance cannot compete. The strategy is FFI bindings, not reim
 | **Done** | Apple Silicon (Metal) backend | Custom Q4_K/Q6_K dequant, fused MoE GEMV, paged-KV decode, batched flash attention. Group A matches/beats llama.cpp at c=16 — see bench report |
 | **Done** | INT4 quantization | GPTQ auto-detect, Marlin Blackwell-tuned, also Triton w4a16 (interactive path) |
 | **Done** | Speculative decoding | Draft model + DeepMind accept/reject (`--spec-draft`) |
-| **Done** | Structured output | OpenAI `response_format: json_object` + `json_schema`, DFA-guided masking |
+| **Done** | Structured output | OpenAI `response_format=json_object` best-effort plus strict `json_schema` validation for the supported subset |
 | **Done** | Tensor parallelism | Persistent per-rank threads + NCCL all-reduce. Most useful with NVLink — PCIe path is bandwidth-bound |
 | **Done** | Whisper ASR + Qwen3-TTS | Custom forward passes on Metal/CUDA/CPU, OpenAI-compatible APIs |
 | **Done** | Benchmark + observability | Continuous-batching bench harness, Prometheus metrics, `/health` |

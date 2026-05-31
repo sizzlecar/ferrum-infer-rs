@@ -1,0 +1,14 @@
+server_ready_after=21s
+PARIS_CONTENT= The capital of France is **Paris**.
+== ferrum fa2_direct bench c=1 ==
+RESULT c=1 throughput=160.41862710101123 ci95=0.21348243148033189 completed=[128, 128, 128, 128, 128] errored=[0, 0, 0, 0, 0] file=/workspace/m3-fa2-direct-ffi-confirm-n5-20260530/c1_n5.json
+== ferrum fa2_direct bench c=4 ==
+RESULT c=4 throughput=446.3150102636785 ci95=6.971852702560416 completed=[128, 128, 128, 128, 128] errored=[0, 0, 0, 0, 0] file=/workspace/m3-fa2-direct-ffi-confirm-n5-20260530/c4_n5.json
+== ferrum fa2_direct bench c=16 ==
+RESULT c=16 throughput=1185.1321017141572 ci95=12.267814460081173 completed=[128, 128, 128, 128, 128] errored=[0, 0, 0, 0, 0] file=/workspace/m3-fa2-direct-ffi-confirm-n5-20260530/c16_n5.json
+== ferrum fa2_direct bench c=32 ==
+RESULT c=32 throughput=1641.8662374191013 ci95=4.75400850462988 completed=[128, 128, 128, 128, 128] errored=[0, 0, 0, 0, 0] file=/workspace/m3-fa2-direct-ffi-confirm-n5-20260530/c32_n5.json
+SUMMARY c=1: ferrum_fa2=160.4 ± 0.21348243148033189 tok/s tpot_p50=5.86 itl_p95=6.01 ttft_p50=48.8
+SUMMARY c=4: ferrum_fa2=446.3 ± 6.971852702560416 tok/s tpot_p50=8.40 itl_p95=15.32 ttft_p50=62.7
+SUMMARY c=16: ferrum_fa2=1185.1 ± 12.267814460081173 tok/s tpot_p50=12.42 itl_p95=14.82 ttft_p50=142.9
+SUMMARY c=32: ferrum_fa2=1641.9 ± 4.75400850462988 tok/s tpot_p50=17.89 itl_p95=47.70 ttft_p50=180.0

@@ -10,6 +10,35 @@
 
 use super::CudaBackend;
 use crate::backend::{Backend, BackendCollective, ReduceOp};
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CudaCollectiveRuntimeConfig {
+    world_size: usize,
+    rank: usize,
+}
+
+fn cuda_collective_runtime_config() -> &'static CudaCollectiveRuntimeConfig {
+    static CONFIG: OnceLock<CudaCollectiveRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = CudaCollectiveRuntimeConfig {
+            world_size: 1,
+            rank: 0,
+        };
+        for (name, value) in std::env::vars() {
+            match name.as_str() {
+                "FERRUM_TP" => {
+                    config.world_size = value.parse::<usize>().unwrap_or(1).max(1);
+                }
+                "FERRUM_RANK" => {
+                    config.rank = value.parse::<usize>().unwrap_or(0);
+                }
+                _ => {}
+            }
+        }
+        config
+    })
+}
 
 impl BackendCollective for CudaBackend {
     // ── TP collectives ──────────────────────────────────────────────────
@@ -22,17 +51,11 @@ impl BackendCollective for CudaBackend {
     // blocking on the LLM decode path — single-rank skips these entirely).
 
     fn world_size(_ctx: &Self::Context) -> usize {
-        std::env::var("FERRUM_TP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1)
+        cuda_collective_runtime_config().world_size
     }
 
     fn rank(_ctx: &Self::Context) -> usize {
-        std::env::var("FERRUM_RANK")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
+        cuda_collective_runtime_config().rank
     }
 
     fn all_reduce(ctx: &mut Self::Context, buf: &mut Self::Buffer, len: usize, op: ReduceOp) {

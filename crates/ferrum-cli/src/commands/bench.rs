@@ -133,20 +133,18 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());
 
-    unsafe {
-        std::env::set_var(
-            "FERRUM_MODEL_PATH",
-            source.local_path.to_string_lossy().to_string(),
-        );
-    }
+    let engine_model_path = source.local_path.to_string_lossy().to_string();
 
     let device = super::run::select_device(&cmd.backend);
     let backend_str = format!("{:?}", device).to_lowercase();
     eprintln!("{} {:?}", "Device:".dimmed(), device);
+    let runtime_config = ferrum_types::RuntimeConfigSnapshot::capture_current();
 
     #[cfg(feature = "cuda")]
     {
-        let graph_mode = std::env::var("FERRUM_CUDA_GRAPH").is_ok();
+        let graph_mode =
+            crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_CUDA_GRAPH")
+                .is_some();
         if !graph_mode {
             if let Ok(d) = candle_core::Device::new_cuda(0) {
                 if let Ok(cd) = d.as_cuda_device() {
@@ -155,8 +153,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
                 }
             }
         }
-        let tp = std::env::var("FERRUM_TP")
-            .ok()
+        let tp = crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_TP")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(|| {
                 candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
@@ -171,8 +168,19 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let mut engine_config = ferrum_types::EngineConfig::default();
     engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
     engine_config.backend.device = device;
+    engine_config.backend.backend_options.insert(
+        "model_path".to_string(),
+        serde_json::Value::String(engine_model_path),
+    );
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
-    super::run::apply_kv_dtype_override(&mut engine_config, cmd.kv_dtype.as_deref())?;
+    engine_config
+        .apply_runtime_config_snapshot(&runtime_config)
+        .map_err(ferrum_types::FerrumError::config)?;
+    let effective_kv_dtype = cmd
+        .kv_dtype
+        .as_deref()
+        .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
+    super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
     let engine = ferrum_engine::create_default_engine(engine_config).await?;
 
     let prompt = if cmd.long_context {
@@ -368,6 +376,7 @@ fn make_request(model_id: &str, prompt: &str, max_tokens: u32) -> InferenceReque
         client_id: None,
         session_id: None,
         created_at: Utc::now(),
+        api_request: None,
         metadata: HashMap::new(),
     }
 }

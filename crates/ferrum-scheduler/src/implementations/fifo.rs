@@ -376,6 +376,7 @@ mod tests {
             client_id: None,
             session_id: None,
             created_at: chrono::Utc::now(),
+            api_request: None,
             metadata: std::collections::HashMap::new(),
         }
     }

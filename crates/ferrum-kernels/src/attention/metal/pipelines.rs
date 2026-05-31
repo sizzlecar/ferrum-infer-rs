@@ -3,6 +3,31 @@
 use metal::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalAttentionRuntimeConfig {
+    force_legacy: bool,
+    allow_decode_widen: bool,
+}
+
+fn metal_attention_runtime_config() -> &'static MetalAttentionRuntimeConfig {
+    static CONFIG: OnceLock<MetalAttentionRuntimeConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut config = MetalAttentionRuntimeConfig {
+            force_legacy: false,
+            allow_decode_widen: true,
+        };
+        for (name, value) in std::env::vars() {
+            match name.as_str() {
+                "FERRUM_FA_LEGACY" => config.force_legacy = value == "1",
+                "FERRUM_FA_DECODE" => config.allow_decode_widen = value != "0",
+                _ => {}
+            }
+        }
+        config
+    })
+}
 
 pub struct MetalPipelines {
     pub device: Device,
@@ -1066,8 +1091,9 @@ impl MetalPipelines {
         // / numerical comparison). `FERRUM_FA_DECODE=0` disables the new
         // decode kernel specifically while leaving Q-tiled prefill enabled.
         const Q_TILE_R: usize = 8;
-        let force_legacy = std::env::var("FERRUM_FA_LEGACY").as_deref() == Ok("1");
-        let allow_decode_widen = std::env::var("FERRUM_FA_DECODE").as_deref() != Ok("0");
+        let runtime_config = metal_attention_runtime_config();
+        let force_legacy = runtime_config.force_legacy;
+        let allow_decode_widen = runtime_config.allow_decode_widen;
         let use_q_tiled = !force_legacy
             && params.head_dim == 128
             && params.sliding_window == 0
