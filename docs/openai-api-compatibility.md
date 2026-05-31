@@ -26,6 +26,8 @@ describes the current product contract for the always-on server path.
 | `/v1/audio/speech response_format=wav` | Supported | Returns 16-bit mono WAV bytes with `content-type: audio/wav`. |
 | `/v1/audio/speech response_format=pcm` | Supported | Returns raw 16-bit little-endian mono PCM bytes with `content-type: audio/pcm`. |
 | `/v1/audio/speech` other `response_format` values | Rejected | Returns HTTP 400 with `param=response_format`; compressed speech formats are not implemented. |
+| `/v1/audio/speech voice=default` | Supported | Uses the loaded TTS model's default speaker. |
+| `/v1/audio/speech` other `voice` values | Rejected | Returns HTTP 400 with `param=voice`; named speaker/voice presets are not implemented. |
 
 ## Chat Fields
 

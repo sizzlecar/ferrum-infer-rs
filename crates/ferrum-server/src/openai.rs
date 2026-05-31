@@ -649,7 +649,7 @@ pub struct SpeechRequest {
     /// Text to synthesize
     pub input: String,
 
-    /// Voice preset (ignored for now — uses default speaker)
+    /// Voice preset. Ferrum currently supports only the default speaker.
     #[serde(default = "default_voice")]
     pub voice: String,
 

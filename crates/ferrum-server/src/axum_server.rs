@@ -1666,6 +1666,7 @@ async fn speech_handler(
     let Json(request) = request
         .map_err(|e| ServerError::invalid_request(format!("invalid speech request: {e}"), None))?;
 
+    validate_speech_request(&request)?;
     let response_format = speech_output_format(&request)?;
 
     let span = span!(Level::INFO, "speech");
@@ -1737,6 +1738,17 @@ async fn speech_handler(
             .header("content-length", audio_bytes.len().to_string())
             .body(axum::body::Body::from(audio_bytes))
             .unwrap())
+    }
+}
+
+fn validate_speech_request(request: &SpeechRequest) -> std::result::Result<(), ServerError> {
+    if request.voice.is_empty() || request.voice.eq_ignore_ascii_case("default") {
+        Ok(())
+    } else {
+        Err(ServerError::unsupported_feature(
+            "only voice=default is supported for speech",
+            Some("voice"),
+        ))
     }
 }
 
@@ -4143,6 +4155,25 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "response_format");
+    }
+
+    #[tokio::test]
+    async fn route_speech_rejects_unsupported_voice() {
+        let response = post_json(
+            router_with_stub_tts(),
+            "/v1/audio/speech",
+            json!({
+                "model": "stub-tts",
+                "input": "hello",
+                "voice": "alloy",
+                "response_format": "wav"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "voice");
     }
 
     #[tokio::test]
