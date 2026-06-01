@@ -78,6 +78,23 @@ __device__ __forceinline__ int fa2_find_seq_idx(
     return lo;
 }
 
+__device__ __forceinline__ const __half *fa_kv_ptr(
+    const __half *pool,
+    int physical_block,
+    int slot,
+    int kv_head,
+    int dim,
+    int block_size,
+    int num_kv_heads,
+    int head_dim) {
+    const long long block_stride =
+        static_cast<long long>(block_size) * num_kv_heads * head_dim;
+    const long long slot_stride = static_cast<long long>(num_kv_heads) * head_dim;
+    return pool + static_cast<long long>(physical_block) * block_stride +
+           static_cast<long long>(slot) * slot_stride +
+           static_cast<long long>(kv_head) * head_dim + dim;
+}
+
 __global__ void ferrum_fa2_paged_varlen_kernel_f16(
     const __half *__restrict__ q,
     const __half *__restrict__ k_block_pool,
@@ -116,9 +133,6 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
     const int q_per_kv = num_heads / num_kv_heads;
     const int kv_head = q_head / q_per_kv;
     const int *my_block_table = block_tables + seq_idx * max_blocks_per_seq;
-    const long long block_stride = static_cast<long long>(block_size) * num_kv_heads * 128;
-    const long long slot_stride = static_cast<long long>(num_kv_heads) * 128;
-    const long long kv_head_base = static_cast<long long>(kv_head) * 128;
     const __half *q_ptr =
         q + (static_cast<size_t>(token_global) * num_heads + q_head) * head_dim;
     __half *out_ptr =
@@ -147,14 +161,13 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
         const int logical_block = kv_pos / block_size;
         const int slot = kv_pos - logical_block * block_size;
         const int physical_block = my_block_table[logical_block];
-        const long long kv_base = static_cast<long long>(physical_block) * block_stride +
-                                  static_cast<long long>(slot) * slot_stride +
-                                  kv_head_base;
         float dot = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int d = lane_id + i * FERRUM_FA2_WARP_SIZE;
-            dot += q_reg[i] * __half2float(k_block_pool[kv_base + d]);
+            dot += q_reg[i] *
+                   __half2float(*fa_kv_ptr(k_block_pool, physical_block, slot, kv_head,
+                                           d, block_size, num_kv_heads, head_dim));
         }
         float score = warp_reduce_sum(dot);
         score = __shfl_sync(0xffffffff, score, 0) * scale;
@@ -168,7 +181,9 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int d = lane_id + i * FERRUM_FA2_WARP_SIZE;
-            const float v_val = __half2float(v_block_pool[kv_base + d]);
+            const float v_val =
+                __half2float(*fa_kv_ptr(v_block_pool, physical_block, slot, kv_head,
+                                        d, block_size, num_kv_heads, head_dim));
             acc[i] = acc[i] * alpha + beta * v_val;
         }
     }
