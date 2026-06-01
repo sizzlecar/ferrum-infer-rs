@@ -38,6 +38,9 @@ python3 scripts/m3_collect_allcell_runner_artifacts.py --self-test
 - No new GPU performance claim is made by this checkpoint.
 - Default-path changes still need a same-pod c=1/4/16/32 full sweep with
   `n_repeats >= 3` and the existing correctness gates.
+- Multi-turn correctness coverage now includes a three-user-turn recall gate
+  for runner artifacts that enable `multi_turn=true`; the gate requires the
+  third response to preserve both `Paris` and the checkpoint token `basalt`.
 - Source-linked FA2 still needs all-cell N>=3/N=5 confirmation before it can
   support a default-path or final completion claim.
 - The final goal packet still needs one committed correctness and performance

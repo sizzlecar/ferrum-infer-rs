@@ -1,8 +1,10 @@
 # CUDA Build Cache Status - 2026-05-30
 
-Milestone A is not complete. This checkpoint replaces the core PTX build path
-with per-kernel content-hash stamps and adds machine-readable CUDA build
-summary lines.
+Milestone A is mostly complete for the current checkpoint. This checkpoint
+replaces the core PTX build path with per-kernel content-hash stamps, adds
+machine-readable CUDA build summary lines, and now has restored-pod release
+touch timing evidence below the target after the thin-LTO release profile
+change.
 
 ## Added
 
@@ -59,6 +61,10 @@ summary lines.
   the `cuda` feature check. CUDA builds still watch the same core PTX inputs in
   `compile_core_ptx`, but non-CUDA builds are no longer dirtied by unrelated
   core CUDA kernel touches.
+- The root release profile now uses thin LTO with more codegen units for the
+  current GPU iteration branch. This reduces the post-CUDA release rebuild/link
+  tail that previously dominated the Milestone A release touch probe even when
+  all CUDA artifacts were cache hits.
 
 ## Validation
 
@@ -203,6 +209,36 @@ Evidence:
 - Every run had `status_counts {"cache_hit": 39}` and no summary validation
   error. This proves the current miss is not broad CUDA/nvcc rebuild; it is
   the remaining Rust/Cargo release dirtying and release link tail.
+
+Restored-pod thin-LTO 5-run release touch probe:
+
+```bash
+cd /workspace/ferrum-fa2-native-restore-git-ac3dfab
+python3 scripts/m3_cuda_build_boundary_probe.py \
+  --iterations 5 \
+  --out /workspace/m3-release-touch-probe-thinlto-20260601-20260601_064127 \
+  --fail-on-limit
+```
+
+Evidence:
+
+- Artifact summary:
+  `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-release-touch-probe-thinlto-20260601.md`.
+- Remote manifest:
+  `/workspace/m3-release-touch-probe-thinlto-20260601-20260601_064127/build_boundary_manifest.json`.
+- Git head: `73a26af898371f202dcdc89bfb74a1437a8e4be1`.
+- All 5 runs exited `0`; per-run elapsed seconds were `34.454`, `33.469`,
+  `33.056`, `33.164`, and `32.502`.
+- The manifest timing gate passed: `p50_sec_nearest_rank=33.164`,
+  `p95_sec_nearest_rank=34.454`, limits `75.0/90.0`,
+  `limits_pass=true`.
+- Every run had `39` CUDA build summary rows with
+  `status_counts {"cache_hit": 39}`. Required cache-hit artifacts included the
+  touched `core-ptx:kernels/paged_varlen_attention_vllm.cu` row and all five
+  static libraries: `marlin`, `vllm_marlin`, `vllm_moe_marlin`,
+  `vllm_paged_attn`, and `fa2_source`.
+- This supersedes the earlier `231.517s/234.608s` restored-pod release touch
+  result for the current checkpoint.
 
 Remote package-scoped release dirty probe:
 
