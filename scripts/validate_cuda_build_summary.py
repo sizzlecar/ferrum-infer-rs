@@ -13,7 +13,7 @@ from typing import Any
 
 
 SUMMARY_RE = re.compile(
-    r"^\[cuda-build-summary\]\s+"
+    r"^(?:\[[^\]]+\]\s+)?\[cuda-build-summary\]\s+"
     r"artifact=(?P<artifact>\S+)\s+"
     r"status=(?P<status>built|cache_hit)\s+"
     r"reason=(?P<reason>\S+)\s+"
@@ -94,6 +94,7 @@ def run_self_test() -> None:
     fixture = "\n".join(
         [
             "[cuda-build-summary] artifact=core-ptx:kernels/paged_varlen_attention_vllm.cu status=cache_hit reason=signature-match elapsed_ms=0 inputs_hash=fnv1a64:0123456789abcdef",
+            "[ferrum-kernels 0.7.3] [cuda-build-summary] artifact=vllm_marlin status=cache_hit reason=signature-match elapsed_ms=1 inputs_hash=fnv1a64:1111111111111111",
             "[cuda-build-summary] artifact=vllm_moe_marlin status=built reason=signature-changed elapsed_ms=474451 inputs_hash=fnv1a64:abcdef0123456789",
         ]
     )
@@ -101,13 +102,17 @@ def run_self_test() -> None:
         fixture,
         require_artifacts=[
             "core-ptx:kernels/paged_varlen_attention_vllm.cu",
+            "vllm_marlin",
             "vllm_moe_marlin",
         ],
-        require_cache_hit=["core-ptx:kernels/paged_varlen_attention_vllm.cu"],
+        require_cache_hit=[
+            "core-ptx:kernels/paged_varlen_attention_vllm.cu",
+            "vllm_marlin",
+        ],
         require_built=["vllm_moe_marlin"],
     )
-    assert result["row_count"] == 2
-    assert result["status_counts"] == {"built": 1, "cache_hit": 1}
+    assert result["row_count"] == 3
+    assert result["status_counts"] == {"built": 1, "cache_hit": 2}
 
     try:
         validate_summary(
@@ -131,7 +136,7 @@ def run_self_test() -> None:
         path = Path(tmpdir) / "summary.log"
         path.write_text(fixture + "\n", encoding="utf-8")
         loaded = path.read_text(encoding="utf-8")
-        assert validate_summary(loaded)["row_count"] == 2
+        assert validate_summary(loaded)["row_count"] == 3
 
     print("validate_cuda_build_summary self-test ok")
 
