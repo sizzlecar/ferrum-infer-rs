@@ -47,6 +47,13 @@
   `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-8b-q4km-smoke-20260601/`
   passed Paris correctness and measured 64-token decode median `23.5 tok/s`
   over 3 runs with swap active.
+- Local Metal Qwen3-0.6B smoke at
+  `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-06b-smoke-20260601/`
+  passed Paris correctness and measured 64-token decode median `43.0 tok/s`
+  over 3 runs with swap active. The same artifact now also covers
+  OpenAI-compatible Metal server health, multi-turn recall (`basalt`), and
+  c4/r8 concurrent chat completions (`8/8` success, `54.614 tok/s`
+  aggregate).
 - Release packaging automation now includes a dedicated CUDA GitHub Release
   workflow and Homebrew tap generation for `ferrum-cuda` on Linux x86_64
   (`ferrum-linux-x86_64-cuda-sm89.tar.gz`). This is wired but remains
@@ -81,6 +88,7 @@ All commands above have explicit status noted above; all tooling self-tests pass
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-30b-a3b-prefill-syncfix-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-quick-regress-1e3ce42-c32-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-8b-q4km-smoke-20260601/summary.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-06b-smoke-20260601/summary.md`
 
 ### Next-turn execution path (from this evidence state)
 

@@ -1,0 +1,19 @@
+Endpoint:     http://127.0.0.1:18080/v1/chat/completions
+Model:        qwen3:0.6b
+Requests:     8
+Concurrency:  4
+Max tokens:   32
+Temperature:  0
+
+Summary
+  Success:            8/8
+  Failure:            0
+  Wall time:          4.376132s
+  Requests/s:         1.828
+  Completion tokens:  239
+  Prompt tokens:      200
+  Aggregate tok/s:    54.614
+  Avg req tok/s:      15.255
+  Avg latency:        1.961s
+  P50 latency:        1.947512s
+  P95 latency:        2.206260s

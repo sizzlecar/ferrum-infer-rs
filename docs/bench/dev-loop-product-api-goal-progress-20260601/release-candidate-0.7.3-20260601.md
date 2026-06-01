@@ -24,6 +24,7 @@ Current release-candidate code checkpoint:
 | LLaMA-3.1-8B GGUF CUDA serve | pass smoke | `/workspace/release-llama31-8b-gguf-cuda-smoke-42ffbe2`, health/chat passed |
 | 8B GGUF Ferrum/vLLM comparison | pass with caveats | `gguf-8b-release-benchmarks-20260601.md`, Qwen3-8B and LLaMA-3.1-8B GGUF-vs-GGUF tables saved |
 | Metal Qwen3-MoE prefill readback | pass smoke | `metal-qwen3-30b-a3b-prefill-syncfix-20260601.md`, Paris output is sane and encoder assertion no longer reproduces |
+| Metal Qwen3-0.6B smoke | pass | `metal-qwen3-06b-smoke-20260601`, Paris correctness passed; 64-token decode median `43.0 tok/s`; OpenAI server multi-turn returned `basalt`; concurrent c4/r8 chat completed `8/8` with aggregate `54.614 tok/s`; local swap active |
 | Metal Qwen3-8B GGUF smoke | pass | `metal-qwen3-8b-q4km-smoke-20260601`, Paris correctness passed; 64-token decode median `23.5 tok/s` with local swap active |
 | Post-fix GPU quick regression | pass | `m3-quick-regress-1e3ce42-c32-20260601.md`, c32 source FA2 `1403.98 tok/s`, correctness/multi-turn passed |
 | q2 native FA2 experiment | rejected safely | microbench-positive but full-model c32 regressed; reverted by `2197077` |
@@ -77,6 +78,12 @@ These do not invalidate the `0.7.3` release candidate, but they must be explicit
   and the Homebrew tap must be updated with both `ferrum` and `ferrum-cuda`.
 - Saved 8B Ferrum/vLLM GGUF comparison tables are complete but must be labelled GGUF-vs-GGUF and caveated: Ferrum uses eager-dequant/fp16 dense CUDA fallback; vLLM GGUF is experimental.
 - The Metal correctness fix is validated by smoke only. The local Mac had active swap, so no clean Metal performance claim should be made from this run.
+- The Metal Qwen3-0.6B and Qwen3-8B smoke results are useful regression
+  evidence, but local swap was active, so neither should be used as a clean
+  headline benchmark.
+- The Metal Qwen3-0.6B smoke covers single-turn correctness, CLI decode
+  throughput, OpenAI-compatible multi-turn recall, and concurrent chat
+  completions. Treat the throughput numbers as local regression evidence only.
 
 ## Latest post-code-change regression
 

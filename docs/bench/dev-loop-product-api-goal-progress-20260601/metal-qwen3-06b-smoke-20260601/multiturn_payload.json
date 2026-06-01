@@ -1,0 +1,12 @@
+{
+  "model": "qwen3:0.6b",
+  "messages": [
+    {"role": "system", "content": "You are a concise assistant. Follow the user's instruction exactly."},
+    {"role": "user", "content": "Remember this code word: basalt. Reply only: remembered."},
+    {"role": "assistant", "content": "remembered"},
+    {"role": "user", "content": "What code word did I ask you to remember? Reply with just the word."}
+  ],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stream": false
+}

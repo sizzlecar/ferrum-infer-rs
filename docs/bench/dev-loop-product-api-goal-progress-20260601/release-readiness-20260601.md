@@ -32,6 +32,7 @@ Evidence summary:
 | LLaMA-3.1-8B GGUF CUDA serve | pass smoke | `llama3.1:8b-q4_k_m` release-binary OpenAI smoke passed at `/workspace/release-llama31-8b-gguf-cuda-smoke-42ffbe2` |
 | 8B GGUF Ferrum/vLLM benchmark | pass with caveats | Saved GGUF-vs-GGUF tables are mirrored in `gguf-8b-remote-artifacts/` and summarized in `gguf-8b-release-benchmarks-20260601.md` |
 | Metal Qwen3-MoE prefill readback | pass smoke | `1e3ce42` adds a pre-readback sync; local Metal smoke returns Paris and no longer triggers the encoder assertion |
+| Metal Qwen3-0.6B smoke | pass | `metal-qwen3-06b-smoke-20260601`, Paris correctness passed; 64-token decode median `43.0 tok/s`; OpenAI server multi-turn returned `basalt`; concurrent c4/r8 chat completed `8/8` with aggregate `54.614 tok/s`; local swap active |
 | Metal Qwen3-8B GGUF smoke | pass | `metal-qwen3-8b-q4km-smoke-20260601`, Paris correctness passed; 64-token decode median `23.5 tok/s` with local swap active |
 | Post-fix GPU quick regression | pass | `/workspace/m3-quick-regress-1e3ce42-c32-20260601`, c32 source FA2 `1403.98 tok/s`, correctness/multi-turn passed, perf gate `ok=true` |
 | GitHub CUDA release artifact | wired, pending tag run | `.github/workflows/release-cuda.yml` builds `ferrum-linux-x86_64-cuda-sm89.tar.gz` with `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source` and rejects Torch/Python/vLLM dynamic links |
@@ -68,6 +69,12 @@ Release blockers remaining as of this checkpoint:
 - A smaller Qwen3-8B Metal smoke did produce a stable 64-token decode run:
   median `23.5 tok/s` over 3 runs, with swap still active. Treat it as a
   regression smoke, not a clean headline benchmark.
+- Qwen3-0.6B Metal smoke also passed the Paris correctness check and produced
+  a stable 64-token decode median of `43.0 tok/s` over 3 runs. Its
+  OpenAI-compatible server path also passed multi-turn recall and c4/r8
+  concurrent chat completions (`8/8`, aggregate `54.614 tok/s`). Swap was
+  still active, so use it as a small-model regression smoke rather than a
+  clean headline benchmark.
 
 Release packaging notes:
 

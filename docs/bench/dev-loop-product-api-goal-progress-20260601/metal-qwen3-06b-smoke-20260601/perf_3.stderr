@@ -1,0 +1,19 @@
+[auto-size] MOE_GRAPH=1 requested, but vllm-moe-marlin is not built; graph capture requires FERRUM_VLLM_MOE=1
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading Qwen/Qwen3-0.6B...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-01T12:51:49.858862Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T12:51:49.858877Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T12:51:49.858918Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer.json"
+2026-06-01T12:51:50.059687Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T12:51:50.059746Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T12:51:50.059752Z  INFO ferrum_engine::registry: Creating priority scheduler
+2026-06-01T12:51:50.059763Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T12:51:50.059820Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca (format: safetensors)
+2026-06-01T12:51:50.060015Z  INFO ferrum_engine::registry:   Architecture: Qwen3, Layers: 28, Vocab: 151936
+2026-06-01T12:51:50.106210Z  INFO ferrum_engine::registry: Building model...
+2026-06-01T12:51:50.106328Z  INFO ferrum_engine::registry: Loading Qwen3 via LlamaFamilyModel (QK-norm on)
+2026-06-01T12:51:50.106340Z  INFO ferrum_engine::registry:   Backend: Metal (weights f32), KV: fp16
+Model loaded in 1.7s.
+[64 tokens, 43.0 tok/s, 1.5s]
