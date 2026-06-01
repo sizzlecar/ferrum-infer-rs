@@ -258,6 +258,13 @@ Evidence:
 - KV block budget and max-batched-token selections are also applied from the
   startup/runtime snapshot into typed `EngineConfig`, so the default config
   constructors no longer hide process-env reads for those autosized values.
+- The startup runtime snapshot now travels through `EngineConfig.backend`
+  options into model/backend factories. Qwen3-MoE safetensors construction can
+  build `Qwen3MoeRuntimeEnv` from that typed `RuntimeConfigSnapshot`, so the
+  M3 safetensors model path no longer has to reconstruct FA-layout/FA2/MoE/KV
+  startup defaults directly from process env when a resolved snapshot is
+  available. The old env fallback remains for direct external model-builder
+  callers that do not pass an `EngineConfig` snapshot.
 - No new GPU performance claim is made by this checkpoint. Default-path
   equivalence for the Rust auto-config path still needs the Milestone I
   correctness and non-regression packet.

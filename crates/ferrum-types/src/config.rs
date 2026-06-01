@@ -7,6 +7,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
+/// Backend option key carrying the startup-resolved runtime snapshot into
+/// lower model/backend factories.
+pub const RUNTIME_CONFIG_SNAPSHOT_BACKEND_OPTION: &str = "runtime_config_snapshot";
+
 /// Engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EngineConfig {
@@ -25,6 +29,12 @@ impl EngineConfig {
         &mut self,
         snapshot: &RuntimeConfigSnapshot,
     ) -> std::result::Result<(), String> {
+        let snapshot_value = serde_json::to_value(snapshot)
+            .map_err(|err| format!("runtime_config_snapshot: {err}"))?;
+        self.backend.backend_options.insert(
+            RUNTIME_CONFIG_SNAPSHOT_BACKEND_OPTION.to_string(),
+            snapshot_value,
+        );
         self.scheduler.apply_runtime_config_snapshot(snapshot)?;
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_KV_MAX_BLOCKS") {
             self.kv_cache.max_blocks =

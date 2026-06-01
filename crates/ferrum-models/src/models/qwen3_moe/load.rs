@@ -149,12 +149,33 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         cfg: Qwen3MoeConfig,
         loader: &ferrum_quantization::NativeSafetensorsLoader<B>,
     ) -> Result<Self> {
+        Self::new_safetensors_with_runtime_env(cfg, loader, Qwen3MoeRuntimeEnv::from_env())
+    }
+
+    /// Build from safetensors using the startup-resolved runtime snapshot
+    /// instead of re-reading the process environment in the model loader.
+    pub fn new_safetensors_with_runtime_config_snapshot(
+        cfg: Qwen3MoeConfig,
+        loader: &ferrum_quantization::NativeSafetensorsLoader<B>,
+        runtime_config: &ferrum_types::RuntimeConfigSnapshot,
+    ) -> Result<Self> {
+        Self::new_safetensors_with_runtime_env(
+            cfg,
+            loader,
+            Qwen3MoeRuntimeEnv::from_runtime_config_snapshot(runtime_config),
+        )
+    }
+
+    fn new_safetensors_with_runtime_env(
+        cfg: Qwen3MoeConfig,
+        loader: &ferrum_quantization::NativeSafetensorsLoader<B>,
+        runtime_env: Qwen3MoeRuntimeEnv,
+    ) -> Result<Self> {
         use ferrum_quantization::WeightLoader as _;
         {
             let mut ctx = B::new_context();
             B::reset_all_graphs(&mut ctx);
         }
-        let runtime_env = Qwen3MoeRuntimeEnv::from_env();
         let rope = build_rope_cache::<B>(&cfg.base);
         let scratch = Qwen3MoeScratch::alloc(&cfg, runtime_env.initial_scratch_tokens);
         let embed = loader.load_tensor("model.embed_tokens.weight")?;

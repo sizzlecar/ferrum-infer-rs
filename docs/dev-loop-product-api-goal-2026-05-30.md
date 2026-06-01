@@ -127,6 +127,13 @@ artifact proof before final completion.
   - GPU clean checkout: `/workspace/ferrum-fa2-native-restore-git-ac3dfab`
   - No GPU build, native guard, smoke, or benchmark evidence has been run from
     this checkpoint yet.
+- `2026-06-01 12:20:00 +0800`: advanced Milestone E default ownership by
+  carrying the startup `RuntimeConfigSnapshot` through `EngineConfig.backend`
+  options into model/backend factories. Qwen3-MoE safetensors construction now
+  has a typed snapshot path for `Qwen3MoeRuntimeEnv` and falls back to process
+  env only when no `EngineConfig` snapshot is supplied. This reduces the M3
+  model startup surface that must reconstruct selector defaults from shell env;
+  compile/runtime validation is still pending.
 - Next hard-stop decision points remain unchanged: A/I/E/F/G blockers.
 
 ### As-of-now blocker state

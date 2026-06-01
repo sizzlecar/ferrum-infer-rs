@@ -14,7 +14,10 @@ use async_trait::async_trait;
 use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
-use ferrum_types::{Device, EngineConfig, FerrumError, Result};
+use ferrum_types::{
+    Device, EngineConfig, FerrumError, Result, RuntimeConfigSnapshot,
+    RUNTIME_CONFIG_SNAPSHOT_BACKEND_OPTION,
+};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -68,6 +71,14 @@ impl ComponentConfig {
             .get(key)
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
+    }
+
+    /// Startup-resolved runtime snapshot carried through `EngineConfig` into
+    /// model/backend factories. This lets model loaders consume the same typed
+    /// selector output that server artifacts publish, instead of reconstructing
+    /// defaults from process env.
+    pub fn runtime_config_snapshot(&self) -> Option<RuntimeConfigSnapshot> {
+        self.get_option(RUNTIME_CONFIG_SNAPSHOT_BACKEND_OPTION)
     }
 }
 
@@ -950,6 +961,7 @@ fn build_llm<B, K>(
     arch: ferrum_models::Architecture,
     qcfg: ferrum_models::models::LlamaFamilyConfig,
     moe_cfg: Option<ferrum_models::moe_config::Qwen3MoeConfig>,
+    runtime_config_snapshot: Option<&RuntimeConfigSnapshot>,
     model_path: &str,
 ) -> Result<Box<dyn ferrum_models::common::DecoderOnlyLLM>>
 where
@@ -964,9 +976,18 @@ where
                 "Qwen3Moe arch reached build_llm without Qwen3MoeConfig (caller bug)",
             )
         })?;
-        Ok(Box::new(
-            ferrum_models::models::Qwen3MoeModel::<B, K>::new_safetensors(mc, &weight_loader)?,
-        ))
+        let model = match runtime_config_snapshot {
+            Some(snapshot) => ferrum_models::models::Qwen3MoeModel::<B, K>::new_safetensors_with_runtime_config_snapshot(
+                mc,
+                &weight_loader,
+                snapshot,
+            )?,
+            None => ferrum_models::models::Qwen3MoeModel::<B, K>::new_safetensors(
+                mc,
+                &weight_loader,
+            )?,
+        };
+        Ok(Box::new(model))
     } else {
         Ok(Box::new(
             ferrum_models::models::LlamaFamilyModel::<B, K>::new(qcfg, &weight_loader)?,
@@ -1030,6 +1051,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         // + dims from `config.json`, then dispatch over Dim 1 (arch) +
         // Dim 4 (device) below.
         let mut config_manager = ferrum_models::ConfigManager::new();
+        let runtime_config_snapshot = config.runtime_config_snapshot();
         let model_def = config_manager
             .load_from_path(std::path::Path::new(&model_path))
             .await?;
@@ -1161,6 +1183,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                 arch,
                                 qcfg,
                                 moe_cfg,
+                                runtime_config_snapshot.as_ref(),
                                 &model_path,
                             )?
                         }
@@ -1177,6 +1200,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     arch,
                                     qcfg,
                                     moe_cfg,
+                                    runtime_config_snapshot.as_ref(),
                                     &model_path,
                                 )?
                             }
@@ -1195,6 +1219,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     arch,
                                     qcfg,
                                     moe_cfg,
+                                    runtime_config_snapshot.as_ref(),
                                     &model_path,
                                 )?
                             }
@@ -1226,6 +1251,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     arch,
                                     qcfg,
                                     moe_cfg,
+                                    runtime_config_snapshot.as_ref(),
                                     &model_path,
                                 )?
                             }

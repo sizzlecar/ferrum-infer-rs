@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use ferrum_types::RuntimeConfigSnapshot;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Qwen3MoeRuntimeEnv {
     pub(crate) decode_op_profile: bool,
@@ -38,6 +40,15 @@ pub(crate) struct Qwen3MoeRuntimeEnv {
 impl Qwen3MoeRuntimeEnv {
     pub(crate) fn from_env() -> Self {
         Self::from_env_vars(std::env::vars())
+    }
+
+    pub(crate) fn from_runtime_config_snapshot(snapshot: &RuntimeConfigSnapshot) -> Self {
+        Self::from_env_vars(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry.effective_value.as_str())),
+        )
     }
 
     fn from_env_vars<I, K, V>(vars: I) -> Self
@@ -260,5 +271,45 @@ mod tests {
 
         assert!(env.fa2_source);
         assert!(!env.fa2_direct_ffi);
+    }
+
+    #[test]
+    fn qwen3_moe_runtime_env_can_use_typed_snapshot_without_process_env() {
+        let snapshot = RuntimeConfigSnapshot::from_entries([
+            ferrum_types::RuntimeConfigEntry::new(
+                "FERRUM_FA_LAYOUT_VARLEN",
+                "1",
+                ferrum_types::RuntimeConfigSource::Default,
+            ),
+            ferrum_types::RuntimeConfigEntry::new(
+                "FERRUM_FA2_SOURCE",
+                "1",
+                ferrum_types::RuntimeConfigSource::Default,
+            ),
+            ferrum_types::RuntimeConfigEntry::new(
+                "FERRUM_MAX_BATCHED_TOKENS",
+                "3072",
+                ferrum_types::RuntimeConfigSource::MemoryProfile,
+            ),
+            ferrum_types::RuntimeConfigEntry::new(
+                "FERRUM_MOE_GRAPH",
+                "1",
+                ferrum_types::RuntimeConfigSource::Default,
+            ),
+            ferrum_types::RuntimeConfigEntry::new(
+                "FERRUM_VLLM_MOE",
+                "1",
+                ferrum_types::RuntimeConfigSource::Default,
+            ),
+        ]);
+
+        let env = Qwen3MoeRuntimeEnv::from_runtime_config_snapshot(&snapshot);
+
+        assert!(env.fa_layout_varlen);
+        assert!(env.fa2_source);
+        assert!(!env.fa2_direct_ffi);
+        assert_eq!(env.initial_scratch_tokens, 3072);
+        assert!(env.moe_graph_requested);
+        assert!(env.moe_graph_vllm_clean);
     }
 }
