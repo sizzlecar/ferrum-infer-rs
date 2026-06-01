@@ -89,6 +89,7 @@ All commands above have explicit status noted above; all tooling self-tests pass
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-quick-regress-1e3ce42-c32-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-8b-q4km-smoke-20260601/summary.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-06b-smoke-20260601/summary.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/release-pretag-checklist-0.7.3-20260601.md`
 
 ### Next-turn execution path (from this evidence state)
 
@@ -103,6 +104,8 @@ All commands above have explicit status noted above; all tooling self-tests pass
    source-FA2 default/opt-in policy wording, and the final tag-run proof that
    CPU, Metal, CUDA, `ferrum`, and `ferrum-cuda` release assets publish
    correctly.
+4. Do not create, move, or push `v0.7.3` until the user explicitly authorizes
+   the tag/release step. Use the pre-tag checklist before doing so.
 ## Current Progress Snapshot (2026-06-01)
 
 This objective is being tracked through the following module status packets:

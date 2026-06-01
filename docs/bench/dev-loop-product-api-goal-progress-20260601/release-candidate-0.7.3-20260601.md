@@ -4,6 +4,8 @@ Scope: formal release candidate for `docs/dev-loop-product-api-goal-2026-05-30.m
 
 Current release-candidate code checkpoint:
 
+- Current evidence checkpoint before the pre-tag checklist:
+  `2ecd2bb docs: add metal qwen3 0.6b server smoke`
 - Last runtime-affecting checkpoint: `1e3ce42 fix: sync qwen3 moe prefill logits before readback`
 - Packaging checkpoint in current branch: dedicated CUDA GitHub Release
   workflow plus Homebrew `ferrum-cuda` tap generation, pending final tag-run

@@ -5,6 +5,7 @@ Scope: converge the dev-loop/product-API goal into a formal release candidate.
 Release candidate packet:
 
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/release-candidate-0.7.3-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/release-pretag-checklist-0.7.3-20260601.md`
 
 Release performance threshold:
 
@@ -53,6 +54,8 @@ Release blockers remaining as of this checkpoint:
   script hang; direct release-binary smoke passed and is sufficient for release
   evidence if accepted.
 - Final release checkpoint/tag has not yet been created.
+- The user has explicitly required waiting for the next instruction before any
+  tag/release action. The pre-tag checklist records this as a hard rule.
 - The final tag workflow has not yet proven CPU, Metal, and CUDA release
   artifacts end-to-end, and the Homebrew tap has not yet been pushed with both
   `ferrum` and `ferrum-cuda` formulas.
