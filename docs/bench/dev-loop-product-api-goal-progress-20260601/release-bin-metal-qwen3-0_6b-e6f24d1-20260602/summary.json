@@ -1,0 +1,24 @@
+{
+  "bench": {
+    "completed": null,
+    "concurrency": 4,
+    "errored": null,
+    "itl": null,
+    "num_prompts": 16,
+    "output_throughput": null,
+    "output_throughput_tps": {
+      "mean": 56.81453890868418
+    },
+    "tpot": null,
+    "ttft": null
+  },
+  "binary": "ferrum 0.7.4",
+  "commit": "e6f24d1",
+  "gates": {
+    "multiturn": true,
+    "multiturn_3round": true,
+    "paris": true
+  },
+  "model": "Qwen/Qwen3-0.6B",
+  "release_run": "26770107576"
+}

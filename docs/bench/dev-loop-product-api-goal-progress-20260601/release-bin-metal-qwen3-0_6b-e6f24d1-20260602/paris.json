@@ -1,0 +1,1 @@
+{"id":"fd65ed82-c8b0-4bbf-802c-6f31a5f4844e","object":"chat.completion","created":1780334397,"model":"Qwen/Qwen3-0.6B","choices":[{"index":0,"message":{"role":"assistant","content":"The capital of France is **Paris**."},"finish_reason":"stop"}],"usage":{"prompt_tokens":19,"completion_tokens":10,"total_tokens":29}}

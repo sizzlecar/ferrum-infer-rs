@@ -1,0 +1,103 @@
+{
+  "backend": "metal",
+  "completed_per_run": [
+    16
+  ],
+  "concurrency": 4,
+  "e2e_ms": {
+    "p50": {
+      "mean": 2201.4692914999996
+    },
+    "p75": {
+      "mean": 2203.6495835
+    },
+    "p95": {
+      "mean": 2207.3632085
+    },
+    "p99": {
+      "mean": 2207.4491081
+    }
+  },
+  "env": {
+    "commit_sha": "e6f24d1",
+    "ferrum_env": {},
+    "ferrum_features": [
+      "metal"
+    ],
+    "hw_id": "apple-m1-max",
+    "runtime_config": {
+      "entries": []
+    },
+    "rust": "1.91.0"
+  },
+  "env_hash": "sha256:a769bbc44428ac6cfdcbd0adf5135becd80da059ccab809312d9158a647b9da1",
+  "errored_per_run": [
+    0
+  ],
+  "goodput_rps": {
+    "mean": 1.8180652450778936
+  },
+  "itl_ms": {
+    "p50": {
+      "mean": 58.481438
+    },
+    "p75": {
+      "mean": 58.93669775000001
+    },
+    "p95": {
+      "mean": 59.72879385
+    },
+    "p99": {
+      "mean": 128.3584208900009
+    }
+  },
+  "model": "Qwen/Qwen3-0.6B",
+  "n_gen": 32,
+  "n_prompt": 64,
+  "n_repeats": 1,
+  "n_requests_per_run": 16,
+  "output_throughput_tps": {
+    "mean": 56.81453890868418
+  },
+  "request_throughput_rps": {
+    "mean": 1.8180652450778936
+  },
+  "scenario": "closed_loop",
+  "slo": {
+    "e2e_p99_ms": null,
+    "tpot_p99_ms": null,
+    "ttft_p99_ms": null
+  },
+  "total_throughput_tps": {
+    "mean": 173.17071459366937
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 56.83331834375
+    },
+    "p75": {
+      "mean": 58.51170697580644
+    },
+    "p95": {
+      "mean": 84.39306008333332
+    },
+    "p99": {
+      "mean": 97.22044348333333
+    }
+  },
+  "ttft_ms": {
+    "p50": {
+      "mean": 386.1690625
+    },
+    "p75": {
+      "mean": 388.8494685
+    },
+    "p95": {
+      "mean": 389.404302
+    },
+    "p99": {
+      "mean": 389.4314268
+    }
+  },
+  "warmup_requests": 2
+}
