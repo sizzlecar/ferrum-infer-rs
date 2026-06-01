@@ -119,6 +119,14 @@ artifact proof before final completion.
   - Split runtime semantics so `FERRUM_FA2_SOURCE=1` no longer reports itself
     through the `fa2_direct_ffi` flag while still using the required
     FA-compatible K/V pool and C ABI attention dispatch.
+- `2026-06-01 12:00:00 +0800`: checkpointed the restored native FA2 source path
+  in git and synced it to the GPU host using a git bare remote + branch checkout:
+  - local checkpoint commit: `ac3dfab983c25c696c8865f9fd18e3a2a5cd2914`
+  - GPU bare repo: `/workspace/ferrum-git-remotes/ferrum-infer-rs-ac3dfab.git`
+  - GPU branch: `codex/fa2-native-restore-ac3dfab`
+  - GPU clean checkout: `/workspace/ferrum-fa2-native-restore-git-ac3dfab`
+  - No GPU build, native guard, smoke, or benchmark evidence has been run from
+    this checkpoint yet.
 - Next hard-stop decision points remain unchanged: A/I/E/F/G blockers.
 
 ### As-of-now blocker state

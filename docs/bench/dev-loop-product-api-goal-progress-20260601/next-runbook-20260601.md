@@ -1,7 +1,7 @@
 # Next Runbook — Dev Loop Product API Goal (2026-06-01)
 
 This runbook is the executor-facing plan for continuing
-[`docs/dev-loop-product-api-goal-2026-05-30.md`](../dev-loop-product-api-goal-2026-05-30.md).
+[`docs/dev-loop-product-api-goal-2026-05-30.md`](../../dev-loop-product-api-goal-2026-05-30.md).
 
 ## 0) Preconditions
 
@@ -102,7 +102,7 @@ Acceptance for Milestone E:
 ## 4) Milestone F/G — real-model API evidence
 
 Open
-[`docs/status/openai-api-compat-2026-05-30.md`](../status/openai-api-compat-2026-05-30.md)
+[`docs/status/openai-api-compat-2026-05-30.md`](../../status/openai-api-compat-2026-05-30.md)
 for the ignored SDK smoke list and run those tests against a real model on GPU.
 
 On a real-model host with `Qwen/Qwen3-0.6B` available, run. Use
