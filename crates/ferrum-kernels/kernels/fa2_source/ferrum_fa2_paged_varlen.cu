@@ -118,14 +118,20 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
         return;
     }
 
-    const int seq_idx = fa2_find_seq_idx(cu_seqlens_q, num_seqs, token_global);
-
-    const int seq_q_start = cu_seqlens_q[seq_idx];
-    const int seq_q_end = cu_seqlens_q[seq_idx + 1];
-    const int q_len = seq_q_end - seq_q_start;
-    const int local_idx = token_global - seq_q_start;
-    const int prior_kv_len = seq_lens[seq_idx] - q_len;
-    const int valid_kv_len = prior_kv_len + local_idx + 1;
+    int seq_idx;
+    int valid_kv_len;
+    if (total_q_tokens == num_seqs) {
+        seq_idx = token_global;
+        valid_kv_len = seq_lens[seq_idx];
+    } else {
+        seq_idx = fa2_find_seq_idx(cu_seqlens_q, num_seqs, token_global);
+        const int seq_q_start = cu_seqlens_q[seq_idx];
+        const int seq_q_end = cu_seqlens_q[seq_idx + 1];
+        const int q_len = seq_q_end - seq_q_start;
+        const int local_idx = token_global - seq_q_start;
+        const int prior_kv_len = seq_lens[seq_idx] - q_len;
+        valid_kv_len = prior_kv_len + local_idx + 1;
+    }
     if (valid_kv_len <= 0) {
         return;
     }
