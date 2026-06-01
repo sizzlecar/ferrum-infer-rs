@@ -493,15 +493,24 @@ class Runner:
             return {}
         return dict(RUNTIME_PRESET_ENV[preset])
 
+    def model_path_env(self) -> dict[str, str]:
+        return {"FERRUM_MODEL_PATH": str(self.model_dir)}
+
     def merged_env(self, case: dict[str, Any]) -> dict[str, str]:
         env = dict(os.environ)
-        for source in (self.preset_env(), self.config.get("base_env", {}), case.get("env", {})):
+        for source in (
+            self.model_path_env(),
+            self.preset_env(),
+            self.config.get("base_env", {}),
+            case.get("env", {}),
+        ):
             for key, value in source.items():
                 env[str(key)] = str(value)
         return env
 
     def case_env_only(self, case: dict[str, Any]) -> dict[str, str]:
-        merged = self.preset_env()
+        merged = self.model_path_env()
+        merged.update(self.preset_env())
         merged.update(self.config.get("base_env", {}))
         merged.update(case.get("env", {}))
         return {str(k): str(v) for k, v in merged.items()}
@@ -543,6 +552,7 @@ class Runner:
         values: dict[str, str] = {}
         sources: dict[str, str] = {}
         for source, source_name in (
+            (self.model_path_env(), "runner_model_dir"),
             (self.config.get("base_env", {}), "script_case"),
             (case.get("env", {}), "script_case"),
         ):
@@ -1424,16 +1434,20 @@ def self_test() -> None:
         env = runner.case_env_only(cfg["cases"][0])
         assert env == {
             "FERRUM_FA_LAYOUT_VARLEN": "1",
+            "FERRUM_MODEL_PATH": str(root / "model"),
             "FERRUM_MOE_GRAPH": "1",
             "HF_HOME": "/tmp/hf",
         }
         snapshot = runner.runtime_config_snapshot(cfg["cases"][0])
         assert [entry["key"] for entry in snapshot["entries"]] == [
             "FERRUM_FA_LAYOUT_VARLEN",
+            "FERRUM_MODEL_PATH",
             "FERRUM_MOE_GRAPH",
         ]
-        assert snapshot["entries"][1]["source"] == "script_case"
-        assert snapshot["entries"][1]["affects"] == ["performance"]
+        assert snapshot["entries"][1]["source"] == "runner_model_dir"
+        assert snapshot["entries"][1]["affects"] == ["correctness"]
+        assert snapshot["entries"][2]["source"] == "script_case"
+        assert snapshot["entries"][2]["affects"] == ["performance"]
         assert sha256_text(env).startswith("sha256:")
         default_snapshot = runner.runtime_config_snapshot({"name": "default", "env": {}})
         diff = runner.runtime_config_diff(default_snapshot, snapshot)
@@ -1491,10 +1505,12 @@ def self_test() -> None:
         preset_runner = Runner(preset_cfg)
         preset_runner.validate()
         preset_env = preset_runner.case_env_only(preset_cfg["cases"][0])
+        assert preset_env["FERRUM_MODEL_PATH"] == str(root / "model")
         assert "FERRUM_MOE_GRAPH" not in preset_env
         assert preset_env["HF_HOME"] == "/workspace/hf-cache"
         preset_snapshot = preset_runner.runtime_config_snapshot(preset_cfg["cases"][0])
         preset_entry = {entry["key"]: entry for entry in preset_snapshot["entries"]}
+        assert preset_entry["FERRUM_MODEL_PATH"]["source"] == "runner_model_dir"
         assert "FERRUM_MOE_GRAPH" not in preset_entry
         assert "FERRUM_VLLM_MOE" not in preset_entry
         assert preset_entry["FERRUM_FA_LAYOUT_VARLEN"]["source"] == "script_case"
