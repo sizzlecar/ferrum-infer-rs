@@ -8,12 +8,17 @@
 
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cudarc::driver::{CudaSlice, CudaStream};
 use ferrum_types::Result;
 use half::f16;
 
 use super::fa2_ffi::call_paged_varlen_fn;
+
+static FA2_SOURCE_SHAPE_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
+static FA2_SOURCE_SHAPE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" {
     fn ferrum_fa2_paged_varlen_fwd(
@@ -61,6 +66,26 @@ pub fn paged_varlen_attention_fa2_source(
     block_size: usize,
     max_blocks_per_seq: usize,
 ) -> Result<()> {
+    if *FA2_SOURCE_SHAPE_LOG_ENABLED
+        .get_or_init(|| std::env::var("FERRUM_DIAG_SHAPES").as_deref() == Ok("1"))
+    {
+        let n = FA2_SOURCE_SHAPE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 128 {
+            eprintln!(
+                "[fa2-source-shape] n={} num_seqs={} total_q={} max_q={} max_kv={} heads={} kv_heads={} head_dim={} block_size={} max_blocks={}",
+                n,
+                num_seqs,
+                total_q_tokens,
+                max_q_len,
+                max_kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_blocks_per_seq
+            );
+        }
+    }
     unsafe {
         call_paged_varlen_fn(
             ferrum_fa2_paged_varlen_fwd,
