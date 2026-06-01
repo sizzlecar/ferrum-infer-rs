@@ -48,9 +48,10 @@ impl Qwen3MoeRuntimeEnv {
             .iter()
             .map(|entry| (entry.key.clone(), entry.effective_value.clone()))
             .collect();
-        entries.extend(std::env::vars().filter(|(key, _)| {
-            key.starts_with("FERRUM_") || key == "MTL_CAPTURE_ENABLED"
-        }));
+        entries.extend(
+            std::env::vars()
+                .filter(|(key, _)| key.starts_with("FERRUM_") || key == "MTL_CAPTURE_ENABLED"),
+        );
         Self::from_env_vars(entries)
     }
 

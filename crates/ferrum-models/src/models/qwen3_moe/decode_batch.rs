@@ -686,10 +686,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 // Per-item fallback. The known-good Metal PR #81 path used
                 // FP16 byte strides here (matching llama_family batched
                 // decode). Keep this exactly aligned with fbdfcfe.
-                let qkv_stride_bytes =
-                    (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
-                let q_head_major_size_bytes =
-                    (q_dim * std::mem::size_of::<half::f16>()) as u64;
+                let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
+                let q_head_major_size_bytes = (q_dim * std::mem::size_of::<half::f16>()) as u64;
                 let pos_offsets_host = metal_pos_offsets_host
                     .as_ref()
                     .expect("Metal per-item fallback pos_offsets missing");
