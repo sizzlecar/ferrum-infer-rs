@@ -1,0 +1,138 @@
+{
+  "artifact_verdict": "pass",
+  "cases": [
+    {
+      "manifest": "/workspace/release-bin-cuda-qwen3-30b-a3b-9012ece-20260602/fa2_source_c32_n1/manifest.json",
+      "name": "fa2_source"
+    },
+    {
+      "manifest": "/workspace/release-bin-cuda-qwen3-30b-a3b-9012ece-20260602/fa_layout_c32_n1/manifest.json",
+      "name": "fa_layout"
+    }
+  ],
+  "created_at": "2026-06-01T18:53:05.100450+00:00",
+  "finished_at": "2026-06-01T18:54:06.415245+00:00",
+  "name": "m3-fa2-direct-ffi-ab",
+  "not_publishable": false,
+  "not_publishable_reason": null,
+  "preflight": {
+    "bin": "/workspace/ferrum-release-test/bin/ferrum",
+    "binary_sha256": "sha256:bbd17ab3952f52618ffa1d012d237e29834a97cf9c004a4135497ca03b7c0732",
+    "date": "2026-06-01T18:53:05.041323+00:00",
+    "features": "cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source",
+    "git_head": "9012ece86431d2c8b9900d879142a481bb9ea070",
+    "git_status_short": [
+      "?? scripts/__pycache__/"
+    ],
+    "gpu_process_state": "    PID    PPID STAT     ELAPSED CMD\n      1       0 Ss         05:48 bash /.launch\n    387       1 Ss         05:41 sshd: /usr/sbin/sshd -E /proc/1/fd/1 [listener] 0 of 10-100 startups\n    393       1 S          05:41 ssh -i /etc/forward_key -R *:24398:localhost:8080 -R *:24399:localhost:22 -N -o TCPKeepAlive=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 ubuntu@ssh6.vast.ai -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o RequestTTY=no -o ExitOnForwardFailure=yes\n    402       1 S          05:40 /opt/conda/bin/python /opt/conda/bin/jupyter-notebook --ip=0.0.0.0 --port=8080 --NotebookApp.open_browser=False --NotebookApp.token=82f2392efd2de61a51dec13b535619486aa439a3a3f2770773cfecdb52decf02 --NotebookApp.allow_remote_access=True --NotebookApp.allow_origin=* --NotebookApp.certfile=/etc/instance.crt --NotebookApp.keyfile=/etc/instance.key --allow-root\n    768     387 Ss         00:03 sshd: root@notty\n    779     768 Ss         00:00 bash scripts/m3_fa2_direct_ffi_ab.sh\n    782     779 S          00:00 python3 scripts/m3_ab_runner.py --config /workspace/release-bin-cuda-qwen3-30b-a3b-9012ece-20260602/runner_config.json\n    790     782 R          00:00 ps -eo pid,ppid,stat,etime,cmd\n",
+    "hf_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+    "host": "853643866d79",
+    "model_dir": "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+    "nvidia_smi": "Mon Jun  1 18:53:04 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 580.82.07              Driver Version: 580.82.07      CUDA Version: 13.0     |\n+-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA GeForce RTX 4090        On  |   00000000:42:00.0 Off |                  Off |\n|  0%   40C    P8             23W /  300W |       1MiB /  24564MiB |      0%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n\n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|  No running processes found                                                             |\n+-----------------------------------------------------------------------------------------+\n",
+    "preset": "m3_qwen3_30b_a3b_int4",
+    "repo": "/workspace/ferrum-infer-rs"
+  },
+  "runner": "scripts/m3_ab_runner.py",
+  "runtime_preset": "m3_qwen3_30b_a3b_int4",
+  "schema_version": 1,
+  "summary_json": "/workspace/release-bin-cuda-qwen3-30b-a3b-9012ece-20260602/summary.json",
+  "validation_checklist": {
+    "baseline_case": "fa_layout",
+    "bench_completion": {
+      "completed": null,
+      "errored": null,
+      "ok": null,
+      "required": true
+    },
+    "case": null,
+    "change_type": "opt_in_experiment",
+    "local_gates": [],
+    "observed_correctness_gates": [],
+    "performance_regression_gates": {
+      "baseline_case": "fa_layout",
+      "cases": {
+        "fa2_source": {
+          "baseline_case": "fa_layout",
+          "metrics": [
+            {
+              "baseline": 960.8412616780123,
+              "candidate": 938.0408172056224,
+              "delta_pct": -2.3729668345602972,
+              "metric": "throughput_mean",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "min_delta_pct",
+                "value": -3.0
+              }
+            },
+            {
+              "baseline": 408.295621,
+              "candidate": 381.4475885,
+              "delta_pct": -6.5756356715861,
+              "metric": "ttft_p50",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 10.0
+              }
+            },
+            {
+              "baseline": 13.551857585937498,
+              "candidate": 13.894106015811015,
+              "delta_pct": 2.5254724505713755,
+              "metric": "tpot_p50",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 5.0
+              }
+            },
+            {
+              "baseline": 15.9539668,
+              "candidate": 16.544176599999997,
+              "delta_pct": 3.699454859088691,
+              "metric": "itl_p95",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 10.0
+              }
+            }
+          ],
+          "ok": true
+        }
+      },
+      "concurrency_cells_ok": true,
+      "enabled": true,
+      "observed_concurrency_cells": [
+        32
+      ],
+      "required_concurrency_cells": [],
+      "schema_version": 1,
+      "thresholds": {
+        "enabled": true,
+        "itl_p95_max_regression_pct": 10.0,
+        "throughput_min_delta_pct": -3.0,
+        "tpot_max_regression_pct": 5.0,
+        "ttft_max_regression_pct": 10.0
+      }
+    },
+    "performance_regression_required": true,
+    "required_correctness_gates": [
+      "paris",
+      "multi_turn_paris",
+      "bench_completion"
+    ],
+    "schema_version": 1,
+    "skipped_gates": [],
+    "touched_areas": [
+      "model_forward",
+      "attention_prefill_mixed_path",
+      "fa2_runtime_path"
+    ]
+  }
+}
