@@ -97,7 +97,7 @@ manual GPU/Metal validation, not the always-on stub path.
 | SDK | Coverage | Test |
 |---|---|---|
 | `async-openai` | Basic chat response parsing | `test_openai_client_chat_basic` |
-| `async-openai` | Non-streaming chat usage object parsing and token total invariant | `test_openai_client_chat_usage_fields` |
+| `async-openai` | Non-streaming chat usage object parsing, Qwen3 tokenizer-backed `prompt_tokens`, and token total invariant | `test_openai_client_chat_usage_fields` |
 | `async-openai` | Chat SSE parsing | `test_openai_client_chat_streaming` |
 | `async-openai` | Typed tool request fields plus `stream_options.include_usage` final usage chunk | `test_openai_client_tools_stream_options_include_usage` |
 | `async-openai` | `response_format=json_object` best-effort parseable JSON smoke | `test_openai_client_response_format_json_object` |
@@ -107,7 +107,7 @@ manual GPU/Metal validation, not the always-on stub path.
 
 ## Known Remaining Gaps
 
-- Always-on engine tests cover tokenizer-backed mock-executor paths, including a byte-level tokenizer fixture that differs from whitespace counting. Real-model tokenizer-vs-usage fixture tests are still needed outside the mock executor path.
+- Always-on engine tests cover tokenizer-backed mock-executor paths, including a byte-level tokenizer fixture that differs from whitespace counting. An ignored real-model SDK smoke now asserts Qwen3 tokenizer-backed `prompt_tokens` on the served path, but it still needs GPU/Metal execution before it becomes evidence.
 - Tool-call generation is implemented for deterministic non-streaming and
   streaming server paths when model output emits supported JSON matching
   declared function tools or legacy functions. Server-side execution of

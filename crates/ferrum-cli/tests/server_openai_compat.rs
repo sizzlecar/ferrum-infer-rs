@@ -38,6 +38,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SMOKE_MODEL: &str = "qwen3:0.6b";
+const SMOKE_MODEL_HF_ID: &str = "Qwen/Qwen3-0.6B";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn ferrum_bin() -> PathBuf {
@@ -66,6 +67,28 @@ fn python_bin() -> String {
     std::env::var("FERRUM_PYTHON")
         .or_else(|_| std::env::var("PYTHON"))
         .unwrap_or_else(|_| "python3".to_string())
+}
+
+fn smoke_model_path() -> PathBuf {
+    let config = ferrum_cli::CliConfig::default();
+    let cache_dir = ferrum_cli::commands::run::get_hf_cache_dir(&config);
+    ferrum_cli::source_resolver::find_cached_model(&cache_dir, SMOKE_MODEL_HF_ID)
+        .unwrap_or_else(|| panic!("{SMOKE_MODEL_HF_ID} not found in {}", cache_dir.display()))
+        .local_path
+}
+
+fn qwen3_prompt_tokens_for_user_message(content: &str) -> usize {
+    let model_path = smoke_model_path();
+    let tokenizer_path = model_path.join("tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .unwrap_or_else(|err| panic!("load {}: {err}", tokenizer_path.display()));
+    let rendered_prompt = format!(
+        "<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
+    tokenizer
+        .encode(rendered_prompt, true)
+        .expect("encode rendered prompt")
+        .len()
 }
 
 /// Same fixture as `server_smoke.rs`; duplicated rather than shared via
@@ -161,14 +184,17 @@ async fn test_openai_client_chat_basic() {
 #[ignore = "loads real model"]
 async fn test_openai_client_chat_usage_fields() {
     // Real-model SDK usage smoke: async-openai should parse Ferrum's usage
-    // object, and the accounting invariant must hold on the served path.
+    // object, and prompt accounting should match the real Qwen3 tokenizer
+    // rather than a whitespace estimate.
+    const PROMPT: &str = "Count to two, then stop.";
+    let expected_prompt_tokens = qwen3_prompt_tokens_for_user_message(PROMPT);
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
     let client = fx.client();
 
     let request = CreateChatCompletionRequestArgs::default()
         .model(SMOKE_MODEL)
         .messages([ChatCompletionRequestUserMessageArgs::default()
-            .content("Count to two, then stop.")
+            .content(PROMPT)
             .build()
             .expect("build user msg")
             .into()])
@@ -182,7 +208,10 @@ async fn test_openai_client_chat_usage_fields() {
         .usage
         .as_ref()
         .expect("non-streaming chat should include SDK usage");
-    assert!(usage.prompt_tokens > 0, "prompt_tokens should be positive");
+    assert_eq!(
+        usage.prompt_tokens as usize, expected_prompt_tokens,
+        "prompt_tokens should match tokenizer-encoded rendered prompt"
+    );
     assert!(
         usage.completion_tokens > 0,
         "completion_tokens should be positive"
