@@ -43,7 +43,7 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 TAG="v${VERSION}"
-CUDA_BREW_COMPUTE_CAP="${CUDA_BREW_COMPUTE_CAP:-89}"
+CUDA_BREW_COMPUTE_CAP="89"
 CUDA_BREW_ASSET="ferrum-linux-x86_64-cuda-sm${CUDA_BREW_COMPUTE_CAP}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

@@ -80,7 +80,7 @@ def check(root: Path) -> list[str]:
 
     _require(
         release_sh,
-        'CUDA_BREW_COMPUTE_CAP="${CUDA_BREW_COMPUTE_CAP:-89}"',
+        'CUDA_BREW_COMPUTE_CAP="89"',
         root / "scripts/release.sh",
         errors,
         "default Homebrew CUDA compute capability",
@@ -172,7 +172,7 @@ def self_test() -> None:
         _write(root / ".github/workflows/release.yml", "release-cuda.yml\n")
         _write(
             root / "scripts/release.sh",
-            'CUDA_BREW_COMPUTE_CAP="${CUDA_BREW_COMPUTE_CAP:-89}"\n'
+            'CUDA_BREW_COMPUTE_CAP="89"\n'
             'CUDA_BREW_ASSET="ferrum-linux-x86_64-cuda-sm${CUDA_BREW_COMPUTE_CAP}"\n'
             'wait_workflow_success "release-cuda.yml"\n'
             "SHA_LINUX_CUDA=abc\n"
