@@ -7,9 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to publish (e.g. v0.1.0). Required for manual runs.'
-        required: true
+        description: 'Release tag to publish, or label dry-run artifacts with. Optional when publish_release=false.'
+        required: false
+        default: ''
         type: string
+      publish_release:
+        description: 'Create/update the GitHub Release. Leave false for pre-release binary testing.'
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -27,6 +33,12 @@ jobs:
     name: Linux x86_64
     runs-on: ubuntu-22.04
     steps:
+      - name: Validate manual release inputs
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true' && github.event.inputs.tag == ''
+        run: |
+          echo "tag is required when publish_release=true" >&2
+          exit 1
+
       - uses: actions/checkout@v4
 
       - name: Free disk space
@@ -65,7 +77,11 @@ jobs:
         id: version
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+            tag="${{ github.event.inputs.tag }}"
+            if [[ -z "$tag" ]]; then
+              tag="dry-run-${GITHUB_SHA::7}"
+            fi
+            echo "tag=$tag" >> $GITHUB_OUTPUT
           else
             echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
@@ -86,7 +102,16 @@ jobs:
           mkdir -p smoke && tar -C smoke -xzf ferrum-linux-x86_64.tar.gz
           ./smoke/ferrum --help | head -5
 
+      - name: Upload dry-run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrum-linux-x86_64-${{ steps.version.outputs.tag }}
+          path: |
+            ferrum-linux-x86_64.tar.gz
+            ferrum-linux-x86_64.tar.gz.sha256
+
       - uses: softprops/action-gh-release@v2
+        if: github.event_name == 'push' || github.event.inputs.publish_release == 'true'
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
@@ -103,6 +128,12 @@ jobs:
     name: macOS aarch64 (Apple Silicon)
     runs-on: macos-14
     steps:
+      - name: Validate manual release inputs
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true' && github.event.inputs.tag == ''
+        run: |
+          echo "tag is required when publish_release=true" >&2
+          exit 1
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
@@ -128,7 +159,11 @@ jobs:
         id: version
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+            tag="${{ github.event.inputs.tag }}"
+            if [[ -z "$tag" ]]; then
+              tag="dry-run-${GITHUB_SHA::7}"
+            fi
+            echo "tag=$tag" >> $GITHUB_OUTPUT
           else
             echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
@@ -148,7 +183,16 @@ jobs:
           mkdir -p smoke && tar -C smoke -xzf ferrum-macos-aarch64.tar.gz
           ./smoke/ferrum --help | head -5
 
+      - name: Upload dry-run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrum-macos-aarch64-${{ steps.version.outputs.tag }}
+          path: |
+            ferrum-macos-aarch64.tar.gz
+            ferrum-macos-aarch64.tar.gz.sha256
+
       - uses: softprops/action-gh-release@v2
+        if: github.event_name == 'push' || github.event.inputs.publish_release == 'true'
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}

@@ -7,14 +7,20 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to publish (e.g. v0.7.3). Required for manual runs.'
-        required: true
+        description: 'Release tag to publish, or label dry-run artifacts with. Optional when publish_release=false.'
+        required: false
+        default: ''
         type: string
       cuda_compute_cap:
         description: 'CUDA compute capability without dot; 89 targets RTX 4090/Ada.'
         required: true
         default: '89'
         type: string
+      publish_release:
+        description: 'Create/update the GitHub Release. Leave false for pre-release binary testing.'
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -32,6 +38,12 @@ jobs:
     container:
       image: nvidia/cuda:12.6.0-devel-ubuntu22.04
     steps:
+      - name: Validate manual release inputs
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true' && github.event.inputs.tag == ''
+        run: |
+          echo "tag is required when publish_release=true" >&2
+          exit 1
+
       - name: Install system deps and Rust
         run: |
           apt-get update
@@ -50,6 +62,9 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             tag="${{ github.event.inputs.tag }}"
             cuda_compute_cap="${{ github.event.inputs.cuda_compute_cap }}"
+            if [[ -z "$tag" ]]; then
+              tag="dry-run-${GITHUB_SHA::7}"
+            fi
           else
             tag="${GITHUB_REF#refs/tags/}"
             cuda_compute_cap="89"
@@ -123,7 +138,17 @@ jobs:
           tar -C smoke -xzf "${asset}.tar.gz"
           LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ./smoke/ferrum --help | head -5
 
+      - name: Upload dry-run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.asset }}-${{ steps.version.outputs.tag }}
+          path: |
+            ${{ steps.version.outputs.asset }}.tar.gz
+            ${{ steps.version.outputs.asset }}.tar.gz.sha256
+            ${{ steps.version.outputs.asset }}.ldd.txt
+
       - uses: softprops/action-gh-release@v2
+        if: github.event_name == 'push' || github.event.inputs.publish_release == 'true'
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
