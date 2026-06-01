@@ -36,8 +36,13 @@ Current status:
 - Runtime source/direct-FFI flag separation is present locally but still needs
   ordinary Rust test coverage in the next evidence refresh.
 - GPU build, Paris/multi-turn smoke, and focused c32 performance validation
-  have been exercised during the native FA2 restore loop. A publishable
-  all-cell N>=3 packet is still pending.
+  have been exercised during the native FA2 restore loop.
+- All-cell N=3 source-FA2 validation now exists at
+  `/workspace/m3-fa2-source-current-allcells-n3-20260601`; all c=1/4/16/32
+  cells passed Paris, multi-turn, three-turn recall, benchmark completion, and
+  artifact validation.
+- The all-cell result still does not close the M3 80% target because c32 source
+  FA2 measured `1488.08 tok/s`, about `0.754×` of same-pod vLLM `1972.9`.
 - Earlier source-linked FA2 smoke artifacts remain performance-direction
   evidence only because they used external FlashAttention source at build time.
 

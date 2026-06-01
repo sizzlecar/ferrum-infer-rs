@@ -118,6 +118,19 @@ OpenAI SDK smoke to be present, passing, and backed by per-command log files.
 `--allow-partial` is available only for local/debug packet shape checks and is
 not sufficient for a completion claim.
 
+2026-06-01 GPU attempt:
+
+- Attempted remote artifact:
+  `/workspace/m3-real-model-api-smoke-20260601`.
+- The wrapper was launched with CUDA features and `MODEL=qwen3:0.6b`, but the
+  first command `target/release/ferrum pull qwen3:0.6b` failed with HuggingFace
+  `401 Unauthorized` (`Invalid username or password`).
+- The smoke session was stopped after the pull failure. This does not count as
+  F/G real-model evidence.
+- The ignored SDK tests currently use the fixed `Qwen/Qwen3-0.6B` smoke model,
+  so the cached Qwen3-30B GPTQ benchmark model is not a drop-in replacement for
+  this packet.
+
 ## Known Remaining Gaps
 
 - Always-on engine tests cover tokenizer-backed mock-executor paths, including a byte-level tokenizer fixture that differs from whitespace counting. Ignored real-model SDK smokes now assert Qwen3 tokenizer-backed `prompt_tokens` on non-streaming and streaming served paths, but they still need GPU/Metal execution before they become evidence.
@@ -140,5 +153,7 @@ not sufficient for a completion claim.
   not sent, but strict streaming no longer has token-by-token latency.
 - `response_format=json_object` remains best-effort.
 - Real-model SDK tests remain ignored; deterministic route tests cover the always-on path. The strict-schema 20-run smoke exists but has not been executed in the always-on local gate.
+- The latest real-model smoke attempt is blocked by the missing/unauthorized
+  `Qwen/Qwen3-0.6B` cache entry on the restored GPU host.
 - The Python OpenAI SDK smoke requires `python3 -m pip install openai` and can
   be pointed at a specific Python with `FERRUM_PYTHON`.

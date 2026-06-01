@@ -74,6 +74,30 @@ reader or external FA2 template bridge. Treat the earlier source-linked smoke as
 performance direction evidence only until the native in-repo kernel has fresh
 GPU compile, Paris/multi-turn, and all-cell N>=3/N=5 evidence.
 
+2026-06-01 native in-repo source-FA2 all-cell N=3 evidence:
+`/workspace/m3-fa2-source-current-allcells-n3-20260601` ran from restored
+native source FA2 code head `451a97f`. All c=1/4/16/32 rows passed Paris,
+multi-turn Paris, three-turn `Paris/basalt` recall, benchmark completion, and
+artifact validation. Results versus same-pod vLLM 0.20.2 N=5 baseline:
+
+| c | native source FA2 tok/s | vLLM 0.20.2 tok/s | ratio |
+|---:|---:|---:|---:|
+| 1 | `157.18 ± 0.21` | `183.9` | `0.855×` |
+| 4 | `448.36 ± 44.73` | `512.5` | `0.875×` |
+| 16 | `1115.58 ± 39.16` | `1331.9` | `0.838×` |
+| 32 | `1488.08 ± 205.49` | `1972.9` | `0.754×` |
+
+This proves the restored Ferrum-owned FA2 source path is correct and beneficial
+over FA-layout, but it does not close the M3 80% target: c32 still needs about
+`+90 tok/s` (`+6.1%`) to reach `1578.3 tok/s`.
+
+2026-06-01 native q2 grouping negative control: commit `3a5ab00` improved the
+standalone native FA2 microbench on large prefill-like shapes by about
+`+34%/+36%`, but full-model c32 N=3 artifact
+`/workspace/m3-fa2-q2-c32-n3-20260601` regressed source FA2 to
+`1462.15 ± 119.46 tok/s`. It was reverted by `2197077`. Do not repeat q2
+grouping without a new profile explaining the full-model mismatch.
+
 ## Current baseline (2026-05-25 sweep)
 
 Sweep dir: [`docs/bench/sweep-2026-05-25-1631-qwen3-moe-30b-int4/`](../sweep-2026-05-25-1631-qwen3-moe-30b-int4/) · ferrum commit `cbe04ea`, n_repeats=1, num_prompts=30, warmup=5, random in=256 out=128.
