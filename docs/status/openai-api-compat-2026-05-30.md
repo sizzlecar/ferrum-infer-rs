@@ -97,6 +97,7 @@ manual GPU/Metal validation, not the always-on stub path.
 | SDK | Coverage | Test |
 |---|---|---|
 | `async-openai` | Basic chat response parsing | `test_openai_client_chat_basic` |
+| `async-openai` | Non-streaming chat usage object parsing and token total invariant | `test_openai_client_chat_usage_fields` |
 | `async-openai` | Chat SSE parsing | `test_openai_client_chat_streaming` |
 | `async-openai` | Typed tool request fields plus `stream_options.include_usage` final usage chunk | `test_openai_client_tools_stream_options_include_usage` |
 | `async-openai` | `response_format=json_object` best-effort parseable JSON smoke | `test_openai_client_response_format_json_object` |

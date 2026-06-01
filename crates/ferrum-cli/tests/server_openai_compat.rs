@@ -159,6 +159,43 @@ async fn test_openai_client_chat_basic() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "loads real model"]
+async fn test_openai_client_chat_usage_fields() {
+    // Real-model SDK usage smoke: async-openai should parse Ferrum's usage
+    // object, and the accounting invariant must hold on the served path.
+    let fx = ServerFixture::spawn(SMOKE_MODEL).await;
+    let client = fx.client();
+
+    let request = CreateChatCompletionRequestArgs::default()
+        .model(SMOKE_MODEL)
+        .messages([ChatCompletionRequestUserMessageArgs::default()
+            .content("Count to two, then stop.")
+            .build()
+            .expect("build user msg")
+            .into()])
+        .max_tokens(20u32)
+        .temperature(0.0)
+        .build()
+        .expect("build usage request");
+
+    let response = client.chat().create(request).await.expect("chat request");
+    let usage = response
+        .usage
+        .as_ref()
+        .expect("non-streaming chat should include SDK usage");
+    assert!(usage.prompt_tokens > 0, "prompt_tokens should be positive");
+    assert!(
+        usage.completion_tokens > 0,
+        "completion_tokens should be positive"
+    );
+    assert_eq!(
+        usage.total_tokens,
+        usage.prompt_tokens + usage.completion_tokens,
+        "total_tokens should equal prompt_tokens + completion_tokens"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "loads real model"]
 async fn test_openai_client_chat_streaming() {
     // async-openai parses SSE events into typed `CreateChatCompletionStreamResponse`.
     // Bad event format (missing `data:` prefix, wrong JSON, `[DONE]` malformed)
