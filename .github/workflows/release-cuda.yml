@@ -25,6 +25,10 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -47,7 +51,7 @@ jobs:
       - name: Install system deps and Rust
         run: |
           apt-get update
-          apt-get install -y ca-certificates curl build-essential pkg-config libssl-dev git file libnccl2 libnccl-dev
+          apt-get install -y --allow-change-held-packages ca-certificates curl build-essential pkg-config libssl-dev git file libnccl2 libnccl-dev
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
