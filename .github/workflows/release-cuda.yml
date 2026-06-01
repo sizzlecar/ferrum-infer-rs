@@ -157,7 +157,12 @@ jobs:
           asset="${{ steps.version.outputs.asset }}"
           mkdir -p smoke
           tar -C smoke -xzf "${asset}.tar.gz"
-          LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ./smoke/ferrum --help | head -5
+          if ldconfig -p 2>/dev/null | grep -q 'libcuda.so.1'; then
+            LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ./smoke/ferrum --help | head -5
+          else
+            echo "libcuda.so.1 is not available in the GitHub Actions container; deferring executable smoke to the GPU release gate."
+            ldd ./smoke/ferrum
+          fi
 
       - name: Upload dry-run artifact
         uses: actions/upload-artifact@v4
