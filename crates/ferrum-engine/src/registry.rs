@@ -540,6 +540,7 @@ impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizer
         // Try to find tokenizer path from config or environment
         let tokenizer_path = config
             .get_string_option("tokenizer_path")
+            .or_else(|| config.get_string_option("model_path"))
             .or_else(|| registry_runtime_env().model_path());
 
         if let Some(model_path) = tokenizer_path {
