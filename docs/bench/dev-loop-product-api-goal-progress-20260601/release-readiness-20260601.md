@@ -2,6 +2,10 @@
 
 Scope: converge the dev-loop/product-API goal into a formal release candidate.
 
+Release candidate packet:
+
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/release-candidate-0.7.3-20260601.md`
+
 Release performance threshold:
 
 - User-adjusted M3 release gate: Ferrum throughput at or above `0.75x` of

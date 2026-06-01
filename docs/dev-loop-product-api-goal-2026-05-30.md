@@ -56,6 +56,7 @@ All commands above have explicit status noted above; all tooling self-tests pass
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/release-readiness-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-direct-smoke-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/release-benchmark-plan-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/release-candidate-0.7.3-20260601.md`
 
 ### Next-turn execution path (from this evidence state)
 
@@ -253,6 +254,11 @@ completion blocker for the current checkpoint.
   with explicit vLLM GGUF model IDs and tokenizer models. A fresh RTX 4090
   creation attempt on offer `38712898` still failed with `insufficient_credit`,
   so execution remains blocked on Vast credit.
+- `2026-06-01 18:00:00 +0800`: added the formal `0.7.3` release-candidate
+  packet at
+  `docs/bench/dev-loop-product-api-goal-progress-20260601/release-candidate-0.7.3-20260601.md`.
+  It separates satisfied release gates from the pending 8B Ferrum/vLLM
+  publicity benchmark and records release-note wording constraints.
   comparisons for Qwen3-8B and LLaMA-3.1-8B. vLLM GGUF support is treated as
   experimental and must be labeled separately.
 - Next hard-stop decision points are now I/E/F/G blockers; Milestone A must
