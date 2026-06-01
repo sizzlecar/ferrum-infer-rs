@@ -116,3 +116,27 @@ Ferrum/vLLM benchmark tables are still pending a runnable GPU instance:
 - `38872161` was destroyed per the recovery rule.
 - Replacement RTX 4090 creation attempt on offer `32736582` failed with
   `insufficient_credit`.
+- Fresh replacement attempt on offer `38712898` also failed with
+  `insufficient_credit`.
+
+## Ready-to-run command when GPU credit is restored
+
+The release GGUF benchmark wrapper is now:
+
+```bash
+source /workspace/vllm-venv/bin/activate
+cargo build --release -p ferrum-cli \
+  --features cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source
+OUT_ROOT=/workspace/release-bench-20260601-gguf-8b \
+  bash scripts/release_gguf_8b_vs_vllm.sh
+```
+
+Defaults:
+
+- models: `qwen3:8b-q4_k_m` and `llama3.1:8b-q4_k_m`
+- vLLM models: `Qwen/Qwen3-8B-GGUF:Q4_K_M` and
+  `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M`
+- tokenizer models: `Qwen/Qwen3-8B` and
+  `NousResearch/Meta-Llama-3.1-8B-Instruct`
+- workload: random `256/128`, c=`1,4,16,32`, `N=3`,
+  `128` prompts, `10` warmup requests.

@@ -49,7 +49,10 @@ Release blockers remaining as of this checkpoint:
 - Saved 8B GGUF Ferrum/vLLM comparison tables are still pending because no
   runnable GPU instance is available. Vast instance `38872161` could not be
   restarted (`resources_unavailable`), was destroyed, and replacement creation
-  failed with `insufficient_credit`.
+  failed with `insufficient_credit`; a fresh offer `38712898` failed the same
+  way.
+- The benchmark execution wrapper is ready at
+  `scripts/release_gguf_8b_vs_vllm.sh`.
 
 8B GGUF CUDA serve notes:
 

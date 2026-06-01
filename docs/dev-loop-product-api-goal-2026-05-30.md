@@ -247,6 +247,12 @@ completion blocker for the current checkpoint.
   Replacement RTX 4090 creation on offer `32736582` failed with
   `insufficient_credit`, so saved 8B Ferrum/vLLM benchmark tables are pending
   more Vast credit or another available GPU source.
+- `2026-06-01 17:50:00 +0800`: prepared the saved 8B GGUF Ferrum/vLLM release
+  benchmark wrapper `scripts/release_gguf_8b_vs_vllm.sh`. It runs Qwen3-8B
+  and LLaMA-3.1-8B GGUF-vs-GGUF through the shared `bench_vs_vllm.sh` harness
+  with explicit vLLM GGUF model IDs and tokenizer models. A fresh RTX 4090
+  creation attempt on offer `38712898` still failed with `insufficient_credit`,
+  so execution remains blocked on Vast credit.
   comparisons for Qwen3-8B and LLaMA-3.1-8B. vLLM GGUF support is treated as
   experimental and must be labeled separately.
 - Next hard-stop decision points are now I/E/F/G blockers; Milestone A must

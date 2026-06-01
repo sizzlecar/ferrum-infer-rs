@@ -88,22 +88,29 @@ case "$MODEL_ALIAS" in
     qwen3-moe-30b-int4) VLLM_MODEL="Qwen/Qwen3-30B-A3B-GPTQ-Int4" ;;
     *) VLLM_MODEL="$MODEL_ALIAS" ;;  # caller passed an HF ID directly
 esac
+VLLM_MODEL="${VLLM_MODEL_OVERRIDE:-$VLLM_MODEL}"
+BENCH_MODEL="${BENCH_MODEL:-$VLLM_MODEL}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-$VLLM_MODEL}"
 
 # ─────────────────────────────────────────────────────────────────────
 # Tokenizer path (needed by ferrum bench-serve --tokenizer)
 # ─────────────────────────────────────────────────────────────────────
 
 HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
-TOK_REPO_DIR=$(echo "$VLLM_MODEL" | tr '/' '-')
-TOK_DIR=$(find "$HF_HOME/hub" -type d -name "models--${TOK_REPO_DIR}*" 2>/dev/null | head -1)
-if [ -z "$TOK_DIR" ]; then
-    echo "ERROR: tokenizer not found in $HF_HOME/hub/ for $VLLM_MODEL" >&2
-    echo "  run: huggingface-cli download $VLLM_MODEL" >&2
-    exit 1
+if [ -n "${TOKENIZER_PATH_OVERRIDE:-}" ]; then
+    TOK_SNAPSHOT="$TOKENIZER_PATH_OVERRIDE"
+else
+    TOK_REPO_DIR=$(echo "$TOKENIZER_MODEL" | tr '/' '-')
+    TOK_DIR=$(find "$HF_HOME/hub" -type d -name "models--${TOK_REPO_DIR}*" 2>/dev/null | head -1)
+    if [ -z "$TOK_DIR" ]; then
+        echo "ERROR: tokenizer not found in $HF_HOME/hub/ for $TOKENIZER_MODEL" >&2
+        echo "  run: huggingface-cli download $TOKENIZER_MODEL" >&2
+        exit 1
+    fi
+    TOK_SNAPSHOT=$(find "$TOK_DIR/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
 fi
-TOK_SNAPSHOT=$(find "$TOK_DIR/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
 if [ -z "$TOK_SNAPSHOT" ] || [ ! -f "$TOK_SNAPSHOT/tokenizer.json" ]; then
-    echo "ERROR: tokenizer.json not found under $TOK_DIR" >&2
+    echo "ERROR: tokenizer.json not found under $TOK_SNAPSHOT" >&2
     exit 1
 fi
 
@@ -120,6 +127,7 @@ VLLM_DTYPE="${VLLM_DTYPE:-fp16}"
 VLLM_ENABLE_CHUNKED_PREFILL="${VLLM_ENABLE_CHUNKED_PREFILL:-true}"
 # Ferrum's prefix cache defaults OFF (PR #204) — match here for parity.
 VLLM_PREFIX_CACHE="${VLLM_PREFIX_CACHE:-false}"
+VLLM_TOKENIZER_MODEL="${VLLM_TOKENIZER_MODEL:-}"
 
 VLLM_ARGS=(
     "$VLLM_MODEL"
@@ -129,6 +137,14 @@ VLLM_ARGS=(
     --max-num-batched-tokens "$VLLM_MAX_NUM_BATCHED_TOKENS"
     --dtype "$VLLM_DTYPE"
 )
+if [ -n "$VLLM_TOKENIZER_MODEL" ]; then
+    VLLM_ARGS+=(--tokenizer "$VLLM_TOKENIZER_MODEL")
+fi
+if [ -n "${VLLM_EXTRA_ARGS:-}" ]; then
+    # shellcheck disable=SC2206
+    VLLM_EXTRA_ARGS_ARRAY=($VLLM_EXTRA_ARGS)
+    VLLM_ARGS+=("${VLLM_EXTRA_ARGS_ARRAY[@]}")
+fi
 if [ "$VLLM_ENABLE_CHUNKED_PREFILL" = "true" ]; then
     VLLM_ARGS+=(--enable-chunked-prefill)
 fi
@@ -148,7 +164,7 @@ PARITY_FILE="$OUT_DIR/parity.md"
 {
     echo "# Config parity — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo
-    echo "Model:    $MODEL_ALIAS (vllm sees \`$VLLM_MODEL\`)"
+    echo "Model:    $MODEL_ALIAS (vllm sees \`$VLLM_MODEL\`, bench sends \`$BENCH_MODEL\`)"
     echo "Sweep:    $SWEEP_CSV"
     [ -n "$REQUEST_RATE" ] && echo "Mode:     open-loop @ ${REQUEST_RATE} req/s"
     echo "Repeats:  $N_REPEATS"
@@ -227,7 +243,7 @@ run_one_engine() {
     # shellcheck disable=SC2086
     timeout 1800 "$FERRUM_BIN" bench-serve \
         --base-url "$base_url" \
-        --model "$VLLM_MODEL" \
+        --model "$BENCH_MODEL" \
         --tokenizer "$TOK_SNAPSHOT" \
         --dataset random \
         --random-input-len 256 --random-output-len 128 \
