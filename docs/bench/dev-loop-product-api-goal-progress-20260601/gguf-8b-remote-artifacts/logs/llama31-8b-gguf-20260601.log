@@ -1,0 +1,88 @@
+[llama-start] 2026-06-01T10:55:18+00:00
+/workspace/vllm-venv/lib/python3.12/site-packages/huggingface_hub/cli/download.py:152: UserWarning: Ignoring `--include` since filenames have being explicitly set.
+  warnings.warn("Ignoring `--include` since filenames have being explicitly set.")
+Fetching 2 files:   0%|          | 0/2 [00:00<?, ?it/s]Fetching 2 files: 100%|██████████| 2/2 [00:00<00:00, 4353.20it/s]
+[32m✓ Downloaded[0m
+  path: /root/.cache/huggingface/hub/models--NousResearch--Meta-Llama-3.1-8B-Instruct/snapshots/d10aef7999a2b5ba950ab3974312feeedbfe0b77
+# Config parity — 2026-06-01T10:55:40Z
+
+Model:    llama3.1:8b-q4_k_m (vllm sees `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M`, bench sends `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M`)
+Sweep:    1,4,16,32
+Repeats:  3
+Warmup:   10
+Prompts:  128 per cell
+SLO:      ttft=500  tpot=50  e2el=30000 (ms)
+
+| knob | ferrum | vllm | parity |
+|---|---|---|---|
+| gpu_memory_utilization | (computed at load) | 0.85 | ⚠ inspect after run |
+| max_seqs | 32 | 32 | ✓ |
+| max_num_batched_tokens | (engine constant) | 2048 | ⚠ inspect |
+| chunked_prefill | on (Phase 3 path) | true | ✓ |
+| prefix_caching | off | off | ✓ |
+| dtype | (model config) | float16 | ⚠ inspect after run |
+
+**Action required**: confirm the ⚠ rows match before trusting any ratio.
+
+✓ parity → /workspace/release-bench-20260601-gguf-8b-d7d3ebb-llama/llama31-8b-q4_k_m/parity.md
+
+▶ starting ferrum on port 18810
+  ferrum ready (93s)
+▶ bench-serve → ferrum
+ferrum bench-serve — dataset=random num_prompts=128 warmup=10 n_repeats=3
+→ closed_loop c=1
+  cell closed_loop c=1 — repeat 1/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 288.0s
+  cell closed_loop c=1 — repeat 2/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 292.3s
+  cell closed_loop c=1 — repeat 3/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 292.3s
+    summary c=1 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=48.7±0.6  p95=50.7±0.5  p99=57.1±13.9
+      TPOT_ms  p50=17.5±0.0  p95=22.4±20.8  p99=34.5±0.8
+      ITL_ms   p50=17.6±0.0  p95=17.8±0.0  p99=35.1±0.4
+      throughput      55.4 ± 1.3 tok/s
+      goodput         0.44 ± 0.01 req/s
+→ closed_loop c=4
+  cell closed_loop c=4 — repeat 1/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 85.8s
+  cell closed_loop c=4 — repeat 2/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 86.0s
+  cell closed_loop c=4 — repeat 3/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 85.8s
+    summary c=4 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=128.9±46.5  p95=162.8±42.1  p99=166.9±41.8
+      TPOT_ms  p50=20.0±0.3  p95=20.4±0.0  p99=35.7±7.6
+      ITL_ms   p50=19.8±0.0  p95=20.2±0.0  p99=45.0±11.7
+      throughput      188.6 ± 1.9 tok/s
+      goodput         1.49 ± 0.01 req/s
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 32.4s
+  cell closed_loop c=16 — repeat 2/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 33.1s
+  cell closed_loop c=16 — repeat 3/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 32.4s
+    summary c=16 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=285.9±36.2  p95=472.4±47.1  p99=668.1±89.4
+      TPOT_ms  p50=29.8±2.2  p95=39.4±37.0  p99=51.5±36.8
+      ITL_ms   p50=27.8±1.8  p95=46.4±39.4  p99=121.1±3.5
+      throughput      486.4 ± 60.2 tok/s
+      goodput         3.58 ± 0.55 req/s
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 24.2s
+  cell closed_loop c=32 — repeat 2/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 23.0s
+  cell closed_loop c=32 — repeat 3/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 23.2s
+    summary c=32 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=338.4±42.7  p95=1170.1±180.2  p99=1410.3±425.7
+      TPOT_ms  p50=43.3±3.2  p95=46.5±9.1  p99=75.9±28.2
+      ITL_ms   p50=37.3±3.7  p95=99.5±4.1  p99=136.5±17.2
+      throughput      677.0 ± 52.5 tok/s
+      goodput         4.32 ± 0.42 req/s
+
+→ wrote /workspace/release-bench-20260601-gguf-8b-d7d3ebb-llama/llama31-8b-q4_k_m/ferrum_report.json
+▶ starting vllm on port 18910
+ERROR: vllm did not become healthy within 300s

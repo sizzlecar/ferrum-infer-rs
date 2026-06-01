@@ -1,0 +1,139 @@
+{
+  "artifact_verdict": "pass",
+  "cases": [
+    {
+      "manifest": "/workspace/m3-quick-regress-1e3ce42-c32-20260601/fa2_source_c32_n1/manifest.json",
+      "name": "fa2_source"
+    },
+    {
+      "manifest": "/workspace/m3-quick-regress-1e3ce42-c32-20260601/fa_layout_c32_n1/manifest.json",
+      "name": "fa_layout"
+    }
+  ],
+  "created_at": "2026-06-01T12:21:19.012600+00:00",
+  "finished_at": "2026-06-01T12:22:26.075993+00:00",
+  "name": "m3-fa2-direct-ffi-ab",
+  "not_publishable": false,
+  "not_publishable_reason": null,
+  "preflight": {
+    "bin": "target/release/ferrum",
+    "binary_sha256": "sha256:2fa3dea8394c4f334d5b021a842fbdd8adac282c6064958cd6787533667d1cb2",
+    "date": "2026-06-01T12:21:18.943010+00:00",
+    "features": "cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source",
+    "git_head": "1e3ce42d63cb1f903e852be5e9b1c1efe05c9b64",
+    "git_status_short": [
+      "?? scripts/__pycache__/"
+    ],
+    "gpu_process_state": "    PID    PPID STAT     ELAPSED CMD\n      1       0 Ss         31:22 /bin/sh -c while [ ! -e /.launch ]; do sleep 1; done; bash /.launch\n     45       1 S          31:22 bash /.launch\n     60       1 Ss         31:22 sshd: /usr/sbin/sshd -E /proc/1/fd/1 [listener] 0 of 10-100 startups\n   9468      60 Ss         00:04 sshd: root@notty\n   9487      45 S          00:00 sleep 1\n   9492       1 Ss         00:00 tmux new-session -d -s ferrum_gpu_regress set -euo pipefail; source /root/.cargo/env; cd /workspace/ferrum-release-bench; OUT_ROOT=/workspace/m3-quick-regress-1e3ce42-c32-20260601 REPEATS=1 NUM_PROMPTS=64 WARMUP_REQUESTS=2 CONCURRENCY=32 FA2_SOURCE=1 FA2_EXTRA_LD_LIBRARY_PATH= VALIDATION_CHANGE_TYPE=opt_in_experiment BUILD=0 bash scripts/m3_fa2_direct_ffi_ab.sh 2>&1 | tee /workspace/release-logs/quick-regress-1e3ce42-c32-20260601.log\n   9493    9492 Ss+        00:00 bash -c set -euo pipefail; source /root/.cargo/env; cd /workspace/ferrum-release-bench; OUT_ROOT=/workspace/m3-quick-regress-1e3ce42-c32-20260601 REPEATS=1 NUM_PROMPTS=64 WARMUP_REQUESTS=2 CONCURRENCY=32 FA2_SOURCE=1 FA2_EXTRA_LD_LIBRARY_PATH= VALIDATION_CHANGE_TYPE=opt_in_experiment BUILD=0 bash scripts/m3_fa2_direct_ffi_ab.sh 2>&1 | tee /workspace/release-logs/quick-regress-1e3ce42-c32-20260601.log\n   9495    9493 S+         00:00 bash scripts/m3_fa2_direct_ffi_ab.sh\n   9496    9493 S+         00:00 tee /workspace/release-logs/quick-regress-1e3ce42-c32-20260601.log\n   9499    9495 S+         00:00 python3 scripts/m3_ab_runner.py --config /workspace/m3-quick-regress-1e3ce42-c32-20260601/runner_config.json\n   9507    9499 R+         00:00 ps -eo pid,ppid,stat,etime,cmd\n",
+    "hf_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+    "host": "8ef870754182",
+    "model_dir": "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+    "nvidia_smi": "Mon Jun  1 12:21:18 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |\n+-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA GeForce RTX 4090        On  |   00000000:A1:00.0 Off |                  Off |\n| 30%   36C    P8             45W /  450W |       1MiB /  24564MiB |      0%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n\n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|  No running processes found                                                             |\n+-----------------------------------------------------------------------------------------+\n",
+    "preset": "m3_qwen3_30b_a3b_int4",
+    "repo": "/workspace/ferrum-release-bench"
+  },
+  "runner": "scripts/m3_ab_runner.py",
+  "runtime_preset": "m3_qwen3_30b_a3b_int4",
+  "schema_version": 1,
+  "summary_json": "/workspace/m3-quick-regress-1e3ce42-c32-20260601/summary.json",
+  "validation_checklist": {
+    "baseline_case": "fa_layout",
+    "bench_completion": {
+      "completed": null,
+      "errored": null,
+      "ok": null,
+      "required": true
+    },
+    "case": null,
+    "change_type": "opt_in_experiment",
+    "local_gates": [],
+    "observed_correctness_gates": [],
+    "performance_regression_gates": {
+      "baseline_case": "fa_layout",
+      "cases": {
+        "fa2_source": {
+          "baseline_case": "fa_layout",
+          "metrics": [
+            {
+              "baseline": 1230.5391762888585,
+              "candidate": 1403.9840123355493,
+              "delta_pct": 14.095027560989749,
+              "metric": "throughput_mean",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "min_delta_pct",
+                "value": -3.0
+              }
+            },
+            {
+              "baseline": 309.43161050000003,
+              "candidate": 242.8675965,
+              "delta_pct": -21.511704603302007,
+              "metric": "ttft_p50",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 10.0
+              }
+            },
+            {
+              "baseline": 21.702128107608694,
+              "candidate": 19.43332953125,
+              "delta_pct": -10.454267734062729,
+              "metric": "tpot_p50",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 5.0
+              }
+            },
+            {
+              "baseline": 65.80602144999999,
+              "candidate": 49.340378599999994,
+              "delta_pct": -25.02148357732087,
+              "metric": "itl_p95",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 10.0
+              }
+            }
+          ],
+          "ok": true
+        }
+      },
+      "concurrency_cells_ok": true,
+      "enabled": true,
+      "observed_concurrency_cells": [
+        32
+      ],
+      "required_concurrency_cells": [],
+      "schema_version": 1,
+      "thresholds": {
+        "enabled": true,
+        "itl_p95_max_regression_pct": 10.0,
+        "throughput_min_delta_pct": -3.0,
+        "tpot_max_regression_pct": 5.0,
+        "ttft_max_regression_pct": 10.0
+      }
+    },
+    "performance_regression_required": true,
+    "required_correctness_gates": [
+      "paris",
+      "multi_turn_paris",
+      "multi_turn_three_recall",
+      "bench_completion"
+    ],
+    "schema_version": 1,
+    "skipped_gates": [],
+    "touched_areas": [
+      "model_forward",
+      "attention_prefill_mixed_path",
+      "fa2_runtime_path"
+    ]
+  }
+}

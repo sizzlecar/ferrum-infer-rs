@@ -1,0 +1,17 @@
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-01T12:00:23.055736Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T12:00:23.055752Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T12:00:23.055807Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-01T12:00:23.233352Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T12:00:23.233407Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T12:00:23.233413Z  INFO ferrum_engine::registry: Creating priority scheduler
+2026-06-01T12:00:23.233426Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T12:00:23.233476Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+Model loaded in 1.7s.
+
+thread 'tokio-runtime-worker' (67032005) panicked at crates/ferrum-models/src/models/qwen3_moe/forward_layer.rs:113:13:
+KV cache overflow on layer 0: would write tokens [0..513) but capacity is 512 (cache_id="cache_a4be8133-d293-4eaf-bf9a-49bbf4e5dc10"). Increase FERRUM_KV_CAPACITY or call /clear in the REPL.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

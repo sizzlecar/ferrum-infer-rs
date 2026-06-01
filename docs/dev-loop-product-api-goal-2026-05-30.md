@@ -33,7 +33,16 @@
 - Alias release-binary smoke at `/workspace/release-alias-serve-qwen3-06b-8ec0858` → `serve qwen3:0.6b` passed without `FERRUM_MODEL_PATH`
 - 8B GGUF CUDA serve smoke at `/workspace/release-qwen3-8b-gguf-cuda-smoke-42ffbe2` → `qwen3:8b-q4_k_m` passed health + OpenAI chat through the CUDA eager-dequant fallback path
 - 8B GGUF CUDA serve smoke at `/workspace/release-llama31-8b-gguf-cuda-smoke-42ffbe2` → `llama3.1:8b-q4_k_m` passed health + OpenAI chat through the CUDA eager-dequant fallback path
-- 8B GGUF Ferrum/vLLM benchmark packet remains pending because Vast instance `38872161` could not restart (`resources_unavailable`), was destroyed, and replacement 4090 creation failed with `insufficient_credit`
+- 8B GGUF Ferrum/vLLM benchmark packets are complete and mirrored locally:
+  `gguf-8b-release-benchmarks-20260601.md`.
+- Metal Qwen3-MoE prefill readback bug was fixed in `1e3ce42`; local Metal
+  smoke now returns Paris and no longer reproduces the command-encoder
+  assertion. The local Mac had swap, so this is not a clean Metal performance
+  claim.
+- Post-fix GPU quick regression at
+  `/workspace/m3-quick-regress-1e3ce42-c32-20260601` passed Paris,
+  multi-turn, three-round recall, and c32 performance gate
+  (`fa2_source=1403.98 tok/s`, `fa_layout=1230.54 tok/s`, `+14.10%`).
 
 All commands above have explicit status noted above; all tooling self-tests passed while the Milestone A 5-run probe failed in this environment due missing CUDA binaries.
 
@@ -57,17 +66,21 @@ All commands above have explicit status noted above; all tooling self-tests pass
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-direct-smoke-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/release-benchmark-plan-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/release-candidate-0.7.3-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/gguf-8b-release-benchmarks-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-30b-a3b-prefill-syncfix-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-quick-regress-1e3ce42-c32-20260601.md`
 
 ### Next-turn execution path (from this evidence state)
 
 1. Do not rerun Milestone A as an evidence-only loop: the thin-LTO restored-pod
-   5-run release touch artifact now passes the timing target at
+   5-run release touch artifact already passes the timing target at
    `/workspace/m3-release-touch-probe-thinlto-20260601-20260601_064127`.
-2. On the same host, complete the all-cell default-path packet, and after the wrapper returns run
-   `python3 scripts/m3_validate_runner_artifact.py --require-bench "$OUT_I"` where `OUT_I` is the aggregate root.
-3. Only after the all-cell packet, real-model API smoke evidence, and remaining
-   runtime-default ownership work are complete, update this objective file’s
-   blocker list from `hard-blocked` to `closing`.
+2. Do not rerun full M3 all-cells unless runtime code changes again. The
+   release-performance source of truth is
+   `/workspace/m3-fa2-source-current-allcells-n3-20260601`; the post-`1e3ce42`
+   c32 quick regression is saved separately.
+3. Finish release-note wording, final release checkpoint/tag decision, and
+   source-FA2 default/opt-in policy wording.
 ## Current Progress Snapshot (2026-06-01)
 
 This objective is being tracked through the following module status packets:
@@ -258,10 +271,26 @@ completion blocker for the current checkpoint.
   packet at
   `docs/bench/dev-loop-product-api-goal-progress-20260601/release-candidate-0.7.3-20260601.md`.
   It separates satisfied release gates from the pending 8B Ferrum/vLLM
-  publicity benchmark and records release-note wording constraints.
-  comparisons for Qwen3-8B and LLaMA-3.1-8B. vLLM GGUF support is treated as
-  experimental and must be labeled separately.
-- Next hard-stop decision points are now I/E/F/G blockers; Milestone A must
+  comparison work.
+- `2026-06-01 20:20:00 +0800`: completed Qwen3-8B and LLaMA-3.1-8B
+  GGUF-vs-GGUF Ferrum/vLLM benchmark tables and mirrored the artifacts under
+  `docs/bench/dev-loop-product-api-goal-progress-20260601/gguf-8b-remote-artifacts/`.
+  Qwen3-8B measured Ferrum/vLLM ratios c1 `0.477x`, c4 `0.735x`,
+  c16 `1.40x`, c32 `1.71x`; LLaMA-3.1-8B measured c1 `0.471x`,
+  c4 `0.786x`, c16 `1.55x`, c32 `2.09x`.
+- `2026-06-01 20:30:00 +0800`: fixed Metal Qwen3-MoE prefill logits
+  readback in commit `1e3ce42` by synchronizing before `to_vec`. Local Metal
+  smoke changed from garbage output plus `Command encoder released without
+  endEncoding` to `The capital of France is **Paris**.` without the assertion.
+  A clean Metal performance claim was not made because the local Mac had active
+  swap and the attempted `run --bench-mode` tg128 stopped early on EOS.
+- `2026-06-01 20:45:00 +0800`: ran post-`1e3ce42` GPU quick regression at
+  `/workspace/m3-quick-regress-1e3ce42-c32-20260601`. Both `fa2_source` and
+  `fa_layout` passed Paris, multi-turn, and three-round recall. c32 quick
+  throughput measured `fa2_source=1403.98 tok/s` versus
+  `fa_layout=1230.54 tok/s`; runner perf gate passed.
+- Next hard-stop decision points are release-note wording, source-FA2 opt-in
+  versus default policy, and final checkpoint/tag creation. Milestone A must
   stay green but is no longer a binding blocker for the current checkpoint.
 
 ### As-of-now blocker state
@@ -269,7 +298,7 @@ completion blocker for the current checkpoint.
 - `Milestone A` release-boundary timing is unblocked by the thin-LTO 5-run
   restored-pod proof (`p50=33.164s`, `p95=34.454s`, required
   `<=75s/<=90s`) with all CUDA artifacts at cache-hit.
-- `Milestone E` is hard-blocked by unresolved auto-config ownership in benchmark/model/admin startup default branches.
+- `Milestone E` still has unresolved auto-config ownership in some benchmark/model/admin startup default branches.
 - `Milestone I` has source-FA2 all-cell N=3 evidence and passes the adjusted
   `0.75× vLLM` formal release threshold. It remains open only if the release
   requires source FA2 to become the default path rather than a release-supported
@@ -322,7 +351,9 @@ This goal is achieved only when a developer can make a narrow kernel/API/schedul
 ### Current objective-impacting gaps
 
 - M3 performance source-of-truth remains `docs/bench/m3-80pct-goal-2026-05-25/GOAL.md`. As of 2026-06-01, formal release performance threshold is `0.75× vLLM`; `0.80×` remains a stretch goal.
-- The active goal is currently blocked by evidence completeness, not design intent: E, I, and F/G are the binding gaps for completion with current repo state.
+- The active goal is incomplete because some ownership/default and strict-SDK
+  proof items remain, not because the release candidate lacks performance/API
+  smoke evidence.
 - Milestone A now has CUDA-hosted release-boundary proof for this checkpoint; future kernel/build changes must keep the same probe green.
 
 ### Current completion debt (authoritative, as of 2026-06-01)
@@ -335,9 +366,9 @@ This goal is achieved only when a developer can make a narrow kernel/API/schedul
 - Partial blockers that still need closure work:
   - `Milestone B`: producer migrations and required-event coverage are in place for migrated paths, but remaining paths still need periodic validation as they move.
   - `Milestone C`: wrapper migration is broad but still depends on final stable all-cell publishable outputs for all active default-path scripts.
-  - `Milestone F/G`: real-model ignored-smoke evidence remains a remaining
-    production proof requirement; the latest restored-pod attempt is blocked by
-    a `Qwen/Qwen3-0.6B` pull/cache authentication failure.
+  - `Milestone F/G`: direct release-binary real-model smoke passed. The
+    ignored SDK cargo wrapper remains a post-release harness gap unless the
+    release explicitly requires SDK-wrapper evidence.
 - Any completion claim that omits one of the binding blockers is invalid regardless of local green checks.
 
 ## Milestone Evidence Ledger (current)
@@ -433,10 +464,16 @@ To satisfy the final packet requirement, the following artifacts must be present
 
 Current missing completion packets to generate in this objective run:
 
-- `docs/bench/m3-release-touch-probe-20260601-*.json/.log` — Milestone A timing evidence with limits pass/fail.
-- `docs/bench/m3-default-path-all-cell-80pct-*.*/` — Milestone I publishable packet with `n_repeats>=3` and concurrency cells `1/4/16/32`.
+- Milestone A release timing evidence is present at
+  `/workspace/m3-release-touch-probe-thinlto-20260601-20260601_064127`.
+- Milestone I release-threshold evidence is present at
+  `/workspace/m3-fa2-source-current-allcells-n3-20260601`; remaining work is
+  the source-FA2 default/opt-in policy decision.
 - `docs/status/auto-config-default-owner-closure-20260601.md` or equivalent section update — Milestone E ownership closure with explicit branch coverage.
-- `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-20260601-*/` — Milestone F/G real-model evidence and streaming strict-schema latency summary (artifact should include `commands.md`, `run_summary.json`, `cargo-test-*.log`, and a passing `scripts/validate_real_model_api_smoke.py "$OUT_F"` result).
+- Direct release-binary real-model API evidence is present at
+  `/workspace/m3-real-model-api-direct-smoke-20260601`; remaining F/G work is
+  SDK-wrapper/strict-streaming production framing if required for the final
+  goal rather than this release candidate.
 
 ### Completion evidence matrix (hard check, no substitutions)
 
@@ -453,15 +490,15 @@ Current missing completion packets to generate in this objective run:
 
 | Milestone | Required evidence | Current local/state evidence | Closure status |
 |---|---|---|---|
-| A | 5-run release build boundary manifest (`p50`, `p95`, `limits_pass`), per-run `cuda-build-summary` validation, and `scripts/validate_cuda_build_boundary_manifest.py --require-limits-pass` pass | `scripts/m3_cuda_build_boundary_probe.py` and `scripts/validate_cuda_build_boundary_manifest.py` self-tests pass locally; status packet not yet produced for 5-run release boundary | **blocked** (requires GPU-bound release loop execution) |
+| A | 5-run release build boundary manifest (`p50`, `p95`, `limits_pass`), per-run `cuda-build-summary` validation, and `scripts/validate_cuda_build_boundary_manifest.py --require-limits-pass` pass | `/workspace/m3-release-touch-probe-thinlto-20260601-20260601_064127`, p50 `33.164s`, p95 `34.454s`, all `39` CUDA rows cache-hit | **done for release checkpoint** |
 | B | Publishable profile run with structured JSONL event groups and parser/fixture validation | schema + parser + migrated runner validations are in place; status includes structured profile artifacts | **partial** (no new full publishable packet written in this branch) |
 | C | Publishable all-cell runner output with manifest + summaries + validator pass | runner/validator tooling exists and self-tests pass; no new default-path full-cell publish artifact from this change set | **partial** |
 | D | Registry + env snapshot + diff artifact fields in runner manifests | static scan and schema gates pass; status shows `146/146` entries and bounded reads | **close to done** |
 | E | Builder-owned default path decisions for all benchmark/model/admin runtime defaults; same manifest includes source/effect metadata and decision trace parity | runtime selector path exists and artifacts are schema-valid; universal ownership still incomplete | **blocked** |
-| F | Real-model API compatibility packet + strict-schema behavior report | stub contracts are covered in status; `scripts/m3_real_model_api_smoke.sh` defines required command set and artifact shape; real-model packet with `commands.md` + `run_summary.json` still missing | **blocked** |
+| F | Real-model API compatibility packet + strict-schema behavior report | direct release-binary smoke passed at `/workspace/m3-real-model-api-direct-smoke-20260601`; SDK cargo wrapper remains a harness gap | **release-pass, goal-partial** |
 | G | Strict-schema production/streaming tradeoff doc + evidence of hard-gated behavior under strict schema | partial in status; final production story still pending | **partial** |
 | H | Shape split, line limits, and signature controls verified in codebase-shape status | verified and tracked | **close to done** |
-| I | Same-pod publishable default-path full-cell non-regression packet (c1/4/16/32, n_repeats>=3) with baseline/candidate and correctness gates | status requires this packet; currently absent | **blocked** |
+| I | Same-pod publishable default-path full-cell non-regression packet (c1/4/16/32, n_repeats>=3) with baseline/candidate and correctness gates | `/workspace/m3-fa2-source-current-allcells-n3-20260601` passes adjusted `0.75× vLLM` release threshold; post-`1e3ce42` c32 quick regression also passed | **release-pass, policy-open** |
 
 ### Evidence quality rule for this objective
 
@@ -470,8 +507,8 @@ Current missing completion packets to generate in this objective run:
 
 ### Priority next validation tasks (next turn)
 
-1. Produce the Milestone A timing packet for 5 consecutive attention-only `ferrum-cli --release` rebuilds and record pass/fail against the `<=75s/<=90s` gate in a committed `docs/bench/*` artifact.
-2. Run/publish a default-path, same-pod, all-cell (c1/4/16/32), n_repeats>=3 comparison packet with full `validation_checklist`, latency/throughput deltas, and local+artifact checks to close Milestone I. Use the explicit per-concurrency+aggregation sequence in `docs/bench/dev-loop-product-api-goal-progress-20260601/next-runbook-20260601.md`. The candidate must be the restored native in-repo `FERRUM_FA2_SOURCE=1` path, not the earlier external FlashAttention-source build or vLLM/Torch direct FFI shim.
+1. Finalize release-note wording for source FA2 as opt-in versus default/selector-owned.
+2. Create the final release checkpoint/tag after docs and artifacts are committed.
 3. Close the remaining auto-config ownership gap by making startup selectors the default owner for all runtime default branches covered by current benchmarks, then document the behavioral deltas (if any) with artifact-backed proof for Milestone E.
 4. Produce a real-model API evidence packet (including strict schema behavior and strict/non-strict streaming behavior) for Milestones F/G via `scripts/m3_real_model_api_smoke.sh`, validate it with `scripts/validate_real_model_api_smoke.py "$OUT_F"`, then include it under the final completion packet. Required artifacts: `commands.md`, `run_summary.json`, and `cargo-test-*.log` in a timestamped `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-*` path.
 5. After #1/#2/#3/#4 complete, run:

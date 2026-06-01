@@ -1,0 +1,122 @@
+{
+  "model": "/Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf",
+  "backend": "metal",
+  "scenario": "cli",
+  "n_prompt": 2,
+  "n_gen": 1,
+  "n_repeats": 1,
+  "n_requests_per_run": 1,
+  "warmup_requests": 0,
+  "ttft_ms": {
+    "p50": {
+      "mean": 0.0
+    },
+    "p75": {
+      "mean": 0.0
+    },
+    "p95": {
+      "mean": 0.0
+    },
+    "p99": {
+      "mean": 0.0
+    }
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 0.0
+    },
+    "p75": {
+      "mean": 0.0
+    },
+    "p95": {
+      "mean": 0.0
+    },
+    "p99": {
+      "mean": 0.0
+    }
+  },
+  "itl_ms": {
+    "p50": {
+      "mean": 0.0
+    },
+    "p75": {
+      "mean": 0.0
+    },
+    "p95": {
+      "mean": 0.0
+    },
+    "p99": {
+      "mean": 0.0
+    }
+  },
+  "e2e_ms": {
+    "p50": {
+      "mean": 0.0
+    },
+    "p75": {
+      "mean": 0.0
+    },
+    "p95": {
+      "mean": 0.0
+    },
+    "p99": {
+      "mean": 0.0
+    }
+  },
+  "output_throughput_tps": {
+    "mean": 0.0
+  },
+  "total_throughput_tps": {
+    "mean": 0.0
+  },
+  "request_throughput_rps": {
+    "mean": 0.0
+  },
+  "goodput_rps": {
+    "mean": 0.0
+  },
+  "slo": {
+    "ttft_p99_ms": null,
+    "tpot_p99_ms": null,
+    "e2e_p99_ms": null
+  },
+  "completed_per_run": [
+    0
+  ],
+  "errored_per_run": [
+    1
+  ],
+  "env": {
+    "commit_sha": "6016c1d",
+    "hw_id": "apple-m1-max",
+    "rust": "1.91.0",
+    "ferrum_features": [
+      "metal"
+    ],
+    "ferrum_env": {
+      "FERRUM_KV_CAPACITY": "1024",
+      "FERRUM_MOE_GRAPH": "0"
+    },
+    "runtime_config": {
+      "entries": [
+        {
+          "key": "FERRUM_KV_CAPACITY",
+          "effective_value": "1024",
+          "source": "env",
+          "affects": [
+            "memory"
+          ]
+        },
+        {
+          "key": "FERRUM_MOE_GRAPH",
+          "effective_value": "0",
+          "source": "env",
+          "affects": [
+            "performance"
+          ]
+        }
+      ]
+    }
+  },
+  "env_hash": "sha256:c8e20655653615ff0c9f0d2a01f34b5d89eb500c902e217c09330349c20499f8"
+}

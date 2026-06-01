@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=random num_prompts=64 warmup=2 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/1 (66 prompts including 2 warmup)
+    64 completed / 0 errored / 6.6s
+    summary c=32 (n_repeats=1, no CI)
+      TTFT_ms  p50=309.4  p95=1321.4  p99=1363.8
+      TPOT_ms  p50=21.7  p95=24.4  p99=24.8
+      ITL_ms   p50=15.7  p95=65.8  p99=129.4
+      throughput      1230.5 tok/s
+      goodput         9.72 req/s
+
+→ wrote /workspace/m3-quick-regress-1e3ce42-c32-20260601/fa_layout_c32_n1/bench.json

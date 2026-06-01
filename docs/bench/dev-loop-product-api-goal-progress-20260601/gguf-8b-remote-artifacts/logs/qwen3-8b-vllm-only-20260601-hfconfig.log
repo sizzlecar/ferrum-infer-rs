@@ -1,0 +1,58 @@
+[vllm-only-start] 2026-06-01T10:34:01+00:00
+vllm ready after 142s
+ferrum bench-serve — dataset=random num_prompts=128 warmup=10 n_repeats=3
+→ closed_loop c=1
+  cell closed_loop c=1 — repeat 1/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 144.6s
+  cell closed_loop c=1 — repeat 2/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 144.4s
+  cell closed_loop c=1 — repeat 3/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 143.8s
+    summary c=1 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=246.0±1.7  p95=254.6±4.1  p99=259.5±2.4
+      TPOT_ms  p50=6.9±0.0  p95=6.9±0.0  p99=6.9±0.2
+      ITL_ms   p50=6.9±0.0  p95=7.1±0.1  p99=7.4±0.1
+      throughput      114.3 ± 0.3 tok/s
+      goodput         0.89 ± 0.01 req/s
+→ closed_loop c=4
+  cell closed_loop c=4 — repeat 1/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 68.2s
+  cell closed_loop c=4 — repeat 2/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 68.5s
+  cell closed_loop c=4 — repeat 3/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 68.2s
+    summary c=4 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=876.4±332.2  p95=968.6±8.0  p99=978.8±29.9
+      TPOT_ms  p50=9.8±2.7  p95=14.8±0.1  p99=14.8±0.1
+      ITL_ms   p50=9.2±0.0  p95=9.5±0.1  p99=21.8±51.7
+      throughput      241.5 ± 2.0 tok/s
+      goodput         0.61 ± 0.50 req/s
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 52.2s
+  cell closed_loop c=16 — repeat 2/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 52.3s
+  cell closed_loop c=16 — repeat 3/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 52.3s
+    summary c=16 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=2603.9±942.2  p95=3803.5±78.1  p99=3806.0±88.1
+      TPOT_ms  p50=30.6±7.3  p95=48.4±0.8  p99=48.9±0.3
+      ITL_ms   p50=21.4±0.1  p95=22.0±0.2  p99=230.6±41.8
+      throughput      315.9 ± 0.6 tok/s
+      goodput         0.13 ± 0.08 req/s
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 49.7s
+  cell closed_loop c=32 — repeat 2/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 49.6s
+  cell closed_loop c=32 — repeat 3/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 49.8s
+    summary c=32 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=4191.0±379.0  p95=7288.1±716.7  p99=7635.7±210.7
+      TPOT_ms  p50=64.1±2.6  p95=85.8±13.5  p99=93.7±2.6
+      ITL_ms   p50=37.8±0.1  p95=39.1±0.4  p99=1670.3±18.2
+      throughput      332.4 ± 1.1 tok/s
+      goodput         0.00 ± 0.00 req/s
+
+→ wrote /workspace/release-bench-20260601-gguf-8b-a075e64/qwen3-8b-q4_k_m/vllm_report.json
+[vllm-only-done] 2026-06-01T10:53:33+00:00

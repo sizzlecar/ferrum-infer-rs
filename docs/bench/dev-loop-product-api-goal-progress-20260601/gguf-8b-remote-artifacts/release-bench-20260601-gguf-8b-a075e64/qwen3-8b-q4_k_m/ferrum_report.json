@@ -1,0 +1,738 @@
+[
+  {
+    "backend": "cuda",
+    "completed_per_run": [
+      128,
+      128,
+      128
+    ],
+    "concurrency": 1,
+    "e2e_ms": {
+      "p50": {
+        "ci95_hw": 2.6917847249994833,
+        "mean": 2335.9409611666665,
+        "stddev": 1.0835017212960547
+      },
+      "p75": {
+        "ci95_hw": 1.6691824932812693,
+        "mean": 2340.1146245,
+        "stddev": 0.6718821486097268
+      },
+      "p95": {
+        "ci95_hw": 0.40491838479321807,
+        "mean": 2344.2662058833334,
+        "stddev": 0.16298843025344614
+      },
+      "p99": {
+        "ci95_hw": 1.4085416126858992,
+        "mean": 2346.3555309999997,
+        "stddev": 0.5669685423534697
+      }
+    },
+    "env": {
+      "commit_sha": "a075e64",
+      "cuda": "13.0",
+      "driver": "580.95.05",
+      "ferrum_env": {
+        "FERRUM_BIN": "./target/release/ferrum",
+        "FERRUM_PAGED_MAX_SEQS": "32",
+        "FERRUM_PREFIX_CACHE": "0"
+      },
+      "ferrum_features": [
+        "cuda",
+        "vllm-moe-marlin",
+        "vllm-paged-attn-v2"
+      ],
+      "gpu_clock_lock_mhz": 2820,
+      "gpu_persistence_mode": true,
+      "gpu_power_limit_w": 450,
+      "hw_id": "rtx-4090",
+      "runtime_config": {
+        "entries": [
+          {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "./target/release/ferrum",
+            "key": "FERRUM_BIN",
+            "source": "env"
+          },
+          {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "32",
+            "key": "FERRUM_PAGED_MAX_SEQS",
+            "source": "env"
+          },
+          {
+            "affects": [
+              "correctness"
+            ],
+            "effective_value": "0",
+            "key": "FERRUM_PREFIX_CACHE",
+            "source": "env"
+          }
+        ]
+      },
+      "rust": "1.96.0"
+    },
+    "env_hash": "sha256:fa916e1cd200134533015c3dc980f952db9e9abadb766d5985399ac1d457d445",
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "goodput_rps": {
+      "ci95_hw": 0.032238693684449225,
+      "mean": 0.47564216353422695,
+      "stddev": 0.012976773281690902
+    },
+    "itl_ms": {
+      "p50": {
+        "ci95_hw": 0.007990552050630062,
+        "mean": 18.011384000000003,
+        "stddev": 0.0032163704699546707
+      },
+      "p75": {
+        "ci95_hw": 0.003684495591535627,
+        "mean": 18.096343166666667,
+        "stddev": 0.0014830893713230887
+      },
+      "p95": {
+        "ci95_hw": 0.013246768832495915,
+        "mean": 18.219288366666664,
+        "stddev": 0.005332111702068971
+      },
+      "p99": {
+        "ci95_hw": 0.009002997025471287,
+        "mean": 18.44427526666667,
+        "stddev": 0.0036239015264949437
+      }
+    },
+    "model": "Qwen/Qwen3-8B-GGUF:Q4_K_M#ferrum",
+    "n_gen": 128,
+    "n_prompt": 256,
+    "n_repeats": 3,
+    "n_requests_per_run": 128,
+    "output_throughput_tps": {
+      "ci95_hw": 0.5380887461714399,
+      "mean": 54.52151790601926,
+      "stddev": 0.2165923884150516
+    },
+    "request_throughput_rps": {
+      "ci95_hw": 0.029992760899326038,
+      "mean": 0.47687122223600337,
+      "stddev": 0.012072736634184966
+    },
+    "scenario": "closed_loop",
+    "slo": {
+      "e2e_p99_ms": 30000.0,
+      "tpot_p99_ms": 50.0,
+      "ttft_p99_ms": 500.0
+    },
+    "total_throughput_tps": {
+      "ci95_hw": 7.868163589415552,
+      "mean": 176.6005507984361,
+      "stddev": 3.167106460406982
+    },
+    "tpot_ms": {
+      "p50": {
+        "ci95_hw": 0.09859853205972731,
+        "mean": 17.959150066421106,
+        "stddev": 0.03968804719478422
+      },
+      "p75": {
+        "ci95_hw": 0.026466296401087927,
+        "mean": 18.036350946262136,
+        "stddev": 0.010653258204708718
+      },
+      "p95": {
+        "ci95_hw": 0.21266540126424022,
+        "mean": 18.323791730005777,
+        "stddev": 0.08560243551050119
+      },
+      "p99": {
+        "ci95_hw": 0.706829804763365,
+        "mean": 19.061068133692235,
+        "stddev": 0.284514323531057
+      }
+    },
+    "ttft_ms": {
+      "p50": {
+        "ci95_hw": 0.29611660755326674,
+        "mean": 50.38978050000001,
+        "stddev": 0.11919335562333068
+      },
+      "p75": {
+        "ci95_hw": 0.3202043890143853,
+        "mean": 51.06712758333333,
+        "stddev": 0.12888920998825587
+      },
+      "p95": {
+        "ci95_hw": 0.5551353056423317,
+        "mean": 51.97026094999999,
+        "stddev": 0.223453998244898
+      },
+      "p99": {
+        "ci95_hw": 1.5309568288070197,
+        "mean": 53.00819950333334,
+        "stddev": 0.6162433213312307
+      }
+    },
+    "warmup_requests": 10
+  },
+  {
+    "backend": "cuda",
+    "completed_per_run": [
+      128,
+      128,
+      128
+    ],
+    "concurrency": 4,
+    "e2e_ms": {
+      "p50": {
+        "ci95_hw": 15.020156052673144,
+        "mean": 2820.7565448333335,
+        "stddev": 6.04593851286151
+      },
+      "p75": {
+        "ci95_hw": 44.624893242559466,
+        "mean": 2851.1080813333333,
+        "stddev": 17.962487189972123
+      },
+      "p95": {
+        "ci95_hw": 62.1590598074857,
+        "mean": 2891.6481067500004,
+        "stddev": 25.02036944858883
+      },
+      "p99": {
+        "ci95_hw": 107.73717099626154,
+        "mean": 2918.009862816667,
+        "stddev": 43.366547531782714
+      }
+    },
+    "env": {
+      "commit_sha": "a075e64",
+      "cuda": "13.0",
+      "driver": "580.95.05",
+      "ferrum_env": {
+        "FERRUM_BIN": "./target/release/ferrum",
+        "FERRUM_PAGED_MAX_SEQS": "32",
+        "FERRUM_PREFIX_CACHE": "0"
+      },
+      "ferrum_features": [
+        "cuda",
+        "vllm-moe-marlin",
+        "vllm-paged-attn-v2"
+      ],
+      "gpu_clock_lock_mhz": 2820,
+      "gpu_persistence_mode": true,
+      "gpu_power_limit_w": 450,
+      "hw_id": "rtx-4090",
+      "runtime_config": {
+        "entries": [
+          {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "./target/release/ferrum",
+            "key": "FERRUM_BIN",
+            "source": "env"
+          },
+          {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "32",
+            "key": "FERRUM_PAGED_MAX_SEQS",
+            "source": "env"
+          },
+          {
+            "affects": [
+              "correctness"
+            ],
+            "effective_value": "0",
+            "key": "FERRUM_PREFIX_CACHE",
+            "source": "env"
+          }
+        ]
+      },
+      "rust": "1.96.0"
+    },
+    "env_hash": "sha256:fa916e1cd200134533015c3dc980f952db9e9abadb766d5985399ac1d457d445",
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "goodput_rps": {
+      "ci95_hw": 0.057296923537650896,
+      "mean": 1.5873303537681318,
+      "stddev": 0.023063254167929453
+    },
+    "itl_ms": {
+      "p50": {
+        "ci95_hw": 0.2865965728673422,
+        "mean": 20.93668033333333,
+        "stddev": 0.11536133522690045
+      },
+      "p75": {
+        "ci95_hw": 0.27820299934605475,
+        "mean": 21.175225833333332,
+        "stddev": 0.11198273987576526
+      },
+      "p95": {
+        "ci95_hw": 0.7702124652893639,
+        "mean": 21.607628249999994,
+        "stddev": 0.31002721880177986
+      },
+      "p99": {
+        "ci95_hw": 0.3804796091832531,
+        "mean": 50.23662970666667,
+        "stddev": 0.15315129313254572
+      }
+    },
+    "model": "Qwen/Qwen3-8B-GGUF:Q4_K_M#ferrum",
+    "n_gen": 128,
+    "n_prompt": 256,
+    "n_repeats": 3,
+    "n_requests_per_run": 128,
+    "output_throughput_tps": {
+      "ci95_hw": 3.6766846151308292,
+      "mean": 177.59593995791434,
+      "stddev": 1.4799452839445548
+    },
+    "request_throughput_rps": {
+      "ci95_hw": 0.057296923537650896,
+      "mean": 1.5873303537681318,
+      "stddev": 0.023063254167929453
+    },
+    "scenario": "closed_loop",
+    "slo": {
+      "e2e_p99_ms": 30000.0,
+      "tpot_p99_ms": 50.0,
+      "ttft_p99_ms": 500.0
+    },
+    "total_throughput_tps": {
+      "ci95_hw": 11.965886741411518,
+      "mean": 583.952510522556,
+      "stddev": 4.816528885368241
+    },
+    "tpot_ms": {
+      "p50": {
+        "ci95_hw": 0.3491186438263092,
+        "mean": 21.614407696717922,
+        "stddev": 0.1405278245356054
+      },
+      "p75": {
+        "ci95_hw": 0.41273835310865586,
+        "mean": 21.831995772447627,
+        "stddev": 0.166136137070996
+      },
+      "p95": {
+        "ci95_hw": 0.4688461046313451,
+        "mean": 22.30123949354019,
+        "stddev": 0.18872072371653348
+      },
+      "p99": {
+        "ci95_hw": 0.7460454827717304,
+        "mean": 22.904100162886607,
+        "stddev": 0.30029948429418746
+      }
+    },
+    "ttft_ms": {
+      "p50": {
+        "ci95_hw": 0.44795398426025035,
+        "mean": 90.70257666666667,
+        "stddev": 0.18031119223603598
+      },
+      "p75": {
+        "ci95_hw": 1.075160212748062,
+        "mean": 91.44161916666667,
+        "stddev": 0.43277529973418694
+      },
+      "p95": {
+        "ci95_hw": 50.59483043132982,
+        "mean": 135.3373504,
+        "stddev": 20.365516362397212
+      },
+      "p99": {
+        "ci95_hw": 16.870352867278637,
+        "mean": 159.47278164666668,
+        "stddev": 6.790682850974178
+      }
+    },
+    "warmup_requests": 10
+  },
+  {
+    "backend": "cuda",
+    "completed_per_run": [
+      128,
+      128,
+      128
+    ],
+    "concurrency": 16,
+    "e2e_ms": {
+      "p50": {
+        "ci95_hw": 45.97284892490809,
+        "mean": 4324.637656166667,
+        "stddev": 18.505068581600987
+      },
+      "p75": {
+        "ci95_hw": 365.6206897895099,
+        "mean": 4487.164507333334,
+        "stddev": 147.1702558712086
+      },
+      "p95": {
+        "ci95_hw": 425.9906540456855,
+        "mean": 4662.261609616667,
+        "stddev": 171.47047556509963
+      },
+      "p99": {
+        "ci95_hw": 440.957406400335,
+        "mean": 4783.500908763333,
+        "stddev": 177.4949179314845
+      }
+    },
+    "env": {
+      "commit_sha": "a075e64",
+      "cuda": "13.0",
+      "driver": "580.95.05",
+      "ferrum_env": {
+        "FERRUM_BIN": "./target/release/ferrum",
+        "FERRUM_PAGED_MAX_SEQS": "32",
+        "FERRUM_PREFIX_CACHE": "0"
+      },
+      "ferrum_features": [
+        "cuda",
+        "vllm-moe-marlin",
+        "vllm-paged-attn-v2"
+      ],
+      "gpu_clock_lock_mhz": 2820,
+      "gpu_persistence_mode": true,
+      "gpu_power_limit_w": 450,
+      "hw_id": "rtx-4090",
+      "runtime_config": {
+        "entries": [
+          {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "./target/release/ferrum",
+            "key": "FERRUM_BIN",
+            "source": "env"
+          },
+          {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "32",
+            "key": "FERRUM_PAGED_MAX_SEQS",
+            "source": "env"
+          },
+          {
+            "affects": [
+              "correctness"
+            ],
+            "effective_value": "0",
+            "key": "FERRUM_PREFIX_CACHE",
+            "source": "env"
+          }
+        ]
+      },
+      "rust": "1.96.0"
+    },
+    "env_hash": "sha256:fa916e1cd200134533015c3dc980f952db9e9abadb766d5985399ac1d457d445",
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "goodput_rps": {
+      "ci95_hw": 0.37295555760225463,
+      "mean": 3.7900914552635534,
+      "stddev": 0.15012269921735674
+    },
+    "itl_ms": {
+      "p50": {
+        "ci95_hw": 0.7336322031455078,
+        "mean": 29.899403333333336,
+        "stddev": 0.2953028700712785
+      },
+      "p75": {
+        "ci95_hw": 3.77061766089383,
+        "mean": 30.990712,
+        "stddev": 1.517755371737074
+      },
+      "p95": {
+        "ci95_hw": 0.9804766101838985,
+        "mean": 58.6758508,
+        "stddev": 0.39466309655389653
+      },
+      "p99": {
+        "ci95_hw": 6.990964515361079,
+        "mean": 89.6504819333333,
+        "stddev": 2.8140148116468793
+      }
+    },
+    "model": "Qwen/Qwen3-8B-GGUF:Q4_K_M#ferrum",
+    "n_gen": 128,
+    "n_prompt": 256,
+    "n_repeats": 3,
+    "n_requests_per_run": 128,
+    "output_throughput_tps": {
+      "ci95_hw": 22.778550616632227,
+      "mean": 442.6307568074631,
+      "stddev": 9.168860560257123
+    },
+    "request_throughput_rps": {
+      "ci95_hw": 0.35274421274009954,
+      "mean": 3.954612076191063,
+      "stddev": 0.1419871946413519
+    },
+    "scenario": "closed_loop",
+    "slo": {
+      "e2e_p99_ms": 30000.0,
+      "tpot_p99_ms": 50.0,
+      "ttft_p99_ms": 500.0
+    },
+    "total_throughput_tps": {
+      "ci95_hw": 108.78748486720086,
+      "mean": 1455.0114483123753,
+      "stddev": 43.7893216401632
+    },
+    "tpot_ms": {
+      "p50": {
+        "ci95_hw": 1.7384027051986901,
+        "mean": 33.62241254740885,
+        "stddev": 0.6997447848987478
+      },
+      "p75": {
+        "ci95_hw": 2.829557583981283,
+        "mean": 34.398903344197294,
+        "stddev": 1.138958284545067
+      },
+      "p95": {
+        "ci95_hw": 3.123992763646412,
+        "mean": 35.44979225677412,
+        "stddev": 1.2574748289828253
+      },
+      "p99": {
+        "ci95_hw": 3.9082187617459097,
+        "mean": 36.57292858447814,
+        "stddev": 1.5731427986144177
+      }
+    },
+    "ttft_ms": {
+      "p50": {
+        "ci95_hw": 7.51338972380018,
+        "mean": 128.57439166666666,
+        "stddev": 3.0243022864717184
+      },
+      "p75": {
+        "ci95_hw": 22.48203928312107,
+        "mean": 167.66437741666667,
+        "stddev": 9.049508318876383
+      },
+      "p95": {
+        "ci95_hw": 64.66137521198624,
+        "mean": 424.9457700166663,
+        "stddev": 26.02760565987333
+      },
+      "p99": {
+        "ci95_hw": 139.9195021534307,
+        "mean": 680.1102606999999,
+        "stddev": 56.3206336740611
+      }
+    },
+    "warmup_requests": 10
+  },
+  {
+    "backend": "cuda",
+    "completed_per_run": [
+      128,
+      128,
+      128
+    ],
+    "concurrency": 32,
+    "e2e_ms": {
+      "p50": {
+        "ci95_hw": 1313.8361139244216,
+        "mean": 6200.108632666666,
+        "stddev": 528.8475254789565
+      },
+      "p75": {
+        "ci95_hw": 1386.8843281099241,
+        "mean": 6912.018674250001,
+        "stddev": 558.2510156884531
+      },
+      "p95": {
+        "ci95_hw": 2306.644567233357,
+        "mean": 7888.966633566666,
+        "stddev": 928.4744562981407
+      },
+      "p99": {
+        "ci95_hw": 2374.8059187380395,
+        "mean": 8162.560578126667,
+        "stddev": 955.9108783103812
+      }
+    },
+    "env": {
+      "commit_sha": "a075e64",
+      "cuda": "13.0",
+      "driver": "580.95.05",
+      "ferrum_env": {
+        "FERRUM_BIN": "./target/release/ferrum",
+        "FERRUM_PAGED_MAX_SEQS": "32",
+        "FERRUM_PREFIX_CACHE": "0"
+      },
+      "ferrum_features": [
+        "cuda",
+        "vllm-moe-marlin",
+        "vllm-paged-attn-v2"
+      ],
+      "gpu_clock_lock_mhz": 2820,
+      "gpu_persistence_mode": true,
+      "gpu_power_limit_w": 450,
+      "hw_id": "rtx-4090",
+      "runtime_config": {
+        "entries": [
+          {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "./target/release/ferrum",
+            "key": "FERRUM_BIN",
+            "source": "env"
+          },
+          {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "32",
+            "key": "FERRUM_PAGED_MAX_SEQS",
+            "source": "env"
+          },
+          {
+            "affects": [
+              "correctness"
+            ],
+            "effective_value": "0",
+            "key": "FERRUM_PREFIX_CACHE",
+            "source": "env"
+          }
+        ]
+      },
+      "rust": "1.96.0"
+    },
+    "env_hash": "sha256:fa916e1cd200134533015c3dc980f952db9e9abadb766d5985399ac1d457d445",
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "goodput_rps": {
+      "ci95_hw": 2.597695898067141,
+      "mean": 2.141542124919775,
+      "stddev": 1.045628928204869
+    },
+    "itl_ms": {
+      "p50": {
+        "ci95_hw": 13.948091837241595,
+        "mean": 45.273692000000004,
+        "stddev": 5.614409419181773
+      },
+      "p75": {
+        "ci95_hw": 22.913635911305484,
+        "mean": 48.877642333333334,
+        "stddev": 9.223235320593979
+      },
+      "p95": {
+        "ci95_hw": 40.29263008443727,
+        "mean": 88.81784600000002,
+        "stddev": 16.21865732670779
+      },
+      "p99": {
+        "ci95_hw": 17.024419263735318,
+        "mean": 141.87697297666668,
+        "stddev": 6.852697916370882
+      }
+    },
+    "model": "Qwen/Qwen3-8B-GGUF:Q4_K_M#ferrum",
+    "n_gen": 128,
+    "n_prompt": 256,
+    "n_repeats": 3,
+    "n_requests_per_run": 128,
+    "output_throughput_tps": {
+      "ci95_hw": 98.35769361728022,
+      "mean": 568.8822594385583,
+      "stddev": 39.591104499284775
+    },
+    "request_throughput_rps": {
+      "ci95_hw": 0.9002889066814945,
+      "mean": 5.066260686058432,
+      "stddev": 0.36238580707947576
+    },
+    "scenario": "closed_loop",
+    "slo": {
+      "e2e_p99_ms": 30000.0,
+      "tpot_p99_ms": 50.0,
+      "ttft_p99_ms": 500.0
+    },
+    "total_throughput_tps": {
+      "ci95_hw": 327.42697024999916,
+      "mean": 1865.8449950695167,
+      "stddev": 131.79645555225233
+    },
+    "tpot_ms": {
+      "p50": {
+        "ci95_hw": 8.570541338056174,
+        "mean": 51.436958249852296,
+        "stddev": 3.4498287348088876
+      },
+      "p75": {
+        "ci95_hw": 14.02109049439339,
+        "mean": 54.04566715603632,
+        "stddev": 5.643792961610592
+      },
+      "p95": {
+        "ci95_hw": 17.986681990956495,
+        "mean": 57.67392026528993,
+        "stddev": 7.240029530076872
+      },
+      "p99": {
+        "ci95_hw": 22.046719210825422,
+        "mean": 60.719566474916036,
+        "stddev": 8.874282550163713
+      }
+    },
+    "ttft_ms": {
+      "p50": {
+        "ci95_hw": 22.49860019667285,
+        "mean": 189.0180651666667,
+        "stddev": 9.056174445692891
+      },
+      "p75": {
+        "ci95_hw": 2.9121986273168203,
+        "mean": 286.715793,
+        "stddev": 1.1722230965012954
+      },
+      "p95": {
+        "ci95_hw": 172.81702116142725,
+        "mean": 1210.1584358166658,
+        "stddev": 69.56259843464973
+      },
+      "p99": {
+        "ci95_hw": 451.31456141475593,
+        "mean": 1465.9337852099998,
+        "stddev": 181.66389741250794
+      }
+    },
+    "warmup_requests": 10
+  }
+]

@@ -1,0 +1,19 @@
+Ferrum Benchmark - /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf
+============================================================
+Device: Metal
+2026-06-01T12:13:09.951852Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T12:13:09.951867Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T12:13:09.951911Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-01T12:13:10.120573Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T12:13:10.120646Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T12:13:10.121570Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-01T12:13:10.121592Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T12:13:10.121699Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+Config: 1 rounds × 1 repeats, 1 max_tokens, mode=sequential, prompt_len=~2chars
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+============================================================
+Warmup...
+Repeat 1/1
+  1 requests · 0.2s · 0.0 tok/s
+
+→ wrote docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-30b-a3b-benchcmd-probe-20260601/report.json

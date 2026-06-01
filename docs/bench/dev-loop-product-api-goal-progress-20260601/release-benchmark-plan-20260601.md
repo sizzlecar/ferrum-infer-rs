@@ -2,6 +2,9 @@
 
 Purpose: produce saved benchmark artifacts for the formal release announcement.
 
+Status update: the 8B GGUF comparison tables have now been measured and mirrored
+locally. This file remains as the runbook plus result index.
+
 Common benchmark shape:
 
 - dataset: `random`
@@ -42,6 +45,8 @@ Current release ratios from saved evidence:
 
 Goal: Ferrum GGUF vs vLLM GGUF saved comparison.
 
+Status: measured.
+
 Ferrum model:
 
 - alias: `qwen3:8b-q4_k_m`
@@ -68,9 +73,20 @@ If repo-id quant loading fails, download the GGUF file and run:
 vllm serve ./Qwen3-8B-Q4_K_M.gguf --tokenizer Qwen/Qwen3-8B
 ```
 
+Measured table:
+
+| c | Ferrum tok/s | vLLM tok/s | Ferrum/vLLM |
+|---:|---:|---:|---:|
+| 1 | `54.5 ± 0.5` | `114.3 ± 0.3` | `0.477x` |
+| 4 | `177.6 ± 3.7` | `241.5 ± 2.0` | `0.735x` |
+| 16 | `442.6 ± 22.8` | `315.9 ± 0.6` | `1.40x` |
+| 32 | `568.9 ± 98.4` | `332.4 ± 1.1` | `1.71x` |
+
 ## 3. LLaMA-3.1-8B GGUF
 
 Goal: Ferrum GGUF vs vLLM GGUF saved comparison.
+
+Status: measured.
 
 Ferrum model:
 
@@ -100,26 +116,22 @@ vllm serve ./Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
   --tokenizer meta-llama/Meta-Llama-3.1-8B-Instruct
 ```
 
+Measured table:
+
+| c | Ferrum tok/s | vLLM tok/s | Ferrum/vLLM |
+|---:|---:|---:|---:|
+| 1 | `55.4 ± 1.3` | `117.6 ± 0.1` | `0.471x` |
+| 4 | `188.6 ± 1.9` | `240.0 ± 0.9` | `0.786x` |
+| 16 | `486.4 ± 60.2` | `313.2 ± 7.7` | `1.55x` |
+| 32 | `677.0 ± 52.5` | `323.4 ± 28.4` | `2.09x` |
+
 ## Release note caveat
 
 vLLM GGUF support is experimental and may be under-optimized. Release tables
 must label GGUF comparisons as GGUF-vs-GGUF and keep them separate from the M3
 GPTQ-Marlin table.
 
-## Current benchmark blocker
-
-The Ferrum side of the 8B GGUF comparisons is now smoke-unblocked. The saved
-Ferrum/vLLM benchmark tables are still pending a runnable GPU instance:
-
-- Vast instance `38872161` could not be restarted after stopping; repeated
-  `state=running` attempts returned `resources_unavailable`.
-- `38872161` was destroyed per the recovery rule.
-- Replacement RTX 4090 creation attempt on offer `32736582` failed with
-  `insufficient_credit`.
-- Fresh replacement attempt on offer `38712898` also failed with
-  `insufficient_credit`.
-
-## Ready-to-run command when GPU credit is restored
+## Reproduction command
 
 The release GGUF benchmark wrapper is now:
 

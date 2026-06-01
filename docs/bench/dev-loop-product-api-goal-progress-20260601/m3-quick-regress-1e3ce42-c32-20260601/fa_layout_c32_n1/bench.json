@@ -1,0 +1,110 @@
+{
+  "backend": "cuda",
+  "completed_per_run": [
+    64
+  ],
+  "concurrency": 32,
+  "e2e_ms": {
+    "p50": {
+      "mean": 3061.6729985
+    },
+    "p75": {
+      "mean": 3568.10468725
+    },
+    "p95": {
+      "mean": 4043.174323099999
+    },
+    "p99": {
+      "mean": 4097.72386749
+    }
+  },
+  "env": {
+    "commit_sha": "1e3ce42",
+    "cuda": "13.0",
+    "driver": "580.95.05",
+    "ferrum_env": {},
+    "ferrum_features": [
+      "cuda",
+      "vllm-moe-marlin",
+      "vllm-paged-attn-v2"
+    ],
+    "gpu_clock_lock_mhz": 2820,
+    "gpu_persistence_mode": true,
+    "gpu_power_limit_w": 450,
+    "hw_id": "rtx-4090",
+    "runtime_config": {
+      "entries": []
+    },
+    "rust": "1.96.0"
+  },
+  "env_hash": "sha256:6d64e61f5dbddfc4ac5db77a4e6bf14b09ea8b2b34c3873fd5e971aca0e8ed53",
+  "errored_per_run": [
+    0
+  ],
+  "goodput_rps": {
+    "mean": 9.717979674541823
+  },
+  "itl_ms": {
+    "p50": {
+      "mean": 15.682734
+    },
+    "p75": {
+      "mean": 16.373109
+    },
+    "p95": {
+      "mean": 65.80602144999999
+    },
+    "p99": {
+      "mean": 129.39981812
+    }
+  },
+  "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+  "n_gen": 128,
+  "n_prompt": 256,
+  "n_repeats": 1,
+  "n_requests_per_run": 64,
+  "output_throughput_tps": {
+    "mean": 1230.5391762888585
+  },
+  "request_throughput_rps": {
+    "mean": 9.717979674541823
+  },
+  "scenario": "closed_loop",
+  "slo": {
+    "e2e_p99_ms": null,
+    "tpot_p99_ms": null,
+    "ttft_p99_ms": null
+  },
+  "total_throughput_tps": {
+    "mean": 3718.341972971565
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 21.702128107608694
+    },
+    "p75": {
+      "mean": 22.681779000000002
+    },
+    "p95": {
+      "mean": 24.442879209578656
+    },
+    "p99": {
+      "mean": 24.829381844628102
+    }
+  },
+  "ttft_ms": {
+    "p50": {
+      "mean": 309.43161050000003
+    },
+    "p75": {
+      "mean": 716.44804475
+    },
+    "p95": {
+      "mean": 1321.3852372499994
+    },
+    "p99": {
+      "mean": 1363.8366055499998
+    }
+  },
+  "warmup_requests": 2
+}

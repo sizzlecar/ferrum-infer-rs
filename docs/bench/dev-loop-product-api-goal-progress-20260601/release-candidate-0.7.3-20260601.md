@@ -4,7 +4,7 @@ Scope: formal release candidate for `docs/dev-loop-product-api-goal-2026-05-30.m
 
 Current release-candidate code checkpoint:
 
-- `be0596c bench: add release gguf 8b vllm wrapper`
+- `1e3ce42 fix: sync qwen3 moe prefill logits before readback`
 - Workspace package version: `0.7.3`
 
 ## Release gates that are satisfied
@@ -19,6 +19,9 @@ Current release-candidate code checkpoint:
 | `qwen3:0.6b` alias serve | pass | `/workspace/release-alias-serve-qwen3-06b-8ec0858`, no manual `FERRUM_MODEL_PATH`, health/chat passed |
 | Qwen3-8B GGUF CUDA serve | pass smoke | `/workspace/release-qwen3-8b-gguf-cuda-smoke-42ffbe2`, health/chat passed |
 | LLaMA-3.1-8B GGUF CUDA serve | pass smoke | `/workspace/release-llama31-8b-gguf-cuda-smoke-42ffbe2`, health/chat passed |
+| 8B GGUF Ferrum/vLLM comparison | pass with caveats | `gguf-8b-release-benchmarks-20260601.md`, Qwen3-8B and LLaMA-3.1-8B GGUF-vs-GGUF tables saved |
+| Metal Qwen3-MoE prefill readback | pass smoke | `metal-qwen3-30b-a3b-prefill-syncfix-20260601.md`, Paris output is sane and encoder assertion no longer reproduces |
+| Post-fix GPU quick regression | pass | `m3-quick-regress-1e3ce42-c32-20260601.md`, c32 source FA2 `1403.98 tok/s`, correctness/multi-turn passed |
 | q2 native FA2 experiment | rejected safely | microbench-positive but full-model c32 regressed; reverted by `2197077` |
 
 ## M3 release performance table
@@ -42,6 +45,7 @@ The old `0.80x` goal remains a stretch target; it is not satisfied at c32.
 - `llama3.1:8b-q4_k_m` uses a public tokenizer source for sidecars.
 - CUDA GGUF serve path is enabled through an eager-dequant/fp16 dense fallback. This is a compatibility path, not a native CUDA k-quant performance path.
 - `scripts/release_gguf_8b_vs_vllm.sh` is ready for saved Qwen3-8B and LLaMA-3.1-8B Ferrum/vLLM GGUF benchmark packets.
+- Qwen3-MoE Metal prefill now synchronizes before reading logits back to host.
 
 ## Remaining release decisions
 
@@ -49,30 +53,38 @@ These do not invalidate the `0.7.3` release candidate, but they must be explicit
 
 - Source FA2 is release-supported and benchmarked as an opt-in path. If the final release requires it to be the default selector for M3, that policy change still needs an explicit code/default decision.
 - The ignored SDK cargo wrapper smoke remains blocked by a debug CUDA build-script path. The direct release-binary real-model API smoke is the accepted release evidence for this RC.
-- Saved 8B Ferrum/vLLM GGUF comparison tables are pending GPU availability. Ferrum-side serve smoke is complete; vLLM comparison execution is blocked by Vast credit.
+- Saved 8B Ferrum/vLLM GGUF comparison tables are complete but must be labelled GGUF-vs-GGUF and caveated: Ferrum uses eager-dequant/fp16 dense CUDA fallback; vLLM GGUF is experimental.
+- The Metal correctness fix is validated by smoke only. The local Mac had active swap, so no clean Metal performance claim should be made from this run.
 
-## Current external blocker
+## Latest post-code-change regression
 
-There is currently no runnable Vast GPU instance.
+Commit `1e3ce42` changed runtime readback behavior for Qwen3-MoE prefill. A fast
+RTX 4090 regression was run instead of a full all-cell rerun:
 
-- Instance `38872161` could not be restarted after stop; repeated start attempts returned `resources_unavailable`.
-- `38872161` was destroyed.
-- Replacement RTX 4090 creation attempts failed with `insufficient_credit`, including fresh offer `38712898`.
+| Case | c | prompts | throughput tok/s | correctness | perf gate |
+|---|---:|---:|---:|---|---|
+| `fa2_source` | 32 | 64 | `1403.98` | Paris + multi-turn + 3-round recall pass | pass |
+| `fa_layout` | 32 | 64 | `1230.54` | Paris + multi-turn + 3-round recall pass | control |
 
-When credit is restored, run:
+Artifact:
 
-```bash
-source /workspace/vllm-venv/bin/activate
-cargo build --release -p ferrum-cli \
-  --features cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source
-OUT_ROOT=/workspace/release-bench-20260601-gguf-8b \
-  bash scripts/release_gguf_8b_vs_vllm.sh
-```
+- Remote: `/workspace/m3-quick-regress-1e3ce42-c32-20260601`
+- Local mirror: `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-quick-regress-1e3ce42-c32-20260601/`
+
+## 8B GGUF saved benchmark tables
+
+| Model | c1 | c4 | c16 | c32 |
+|---|---:|---:|---:|---:|
+| Qwen3-8B GGUF Ferrum/vLLM | `0.477x` | `0.735x` | `1.40x` | `1.71x` |
+| LLaMA-3.1-8B GGUF Ferrum/vLLM | `0.471x` | `0.786x` | `1.55x` | `2.09x` |
+
+Full tables and raw report mirrors are in
+`docs/bench/dev-loop-product-api-goal-progress-20260601/gguf-8b-release-benchmarks-20260601.md`.
 
 ## Release-note wording constraints
 
 - M3 table may claim Ferrum reaches the formal `0.75x vLLM` release gate on RTX 4090 for Qwen3-30B-A3B GPTQ Int4.
 - Do not claim the old `0.80x` stretch goal is complete.
-- 8B GGUF support may be described as smoke-validated on CUDA, but performance comparison vs vLLM is not yet measured.
+- 8B GGUF performance comparison is measured, but it is GGUF-vs-GGUF and should not be used as a native CUDA k-quant claim.
 - Any GGUF-vs-vLLM table must be labeled `GGUF-vs-GGUF`; vLLM GGUF is experimental/under-optimized per vLLM docs.
 - CUDA GGUF in Ferrum is currently eager-dequant fallback, not native CUDA k-quant.

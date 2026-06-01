@@ -30,7 +30,9 @@ Evidence summary:
 | Alias serve ergonomics | pass | `serve qwen3:0.6b` release-binary smoke passed without `FERRUM_MODEL_PATH` at `/workspace/release-alias-serve-qwen3-06b-8ec0858` |
 | Qwen3-8B GGUF CUDA serve | pass smoke | `qwen3:8b-q4_k_m` release-binary OpenAI smoke passed at `/workspace/release-qwen3-8b-gguf-cuda-smoke-42ffbe2` |
 | LLaMA-3.1-8B GGUF CUDA serve | pass smoke | `llama3.1:8b-q4_k_m` release-binary OpenAI smoke passed at `/workspace/release-llama31-8b-gguf-cuda-smoke-42ffbe2` |
-| 8B GGUF Ferrum/vLLM benchmark | pending | Ferrum smoke is unblocked, but vLLM comparison is pending a runnable GPU instance; Vast creation failed with `insufficient_credit` after stopped instance `38872161` could not restart |
+| 8B GGUF Ferrum/vLLM benchmark | pass with caveats | Saved GGUF-vs-GGUF tables are mirrored in `gguf-8b-remote-artifacts/` and summarized in `gguf-8b-release-benchmarks-20260601.md` |
+| Metal Qwen3-MoE prefill readback | pass smoke | `1e3ce42` adds a pre-readback sync; local Metal smoke returns Paris and no longer triggers the encoder assertion |
+| Post-fix GPU quick regression | pass | `/workspace/m3-quick-regress-1e3ce42-c32-20260601`, c32 source FA2 `1403.98 tok/s`, correctness/multi-turn passed, perf gate `ok=true` |
 
 M3 release-threshold table:
 
@@ -50,13 +52,13 @@ Release blockers remaining as of this checkpoint:
 - If the release requires source FA2 to be enabled by default rather than
   release-supported opt-in, the default/selector decision must be made before
   tagging.
-- Saved 8B GGUF Ferrum/vLLM comparison tables are still pending because no
-  runnable GPU instance is available. Vast instance `38872161` could not be
-  restarted (`resources_unavailable`), was destroyed, and replacement creation
-  failed with `insufficient_credit`; a fresh offer `38712898` failed the same
-  way.
-- The benchmark execution wrapper is ready at
-  `scripts/release_gguf_8b_vs_vllm.sh`.
+- The 8B GGUF Ferrum/vLLM tables are measured, but release notes must label
+  them as GGUF-vs-GGUF and explain that Ferrum uses eager-dequant/fp16 dense
+  CUDA fallback while vLLM GGUF is experimental.
+- The local Metal performance run is not clean enough for a release
+  performance claim because the Mac had active swap and `run --bench-mode`
+  stopped early on EOS; only the Metal correctness/syncfix evidence should be
+  used for this release.
 
 8B GGUF CUDA serve notes:
 
@@ -67,3 +69,7 @@ Release blockers remaining as of this checkpoint:
 - Release benchmark tables must label this clearly if used: Ferrum currently
   loads GGUF weights through eager-dequant/fp16 dense CUDA fallback, while vLLM
   is expected to run its experimental GGUF path.
+- Qwen3-8B GGUF measured Ferrum/vLLM ratios: c1 `0.477x`, c4 `0.735x`,
+  c16 `1.40x`, c32 `1.71x`.
+- LLaMA-3.1-8B GGUF measured Ferrum/vLLM ratios: c1 `0.471x`, c4 `0.786x`,
+  c16 `1.55x`, c32 `2.09x`.

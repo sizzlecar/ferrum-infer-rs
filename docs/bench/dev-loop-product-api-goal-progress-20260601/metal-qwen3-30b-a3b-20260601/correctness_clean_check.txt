@@ -1,0 +1,20 @@
+clean_status=133
+clean_correctness=FAIL
+stdout_tail:
+褫褫 l l L L LLLLLLLLLLLLLLLBBBBBBBBbbbbbbbbbb
+stderr_tail:
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-01T11:56:27.207936Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T11:56:27.207953Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T11:56:27.208028Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-01T11:56:27.377015Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T11:56:27.377075Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T11:56:27.377081Z  INFO ferrum_engine::registry: Creating priority scheduler
+2026-06-01T11:56:27.377092Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T11:56:27.377138Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+Model loaded in 1.4s.
+[16 tokens, 13.2 tok/s, 1.2s]
+-[_MTLCommandEncoder dealloc]:134: failed assertion `Command encoder released without endEncoding'
