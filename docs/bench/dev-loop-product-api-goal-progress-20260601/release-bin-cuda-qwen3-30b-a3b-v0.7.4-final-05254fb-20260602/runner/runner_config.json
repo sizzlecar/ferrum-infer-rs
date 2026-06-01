@@ -1,0 +1,51 @@
+{
+  "base_env": {
+    "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+  },
+  "baseline_case": "fa_layout",
+  "bin": "/workspace/ferrum-final-regression/ferrum",
+  "build": false,
+  "cases": [
+    {
+      "env": {
+        "FERRUM_FA2_SOURCE": "1",
+        "FERRUM_FA_LAYOUT_VARLEN": "1"
+      },
+      "name": "fa2_source",
+      "port": 18480
+    },
+    {
+      "env": {
+        "FERRUM_FA2_DIRECT_FFI": "0",
+        "FERRUM_FA_LAYOUT_VARLEN": "1"
+      },
+      "name": "fa_layout",
+      "port": 18481
+    }
+  ],
+  "concurrency": 32,
+  "features": "cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source",
+  "gates": {
+    "multi_turn": true,
+    "multi_turn_3round": true,
+    "paris": true
+  },
+  "hf_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+  "model_dir": "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+  "name": "m3-fa2-direct-ffi-ab",
+  "num_prompts": 16,
+  "out_root": "/workspace/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602",
+  "port_base": 18480,
+  "preset": "m3_qwen3_30b_a3b_int4",
+  "repeats": 1,
+  "validation": {
+    "change_type": "opt_in_experiment",
+    "performance_regression_required": true,
+    "touched_areas": [
+      "model_forward",
+      "attention_prefill_mixed_path",
+      "fa2_runtime_path"
+    ]
+  },
+  "warmup_requests": 4
+}
