@@ -111,13 +111,14 @@ where
             &mut pools[li].0 as *mut B::Buffer,
             &mut pools[li].1 as *mut B::Buffer,
         );
-        let use_fa_layout_varlen = self.use_vllm_paged_attn
-            && (self.runtime_env.fa_layout_varlen || self.runtime_env.fa2_direct_ffi);
+        let use_fa2_c_abi = self.runtime_env.fa2_source || self.runtime_env.fa2_direct_ffi;
+        let use_fa_layout_varlen =
+            self.use_vllm_paged_attn && (self.runtime_env.fa_layout_varlen || use_fa2_c_abi);
         let fa_pool_ptr = if use_fa_layout_varlen {
             let pools = self
                 .paged_fa_pools
                 .as_mut()
-                .expect("FA-layout varlen or FA2 direct FFI requires paged_fa_pools");
+                .expect("FA-layout varlen or FA2 C ABI requires paged_fa_pools");
             Some((
                 &mut pools[li].0 as *mut B::Buffer,
                 &mut pools[li].1 as *mut B::Buffer,
@@ -235,7 +236,7 @@ where
             if self.use_vllm_paged_attn {
                 if let Some((fa_k_ptr, fa_v_ptr)) = fa_pool_ptr {
                     let (fa_pool_k, fa_pool_v) = unsafe { (&mut *fa_k_ptr, &mut *fa_v_ptr) };
-                    if self.runtime_env.fa2_direct_ffi {
+                    if use_fa2_c_abi {
                         let lse_buf = self
                             .scratch
                             .unified_attn_lse

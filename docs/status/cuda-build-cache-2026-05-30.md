@@ -25,6 +25,14 @@ summary lines.
 - Existing content-hash stamps for Marlin, vLLM-Marlin, vLLM-MoE-Marlin,
   vLLM paged-attn, and FA2 source now also emit the same summary format on
   both cache-hit and build paths.
+- 2026-06-01 restoration note: the `fa2-source` static library now compiles
+  only `crates/ferrum-kernels/kernels/fa2_source/ferrum_fa2_paged_varlen.cu`.
+  It no longer reads `FERRUM_FA2_SRC_DIR`, `FERRUM_CUTLASS_INCLUDE_DIR`, or
+  `CUTLASS_INCLUDE_DIR`, and no longer depends on an external FlashAttention
+  checkout or CUTLASS header tree for the product build path.
+- `scripts/check_fa2_source_native.py` guards that source boundary so future
+  product `fa2-source` changes cannot silently reintroduce external
+  FlashAttention/CUTLASS build dependencies.
 - `scripts/validate_cuda_build_summary.py` validates the machine-readable
   summary log format, required artifacts, and required
   `status=cache_hit`/`status=built` expectations. CI runs its self-test so
@@ -65,6 +73,9 @@ python3 -m py_compile scripts/validate_cuda_build_boundary_manifest.py
 python3 scripts/validate_cuda_build_boundary_manifest.py --self-test
 python3 -m py_compile scripts/m3_cuda_build_boundary_probe.py
 python3 scripts/m3_cuda_build_boundary_probe.py --self-test
+python3 -m py_compile scripts/check_fa2_source_native.py
+python3 scripts/check_fa2_source_native.py --self-test
+python3 scripts/check_fa2_source_native.py
 git diff --check
 ```
 

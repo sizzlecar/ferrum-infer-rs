@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build a source-owned FlashAttention-2 C ABI shim for Ferrum.
+# Build a legacy source-owned FlashAttention-2 C ABI shim for Ferrum.
 #
 # This is deliberately different from build_fa2_ferrum_shim.sh: it does not
 # link vLLM's _vllm_fa2_C Torch extension and does not require libtorch,
@@ -9,6 +9,10 @@ set -euo pipefail
 # we need directly from a FlashAttention source checkout:
 #   - hdim128 fp16 split-K, causal=false
 #   - hdim128 fp16 split-K, causal=true
+#
+# This is not the product `fa2-source` build path anymore; ferrum-kernels now
+# builds an in-repo native C ABI kernel. This script is retained only for
+# historical A/B and diagnostic replay.
 #
 # The default paths target the Vast M3 pod. CUTLASS_INCLUDE_DIR must point at a
 # CUTLASS 3.x include tree. The current pod already has one through FlashInfer;

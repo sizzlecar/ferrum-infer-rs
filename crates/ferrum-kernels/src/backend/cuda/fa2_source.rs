@@ -1,9 +1,10 @@
-//! Source-built FlashAttention-2 bridge.
+//! Ferrum-owned FlashAttention-style paged-varlen bridge.
 //!
 //! This module is compiled only with the `fa2-source` cargo feature. The C ABI
-//! symbol is linked from a static library built by `build.rs` from
-//! FlashAttention source templates, so runtime does not need vLLM, Torch,
-//! Python, or a user-provided shim `.so`.
+//! symbol is linked from a static library built by `build.rs` from in-repo CUDA
+//! source, so runtime and build time do not need vLLM, Torch, Python,
+//! FlashAttention source checkouts, CUTLASS headers, or a user-provided shim
+//! `.so`.
 
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::Arc;

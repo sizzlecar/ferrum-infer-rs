@@ -1,0 +1,99 @@
+   Compiling ferrum-types v0.7.3 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-types)
+   Compiling cudarc v0.19.4
+   Compiling candle-kernels v0.9.2
+   Compiling float8 v0.7.0
+   Compiling libloading v0.9.0
+   Compiling ferrum-kernels v0.7.3 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-kernels)
+   Compiling tower v0.4.13
+   Compiling regex-lite v0.1.9
+error: failed to run custom build command for `cudarc v0.19.4`
+
+Caused by:
+  process didn't exit successfully: `/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/build/cudarc-6516ba14a564fbed/build-script-build` (exit status: 101)
+  --- stdout
+  cargo:rerun-if-changed=build.rs
+  cargo:rerun-if-env-changed=CUDARC_CUDA_VERSION
+  cargo:rerun-if-env-changed=CUDA_HOME
+  cargo:rerun-if-env-changed=CUDA_PATH
+  cargo:rerun-if-env-changed=CUDA_ROOT
+  cargo:rerun-if-env-changed=CUDA_TOOLKIT_ROOT_DIR
+  cargo:rerun-if-env-changed=CUDNN_LIB
+
+  --- stderr
+
+  thread 'main' (66178017) panicked at /Users/chejinxuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.19.4/build.rs:125:13:
+  `nvcc --version` failed.
+  Err(Os { code: 2, kind: NotFound, message: "No such file or directory" })
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+warning: build failed, waiting for other jobs to finish...
+error: failed to run custom build command for `ferrum-kernels v0.7.3 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-kernels)`
+
+Caused by:
+  process didn't exit successfully: `/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/build/ferrum-kernels-bd1685d2d9e3c952/build-script-build` (exit status: 101)
+  --- stdout
+  cargo:rerun-if-changed=build.rs
+  cargo:rustc-link-lib=framework=Accelerate
+  cargo:rerun-if-changed=kernels/fused_add_rms_norm.cu
+  cargo:rerun-if-changed=kernels/fused_silu_mul.cu
+  cargo:rerun-if-changed=kernels/rms_norm.cu
+  cargo:rerun-if-changed=kernels/rope.cu
+  cargo:rerun-if-changed=kernels/decode_attention.cu
+  cargo:rerun-if-changed=kernels/residual_add.cu
+  cargo:rerun-if-changed=kernels/flash_decode_attention.cu
+  cargo:rerun-if-changed=kernels/paged_decode_attention.cu
+  cargo:rerun-if-changed=kernels/paged_varlen_attention.cu
+  cargo:rerun-if-changed=kernels/paged_varlen_attention_vllm.cu
+  cargo:rerun-if-changed=kernels/dequant_int4.cu
+  cargo:rerun-if-changed=kernels/batched_decode_attention.cu
+  cargo:rerun-if-changed=kernels/softmax.cu
+  cargo:rerun-if-changed=kernels/embedding_lookup.cu
+  cargo:rerun-if-changed=kernels/flash_attn_full.cu
+  cargo:rerun-if-changed=kernels/batched_flash_decode_attention.cu
+  cargo:rerun-if-changed=kernels/qk_norm_rope.cu
+  cargo:rerun-if-changed=kernels/split_qkv_norm_rope_into_paged_cache.cu
+  cargo:rerun-if-changed=kernels/transpose.cu
+  cargo:rerun-if-changed=kernels/kv_cache_append.cu
+  cargo:rerun-if-changed=kernels/split_qkv.cu
+  cargo:rerun-if-changed=kernels/add_bias.cu
+  cargo:rerun-if-changed=kernels/layer_norm.cu
+  cargo:rerun-if-changed=kernels/gelu.cu
+  cargo:rerun-if-changed=kernels/decode_attention_hm.cu
+  cargo:rerun-if-changed=kernels/gather_columns.cu
+  cargo:rerun-if-changed=kernels/moe_combine.cu
+  cargo:rerun-if-changed=kernels/moe_router.cu
+  cargo:rerun-if-changed=kernels/moe_align_block_size.cu
+  cargo:rerun-if-changed=kernels/moe_align_block_size_pair_ids.cu
+  cargo:rerun-if-changed=kernels/moe_build_pairs.cu
+  cargo:rerun-if-changed=kernels/int8_paged_decode_attention.cu
+  cargo:rerun-if-changed=kernels/argmax_rows.cu
+  cargo:rerun-if-changed=kernels/split_qkv_norm_rope_into_paged_cache_vllm.cu
+  cargo:rerun-if-changed=kernels/common.cuh
+  cargo:rerun-if-env-changed=NVCC_CCBIN
+  cargo:rerun-if-env-changed=CUDA_HOME
+  cargo:rerun-if-env-changed=CUDA_PATH
+  cargo:rerun-if-env-changed=CUDA_ROOT
+  cargo:rerun-if-env-changed=CUDA_TOOLKIT_ROOT_DIR
+  cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP
+
+  --- stderr
+
+  thread 'main' (66178021) panicked at crates/ferrum-kernels/build.rs:285:10:
+  nvidia-smi failed while detecting CUDA compute capability: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: failed to run custom build command for `candle-kernels v0.9.2`
+
+Caused by:
+  process didn't exit successfully: `/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/build/candle-kernels-ca06fe0f133369de/build-script-build` (exit status: 101)
+  --- stdout
+  cargo::rerun-if-changed=build.rs
+  cargo::rerun-if-changed=src/compatibility.cuh
+  cargo::rerun-if-changed=src/cuda_utils.cuh
+  cargo::rerun-if-changed=src/binary_op_macros.cuh
+  cargo:info=["/usr", "/usr/local/cuda", "/opt/cuda", "/usr/lib/cuda", "C:/Program Files/NVIDIA GPU Computing Toolkit", "C:/CUDA"]
+  cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP
+
+  --- stderr
+
+  thread 'main' (66178023) panicked at /Users/chejinxuan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bindgen_cuda-0.1.6/src/lib.rs:503:18:
+  `nvidia-smi` failed. Ensure that you have CUDA installed and that `nvidia-smi` is in your PATH.: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

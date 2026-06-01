@@ -1,9 +1,13 @@
-// C ABI bridge from Ferrum to a source-built FlashAttention-2 forward kernel.
+// Legacy C ABI bridge from Ferrum to a source-built FlashAttention-2 forward kernel.
 //
 // Unlike fa2_ferrum_shim.cpp, this file does not call into vLLM's packaged
 // Torch extension. The build script compiles the needed FlashAttention source
 // templates into this shared object directly, then Ferrum can use the same
 // ferrum_fa2_paged_varlen_fwd ABI for an apples-to-apples runtime check.
+//
+// This is no longer the product `fa2-source` build path. The in-repo
+// ferrum-kernels feature compiles kernels/fa2_source/ferrum_fa2_paged_varlen.cu
+// and does not require FlashAttention source or CUTLASS headers.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

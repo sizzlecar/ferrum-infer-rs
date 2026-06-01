@@ -1,0 +1,1945 @@
+{
+  "candidate_names": [
+    "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+    "FERRUM_BACKEND",
+    "FERRUM_BATCHED_GRAPH",
+    "FERRUM_BATCHED_TRACE",
+    "FERRUM_BATCH_DECODE_PROF",
+    "FERRUM_BATCH_PREFILL_PROF",
+    "FERRUM_BIN",
+    "FERRUM_BIN_FEATURES",
+    "FERRUM_CHUNKED_PREFILL",
+    "FERRUM_CUDA_DEVICE",
+    "FERRUM_CUDA_GRAPH",
+    "FERRUM_CUDA_MAX_KV",
+    "FERRUM_CUTLASS_INCLUDE_DIR",
+    "FERRUM_DEBUG_SPEC_POS",
+    "FERRUM_DECODE_LAYER_PROFILE",
+    "FERRUM_DECODE_OP_PROFILE",
+    "FERRUM_DIAG",
+    "FERRUM_DIAG_ATTN",
+    "FERRUM_DIAG_NUMERICAL",
+    "FERRUM_DIAG_SHAPES",
+    "FERRUM_DIAG_TIMING",
+    "FERRUM_DIR",
+    "FERRUM_DTYPE",
+    "FERRUM_FA2_DIRECT_FFI",
+    "FERRUM_FA2_DIRECT_FFI_SHIM",
+    "FERRUM_FA2_SOURCE",
+    "FERRUM_FA2_SRC_DIR",
+    "FERRUM_FA_DECODE",
+    "FERRUM_FA_LAYOUT_VARLEN",
+    "FERRUM_FA_LEGACY",
+    "FERRUM_FORCE_PER_ITEM",
+    "FERRUM_FUSED_CPU",
+    "FERRUM_FUSED_METAL",
+    "FERRUM_FUSED_MOE_TILE",
+    "FERRUM_FUSED_MOE_TILE_BENCH",
+    "FERRUM_GEMM_NR0",
+    "FERRUM_GEMM_NR1",
+    "FERRUM_GGUF_LOAD_TRACE",
+    "FERRUM_GRAPH",
+    "FERRUM_GRAPH_PROF",
+    "FERRUM_GRAPH_SKIP_SYNC",
+    "FERRUM_GRAPH_SKIP_UPLOAD",
+    "FERRUM_GREEDY_ARGMAX",
+    "FERRUM_IDS_TPE_NSG",
+    "FERRUM_IDS_TPE_THREADS",
+    "FERRUM_KV_BLOCKS",
+    "FERRUM_KV_CAPACITY",
+    "FERRUM_KV_DTYPE",
+    "FERRUM_KV_MAX_BLOCKS",
+    "FERRUM_M3_PATH",
+    "FERRUM_MARLIN_SKIP_WS_ZERO",
+    "FERRUM_MARLIN_TILE",
+    "FERRUM_MAX_BATCH",
+    "FERRUM_MAX_BATCHED_TOKENS",
+    "FERRUM_MAX_MODEL_LEN",
+    "FERRUM_METAL_CAPTURE",
+    "FERRUM_METAL_DTYPE",
+    "FERRUM_METAL_PAGED_KV",
+    "FERRUM_METAL_QUANT_PROFILE",
+    "FERRUM_MMAP_TRACE",
+    "FERRUM_MODEL_PATH",
+    "FERRUM_MOE_BATCHED",
+    "FERRUM_MOE_BATCHED_DECODE",
+    "FERRUM_MOE_BATCH_THRESHOLD",
+    "FERRUM_MOE_BLOCK_SIZE",
+    "FERRUM_MOE_BUCKETED",
+    "FERRUM_MOE_DEVICE_ROUTE",
+    "FERRUM_MOE_DIRECT_DISPATCH",
+    "FERRUM_MOE_DUMP",
+    "FERRUM_MOE_DUMP_BATCH_X_TOPK",
+    "FERRUM_MOE_FUSED",
+    "FERRUM_MOE_FUSED_GATE_UP_SILU",
+    "FERRUM_MOE_GRAPH",
+    "FERRUM_MOE_HOST_ROUTE",
+    "FERRUM_MOE_HOST_TOPK",
+    "FERRUM_MOE_LARGE_M_BLOCK_SIZE",
+    "FERRUM_MOE_LARGE_M_MIN_PAIRS",
+    "FERRUM_MOE_LOAD_TRACE",
+    "FERRUM_MOE_PREFILL_THRESHOLD",
+    "FERRUM_MOE_PROFILE",
+    "FERRUM_MOE_STREAMS",
+    "FERRUM_NEXT_BATCH_PROF",
+    "FERRUM_NVCC_THREADS",
+    "FERRUM_OPENAI_BASE_URL",
+    "FERRUM_OPENAI_MODEL",
+    "FERRUM_PAGED_FLASH",
+    "FERRUM_PAGED_FLASH_SPLITS",
+    "FERRUM_PAGED_KV",
+    "FERRUM_PAGED_MAX_SEQS",
+    "FERRUM_PARITY_FORCE_EXPERT0",
+    "FERRUM_PARITY_UNIT_SCALES",
+    "FERRUM_PID",
+    "FERRUM_PORT",
+    "FERRUM_PREFILL_OP_PROFILE",
+    "FERRUM_PREFIX_CACHE",
+    "FERRUM_PROFILE_COMMIT_SHA",
+    "FERRUM_PROFILE_CONCURRENCY",
+    "FERRUM_PROFILE_ENV_HASH",
+    "FERRUM_PROFILE_JSONL",
+    "FERRUM_PROFILE_MODEL",
+    "FERRUM_PROFILE_RUNTIME_FLAGS_JSON",
+    "FERRUM_PROFILE_STAGES",
+    "FERRUM_PYTHON",
+    "FERRUM_QWEN_TEST_MODEL_PATH",
+    "FERRUM_QWEN_UNIFIED_PREFILL",
+    "FERRUM_QWEN_UNIFIED_TRACE",
+    "FERRUM_RANK",
+    "FERRUM_RBD_PROF",
+    "FERRUM_REF_CODES",
+    "FERRUM_REF_PCM",
+    "FERRUM_SCHED_NONE_PROF",
+    "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+    "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
+    "FERRUM_SPEC_DRAFT",
+    "FERRUM_SPEC_N",
+    "FERRUM_SPLIT_K_ATTN",
+    "FERRUM_ST_TEMP",
+    "FERRUM_TP",
+    "FERRUM_TRACE_OUT",
+    "FERRUM_TRITON_INT4",
+    "FERRUM_TTS_MIN_FRAMES",
+    "FERRUM_TTS_TEMP",
+    "FERRUM_UNIFIED_GRAPH",
+    "FERRUM_UNIFIED_GREEDY_ARGMAX",
+    "FERRUM_UNIFIED_LAYER_PROF",
+    "FERRUM_UNIFIED_LAYER_PROF_EVERY",
+    "FERRUM_UNIFIED_LAYER_PROF_MAX_M",
+    "FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS",
+    "FERRUM_UNIFIED_POST_PROF",
+    "FERRUM_UNIFIED_PROFILE",
+    "FERRUM_UPDATE_FIXTURES",
+    "FERRUM_USE_CANDLE",
+    "FERRUM_USE_VLLM_PAGED_ATTN",
+    "FERRUM_VLLM_ATOMIC_ADD",
+    "FERRUM_VLLM_DECODE_VARLEN",
+    "FERRUM_VLLM_FP32_REDUCE",
+    "FERRUM_VLLM_MARLIN",
+    "FERRUM_VLLM_MARLIN_SMS",
+    "FERRUM_VLLM_MOE",
+    "FERRUM_VLLM_MOE_BF16",
+    "FERRUM_VLLM_MOE_BLOCKS_PER_SM",
+    "FERRUM_VLLM_MOE_LOG_CONFIG",
+    "FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT",
+    "FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS",
+    "FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS",
+    "FERRUM_VLLM_MOE_PAIR_IDS",
+    "FERRUM_VLLM_MOE_THREAD_K",
+    "FERRUM_VLLM_MOE_THREAD_N",
+    "FERRUM_VLLM_MOE_ZERO_WS",
+    "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+    "FERRUM_VLLM_VARLEN_TILED_Q4"
+  ],
+  "direct_env_reads": 75,
+  "embedded_ferrum_tokens": [
+    "FERRUM_2M"
+  ],
+  "files_scanned": 583,
+  "hot_direct_env_read_classification": {
+    "classified": [
+      {
+        "call": "std::getenv",
+        "classification": "diagnostic_tile_override",
+        "column": 23,
+        "env_name": "FERRUM_MARLIN_TILE",
+        "line": 852,
+        "path": "crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu",
+        "read_phase": "request",
+        "reason": "legacy Marlin tile-tuning override; the CUDA vLLM-MoE hot path uses typed runtime config instead",
+        "source": "const char* env = std::getenv(\"FERRUM_MARLIN_TILE\");"
+      },
+      {
+        "call": "std::getenv",
+        "classification": "diagnostic_tile_override",
+        "column": 23,
+        "env_name": "FERRUM_MARLIN_TILE",
+        "line": 975,
+        "path": "crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu",
+        "read_phase": "request",
+        "reason": "legacy Marlin tile-tuning override; the CUDA vLLM-MoE hot path uses typed runtime config instead",
+        "source": "const char* env = std::getenv(\"FERRUM_MARLIN_TILE\");"
+      },
+      {
+        "call": "std::getenv",
+        "classification": "process_static_native_config_helper",
+        "column": 10,
+        "env_name": null,
+        "line": 55,
+        "path": "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu",
+        "read_phase": "startup",
+        "reason": "single helper backing process-static vLLM-MoE native diagnostic config and the backwards-compatible profile metadata fallback",
+        "source": "return std::getenv(name);"
+      },
+      {
+        "call": "std::env::var",
+        "classification": "ignored_manual_metal_capture_test",
+        "column": 12,
+        "env_name": "MTL_CAPTURE_ENABLED",
+        "line": 661,
+        "path": "crates/ferrum-kernels/src/backend/metal/q4_k_moe_id_gemv_batched.rs",
+        "read_phase": "test-only",
+        "reason": "ignored manual GPU capture test guard, not a product runtime Ferrum knob",
+        "source": "if std::env::var(\"MTL_CAPTURE_ENABLED\").as_deref() != Ok(\"1\") {"
+      }
+    ],
+    "classified_count": 4,
+    "unclassified": [],
+    "unclassified_count": 0,
+    "unused_classifications": []
+  },
+  "hot_direct_env_reads": 4,
+  "hot_direct_env_reads_classified": 4,
+  "hot_direct_env_reads_unclassified": 0,
+  "hot_top_direct_env_read_files": [
+    {
+      "count": 2,
+      "path": "crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-kernels/src/backend/metal/q4_k_moe_id_gemv_batched.rs"
+    }
+  ],
+  "hot_unique_ferrum_tokens": 120,
+  "hot_unique_names": [
+    "FERRUM_BATCHED_GRAPH",
+    "FERRUM_BATCHED_TRACE",
+    "FERRUM_BATCH_DECODE_PROF",
+    "FERRUM_BATCH_PREFILL_PROF",
+    "FERRUM_CHUNKED_PREFILL",
+    "FERRUM_CUDA_DEVICE",
+    "FERRUM_CUDA_GRAPH",
+    "FERRUM_CUDA_MAX_KV",
+    "FERRUM_DEBUG_SPEC_POS",
+    "FERRUM_DECODE_LAYER_PROFILE",
+    "FERRUM_DECODE_OP_PROFILE",
+    "FERRUM_DIAG",
+    "FERRUM_DIAG_ATTN",
+    "FERRUM_DIAG_NUMERICAL",
+    "FERRUM_DIAG_SHAPES",
+    "FERRUM_DIAG_TIMING",
+    "FERRUM_DTYPE",
+    "FERRUM_FA2_DIRECT_FFI",
+    "FERRUM_FA2_DIRECT_FFI_SHIM",
+    "FERRUM_FA2_SOURCE",
+    "FERRUM_FA_DECODE",
+    "FERRUM_FA_LAYOUT_VARLEN",
+    "FERRUM_FA_LEGACY",
+    "FERRUM_FUSED_CPU",
+    "FERRUM_FUSED_METAL",
+    "FERRUM_GEMM_NR0",
+    "FERRUM_GEMM_NR1",
+    "FERRUM_GRAPH_PROF",
+    "FERRUM_GRAPH_SKIP_SYNC",
+    "FERRUM_GRAPH_SKIP_UPLOAD",
+    "FERRUM_GREEDY_ARGMAX",
+    "FERRUM_IDS_TPE_NSG",
+    "FERRUM_IDS_TPE_THREADS",
+    "FERRUM_KV_BLOCKS",
+    "FERRUM_KV_CAPACITY",
+    "FERRUM_MARLIN_SKIP_WS_ZERO",
+    "FERRUM_MARLIN_TILE",
+    "FERRUM_MAX_BATCHED_TOKENS",
+    "FERRUM_METAL_CAPTURE",
+    "FERRUM_METAL_DTYPE",
+    "FERRUM_METAL_PAGED_KV",
+    "FERRUM_METAL_QUANT_PROFILE",
+    "FERRUM_MMAP_TRACE",
+    "FERRUM_MODEL_PATH",
+    "FERRUM_MOE_BATCHED",
+    "FERRUM_MOE_BATCHED_DECODE",
+    "FERRUM_MOE_BATCH_THRESHOLD",
+    "FERRUM_MOE_BLOCK_SIZE",
+    "FERRUM_MOE_BUCKETED",
+    "FERRUM_MOE_DEVICE_ROUTE",
+    "FERRUM_MOE_DIRECT_DISPATCH",
+    "FERRUM_MOE_DUMP",
+    "FERRUM_MOE_DUMP_BATCH_X_TOPK",
+    "FERRUM_MOE_FUSED",
+    "FERRUM_MOE_FUSED_GATE_UP_SILU",
+    "FERRUM_MOE_GRAPH",
+    "FERRUM_MOE_HOST_ROUTE",
+    "FERRUM_MOE_HOST_TOPK",
+    "FERRUM_MOE_LARGE_M_BLOCK_SIZE",
+    "FERRUM_MOE_LARGE_M_MIN_PAIRS",
+    "FERRUM_MOE_LOAD_TRACE",
+    "FERRUM_MOE_PREFILL_THRESHOLD",
+    "FERRUM_MOE_PROFILE",
+    "FERRUM_MOE_STREAMS",
+    "FERRUM_NEXT_BATCH_PROF",
+    "FERRUM_PAGED_FLASH",
+    "FERRUM_PAGED_FLASH_SPLITS",
+    "FERRUM_PAGED_KV",
+    "FERRUM_PAGED_MAX_SEQS",
+    "FERRUM_PREFILL_OP_PROFILE",
+    "FERRUM_PREFIX_CACHE",
+    "FERRUM_PROFILE_COMMIT_SHA",
+    "FERRUM_PROFILE_CONCURRENCY",
+    "FERRUM_PROFILE_ENV_HASH",
+    "FERRUM_PROFILE_JSONL",
+    "FERRUM_PROFILE_MODEL",
+    "FERRUM_PROFILE_RUNTIME_FLAGS_JSON",
+    "FERRUM_QWEN_UNIFIED_PREFILL",
+    "FERRUM_QWEN_UNIFIED_TRACE",
+    "FERRUM_RANK",
+    "FERRUM_RBD_PROF",
+    "FERRUM_REF_CODES",
+    "FERRUM_REF_PCM",
+    "FERRUM_SPEC_DRAFT",
+    "FERRUM_SPEC_N",
+    "FERRUM_SPLIT_K_ATTN",
+    "FERRUM_ST_TEMP",
+    "FERRUM_TP",
+    "FERRUM_TRACE_OUT",
+    "FERRUM_TRITON_INT4",
+    "FERRUM_TTS_MIN_FRAMES",
+    "FERRUM_TTS_TEMP",
+    "FERRUM_UNIFIED_GRAPH",
+    "FERRUM_UNIFIED_GREEDY_ARGMAX",
+    "FERRUM_UNIFIED_LAYER_PROF",
+    "FERRUM_UNIFIED_LAYER_PROF_EVERY",
+    "FERRUM_UNIFIED_LAYER_PROF_MAX_M",
+    "FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS",
+    "FERRUM_UNIFIED_POST_PROF",
+    "FERRUM_UNIFIED_PROFILE",
+    "FERRUM_USE_CANDLE",
+    "FERRUM_USE_VLLM_PAGED_ATTN",
+    "FERRUM_VLLM_ATOMIC_ADD",
+    "FERRUM_VLLM_DECODE_VARLEN",
+    "FERRUM_VLLM_FP32_REDUCE",
+    "FERRUM_VLLM_MARLIN",
+    "FERRUM_VLLM_MARLIN_SMS",
+    "FERRUM_VLLM_MOE",
+    "FERRUM_VLLM_MOE_BF16",
+    "FERRUM_VLLM_MOE_BLOCKS_PER_SM",
+    "FERRUM_VLLM_MOE_LOG_CONFIG",
+    "FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT",
+    "FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS",
+    "FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS",
+    "FERRUM_VLLM_MOE_PAIR_IDS",
+    "FERRUM_VLLM_MOE_THREAD_K",
+    "FERRUM_VLLM_MOE_THREAD_N",
+    "FERRUM_VLLM_MOE_ZERO_WS",
+    "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+    "FERRUM_VLLM_VARLEN_TILED_Q4"
+  ],
+  "name_paths": {
+    "FERRUM_2M": [
+      "scripts/microbenches/moe_marlin_correctness.cu"
+    ],
+    "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK": [
+      "crates/ferrum-types/src/auto_config.rs",
+      "crates/ferrum-types/src/config.rs",
+      "crates/ferrum-types/tests/config_tests.rs",
+      "scripts/m3_active_prefill_chunk_ab.sh"
+    ],
+    "FERRUM_BACKEND": [
+      "crates/ferrum-cli/src/commands/serve.rs"
+    ],
+    "FERRUM_BATCHED_GRAPH": [
+      "crates/ferrum-kernels/src/backend/cuda/mod.rs",
+      "crates/ferrum-models/src/models/llama_family_forward_batched.rs"
+    ],
+    "FERRUM_BATCHED_TRACE": [
+      "crates/ferrum-models/src/models/llama_family_forward_batched.rs"
+    ],
+    "FERRUM_BATCH_DECODE_PROF": [
+      "crates/ferrum-engine/src/continuous_engine.rs",
+      "crates/ferrum-models/src/executor/llm_executor.rs",
+      "scripts/m3_graph_runtime_profile.sh",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_BATCH_PREFILL_PROF": [
+      "crates/ferrum-models/src/executor/llm_executor.rs"
+    ],
+    "FERRUM_BIN": [
+      "scripts/bench_m1_q4_k_m.sh",
+      "scripts/bench_vs_vllm.sh",
+      "scripts/bottleneck_localize.sh",
+      "scripts/lm_eval_light.sh",
+      "scripts/paris_bisect.sh",
+      "scripts/phase-e-verify.sh",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_BIN_FEATURES": [
+      "scripts/compare-commits.sh"
+    ],
+    "FERRUM_CHUNKED_PREFILL": [
+      "crates/ferrum-engine/src/continuous_engine.rs",
+      "crates/ferrum-engine/src/continuous_engine/inner/batch.rs",
+      "crates/ferrum-engine/src/continuous_engine/inner/prefill.rs",
+      "crates/ferrum-engine/tests/chunked_prefill_test.rs"
+    ],
+    "FERRUM_CUDA_DEVICE": [
+      "crates/ferrum-kernels/src/backend/cuda/mod.rs"
+    ],
+    "FERRUM_CUDA_GRAPH": [
+      "crates/ferrum-cli/src/commands/bench.rs",
+      "crates/ferrum-models/src/models/llama_family.rs"
+    ],
+    "FERRUM_CUDA_MAX_KV": [
+      "crates/ferrum-kernels/src/backend/cuda/mod.rs"
+    ],
+    "FERRUM_CUTLASS_INCLUDE_DIR": [
+      "crates/ferrum-kernels/build.rs"
+    ],
+    "FERRUM_DEBUG_SPEC_POS": [
+      "crates/ferrum-engine/src/continuous_engine/inner/decode.rs"
+    ],
+    "FERRUM_DECODE_LAYER_PROFILE": [
+      "crates/ferrum-models/src/models/llama_family.rs"
+    ],
+    "FERRUM_DECODE_OP_PROFILE": [
+      "crates/ferrum-models/src/models/llama_family.rs",
+      "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/prefill_decode.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_profile.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-models/src/moe/dispatch.rs",
+      "crates/ferrum-models/src/moe/forward.rs",
+      "scripts/bottleneck_localize.sh",
+      "scripts/m3_route_unified_profile.sh",
+      "scripts/parse_decode_profile.py",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_DIAG": [
+      "crates/ferrum-kernels/src/backend/cuda/cuda_decode.rs"
+    ],
+    "FERRUM_DIAG_ATTN": [
+      "crates/ferrum-kernels/src/backend/cuda/cuda_decode.rs"
+    ],
+    "FERRUM_DIAG_NUMERICAL": [
+      "crates/ferrum-kernels/src/backend/cuda/cuda_decode.rs"
+    ],
+    "FERRUM_DIAG_SHAPES": [
+      "crates/ferrum-kernels/src/backend/cuda/cuda_decode.rs"
+    ],
+    "FERRUM_DIAG_TIMING": [
+      "crates/ferrum-kernels/src/backend/cuda/cuda_decode.rs"
+    ],
+    "FERRUM_DIR": [
+      "scripts/regen-fused-moe-tile-sweep.sh",
+      "scripts/regen-triton-ptx.sh",
+      "scripts/sweep-fused-moe-tiles.sh"
+    ],
+    "FERRUM_DTYPE": [
+      "crates/ferrum-engine/src/registry.rs",
+      "crates/ferrum-types/src/auto_config.rs"
+    ],
+    "FERRUM_FA2_DIRECT_FFI": [
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "scripts/m3_fa2_direct_ffi_ab.sh",
+      "scripts/microbenches/build_fa2_ferrum_shim.sh",
+      "scripts/microbenches/fa2_ferrum_shim.cpp"
+    ],
+    "FERRUM_FA2_DIRECT_FFI_SHIM": [
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-kernels/src/backend/cuda/fa2_ffi.rs",
+      "crates/ferrum-kernels/src/backend/traits.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "scripts/m3_fa2_direct_ffi_ab.sh"
+    ],
+    "FERRUM_FA2_SOURCE": [
+      "crates/ferrum-cli/Cargo.toml",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-kernels/Cargo.toml",
+      "crates/ferrum-kernels/src/backend/cuda/paged.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "scripts/m3_fa2_direct_ffi_ab.sh"
+    ],
+    "FERRUM_FA2_SRC_DIR": [
+      "crates/ferrum-kernels/build.rs"
+    ],
+    "FERRUM_FA_DECODE": [
+      "crates/ferrum-kernels/src/attention/metal/pipelines.rs"
+    ],
+    "FERRUM_FA_LAYOUT_VARLEN": [
+      "crates/ferrum-bench-core/src/profile.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "scripts/m3_ab_runner.py",
+      "scripts/m3_collect_allcell_runner_artifacts.py",
+      "scripts/m3_fa2_direct_ffi_ab.sh",
+      "scripts/m3_fa_layout_varlen_ab.sh",
+      "scripts/m3_validate_runner_artifact.py"
+    ],
+    "FERRUM_FA_LEGACY": [
+      "crates/ferrum-kernels/src/attention/metal/pipelines.rs"
+    ],
+    "FERRUM_FORCE_PER_ITEM": [
+      "crates/ferrum-kernels/tests/qk_norm_rope_batched_eq.rs"
+    ],
+    "FERRUM_FUSED_CPU": [
+      "crates/ferrum-kernels/src/attention/mod.rs"
+    ],
+    "FERRUM_FUSED_METAL": [
+      "crates/ferrum-kernels/src/attention/mod.rs"
+    ],
+    "FERRUM_FUSED_MOE_TILE": [
+      "scripts/regen-fused-moe-tile-sweep.sh"
+    ],
+    "FERRUM_FUSED_MOE_TILE_BENCH": [
+      "crates/ferrum-kernels/tests/triton_fused_moe_tile_sweep.rs",
+      "scripts/sweep-fused-moe-tiles.sh"
+    ],
+    "FERRUM_GEMM_NR0": [
+      "crates/ferrum-kernels/src/backend/metal/moe_router.metal"
+    ],
+    "FERRUM_GEMM_NR1": [
+      "crates/ferrum-kernels/src/backend/metal/moe_router.metal"
+    ],
+    "FERRUM_GGUF_LOAD_TRACE": [
+      "crates/ferrum-quantization/src/gguf/loader.rs"
+    ],
+    "FERRUM_GRAPH": [
+      "scripts/paris_bisect.sh",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_GRAPH_PROF": [
+      "crates/ferrum-kernels/src/backend/cuda/graph.rs",
+      "scripts/m3_graph_runtime_profile.sh"
+    ],
+    "FERRUM_GRAPH_SKIP_SYNC": [
+      "crates/ferrum-kernels/src/backend/cuda/graph.rs"
+    ],
+    "FERRUM_GRAPH_SKIP_UPLOAD": [
+      "crates/ferrum-kernels/src/backend/cuda/graph.rs",
+      "scripts/paris_bisect.sh",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_GREEDY_ARGMAX": [
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-engine/src/continuous_engine/inner/decode.rs",
+      "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "scripts/paris_bisect.sh",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_IDS_TPE_NSG": [
+      "crates/ferrum-kernels/src/backend/metal/moe_router.metal"
+    ],
+    "FERRUM_IDS_TPE_THREADS": [
+      "crates/ferrum-kernels/src/backend/metal/moe_router.metal"
+    ],
+    "FERRUM_KV_BLOCKS": [
+      "crates/ferrum-kernels/src/backend/cuda/cuda_decode.rs"
+    ],
+    "FERRUM_KV_CAPACITY": [
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/gpu_mem_autosize.rs",
+      "crates/ferrum-cli/src/source_resolver.rs",
+      "crates/ferrum-kernels/kernels/paged_decode_attention.cu",
+      "crates/ferrum-kernels/src/backend/cuda/paged.rs",
+      "crates/ferrum-models/src/common/llm.rs",
+      "crates/ferrum-models/src/models/llama_family.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/forward_layer.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    ],
+    "FERRUM_KV_DTYPE": [
+      "crates/ferrum-cli/src/commands/bench.rs",
+      "crates/ferrum-cli/src/commands/run.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "crates/ferrum-types/src/runtime_config.rs",
+      "scripts/m3_validate_runner_artifact.py"
+    ],
+    "FERRUM_KV_MAX_BLOCKS": [
+      "crates/ferrum-bench-core/src/env.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-cli/src/gpu_mem_autosize.rs",
+      "crates/ferrum-cli/src/source_resolver.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "crates/ferrum-types/src/config.rs",
+      "crates/ferrum-types/tests/config_tests.rs",
+      "scripts/paris_bisect.sh",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_M3_PATH": [
+      "crates/ferrum-models/tests/qwen3_moe_safetensors_smoke.rs"
+    ],
+    "FERRUM_MARLIN_SKIP_WS_ZERO": [
+      "crates/ferrum-kernels/src/backend/cuda/marlin.rs"
+    ],
+    "FERRUM_MARLIN_TILE": [
+      "crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu"
+    ],
+    "FERRUM_MAX_BATCH": [
+      "crates/ferrum-cli/src/source_resolver.rs",
+      "scripts/phase-e-verify.sh",
+      "scripts/test_gpu.sh"
+    ],
+    "FERRUM_MAX_BATCHED_TOKENS": [
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-cli/src/gpu_mem_autosize.rs",
+      "crates/ferrum-engine/src/continuous_engine/inner.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "crates/ferrum-types/src/config.rs",
+      "crates/ferrum-types/tests/config_tests.rs",
+      "scripts/m3_validate_runner_artifact.py"
+    ],
+    "FERRUM_MAX_MODEL_LEN": [
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-types/src/auto_config.rs"
+    ],
+    "FERRUM_METAL_CAPTURE": [
+      "crates/ferrum-kernels/src/backend/metal/mod.rs"
+    ],
+    "FERRUM_METAL_DTYPE": [
+      "crates/ferrum-engine/src/registry.rs",
+      "crates/ferrum-kernels/src/backend/metal/mod.rs",
+      "crates/ferrum-kernels/src/backend/traits.rs",
+      "crates/ferrum-models/tests/qwen3_f16_parity_test.rs"
+    ],
+    "FERRUM_METAL_PAGED_KV": [
+      "crates/ferrum-cli/src/source_resolver.rs",
+      "crates/ferrum-kernels/src/backend/cuda/paged.rs",
+      "crates/ferrum-kernels/src/backend/traits.rs",
+      "crates/ferrum-kernels/src/backend/types.rs",
+      "crates/ferrum-models/src/models/llama_family.rs",
+      "crates/ferrum-models/src/models/qwen3_moe.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/api.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/kv.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/scratch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_forward_unified.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-models/tests/qwen3_moe_safetensors_smoke.rs"
+    ],
+    "FERRUM_METAL_QUANT_PROFILE": [
+      "crates/ferrum-kernels/src/backend/metal/quant.rs"
+    ],
+    "FERRUM_MMAP_TRACE": [
+      "crates/ferrum-kernels/src/backend/metal/mod.rs"
+    ],
+    "FERRUM_MODEL_PATH": [
+      "crates/ferrum-engine/src/builder.rs",
+      "crates/ferrum-engine/src/registry.rs",
+      "crates/ferrum-engine/tests/qwen_concurrency.rs"
+    ],
+    "FERRUM_MOE_BATCHED": [
+      "crates/ferrum-cli/src/source_resolver.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/api.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    ],
+    "FERRUM_MOE_BATCHED_DECODE": [
+      "crates/ferrum-cli/src/source_resolver.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    ],
+    "FERRUM_MOE_BATCH_THRESHOLD": [
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-cli/src/source_resolver.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/api.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-models/tests/qwen3_moe_model_test.rs"
+    ],
+    "FERRUM_MOE_BLOCK_SIZE": [
+      "crates/ferrum-models/src/moe/dispatch.rs"
+    ],
+    "FERRUM_MOE_BUCKETED": [
+      "crates/ferrum-models/src/models/qwen3_moe/forward_layer.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    ],
+    "FERRUM_MOE_DEVICE_ROUTE": [
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-models/src/models/qwen3_moe.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "crates/ferrum-models/src/moe/dispatch.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "scripts/paris_bisect.sh",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_MOE_DIRECT_DISPATCH": [
+      "crates/ferrum-models/src/moe/forward.rs"
+    ],
+    "FERRUM_MOE_DUMP": [
+      "crates/ferrum-kernels/src/backend/cuda/moe.rs",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_MOE_DUMP_BATCH_X_TOPK": [
+      "crates/ferrum-kernels/src/backend/cuda/moe.rs",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_MOE_FUSED": [
+      "crates/ferrum-kernels/src/backend/cuda/quant.rs"
+    ],
+    "FERRUM_MOE_FUSED_GATE_UP_SILU": [
+      "crates/ferrum-models/src/moe/forward.rs"
+    ],
+    "FERRUM_MOE_GRAPH": [
+      "crates/ferrum-bench-core/src/profile.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-cli/src/gpu_mem_autosize.rs",
+      "crates/ferrum-cli/src/runtime_env.rs",
+      "crates/ferrum-models/src/models/qwen3_moe.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/api.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/load.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "crates/ferrum-types/src/runtime_config.rs",
+      "scripts/m3_ab_runner.py",
+      "scripts/m3_route_unified_profile.sh",
+      "scripts/m3_validate_runner_artifact.py",
+      "scripts/paris_bisect.sh",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_MOE_HOST_ROUTE": [
+      "crates/ferrum-models/src/models/qwen3_moe/load.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-models/src/moe/dispatch.rs",
+      "scripts/paris_bisect.sh"
+    ],
+    "FERRUM_MOE_HOST_TOPK": [
+      "crates/ferrum-models/src/moe/forward.rs"
+    ],
+    "FERRUM_MOE_LARGE_M_BLOCK_SIZE": [
+      "crates/ferrum-models/src/moe/dispatch.rs"
+    ],
+    "FERRUM_MOE_LARGE_M_MIN_PAIRS": [
+      "crates/ferrum-models/src/moe/dispatch.rs"
+    ],
+    "FERRUM_MOE_LOAD_TRACE": [
+      "crates/ferrum-models/src/moe/dispatch.rs"
+    ],
+    "FERRUM_MOE_PREFILL_THRESHOLD": [
+      "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    ],
+    "FERRUM_MOE_PROFILE": [
+      "crates/ferrum-bench-core/src/profile.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-models/src/moe/dispatch.rs",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_MOE_STREAMS": [
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-kernels/src/backend/cuda/mod.rs",
+      "crates/ferrum-kernels/src/backend/cuda/quant.rs",
+      "scripts/paris_bisect.sh",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_NEXT_BATCH_PROF": [
+      "crates/ferrum-engine/src/continuous_engine.rs",
+      "crates/ferrum-engine/src/continuous_engine/inner.rs",
+      "scripts/m3_graph_runtime_profile.sh",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_NVCC_THREADS": [
+      "crates/ferrum-kernels/build.rs",
+      "scripts/microbenches/build_fa2_ferrum_source_shim.sh"
+    ],
+    "FERRUM_OPENAI_BASE_URL": [
+      "crates/ferrum-cli/tests/server_openai_compat.rs"
+    ],
+    "FERRUM_OPENAI_MODEL": [
+      "crates/ferrum-cli/tests/server_openai_compat.rs"
+    ],
+    "FERRUM_PAGED_FLASH": [
+      "crates/ferrum-kernels/src/backend/cuda/paged.rs"
+    ],
+    "FERRUM_PAGED_FLASH_SPLITS": [
+      "crates/ferrum-kernels/src/backend/cuda/paged.rs"
+    ],
+    "FERRUM_PAGED_KV": [
+      "crates/ferrum-kernels/src/backend/cuda/cuda_decode.rs"
+    ],
+    "FERRUM_PAGED_MAX_SEQS": [
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-cli/src/gpu_mem_autosize.rs",
+      "crates/ferrum-cli/src/source_resolver.rs",
+      "crates/ferrum-models/src/models/llama_family.rs",
+      "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/api.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/kv.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/scratch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "scripts/bench_vs_vllm.sh",
+      "scripts/paris_bisect.sh",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_PARITY_FORCE_EXPERT0": [
+      "crates/ferrum-quantization/tests/marlin_moe_vllm_parity_test.rs"
+    ],
+    "FERRUM_PARITY_UNIT_SCALES": [
+      "crates/ferrum-quantization/tests/marlin_moe_vllm_parity_test.rs"
+    ],
+    "FERRUM_PID": [
+      "scripts/bench_vs_vllm.sh",
+      "scripts/bottleneck_localize.sh"
+    ],
+    "FERRUM_PORT": [
+      "scripts/bench_vs_vllm.sh",
+      "scripts/bottleneck_localize.sh"
+    ],
+    "FERRUM_PREFILL_OP_PROFILE": [
+      "crates/ferrum-models/src/models/llama_family.rs"
+    ],
+    "FERRUM_PREFIX_CACHE": [
+      "crates/ferrum-bench-core/src/env.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-cli/tests/quant_kl.rs",
+      "crates/ferrum-cli/tests/server_stress.rs",
+      "crates/ferrum-engine/src/continuous_engine.rs",
+      "crates/ferrum-engine/src/continuous_engine/inner/batch.rs",
+      "crates/ferrum-engine/src/continuous_engine/inner/prefill.rs",
+      "crates/ferrum-engine/tests/continuous_batch_test.rs",
+      "crates/ferrum-engine/tests/prefix_cache_test.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/prefill_decode.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "crates/ferrum-types/src/runtime_config.rs",
+      "scripts/bench_vs_vllm.sh",
+      "scripts/test_chat_suites.sh"
+    ],
+    "FERRUM_PROFILE_COMMIT_SHA": [
+      "crates/ferrum-bench-core/src/profile.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu"
+    ],
+    "FERRUM_PROFILE_CONCURRENCY": [
+      "crates/ferrum-bench-core/src/profile.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu"
+    ],
+    "FERRUM_PROFILE_ENV_HASH": [
+      "crates/ferrum-bench-core/src/profile.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu"
+    ],
+    "FERRUM_PROFILE_JSONL": [
+      "crates/ferrum-bench-core/src/profile.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu",
+      "crates/ferrum-types/src/runtime_config.rs"
+    ],
+    "FERRUM_PROFILE_MODEL": [
+      "crates/ferrum-bench-core/src/profile.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu"
+    ],
+    "FERRUM_PROFILE_RUNTIME_FLAGS_JSON": [
+      "crates/ferrum-bench-core/src/profile.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu"
+    ],
+    "FERRUM_PROFILE_STAGES": [
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_PYTHON": [
+      "crates/ferrum-cli/tests/server_openai_compat.rs"
+    ],
+    "FERRUM_QWEN_TEST_MODEL_PATH": [
+      "crates/ferrum-engine/tests/qwen_concurrency.rs"
+    ],
+    "FERRUM_QWEN_UNIFIED_PREFILL": [
+      "crates/ferrum-models/src/models/qwen3_moe/api.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    ],
+    "FERRUM_QWEN_UNIFIED_TRACE": [
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    ],
+    "FERRUM_RANK": [
+      "crates/ferrum-kernels/src/backend/cuda/collective.rs"
+    ],
+    "FERRUM_RBD_PROF": [
+      "crates/ferrum-engine/src/continuous_engine.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "scripts/m3_graph_runtime_profile.sh"
+    ],
+    "FERRUM_REF_CODES": [
+      "crates/ferrum-models/src/executor/tts_executor.rs"
+    ],
+    "FERRUM_REF_PCM": [
+      "crates/ferrum-models/src/executor/tts_executor.rs"
+    ],
+    "FERRUM_SCHED_NONE_PROF": [
+      "crates/ferrum-scheduler/src/implementations/continuous.rs",
+      "crates/ferrum-types/src/config.rs",
+      "crates/ferrum-types/tests/config_tests.rs"
+    ],
+    "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE": [
+      "crates/ferrum-types/src/auto_config.rs",
+      "crates/ferrum-types/src/config.rs",
+      "crates/ferrum-types/tests/config_tests.rs",
+      "scripts/m3_prefill_first_ab.sh"
+    ],
+    "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE": [
+      "crates/ferrum-types/src/auto_config.rs",
+      "crates/ferrum-types/src/config.rs",
+      "crates/ferrum-types/tests/config_tests.rs"
+    ],
+    "FERRUM_SPEC_DRAFT": [
+      "crates/ferrum-engine/src/builder.rs"
+    ],
+    "FERRUM_SPEC_N": [
+      "crates/ferrum-engine/src/builder.rs"
+    ],
+    "FERRUM_SPLIT_K_ATTN": [
+      "crates/ferrum-kernels/src/backend/cuda/paged.rs"
+    ],
+    "FERRUM_ST_TEMP": [
+      "crates/ferrum-models/src/executor/tts_executor.rs"
+    ],
+    "FERRUM_TP": [
+      "crates/ferrum-cli/src/commands/bench.rs",
+      "crates/ferrum-engine/src/registry.rs",
+      "crates/ferrum-kernels/src/backend/cuda/collective.rs",
+      "scripts/remote.sh"
+    ],
+    "FERRUM_TRACE_OUT": [
+      "crates/ferrum-bench-core/src/trace.rs",
+      "crates/ferrum-cli/src/commands/bench.rs",
+      "crates/ferrum-kernels/Cargo.toml",
+      "crates/ferrum-kernels/src/backend/timer.rs",
+      "crates/ferrum-models/src/moe/forward.rs",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_TRITON_INT4": [
+      "crates/ferrum-kernels/src/backend/cuda/quant.rs",
+      "crates/ferrum-kernels/src/backend/cuda/triton_ptx.rs",
+      "crates/ferrum-kernels/src/backend/cuda/triton_w4a16.rs",
+      "crates/ferrum-kernels/src/quant_linear/cuda_marlin.rs"
+    ],
+    "FERRUM_TTS_MIN_FRAMES": [
+      "crates/ferrum-models/src/executor/tts_executor.rs"
+    ],
+    "FERRUM_TTS_TEMP": [
+      "crates/ferrum-models/src/executor/tts_executor.rs"
+    ],
+    "FERRUM_UNIFIED_GRAPH": [
+      "crates/ferrum-models/src/models/llama_family_forward_batched.rs"
+    ],
+    "FERRUM_UNIFIED_GREEDY_ARGMAX": [
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    ],
+    "FERRUM_UNIFIED_LAYER_PROF": [
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_UNIFIED_LAYER_PROF_EVERY": [
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_UNIFIED_LAYER_PROF_MAX_M": [
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS": [
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_UNIFIED_POST_PROF": [
+      "crates/ferrum-engine/src/continuous_engine.rs",
+      "scripts/m3_graph_runtime_profile.sh",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_UNIFIED_PROFILE": [
+      "crates/ferrum-models/src/models/llama_family_forward_batched.rs"
+    ],
+    "FERRUM_UPDATE_FIXTURES": [
+      ".github/workflows/chat-smoke.yml",
+      "crates/ferrum-cli/tests/reference_match.rs"
+    ],
+    "FERRUM_USE_CANDLE": [
+      "crates/ferrum-models/src/multimodal/qwen3_tts.rs"
+    ],
+    "FERRUM_USE_VLLM_PAGED_ATTN": [
+      "crates/ferrum-cli/Cargo.toml",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-kernels/Cargo.toml",
+      "crates/ferrum-kernels/kernels/paged_varlen_attention_vllm.cu",
+      "crates/ferrum-kernels/src/backend/traits.rs",
+      "crates/ferrum-models/src/models/qwen3_moe.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "scripts/paris_bisect.sh",
+      "scripts/sweep_bottleneck.sh"
+    ],
+    "FERRUM_VLLM_ATOMIC_ADD": [
+      "crates/ferrum-kernels/src/backend/cuda/quant.rs"
+    ],
+    "FERRUM_VLLM_DECODE_VARLEN": [
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    ],
+    "FERRUM_VLLM_FP32_REDUCE": [
+      "crates/ferrum-kernels/src/backend/cuda/quant.rs"
+    ],
+    "FERRUM_VLLM_MARLIN": [
+      "crates/ferrum-kernels/src/backend/cuda/quant.rs"
+    ],
+    "FERRUM_VLLM_MARLIN_SMS": [
+      "crates/ferrum-kernels/src/backend/cuda/quant.rs"
+    ],
+    "FERRUM_VLLM_MOE": [
+      "crates/ferrum-bench-core/src/env.rs",
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-cli/src/runtime_env.rs",
+      "crates/ferrum-kernels/src/backend/cuda/quant.rs",
+      "crates/ferrum-models/src/models/qwen3_moe.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "crates/ferrum-models/src/models/qwen3_moe/load.rs",
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+      "crates/ferrum-models/src/moe/dispatch.rs",
+      "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "scripts/m3_ab_runner.py",
+      "scripts/paris_bisect.sh",
+      "scripts/pod_session_m3_80pct.sh"
+    ],
+    "FERRUM_VLLM_MOE_BF16": [
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/kernel_instantiations.cu"
+    ],
+    "FERRUM_VLLM_MOE_BLOCKS_PER_SM": [
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu"
+    ],
+    "FERRUM_VLLM_MOE_LOG_CONFIG": [
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT": [
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS": [
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS": [
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_VLLM_MOE_PAIR_IDS": [
+      "crates/ferrum-cli/src/commands/serve.rs",
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-cli/src/runtime_env.rs",
+      "crates/ferrum-models/src/moe/dispatch.rs",
+      "crates/ferrum-types/src/auto_config.rs"
+    ],
+    "FERRUM_VLLM_MOE_THREAD_K": [
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu"
+    ],
+    "FERRUM_VLLM_MOE_THREAD_N": [
+      "crates/ferrum-kernels/kernels/vllm_marlin_moe/ops.cu"
+    ],
+    "FERRUM_VLLM_MOE_ZERO_WS": [
+      "crates/ferrum-models/src/moe/dispatch.rs"
+    ],
+    "FERRUM_VLLM_PAGED_ATTN_V1_SHORT": [
+      "crates/ferrum-cli/src/config.rs",
+      "crates/ferrum-kernels/src/backend/cuda/vllm_paged_attn.rs",
+      "crates/ferrum-types/src/auto_config.rs",
+      "scripts/m3_attn_v1_ab.sh",
+      "scripts/m3_route_unified_profile.sh"
+    ],
+    "FERRUM_VLLM_VARLEN_TILED_Q4": [
+      "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    ]
+  },
+  "non_test_process_env_writes": 1,
+  "non_test_process_env_writes_classified": 1,
+  "non_test_process_env_writes_unclassified": 0,
+  "process_env_write_classification": {
+    "classified": [
+      {
+        "call": "std::env::set_var",
+        "classification": "runtime_config_compatibility_bridge",
+        "column": 13,
+        "env_name": null,
+        "line": 14,
+        "path": "crates/ferrum-cli/src/runtime_env.rs",
+        "reason": "centralized CLI bridge materializing typed RuntimeConfigEntry defaults for backend paths that still consume process env",
+        "source": "std::env::set_var(&entry.key, &entry.effective_value);",
+        "test_context": false
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 5,
+        "env_name": "FERRUM_CHUNKED_PREFILL",
+        "line": 56,
+        "path": "crates/ferrum-engine/tests/chunked_prefill_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_CHUNKED_PREFILL\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 5,
+        "env_name": "FERRUM_CHUNKED_PREFILL",
+        "line": 74,
+        "path": "crates/ferrum-engine/tests/chunked_prefill_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_CHUNKED_PREFILL\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 5,
+        "env_name": "FERRUM_CHUNKED_PREFILL",
+        "line": 82,
+        "path": "crates/ferrum-engine/tests/chunked_prefill_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_CHUNKED_PREFILL\", \"64\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 5,
+        "env_name": "FERRUM_CHUNKED_PREFILL",
+        "line": 88,
+        "path": "crates/ferrum-engine/tests/chunked_prefill_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_CHUNKED_PREFILL\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 5,
+        "env_name": "FERRUM_CHUNKED_PREFILL",
+        "line": 105,
+        "path": "crates/ferrum-engine/tests/chunked_prefill_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_CHUNKED_PREFILL\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 5,
+        "env_name": "FERRUM_CHUNKED_PREFILL",
+        "line": 113,
+        "path": "crates/ferrum-engine/tests/chunked_prefill_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_CHUNKED_PREFILL\", \"4\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 5,
+        "env_name": "FERRUM_CHUNKED_PREFILL",
+        "line": 119,
+        "path": "crates/ferrum-engine/tests/chunked_prefill_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_CHUNKED_PREFILL\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 5,
+        "env_name": "FERRUM_CHUNKED_PREFILL",
+        "line": 127,
+        "path": "crates/ferrum-engine/tests/chunked_prefill_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_CHUNKED_PREFILL\", \"4096\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 5,
+        "env_name": "FERRUM_CHUNKED_PREFILL",
+        "line": 133,
+        "path": "crates/ferrum-engine/tests/chunked_prefill_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_CHUNKED_PREFILL\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 9,
+        "env_name": "FERRUM_MODEL_PATH",
+        "line": 25,
+        "path": "crates/ferrum-engine/tests/qwen_concurrency.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_MODEL_PATH\", &model_path);",
+        "test_context": true
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 9,
+        "env_name": "FERRUM_MODEL_PATH",
+        "line": 81,
+        "path": "crates/ferrum-engine/tests/qwen_concurrency.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_MODEL_PATH\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 5,
+        "env_name": "FERRUM_METAL_DTYPE",
+        "line": 85,
+        "path": "crates/ferrum-models/tests/qwen3_f16_parity_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_METAL_DTYPE\", \"f16\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 13,
+        "env_name": "FERRUM_MOE_GRAPH",
+        "line": 280,
+        "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_MOE_GRAPH\", graph_value);",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 13,
+        "env_name": "FERRUM_MOE_BATCH_THRESHOLD",
+        "line": 281,
+        "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_MOE_BATCH_THRESHOLD\", \"2\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 17,
+        "env_name": "FERRUM_VLLM_MOE",
+        "line": 283,
+        "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_VLLM_MOE\", \"1\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 17,
+        "env_name": "FERRUM_VLLM_MOE",
+        "line": 285,
+        "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_VLLM_MOE\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 17,
+        "env_name": "FERRUM_MOE_GRAPH",
+        "line": 301,
+        "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_MOE_GRAPH\", v);",
+        "test_context": true
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 17,
+        "env_name": "FERRUM_MOE_GRAPH",
+        "line": 303,
+        "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_MOE_GRAPH\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 17,
+        "env_name": "FERRUM_MOE_BATCH_THRESHOLD",
+        "line": 306,
+        "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_MOE_BATCH_THRESHOLD\", v);",
+        "test_context": true
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 17,
+        "env_name": "FERRUM_MOE_BATCH_THRESHOLD",
+        "line": 308,
+        "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_MOE_BATCH_THRESHOLD\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 17,
+        "env_name": "FERRUM_VLLM_MOE",
+        "line": 311,
+        "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_VLLM_MOE\", v);",
+        "test_context": true
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "test_only_env_mutation",
+        "column": 17,
+        "env_name": "FERRUM_VLLM_MOE",
+        "line": 313,
+        "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::remove_var(\"FERRUM_VLLM_MOE\");",
+        "test_context": true
+      },
+      {
+        "call": "std::env::set_var",
+        "classification": "test_only_env_mutation",
+        "column": 9,
+        "env_name": "FERRUM_METAL_PAGED_KV",
+        "line": 43,
+        "path": "crates/ferrum-models/tests/qwen3_moe_safetensors_smoke.rs",
+        "reason": "test fixture setup/cleanup outside product runtime paths",
+        "source": "std::env::set_var(\"FERRUM_METAL_PAGED_KV\", \"0\");",
+        "test_context": true
+      }
+    ],
+    "classified_count": 24,
+    "unclassified": [],
+    "unclassified_count": 0,
+    "unused_classifications": [
+      {
+        "call": "std::env::set_var",
+        "classification": "profile_sink_compatibility_bridge",
+        "expected_count": 6,
+        "path": "crates/ferrum-bench-core/src/profile.rs",
+        "reason": "backwards-compatible FERRUM_PROFILE_* process-env materialization; normal server profile wiring uses typed --profile-* arguments",
+        "unused_count": 6
+      },
+      {
+        "call": "std::env::remove_var",
+        "classification": "profile_sink_compatibility_bridge",
+        "expected_count": 1,
+        "path": "crates/ferrum-bench-core/src/profile.rs",
+        "reason": "backwards-compatible FERRUM_PROFILE_* process-env cleanup; normal server profile wiring uses typed --profile-* arguments",
+        "unused_count": 1
+      }
+    ]
+  },
+  "process_env_writes": 24,
+  "process_env_writes_classified": 24,
+  "process_env_writes_unclassified": 0,
+  "product_config_surface": {
+    "allowed_runtime_keys": [
+      "kv_dtype",
+      "kv_max_blocks",
+      "max_batched_tokens",
+      "moe_graph",
+      "paged_max_seqs",
+      "prefix_cache",
+      "preset"
+    ],
+    "errors": [],
+    "exists": true,
+    "ferrum_tokens": [],
+    "path": "ferrum.toml",
+    "runtime_keys": [
+      "kv_dtype",
+      "kv_max_blocks",
+      "max_batched_tokens",
+      "moe_graph",
+      "paged_max_seqs",
+      "prefix_cache"
+    ]
+  },
+  "registry": {
+    "comparison": {
+      "coverage": 146,
+      "coverage_percent": 100.0,
+      "errors": [],
+      "extra_count": 0,
+      "extra_names": [],
+      "ignored_count": 5,
+      "ignored_names": [
+        "FERRUM_GEMM_NR0",
+        "FERRUM_GEMM_NR1",
+        "FERRUM_IDS_TPE_NSG",
+        "FERRUM_IDS_TPE_THREADS",
+        "FERRUM_VLLM_MOE_BF16"
+      ],
+      "missing_count": 0,
+      "missing_names": [],
+      "scan_count": 146
+    },
+    "entries": 146,
+    "errors": [],
+    "exists": true,
+    "ignored_names": {
+      "entries": 5,
+      "errors": [],
+      "exists": true,
+      "names": [
+        "FERRUM_GEMM_NR0",
+        "FERRUM_GEMM_NR1",
+        "FERRUM_IDS_TPE_NSG",
+        "FERRUM_IDS_TPE_THREADS",
+        "FERRUM_VLLM_MOE_BF16"
+      ],
+      "path": "docs/runtime-env-registry-ignore.txt"
+    },
+    "names": [
+      "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+      "FERRUM_BACKEND",
+      "FERRUM_BATCHED_GRAPH",
+      "FERRUM_BATCHED_TRACE",
+      "FERRUM_BATCH_DECODE_PROF",
+      "FERRUM_BATCH_PREFILL_PROF",
+      "FERRUM_BIN",
+      "FERRUM_BIN_FEATURES",
+      "FERRUM_CHUNKED_PREFILL",
+      "FERRUM_CUDA_DEVICE",
+      "FERRUM_CUDA_GRAPH",
+      "FERRUM_CUDA_MAX_KV",
+      "FERRUM_CUTLASS_INCLUDE_DIR",
+      "FERRUM_DEBUG_SPEC_POS",
+      "FERRUM_DECODE_LAYER_PROFILE",
+      "FERRUM_DECODE_OP_PROFILE",
+      "FERRUM_DIAG",
+      "FERRUM_DIAG_ATTN",
+      "FERRUM_DIAG_NUMERICAL",
+      "FERRUM_DIAG_SHAPES",
+      "FERRUM_DIAG_TIMING",
+      "FERRUM_DIR",
+      "FERRUM_DTYPE",
+      "FERRUM_FA2_DIRECT_FFI",
+      "FERRUM_FA2_DIRECT_FFI_SHIM",
+      "FERRUM_FA2_SOURCE",
+      "FERRUM_FA2_SRC_DIR",
+      "FERRUM_FA_DECODE",
+      "FERRUM_FA_LAYOUT_VARLEN",
+      "FERRUM_FA_LEGACY",
+      "FERRUM_FORCE_PER_ITEM",
+      "FERRUM_FUSED_CPU",
+      "FERRUM_FUSED_METAL",
+      "FERRUM_FUSED_MOE_TILE",
+      "FERRUM_FUSED_MOE_TILE_BENCH",
+      "FERRUM_GGUF_LOAD_TRACE",
+      "FERRUM_GRAPH",
+      "FERRUM_GRAPH_PROF",
+      "FERRUM_GRAPH_SKIP_SYNC",
+      "FERRUM_GRAPH_SKIP_UPLOAD",
+      "FERRUM_GREEDY_ARGMAX",
+      "FERRUM_KV_BLOCKS",
+      "FERRUM_KV_CAPACITY",
+      "FERRUM_KV_DTYPE",
+      "FERRUM_KV_MAX_BLOCKS",
+      "FERRUM_M3_PATH",
+      "FERRUM_MARLIN_SKIP_WS_ZERO",
+      "FERRUM_MARLIN_TILE",
+      "FERRUM_MAX_BATCH",
+      "FERRUM_MAX_BATCHED_TOKENS",
+      "FERRUM_MAX_MODEL_LEN",
+      "FERRUM_METAL_CAPTURE",
+      "FERRUM_METAL_DTYPE",
+      "FERRUM_METAL_PAGED_KV",
+      "FERRUM_METAL_QUANT_PROFILE",
+      "FERRUM_MMAP_TRACE",
+      "FERRUM_MODEL_PATH",
+      "FERRUM_MOE_BATCHED",
+      "FERRUM_MOE_BATCHED_DECODE",
+      "FERRUM_MOE_BATCH_THRESHOLD",
+      "FERRUM_MOE_BLOCK_SIZE",
+      "FERRUM_MOE_BUCKETED",
+      "FERRUM_MOE_DEVICE_ROUTE",
+      "FERRUM_MOE_DIRECT_DISPATCH",
+      "FERRUM_MOE_DUMP",
+      "FERRUM_MOE_DUMP_BATCH_X_TOPK",
+      "FERRUM_MOE_FUSED",
+      "FERRUM_MOE_FUSED_GATE_UP_SILU",
+      "FERRUM_MOE_GRAPH",
+      "FERRUM_MOE_HOST_ROUTE",
+      "FERRUM_MOE_HOST_TOPK",
+      "FERRUM_MOE_LARGE_M_BLOCK_SIZE",
+      "FERRUM_MOE_LARGE_M_MIN_PAIRS",
+      "FERRUM_MOE_LOAD_TRACE",
+      "FERRUM_MOE_PREFILL_THRESHOLD",
+      "FERRUM_MOE_PROFILE",
+      "FERRUM_MOE_STREAMS",
+      "FERRUM_NEXT_BATCH_PROF",
+      "FERRUM_NVCC_THREADS",
+      "FERRUM_OPENAI_BASE_URL",
+      "FERRUM_OPENAI_MODEL",
+      "FERRUM_PAGED_FLASH",
+      "FERRUM_PAGED_FLASH_SPLITS",
+      "FERRUM_PAGED_KV",
+      "FERRUM_PAGED_MAX_SEQS",
+      "FERRUM_PARITY_FORCE_EXPERT0",
+      "FERRUM_PARITY_UNIT_SCALES",
+      "FERRUM_PID",
+      "FERRUM_PORT",
+      "FERRUM_PREFILL_OP_PROFILE",
+      "FERRUM_PREFIX_CACHE",
+      "FERRUM_PROFILE_COMMIT_SHA",
+      "FERRUM_PROFILE_CONCURRENCY",
+      "FERRUM_PROFILE_ENV_HASH",
+      "FERRUM_PROFILE_JSONL",
+      "FERRUM_PROFILE_MODEL",
+      "FERRUM_PROFILE_RUNTIME_FLAGS_JSON",
+      "FERRUM_PROFILE_STAGES",
+      "FERRUM_PYTHON",
+      "FERRUM_QWEN_TEST_MODEL_PATH",
+      "FERRUM_QWEN_UNIFIED_PREFILL",
+      "FERRUM_QWEN_UNIFIED_TRACE",
+      "FERRUM_RANK",
+      "FERRUM_RBD_PROF",
+      "FERRUM_REF_CODES",
+      "FERRUM_REF_PCM",
+      "FERRUM_SCHED_NONE_PROF",
+      "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+      "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
+      "FERRUM_SPEC_DRAFT",
+      "FERRUM_SPEC_N",
+      "FERRUM_SPLIT_K_ATTN",
+      "FERRUM_ST_TEMP",
+      "FERRUM_TP",
+      "FERRUM_TRACE_OUT",
+      "FERRUM_TRITON_INT4",
+      "FERRUM_TTS_MIN_FRAMES",
+      "FERRUM_TTS_TEMP",
+      "FERRUM_UNIFIED_GRAPH",
+      "FERRUM_UNIFIED_GREEDY_ARGMAX",
+      "FERRUM_UNIFIED_LAYER_PROF",
+      "FERRUM_UNIFIED_LAYER_PROF_EVERY",
+      "FERRUM_UNIFIED_LAYER_PROF_MAX_M",
+      "FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS",
+      "FERRUM_UNIFIED_POST_PROF",
+      "FERRUM_UNIFIED_PROFILE",
+      "FERRUM_UPDATE_FIXTURES",
+      "FERRUM_USE_CANDLE",
+      "FERRUM_USE_VLLM_PAGED_ATTN",
+      "FERRUM_VLLM_ATOMIC_ADD",
+      "FERRUM_VLLM_DECODE_VARLEN",
+      "FERRUM_VLLM_FP32_REDUCE",
+      "FERRUM_VLLM_MARLIN",
+      "FERRUM_VLLM_MARLIN_SMS",
+      "FERRUM_VLLM_MOE",
+      "FERRUM_VLLM_MOE_BLOCKS_PER_SM",
+      "FERRUM_VLLM_MOE_LOG_CONFIG",
+      "FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT",
+      "FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS",
+      "FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS",
+      "FERRUM_VLLM_MOE_PAIR_IDS",
+      "FERRUM_VLLM_MOE_THREAD_K",
+      "FERRUM_VLLM_MOE_THREAD_N",
+      "FERRUM_VLLM_MOE_ZERO_WS",
+      "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+      "FERRUM_VLLM_VARLEN_TILED_Q4"
+    ],
+    "path": "docs/runtime-env-registry.tsv"
+  },
+  "scan_roots": [
+    "crates",
+    "scripts",
+    "Cargo.toml",
+    "ferrum.toml",
+    ".github"
+  ],
+  "test_process_env_writes": 23,
+  "threshold_errors": [],
+  "top_direct_env_read_files": [
+    {
+      "count": 22,
+      "path": "crates/ferrum-kernels/build.rs"
+    },
+    {
+      "count": 5,
+      "path": "crates/ferrum-cli/src/commands/pull.rs"
+    },
+    {
+      "count": 3,
+      "path": "crates/ferrum-cli/src/commands/embed.rs"
+    },
+    {
+      "count": 3,
+      "path": "crates/ferrum-cli/src/commands/transcribe.rs"
+    },
+    {
+      "count": 3,
+      "path": "crates/ferrum-cli/src/commands/tts.rs"
+    },
+    {
+      "count": 3,
+      "path": "crates/ferrum-cli/tests/quant_kl.rs"
+    },
+    {
+      "count": 3,
+      "path": "crates/ferrum-cli/tests/server_openai_compat.rs"
+    },
+    {
+      "count": 3,
+      "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs"
+    },
+    {
+      "count": 2,
+      "path": "crates/ferrum-cli/src/source_resolver.rs"
+    },
+    {
+      "count": 2,
+      "path": "crates/ferrum-cli/tests/reference_match.rs"
+    },
+    {
+      "count": 2,
+      "path": "crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu"
+    },
+    {
+      "count": 2,
+      "path": "crates/ferrum-models/tests/qwen3_moe_safetensors_smoke.rs"
+    },
+    {
+      "count": 2,
+      "path": "crates/ferrum-models/tests/qwen3_tts_backend_smoke.rs"
+    },
+    {
+      "count": 2,
+      "path": "crates/ferrum-quantization/tests/marlin_moe_vllm_parity_test.rs"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-bench-core/src/env.rs"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-cli/src/commands/list.rs"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-cli/src/commands/run.rs"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-cli/src/commands/serve.rs"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-cli/src/config.rs"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-cli/src/runtime_env.rs"
+    }
+  ],
+  "top_ferrum_token_files": [
+    {
+      "count": 134,
+      "path": "crates/ferrum-types/src/auto_config.rs"
+    },
+    {
+      "count": 88,
+      "path": "crates/ferrum-cli/src/commands/serve.rs"
+    },
+    {
+      "count": 62,
+      "path": "crates/ferrum-models/src/models/qwen3_moe_runtime.rs"
+    },
+    {
+      "count": 53,
+      "path": "crates/ferrum-cli/src/config.rs"
+    },
+    {
+      "count": 44,
+      "path": "crates/ferrum-models/src/moe/dispatch.rs"
+    },
+    {
+      "count": 30,
+      "path": "crates/ferrum-cli/src/source_resolver.rs"
+    },
+    {
+      "count": 29,
+      "path": "crates/ferrum-models/src/models/llama_family.rs"
+    },
+    {
+      "count": 29,
+      "path": "scripts/bottleneck_localize.sh"
+    },
+    {
+      "count": 28,
+      "path": "crates/ferrum-kernels/src/backend/cuda/quant.rs"
+    },
+    {
+      "count": 27,
+      "path": "scripts/bench_vs_vllm.sh"
+    },
+    {
+      "count": 26,
+      "path": "crates/ferrum-kernels/src/backend/cuda/paged.rs"
+    },
+    {
+      "count": 26,
+      "path": "scripts/paris_bisect.sh"
+    },
+    {
+      "count": 23,
+      "path": "scripts/m3_route_unified_profile.sh"
+    },
+    {
+      "count": 21,
+      "path": "crates/ferrum-kernels/src/backend/cuda/cuda_decode.rs"
+    },
+    {
+      "count": 21,
+      "path": "scripts/sweep_bottleneck.sh"
+    },
+    {
+      "count": 20,
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs"
+    },
+    {
+      "count": 19,
+      "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs"
+    },
+    {
+      "count": 18,
+      "path": "crates/ferrum-engine/src/registry.rs"
+    },
+    {
+      "count": 16,
+      "path": "crates/ferrum-cli/src/gpu_mem_autosize.rs"
+    },
+    {
+      "count": 16,
+      "path": "crates/ferrum-cli/src/runtime_env.rs"
+    }
+  ],
+  "top_process_env_write_files": [
+    {
+      "count": 10,
+      "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs"
+    },
+    {
+      "count": 9,
+      "path": "crates/ferrum-engine/tests/chunked_prefill_test.rs"
+    },
+    {
+      "count": 2,
+      "path": "crates/ferrum-engine/tests/qwen_concurrency.rs"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-cli/src/runtime_env.rs"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-models/tests/qwen3_f16_parity_test.rs"
+    },
+    {
+      "count": 1,
+      "path": "crates/ferrum-models/tests/qwen3_moe_safetensors_smoke.rs"
+    }
+  ],
+  "unique_ferrum_env_candidates": 151,
+  "unique_ferrum_tokens": 152,
+  "unique_names": [
+    "FERRUM_2M",
+    "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+    "FERRUM_BACKEND",
+    "FERRUM_BATCHED_GRAPH",
+    "FERRUM_BATCHED_TRACE",
+    "FERRUM_BATCH_DECODE_PROF",
+    "FERRUM_BATCH_PREFILL_PROF",
+    "FERRUM_BIN",
+    "FERRUM_BIN_FEATURES",
+    "FERRUM_CHUNKED_PREFILL",
+    "FERRUM_CUDA_DEVICE",
+    "FERRUM_CUDA_GRAPH",
+    "FERRUM_CUDA_MAX_KV",
+    "FERRUM_CUTLASS_INCLUDE_DIR",
+    "FERRUM_DEBUG_SPEC_POS",
+    "FERRUM_DECODE_LAYER_PROFILE",
+    "FERRUM_DECODE_OP_PROFILE",
+    "FERRUM_DIAG",
+    "FERRUM_DIAG_ATTN",
+    "FERRUM_DIAG_NUMERICAL",
+    "FERRUM_DIAG_SHAPES",
+    "FERRUM_DIAG_TIMING",
+    "FERRUM_DIR",
+    "FERRUM_DTYPE",
+    "FERRUM_FA2_DIRECT_FFI",
+    "FERRUM_FA2_DIRECT_FFI_SHIM",
+    "FERRUM_FA2_SOURCE",
+    "FERRUM_FA2_SRC_DIR",
+    "FERRUM_FA_DECODE",
+    "FERRUM_FA_LAYOUT_VARLEN",
+    "FERRUM_FA_LEGACY",
+    "FERRUM_FORCE_PER_ITEM",
+    "FERRUM_FUSED_CPU",
+    "FERRUM_FUSED_METAL",
+    "FERRUM_FUSED_MOE_TILE",
+    "FERRUM_FUSED_MOE_TILE_BENCH",
+    "FERRUM_GEMM_NR0",
+    "FERRUM_GEMM_NR1",
+    "FERRUM_GGUF_LOAD_TRACE",
+    "FERRUM_GRAPH",
+    "FERRUM_GRAPH_PROF",
+    "FERRUM_GRAPH_SKIP_SYNC",
+    "FERRUM_GRAPH_SKIP_UPLOAD",
+    "FERRUM_GREEDY_ARGMAX",
+    "FERRUM_IDS_TPE_NSG",
+    "FERRUM_IDS_TPE_THREADS",
+    "FERRUM_KV_BLOCKS",
+    "FERRUM_KV_CAPACITY",
+    "FERRUM_KV_DTYPE",
+    "FERRUM_KV_MAX_BLOCKS",
+    "FERRUM_M3_PATH",
+    "FERRUM_MARLIN_SKIP_WS_ZERO",
+    "FERRUM_MARLIN_TILE",
+    "FERRUM_MAX_BATCH",
+    "FERRUM_MAX_BATCHED_TOKENS",
+    "FERRUM_MAX_MODEL_LEN",
+    "FERRUM_METAL_CAPTURE",
+    "FERRUM_METAL_DTYPE",
+    "FERRUM_METAL_PAGED_KV",
+    "FERRUM_METAL_QUANT_PROFILE",
+    "FERRUM_MMAP_TRACE",
+    "FERRUM_MODEL_PATH",
+    "FERRUM_MOE_BATCHED",
+    "FERRUM_MOE_BATCHED_DECODE",
+    "FERRUM_MOE_BATCH_THRESHOLD",
+    "FERRUM_MOE_BLOCK_SIZE",
+    "FERRUM_MOE_BUCKETED",
+    "FERRUM_MOE_DEVICE_ROUTE",
+    "FERRUM_MOE_DIRECT_DISPATCH",
+    "FERRUM_MOE_DUMP",
+    "FERRUM_MOE_DUMP_BATCH_X_TOPK",
+    "FERRUM_MOE_FUSED",
+    "FERRUM_MOE_FUSED_GATE_UP_SILU",
+    "FERRUM_MOE_GRAPH",
+    "FERRUM_MOE_HOST_ROUTE",
+    "FERRUM_MOE_HOST_TOPK",
+    "FERRUM_MOE_LARGE_M_BLOCK_SIZE",
+    "FERRUM_MOE_LARGE_M_MIN_PAIRS",
+    "FERRUM_MOE_LOAD_TRACE",
+    "FERRUM_MOE_PREFILL_THRESHOLD",
+    "FERRUM_MOE_PROFILE",
+    "FERRUM_MOE_STREAMS",
+    "FERRUM_NEXT_BATCH_PROF",
+    "FERRUM_NVCC_THREADS",
+    "FERRUM_OPENAI_BASE_URL",
+    "FERRUM_OPENAI_MODEL",
+    "FERRUM_PAGED_FLASH",
+    "FERRUM_PAGED_FLASH_SPLITS",
+    "FERRUM_PAGED_KV",
+    "FERRUM_PAGED_MAX_SEQS",
+    "FERRUM_PARITY_FORCE_EXPERT0",
+    "FERRUM_PARITY_UNIT_SCALES",
+    "FERRUM_PID",
+    "FERRUM_PORT",
+    "FERRUM_PREFILL_OP_PROFILE",
+    "FERRUM_PREFIX_CACHE",
+    "FERRUM_PROFILE_COMMIT_SHA",
+    "FERRUM_PROFILE_CONCURRENCY",
+    "FERRUM_PROFILE_ENV_HASH",
+    "FERRUM_PROFILE_JSONL",
+    "FERRUM_PROFILE_MODEL",
+    "FERRUM_PROFILE_RUNTIME_FLAGS_JSON",
+    "FERRUM_PROFILE_STAGES",
+    "FERRUM_PYTHON",
+    "FERRUM_QWEN_TEST_MODEL_PATH",
+    "FERRUM_QWEN_UNIFIED_PREFILL",
+    "FERRUM_QWEN_UNIFIED_TRACE",
+    "FERRUM_RANK",
+    "FERRUM_RBD_PROF",
+    "FERRUM_REF_CODES",
+    "FERRUM_REF_PCM",
+    "FERRUM_SCHED_NONE_PROF",
+    "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+    "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
+    "FERRUM_SPEC_DRAFT",
+    "FERRUM_SPEC_N",
+    "FERRUM_SPLIT_K_ATTN",
+    "FERRUM_ST_TEMP",
+    "FERRUM_TP",
+    "FERRUM_TRACE_OUT",
+    "FERRUM_TRITON_INT4",
+    "FERRUM_TTS_MIN_FRAMES",
+    "FERRUM_TTS_TEMP",
+    "FERRUM_UNIFIED_GRAPH",
+    "FERRUM_UNIFIED_GREEDY_ARGMAX",
+    "FERRUM_UNIFIED_LAYER_PROF",
+    "FERRUM_UNIFIED_LAYER_PROF_EVERY",
+    "FERRUM_UNIFIED_LAYER_PROF_MAX_M",
+    "FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS",
+    "FERRUM_UNIFIED_POST_PROF",
+    "FERRUM_UNIFIED_PROFILE",
+    "FERRUM_UPDATE_FIXTURES",
+    "FERRUM_USE_CANDLE",
+    "FERRUM_USE_VLLM_PAGED_ATTN",
+    "FERRUM_VLLM_ATOMIC_ADD",
+    "FERRUM_VLLM_DECODE_VARLEN",
+    "FERRUM_VLLM_FP32_REDUCE",
+    "FERRUM_VLLM_MARLIN",
+    "FERRUM_VLLM_MARLIN_SMS",
+    "FERRUM_VLLM_MOE",
+    "FERRUM_VLLM_MOE_BF16",
+    "FERRUM_VLLM_MOE_BLOCKS_PER_SM",
+    "FERRUM_VLLM_MOE_LOG_CONFIG",
+    "FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT",
+    "FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS",
+    "FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS",
+    "FERRUM_VLLM_MOE_PAIR_IDS",
+    "FERRUM_VLLM_MOE_THREAD_K",
+    "FERRUM_VLLM_MOE_THREAD_N",
+    "FERRUM_VLLM_MOE_ZERO_WS",
+    "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+    "FERRUM_VLLM_VARLEN_TILED_Q4"
+  ]
+}

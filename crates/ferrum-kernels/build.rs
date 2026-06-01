@@ -263,9 +263,10 @@ fn main() {
         compile_vllm_paged_attn(&out_dir_clone);
     }
 
-    // Source-built FlashAttention-2 paged-varlen bridge for the Qwen3 M3
-    // shape. Unlike the runtime FFI shim, this links the FA2 templates into
-    // ferrum-kernels and needs no vLLM/Torch/Python library at runtime.
+    // Ferrum-owned FlashAttention-style paged-varlen bridge for the Qwen3 M3
+    // shape. Unlike the runtime FFI shim and the earlier source-built
+    // prototype, this links only in-repo CUDA code and needs no vLLM, Torch,
+    // Python, FlashAttention checkout, or CUTLASS headers at build/runtime.
     if env::var_os("CARGO_FEATURE_FA2_SOURCE").is_some() {
         compile_fa2_source(&out_dir_clone);
     }
@@ -458,97 +459,10 @@ fn compile_core_ptx(out_dir: &Path) {
     write_core_ptx_bindings(out_dir);
 }
 
-fn find_cutlass_include_dir() -> Option<PathBuf> {
-    println!("cargo:rerun-if-env-changed=FERRUM_CUTLASS_INCLUDE_DIR");
-    println!("cargo:rerun-if-env-changed=CUTLASS_INCLUDE_DIR");
-    for key in ["FERRUM_CUTLASS_INCLUDE_DIR", "CUTLASS_INCLUDE_DIR"] {
-        if let Some(value) = env::var_os(key) {
-            let path = PathBuf::from(value);
-            if path.join("cute").join("tensor.hpp").is_file()
-                && path.join("cutlass").join("cutlass.h").is_file()
-            {
-                return Some(path);
-            }
-        }
-    }
-    for candidate in [
-        "/workspace/vllm-venv/lib/python3.12/site-packages/flashinfer/data/cutlass/include",
-        "/workspace/vllm-venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include",
-        "/workspace/vllm-venv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/include",
-    ] {
-        let path = PathBuf::from(candidate);
-        if path.join("cute").join("tensor.hpp").is_file()
-            && path.join("cutlass").join("cutlass.h").is_file()
-        {
-            return Some(path);
-        }
-    }
-    None
-}
-
 fn compile_fa2_source(out_dir: &PathBuf) {
-    println!("cargo:rerun-if-env-changed=FERRUM_FA2_SRC_DIR");
-    println!("cargo:rerun-if-env-changed=FA_SRC_DIR");
-    let fa_src_dir = env::var_os("FERRUM_FA2_SRC_DIR")
-        .or_else(|| env::var_os("FA_SRC_DIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/workspace/vllm-flash-attention-f5bc33c"));
-    let fa_src = fa_src_dir.join("csrc/flash_attn/src");
-    if !fa_src.join("flash.h").is_file() {
-        panic!(
-            "[fa2-source] FlashAttention source not found at {}. Set FERRUM_FA2_SRC_DIR.",
-            fa_src_dir.display()
-        );
-    }
-    let cutlass_include = find_cutlass_include_dir().unwrap_or_else(|| {
-        panic!("[fa2-source] CUTLASS headers not found; set FERRUM_CUTLASS_INCLUDE_DIR")
-    });
-    let stub_dir = PathBuf::from("kernels/fa2_source/stubs");
-    let stub_files = [
-        stub_dir.join("ferrum_fa2_prelude.h"),
-        stub_dir.join("ATen/cuda/CUDAGeneratorImpl.h"),
-        stub_dir.join("ATen/cuda/detail/UnpackRaw.cuh"),
-        stub_dir.join("c10/cuda/CUDAException.h"),
-    ];
-
-    let local_src = "../../scripts/microbenches/fa2_ferrum_source_shim.cu";
-    let external_sources = [
-        fa_src
-            .join("flash_fwd_split_hdim128_fp16_sm80.cu")
-            .display()
-            .to_string(),
-        fa_src
-            .join("flash_fwd_split_hdim128_fp16_causal_sm80.cu")
-            .display()
-            .to_string(),
-    ];
-    let cu_files: Vec<String> = std::iter::once(local_src.to_string())
-        .chain(external_sources.iter().cloned())
-        .collect();
-    let header_files: Vec<String> = [
-        fa_src.join("flash.h"),
-        fa_src.join("flash_fwd_launch_template.h"),
-        fa_src.join("flash_fwd_kernel.h"),
-        fa_src.join("kernel_traits.h"),
-        fa_src.join("utils.h"),
-        fa_src.join("softmax.h"),
-        fa_src.join("mask.h"),
-        fa_src.join("block_info.h"),
-        fa_src.join("dropout.h"),
-        fa_src.join("rotary.h"),
-        fa_src.join("hardware_info.h"),
-        fa_src.join("namespace_config.h"),
-        fa_src.join("philox_unpack.cuh"),
-    ]
-    .iter()
-    .map(|p| p.display().to_string())
-    .collect();
-    let stub_files: Vec<String> = stub_files.iter().map(|p| p.display().to_string()).collect();
-    for f in cu_files
-        .iter()
-        .chain(header_files.iter())
-        .chain(stub_files.iter())
-    {
+    let cu_files: Vec<String> =
+        vec!["kernels/fa2_source/ferrum_fa2_paged_varlen.cu".to_string()];
+    for f in &cu_files {
         println!("cargo:rerun-if-changed={f}");
     }
 
@@ -567,19 +481,11 @@ fn compile_fa2_source(out_dir: &PathBuf) {
         format!("nvcc={}", nvcc.display()),
         format!("arch=sm_{compute_cap}"),
         format!("threads={nvcc_threads}"),
-        format!("-I{}", stub_dir.display()),
-        format!("-I{}", fa_src.display()),
-        format!("-I{}", cutlass_include.display()),
         "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda"
             .to_string(),
         "-Xcompiler -fPIC -Xcompiler -fvisibility=hidden".to_string(),
     ];
-    let deps: Vec<&str> = cu_files
-        .iter()
-        .chain(header_files.iter())
-        .chain(stub_files.iter())
-        .map(String::as_str)
-        .collect();
+    let deps: Vec<&str> = cu_files.iter().map(String::as_str).collect();
     let signature = static_lib_signature("fa2-source", &deps, &flags);
     let metadata_hash_signature = metadata_hash_static_lib_signature("fa2-source", &deps, &flags);
     let metadata_signature = metadata_static_lib_signature("fa2-source", &deps, &flags);
@@ -629,17 +535,6 @@ fn compile_fa2_source(out_dir: &PathBuf) {
                 "-fvisibility=hidden",
                 "--threads",
                 nvcc_threads.as_str(),
-                "-I",
-                stub_dir.to_str().unwrap(),
-                "-I",
-                fa_src.to_str().unwrap(),
-                "-I",
-                cutlass_include.to_str().unwrap(),
-                "-include",
-                stub_dir
-                    .join("ferrum_fa2_prelude.h")
-                    .to_str()
-                    .expect("prelude path"),
             ])
             .status()
             .unwrap_or_else(|e| panic!("[fa2-source] nvcc spawn failed for {src}: {e}"));

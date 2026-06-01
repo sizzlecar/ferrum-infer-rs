@@ -62,6 +62,18 @@ c32 N=1/64 prompts measured source-linked FA2 `1540.3 tok/s` versus FA-layout
 tested path, but the goal remains open until all-cell N>=3/N=5 confirmation and
 source dependency/defaulting decisions are complete.
 
+2026-06-01 correction/restoration: later inspection showed the `2ba56af`
+`fa2-source` build still depended on an external FlashAttention source checkout
+and CUTLASS headers at build time. The product path is being restored to a
+Ferrum-owned in-repo CUDA C ABI kernel under
+`crates/ferrum-kernels/kernels/fa2_source/ferrum_fa2_paged_varlen.cu`, keeping
+the same `FERRUM_FA2_SOURCE=1` runtime switch and
+`ferrum_fa2_paged_varlen_fwd` ABI. The restored kernel is an in-repo
+warp-partition online-softmax implementation, not the previous full-score
+reader or external FA2 template bridge. Treat the earlier source-linked smoke as
+performance direction evidence only until the native in-repo kernel has fresh
+GPU compile, Paris/multi-turn, and all-cell N>=3/N=5 evidence.
+
 ## Current baseline (2026-05-25 sweep)
 
 Sweep dir: [`docs/bench/sweep-2026-05-25-1631-qwen3-moe-30b-int4/`](../sweep-2026-05-25-1631-qwen3-moe-30b-int4/) · ferrum commit `cbe04ea`, n_repeats=1, num_prompts=30, warmup=5, random in=256 out=128.

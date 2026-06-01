@@ -63,3 +63,9 @@ Interpretation:
   multi-turn, and c32 N=1/64 prompts measured `1540.3 tok/s` versus FA-layout
   `1325.4 tok/s` (`+16.21%`). This is still opt-in and not final/default:
   all-cell N>=3/N=5 confirmation and source dependency productization remain.
+- 2026-06-01 correction: the source-linked smoke above still used external
+  FlashAttention source/CUTLASS at build time. The restored product direction is
+  the in-repo native CUDA C ABI kernel under
+  `crates/ferrum-kernels/kernels/fa2_source/ferrum_fa2_paged_varlen.cu`; fresh
+  GPU correctness/performance evidence is required before treating it as the
+  replacement for FA2 direct FFI.

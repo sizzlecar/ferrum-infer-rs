@@ -1,9 +1,132 @@
 # Goal: Shorten Performance Iteration Loop and Harden Product API
 
-**Status:** draft @ 2026-05-30  
-**Owner:** ferrum core  
-**Source review baseline:** local HEAD `cb95d05`  
+**Status:** draft @ 2026-05-30
+**Owner:** ferrum core
+**Source review baseline:** local HEAD `36e3dc2`
 **Primary scope:** build iteration speed, profiling/benchmark discipline, runtime config clarity, auto configuration, OpenAI-compatible product API
+
+**Evidence refresh:** 2026-06-01 10:19:37 +0800 (local self-test health passes)
+
+## Evidence freshness checks (latest run at 10:19:37 +0800)
+
+- `python3 scripts/m3_cuda_build_boundary_probe.py --self-test` → `ok`
+- `python3 scripts/validate_cuda_build_summary.py --self-test` → `ok`
+- `python3 scripts/validate_cuda_build_boundary_manifest.py --self-test` → `ok`
+- `python3 scripts/m3_validate_runner_artifact.py --self-test` → `ok`
+- `python3 scripts/m3_collect_allcell_runner_artifacts.py --self-test` → `ok`
+- `python3 scripts/validate_real_model_api_smoke.py --self-test` → `ok`
+- `python3 scripts/check_ferrum_env_registry.py --self-test` → `ok`
+- `python3 scripts/m3_cuda_build_boundary_probe.py --iterations 5 --out /tmp/m3-release-touch-probe-20260601-01 --fail-on-limit --no-cargo-verbose` → failed (`nvcc --version` not found / `nvidia-smi` not found)
+- `python3 scripts/check_ferrum_env_registry.py --json --fail-on-registry-gap > docs/bench/dev-loop-product-api-goal-progress-20260601/registry-json-snapshot-20260601.json` → `ok`
+- `python3 scripts/check_ferrum_env_registry.py --json --fail-on-registry-gap --max-direct-env-reads 75 --max-process-env-writes 24 --max-non-test-process-env-writes 1 --max-hot-direct-env-reads 4 > /tmp/registry-threshold-check-20260601.json` → `pass` (values: direct=75, hot=4, non_test_writes=1)
+
+All commands above have explicit status noted above; all tooling self-tests passed while the Milestone A 5-run probe failed in this environment due missing CUDA binaries.
+
+### Evidence index for this run
+
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/local-selftest-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/registry-json-snapshot-20260601.json`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/registry-threshold-check-20260601.json`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-release-touch-probe-20260601-01.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-release-touch-probe-20260601-01-run1-build.log`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-default-path-allcells-local-validate-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-script-local-validate-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/fa2-source-native-restore-20260601.md`
+
+### Next-turn execution path (from this evidence state)
+
+1. On restored CUDA host, run the Milestone A probe from
+   `docs/bench/dev-loop-product-api-goal-progress-20260601/next-runbook-20260601.md` step 1 with `OUT_A` under `/workspace`.
+2. Immediately validate with `python3 scripts/validate_cuda_build_boundary_manifest.py --fail-on-limit --manifest "$OUT_A/build_boundary_manifest.json"` and `python3 scripts/check_fa2_source_native.py`.
+3. On same host, run the all-cell default-path packet from step 2, and after the wrapper returns run
+   `python3 scripts/m3_validate_runner_artifact.py --require-bench "$OUT_I"` where `OUT_I` is the aggregate root.
+4. Only after both step 1-3 artifacts are generated and pass, update this objective file’s blocker list from `hard-blocked` to `closing`.
+## Current Progress Snapshot (2026-06-01)
+
+This objective is being tracked through the following module status packets:
+
+- `docs/status/cuda-build-cache-2026-05-30.md` (Milestone A)
+- `docs/status/structured-profile-2026-05-30.md` (Milestone B)
+- `docs/status/m3-ab-runner-2026-05-30.md` (Milestone C)
+- `docs/status/runtime-env-registry-2026-05-30.md` (Milestone D)
+- `docs/status/auto-config-2026-05-30.md` (Milestone E)
+- `docs/status/openai-api-compat-2026-05-30.md` (Milestone F/G)
+- `docs/status/codebase-shape-2026-05-30.md` (Milestone H)
+- `docs/status/non-regression-gates-2026-05-31.md` (Milestone I)
+- `docs/bench/m3-80pct-goal-2026-05-25/GOAL.md` as M3 80% performance source of truth
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/next-runbook-20260601.md` (next execution runbook)
+
+### Milestone status vs this objective
+
+- A: largely implemented for content-hash cache stamps and structured CUDA build summaries; remaining gap is the 5-iteration release rebuild timing target (`<= 90s p95`) which is not proven yet.
+- B: structured profile schema/events are in use and validated; remaining gap is complete migration of all primary producer coverage and routine use of `structured_jsonl` with required profile groups.
+- C: reusable runner is in place and wrappers migrated for FA2, profile, scheduler, and route/profile flows; remaining gap is broader script migration and stable all-cell publishable packets.
+- D: registry coverage is at `146/146` (scan scope), with parser gates and CI enforcement; remaining work is reducing hot-path direct reads in the remaining small surface and tightening non-product ownership across older compatibility bridges.
+- E: startup `FerrumConfigBuilder`, preset, decision trace, and typed runtime artifacts are in place; remaining gap is making selector-driven defaults the sole owner across all runtime/model/admin paths and further hardware/GPU memory validation.
+- F: OpenAI compatibility coverage is broad for the stub path and contract tests; remaining gap is real-model GPU smoke evidence and a few execution-order tradeoffs around strict schema streaming.
+- G: strict schema handling is implemented for supported subset and rejected for unsupported `response_format.json_schema.strict=true`; remaining gap is a complete production-ready streaming latency story for strict schema while keeping hard validation.
+- H: file ownership and line-count targets are mostly achieved; remaining gap is lowering typed-parameter-arity baseline and final cleanup for long signatures.
+- I: correctness/performance checklist gates are tightened and benchmark impact metadata is required; remaining gap is a published full c1/4/16/32 all-cell, same-pod non-regression packet for default-path claims.
+
+The objective remains incomplete because Milestones A, I, and E have explicit
+remaining acceptance gaps and Milestone F/G still depend on full end-to-end real-model
+artifact proof before final completion.
+
+## Turn log
+
+- `2026-06-01 10:19:37 +0800`: ran and confirmed all configured local self-tests still pass in this workspace:
+  - `m3_cuda_build_boundary_probe`, `validate_cuda_build_summary`,
+    `validate_cuda_build_boundary_manifest`,
+    `m3_validate_runner_artifact`,
+    `m3_collect_allcell_runner_artifacts`,
+    `check_ferrum_env_registry`.
+  - Evidence artifact: `docs/bench/dev-loop-product-api-goal-progress-20260601/local-selftest-20260601.md`
+- `2026-06-01 10:21:00 +0800`: captured registry machine-readable snapshot for target proof replay:
+  - `docs/bench/dev-loop-product-api-goal-progress-20260601/registry-json-snapshot-20260601.json`
+- `2026-06-01 10:22:00 +0800`: attempted Milestone A 5-run boundary probe in local environment. Probe failed on run 1 because CUDA tooling was unavailable (`nvcc` / `nvidia-smi` not found). Evidence saved in:
+  - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-release-touch-probe-20260601-01.md`
+  - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-release-touch-probe-20260601-01-run1-build.log`
+- `2026-06-01 10:40:00 +0800`: added dedicated default-path all-cell
+  executor wrapper and runbook shortcut:
+  - `scripts/m3_default_path_allcells_ab.sh`
+  - `docs/bench/dev-loop-product-api-goal-progress-20260601/next-runbook-20260601.md`
+  - status sync entry in `docs/status/m3-ab-runner-2026-05-30.md`
+- `2026-06-01 10:33:00 +0800`: fixed local validation gating for
+  `scripts/m3_default_path_allcells_ab.sh`:
+  - removed deprecated `validation.touched_areas` token to match validator vocabulary.
+  - validated local `VALIDATE_ONLY=1` execution for all cells via
+    `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-default-path-allcells-local-validate-20260601.md`
+- `2026-06-01 11:05:00 +0800`: hardened the F/G real-model smoke executor:
+  - `scripts/m3_real_model_api_smoke.sh` now writes `run_summary.json` before
+    returning non-zero when a command fails.
+  - fixed `all_passed` calculation so `rc=0` commands count as passed.
+  - added `FERRUM_BIN` for explicit `ferrum pull` binary selection.
+  - added `scripts/validate_real_model_api_smoke.py` so real-model F/G
+    artifacts have a reusable shape/full-suite/pass validator.
+  - local script-only validation is recorded in
+    `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-script-local-validate-20260601.md`.
+- `2026-06-01 11:39:19 +0800`: restored the `fa2-source` product build path away
+  from the accidental external FlashAttention-source dependency:
+  - `crates/ferrum-kernels/build.rs` now builds only the in-repo native C ABI
+    kernel for `fa2-source`.
+  - Added `crates/ferrum-kernels/kernels/fa2_source/ferrum_fa2_paged_varlen.cu`
+    exporting `ferrum_fa2_paged_varlen_fwd`.
+  - Removed the product build dependency on `FERRUM_FA2_SRC_DIR`,
+    `FERRUM_CUTLASS_INCLUDE_DIR`, external FlashAttention source, and CUTLASS
+    headers. GPU build/smoke validation is still pending.
+  - Added `scripts/check_fa2_source_native.py` as a static source-boundary
+    guard; it still needs to be run in the next evidence refresh.
+  - Split runtime semantics so `FERRUM_FA2_SOURCE=1` no longer reports itself
+    through the `fa2_direct_ffi` flag while still using the required
+    FA-compatible K/V pool and C ABI attention dispatch.
+- Next hard-stop decision points remain unchanged: A/I/E/F/G blockers.
+
+### As-of-now blocker state
+
+- `Milestone A` is hard-blocked by missing 5-run release boundary timing proof (`p50 <= 75s`, `p95 <= 90s`) on a restored RTX 4090 pod.
+- `Milestone E` is hard-blocked by unresolved auto-config ownership in benchmark/model/admin startup default branches.
+- `Milestone I` is hard-blocked by absence of a publishable same-pod full-cell default-path evidence packet (`c=1/4/16/32`, `n_repeats >= 3`) including baseline/candidate comparison and regression gates.
+- `Milestone F` and `Milestone G` are blocked for final completion by real-model packet evidence.
 
 ---
 
@@ -19,6 +142,251 @@ Make Ferrum easier to optimize and safer to expose as a product server by fixing
 6. best-known runtime paths are encoded as shell env bundles instead of a validated auto-selection policy.
 
 This goal is achieved only when a developer can make a narrow kernel/API/scheduler change, validate it with a scoped harness, and get comparable artifacts without manually reconstructing environment state from shell scripts and logs.
+
+### Objective item coverage (6-item scope)
+
+| Objective item | Status | Responsible milestone(s) | Evidence anchors |
+|---|---|---|---|
+| 1) Reduce ad-hoc bottleneck localization and log-grep dependency | Partial | B, C | `docs/status/structured-profile-2026-05-30.md`, `docs/status/m3-ab-runner-2026-05-30.md` |
+| 2) Reduce narrow CUDA edit rebuild blast radius | Partial | A, D | `docs/status/cuda-build-cache-2026-05-30.md` |
+| 3) Unify M3 A/B scripts and lifecycle | Partial | C | `docs/status/m3-ab-runner-2026-05-30.md` |
+| 4) Complete OpenAI-compatible product API (tools, errors, usage, contracts) | Partial | F | `docs/status/openai-api-compat-2026-05-30.md` |
+| 5) Structured strict-JSON/tooling in internal request/response model | Partial | F, G | `docs/status/openai-api-compat-2026-05-30.md` |
+| 6) Move defaults from shell/env bundle to validated selector ownership | Partial | E, D | `docs/status/auto-config-2026-05-30.md`, `docs/status/runtime-env-registry-2026-05-30.md` |
+
+## Completion Audit vs Source-of-Truth (2026-06-01)
+
+| Milestone | Evidence status | Coverage in status/docs artifacts | Remaining acceptance gap |
+|---|---|---|---|
+| A (Build cache boundary) | Partially complete | `docs/status/cuda-build-cache-2026-05-30.md` | 5-iteration release rebuild p50/p95 probe is not yet proven `<= 75s/<=90s`; full-release touch timing still exceeds target (`3m17s`) with current Rust-link burden exposed. |
+| B (Structured profiling) | Partially complete | `docs/status/structured-profile-2026-05-30.md` | Core schema/events are in place, but some producer/profile-path migration remains and overhead proof must be kept current for new rows. |
+| C (Unified runner) | Mostly complete | `docs/status/m3-ab-runner-2026-05-30.md` | Need broader wrapper migration stability and publishable all-cell summaries for default-path sweeps. |
+| D (Registry + snapshots) | Complete at current scope, with residual reduction potential | `docs/status/runtime-env-registry-2026-05-30.md` | Remaining work is reducing residual hot-path direct reads to keep all new code from regressing and shrinking product surface where possible. |
+| E (Auto-config + selector) | Partially complete | `docs/status/auto-config-2026-05-30.md` | Selector logic is implemented and persisted to artifacts, but not yet the universal source-of-truth owner for all runtime defaults and model/admin paths. |
+| F (Product API) | Partially complete | `docs/status/openai-api-compat-2026-05-30.md` | Deterministic and stub-contracts are strong; full real-model SDK smoke evidence is still required for completion posture. |
+| G (Strict JSON/schema) | Partially complete | `docs/status/openai-api-compat-2026-05-30.md` | Strict schema is enforced/rejected correctly in many paths; strict streaming still needs final production-ready latency/correctness framing while preserving hard validation guarantees. |
+| H (Codebase shape) | Mostly complete | `docs/status/codebase-shape-2026-05-30.md` | File-size limits are achieved; remaining long-signature baseline cleanup still required to reduce future drift. |
+| I (Gates + non-regression) | Partial hardening complete | `docs/status/non-regression-gates-2026-05-31.md` | Full publishable default-path packet still missing: same-pod c1/4/16/32 (n_repeats >= 3), full correctness/performance regression table, and explicit baseline comparisons. |
+
+### Current objective-impacting gaps
+
+- M3 performance source-of-truth remains `docs/bench/m3-80pct-goal-2026-05-25/GOAL.md`, with opt-in FA2 wins validated and default-path gaps still requiring all-cell confirmation before any completion-level claim.
+- The active goal is currently blocked by evidence completeness, not design intent: A, E, I are the binding gaps for completion with current repo state.
+- Milestone A additionally requires this exact probe run on CUDA-hosted infra before marking completion; local environment is not CUDA-ready for this step.
+
+### Current completion debt (authoritative, as of 2026-06-01)
+
+- Binding blockers for completion:
+  - `Milestone A`: no 5-run release rebuild boundary proof (`p50 <= 75s`, `p95 <= 90s`) committed yet.
+  - `Milestone E`: not all runtime default branches are fully sourced from startup builder/selector defaults with validated precedence metadata.
+  - `Milestone I`: no publishable default-path full-cell same-pod packet (`c=1/4/16/32`, `n_repeats>=3`).
+- Partial blockers that still need closure work:
+  - `Milestone B`: producer migrations and required-event coverage are in place for migrated paths, but remaining paths still need periodic validation as they move.
+  - `Milestone C`: wrapper migration is broad but still depends on final stable all-cell publishable outputs for all active default-path scripts.
+  - `Milestone F/G`: real-model ignored-smoke evidence remains a remaining production proof requirement.
+- Any completion claim that omits one of the binding blockers is invalid regardless of local green checks.
+
+## Milestone Evidence Ledger (current)
+
+The rows below are tied to explicit acceptance requirements in this objective. “Proved” means evidence is present in the status packet(s) and the cited command/output.
+
+### A (Incremental CUDA Build Boundary)
+
+- `cuda build.rs` now uses per-kernel stamped artifacts and emits unified summary lines for each artifact.
+  Evidence: `docs/status/cuda-build-cache-2026-05-30.md` (core-ptx + static library cache-hit summary).
+- Touching `crates/ferrum-kernels/kernels/paged_varlen_attention_vllm.cu` gives attention cache hits for unrelated kernels/libraries when signature unchanged; vLLM-MoE change rebuild scope is isolated to its target artifact.
+  Evidence: `docs/status/cuda-build-cache-2026-05-30.md` (remote no-content/content-change validations).
+- **Not proved yet**: 5 consecutive release rebuild timing gate (`p50 <= 75s`, `p95 <= 90s`) on restored RTX 4090; the recorded 1-shot release rebuild probe is `3m17s`.
+- **Required for completion:** run `scripts/m3_cuda_build_boundary_probe.py --iterations 5 --out ... --fail-on-limit` and persist resulting manifest as the build timing artifact for the final packet.
+
+### B (Structured Profiling and Artifact Schema)
+
+- `ProfileEvent` schema and required field validators are in place.
+  Evidence: `docs/status/structured-profile-2026-05-30.md` (profile parser coverage + self-test).
+- Route/profile scripts now consume structured JSONL events and do not rely on required grep patterns for required events.
+  Evidence: `docs/status/structured-profile-2026-05-30.md`, `docs/status/m3-ab-runner-2026-05-30.md`.
+- Producer coverage and overhead proof are partially in place and must remain current with any newly migrated scripts.
+  Evidence: same.
+
+### C (Unified A/B Runner)
+
+- Runner owns process lifecycle, gate orchestration, manifest writing, and summary metrics.
+  Evidence: `docs/status/m3-ab-runner-2026-05-30.md` and script self-tests.
+- ≥4 scripts migrated; current migrated set is beyond 4 (FA2, FA-layout, profile, route, scheduler/admission variants).
+  Evidence: same.
+- Publishable all-cell summary examples are progressing but still need the final default-path full packet.
+
+### D (Runtime Env Registry and Snapshot)
+
+- Registry coverage currently complete in scan scope (`146/146`) with CI gate.
+  Evidence: `docs/status/runtime-env-registry-2026-05-30.md`.
+- Hot-path direct reads reduced to 4 (vs prior baseline target `<=26`) and are classified.
+  Evidence: same.
+- Remaining improvement: remove remaining compatibility bridge/direct read surfaces as broader conversion lands; keep the current 4-path baseline from regressing.
+
+### E (Auto Configuration and Backend Selection)
+
+- Typed builder, presets, decision trace, and startup artifacts (`effective_config.json`, `decision_trace.jsonl`) are implemented and schema-validated.
+  Evidence: `docs/status/auto-config-2026-05-30.md`.
+- Builder-aware default selection runs through runner-backed M3 preset flow and is used by FA2/FA-layout / profile wrapper paths.
+  Evidence: same.
+- **Not proved yet:** builder as universal owner for all runtime default branches across all benchmark/model/admin hot paths, plus GPU probe-backed memory validation for sequence/token sizing.
+
+### F/G (API + Strict Schema)
+
+- Deterministic contract coverage is broad for tools/functionality and strict schema handling (supported-enforced / unsupported-rejected).
+  Evidence: `docs/status/openai-api-compat-2026-05-30.md`.
+- Ignored real-model SDK smokes exist and validate intended paths but are not yet executed for production evidence.
+  Evidence: same.
+- Open item: document final strict-schema streaming tradeoff and keep proof that non-streaming/streaming gating meets the 100× / 20× deterministic expectations.
+
+### H (Codebase Shape and Ownership)
+
+- Line-count and file split targets for core owned surfaces are currently met.
+  Evidence: `docs/status/codebase-shape-2026-05-30.md`.
+- Remaining work is baseline-signature cleanup to prevent future 16+ param drift.
+
+### I (Correctness and Non-Regression)
+
+- Mandatory checklist fields and benchmark-impact traceability are now enforced in validator schema.
+  Evidence: `docs/status/non-regression-gates-2026-05-31.md`.
+- Default-path all-cell non-regression packet (c1/4/16/32, n_repeats≥3, same-pod baseline comparison) is still missing.
+  Evidence: gap noted in `docs/status/non-regression-gates-2026-05-31.md`.
+
+### Completion packet requirement mapping
+
+To satisfy the final packet requirement, the following artifacts must be present under `docs/bench/` or `docs/status/` before marking complete:
+
+1. `build timing table before/after` — from Milestone A probe manifest + log.
+2. `structured profile sample + schema validation` — from Milestone B fixture/runner smoke.
+3. `migrated runner example artifact` — from a publishable M3 wrapper run + validator.
+4. `env registry + preset + runtime config snapshot example` — from runner `effective_config.json` and registry report.
+5. `auto-config decision trace + selector validation report` — from runner/server artifacts and auto-config tests.
+6. `OpenAI API compatibility matrix + strict JSON/schema report` — from `docs/openai-api-compatibility.md` plus status packet.
+7. `code-size / ownership summary` — from `docs/status/codebase-shape-2026-05-30.md`.
+8. `correctness + performance non-regression report` — from a signed full-cell default-path benchmark packet with `baseline_`/`candidate_` comparison.
+9. `exact local + GPU commands` — in the corresponding status/docs evidence blocks.
+
+Current missing completion packets to generate in this objective run:
+
+- `docs/bench/m3-release-touch-probe-20260601-*.json/.log` — Milestone A timing evidence with limits pass/fail.
+- `docs/bench/m3-default-path-all-cell-80pct-*.*/` — Milestone I publishable packet with `n_repeats>=3` and concurrency cells `1/4/16/32`.
+- `docs/status/auto-config-default-owner-closure-20260601.md` or equivalent section update — Milestone E ownership closure with explicit branch coverage.
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-20260601-*/` — Milestone F/G real-model evidence and streaming strict-schema latency summary (artifact should include `commands.md`, `run_summary.json`, `cargo-test-*.log`, and a passing `scripts/validate_real_model_api_smoke.py "$OUT_F"` result).
+
+### Completion evidence matrix (hard check, no substitutions)
+
+- A completion claim is invalid unless each requirement below has direct evidence in this document or linked status packets:
+  - `Milestone A`: timing packet with manifest + per-run validation; no pass/fail inferred from local notes.
+  - `Milestone B`: profile sample + validator result from structured JSONL path for each claimed migrated profile run.
+  - `Milestone C/I`: one publishable all-cell default-path artifact (`c1/4/16/32`, `n_repeats>=3`) with checklist fields and explicit `not_publishable=false` justification.
+  - `Milestone D/E`: same manifest must carry sorted config snapshots, source/effect metadata, and decision trace IDs.
+  - `Milestone F/G`: strict-schema/compatibility claims require corresponding test/packet citation plus `scripts/validate_real_model_api_smoke.py` pass for the real-model artifact.
+  - `Milestone H`: file-shape/ownership claims point to the latest codebase-shape status snapshot.
+  - `Exact commands`: every bullet above must be traceable to a concrete command line in either a status doc or this file.
+
+## Milestone completion readiness (as-of-now)
+
+| Milestone | Required evidence | Current local/state evidence | Closure status |
+|---|---|---|---|
+| A | 5-run release build boundary manifest (`p50`, `p95`, `limits_pass`), per-run `cuda-build-summary` validation, and `scripts/validate_cuda_build_boundary_manifest.py --fail-on-limit` pass | `scripts/m3_cuda_build_boundary_probe.py` and `scripts/validate_cuda_build_boundary_manifest.py` self-tests pass locally; status packet not yet produced for 5-run release boundary | **blocked** (requires GPU-bound release loop execution) |
+| B | Publishable profile run with structured JSONL event groups and parser/fixture validation | schema + parser + migrated runner validations are in place; status includes structured profile artifacts | **partial** (no new full publishable packet written in this branch) |
+| C | Publishable all-cell runner output with manifest + summaries + validator pass | runner/validator tooling exists and self-tests pass; no new default-path full-cell publish artifact from this change set | **partial** |
+| D | Registry + env snapshot + diff artifact fields in runner manifests | static scan and schema gates pass; status shows `146/146` entries and bounded reads | **close to done** |
+| E | Builder-owned default path decisions for all benchmark/model/admin runtime defaults; same manifest includes source/effect metadata and decision trace parity | runtime selector path exists and artifacts are schema-valid; universal ownership still incomplete | **blocked** |
+| F | Real-model API compatibility packet + strict-schema behavior report | stub contracts are covered in status; `scripts/m3_real_model_api_smoke.sh` defines required command set and artifact shape; real-model packet with `commands.md` + `run_summary.json` still missing | **blocked** |
+| G | Strict-schema production/streaming tradeoff doc + evidence of hard-gated behavior under strict schema | partial in status; final production story still pending | **partial** |
+| H | Shape split, line limits, and signature controls verified in codebase-shape status | verified and tracked | **close to done** |
+| I | Same-pod publishable default-path full-cell non-regression packet (c1/4/16/32, n_repeats>=3) with baseline/candidate and correctness gates | status requires this packet; currently absent | **blocked** |
+
+### Evidence quality rule for this objective
+
+- If a claim in Milestone D/I/F/G is supported only by a status file status line and no corresponding artifact path, the claim is treated as `partial` and does not satisfy completion.
+- For any final completion decision, each row above must be `done` and point to at least one concrete artifact path plus one validation command.
+
+### Priority next validation tasks (next turn)
+
+1. Produce the Milestone A timing packet for 5 consecutive attention-only `ferrum-cli --release` rebuilds and record pass/fail against the `<=75s/<=90s` gate in a committed `docs/bench/*` artifact.
+2. Run/publish a default-path, same-pod, all-cell (c1/4/16/32), n_repeats>=3 comparison packet with full `validation_checklist`, latency/throughput deltas, and local+artifact checks to close Milestone I. Use the explicit per-concurrency+aggregation sequence in `docs/bench/dev-loop-product-api-goal-progress-20260601/next-runbook-20260601.md`. The candidate must be the restored native in-repo `FERRUM_FA2_SOURCE=1` path, not the earlier external FlashAttention-source build or vLLM/Torch direct FFI shim.
+3. Close the remaining auto-config ownership gap by making startup selectors the default owner for all runtime default branches covered by current benchmarks, then document the behavioral deltas (if any) with artifact-backed proof for Milestone E.
+4. Produce a real-model API evidence packet (including strict schema behavior and strict/non-strict streaming behavior) for Milestones F/G via `scripts/m3_real_model_api_smoke.sh`, validate it with `scripts/validate_real_model_api_smoke.py "$OUT_F"`, then include it under the final completion packet. Required artifacts: `commands.md`, `run_summary.json`, and `cargo-test-*.log` in a timestamped `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-*` path.
+5. After #1/#2/#3/#4 complete, run:
+   - `python3 scripts/m3_validate_runner_artifact.py <artifact-root>`
+   - `python3 scripts/validate_cuda_build_boundary_manifest.py --fail-on-limit --manifest <manifest>`
+   - `python3 scripts/check_fa2_source_native.py`
+
+### Next runbook template (reproducible commands)
+
+Canonical executor-facing sequence for this next turn is tracked here:
+
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/next-runbook-20260601.md`
+
+Use these templates when you resume execution (edit paths/tags only):
+
+```bash
+cd /Users/chejinxuan/rust_ws/ferrum-infer-rs
+
+# Milestone A: 5-run release rebuild boundary
+OUT_A=/workspace/m3-release-touch-probe-20260601-$(date +%Y%m%d_%H%M%S)
+python3 scripts/m3_cuda_build_boundary_probe.py \
+  --iterations 5 \
+  --out "$OUT_A" \
+  --fail-on-limit
+python3 scripts/validate_cuda_build_boundary_manifest.py \
+  --fail-on-limit \
+  --manifest "$OUT_A/build_boundary_manifest.json"
+
+# Milestone I: same-pod all-cell default-path packet (example orchestrator)
+OUT_I=/workspace/m3-default-path-allcell-20260601-$(date +%Y%m%d_%H%M%S)
+REPEATS=3 \
+NUM_PROMPTS=128 \
+WARMUP_REQUESTS=10 \
+VALIDATION_CHANGE_TYPE=default_path \
+CONCURRENCIES="1 4 16 32" \
+OUT_ROOT="$OUT_I" \
+BASELINE_ENV_JSON='{"FERRUM_FA_LAYOUT_VARLEN":"1"}' \
+CANDIDATE_ENV_JSON='{"FERRUM_FA_LAYOUT_VARLEN":"1","FERRUM_FA2_SOURCE":"1"}' \
+bash scripts/m3_default_path_allcells_ab.sh
+python3 scripts/m3_validate_runner_artifact.py \
+  --require-bench \
+  "$OUT_I"
+python3 scripts/check_fa2_source_native.py
+
+# Milestone I practical note:
+# - Milestone I now uses the dedicated default-path wrapper above.
+#   The wrapper aggregates per-cell outputs and runs artifact validation by
+#   default; set `VALIDATE_ARTIFACT=0` only when collecting validation manually.
+#   Do not claim default-path closure until c1/4/16/32 rows are present and
+#   both baseline/candidate rows are `not_publishable=false` in the same
+#   aggregate artifact.
+
+# Milestone E: auto-config ownership and decision-trace parity checks
+cargo test -q -p ferrum-types auto_config -- --nocapture
+cargo test -q -p ferrum-types runtime_config -- --nocapture
+cargo test -q -p ferrum-cli config -- --nocapture
+cargo test -q -p ferrum-cli runtime-env -- --nocapture
+cargo test -q -p ferrum-cli source-resolver -- --nocapture
+cargo test -q -p ferrum-cli commands::serve -- --nocapture
+cargo test -q -p ferrum-server route_health_includes_runtime_config_snapshot -- --nocapture
+python3 scripts/m3_ab_runner.py --self-test
+python3 scripts/m3_validate_runner_artifact.py --self-test
+python3 scripts/validate_real_model_api_smoke.py --self-test
+python3 scripts/check_fa2_source_native.py --self-test
+python3 scripts/check_fa2_source_native.py
+python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap
+
+# Milestone F/G: real-model API evidence packet
+# Run the ignored SDK smoke tests documented in docs/status/openai-api-compat-2026-05-30.md
+# (async-openai + Python OpenAI client) against a real model on a controlled GPU path,
+# then store command output, logs, and pass/fail trace in a dedicated completion artifact.
+OUT_F=${OUT_F:-/workspace/m3-real-model-api-smoke-20260601-$(date +%Y%m%d_%H%M%S)}
+MODEL=${MODEL:-qwen3:0.6b} \
+FERRUM_BIN=${FERRUM_BIN:-ferrum} \
+OUT_ROOT="$OUT_F" \
+CARGO_FEATURES=${CARGO_FEATURES:-metal} \
+bash scripts/m3_real_model_api_smoke.sh
+python3 scripts/validate_real_model_api_smoke.py "$OUT_F"
+```
 
 ## Acceptance Summary
 
@@ -159,12 +527,12 @@ This goal is achieved only when a developer can make a narrow kernel/API/schedul
 ### Quantitative Acceptance
 
 - Baseline measured on 2026-05-30:
-  - `143` unique `FERRUM_*` names across `crates/`, `scripts/`, root `Cargo.toml`, and `ferrum.toml`;
-  - `269` direct env reads across the same scope (`std::env::var`, `env::var`, `var_os`, `std::getenv`, `getenv`);
-  - hot core paths (`ferrum-engine/src`, `ferrum-models/src`, `ferrum-kernels/src`, `ferrum-kernels/kernels`) contain `116` unique `FERRUM_*` names and `175` direct env reads.
+  - Current status snapshot reports `152` unique `FERRUM_*` token names in scan scope and `146/146` registry entries;
+  - `75` direct env reads across the same scope (`std::env::var`, `env::var`, `var_os`, `std::getenv`, `getenv`);
+  - hot core paths (`ferrum-engine/src`, `ferrum-models/src`, `ferrum-kernels/src`, `ferrum-kernels/kernels`) contain `120` unique `FERRUM_*` names and `4` hot-path direct env reads.
 - Registry coverage is `100%` for all `FERRUM_*` names found by static scan.
 - CI/static check fails if a new `FERRUM_*` name appears without a registry entry and parser test.
-- Direct env reads in hot core paths are reduced by at least `85%` from the `175` baseline, to `<= 26`.
+- Direct env reads in hot core paths are now at `4` and remain fully classified.
 - No direct env read is allowed inside per-token, per-layer, scheduler-decision, kernel-launch, or request-handling hot loops except allowlisted diagnostic probes that are cached before the loop.
 - CUDA/C++ source has `<= 5` direct `getenv` reads, all diagnostic or build/probe related and registry allowlisted.
 - All default-on behavior for M3 is represented in typed config:
@@ -186,6 +554,11 @@ This goal is achieved only when a developer can make a narrow kernel/API/schedul
   - whether it affects correctness, performance, memory, or diagnostics.
 - Config snapshot diff between two A/B cases is machine-readable and included in the bench summary.
 - Unit tests cover env parsing for boolean, integer, path, and tri-state default/forced-off/forced-on cases.
+
+Notes:
+
+- The numeric baseline in this section is the historical anchor from the initial status snapshot. The latest registry scan (from `docs/status/runtime-env-registry-2026-05-30.md`) currently reports `152` candidate env tokens, `146` registered entries, `75` direct read sites, and `4` hot-path direct reads in the current scan scope.
+- Milestone D acceptance against this update is currently met if coverage remains complete and hot-path direct reads remain within the historical upper bound (`<= 26`), with direct pressure to reduce that further as conversion continues.
 
 ## Milestone E: vLLM-Style Auto Configuration and Backend Selection
 

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 pub(crate) struct Qwen3MoeRuntimeEnv {
     pub(crate) decode_op_profile: bool,
     pub(crate) fa2_direct_ffi: bool,
+    pub(crate) fa2_source: bool,
     pub(crate) fa_layout_varlen: bool,
     pub(crate) greedy_argmax: bool,
     pub(crate) initial_scratch_tokens: usize,
@@ -54,13 +55,14 @@ impl Qwen3MoeRuntimeEnv {
             Some("0" | "false" | "FALSE" | "off" | "OFF") => false,
             Some("1" | "true" | "TRUE" | "on" | "ON") => true,
             Some(_) => true,
-            None => vars.contains_key("FERRUM_FA2_DIRECT_FFI_SHIM") || fa2_source,
+            None => vars.contains_key("FERRUM_FA2_DIRECT_FFI_SHIM"),
         };
         let greedy_argmax = vars.get("FERRUM_GREEDY_ARGMAX").is_some_and(|v| v == "1");
 
         Self {
             decode_op_profile: vars.contains_key("FERRUM_DECODE_OP_PROFILE"),
             fa2_direct_ffi,
+            fa2_source,
             fa_layout_varlen: vars
                 .get("FERRUM_FA_LAYOUT_VARLEN")
                 .is_some_and(|v| v == "1"),
@@ -199,6 +201,7 @@ mod tests {
 
         assert!(env.decode_op_profile);
         assert!(env.fa2_direct_ffi);
+        assert!(!env.fa2_source);
         assert!(env.fa_layout_varlen);
         assert!(env.greedy_argmax);
         assert_eq!(env.initial_scratch_tokens, 4096);
@@ -249,5 +252,13 @@ mod tests {
         assert!(env.qwen_unified_prefill);
         assert!(env.use_vllm_paged_attn);
         assert!(!env.unified_layer_prof_selected(1, 1));
+    }
+
+    #[test]
+    fn qwen3_moe_runtime_env_keeps_fa2_source_distinct_from_direct_ffi() {
+        let env = Qwen3MoeRuntimeEnv::from_env_vars([("FERRUM_FA2_SOURCE", "1")]);
+
+        assert!(env.fa2_source);
+        assert!(!env.fa2_direct_ffi);
     }
 }

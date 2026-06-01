@@ -105,6 +105,19 @@ manual GPU/Metal validation, not the always-on stub path.
 | `async-openai` | Multi-turn typed message builders | `test_openai_client_multi_turn` |
 | Python OpenAI SDK | Non-streaming chat plus streaming chat with `stream_options.include_usage` | `test_python_openai_sdk_chat_and_stream_smoke` |
 
+## Real-Model Evidence Tooling
+
+`scripts/m3_real_model_api_smoke.sh` is the executor wrapper for turning the
+ignored real-model SDK smokes above into a completion-grade F/G evidence packet.
+It records `commands.md`, `run_summary.json`, per-command `cargo-test-*.log`
+files, elapsed milliseconds, and return codes under the selected `OUT_ROOT`.
+
+`scripts/validate_real_model_api_smoke.py` validates the artifact shape. The
+default validator mode requires all seven `async-openai` tests plus the Python
+OpenAI SDK smoke to be present, passing, and backed by per-command log files.
+`--allow-partial` is available only for local/debug packet shape checks and is
+not sufficient for a completion claim.
+
 ## Known Remaining Gaps
 
 - Always-on engine tests cover tokenizer-backed mock-executor paths, including a byte-level tokenizer fixture that differs from whitespace counting. Ignored real-model SDK smokes now assert Qwen3 tokenizer-backed `prompt_tokens` on non-streaming and streaming served paths, but they still need GPU/Metal execution before they become evidence.
