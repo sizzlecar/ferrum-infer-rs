@@ -30,6 +30,10 @@
 - Native source FA2 q2 grouping experiment → microbench positive but full-model c32 negative (`1462.15 tok/s`), reverted by `2197077`
 - Real-model API smoke attempt at `/workspace/m3-real-model-api-smoke-20260601` → failed before SDK tests because `ferrum pull qwen3:0.6b` returned HuggingFace `401 Unauthorized`
 - Real-model direct release-binary API smoke at `/workspace/m3-real-model-api-direct-smoke-20260601` → passed health, chat, usage, streaming usage, json_object, and three-turn recall on `Qwen/Qwen3-0.6B`
+- Alias release-binary smoke at `/workspace/release-alias-serve-qwen3-06b-8ec0858` → `serve qwen3:0.6b` passed without `FERRUM_MODEL_PATH`
+- 8B GGUF CUDA serve smoke at `/workspace/release-qwen3-8b-gguf-cuda-smoke-42ffbe2` → `qwen3:8b-q4_k_m` passed health + OpenAI chat through the CUDA eager-dequant fallback path
+- 8B GGUF CUDA serve smoke at `/workspace/release-llama31-8b-gguf-cuda-smoke-42ffbe2` → `llama3.1:8b-q4_k_m` passed health + OpenAI chat through the CUDA eager-dequant fallback path
+- 8B GGUF Ferrum/vLLM benchmark packet remains pending because Vast instance `38872161` could not restart (`resources_unavailable`), was destroyed, and replacement 4090 creation failed with `insufficient_credit`
 
 All commands above have explicit status noted above; all tooling self-tests passed while the Milestone A 5-run probe failed in this environment due missing CUDA binaries.
 
@@ -218,6 +222,31 @@ completion blocker for the current checkpoint.
   release because it blocked in a debug CUDA build-script path.
 - `2026-06-01 16:31:00 +0800`: added release benchmark plan for saved
   Ferrum/vLLM artifacts: M3 Qwen3-30B-A3B GPTQ Int4 plus GGUF-vs-GGUF
+  Qwen3-8B and LLaMA-3.1-8B comparison tables.
+- `2026-06-01 16:55:00 +0800`: closed the `serve qwen3:0.6b` alias
+  release blocker. Commit `8ec0858` makes the tokenizer factory use typed
+  `model_path` from component config instead of requiring process
+  `FERRUM_MODEL_PATH`; GPU artifact
+  `/workspace/release-alias-serve-qwen3-06b-8ec0858` passed health and
+  OpenAI chat with the alias.
+- `2026-06-01 17:05:00 +0800`: fixed GGUF tokenizer sidecar handling for
+  LLaMA-3.1-8B. Commits `27d12b8` and `f346a87` map the LLaMA GGUF alias to
+  a public tokenizer source and download only tokenizer/config sidecars
+  instead of a full safetensors sibling. Artifact
+  `/workspace/release-llama-gguf-tokenizer-f346a87` passed with GGUF,
+  `tokenizer.json`, and `tokenizer_config.json` present.
+- `2026-06-01 17:20:00 +0800`: added CUDA GGUF eager-dequant fallback support
+  in commit `42ffbe2`. Qwen3-8B and LLaMA-3.1-8B GGUF both passed
+  release-binary OpenAI-compatible smoke on RTX 4090:
+  `/workspace/release-qwen3-8b-gguf-cuda-smoke-42ffbe2` and
+  `/workspace/release-llama31-8b-gguf-cuda-smoke-42ffbe2`. This is a
+  compatibility path, not a native CUDA k-quant performance path.
+- `2026-06-01 17:35:00 +0800`: Vast instance `38872161` was found stopped and
+  could not be restarted after three `state=running` attempts
+  (`resources_unavailable`). It was destroyed per the GPU recovery rule.
+  Replacement RTX 4090 creation on offer `32736582` failed with
+  `insufficient_credit`, so saved 8B Ferrum/vLLM benchmark tables are pending
+  more Vast credit or another available GPU source.
   comparisons for Qwen3-8B and LLaMA-3.1-8B. vLLM GGUF support is treated as
   experimental and must be labeled separately.
 - Next hard-stop decision points are now I/E/F/G blockers; Milestone A must

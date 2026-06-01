@@ -46,6 +46,11 @@ Ferrum model:
 
 - alias: `qwen3:8b-q4_k_m`
 - repo/file: `Qwen/Qwen3-8B-GGUF` / `Qwen3-8B-Q4_K_M.gguf`
+- CUDA serve smoke: `/workspace/release-qwen3-8b-gguf-cuda-smoke-42ffbe2`
+  passed health + OpenAI chat on RTX 4090.
+- Implementation caveat: commit `42ffbe2` uses the CUDA GGUF eager-dequant
+  fallback path. This is compatibility evidence, not a native CUDA k-quant
+  performance claim.
 
 vLLM model:
 
@@ -72,6 +77,11 @@ Ferrum model:
 - alias: `llama3.1:8b-q4_k_m`
 - repo/file: `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF` /
   `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`
+- CUDA serve smoke: `/workspace/release-llama31-8b-gguf-cuda-smoke-42ffbe2`
+  passed health + OpenAI chat on RTX 4090.
+- Implementation caveat: commit `42ffbe2` uses the CUDA GGUF eager-dequant
+  fallback path. This is compatibility evidence, not a native CUDA k-quant
+  performance claim.
 
 vLLM model:
 
@@ -95,3 +105,14 @@ vllm serve ./Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
 vLLM GGUF support is experimental and may be under-optimized. Release tables
 must label GGUF comparisons as GGUF-vs-GGUF and keep them separate from the M3
 GPTQ-Marlin table.
+
+## Current benchmark blocker
+
+The Ferrum side of the 8B GGUF comparisons is now smoke-unblocked. The saved
+Ferrum/vLLM benchmark tables are still pending a runnable GPU instance:
+
+- Vast instance `38872161` could not be restarted after stopping; repeated
+  `state=running` attempts returned `resources_unavailable`.
+- `38872161` was destroyed per the recovery rule.
+- Replacement RTX 4090 creation attempt on offer `32736582` failed with
+  `insufficient_credit`.
