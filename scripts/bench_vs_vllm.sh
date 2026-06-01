@@ -100,7 +100,7 @@ HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 if [ -n "${TOKENIZER_PATH_OVERRIDE:-}" ]; then
     TOK_SNAPSHOT="$TOKENIZER_PATH_OVERRIDE"
 else
-    TOK_REPO_DIR=$(echo "$TOKENIZER_MODEL" | tr '/' '-')
+    TOK_REPO_DIR=$(echo "$TOKENIZER_MODEL" | sed 's#/#--#g')
     TOK_DIR=$(find "$HF_HOME/hub" -type d -name "models--${TOK_REPO_DIR}*" 2>/dev/null | head -1)
     if [ -z "$TOK_DIR" ]; then
         echo "ERROR: tokenizer not found in $HF_HOME/hub/ for $TOKENIZER_MODEL" >&2
