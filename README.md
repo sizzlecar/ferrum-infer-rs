@@ -3,9 +3,16 @@
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
 
-Production-grade LLM inference in Rust. Single binary, OpenAI-compatible, runs on Apple Silicon and CUDA.
+Production-grade LLM inference in Rust: one CLI, one server, Apple Silicon + CUDA backends.
 
 [中文说明](README_zh.md)
+
+## Why look at Ferrum for 10 seconds?
+
+- **One Rust binary** for `ferrum run` and OpenAI-compatible `ferrum serve`; no Python service in the runtime path.
+- **Apple Silicon and NVIDIA CUDA** from the same project, with Metal and CUDA release binaries.
+- **CUDA evidence today:** RTX 4090 + Qwen3-30B-A3B GPTQ-Int4 reaches `0.83x-0.89x` vLLM `0.20.2` throughput in same-pod `n_repeats=5` testing.
+- **Metal evidence today:** Qwen3 / LLaMA 8B and Qwen3-30B-A3B pass correctness, multi-turn, and concurrency release-candidate gates on Apple Silicon.
 
 ## What it is
 
@@ -52,19 +59,19 @@ Older single-model decode checks are also kept for auditability:
 
 The hard case for laptop inference is concurrent serving. ferrum holds its own at single-request decode and pulls ahead as concurrency goes up. Same machine, same `Q4_K_M` GGUFs, same OpenAI-compatible HTTP load — see the audit-quality report at [`docs/bench/macos-2026-05-02/`](docs/bench/macos-2026-05-02/) (env, scripts, raw JSON, logs).
 
-**M1 Max 32 GB · Q4_K_M · output throughput (tok/s)** — best of multiple runs, see [bench report § Methodology](docs/bench/macos-2026-05-02/README.md#methodology--why-two-reruns) for variance and re-run protocol.
+**M1 Max 32 GB · Q4_K_M · output throughput (tok/s)** — current release-candidate regression numbers for ferrum are saved in [`docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/). Baseline engine numbers are from the audit-quality [macOS bench report](docs/bench/macos-2026-05-02/README.md).
 
 | Model | c | ferrum | llama.cpp (b8960) | mistralrs (0.8.1) |
 |---|---:|---:|---:|---:|
-| LLaMA-3.1-8B | 1 | 29.1 | 28.7 | 30.2 |
-| LLaMA-3.1-8B | 8 | **51.3** | 42.3 | 14.6 |
-| LLaMA-3.1-8B | 16 | **96.7** | 67.2 | 23.3 |
-| Qwen3-8B | 16 | **93.2** | 68.6 | 23.5 |
-| Qwen3-30B-A3B (MoE) | 16 | 79.2¹ | 83.4 | panic² |
+| LLaMA-3.1-8B | 1 | **31.7** | 28.7 | 30.2 |
+| LLaMA-3.1-8B | 8 | **51.7** | 42.3 | 14.6 |
+| LLaMA-3.1-8B | 16 | **89.4** | 67.2 | 23.3 |
+| Qwen3-8B | 16 | **86.0** | 68.6 | 23.5 |
+| Qwen3-30B-A3B (MoE) | 16 | 72.5¹ | 83.4 | panic² |
 
 > ¹ ferrum MoE c ≥ 8 requires `FERRUM_MOE_BATCHED=1 FERRUM_MOE_BATCHED_DECODE=1` (currently opt-in). Without it, MoE c = 16 falls to 48 tok/s. ² mistralrs 0.8.1 PoisonError-panics on Qwen3-30B-A3B-Q4_K_M (`add_request.rs:466`) — not a ferrum issue.
 
-> The Qwen3-30B-A3B (MoE) row is the headline. That's the model where Apple Silicon Rust support was effectively missing two months ago. ferrum closed it from a 51 → 80 tok/s gap to llama.cpp in a single PR (#81) by mirroring the Phase-4 paged-KV scaffolding into `Qwen3MoeModel`. On the dense 8B models, ferrum is +36–44% over llama.cpp at c = 16.
+> The Qwen3-30B-A3B (MoE) row is still important because Apple Silicon Rust support for this model class was effectively missing two months ago. The current release candidate runs it correctly with concurrent serving and multi-turn gates, but the latest c = 16 throughput is below llama.cpp and is reported as such here.
 
 The full 36-cell grid (c = 1, 4, 8, 16 across all three engines and three models, including TPOT / TTFT distributions) is in the [bench report](docs/bench/macos-2026-05-02/README.md).
 
@@ -88,7 +95,8 @@ The full 36-cell grid (c = 1, 4, 8, 16 across all three engines and three models
 
 ```bash
 brew tap sizzlecar/ferrum
-brew install ferrum
+brew install ferrum        # macOS Metal / Linux CPU
+brew install ferrum-cuda   # Linux x86_64 CUDA sm89 build
 ferrum --version
 ```
 
@@ -99,12 +107,16 @@ ferrum --version
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64.tar.gz | tar xz
 ./ferrum --help
 
+# Linux x86_64 CUDA, sm89 build
+curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz | tar xz
+LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --help
+
 # macOS Apple Silicon (Metal)
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz | tar xz
 ./ferrum --help
 ```
 
-Linux x86_64 is the CPU build. macOS aarch64 is the Metal build (the same backend that beats llama.cpp at c=16 on the [Group A bench](docs/bench/macos-2026-05-02/README.md)). For CUDA, build from source.
+Linux x86_64 is the CPU build. Linux x86_64 CUDA is built for `sm89` and requires a compatible NVIDIA driver, CUDA runtime, and NCCL runtime on the target host. macOS aarch64 is the Metal build.
 
 ### From source
 
@@ -187,8 +199,8 @@ cargo install ferrum-cli
 # Metal acceleration (macOS)
 cargo install ferrum-cli --features metal
 
-# CUDA acceleration (NVIDIA, requires CUDA toolkit + nvcc)
-cargo install ferrum-cli --features cuda
+# CUDA acceleration from source (NVIDIA, requires CUDA toolkit + nvcc)
+cargo install ferrum-cli --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source
 ```
 
 ## Architecture
