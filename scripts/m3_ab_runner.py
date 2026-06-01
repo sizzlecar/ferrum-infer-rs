@@ -325,6 +325,7 @@ class Runner:
             required.append("paris")
         if gates.get("multi_turn", False):
             required.append("multi_turn_paris")
+            required.append("multi_turn_three_recall")
         required.append("bench_completion")
         return required
 
@@ -1053,6 +1054,43 @@ class Runner:
             print(f"MULTITURN_CONTENT= {content}", flush=True)
             if not ok:
                 raise RuntimeError("multi-turn Paris gate failed")
+
+            payload = {
+                "model": self.hf_model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Remember this checkpoint word: basalt. "
+                            "Also answer: what is the capital of France?"
+                        ),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "The capital of France is Paris. Checkpoint word: basalt.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "What checkpoint word did I give you? Reply with only that word.",
+                    },
+                    {"role": "assistant", "content": "basalt"},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Now reply with only the city and checkpoint word, separated by a slash."
+                        ),
+                    },
+                ],
+                "max_tokens": 48,
+                "temperature": 0.0,
+            }
+            data = self.post_chat(port, payload, paths.case_dir / "multiturn_3round.json")
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            ok = "Paris" in content and "basalt" in content.lower()
+            gates.append({"name": "multi_turn_three_recall", "ok": ok, "content": content})
+            print(f"MULTITURN_3ROUND_CONTENT= {content}", flush=True)
+            if not ok:
+                raise RuntimeError("multi-turn three-round recall gate failed")
 
         return gates
 
