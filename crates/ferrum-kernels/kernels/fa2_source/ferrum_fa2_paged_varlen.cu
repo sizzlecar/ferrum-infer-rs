@@ -53,6 +53,31 @@ __inline__ __device__ float warp_reduce_sum(float val) {
     return val;
 }
 
+__device__ __forceinline__ int fa2_find_seq_idx(
+    const int *__restrict__ cu_seqlens_q,
+    int num_seqs,
+    int token_global) {
+    if (num_seqs <= 8) {
+        int seq_idx = 0;
+        while (seq_idx + 1 < num_seqs && cu_seqlens_q[seq_idx + 1] <= token_global) {
+            seq_idx++;
+        }
+        return seq_idx;
+    }
+
+    int lo = 0;
+    int hi = num_seqs;
+    while (lo + 1 < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (cu_seqlens_q[mid] <= token_global) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 __device__ __forceinline__ const __half *fa_kv_ptr(
     const __half *pool,
     int physical_block,
@@ -93,10 +118,7 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
         return;
     }
 
-    int seq_idx = 0;
-    while (seq_idx + 1 < num_seqs && cu_seqlens_q[seq_idx + 1] <= token_global) {
-        seq_idx++;
-    }
+    const int seq_idx = fa2_find_seq_idx(cu_seqlens_q, num_seqs, token_global);
 
     const int seq_q_start = cu_seqlens_q[seq_idx];
     const int seq_q_end = cu_seqlens_q[seq_idx + 1];
