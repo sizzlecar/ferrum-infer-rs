@@ -141,20 +141,19 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
     const int lane_id = threadIdx.x % FERRUM_FA2_WARP_SIZE;
     const int warp_id = threadIdx.x / FERRUM_FA2_WARP_SIZE;
     const int num_warps = blockDim.x / FERRUM_FA2_WARP_SIZE;
-    const int elems_per_thread = (head_dim + FERRUM_FA2_WARP_SIZE - 1) / FERRUM_FA2_WARP_SIZE;
     extern __shared__ float smem[];
     float *partial_out = smem;
     float *partial_m = partial_out + num_warps * head_dim;
     float *partial_l = partial_m + num_warps;
-    float q_reg[8];
-    float acc[8];
+    float q_reg[4];
+    float acc[4];
     float local_m = -1.0e20f;
     float local_l = 0.0f;
 
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 4; ++i) {
         const int d = lane_id + i * FERRUM_FA2_WARP_SIZE;
-        q_reg[i] = (i < elems_per_thread && d < head_dim) ? __half2float(q_ptr[d]) : 0.0f;
+        q_reg[i] = __half2float(q_ptr[d]);
         acc[i] = 0.0f;
     }
 
@@ -164,13 +163,11 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
         const int physical_block = my_block_table[logical_block];
         float dot = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 4; ++i) {
             const int d = lane_id + i * FERRUM_FA2_WARP_SIZE;
-            if (i < elems_per_thread && d < head_dim) {
-                dot += q_reg[i] *
-                       __half2float(*fa_kv_ptr(k_block_pool, physical_block, slot, kv_head,
-                                               d, block_size, num_kv_heads, head_dim));
-            }
+            dot += q_reg[i] *
+                   __half2float(*fa_kv_ptr(k_block_pool, physical_block, slot, kv_head,
+                                           d, block_size, num_kv_heads, head_dim));
         }
         float score = warp_reduce_sum(dot);
         score = __shfl_sync(0xffffffff, score, 0) * scale;
@@ -182,14 +179,12 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
         local_m = new_m;
 
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 4; ++i) {
             const int d = lane_id + i * FERRUM_FA2_WARP_SIZE;
-            if (i < elems_per_thread && d < head_dim) {
-                const float v_val =
-                    __half2float(*fa_kv_ptr(v_block_pool, physical_block, slot, kv_head,
-                                            d, block_size, num_kv_heads, head_dim));
-                acc[i] = acc[i] * alpha + beta * v_val;
-            }
+            const float v_val =
+                __half2float(*fa_kv_ptr(v_block_pool, physical_block, slot, kv_head,
+                                        d, block_size, num_kv_heads, head_dim));
+            acc[i] = acc[i] * alpha + beta * v_val;
         }
     }
 
@@ -199,11 +194,9 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
     }
 
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 4; ++i) {
         const int d = lane_id + i * FERRUM_FA2_WARP_SIZE;
-        if (i < elems_per_thread && d < head_dim) {
-            partial_out[warp_id * head_dim + d] = acc[i];
-        }
+        partial_out[warp_id * head_dim + d] = acc[i];
     }
     __syncthreads();
 
