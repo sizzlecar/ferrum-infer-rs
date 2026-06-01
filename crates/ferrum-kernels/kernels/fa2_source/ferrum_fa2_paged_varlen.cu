@@ -215,6 +215,8 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
         }
         s_global_max = global_m;
         s_global_sum = global_l;
+        lse[static_cast<size_t>(q_head) * total_q_tokens + token_global] =
+            logf(global_l) + global_m;
     }
     __syncthreads();
 
