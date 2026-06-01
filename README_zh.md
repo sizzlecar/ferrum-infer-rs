@@ -3,9 +3,16 @@
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
 
-Rust 编写的生产级 LLM 推理引擎。单二进制，OpenAI 兼容 API，原生支持 Apple Silicon 与 CUDA。
+Rust 编写的生产级 LLM 推理引擎：一个 CLI、一个 server，同时覆盖 Apple Silicon 与 CUDA。
 
 [English](README.md)
+
+## 为什么值得看 10 秒？
+
+- **一个 Rust 二进制**同时支持 `ferrum run` 和 OpenAI 兼容的 `ferrum serve`；runtime 路径不需要 Python 服务。
+- **同一项目覆盖 Apple Silicon 与 NVIDIA CUDA**，发布包包含 Metal 与 CUDA 二进制。
+- **当前 CUDA 证据：**RTX 4090 + Qwen3-30B-A3B GPTQ-Int4 在 same-pod `n_repeats=5` 测试里达到 vLLM `0.20.2` 的 `0.83x-0.89x` 吞吐。
+- **当前 Metal 证据：**Qwen3 / LLaMA 8B 与 Qwen3-30B-A3B 在 Apple Silicon 上通过正确性、多轮对话和并发 release-candidate gates。
 
 ## 项目简介
 
@@ -52,19 +59,19 @@ commit `e511077` 的发布候选 CUDA smoke 已保存到 [`docs/bench/dev-loop-p
 
 笔记本本地推理的硬骨头是「并发服务」。ferrum 在单请求上和主流引擎打平,并发越高优势越明显。同一台机器、同一份 `Q4_K_M` GGUF、同一份 OpenAI HTTP 压测脚本 —— 完整的可审阅报告(环境、脚本、原始 JSON 与日志)在 [`docs/bench/macos-2026-05-02/`](docs/bench/macos-2026-05-02/)。
 
-**M1 Max 32 GB · Q4_K_M · 输出吞吐 (tok/s)** —— 多次运行取最优值,详细方差与重跑协议见 [bench 报告 § Methodology](docs/bench/macos-2026-05-02/README.md#methodology--why-two-reruns)。
+**M1 Max 32 GB · Q4_K_M · 输出吞吐 (tok/s)** —— ferrum 使用当前 release-candidate 回归数字，证据保存在 [`docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/)。对比引擎数字来自可审阅的 [macOS bench 报告](docs/bench/macos-2026-05-02/README.md)。
 
 | 模型 | c | ferrum | llama.cpp (b8960) | mistralrs (0.8.1) |
 |---|---:|---:|---:|---:|
-| LLaMA-3.1-8B | 1 | 29.1 | 28.7 | 30.2 |
-| LLaMA-3.1-8B | 8 | **51.3** | 42.3 | 14.6 |
-| LLaMA-3.1-8B | 16 | **96.7** | 67.2 | 23.3 |
-| Qwen3-8B | 16 | **93.2** | 68.6 | 23.5 |
-| Qwen3-30B-A3B (MoE) | 16 | 79.2¹ | 83.4 | panic² |
+| LLaMA-3.1-8B | 1 | **31.7** | 28.7 | 30.2 |
+| LLaMA-3.1-8B | 8 | **51.7** | 42.3 | 14.6 |
+| LLaMA-3.1-8B | 16 | **89.4** | 67.2 | 23.3 |
+| Qwen3-8B | 16 | **86.0** | 68.6 | 23.5 |
+| Qwen3-30B-A3B (MoE) | 16 | 72.5¹ | 83.4 | panic² |
 
 > ¹ ferrum MoE 在 c ≥ 8 时需要 `FERRUM_MOE_BATCHED=1 FERRUM_MOE_BATCHED_DECODE=1` (当前为 opt-in)。不开启的话 MoE c = 16 跌到 48 tok/s。² mistralrs 0.8.1 在 Qwen3-30B-A3B-Q4_K_M 上 PoisonError-panic (`add_request.rs:466`) —— 不是 ferrum 的问题。
 
-> Qwen3-30B-A3B (MoE) 这一行是头条 —— 两个月前 Apple Silicon 上 Rust 引擎实质性缺失的就是这种模型。ferrum 通过 PR #81 把 `LlamaFamilyModel` 的 Phase-4 paged-KV 镜像到 `Qwen3MoeModel`,把对 llama.cpp 的差距从 51 → 80 tok/s 抹平。在 dense 8B 模型上 c = 16 ferrum 比 llama.cpp 快 +36–44%。
+> Qwen3-30B-A3B (MoE) 这一行仍然重要：两个月前 Apple Silicon 上 Rust 引擎实质性缺失的就是这种模型。当前 release candidate 能正确运行并通过并发与多轮对话 gates，但最新 c = 16 吞吐低于 llama.cpp，所以这里按当前数字如实展示。
 
 完整的 36-cell 矩阵(c = 1, 4, 8, 16,三引擎 × 三模型,含 TPOT / TTFT 分布)见 [bench 报告](docs/bench/macos-2026-05-02/README.md)。
 
@@ -88,7 +95,8 @@ commit `e511077` 的发布候选 CUDA smoke 已保存到 [`docs/bench/dev-loop-p
 
 ```bash
 brew tap sizzlecar/ferrum
-brew install ferrum
+brew install ferrum        # macOS Metal / Linux CPU
+brew install ferrum-cuda   # Linux x86_64 CUDA sm89 构建
 ferrum --version
 ```
 
@@ -99,12 +107,16 @@ ferrum --version
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64.tar.gz | tar xz
 ./ferrum --help
 
+# Linux x86_64 CUDA, sm89 构建
+curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz | tar xz
+LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --help
+
 # macOS Apple Silicon (Metal)
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz | tar xz
 ./ferrum --help
 ```
 
-Linux x86_64 是 CPU 构建。macOS aarch64 是 Metal 构建(就是在 [Group A bench](docs/bench/macos-2026-05-02/README.md) 中 c=16 击败 llama.cpp 的那个 Metal 后端)。CUDA 用户请从源码构建。
+Linux x86_64 是 CPU 构建。Linux x86_64 CUDA 是 `sm89` 构建，目标机器需要兼容的 NVIDIA driver、CUDA runtime 和 NCCL runtime。macOS aarch64 是 Metal 构建。
 
 ### 从源码
 
@@ -183,8 +195,8 @@ cargo install ferrum-cli
 # Metal 加速 (macOS)
 cargo install ferrum-cli --features metal
 
-# CUDA 加速 (NVIDIA, 需要 CUDA toolkit + nvcc)
-cargo install ferrum-cli --features cuda
+# 从源码构建 CUDA 加速 (NVIDIA, 需要 CUDA toolkit + nvcc)
+cargo install ferrum-cli --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source
 ```
 
 ## 项目结构
@@ -216,7 +228,7 @@ Architecture v2 (Model-as-Code) 的意思是: 模型层是显式的 Rust 泛型,
 - CLI 对话、OpenAI 兼容 HTTP server (含流式)
 - Continuous batching、PagedAttention (CUDA + Metal pools)、前缀缓存、抢占
 - 自研 CUDA decode runner (Qwen3, LLaMA): 比 Candle 快 2×
-- Apple Silicon MoE 推理 (Qwen3-30B-A3B) —— c=16 与 llama.cpp 持平
+- Apple Silicon MoE 推理 (Qwen3-30B-A3B)，并通过正确性、多轮对话和并发 gates
 - INT4 GPTQ with Marlin fused kernel (Blackwell + Ampere); 同时有 Triton w4a16
 - Tensor parallelism (多 GPU NCCL, 持久化 per-rank 线程)
 - Speculative decoding (`--spec-draft <MODEL>` DeepMind accept/reject)
