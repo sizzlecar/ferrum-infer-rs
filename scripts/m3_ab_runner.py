@@ -908,7 +908,9 @@ class Runner:
                 continue
             cmd = str(proc["cmd"])
             reason = None
-            if "bench-serve" in cmd:
+            if re.search(r"(^|[/\s])bench-serve(\s|$)", cmd) or re.search(
+                r"(^|[/\s])ferrum\s+bench-serve(\s|$)", cmd
+            ):
                 reason = "bench-serve-global"
             elif "target/release/ferrum" in cmd or re.search(r"(^|[/\s])ferrum\s+serve\b", cmd):
                 reason = "ferrum-server-global"
