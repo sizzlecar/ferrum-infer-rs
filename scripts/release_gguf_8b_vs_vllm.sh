@@ -56,7 +56,11 @@ run_model() {
         return 1
     }
 
-    if command -v huggingface-cli >/dev/null 2>&1; then
+    if command -v hf >/dev/null 2>&1; then
+        hf download "$tokenizer_model" \
+            --include tokenizer.json tokenizer_config.json special_tokens_map.json chat_template.json \
+            >"$out_dir/tokenizer_pull.log" 2>&1 || true
+    elif command -v huggingface-cli >/dev/null 2>&1; then
         huggingface-cli download "$tokenizer_model" \
             --include tokenizer.json tokenizer_config.json special_tokens_map.json chat_template.json \
             >"$out_dir/tokenizer_pull.log" 2>&1 || true
