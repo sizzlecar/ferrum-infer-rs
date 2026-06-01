@@ -249,20 +249,25 @@ __global__ void ferrum_fa2_paged_varlen_q4_kernel_f16(
     int head_dim,
     int block_size,
     int max_blocks_per_seq,
+    int max_q_tiles,
     float scale) {
     const int q_head = blockIdx.x;
-    const int seq_idx = blockIdx.y;
+    const int seq_idx = blockIdx.y / max_q_tiles;
+    const int q_tile = blockIdx.y - seq_idx * max_q_tiles;
     if (q_head >= num_heads || seq_idx >= num_seqs) {
         return;
     }
 
-    const int seq_q_start = cu_seqlens_q[seq_idx];
+    const int seq_q_base = cu_seqlens_q[seq_idx];
     const int seq_q_end = cu_seqlens_q[seq_idx + 1];
-    const int q_len_raw = seq_q_end - seq_q_start;
-    if (q_len_raw <= 0) {
+    const int seq_q_len = seq_q_end - seq_q_base;
+    const int seq_q_start = seq_q_base + q_tile * 4;
+    if (seq_q_len <= 0 || seq_q_start >= seq_q_end) {
         return;
     }
-    const int q_len = q_len_raw < 4 ? q_len_raw : 4;
+    const int q_len_raw = seq_q_len;
+    const int remaining_q = seq_q_end - seq_q_start;
+    const int q_len = remaining_q < 4 ? remaining_q : 4;
     const int final_kv_len = seq_lens[seq_idx];
     const int prior_kv_len = final_kv_len - q_len_raw;
     if (final_kv_len <= 0) {
@@ -320,7 +325,7 @@ __global__ void ferrum_fa2_paged_varlen_q4_kernel_f16(
 
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            if (r >= q_len || kv_pos > prior_kv_len + r) {
+            if (r >= q_len || kv_pos > prior_kv_len + q_tile * 4 + r) {
                 continue;
             }
             float dot = 0.0f;
@@ -456,8 +461,9 @@ extern "C" __attribute__((visibility("default"))) int ferrum_fa2_paged_varlen_fw
         static_cast<size_t>(num_warps * head_dim + num_warps * 2) * sizeof(float);
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-    if (max_q_len <= 4 && total_q_tokens > num_seqs) {
-        const dim3 q4_grid(num_heads, num_seqs, 1);
+    if (max_q_len > 1) {
+        const int max_q_tiles = (max_q_len + 3) / 4;
+        const dim3 q4_grid(num_heads, num_seqs * max_q_tiles, 1);
         const size_t q4_shared_bytes =
             static_cast<size_t>(num_warps * 4 * head_dim + num_warps * 8 + 8) *
             sizeof(float);
@@ -478,6 +484,7 @@ extern "C" __attribute__((visibility("default"))) int ferrum_fa2_paged_varlen_fw
             head_dim,
             block_size,
             max_blocks_per_seq,
+            max_q_tiles,
             scale);
     } else {
         ferrum_fa2_paged_varlen_kernel_f16<<<grid, block, shared_bytes,
