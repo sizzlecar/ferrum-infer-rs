@@ -1,0 +1,1 @@
+{"id":"36920ef5-6afe-4b83-b79b-0f424dd22595","object":"chat.completion","created":1780334397,"model":"Qwen/Qwen3-0.6B","choices":[{"index":0,"message":{"role":"assistant","content":"Paris"},"finish_reason":"stop"}],"usage":{"prompt_tokens":37,"completion_tokens":2,"total_tokens":39}}

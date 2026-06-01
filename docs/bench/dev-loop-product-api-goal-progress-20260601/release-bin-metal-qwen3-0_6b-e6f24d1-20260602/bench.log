@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=random num_prompts=16 warmup=2 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=4
+  cell closed_loop c=4 — repeat 1/1 (18 prompts including 2 warmup)
+    16 completed / 0 errored / 8.8s
+    summary c=4 (n_repeats=1, no CI)
+      TTFT_ms  p50=386.2  p95=389.4  p99=389.4
+      TPOT_ms  p50=56.8  p95=84.4  p99=97.2
+      ITL_ms   p50=58.5  p95=59.7  p99=128.4
+      throughput      56.8 tok/s
+      goodput         1.82 req/s
+
+→ wrote docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-metal-qwen3-0_6b-e6f24d1-20260602/bench.json
