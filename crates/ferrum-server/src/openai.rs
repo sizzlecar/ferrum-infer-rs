@@ -40,6 +40,12 @@ pub struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
 
+    /// vLLM-compatible extension for benchmark/throughput workloads.
+    /// When true, Ferrum ignores model EOS tokens and stops only on the
+    /// requested token budget or explicit user stop sequences.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore_eos: Option<bool>,
+
     /// Stop sequences
     #[serde(default, deserialize_with = "deserialize_stop_sequences")]
     #[serde(skip_serializing_if = "Option::is_none")]

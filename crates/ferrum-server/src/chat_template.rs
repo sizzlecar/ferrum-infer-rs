@@ -48,7 +48,11 @@ pub(crate) fn render_chat_prompt_with_tools(
         }
         prompt
     } else if model_lower.contains("llama") && model_lower.contains("3") {
-        let mut prompt = String::from("<|begin_of_text|>");
+        // The engine encodes prompts with `add_special=true`, so do not
+        // include `<|begin_of_text|>` here. Including it manually creates a
+        // double-BOS prompt for Llama-3 tokenizers and degrades instruction
+        // following.
+        let mut prompt = String::new();
         if let Some(tool_spec) = render_tool_spec(tools, tool_choice, functions, function_call) {
             prompt.push_str(&format!(
                 "<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
@@ -231,7 +235,7 @@ mod tests {
             ],
             "meta-llama/Llama-3.2-1B-Instruct",
         );
-        assert!(out.starts_with("<|begin_of_text|>"));
+        assert!(!out.starts_with("<|begin_of_text|>"));
         assert!(out.contains("<|start_header_id|>system<|end_header_id|>\n\nsys<|eot_id|>"));
         assert!(out.contains("<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"));
         assert!(out.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
