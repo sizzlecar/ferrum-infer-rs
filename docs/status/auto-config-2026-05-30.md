@@ -169,6 +169,8 @@ python3 -m py_compile \
 python3 scripts/m3_ab_runner.py --self-test
 python3 scripts/m3_validate_runner_artifact.py --self-test
 python3 scripts/m3_collect_allcell_runner_artifacts.py --self-test
+python3 scripts/check_runtime_snapshot_boundary.py --self-test
+python3 scripts/check_runtime_snapshot_boundary.py
 MODEL_DIR=/tmp BIN=/bin/echo OUT_ROOT=/tmp/m3-runner-validate-fa-layout \
   VALIDATE_ONLY=1 bash scripts/m3_fa_layout_varlen_ab.sh
 MODEL_DIR=/tmp BIN=/bin/echo OUT_ROOT=/tmp/m3-runner-validate-route \

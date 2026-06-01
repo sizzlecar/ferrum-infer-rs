@@ -14,6 +14,8 @@ python3 scripts/m3_collect_allcell_runner_artifacts.py --self-test
 python3 scripts/validate_real_model_api_smoke.py --self-test
 python3 scripts/check_fa2_source_native.py --self-test
 python3 scripts/check_fa2_source_native.py
+python3 scripts/check_runtime_snapshot_boundary.py --self-test
+python3 scripts/check_runtime_snapshot_boundary.py
 python3 scripts/m3_cuda_build_boundary_probe.py --self-test
 python3 scripts/validate_cuda_build_summary.py --self-test
 python3 scripts/validate_cuda_build_boundary_manifest.py --self-test
@@ -167,4 +169,5 @@ python3 scripts/m3_validate_runner_artifact.py "$OUT_I" \
 python3 scripts/validate_cuda_build_boundary_manifest.py --fail-on-limit \
   --manifest "$OUT_A/build_boundary_manifest.json"
 python3 scripts/check_fa2_source_native.py
+python3 scripts/check_runtime_snapshot_boundary.py
 ```

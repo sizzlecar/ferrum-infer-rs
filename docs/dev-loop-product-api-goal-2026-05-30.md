@@ -134,6 +134,11 @@ artifact proof before final completion.
   env only when no `EngineConfig` snapshot is supplied. This reduces the M3
   model startup surface that must reconstruct selector defaults from shell env;
   compile/runtime validation is still pending.
+- `2026-06-01 12:32:00 +0800`: added
+  `scripts/check_runtime_snapshot_boundary.py` as a static Milestone E guard
+  for the typed runtime-snapshot path into Qwen3-MoE safetensors startup, and
+  added it to the next-runbook preconditions/finalization checklist. The guard
+  has not been executed yet in this checkpoint.
 - Next hard-stop decision points remain unchanged: A/I/E/F/G blockers.
 
 ### As-of-now blocker state
