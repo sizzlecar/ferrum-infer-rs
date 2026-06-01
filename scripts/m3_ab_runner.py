@@ -1042,6 +1042,27 @@ class Runner:
             if not ok:
                 raise RuntimeError("multi-turn Paris gate failed")
 
+        if gate_config.get("multi_turn_3round", False):
+            payload = {
+                "model": self.hf_model,
+                "messages": [
+                    {"role": "user", "content": "What is the capital of France?"},
+                    {"role": "assistant", "content": "Paris"},
+                    {"role": "user", "content": "Reply with only the first letter of that city."},
+                    {"role": "assistant", "content": "P"},
+                    {"role": "user", "content": "Reply with the full city name again, and nothing else."},
+                ],
+                "max_tokens": 32,
+                "temperature": 0.0,
+            }
+            data = self.post_chat(port, payload, paths.case_dir / "multiturn_3round.json")
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            ok = "Paris" in content
+            gates.append({"name": "multi_turn_3round_paris", "ok": ok, "content": content})
+            print(f"MULTITURN_3ROUND_CONTENT= {content}", flush=True)
+            if not ok:
+                raise RuntimeError("three-round multi-turn Paris gate failed")
+
         return gates
 
     def run_bench(self, paths: RunPaths, port: int) -> None:
