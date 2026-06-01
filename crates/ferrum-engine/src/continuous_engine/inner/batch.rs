@@ -24,10 +24,16 @@ impl EngineInner {
             .get("ferrum_arch")
             .and_then(|value| value.as_str())
             == Some("qwen3moe");
-        let backend_lacks_native_unified = matches!(
-            info.device,
-            ferrum_types::Device::CPU | ferrum_types::Device::Metal
-        );
+        let backend_lacks_native_unified = matches!(info.device, ferrum_types::Device::CPU) || {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                matches!(info.device, ferrum_types::Device::Metal)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                false
+            }
+        };
         if is_qwen3_moe && backend_lacks_native_unified {
             return self.process_batch_legacy_split(batch).await;
         }
