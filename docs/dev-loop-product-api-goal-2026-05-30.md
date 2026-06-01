@@ -51,6 +51,9 @@
   workflow and Homebrew tap generation for `ferrum-cuda` on Linux x86_64
   (`ferrum-linux-x86_64-cuda-sm89.tar.gz`). This is wired but remains
   unproven until the final tag workflow runs.
+- `scripts/check_release_packaging.py` is wired into CI and the release
+  runbook to catch drift between CUDA release assets, Homebrew `ferrum-cuda`,
+  README install commands, and release candidate docs before tagging.
 
 All commands above have explicit status noted above; all tooling self-tests passed while the Milestone A 5-run probe failed in this environment due missing CUDA binaries.
 

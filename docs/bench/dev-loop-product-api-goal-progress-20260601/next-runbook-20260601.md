@@ -16,6 +16,8 @@ python3 scripts/check_fa2_source_native.py --self-test
 python3 scripts/check_fa2_source_native.py
 python3 scripts/check_runtime_snapshot_boundary.py --self-test
 python3 scripts/check_runtime_snapshot_boundary.py
+python3 scripts/check_release_packaging.py --self-test
+python3 scripts/check_release_packaging.py
 python3 scripts/m3_cuda_build_boundary_probe.py --self-test
 python3 scripts/validate_cuda_build_summary.py --self-test
 python3 scripts/validate_cuda_build_boundary_manifest.py --self-test

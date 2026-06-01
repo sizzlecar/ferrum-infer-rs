@@ -88,6 +88,12 @@ jobs:
           python3 -m py_compile scripts/m3_cuda_build_boundary_probe.py
           python3 scripts/m3_cuda_build_boundary_probe.py --self-test
 
+      - name: Release packaging check
+        run: |
+          python3 -m py_compile scripts/check_release_packaging.py
+          python3 scripts/check_release_packaging.py --self-test
+          python3 scripts/check_release_packaging.py
+
       - name: Codebase shape check
         run: cargo test -q -p ferrum-types --test codebase_shape_test -- --nocapture
 
