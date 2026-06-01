@@ -285,7 +285,7 @@ extern "C" __attribute__((visibility("default"))) int ferrum_fa2_paged_varlen_fw
         return 3;
     }
 
-    const int threads = 256;
+    const int threads = (max_kv_len <= 512) ? 128 : 256;
     const dim3 grid(num_heads, total_q_tokens, 1);
     const dim3 block(threads, 1, 1);
     const int num_warps = threads / FERRUM_FA2_WARP_SIZE;
