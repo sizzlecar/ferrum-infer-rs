@@ -1,0 +1,2 @@
+content=The assistant just named Paris.
+passed=true

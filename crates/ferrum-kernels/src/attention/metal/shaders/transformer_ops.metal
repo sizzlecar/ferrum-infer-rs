@@ -330,6 +330,62 @@ kernel void argmax_f32(
     }
 }
 
+kernel void argmax_rows_f32(
+    device const float* data   [[buffer(0)]],
+    device uint*        result [[buffer(1)]],
+    constant ArgmaxParams& p  [[buffer(2)]],
+    uint2 tgpig                [[threadgroup_position_in_grid]],
+    uint2 tpitg                [[thread_position_in_threadgroup]],
+    uint2 tg_size2             [[threads_per_threadgroup]]
+) {
+    const uint row = tgpig.y;
+    const uint tid = tpitg.x;
+    const uint tg_size = tg_size2.x;
+    device const float* row_data = data + row * uint(p.n);
+
+    float local_max = -INFINITY;
+    int local_idx = 0;
+    for (int i = int(tid); i < p.n; i += int(tg_size)) {
+        float v = row_data[i];
+        if (v > local_max) {
+            local_max = v;
+            local_idx = i;
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_max = simd_shuffle_down(local_max, offset);
+        int other_idx = simd_shuffle_down(local_idx, offset);
+        if (other_max > local_max) {
+            local_max = other_max;
+            local_idx = other_idx;
+        }
+    }
+
+    threadgroup float tg_max[32];
+    threadgroup int tg_idx[32];
+    int simd_id = int(tid / 32);
+    int lane = int(tid % 32);
+    if (lane == 0) {
+        tg_max[simd_id] = local_max;
+        tg_idx[simd_id] = local_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float best = tg_max[0];
+        int best_idx = tg_idx[0];
+        int n_simd = (int(tg_size) + 31) / 32;
+        for (int s = 1; s < n_simd; s++) {
+            if (tg_max[s] > best) {
+                best = tg_max[s];
+                best_idx = tg_idx[s];
+            }
+        }
+        result[row] = (uint)best_idx;
+    }
+}
+
 // ── Embedding Lookup ───────────────────────────────────────────────────
 // output[i] = table[index * dim + i]
 // table: [vocab_size, dim], index: scalar, output: [dim]

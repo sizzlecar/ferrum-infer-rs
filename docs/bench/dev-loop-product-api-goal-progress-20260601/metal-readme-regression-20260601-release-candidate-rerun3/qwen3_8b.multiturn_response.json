@@ -1,0 +1,1 @@
+{"id":"748b673a-b77f-4929-b7ca-3d819a838af2","object":"chat.completion","created":1780329847,"model":"Qwen3-8B","choices":[{"index":0,"message":{"role":"assistant","content":"The assistant named Paris."},"finish_reason":"stop"}],"usage":{"prompt_tokens":54,"completion_tokens":6,"total_tokens":60}}

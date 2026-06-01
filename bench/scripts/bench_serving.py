@@ -71,6 +71,7 @@ DEFAULT_PROMPTS: list[str] = [
 class RequestInput:
     prompt: str
     max_tokens: int
+    ignore_eos: bool = False
 
 
 @dataclass
@@ -125,8 +126,11 @@ async def stream_request(
         "messages": [{"role": "user", "content": req.prompt}],
         "max_tokens": req.max_tokens,
         "stream": True,
+        "stream_options": {"include_usage": True},
         "temperature": 0.0,  # deterministic for reproducibility
     }
+    if req.ignore_eos:
+        body["ignore_eos"] = True
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
 
     result = RequestResult(success=False)
@@ -273,7 +277,13 @@ def make_inputs(args: argparse.Namespace) -> list[RequestInput]:
     inputs: list[RequestInput] = []
     for i in range(args.num_prompts):
         prompt = prompts[i % len(prompts)] if args.deterministic_prompts else rng.choice(prompts)
-        inputs.append(RequestInput(prompt=prompt, max_tokens=args.max_tokens))
+        inputs.append(
+            RequestInput(
+                prompt=prompt,
+                max_tokens=args.max_tokens,
+                ignore_eos=args.ignore_eos,
+            )
+        )
     return inputs
 
 
@@ -393,6 +403,11 @@ def main() -> None:
     p.add_argument("--result-file", help="Path to write per-run JSON summary")
     p.add_argument("--label", default="", help="Optional label echoed into the JSON")
     p.add_argument("--no-warmup", action="store_true")
+    p.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="Request vLLM-compatible ignore_eos=true so throughput cells run to max_tokens.",
+    )
     args = p.parse_args()
 
     inputs = make_inputs(args)

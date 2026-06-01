@@ -108,17 +108,20 @@ fn parse_positive_usize_env(vars: &HashMap<String, String>, name: &str) -> Optio
 fn resolve_stop_conditions(
     params: &SamplingParams,
     tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+    ignore_eos: bool,
 ) -> (HashSet<u32>, Vec<String>) {
     let mut ids: HashSet<u32> = HashSet::new();
     let mut text_seqs: Vec<String> = Vec::new();
 
     if let Some(tok) = tokenizer {
-        if let Some(eos) = tok.special_tokens().eos_token {
-            ids.insert(eos.get());
-        }
-        for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"] {
-            if let Some(t) = tok.token_id(name) {
-                ids.insert(t.get());
+        if !ignore_eos {
+            if let Some(eos) = tok.special_tokens().eos_token {
+                ids.insert(eos.get());
+            }
+            for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"] {
+                if let Some(t) = tok.token_id(name) {
+                    ids.insert(t.get());
+                }
             }
         }
         for stop_seq in &params.stop_sequences {
@@ -258,8 +261,13 @@ impl SequenceState {
             }
             _ => None,
         };
+        let ignore_eos = request
+            .metadata
+            .get("ferrum_ignore_eos")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
         let (stop_token_ids, stop_text_seqs) =
-            resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref());
+            resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref(), ignore_eos);
         Self {
             request_id: request.id.clone(),
             original_request: request.clone(),

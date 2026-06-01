@@ -93,6 +93,12 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
                 self.use_vllm_paged_attn
             );
         }
+        if !B::supports_varlen_qkv() {
+            return Err(FerrumError::unsupported(
+                "Qwen3MoeModel::unified_forward: backend lacks varlen QKV kernels. \
+                 Engine will fall back to legacy paths.",
+            ));
+        }
         // Pure-decode shortcut: every item is q_len=1 + is_final_chunk.
         // For this shape, ferrum's legacy `forward_layer_batched_decode`
         // path (with FERRUM_MOE_GRAPH=1 graph capture + decode-tuned

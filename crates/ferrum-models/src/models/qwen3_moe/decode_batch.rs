@@ -49,13 +49,16 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             .expect("scratch residual missing (previous call didn't restore)");
         B::embedding_lookup(&mut ctx, &self.embed, &tokens, &mut residual, h);
 
-        // Pre-populate paged-batch scratch (block_tables / context_lens
-        // / pos_offsets / cu_seqlens_q) ONCE before the layer loop. All
-        // layers share the same per-step host state for a given
-        // cache_id, so 1 set of write_typeds replaces num_layers sets.
-        // This is also the prerequisite for CUDA Graph capture — H2D
-        // copies inside captured regions record stale host pointers.
-        self.populate_paged_batch_scratch_decode(&mut ctx, batch, m);
+        // CUDA varlen/graph path: pre-populate paged-batch scratch
+        // (block_tables / context_lens / pos_offsets / cu_seqlens_q) ONCE
+        // before the layer loop. Metal has no varlen QKV kernel and must
+        // keep the historical PR #81 per-layer metadata/bump flow inside
+        // `forward_layer_batched_decode`; moving that work out of the layer
+        // loop regressed Qwen3-30B-A3B c16 on Apple Silicon by ~4x.
+        let prepopulate_paged_decode = self.paged_pools.is_some() && B::supports_varlen_qkv();
+        if prepopulate_paged_decode {
+            self.populate_paged_batch_scratch_decode(&mut ctx, batch, m);
+        }
 
         // ── CUDA-graph capture/replay (FERRUM_MOE_GRAPH=1) ───────────
         //
@@ -94,12 +97,16 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         // `total_pairs * intermediate_size` (phase 3 is the bigger k).
         let total_pairs = m * self.cfg.num_experts_per_tok;
         let max_marlin_required = total_pairs * self.cfg.expert_intermediate_size;
-        B::pregrow_marlin_gather_scratch(&mut ctx, max_marlin_required);
+        if prepopulate_paged_decode {
+            B::pregrow_marlin_gather_scratch(&mut ctx, max_marlin_required);
+        }
 
         // Settle pre-work (write_typeds + embed + pregrow) before
         // begin_capture or replay — the captured region must start
         // from a quiescent stream state.
-        B::sync(&mut ctx);
+        if prepopulate_paged_decode {
+            B::sync(&mut ctx);
+        }
 
         let mut did_pure_replay = false;
         if graph_enabled && cache_has_key && !self.batched_graph_failed {
@@ -577,6 +584,47 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             // SAFETY: pools allocated-once, see paged_pools field comment.
             let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
 
+            let mut metal_pos_offsets_host: Option<Vec<u32>> = None;
+            if !B::supports_varlen_qkv() {
+                // Historical Metal path from PR #81: gather per-seq
+                // metadata, bump this layer's cache length, and upload the
+                // batched block/context tensors before the per-item QKV
+                // writes. CUDA does this once outside the layer loop via
+                // populate_paged_batch_scratch_decode; Metal has no varlen
+                // QKV kernel and must keep the per-layer flow.
+                let mut stacked_bt: Vec<u32> = vec![0u32; m * max_blocks_per_seq];
+                let mut stacked_cl: Vec<u32> = vec![0u32; m];
+                let mut pos_offsets_host: Vec<u32> = vec![0u32; m];
+                for (i, (cache_id, _, _)) in batch.iter().enumerate() {
+                    let caches = self
+                        .kv_caches
+                        .get_mut(cache_id)
+                        .expect("paged batched: cache not present");
+                    let cache = &mut caches[li];
+                    pos_offsets_host[i] = cache.len as u32;
+                    let blocks = &cache.paged_block_indices;
+                    let n_to_copy = blocks.len().min(max_blocks_per_seq);
+                    stacked_bt[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
+                        .copy_from_slice(&blocks[..n_to_copy]);
+                    cache.len += 1;
+                    stacked_cl[i] = cache.len as u32;
+                }
+
+                let bt_buf = self
+                    .scratch
+                    .paged_batch_block_tables
+                    .as_mut()
+                    .expect("paged_batch_block_tables missing");
+                B::write_typed::<u32>(ctx, bt_buf, &stacked_bt);
+                let cl_buf = self
+                    .scratch
+                    .paged_batch_context_lens
+                    .as_mut()
+                    .expect("paged_batch_context_lens missing");
+                B::write_typed::<u32>(ctx, cl_buf, &stacked_cl);
+                metal_pos_offsets_host = Some(pos_offsets_host);
+            }
+
             // Step 1: write K/V into the shared pool + RoPE'd Q into
             // paged_batch_q at offset i × q_dim. Two code paths:
             //
@@ -635,13 +683,16 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 )
                 .expect("split_qkv_norm_rope_into_paged_cache_varlen (batched)");
             } else {
-                // Per-item fallback. Element size for qkv / Q output is the
-                // backend's `Buffer` payload type — FP16 on CUDA / Metal,
-                // FP32 on CPU. The Metal MoE path lives on FP16 buffers
-                // (`half::f16`), matching what llama_family's batched-
-                // decode path uses.
-                let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
-                let q_head_major_size_bytes = (q_dim * std::mem::size_of::<half::f16>()) as u64;
+                // Per-item fallback. The known-good Metal PR #81 path used
+                // FP16 byte strides here (matching llama_family batched
+                // decode). Keep this exactly aligned with fbdfcfe.
+                let qkv_stride_bytes =
+                    (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
+                let q_head_major_size_bytes =
+                    (q_dim * std::mem::size_of::<half::f16>()) as u64;
+                let pos_offsets_host = metal_pos_offsets_host
+                    .as_ref()
+                    .expect("Metal per-item fallback pos_offsets missing");
                 for (i, (cache_id, _, _)) in batch.iter().enumerate() {
                     let caches = self
                         .kv_caches
@@ -652,12 +703,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                         .block_table
                         .as_ref()
                         .expect("paged batched: cache.block_table missing");
-                    // Pre-append cache.len = post-bump cache.len - 1.
-                    // `populate_paged_batch_scratch_decode` (called once
-                    // before the layer loop) already bumped this layer's
-                    // cache.len by 1; the per-item kernel uses pre-append
-                    // pos for BOTH RoPE position AND K/V write offset.
-                    let pos_i = cache.len.saturating_sub(1);
+                    let pos_i = pos_offsets_host[i] as usize;
                     let bt_raw = bt as *const B::Buffer;
                     // SAFETY: bt is read-only in the dispatch; we don't
                     // mutate self.kv_caches between this raw deref and
@@ -683,7 +729,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                         pos_i,
                         eps,
                         qk_mode,
-                        pos_i, // cache_len = pre-append
+                        pos_i,
                         block_size,
                         max_blocks_per_seq,
                     )

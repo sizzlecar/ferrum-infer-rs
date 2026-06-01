@@ -71,7 +71,7 @@ use crate::attention::metal::pipelines::MetalPipelines;
 use crate::attention::AttentionParams;
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
-use metal::{Device, MTLResourceOptions};
+use metal::{Device, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -1028,6 +1028,56 @@ impl Backend for MetalBackend {
                 other.name()
             ),
         }
+    }
+
+    fn argmax_rows_f16(
+        ctx: &mut Self::Context,
+        logits: &Self::Buffer,
+        m: usize,
+        n: usize,
+    ) -> Result<Vec<u32>> {
+        if !matches!(logits.dtype, Dtype::F32) {
+            let host = Self::to_vec(logits, m * n);
+            let mut out = Vec::with_capacity(m);
+            for row in 0..m {
+                let slice = &host[row * n..(row + 1) * n];
+                let mut max_idx = 0usize;
+                let mut max_val = f32::NEG_INFINITY;
+                for (i, &v) in slice.iter().enumerate() {
+                    if v > max_val {
+                        max_val = v;
+                        max_idx = i;
+                    }
+                }
+                out.push(max_idx as u32);
+            }
+            return Ok(out);
+        }
+
+        #[repr(C)]
+        struct ArgmaxParams {
+            n: i32,
+        }
+
+        let out = st().pipes.device.new_buffer(
+            (m * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let params = ArgmaxParams { n: n as i32 };
+        let enc = ctx.compute_encoder();
+        enc.set_compute_pipeline_state(st().pipes.pipeline("argmax_rows_f32"));
+        enc.set_buffer(0, Some(&logits.raw), 0);
+        enc.set_buffer(1, Some(&out), 0);
+        enc.set_bytes(
+            2,
+            std::mem::size_of::<ArgmaxParams>() as u64,
+            &params as *const _ as *const c_void,
+        );
+        enc.dispatch_thread_groups(MTLSize::new(1, m as u64, 1), MTLSize::new(256, 1, 1));
+        ctx.flush();
+        let ptr = out.contents() as *const u32;
+        let tokens = unsafe { std::slice::from_raw_parts(ptr, m).to_vec() };
+        Ok(tokens)
     }
 
     fn from_slice(data: &[f32]) -> Self::Buffer {

@@ -838,8 +838,13 @@ impl FerrumConfigBuilder {
         if greedy && !self.hardware.compiled_features.greedy_argmax {
             return self.invalid("FERRUM_GREEDY_ARGMAX", "GPU argmax is not compiled");
         }
-        if greedy && !self.is_cuda_backend() {
-            return self.invalid("FERRUM_GREEDY_ARGMAX", "GPU argmax requires CUDA backend");
+        if greedy
+            && !(self.is_cuda_backend() || self.hardware.backend.eq_ignore_ascii_case("metal"))
+        {
+            return self.invalid(
+                "FERRUM_GREEDY_ARGMAX",
+                "greedy argmax requires CUDA or Metal backend",
+            );
         }
         Ok(())
     }
