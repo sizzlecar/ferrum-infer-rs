@@ -26,6 +26,7 @@
 - Vast RTX 4090 5-run Milestone A cache-hit release touch probe at `/workspace/m3-release-touch-probe-cachehit-20260601-20260601_043825` → executed successfully but timing gate failed (`p50=231.517s`, `p95=234.608s`, limits `75s/90s`; every run had `cache_hit=39` CUDA summary rows)
 - Vast RTX 4090 5-run Milestone A thin-LTO release touch probe at `/workspace/m3-release-touch-probe-thinlto-20260601-20260601_064127` → passed timing gate (`p50=33.164s`, `p95=34.454s`, limits `75s/90s`; every run had `cache_hit=39` CUDA summary rows)
 - Native source FA2 all-cell N=3 at `/workspace/m3-fa2-source-current-allcells-n3-20260601` → artifact validator `ok=true`, all c=1/4/16/32 correctness gates passed, c32 source FA2 `1488.08 tok/s` (`0.754×` vLLM)
+- User-adjusted formal release performance threshold is `0.75× vLLM`; the native source FA2 all-cell N=3 packet passes this release threshold for all cells.
 - Native source FA2 q2 grouping experiment → microbench positive but full-model c32 negative (`1462.15 tok/s`), reverted by `2197077`
 - Real-model API smoke attempt at `/workspace/m3-real-model-api-smoke-20260601` → failed before SDK tests because `ferrum pull qwen3:0.6b` returned HuggingFace `401 Unauthorized`
 
@@ -47,6 +48,7 @@ All commands above have explicit status noted above; all tooling self-tests pass
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-fa2-source-current-allcells-n3-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-native-fa2-q2-negative-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-hf401-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/release-readiness-20260601.md`
 
 ### Next-turn execution path (from this evidence state)
 
@@ -193,7 +195,9 @@ completion blocker for the current checkpoint.
   validation at `/workspace/m3-fa2-source-current-allcells-n3-20260601`.
   Artifact validation passed with 8 bench rows. Source FA2 measured c1
   `157.18`, c4 `448.36`, c16 `1115.58`, c32 `1488.08` tok/s; c32 remains
-  about `0.754×` of same-pod vLLM and does not close the M3 80% target.
+  about `0.754×` of same-pod vLLM. Under the user-adjusted formal release
+  threshold of `0.75× vLLM`, all four cells pass; the previous `0.80×` target
+  remains a stretch target.
 - `2026-06-01 16:10:00 +0800`: tested native FA2 q2 grouping candidate
   `3a5ab00`. Standalone nvcc microbench improved large prefill-like shapes by
   about `+34%/+36%`, but full-model c32 N=3 regressed to `1462.15 tok/s`, so
@@ -212,9 +216,10 @@ completion blocker for the current checkpoint.
   restored-pod proof (`p50=33.164s`, `p95=34.454s`, required
   `<=75s/<=90s`) with all CUDA artifacts at cache-hit.
 - `Milestone E` is hard-blocked by unresolved auto-config ownership in benchmark/model/admin startup default branches.
-- `Milestone I` has source-FA2 all-cell N=3 evidence, but remains blocked for
-  final completion by absence of a publishable same-pod full-cell default-path
-  packet and by c32 source FA2 still being below 0.80× vLLM.
+- `Milestone I` has source-FA2 all-cell N=3 evidence and passes the adjusted
+  `0.75× vLLM` formal release threshold. It remains open only if the release
+  requires source FA2 to become the default path rather than a release-supported
+  opt-in path.
 - `Milestone F` and `Milestone G` are blocked for final completion by
   real-model packet evidence; the latest attempt failed at `qwen3:0.6b` pull
   with HuggingFace 401.
@@ -261,7 +266,7 @@ This goal is achieved only when a developer can make a narrow kernel/API/schedul
 
 ### Current objective-impacting gaps
 
-- M3 performance source-of-truth remains `docs/bench/m3-80pct-goal-2026-05-25/GOAL.md`, with opt-in FA2 wins validated and default-path gaps still requiring all-cell confirmation before any completion-level claim.
+- M3 performance source-of-truth remains `docs/bench/m3-80pct-goal-2026-05-25/GOAL.md`. As of 2026-06-01, formal release performance threshold is `0.75× vLLM`; `0.80×` remains a stretch goal.
 - The active goal is currently blocked by evidence completeness, not design intent: E, I, and F/G are the binding gaps for completion with current repo state.
 - Milestone A now has CUDA-hosted release-boundary proof for this checkpoint; future kernel/build changes must keep the same probe green.
 
@@ -269,9 +274,9 @@ This goal is achieved only when a developer can make a narrow kernel/API/schedul
 
 - Binding blockers for completion:
   - `Milestone E`: not all runtime default branches are fully sourced from startup builder/selector defaults with validated precedence metadata.
-  - `Milestone I`: source-FA2 full-cell same-pod packet exists, but no
-    publishable final default-path packet exists and c32 source FA2 remains
-    below 0.80× vLLM.
+  - `Milestone I`: source-FA2 full-cell same-pod packet exists and passes the
+    `0.75× vLLM` release threshold. The remaining decision is whether this
+    release ships source FA2 as opt-in or makes it selector/default-owned.
 - Partial blockers that still need closure work:
   - `Milestone B`: producer migrations and required-event coverage are in place for migrated paths, but remaining paths still need periodic validation as they move.
   - `Milestone C`: wrapper migration is broad but still depends on final stable all-cell publishable outputs for all active default-path scripts.

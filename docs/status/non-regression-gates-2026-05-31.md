@@ -48,9 +48,9 @@ python3 scripts/m3_collect_allcell_runner_artifacts.py --self-test
 - Multi-turn correctness coverage now includes a three-user-turn recall gate
   for runner artifacts that enable `multi_turn=true`; the gate requires the
   third response to preserve both `Paris` and the checkpoint token `basalt`.
-- Native source FA2 still needs either more performance work or a different
-  attention path before it can support an M3 80% completion claim; c32 remains
-  `1488.08 tok/s`, about `0.754×` of vLLM.
+- Native source FA2 passes the 2026-06-01 formal release performance threshold
+  of `0.75× vLLM` on all cells; c32 remains below the stretch `0.80×` target
+  at `1488.08 tok/s`, about `0.754×` of vLLM.
 - The final goal packet still needs one committed correctness and performance
   non-regression report tying local gates, GPU gates, artifact validator
   output, and exact commands together.

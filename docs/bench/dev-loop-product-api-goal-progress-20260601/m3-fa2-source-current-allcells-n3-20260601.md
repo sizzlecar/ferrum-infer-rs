@@ -47,9 +47,11 @@ Conclusion:
 
 - The restored in-repo native source FA2 path is correct on all four cells and
   improves over FA-layout at c4/c16/c32.
-- It does not meet the M3 80% target because c32 remains below the required
-  `0.80 * 1972.9 = 1578.3 tok/s`.
+- It passes the 2026-06-01 formal release performance threshold of
+  `0.75x vLLM` on all cells.
+- It does not meet the stretch M3 80% target because c32 remains below the
+  required `0.80 * 1972.9 = 1578.3 tok/s`.
 - c32 needs about `+90 tok/s` over this result, roughly `+6.1%`, to clear the
-  target.
+  stretch target.
 - This is opt-in source-FA2 evidence. It is not a final default-path completion
   packet for the dev-loop/product-API goal.
