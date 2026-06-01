@@ -229,20 +229,27 @@ async fn test_openai_client_chat_streaming() {
     // async-openai parses SSE events into typed `CreateChatCompletionStreamResponse`.
     // Bad event format (missing `data:` prefix, wrong JSON, `[DONE]` malformed)
     // causes the stream to error mid-way; we assert clean iteration to
-    // end-of-stream + non-empty concatenated delta.
+    // end-of-stream + non-empty concatenated delta. The include_usage final
+    // chunk also verifies streaming usage uses the same tokenizer accounting
+    // as the non-streaming path.
+    const PROMPT: &str = "Say hi in one short sentence.";
+    let expected_prompt_tokens = qwen3_prompt_tokens_for_user_message(PROMPT);
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
     let client = fx.client();
 
     let request = CreateChatCompletionRequestArgs::default()
         .model(SMOKE_MODEL)
         .messages([ChatCompletionRequestUserMessageArgs::default()
-            .content("Say hi in one short sentence.")
+            .content(PROMPT)
             .build()
             .expect("build user msg")
             .into()])
         .max_tokens(50u32)
         .temperature(0.0)
         .stream(true)
+        .stream_options(ChatCompletionStreamOptions {
+            include_usage: true,
+        })
         .build()
         .expect("build streaming request");
 
@@ -254,9 +261,18 @@ async fn test_openai_client_chat_streaming() {
 
     let mut content = String::new();
     let mut chunk_count = 0usize;
+    let mut usage_prompt_tokens = None;
     while let Some(result) = stream.next().await {
         let chunk = result.expect("parse stream chunk");
         chunk_count += 1;
+        if let Some(usage) = &chunk.usage {
+            usage_prompt_tokens = Some(usage.prompt_tokens);
+            assert_eq!(
+                usage.total_tokens,
+                usage.prompt_tokens + usage.completion_tokens,
+                "stream usage total_tokens should equal prompt_tokens + completion_tokens"
+            );
+        }
         if let Some(choice) = chunk.choices.first() {
             if let Some(delta) = &choice.delta.content {
                 content.push_str(delta);
@@ -267,6 +283,11 @@ async fn test_openai_client_chat_streaming() {
     assert!(
         !content.trim().is_empty(),
         "concatenated stream content empty"
+    );
+    assert_eq!(
+        usage_prompt_tokens.map(|value| value as usize),
+        Some(expected_prompt_tokens),
+        "stream usage prompt_tokens should match tokenizer-encoded rendered prompt"
     );
 }
 

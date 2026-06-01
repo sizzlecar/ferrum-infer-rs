@@ -98,7 +98,7 @@ manual GPU/Metal validation, not the always-on stub path.
 |---|---|---|
 | `async-openai` | Basic chat response parsing | `test_openai_client_chat_basic` |
 | `async-openai` | Non-streaming chat usage object parsing, Qwen3 tokenizer-backed `prompt_tokens`, and token total invariant | `test_openai_client_chat_usage_fields` |
-| `async-openai` | Chat SSE parsing | `test_openai_client_chat_streaming` |
+| `async-openai` | Chat SSE parsing plus `stream_options.include_usage` tokenizer-backed final usage | `test_openai_client_chat_streaming` |
 | `async-openai` | Typed tool request fields plus `stream_options.include_usage` final usage chunk | `test_openai_client_tools_stream_options_include_usage` |
 | `async-openai` | `response_format=json_object` best-effort parseable JSON smoke | `test_openai_client_response_format_json_object` |
 | `async-openai` | Strict `json_schema` simple object, 20/20 runs at temperature 0 | `test_openai_client_strict_json_schema_20_runs` |
@@ -107,7 +107,7 @@ manual GPU/Metal validation, not the always-on stub path.
 
 ## Known Remaining Gaps
 
-- Always-on engine tests cover tokenizer-backed mock-executor paths, including a byte-level tokenizer fixture that differs from whitespace counting. An ignored real-model SDK smoke now asserts Qwen3 tokenizer-backed `prompt_tokens` on the served path, but it still needs GPU/Metal execution before it becomes evidence.
+- Always-on engine tests cover tokenizer-backed mock-executor paths, including a byte-level tokenizer fixture that differs from whitespace counting. Ignored real-model SDK smokes now assert Qwen3 tokenizer-backed `prompt_tokens` on non-streaming and streaming served paths, but they still need GPU/Metal execution before they become evidence.
 - Tool-call generation is implemented for deterministic non-streaming and
   streaming server paths when model output emits supported JSON matching
   declared function tools or legacy functions. Server-side execution of
