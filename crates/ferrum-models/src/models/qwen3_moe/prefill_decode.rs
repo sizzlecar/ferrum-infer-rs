@@ -223,6 +223,11 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             self.register_prefix_cache(cache_id, tokens, cached_prefix_tokens);
         }
 
+        // Metal keeps a sticky compute encoder open inside the context.
+        // The logits buffer is only host-visible after the command buffer
+        // is committed and completed; CUDA's to_vec also synchronizes, so
+        // this is the backend-neutral pre-read barrier.
+        B::sync(&mut ctx);
         B::to_vec(&self.scratch.logits, vocab)
     }
 
