@@ -178,6 +178,32 @@ Evidence:
 - This does not meet the Milestone A `<= 90s` attention-only release rebuild
   target even though CUDA artifact rebuilds were avoided.
 
+Restored-pod 5-run cache-hit release touch probe:
+
+```bash
+cd /workspace/ferrum-fa2-native-restore-git-ac3dfab
+python3 scripts/m3_cuda_build_boundary_probe.py \
+  --iterations 5 \
+  --out /workspace/m3-release-touch-probe-cachehit-20260601-20260601_043825 \
+  --fail-on-limit
+```
+
+Evidence:
+
+- Artifact summary:
+  `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-release-touch-probe-cachehit-20260601.md`.
+- Remote manifest:
+  `/workspace/m3-release-touch-probe-cachehit-20260601-20260601_043825/build_boundary_manifest.json`.
+- Git head: `d93790393c04232e265abecfb32fdd81b3547e01`.
+- All 5 runs exited `0`; per-run elapsed seconds were `231.517`, `229.133`,
+  `230.500`, `234.102`, and `234.608`.
+- The manifest timing gate failed: `p50_sec_nearest_rank=231.517`,
+  `p95_sec_nearest_rank=234.608`, limits `75.0/90.0`,
+  `limits_pass=false`.
+- Every run had `status_counts {"cache_hit": 39}` and no summary validation
+  error. This proves the current miss is not broad CUDA/nvcc rebuild; it is
+  the remaining Rust/Cargo release dirtying and release link tail.
+
 Remote package-scoped release dirty probe:
 
 ```bash
@@ -237,10 +263,9 @@ Evidence:
 
 ## Remaining A Gaps
 
-- The 5-run release rebuild timing gate has not been run yet, so p50/p95
-  acceptance is not proven. The probe script now exists, but the GPU timing
-  artifact still needs to be produced.
-- The single release touch probe currently fails the `<= 90s` target: the
+- The 5-run restored-pod release rebuild timing gate has been run and fails:
+  `p50=231.517s`, `p95=234.608s`, required `<=75s/<=90s`.
+- The earlier single release touch probe also failed the `<= 90s` target: the
   best measured full `ferrum-cli` rebuild after an attention-kernel touch is
   `3m17s`.
 - The release build still spends substantial time in Rust release compilation

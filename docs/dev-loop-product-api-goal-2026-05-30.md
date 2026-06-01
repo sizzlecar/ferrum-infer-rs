@@ -19,6 +19,7 @@
 - `python3 scripts/m3_cuda_build_boundary_probe.py --iterations 5 --out /tmp/m3-release-touch-probe-20260601-01 --fail-on-limit --no-cargo-verbose` → failed (`nvcc --version` not found / `nvidia-smi` not found)
 - `python3 scripts/check_ferrum_env_registry.py --json --fail-on-registry-gap > docs/bench/dev-loop-product-api-goal-progress-20260601/registry-json-snapshot-20260601.json` → `ok`
 - `python3 scripts/check_ferrum_env_registry.py --json --fail-on-registry-gap --max-direct-env-reads 75 --max-process-env-writes 24 --max-non-test-process-env-writes 1 --max-hot-direct-env-reads 4 > /tmp/registry-threshold-check-20260601.json` → `pass` (values: direct=75, hot=4, non_test_writes=1)
+- Vast RTX 4090 5-run Milestone A cache-hit release touch probe at `/workspace/m3-release-touch-probe-cachehit-20260601-20260601_043825` → executed successfully but timing gate failed (`p50=231.517s`, `p95=234.608s`, limits `75s/90s`; every run had `cache_hit=39` CUDA summary rows)
 
 All commands above have explicit status noted above; all tooling self-tests passed while the Milestone A 5-run probe failed in this environment due missing CUDA binaries.
 
@@ -32,13 +33,18 @@ All commands above have explicit status noted above; all tooling self-tests pass
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-default-path-allcells-local-validate-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-script-local-validate-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/fa2-source-native-restore-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-release-touch-probe-cachehit-20260601.md`
 
 ### Next-turn execution path (from this evidence state)
 
-1. On restored CUDA host, run the Milestone A probe from
-   `docs/bench/dev-loop-product-api-goal-progress-20260601/next-runbook-20260601.md` step 1 with `OUT_A` under `/workspace`.
-2. Immediately validate with `python3 scripts/validate_cuda_build_boundary_manifest.py --require-limits-pass "$OUT_A/build_boundary_manifest.json"` and `python3 scripts/check_fa2_source_native.py`.
-3. On same host, run the all-cell default-path packet from step 2, and after the wrapper returns run
+1. Do not rerun Milestone A as an evidence-only loop: the CUDA-hosted 5-run
+   artifact now exists and fails the timing target. First reduce the
+   Rust/Cargo release dirtying/link tail exposed by
+   `/workspace/m3-release-touch-probe-cachehit-20260601-20260601_043825`.
+2. After the release touch path is changed, rerun
+   `python3 scripts/m3_cuda_build_boundary_probe.py --iterations 5 --out "$OUT_A" --fail-on-limit`
+   and validate with `python3 scripts/validate_cuda_build_boundary_manifest.py --require-limits-pass "$OUT_A/build_boundary_manifest.json"`.
+3. On the same host, complete the all-cell default-path packet from step 2, and after the wrapper returns run
    `python3 scripts/m3_validate_runner_artifact.py --require-bench "$OUT_I"` where `OUT_I` is the aggregate root.
 4. Only after both step 1-3 artifacts are generated and pass, update this objective file’s blocker list from `hard-blocked` to `closing`.
 ## Current Progress Snapshot (2026-06-01)
@@ -58,7 +64,7 @@ This objective is being tracked through the following module status packets:
 
 ### Milestone status vs this objective
 
-- A: largely implemented for content-hash cache stamps and structured CUDA build summaries; remaining gap is the 5-iteration release rebuild timing target (`<= 90s p95`) which is not proven yet.
+- A: largely implemented for content-hash cache stamps and structured CUDA build summaries; the 5-iteration GPU cache-hit release probe is now produced and fails the timing target (`p50=231.517s`, `p95=234.608s` versus `75s/90s`), exposing Rust/Cargo release dirtying and link tail as the remaining gap.
 - B: structured profile schema/events are in use and validated; remaining gap is complete migration of all primary producer coverage and routine use of `structured_jsonl` with required profile groups.
 - C: reusable runner is in place and wrappers migrated for FA2, profile, scheduler, and route/profile flows; remaining gap is broader script migration and stable all-cell publishable packets.
 - D: registry coverage is at `146/146` (scan scope), with parser gates and CI enforcement; remaining work is reducing hot-path direct reads in the remaining small surface and tightening non-product ownership across older compatibility bridges.
@@ -139,11 +145,30 @@ artifact proof before final completion.
   for the typed runtime-snapshot path into Qwen3-MoE safetensors startup, and
   added it to the next-runbook preconditions/finalization checklist. The guard
   has not been executed yet in this checkpoint.
+- `2026-06-01 13:20:00 +0800`: restored GPU execution on Vast instance
+  `38872161` after confirming `38237968` is no longer recoverable
+  (`no_such_instance`). The Qwen3 GPTQ model cache was repopulated under
+  `/workspace/hf-cache/.../9b534e4318b7ebc3c961a839f13eb18b1833f441`.
+  The first default-path all-cell attempts exposed a runner startup bug where
+  `ferrum serve <MODEL_DIR>` did not also populate `FERRUM_MODEL_PATH` for the
+  tokenizer/model component factories. Commit `c9ba8fd` fixes the runner by
+  carrying `FERRUM_MODEL_PATH` in case env and metadata. In-flight GPU run
+  `/workspace/m3-default-path-allcells-20260601-20260601_051417` passed Paris
+  and multi-turn gates for c=1 baseline and is consuming GPU; final all-cell
+  publishability is still pending.
+- `2026-06-01 13:25:00 +0800`: captured Milestone A restored-pod 5-run
+  cache-hit release touch evidence:
+  `/workspace/m3-release-touch-probe-cachehit-20260601-20260601_043825`.
+  All 5 runs exited `0` and each had `39` CUDA summary rows at
+  `status=cache_hit`, but timing failed (`p50=231.517s`,
+  `p95=234.608s`, limits `75s/90s`). Milestone A is therefore no longer
+  blocked by missing evidence; it is blocked by measured Rust/Cargo release
+  dirtying and link time.
 - Next hard-stop decision points remain unchanged: A/I/E/F/G blockers.
 
 ### As-of-now blocker state
 
-- `Milestone A` is hard-blocked by missing 5-run release boundary timing proof (`p50 <= 75s`, `p95 <= 90s`) on a restored RTX 4090 pod.
+- `Milestone A` is hard-blocked by a failing 5-run restored-pod release boundary timing proof (`p50=231.517s`, `p95=234.608s`, required `<=75s/<=90s`) even though CUDA artifacts are cache hits.
 - `Milestone E` is hard-blocked by unresolved auto-config ownership in benchmark/model/admin startup default branches.
 - `Milestone I` is hard-blocked by absence of a publishable same-pod full-cell default-path evidence packet (`c=1/4/16/32`, `n_repeats >= 3`) including baseline/candidate comparison and regression gates.
 - `Milestone F` and `Milestone G` are blocked for final completion by real-model packet evidence.
@@ -178,7 +203,7 @@ This goal is achieved only when a developer can make a narrow kernel/API/schedul
 
 | Milestone | Evidence status | Coverage in status/docs artifacts | Remaining acceptance gap |
 |---|---|---|---|
-| A (Build cache boundary) | Partially complete | `docs/status/cuda-build-cache-2026-05-30.md` | 5-iteration release rebuild p50/p95 probe is not yet proven `<= 75s/<=90s`; full-release touch timing still exceeds target (`3m17s`) with current Rust-link burden exposed. |
+| A (Build cache boundary) | Partially complete | `docs/status/cuda-build-cache-2026-05-30.md` | 5-iteration restored-pod release rebuild p50/p95 probe now exists but fails (`231.517s/234.608s` versus `75s/90s`); CUDA cache-hit behavior is proven, but Rust/Cargo release dirtying and link tail remain above target. |
 | B (Structured profiling) | Partially complete | `docs/status/structured-profile-2026-05-30.md` | Core schema/events are in place, but some producer/profile-path migration remains and overhead proof must be kept current for new rows. |
 | C (Unified runner) | Mostly complete | `docs/status/m3-ab-runner-2026-05-30.md` | Need broader wrapper migration stability and publishable all-cell summaries for default-path sweeps. |
 | D (Registry + snapshots) | Complete at current scope, with residual reduction potential | `docs/status/runtime-env-registry-2026-05-30.md` | Remaining work is reducing residual hot-path direct reads to keep all new code from regressing and shrinking product surface where possible. |
@@ -197,7 +222,7 @@ This goal is achieved only when a developer can make a narrow kernel/API/schedul
 ### Current completion debt (authoritative, as of 2026-06-01)
 
 - Binding blockers for completion:
-  - `Milestone A`: no 5-run release rebuild boundary proof (`p50 <= 75s`, `p95 <= 90s`) committed yet.
+  - `Milestone A`: 5-run release rebuild boundary proof exists and fails (`p50=231.517s`, `p95=234.608s`, required `<=75s/<=90s`).
   - `Milestone E`: not all runtime default branches are fully sourced from startup builder/selector defaults with validated precedence metadata.
   - `Milestone I`: no publishable default-path full-cell same-pod packet (`c=1/4/16/32`, `n_repeats>=3`).
 - Partial blockers that still need closure work:
@@ -216,8 +241,14 @@ The rows below are tied to explicit acceptance requirements in this objective. �
   Evidence: `docs/status/cuda-build-cache-2026-05-30.md` (core-ptx + static library cache-hit summary).
 - Touching `crates/ferrum-kernels/kernels/paged_varlen_attention_vllm.cu` gives attention cache hits for unrelated kernels/libraries when signature unchanged; vLLM-MoE change rebuild scope is isolated to its target artifact.
   Evidence: `docs/status/cuda-build-cache-2026-05-30.md` (remote no-content/content-change validations).
-- **Not proved yet**: 5 consecutive release rebuild timing gate (`p50 <= 75s`, `p95 <= 90s`) on restored RTX 4090; the recorded 1-shot release rebuild probe is `3m17s`.
-- **Required for completion:** run `scripts/m3_cuda_build_boundary_probe.py --iterations 5 --out ... --fail-on-limit` and persist resulting manifest as the build timing artifact for the final packet.
+- 5 consecutive release rebuild timing gate was run on restored RTX 4090 and
+  failed: `/workspace/m3-release-touch-probe-cachehit-20260601-20260601_043825`
+  measured `p50=231.517s`, `p95=234.608s` versus `75s/90s`. All runs had
+  `39` CUDA summary rows at `status=cache_hit`, so the remaining miss is
+  outside nvcc artifact rebuild.
+- **Required for completion:** reduce the Rust/Cargo release dirtying/link tail,
+  rerun `scripts/m3_cuda_build_boundary_probe.py --iterations 5 --out ... --fail-on-limit`,
+  and persist a manifest whose `limits_pass=true`.
 
 ### B (Structured Profiling and Artifact Schema)
 
