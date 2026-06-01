@@ -182,6 +182,9 @@ python3 scripts/check_ferrum_env_registry.py --fail-on-registry-gap
 
 Evidence:
 
+- `scripts/check_runtime_snapshot_boundary.py --self-test` and
+  `scripts/check_runtime_snapshot_boundary.py` passed on 2026-06-01, guarding
+  the typed runtime snapshot path into Qwen3-MoE safetensors startup.
 - `ferrum-types` auto-config tests passed: `17 passed`, including
   non-env source attribution for config-file, CLI, and script-case entries plus
   locked artifact schema-shape coverage for runtime entries, model

@@ -19,6 +19,10 @@
 - `python3 scripts/m3_cuda_build_boundary_probe.py --iterations 5 --out /tmp/m3-release-touch-probe-20260601-01 --fail-on-limit --no-cargo-verbose` → failed (`nvcc --version` not found / `nvidia-smi` not found)
 - `python3 scripts/check_ferrum_env_registry.py --json --fail-on-registry-gap > docs/bench/dev-loop-product-api-goal-progress-20260601/registry-json-snapshot-20260601.json` → `ok`
 - `python3 scripts/check_ferrum_env_registry.py --json --fail-on-registry-gap --max-direct-env-reads 75 --max-process-env-writes 24 --max-non-test-process-env-writes 1 --max-hot-direct-env-reads 4 > /tmp/registry-threshold-check-20260601.json` → `pass` (values: direct=75, hot=4, non_test_writes=1)
+- `python3 scripts/check_fa2_source_native.py --self-test` → `ok`
+- `python3 scripts/check_fa2_source_native.py` → `ok`
+- `python3 scripts/check_runtime_snapshot_boundary.py --self-test` → `ok`
+- `python3 scripts/check_runtime_snapshot_boundary.py` → `ok`
 - Vast RTX 4090 5-run Milestone A cache-hit release touch probe at `/workspace/m3-release-touch-probe-cachehit-20260601-20260601_043825` → executed successfully but timing gate failed (`p50=231.517s`, `p95=234.608s`, limits `75s/90s`; every run had `cache_hit=39` CUDA summary rows)
 - Vast RTX 4090 5-run Milestone A thin-LTO release touch probe at `/workspace/m3-release-touch-probe-thinlto-20260601-20260601_064127` → passed timing gate (`p50=33.164s`, `p95=34.454s`, limits `75s/90s`; every run had `cache_hit=39` CUDA summary rows)
 
@@ -34,6 +38,7 @@ All commands above have explicit status noted above; all tooling self-tests pass
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-default-path-allcells-local-validate-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-script-local-validate-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/fa2-source-native-restore-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/local-static-boundary-guards-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-release-touch-probe-cachehit-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-release-touch-probe-thinlto-20260601.md`
 
@@ -172,7 +177,14 @@ completion blocker for the current checkpoint.
   `status=cache_hit`, and timing passed (`p50=33.164s`, `p95=34.454s`,
   limits `75s/90s`). Milestone A is no longer a binding blocker for the
   current checkpoint.
-- Next hard-stop decision points remain unchanged: A/I/E/F/G blockers.
+- `2026-06-01 15:55:11 +0800`: closed two local static guard evidence gaps:
+  `scripts/check_fa2_source_native.py --self-test`,
+  `scripts/check_fa2_source_native.py`,
+  `scripts/check_runtime_snapshot_boundary.py --self-test`, and
+  `scripts/check_runtime_snapshot_boundary.py` all passed. Evidence saved in
+  `docs/bench/dev-loop-product-api-goal-progress-20260601/local-static-boundary-guards-20260601.md`.
+- Next hard-stop decision points are now I/E/F/G blockers; Milestone A must
+  stay green but is no longer a binding blocker for the current checkpoint.
 
 ### As-of-now blocker state
 

@@ -114,6 +114,10 @@ Evidence:
 - `scripts/m3_cuda_build_boundary_probe.py --self-test` passed with a fake
   cargo binary, covering manifest writing, per-run CUDA summary validation,
   manifest validation, required cache-hit artifacts, and timing limit checks.
+- `scripts/check_fa2_source_native.py --self-test` and
+  `scripts/check_fa2_source_native.py` passed on 2026-06-01, guarding the
+  product `fa2-source` build boundary against external FlashAttention/CUTLASS
+  source dependencies and source/direct-FFI flag conflation.
 - `/workspace/m3-core-ptx-cache-summary-20260530.log` contained `39`
   `[cuda-build-summary]` rows: `34` core PTX artifacts plus `5` static
   libraries.

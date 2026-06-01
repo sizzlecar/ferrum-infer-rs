@@ -30,12 +30,14 @@ Changed code:
 Current status:
 
 - Code restoration is present locally.
-- Native source-boundary guard is present but still needs local/GPU validation
-  in the next evidence refresh.
+- Native source-boundary guard passed locally:
+  `python3 scripts/check_fa2_source_native.py --self-test` and
+  `python3 scripts/check_fa2_source_native.py`.
 - Runtime source/direct-FFI flag separation is present locally but still needs
   ordinary Rust test coverage in the next evidence refresh.
-- GPU build, Paris/multi-turn smoke, and all-cell performance validation are
-  still pending.
+- GPU build, Paris/multi-turn smoke, and focused c32 performance validation
+  have been exercised during the native FA2 restore loop. A publishable
+  all-cell N>=3 packet is still pending.
 - Earlier source-linked FA2 smoke artifacts remain performance-direction
   evidence only because they used external FlashAttention source at build time.
 
