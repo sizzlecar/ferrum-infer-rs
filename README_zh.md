@@ -15,6 +15,39 @@ OpenAI 兼容 HTTP API、秒级启动。
 为单 GPU 服务器、边缘设备和 Apple Silicon 而设计 ——
 Docker 镜像体积、冷启动时间、Python 工具链复杂度真正重要的场景。
 
+## 性能亮点：NVIDIA GPUs (CUDA)
+
+ferrum 提供自研 CUDA runner，覆盖 PagedAttention、continuous batching、INT4 Marlin MoE、CUDA Graphs，以及可选的 FlashAttention-2 prefill 路径。
+
+**RTX 4090 · Qwen3-30B-A3B GPTQ-Int4 · random 256/128 · 输出吞吐 (tok/s)** —— 同一台机器、`n_repeats=5`、vLLM `0.20.2`；完整原始日志和 JSON 见 [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)。
+
+| c | ferrum FA2 path | vLLM 0.20.2 | ratio |
+|---:|---:|---:|---:|
+| 1 | 160.4 +/- 0.2 | 183.9 +/- 0.2 | 0.872x |
+| 4 | 446.3 +/- 7.0 | 512.5 +/- 2.8 | 0.871x |
+| 16 | 1185.1 +/- 12.3 | 1331.9 +/- 5.7 | 0.890x |
+| 32 | 1641.9 +/- 4.8 | 1972.9 +/- 18.6 | 0.832x |
+
+commit `e511077` 的发布候选 CUDA smoke 已保存到 [`docs/bench/dev-loop-product-api-goal-progress-20260601/cuda-quick-regress-e511077-c32-20260601/`](docs/bench/dev-loop-product-api-goal-progress-20260601/cuda-quick-regress-e511077-c32-20260601/)：Paris、多轮、三轮对话 gate 均通过；c=32 完成 32/32 请求，0 errors。
+
+较早的单模型 decode 检查也保留作审计证据：
+
+**Qwen3-4B on RTX PRO 6000 (Blackwell)**
+
+| 模式 | Decode (tok/s) | 显存 |
+|---|---:|---:|
+| FP16 (eager) | 70.3 | ~8 GB |
+| FP16 + CUDA Graphs | 82.9 (+18%) | ~8 GB |
+| INT4 (GPTQ + Marlin) | **130.4 (+85%)** | **~2.5 GB (-69%)** |
+| 4 并发 (INT4) | 124.2 | ~2.5 GB |
+
+**TinyLlama-1.1B**
+
+| Backend | Decode (tok/s) |
+|---|---:|
+| Candle | 126 |
+| ferrum CUDA | **256.5 (+103%)** |
+
 ## 性能亮点：Apple Silicon 并发
 
 笔记本本地推理的硬骨头是「并发服务」。ferrum 在单请求上和主流引擎打平,并发越高优势越明显。同一台机器、同一份 `Q4_K_M` GGUF、同一份 OpenAI HTTP 压测脚本 —— 完整的可审阅报告(环境、脚本、原始 JSON 与日志)在 [`docs/bench/macos-2026-05-02/`](docs/bench/macos-2026-05-02/)。
@@ -34,28 +67,6 @@ Docker 镜像体积、冷启动时间、Python 工具链复杂度真正重要的
 > Qwen3-30B-A3B (MoE) 这一行是头条 —— 两个月前 Apple Silicon 上 Rust 引擎实质性缺失的就是这种模型。ferrum 通过 PR #81 把 `LlamaFamilyModel` 的 Phase-4 paged-KV 镜像到 `Qwen3MoeModel`,把对 llama.cpp 的差距从 51 → 80 tok/s 抹平。在 dense 8B 模型上 c = 16 ferrum 比 llama.cpp 快 +36–44%。
 
 完整的 36-cell 矩阵(c = 1, 4, 8, 16,三引擎 × 三模型,含 TPOT / TTFT 分布)见 [bench 报告](docs/bench/macos-2026-05-02/README.md)。
-
-## 性能亮点：NVIDIA GPUs (CUDA)
-
-ferrum 拥有自研 CUDA decode runner,支持 INT4 Marlin。来自 RTX PRO 6000 (Blackwell) 的数据:
-
-**Qwen3-4B**
-
-| 模式 | Decode (tok/s) | 显存 |
-|---|---:|---:|
-| FP16 (eager) | 70.3 | ~8 GB |
-| FP16 + CUDA Graphs | 82.9 (+18%) | ~8 GB |
-| INT4 (GPTQ + Marlin) | **130.4 (+85%)** | **~2.5 GB (-69%)** |
-| 4 并发 (INT4) | 124.2 | ~2.5 GB |
-
-**TinyLlama-1.1B**
-
-| Backend | Decode (tok/s) |
-|---|---:|
-| Candle | 126 |
-| ferrum CUDA | **256.5 (+103%)** |
-
-包含 vLLM 风格的全部调度特性: PagedAttention、continuous batching、FlashAttention-2 prefill、batched decode、自研 fused kernel、piecewise CUDA Graphs、NCCL tensor parallel。
 
 ## 横向对比
 
@@ -132,11 +143,11 @@ curl http://localhost:8000/v1/chat/completions \
 |---|:---:|:---:|:---:|:---:|
 | LLaMA (3.x, TinyLlama, Vicuna, Mistral) | ✓ | ✓ | ✓ | ✓ |
 | Qwen3 dense (0.6B – 8B) | ✓ | ✓ | ✓ | ✓ |
-| Qwen3-MoE (30B-A3B) | ✓ | — | — | — |
+| Qwen3-MoE (30B-A3B) | ✓ | ✓ | ✓ | — |
 | Qwen2 / Qwen2.5 | ✓ | ✓ | ✓ | — |
 | BERT (embeddings) | ✓ | — | — | — |
 | Whisper ASR (tiny → large-v3-turbo) | ✓ | — | — | — |
-| Qwen3-TTS (0.6B / 1.7B, 含声音克隆) | ✓ | — | — | — |
+| Qwen3-TTS (0.6B / 1.7B) | ✓ | — | — | — |
 | CLIP / Chinese-CLIP / SigLIP (文本 + 图像) | ✓ | — | — | — |
 
 可使用任意 HuggingFace 模型 ID:
@@ -154,9 +165,8 @@ ferrum run JunHowie/Qwen3-4B-GPTQ-Int4    # INT4 自动识别
 ferrum transcribe whisper-turbo recording.m4a -l zh
 ferrum serve whisper-turbo
 
-# 文本转语音 (含 ICL 声音克隆)
+# 文本转语音 (基础合成；可选参考音频克隆)
 ferrum tts qwen3-tts "你好欢迎使用语音合成系统" -o output.wav
-ferrum tts qwen3-tts "你好" --ref-audio ref.wav --ref-text "参考文本" -o clone.wav
 ferrum serve qwen3-tts
 
 # Embedding (文本 + 图像)
@@ -211,7 +221,7 @@ Architecture v2 (Model-as-Code) 的意思是: 模型层是显式的 Rust 泛型,
 - Tensor parallelism (多 GPU NCCL, 持久化 per-rank 线程)
 - Speculative decoding (`--spec-draft <MODEL>` DeepMind accept/reject)
 - 结构化输出 (`response_format: json_object` + `json_schema`,DFA-guided 硬遮蔽)
-- Whisper ASR (Metal 加速 forward pass) + Qwen3-TTS (声音克隆、流式)
+- Whisper ASR (Metal 加速 forward pass) + Qwen3-TTS
 - Top-k / top-p / 温度 / 重复惩罚
 
 已知 regression / 优化中:
@@ -223,8 +233,8 @@ Architecture v2 (Model-as-Code) 的意思是: 模型层是显式的 Rust 泛型,
 完整路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 近期:
-- v0.1: Apple Silicon Group A 生产 release,含并发 benchmark (本次 PR)
-- v0.2: 普及型硬件(RTX 4090) 上的 CUDA serving benchmark vs vLLM
+- v0.1: CUDA + Apple Silicon 生产 release，含并发 benchmark
+- v0.2: 更完整的 release 矩阵和长上下文 serving benchmark
 - v0.3: 长上下文调优 (32k+)、更多架构 (Phi、DeepSeek、Gemma)
 
 ## License
