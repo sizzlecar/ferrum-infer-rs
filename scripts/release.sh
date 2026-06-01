@@ -12,13 +12,14 @@
 #                        release branch; push; open PR
 #   3. wait-merge      : poll PR CI; auto-merge once CPU + Metal pass;
 #                        sync local main to merged commit
-#   4. tag             : push v$VERSION tag → triggers release.yml
-#   5. wait-release    : poll release.yml until SUCCESS; verify both
-#                        tarballs uploaded
+#   4. tag             : push v$VERSION tag → triggers release workflows
+#   5. wait-release    : poll release.yml and release-cuda.yml until SUCCESS;
+#                        verify CPU, Metal, and CUDA tarballs uploaded
 #   6. cargo-publish   : publish all 15 crates in topo order (5s sleep
 #                        between for crates.io indexing)
-#   7. brew-tap-update : clone homebrew-ferrum, edit Formula/ferrum.rb
-#                        with new version + SHA256s, push
+#   7. brew-tap-update : clone homebrew-ferrum, edit Formula/ferrum.rb and
+#                        Formula/ferrum-cuda.rb with new version + SHA256s,
+#                        push
 #   8. brew-verify     : `brew upgrade ferrum` locally, assert
 #                        `ferrum --version == $VERSION`
 #
@@ -42,6 +43,8 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 TAG="v${VERSION}"
+CUDA_BREW_COMPUTE_CAP="${CUDA_BREW_COMPUTE_CAP:-89}"
+CUDA_BREW_ASSET="ferrum-linux-x86_64-cuda-sm${CUDA_BREW_COMPUTE_CAP}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -170,7 +173,7 @@ if [[ -n "$BRANCH" ]]; then
 fi
 
 # ── 4. tag ──────────────────────────────────────────────────────────
-log "[4/8] tag $TAG + trigger release.yml"
+log "[4/8] tag $TAG + trigger release workflows"
 
 if git rev-parse "$TAG" >/dev/null 2>&1; then
   warn "tag $TAG already exists — skipping"
@@ -179,30 +182,37 @@ else
   git push origin "$TAG"
 fi
 
-# ── 5. wait for release.yml ─────────────────────────────────────────
-log "[5/8] wait for release.yml binaries"
+# ── 5. wait for release workflows ───────────────────────────────────
+log "[5/8] wait for release binaries"
 
-# Find the run for this tag.
-RUN_ID=""
-for _ in {1..12}; do
-  RUN_ID=$(gh run list --workflow=release.yml --limit 5 \
-    --json databaseId,headBranch \
-    --jq ".[] | select(.headBranch==\"$TAG\") | .databaseId" | head -1 || true)
-  [[ -n "$RUN_ID" ]] && break
-  sleep 5
-done
-[[ -z "$RUN_ID" ]] && die "could not find release.yml run for $TAG"
+wait_workflow_success() {
+  local workflow="$1"
+  local run_id=""
+  for _ in {1..12}; do
+    run_id=$(gh run list --workflow="$workflow" --limit 10 \
+      --json databaseId,headBranch \
+      --jq ".[] | select(.headBranch==\"$TAG\") | .databaseId" | head -1 || true)
+    [[ -n "$run_id" ]] && break
+    sleep 5
+  done
+  [[ -z "$run_id" ]] && die "could not find $workflow run for $TAG"
 
-while :; do
-  STATUS=$(gh run view "$RUN_ID" --json status,conclusion --jq '.status + ":" + (.conclusion // "")')
-  case "$STATUS" in
-    completed:success) break ;;
-    completed:*)       die "release.yml failed: $STATUS — see gh run view $RUN_ID" ;;
-    *)                 printf "  release.yml: %s — sleeping 30s\r" "$STATUS"; sleep 30 ;;
-  esac
-done
-echo
-ok "release.yml completed; tarballs uploaded to v$VERSION release"
+  while :; do
+    local status
+    status=$(gh run view "$run_id" --json status,conclusion --jq '.status + ":" + (.conclusion // "")')
+    case "$status" in
+      completed:success) break ;;
+      completed:*)       die "$workflow failed: $status — see gh run view $run_id" ;;
+      *)                 printf "  %s: %s — sleeping 30s\r" "$workflow" "$status"; sleep 30 ;;
+    esac
+  done
+  echo
+  ok "$workflow completed"
+}
+
+wait_workflow_success "release.yml"
+wait_workflow_success "release-cuda.yml"
+ok "release workflows completed; CPU, Metal, and CUDA tarballs uploaded to v$VERSION release"
 
 # ── 6. cargo publish loop ───────────────────────────────────────────
 log "[6/8] cargo publish 15 crates"
@@ -229,8 +239,10 @@ log "[7/8] update Homebrew tap"
 
 SHA_MAC=$(curl -sfL "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/${TAG}/ferrum-macos-aarch64.tar.gz.sha256" | cut -d' ' -f1)
 SHA_LINUX=$(curl -sfL "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/${TAG}/ferrum-linux-x86_64.tar.gz.sha256" | cut -d' ' -f1)
+SHA_LINUX_CUDA=$(curl -sfL "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/${TAG}/${CUDA_BREW_ASSET}.tar.gz.sha256" | cut -d' ' -f1)
 [[ -z "$SHA_MAC"   ]] && die "could not fetch macOS sha256"
 [[ -z "$SHA_LINUX" ]] && die "could not fetch Linux sha256"
+[[ -z "$SHA_LINUX_CUDA" ]] && die "could not fetch Linux CUDA sha256"
 
 TAP_DIR="/tmp/homebrew-ferrum-release-${VERSION}"
 rm -rf "$TAP_DIR"
@@ -268,11 +280,48 @@ class Ferrum < Formula
 end
 EOF
 
+cat > "$TAP_DIR/Formula/ferrum-cuda.rb" <<EOF
+class FerrumCuda < Formula
+  desc "Production-grade LLM inference in Rust with CUDA acceleration"
+  homepage "https://github.com/sizzlecar/ferrum-infer-rs"
+  version "${VERSION}"
+  license "MIT"
+
+  on_linux do
+    on_intel do
+      url "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/${TAG}/${CUDA_BREW_ASSET}.tar.gz"
+      sha256 "${SHA_LINUX_CUDA}"
+    end
+  end
+
+  conflicts_with "ferrum", because: "both install a ferrum binary"
+
+  def install
+    odie "ferrum-cuda is only packaged for Linux x86_64" unless OS.linux? && Hardware::CPU.intel?
+    bin.install "ferrum"
+    doc.install "README.md"
+    doc.install "CUDA-BUILD.txt"
+  end
+
+  def caveats
+    <<~EOS
+      ferrum-cuda installs the CUDA-enabled ferrum binary (${CUDA_BREW_ASSET}).
+      It does not bundle NVIDIA driver, CUDA runtime, or NCCL runtime libraries.
+      Install compatible NVIDIA/CUDA/NCCL runtime libraries on the target host.
+    EOS
+  end
+
+  test do
+    assert_match "ferrum #{version}", shell_output("#{bin}/ferrum --version")
+  end
+end
+EOF
+
 cd "$TAP_DIR"
 if git diff --quiet; then
   warn "tap formula already at $VERSION — skipping push"
 else
-  git add Formula/ferrum.rb
+  git add Formula/ferrum.rb Formula/ferrum-cuda.rb
   git commit -m "ferrum ${VERSION}"
   git push --quiet
   ok "tap pushed: sizzlecar/homebrew-ferrum @ ${VERSION}"
@@ -293,8 +342,9 @@ fi
 
 echo
 echo "─────────────────────────────────────────────────────"
-echo "✅ ferrum $VERSION shipped on all three channels:"
+echo "✅ ferrum $VERSION shipped:"
 echo "   • GitHub Release: https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/$TAG"
 echo "   • crates.io:      https://crates.io/crates/ferrum-cli/$VERSION"
 echo "   • Homebrew:       brew tap sizzlecar/ferrum && brew install ferrum"
+echo "   • Homebrew CUDA:  brew tap sizzlecar/ferrum && brew install ferrum-cuda"
 echo "─────────────────────────────────────────────────────"

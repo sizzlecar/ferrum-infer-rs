@@ -77,7 +77,13 @@ vLLM-style scheduling features included: PagedAttention, continuous batching, Fl
 
 ```bash
 brew tap sizzlecar/ferrum
+
+# CPU on Linux, Metal on Apple Silicon
 brew install ferrum
+ferrum --version
+
+# CUDA on Linux x86_64
+brew install ferrum-cuda
 ferrum --version
 ```
 
@@ -88,12 +94,16 @@ ferrum --version
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64.tar.gz | tar xz
 ./ferrum --help
 
+# Linux x86_64 CUDA (sm89/Ada release binary)
+curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz | tar xz
+./ferrum --help
+
 # macOS Apple Silicon (Metal)
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz | tar xz
 ./ferrum --help
 ```
 
-Linux x86_64 is the CPU build. macOS aarch64 is the Metal build (the same backend that beats llama.cpp at c=16 on the [Group A bench](docs/bench/macos-2026-05-02/README.md)). For CUDA, build from source.
+Linux x86_64 is the CPU build. Linux x86_64 CUDA is packaged separately as `ferrum-cuda` / `ferrum-linux-x86_64-cuda-sm89.tar.gz` and requires compatible NVIDIA driver, CUDA runtime, and NCCL runtime libraries on the target host. macOS aarch64 is the Metal build (the same backend that beats llama.cpp at c=16 on the [Group A bench](docs/bench/macos-2026-05-02/README.md)).
 
 ### From source
 

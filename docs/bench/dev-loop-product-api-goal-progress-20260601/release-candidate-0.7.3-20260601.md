@@ -4,7 +4,10 @@ Scope: formal release candidate for `docs/dev-loop-product-api-goal-2026-05-30.m
 
 Current release-candidate code checkpoint:
 
-- `1e3ce42 fix: sync qwen3 moe prefill logits before readback`
+- Last runtime-affecting checkpoint: `1e3ce42 fix: sync qwen3 moe prefill logits before readback`
+- Packaging checkpoint in current branch: dedicated CUDA GitHub Release
+  workflow plus Homebrew `ferrum-cuda` tap generation, pending final tag-run
+  proof.
 - Workspace package version: `0.7.3`
 
 ## Release gates that are satisfied
@@ -24,6 +27,22 @@ Current release-candidate code checkpoint:
 | Metal Qwen3-8B GGUF smoke | pass | `metal-qwen3-8b-q4km-smoke-20260601`, Paris correctness passed; 64-token decode median `23.5 tok/s` with local swap active |
 | Post-fix GPU quick regression | pass | `m3-quick-regress-1e3ce42-c32-20260601.md`, c32 source FA2 `1403.98 tok/s`, correctness/multi-turn passed |
 | q2 native FA2 experiment | rejected safely | microbench-positive but full-model c32 regressed; reverted by `2197077` |
+
+## Release packaging status
+
+- GitHub Release CPU and Metal artifacts continue to be produced by
+  `release.yml`.
+- GitHub Release CUDA artifact is now produced by `release-cuda.yml` as
+  `ferrum-linux-x86_64-cuda-sm89.tar.gz`, built with
+  `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`.
+- The CUDA workflow records `.ldd.txt` and fails if the release binary links
+  Torch, Python, or vLLM.
+- Homebrew tap update now writes both `Formula/ferrum.rb` and
+  `Formula/ferrum-cuda.rb`.
+- `brew install ferrum` remains normal CPU/Metal. `brew install ferrum-cuda`
+  is Linux x86_64 CUDA and downloads the CUDA tarball.
+- This packaging path is wired but not yet final evidence; the proof point is
+  the final tag workflow run plus tap push.
 
 ## M3 release performance table
 
@@ -54,6 +73,8 @@ These do not invalidate the `0.7.3` release candidate, but they must be explicit
 
 - Source FA2 is release-supported and benchmarked as an opt-in path. If the final release requires it to be the default selector for M3, that policy change still needs an explicit code/default decision.
 - The ignored SDK cargo wrapper smoke remains blocked by a debug CUDA build-script path. The direct release-binary real-model API smoke is the accepted release evidence for this RC.
+- The final tag workflow must still publish CPU, Metal, and CUDA release assets,
+  and the Homebrew tap must be updated with both `ferrum` and `ferrum-cuda`.
 - Saved 8B Ferrum/vLLM GGUF comparison tables are complete but must be labelled GGUF-vs-GGUF and caveated: Ferrum uses eager-dequant/fp16 dense CUDA fallback; vLLM GGUF is experimental.
 - The Metal correctness fix is validated by smoke only. The local Mac had active swap, so no clean Metal performance claim should be made from this run.
 

@@ -77,7 +77,13 @@ ferrum 拥有自研 CUDA decode runner,支持 INT4 Marlin。来自 RTX PRO 6000 
 
 ```bash
 brew tap sizzlecar/ferrum
+
+# Linux CPU / Apple Silicon Metal
 brew install ferrum
+ferrum --version
+
+# Linux x86_64 CUDA
+brew install ferrum-cuda
 ferrum --version
 ```
 
@@ -88,12 +94,16 @@ ferrum --version
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64.tar.gz | tar xz
 ./ferrum --help
 
+# Linux x86_64 CUDA (sm89/Ada 发布二进制)
+curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz | tar xz
+./ferrum --help
+
 # macOS Apple Silicon (Metal)
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz | tar xz
 ./ferrum --help
 ```
 
-Linux x86_64 是 CPU 构建。macOS aarch64 是 Metal 构建(就是在 [Group A bench](docs/bench/macos-2026-05-02/README.md) 中 c=16 击败 llama.cpp 的那个 Metal 后端)。CUDA 用户请从源码构建。
+Linux x86_64 是 CPU 构建。Linux x86_64 CUDA 单独以 `ferrum-cuda` / `ferrum-linux-x86_64-cuda-sm89.tar.gz` 发布，需要目标机器已有兼容的 NVIDIA driver、CUDA runtime 和 NCCL runtime。macOS aarch64 是 Metal 构建(就是在 [Group A bench](docs/bench/macos-2026-05-02/README.md) 中 c=16 击败 llama.cpp 的那个 Metal 后端)。
 
 ### 从源码
 

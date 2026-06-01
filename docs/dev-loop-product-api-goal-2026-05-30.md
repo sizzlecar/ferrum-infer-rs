@@ -47,6 +47,10 @@
   `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-8b-q4km-smoke-20260601/`
   passed Paris correctness and measured 64-token decode median `23.5 tok/s`
   over 3 runs with swap active.
+- Release packaging automation now includes a dedicated CUDA GitHub Release
+  workflow and Homebrew tap generation for `ferrum-cuda` on Linux x86_64
+  (`ferrum-linux-x86_64-cuda-sm89.tar.gz`). This is wired but remains
+  unproven until the final tag workflow runs.
 
 All commands above have explicit status noted above; all tooling self-tests passed while the Milestone A 5-run probe failed in this environment due missing CUDA binaries.
 
@@ -84,8 +88,10 @@ All commands above have explicit status noted above; all tooling self-tests pass
    release-performance source of truth is
    `/workspace/m3-fa2-source-current-allcells-n3-20260601`; the post-`1e3ce42`
    c32 quick regression is saved separately.
-3. Finish release-note wording, final release checkpoint/tag decision, and
-   source-FA2 default/opt-in policy wording.
+3. Finish release-note wording, final release checkpoint/tag decision,
+   source-FA2 default/opt-in policy wording, and the final tag-run proof that
+   CPU, Metal, CUDA, `ferrum`, and `ferrum-cuda` release assets publish
+   correctly.
 ## Current Progress Snapshot (2026-06-01)
 
 This objective is being tracked through the following module status packets:

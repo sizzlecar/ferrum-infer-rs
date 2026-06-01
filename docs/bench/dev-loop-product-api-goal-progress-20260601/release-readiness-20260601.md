@@ -34,6 +34,8 @@ Evidence summary:
 | Metal Qwen3-MoE prefill readback | pass smoke | `1e3ce42` adds a pre-readback sync; local Metal smoke returns Paris and no longer triggers the encoder assertion |
 | Metal Qwen3-8B GGUF smoke | pass | `metal-qwen3-8b-q4km-smoke-20260601`, Paris correctness passed; 64-token decode median `23.5 tok/s` with local swap active |
 | Post-fix GPU quick regression | pass | `/workspace/m3-quick-regress-1e3ce42-c32-20260601`, c32 source FA2 `1403.98 tok/s`, correctness/multi-turn passed, perf gate `ok=true` |
+| GitHub CUDA release artifact | wired, pending tag run | `.github/workflows/release-cuda.yml` builds `ferrum-linux-x86_64-cuda-sm89.tar.gz` with `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source` and rejects Torch/Python/vLLM dynamic links |
+| Homebrew CUDA install path | wired, pending tap push | `scripts/release.sh` writes `Formula/ferrum-cuda.rb` so Linux x86_64 Homebrew downloads the CUDA tarball; normal `ferrum` remains CPU/Metal |
 
 M3 release-threshold table:
 
@@ -50,6 +52,9 @@ Release blockers remaining as of this checkpoint:
   script hang; direct release-binary smoke passed and is sufficient for release
   evidence if accepted.
 - Final release checkpoint/tag has not yet been created.
+- The final tag workflow has not yet proven CPU, Metal, and CUDA release
+  artifacts end-to-end, and the Homebrew tap has not yet been pushed with both
+  `ferrum` and `ferrum-cuda` formulas.
 - If the release requires source FA2 to be enabled by default rather than
   release-supported opt-in, the default/selector decision must be made before
   tagging.
@@ -63,6 +68,15 @@ Release blockers remaining as of this checkpoint:
 - A smaller Qwen3-8B Metal smoke did produce a stable 64-token decode run:
   median `23.5 tok/s` over 3 runs, with swap still active. Treat it as a
   regression smoke, not a clean headline benchmark.
+
+Release packaging notes:
+
+- `brew install ferrum` remains the normal package: Metal on macOS Apple
+  Silicon and CPU on Linux x86_64.
+- `brew install ferrum-cuda` is the CUDA package for Linux x86_64 and downloads
+  `ferrum-linux-x86_64-cuda-sm89.tar.gz`.
+- The CUDA package does not bundle NVIDIA driver, CUDA runtime, or NCCL runtime
+  libraries; release notes must state those target-host prerequisites.
 
 8B GGUF CUDA serve notes:
 
