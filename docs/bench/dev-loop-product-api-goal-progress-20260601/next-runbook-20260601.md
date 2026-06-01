@@ -34,8 +34,8 @@ python3 scripts/m3_cuda_build_boundary_probe.py \
   --out "$OUT_A" \
   --fail-on-limit
 python3 scripts/validate_cuda_build_boundary_manifest.py \
-  --fail-on-limit \
-  --manifest "$OUT_A/build_boundary_manifest.json"
+  --require-limits-pass \
+  "$OUT_A/build_boundary_manifest.json"
 ```
 
 Acceptance for Milestone A:
@@ -167,7 +167,7 @@ Acceptance for Milestone F/G:
 python3 scripts/m3_validate_runner_artifact.py "$OUT_I" \
   --require-bench
 python3 scripts/validate_cuda_build_boundary_manifest.py --fail-on-limit \
-  --manifest "$OUT_A/build_boundary_manifest.json"
+  "$OUT_A/build_boundary_manifest.json"
 python3 scripts/check_fa2_source_native.py
 python3 scripts/check_runtime_snapshot_boundary.py
 ```

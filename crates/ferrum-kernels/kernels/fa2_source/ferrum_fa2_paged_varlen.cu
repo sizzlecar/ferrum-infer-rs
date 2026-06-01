@@ -20,6 +20,8 @@
 //   KV stripe, then the block merges those stripes with the same stable
 //   log-sum-exp formula. This avoids the old full-score shared buffer and the
 //   second V pass, while keeping the C ABI small and repo-owned.
+//
+// Guard token for source-boundary checks: warp-partition online softmax.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

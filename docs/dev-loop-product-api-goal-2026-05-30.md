@@ -37,7 +37,7 @@ All commands above have explicit status noted above; all tooling self-tests pass
 
 1. On restored CUDA host, run the Milestone A probe from
    `docs/bench/dev-loop-product-api-goal-progress-20260601/next-runbook-20260601.md` step 1 with `OUT_A` under `/workspace`.
-2. Immediately validate with `python3 scripts/validate_cuda_build_boundary_manifest.py --fail-on-limit --manifest "$OUT_A/build_boundary_manifest.json"` and `python3 scripts/check_fa2_source_native.py`.
+2. Immediately validate with `python3 scripts/validate_cuda_build_boundary_manifest.py --require-limits-pass "$OUT_A/build_boundary_manifest.json"` and `python3 scripts/check_fa2_source_native.py`.
 3. On same host, run the all-cell default-path packet from step 2, and after the wrapper returns run
    `python3 scripts/m3_validate_runner_artifact.py --require-bench "$OUT_I"` where `OUT_I` is the aggregate root.
 4. Only after both step 1-3 artifacts are generated and pass, update this objective file’s blocker list from `hard-blocked` to `closing`.
@@ -309,7 +309,7 @@ Current missing completion packets to generate in this objective run:
 
 | Milestone | Required evidence | Current local/state evidence | Closure status |
 |---|---|---|---|
-| A | 5-run release build boundary manifest (`p50`, `p95`, `limits_pass`), per-run `cuda-build-summary` validation, and `scripts/validate_cuda_build_boundary_manifest.py --fail-on-limit` pass | `scripts/m3_cuda_build_boundary_probe.py` and `scripts/validate_cuda_build_boundary_manifest.py` self-tests pass locally; status packet not yet produced for 5-run release boundary | **blocked** (requires GPU-bound release loop execution) |
+| A | 5-run release build boundary manifest (`p50`, `p95`, `limits_pass`), per-run `cuda-build-summary` validation, and `scripts/validate_cuda_build_boundary_manifest.py --require-limits-pass` pass | `scripts/m3_cuda_build_boundary_probe.py` and `scripts/validate_cuda_build_boundary_manifest.py` self-tests pass locally; status packet not yet produced for 5-run release boundary | **blocked** (requires GPU-bound release loop execution) |
 | B | Publishable profile run with structured JSONL event groups and parser/fixture validation | schema + parser + migrated runner validations are in place; status includes structured profile artifacts | **partial** (no new full publishable packet written in this branch) |
 | C | Publishable all-cell runner output with manifest + summaries + validator pass | runner/validator tooling exists and self-tests pass; no new default-path full-cell publish artifact from this change set | **partial** |
 | D | Registry + env snapshot + diff artifact fields in runner manifests | static scan and schema gates pass; status shows `146/146` entries and bounded reads | **close to done** |
@@ -332,7 +332,7 @@ Current missing completion packets to generate in this objective run:
 4. Produce a real-model API evidence packet (including strict schema behavior and strict/non-strict streaming behavior) for Milestones F/G via `scripts/m3_real_model_api_smoke.sh`, validate it with `scripts/validate_real_model_api_smoke.py "$OUT_F"`, then include it under the final completion packet. Required artifacts: `commands.md`, `run_summary.json`, and `cargo-test-*.log` in a timestamped `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-*` path.
 5. After #1/#2/#3/#4 complete, run:
    - `python3 scripts/m3_validate_runner_artifact.py <artifact-root>`
-   - `python3 scripts/validate_cuda_build_boundary_manifest.py --fail-on-limit --manifest <manifest>`
+   - `python3 scripts/validate_cuda_build_boundary_manifest.py --require-limits-pass <manifest>`
    - `python3 scripts/check_fa2_source_native.py`
 
 ### Next runbook template (reproducible commands)
@@ -353,8 +353,8 @@ python3 scripts/m3_cuda_build_boundary_probe.py \
   --out "$OUT_A" \
   --fail-on-limit
 python3 scripts/validate_cuda_build_boundary_manifest.py \
-  --fail-on-limit \
-  --manifest "$OUT_A/build_boundary_manifest.json"
+  --require-limits-pass \
+  "$OUT_A/build_boundary_manifest.json"
 
 # Milestone I: same-pod all-cell default-path packet (example orchestrator)
 OUT_I=/workspace/m3-default-path-allcell-20260601-$(date +%Y%m%d_%H%M%S)

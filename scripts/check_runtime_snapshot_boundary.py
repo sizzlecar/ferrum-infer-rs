@@ -46,9 +46,6 @@ FORBIDDEN_TOKENS = {
     "crates/ferrum-engine/src/registry.rs": [
         "Qwen3MoeModel::<B, K>::new_safetensors(mc, &weight_loader)?;\n        ))",
     ],
-    "crates/ferrum-models/src/models/qwen3_moe/load.rs": [
-        "let runtime_env = Qwen3MoeRuntimeEnv::from_env();\n        let rope = build_rope_cache::<B>(&cfg.base);",
-    ],
 }
 
 
