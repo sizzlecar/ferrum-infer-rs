@@ -272,14 +272,6 @@ impl EngineBuilder {
 
         let component_config = ComponentConfig::from_engine_config(&self.config);
         let typed_model_path = component_config.get_string_option("model_path");
-        if let Some(model_path) = typed_model_path.as_ref() {
-            // Keep legacy env-backed component factories in sync with the
-            // typed startup path. The tokenizer and executor factories both
-            // accept `model_path` through `ComponentConfig`, but release-bin
-            // serve smoke tests showed the tokenizer fallback path still
-            // needs `FERRUM_MODEL_PATH` populated for model-mode startup.
-            std::env::set_var("FERRUM_MODEL_PATH", model_path);
-        }
         let has_model_path =
             typed_model_path.is_some() || engine_builder_runtime_env().has_model_path();
         let runtime_env = engine_builder_runtime_env();
