@@ -71,7 +71,7 @@ config = {
     "warmup_requests": int(os.environ["WARMUP_REQUESTS"]),
     "concurrency": int(os.environ["CONCURRENCY"]),
     "baseline_case": "fa_layout",
-    "gates": {"paris": True, "multi_turn": True},
+    "gates": {"paris": True, "multi_turn": True, "multi_turn_3round": True},
     "validation": {
         "change_type": os.environ["VALIDATION_CHANGE_TYPE"],
         "touched_areas": ["model_forward", "attention_prefill_mixed_path", "fa2_runtime_path"],
