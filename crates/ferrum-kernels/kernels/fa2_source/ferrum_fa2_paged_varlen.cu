@@ -173,8 +173,8 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
         score = __shfl_sync(0xffffffff, score, 0) * scale;
 
         const float new_m = fmaxf(local_m, score);
-        const float alpha = expf(local_m - new_m);
-        const float beta = expf(score - new_m);
+        const float alpha = __expf(local_m - new_m);
+        const float beta = __expf(score - new_m);
         local_l = local_l * alpha + beta;
         local_m = new_m;
 
@@ -210,7 +210,7 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
         float global_l = 0.0f;
         for (int w = 0; w < num_warps; ++w) {
             if (partial_l[w] > 0.0f) {
-                global_l += expf(partial_m[w] - global_m) * partial_l[w];
+                global_l += __expf(partial_m[w] - global_m) * partial_l[w];
             }
         }
         s_global_max = global_m;
@@ -225,7 +225,7 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
         float acc = 0.0f;
         for (int w = 0; w < num_warps; ++w) {
             if (partial_l[w] > 0.0f) {
-                const float weight = expf(partial_m[w] - s_global_max) * inv_sum;
+                const float weight = __expf(partial_m[w] - s_global_max) * inv_sum;
                 acc += weight * partial_out[w * head_dim + d];
             }
         }
