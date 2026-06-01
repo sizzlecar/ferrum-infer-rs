@@ -71,6 +71,7 @@ run_model() {
     BENCH_MODEL="$vllm_model" \
     TOKENIZER_MODEL="$tokenizer_model" \
     VLLM_TOKENIZER_MODEL="$tokenizer_model" \
+    VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-} --hf-config-path $tokenizer_model" \
     VLLM_PREFIX_CACHE="${VLLM_PREFIX_CACHE:-false}" \
     VLLM_ENABLE_CHUNKED_PREFILL="${VLLM_ENABLE_CHUNKED_PREFILL:-true}" \
     VLLM_GPU_MEM_FRAC="${VLLM_GPU_MEM_FRAC:-0.85}" \
