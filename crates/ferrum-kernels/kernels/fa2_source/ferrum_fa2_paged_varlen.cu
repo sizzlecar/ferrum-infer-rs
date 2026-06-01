@@ -233,6 +233,176 @@ __global__ void ferrum_fa2_paged_varlen_kernel_f16(
     }
 }
 
+__global__ void ferrum_fa2_paged_varlen_q4_kernel_f16(
+    const __half *__restrict__ q,
+    const __half *__restrict__ k_block_pool,
+    const __half *__restrict__ v_block_pool,
+    __half *__restrict__ output,
+    float *__restrict__ lse,
+    const int *__restrict__ cu_seqlens_q,
+    const int *__restrict__ seq_lens,
+    const int *__restrict__ block_tables,
+    int num_seqs,
+    int total_q_tokens,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int max_blocks_per_seq,
+    float scale) {
+    const int q_head = blockIdx.x;
+    const int seq_idx = blockIdx.y;
+    if (q_head >= num_heads || seq_idx >= num_seqs) {
+        return;
+    }
+
+    const int seq_q_start = cu_seqlens_q[seq_idx];
+    const int seq_q_end = cu_seqlens_q[seq_idx + 1];
+    const int q_len_raw = seq_q_end - seq_q_start;
+    if (q_len_raw <= 0) {
+        return;
+    }
+    const int q_len = q_len_raw < 4 ? q_len_raw : 4;
+    const int final_kv_len = seq_lens[seq_idx];
+    const int prior_kv_len = final_kv_len - q_len_raw;
+    if (final_kv_len <= 0) {
+        return;
+    }
+
+    const int q_per_kv = num_heads / num_kv_heads;
+    const int kv_head = q_head / q_per_kv;
+    const int *my_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    const int lane_id = threadIdx.x % FERRUM_FA2_WARP_SIZE;
+    const int warp_id = threadIdx.x / FERRUM_FA2_WARP_SIZE;
+    const int num_warps = blockDim.x / FERRUM_FA2_WARP_SIZE;
+
+    extern __shared__ float smem[];
+    float *partial_out = smem;
+    float *partial_m = partial_out + num_warps * 4 * head_dim;
+    float *partial_l = partial_m + num_warps * 4;
+    float *global_m_s = partial_l + num_warps * 4;
+    float *global_l_s = global_m_s + 4;
+
+    float q_reg[4][4];
+    float acc[4][4];
+    float local_m[4];
+    float local_l[4];
+
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const __half *q_ptr =
+            q + (static_cast<size_t>(seq_q_start + r) * num_heads + q_head) * head_dim;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int d = lane_id + i * FERRUM_FA2_WARP_SIZE;
+            q_reg[r][i] = (r < q_len) ? __half2float(q_ptr[d]) : 0.0f;
+            acc[r][i] = 0.0f;
+        }
+        local_m[r] = -1.0e20f;
+        local_l[r] = 0.0f;
+    }
+
+    for (int kv_pos = warp_id; kv_pos < final_kv_len; kv_pos += num_warps) {
+        const int logical_block = kv_pos / block_size;
+        const int slot = kv_pos - logical_block * block_size;
+        const int physical_block = my_block_table[logical_block];
+        float k_reg[4];
+        float v_reg[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int d = lane_id + i * FERRUM_FA2_WARP_SIZE;
+            k_reg[i] = __half2float(*fa_kv_ptr(k_block_pool, physical_block, slot, kv_head,
+                                               d, block_size, num_kv_heads, head_dim));
+            v_reg[i] = __half2float(*fa_kv_ptr(v_block_pool, physical_block, slot, kv_head,
+                                               d, block_size, num_kv_heads, head_dim));
+        }
+
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            if (r >= q_len || kv_pos > prior_kv_len + r) {
+                continue;
+            }
+            float dot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                dot += q_reg[r][i] * k_reg[i];
+            }
+            float score = warp_reduce_sum(dot);
+            score = __shfl_sync(0xffffffff, score, 0) * scale;
+
+            const float new_m = fmaxf(local_m[r], score);
+            const float alpha = expf(local_m[r] - new_m);
+            const float beta = expf(score - new_m);
+            local_l[r] = local_l[r] * alpha + beta;
+            local_m[r] = new_m;
+
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[r][i] = acc[r][i] * alpha + beta * v_reg[i];
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            partial_m[warp_id * 4 + r] = local_m[r];
+            partial_l[warp_id * 4 + r] = local_l[r];
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int d = lane_id + i * FERRUM_FA2_WARP_SIZE;
+            partial_out[(warp_id * 4 + r) * head_dim + d] = acc[r][i];
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            float global_m = -1.0e20f;
+            for (int w = 0; w < num_warps; ++w) {
+                global_m = fmaxf(global_m, partial_m[w * 4 + r]);
+            }
+            float global_l = 0.0f;
+            for (int w = 0; w < num_warps; ++w) {
+                const float l = partial_l[w * 4 + r];
+                if (l > 0.0f) {
+                    global_l += expf(partial_m[w * 4 + r] - global_m) * l;
+                }
+            }
+            global_m_s[r] = global_m;
+            global_l_s[r] = global_l;
+            if (r < q_len) {
+                lse[static_cast<size_t>(q_head) * total_q_tokens + seq_q_start + r] =
+                    logf(global_l) + global_m;
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int idx = threadIdx.x; idx < q_len * head_dim; idx += blockDim.x) {
+        const int r = idx / head_dim;
+        const int d = idx - r * head_dim;
+        const float inv_sum = 1.0f / global_l_s[r];
+        float out_acc = 0.0f;
+        for (int w = 0; w < num_warps; ++w) {
+            const float l = partial_l[w * 4 + r];
+            if (l > 0.0f) {
+                const float weight = expf(partial_m[w * 4 + r] - global_m_s[r]) * inv_sum;
+                out_acc += weight * partial_out[(w * 4 + r) * head_dim + d];
+            }
+        }
+        output[(static_cast<size_t>(seq_q_start + r) * num_heads + q_head) * head_dim + d] =
+            __float2half(out_acc);
+    }
+}
+
 }  // namespace
 
 extern "C" __attribute__((visibility("default"))) int ferrum_fa2_paged_varlen_fwd(
@@ -286,24 +456,49 @@ extern "C" __attribute__((visibility("default"))) int ferrum_fa2_paged_varlen_fw
         static_cast<size_t>(num_warps * head_dim + num_warps * 2) * sizeof(float);
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-    ferrum_fa2_paged_varlen_kernel_f16<<<grid, block, shared_bytes,
-                                         reinterpret_cast<cudaStream_t>(stream)>>>(
-        static_cast<const __half *>(q),
-        static_cast<const __half *>(k),
-        static_cast<const __half *>(v),
-        static_cast<__half *>(out),
-        static_cast<float *>(lse),
-        static_cast<const int *>(cu_seqlens_q),
-        static_cast<const int *>(seq_lens),
-        static_cast<const int *>(block_tables),
-        num_seqs,
-        total_q_tokens,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        block_size,
-        max_blocks_per_seq,
-        scale);
+    if (max_q_len <= 4 && total_q_tokens > num_seqs) {
+        const dim3 q4_grid(num_heads, num_seqs, 1);
+        const size_t q4_shared_bytes =
+            static_cast<size_t>(num_warps * 4 * head_dim + num_warps * 8 + 8) *
+            sizeof(float);
+        ferrum_fa2_paged_varlen_q4_kernel_f16<<<q4_grid, block, q4_shared_bytes,
+                                                reinterpret_cast<cudaStream_t>(stream)>>>(
+            static_cast<const __half *>(q),
+            static_cast<const __half *>(k),
+            static_cast<const __half *>(v),
+            static_cast<__half *>(out),
+            static_cast<float *>(lse),
+            static_cast<const int *>(cu_seqlens_q),
+            static_cast<const int *>(seq_lens),
+            static_cast<const int *>(block_tables),
+            num_seqs,
+            total_q_tokens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            scale);
+    } else {
+        ferrum_fa2_paged_varlen_kernel_f16<<<grid, block, shared_bytes,
+                                             reinterpret_cast<cudaStream_t>(stream)>>>(
+            static_cast<const __half *>(q),
+            static_cast<const __half *>(k),
+            static_cast<const __half *>(v),
+            static_cast<__half *>(out),
+            static_cast<float *>(lse),
+            static_cast<const int *>(cu_seqlens_q),
+            static_cast<const int *>(seq_lens),
+            static_cast<const int *>(block_tables),
+            num_seqs,
+            total_q_tokens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            scale);
+    }
 
     const cudaError_t launch_err = cudaPeekAtLastError();
     if (launch_err != cudaSuccess) {
