@@ -721,7 +721,7 @@ pub fn resolve_gguf_alias(name: &str) -> Option<(String, String)> {
 /// that already host their own tokenizer (e.g. bartowski/*).
 pub fn tokenizer_sibling_repo(gguf_repo: &str) -> Option<String> {
     if gguf_repo == "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF" {
-        return Some("meta-llama/Meta-Llama-3.1-8B-Instruct".to_string());
+        return Some("NousResearch/Meta-Llama-3.1-8B-Instruct".to_string());
     }
     if let Some(stripped) = gguf_repo.strip_suffix("-GGUF") {
         Some(stripped.to_string())

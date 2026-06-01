@@ -58,7 +58,19 @@ pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
                     sibling.dimmed()
                 );
                 let dl2 = HfDownloader::new(cache_dir.clone(), token.clone())?;
-                match dl2.download(&sibling, None).await {
+                match dl2
+                    .download_selected_files(
+                        &sibling,
+                        None,
+                        &[
+                            "tokenizer.json",
+                            "tokenizer_config.json",
+                            "special_tokens_map.json",
+                            "chat_template.json",
+                        ],
+                    )
+                    .await
+                {
                     Ok(sibling_dir) => {
                         // Copy tokenizer.json + tokenizer_config.json into
                         // the GGUF snapshot dir so they live next to the

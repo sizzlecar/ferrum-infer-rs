@@ -225,6 +225,68 @@ impl HfDownloader {
         Ok(gguf_path)
     }
 
+    /// Download a small selected set of root-level files from a HuggingFace
+    /// repo into the normal cache snapshot layout.
+    pub async fn download_selected_files(
+        &self,
+        model_id: &str,
+        revision: Option<&str>,
+        filenames: &[&str],
+    ) -> Result<PathBuf> {
+        let revision = revision.unwrap_or("main");
+        let model_cache_name = format!("models--{}", model_id.replace('/', "--"));
+        let model_dir = self.cache_dir.join("hub").join(&model_cache_name);
+        let snapshots_dir = model_dir.join("snapshots");
+        let blobs_dir = model_dir.join("blobs");
+        let refs_dir = model_dir.join("refs");
+        fs::create_dir_all(&snapshots_dir).await?;
+        fs::create_dir_all(&blobs_dir).await?;
+        fs::create_dir_all(&refs_dir).await?;
+
+        let files = self.list_files(model_id, revision).await?;
+        let files_to_download: Vec<_> = files
+            .iter()
+            .filter(|f| {
+                f.file_type.as_deref() != Some("directory")
+                    && filenames.iter().any(|wanted| f.path == *wanted)
+            })
+            .collect();
+        if files_to_download.is_empty() {
+            return Err(FerrumError::model(format!(
+                "none of the requested files were found in repo '{}'",
+                model_id
+            )));
+        }
+
+        let commit_sha = self.get_commit_sha(model_id, revision).await?;
+        let snapshot_dir = snapshots_dir.join(&commit_sha);
+        fs::create_dir_all(&snapshot_dir).await?;
+
+        let total_size: u64 = files_to_download.iter().filter_map(|f| f.size).sum();
+        println!(
+            "📦 Downloading {} files ({:.2} MB)",
+            files_to_download.len(),
+            total_size as f64 / 1_048_576.0
+        );
+
+        for f in &files_to_download {
+            self.download_file_concurrent(
+                model_id,
+                revision,
+                &f.path,
+                f.size.unwrap_or(0),
+                &blobs_dir,
+                &snapshot_dir,
+                None,
+            )
+            .await?;
+        }
+
+        let ref_file = refs_dir.join(revision);
+        fs::write(&ref_file, &commit_sha).await?;
+        Ok(snapshot_dir)
+    }
+
     /// Download a model from HuggingFace
     pub async fn download(&self, model_id: &str, revision: Option<&str>) -> Result<PathBuf> {
         let revision = revision.unwrap_or("main");
