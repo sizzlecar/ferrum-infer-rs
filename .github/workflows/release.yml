@@ -21,9 +21,8 @@ env:
 jobs:
   # ── Linux x86_64 (CPU only) ──────────────────────────────────────────
   # Built on ubuntu-22.04 for broader glibc compatibility (2.35 covers
-  # Ubuntu 22.04+, Debian 12+, RHEL 9+, Fedora 36+). CUDA users build
-  # from source — bundling CUDA in the release tarball is too large
-  # and pins them to a specific toolkit version anyway.
+  # Ubuntu 22.04+, Debian 12+, RHEL 9+, Fedora 36+). CUDA is packaged by
+  # release-cuda.yml so the toolkit-specific build stays isolated.
   linux-x86_64:
     name: Linux x86_64
     runs-on: ubuntu-22.04
