@@ -1,0 +1,1 @@
+{"id":"87d7cc77-bbf5-4f62-b0d7-1267857d51b9","object":"chat.completion","created":1780330390,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"message":{"role":"assistant","content":"Paris/basalt"},"finish_reason":"stop"}],"usage":{"prompt_tokens":95,"completion_tokens":5,"total_tokens":100}}

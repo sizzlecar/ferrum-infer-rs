@@ -1,0 +1,144 @@
+{
+  "performance_regression_gates": {
+    "baseline_case": "fa_layout",
+    "cases": {
+      "fa2_source": {
+        "baseline_case": "fa_layout",
+        "metrics": [
+          {
+            "baseline": 1205.260257873784,
+            "candidate": 1337.2827134628308,
+            "delta_pct": 10.953854549385822,
+            "metric": "throughput_mean",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "min_delta_pct",
+              "value": -3.0
+            }
+          },
+          {
+            "baseline": 705.5377404999999,
+            "candidate": 572.1326005,
+            "delta_pct": -18.90829254654166,
+            "metric": "ttft_p50",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 10.0
+            }
+          },
+          {
+            "baseline": 20.563026779637894,
+            "candidate": 19.05550906117741,
+            "delta_pct": -7.331205345476044,
+            "metric": "tpot_p50",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 5.0
+            }
+          },
+          {
+            "baseline": 57.97966699999999,
+            "candidate": 31.531715349999992,
+            "delta_pct": -45.61590815966571,
+            "metric": "itl_p95",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 10.0
+            }
+          }
+        ],
+        "ok": true
+      }
+    },
+    "concurrency_cells_ok": true,
+    "enabled": true,
+    "observed_concurrency_cells": [
+      32
+    ],
+    "required_concurrency_cells": [],
+    "schema_version": 1,
+    "thresholds": {
+      "enabled": true,
+      "itl_p95_max_regression_pct": 10.0,
+      "throughput_min_delta_pct": -3.0,
+      "tpot_max_regression_pct": 5.0,
+      "ttft_max_regression_pct": 10.0
+    }
+  },
+  "rows": [
+    {
+      "artifact_verdict": "pass",
+      "completed": 32,
+      "concurrency": 32,
+      "env_hash": "sha256:1bf7a549e331a0c1e78e6e70de4a374e1af62840e0c617fa80829e2475bcbca1",
+      "errored": 0,
+      "itl_p95": 31.531715349999992,
+      "name": "fa2_source",
+      "not_publishable": false,
+      "performance_gate_ok": true,
+      "runtime_config_entry_count": 15,
+      "status": "pass",
+      "throughput_ci95_hw": null,
+      "throughput_mean": 1337.2827134628308,
+      "throughput_stddev": null,
+      "tpot_p50": 19.05550906117741,
+      "ttft_p50": 572.1326005
+    },
+    {
+      "artifact_verdict": "pass",
+      "completed": 32,
+      "concurrency": 32,
+      "env_hash": "sha256:d1b1513b20c2574547d1b4da4010e4ac7cbc0744a6e51ea3a9af706b7ebeec46",
+      "errored": 0,
+      "itl_p95": 57.97966699999999,
+      "name": "fa_layout",
+      "not_publishable": false,
+      "runtime_config_entry_count": 15,
+      "status": "pass",
+      "throughput_ci95_hw": null,
+      "throughput_mean": 1205.260257873784,
+      "throughput_stddev": null,
+      "tpot_p50": 20.563026779637894,
+      "ttft_p50": 705.5377404999999
+    }
+  ],
+  "runtime_config_diff_vs_baseline": {
+    "fa2_source": {
+      "added": [
+        {
+          "affects": [
+            "performance"
+          ],
+          "effect": "performance",
+          "effective_value": "1",
+          "key": "FERRUM_FA2_SOURCE",
+          "source": "env"
+        }
+      ],
+      "baseline_env_hash": "sha256:d1b1513b20c2574547d1b4da4010e4ac7cbc0744a6e51ea3a9af706b7ebeec46",
+      "candidate_env_hash": "sha256:1bf7a549e331a0c1e78e6e70de4a374e1af62840e0c617fa80829e2475bcbca1",
+      "changed": [],
+      "removed": [
+        {
+          "affects": [
+            "performance"
+          ],
+          "effect": "performance",
+          "effective_value": "0",
+          "key": "FERRUM_FA2_DIRECT_FFI",
+          "source": "env"
+        }
+      ]
+    }
+  },
+  "throughput_delta_pct_vs_baseline": {
+    "fa2_source": 10.953854549385822
+  }
+}
