@@ -29,6 +29,7 @@
 - User-adjusted formal release performance threshold is `0.75× vLLM`; the native source FA2 all-cell N=3 packet passes this release threshold for all cells.
 - Native source FA2 q2 grouping experiment → microbench positive but full-model c32 negative (`1462.15 tok/s`), reverted by `2197077`
 - Real-model API smoke attempt at `/workspace/m3-real-model-api-smoke-20260601` → failed before SDK tests because `ferrum pull qwen3:0.6b` returned HuggingFace `401 Unauthorized`
+- Real-model direct release-binary API smoke at `/workspace/m3-real-model-api-direct-smoke-20260601` → passed health, chat, usage, streaming usage, json_object, and three-turn recall on `Qwen/Qwen3-0.6B`
 
 All commands above have explicit status noted above; all tooling self-tests passed while the Milestone A 5-run probe failed in this environment due missing CUDA binaries.
 
@@ -49,6 +50,8 @@ All commands above have explicit status noted above; all tooling self-tests pass
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-native-fa2-q2-negative-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-smoke-hf401-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/release-readiness-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-real-model-api-direct-smoke-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/release-benchmark-plan-20260601.md`
 
 ### Next-turn execution path (from this evidence state)
 
@@ -207,6 +210,16 @@ completion blocker for the current checkpoint.
   HuggingFace `401 Unauthorized` for `qwen3:0.6b`, before SDK tests ran.
   Vast instance `38872161` was stopped through the Vast API after GPU work
   completed.
+- `2026-06-01 16:31:00 +0800`: completed direct release-binary real-model API
+  smoke at `/workspace/m3-real-model-api-direct-smoke-20260601`.
+  `Qwen/Qwen3-0.6B` passed health, non-streaming chat, usage fields,
+  streaming `[DONE]`, streaming usage, `json_object`, and three-turn
+  `basalt`/`Paris` recall. The ignored SDK cargo wrapper is still not used for
+  release because it blocked in a debug CUDA build-script path.
+- `2026-06-01 16:31:00 +0800`: added release benchmark plan for saved
+  Ferrum/vLLM artifacts: M3 Qwen3-30B-A3B GPTQ Int4 plus GGUF-vs-GGUF
+  comparisons for Qwen3-8B and LLaMA-3.1-8B. vLLM GGUF support is treated as
+  experimental and must be labeled separately.
 - Next hard-stop decision points are now I/E/F/G blockers; Milestone A must
   stay green but is no longer a binding blocker for the current checkpoint.
 
@@ -220,9 +233,10 @@ completion blocker for the current checkpoint.
   `0.75× vLLM` formal release threshold. It remains open only if the release
   requires source FA2 to become the default path rather than a release-supported
   opt-in path.
-- `Milestone F` and `Milestone G` are blocked for final completion by
-  real-model packet evidence; the latest attempt failed at `qwen3:0.6b` pull
-  with HuggingFace 401.
+- `Milestone F` and `Milestone G` have direct release-binary real-model smoke
+  evidence. The ignored SDK cargo wrapper remains blocked by a debug CUDA
+  build-script hang and should be treated as a post-release harness issue
+  unless strict SDK-wrapper evidence is required.
 
 ---
 

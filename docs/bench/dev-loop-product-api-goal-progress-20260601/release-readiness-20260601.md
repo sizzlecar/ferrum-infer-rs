@@ -22,7 +22,8 @@ Evidence summary:
 | Source FA2 all-cell correctness | pass | `/workspace/m3-fa2-source-current-allcells-n3-20260601`, Paris, multi-turn, and three-turn `Paris/basalt` recall passed for c=1/4/16/32 |
 | Source FA2 all-cell performance | pass at `0.75x` release threshold | c1 `0.855x`, c4 `0.875x`, c16 `0.838x`, c32 `0.754x` versus same-pod vLLM |
 | q2 native FA2 candidate | rejected | microbench-positive but full-model c32 regressed to `1462.15 tok/s`; reverted by `2197077` |
-| Real-model OpenAI API smoke | in progress / required before release sign-off | first attempt hit HF pull failure; `Qwen/Qwen3-0.6B` cache was populated, then smoke restarted with `PULL_MODEL=0` |
+| Real-model OpenAI API smoke | pass for direct release-binary smoke | `/workspace/m3-real-model-api-direct-smoke-20260601`, `all_passed=true` |
+| Alias serve ergonomics | needs follow-up | `serve qwen3:0.6b` found the snapshot but failed tokenizer creation without `FERRUM_MODEL_PATH`; direct snapshot-path serve passed |
 
 M3 release-threshold table:
 
@@ -35,8 +36,9 @@ M3 release-threshold table:
 
 Release blockers remaining as of this checkpoint:
 
-- Real-model OpenAI API smoke must finish and validate, or be explicitly
-  waived with the failed/pending reason documented.
+- The ignored `cargo test` SDK smoke remains blocked by a debug CUDA build
+  script hang; direct release-binary smoke passed and is sufficient for release
+  evidence if accepted.
 - Final release checkpoint/tag has not yet been created.
 - If the release requires source FA2 to be enabled by default rather than
   release-supported opt-in, the default/selector decision must be made before

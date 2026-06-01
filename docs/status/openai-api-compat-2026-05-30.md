@@ -131,6 +131,18 @@ not sufficient for a completion claim.
   so the cached Qwen3-30B GPTQ benchmark model is not a drop-in replacement for
   this packet.
 
+2026-06-01 direct release-binary real-model smoke:
+
+- Artifact: `/workspace/m3-real-model-api-direct-smoke-20260601`.
+- Model: `Qwen/Qwen3-0.6B`, snapshot
+  `/root/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca`.
+- Server command used `target/release/ferrum serve <snapshot-path>` with
+  `FERRUM_MODEL_PATH=<snapshot-path>`.
+- Passed checks: `/health`, non-streaming chat, Paris content, usage fields,
+  streaming `[DONE]`, streaming usage chunk, `response_format=json_object`, and
+  three-turn `basalt`/`Paris` recall.
+- Summary file: `summary.json` with `all_passed=true`.
+
 ## Known Remaining Gaps
 
 - Always-on engine tests cover tokenizer-backed mock-executor paths, including a byte-level tokenizer fixture that differs from whitespace counting. Ignored real-model SDK smokes now assert Qwen3 tokenizer-backed `prompt_tokens` on non-streaming and streaming served paths, but they still need GPU/Metal execution before they become evidence.
@@ -153,7 +165,8 @@ not sufficient for a completion claim.
   not sent, but strict streaming no longer has token-by-token latency.
 - `response_format=json_object` remains best-effort.
 - Real-model SDK tests remain ignored; deterministic route tests cover the always-on path. The strict-schema 20-run smoke exists but has not been executed in the always-on local gate.
-- The latest real-model smoke attempt is blocked by the missing/unauthorized
-  `Qwen/Qwen3-0.6B` cache entry on the restored GPU host.
+- The ignored `cargo test` real-model SDK wrapper remains blocked by a debug
+  CUDA build-script hang on the restored GPU host. The direct release-binary
+  smoke above is the current F/G release evidence.
 - The Python OpenAI SDK smoke requires `python3 -m pip install openai` and can
   be pointed at a specific Python with `FERRUM_PYTHON`.
