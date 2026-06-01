@@ -21,6 +21,7 @@ Current release-candidate code checkpoint:
 | LLaMA-3.1-8B GGUF CUDA serve | pass smoke | `/workspace/release-llama31-8b-gguf-cuda-smoke-42ffbe2`, health/chat passed |
 | 8B GGUF Ferrum/vLLM comparison | pass with caveats | `gguf-8b-release-benchmarks-20260601.md`, Qwen3-8B and LLaMA-3.1-8B GGUF-vs-GGUF tables saved |
 | Metal Qwen3-MoE prefill readback | pass smoke | `metal-qwen3-30b-a3b-prefill-syncfix-20260601.md`, Paris output is sane and encoder assertion no longer reproduces |
+| Metal Qwen3-8B GGUF smoke | pass | `metal-qwen3-8b-q4km-smoke-20260601`, Paris correctness passed; 64-token decode median `23.5 tok/s` with local swap active |
 | Post-fix GPU quick regression | pass | `m3-quick-regress-1e3ce42-c32-20260601.md`, c32 source FA2 `1403.98 tok/s`, correctness/multi-turn passed |
 | q2 native FA2 experiment | rejected safely | microbench-positive but full-model c32 regressed; reverted by `2197077` |
 

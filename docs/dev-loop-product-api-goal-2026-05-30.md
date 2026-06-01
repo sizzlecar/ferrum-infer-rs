@@ -43,6 +43,10 @@
   `/workspace/m3-quick-regress-1e3ce42-c32-20260601` passed Paris,
   multi-turn, three-round recall, and c32 performance gate
   (`fa2_source=1403.98 tok/s`, `fa_layout=1230.54 tok/s`, `+14.10%`).
+- Local Metal Qwen3-8B Q4_K_M smoke at
+  `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-8b-q4km-smoke-20260601/`
+  passed Paris correctness and measured 64-token decode median `23.5 tok/s`
+  over 3 runs with swap active.
 
 All commands above have explicit status noted above; all tooling self-tests passed while the Milestone A 5-run probe failed in this environment due missing CUDA binaries.
 
@@ -69,6 +73,7 @@ All commands above have explicit status noted above; all tooling self-tests pass
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/gguf-8b-release-benchmarks-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-30b-a3b-prefill-syncfix-20260601.md`
 - `docs/bench/dev-loop-product-api-goal-progress-20260601/m3-quick-regress-1e3ce42-c32-20260601.md`
+- `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-8b-q4km-smoke-20260601/summary.md`
 
 ### Next-turn execution path (from this evidence state)
 
@@ -289,6 +294,12 @@ completion blocker for the current checkpoint.
   `fa_layout` passed Paris, multi-turn, and three-round recall. c32 quick
   throughput measured `fa2_source=1403.98 tok/s` versus
   `fa_layout=1230.54 tok/s`; runner perf gate passed.
+- `2026-06-01 21:00:00 +0800`: ran local Metal Qwen3-8B Q4_K_M smoke at
+  `docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-8b-q4km-smoke-20260601/`.
+  Paris correctness passed. Three 64-token decode runs measured
+  `23.8/23.5/23.5 tok/s`, median `23.5 tok/s`. Local swap was active
+  (`1.64GB/2GB`), so this is a smoke/regression number, not a clean headline
+  Metal benchmark.
 - Next hard-stop decision points are release-note wording, source-FA2 opt-in
   versus default policy, and final checkpoint/tag creation. Milestone A must
   stay green but is no longer a binding blocker for the current checkpoint.

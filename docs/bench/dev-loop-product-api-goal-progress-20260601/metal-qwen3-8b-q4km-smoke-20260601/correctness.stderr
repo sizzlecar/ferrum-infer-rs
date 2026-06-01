@@ -1,0 +1,14 @@
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading /Users/chejinxuan/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-01T12:31:24.523100Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T12:31:24.523346Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T12:31:24.524704Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-8B.tokenizer.json"
+2026-06-01T12:31:24.720212Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T12:31:24.720571Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T12:31:24.720600Z  INFO ferrum_engine::registry: Creating priority scheduler
+2026-06-01T12:31:24.720952Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T12:31:24.721267Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf (format: gguf)
+Model loaded in 7.0s.
+[7 tokens, 5.3 tok/s, 1.3s]

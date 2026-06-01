@@ -32,6 +32,7 @@ Evidence summary:
 | LLaMA-3.1-8B GGUF CUDA serve | pass smoke | `llama3.1:8b-q4_k_m` release-binary OpenAI smoke passed at `/workspace/release-llama31-8b-gguf-cuda-smoke-42ffbe2` |
 | 8B GGUF Ferrum/vLLM benchmark | pass with caveats | Saved GGUF-vs-GGUF tables are mirrored in `gguf-8b-remote-artifacts/` and summarized in `gguf-8b-release-benchmarks-20260601.md` |
 | Metal Qwen3-MoE prefill readback | pass smoke | `1e3ce42` adds a pre-readback sync; local Metal smoke returns Paris and no longer triggers the encoder assertion |
+| Metal Qwen3-8B GGUF smoke | pass | `metal-qwen3-8b-q4km-smoke-20260601`, Paris correctness passed; 64-token decode median `23.5 tok/s` with local swap active |
 | Post-fix GPU quick regression | pass | `/workspace/m3-quick-regress-1e3ce42-c32-20260601`, c32 source FA2 `1403.98 tok/s`, correctness/multi-turn passed, perf gate `ok=true` |
 
 M3 release-threshold table:
@@ -59,6 +60,9 @@ Release blockers remaining as of this checkpoint:
   performance claim because the Mac had active swap and `run --bench-mode`
   stopped early on EOS; only the Metal correctness/syncfix evidence should be
   used for this release.
+- A smaller Qwen3-8B Metal smoke did produce a stable 64-token decode run:
+  median `23.5 tok/s` over 3 runs, with swap still active. Treat it as a
+  regression smoke, not a clean headline benchmark.
 
 8B GGUF CUDA serve notes:
 
