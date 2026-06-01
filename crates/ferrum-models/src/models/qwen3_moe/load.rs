@@ -20,7 +20,18 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         }
         let runtime_env = Qwen3MoeRuntimeEnv::from_env();
         let rope = build_rope_cache::<B>(&cfg.base);
-        let scratch = Qwen3MoeScratch::alloc(&cfg, runtime_env.initial_scratch_tokens);
+        // GGUF/Metal uses the legacy decode path, not the CUDA varlen
+        // unified path. Keep the historical small scratch allocation here
+        // and let ensure_scratch grow to the actual batch size (for the
+        // README c=16 row this means 16, not 2048). A 2048-token scratch
+        // allocates multi-GB batch_logits/MoE temporaries on Apple Silicon
+        // and regresses Qwen3-30B-A3B by ~4x through memory pressure.
+        let initial_scratch_tokens = if B::supports_varlen_qkv() {
+            runtime_env.initial_scratch_tokens
+        } else {
+            1
+        };
+        let scratch = Qwen3MoeScratch::alloc(&cfg, initial_scratch_tokens);
 
         let embed = loader.load_tensor("model.embed_tokens.weight")?;
 

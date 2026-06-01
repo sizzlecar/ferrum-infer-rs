@@ -90,6 +90,7 @@ impl MetalPipelines {
                     "fused_residual_norm_f32",
                     "gemm_f32",
                     "argmax_f32",
+                    "argmax_rows_f32",
                     "embedding_lookup_f32",
                     "split_qkv_f32",
                     "silu_mul_split_f32",

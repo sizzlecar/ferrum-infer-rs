@@ -158,6 +158,8 @@ pub fn load_gguf_decoder_with_info(
         "mistral" => ModelType::Mistral,
         other => ModelType::Custom(other.to_string()),
     };
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("ferrum_arch".to_string(), serde_json::json!(arch.as_str()));
     let model_info = ModelInfo {
         model_id,
         model_type,
@@ -172,7 +174,7 @@ pub fn load_gguf_decoder_with_info(
         device: device.clone(),
         version: None,
         license: None,
-        metadata: std::collections::HashMap::new(),
+        metadata,
     };
 
     let gguf_arc = Arc::new(gguf);

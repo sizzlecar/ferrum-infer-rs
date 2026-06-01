@@ -43,12 +43,15 @@ impl Qwen3MoeRuntimeEnv {
     }
 
     pub(crate) fn from_runtime_config_snapshot(snapshot: &RuntimeConfigSnapshot) -> Self {
-        Self::from_env_vars(
-            snapshot
-                .entries
-                .iter()
-                .map(|entry| (entry.key.as_str(), entry.effective_value.as_str())),
-        )
+        let mut entries: Vec<(String, String)> = snapshot
+            .entries
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.effective_value.clone()))
+            .collect();
+        entries.extend(std::env::vars().filter(|(key, _)| {
+            key.starts_with("FERRUM_") || key == "MTL_CAPTURE_ENABLED"
+        }));
+        Self::from_env_vars(entries)
     }
 
     fn from_env_vars<I, K, V>(vars: I) -> Self

@@ -18,6 +18,19 @@ impl EngineInner {
         if chunked_or_spec {
             return self.process_batch_legacy_split(batch).await;
         }
+        let info = self.model_executor.info();
+        let is_qwen3_moe = info
+            .metadata
+            .get("ferrum_arch")
+            .and_then(|value| value.as_str())
+            == Some("qwen3moe");
+        let backend_lacks_native_unified = matches!(
+            info.device,
+            ferrum_types::Device::CPU | ferrum_types::Device::Metal
+        );
+        if is_qwen3_moe && backend_lacks_native_unified {
+            return self.process_batch_legacy_split(batch).await;
+        }
         self.process_batch_unified(batch).await
     }
 

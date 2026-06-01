@@ -720,6 +720,9 @@ fn convert_chat_request(
             serde_json::to_value(function_call)?,
         );
     }
+    if request.ignore_eos.unwrap_or(false) {
+        metadata.insert("ferrum_ignore_eos".to_string(), serde_json::json!(true));
+    }
 
     Ok(InferenceRequest {
         id: RequestId(Uuid::new_v4()),

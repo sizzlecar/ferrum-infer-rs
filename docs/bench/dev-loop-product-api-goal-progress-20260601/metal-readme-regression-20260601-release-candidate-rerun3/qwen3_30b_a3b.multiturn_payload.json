@@ -1,0 +1,24 @@
+{
+  "model": "Qwen3-30B-A3B",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Answer the final user question using the conversation context."
+    },
+    {
+      "role": "user",
+      "content": "What is the capital of France?"
+    },
+    {
+      "role": "assistant",
+      "content": "Paris."
+    },
+    {
+      "role": "user",
+      "content": "What city did the assistant just name?"
+    }
+  ],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stream": false
+}
