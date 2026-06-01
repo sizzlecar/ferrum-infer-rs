@@ -321,6 +321,38 @@ pub async fn resolve_model_source(
         });
     }
 
+    // 1b. GGUF alias.
+    if let Some((repo, filename)) = super::commands::run::resolve_gguf_alias(model) {
+        let local_path = super::commands::run::find_cached_gguf(
+            &cache_dir.to_path_buf(),
+            &repo,
+            &filename,
+        )
+        .ok_or_else(|| {
+            FerrumError::model(format!(
+                "GGUF alias '{}' not found locally; run `ferrum pull {}` first",
+                model, model
+            ))
+        })?;
+        let mut autosized = false;
+        if let Some((profile, gpu_util)) = autosize {
+            apply_auto_size_with_profile(&local_path, gpu_util, profile);
+            autosized = true;
+            if profile == AutoSizeProfile::Chat {
+                apply_chat_profile_env(&local_path);
+            }
+        }
+        return Ok(Resolved {
+            source: ResolvedModelSource {
+                original: model.to_string(),
+                local_path,
+                format: ModelFormat::GGUF,
+                from_cache: true,
+            },
+            autosized,
+        });
+    }
+
     // 2. Local directory.
     let direct = PathBuf::from(model);
     if direct.is_dir() {

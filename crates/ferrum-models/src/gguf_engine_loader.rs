@@ -221,11 +221,25 @@ pub fn load_gguf_decoder_with_info(
             }
         }
         Device::CUDA(_) => {
-            return Err(FerrumError::unsupported(
-                "GGUF decoder loading on CUDA is not yet wired through the engine — \
-                 use --features cuda with the safetensors path, or fall back to \
-                 `ferrum run <path.gguf>` which uses candle's quantized_* modules.",
-            ));
+            #[cfg(feature = "cuda")]
+            {
+                use ferrum_kernels::backend::cuda::CudaBackend;
+                let loader = GgufLoader::<CudaBackend>::from_file(gguf_arc.clone());
+                if let Some(mc) = moe_cfg {
+                    let model = Qwen3MoeModel::<CudaBackend>::new(mc, &loader, &gguf_arc)?;
+                    Box::new(model)
+                } else {
+                    let dc = dense_cfg.unwrap();
+                    let model = LlamaFamilyModel::<CudaBackend>::new(dc, &loader)?;
+                    Box::new(model)
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                return Err(FerrumError::device(
+                    "CUDA device requested but `cuda` feature not enabled",
+                ));
+            }
         }
         other => {
             return Err(FerrumError::device(format!(

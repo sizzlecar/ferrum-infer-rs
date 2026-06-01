@@ -361,12 +361,14 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
         }
 
         let cols = cols_check.ok_or_else(|| FerrumError::model("fusion: no parts"))?;
-        let quant = crate::QuantLinear::<B>::from_gguf_bytes(
+        let Ok(quant) = crate::QuantLinear::<B>::from_gguf_bytes(
             ferrum_kernels::backend::GgufQuantType::Q4K,
             &fused_bytes,
             total_rows,
             cols,
-        )?;
+        ) else {
+            return Ok(None);
+        };
         Ok(Some(Box::new(quant)))
     }
 
@@ -474,9 +476,11 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> WeightLoader<B> for Ggu
                                 "GgufLoader: tensor_byte_slice failed for '{gguf_weight}'"
                             ))
                         })?;
-                        let quant =
-                            crate::QuantLinear::<B>::from_gguf_bytes(kind, bytes, n_rows, n_cols)?;
-                        return Ok(Box::new(quant));
+                        if let Ok(quant) =
+                            crate::QuantLinear::<B>::from_gguf_bytes(kind, bytes, n_rows, n_cols)
+                        {
+                            return Ok(Box::new(quant));
+                        }
                     }
                     // else fall through to eager-dequant bias path below
                 }
