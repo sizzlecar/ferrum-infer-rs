@@ -1765,6 +1765,20 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             let (cid, tok, pos) = &batch[0];
             return vec![self.decode_internal(cid, *tok, *pos)];
         }
+        if B::is_metal_backend() {
+            // Metal LLaMA-family batched decode currently produces incorrect
+            // follow-up logits after the first generated token under
+            // concurrent serving: single-request decode emits EOS and stops,
+            // while m>1 batched decode continues with corrupted tails such as
+            // repeated assistant/control fragments. Preserve correctness for
+            // the user-facing serving path by falling back to the known-good
+            // per-item decode path on Metal until the batched kernel path has
+            // a dedicated correctness fix.
+            return batch
+                .iter()
+                .map(|(cid, tok, pos)| self.decode_internal(cid, *tok, *pos))
+                .collect();
+        }
 
         // Ensure all caches exist and scratch is sized for M tokens.
         for (cid, _, _) in batch {
