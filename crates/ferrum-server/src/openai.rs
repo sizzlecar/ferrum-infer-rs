@@ -210,6 +210,12 @@ pub struct ChatMessage {
     #[serde(deserialize_with = "deserialize_message_content")]
     pub content: String,
 
+    /// vLLM-compatible parsed reasoning text. When Ferrum parses
+    /// `<think>...</think>`, `content` contains only the final visible
+    /// answer and this field contains the reasoning block text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+
     /// Message name (for function calls)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
