@@ -77,6 +77,8 @@ fn toy_config(n_experts: usize, hidden: usize, ffn: usize, top_k: usize) -> Qwen
         max_seq_len: 32,
         rms_norm_eps: 1.0e-6,
         rope_theta: 1.0e6,
+        rope_scaling: None,
+        rope_interleaved: false,
         has_qk_norm: true,
         sliding_window: 0,
     };

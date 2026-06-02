@@ -519,7 +519,11 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 };
 
                 let start = std::time::Instant::now();
-                let trace_tokens = std::env::var("FERRUM_RUN_TRACE_TOKENS").is_ok();
+                let trace_tokens = crate::runtime_env::runtime_snapshot_value(
+                    &runtime_config,
+                    "FERRUM_RUN_TRACE_TOKENS",
+                )
+                .is_some();
                 let (clean_response, finish_reason, token_count, chunk_count) = match format {
                     OutputFormat::Text => {
                         let mut stream = engine.infer_stream(request).await?;
