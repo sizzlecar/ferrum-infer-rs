@@ -388,6 +388,10 @@ async fn handle_chat_completions_stream(
     let buffer_structured_api_stream =
         ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
     let buffer_stream_output = buffer_strict_json_schema_stream || buffer_structured_api_stream;
+    let mut stream = engine
+        .infer_stream(inference_request)
+        .await
+        .map_err(server_error_from_ferrum_error)?;
 
     tokio::spawn(async move {
         let mut current_text = String::new();
@@ -396,227 +400,206 @@ async fn handle_chat_completions_stream(
         let mut token_count = 0;
         let max_tokens = chat_completion_max_tokens(&openai_request);
 
-        match engine.infer_stream(inference_request).await {
-            Ok(mut stream) => {
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(chunk) => {
-                            if chunk.token.is_some() {
-                                token_count += 1;
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(chunk) => {
+                    if chunk.token.is_some() {
+                        token_count += 1;
+                    }
+                    if !chunk.text.is_empty() {
+                        current_text.push_str(&chunk.text);
+
+                        if !buffer_stream_output {
+                            let parsed = parse_reasoning_response(&current_text);
+                            let full_reasoning = parsed.reasoning.as_deref().unwrap_or("");
+                            let reasoning_delta = full_reasoning[sent_reasoning_len..].to_string();
+                            sent_reasoning_len = full_reasoning.len();
+                            let content_delta = parsed.content[sent_content_len..].to_string();
+                            sent_content_len = parsed.content.len();
+                            if reasoning_delta.is_empty() && content_delta.is_empty() {
+                                continue;
                             }
-                            if !chunk.text.is_empty() {
-                                current_text.push_str(&chunk.text);
+                            // Create streaming response chunk
+                            let response_chunk = ChatCompletionsResponse {
+                                id: request_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created: chrono::Utc::now().timestamp() as u64,
+                                model: openai_request.model.clone(),
+                                choices: vec![ChatChoice {
+                                    index: 0,
+                                    message: None,
+                                    delta: Some(ChatMessage {
+                                        role: MessageRole::Assistant,
+                                        content: content_delta,
+                                        reasoning: (!reasoning_delta.is_empty())
+                                            .then_some(reasoning_delta),
+                                        name: None,
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                        function_call: None,
+                                    }),
+                                    finish_reason: None,
+                                }],
+                                usage: None,
+                            };
 
-                                if !buffer_stream_output {
-                                    let parsed = parse_reasoning_response(&current_text);
-                                    let full_reasoning = parsed.reasoning.as_deref().unwrap_or("");
-                                    let reasoning_delta =
-                                        full_reasoning[sent_reasoning_len..].to_string();
-                                    sent_reasoning_len = full_reasoning.len();
-                                    let content_delta =
-                                        parsed.content[sent_content_len..].to_string();
-                                    sent_content_len = parsed.content.len();
-                                    if reasoning_delta.is_empty() && content_delta.is_empty() {
-                                        continue;
-                                    }
-                                    // Create streaming response chunk
-                                    let response_chunk = ChatCompletionsResponse {
-                                        id: request_id.clone(),
-                                        object: "chat.completion.chunk".to_string(),
-                                        created: chrono::Utc::now().timestamp() as u64,
-                                        model: openai_request.model.clone(),
-                                        choices: vec![ChatChoice {
-                                            index: 0,
-                                            message: None,
-                                            delta: Some(ChatMessage {
-                                                role: MessageRole::Assistant,
-                                                content: content_delta,
-                                                reasoning: (!reasoning_delta.is_empty())
-                                                    .then_some(reasoning_delta),
-                                                name: None,
-                                                tool_calls: None,
-                                                tool_call_id: None,
-                                                function_call: None,
-                                            }),
-                                            finish_reason: None,
-                                        }],
-                                        usage: None,
-                                    };
-
-                                    let sse_event = Event::default()
-                                        .json_data(&response_chunk)
-                                        .unwrap_or_else(|_| Event::default().data("error"));
-                                    if tx.send(Ok(sse_event)).is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if token_count >= max_tokens || chunk.finish_reason.is_some() {
-                                let usage = chunk.usage.as_ref().map(openai_usage_from_token_usage);
-                                if let Err(e) = validate_strict_json_schema_response(
-                                    &openai_request,
-                                    &current_text,
-                                ) {
-                                    let error_event = openai_error_sse_event(
-                                        strict_stream_validation_error_message(e),
-                                        "internal_server_error",
-                                        Some("response_format.json_schema"),
-                                    );
-                                    let _ = tx.send(Ok(error_event));
-                                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                                    break;
-                                }
-                                let structured_chat_response = match chunk.api_response.as_ref() {
-                                    Some(ferrum_types::ApiResponse::Chat(response)) => {
-                                        Some(response.clone())
-                                    }
-                                    _ if buffer_structured_api_stream => {
-                                        ferrum_types::chat_api_response_from_generated_text(
-                                            &stream_api_request,
-                                            &current_text,
-                                        )
-                                    }
-                                    _ => None,
-                                };
-
-                                if let Some(chat_response) = structured_chat_response.as_ref() {
-                                    let response_chunk = ChatCompletionsResponse {
-                                        id: request_id.clone(),
-                                        object: "chat.completion.chunk".to_string(),
-                                        created: chrono::Utc::now().timestamp() as u64,
-                                        model: openai_request.model.clone(),
-                                        choices: vec![ChatChoice {
-                                            index: 0,
-                                            message: None,
-                                            delta: Some(openai_chat_delta_from_api(
-                                                &chat_response.message,
-                                            )),
-                                            finish_reason: None,
-                                        }],
-                                        usage: None,
-                                    };
-
-                                    let sse_event = Event::default()
-                                        .json_data(&response_chunk)
-                                        .unwrap_or_else(|_| Event::default().data("error"));
-                                    if tx.send(Ok(sse_event)).is_err() {
-                                        break;
-                                    }
-                                } else if buffer_stream_output && !current_text.is_empty() {
-                                    let parsed = parse_reasoning_response(&current_text);
-                                    let response_chunk = ChatCompletionsResponse {
-                                        id: request_id.clone(),
-                                        object: "chat.completion.chunk".to_string(),
-                                        created: chrono::Utc::now().timestamp() as u64,
-                                        model: openai_request.model.clone(),
-                                        choices: vec![ChatChoice {
-                                            index: 0,
-                                            message: None,
-                                            delta: Some(ChatMessage {
-                                                role: MessageRole::Assistant,
-                                                content: parsed.content,
-                                                reasoning: parsed.reasoning,
-                                                name: None,
-                                                tool_calls: None,
-                                                tool_call_id: None,
-                                                function_call: None,
-                                            }),
-                                            finish_reason: None,
-                                        }],
-                                        usage: None,
-                                    };
-
-                                    let sse_event = Event::default()
-                                        .json_data(&response_chunk)
-                                        .unwrap_or_else(|_| Event::default().data("error"));
-                                    if tx.send(Ok(sse_event)).is_err() {
-                                        break;
-                                    }
-                                }
-                                // Send final chunk. OpenAI-style streaming
-                                // clients (e.g. `vllm bench serve`) blindly
-                                // read `choices[0]["delta"]` on every chunk
-                                // that has any `choices` entries, so the
-                                // last chunk must include `delta` even when
-                                // empty. Skipping it triggers
-                                // `KeyError: 'delta'` on the client side
-                                // and the request is reported as failed
-                                // despite returning a 200 with content.
-                                let final_chunk = ChatCompletionsResponse {
-                                    id: request_id.clone(),
-                                    object: "chat.completion.chunk".to_string(),
-                                    created: chrono::Utc::now().timestamp() as u64,
-                                    model: openai_request.model.clone(),
-                                    choices: vec![ChatChoice {
-                                        index: 0,
-                                        message: None,
-                                        delta: Some(ChatMessage {
-                                            role: MessageRole::Assistant,
-                                            content: String::new(),
-                                            reasoning: None,
-                                            name: None,
-                                            tool_calls: None,
-                                            tool_call_id: None,
-                                            function_call: None,
-                                        }),
-                                        finish_reason: structured_chat_response
-                                            .as_ref()
-                                            .and_then(|response| response.finish_reason.clone())
-                                            .or_else(|| {
-                                                chunk
-                                                    .finish_reason
-                                                    .as_ref()
-                                                    .map(finish_reason_to_string)
-                                            })
-                                            .or(Some("length".to_string())),
-                                    }],
-                                    usage: None,
-                                };
-
-                                let final_event = Event::default()
-                                    .json_data(&final_chunk)
-                                    .unwrap_or_else(|_| Event::default().data("error"));
-                                let _ = tx.send(Ok(final_event));
-                                if include_stream_usage && usage.is_some() {
-                                    let usage_chunk = ChatCompletionsResponse {
-                                        id: request_id.clone(),
-                                        object: "chat.completion.chunk".to_string(),
-                                        created: chrono::Utc::now().timestamp() as u64,
-                                        model: openai_request.model.clone(),
-                                        choices: vec![],
-                                        usage,
-                                    };
-                                    let usage_event = Event::default()
-                                        .json_data(&usage_chunk)
-                                        .unwrap_or_else(|_| Event::default().data("error"));
-                                    let _ = tx.send(Ok(usage_event));
-                                }
-                                let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                            let sse_event = Event::default()
+                                .json_data(&response_chunk)
+                                .unwrap_or_else(|_| Event::default().data("error"));
+                            if tx.send(Ok(sse_event)).is_err() {
                                 break;
                             }
                         }
-                        Err(e) => {
-                            error!("Stream generation error: {}", e);
-                            let _ = tx.send(Ok(openai_error_sse_event(
-                                e.to_string(),
+                    }
+
+                    if token_count >= max_tokens || chunk.finish_reason.is_some() {
+                        let usage = chunk.usage.as_ref().map(openai_usage_from_token_usage);
+                        if let Err(e) =
+                            validate_strict_json_schema_response(&openai_request, &current_text)
+                        {
+                            let error_event = openai_error_sse_event(
+                                strict_stream_validation_error_message(e),
                                 "internal_server_error",
-                                None,
-                            )));
+                                Some("response_format.json_schema"),
+                            );
+                            let _ = tx.send(Ok(error_event));
                             let _ = tx.send(Ok(Event::default().data("[DONE]")));
                             break;
                         }
+                        let structured_chat_response = match chunk.api_response.as_ref() {
+                            Some(ferrum_types::ApiResponse::Chat(response)) => {
+                                Some(response.clone())
+                            }
+                            _ if buffer_structured_api_stream => {
+                                ferrum_types::chat_api_response_from_generated_text(
+                                    &stream_api_request,
+                                    &current_text,
+                                )
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(chat_response) = structured_chat_response.as_ref() {
+                            let response_chunk = ChatCompletionsResponse {
+                                id: request_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created: chrono::Utc::now().timestamp() as u64,
+                                model: openai_request.model.clone(),
+                                choices: vec![ChatChoice {
+                                    index: 0,
+                                    message: None,
+                                    delta: Some(openai_chat_delta_from_api(&chat_response.message)),
+                                    finish_reason: None,
+                                }],
+                                usage: None,
+                            };
+
+                            let sse_event = Event::default()
+                                .json_data(&response_chunk)
+                                .unwrap_or_else(|_| Event::default().data("error"));
+                            if tx.send(Ok(sse_event)).is_err() {
+                                break;
+                            }
+                        } else if buffer_stream_output && !current_text.is_empty() {
+                            let parsed = parse_reasoning_response(&current_text);
+                            let response_chunk = ChatCompletionsResponse {
+                                id: request_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created: chrono::Utc::now().timestamp() as u64,
+                                model: openai_request.model.clone(),
+                                choices: vec![ChatChoice {
+                                    index: 0,
+                                    message: None,
+                                    delta: Some(ChatMessage {
+                                        role: MessageRole::Assistant,
+                                        content: parsed.content,
+                                        reasoning: parsed.reasoning,
+                                        name: None,
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                        function_call: None,
+                                    }),
+                                    finish_reason: None,
+                                }],
+                                usage: None,
+                            };
+
+                            let sse_event = Event::default()
+                                .json_data(&response_chunk)
+                                .unwrap_or_else(|_| Event::default().data("error"));
+                            if tx.send(Ok(sse_event)).is_err() {
+                                break;
+                            }
+                        }
+                        // Send final chunk. OpenAI-style streaming
+                        // clients (e.g. `vllm bench serve`) blindly
+                        // read `choices[0]["delta"]` on every chunk
+                        // that has any `choices` entries, so the
+                        // last chunk must include `delta` even when
+                        // empty. Skipping it triggers
+                        // `KeyError: 'delta'` on the client side
+                        // and the request is reported as failed
+                        // despite returning a 200 with content.
+                        let final_chunk = ChatCompletionsResponse {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created: chrono::Utc::now().timestamp() as u64,
+                            model: openai_request.model.clone(),
+                            choices: vec![ChatChoice {
+                                index: 0,
+                                message: None,
+                                delta: Some(ChatMessage {
+                                    role: MessageRole::Assistant,
+                                    content: String::new(),
+                                    reasoning: None,
+                                    name: None,
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                    function_call: None,
+                                }),
+                                finish_reason: structured_chat_response
+                                    .as_ref()
+                                    .and_then(|response| response.finish_reason.clone())
+                                    .or_else(|| {
+                                        chunk.finish_reason.as_ref().map(finish_reason_to_string)
+                                    })
+                                    .or(Some("length".to_string())),
+                            }],
+                            usage: None,
+                        };
+
+                        let final_event = Event::default()
+                            .json_data(&final_chunk)
+                            .unwrap_or_else(|_| Event::default().data("error"));
+                        let _ = tx.send(Ok(final_event));
+                        if include_stream_usage && usage.is_some() {
+                            let usage_chunk = ChatCompletionsResponse {
+                                id: request_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created: chrono::Utc::now().timestamp() as u64,
+                                model: openai_request.model.clone(),
+                                choices: vec![],
+                                usage,
+                            };
+                            let usage_event = Event::default()
+                                .json_data(&usage_chunk)
+                                .unwrap_or_else(|_| Event::default().data("error"));
+                            let _ = tx.send(Ok(usage_event));
+                        }
+                        let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                        break;
                     }
                 }
-            }
-            Err(e) => {
-                error!("Failed to start streaming: {}", e);
-                let _ = tx.send(Ok(openai_error_sse_event(
-                    e.to_string(),
-                    "internal_server_error",
-                    None,
-                )));
-                let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                Err(e) => {
+                    error!("Stream generation error: {}", e);
+                    let _ = tx.send(Ok(openai_error_sse_event(
+                        e.to_string(),
+                        "internal_server_error",
+                        None,
+                    )));
+                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                    break;
+                }
             }
         }
     });
@@ -723,7 +706,7 @@ async fn handle_chat_completions_sync(
         }
         Err(e) => {
             error!("Generation failed: {}", e);
-            Err(ServerError::InternalError(e.to_string()))
+            Err(server_error_from_ferrum_error(e))
         }
     }
 }
@@ -1344,6 +1327,14 @@ fn strict_stream_validation_error_message(error: ServerError) -> String {
         | ServerError::ServiceUnavailable(message)
         | ServerError::InvalidRequest { message, .. }
         | ServerError::UnsupportedFeature { message, .. } => message,
+    }
+}
+
+fn server_error_from_ferrum_error(error: Error) -> ServerError {
+    match error {
+        Error::RequestValidation { message } => ServerError::invalid_request(message, None),
+        Error::ResourceExhausted { message } => ServerError::ServiceUnavailable(message),
+        other => ServerError::InternalError(other.to_string()),
     }
 }
 
