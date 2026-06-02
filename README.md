@@ -78,7 +78,7 @@ Release and Metal gates:
 
 | Target | Model / workload | Result | Evidence |
 | --- | --- | --- | --- |
-| CUDA release binary | Qwen3-30B-A3B GPTQ-Int4, c=32 smoke | `16/16` requests, `0` errors; Paris, multi-turn, and three-round chat gates passed | [`release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/) |
+| CUDA release binary | Qwen3-30B-A3B GPTQ-Int4, c=32 smoke | `16/16` requests, `0` errors; Paris, multi-turn, and three-round chat gates passed | [`CUDA release-binary validation`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/) |
 | Apple Silicon Metal | Qwen3/LLaMA 8B and Qwen3-30B-A3B | Correctness, multi-turn, and concurrency gates covered | [`metal-readme-regression-20260601-release-candidate-rerun3`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/) |
 | Apple Silicon Metal limitation | Qwen3-30B-A3B, c=16 | Ferrum `72.5 tok/s`; recorded llama.cpp `83.4 tok/s` | Same Metal report above |
 
