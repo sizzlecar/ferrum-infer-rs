@@ -1,0 +1,14 @@
+   Compiling ferrum-tokenizer v0.7.4 (/workspace/ferrum-infer-rs/crates/ferrum-tokenizer)
+   Compiling ferrum-engine v0.7.4 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.4 (/workspace/ferrum-infer-rs/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.4 (/workspace/ferrum-infer-rs/crates/ferrum-cli)
+warning: unused variable: `snapshot`
+  --> crates/ferrum-cli/src/runtime_env.rs:60:49
+   |
+60 | pub fn warn_if_moe_graph_needs_unbuilt_vllm_moe(snapshot: &RuntimeConfigSnapshot) {
+   |                                                 ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_snapshot`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ferrum-cli` (lib) generated 1 warning (run `cargo fix --lib -p ferrum-cli` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 18.74s

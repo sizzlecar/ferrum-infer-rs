@@ -1,0 +1,14 @@
+{
+  "health": 200,
+  "models": 200,
+  "multiturn_status": 200,
+  "multiturn_content": "</think>\n\n蓝色月亮。",
+  "multiturn_passed": true,
+  "stream_status": 200,
+  "stream_content": "</think>\n\n你好！很高兴见到你。",
+  "stream_chunks": 9,
+  "stream_passed": true,
+  "invalid_token_text_present": false,
+  "panic_present": false,
+  "passed": true
+}
