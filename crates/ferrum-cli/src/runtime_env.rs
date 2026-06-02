@@ -57,10 +57,10 @@ pub fn moe_graph_default_entries(
     entries
 }
 
-pub fn warn_if_moe_graph_needs_unbuilt_vllm_moe(snapshot: &RuntimeConfigSnapshot) {
+pub fn warn_if_moe_graph_needs_unbuilt_vllm_moe(_snapshot: &RuntimeConfigSnapshot) {
     #[cfg(not(feature = "vllm-moe-marlin"))]
-    if runtime_snapshot_value(snapshot, "FERRUM_MOE_GRAPH") == Some("1")
-        && runtime_snapshot_value(snapshot, "FERRUM_VLLM_MOE") != Some("1")
+    if runtime_snapshot_value(_snapshot, "FERRUM_MOE_GRAPH") == Some("1")
+        && runtime_snapshot_value(_snapshot, "FERRUM_VLLM_MOE") != Some("1")
     {
         eprintln!(
             "[auto-size] MOE_GRAPH=1 requested, but vllm-moe-marlin is not built; graph capture requires FERRUM_VLLM_MOE=1"
