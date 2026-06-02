@@ -7,13 +7,13 @@ use colored::*;
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::{ModelChatTemplate, PromptMessage};
 use ferrum_types::{
-    FinishReason, InferenceRequest, Priority, RequestId, Result, RuntimeConfigSnapshot,
-    SamplingParams,
+    FerrumError, FinishReason, InferenceRequest, Priority, RequestId, Result,
+    RuntimeConfigSnapshot, SamplingParams,
 };
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Output format for `ferrum run`. JSONL mode emits one record per event
@@ -85,6 +85,43 @@ fn emit_jsonl_exit(reason: &str) {
     println!("{record}");
 }
 
+#[derive(Debug, Clone)]
+struct RunPromptPlan {
+    prompt: String,
+    sampling_params: SamplingParams,
+}
+
+struct RunBudget {
+    tokenizer: Option<tokenizers::Tokenizer>,
+    kv_capacity: Option<usize>,
+}
+
+impl RunBudget {
+    fn from_source(source_path: &Path, snapshot: &RuntimeConfigSnapshot) -> Self {
+        let tokenizer = discover_run_tokenizer_path(source_path)
+            .and_then(|path| tokenizers::Tokenizer::from_file(path).ok());
+        let kv_capacity =
+            crate::runtime_env::runtime_snapshot_value(snapshot, "FERRUM_KV_CAPACITY")
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&value| value > 0);
+        Self {
+            tokenizer,
+            kv_capacity,
+        }
+    }
+
+    fn prompt_tokens(&self, prompt: &str) -> Option<usize> {
+        self.tokenizer
+            .as_ref()
+            .and_then(|tok| tok.encode(prompt, true).ok())
+            .map(|encoding| encoding.len())
+    }
+}
+
+fn display_response_text(text: &str) -> String {
+    text.trim().to_string()
+}
+
 #[derive(Args)]
 pub struct RunCommand {
     /// Model name (alias like `qwen3:8b`, HF repo id, or path to a `.gguf` file).
@@ -98,7 +135,7 @@ pub struct RunCommand {
     pub system: Option<String>,
 
     /// Maximum tokens to generate
-    #[arg(long, default_value = "2048")]
+    #[arg(long, default_value = "512")]
     pub max_tokens: u32,
 
     /// Sampling temperature (0.0–2.0). 0.0 = greedy / argmax (deterministic,
@@ -244,6 +281,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         serde_json::Value::String(engine_model_path),
     );
     let runtime_config = RuntimeConfigSnapshot::capture_current();
+    let run_budget = RunBudget::from_source(&source.local_path, &runtime_config);
     engine_config
         .apply_runtime_config_snapshot(&runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
@@ -271,18 +309,21 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // path ignored it and dropped into REPL, which exits silently when
     // stdin is not a TTY.
     if let Some(one_shot) = cmd.prompt.clone() {
-        let chat_prompt = build_chat_prompt(
+        let format = cmd.output_format;
+        let plan = build_run_prompt_plan(
             &[],
             &one_shot,
             cmd.system.as_deref(),
             &model_id,
             model_chat_template.as_ref(),
-        );
+            &cmd,
+            &run_budget,
+        )?;
         let request = InferenceRequest {
             id: RequestId(Uuid::new_v4()),
             model_id: ferrum_types::ModelId(model_id.clone()),
-            prompt: chat_prompt,
-            sampling_params: build_sampling_params(&cmd),
+            prompt: plan.prompt,
+            sampling_params: plan.sampling_params,
             stream: false,
             priority: Priority::Normal,
             client_id: None,
@@ -294,10 +335,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         let start = std::time::Instant::now();
         let response = engine.infer(request).await?;
         let tokens = response.tokens.len();
-        let content = response.text;
+        let content = display_response_text(&response.text);
         let chunk_count = usize::from(!content.is_empty());
         let finish_reason = Some(response.finish_reason);
-        let format = cmd.output_format;
         let bench = cmd.bench_mode;
         if format == OutputFormat::Text && !bench {
             print!("{}", content);
@@ -407,21 +447,21 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     emit_jsonl_user(turn, input);
                 }
 
-                // Build prompt with history
-                let prompt = build_chat_prompt(
+                let plan = build_run_prompt_plan(
                     &history,
                     input,
                     cmd.system.as_deref(),
                     &model_id,
                     model_chat_template.as_ref(),
-                );
-
+                    &cmd,
+                    &run_budget,
+                )?;
                 // Create request
                 let request = InferenceRequest {
                     id: RequestId(Uuid::new_v4()),
                     model_id: ferrum_types::ModelId(model_id.clone()),
-                    prompt,
-                    sampling_params: build_sampling_params(&cmd),
+                    prompt: plan.prompt,
+                    sampling_params: plan.sampling_params,
                     stream: format == OutputFormat::Text,
                     priority: Priority::Normal,
                     client_id: None,
@@ -436,7 +476,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 let (clean_response, finish_reason, token_count, chunk_count) = match format {
                     OutputFormat::Text => {
                         let mut stream = engine.infer_stream(request).await?;
-                        let mut response_text = String::new();
+                        let mut raw_response_text = String::new();
                         let mut finish_reason = None;
                         let mut token_count = 0usize;
                         let mut chunk_count = 0usize;
@@ -452,9 +492,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                                 }
                             }
                             if !chunk.text.is_empty() {
+                                raw_response_text.push_str(&chunk.text);
                                 print!("{}", chunk.text);
                                 io::stdout().flush().ok();
-                                response_text.push_str(&chunk.text);
                                 chunk_count += 1;
                             }
                             if chunk.token.is_some() {
@@ -468,7 +508,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             }
                         }
                         (
-                            response_text.trim().to_string(),
+                            display_response_text(&raw_response_text),
                             finish_reason,
                             token_count,
                             chunk_count,
@@ -484,11 +524,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                                 .collect::<Vec<_>>();
                             eprintln!("[run-token-trace] turn={turn} tokens={tokens:?}");
                         }
+                        let content = display_response_text(&response.text);
+                        let chunk_count = usize::from(!content.is_empty());
                         (
-                            response.text.trim().to_string(),
+                            content,
                             Some(response.finish_reason),
                             response.tokens.len(),
-                            usize::from(!response.text.is_empty()),
+                            chunk_count,
                         )
                     }
                 };
@@ -590,6 +632,57 @@ fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
         seed: Some(cmd.seed),
         ..Default::default()
     }
+}
+
+fn build_run_prompt_plan(
+    history: &[(String, String)],
+    user_input: &str,
+    system: Option<&str>,
+    model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    cmd: &RunCommand,
+    budget: &RunBudget,
+) -> Result<RunPromptPlan> {
+    let base_sampling = build_sampling_params(cmd);
+    let prompt = build_chat_prompt(history, user_input, system, model_id, model_template);
+    let prompt_tokens = budget.prompt_tokens(&prompt);
+    if !fits_kv_budget(&base_sampling, prompt_tokens, budget.kv_capacity) {
+        return Err(FerrumError::invalid_request(format!(
+            "This model context is limited to {} tokens, but this turn needs {} input tokens + {} output tokens. Reduce --max-tokens, use /clear, or shorten the prompt.",
+            budget.kv_capacity.unwrap_or(0),
+            prompt_tokens.unwrap_or(0),
+            base_sampling.max_tokens,
+        )));
+    }
+
+    Ok(RunPromptPlan {
+        prompt,
+        sampling_params: base_sampling,
+    })
+}
+
+fn fits_kv_budget(
+    base: &SamplingParams,
+    prompt_tokens: Option<usize>,
+    kv_capacity: Option<usize>,
+) -> bool {
+    let (Some(prompt_tokens), Some(kv_capacity)) = (prompt_tokens, kv_capacity) else {
+        return true;
+    };
+    prompt_tokens < kv_capacity && prompt_tokens + base.max_tokens <= kv_capacity
+}
+
+fn discover_run_tokenizer_path(source_path: &Path) -> Option<PathBuf> {
+    if source_path.is_file()
+        && source_path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false)
+    {
+        return ferrum_models::gguf_engine_loader::auto_discover_tokenizer_path(source_path);
+    }
+    let tokenizer = source_path.join("tokenizer.json");
+    tokenizer.is_file().then_some(tokenizer)
 }
 
 pub fn resolve_model_alias(name: &str) -> String {
@@ -893,5 +986,48 @@ pub fn apply_kv_dtype_override(
         KvCacheDtype::Bf16 => Err(ferrum_types::FerrumError::unsupported(
             "BF16 KV cache: marker only, no backend impl ships yet.",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_params(max_tokens: usize) -> SamplingParams {
+        SamplingParams {
+            max_tokens,
+            ..SamplingParams::default()
+        }
+    }
+
+    #[test]
+    fn cli_display_preserves_thinking_markers() {
+        assert_eq!(
+            display_response_text("<think>\nreasoning\n</think>\n\n最终答案"),
+            "<think>\nreasoning\n</think>\n\n最终答案"
+        );
+    }
+
+    #[test]
+    fn cli_display_preserves_orphan_think_close() {
+        assert_eq!(
+            display_response_text("</think>\n\n你好！很高兴见到你。"),
+            "</think>\n\n你好！很高兴见到你。"
+        );
+    }
+
+    #[test]
+    fn kv_budget_accepts_request_inside_capacity() {
+        assert!(fits_kv_budget(&default_params(512), Some(64), Some(2048)));
+    }
+
+    #[test]
+    fn kv_budget_rejects_output_past_capacity() {
+        assert!(!fits_kv_budget(&default_params(2048), Some(64), Some(2048)));
+    }
+
+    #[test]
+    fn kv_budget_rejects_prompt_at_capacity() {
+        assert!(!fits_kv_budget(&default_params(1), Some(2048), Some(2048)));
     }
 }
