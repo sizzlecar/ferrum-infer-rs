@@ -35,6 +35,9 @@ use uuid::Uuid;
 
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
+const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
+const THINK_START_TAG: &str = "<think>";
+const THINK_END_TAG: &str = "</think>";
 
 /// Shared Prometheus recorder handle for rendering metrics.
 static PROM_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
@@ -767,6 +770,12 @@ fn convert_chat_request_with_template_model(
     if request.ignore_eos.unwrap_or(false) {
         metadata.insert("ferrum_ignore_eos".to_string(), serde_json::json!(true));
     }
+    if !has_unclosed_thinking_block(&prompt) {
+        metadata.insert(
+            INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY.to_string(),
+            serde_json::json!([THINK_END_TAG]),
+        );
+    }
 
     Ok(InferenceRequest {
         id: RequestId(Uuid::new_v4()),
@@ -818,6 +827,14 @@ fn convert_chat_request_with_template_model(
         api_request: Some(ferrum_types::ApiRequest::Chat(api_chat_request(request))),
         metadata,
     })
+}
+
+fn has_unclosed_thinking_block(prompt: &str) -> bool {
+    match (prompt.rfind(THINK_START_TAG), prompt.rfind(THINK_END_TAG)) {
+        (Some(start), Some(end)) => start > end,
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 fn api_chat_request(request: &ChatCompletionsRequest) -> ferrum_types::ApiChatRequest {
@@ -3636,6 +3653,30 @@ mod tests {
             DEFAULT_SAMPLING_TEMPERATURE
         );
         assert_eq!(request.sampling_params.stop_sequences, vec!["<END>"]);
+    }
+
+    #[tokio::test]
+    async fn chat_request_forbids_initial_think_close_token() {
+        let engine = Arc::new(CapturingLlm::new());
+        let router = AxumServer::from_llm(engine.clone()).build_router();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let request = engine.last_request();
+        assert_eq!(
+            request
+                .metadata
+                .get(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY),
+            Some(&serde_json::json!([THINK_END_TAG]))
+        );
     }
 
     #[tokio::test]
