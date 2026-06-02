@@ -182,6 +182,31 @@ split_qkv_norm_rope_into_paged_cache_vllm_f16(
         physical_block = block_table[logical_block];
     }
 
+    if (mode == 3) {
+        for (int i = lane; i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = __half2float(src[j]);
+            float x1 = __half2float(src[j + 1]);
+            float c = __half2float(cos_row[i]);
+            float s = __half2float(sin_row[i]);
+            __half out0 = __float2half(x0 * c - x1 * s);
+            __half out1 = __float2half(x1 * c + x0 * s);
+
+            if (is_q) {
+                __half* q_out = (__half*)((char*)q_out_base + q_out_byte_offset);
+                __half* dst = q_out + (tok * q_heads + local_head) * hd;
+                dst[j] = out0;
+                dst[j + 1] = out1;
+            } else {
+                store_kv_vllm(cache_k, cache_v, true, physical_block, local_head,
+                              j, slot, hd, kv_heads, block_size, out0);
+                store_kv_vllm(cache_k, cache_v, true, physical_block, local_head,
+                              j + 1, slot, hd, kv_heads, block_size, out1);
+            }
+        }
+        return;
+    }
+
     for (int i = lane; i < half_d; i += 32) {
         float x0 = __half2float(src[i]);
         float x1 = __half2float(src[i + half_d]);
@@ -324,6 +349,32 @@ split_qkv_norm_rope_into_paged_cache_varlen_vllm_f16(
         slot = abs_pos % block_size;
         physical_block =
             block_tables[seq_idx * max_blocks_per_seq + logical_block];
+    }
+
+    if (mode == 3) {
+        for (int i = lane; i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = __half2float(src[j]);
+            float x1 = __half2float(src[j + 1]);
+            float c = __half2float(cos_row[i]);
+            float s = __half2float(sin_row[i]);
+            __half out0 = __float2half(x0 * c - x1 * s);
+            __half out1 = __float2half(x1 * c + x0 * s);
+
+            if (is_q) {
+                __half* dst = q_out + (global_tok * q_heads + local_head) * hd;
+                dst[j] = out0;
+                dst[j + 1] = out1;
+            } else {
+                store_kv_vllm(cache_k, cache_v, true, physical_block,
+                              local_head, j, slot, hd, kv_heads, block_size,
+                              out0);
+                store_kv_vllm(cache_k, cache_v, true, physical_block,
+                              local_head, j + 1, slot, hd, kv_heads,
+                              block_size, out1);
+            }
+        }
+        return;
     }
 
     for (int i = lane; i < half_d; i += 32) {

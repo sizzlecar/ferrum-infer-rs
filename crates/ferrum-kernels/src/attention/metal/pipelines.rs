@@ -558,7 +558,8 @@ impl MetalPipelines {
         eps: f32,
         norm_mode: i32,
     )
-    // norm_mode: 0=transpose only (V), 1=norm+RoPE (Q/K with QK-norm), 2=RoPE only (Q/K without QK-norm)
+    // norm_mode: 0=transpose only (V), 1=norm+half-split RoPE,
+    // 2=half-split RoPE only, 3=interleaved RoPE only (GGUF LLaMA).
     {
         #[repr(C)]
         struct P {
@@ -602,8 +603,9 @@ impl MetalPipelines {
     /// writes head-major Q/K (with norm+RoPE) and V (transpose only)
     /// directly to attention scratch.
     ///
-    /// `qk_mode`: 1 = norm + RoPE for Q/K (Qwen3 with QK-norm),
-    ///            2 = RoPE only for Q/K (no QK-norm; Llama-style).
+    /// `qk_mode`: 1 = norm + half-split RoPE for Q/K (Qwen3 with QK-norm),
+    ///            2 = half-split RoPE only for Q/K,
+    ///            3 = interleaved RoPE only for Q/K (GGUF LLaMA / llama.cpp layout).
     #[allow(clippy::too_many_arguments)]
     pub fn split_qkv_norm_rope(
         &self,

@@ -19,7 +19,8 @@
 // Both share the same RoPE / QK-norm semantics as `qk_norm_rope.cu`:
 //   qk_mode == 0 → copy only (V)
 //   qk_mode == 1 → QK-norm + RoPE (Qwen3)
-//   qk_mode == 2 → RoPE only        (Llama / Mistral)
+//   qk_mode == 2 → half-split RoPE only
+//   qk_mode == 3 → interleaved RoPE only (GGUF LLaMA / llama.cpp layout)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -136,6 +137,19 @@ extern "C" __global__ void split_qkv_norm_rope_into_paged_cache_f16(
     const int pos = pos_offset + tok;
     const __half* cos_row = cos_tab + pos * half_d;
     const __half* sin_row = sin_tab + pos * half_d;
+
+    if (mode == 3) {
+        for (int i = lane; i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = __half2float(src[j]);
+            float x1 = __half2float(src[j + 1]);
+            float c = __half2float(cos_row[i]);
+            float s = __half2float(sin_row[i]);
+            dst[j]     = __float2half(x0 * c - x1 * s);
+            dst[j + 1] = __float2half(x1 * c + x0 * s);
+        }
+        return;
+    }
 
     for (int i = lane; i < half_d; i += 32) {
         float x0 = __half2float(src[i]);
@@ -265,6 +279,19 @@ extern "C" __global__ void split_qkv_norm_rope_into_paged_cache_varlen_f16(
     const int pos = pos_offset + local_tok;
     const __half* cos_row = cos_tab + pos * half_d;
     const __half* sin_row = sin_tab + pos * half_d;
+
+    if (mode == 3) {
+        for (int i = lane; i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = __half2float(src[j]);
+            float x1 = __half2float(src[j + 1]);
+            float c = __half2float(cos_row[i]);
+            float s = __half2float(sin_row[i]);
+            dst[j]     = __float2half(x0 * c - x1 * s);
+            dst[j + 1] = __float2half(x1 * c + x0 * s);
+        }
+        return;
+    }
 
     for (int i = lane; i < half_d; i += 32) {
         float x0 = __half2float(src[i]);

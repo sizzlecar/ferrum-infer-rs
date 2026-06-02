@@ -5,7 +5,8 @@
 //
 // mode = 0 : transpose only                 (for V)
 // mode = 1 : per-head RMS norm + RoPE + transpose  (Q/K with QK-norm, Qwen3)
-// mode = 2 : RoPE + transpose                (Q/K without QK-norm, Llama/Mistral)
+// mode = 2 : half-split RoPE + transpose     (Q/K without QK-norm)
+// mode = 3 : interleaved RoPE + transpose    (GGUF LLaMA / llama.cpp layout)
 //
 // Launch: grid = (tokens, heads, 1), block = (warpSize=32, 1, 1).
 // Each warp handles one (tok, head) pair; threads in the warp stride by 32 over head_dim.
@@ -71,7 +72,20 @@ extern "C" __global__ void qk_norm_rope_transpose_f16(
     const __half* cos_row = cos_tab + pos * half_d;
     const __half* sin_row = sin_tab + pos * half_d;
 
-    // Apply norm (if mode 1) + RoPE + write.
+    if (mode == 3) {
+        for (int i = lane; i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = __half2float(src[j]);
+            float x1 = __half2float(src[j + 1]);
+            float c = __half2float(cos_row[i]);
+            float s = __half2float(sin_row[i]);
+            dst[j]     = __float2half(x0 * c - x1 * s);
+            dst[j + 1] = __float2half(x1 * c + x0 * s);
+        }
+        return;
+    }
+
+    // Apply norm (if mode 1) + half-split RoPE + write.
     for (int i = lane; i < half_d; i += 32) {
         float x0 = __half2float(src[i]);
         float x1 = __half2float(src[i + half_d]);
@@ -100,7 +114,8 @@ extern "C" __global__ void qk_norm_rope_transpose_f16(
 //   0 = transpose-only path (V) — degenerate to identity here since we
 //       keep token-major; included for API symmetry.
 //   1 = per-head RMSNorm + RoPE  (Q/K with QK-norm, Qwen3)
-//   2 = RoPE-only                (Q/K without QK-norm, Llama/Mistral)
+//   2 = half-split RoPE-only     (Q/K without QK-norm)
+//   3 = interleaved RoPE-only    (GGUF LLaMA / llama.cpp layout)
 //
 // Launch: grid = (m, heads, 1), block = (warpSize=32, 1, 1).
 // Each warp handles one (item, head) pair.
@@ -150,6 +165,19 @@ extern "C" __global__ void qk_norm_rope_batched_decode_f16(
     const int pos = positions[item];
     const __half* cos_row = cos_tab + pos * half_d;
     const __half* sin_row = sin_tab + pos * half_d;
+
+    if (mode == 3) {
+        for (int i = lane; i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = __half2float(src[j]);
+            float x1 = __half2float(src[j + 1]);
+            float c = __half2float(cos_row[i]);
+            float s = __half2float(sin_row[i]);
+            dst[j]     = __float2half(x0 * c - x1 * s);
+            dst[j + 1] = __float2half(x1 * c + x0 * s);
+        }
+        return;
+    }
 
     for (int i = lane; i < half_d; i += 32) {
         float x0 = __half2float(src[i]);
@@ -213,6 +241,19 @@ extern "C" __global__ void qk_norm_rope_transpose_f16_dyn(
     const int pos = pos_offset + tok;
     const __half* cos_row = cos_tab + pos * half_d;
     const __half* sin_row = sin_tab + pos * half_d;
+
+    if (mode == 3) {
+        for (int i = lane; i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = __half2float(src[j]);
+            float x1 = __half2float(src[j + 1]);
+            float c = __half2float(cos_row[i]);
+            float s = __half2float(sin_row[i]);
+            dst[j]     = __float2half(x0 * c - x1 * s);
+            dst[j + 1] = __float2half(x1 * c + x0 * s);
+        }
+        return;
+    }
 
     for (int i = lane; i < half_d; i += 32) {
         float x0 = __half2float(src[i]);

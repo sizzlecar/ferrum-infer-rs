@@ -25,7 +25,7 @@
 use ferrum_quantization::gguf::GgufFile;
 use ferrum_types::{FerrumError, Result};
 
-use crate::models::llama_family::LlamaFamilyConfig;
+use crate::models::llama_family::{LlamaFamilyConfig, RopeScalingConfig};
 use crate::moe_config::Qwen3MoeConfig;
 
 /// Architectures that are known MoE — `LlamaFamilyConfig::from_gguf` rejects
@@ -80,9 +80,11 @@ impl LlamaFamilyConfig {
         let rope_theta = read_f32(gguf, &format!("{arch}.rope.freq_base"))
             .map(|v| v as f64)
             .unwrap_or(default_rope);
+        let rope_scaling = infer_llama3_rope_scaling(gguf, arch.as_str(), max_seq_len, rope_theta);
 
         // QK-norm: only Qwen3 has it among supported architectures.
         let has_qk_norm = matches!(arch.as_str(), "qwen3");
+        let rope_interleaved = matches!(arch.as_str(), "llama");
 
         // Sliding window: only Mistral v0.1 sets it; missing → 0 (disabled).
         let sliding_window = read_u32(gguf, &format!("{arch}.attention.sliding_window"))
@@ -123,6 +125,8 @@ impl LlamaFamilyConfig {
             max_seq_len,
             rms_norm_eps,
             rope_theta,
+            rope_scaling,
+            rope_interleaved,
             has_qk_norm,
             sliding_window,
         })
@@ -222,6 +226,8 @@ impl Qwen3MoeConfig {
             max_seq_len,
             rms_norm_eps,
             rope_theta,
+            rope_scaling: None,
+            rope_interleaved: false,
             // Qwen3-MoE uses QK-norm exactly like dense Qwen3.
             has_qk_norm: true,
             // No sliding window in Qwen3-MoE.
@@ -246,6 +252,46 @@ fn read_u32(gguf: &GgufFile, key: &str) -> Result<u32> {
 fn read_f32(gguf: &GgufFile, key: &str) -> Result<f32> {
     gguf.metadata_f32(key)
         .map_err(|e| FerrumError::model(format!("GGUF {key}: {e}")))
+}
+
+fn infer_llama3_rope_scaling(
+    gguf: &GgufFile,
+    arch: &str,
+    max_seq_len: usize,
+    rope_theta: f64,
+) -> Option<RopeScalingConfig> {
+    if arch != "llama" || max_seq_len < 65_536 || (rope_theta - 500_000.0).abs() > 1.0 {
+        return None;
+    }
+    let meta = [
+        "general.basename",
+        "general.name",
+        "general.license",
+        "general.finetune",
+    ]
+    .iter()
+    .filter_map(|key| gguf.metadata_string(key).ok())
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    let is_llama3_long = [
+        "llama-3.1",
+        "llama 3.1",
+        "llama3.1",
+        "llama-3.2",
+        "llama 3.2",
+        "llama3.2",
+        "llama-3.3",
+        "llama 3.3",
+        "llama3.3",
+    ]
+    .iter()
+    .any(|needle| meta.contains(needle));
+    if is_llama3_long {
+        Some(RopeScalingConfig::llama3_default())
+    } else {
+        None
+    }
 }
 
 /// Vocab size ≈ rows of the embedding table. Used when `<arch>.vocab_size`

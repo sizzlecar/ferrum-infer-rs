@@ -119,6 +119,28 @@ fn llama_family_runtime_env() -> &'static LlamaFamilyRuntimeEnv {
     CONFIG.get_or_init(LlamaFamilyRuntimeEnv::from_env)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum RopeScalingConfig {
+    /// Meta Llama 3.1/3.2/3.3 long-context RoPE scaling.
+    Llama3 {
+        factor: f64,
+        low_freq_factor: f64,
+        high_freq_factor: f64,
+        original_max_position_embeddings: f64,
+    },
+}
+
+impl RopeScalingConfig {
+    pub fn llama3_default() -> Self {
+        Self::Llama3 {
+            factor: 8.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192.0,
+        }
+    }
+}
+
 /// Full Qwen3 architecture config (everything the model code needs, not just
 /// the engine-facing subset in `LlmRuntimeConfig`).
 #[derive(Clone, Debug, PartialEq)]
@@ -133,6 +155,11 @@ pub struct LlamaFamilyConfig {
     pub max_seq_len: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f64,
+    pub rope_scaling: Option<RopeScalingConfig>,
+    /// GGUF LLaMA stores Q/K in the llama.cpp interleaved RoPE layout.
+    /// HF safetensors Qwen/LLaMA definitions keep the default half-split
+    /// GPT-NeoX layout used by existing Ferrum kernels.
+    pub rope_interleaved: bool,
     /// Whether the checkpoint has `q_norm` / `k_norm` per layer. All known
     /// Qwen3 checkpoints do; some derivatives may strip them.
     pub has_qk_norm: bool,
@@ -184,6 +211,7 @@ impl LlamaFamilyConfig {
             max_seq_len: def.max_position_embeddings,
             rms_norm_eps: def.norm_eps as f32,
             rope_theta_opt: def.rope_theta,
+            rope_scaling: rope_scaling_from_model_def(def),
             sliding_window,
         }
     }
@@ -200,6 +228,8 @@ impl LlamaFamilyConfig {
             max_seq_len: b.max_seq_len,
             rms_norm_eps: b.rms_norm_eps,
             rope_theta: b.rope_theta_opt.unwrap_or(rope_default),
+            rope_scaling: b.rope_scaling,
+            rope_interleaved: false,
             has_qk_norm,
             sliding_window: b.sliding_window,
         }
@@ -241,7 +271,52 @@ struct LlamaFamilyConfigBase {
     max_seq_len: usize,
     rms_norm_eps: f32,
     rope_theta_opt: Option<f64>,
+    rope_scaling: Option<RopeScalingConfig>,
     sliding_window: usize,
+}
+
+fn rope_scaling_from_model_def(
+    def: &crate::definition::ModelDefinition,
+) -> Option<RopeScalingConfig> {
+    let value = def.extra_params.get("rope_scaling")?;
+    let obj = value.as_object()?;
+    let rope_type = obj
+        .get("rope_type")
+        .or_else(|| obj.get("type"))
+        .and_then(|v| v.as_str())?;
+    if rope_type != "llama3" {
+        return None;
+    }
+    let factor = json_f64(obj.get("factor"))?;
+    let low_freq_factor = json_f64(obj.get("low_freq_factor"))?;
+    let high_freq_factor = json_f64(obj.get("high_freq_factor"))?;
+    let original_max_position_embeddings = json_f64(obj.get("original_max_position_embeddings"))
+        .or_else(|| {
+            def.extra_params
+                .get("original_max_position_embeddings")
+                .and_then(|v| json_f64(Some(v)))
+        })
+        .unwrap_or(8192.0);
+    if factor <= 0.0
+        || low_freq_factor <= 0.0
+        || high_freq_factor <= low_freq_factor
+        || original_max_position_embeddings <= 0.0
+    {
+        return None;
+    }
+    Some(RopeScalingConfig::Llama3 {
+        factor,
+        low_freq_factor,
+        high_freq_factor,
+        original_max_position_embeddings,
+    })
+}
+
+fn json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    match value? {
+        serde_json::Value::Number(n) => n.as_f64(),
+        _ => None,
+    }
 }
 
 /// Per-layer weights. `Box<dyn Linear<B>>` means each projection can be
@@ -1134,9 +1209,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // backend implements the fused kernel; CPU and other backends
         // keep using the unfused chain via the Unsupported fallbacks.
         //
-        // qk_mode: 1 = norm + RoPE (Qwen3); 2 = RoPE only (Llama).
+        // qk_mode: 1 = norm + half-split RoPE (Qwen3/Qwen HF);
+        //          2 = half-split RoPE only;
+        //          3 = interleaved RoPE only (GGUF LLaMA / llama.cpp layout).
         // V always passes apply_norm=0.
-        let qk_mode: i32 = if cfg.has_qk_norm { 1 } else { 2 };
+        let qk_mode: i32 = if cfg.has_qk_norm {
+            1
+        } else if cfg.rope_interleaved {
+            3
+        } else {
+            2
+        };
         let dummy = &layer.input_ln_w;
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy);
@@ -2239,7 +2322,7 @@ fn build_rope_cache<B: QuantLlmBackend + BackendMoeFused>(cfg: &LlamaFamilyConfi
     let mut sin = vec![0.0f32; max * half];
     for pos in 0..max {
         for i in 0..half {
-            let freq = 1.0f64 / cfg.rope_theta.powf((2 * i) as f64 / hd as f64);
+            let freq = rope_freq(cfg, i);
             let angle = pos as f64 * freq;
             cos[pos * half + i] = angle.cos() as f32;
             sin[pos * half + i] = angle.sin() as f32;
@@ -2248,6 +2331,49 @@ fn build_rope_cache<B: QuantLlmBackend + BackendMoeFused>(cfg: &LlamaFamilyConfi
     RopeCache {
         cos: B::from_slice(&cos),
         sin: B::from_slice(&sin),
+    }
+}
+
+fn rope_freq(cfg: &LlamaFamilyConfig, pair_idx: usize) -> f64 {
+    let base_freq = 1.0f64
+        / cfg
+            .rope_theta
+            .powf((2 * pair_idx) as f64 / cfg.head_dim as f64);
+    match &cfg.rope_scaling {
+        Some(RopeScalingConfig::Llama3 {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            original_max_position_embeddings,
+        }) => scale_llama3_rope_freq(
+            base_freq,
+            *factor,
+            *low_freq_factor,
+            *high_freq_factor,
+            *original_max_position_embeddings,
+        ),
+        None => base_freq,
+    }
+}
+
+fn scale_llama3_rope_freq(
+    freq: f64,
+    factor: f64,
+    low_freq_factor: f64,
+    high_freq_factor: f64,
+    original_max_position_embeddings: f64,
+) -> f64 {
+    let wavelen = 2.0 * std::f64::consts::PI / freq;
+    let low_freq_wavelen = original_max_position_embeddings / low_freq_factor;
+    let high_freq_wavelen = original_max_position_embeddings / high_freq_factor;
+    if wavelen < high_freq_wavelen {
+        freq
+    } else if wavelen > low_freq_wavelen {
+        freq / factor
+    } else {
+        let smooth = (original_max_position_embeddings / wavelen - low_freq_factor)
+            / (high_freq_factor - low_freq_factor);
+        (1.0 - smooth) * freq / factor + smooth * freq
     }
 }
 

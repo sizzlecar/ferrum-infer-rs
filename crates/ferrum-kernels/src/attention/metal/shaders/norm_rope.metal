@@ -49,7 +49,7 @@ kernel void qk_norm_rope_transpose_f32(
     }
 
     if (p.apply_norm == 2) {
-        // Mode 2: Transpose + RoPE only, NO norm (vocoder Q/K without QK-norm)
+        // Mode 2: Transpose + half-split RoPE only, NO norm.
         const int pos = p.pos_offset + tok;
         device const float* cos_row = cos_tab + pos * half_d;
         device const float* sin_row = sin_tab + pos * half_d;
@@ -60,6 +60,24 @@ kernel void qk_norm_rope_transpose_f32(
             float s = sin_row[i];
             dst[i]          = x0 * c - x1 * s;
             dst[i + half_d] = x1 * c + x0 * s;
+        }
+        return;
+    }
+
+    if (p.apply_norm == 3) {
+        // Mode 3: Transpose + interleaved RoPE only, NO norm
+        // (GGUF LLaMA / llama.cpp Q/K layout).
+        const int pos = p.pos_offset + tok;
+        device const float* cos_row = cos_tab + pos * half_d;
+        device const float* sin_row = sin_tab + pos * half_d;
+        for (int i = tiisg; i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = src[j];
+            float x1 = src[j + 1];
+            float c = cos_row[i];
+            float s = sin_row[i];
+            dst[j]     = x0 * c - x1 * s;
+            dst[j + 1] = x1 * c + x0 * s;
         }
         return;
     }
@@ -171,8 +189,10 @@ kernel void kv_cache_append_f32(
 // head_global ∈ [q_heads, q_heads+kv_heads)               → K (norm+RoPE, k_norm_w)
 // head_global ∈ [q_heads+kv_heads, q_heads+2*kv_heads)    → V (transpose only)
 //
-// qk_mode: 1 = full QK-norm + RoPE (Qwen3); 2 = RoPE only no norm
-// (vocoder Q/K). V always passes apply_norm=0.
+// qk_mode: 1 = full QK-norm + half-split RoPE (Qwen3);
+//          2 = half-split RoPE only;
+//          3 = interleaved RoPE only (GGUF LLaMA / llama.cpp layout).
+// V always passes apply_norm=0.
 
 struct SplitQkvNormRopeParams {
     int tokens;
@@ -182,7 +202,7 @@ struct SplitQkvNormRopeParams {
     int half_dim;
     int pos_offset;
     float eps;
-    int qk_mode;       // 1 = norm+RoPE for Q/K, 2 = RoPE only for Q/K
+    int qk_mode;       // 1 = norm+half-split, 2 = half-split, 3 = interleaved
 };
 
 kernel void split_qkv_norm_rope_f32(
@@ -258,15 +278,27 @@ kernel void split_qkv_norm_rope_f32(
     device const float* cos_row = cos_tab + pos * half_d;
     device const float* sin_row = sin_tab + pos * half_d;
 
-    for (int i = tiisg; i < half_d; i += 32) {
-        float w0 = apply_norm ? (scale * norm_w[i])          : 1.0f;
-        float w1 = apply_norm ? (scale * norm_w[i + half_d]) : 1.0f;
-        float x0 = src[i]          * w0;
-        float x1 = src[i + half_d] * w1;
-        float c = cos_row[i];
-        float s = sin_row[i];
-        dst[i]          = x0 * c - x1 * s;
-        dst[i + half_d] = x1 * c + x0 * s;
+    if (p.qk_mode == 3) {
+        for (int i = tiisg; i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = src[j];
+            float x1 = src[j + 1];
+            float c = cos_row[i];
+            float s = sin_row[i];
+            dst[j]     = x0 * c - x1 * s;
+            dst[j + 1] = x1 * c + x0 * s;
+        }
+    } else {
+        for (int i = tiisg; i < half_d; i += 32) {
+            float w0 = apply_norm ? (scale * norm_w[i])          : 1.0f;
+            float w1 = apply_norm ? (scale * norm_w[i + half_d]) : 1.0f;
+            float x0 = src[i]          * w0;
+            float x1 = src[i + half_d] * w1;
+            float c = cos_row[i];
+            float s = sin_row[i];
+            dst[i]          = x0 * c - x1 * s;
+            dst[i + half_d] = x1 * c + x0 * s;
+        }
     }
 }
 
@@ -374,15 +406,27 @@ kernel void split_qkv_norm_rope_kvc_f32(
     device const float* cos_row = cos_tab + pos * half_d;
     device const float* sin_row = sin_tab + pos * half_d;
 
-    for (int i = tiisg; i < half_d; i += 32) {
-        float w0 = apply_norm ? (scale * norm_w[i])          : 1.0f;
-        float w1 = apply_norm ? (scale * norm_w[i + half_d]) : 1.0f;
-        float x0 = src[i]          * w0;
-        float x1 = src[i + half_d] * w1;
-        float c = cos_row[i];
-        float s = sin_row[i];
-        dst[i]          = x0 * c - x1 * s;
-        dst[i + half_d] = x1 * c + x0 * s;
+    if (p.qk_mode == 3) {
+        for (int i = tiisg; i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = src[j];
+            float x1 = src[j + 1];
+            float c = cos_row[i];
+            float s = sin_row[i];
+            dst[j]     = x0 * c - x1 * s;
+            dst[j + 1] = x1 * c + x0 * s;
+        }
+    } else {
+        for (int i = tiisg; i < half_d; i += 32) {
+            float w0 = apply_norm ? (scale * norm_w[i])          : 1.0f;
+            float w1 = apply_norm ? (scale * norm_w[i + half_d]) : 1.0f;
+            float x0 = src[i]          * w0;
+            float x1 = src[i + half_d] * w1;
+            float c = cos_row[i];
+            float s = sin_row[i];
+            dst[i]          = x0 * c - x1 * s;
+            dst[i + half_d] = x1 * c + x0 * s;
+        }
     }
 }
 
@@ -503,14 +547,26 @@ kernel void split_qkv_norm_rope_paged_kvc_f32(
     device const float* cos_row = cos_tab + pos * half_d;
     device const float* sin_row = sin_tab + pos * half_d;
 
-    for (int i = int(tiisg); i < half_d; i += 32) {
-        float w0 = apply_norm ? (scale * norm_w[i])          : 1.0f;
-        float w1 = apply_norm ? (scale * norm_w[i + half_d]) : 1.0f;
-        float x0 = src[i]          * w0;
-        float x1 = src[i + half_d] * w1;
-        float c = cos_row[i];
-        float s = sin_row[i];
-        dst[i]          = x0 * c - x1 * s;
-        dst[i + half_d] = x1 * c + x0 * s;
+    if (p.qk_mode == 3) {
+        for (int i = int(tiisg); i < half_d; i += 32) {
+            const int j = 2 * i;
+            float x0 = src[j];
+            float x1 = src[j + 1];
+            float c = cos_row[i];
+            float s = sin_row[i];
+            dst[j]     = x0 * c - x1 * s;
+            dst[j + 1] = x1 * c + x0 * s;
+        }
+    } else {
+        for (int i = int(tiisg); i < half_d; i += 32) {
+            float w0 = apply_norm ? (scale * norm_w[i])          : 1.0f;
+            float w1 = apply_norm ? (scale * norm_w[i + half_d]) : 1.0f;
+            float x0 = src[i]          * w0;
+            float x1 = src[i + half_d] * w1;
+            float c = cos_row[i];
+            float s = sin_row[i];
+            dst[i]          = x0 * c - x1 * s;
+            dst[i + half_d] = x1 * c + x0 * s;
+        }
     }
 }

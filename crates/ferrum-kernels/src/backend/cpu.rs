@@ -425,21 +425,34 @@ impl Backend for CpuBackend {
                     1.0
                 };
 
-                // Apply (norm?) + RoPE to halves, write to head-major output.
-                for i in 0..half {
-                    let (x0_raw, x1_raw) = (input[src_off + i], input[src_off + i + half]);
-                    let (x0, x1) = if mode == 1 {
-                        (
-                            x0_raw * scale * norm_w[i],
-                            x1_raw * scale * norm_w[i + half],
-                        )
-                    } else {
-                        (x0_raw, x1_raw)
-                    };
-                    let c = cos[pos * half + i];
-                    let s = sin[pos * half + i];
-                    output[dst_off + i] = x0 * c - x1 * s;
-                    output[dst_off + i + half] = x1 * c + x0 * s;
+                if mode == 3 {
+                    // GGUF LLaMA / llama.cpp interleaved RoPE layout.
+                    for i in 0..half {
+                        let j = 2 * i;
+                        let x0 = input[src_off + j];
+                        let x1 = input[src_off + j + 1];
+                        let c = cos[pos * half + i];
+                        let s = sin[pos * half + i];
+                        output[dst_off + j] = x0 * c - x1 * s;
+                        output[dst_off + j + 1] = x1 * c + x0 * s;
+                    }
+                } else {
+                    // Apply (norm?) + half-split RoPE to head-major output.
+                    for i in 0..half {
+                        let (x0_raw, x1_raw) = (input[src_off + i], input[src_off + i + half]);
+                        let (x0, x1) = if mode == 1 {
+                            (
+                                x0_raw * scale * norm_w[i],
+                                x1_raw * scale * norm_w[i + half],
+                            )
+                        } else {
+                            (x0_raw, x1_raw)
+                        };
+                        let c = cos[pos * half + i];
+                        let s = sin[pos * half + i];
+                        output[dst_off + i] = x0 * c - x1 * s;
+                        output[dst_off + i + half] = x1 * c + x0 * s;
+                    }
                 }
             }
         }
