@@ -207,7 +207,7 @@ What works today:
 - CLI chat, OpenAI-compatible HTTP server with streaming
 - Continuous batching, PagedAttention (CUDA + Metal pools), prefix caching, preemption
 - Custom CUDA decode runner (Qwen3, LLaMA): 2× over Candle baseline
-- Apple Silicon MoE inference (Qwen3-30B-A3B) — matches llama.cpp at c=16
+- Apple Silicon MoE inference (Qwen3-30B-A3B) — correctness, multi-turn, and concurrency gates covered; c=16 is currently below the recorded llama.cpp row
 - INT4 GPTQ with Marlin fused kernel (Blackwell + Ampere); also Triton w4a16
 - Tensor parallelism (multi-GPU NCCL, persistent per-rank threads)
 - Speculative decoding (`--spec-draft <MODEL>` DeepMind accept/reject)
