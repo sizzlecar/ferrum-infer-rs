@@ -31,9 +31,10 @@ use serde_json::Value;
 /// pattern suitable for feeding into `RegexGuidedProcessor`.
 ///
 /// The returned pattern:
-///   * has a leading `\s*` so BPE tokenisers that prepend a space
-///     to the first generated token (Qwen3, Llama-3) still transition
-///     cleanly — without it the DFA would die at the very first step.
+///   * allows a small finite amount of leading/trailing JSON whitespace so
+///     BPE tokenisers that prepend a space to the first generated token still
+///     transition cleanly, without letting the model generate whitespace
+///     forever under a hard mask.
 ///   * is anchored to end internally by the processor (which wraps
 ///     with `^(?:...)\z`).
 pub fn schema_to_regex(schema_json: &str) -> Result<String> {
@@ -41,7 +42,7 @@ pub fn schema_to_regex(schema_json: &str) -> Result<String> {
         FerrumError::invalid_request(format!("response_format.schema is not valid JSON: {e}"))
     })?;
     let inner = translate(&schema)?;
-    Ok(format!(r"\s*{inner}\s*"))
+    Ok(format!(r"[ \t\r\n]{{0,8}}{inner}[ \t\r\n]{{0,8}}"))
 }
 
 fn translate(node: &Value) -> Result<String> {

@@ -279,7 +279,9 @@ fn parse_tool_calls_from_generated_text(
     if let Some(tool_call) = value.get("tool_call") {
         return parse_tool_call_value(tool_call, 0, chat_request).map(|call| vec![call]);
     }
-    parse_tool_call_value(&value, 0, chat_request).map(|call| vec![call])
+    parse_tool_call_value(&value, 0, chat_request)
+        .or_else(|| parse_forced_tool_arguments_value(&value, 0, chat_request))
+        .map(|call| vec![call])
 }
 
 fn parse_tool_call_value(
@@ -314,6 +316,42 @@ fn parse_tool_call_value(
             arguments,
         },
     })
+}
+
+fn parse_forced_tool_arguments_value(
+    value: &serde_json::Value,
+    index: usize,
+    chat_request: &ApiChatRequest,
+) -> Option<ApiToolCall> {
+    let name = forced_tool_choice_name(chat_request)?;
+    if value.get("tool_calls").is_some()
+        || value.get("tool_call").is_some()
+        || value.get("function").is_some()
+        || value.get("name").is_some()
+    {
+        return None;
+    }
+
+    Some(ApiToolCall {
+        id: format!("call_{index}"),
+        tool_type: "function".to_string(),
+        function: ApiFunctionCall {
+            name: name.to_string(),
+            arguments: serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()),
+        },
+    })
+}
+
+fn forced_tool_choice_name(chat_request: &ApiChatRequest) -> Option<&str> {
+    match chat_request.tool_choice.as_ref() {
+        Some(ApiToolChoice::Function {
+            tool_type,
+            function,
+        }) if tool_type == "function" && api_tool_name_allowed(chat_request, &function.name) => {
+            Some(function.name.as_str())
+        }
+        _ => None,
+    }
 }
 
 fn parse_legacy_function_call_from_generated_text(

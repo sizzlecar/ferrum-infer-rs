@@ -454,9 +454,15 @@ async fn handle_chat_completions_stream(
 
                     if token_count >= max_tokens || chunk.finish_reason.is_some() {
                         let usage = chunk.usage.as_ref().map(openai_usage_from_token_usage);
-                        if let Err(e) =
-                            validate_strict_json_schema_response(&openai_request, &current_text)
-                        {
+                        let mut parsed_final = parse_reasoning_response(&current_text);
+                        parsed_final.content = normalize_structured_response_content(
+                            &openai_request,
+                            &parsed_final.content,
+                        );
+                        if let Err(e) = validate_strict_json_schema_response(
+                            &openai_request,
+                            &parsed_final.content,
+                        ) {
                             let error_event = openai_error_sse_event(
                                 strict_stream_validation_error_message(e),
                                 "internal_server_error",
@@ -473,13 +479,17 @@ async fn handle_chat_completions_stream(
                             _ if buffer_structured_api_stream => {
                                 ferrum_types::chat_api_response_from_generated_text(
                                     &stream_api_request,
-                                    &current_text,
+                                    &parsed_final.content,
                                 )
                             }
                             _ => None,
                         };
 
                         if let Some(chat_response) = structured_chat_response.as_ref() {
+                            let mut delta = openai_chat_delta_from_api(&chat_response.message);
+                            if delta.reasoning.is_none() {
+                                delta.reasoning = parsed_final.reasoning.clone();
+                            }
                             let response_chunk = ChatCompletionsResponse {
                                 id: request_id.clone(),
                                 object: "chat.completion.chunk".to_string(),
@@ -488,7 +498,7 @@ async fn handle_chat_completions_stream(
                                 choices: vec![ChatChoice {
                                     index: 0,
                                     message: None,
-                                    delta: Some(openai_chat_delta_from_api(&chat_response.message)),
+                                    delta: Some(delta),
                                     finish_reason: None,
                                 }],
                                 usage: None,
@@ -500,8 +510,18 @@ async fn handle_chat_completions_stream(
                             if tx.send(Ok(sse_event)).is_err() {
                                 break;
                             }
+                        } else if buffer_structured_api_stream
+                            && parsed_final.content.trim().is_empty()
+                        {
+                            let error_event = openai_error_sse_event(
+                                "model output did not satisfy tool/function call request",
+                                "internal_server_error",
+                                Some("tool_choice"),
+                            );
+                            let _ = tx.send(Ok(error_event));
+                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
                         } else if buffer_stream_output && !current_text.is_empty() {
-                            let parsed = parse_reasoning_response(&current_text);
                             let response_chunk = ChatCompletionsResponse {
                                 id: request_id.clone(),
                                 object: "chat.completion.chunk".to_string(),
@@ -512,8 +532,8 @@ async fn handle_chat_completions_stream(
                                     message: None,
                                     delta: Some(ChatMessage {
                                         role: MessageRole::Assistant,
-                                        content: parsed.content,
-                                        reasoning: parsed.reasoning,
+                                        content: parsed_final.content.clone(),
+                                        reasoning: parsed_final.reasoning.clone(),
                                         name: None,
                                         tool_calls: None,
                                         tool_call_id: None,
@@ -661,10 +681,12 @@ async fn handle_chat_completions_sync(
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
             let content = strip_trailing_stop(&after_fence, &stop_sequences);
             let parsed = parse_reasoning_response(&content);
+            let visible_content =
+                normalize_structured_response_content(&openai_request, &parsed.content);
             let mut message = ChatMessage {
                 role: MessageRole::Assistant,
-                content: parsed.content,
-                reasoning: parsed.reasoning,
+                content: visible_content,
+                reasoning: parsed.reasoning.clone(),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -683,6 +705,9 @@ async fn handle_chat_completions_sync(
             };
             if let Some(chat_response) = structured_chat_response.as_ref() {
                 message = openai_chat_message_from_api(&chat_response.message);
+                if message.reasoning.is_none() {
+                    message.reasoning = parsed.reasoning.clone();
+                }
                 if let Some(reason) = &chat_response.finish_reason {
                     openai_finish_reason = reason.clone();
                 }
@@ -798,29 +823,28 @@ fn convert_chat_request_with_template_model(
             tfs: None,
             typical_p: None,
             mirostat: None,
-            response_format: match &request.response_format {
-                Some(rf) if rf.format_type == "json_object" => {
-                    ferrum_types::ResponseFormat::JsonObject
-                }
-                Some(rf)
-                    if rf.format_type == "json_schema"
-                        && rf
-                            .json_schema
-                            .as_ref()
-                            .and_then(|schema| schema.strict)
-                            .unwrap_or(false) =>
-                {
-                    // OpenAI wraps the actual schema one level deeper.
-                    match rf.json_schema.as_ref().and_then(|js| js.schema.as_ref()) {
-                        Some(schema) => match serde_json::to_string(schema) {
-                            Ok(s) => ferrum_types::ResponseFormat::JsonSchema(s),
-                            Err(_) => ferrum_types::ResponseFormat::Text,
-                        },
-                        None => ferrum_types::ResponseFormat::Text,
+            response_format: forced_tool_choice_response_format(request).unwrap_or_else(|| {
+                match &request.response_format {
+                    Some(rf) if rf.format_type == "json_object" => {
+                        ferrum_types::ResponseFormat::JsonObject
                     }
+                    Some(rf)
+                        if rf.format_type == "json_schema"
+                            && rf
+                                .json_schema
+                                .as_ref()
+                                .and_then(|schema| schema.strict)
+                                .unwrap_or(false) =>
+                    {
+                        // Strict json_schema still gets hard validation after
+                        // generation. Use JSON-object steering here instead of
+                        // regex hard-masking because GPU greedy sentinels can
+                        // bypass host logits processors on the first token.
+                        ferrum_types::ResponseFormat::JsonObject
+                    }
+                    _ => ferrum_types::ResponseFormat::Text,
                 }
-                _ => ferrum_types::ResponseFormat::Text,
-            },
+            }),
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal, // Default priority
@@ -830,6 +854,33 @@ fn convert_chat_request_with_template_model(
         api_request: Some(ferrum_types::ApiRequest::Chat(api_chat_request(request))),
         metadata,
     })
+}
+
+fn forced_tool_choice_response_format(
+    request: &ChatCompletionsRequest,
+) -> Option<ferrum_types::ResponseFormat> {
+    let ToolChoice::Function {
+        tool_type,
+        function,
+    } = request.tool_choice.as_ref()?
+    else {
+        return None;
+    };
+    if tool_type != "function" {
+        return None;
+    }
+    let selected_tool = request
+        .tools
+        .as_ref()?
+        .iter()
+        .find(|tool| tool.function.name == function.name)?;
+    let schema = serde_json::to_value(&selected_tool.function.parameters).ok()?;
+    if schema.is_null() {
+        return None;
+    }
+    serde_json::to_string(&schema)
+        .ok()
+        .map(ferrum_types::ResponseFormat::JsonSchema)
 }
 
 fn has_unclosed_thinking_block(prompt: &str) -> bool {
@@ -848,6 +899,16 @@ struct ParsedReasoningResponse {
 
 fn parse_reasoning_response(text: &str) -> ParsedReasoningResponse {
     let Some(start) = text.find(THINK_START_TAG) else {
+        if let Some(end) = text.find(THINK_END_TAG) {
+            let reasoning = text[..end].to_string();
+            let content = text[end + THINK_END_TAG.len()..]
+                .trim_start_matches(['\r', '\n'])
+                .to_string();
+            return ParsedReasoningResponse {
+                content,
+                reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            };
+        }
         return ParsedReasoningResponse {
             content: text.to_string(),
             reasoning: None,
@@ -873,6 +934,68 @@ fn parse_reasoning_response(text: &str) -> ParsedReasoningResponse {
         content,
         reasoning: (!reasoning.is_empty()).then_some(reasoning),
     }
+}
+
+fn normalize_structured_response_content(
+    request: &ChatCompletionsRequest,
+    content: &str,
+) -> String {
+    let Some(response_format) = request.response_format.as_ref() else {
+        return content.to_string();
+    };
+    match response_format.format_type.as_str() {
+        "json_object" | "json_schema" => extract_json_object_text(content)
+            .unwrap_or_else(|| strip_markdown_json_fence(content).to_string()),
+        _ => content.to_string(),
+    }
+}
+
+fn extract_json_object_text(text: &str) -> Option<String> {
+    let text = strip_markdown_json_fence(text.trim());
+    if serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .filter(|value| value.is_object())
+        .is_some()
+    {
+        return Some(text.to_string());
+    }
+
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    let candidate = &text[start..end];
+                    if serde_json::from_str::<serde_json::Value>(candidate)
+                        .ok()
+                        .filter(|value| value.is_object())
+                        .is_some()
+                    {
+                        return Some(candidate.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn api_chat_request(request: &ChatCompletionsRequest) -> ferrum_types::ApiChatRequest {
@@ -2304,7 +2427,7 @@ mod tests {
     impl CapturingLlm {
         fn new() -> Self {
             let mut config = EngineConfig::default();
-            config.model.model_id = ModelId::new("capture-model");
+            config.model.model_id = ModelId::new("qwen3");
             Self {
                 config,
                 last_request: Mutex::new(None),
