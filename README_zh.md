@@ -3,107 +3,90 @@
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
 
-Rust 编写的生产级 LLM 推理引擎：一个 CLI、一个 server，同时覆盖 Apple Silicon 与 CUDA。
+> Rust-native LLM inference for fast, simple, OpenAI-compatible serving.
+
+**一个二进制。Serving 路径不需要 Python runtime。Apple Silicon 与 NVIDIA CUDA 硬件加速。**
+
+Ferrum 是一个 Rust 原生的 LLM 推理引擎，用于运行和部署 OpenAI 兼容的 transformer LLM 服务。
+它面向希望简化部署、保留实际 serving 性能，并使用干净 Rust-native runtime 的开发者和团队，覆盖本地、边缘和生产推理场景。
 
 [English](README.md)
 
-## 为什么值得看 10 秒？
-
-- **一个 Rust 二进制**同时支持 `ferrum run` 和 OpenAI 兼容的 `ferrum serve`；runtime 路径不需要 Python 服务。
-- **同一项目覆盖 Apple Silicon 与 NVIDIA CUDA**，发布包包含 Metal 与 CUDA 二进制。
-- **当前 CUDA 证据：**RTX 4090 + Qwen3-30B-A3B GPTQ-Int4 在 same-pod `n_repeats=5` 测试里达到 vLLM `0.20.2` 的 `0.83x-0.89x` 吞吐。
-- **当前 Metal 证据：**Qwen3 / LLaMA 8B 与 Qwen3-30B-A3B 在 Apple Silicon 上通过正确性、多轮对话和并发 release-candidate gates。
-
-## 项目简介
-
-ferrum-infer-rs 是一个 Rust 原生的 LLM 推理引擎: 单二进制、无 Python、
-OpenAI 兼容 HTTP API、秒级启动。
-
-为单 GPU 服务器、边缘设备和 Apple Silicon 而设计 ——
-Docker 镜像体积、冷启动时间、Python 工具链复杂度真正重要的场景。
-
-## 性能亮点：NVIDIA GPUs (CUDA)
-
-ferrum 提供自研 CUDA runner，覆盖 PagedAttention、continuous batching、INT4 Marlin MoE、CUDA Graphs，以及可选的 FlashAttention-2 prefill 路径。
-
-**RTX 4090 · Qwen3-30B-A3B GPTQ-Int4 · random 256/128 · 输出吞吐 (tok/s)** —— 同一台机器、`n_repeats=5`、vLLM `0.20.2`；完整原始日志和 JSON 见 [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)。
-
-| c | ferrum FA2 path | vLLM 0.20.2 | ratio |
-|---:|---:|---:|---:|
-| 1 | 160.4 +/- 0.2 | 183.9 +/- 0.2 | 0.872x |
-| 4 | 446.3 +/- 7.0 | 512.5 +/- 2.8 | 0.871x |
-| 16 | 1185.1 +/- 12.3 | 1331.9 +/- 5.7 | 0.890x |
-| 32 | 1641.9 +/- 4.8 | 1972.9 +/- 18.6 | 0.832x |
-
-commit `e511077` 的发布候选 CUDA smoke 已保存到 [`docs/bench/dev-loop-product-api-goal-progress-20260601/cuda-quick-regress-e511077-c32-20260601/`](docs/bench/dev-loop-product-api-goal-progress-20260601/cuda-quick-regress-e511077-c32-20260601/)：Paris、多轮、三轮对话 gate 均通过；c=32 完成 32/32 请求，0 errors。
-
-较早的单模型 decode 检查也保留作审计证据：
-
-**Qwen3-4B on RTX PRO 6000 (Blackwell)**
-
-| 模式 | Decode (tok/s) | 显存 |
-|---|---:|---:|
-| FP16 (eager) | 70.3 | ~8 GB |
-| FP16 + CUDA Graphs | 82.9 (+18%) | ~8 GB |
-| INT4 (GPTQ + Marlin) | **130.4 (+85%)** | **~2.5 GB (-69%)** |
-| 4 并发 (INT4) | 124.2 | ~2.5 GB |
-
-**TinyLlama-1.1B**
-
-| Backend | Decode (tok/s) |
-|---|---:|
-| Candle | 126 |
-| ferrum CUDA | **256.5 (+103%)** |
-
-## 性能亮点：Apple Silicon 并发
-
-笔记本本地推理的硬骨头是「并发服务」。ferrum 在单请求上和主流引擎打平,并发越高优势越明显。同一台机器、同一份 `Q4_K_M` GGUF、同一份 OpenAI HTTP 压测脚本 —— 完整的可审阅报告(环境、脚本、原始 JSON 与日志)在 [`docs/bench/macos-2026-05-02/`](docs/bench/macos-2026-05-02/)。
-
-**M1 Max 32 GB · Q4_K_M · 输出吞吐 (tok/s)** —— ferrum 使用当前 release-candidate 回归数字，证据保存在 [`docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/)。对比引擎数字来自可审阅的 [macOS bench 报告](docs/bench/macos-2026-05-02/README.md)。
-
-| 模型 | c | ferrum | llama.cpp (b8960) | mistralrs (0.8.1) |
-|---|---:|---:|---:|---:|
-| LLaMA-3.1-8B | 1 | **31.7** | 28.7 | 30.2 |
-| LLaMA-3.1-8B | 8 | **51.7** | 42.3 | 14.6 |
-| LLaMA-3.1-8B | 16 | **89.4** | 67.2 | 23.3 |
-| Qwen3-8B | 16 | **86.0** | 68.6 | 23.5 |
-| Qwen3-30B-A3B (MoE) | 16 | 72.5¹ | 83.4 | panic² |
-
-> ¹ ferrum MoE 在 c ≥ 8 时需要 `FERRUM_MOE_BATCHED=1 FERRUM_MOE_BATCHED_DECODE=1` (当前为 opt-in)。不开启的话 MoE c = 16 跌到 48 tok/s。² mistralrs 0.8.1 在 Qwen3-30B-A3B-Q4_K_M 上 PoisonError-panic (`add_request.rs:466`) —— 不是 ferrum 的问题。
-
-> Qwen3-30B-A3B (MoE) 这一行仍然重要：两个月前 Apple Silicon 上 Rust 引擎实质性缺失的就是这种模型。当前 release candidate 能正确运行并通过并发与多轮对话 gates，但最新 c = 16 吞吐低于 llama.cpp，所以这里按当前数字如实展示。
-
-完整的 36-cell 矩阵(c = 1, 4, 8, 16,三引擎 × 三模型,含 TPOT / TTFT 分布)见 [bench 报告](docs/bench/macos-2026-05-02/README.md)。
-
-## 横向对比
-
-|  | ferrum | vLLM | llama.cpp | mistralrs |
-|---|---|---|---|---|
-| 语言 | Rust | Python+CUDA | C++ | Rust |
-| 单二进制 | ✓ | ✗ (Docker) | ✓ | ✓ |
-| Apple Silicon | ✓ (含 MoE) | ✗ | ✓ | 部分 (无 MoE) |
-| CUDA | ✓ (自研) | ✓ (最强) | ✓ | ✓ |
-| 并发服务 | ✓ | ✓ (最强) | ✓ | ✓ |
-| Continuous batching | ✓ | ✓ | 部分 | ✓ |
-| INT4 量化 | ✓ Marlin / Triton | GPTQ / AWQ | 仅 GGUF | 视情况 |
-| OpenAI 兼容 API | ✓ | ✓ | ✓ | ✓ |
-| 可作为库嵌入 | ✓ | ✗ | ✓ | ✓ |
-
 ## 快速开始
 
-### Homebrew (macOS Apple Silicon、Linux x86_64)
+安装预编译二进制：
+
+```bash
+brew tap sizzlecar/ferrum
+brew install ferrum        # macOS Apple Silicon Metal / Linux x86_64 CPU
+brew install ferrum-cuda   # Linux x86_64 CUDA sm89 构建
+ferrum --version
+```
+
+直接运行模型：
+
+```bash
+export HF_TOKEN=hf_your_token_here   # 仅 gated 模型需要
+ferrum run qwen3:4b
+```
+
+通过 OpenAI 兼容 API 提供服务：
+
+```bash
+ferrum serve --model qwen3:4b --port 8000
+
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+## 为什么选择 Ferrum？
+
+- **一个二进制：**同时提供 `ferrum run` 和 `ferrum serve`，runtime 路径不需要 Python 服务。
+- **OpenAI 兼容 API：**可以复用现有 OpenAI 风格的 client、SDK 和 HTTP 工具。
+- **硬件加速：**同一项目覆盖 Apple Silicon Metal 与 NVIDIA CUDA。
+- **Rust-native runtime：**更少依赖、更简单部署，也更容易嵌入或分发。
+- **实用 serving 性能：**支持 continuous batching、paged KV cache、INT4 GPTQ/Marlin、CUDA Graphs，并有 release 级并发 gate。
+
+## Ferrum 适合什么场景？
+
+Ferrum 面向这些开发和部署场景：
+
+- 本地 AI agent
+- 私有 OpenAI 兼容推理服务
+- Apple Silicon LLM 应用
+- CUDA 加速推理服务
+- 边缘设备和工作站部署
+- Rust-native AI 基础设施
+
+## 性能快照
+
+Ferrum 面向现代加速器上的高吞吐 serving 场景，并把原始 benchmark 日志和证据保存到仓库，而不是只给摘要数字。
+
+**CUDA：**在 RTX 4090 + Qwen3-30B-A3B GPTQ-Int4 上，Ferrum 在 same-pod `n_repeats=5` 测试里达到 vLLM `0.20.2` 吞吐的 `0.83x-0.89x`。c=32 时，Ferrum 输出吞吐为 `1641.9 +/- 4.8 tok/s`，vLLM 为 `1972.9 +/- 18.6 tok/s`，比例 `0.832x`。完整方法和原始证据见 [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)。
+
+**CUDA release gate：**公开发布的 `v0.7.4` CUDA 二进制通过 Paris、两轮多轮、三轮多轮对话 gate；c=32 smoke 完成 `16/16` 请求，`0` errors。证据在 [`docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/)。
+
+**Apple Silicon：**Metal release-candidate gates 覆盖 Qwen3/LLaMA 8B 和 Qwen3-30B-A3B，包含正确性、多轮对话和并发检查。Ferrum 当前 Qwen3-30B-A3B c=16 结果为 `72.5 tok/s`，低于记录里的 llama.cpp `83.4 tok/s`；这个限制在 benchmark 报告中明确保留：[`docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/)。
+
+## API 兼容性
+
+Ferrum 提供 OpenAI 风格的 chat completions API，适合本地和私有部署。Endpoint 合约、明确拒绝的字段、tool 字段状态、usage 统计和 structured-output 限制见 [`docs/openai-api-compatibility.md`](docs/openai-api-compatibility.md)。
+
+## 安装
+
+Homebrew：
 
 ```bash
 brew tap sizzlecar/ferrum
 brew install ferrum        # macOS Metal / Linux CPU
 brew install ferrum-cuda   # Linux x86_64 CUDA sm89 构建
-ferrum --version
 ```
 
-### 预编译二进制 (原始 tarball)
+预编译 release tarball：
 
 ```bash
-# Linux x86_64
+# Linux x86_64 CPU
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64.tar.gz | tar xz
 ./ferrum --help
 
@@ -111,43 +94,26 @@ curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/fe
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz | tar xz
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --help
 
-# macOS Apple Silicon (Metal)
+# macOS Apple Silicon Metal
 curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz | tar xz
 ./ferrum --help
 ```
 
-Linux x86_64 是 CPU 构建。Linux x86_64 CUDA 是 `sm89` 构建，目标机器需要兼容的 NVIDIA driver、CUDA runtime 和 NCCL runtime。macOS aarch64 是 Metal 构建。
+Linux x86_64 是 CPU 构建。Linux x86_64 CUDA 是 `sm89` 构建，目标机器需要兼容的 NVIDIA driver 和 CUDA runtime libraries。macOS aarch64 是 Metal 构建。
 
-### 从源码
+从源码：
 
 ```bash
-# crates.io
 cargo install ferrum-cli
-
-# 或 git
 cargo build --release -p ferrum-cli --bin ferrum
 ```
 
-### 运行
+## Benchmarks / Docs
 
-```bash
-# Gated 模型(如 Llama 3.x)需要设置 HF token
-export HF_TOKEN=hf_your_token_here
-
-# 直接对话
-ferrum run qwen3:4b
-
-# 或启动 OpenAI 兼容 API
-ferrum serve --model qwen3:4b --port 8000
-```
-
-API 调用:
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello"}]}'
-```
+- CUDA vLLM 对比：[`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)
+- Apple Silicon 回归报告：[`docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/)
+- OpenAI API 兼容性：[`docs/openai-api-compatibility.md`](docs/openai-api-compatibility.md)
+- 模块状态记录：[`docs/status/`](docs/status/)
 
 ## 支持的模型
 
