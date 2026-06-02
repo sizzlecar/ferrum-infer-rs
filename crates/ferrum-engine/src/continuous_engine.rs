@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
@@ -39,6 +40,19 @@ const NEXT_BATCH_PROF_ENV: &str = "FERRUM_NEXT_BATCH_PROF";
 const PREFIX_CACHE_ENV: &str = "FERRUM_PREFIX_CACHE";
 const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
 const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
+const GENERATION_POLICY_SCAN_LIMIT: usize = 262_144;
+const GENERATED_CONTROL_TOKEN_TEXTS: &[&str] = &[
+    "<think>",
+    "</think>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|eot_id|>",
+    "<|eom_id|>",
+    "</s>",
+];
+
+static TOKEN_POLICY_CACHE: OnceLock<std::sync::Mutex<HashMap<(usize, usize), HashSet<u32>>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ContinuousEngineRuntimeConfig {
@@ -144,33 +158,115 @@ fn resolve_sampling_token_constraints(
     tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
     stop_token_ids: &HashSet<u32>,
 ) -> (HashSet<u32>, Option<usize>, HashSet<u32>) {
-    let mut forbidden = HashSet::new();
     let mut allowed_extended = stop_token_ids.clone();
     let Some(tok) = tokenizer else {
-        return (forbidden, None, allowed_extended);
+        return (HashSet::new(), None, allowed_extended);
     };
 
-    for text in ["<unk", "<unk>"] {
-        if let Some(token) = tok.token_id(text) {
-            forbidden.insert(token.get());
-        }
+    if let Some(eos) = tok.special_tokens().eos_token {
+        allowed_extended.insert(eos.get());
     }
-
-    for text in [
-        "<think>",
-        "</think>",
-        "<|im_start|>",
-        "<|im_end|>",
-        "<|endoftext|>",
-        "<|eot_id|>",
-        "</s>",
-    ] {
+    for text in GENERATED_CONTROL_TOKEN_TEXTS {
         if let Some(token) = tok.token_id(text) {
             allowed_extended.insert(token.get());
         }
     }
 
+    let forbidden = cached_forbidden_generation_tokens(tok, &allowed_extended);
+
     (forbidden, Some(tok.vocab_size()), allowed_extended)
+}
+
+fn cached_forbidden_generation_tokens(
+    tok: &(dyn Tokenizer + Send + Sync),
+    allowed_generated_controls: &HashSet<u32>,
+) -> HashSet<u32> {
+    let key = (tokenizer_cache_key(tok), tok.vocab_size());
+    let cache = TOKEN_POLICY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(cached) = cache.lock().expect("token policy cache poisoned").get(&key) {
+        return cached.clone();
+    }
+
+    let mut forbidden = HashSet::new();
+    let special = tok.special_tokens();
+    for token in [
+        special.bos_token,
+        special.unk_token,
+        special.pad_token,
+        special.sep_token,
+        special.cls_token,
+        special.mask_token,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !allowed_generated_controls.contains(&token.get()) {
+            forbidden.insert(token.get());
+        }
+    }
+
+    for text in [
+        "<unk", "<unk>", "[UNK]", "<pad>", "[PAD]", "<|pad|>", "<mask>", "[MASK]",
+    ] {
+        if let Some(token) = tok.token_id(text) {
+            if !allowed_generated_controls.contains(&token.get()) {
+                forbidden.insert(token.get());
+            }
+        }
+    }
+
+    let scan_limit = tok.vocab_size().min(GENERATION_POLICY_SCAN_LIMIT);
+    for token_id in 0..scan_limit {
+        let id = token_id as u32;
+        if allowed_generated_controls.contains(&id) {
+            continue;
+        }
+        if tok
+            .token_text(TokenId::new(id))
+            .is_some_and(is_forbidden_generation_token_text)
+        {
+            forbidden.insert(id);
+        }
+    }
+
+    cache
+        .lock()
+        .expect("token policy cache poisoned")
+        .insert(key, forbidden.clone());
+    forbidden
+}
+
+fn tokenizer_cache_key(tok: &(dyn Tokenizer + Send + Sync)) -> usize {
+    let ptr = tok as *const (dyn Tokenizer + Send + Sync);
+    ptr.cast::<()>() as usize
+}
+
+fn is_forbidden_generation_token_text(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let lower = lower.as_str();
+    if matches!(
+        lower,
+        "<unk" | "<unk>" | "[unk]" | "<pad>" | "[pad]" | "<|pad|>" | "<mask>" | "[mask]"
+    ) {
+        return true;
+    }
+
+    let looks_like_special = (lower.starts_with('<') && lower.ends_with('>'))
+        || (lower.starts_with('[') && lower.ends_with(']'));
+    if !looks_like_special {
+        return false;
+    }
+
+    lower.contains("unk")
+        || lower.contains("pad")
+        || lower.contains("mask")
+        || lower.contains("reserved")
+        || lower.contains("unused")
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -819,6 +915,104 @@ impl std::fmt::Debug for ContinuousBatchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
+
+    struct PolicyTokenizer {
+        vocab_size: usize,
+        special: ferrum_types::SpecialTokens,
+        ids: HashMap<String, TokenId>,
+        texts: Vec<Option<String>>,
+    }
+
+    impl PolicyTokenizer {
+        fn new(vocab_size: usize, pairs: &[(&str, u32)]) -> Self {
+            let max_id = pairs.iter().map(|(_, id)| *id as usize).max().unwrap_or(0);
+            let mut texts = vec![None; max_id + 1];
+            let mut ids = HashMap::new();
+            for (text, id) in pairs {
+                ids.insert((*text).to_string(), TokenId::new(*id));
+                texts[*id as usize] = Some((*text).to_string());
+            }
+            Self {
+                vocab_size,
+                special: ferrum_types::SpecialTokens {
+                    bos_token: Some(TokenId::new(1)),
+                    eos_token: Some(TokenId::new(3)),
+                    unk_token: Some(TokenId::new(2)),
+                    pad_token: Some(TokenId::new(4)),
+                    sep_token: None,
+                    cls_token: None,
+                    mask_token: None,
+                },
+                ids,
+                texts,
+            }
+        }
+    }
+
+    impl Tokenizer for PolicyTokenizer {
+        fn encode(&self, _text: &str, _add_special: bool) -> Result<Vec<TokenId>> {
+            Ok(vec![TokenId::new(0)])
+        }
+
+        fn decode(&self, tokens: &[TokenId], _skip_special: bool) -> Result<String> {
+            Ok(tokens
+                .iter()
+                .filter_map(|token| self.token_text(*token))
+                .collect::<Vec<_>>()
+                .join(""))
+        }
+
+        fn decode_incremental(&self, _prev: &[TokenId], next: TokenId) -> Result<String> {
+            Ok(self.token_text(next).unwrap_or_default().to_string())
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.vocab_size
+        }
+
+        fn special_tokens(&self) -> &ferrum_types::SpecialTokens {
+            &self.special
+        }
+
+        fn token_id(&self, text: &str) -> Option<TokenId> {
+            self.ids.get(text).copied()
+        }
+
+        fn token_text(&self, token_id: TokenId) -> Option<&str> {
+            self.texts
+                .get(token_id.get() as usize)
+                .and_then(|text| text.as_deref())
+        }
+
+        fn info(&self) -> TokenizerInfo {
+            TokenizerInfo {
+                tokenizer_type: TokenizerType::Custom,
+                vocab_size: self.vocab_size,
+                special_tokens: self.special.clone(),
+                supports_incremental: true,
+                supports_chat_template: false,
+                max_token_length: None,
+                model_name: Some("policy-tokenizer-test".to_string()),
+            }
+        }
+    }
+
+    fn policy_request() -> InferenceRequest {
+        InferenceRequest {
+            id: RequestId::new(),
+            prompt: "test".to_string(),
+            model_id: ferrum_types::ModelId::new("test"),
+            sampling_params: SamplingParams::greedy(),
+            stream: false,
+            priority: Priority::Normal,
+            client_id: None,
+            session_id: None,
+            created_at: chrono::Utc::now(),
+            api_request: None,
+            metadata: HashMap::new(),
+        }
+    }
 
     #[test]
     fn continuous_engine_runtime_config_parses_env_snapshot() {
@@ -881,5 +1075,71 @@ mod tests {
         assert_eq!(state.phase, RequestPhase::Waiting);
         assert_eq!(state.total_tokens(), 2);
         assert!(!state.prefill_complete);
+    }
+
+    #[test]
+    fn sample_masks_unknown_pad_reserved_and_bos_tokens() {
+        let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+            8,
+            &[
+                ("normal", 0),
+                ("<s>", 1),
+                ("<unk>", 2),
+                ("</s>", 3),
+                ("[PAD151935]", 4),
+                ("<|reserved_special_token_0|>", 5),
+                ("ok", 6),
+                ("other", 7),
+            ],
+        ));
+        let mut state = SequenceState::new_with_tokenizer(
+            policy_request(),
+            vec![TokenId::new(0)],
+            Some(tokenizer),
+        );
+        let mut logits = vec![0.0f32; 8];
+        logits[1] = 100.0;
+        logits[2] = 99.0;
+        logits[4] = 98.0;
+        logits[5] = 97.0;
+        logits[6] = 1.0;
+
+        let token = state.sample_with_processors(&mut logits).unwrap();
+
+        assert_eq!(token.get(), 6);
+        for token_id in [1usize, 2, 4, 5] {
+            assert_eq!(logits[token_id], f32::NEG_INFINITY);
+        }
+    }
+
+    #[test]
+    fn sample_allows_generated_control_tokens_above_base_vocab() {
+        let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+            4,
+            &[
+                ("normal", 0),
+                ("<s>", 1),
+                ("<unk>", 2),
+                ("</s>", 3),
+                ("ok", 4),
+                ("</think>", 5),
+                ("[PAD151935]", 6),
+            ],
+        ));
+        let mut state = SequenceState::new_with_tokenizer(
+            policy_request(),
+            vec![TokenId::new(0)],
+            Some(tokenizer),
+        );
+        let mut logits = vec![0.0f32; 7];
+        logits[4] = 1.0;
+        logits[5] = 90.0;
+        logits[6] = 100.0;
+
+        let token = state.sample_with_processors(&mut logits).unwrap();
+
+        assert_eq!(token.get(), 5);
+        assert_eq!(logits[5], 90.0);
+        assert_eq!(logits[6], f32::NEG_INFINITY);
     }
 }

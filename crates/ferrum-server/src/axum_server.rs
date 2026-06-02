@@ -33,6 +33,9 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, error, info, span, Level};
 use uuid::Uuid;
 
+const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
+const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
+
 /// Shared Prometheus recorder handle for rendering metrics.
 static PROM_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
     std::sync::OnceLock::new();
@@ -771,8 +774,8 @@ fn convert_chat_request_with_template_model(
         prompt,
         sampling_params: SamplingParams {
             max_tokens: chat_completion_max_tokens(request) as usize,
-            temperature: request.temperature.unwrap_or(1.0),
-            top_p: request.top_p.unwrap_or(1.0),
+            temperature: request.temperature.unwrap_or(DEFAULT_SAMPLING_TEMPERATURE),
+            top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
             top_k: None, // OpenAI doesn't use top-k
             repetition_penalty: 1.0,
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
@@ -1307,8 +1310,8 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
         prompt: prompt.to_string(),
         sampling_params: SamplingParams {
             max_tokens: request.max_tokens.unwrap_or(100) as usize,
-            temperature: request.temperature.unwrap_or(1.0),
-            top_p: request.top_p.unwrap_or(1.0),
+            temperature: request.temperature.unwrap_or(DEFAULT_SAMPLING_TEMPERATURE),
+            top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
             top_k: None,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
@@ -3628,6 +3631,10 @@ mod tests {
 
         let request = engine.last_request();
         assert_eq!(request.sampling_params.max_tokens, 3);
+        assert_eq!(
+            request.sampling_params.temperature,
+            DEFAULT_SAMPLING_TEMPERATURE
+        );
         assert_eq!(request.sampling_params.stop_sequences, vec!["<END>"]);
     }
 
