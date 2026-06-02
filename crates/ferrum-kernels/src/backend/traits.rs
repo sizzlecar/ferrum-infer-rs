@@ -50,6 +50,15 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// concrete impl. PLAYBOOK § 1.2.
     fn make_timer() -> Self::Timer;
 
+    /// True for the Apple Metal backend.
+    ///
+    /// Keep this as a backend capability instead of matching on type names in
+    /// model code. It is used only for backend-specific safety fallbacks where
+    /// a generic optimized path is known to be incorrect on one backend.
+    fn is_metal_backend() -> bool {
+        false
+    }
+
     /// Opaque per-backend GPTQ weight representation.
     ///   - CPU: dequantized f32 weights (run as regular GEMM)
     ///   - Metal: `()` — unsupported; `gemm_gptq` errors
