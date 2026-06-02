@@ -63,11 +63,24 @@ Ferrum 面向这些开发和部署场景：
 
 Ferrum 面向现代加速器上的高吞吐 serving 场景，并把原始 benchmark 日志和证据保存到仓库，而不是只给摘要数字。
 
-**CUDA：**在 RTX 4090 + Qwen3-30B-A3B GPTQ-Int4 上，Ferrum 在 same-pod `n_repeats=5` 测试里达到 vLLM `0.20.2` 吞吐的 `0.83x-0.89x`。c=32 时，Ferrum 输出吞吐为 `1641.9 +/- 4.8 tok/s`，vLLM 为 `1972.9 +/- 18.6 tok/s`，比例 `0.832x`。完整方法和原始证据见 [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)。
+RTX 4090 + `Qwen3-30B-A3B-GPTQ-Int4` same-pod 吞吐：
 
-**CUDA release gate：**公开发布的 `v0.7.4` CUDA 二进制通过 Paris、两轮多轮、三轮多轮对话 gate；c=32 smoke 完成 `16/16` 请求，`0` errors。证据在 [`docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/)。
+| 并发 | Ferrum tok/s | vLLM 0.20.2 tok/s | Ferrum / vLLM |
+| ---: | ---: | ---: | ---: |
+| 1 | `160.4 +/- 0.2` | `183.9 +/- 0.2` | `0.872x` |
+| 4 | `446.3 +/- 7.0` | `512.5 +/- 2.8` | `0.871x` |
+| 16 | `1185.1 +/- 12.3` | `1331.9 +/- 5.7` | `0.890x` |
+| 32 | `1641.9 +/- 4.8` | `1972.9 +/- 18.6` | `0.832x` |
 
-**Apple Silicon：**Metal release-candidate gates 覆盖 Qwen3/LLaMA 8B 和 Qwen3-30B-A3B，包含正确性、多轮对话和并发检查。Ferrum 当前 Qwen3-30B-A3B c=16 结果为 `72.5 tok/s`，低于记录里的 llama.cpp `83.4 tok/s`；这个限制在 benchmark 报告中明确保留：[`docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/)。
+完整 CUDA 方法和原始证据见 [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)。
+
+Release 和 Metal gates：
+
+| 目标 | 模型 / workload | 结果 | 证据 |
+| --- | --- | --- | --- |
+| CUDA release 二进制 | Qwen3-30B-A3B GPTQ-Int4, c=32 smoke | `16/16` 请求，`0` errors；Paris、多轮和三轮对话 gates 通过 | [`release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/) |
+| Apple Silicon Metal | Qwen3/LLaMA 8B 和 Qwen3-30B-A3B | 覆盖正确性、多轮对话和并发 gates | [`metal-readme-regression-20260601-release-candidate-rerun3`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/) |
+| Apple Silicon Metal 限制 | Qwen3-30B-A3B, c=16 | Ferrum `72.5 tok/s`；记录中的 llama.cpp `83.4 tok/s` | 同上 Metal 报告 |
 
 ## API 兼容性
 

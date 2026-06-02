@@ -63,11 +63,24 @@ Ferrum is built for developers and teams building:
 
 Ferrum is designed for practical high-throughput serving on modern accelerators, with raw benchmark logs checked into the repository instead of only summary claims.
 
-**CUDA:** On RTX 4090 with Qwen3-30B-A3B GPTQ-Int4, Ferrum reaches `0.83x-0.89x` of vLLM `0.20.2` throughput in same-pod `n_repeats=5` runs. At c=32, the measured output throughput is `1641.9 +/- 4.8 tok/s` for Ferrum versus `1972.9 +/- 18.6 tok/s` for vLLM (`0.832x`). Full methodology and raw artifacts are in [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/).
+CUDA same-pod throughput on RTX 4090 with `Qwen3-30B-A3B-GPTQ-Int4`:
 
-**CUDA release gate:** the public `v0.7.4` CUDA binary passed Paris, multi-turn, and three-round chat gates; the c=32 smoke completed `16/16` requests with `0` errors. Evidence is in [`docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/).
+| Concurrency | Ferrum tok/s | vLLM 0.20.2 tok/s | Ferrum / vLLM |
+| ---: | ---: | ---: | ---: |
+| 1 | `160.4 +/- 0.2` | `183.9 +/- 0.2` | `0.872x` |
+| 4 | `446.3 +/- 7.0` | `512.5 +/- 2.8` | `0.871x` |
+| 16 | `1185.1 +/- 12.3` | `1331.9 +/- 5.7` | `0.890x` |
+| 32 | `1641.9 +/- 4.8` | `1972.9 +/- 18.6` | `0.832x` |
 
-**Apple Silicon:** release-candidate Metal gates cover Qwen3/LLaMA 8B and Qwen3-30B-A3B with correctness, multi-turn, and concurrency checks. Ferrum reports the current Qwen3-30B-A3B c=16 result as `72.5 tok/s`, below the recorded llama.cpp `83.4 tok/s`, and keeps that limitation visible in the benchmark report: [`docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/).
+Full CUDA methodology and raw artifacts are in [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/).
+
+Release and Metal gates:
+
+| Target | Model / workload | Result | Evidence |
+| --- | --- | --- | --- |
+| CUDA release binary | Qwen3-30B-A3B GPTQ-Int4, c=32 smoke | `16/16` requests, `0` errors; Paris, multi-turn, and three-round chat gates passed | [`release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/) |
+| Apple Silicon Metal | Qwen3/LLaMA 8B and Qwen3-30B-A3B | Correctness, multi-turn, and concurrency gates covered | [`metal-readme-regression-20260601-release-candidate-rerun3`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/) |
+| Apple Silicon Metal limitation | Qwen3-30B-A3B, c=16 | Ferrum `72.5 tok/s`; recorded llama.cpp `83.4 tok/s` | Same Metal report above |
 
 ## API Compatibility
 
