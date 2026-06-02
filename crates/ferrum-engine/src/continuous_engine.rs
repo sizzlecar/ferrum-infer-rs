@@ -107,6 +107,51 @@ fn parse_positive_usize_env(vars: &HashMap<String, String>, name: &str) -> Optio
         .filter(|&v| v > 0)
 }
 
+fn positive_usize_env(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+}
+
+fn effective_request_context_capacity(config: &EngineConfig) -> Option<usize> {
+    let kv_capacity = positive_usize_env("FERRUM_KV_CAPACITY")
+        .or_else(|| (config.kv_cache.max_blocks > 0).then_some(config.kv_cache.max_blocks));
+    let max_model_len = positive_usize_env("FERRUM_MAX_MODEL_LEN").or_else(|| {
+        config
+            .model
+            .model_info
+            .as_ref()
+            .map(|info| info.max_sequence_length)
+            .filter(|&len| len > 0)
+    });
+
+    match (kv_capacity, max_model_len) {
+        (Some(kv), Some(model)) => Some(kv.min(model)),
+        (Some(kv), None) => Some(kv),
+        (None, Some(model)) => Some(model),
+        (None, None) => None,
+    }
+}
+
+fn validate_request_context_budget(
+    request: &InferenceRequest,
+    input_tokens: usize,
+    config: &EngineConfig,
+) -> Result<()> {
+    let Some(capacity) = effective_request_context_capacity(config) else {
+        return Ok(());
+    };
+    let output_tokens = request.sampling_params.max_tokens;
+    if input_tokens.saturating_add(output_tokens) <= capacity {
+        return Ok(());
+    }
+
+    Err(FerrumError::request_validation(format!(
+        "This model context is limited to {capacity} tokens, but this request needs {input_tokens} input tokens + {output_tokens} output tokens. Reduce max_tokens or shorten the messages."
+    )))
+}
+
 /// Resolve per-request stop conditions into (single-token-ids, multi-token-texts).
 ///
 /// Combines:
@@ -767,6 +812,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         gauge!("ferrum.engine.active_requests").increment(1.0);
 
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
+        validate_request_context_budget(&request, input_tokens.len(), &self.inner.config)?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
             serde_json::Value::from(input_tokens.len() as u64),
@@ -824,6 +870,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let request_id = request.id.clone();
 
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
+        validate_request_context_budget(&request, input_tokens.len(), &self.inner.config)?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
             serde_json::Value::from(input_tokens.len() as u64),
