@@ -109,6 +109,12 @@ fn render_model_template(
     env.add_filter("trim_end_newlines", |s: String| {
         s.trim_end_matches('\n').to_string()
     });
+    env.add_filter("starts_with", |s: String, prefix: String| {
+        s.starts_with(&prefix)
+    });
+    env.add_filter("ends_with", |s: String, suffix: String| {
+        s.ends_with(&suffix)
+    });
     env.add_filter("after_think_end", |s: String| {
         s.split("</think>")
             .last()
@@ -156,6 +162,8 @@ fn normalize_hf_chat_template(template: &str) -> String {
             "content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n')",
             "content|reasoning_from_think",
         )
+        .replace(".startswith(", "|starts_with(")
+        .replace(".endswith(", "|ends_with(")
         .replace(".strip('\\n')", "|trim_newlines")
         .replace(".lstrip('\\n')", "|trim_start_newlines")
         .replace(".rstrip('\\n')", "|trim_end_newlines")
@@ -465,6 +473,23 @@ mod tests {
             Some(&template),
         );
         assert_eq!(out, "<r>reason</r>answer");
+    }
+
+    #[test]
+    fn qwen3_python_startswith_endswith_are_normalized_for_minijinja() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% if message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}plain{% else %}tool{% endif %}{% endfor %}",
+            "qwen3-startswith-template",
+        );
+        let out = render_prompt_messages(
+            &[
+                PromptMessage::new("user", "hello"),
+                PromptMessage::new("user", "<tool_response>ok</tool_response>"),
+            ],
+            "qwen3",
+            Some(&template),
+        );
+        assert_eq!(out, "plaintool");
     }
 
     #[test]
