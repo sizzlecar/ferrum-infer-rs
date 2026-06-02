@@ -87,7 +87,14 @@ impl EngineInner {
                 metadata: HashMap::new(),
                 api_response: None,
             };
-            let _ = tx.send(Ok(chunk)).await;
+            if tx.send(Ok(chunk)).await.is_ok() {
+                // A bounded channel send often completes immediately, so a
+                // hot decode loop can keep running without giving the CLI /
+                // HTTP stream receiver a chance to flush visible output. Yield
+                // after successful streaming sends to preserve token-level UX;
+                // non-streaming requests do not enter this branch.
+                tokio::task::yield_now().await;
+            }
         }
     }
 
