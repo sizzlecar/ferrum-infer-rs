@@ -112,11 +112,18 @@ fn has_unclosed_thinking_block(prompt: &str) -> bool {
 struct RunPromptPlan {
     prompt: String,
     sampling_params: SamplingParams,
+    prompt_tokens: Option<usize>,
+    kv_capacity: Option<usize>,
+    dropped_history_messages: usize,
+    dropped_history_turns: usize,
+    max_tokens_clamped_from: Option<usize>,
 }
 
 struct RunBudget {
     tokenizer: Option<tokenizers::Tokenizer>,
     kv_capacity: Option<usize>,
+    #[cfg(test)]
+    prompt_token_counter: Option<fn(&str) -> usize>,
 }
 
 impl RunBudget {
@@ -130,10 +137,16 @@ impl RunBudget {
         Self {
             tokenizer,
             kv_capacity,
+            #[cfg(test)]
+            prompt_token_counter: None,
         }
     }
 
     fn prompt_tokens(&self, prompt: &str) -> Option<usize> {
+        #[cfg(test)]
+        if let Some(counter) = self.prompt_token_counter {
+            return Some(counter(prompt));
+        }
         self.tokenizer
             .as_ref()
             .and_then(|tok| tok.encode(prompt, true).ok())
@@ -158,8 +171,15 @@ pub struct RunCommand {
     pub system: Option<String>,
 
     /// Maximum tokens to generate
-    #[arg(long, default_value = "512")]
+    #[arg(long, default_value = "1024")]
     pub max_tokens: u32,
+
+    /// Disable CLI context shift. By default, `ferrum run` keeps the REPL
+    /// alive by dropping the oldest history when the rendered prompt no
+    /// longer fits the KV cache, and clamps this turn's max output tokens to
+    /// the remaining context budget.
+    #[arg(long)]
+    pub no_context_shift: bool,
 
     /// Sampling temperature (0.0–2.0). 0.0 = greedy / argmax (deterministic,
     /// what you want for benchmarks). >0 = softmax sample with `--top-k`
@@ -342,6 +362,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             &cmd,
             &run_budget,
         )?;
+        maybe_warn_context_shift(&plan, format);
         let metadata = run_request_metadata(&plan.prompt);
         let request = InferenceRequest {
             id: RequestId(Uuid::new_v4()),
@@ -480,6 +501,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     &cmd,
                     &run_budget,
                 )?;
+                maybe_warn_context_shift(&plan, format);
                 let metadata = run_request_metadata(&plan.prompt);
                 // Create request
                 let request = InferenceRequest {
@@ -669,21 +691,149 @@ fn build_run_prompt_plan(
     budget: &RunBudget,
 ) -> Result<RunPromptPlan> {
     let base_sampling = build_sampling_params(cmd);
-    let prompt = build_chat_prompt(history, user_input, system, model_id, model_template);
-    let prompt_tokens = budget.prompt_tokens(&prompt);
-    if !fits_kv_budget(&base_sampling, prompt_tokens, budget.kv_capacity) {
-        return Err(FerrumError::invalid_request(format!(
-            "This model context is limited to {} tokens, but this turn needs {} input tokens + {} output tokens. Reduce --max-tokens, use /clear, or shorten the prompt.",
-            budget.kv_capacity.unwrap_or(0),
-            prompt_tokens.unwrap_or(0),
-            base_sampling.max_tokens,
-        )));
+
+    if cmd.no_context_shift {
+        let prompt = build_chat_prompt(history, user_input, system, model_id, model_template);
+        let prompt_tokens = budget.prompt_tokens(&prompt);
+        if !fits_kv_budget(&base_sampling, prompt_tokens, budget.kv_capacity) {
+            return Err(FerrumError::invalid_request(format!(
+                "This model context is limited to {} tokens, but this turn needs {} input tokens + {} output tokens. Reduce --max-tokens, use /clear, or shorten the prompt.",
+                budget.kv_capacity.unwrap_or(0),
+                prompt_tokens.unwrap_or(0),
+                base_sampling.max_tokens,
+            )));
+        }
+
+        return Ok(RunPromptPlan {
+            prompt,
+            sampling_params: base_sampling,
+            prompt_tokens,
+            kv_capacity: budget.kv_capacity,
+            dropped_history_messages: 0,
+            dropped_history_turns: 0,
+            max_tokens_clamped_from: None,
+        });
     }
 
-    Ok(RunPromptPlan {
-        prompt,
-        sampling_params: base_sampling,
-    })
+    let mut history_start = 0usize;
+    loop {
+        let prompt = build_chat_prompt(
+            &history[history_start..],
+            user_input,
+            system,
+            model_id,
+            model_template,
+        );
+        let prompt_tokens = budget.prompt_tokens(&prompt);
+
+        let Some(kv_capacity) = budget.kv_capacity else {
+            return Ok(RunPromptPlan {
+                prompt,
+                sampling_params: base_sampling,
+                prompt_tokens,
+                kv_capacity: None,
+                dropped_history_messages: history_start,
+                dropped_history_turns: count_user_turns(&history[..history_start]),
+                max_tokens_clamped_from: None,
+            });
+        };
+        let Some(prompt_tokens) = prompt_tokens else {
+            return Ok(RunPromptPlan {
+                prompt,
+                sampling_params: base_sampling,
+                prompt_tokens: None,
+                kv_capacity: Some(kv_capacity),
+                dropped_history_messages: history_start,
+                dropped_history_turns: count_user_turns(&history[..history_start]),
+                max_tokens_clamped_from: None,
+            });
+        };
+
+        if prompt_tokens < kv_capacity {
+            let remaining = kv_capacity - prompt_tokens;
+            let mut sampling_params = base_sampling.clone();
+            let max_tokens_clamped_from = if sampling_params.max_tokens > remaining {
+                let old = sampling_params.max_tokens;
+                sampling_params.max_tokens = remaining;
+                Some(old)
+            } else {
+                None
+            };
+            return Ok(RunPromptPlan {
+                prompt,
+                sampling_params,
+                prompt_tokens: Some(prompt_tokens),
+                kv_capacity: Some(kv_capacity),
+                dropped_history_messages: history_start,
+                dropped_history_turns: count_user_turns(&history[..history_start]),
+                max_tokens_clamped_from,
+            });
+        }
+
+        if history_start >= history.len() {
+            return Err(FerrumError::invalid_request(format!(
+                "This model context is limited to {kv_capacity} tokens, but the current turn needs {prompt_tokens} input tokens before generation. Use a shorter prompt or increase KV capacity.",
+            )));
+        }
+        history_start = next_context_shift_history_start(history, history_start);
+    }
+}
+
+fn next_context_shift_history_start(history: &[(String, String)], start: usize) -> usize {
+    if start + 1 < history.len()
+        && history[start].0 == "user"
+        && history[start + 1].0 == "assistant"
+    {
+        start + 2
+    } else {
+        start + 1
+    }
+}
+
+fn count_user_turns(history: &[(String, String)]) -> usize {
+    history.iter().filter(|(role, _)| role == "user").count()
+}
+
+fn maybe_warn_context_shift(plan: &RunPromptPlan, format: OutputFormat) {
+    if format != OutputFormat::Text {
+        return;
+    }
+    if plan.dropped_history_messages == 0 && plan.max_tokens_clamped_from.is_none() {
+        return;
+    }
+
+    let prompt_tokens = plan
+        .prompt_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let kv_capacity = plan
+        .kv_capacity
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let mut parts = Vec::new();
+    if plan.dropped_history_messages > 0 {
+        parts.push(format!(
+            "dropped {} old message(s) / {} turn(s)",
+            plan.dropped_history_messages, plan.dropped_history_turns
+        ));
+    }
+    if let Some(old) = plan.max_tokens_clamped_from {
+        parts.push(format!(
+            "max_tokens {} -> {}",
+            old, plan.sampling_params.max_tokens
+        ));
+    }
+
+    eprintln!(
+        "{}",
+        format!(
+            "[context-shift] {} (prompt_tokens={}, kv_capacity={})",
+            parts.join("; "),
+            prompt_tokens,
+            kv_capacity
+        )
+        .dimmed()
+    );
 }
 
 fn fits_kv_budget(
@@ -1025,6 +1175,36 @@ mod tests {
         }
     }
 
+    fn test_run_cmd() -> RunCommand {
+        RunCommand {
+            model: "tinyllama".to_string(),
+            system: None,
+            max_tokens: 1024,
+            no_context_shift: false,
+            temperature: 0.0,
+            backend: "auto".to_string(),
+            prompt: None,
+            tokenizer: None,
+            bench_mode: false,
+            top_k: 50,
+            top_p: 0.95,
+            repeat_penalty: 1.0,
+            repeat_last_n: 64,
+            seed: None,
+            gpu_memory_utilization: 0.9,
+            kv_dtype: None,
+            output_format: OutputFormat::Text,
+        }
+    }
+
+    fn whitespace_budget(kv_capacity: usize) -> RunBudget {
+        RunBudget {
+            tokenizer: None,
+            kv_capacity: Some(kv_capacity),
+            prompt_token_counter: Some(|prompt| prompt.split_whitespace().count()),
+        }
+    }
+
     #[test]
     fn run_metadata_forbids_initial_thinking_close_without_open_block() {
         let metadata = run_request_metadata("<|im_start|>assistant\n");
@@ -1062,25 +1242,39 @@ mod tests {
 
     #[test]
     fn default_run_temperature_is_greedy() {
-        let cmd = RunCommand {
-            model: "tinyllama".to_string(),
-            system: None,
-            max_tokens: 512,
-            temperature: 0.0,
-            backend: "auto".to_string(),
-            prompt: None,
-            tokenizer: None,
-            bench_mode: false,
-            top_k: 50,
-            top_p: 0.95,
-            repeat_penalty: 1.0,
-            repeat_last_n: 64,
-            seed: None,
-            gpu_memory_utilization: 0.9,
-            kv_dtype: None,
-            output_format: OutputFormat::Text,
-        };
+        let cmd = test_run_cmd();
         assert_eq!(build_sampling_params(&cmd).temperature, 0.0);
+        assert_eq!(build_sampling_params(&cmd).max_tokens, 1024);
+    }
+
+    #[test]
+    fn context_shift_clamps_output_to_remaining_kv_budget() {
+        let cmd = test_run_cmd();
+        let budget = whitespace_budget(64);
+        let plan =
+            build_run_prompt_plan(&[], "demo", None, "tinyllama", None, &cmd, &budget).unwrap();
+
+        let prompt_tokens = plan.prompt_tokens.unwrap();
+        assert!(prompt_tokens < 64);
+        assert_eq!(plan.max_tokens_clamped_from, Some(1024));
+        assert_eq!(plan.sampling_params.max_tokens, 64 - prompt_tokens);
+    }
+
+    #[test]
+    fn context_shift_drops_oldest_history_until_prompt_fits() {
+        let cmd = test_run_cmd();
+        let budget = whitespace_budget(64);
+        let long = std::iter::repeat_n("old", 80).collect::<Vec<_>>().join(" ");
+        let history = vec![
+            ("user".to_string(), long.clone()),
+            ("assistant".to_string(), long),
+        ];
+        let plan = build_run_prompt_plan(&history, "demo", None, "tinyllama", None, &cmd, &budget)
+            .unwrap();
+
+        assert_eq!(plan.dropped_history_messages, 2);
+        assert_eq!(plan.dropped_history_turns, 1);
+        assert!(plan.prompt_tokens.unwrap() < 64);
     }
 
     #[test]
