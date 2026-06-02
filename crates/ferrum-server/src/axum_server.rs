@@ -389,10 +389,20 @@ async fn handle_chat_completions_stream(
     let buffer_structured_api_stream =
         ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
     let buffer_stream_output = buffer_strict_json_schema_stream || buffer_structured_api_stream;
-    let mut stream = engine
-        .infer_stream(inference_request)
-        .await
-        .map_err(server_error_from_ferrum_error)?;
+    let mut stream = match engine.infer_stream(inference_request).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!("Stream generation failed before first chunk: {}", e);
+            let _ = tx.send(Ok(openai_error_sse_event(
+                e.to_string(),
+                "internal_server_error",
+                None,
+            )));
+            let _ = tx.send(Ok(Event::default().data("[DONE]")));
+            let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+            return Ok(Sse::new(stream).into_response());
+        }
+    };
 
     tokio::spawn(async move {
         let mut current_text = String::new();
@@ -951,8 +961,18 @@ fn normalize_structured_response_content(
         return content.to_string();
     };
     match response_format.format_type.as_str() {
-        "json_object" | "json_schema" => extract_json_object_text(content)
+        "json_object" => extract_json_object_text(content)
             .unwrap_or_else(|| strip_markdown_json_fence(content).to_string()),
+        "json_schema"
+            if !response_format
+                .json_schema
+                .as_ref()
+                .and_then(|schema| schema.strict)
+                .unwrap_or(false) =>
+        {
+            extract_json_object_text(content)
+                .unwrap_or_else(|| strip_markdown_json_fence(content).to_string())
+        }
         _ => content.to_string(),
     }
 }
