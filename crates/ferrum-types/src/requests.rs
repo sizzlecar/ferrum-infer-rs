@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub const PROMPT_TOKENS_METADATA_KEY: &str = "ferrum_prompt_tokens";
+pub const DEFAULT_MAX_TOKENS_METADATA_KEY: &str = "ferrum_default_max_tokens";
 
 /// Inference request
 #[derive(Debug, Clone, Serialize, Deserialize)]
