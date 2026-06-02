@@ -232,8 +232,7 @@ pub fn metal_gguf_moe_correctness_entries(
             .extension()
             .map(|e| e.eq_ignore_ascii_case("gguf"))
             .unwrap_or(false);
-    if !is_gguf || !matches!(device, ferrum_types::Device::Metal) || !detect_moe_arch(snapshot_path)
-    {
+    if !is_gguf || !device_is_metal(device) || !detect_moe_arch(snapshot_path) {
         return Vec::new();
     }
 
@@ -268,10 +267,22 @@ pub fn serve_profile_runtime_entries(
     serve_profile_runtime_entries_for_arch(
         is_gguf,
         detect_moe_arch(snapshot_path),
-        matches!(device, ferrum_types::Device::Metal),
+        device_is_metal(device),
         current,
         source,
     )
+}
+
+fn device_is_metal(device: &ferrum_types::Device) -> bool {
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "metal"))]
+    {
+        matches!(device, ferrum_types::Device::Metal)
+    }
+    #[cfg(not(all(any(target_os = "macos", target_os = "ios"), feature = "metal")))]
+    {
+        let _ = device;
+        false
+    }
 }
 
 pub fn serve_profile_runtime_entries_for_arch(

@@ -13,6 +13,7 @@ pub struct HuggingFaceTokenizer {
     tokenizer: Arc<HfTokenizer>,
     special_tokens: SpecialTokens,
     info: TokenizerInfo,
+    id_to_token: Vec<Option<String>>,
     /// Incremental decode cache for efficiency
     decode_cache: RwLock<DecodeCache>,
 }
@@ -65,6 +66,7 @@ impl HuggingFaceTokenizer {
     /// Create new HuggingFace tokenizer
     pub async fn new(tokenizer: HfTokenizer) -> Result<Self> {
         let vocab_size = tokenizer.get_vocab_size(false);
+        let id_to_token = build_id_to_token(&tokenizer);
 
         // Extract special tokens
         let special_tokens = extract_special_tokens(&tokenizer)?;
@@ -88,6 +90,7 @@ impl HuggingFaceTokenizer {
             tokenizer: Arc::new(tokenizer),
             special_tokens,
             info,
+            id_to_token,
             decode_cache: RwLock::new(DecodeCache::new(1000)),
         })
     }
@@ -199,9 +202,10 @@ impl Tokenizer for HuggingFaceTokenizer {
         self.tokenizer.token_to_id(text).map(TokenId::new)
     }
 
-    fn token_text(&self, _token_id: TokenId) -> Option<&str> {
-        // HF tokenizer doesn't support this efficiently, return None
-        None
+    fn token_text(&self, token_id: TokenId) -> Option<&str> {
+        self.id_to_token
+            .get(token_id.get() as usize)
+            .and_then(|value| value.as_deref())
     }
 
     fn apply_chat_template(
@@ -314,6 +318,21 @@ impl TokenizerFactory for HuggingFaceTokenizerFactory {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+fn build_id_to_token(tokenizer: &HfTokenizer) -> Vec<Option<String>> {
+    let vocab = tokenizer.get_vocab(true);
+    let Some(max_id) = vocab.values().copied().max() else {
+        return Vec::new();
+    };
+    let mut id_to_token = vec![None; max_id as usize + 1];
+    for (token, id) in vocab {
+        let slot = &mut id_to_token[id as usize];
+        if slot.is_none() {
+            *slot = Some(token);
+        }
+    }
+    id_to_token
+}
 
 /// Extract special tokens from HF tokenizer
 fn extract_special_tokens(tokenizer: &HfTokenizer) -> Result<SpecialTokens> {
@@ -636,6 +655,33 @@ mod tests {
         let token_id = tokenizer.token_id("hello");
         assert!(token_id.is_some());
         assert_eq!(token_id.unwrap().get(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tokenizer_token_text_reverse_lookup() {
+        use tokenizers::models::bpe::{Vocab, BPE};
+        use tokenizers::Tokenizer as HfTokenizer;
+
+        let vocab: Vocab = [
+            ("hello".to_string(), 0),
+            ("[PAD151935]".to_string(), 1),
+            ("</think>".to_string(), 2),
+        ]
+        .into_iter()
+        .collect();
+
+        let merges = vec![];
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .unwrap();
+
+        let hf_tokenizer = HfTokenizer::new(bpe);
+        let tokenizer = HuggingFaceTokenizer::new(hf_tokenizer).await.unwrap();
+
+        assert_eq!(tokenizer.token_text(TokenId::new(1)), Some("[PAD151935]"));
+        assert_eq!(tokenizer.token_text(TokenId::new(2)), Some("</think>"));
+        assert_eq!(tokenizer.token_text(TokenId::new(99)), None);
     }
 
     #[tokio::test]
