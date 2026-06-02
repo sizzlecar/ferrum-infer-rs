@@ -214,7 +214,6 @@ fn cached_forbidden_generation_tokens(
             }
         }
     }
-
     let scan_limit = tok.vocab_size().min(GENERATION_POLICY_SCAN_LIMIT);
     for token_id in 0..scan_limit {
         let id = token_id as u32;
@@ -332,6 +331,8 @@ pub struct SequenceState {
     /// tokenizer/model vocab holes such as Qwen3's reserved tail IDs and
     /// literal `<unk` / `<unk>` pieces.
     pub forbidden_token_ids: HashSet<u32>,
+    /// Token IDs masked only before the first generated token.
+    pub initial_forbidden_token_ids: HashSet<u32>,
     /// Base tokenizer vocabulary size. IDs above this are allowed only when
     /// they are explicitly whitelisted in `allowed_extended_token_ids`.
     pub tokenizer_base_vocab_size: Option<usize>,
@@ -362,7 +363,14 @@ impl SequenceState {
         tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
     ) -> Self {
         use ferrum_types::ResponseFormat;
-        let seed = request.sampling_params.seed.unwrap_or(42);
+        let rng = request
+            .sampling_params
+            .seed
+            .map(StdRng::seed_from_u64)
+            .unwrap_or_else(|| {
+                let mut rng = rand::rng();
+                StdRng::from_rng(&mut rng)
+            });
         let json_processor = match &request.sampling_params.response_format {
             ResponseFormat::JsonObject => Some(Arc::new(JsonModeProcessor::new())),
             _ => None,
@@ -407,6 +415,18 @@ impl SequenceState {
             resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref(), ignore_eos);
         let (forbidden_token_ids, tokenizer_base_vocab_size, allowed_extended_token_ids) =
             resolve_sampling_token_constraints(tokenizer.as_deref(), &stop_token_ids);
+        let mut initial_forbidden_token_ids = HashSet::new();
+        let initial_forbidden_token_texts = request
+            .metadata
+            .get("ferrum_initial_forbidden_token_texts")
+            .and_then(|value| value.as_array());
+        if let (Some(texts), Some(tok)) = (initial_forbidden_token_texts, tokenizer.as_deref()) {
+            for text in texts.iter().filter_map(|value| value.as_str()) {
+                if let Some(token) = tok.token_id(text) {
+                    initial_forbidden_token_ids.insert(token.get());
+                }
+            }
+        }
         Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
@@ -415,7 +435,7 @@ impl SequenceState {
             kv_cache: None,
             sampling_params: request.sampling_params,
             phase: RequestPhase::Waiting,
-            rng: StdRng::seed_from_u64(seed),
+            rng,
             prefill_complete: false,
             prefill_tokens_processed: 0,
             stream_sender: None,
@@ -433,6 +453,7 @@ impl SequenceState {
             model_cache_id: None,
             stop_token_ids,
             forbidden_token_ids,
+            initial_forbidden_token_ids,
             tokenizer_base_vocab_size,
             allowed_extended_token_ids,
             stop_text_seqs,
@@ -502,6 +523,13 @@ impl SequenceState {
         for &token_id in &self.forbidden_token_ids {
             if let Some(logit) = logits.get_mut(token_id as usize) {
                 *logit = f32::NEG_INFINITY;
+            }
+        }
+        if self.generated_tokens.is_empty() {
+            for &token_id in &self.initial_forbidden_token_ids {
+                if let Some(logit) = logits.get_mut(token_id as usize) {
+                    *logit = f32::NEG_INFINITY;
+                }
             }
         }
         if let Some(base_vocab_size) = self.tokenizer_base_vocab_size {
@@ -1115,7 +1143,7 @@ mod tests {
     #[test]
     fn sample_allows_generated_control_tokens_above_base_vocab() {
         let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
-            4,
+            6,
             &[
                 ("normal", 0),
                 ("<s>", 1),
@@ -1141,5 +1169,42 @@ mod tests {
         assert_eq!(token.get(), 5);
         assert_eq!(logits[5], 90.0);
         assert_eq!(logits[6], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
+        let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+            6,
+            &[
+                ("normal", 0),
+                ("<s>", 1),
+                ("<unk>", 2),
+                ("</s>", 3),
+                ("ok", 4),
+                ("</think>", 5),
+            ],
+        ));
+        let mut request = policy_request();
+        request.metadata.insert(
+            "ferrum_initial_forbidden_token_texts".to_string(),
+            serde_json::json!(["</think>"]),
+        );
+        let mut state =
+            SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+
+        let mut first_logits = vec![0.0f32; 6];
+        first_logits[0] = 1.0;
+        first_logits[5] = 100.0;
+        let first = state.sample_with_processors(&mut first_logits).unwrap();
+        assert_eq!(first.get(), 0);
+        assert_eq!(first_logits[5], f32::NEG_INFINITY);
+
+        state.generated_tokens.push(first);
+        let mut next_logits = vec![0.0f32; 6];
+        next_logits[0] = 1.0;
+        next_logits[5] = 100.0;
+        let next = state.sample_with_processors(&mut next_logits).unwrap();
+        assert_eq!(next.get(), 5);
+        assert_eq!(next_logits[5], 100.0);
     }
 }

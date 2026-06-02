@@ -16,6 +16,10 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+const RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
+const THINK_START_TAG: &str = "<think>";
+const THINK_END_TAG: &str = "</think>";
+
 /// Output format for `ferrum run`. JSONL mode emits one record per event
 /// (assistant generation result, user input, exit) on stdout — used by
 /// integration tests and scripting. Text mode is the default interactive UX.
@@ -83,6 +87,25 @@ fn emit_jsonl_exit(reason: &str) {
         "reason": reason,
     });
     println!("{record}");
+}
+
+fn run_request_metadata(prompt: &str) -> HashMap<String, serde_json::Value> {
+    let mut metadata = HashMap::new();
+    if !has_unclosed_thinking_block(prompt) {
+        metadata.insert(
+            RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY.to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(THINK_END_TAG.to_string())]),
+        );
+    }
+    metadata
+}
+
+fn has_unclosed_thinking_block(prompt: &str) -> bool {
+    match (prompt.rfind(THINK_START_TAG), prompt.rfind(THINK_END_TAG)) {
+        (Some(start), Some(end)) => start > end,
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -188,9 +211,9 @@ pub struct RunCommand {
     #[arg(long, default_value = "64")]
     pub repeat_last_n: usize,
 
-    /// Random seed for sampling (when temperature > 0). Default 42.
-    #[arg(long, default_value = "42")]
-    pub seed: u64,
+    /// Random seed for sampling (when temperature > 0). Omit for non-deterministic chat.
+    #[arg(long)]
+    pub seed: Option<u64>,
 
     /// Fraction of GPU memory ferrum is allowed to use (mirrors vLLM's
     /// `--gpu-memory-utilization`). Auto-sizes the KV pool: at 0.9
@@ -319,6 +342,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             &cmd,
             &run_budget,
         )?;
+        let metadata = run_request_metadata(&plan.prompt);
         let request = InferenceRequest {
             id: RequestId(Uuid::new_v4()),
             model_id: ferrum_types::ModelId(model_id.clone()),
@@ -330,7 +354,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             session_id: None,
             created_at: Utc::now(),
             api_request: None,
-            metadata: HashMap::new(),
+            metadata,
         };
         let start = std::time::Instant::now();
         let response = engine.infer(request).await?;
@@ -456,6 +480,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     &cmd,
                     &run_budget,
                 )?;
+                let metadata = run_request_metadata(&plan.prompt);
                 // Create request
                 let request = InferenceRequest {
                     id: RequestId(Uuid::new_v4()),
@@ -468,7 +493,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     session_id: None,
                     created_at: Utc::now(),
                     api_request: None,
-                    metadata: HashMap::new(),
+                    metadata,
                 };
 
                 let start = std::time::Instant::now();
@@ -629,7 +654,7 @@ fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
             "</s>".to_string(),
             "<|endoftext|>".to_string(),
         ],
-        seed: Some(cmd.seed),
+        seed: cmd.seed,
         ..Default::default()
     }
 }
@@ -1001,6 +1026,25 @@ mod tests {
     }
 
     #[test]
+    fn run_metadata_forbids_initial_thinking_close_without_open_block() {
+        let metadata = run_request_metadata("<|im_start|>assistant\n");
+        let forbidden = metadata
+            .get(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY)
+            .and_then(|value| value.as_array())
+            .expect("initial forbidden token texts");
+        assert_eq!(
+            forbidden,
+            &[serde_json::Value::String(THINK_END_TAG.to_string())]
+        );
+    }
+
+    #[test]
+    fn run_metadata_allows_thinking_close_when_prompt_opened_block() {
+        let metadata = run_request_metadata("<|im_start|>assistant\n<think>\n");
+        assert!(!metadata.contains_key(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
+    }
+
+    #[test]
     fn cli_display_preserves_thinking_markers() {
         assert_eq!(
             display_response_text("<think>\nreasoning\n</think>\n\n最终答案"),
@@ -1014,6 +1058,29 @@ mod tests {
             display_response_text("</think>\n\n你好！很高兴见到你。"),
             "</think>\n\n你好！很高兴见到你。"
         );
+    }
+
+    #[test]
+    fn default_run_temperature_is_greedy() {
+        let cmd = RunCommand {
+            model: "tinyllama".to_string(),
+            system: None,
+            max_tokens: 512,
+            temperature: 0.0,
+            backend: "auto".to_string(),
+            prompt: None,
+            tokenizer: None,
+            bench_mode: false,
+            top_k: 50,
+            top_p: 0.95,
+            repeat_penalty: 1.0,
+            repeat_last_n: 64,
+            seed: None,
+            gpu_memory_utilization: 0.9,
+            kv_dtype: None,
+            output_format: OutputFormat::Text,
+        };
+        assert_eq!(build_sampling_params(&cmd).temperature, 0.0);
     }
 
     #[test]
