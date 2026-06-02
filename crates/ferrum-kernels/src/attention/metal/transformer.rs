@@ -158,7 +158,8 @@ pub fn metal_layer_forward_v2(
     // Encoder 3: QK-norm + RoPE + transpose (3 independent dispatches)
     {
         let enc = cmd.new_compute_command_encoder();
-        // Q/K: mode 1 (norm+RoPE) if has_qk_norm, mode 2 (RoPE only) if not
+        // Q/K: mode 1 (norm+half-split RoPE) if has_qk_norm,
+        // mode 2 (half-split RoPE only) if not.
         let qk_mode: i32 = if w.has_qk_norm { 1 } else { 2 };
         pipes.qk_norm_rope(
             enc,

@@ -61,6 +61,8 @@ impl<B: MoeLlmBackend> TalkerBackboneBackend<B> {
             max_seq_len: cfg.max_position_embeddings,
             rms_norm_eps: cfg.rms_norm_eps as f32,
             rope_theta: cfg.rope_theta,
+            rope_scaling: None,
+            rope_interleaved: false,
             has_qk_norm: true,
             sliding_window: 0,
         };
@@ -94,6 +96,8 @@ impl<B: MoeLlmBackend> TalkerBackboneBackend<B> {
             max_seq_len: cfg.max_position_embeddings,
             rms_norm_eps: cfg.rms_norm_eps as f32,
             rope_theta: cfg.rope_theta,
+            rope_scaling: None,
+            rope_interleaved: false,
             has_qk_norm: true,
             sliding_window: 0,
         };

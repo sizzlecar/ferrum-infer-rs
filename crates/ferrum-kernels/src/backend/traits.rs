@@ -423,8 +423,9 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ///
     /// `qkv` layout: `[tokens, q_heads*hd + 2*kv_heads*hd]`.
     /// `q_out`: `[q_heads, tokens, hd]`. `k_out`/`v_out`: `[kv_heads, tokens, hd]`.
-    /// `qk_mode`: 1 = norm + RoPE for Q/K (Qwen3 with QK-norm),
-    ///            2 = RoPE only for Q/K (no QK-norm; Llama-style).
+    /// `qk_mode`: 1 = norm + half-split RoPE for Q/K (Qwen3 with QK-norm),
+    ///            2 = half-split RoPE only for Q/K,
+    ///            3 = interleaved RoPE only for Q/K (GGUF LLaMA / llama.cpp layout).
     /// V always falls through to transpose-only.
     ///
     /// Default returns Unsupported. Backends that implement it are
