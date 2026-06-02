@@ -148,6 +148,14 @@ fn normalize_hf_chat_template(template: &str) -> String {
             "message.content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n')",
             "message.content|reasoning_from_think",
         )
+        .replace(
+            "content.split('</think>')[-1].lstrip('\\n')",
+            "content|after_think_end",
+        )
+        .replace(
+            "content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n')",
+            "content|reasoning_from_think",
+        )
         .replace(".strip('\\n')", "|trim_newlines")
         .replace(".lstrip('\\n')", "|trim_start_newlines")
         .replace(".rstrip('\\n')", "|trim_end_newlines")
@@ -428,6 +436,24 @@ mod tests {
         let template = ModelChatTemplate::new(
             "{% for message in messages %}{% set content = message.content.split('</think>')[-1].lstrip('\\n') %}{% set reasoning_content = message.content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}<r>{{ reasoning_content.strip('\\n') }}</r>{{ content.lstrip('\\n') }}{% endfor %}",
             "split-template",
+        );
+        let out = render_prompt_messages(
+            &[PromptMessage {
+                role: "assistant".to_string(),
+                content: "<think>\nreason\n</think>\n\nanswer".to_string(),
+                reasoning_content: None,
+            }],
+            "qwen3",
+            Some(&template),
+        );
+        assert_eq!(out, "<r>reason</r>answer");
+    }
+
+    #[test]
+    fn qwen3_content_variable_split_expressions_are_normalized_for_minijinja() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% set content = message.content %}{% if '</think>' in content %}{% set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}{% set content = content.split('</think>')[-1].lstrip('\\n') %}{% endif %}<r>{{ reasoning_content.strip('\\n') }}</r>{{ content.lstrip('\\n') }}{% endfor %}",
+            "qwen3-content-split-template",
         );
         let out = render_prompt_messages(
             &[PromptMessage {
