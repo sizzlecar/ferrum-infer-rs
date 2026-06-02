@@ -75,7 +75,8 @@ async fn main() {
     let cli = Cli::parse();
 
     // Setup logging
-    if let Err(e) = setup_logging(cli.verbose, false) {
+    let suppress_chat_template_warnings = matches!(cli.command, Commands::Run(_)) && !cli.verbose;
+    if let Err(e) = setup_logging(cli.verbose, false, suppress_chat_template_warnings) {
         eprintln!("{} Failed to setup logging: {}", "Error:".red().bold(), e);
         process::exit(1);
     }

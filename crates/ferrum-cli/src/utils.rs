@@ -4,8 +4,16 @@ use ferrum_types::Result;
 use std::io;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// Setup logging based on verbosity level
-pub fn setup_logging(verbose: bool, quiet: bool) -> Result<()> {
+/// Setup logging based on verbosity level.
+///
+/// `suppress_chat_template_warnings` is used by the interactive `run` UX:
+/// template fallback diagnostics are useful in server logs, but they should
+/// not be printed in the middle of a user-facing REPL turn.
+pub fn setup_logging(
+    verbose: bool,
+    quiet: bool,
+    suppress_chat_template_warnings: bool,
+) -> Result<()> {
     let log_level = if quiet {
         tracing::Level::ERROR
     } else if verbose {
@@ -23,14 +31,18 @@ pub fn setup_logging(verbose: bool, quiet: bool) -> Result<()> {
         EnvFilter::new(log_level.to_string())
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(format!(
+            let mut filter = format!(
                 "{},\
                  tokenizers=error,\
                  ferrum_models=info,\
                  ferrum_quantization=info,\
                  ferrum_engine::registry=info",
                 log_level
-            ))
+            );
+            if suppress_chat_template_warnings {
+                filter.push_str(",ferrum_server::chat_template=error");
+            }
+            EnvFilter::new(filter)
         })
     };
 
