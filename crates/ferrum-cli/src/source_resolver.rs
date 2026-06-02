@@ -25,6 +25,7 @@
 use std::path::{Path, PathBuf};
 
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
+use ferrum_server::chat_template::ModelChatTemplate;
 use ferrum_types::{
     FerrumError, Result, RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource,
 };
@@ -64,7 +65,7 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
 /// (dense vs MoE — works for both GGUF files and safetensors snapshot
 /// dirs) and materializes missing compatibility env vars for:
 ///
-///   - `FERRUM_KV_CAPACITY`     — 8192 dense / 512 MoE
+///   - `FERRUM_KV_CAPACITY`     — 8192 dense / 2048 MoE
 ///   - `FERRUM_METAL_PAGED_KV`  — 0 dense GGUF / 1 dense safetensors / 1 MoE.
 ///     Paged-KV is a hard requirement for the Qwen3-MoE GPU dispatch path
 ///     (without it decode emits ~0.1 tok/s of garbage on Metal). Dense
@@ -73,7 +74,7 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
 ///     for safetensors-loaded Qwen3. Dense GGUF (candle-transformers
 ///     loader) works on the contig path and keeps `0` to avoid allocating
 ///     a pool it doesn't need.
-///   - `FERRUM_PAGED_MAX_SEQS=2`, `FERRUM_MAX_BATCH=1` — single-user REPL.
+///   - `FERRUM_PAGED_MAX_SEQS=2` dense / `1` MoE, `FERRUM_MAX_BATCH=1` — single-user REPL.
 ///     Keeps the paged pool at ~1.7 GB for `cap=8192` dense; without this
 ///     cap the default `max_seqs=32` makes the pool ~30 GB on a 32 GB Mac.
 ///   - `FERRUM_MOE_BATCHED=1`, `FERRUM_MOE_BATCHED_DECODE=1`,
@@ -117,7 +118,7 @@ pub fn chat_profile_runtime_entries(
         &mut entries,
         current,
         "FERRUM_KV_CAPACITY",
-        if is_moe { "512" } else { "8192" },
+        if is_moe { "2048" } else { "8192" },
         source,
     );
     // Dense GGUF: contig path works, no need to allocate the pool.
@@ -130,11 +131,14 @@ pub fn chat_profile_runtime_entries(
         if need_paged { "1" } else { "0" },
         source,
     );
-    // Single-user REPL pool sizing — both safetensors dense (avoids
-    // 30 GB pool at default max_seqs=32) and MoE (per published bench
-    // tuning). Skipped for GGUF dense which doesn't allocate a pool.
+    // Single-user REPL pool sizing — dense safetensors keeps a spare
+    // sequence, while MoE uses one long interactive session. Keeping MoE at
+    // 512 tokens overflows after a few normal Qwen3-30B-A3B turns.
     if !is_gguf || is_moe {
-        for (k, v) in [("FERRUM_PAGED_MAX_SEQS", "2"), ("FERRUM_MAX_BATCH", "1")] {
+        for (k, v) in [
+            ("FERRUM_PAGED_MAX_SEQS", if is_moe { "1" } else { "2" }),
+            ("FERRUM_MAX_BATCH", "1"),
+        ] {
             push_missing_entry(&mut entries, current, k, v, source);
         }
     }
@@ -234,14 +238,184 @@ pub fn metal_gguf_moe_correctness_entries(
     }
 
     let mut entries = Vec::new();
-    push_missing_entry(
-        &mut entries,
-        current,
-        "FERRUM_MOE_HOST_TOPK",
-        "1",
-        source,
-    );
+    push_missing_entry(&mut entries, current, "FERRUM_MOE_HOST_TOPK", "1", source);
     entries
+}
+
+/// Product defaults for `ferrum serve` on GGUF LLMs.
+///
+/// GGUF paths do not go through the HF-directory autosizer. Without an
+/// explicit profile, Qwen3-30B-A3B falls back to the model default
+/// `FERRUM_KV_CAPACITY=512`, which can make a normal sequence of OpenAI
+/// requests (sync correctness, multi-turn, then stream) end the stream
+/// immediately with an empty EOS. Keep this product path safe by default:
+/// enough context for Qwen3 thinking-mode responses and enough slots for the
+/// validated serving rows. Metal GGUF MoE is intentionally kept to one paged
+/// sequence today because the multi-slot path corrupts thinking-mode logits.
+/// Bench-only overrides remain possible, but users should not need any env var
+/// combination for normal serve.
+pub fn serve_profile_runtime_entries(
+    snapshot_path: &Path,
+    device: &ferrum_types::Device,
+    current: &RuntimeConfigSnapshot,
+    source: RuntimeConfigSource,
+) -> Vec<RuntimeConfigEntry> {
+    let is_gguf = snapshot_path.is_file()
+        && snapshot_path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+    serve_profile_runtime_entries_for_arch(
+        is_gguf,
+        detect_moe_arch(snapshot_path),
+        matches!(device, ferrum_types::Device::Metal),
+        current,
+        source,
+    )
+}
+
+pub fn serve_profile_runtime_entries_for_arch(
+    is_gguf: bool,
+    is_moe: bool,
+    is_metal: bool,
+    current: &RuntimeConfigSnapshot,
+    source: RuntimeConfigSource,
+) -> Vec<RuntimeConfigEntry> {
+    if !is_gguf {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::new();
+    for (k, v) in [
+        ("FERRUM_KV_CAPACITY", if is_moe { "2048" } else { "512" }),
+        ("FERRUM_METAL_PAGED_KV", "1"),
+        (
+            "FERRUM_PAGED_MAX_SEQS",
+            if is_moe && is_metal {
+                "1"
+            } else if is_moe {
+                "16"
+            } else {
+                "32"
+            },
+        ),
+        ("FERRUM_MAX_BATCH", "16"),
+    ] {
+        push_missing_entry(&mut entries, current, k, v, source);
+    }
+    if is_moe {
+        for (k, v) in [
+            ("FERRUM_MAX_BATCHED_TOKENS", "2048"),
+            ("FERRUM_MOE_BATCHED", "1"),
+            ("FERRUM_MOE_BATCHED_DECODE", "1"),
+            ("FERRUM_MOE_BATCH_THRESHOLD", "2"),
+        ] {
+            push_missing_entry(&mut entries, current, k, v, source);
+        }
+    }
+    entries
+}
+
+/// Load a model-provided chat template, if the source carries one.
+///
+/// GGUF stores this in `tokenizer.chat_template`; HuggingFace snapshots
+/// commonly store it in `chat_template.jinja`, `chat_template.json`, or
+/// `tokenizer_config.json`. The renderer may still fall back if a template
+/// uses unsupported Jinja features, but callers should always prefer this
+/// metadata over model-name heuristics.
+pub fn load_model_chat_template(snapshot_path: &Path) -> Option<ModelChatTemplate> {
+    let is_gguf = snapshot_path.is_file()
+        && snapshot_path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+    if is_gguf {
+        let gguf = ferrum_quantization::gguf::GgufFile::open(snapshot_path).ok()?;
+        let template = gguf.metadata_string("tokenizer.chat_template").ok()?;
+        return Some(ModelChatTemplate::new(
+            template.to_string(),
+            format!("{}:tokenizer.chat_template", snapshot_path.display()),
+        ));
+    }
+
+    if !snapshot_path.is_dir() {
+        return None;
+    }
+
+    let jinja_path = snapshot_path.join("chat_template.jinja");
+    if let Ok(template) = std::fs::read_to_string(&jinja_path) {
+        if !template.trim().is_empty() {
+            return Some(ModelChatTemplate::new(
+                template,
+                jinja_path.display().to_string(),
+            ));
+        }
+    }
+
+    let json_path = snapshot_path.join("chat_template.json");
+    if let Some(template) = read_template_json(&json_path) {
+        return Some(template);
+    }
+
+    let tokenizer_config_path = snapshot_path.join("tokenizer_config.json");
+    read_tokenizer_config_template(&tokenizer_config_path)
+}
+
+fn read_template_json(path: &Path) -> Option<ModelChatTemplate> {
+    let text = std::fs::read_to_string(path).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(&text).ok() {
+        Some(serde_json::Value::String(template)) => {
+            Some(ModelChatTemplate::new(template, path.display().to_string()))
+        }
+        Some(value) => template_value(&value).map(|template| {
+            let mut t = ModelChatTemplate::new(template, path.display().to_string());
+            t.bos_token = token_value(&value, "bos_token");
+            t.eos_token = token_value(&value, "eos_token");
+            t
+        }),
+        None => Some(ModelChatTemplate::new(text, path.display().to_string())),
+    }
+}
+
+fn read_tokenizer_config_template(path: &Path) -> Option<ModelChatTemplate> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    let template = template_value(&value)?;
+    let mut t = ModelChatTemplate::new(template, path.display().to_string());
+    t.bos_token = token_value(&value, "bos_token");
+    t.eos_token = token_value(&value, "eos_token");
+    Some(t)
+}
+
+fn template_value(value: &serde_json::Value) -> Option<String> {
+    match value.get("chat_template")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find(|item| item.get("name").and_then(|v| v.as_str()) == Some("default"))
+            .or_else(|| items.first())
+            .and_then(|item| item.get("template").and_then(|v| v.as_str()))
+            .map(ToString::to_string),
+        serde_json::Value::Object(obj) => obj
+            .get("template")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
+fn token_value(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value.get(key)? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(obj) => obj
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        _ => None,
+    }
 }
 
 /// Look up `model_id` in the HF cache (`hub/models--owner--repo/snapshots/<rev>`).
@@ -459,6 +633,87 @@ mod tests {
     }
 
     #[test]
+    fn serve_profile_defaults_gguf_moe_without_user_env() {
+        let entries = serve_profile_runtime_entries_for_arch(
+            true,
+            true,
+            true,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
+            Some("2048")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
+            Some("1")
+        );
+        assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn serve_profile_keeps_multi_seq_default_for_non_metal_moe() {
+        let entries = serve_profile_runtime_entries_for_arch(
+            true,
+            true,
+            false,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
+            Some("16")
+        );
+    }
+
+    #[test]
+    fn serve_profile_defaults_gguf_dense_without_moe_env() {
+        let entries = serve_profile_runtime_entries_for_arch(
+            true,
+            false,
+            true,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
+            Some("512")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
+            Some("32")
+        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
+    }
+
+    #[test]
+    fn serve_profile_respects_explicit_user_env() {
+        let current = RuntimeConfigSnapshot::from_entries(vec![RuntimeConfigEntry::new(
+            "FERRUM_KV_CAPACITY",
+            "4096",
+            RuntimeConfigSource::Default,
+        )]);
+        let entries = serve_profile_runtime_entries_for_arch(
+            true,
+            true,
+            true,
+            &current,
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(value(&entries, "FERRUM_KV_CAPACITY"), None);
+        assert_eq!(
+            value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn chat_profile_defaults_dense_safetensors_as_typed_entries() {
         let dir = temp_model_dir(
             "dense",
@@ -501,7 +756,11 @@ mod tests {
 
         assert_eq!(
             value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
-            Some("512")
+            Some("2048")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
+            Some("1")
         );
         assert_eq!(
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
@@ -530,6 +789,25 @@ mod tests {
         assert_eq!(value(&entries, "FERRUM_KV_CAPACITY"), None);
         assert_eq!(value(&entries, "FERRUM_MOE_BATCH_THRESHOLD"), None);
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_model_chat_template_reads_tokenizer_config() {
+        let dir = temp_model_dir(
+            "template",
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+        );
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"{{ messages[0].content }}","bos_token":"<s>","eos_token":"</s>"}"#,
+        )
+        .unwrap();
+
+        let template = load_model_chat_template(&dir).unwrap();
+        assert_eq!(template.template, "{{ messages[0].content }}");
+        assert_eq!(template.bos_token.as_deref(), Some("<s>"));
+        assert_eq!(template.eos_token.as_deref(), Some("</s>"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

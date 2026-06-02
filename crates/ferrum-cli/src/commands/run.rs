@@ -5,10 +5,12 @@ use chrono::Utc;
 use clap::{Args, ValueEnum};
 use colored::*;
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
+use ferrum_server::chat_template::{ModelChatTemplate, PromptMessage};
 use ferrum_types::{
     FinishReason, InferenceRequest, Priority, RequestId, Result, RuntimeConfigSnapshot,
     SamplingParams,
 };
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -207,6 +209,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     .await?;
     let source = resolved.source;
     let model_id = source.original.clone();
+    let model_chat_template = crate::source_resolver::load_model_chat_template(&source.local_path);
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 
     let engine_model_path = source.local_path.to_string_lossy().to_string();
@@ -268,7 +271,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // path ignored it and dropped into REPL, which exits silently when
     // stdin is not a TTY.
     if let Some(one_shot) = cmd.prompt.clone() {
-        let chat_prompt = build_chat_prompt(&[], &one_shot, cmd.system.as_deref(), &model_id);
+        let chat_prompt = build_chat_prompt(
+            &[],
+            &one_shot,
+            cmd.system.as_deref(),
+            &model_id,
+            model_chat_template.as_ref(),
+        );
         let request = InferenceRequest {
             id: RequestId(Uuid::new_v4()),
             model_id: ferrum_types::ModelId(model_id.clone()),
@@ -331,7 +340,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         OutputFormat::Text => {
             eprintln!();
             eprintln!("{}", "Ready. Type your message and press Enter.".green());
-            eprintln!("{}", "Use /bye or Ctrl+D to exit.".dimmed());
+            eprintln!(
+                "{}",
+                "Use /clear to reset history; /bye or Ctrl+D to exit.".dimmed()
+            );
             eprintln!();
         }
         OutputFormat::Jsonl => {
@@ -374,13 +386,35 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     };
                     break;
                 }
+                if input == "/clear" {
+                    history.clear();
+                    match format {
+                        OutputFormat::Text => {
+                            eprintln!("{}", "History cleared.".dimmed());
+                        }
+                        OutputFormat::Jsonl => {
+                            let record = serde_json::json!({
+                                "event": "clear",
+                                "turn": turn,
+                            });
+                            println!("{record}");
+                        }
+                    }
+                    continue;
+                }
 
                 if format == OutputFormat::Jsonl {
                     emit_jsonl_user(turn, input);
                 }
 
                 // Build prompt with history
-                let prompt = build_chat_prompt(&history, input, cmd.system.as_deref(), &model_id);
+                let prompt = build_chat_prompt(
+                    &history,
+                    input,
+                    cmd.system.as_deref(),
+                    &model_id,
+                    model_chat_template.as_ref(),
+                );
 
                 // Create request
                 let request = InferenceRequest {
@@ -388,7 +422,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     model_id: ferrum_types::ModelId(model_id.clone()),
                     prompt,
                     sampling_params: build_sampling_params(&cmd),
-                    stream: false,
+                    stream: format == OutputFormat::Text,
                     priority: Priority::Normal,
                     client_id: None,
                     session_id: None,
@@ -397,29 +431,78 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     metadata: HashMap::new(),
                 };
 
-                // Run one full request. We intentionally use final-response
-                // decode here instead of streaming deltas: byte-level BPE
-                // tokenizers can produce unstable intermediate text for
-                // partial UTF-8 pieces, and feeding that streamed text back
-                // into multi-turn history corrupts later turns.
                 let start = std::time::Instant::now();
-                let response = engine.infer(request).await?;
+                let trace_tokens = std::env::var("FERRUM_RUN_TRACE_TOKENS").is_ok();
+                let (clean_response, finish_reason, token_count, chunk_count) = match format {
+                    OutputFormat::Text => {
+                        let mut stream = engine.infer_stream(request).await?;
+                        let mut response_text = String::new();
+                        let mut finish_reason = None;
+                        let mut token_count = 0usize;
+                        let mut chunk_count = 0usize;
+                        while let Some(chunk) = stream.next().await {
+                            let chunk = chunk?;
+                            if trace_tokens {
+                                if let Some(token) = chunk.token {
+                                    eprintln!(
+                                        "[run-token-trace] turn={turn} token={} text={:?}",
+                                        token.get(),
+                                        chunk.text
+                                    );
+                                }
+                            }
+                            if !chunk.text.is_empty() {
+                                print!("{}", chunk.text);
+                                io::stdout().flush().ok();
+                                response_text.push_str(&chunk.text);
+                                chunk_count += 1;
+                            }
+                            if chunk.token.is_some() {
+                                token_count += 1;
+                            }
+                            if let Some(usage) = chunk.usage.as_ref() {
+                                token_count = usage.completion_tokens;
+                            }
+                            if chunk.finish_reason.is_some() {
+                                finish_reason = chunk.finish_reason;
+                            }
+                        }
+                        (
+                            response_text.trim().to_string(),
+                            finish_reason,
+                            token_count,
+                            chunk_count,
+                        )
+                    }
+                    OutputFormat::Jsonl => {
+                        let response = engine.infer(request).await?;
+                        if trace_tokens {
+                            let tokens = response
+                                .tokens
+                                .iter()
+                                .map(|token| token.get())
+                                .collect::<Vec<_>>();
+                            eprintln!("[run-token-trace] turn={turn} tokens={tokens:?}");
+                        }
+                        (
+                            response.text.trim().to_string(),
+                            Some(response.finish_reason),
+                            response.tokens.len(),
+                            usize::from(!response.text.is_empty()),
+                        )
+                    }
+                };
 
                 let elapsed = start.elapsed();
                 let elapsed_s = elapsed.as_secs_f64();
-                let token_count = response.tokens.len();
-                let chunk_count = usize::from(!response.text.is_empty());
-                let finish_reason = Some(response.finish_reason);
                 let tps = if elapsed_s > 0.0 {
                     token_count as f64 / elapsed_s
                 } else {
                     0.0
                 };
-                let clean_response = response.text.trim().to_string();
 
                 match format {
                     OutputFormat::Text => {
-                        print!("{clean_response}");
                         println!();
                         eprintln!(
                             "{}",
@@ -759,60 +842,17 @@ fn build_chat_prompt(
     user_input: &str,
     system: Option<&str>,
     model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
 ) -> String {
-    // Detect model type and use appropriate template
-    let model_lower = model_id.to_lowercase();
-
-    if model_lower.contains("qwen") {
-        // Qwen ChatML format (Qwen2, Qwen2.5, Qwen3)
-        let mut prompt = String::new();
-        if let Some(sys) = system {
-            prompt.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", sys));
-        }
-        for (role, content) in history {
-            prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, content));
-        }
-        prompt.push_str(&format!(
-            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            user_input
-        ));
-        // Qwen3: disable thinking mode by inserting empty think block
-        if model_lower.contains("qwen3") {
-            prompt.push_str("<think>\n\n</think>\n\n");
-        }
-        prompt
-    } else if model_lower.contains("llama") && model_lower.contains("3") {
-        // Llama 3 format
-        let mut prompt = String::new();
-        prompt.push_str("<|begin_of_text|>");
-        if let Some(sys) = system {
-            prompt.push_str(&format!(
-                "<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
-                sys
-            ));
-        }
-        for (role, content) in history {
-            prompt.push_str(&format!(
-                "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
-                role, content
-            ));
-        }
-        prompt.push_str(&format!(
-            "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
-            user_input
-        ));
-        prompt
-    } else {
-        // TinyLlama / generic chat format
-        let sys = system.unwrap_or("You are a helpful assistant.");
-        let mut prompt = format!("<|system|>\n{}</s>\n", sys);
-        for (role, content) in history {
-            let tag = if role == "user" { "user" } else { "assistant" };
-            prompt.push_str(&format!("<|{}|>\n{}</s>\n", tag, content));
-        }
-        prompt.push_str(&format!("<|user|>\n{}</s>\n<|assistant|>\n", user_input));
-        prompt
+    let mut messages = Vec::new();
+    if let Some(sys) = system {
+        messages.push(PromptMessage::new("system", sys));
     }
+    for (role, content) in history {
+        messages.push(PromptMessage::new(role, content));
+    }
+    messages.push(PromptMessage::new("user", user_input));
+    ferrum_server::chat_template::render_prompt_messages(&messages, model_id, model_template)
 }
 
 /// Apply the resolved `--kv-dtype` / runtime-config override to an engine

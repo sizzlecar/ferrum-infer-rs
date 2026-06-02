@@ -1,0 +1,29 @@
+{
+  "jsonl_multiturn": {
+    "rc": 0,
+    "passed": true,
+    "contains_unk": false,
+    "contains_pad": false,
+    "tokens": 12,
+    "ms": 1606.121583,
+    "tok_s": 7.471414447706851,
+    "assistant_heads": [
+      "</think>\n\n已记住。",
+      "</think>\n\n蓝色月亮。"
+    ]
+  },
+  "text_repl_multiturn": {
+    "rc": 0,
+    "passed": true,
+    "contains_unk": false,
+    "contains_pad": false,
+    "turn_stat_lines": [
+      "[11 tokens, 10.5 tok/s, 1.1s]",
+      "[54 tokens, 42.5 tok/s, 1.3s]",
+      "[162 tokens, 46.9 tok/s, 3.5s]",
+      "[43 tokens, 28.2 tok/s, 1.5s]"
+    ],
+    "stdout_head": "</think>\n\n你好！有什么我可以帮你的吗？\n</think>\n\n我是通义千问，由阿里巴巴集团旗下的通义实验室自主研发的超大规模语言模型。我能够回答问题、创作文字、逻辑推理、编程等多种任务。你可以叫我Qwen或者通义千问。有什么我可以帮你的吗？\n</think>\n\n我会做很多很多事情，比如：\n\n1. **回答问题**：无论是科学、文化、技术还是日常生活中的问题，我都可以提供帮助。\n2. **创作文字**：我可以写故事、公文、邮件、剧本、诗歌等。\n3. **逻辑推理**：我可以解决数学题、逻辑题，进行推理和分析。\n4. **编程**：我可以帮你写代码，支持多种编程语言，如Python、Java、C++等。\n5. **翻译**：我可以进行多语言翻译，支持中、英、日、韩、法、西等几十种语言。\n6. **对话交流**：我可以和你进行自然的对话，理解你的需求并给出合适的回应。\n\n你可以告诉我你具体想做什么，我会尽力帮你！\n</think>\n\nRust 是一种系统编程语言，注重安全性、性能和并发。它由 Mozilla 开发，适用于开发高效、可靠的软件，常用于操作系统、驱动程序和高性能应用的开发"
+  },
+  "passed": true
+}

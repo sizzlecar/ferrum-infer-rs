@@ -21,8 +21,24 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
         const WARMUP_CACHE: &str = "__ferrum_warmup__";
         let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
         // Drop the warmup KV cache slot — real cache_id is unaffected.
-        if let Some(caches) = self.kv_caches.remove(WARMUP_CACHE) {
-            self.kv_free_pool.push(caches);
+        if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
+            let paged_cache = caches
+                .first()
+                .is_some_and(|cache| cache.block_table.is_some());
+            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
+                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(c0) = caches.first() {
+                    if !c0.paged_block_indices.is_empty() {
+                        alloc.free(&c0.paged_block_indices);
+                    }
+                }
+                for c in caches.iter_mut() {
+                    c.paged_block_indices.clear();
+                }
+            }
+            if !paged_cache {
+                self.kv_free_pool.push(caches);
+            }
         }
     }
 
@@ -156,6 +172,9 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
         let mut ctx = B::new_context();
         B::sync(&mut ctx);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
+            let paged_cache = caches
+                .first()
+                .is_some_and(|cache| cache.block_table.is_some());
             // Paged mode: return the cache_id's blocks to the shared
             // allocator so other sequences can reuse them. Without this,
             // every request consumes max_blocks_per_seq blocks
@@ -174,7 +193,26 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
                     c.paged_block_indices.clear();
                 }
             }
-            self.kv_free_pool.push(caches);
+            // In paged mode the cache metadata (block_table/context_lens)
+            // is tiny compared with the shared K/V pools. Reusing that
+            // metadata on Metal GGUF MoE can leak stale per-request state
+            // across independent HTTP requests, producing empty completions
+            // or repeated `<think>` tokens after the first request. Drop it
+            // after returning physical blocks; the next ensure_kv allocates
+            // fresh metadata while reusing the shared pools.
+            if !paged_cache {
+                self.kv_free_pool.push(caches);
+            }
+            if paged_cache && self.runtime_env.paged_max_seqs <= 1 {
+                // Product Metal GGUF MoE serve currently uses one active
+                // paged sequence for correctness. In that mode there cannot
+                // be another live request sharing captured graph/model state,
+                // so reset graph/KV bookkeeping after each completed request
+                // to avoid stale paged state leaking into the next HTTP
+                // request. This keeps `ferrum serve` correct without asking
+                // users to manage env combinations.
+                self.reset();
+            }
         }
     }
 
@@ -188,5 +226,15 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
         B::sync(&mut ctx);
         self.kv_caches.clear();
         self.kv_free_pool.clear();
+        self.paged_pools = None;
+        self.paged_fa_pools = None;
+        self.paged_block_alloc = None;
+        self.paged_dims = None;
+        let initial_scratch_tokens = if B::supports_varlen_qkv() {
+            self.runtime_env.initial_scratch_tokens
+        } else {
+            1
+        };
+        self.scratch = Qwen3MoeScratch::alloc(&self.cfg, initial_scratch_tokens);
     }
 }

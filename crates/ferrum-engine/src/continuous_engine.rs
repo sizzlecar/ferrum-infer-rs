@@ -140,6 +140,39 @@ fn resolve_stop_conditions(
     (ids, text_seqs)
 }
 
+fn resolve_sampling_token_constraints(
+    tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+    stop_token_ids: &HashSet<u32>,
+) -> (HashSet<u32>, Option<usize>, HashSet<u32>) {
+    let mut forbidden = HashSet::new();
+    let mut allowed_extended = stop_token_ids.clone();
+    let Some(tok) = tokenizer else {
+        return (forbidden, None, allowed_extended);
+    };
+
+    for text in ["<unk", "<unk>"] {
+        if let Some(token) = tok.token_id(text) {
+            forbidden.insert(token.get());
+        }
+    }
+
+    for text in [
+        "<think>",
+        "</think>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|eot_id|>",
+        "</s>",
+    ] {
+        if let Some(token) = tok.token_id(text) {
+            allowed_extended.insert(token.get());
+        }
+    }
+
+    (forbidden, Some(tok.vocab_size()), allowed_extended)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Sequence state
 // ────────────────────────────────────────────────────────────────────────────
@@ -199,6 +232,14 @@ pub struct SequenceState {
     /// `<|im_end|>`, `<|endoftext|>`, `<|eot_id|>`), and one-token encodings of
     /// `sampling_params.stop_sequences`.
     pub stop_token_ids: HashSet<u32>,
+    /// Token IDs that should never be sampled as normal output. Used for
+    /// tokenizer/model vocab holes such as Qwen3's reserved tail IDs and
+    /// literal `<unk` / `<unk>` pieces.
+    pub forbidden_token_ids: HashSet<u32>,
+    /// Base tokenizer vocabulary size. IDs above this are allowed only when
+    /// they are explicitly whitelisted in `allowed_extended_token_ids`.
+    pub tokenizer_base_vocab_size: Option<usize>,
+    pub allowed_extended_token_ids: HashSet<u32>,
     /// Multi-token text stop sequences (`stop_sequences` entries that don't
     /// resolve to a single token). Checked via accumulated decoded text.
     pub stop_text_seqs: Vec<String>,
@@ -268,6 +309,8 @@ impl SequenceState {
             .unwrap_or(false);
         let (stop_token_ids, stop_text_seqs) =
             resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref(), ignore_eos);
+        let (forbidden_token_ids, tokenizer_base_vocab_size, allowed_extended_token_ids) =
+            resolve_sampling_token_constraints(tokenizer.as_deref(), &stop_token_ids);
         Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
@@ -293,6 +336,9 @@ impl SequenceState {
             token_frequencies: HashMap::new(),
             model_cache_id: None,
             stop_token_ids,
+            forbidden_token_ids,
+            tokenizer_base_vocab_size,
+            allowed_extended_token_ids,
             stop_text_seqs,
             streamed_text_len: 0,
         }
@@ -355,6 +401,21 @@ impl SequenceState {
                 })
                 .collect();
             jp.apply_biases(logits, &generated);
+        }
+
+        for &token_id in &self.forbidden_token_ids {
+            if let Some(logit) = logits.get_mut(token_id as usize) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+        if let Some(base_vocab_size) = self.tokenizer_base_vocab_size {
+            if logits.len() > base_vocab_size {
+                for (token_id, logit) in logits.iter_mut().enumerate().skip(base_vocab_size) {
+                    if !self.allowed_extended_token_ids.contains(&(token_id as u32)) {
+                        *logit = f32::NEG_INFINITY;
+                    }
+                }
+            }
         }
 
         // Build SamplingConfig from this request's params (includes temperature, top-k/p, repetition penalty)

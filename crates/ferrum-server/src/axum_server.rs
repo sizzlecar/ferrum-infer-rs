@@ -4,7 +4,9 @@
 //! using the Axum web framework, with OpenAI-shaped endpoint compatibility.
 
 use crate::{
-    chat_template::{render_chat_prompt, render_chat_prompt_with_tools},
+    chat_template::{
+        render_chat_prompt_with_model_template, render_chat_prompt_with_tools, ModelChatTemplate,
+    },
     openai::*,
     traits::HttpServer,
     types::*,
@@ -98,6 +100,13 @@ impl AxumServer {
         self
     }
 
+    /// Attach the loaded model's prompt template, if available. This keeps
+    /// OpenAI request aliases from driving prompt-family selection.
+    pub fn with_prompt_template(mut self, prompt_template: Option<ModelChatTemplate>) -> Self {
+        self.state = self.state.with_prompt_template(prompt_template);
+        self
+    }
+
     /// Build the router with all routes
     fn build_router(&self) -> Router {
         let app_state = self.state.clone();
@@ -134,6 +143,7 @@ pub struct AppState {
     pub transcribe: Option<Arc<dyn TranscribeEngine + Send + Sync>>,
     pub tts: Option<Arc<dyn TtsEngine + Send + Sync>>,
     pub auto_config: Option<ResolvedFerrumConfig>,
+    pub prompt_template: Option<Arc<ModelChatTemplate>>,
 }
 
 impl AppState {
@@ -156,6 +166,11 @@ impl AppState {
 
     pub fn with_auto_config(mut self, auto_config: ResolvedFerrumConfig) -> Self {
         self.auto_config = Some(auto_config);
+        self
+    }
+
+    pub fn with_prompt_template(mut self, prompt_template: Option<ModelChatTemplate>) -> Self {
+        self.prompt_template = prompt_template.map(Arc::new);
         self
     }
 
@@ -329,8 +344,12 @@ async fn chat_completions_handler(
         .first()
         .map(ToString::to_string)
         .unwrap_or_else(|| request.model.clone());
-    let inference_request = convert_chat_request_with_template_model(&request, &template_model_id)
-        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    let inference_request = convert_chat_request_with_template_model(
+        &request,
+        &template_model_id,
+        state.prompt_template.as_deref(),
+    )
+    .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
@@ -688,7 +707,7 @@ async fn handle_chat_completions_sync(
 fn convert_chat_request(
     request: &ChatCompletionsRequest,
 ) -> ferrum_types::Result<InferenceRequest> {
-    convert_chat_request_with_template_model(request, &request.model)
+    convert_chat_request_with_template_model(request, &request.model, None)
 }
 
 /// Convert OpenAI chat request to internal inference request.
@@ -700,11 +719,12 @@ fn convert_chat_request(
 fn convert_chat_request_with_template_model(
     request: &ChatCompletionsRequest,
     template_model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
 ) -> ferrum_types::Result<InferenceRequest> {
     let tools = request.tools.as_deref().unwrap_or_default();
     let functions = request.functions.as_deref().unwrap_or_default();
     let prompt = if tools.is_empty() && functions.is_empty() {
-        render_chat_prompt(&request.messages, template_model_id)
+        render_chat_prompt_with_model_template(&request.messages, template_model_id, model_template)
     } else {
         render_chat_prompt_with_tools(
             &request.messages,
