@@ -322,8 +322,15 @@ async fn chat_completions_handler(
     validate_chat_request(&request)?;
 
     // Convert OpenAI request to internal format
-    let inference_request =
-        convert_chat_request(&request).map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    let template_model_id = state
+        .status()
+        .await
+        .loaded_models
+        .first()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| request.model.clone());
+    let inference_request = convert_chat_request_with_template_model(&request, &template_model_id)
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
@@ -677,17 +684,31 @@ async fn handle_chat_completions_sync(
 }
 
 /// Convert OpenAI chat request to internal inference request
+#[allow(dead_code)]
 fn convert_chat_request(
     request: &ChatCompletionsRequest,
+) -> ferrum_types::Result<InferenceRequest> {
+    convert_chat_request_with_template_model(request, &request.model)
+}
+
+/// Convert OpenAI chat request to internal inference request.
+///
+/// `template_model_id` is the loaded model id used for prompt-template family
+/// detection. The request `model` field may be an OpenAI-compatible alias such
+/// as "ferrum"; using it for template selection can feed a fallback prompt to
+/// a Qwen/Llama model.
+fn convert_chat_request_with_template_model(
+    request: &ChatCompletionsRequest,
+    template_model_id: &str,
 ) -> ferrum_types::Result<InferenceRequest> {
     let tools = request.tools.as_deref().unwrap_or_default();
     let functions = request.functions.as_deref().unwrap_or_default();
     let prompt = if tools.is_empty() && functions.is_empty() {
-        render_chat_prompt(&request.messages, &request.model)
+        render_chat_prompt(&request.messages, template_model_id)
     } else {
         render_chat_prompt_with_tools(
             &request.messages,
-            &request.model,
+            template_model_id,
             tools,
             request.tool_choice.as_ref(),
             functions,

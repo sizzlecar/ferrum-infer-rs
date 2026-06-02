@@ -1,0 +1,55 @@
+{
+  "ferrum_version": "ferrum 0.7.4\n",
+  "swap_start": "vm.swapusage: total = 4096.00M  used = 2885.19M  free = 1210.81M  (encrypted)",
+  "vm_stat_start": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              372108.\nPages active:                            946254.\nPages inactive:                          178001.\nPages speculative:                       225663.\nPages throttled:                              0.\nPages wired down:                        202756.\nPages purgeable:                            635.\n\"Translation faults\":                5346134905.\nPages copy-on-write:                  331864553.\nPages zero filled:                   3177708130.\nPages reactivated:                    236654376.",
+  "models": [
+    {
+      "key": "qwen3_30b_a3b",
+      "label": "Qwen3-30B-A3B",
+      "gguf": "/Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf",
+      "moe": true,
+      "chat": {
+        "paris": {
+          "status": 200,
+          "passed": true,
+          "content": "\n\nParis"
+        },
+        "multiturn": {
+          "status": 200,
+          "passed": true,
+          "content": "\n\n蓝色月亮"
+        }
+      },
+      "run": {
+        "passed": true,
+        "rc": 0,
+        "assistant": [
+          "已记住。",
+          "蓝色月亮"
+        ],
+        "no_abort": true,
+        "first_turn_ok": true,
+        "second_turn_ok": true,
+        "contains_secret": true
+      },
+      "cells": [
+        {
+          "concurrency": 16,
+          "prompts": 32,
+          "baseline_tps": 72.5,
+          "runner_rc": 0,
+          "completed": 32,
+          "failed": 0,
+          "output_throughput_tok_s": 67.46253517273163,
+          "ratio_to_readme": 0.9305177265204363,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": 3438.1689165000007,
+          "tpot_median_ms": 185.62538029365078
+        }
+      ],
+      "server_ready": true
+    }
+  ],
+  "swap_end": "vm.swapusage: total = 4096.00M  used = 2885.19M  free = 1210.81M  (encrypted)",
+  "vm_stat_end": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              174164.\nPages active:                            738403.\nPages inactive:                          168405.\nPages speculative:                         1321.\nPages throttled:                              0.\nPages wired down:                        829792.\nPages purgeable:                            272.\n\"Translation faults\":                5346978957.\nPages copy-on-write:                  331866883.\nPages zero filled:                   3178521030.\nPages reactivated:                    236664403."
+}

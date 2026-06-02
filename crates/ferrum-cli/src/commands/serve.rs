@@ -329,6 +329,22 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // Select device
     let device = select_device();
     println!("{} {:?}", "Device:".dimmed(), device);
+    let metal_moe_entries = crate::source_resolver::metal_gguf_moe_correctness_entries(
+        &source.local_path,
+        &device,
+        &RuntimeConfigSnapshot::capture_current(),
+        RuntimeConfigSource::Default,
+    );
+    if !metal_moe_entries.is_empty() {
+        non_env_runtime_entries.extend(metal_moe_entries.clone());
+        non_env_runtime_entries =
+            RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
+        materialized_runtime_keys.extend(crate::runtime_env::materialize_runtime_env_defaults(
+            &metal_moe_entries,
+        ));
+        materialized_runtime_keys.sort();
+        materialized_runtime_keys.dedup();
+    }
 
     // Detect architecture to choose engine type. For GGUF we skip
     // ConfigManager::load_from_path (which expects HF safetensors layout)

@@ -1,0 +1,9 @@
+2026-06-02T01:17:31.723938Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-02T01:17:31.723980Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-02T01:17:31.724046Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-02T01:17:31.900365Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-02T01:17:31.900416Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-02T01:17:31.900424Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-02T01:17:31.900432Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-02T01:17:31.900480Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+[qwen3_moe] decode_batch_internal: FERRUM_GREEDY_ARGMAX=1 (path=GPU argmax)

@@ -9,12 +9,9 @@ use ferrum_types::{
     FinishReason, InferenceRequest, Priority, RequestId, Result, RuntimeConfigSnapshot,
     SamplingParams,
 };
-use futures::StreamExt;
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use uuid::Uuid;
 
 /// Output format for `ferrum run`. JSONL mode emits one record per event
@@ -105,7 +102,7 @@ pub struct RunCommand {
     /// Sampling temperature (0.0–2.0). 0.0 = greedy / argmax (deterministic,
     /// what you want for benchmarks). >0 = softmax sample with `--top-k`
     /// and `--top-p` filtering applied.
-    #[arg(long, default_value = "0.7")]
+    #[arg(long, default_value = "0.0")]
     pub temperature: f32,
 
     /// Backend: auto, cpu, metal (default: auto)
@@ -218,6 +215,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let device = select_device(&cmd.backend);
     let device_label = format!("{device:?}");
     eprintln!("{}", format!("Using {device_label} backend").dimmed());
+    let metal_moe_entries = crate::source_resolver::metal_gguf_moe_correctness_entries(
+        &source.local_path,
+        &device,
+        &ferrum_types::RuntimeConfigSnapshot::capture_current(),
+        ferrum_types::RuntimeConfigSource::Default,
+    );
+    crate::runtime_env::materialize_runtime_env_defaults(&metal_moe_entries);
 
     // Create engine. Big-model loads (15-60 GB safetensors) are slow on
     // first run — print a hint so users don't think it's frozen. Per-
@@ -231,6 +235,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let mut engine_config = ferrum_types::EngineConfig::default();
     engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
     engine_config.backend.device = device;
+    engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
     engine_config.backend.backend_options.insert(
         "model_path".to_string(),
         serde_json::Value::String(engine_model_path),
@@ -239,6 +244,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     engine_config
         .apply_runtime_config_snapshot(&runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
+    if runtime_config_bool(&runtime_config, "FERRUM_METAL_PAGED_KV").unwrap_or(false) {
+        engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
+    }
     let effective_kv_dtype = cmd
         .kv_dtype
         .as_deref()
@@ -261,30 +269,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // stdin is not a TTY.
     if let Some(one_shot) = cmd.prompt.clone() {
         let chat_prompt = build_chat_prompt(&[], &one_shot, cmd.system.as_deref(), &model_id);
-        let model_lower = model_id.to_lowercase();
-        let (default_top_p, default_top_k) = if model_lower.contains("qwen3") {
-            (0.8, Some(20))
-        } else {
-            (0.9, None)
-        };
         let request = InferenceRequest {
             id: RequestId(Uuid::new_v4()),
             model_id: ferrum_types::ModelId(model_id.clone()),
             prompt: chat_prompt,
-            sampling_params: SamplingParams {
-                max_tokens: cmd.max_tokens as usize,
-                temperature: cmd.temperature,
-                top_p: default_top_p,
-                top_k: default_top_k,
-                repetition_penalty: 1.1,
-                stop_sequences: vec![
-                    "<|im_end|>".to_string(),
-                    "</s>".to_string(),
-                    "<|endoftext|>".to_string(),
-                ],
-                ..Default::default()
-            },
-            stream: true,
+            sampling_params: build_sampling_params(&cmd),
+            stream: false,
             priority: Priority::Normal,
             client_id: None,
             session_id: None,
@@ -292,32 +282,17 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             api_request: None,
             metadata: HashMap::new(),
         };
-        let mut stream = engine.infer_stream(request).await?;
         let start = std::time::Instant::now();
-        let mut tokens = 0usize;
-        let mut content = String::new();
-        let mut chunk_count = 0usize;
-        let mut finish_reason: Option<FinishReason> = None;
+        let response = engine.infer(request).await?;
+        let tokens = response.tokens.len();
+        let content = response.text;
+        let chunk_count = usize::from(!content.is_empty());
+        let finish_reason = Some(response.finish_reason);
         let format = cmd.output_format;
         let bench = cmd.bench_mode;
-        while let Some(chunk) = stream.next().await {
-            if let Ok(c) = chunk {
-                if !c.text.is_empty() {
-                    chunk_count += 1;
-                    content.push_str(&c.text);
-                    if format == OutputFormat::Text && !bench {
-                        print!("{}", c.text);
-                        io::stdout().flush().ok();
-                    }
-                }
-                if c.token.is_some() {
-                    tokens += 1;
-                }
-                if let Some(r) = c.finish_reason {
-                    finish_reason = Some(r);
-                    break;
-                }
-            }
+        if format == OutputFormat::Text && !bench {
+            print!("{}", content);
+            io::stdout().flush().ok();
         }
         let elapsed = start.elapsed().as_secs_f64();
         let tps = if elapsed > 0.0 {
@@ -346,6 +321,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 );
             }
         }
+        engine.shutdown().await?;
         return Ok(());
     }
 
@@ -365,7 +341,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     // Interactive loop
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content)
-    let generating = Arc::new(AtomicBool::new(false));
     let mut turn = 0usize;
     let mut exit_reason: &str = "eof";
 
@@ -407,34 +382,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 // Build prompt with history
                 let prompt = build_chat_prompt(&history, input, cmd.system.as_deref(), &model_id);
 
-                // Model-specific sampling defaults
-                let model_lower = model_id.to_lowercase();
-                let (default_top_p, default_top_k) = if model_lower.contains("qwen3") {
-                    // Qwen3 non-thinking mode: top_p=0.8, top_k=20
-                    (0.8, Some(20))
-                } else {
-                    (0.9, None)
-                };
-
                 // Create request
                 let request = InferenceRequest {
                     id: RequestId(Uuid::new_v4()),
                     model_id: ferrum_types::ModelId(model_id.clone()),
                     prompt,
-                    sampling_params: SamplingParams {
-                        max_tokens: cmd.max_tokens as usize,
-                        temperature: cmd.temperature,
-                        top_p: default_top_p,
-                        top_k: default_top_k,
-                        repetition_penalty: 1.1,
-                        stop_sequences: vec![
-                            "<|im_end|>".to_string(),
-                            "</s>".to_string(),
-                            "<|endoftext|>".to_string(),
-                        ],
-                        ..Default::default()
-                    },
-                    stream: true,
+                    sampling_params: build_sampling_params(&cmd),
+                    stream: false,
                     priority: Priority::Normal,
                     client_id: None,
                     session_id: None,
@@ -443,63 +397,29 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     metadata: HashMap::new(),
                 };
 
-                // Start generation
-                generating.store(true, Ordering::SeqCst);
-                let mut stream = engine.infer_stream(request).await?;
-                let mut response = String::new();
+                // Run one full request. We intentionally use final-response
+                // decode here instead of streaming deltas: byte-level BPE
+                // tokenizers can produce unstable intermediate text for
+                // partial UTF-8 pieces, and feeding that streamed text back
+                // into multi-turn history corrupts later turns.
                 let start = std::time::Instant::now();
-                let mut token_count = 0usize;
-                let mut chunk_count = 0usize;
-                let mut finish_reason: Option<FinishReason> = None;
-
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(chunk) => {
-                            if !chunk.text.is_empty() {
-                                chunk_count += 1;
-                                response.push_str(&chunk.text);
-                                if format == OutputFormat::Text {
-                                    print!("{}", chunk.text);
-                                    io::stdout().flush().unwrap();
-                                }
-                            }
-                            if chunk.token.is_some() {
-                                token_count += 1;
-                            }
-                            if let Some(r) = chunk.finish_reason {
-                                finish_reason = Some(r);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            if format == OutputFormat::Text {
-                                eprintln!("\n{} {}", "Error:".red(), e);
-                            } else {
-                                let record = serde_json::json!({
-                                    "event": "error",
-                                    "turn": turn,
-                                    "message": e.to_string(),
-                                });
-                                println!("{record}");
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                generating.store(false, Ordering::SeqCst);
+                let response = engine.infer(request).await?;
 
                 let elapsed = start.elapsed();
                 let elapsed_s = elapsed.as_secs_f64();
+                let token_count = response.tokens.len();
+                let chunk_count = usize::from(!response.text.is_empty());
+                let finish_reason = Some(response.finish_reason);
                 let tps = if elapsed_s > 0.0 {
                     token_count as f64 / elapsed_s
                 } else {
                     0.0
                 };
-                let clean_response = response.trim().to_string();
+                let clean_response = response.text.trim().to_string();
 
                 match format {
                     OutputFormat::Text => {
+                        print!("{clean_response}");
                         println!();
                         eprintln!(
                             "{}",
@@ -554,7 +474,39 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             emit_jsonl_exit(exit_reason);
         }
     }
+    engine.shutdown().await?;
     Ok(())
+}
+
+fn runtime_config_bool(snapshot: &RuntimeConfigSnapshot, key: &str) -> Option<bool> {
+    crate::runtime_env::runtime_snapshot_value(snapshot, key).map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
+    let greedy = cmd.temperature <= 0.0;
+    SamplingParams {
+        max_tokens: cmd.max_tokens as usize,
+        temperature: cmd.temperature,
+        top_p: if greedy { 1.0 } else { cmd.top_p },
+        top_k: if greedy || cmd.top_k == 0 {
+            None
+        } else {
+            Some(cmd.top_k)
+        },
+        repetition_penalty: cmd.repeat_penalty,
+        stop_sequences: vec![
+            "<|im_end|>".to_string(),
+            "</s>".to_string(),
+            "<|endoftext|>".to_string(),
+        ],
+        seed: Some(cmd.seed),
+        ..Default::default()
+    }
 }
 
 pub fn resolve_model_alias(name: &str) -> String {

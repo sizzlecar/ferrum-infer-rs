@@ -430,6 +430,12 @@ impl MetalContext {
     }
 }
 
+impl Drop for MetalContext {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 // ── Policy: should big weights land as f16? ───────────────────────────
 // Cached on first read so each tensor load doesn't re-parse env.
 
