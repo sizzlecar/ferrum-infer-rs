@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
+const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 512;
 const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const THINK_START_TAG: &str = "<think>";
 const THINK_END_TAG: &str = "</think>";
@@ -1030,7 +1031,7 @@ fn chat_completion_max_tokens(request: &ChatCompletionsRequest) -> u32 {
     request
         .max_completion_tokens
         .or(request.max_tokens)
-        .unwrap_or(100)
+        .unwrap_or(DEFAULT_COMPLETION_MAX_TOKENS)
 }
 
 fn api_chat_message(message: &ChatMessage) -> ferrum_types::ApiChatMessage {
@@ -1496,7 +1497,7 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
         model_id: ModelId(request.model.clone()),
         prompt: prompt.to_string(),
         sampling_params: SamplingParams {
-            max_tokens: request.max_tokens.unwrap_or(100) as usize,
+            max_tokens: request.max_tokens.unwrap_or(DEFAULT_COMPLETION_MAX_TOKENS) as usize,
             temperature: request.temperature.unwrap_or(DEFAULT_SAMPLING_TEMPERATURE),
             top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
             top_k: None,
@@ -1588,7 +1589,9 @@ async fn handle_completions_stream(
 
     tokio::spawn(async move {
         let mut token_count = 0;
-        let max_tokens = openai_request.max_tokens.unwrap_or(100);
+        let max_tokens = openai_request
+            .max_tokens
+            .unwrap_or(DEFAULT_COMPLETION_MAX_TOKENS);
         match engine.infer_stream(inference_request).await {
             Ok(mut stream) => {
                 while let Some(result) = stream.next().await {
