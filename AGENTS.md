@@ -99,6 +99,14 @@
 - Add tests for new public APIs, serialization changes, and scheduler/cache logic.
 - Run `cargo test --workspace` before opening a PR.
 
+## Release Regression Lessons
+- Release readiness must cover both product entrypoints: `ferrum serve` / OpenAI API and `ferrum run`. A passing server Paris/multi-turn/concurrency gate does not prove the interactive CLI path works.
+- `ferrum run` multi-turn correctness must be tested with default CLI sampling parameters and with explicit deterministic settings. Do not treat `--temperature 0` as a fix for garbage output; it is only a diagnostic.
+- For MoE models, especially Qwen3-30B-A3B GGUF on Metal and GPTQ-Int4 on CUDA, verify the runtime preset actually selects the intended scheduler/KV path. Logs showing `priority scheduler` or `default KV cache manager` when the expected path is continuous batching / paged KV are release blockers.
+- Every release candidate must include `run` multi-turn correctness and a basic `run` performance row in the saved regression evidence, not only HTTP benchmark artifacts.
+- If any code changes after CUDA validation, rerun a CUDA quick regression for correctness, `run` multi-turn, and performance before calling the release ready.
+- Do not publish or tag after a failed local product-path smoke. Fix the failed path, rerun Metal locally, rerun CUDA remotely when code changed, then record the evidence under `docs/bench/`.
+
 ## Commit & Pull Request Guidelines
 - Follow the existing commit style: conventional prefixes plus scope when useful, e.g. `feat(cli): ...`, `refactor(engine): ...`, `feat(cli, models): ...`.
 - Keep commits focused and imperative; avoid mixing unrelated crates in one commit when possible.

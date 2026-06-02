@@ -1,0 +1,24 @@
+{
+  "model": "Qwen3-30B-A3B",
+  "messages": [
+    {
+      "role": "system",
+      "content": "\u8bf7\u7528\u4e2d\u6587\u56de\u7b54\uff0c\u4e0d\u8981\u8f93\u51fa\u4ee3\u7801\u3002"
+    },
+    {
+      "role": "user",
+      "content": "\u8bf7\u8bb0\u4f4f\u6697\u53f7\u662f\u84dd\u8272\u6708\u4eae\u3002\u53ea\u56de\u7b54\uff1a\u5df2\u8bb0\u4f4f\u3002"
+    },
+    {
+      "role": "assistant",
+      "content": "\u5df2\u8bb0\u4f4f\u3002"
+    },
+    {
+      "role": "user",
+      "content": "\u521a\u624d\u6697\u53f7\u662f\u4ec0\u4e48\uff1f\u53ea\u56de\u7b54\u6697\u53f7\u3002"
+    }
+  ],
+  "max_tokens": 32,
+  "temperature": 0,
+  "stream": false
+}

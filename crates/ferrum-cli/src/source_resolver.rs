@@ -174,7 +174,7 @@ fn snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<
 /// `.gguf` file (peek `general.architecture` from GGUF metadata) and a
 /// safetensors snapshot directory (read `config.json` and match
 /// `architectures` / `model_type` against `moe`, case-insensitive).
-fn detect_moe_arch(path: &Path) -> bool {
+pub fn detect_moe_arch(path: &Path) -> bool {
     use ferrum_quantization::gguf::GgufFile;
 
     if path.is_file()
@@ -208,6 +208,40 @@ fn detect_moe_arch(path: &Path) -> bool {
     json.get("model_type")
         .and_then(|v| v.as_str())
         .is_some_and(|mt| mt.to_lowercase().contains("moe"))
+}
+
+/// Correctness fallback for Metal GGUF MoE.
+///
+/// The device-side prefill MoE top-k/bucketing path currently produces
+/// incorrect first-token logits for Qwen3-30B-A3B GGUF on Metal. The host
+/// top-k path is slower, but is the validated product path until the Metal
+/// GPU router is fixed. Keep this scoped to Metal + GGUF + MoE and let an
+/// explicit `FERRUM_MOE_HOST_TOPK` env/config value win for diagnostics.
+pub fn metal_gguf_moe_correctness_entries(
+    snapshot_path: &Path,
+    device: &ferrum_types::Device,
+    current: &RuntimeConfigSnapshot,
+    source: RuntimeConfigSource,
+) -> Vec<RuntimeConfigEntry> {
+    let is_gguf = snapshot_path.is_file()
+        && snapshot_path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+    if !is_gguf || !matches!(device, ferrum_types::Device::Metal) || !detect_moe_arch(snapshot_path)
+    {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::new();
+    push_missing_entry(
+        &mut entries,
+        current,
+        "FERRUM_MOE_HOST_TOPK",
+        "1",
+        source,
+    );
+    entries
 }
 
 /// Look up `model_id` in the HF cache (`hub/models--owner--repo/snapshots/<rev>`).

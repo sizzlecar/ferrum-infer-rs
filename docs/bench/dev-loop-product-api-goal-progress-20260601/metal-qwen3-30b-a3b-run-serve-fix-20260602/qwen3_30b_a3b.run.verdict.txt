@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "rc": 0,
+  "assistant": [
+    "已记住。",
+    "蓝色月亮"
+  ],
+  "no_abort": true,
+  "first_turn_ok": true,
+  "second_turn_ok": true,
+  "contains_secret": true
+}

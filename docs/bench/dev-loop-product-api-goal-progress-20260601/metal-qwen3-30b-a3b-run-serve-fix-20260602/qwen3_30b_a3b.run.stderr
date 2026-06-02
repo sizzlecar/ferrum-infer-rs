@@ -1,0 +1,13 @@
+[auto-size] MOE_GRAPH=1 requested, but vllm-moe-marlin is not built; graph capture requires FERRUM_VLLM_MOE=1
+Loading /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-02T01:16:25.935115Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-02T01:16:25.935129Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-02T01:16:25.935191Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-02T01:16:26.110518Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-02T01:16:26.110547Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-02T01:16:26.110550Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-02T01:16:26.110555Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-02T01:16:26.110611Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+Model loaded in 1.3s.
