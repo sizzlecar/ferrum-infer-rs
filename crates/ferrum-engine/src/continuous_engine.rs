@@ -36,6 +36,8 @@ use tracing::{debug, info, warn};
 
 const BATCH_DECODE_PROF_ENV: &str = "FERRUM_BATCH_DECODE_PROF";
 const CHUNKED_PREFILL_ENV: &str = "FERRUM_CHUNKED_PREFILL";
+const KV_CAPACITY_ENV: &str = "FERRUM_KV_CAPACITY";
+const MAX_MODEL_LEN_ENV: &str = "FERRUM_MAX_MODEL_LEN";
 const NEXT_BATCH_PROF_ENV: &str = "FERRUM_NEXT_BATCH_PROF";
 const PREFIX_CACHE_ENV: &str = "FERRUM_PREFIX_CACHE";
 const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
@@ -60,6 +62,8 @@ struct ContinuousEngineRuntimeConfig {
     batch_decode_prof: bool,
     chunked_prefill_present: bool,
     chunked_prefill_size: Option<usize>,
+    kv_capacity: Option<usize>,
+    max_model_len: Option<usize>,
     next_batch_prof: bool,
     prefix_cache_enabled: bool,
     rbd_prof: bool,
@@ -89,6 +93,8 @@ impl ContinuousEngineRuntimeConfig {
             batch_decode_prof: vars.contains_key(BATCH_DECODE_PROF_ENV),
             chunked_prefill_present: vars.contains_key(CHUNKED_PREFILL_ENV),
             chunked_prefill_size: parse_positive_usize_env(&vars, CHUNKED_PREFILL_ENV),
+            kv_capacity: parse_positive_usize_env(&vars, KV_CAPACITY_ENV),
+            max_model_len: parse_positive_usize_env(&vars, MAX_MODEL_LEN_ENV),
             next_batch_prof: vars.contains_key(NEXT_BATCH_PROF_ENV),
             prefix_cache_enabled: vars.get(PREFIX_CACHE_ENV).is_some_and(|v| v == "1"),
             rbd_prof: vars.contains_key(RBD_PROF_ENV),
@@ -107,17 +113,14 @@ fn parse_positive_usize_env(vars: &HashMap<String, String>, name: &str) -> Optio
         .filter(|&v| v > 0)
 }
 
-fn positive_usize_env(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-}
-
-fn effective_request_context_capacity(config: &EngineConfig) -> Option<usize> {
-    let kv_capacity = positive_usize_env("FERRUM_KV_CAPACITY")
+fn effective_request_context_capacity(
+    config: &EngineConfig,
+    runtime_config: &ContinuousEngineRuntimeConfig,
+) -> Option<usize> {
+    let kv_capacity = runtime_config
+        .kv_capacity
         .or_else(|| (config.kv_cache.max_blocks > 0).then_some(config.kv_cache.max_blocks));
-    let max_model_len = positive_usize_env("FERRUM_MAX_MODEL_LEN").or_else(|| {
+    let max_model_len = runtime_config.max_model_len.or_else(|| {
         config
             .model
             .model_info
@@ -138,8 +141,9 @@ fn validate_request_context_budget(
     request: &InferenceRequest,
     input_tokens: usize,
     config: &EngineConfig,
+    runtime_config: &ContinuousEngineRuntimeConfig,
 ) -> Result<()> {
-    let Some(capacity) = effective_request_context_capacity(config) else {
+    let Some(capacity) = effective_request_context_capacity(config, runtime_config) else {
         return Ok(());
     };
     let output_tokens = request.sampling_params.max_tokens;
@@ -156,6 +160,7 @@ fn clamp_default_max_tokens_to_context(
     request: &mut InferenceRequest,
     input_tokens: usize,
     config: &EngineConfig,
+    runtime_config: &ContinuousEngineRuntimeConfig,
 ) {
     let default_max_tokens = request
         .metadata
@@ -165,7 +170,7 @@ fn clamp_default_max_tokens_to_context(
     if !default_max_tokens {
         return;
     }
-    let Some(capacity) = effective_request_context_capacity(config) else {
+    let Some(capacity) = effective_request_context_capacity(config, runtime_config) else {
         return;
     };
     let available_output_tokens = capacity.saturating_sub(input_tokens);
@@ -843,8 +848,18 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         gauge!("ferrum.engine.active_requests").increment(1.0);
 
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
-        clamp_default_max_tokens_to_context(&mut request, input_tokens.len(), &self.inner.config);
-        validate_request_context_budget(&request, input_tokens.len(), &self.inner.config)?;
+        clamp_default_max_tokens_to_context(
+            &mut request,
+            input_tokens.len(),
+            &self.inner.config,
+            &self.inner.runtime_config,
+        );
+        validate_request_context_budget(
+            &request,
+            input_tokens.len(),
+            &self.inner.config,
+            &self.inner.runtime_config,
+        )?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
             serde_json::Value::from(input_tokens.len() as u64),
@@ -902,8 +917,18 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let request_id = request.id.clone();
 
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
-        clamp_default_max_tokens_to_context(&mut request, input_tokens.len(), &self.inner.config);
-        validate_request_context_budget(&request, input_tokens.len(), &self.inner.config)?;
+        clamp_default_max_tokens_to_context(
+            &mut request,
+            input_tokens.len(),
+            &self.inner.config,
+            &self.inner.runtime_config,
+        );
+        validate_request_context_budget(
+            &request,
+            input_tokens.len(),
+            &self.inner.config,
+            &self.inner.runtime_config,
+        )?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
             serde_json::Value::from(input_tokens.len() as u64),
@@ -1129,6 +1154,8 @@ mod tests {
             [
                 (BATCH_DECODE_PROF_ENV, "1"),
                 (CHUNKED_PREFILL_ENV, "128"),
+                (KV_CAPACITY_ENV, "2048"),
+                (MAX_MODEL_LEN_ENV, "4096"),
                 (NEXT_BATCH_PROF_ENV, "1"),
                 (PREFIX_CACHE_ENV, "1"),
                 (RBD_PROF_ENV, "1"),
@@ -1142,6 +1169,8 @@ mod tests {
         assert_eq!(cfg.chunked_prefill_size, Some(128));
         assert_eq!(cfg.chunked_prefill_size_for(200), Some(128));
         assert_eq!(cfg.chunked_prefill_size_for(128), None);
+        assert_eq!(cfg.kv_capacity, Some(2048));
+        assert_eq!(cfg.max_model_len, Some(4096));
         assert!(cfg.next_batch_prof);
         assert!(cfg.prefix_cache_enabled);
         assert!(cfg.rbd_prof);
