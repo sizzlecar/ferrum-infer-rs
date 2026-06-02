@@ -78,7 +78,7 @@ Release 和 Metal gates：
 
 | 目标 | 模型 / workload | 结果 | 证据 |
 | --- | --- | --- | --- |
-| CUDA release 二进制 | Qwen3-30B-A3B GPTQ-Int4, c=32 smoke | `16/16` 请求，`0` errors；Paris、多轮和三轮对话 gates 通过 | [`release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/) |
+| CUDA release 二进制 | Qwen3-30B-A3B GPTQ-Int4, c=32 smoke | `16/16` 请求，`0` errors；Paris、多轮和三轮对话 gates 通过 | [`CUDA release 二进制验证`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/) |
 | Apple Silicon Metal | Qwen3/LLaMA 8B 和 Qwen3-30B-A3B | 覆盖正确性、多轮对话和并发 gates | [`metal-readme-regression-20260601-release-candidate-rerun3`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/) |
 | Apple Silicon Metal 限制 | Qwen3-30B-A3B, c=16 | Ferrum `72.5 tok/s`；记录中的 llama.cpp `83.4 tok/s` | 同上 Metal 报告 |
 
