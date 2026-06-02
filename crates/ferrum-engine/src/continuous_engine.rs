@@ -19,7 +19,7 @@ use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
 use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest,
     InferenceResponse, Priority, RequestId, Result, SamplingParams, StreamChunk, TokenId,
-    TokenUsage, PROMPT_TOKENS_METADATA_KEY,
+    TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY, PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
@@ -150,6 +150,37 @@ fn validate_request_context_budget(
     Err(FerrumError::request_validation(format!(
         "This model context is limited to {capacity} tokens, but this request needs {input_tokens} input tokens + {output_tokens} output tokens. Reduce max_tokens or shorten the messages."
     )))
+}
+
+fn clamp_default_max_tokens_to_context(
+    request: &mut InferenceRequest,
+    input_tokens: usize,
+    config: &EngineConfig,
+) {
+    let default_max_tokens = request
+        .metadata
+        .get(DEFAULT_MAX_TOKENS_METADATA_KEY)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if !default_max_tokens {
+        return;
+    }
+    let Some(capacity) = effective_request_context_capacity(config) else {
+        return;
+    };
+    let available_output_tokens = capacity.saturating_sub(input_tokens);
+    if available_output_tokens == 0 {
+        return;
+    }
+    let current = request.sampling_params.max_tokens;
+    let clamped = current.min(available_output_tokens);
+    if clamped < current {
+        warn!(
+            "Clamping default max_tokens from {} to {} for context budget: input_tokens={}, capacity={}",
+            current, clamped, input_tokens, capacity
+        );
+        request.sampling_params.max_tokens = clamped;
+    }
 }
 
 /// Resolve per-request stop conditions into (single-token-ids, multi-token-texts).
@@ -812,6 +843,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         gauge!("ferrum.engine.active_requests").increment(1.0);
 
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
+        clamp_default_max_tokens_to_context(&mut request, input_tokens.len(), &self.inner.config);
         validate_request_context_budget(&request, input_tokens.len(), &self.inner.config)?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
@@ -870,6 +902,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let request_id = request.id.clone();
 
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
+        clamp_default_max_tokens_to_context(&mut request, input_tokens.len(), &self.inner.config);
         validate_request_context_budget(&request, input_tokens.len(), &self.inner.config)?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),

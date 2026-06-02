@@ -23,7 +23,7 @@ use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngin
 use ferrum_types::{
     EngineMetrics, EngineStatus, FerrumConfigBuilder, FerrumError as Error, FinishReason,
     InferenceRequest, InferenceResponse, ModelId, Priority, RequestId, ResolvedFerrumConfig,
-    RuntimeConfigSnapshot, SamplingParams, TokenUsage,
+    RuntimeConfigSnapshot, SamplingParams, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
@@ -799,6 +799,12 @@ fn convert_chat_request_with_template_model(
     if request.ignore_eos.unwrap_or(false) {
         metadata.insert("ferrum_ignore_eos".to_string(), serde_json::json!(true));
     }
+    if request.max_completion_tokens.is_none() && request.max_tokens.is_none() {
+        metadata.insert(
+            DEFAULT_MAX_TOKENS_METADATA_KEY.to_string(),
+            serde_json::json!(true),
+        );
+    }
     if !has_unclosed_thinking_block(&prompt) {
         metadata.insert(
             INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY.to_string(),
@@ -1523,7 +1529,14 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
                 response_format: None,
             },
         )),
-        metadata: HashMap::new(),
+        metadata: if request.max_tokens.is_none() {
+            HashMap::from([(
+                DEFAULT_MAX_TOKENS_METADATA_KEY.to_string(),
+                serde_json::json!(true),
+            )])
+        } else {
+            HashMap::new()
+        },
     }
 }
 
