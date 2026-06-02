@@ -391,6 +391,8 @@ async fn handle_chat_completions_stream(
 
     tokio::spawn(async move {
         let mut current_text = String::new();
+        let mut sent_reasoning_len = 0usize;
+        let mut sent_content_len = 0usize;
         let mut token_count = 0;
         let max_tokens = chat_completion_max_tokens(&openai_request);
 
@@ -406,6 +408,17 @@ async fn handle_chat_completions_stream(
                                 current_text.push_str(&chunk.text);
 
                                 if !buffer_stream_output {
+                                    let parsed = parse_reasoning_response(&current_text);
+                                    let full_reasoning = parsed.reasoning.as_deref().unwrap_or("");
+                                    let reasoning_delta =
+                                        full_reasoning[sent_reasoning_len..].to_string();
+                                    sent_reasoning_len = full_reasoning.len();
+                                    let content_delta =
+                                        parsed.content[sent_content_len..].to_string();
+                                    sent_content_len = parsed.content.len();
+                                    if reasoning_delta.is_empty() && content_delta.is_empty() {
+                                        continue;
+                                    }
                                     // Create streaming response chunk
                                     let response_chunk = ChatCompletionsResponse {
                                         id: request_id.clone(),
@@ -417,7 +430,9 @@ async fn handle_chat_completions_stream(
                                             message: None,
                                             delta: Some(ChatMessage {
                                                 role: MessageRole::Assistant,
-                                                content: chunk.text.clone(),
+                                                content: content_delta,
+                                                reasoning: (!reasoning_delta.is_empty())
+                                                    .then_some(reasoning_delta),
                                                 name: None,
                                                 tool_calls: None,
                                                 tool_call_id: None,
@@ -489,6 +504,7 @@ async fn handle_chat_completions_stream(
                                         break;
                                     }
                                 } else if buffer_stream_output && !current_text.is_empty() {
+                                    let parsed = parse_reasoning_response(&current_text);
                                     let response_chunk = ChatCompletionsResponse {
                                         id: request_id.clone(),
                                         object: "chat.completion.chunk".to_string(),
@@ -499,7 +515,8 @@ async fn handle_chat_completions_stream(
                                             message: None,
                                             delta: Some(ChatMessage {
                                                 role: MessageRole::Assistant,
-                                                content: current_text.clone(),
+                                                content: parsed.content,
+                                                reasoning: parsed.reasoning,
                                                 name: None,
                                                 tool_calls: None,
                                                 tool_call_id: None,
@@ -537,6 +554,7 @@ async fn handle_chat_completions_stream(
                                         delta: Some(ChatMessage {
                                             role: MessageRole::Assistant,
                                             content: String::new(),
+                                            reasoning: None,
                                             name: None,
                                             tool_calls: None,
                                             tool_call_id: None,
@@ -659,9 +677,11 @@ async fn handle_chat_completions_sync(
             };
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
             let content = strip_trailing_stop(&after_fence, &stop_sequences);
+            let parsed = parse_reasoning_response(&content);
             let mut message = ChatMessage {
                 role: MessageRole::Assistant,
-                content,
+                content: parsed.content,
+                reasoning: parsed.reasoning,
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -837,6 +857,41 @@ fn has_unclosed_thinking_block(prompt: &str) -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedReasoningResponse {
+    content: String,
+    reasoning: Option<String>,
+}
+
+fn parse_reasoning_response(text: &str) -> ParsedReasoningResponse {
+    let Some(start) = text.find(THINK_START_TAG) else {
+        return ParsedReasoningResponse {
+            content: text.to_string(),
+            reasoning: None,
+        };
+    };
+
+    let before = &text[..start];
+    let after_start = &text[start + THINK_START_TAG.len()..];
+    let Some(end) = after_start.find(THINK_END_TAG) else {
+        return ParsedReasoningResponse {
+            content: before.to_string(),
+            reasoning: Some(after_start.to_string()),
+        };
+    };
+
+    let reasoning = after_start[..end].to_string();
+    let after_end = &after_start[end + THINK_END_TAG.len()..];
+    let mut content = String::new();
+    content.push_str(before);
+    content.push_str(after_end.trim_start_matches(['\r', '\n']));
+
+    ParsedReasoningResponse {
+        content,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
+    }
+}
+
 fn api_chat_request(request: &ChatCompletionsRequest) -> ferrum_types::ApiChatRequest {
     ferrum_types::ApiChatRequest {
         messages: request.messages.iter().map(api_chat_message).collect(),
@@ -954,6 +1009,7 @@ fn openai_chat_message_from_api(message: &ferrum_types::ApiChatMessage) -> ChatM
     ChatMessage {
         role: openai_message_role_from_api(message.role),
         content: message.content.clone(),
+        reasoning: None,
         name: message.name.clone(),
         tool_calls: if message.tool_calls.is_empty() {
             None
@@ -3711,6 +3767,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_response_splits_reasoning_from_content() {
+        let response = post_json(
+            router_with_stub("<think>\nreasoning\n</think>\n\nfinal answer"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let body = response_json(response).await;
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["content"], "final answer");
+        assert_eq!(message["reasoning"], "\nreasoning\n");
+        assert!(message.get("reasoning_content").is_none());
+    }
+
+    #[tokio::test]
     async fn route_rejects_unsupported_tool_and_function_selection() {
         for (extra, param) in [
             (
@@ -4740,6 +4816,7 @@ mod tests {
         let message = ChatMessage {
             role: MessageRole::Assistant,
             content: String::new(),
+            reasoning: None,
             name: None,
             tool_calls: Some(vec![ChatToolCall {
                 index: None,

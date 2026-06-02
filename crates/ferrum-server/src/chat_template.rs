@@ -328,6 +328,7 @@ mod tests {
         ChatMessage {
             role,
             content: content.to_string(),
+            reasoning: None,
             name: None,
             tool_calls: None,
             tool_call_id: None,
