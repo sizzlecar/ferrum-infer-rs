@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -131,7 +132,6 @@ def start_server(
     out_dir: Path,
 ) -> subprocess.Popen[str]:
     env = os.environ.copy()
-    env.update(model_env(case))
     stdout = (out_dir / f"{case.key}.server.stdout").open("w", encoding="utf-8")
     stderr = (out_dir / f"{case.key}.server.stderr").open("w", encoding="utf-8")
     proc = subprocess.Popen(
@@ -155,23 +155,19 @@ def start_server(
     return proc
 
 
-def model_env(case: ModelCase) -> dict[str, str]:
-    env = {
-        "FERRUM_METAL_PAGED_KV": "1",
-        "FERRUM_PAGED_MAX_SEQS": "32",
-        "FERRUM_KV_CAPACITY": "512",
-        "FERRUM_MAX_BATCH": "16",
-        "FERRUM_GREEDY_ARGMAX": "1",
-    }
-    if case.moe:
-        env.update(
-            {
-                "FERRUM_MAX_BATCHED_TOKENS": "3072",
-                "FERRUM_MOE_BATCHED": "1",
-                "FERRUM_MOE_BATCHED_DECODE": "1",
-                "FERRUM_MOE_BATCH_THRESHOLD": "2",
-            }
-        )
+def run_cli_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in [
+        "FERRUM_METAL_PAGED_KV",
+        "FERRUM_PAGED_MAX_SEQS",
+        "FERRUM_KV_CAPACITY",
+        "FERRUM_MAX_BATCH",
+        "FERRUM_MAX_BATCHED_TOKENS",
+        "FERRUM_MOE_BATCHED",
+        "FERRUM_MOE_BATCHED_DECODE",
+        "FERRUM_MOE_BATCH_THRESHOLD",
+    ]:
+        env.pop(key, None)
     return env
 
 
@@ -183,8 +179,7 @@ def run_cli_check(
     timeout_sec: int,
 ) -> dict[str, Any]:
     prefix = f"{case.key}.run"
-    env = os.environ.copy()
-    env.update(model_env(case))
+    env = run_cli_env()
     input_text = "\n".join(
         [
             "请记住暗号是蓝色月亮。只回答：已记住。",
@@ -200,13 +195,19 @@ def run_cli_check(
         "--backend",
         "metal",
         "--max-tokens",
-        "64",
+        "512",
         "--system",
         "请用中文回答，不要输出代码。",
         "--output-format",
         "jsonl",
     ]
-    result: dict[str, Any] = {"passed": False, "rc": None, "assistant": []}
+    result: dict[str, Any] = {
+        "passed": False,
+        "rc": None,
+        "assistant": [],
+        "jsonl_perf": {},
+        "text_long": {},
+    }
     try:
         proc = subprocess.run(
             cmd,
@@ -237,6 +238,7 @@ def run_cli_check(
     result["rc"] = proc.returncode
 
     assistant: list[str] = []
+    assistant_rows: list[dict[str, Any]] = []
     for line in proc.stdout.splitlines():
         try:
             row = json.loads(line)
@@ -244,26 +246,148 @@ def run_cli_check(
             continue
         if row.get("event") == "assistant":
             assistant.append(str(row.get("content", "")))
+            assistant_rows.append(row)
+    token_total = sum(
+        int(row.get("n_tokens", 0))
+        for row in assistant_rows
+        if isinstance(row.get("n_tokens", 0), (int, float))
+    )
+    ms_total = sum(
+        float(row.get("ms", 0.0))
+        for row in assistant_rows
+        if isinstance(row.get("ms", 0.0), (int, float))
+    )
     stderr_lower = proc.stderr.lower()
     joined = "\n".join(assistant).lower()
     no_abort = (
         "failed assertion" not in stderr_lower
         and "command encoder" not in stderr_lower
         and "panic" not in stderr_lower
+        and "failed to render model chat template" not in stderr_lower
+        and "<unk>" not in joined
+        and "[pad" not in joined
     )
     first_ok = len(assistant) >= 1 and "记住" in assistant[0]
     second_ok = len(assistant) >= 2 and "蓝色月亮" in assistant[1]
-    passed = proc.returncode == 0 and no_abort and first_ok and second_ok
+    jsonl_tok_s = (token_total / (ms_total / 1000.0)) if ms_total > 0 else None
+    jsonl_perf_ok = token_total > 0 and jsonl_tok_s is not None and jsonl_tok_s > 1.0
+    passed = proc.returncode == 0 and no_abort and first_ok and second_ok and jsonl_perf_ok
+    text_long = run_cli_text_long_check(
+        ferrum_bin,
+        model_path,
+        case,
+        out_dir,
+        timeout_sec,
+    )
     result.update(
         {
             "assistant": assistant,
+            "jsonl_perf": {
+                "completion_tokens": token_total,
+                "ms": ms_total,
+                "tok_s": jsonl_tok_s,
+                "passed": jsonl_perf_ok,
+            },
+            "text_long": text_long,
             "no_abort": no_abort,
             "first_turn_ok": first_ok,
             "second_turn_ok": second_ok,
             "contains_secret": "蓝色月亮" in "\n".join(assistant),
-            "passed": passed,
+            "passed": passed and bool(text_long.get("passed")),
         }
     )
+    write(out_dir / f"{prefix}.verdict.txt", json.dumps(result, indent=2, ensure_ascii=False))
+    return result
+
+
+def run_cli_text_long_check(
+    ferrum_bin: Path,
+    model_path: Path,
+    case: ModelCase,
+    out_dir: Path,
+    timeout_sec: int,
+) -> dict[str, Any]:
+    prefix = f"{case.key}.run_text_long"
+    input_text = "\n".join(
+        [
+            "你好",
+            "你是谁？",
+            "你会什么？",
+            "Rust 是什么？请用中文简短回答。",
+            "/bye",
+            "",
+        ]
+    )
+    cmd = [
+        str(ferrum_bin),
+        "run",
+        str(model_path),
+        "--backend",
+        "metal",
+        "--max-tokens",
+        "256",
+        "--system",
+        "请用中文回答。",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=ROOT,
+            env=run_cli_env(),
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout or ""
+        stderr = e.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        write(out_dir / f"{prefix}.stdin", input_text)
+        write(out_dir / f"{prefix}.stdout", stdout)
+        write(out_dir / f"{prefix}.stderr", stderr)
+        return {"passed": False, "rc": "timeout", "error": f"text run timed out after {timeout_sec}s"}
+
+    write(out_dir / f"{prefix}.stdin", input_text)
+    write(out_dir / f"{prefix}.stdout", proc.stdout)
+    write(out_dir / f"{prefix}.stderr", proc.stderr)
+    combined_lower = (proc.stdout + "\n" + proc.stderr).lower()
+    no_abort = (
+        "panic" not in combined_lower
+        and "kv cache overflow" not in combined_lower
+        and "failed assertion" not in combined_lower
+        and "command encoder" not in combined_lower
+        and "failed to render model chat template" not in combined_lower
+        and "<unk>" not in combined_lower
+        and "[pad" not in combined_lower
+    )
+    token_lines = [
+        line for line in proc.stderr.splitlines() if "tokens," in line and "tok/s" in line
+    ]
+    tok_s_values = []
+    for line in token_lines:
+        match = re.search(r",\s*([0-9]+(?:\.[0-9]+)?) tok/s", line)
+        if match:
+            tok_s_values.append(float(match.group(1)))
+    perf_ok = len(tok_s_values) >= 4 and min(tok_s_values) > 1.0
+    rust_ok = "rust" in combined_lower or "编程语言" in combined_lower
+    result = {
+        "passed": proc.returncode == 0 and no_abort and rust_ok and perf_ok,
+        "rc": proc.returncode,
+        "no_abort": no_abort,
+        "rust_ok": rust_ok,
+        "turn_stat_lines": len(token_lines),
+        "tok_s_values": tok_s_values,
+        "perf_ok": perf_ok,
+        "contains_think": "<think>" in proc.stdout,
+        "contains_unk": "<unk>" in combined_lower,
+        "contains_pad": "[pad" in combined_lower,
+    }
     write(out_dir / f"{prefix}.verdict.txt", json.dumps(result, indent=2, ensure_ascii=False))
     return result
 
@@ -316,7 +440,7 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 "content": "What is the capital of France? Reply with just the city name.",
             }
         ],
-        "max_tokens": 16,
+        "max_tokens": 256,
         "temperature": 0,
         "stream": False,
     }
@@ -356,7 +480,7 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 "content": "刚才暗号是什么？只回答暗号。",
             },
         ],
-        "max_tokens": 32,
+        "max_tokens": 512,
         "temperature": 0,
         "stream": False,
     }
@@ -380,6 +504,69 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
     write(
         out_dir / f"{case.key}.multiturn_verdict.txt",
         f"content={content}\npassed={str(multiturn_pass).lower()}\n",
+    )
+
+    stream_payload = {
+        "model": case.label,
+        "messages": [
+            {
+                "role": "user",
+                "content": "你好，请用一句中文打招呼。",
+            }
+        ],
+        "max_tokens": 96,
+        "temperature": 0,
+        "stream": True,
+    }
+    stream_chunks = 0
+    stream_content = ""
+    stream_status = 0
+    stream_error = ""
+    req = urllib.request.Request(
+        base,
+        data=json.dumps(stream_payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            stream_status = resp.status
+            for raw in resp:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                stream_chunks += 1
+                try:
+                    row = json.loads(data)
+                    stream_content += (
+                        row.get("choices", [{}])[0]
+                        .get("delta", {})
+                        .get("content", "")
+                        or ""
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        stream_error = str(e)
+    write(
+        out_dir / f"{case.key}.stream_payload.json",
+        json.dumps(stream_payload, indent=2, ensure_ascii=False),
+    )
+    write(out_dir / f"{case.key}.stream_response.txt", stream_content)
+    stream_pass = stream_status == 200 and stream_chunks > 1 and bool(stream_content)
+    result["stream"] = {
+        "status": stream_status,
+        "passed": stream_pass,
+        "chunks": stream_chunks,
+        "content_head": stream_content[:240],
+        "error": stream_error,
+    }
+    write(
+        out_dir / f"{case.key}.stream_verdict.txt",
+        json.dumps(result["stream"], indent=2, ensure_ascii=False),
     )
     return result
 
@@ -487,11 +674,12 @@ def markdown_summary(report: dict[str, Any]) -> str:
     out.append(f"Swap at start: `{report['swap_start']}`")
     out.append(f"Swap at end: `{report['swap_end']}`")
     out.append("")
-    out.append("| Model | Serve correctness | Serve multi-turn | Run REPL multi-turn | c | README tok/s | Current tok/s | Ratio | Completed | Gate |")
-    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    out.append("| Model | Serve correctness | Serve multi-turn | Serve stream | Run REPL multi-turn | c | README tok/s | Current tok/s | Ratio | Completed | Gate |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
     for model in report["models"]:
         correctness = "pass" if model["chat"]["paris"]["passed"] else "FAIL"
         multiturn = "pass" if model["chat"]["multiturn"]["passed"] else "FAIL"
+        stream_gate = "pass" if model["chat"].get("stream", {}).get("passed") else "FAIL"
         run_gate = "pass" if model.get("run", {}).get("passed") else "FAIL"
         for cell in model["cells"]:
             tps = cell.get("output_throughput_tok_s")
@@ -500,26 +688,31 @@ def markdown_summary(report: dict[str, Any]) -> str:
             completed = f"{cell.get('completed')}/{cell.get('prompts')}"
             if isinstance(tps, (int, float)):
                 out.append(
-                    f"| {model['label']} | {correctness} | {multiturn} | {run_gate} | {cell['concurrency']} | "
+                    f"| {model['label']} | {correctness} | {multiturn} | {stream_gate} | {run_gate} | {cell['concurrency']} | "
                     f"{cell['baseline_tps']:.1f} | {tps:.1f} | {ratio:.3f} | {completed} | {gate} |"
                 )
             else:
                 out.append(
-                    f"| {model['label']} | {correctness} | {multiturn} | {run_gate} | {cell['concurrency']} | "
+                    f"| {model['label']} | {correctness} | {multiturn} | {stream_gate} | {run_gate} | {cell['concurrency']} | "
                     f"{cell['baseline_tps']:.1f} | n/a | n/a | {completed} | {gate} |"
                 )
     out.append("")
     out.append("Correctness prompts:")
     for model in report["models"]:
+        perf = model.get("run", {}).get("jsonl_perf", {})
         out.append(
             f"- `{model['label']}` Paris: `{model['chat']['paris']['content']}`; "
             f"serve multi-turn: `{model['chat']['multiturn']['content']}`; "
-            f"run multi-turn: `{model.get('run', {}).get('assistant', [])}`"
+            f"serve stream chunks: `{model['chat'].get('stream', {}).get('chunks')}`; "
+            f"run multi-turn: `{model.get('run', {}).get('assistant', [])}`; "
+            f"run tok/s: `{perf.get('tok_s')}`; "
+            f"run text long: `{model.get('run', {}).get('text_long', {})}`"
         )
     out.append("")
     out.append("Notes:")
     out.append("- Performance gate is `current >= 0.90 * README baseline`, plus all requests completed.")
     out.append("- Throughput cells request `ignore_eos=true` and streaming usage so runs are max-token and token-count comparable to the README harness.")
+    out.append("- `run` coverage includes JSONL multi-turn plus default text-mode long multi-turn to catch streaming and KV overflow regressions.")
     out.append("- This runner records correctness failures and still collects performance data.")
     out.append("- Active swap means results are release-regression evidence, not clean marketing numbers.")
     return "\n".join(out) + "\n"

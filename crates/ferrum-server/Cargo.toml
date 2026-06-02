@@ -22,6 +22,7 @@ pin-project = "1.1"
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+minijinja = { version = "2.20", features = ["json"] }
 regex-lite = "0.1"
 
 # Error handling

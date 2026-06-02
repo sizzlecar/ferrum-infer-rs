@@ -16,7 +16,7 @@
 //! - **Monitoring**: Built-in metrics and health checks
 
 pub mod axum_server;
-pub(crate) mod chat_template;
+pub mod chat_template;
 pub mod middleware;
 pub mod openai;
 pub mod traits;

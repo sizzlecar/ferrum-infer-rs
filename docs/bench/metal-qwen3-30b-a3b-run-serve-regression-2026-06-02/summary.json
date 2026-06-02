@@ -1,0 +1,76 @@
+{
+  "ferrum_version": "ferrum 0.7.4\n",
+  "swap_start": "vm.swapusage: total = 4096.00M  used = 3315.94M  free = 780.06M  (encrypted)",
+  "vm_stat_start": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               80327.\nPages active:                            877328.\nPages inactive:                          530859.\nPages speculative:                       345857.\nPages throttled:                              0.\nPages wired down:                        171700.\nPages purgeable:                           8754.\n\"Translation faults\":                5409075169.\nPages copy-on-write:                  332864087.\nPages zero filled:                   3220775789.\nPages reactivated:                    239600996.",
+  "models": [
+    {
+      "key": "qwen3_30b_a3b",
+      "label": "Qwen3-30B-A3B",
+      "gguf": "/Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf",
+      "moe": true,
+      "chat": {
+        "paris": {
+          "status": 200,
+          "passed": true,
+          "content": "</think>\n\nParis"
+        },
+        "multiturn": {
+          "status": 200,
+          "passed": true,
+          "content": "</think>\n\n蓝色月亮。"
+        },
+        "stream": {
+          "status": 200,
+          "passed": true,
+          "chunks": 9,
+          "content_head": "</think>\n\n你好！很高兴见到你。",
+          "error": ""
+        }
+      },
+      "run": {
+        "passed": true,
+        "rc": 0,
+        "assistant": [
+          "</think>\n\n已记住。",
+          "</think>\n\n蓝色月亮。"
+        ],
+        "jsonl_perf": {
+          "completion_tokens": 12,
+          "ms": 1531.4051670000001,
+          "tok_s": 7.835940650185882
+        },
+        "text_long": {
+          "passed": true,
+          "rc": 0,
+          "no_abort": true,
+          "rust_ok": true,
+          "turn_stat_lines": 4,
+          "contains_think": false,
+          "contains_unk": false,
+          "contains_pad": false
+        },
+        "no_abort": true,
+        "first_turn_ok": true,
+        "second_turn_ok": true,
+        "contains_secret": true
+      },
+      "cells": [
+        {
+          "concurrency": 16,
+          "prompts": 32,
+          "baseline_tps": 72.5,
+          "runner_rc": "timeout",
+          "error": "bench timed out after 420s",
+          "completed": null,
+          "failed": null,
+          "output_throughput_tok_s": null,
+          "ratio_to_readme": null,
+          "not_regressed_90pct": false
+        }
+      ],
+      "server_ready": true
+    }
+  ],
+  "swap_end": "vm.swapusage: total = 4096.00M  used = 3307.94M  free = 788.06M  (encrypted)",
+  "vm_stat_end": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              227700.\nPages active:                            573627.\nPages inactive:                          361488.\nPages speculative:                          972.\nPages throttled:                              0.\nPages wired down:                        817035.\nPages purgeable:                            208.\n\"Translation faults\":                5411900569.\nPages copy-on-write:                  332878041.\nPages zero filled:                   3222172262.\nPages reactivated:                    239641822."
+}

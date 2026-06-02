@@ -106,6 +106,9 @@
 - Every release candidate must include `run` multi-turn correctness and a basic `run` performance row in the saved regression evidence, not only HTTP benchmark artifacts.
 - If any code changes after CUDA validation, rerun a CUDA quick regression for correctness, `run` multi-turn, and performance before calling the release ready.
 - Do not publish or tag after a failed local product-path smoke. Fix the failed path, rerun Metal locally, rerun CUDA remotely when code changed, then record the evidence under `docs/bench/`.
+- Do not validate release behavior by hand-assembling hidden env-var combinations that users will not know to set. Correctness, streaming, multi-turn, and README performance gates must exercise product defaults for `ferrum run` / `ferrum serve`; move required sizing/scheduler choices into typed auto-profile defaults or documented presets.
+- Do not hard-code model-family prompt hacks such as forced empty Qwen3 `<think>` blocks. Prefer model-provided chat templates from GGUF/HF metadata, and make template rendering shared between `run` and `serve`.
+- Do not hide invalid model output by filtering decoded text. If `<unk>`, `[PAD...]`, or tokenizer-reserved IDs appear, trace token IDs and fix sampling/logit masking or KV/logits state before accepting the regression.
 
 ## Commit & Pull Request Guidelines
 - Follow the existing commit style: conventional prefixes plus scope when useful, e.g. `feat(cli): ...`, `refactor(engine): ...`, `feat(cli, models): ...`.

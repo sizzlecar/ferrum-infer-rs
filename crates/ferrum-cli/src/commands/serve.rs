@@ -329,6 +329,22 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // Select device
     let device = select_device();
     println!("{} {:?}", "Device:".dimmed(), device);
+    let serve_profile_entries = crate::source_resolver::serve_profile_runtime_entries(
+        &source.local_path,
+        &device,
+        &RuntimeConfigSnapshot::capture_current(),
+        RuntimeConfigSource::Default,
+    );
+    if !serve_profile_entries.is_empty() {
+        non_env_runtime_entries.extend(serve_profile_entries.clone());
+        non_env_runtime_entries =
+            RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
+        materialized_runtime_keys.extend(crate::runtime_env::materialize_runtime_env_defaults(
+            &serve_profile_entries,
+        ));
+        materialized_runtime_keys.sort();
+        materialized_runtime_keys.dedup();
+    }
     let metal_moe_entries = crate::source_resolver::metal_gguf_moe_correctness_entries(
         &source.local_path,
         &device,
@@ -536,7 +552,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
             let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
                 Arc::from(ferrum_engine::create_default_engine(engine_config).await?);
-            AxumServer::from_llm(engine)
+            AxumServer::from_llm(engine).with_prompt_template(
+                crate::source_resolver::load_model_chat_template(&source.local_path),
+            )
         }
     }
     .with_auto_config(startup_auto_config);
