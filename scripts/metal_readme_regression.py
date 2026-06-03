@@ -526,12 +526,8 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
         "model": case.label,
         "messages": [
             {
-                "role": "system",
-                "content": "直接给出最终回答，不要输出代码。",
-            },
-            {
                 "role": "user",
-                "content": "请只输出一句中文问候，必须包含“你好”。",
+                "content": "请用一句话打招呼，必须包含“你好”。",
             }
         ],
         "max_tokens": CHAT_CHECK_MAX_TOKENS,
