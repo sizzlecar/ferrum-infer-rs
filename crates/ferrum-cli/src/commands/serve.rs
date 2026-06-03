@@ -62,6 +62,26 @@ pub struct ServeCommand {
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
+    /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
+    #[arg(long, value_name = "N")]
+    pub max_model_len: Option<usize>,
+
+    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`.
+    #[arg(long, value_name = "N")]
+    pub max_num_seqs: Option<usize>,
+
+    /// vLLM-compatible alias for `FERRUM_MAX_BATCHED_TOKENS`.
+    #[arg(long, value_name = "N")]
+    pub max_num_batched_tokens: Option<usize>,
+
+    /// Enable prefix caching (`FERRUM_PREFIX_CACHE=1`).
+    #[arg(long, conflicts_with = "no_enable_prefix_caching")]
+    pub enable_prefix_caching: bool,
+
+    /// Disable prefix caching (`FERRUM_PREFIX_CACHE=0`).
+    #[arg(long)]
+    pub no_enable_prefix_caching: bool,
+
     /// KV cache element dtype (Dim 5 polymorphism point). Accepts
     /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
     /// require model wire-up; today only the kernel + type layer ships.
@@ -117,6 +137,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         spec_draft,
         spec_tokens,
         gpu_memory_utilization,
+        max_model_len,
+        max_num_seqs,
+        max_num_batched_tokens,
+        enable_prefix_caching,
+        no_enable_prefix_caching,
         kv_dtype,
         runtime_preset,
         effective_config_json,
@@ -419,6 +444,10 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
 
     let startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
+        max_model_len,
+        max_num_seqs,
+        max_num_batched_tokens,
+        prefix_cache_cli_override(enable_prefix_caching, no_enable_prefix_caching),
         profile_jsonl.as_ref(),
         profile_commit_sha.as_deref(),
         profile_env_hash.as_deref(),
@@ -785,6 +814,10 @@ fn runtime_preset_entries(
 
 fn serve_cli_runtime_entries(
     kv_dtype: Option<&str>,
+    max_model_len: Option<usize>,
+    max_num_seqs: Option<usize>,
+    max_num_batched_tokens: Option<usize>,
+    prefix_cache: Option<bool>,
     profile_jsonl: Option<&PathBuf>,
     profile_commit_sha: Option<&str>,
     profile_env_hash: Option<&str>,
@@ -794,6 +827,20 @@ fn serve_cli_runtime_entries(
 ) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
     push_cli_runtime_entry(&mut entries, "FERRUM_KV_DTYPE", kv_dtype);
+    push_cli_runtime_usize(&mut entries, "FERRUM_MAX_MODEL_LEN", max_model_len);
+    push_cli_runtime_usize(&mut entries, "FERRUM_PAGED_MAX_SEQS", max_num_seqs);
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_MAX_BATCHED_TOKENS",
+        max_num_batched_tokens,
+    );
+    if let Some(enabled) = prefix_cache {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PREFIX_CACHE",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
     if let Some(path) = profile_jsonl {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_PROFILE_JSONL",
@@ -823,6 +870,14 @@ fn serve_cli_runtime_entries(
     entries
 }
 
+fn prefix_cache_cli_override(enable: bool, disable: bool) -> Option<bool> {
+    match (enable, disable) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
+
 fn resolve_effective_kv_dtype<'a>(
     cli_arg: Option<&'a str>,
     env_value: Option<&'a str>,
@@ -833,6 +888,16 @@ fn resolve_effective_kv_dtype<'a>(
 
 fn push_cli_runtime_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<&str>) {
     if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            value.to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+}
+
+fn push_cli_runtime_usize(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<usize>) {
+    if let Some(value) = value {
         entries.push(RuntimeConfigEntry::new(
             key,
             value.to_string(),
@@ -1295,6 +1360,10 @@ mod tests {
     fn serve_cli_runtime_entries_are_cli_sourced_and_classified() {
         let entries = serve_cli_runtime_entries(
             Some("int8"),
+            Some(4096),
+            Some(64),
+            Some(2048),
+            Some(false),
             Some(&PathBuf::from("/tmp/profile.jsonl")),
             Some("abc123"),
             Some("sha256:test"),
@@ -1316,6 +1385,14 @@ mod tests {
         assert!(entry("FERRUM_KV_DTYPE")
             .affects
             .contains(&ferrum_types::RuntimeConfigEffect::Correctness));
+        assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
+        assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
+        assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
+        assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
+        assert_eq!(
+            entry("FERRUM_MAX_MODEL_LEN").source,
+            RuntimeConfigSource::Cli
+        );
         assert_eq!(
             entry("FERRUM_PROFILE_JSONL").effective_value,
             "/tmp/profile.jsonl"
@@ -1337,8 +1414,19 @@ mod tests {
             ..Default::default()
         }
         .runtime_config_entries();
-        let cli_entries =
-            serve_cli_runtime_entries(Some("int8"), None, None, None, None, None, None);
+        let cli_entries = serve_cli_runtime_entries(
+            Some("int8"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
 
         let snapshot = merge_runtime_config_sources(
             config_entries,
@@ -1352,6 +1440,81 @@ mod tests {
             .unwrap();
         assert_eq!(kv.effective_value, "int8");
         assert_eq!(kv.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn vllm_compat_runtime_flags_follow_existing_precedence() {
+        let config_entries = crate::config::RuntimeCliConfig {
+            max_model_len: Some(1024),
+            paged_max_seqs: Some(2),
+            max_batched_tokens: Some(128),
+            prefix_cache: Some(false),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        let env_snapshot = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "2048", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "4", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new(
+                "FERRUM_MAX_BATCHED_TOKENS",
+                "256",
+                RuntimeConfigSource::Env,
+            ),
+            RuntimeConfigEntry::new("FERRUM_PREFIX_CACHE", "1", RuntimeConfigSource::Env),
+        ]);
+
+        let env_over_config =
+            merge_runtime_config_sources(config_entries.clone(), env_snapshot.clone(), Vec::new());
+        fn entry<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> &'a RuntimeConfigEntry {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        }
+        assert_eq!(
+            entry(&env_over_config, "FERRUM_MAX_MODEL_LEN").effective_value,
+            "2048"
+        );
+        assert_eq!(
+            entry(&env_over_config, "FERRUM_PREFIX_CACHE").source,
+            RuntimeConfigSource::Env
+        );
+
+        let cli_entries = serve_cli_runtime_entries(
+            None,
+            Some(4096),
+            Some(8),
+            Some(512),
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let cli_over_env = merge_runtime_config_sources(config_entries, env_snapshot, cli_entries);
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_MAX_MODEL_LEN").effective_value,
+            "4096"
+        );
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_PAGED_MAX_SEQS").effective_value,
+            "8"
+        );
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_MAX_BATCHED_TOKENS").effective_value,
+            "512"
+        );
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_PREFIX_CACHE").effective_value,
+            "0"
+        );
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_PREFIX_CACHE").source,
+            RuntimeConfigSource::Cli
+        );
     }
 
     #[test]
@@ -1766,8 +1929,19 @@ mod tests {
             "int8",
             RuntimeConfigSource::Env,
         )]);
-        let cli_entries =
-            serve_cli_runtime_entries(Some("bf16"), None, None, None, None, None, None);
+        let cli_entries = serve_cli_runtime_entries(
+            Some("bf16"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
         let kv = snapshot

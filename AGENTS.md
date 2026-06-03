@@ -118,6 +118,13 @@
 - Every release gate must print an explicit `PASS` line and return non-zero on failure. A silent successful command is not enough release evidence.
 - If a change touches shared model, scheduler, runtime default, tokenizer/template, CLI, or server code, both Metal and CUDA must be regressed. Backend-local CUDA changes require CUDA full/smoke plus a Metal smoke; backend-local Metal changes require Metal full plus a CUDA smoke.
 
+## G1-G4 Local Goal Policy
+- The local G1-G4 goal does not require tagging, publishing, cargo release, Homebrew release, or GitHub release unless the user explicitly asks for those steps again.
+- G1 vLLM migration compatibility is a local product/API gate and should not open a paid GPU. Use `scripts/release/g1_vllm_migration_gate.py` and save artifacts under `docs/release/g1-g4/g1-vllm-migration/<timestamp>-<short_sha>/`.
+- G1 must preserve real CLI semantics for vLLM-style flags: `--max-model-len` maps to `FERRUM_MAX_MODEL_LEN`, `--max-num-seqs` maps to `FERRUM_PAGED_MAX_SEQS`, `--max-num-batched-tokens` maps to `FERRUM_MAX_BATCHED_TOKENS`, and prefix-cache flags map to `FERRUM_PREFIX_CACHE`.
+- Do not add ignored compatibility flags. If Ferrum cannot implement a vLLM flag, document it in `docs/migration/vllm-compatibility-matrix.md` instead of silently accepting it.
+- G1 acceptance requires `ferrum serve --help` visibility, effective-config JSON entries sourced from `cli`, OpenAI non-stream and stream smoke, exactly one stream `[DONE]`, exactly one usage chunk before `[DONE]`, and a final `G1 VLLM MIGRATION PASS: <artifact_dir>` line.
+
 ## Directory Cleanup Policy
 - Before moving, deleting, or archiving files under `crates/`, `docs/`, or `scripts/`, run `python3 scripts/release/inventory_tree.py --out docs/release/cleanup/<YYYYMMDD>-inventory.md` and commit the inventory.
 - Do not delete benchmark or release evidence unless the cleanup manifest lists the file, category, reference count, and reason.
