@@ -19,7 +19,7 @@ scripts/release/g0_source_gate.sh cuda-smoke /workspace/g0/<version>/source-cuda
 scripts/release/g0_source_gate.sh cuda-full /workspace/g0/<version>/source-cuda-full
 ```
 
-- `unit`: runs `cargo test --workspace --all-targets`.
+- `unit`: runs `cargo test --workspace --all-targets`, release-script Python compile checks, shell syntax checks, and `scripts/release/selftest_g0_validators.py`.
 - `metal`: builds Metal, runs `scripts/metal_readme_regression.py`, then validates the artifact with `scripts/release/validate_metal_readme_regression.py`.
 - `cuda-smoke`: builds CUDA features, runs `scripts/m3_ab_runner.py` through `scripts/release/configs/g0_cuda4090_smoke.json`, then runs `scripts/m3_validate_runner_artifact.py`.
 - `cuda-full`: same as smoke, but covers c=1/4/16/32 with repeats >= 3 using `scripts/release/configs/g0_cuda4090_full.json`.
