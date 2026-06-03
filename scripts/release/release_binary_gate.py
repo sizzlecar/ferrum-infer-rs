@@ -128,7 +128,7 @@ def wait_health(port: int) -> None:
     raise RuntimeError("server did not become healthy")
 
 
-def serve_gate(bin_path: Path, model_path: str, model_name: str, out: Path, port: int, cuda_extra: bool) -> dict:
+def serve_gate(bin_path: Path, model_path: str, model_name: str, out: Path, port: int, api_extra: bool) -> dict:
     log = out / "serve.log"
     with log.open("wb") as f:
         proc = subprocess.Popen([str(bin_path), "serve", model_path, "--host", "127.0.0.1", "--port", str(port)], stdout=f, stderr=subprocess.STDOUT)
@@ -147,7 +147,7 @@ def serve_gate(bin_path: Path, model_path: str, model_name: str, out: Path, port
             raise RuntimeError("serve multi-turn gate failed")
         if s3 != 400:
             raise RuntimeError("serve boundary gate did not return 400")
-        if cuda_extra:
+        if api_extra:
             schema = {"type": "json_schema", "json_schema": {"name": "Answer", "strict": True, "schema": {"type": "object", "additionalProperties": False, "properties": {"answer": {"type": "integer"}}, "required": ["answer"]}}}
             s4, b4 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "计算 123+456。最终答案必须只用 JSON 对象表示，格式为 {\"answer\":579}，不要 Markdown。"}], "response_format": schema, "max_tokens": 1024})
             msg = json.loads(b4)["choices"][0]["message"].get("content", "") if s4 == 200 else b4
@@ -194,7 +194,7 @@ def gate_tarball(args, *, asset: str, default_model: str, model_name: str, cuda:
     if cuda:
         check_ldd(bin_path, args.out)
     model = args.model or default_model
-    checks = {"version": True, "cli": cli_gate(bin_path, model, args.out), "serve": serve_gate(bin_path, model, args.model_name or model_name, args.out, args.port, cuda)}
+    checks = {"version": True, "cli": cli_gate(bin_path, model, args.out), "serve": serve_gate(bin_path, model, args.model_name or model_name, args.out, args.port, True)}
     write_gate(args.out, "cuda-tarball" if cuda else "metal-tarball", args.version, checks)
     print(f"{'CUDA' if cuda else 'METAL'} TARBALL GATE PASS: {args.out}")
 
@@ -207,7 +207,7 @@ def homebrew_metal(args) -> None:
     bin_path = Path(shutil.which("ferrum") or "")
     assert_version(bin_path, args.version)
     model = args.model or "/Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf"
-    checks = {"version": True, "cli": cli_gate(bin_path, model, args.out), "serve": serve_gate(bin_path, model, args.model_name or "Qwen3-30B-A3B-Q4_K_M", args.out, args.port, False)}
+    checks = {"version": True, "cli": cli_gate(bin_path, model, args.out), "serve": serve_gate(bin_path, model, args.model_name or "Qwen3-30B-A3B-Q4_K_M", args.out, args.port, True)}
     write_gate(args.out, "homebrew-metal", args.version, checks)
     print(f"HOMEBREW METAL GATE PASS: {args.out}")
 
