@@ -203,6 +203,7 @@ def run_bench_pair(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
         "--dataset", "shared-prefix",
         "--shared-prefix-len", str(args.shared_prefix_len),
         "--shared-suffix-len", str(args.shared_suffix_len),
+        "--random-output-len", str(args.random_output_len),
         "--num-prompts", str(args.num_prompts),
         "--warmup-requests", str(args.warmup_requests),
         "--concurrency", str(args.concurrency),
@@ -287,11 +288,12 @@ def main() -> int:
     parser.add_argument("--ferrum-bin", type=Path, default=repo_root() / "target" / "release" / "ferrum")
     parser.add_argument("--skip-workspace-test", action="store_true")
     parser.add_argument("--skip-bench", action="store_true")
-    parser.add_argument("--shared-prefix-len", type=int, default=1024)
-    parser.add_argument("--shared-suffix-len", type=int, default=64)
-    parser.add_argument("--num-prompts", type=int, default=64)
-    parser.add_argument("--warmup-requests", type=int, default=8)
-    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--shared-prefix-len", type=int, default=256)
+    parser.add_argument("--shared-suffix-len", type=int, default=32)
+    parser.add_argument("--random-output-len", type=int, default=32)
+    parser.add_argument("--num-prompts", type=int, default=16)
+    parser.add_argument("--warmup-requests", type=int, default=2)
+    parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--n-repeats", type=int, default=3)
     parser.add_argument("--bench-timeout", type=int, default=2400)
     args = parser.parse_args()
