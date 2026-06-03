@@ -1,0 +1,8 @@
+    Finished `release` profile [optimized] target(s) in 0.19s
+     Running tests/server_structured_output.rs (target/release/deps/server_structured_output-296b4c4aa079a5f3)
+
+running 1 test
+test g2_structured_output_real_model_smoke ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 199.48s
+

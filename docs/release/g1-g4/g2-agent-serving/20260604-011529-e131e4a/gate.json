@@ -1,0 +1,10 @@
+{
+  "status": "pass",
+  "goal": "g2-agent-serving",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "ferrum_server_structured_output": true,
+    "strict_schema_real_model_20x": true,
+    "required_tool_call_real_model_10x": true
+  }
+}
