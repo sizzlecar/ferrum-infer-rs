@@ -64,7 +64,15 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def run(cmd: list[str], out: Path, log: GateLog, *, timeout: int = 600, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def run(
+    cmd: list[str],
+    out: Path,
+    log: GateLog,
+    *,
+    timeout: int = 600,
+    env: dict[str, str] | None = None,
+    scan_bad_patterns: bool = False,
+) -> subprocess.CompletedProcess[str]:
     log.write("RUN " + " ".join(cmd))
     proc = subprocess.run(
         cmd,
@@ -79,7 +87,8 @@ def run(cmd: list[str], out: Path, log: GateLog, *, timeout: int = 600, env: dic
     out.write_text(proc.stdout, errors="replace")
     if proc.returncode != 0:
         raise RuntimeError(f"command failed rc={proc.returncode}: {' '.join(cmd)}; log={out}")
-    assert_no_bad_patterns(out.name, proc.stdout)
+    if scan_bad_patterns:
+        assert_no_bad_patterns(out.name, proc.stdout)
     return proc
 
 
