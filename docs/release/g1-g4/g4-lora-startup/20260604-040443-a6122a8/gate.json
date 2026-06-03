@@ -1,0 +1,20 @@
+{
+  "status": "pass",
+  "goal": "g4-lora-startup",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "lora_linear_ref": true,
+    "lora_loader": true,
+    "server_lora_routing": true,
+    "server_lora_startup": true,
+    "bench": {
+      "status": "pass",
+      "base_no_lora_output_tps": 11.019927176001636,
+      "base_with_lora_output_tps": 11.223827029523662,
+      "adapter_output_tps": 11.224275678741565,
+      "base_regression_pct": 0.0,
+      "adapter_to_base_ratio": 1.0000399729269458,
+      "fixture": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g4-lora-startup/20260604-040443-a6122a8/fixtures/sql-adapter"
+    }
+  }
+}

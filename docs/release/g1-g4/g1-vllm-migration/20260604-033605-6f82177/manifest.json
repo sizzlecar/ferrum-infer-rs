@@ -1,0 +1,90 @@
+{
+  "goal": "G1",
+  "name": "vllm-migration",
+  "status": "pass",
+  "passed": true,
+  "git_sha": "6f821771a1915fdb8f6574b72c829fdad300217f",
+  "git_dirty": true,
+  "binary_sha256": "sha256:9eb2c466f89c14f30a90387567385c19c3ee13b4536c7ec81167680e5ae837a2",
+  "features": [],
+  "models": [
+    "qwen3:0.6b"
+  ],
+  "commands": [
+    "cargo test --workspace --all-targets",
+    "cargo test -p ferrum-cli --test vllm_migration_compat serve_help_lists_vllm_compat_flags",
+    "cargo build --release -p ferrum-cli --bin ferrum",
+    "ferrum serve --help",
+    "cargo test --release -p ferrum-cli --test vllm_migration_compat -- --ignored --test-threads=1",
+    "direct OpenAI-compatible smoke via /v1/models and /v1/chat/completions"
+  ],
+  "started_at_utc": "2026-06-03T19:36:05Z",
+  "finished_at_utc": "2026-06-03T19:40:33Z",
+  "created_at": "2026-06-03T19:40:33Z",
+  "repo": {
+    "head": "6f821771a1915fdb8f6574b72c829fdad300217f",
+    "short_head": "6f82177",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "model": "qwen3:0.6b",
+  "model_name": "qwen3:0.6b",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "serve_help_test": true,
+    "serve_help_flags": [
+      "--max-model-len",
+      "--max-num-seqs",
+      "--max-num-batched-tokens",
+      "--enable-prefix-caching",
+      "--no-enable-prefix-caching"
+    ],
+    "rust_ignored_smoke": true,
+    "direct_openai_smoke": {
+      "passed": true,
+      "base_url": "http://127.0.0.1:59208",
+      "model": "qwen3:0.6b",
+      "model_name": "qwen3:0.6b",
+      "effective_config": {
+        "FERRUM_MAX_MODEL_LEN": {
+          "effective_value": "2048",
+          "source": "cli"
+        },
+        "FERRUM_PAGED_MAX_SEQS": {
+          "effective_value": "4",
+          "source": "cli"
+        },
+        "FERRUM_MAX_BATCHED_TOKENS": {
+          "effective_value": "2048",
+          "source": "cli"
+        },
+        "FERRUM_PREFIX_CACHE": {
+          "effective_value": "0",
+          "source": "cli"
+        }
+      },
+      "chat_content_len": 9,
+      "stream_chunks": 114,
+      "stream_done_count": 1,
+      "usage_stream_chunks": 115,
+      "usage_done_count": 1,
+      "usage_chunk_count": 1
+    }
+  },
+  "artifacts": [
+    "cargo-test.log",
+    "chat.json",
+    "effective-config.json",
+    "gate.json",
+    "gate.log",
+    "models.json",
+    "release-build.log",
+    "rust-ignored-smoke.log",
+    "serve-help-test.log",
+    "serve-help.txt",
+    "serve.log",
+    "smoke.json",
+    "stream.sse",
+    "usage_stream.sse"
+  ]
+}

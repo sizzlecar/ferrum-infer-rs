@@ -1,0 +1,46 @@
+{
+  "goal": "G2",
+  "name": "agent-serving",
+  "status": "pass",
+  "passed": true,
+  "git_sha": "6f821771a1915fdb8f6574b72c829fdad300217f",
+  "git_dirty": true,
+  "binary_sha256": "sha256:9eb2c466f89c14f30a90387567385c19c3ee13b4536c7ec81167680e5ae837a2",
+  "features": [],
+  "models": [
+    "qwen3:0.6b"
+  ],
+  "commands": [
+    "cargo test --workspace --all-targets",
+    "cargo build --release -p ferrum-cli --bin ferrum",
+    "cargo test -p ferrum-server structured_output",
+    "cargo test --release -p ferrum-cli --test server_structured_output -- --ignored --test-threads=1",
+    "cargo test --release -p ferrum-cli --test server_agent_tools -- --ignored --test-threads=1"
+  ],
+  "started_at_utc": "2026-06-03T19:40:45Z",
+  "finished_at_utc": "2026-06-03T19:45:37Z",
+  "created_at": "2026-06-04T03:45:37",
+  "repo": {
+    "head": "6f821771a1915fdb8f6574b72c829fdad300217f",
+    "short_head": "6f82177",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "model": "qwen3:0.6b",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "release_build": true,
+    "ferrum_server_structured_output": true,
+    "strict_schema_real_model_20x": true,
+    "required_tool_call_real_model_10x": true
+  },
+  "artifacts": [
+    "cargo-test.log",
+    "gate.json",
+    "gate.log",
+    "release-build.log",
+    "server-agent-tools-real-model.log",
+    "server-structured-output-real-model.log",
+    "server-structured-output.log"
+  ]
+}

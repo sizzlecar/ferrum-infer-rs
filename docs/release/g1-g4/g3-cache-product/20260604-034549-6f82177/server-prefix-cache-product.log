@@ -1,0 +1,9 @@
+   Compiling ferrum-cli v0.7.5 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 21.02s
+     Running tests/server_prefix_cache_product.rs (target/release/deps/server_prefix_cache_product-b4b8aac9292826b7)
+
+running 1 test
+test g3_prefix_cache_product_real_model_smoke ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 79.23s
+

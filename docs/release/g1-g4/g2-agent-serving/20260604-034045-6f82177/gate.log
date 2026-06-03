@@ -1,0 +1,5 @@
+[2026-06-04 03:40:45] RUN cargo test --workspace --all-targets
+[2026-06-04 03:40:55] RUN cargo build --release -p ferrum-cli --bin ferrum
+[2026-06-04 03:40:56] RUN cargo test -p ferrum-server structured_output
+[2026-06-04 03:40:56] RUN cargo test --release -p ferrum-cli --test server_structured_output -- --ignored --test-threads=1
+[2026-06-04 03:44:50] RUN cargo test --release -p ferrum-cli --test server_agent_tools -- --ignored --test-threads=1
