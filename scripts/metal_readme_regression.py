@@ -27,6 +27,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CHAT_CHECK_MAX_TOKENS = 1024
 
 
 @dataclass(frozen=True)
@@ -449,27 +450,30 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 "content": "What is the capital of France? Reply with just the city name.",
             }
         ],
-        "max_tokens": 384,
-        "temperature": 0,
+        "max_tokens": CHAT_CHECK_MAX_TOKENS,
         "stream": False,
     }
     status, body = post_json(base, paris_payload)
     write(out_dir / f"{case.key}.paris_payload.json", json.dumps(paris_payload, indent=2))
     write(out_dir / f"{case.key}.paris_response.json", body)
     content = ""
+    finish_reason = None
     try:
-        content = json.loads(body)["choices"][0]["message"]["content"]
+        parsed = json.loads(body)
+        content = parsed["choices"][0]["message"]["content"]
+        finish_reason = parsed["choices"][0].get("finish_reason")
     except Exception:
         content = body[:300]
-    paris_pass = status == 200 and "paris" in content.lower()
+    paris_pass = status == 200 and finish_reason != "length" and "paris" in content.lower()
     result["paris"] = {
         "status": status,
         "passed": paris_pass,
         "content": content,
+        "finish_reason": finish_reason,
     }
     write(
         out_dir / f"{case.key}.paris_verdict.txt",
-        f"content={content}\npassed={str(paris_pass).lower()}\n",
+        f"content={content}\nfinish_reason={finish_reason}\npassed={str(paris_pass).lower()}\n",
     )
 
     multiturn_payload = {
@@ -489,8 +493,7 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 "content": "刚才暗号是什么？只回答暗号。",
             },
         ],
-        "max_tokens": 384,
-        "temperature": 0,
+        "max_tokens": CHAT_CHECK_MAX_TOKENS,
         "stream": False,
     }
     status, body = post_json(base, multiturn_payload)
@@ -500,19 +503,23 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
     )
     write(out_dir / f"{case.key}.multiturn_response.json", body)
     content = ""
+    finish_reason = None
     try:
-        content = json.loads(body)["choices"][0]["message"]["content"]
+        parsed = json.loads(body)
+        content = parsed["choices"][0]["message"]["content"]
+        finish_reason = parsed["choices"][0].get("finish_reason")
     except Exception:
         content = body[:300]
-    multiturn_pass = status == 200 and "蓝色月亮" in content
+    multiturn_pass = status == 200 and finish_reason != "length" and "蓝色月亮" in content
     result["multiturn"] = {
         "status": status,
         "passed": multiturn_pass,
         "content": content,
+        "finish_reason": finish_reason,
     }
     write(
         out_dir / f"{case.key}.multiturn_verdict.txt",
-        f"content={content}\npassed={str(multiturn_pass).lower()}\n",
+        f"content={content}\nfinish_reason={finish_reason}\npassed={str(multiturn_pass).lower()}\n",
     )
 
     stream_payload = {
@@ -527,8 +534,7 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 "content": "请只输出一句中文问候，必须包含“你好”。",
             }
         ],
-        "max_tokens": 384,
-        "temperature": 0,
+        "max_tokens": CHAT_CHECK_MAX_TOKENS,
         "stream": True,
     }
     stream_chunks = 0
