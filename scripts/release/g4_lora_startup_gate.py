@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from g1_g4_manifest import required_manifest_fields, utc_now
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -309,8 +311,31 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
     return summary
 
 
-def write_manifest(out: Path, args: argparse.Namespace, checks: dict[str, Any]) -> None:
+def write_manifest(
+    out: Path,
+    args: argparse.Namespace,
+    checks: dict[str, Any],
+    started_at_utc: str,
+) -> None:
     manifest = {
+        **required_manifest_fields(
+            repo=repo_root(),
+            goal="G4",
+            name="lora-startup",
+            models=[args.model],
+            commands=[
+                "cargo test --workspace --all-targets",
+                "cargo test -p ferrum-quantization --test lora_linear_ref",
+                "cargo test -p ferrum-models --test lora_loader",
+                "cargo test -p ferrum-server lora",
+                "cargo test -p ferrum-cli --test server_lora_startup",
+                "cargo build --release -p ferrum-cli --bin ferrum",
+                "ferrum bench-serve c=1 no-lora/base-with-lora/adapter",
+            ],
+            started_at_utc=started_at_utc,
+            binary_path=args.ferrum_bin,
+            features=[],
+        ),
         "goal": "G4",
         "name": "lora-startup",
         "status": "pass",
@@ -343,6 +368,7 @@ def write_manifest(out: Path, args: argparse.Namespace, checks: dict[str, Any]) 
 
 
 def main() -> int:
+    started_at_utc = utc_now()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--model", default="qwen3:0.6b")
@@ -378,7 +404,7 @@ def main() -> int:
     run(["cargo", "test", "-p", "ferrum-cli", "--test", "server_lora_startup"], out / "server-lora-startup.log", log)
     checks["server_lora_startup"] = True
     checks["bench"] = run_bench_gate(args, out, log)
-    write_manifest(out, args, checks)
+    write_manifest(out, args, checks, started_at_utc)
     print(f"G4 LORA STARTUP PASS: {out}")
     return 0
 

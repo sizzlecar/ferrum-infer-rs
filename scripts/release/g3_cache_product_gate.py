@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from g1_g4_manifest import required_manifest_fields, utc_now
+
 REQUIRED_METRICS = [
     "ferrum_prefix_cache_hits_total",
     "ferrum_prefix_cache_misses_total",
@@ -249,9 +251,31 @@ def run_bench_pair(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
     return summary
 
 
-def write_artifacts(out: Path, args: argparse.Namespace, checks: dict[str, Any]) -> None:
+def write_artifacts(
+    out: Path,
+    args: argparse.Namespace,
+    checks: dict[str, Any],
+    started_at_utc: str,
+) -> None:
     (out / "gate.json").write_text(json.dumps({"status": "pass", "goal": "g3-cache-product", "checks": checks}, ensure_ascii=False, indent=2) + "\n")
     manifest = {
+        **required_manifest_fields(
+            repo=repo_root(),
+            goal="G3",
+            name="cache-product",
+            models=[args.model],
+            commands=[
+                "cargo test --workspace --all-targets",
+                "cargo test -p ferrum-server cache_metrics_contract",
+                "cargo test --release -p ferrum-cli --test server_prefix_cache_product -- --ignored --test-threads=1",
+                "cargo test --release -p ferrum-cli --test server_session_cache -- --ignored --test-threads=1",
+                "cargo build --release -p ferrum-cli --bin ferrum",
+                "ferrum bench-serve shared-prefix disabled/enabled",
+            ],
+            started_at_utc=started_at_utc,
+            binary_path=args.ferrum_bin,
+            features=[],
+        ),
         "goal": "G3",
         "name": "cache-product",
         "status": "pass",
@@ -282,6 +306,7 @@ def write_artifacts(out: Path, args: argparse.Namespace, checks: dict[str, Any])
 
 
 def main() -> int:
+    started_at_utc = utc_now()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--model", default="qwen3:0.6b")
@@ -320,7 +345,7 @@ def main() -> int:
     checks["server_session_cache"] = True
 
     checks["bench"] = run_bench_pair(args, out, log)
-    write_artifacts(out, args, checks)
+    write_artifacts(out, args, checks, started_at_utc)
     print(f"G3 CACHE PRODUCT PASS: {out}")
     return 0
 

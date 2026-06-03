@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from g1_g4_manifest import required_manifest_fields, utc_now
+
 BAD_RUNTIME_PATTERNS = [
     "panicked at",
     "KV cache overflow",
@@ -80,10 +82,31 @@ def run(cmd: list[str], out: Path, log: GateLog, *, timeout: int = 1200, scan_ru
     return proc
 
 
-def write_artifacts(out: Path, args: argparse.Namespace, checks: dict[str, Any]) -> None:
+def write_artifacts(
+    out: Path,
+    args: argparse.Namespace,
+    checks: dict[str, Any],
+    started_at_utc: str,
+) -> None:
     gate = {"status": "pass", "goal": "g2-agent-serving", "checks": checks}
     (out / "gate.json").write_text(json.dumps(gate, ensure_ascii=False, indent=2) + "\n")
     manifest = {
+        **required_manifest_fields(
+            repo=repo_root(),
+            goal="G2",
+            name="agent-serving",
+            models=[args.model],
+            commands=[
+                "cargo test --workspace --all-targets",
+                "cargo build --release -p ferrum-cli --bin ferrum",
+                "cargo test -p ferrum-server structured_output",
+                "cargo test --release -p ferrum-cli --test server_structured_output -- --ignored --test-threads=1",
+                "cargo test --release -p ferrum-cli --test server_agent_tools -- --ignored --test-threads=1",
+            ],
+            started_at_utc=started_at_utc,
+            binary_path=repo_root() / "target" / "release" / "ferrum",
+            features=[],
+        ),
         "goal": "G2",
         "name": "agent-serving",
         "status": "pass",
@@ -113,6 +136,7 @@ def write_artifacts(out: Path, args: argparse.Namespace, checks: dict[str, Any])
 
 
 def main() -> int:
+    started_at_utc = utc_now()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--model", default="qwen3:0.6b")
@@ -130,6 +154,14 @@ def main() -> int:
     else:
         run(["cargo", "test", "--workspace", "--all-targets"], out / "cargo-test.log", log, timeout=2400)
         checks["cargo_workspace_all_targets"] = True
+
+    run(
+        ["cargo", "build", "--release", "-p", "ferrum-cli", "--bin", "ferrum"],
+        out / "release-build.log",
+        log,
+        timeout=1200,
+    )
+    checks["release_build"] = True
 
     run(["cargo", "test", "-p", "ferrum-server", "structured_output"], out / "server-structured-output.log", log, timeout=600)
     checks["ferrum_server_structured_output"] = True
@@ -152,7 +184,7 @@ def main() -> int:
     )
     checks["required_tool_call_real_model_10x"] = True
 
-    write_artifacts(out, args, checks)
+    write_artifacts(out, args, checks, started_at_utc)
     print(f"G2 AGENT SERVING PASS: {out}")
     return 0
 

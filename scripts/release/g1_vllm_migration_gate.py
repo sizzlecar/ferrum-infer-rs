@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from g1_g4_manifest import required_manifest_fields, utc_now
+
 BAD_LOG_PATTERNS = [
     "panicked",
     "panic",
@@ -309,17 +311,30 @@ def direct_smoke(bin_path: Path, model: str, model_name: str, out: Path, log: Ga
         assert_no_bad_patterns("serve.log", serve_text)
 
 
-def write_manifest(out: Path, args: argparse.Namespace, checks: dict[str, Any]) -> None:
+def write_manifest(
+    out: Path,
+    args: argparse.Namespace,
+    checks: dict[str, Any],
+    started_at_utc: str,
+) -> None:
     manifest = {
-        "goal": "g1-vllm-migration",
-        "status": "pass",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "repo": {
-            "head": git_value(["rev-parse", "HEAD"]),
-            "short_head": git_value(["rev-parse", "--short", "HEAD"]),
-            "branch": git_value(["branch", "--show-current"]),
-            "dirty": bool(git_value(["status", "--porcelain"], "")),
-        },
+        **required_manifest_fields(
+            repo=repo_root(),
+            goal="G1",
+            name="vllm-migration",
+            models=[args.model],
+            commands=[
+                "cargo test --workspace --all-targets",
+                "cargo test -p ferrum-cli --test vllm_migration_compat serve_help_lists_vllm_compat_flags",
+                "cargo build --release -p ferrum-cli --bin ferrum",
+                "ferrum serve --help",
+                "cargo test --release -p ferrum-cli --test vllm_migration_compat -- --ignored --test-threads=1",
+                "direct OpenAI-compatible smoke via /v1/models and /v1/chat/completions",
+            ],
+            started_at_utc=started_at_utc,
+            binary_path=args.ferrum_bin,
+            features=[],
+        ),
         "model": args.model,
         "model_name": args.model_name,
         "checks": checks,
@@ -340,6 +355,7 @@ def write_manifest(out: Path, args: argparse.Namespace, checks: dict[str, Any]) 
 
 
 def main() -> int:
+    started_at_utc = utc_now()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=None, help="artifact directory")
     parser.add_argument("--model", default="qwen3:0.6b", help="local Ferrum model path or alias")
@@ -395,7 +411,7 @@ def main() -> int:
     (out / "smoke.json").write_text(json.dumps(checks["direct_openai_smoke"], ensure_ascii=False, indent=2) + "\n")
 
     (out / "gate.json").write_text(json.dumps({"status": "pass", "goal": "g1-vllm-migration", "checks": checks}, ensure_ascii=False, indent=2) + "\n")
-    write_manifest(out, args, checks)
+    write_manifest(out, args, checks, started_at_utc)
     print(f"G1 VLLM MIGRATION PASS: {out}")
     return 0
 
