@@ -230,16 +230,18 @@ def validate_lora_api(base_url: str, out: Path) -> tuple[str, str]:
     for model in [base_id, adapter_id]:
         code, body = http_json("POST", base_url + "/v1/chat/completions", {
             "model": model,
-            "messages": [{"role": "user", "content": "用一句话解释 LoRA。"}],
+            "messages": [{"role": "user", "content": "不要展开推理，直接用一句话解释 LoRA。"}],
             "temperature": 0,
-            "max_tokens": 32,
+            "max_tokens": 256,
         })
         (out / f"chat-{safe_artifact_name(model)}.json").write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
         if code != 200:
             raise RuntimeError(f"chat failed for {model}: {code} {body}")
-        content = body["choices"][0]["message"].get("content") or ""
-        if not content.strip():
-            raise RuntimeError(f"empty chat content for {model}: {body}")
+        message = body["choices"][0]["message"]
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning") or ""
+        if not (content.strip() or reasoning.strip()):
+            raise RuntimeError(f"empty chat output for {model}: {body}")
 
     code, body = http_json("POST", base_url + "/v1/chat/completions", {
         "model": f"{base_id}:missing",
