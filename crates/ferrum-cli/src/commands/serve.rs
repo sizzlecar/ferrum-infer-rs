@@ -75,12 +75,38 @@ pub struct ServeCommand {
     pub max_num_batched_tokens: Option<usize>,
 
     /// Enable prefix caching (`FERRUM_PREFIX_CACHE=1`).
-    #[arg(long, conflicts_with = "no_enable_prefix_caching")]
+    #[arg(
+        long,
+        conflicts_with_all = ["no_enable_prefix_caching", "disable_prefix_cache"]
+    )]
     pub enable_prefix_caching: bool,
 
     /// Disable prefix caching (`FERRUM_PREFIX_CACHE=0`).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "enable_prefix_cache")]
     pub no_enable_prefix_caching: bool,
+
+    /// Enable prefix cache (`FERRUM_PREFIX_CACHE=1`).
+    #[arg(
+        long,
+        conflicts_with_all = ["no_enable_prefix_caching", "disable_prefix_cache"]
+    )]
+    pub enable_prefix_cache: bool,
+
+    /// Disable prefix cache (`FERRUM_PREFIX_CACHE=0`).
+    #[arg(long, conflicts_with_all = ["enable_prefix_caching", "enable_prefix_cache"])]
+    pub disable_prefix_cache: bool,
+
+    /// Session cache mode (`off` or `memory`).
+    #[arg(long, value_name = "MODE", value_parser = ["off", "memory"])]
+    pub session_cache: Option<String>,
+
+    /// Maximum in-memory session cache entries.
+    #[arg(long, value_name = "N")]
+    pub session_cache_max_entries: Option<usize>,
+
+    /// Approximate maximum tokens retained per session.
+    #[arg(long, value_name = "N")]
+    pub session_cache_max_tokens: Option<usize>,
 
     /// KV cache element dtype (Dim 5 polymorphism point). Accepts
     /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
@@ -142,6 +168,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_num_batched_tokens,
         enable_prefix_caching,
         no_enable_prefix_caching,
+        enable_prefix_cache,
+        disable_prefix_cache,
+        session_cache,
+        session_cache_max_entries,
+        session_cache_max_tokens,
         kv_dtype,
         runtime_preset,
         effective_config_json,
@@ -447,7 +478,15 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
-        prefix_cache_cli_override(enable_prefix_caching, no_enable_prefix_caching),
+        prefix_cache_cli_override(
+            enable_prefix_caching,
+            no_enable_prefix_caching,
+            enable_prefix_cache,
+            disable_prefix_cache,
+        ),
+        session_cache.as_deref(),
+        session_cache_max_entries,
+        session_cache_max_tokens,
         profile_jsonl.as_ref(),
         profile_commit_sha.as_deref(),
         profile_env_hash.as_deref(),
@@ -818,6 +857,9 @@ fn serve_cli_runtime_entries(
     max_num_seqs: Option<usize>,
     max_num_batched_tokens: Option<usize>,
     prefix_cache: Option<bool>,
+    session_cache: Option<&str>,
+    session_cache_max_entries: Option<usize>,
+    session_cache_max_tokens: Option<usize>,
     profile_jsonl: Option<&PathBuf>,
     profile_commit_sha: Option<&str>,
     profile_env_hash: Option<&str>,
@@ -841,6 +883,17 @@ fn serve_cli_runtime_entries(
             RuntimeConfigSource::Cli,
         ));
     }
+    push_cli_runtime_entry(&mut entries, "FERRUM_SESSION_CACHE", session_cache);
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_SESSION_CACHE_MAX_ENTRIES",
+        session_cache_max_entries,
+    );
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_SESSION_CACHE_MAX_TOKENS",
+        session_cache_max_tokens,
+    );
     if let Some(path) = profile_jsonl {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_PROFILE_JSONL",
@@ -870,11 +923,18 @@ fn serve_cli_runtime_entries(
     entries
 }
 
-fn prefix_cache_cli_override(enable: bool, disable: bool) -> Option<bool> {
-    match (enable, disable) {
-        (true, false) => Some(true),
-        (false, true) => Some(false),
-        _ => None,
+fn prefix_cache_cli_override(
+    enable_vllm: bool,
+    disable_vllm: bool,
+    enable_product: bool,
+    disable_product: bool,
+) -> Option<bool> {
+    if enable_vllm || enable_product {
+        Some(true)
+    } else if disable_vllm || disable_product {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -1364,6 +1424,9 @@ mod tests {
             Some(64),
             Some(2048),
             Some(false),
+            Some("memory"),
+            Some(16),
+            Some(1024),
             Some(&PathBuf::from("/tmp/profile.jsonl")),
             Some("abc123"),
             Some("sha256:test"),
@@ -1389,6 +1452,15 @@ mod tests {
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
+        assert_eq!(entry("FERRUM_SESSION_CACHE").effective_value, "memory");
+        assert_eq!(
+            entry("FERRUM_SESSION_CACHE_MAX_ENTRIES").effective_value,
+            "16"
+        );
+        assert_eq!(
+            entry("FERRUM_SESSION_CACHE_MAX_TOKENS").effective_value,
+            "1024"
+        );
         assert_eq!(
             entry("FERRUM_MAX_MODEL_LEN").source,
             RuntimeConfigSource::Cli
@@ -1416,6 +1488,9 @@ mod tests {
         .runtime_config_entries();
         let cli_entries = serve_cli_runtime_entries(
             Some("int8"),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1487,6 +1562,9 @@ mod tests {
             Some(8),
             Some(512),
             Some(false),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1931,6 +2009,9 @@ mod tests {
         )]);
         let cli_entries = serve_cli_runtime_entries(
             Some("bf16"),
+            None,
+            None,
+            None,
             None,
             None,
             None,

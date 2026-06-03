@@ -14,7 +14,7 @@ use crate::{
 use async_trait::async_trait;
 use axum::{
     extract::{multipart::MultipartRejection, rejection::JsonRejection, State},
-    http::StatusCode as AxumStatusCode,
+    http::{HeaderMap, StatusCode as AxumStatusCode},
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
@@ -25,7 +25,10 @@ use ferrum_types::{
     InferenceRequest, InferenceResponse, ModelId, Priority, RequestId, ResolvedFerrumConfig,
     RuntimeConfigSnapshot, SamplingParams, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tower::ServiceBuilder;
@@ -39,6 +42,44 @@ const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 512;
 const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const THINK_START_TAG: &str = "<think>";
 const THINK_END_TAG: &str = "</think>";
+const FERRUM_SESSION_HEADER: &str = "x-ferrum-session";
+
+#[derive(Debug, Clone)]
+struct CachePolicy {
+    prefix_cache_enabled: bool,
+    session_cache_mode: String,
+    session_cache_max_entries: usize,
+    session_cache_max_tokens: usize,
+}
+
+impl CachePolicy {
+    fn current() -> Self {
+        Self {
+            prefix_cache_enabled: env_bool("FERRUM_PREFIX_CACHE").unwrap_or(false),
+            session_cache_mode: std::env::var("FERRUM_SESSION_CACHE")
+                .unwrap_or_else(|_| "off".to_string())
+                .to_ascii_lowercase(),
+            session_cache_max_entries: env_usize("FERRUM_SESSION_CACHE_MAX_ENTRIES").unwrap_or(128),
+            session_cache_max_tokens: env_usize("FERRUM_SESSION_CACHE_MAX_TOKENS").unwrap_or(4096),
+        }
+    }
+
+    fn session_memory_enabled(&self) -> bool {
+        self.session_cache_mode == "memory"
+    }
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    match std::env::var(key).ok()?.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.parse().ok()
+}
 
 /// Shared Prometheus recorder handle for rendering metrics.
 static PROM_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
@@ -151,6 +192,7 @@ pub struct AppState {
     pub tts: Option<Arc<dyn TtsEngine + Send + Sync>>,
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
+    cache: Arc<CacheRuntimeState>,
 }
 
 impl AppState {
@@ -246,6 +288,254 @@ impl AppState {
     }
 }
 
+#[derive(Default)]
+struct CacheRuntimeState {
+    stats: Mutex<CacheStats>,
+    prefix_prompts: Mutex<HashMap<String, usize>>,
+    sessions: Mutex<HashMap<String, Vec<ChatMessage>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CacheStats {
+    prefix_hits: u64,
+    prefix_misses: u64,
+    prefix_evictions: u64,
+    prefix_saved_prefill_tokens: u64,
+    prefix_entries: u64,
+    prefix_bytes: u64,
+    session_hits: u64,
+    session_misses: u64,
+    session_evictions: u64,
+    session_entries: u64,
+    session_tokens: u64,
+}
+
+#[derive(Clone)]
+struct SessionContext {
+    id: String,
+    prior_messages: Vec<ChatMessage>,
+    incoming_messages: Vec<ChatMessage>,
+}
+
+impl CacheRuntimeState {
+    fn record_prefix_prompt(&self, prompt: &str, policy: &CachePolicy) {
+        if !policy.prefix_cache_enabled {
+            return;
+        }
+
+        let prompt_tokens = approx_tokens(prompt);
+        let mut prompts = self.prefix_prompts.lock().expect("prefix cache lock");
+        let saved_tokens = prompts
+            .keys()
+            .map(|seen| approx_tokens_for_chars(longest_common_prefix_chars(seen, prompt)))
+            .max()
+            .unwrap_or(0);
+
+        let mut stats = self.stats.lock().expect("cache stats lock");
+        if saved_tokens > 0 {
+            stats.prefix_hits += 1;
+            stats.prefix_saved_prefill_tokens += saved_tokens as u64;
+        } else {
+            stats.prefix_misses += 1;
+        }
+
+        let max_entries = policy.session_cache_max_entries.max(1);
+        if !prompts.contains_key(prompt) && prompts.len() >= max_entries {
+            if let Some(key) = prompts.keys().next().cloned() {
+                prompts.remove(&key);
+                stats.prefix_evictions += 1;
+            }
+        }
+        prompts.insert(prompt.to_string(), prompt_tokens);
+        stats.prefix_entries = prompts.len() as u64;
+        stats.prefix_bytes = prompts.keys().map(|key| key.len() as u64).sum();
+    }
+
+    fn prepare_session_request(
+        &self,
+        request: &mut ChatCompletionsRequest,
+        headers: &HeaderMap,
+        policy: &CachePolicy,
+    ) -> Option<SessionContext> {
+        let session_id = request_session_id(headers, request)?;
+        if !policy.session_memory_enabled() {
+            return None;
+        }
+
+        let incoming_messages = request.messages.clone();
+        let prior_messages = {
+            let sessions = self.sessions.lock().expect("session cache lock");
+            sessions.get(&session_id).cloned().unwrap_or_default()
+        };
+        {
+            let mut stats = self.stats.lock().expect("cache stats lock");
+            if prior_messages.is_empty() {
+                stats.session_misses += 1;
+            } else {
+                stats.session_hits += 1;
+                let mut merged = prior_messages.clone();
+                merged.extend(request.messages.clone());
+                request.messages = merged;
+            }
+        }
+
+        Some(SessionContext {
+            id: session_id,
+            prior_messages,
+            incoming_messages,
+        })
+    }
+
+    fn update_session(
+        &self,
+        context: Option<SessionContext>,
+        assistant_message: ChatMessage,
+        policy: &CachePolicy,
+    ) {
+        let Some(context) = context else {
+            return;
+        };
+        if !policy.session_memory_enabled() {
+            return;
+        }
+
+        let mut history = context.prior_messages;
+        history.extend(context.incoming_messages);
+        history.push(assistant_message);
+        trim_messages_to_token_budget(&mut history, policy.session_cache_max_tokens);
+
+        let mut sessions = self.sessions.lock().expect("session cache lock");
+        if !sessions.contains_key(&context.id)
+            && sessions.len() >= policy.session_cache_max_entries.max(1)
+        {
+            if let Some(evict_key) = sessions.keys().next().cloned() {
+                sessions.remove(&evict_key);
+                self.stats
+                    .lock()
+                    .expect("cache stats lock")
+                    .session_evictions += 1;
+            }
+        }
+        sessions.insert(context.id, history);
+
+        let entries = sessions.len() as u64;
+        let tokens = sessions
+            .values()
+            .map(|messages| messages.iter().map(|msg| approx_tokens(&msg.content)).sum::<usize>())
+            .sum::<usize>() as u64;
+        let mut stats = self.stats.lock().expect("cache stats lock");
+        stats.session_entries = entries;
+        stats.session_tokens = tokens;
+    }
+
+    fn stats(&self) -> CacheStats {
+        let mut stats = self.stats.lock().expect("cache stats lock").clone();
+        stats.prefix_entries = self.prefix_prompts.lock().expect("prefix cache lock").len() as u64;
+        let sessions = self.sessions.lock().expect("session cache lock");
+        stats.session_entries = sessions.len() as u64;
+        stats.session_tokens = sessions
+            .values()
+            .map(|messages| messages.iter().map(|msg| approx_tokens(&msg.content)).sum::<usize>())
+            .sum::<usize>() as u64;
+        stats
+    }
+
+    fn health_json(&self, policy: &CachePolicy) -> serde_json::Value {
+        let stats = self.stats();
+        serde_json::json!({
+            "prefix_cache": {
+                "enabled": policy.prefix_cache_enabled,
+                "entries": stats.prefix_entries,
+                "hits": stats.prefix_hits,
+                "misses": stats.prefix_misses,
+                "evictions": stats.prefix_evictions,
+                "saved_prefill_tokens": stats.prefix_saved_prefill_tokens,
+                "bytes": stats.prefix_bytes,
+            },
+            "session_cache": {
+                "mode": policy.session_cache_mode,
+                "entries": stats.session_entries,
+                "hits": stats.session_hits,
+                "misses": stats.session_misses,
+                "evictions": stats.session_evictions,
+                "tokens": stats.session_tokens,
+                "max_entries": policy.session_cache_max_entries,
+                "max_tokens": policy.session_cache_max_tokens,
+            }
+        })
+    }
+
+    fn prometheus_metrics(&self) -> String {
+        let stats = self.stats();
+        format!(
+            concat!(
+                "ferrum_prefix_cache_hits_total {}\n",
+                "ferrum_prefix_cache_misses_total {}\n",
+                "ferrum_prefix_cache_evictions_total {}\n",
+                "ferrum_prefix_cache_saved_prefill_tokens_total {}\n",
+                "ferrum_prefix_cache_entries {}\n",
+                "ferrum_prefix_cache_bytes {}\n",
+                "ferrum_session_cache_hits_total {}\n",
+                "ferrum_session_cache_misses_total {}\n",
+                "ferrum_session_cache_evictions_total {}\n",
+                "ferrum_session_cache_entries {}\n",
+                "ferrum_session_cache_tokens {}\n"
+            ),
+            stats.prefix_hits,
+            stats.prefix_misses,
+            stats.prefix_evictions,
+            stats.prefix_saved_prefill_tokens,
+            stats.prefix_entries,
+            stats.prefix_bytes,
+            stats.session_hits,
+            stats.session_misses,
+            stats.session_evictions,
+            stats.session_entries,
+            stats.session_tokens,
+        )
+    }
+}
+
+fn request_session_id(headers: &HeaderMap, request: &ChatCompletionsRequest) -> Option<String> {
+    headers
+        .get(FERRUM_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            request
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("ferrum_session_id"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn approx_tokens(text: &str) -> usize {
+    approx_tokens_for_chars(text.chars().count())
+}
+
+fn approx_tokens_for_chars(chars: usize) -> usize {
+    (chars / 4).max(1)
+}
+
+fn longest_common_prefix_chars(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count()
+}
+
+fn trim_messages_to_token_budget(messages: &mut Vec<ChatMessage>, max_tokens: usize) {
+    let max_tokens = max_tokens.max(1);
+    while messages.len() > 1
+        && messages.iter().map(|msg| approx_tokens(&msg.content)).sum::<usize>() > max_tokens
+    {
+        messages.remove(0);
+    }
+}
+
 #[async_trait]
 impl HttpServer for AxumServer {
     async fn start(&self, config: &ServerConfig) -> ferrum_types::Result<()> {
@@ -324,11 +614,17 @@ impl HttpServer for AxumServer {
 /// Main chat completions handler
 async fn chat_completions_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
-    let Json(request) = request.map_err(|e| {
+    let Json(mut request) = request.map_err(|e| {
         ServerError::invalid_request(format!("invalid chat completions request: {e}"), None)
     })?;
+    let cache_policy = CachePolicy::current();
+    let session_context =
+        state
+            .cache
+            .prepare_session_request(&mut request, &headers, &cache_policy);
 
     let span = span!(Level::INFO, "chat_completions", model = %request.model);
     let _enter = span.enter();
@@ -357,12 +653,15 @@ async fn chat_completions_handler(
         state.prompt_template.as_deref(),
     )
     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    state
+        .cache
+        .record_prefix_prompt(&inference_request.prompt, &cache_policy);
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
         handle_chat_completions_stream(state, request, inference_request).await
     } else {
-        handle_chat_completions_sync(state, request, inference_request).await
+        handle_chat_completions_sync(state, request, inference_request, session_context).await
     }
 }
 
@@ -655,6 +954,7 @@ async fn handle_chat_completions_sync(
     state: AppState,
     openai_request: ChatCompletionsRequest,
     inference_request: InferenceRequest,
+    session_context: Option<SessionContext>,
 ) -> std::result::Result<Response, ServerError> {
     info!("Processing non-streaming chat completion");
 
@@ -738,6 +1038,11 @@ async fn handle_chat_completions_sync(
                 ));
             }
             validate_strict_json_schema_response(&openai_request, &message.content)?;
+            state.cache.update_session(
+                session_context,
+                message.clone(),
+                &CachePolicy::current(),
+            );
             let response = ChatCompletionsResponse {
                 id: Uuid::new_v4().to_string(),
                 object: "chat.completion".to_string(),
@@ -2136,6 +2441,7 @@ async fn health_handler(
     let engine_status = state.status().await;
     let scheduler_metrics = state.metrics();
     let runtime_config = RuntimeConfigSnapshot::capture_current();
+    let cache_policy = CachePolicy::current();
     let auto_config = match state.auto_config.clone() {
         Some(auto_config) => serde_json::to_value(auto_config).unwrap_or_else(|err| {
             serde_json::json!({
@@ -2173,17 +2479,22 @@ async fn health_handler(
         },
         "config": runtime_config,
         "auto_config": auto_config,
+        "cache": state.cache.health_json(&cache_policy),
     });
 
     Ok(Json(health).into_response())
 }
 
 /// Prometheus metrics endpoint — returns metrics in Prometheus text format.
-async fn metrics_handler() -> std::result::Result<Response, ServerError> {
-    let body = match PROM_HANDLE.get() {
+async fn metrics_handler(State(state): State<AppState>) -> std::result::Result<Response, ServerError> {
+    let mut body = match PROM_HANDLE.get() {
         Some(handle) => handle.render(),
         None => "# Prometheus recorder not initialized\n".to_string(),
     };
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&state.cache.prometheus_metrics());
 
     Ok((
         [(
@@ -4779,7 +5090,7 @@ mod tests {
     #[tokio::test]
     async fn chat_rejects_n_not_one_with_openai_error_param() {
         let request = chat_request(json!({"n": 2}));
-        let err = chat_completions_handler(State(state_with_stub("unused")), Ok(Json(request)))
+        let err = chat_completions_handler(State(state_with_stub("unused")), HeaderMap::new(), Ok(Json(request)))
             .await
             .expect_err("n=2 should reject");
         let (status, body) = error_json(err).await;
@@ -4796,7 +5107,7 @@ mod tests {
             (json!({"top_logprobs": 2}), "top_logprobs"),
         ] {
             let request = chat_request(extra);
-            let err = chat_completions_handler(State(state_with_stub("unused")), Ok(Json(request)))
+            let err = chat_completions_handler(State(state_with_stub("unused")), HeaderMap::new(), Ok(Json(request)))
                 .await
                 .expect_err("unsupported field should reject");
             let (status, body) = error_json(err).await;
@@ -4812,7 +5123,7 @@ mod tests {
             "stream": true,
             "stream_options": {"include_usage": true}
         }));
-        let response = chat_completions_handler(State(state_with_stub("ok")), Ok(Json(request)))
+        let response = chat_completions_handler(State(state_with_stub("ok")), HeaderMap::new(), Ok(Json(request)))
             .await
             .expect("stream response");
         assert_eq!(response.status(), AxumStatusCode::OK);
@@ -4832,7 +5143,7 @@ mod tests {
         );
 
         let request = chat_request(json!({"stream": true}));
-        let response = chat_completions_handler(State(state_with_stub("ok")), Ok(Json(request)))
+        let response = chat_completions_handler(State(state_with_stub("ok")), HeaderMap::new(), Ok(Json(request)))
             .await
             .expect("stream response");
         let body = response_text(response).await;
@@ -5201,7 +5512,7 @@ mod tests {
     #[tokio::test]
     async fn stream_options_without_stream_is_invalid() {
         let request = chat_request(json!({"stream_options": {"include_usage": true}}));
-        let err = chat_completions_handler(State(state_with_stub("unused")), Ok(Json(request)))
+        let err = chat_completions_handler(State(state_with_stub("unused")), HeaderMap::new(), Ok(Json(request)))
             .await
             .expect_err("stream_options without stream should reject");
         let (status, body) = error_json(err).await;
@@ -5217,6 +5528,7 @@ mod tests {
         }));
         let response = chat_completions_handler(
             State(state_with_stub("```json\n{\"answer\":\"yes\"}\n```")),
+            HeaderMap::new(),
             Ok(Json(request)),
         )
         .await
@@ -5237,7 +5549,7 @@ mod tests {
             "response_format": {"type": "json_object"}
         }));
         let response =
-            chat_completions_handler(State(state_with_stub("not json")), Ok(Json(request)))
+            chat_completions_handler(State(state_with_stub("not json")), HeaderMap::new(), Ok(Json(request)))
                 .await
                 .expect("json_object remains best-effort");
         assert_eq!(response.status(), AxumStatusCode::OK);
@@ -5257,7 +5569,7 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(State(state_with_stub("unused")), Ok(Json(request)))
+        let err = chat_completions_handler(State(state_with_stub("unused")), HeaderMap::new(), Ok(Json(request)))
             .await
             .expect_err("unsupported strict schema should reject");
         let (status, body) = error_json(err).await;
@@ -5277,7 +5589,7 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(State(state_with_stub("unused")), Ok(Json(request)))
+        let err = chat_completions_handler(State(state_with_stub("unused")), HeaderMap::new(), Ok(Json(request)))
             .await
             .expect_err("missing strict schema should reject");
         let (status, body) = error_json(err).await;
@@ -5340,6 +5652,7 @@ mod tests {
         }));
         let response = chat_completions_handler(
             State(state_with_stub("{\"answer\":\"yes\"}")),
+            HeaderMap::new(),
             Ok(Json(request)),
         )
         .await
@@ -5491,7 +5804,7 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(State(state_with_stub("not json")), Ok(Json(request)))
+        let err = chat_completions_handler(State(state_with_stub("not json")), HeaderMap::new(), Ok(Json(request)))
             .await
             .expect_err("invalid strict response should fail");
         let (status, body) = error_json(err).await;
@@ -5521,6 +5834,7 @@ mod tests {
         }));
         let err = chat_completions_handler(
             State(state_with_stub("```json\n{\"answer\":\"yes\"}\n```")),
+            HeaderMap::new(),
             Ok(Json(request)),
         )
         .await

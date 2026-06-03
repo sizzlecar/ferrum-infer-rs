@@ -105,6 +105,12 @@ pub struct ChatCompletionsRequest {
     /// Legacy OpenAI function-call selector.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_call: Option<FunctionCallChoice>,
+
+    /// Ferrum extension metadata. Used for opt-in product features such as
+    /// `metadata.ferrum_session_id` when callers prefer body metadata over
+    /// the `X-Ferrum-Session` header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// OpenAI streaming options.

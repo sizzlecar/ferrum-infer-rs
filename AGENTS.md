@@ -128,6 +128,10 @@
 - G2 `tool_choice=required` semantics are product behavior: require at least one function tool, steer toward a tool argument schema, return OpenAI-shaped `tool_calls`, and return/stream an OpenAI-shaped error with `param=tool_choice` if no valid tool call is produced.
 - G2 must not leak invalid strict-schema or required-tool content before validation in streaming mode. Buffer first; then emit valid deltas or an OpenAI-shaped SSE error followed by exactly one `[DONE]`.
 - G2 final evidence must print `G2 AGENT SERVING PASS: <artifact_dir>` and record artifacts under `docs/release/g1-g4/g2-agent-serving/<timestamp>-<short_sha>/`.
+- G3 prefix/session cache changes cover `FERRUM_PREFIX_CACHE`, `FERRUM_SESSION_CACHE`, `X-Ferrum-Session`, KV/prefix sharing, request session ids, scheduler admission, `/health.cache`, and cache metrics. Any change touching these paths must run G3 cache correctness tests.
+- G3 correctness is mandatory: prefix cache must not change greedy byte output for identical requests, must not cross-talk shared-prefix suffixes, and must not corrupt strict JSON or tool calls. Session cache must be opt-in and must not leak content across different session ids.
+- G3 performance claims require `ferrum bench-serve --fail-on-error --require-ci` shared-prefix artifacts. If TTFT improvement is inconclusive, the artifact may say so, but cache hits and saved prefill token counters must still be present and correctness must pass.
+- G3 final evidence must print `G3 CACHE PRODUCT PASS: <artifact_dir>` and record artifacts under `docs/release/g1-g4/g3-cache-product/<timestamp>-<short_sha>/`.
 
 ## Directory Cleanup Policy
 - Before moving, deleting, or archiving files under `crates/`, `docs/`, or `scripts/`, run `python3 scripts/release/inventory_tree.py --out docs/release/cleanup/<YYYYMMDD>-inventory.md` and commit the inventory.
