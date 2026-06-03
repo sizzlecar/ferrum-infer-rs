@@ -202,6 +202,10 @@ def throughput(path: Path) -> float:
     return float(obj["output_throughput_tps"]["mean"])
 
 
+def safe_artifact_name(value: str) -> str:
+    return value.replace("/", "--").replace(":", "-")
+
+
 def model_ids(base_url: str) -> set[str]:
     code, models = http_json("GET", base_url + "/v1/models")
     if code != 200:
@@ -230,7 +234,7 @@ def validate_lora_api(base_url: str, out: Path) -> tuple[str, str]:
             "temperature": 0,
             "max_tokens": 32,
         })
-        (out / f"chat-{model.replace(':', '-')}.json").write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
+        (out / f"chat-{safe_artifact_name(model)}.json").write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
         if code != 200:
             raise RuntimeError(f"chat failed for {model}: {code} {body}")
         content = body["choices"][0]["message"].get("content") or ""
