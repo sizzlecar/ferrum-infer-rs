@@ -2,6 +2,14 @@
 
 G0 gates harden release validation for source, official release assets, and Homebrew packaging. Every gate must print an explicit `PASS` line and return non-zero on failure.
 
+Before a release-gate script change is trusted, run the validator selftest:
+
+```bash
+python3 scripts/release/selftest_g0_validators.py
+```
+
+It uses synthetic artifacts to verify both the positive path and the failure path. It does not run models or GPUs.
+
 ## Source gates
 
 ```bash

@@ -9,6 +9,7 @@ This directory keeps release gates, CUDA/M3 runners, benchmark utilities, and mi
 - `scripts/release/release_binary_gate.py`: official release tarball and Homebrew binary/fetch gates.
 - `scripts/release/g0_release_summary.py`: release gate summary aggregator.
 - `scripts/release/inventory_tree.py`: crates/docs/scripts inventory generator required before cleanup.
+- `scripts/release/selftest_g0_validators.py`: tiny positive/negative selftest for the release validators. It does not run models or GPUs.
 
 ## Canonical runners
 
