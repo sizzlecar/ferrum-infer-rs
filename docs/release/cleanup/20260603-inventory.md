@@ -151,6 +151,7 @@ Crates on disk not listed in workspace:
 - `scripts/release/g0_source_gate.sh`
 - `scripts/release/inventory_tree.py`
 - `scripts/release/release_binary_gate.py`
+- `scripts/release/selftest_g0_validators.py`
 - `scripts/release/validate_metal_readme_regression.py`
 
 ## Docs inventory
@@ -945,6 +946,7 @@ Crates on disk not listed in workspace:
 ### release docs
 
 - `docs/release/GATES.md`
+- `docs/release/cleanup/20260603-inventory.md`
 
 ### session/debug notes
 
@@ -975,31 +977,31 @@ Crates on disk not listed in workspace:
 
 ## Archive/delete candidate reference counts
 
-- `scripts/bottleneck_localize.sh`: git-grep references = 5
-- `scripts/check_ferrum_env_registry.py`: git-grep references = 17
-- `scripts/graph_repro.cu`: git-grep references = 3
-- `scripts/graph_repro_v2.cu`: git-grep references = 1
-- `scripts/graph_repro_v3.cu`: git-grep references = 1
-- `scripts/graph_repro_v4.cu`: git-grep references = 2
-- `scripts/graph_repro_v5.cu`: git-grep references = 1
-- `scripts/graph_repro_v6.cu`: git-grep references = 0
-- `scripts/graph_repro_v7.cu`: git-grep references = 0
-- `scripts/graph_repro_v8.cu`: git-grep references = 0
-- `scripts/lm_eval_light.sh`: git-grep references = 8
-- `scripts/lock_gpu.sh`: git-grep references = 10
-- `scripts/metal_readme_regression.py`: git-grep references = 1
-- `scripts/paris_bisect.sh`: git-grep references = 7
-- `scripts/phase-e-gen-baseline.py`: git-grep references = 1
-- `scripts/phase-e-verify.sh`: git-grep references = 5
-- `scripts/regen-fused-moe-tile-sweep.sh`: git-grep references = 4
-- `scripts/regen-triton-ptx.sh`: git-grep references = 1
-- `scripts/release.sh`: git-grep references = 2
-- `scripts/remote.sh`: git-grep references = 0
-- `scripts/run_graph_repro.sh`: git-grep references = 0
-- `scripts/setup_gpu.sh`: git-grep references = 2
-- `scripts/sweep-fused-moe-tiles.sh`: git-grep references = 2
-- `scripts/sweep_bottleneck.sh`: git-grep references = 16
-- `scripts/test_chat_suites.sh`: git-grep references = 5
-- `scripts/test_gpu.sh`: git-grep references = 4
-- `scripts/unlock_gpu.sh`: git-grep references = 8
-- `scripts/visualize_layerwise.py`: git-grep references = 7
+- `scripts/bottleneck_localize.sh`: git-grep references = 7
+- `scripts/check_ferrum_env_registry.py`: git-grep references = 19
+- `scripts/graph_repro.cu`: git-grep references = 5
+- `scripts/graph_repro_v2.cu`: git-grep references = 3
+- `scripts/graph_repro_v3.cu`: git-grep references = 3
+- `scripts/graph_repro_v4.cu`: git-grep references = 4
+- `scripts/graph_repro_v5.cu`: git-grep references = 3
+- `scripts/graph_repro_v6.cu`: git-grep references = 2
+- `scripts/graph_repro_v7.cu`: git-grep references = 2
+- `scripts/graph_repro_v8.cu`: git-grep references = 2
+- `scripts/lm_eval_light.sh`: git-grep references = 10
+- `scripts/lock_gpu.sh`: git-grep references = 12
+- `scripts/metal_readme_regression.py`: git-grep references = 8
+- `scripts/paris_bisect.sh`: git-grep references = 9
+- `scripts/phase-e-gen-baseline.py`: git-grep references = 3
+- `scripts/phase-e-verify.sh`: git-grep references = 7
+- `scripts/regen-fused-moe-tile-sweep.sh`: git-grep references = 6
+- `scripts/regen-triton-ptx.sh`: git-grep references = 3
+- `scripts/release.sh`: git-grep references = 4
+- `scripts/remote.sh`: git-grep references = 2
+- `scripts/run_graph_repro.sh`: git-grep references = 2
+- `scripts/setup_gpu.sh`: git-grep references = 4
+- `scripts/sweep-fused-moe-tiles.sh`: git-grep references = 4
+- `scripts/sweep_bottleneck.sh`: git-grep references = 18
+- `scripts/test_chat_suites.sh`: git-grep references = 7
+- `scripts/test_gpu.sh`: git-grep references = 6
+- `scripts/unlock_gpu.sh`: git-grep references = 10
+- `scripts/visualize_layerwise.py`: git-grep references = 9
