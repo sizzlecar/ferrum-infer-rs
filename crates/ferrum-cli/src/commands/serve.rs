@@ -503,6 +503,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         materialized_runtime_keys,
         startup_cli_runtime_entries,
     )?;
+    crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
     write_startup_config_artifacts(
         &startup_auto_config,
         effective_config_json.as_deref(),
@@ -878,10 +879,27 @@ fn serve_cli_runtime_entries(
     );
     if let Some(enabled) = prefix_cache {
         entries.push(RuntimeConfigEntry::new(
-            "FERRUM_PREFIX_CACHE",
+            "FERRUM_PREFIX_CACHE_REQUESTED",
             if enabled { "1" } else { "0" },
             RuntimeConfigSource::Cli,
         ));
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PREFIX_CACHE_PRODUCT",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PREFIX_CACHE",
+            "0",
+            RuntimeConfigSource::Cli,
+        ));
+        if enabled {
+            entries.push(RuntimeConfigEntry::new(
+                "FERRUM_PREFIX_CACHE_SAFETY",
+                "engine_forced_off_product_observed",
+                RuntimeConfigSource::Cli,
+            ));
+        }
     }
     push_cli_runtime_entry(&mut entries, "FERRUM_SESSION_CACHE", session_cache);
     push_cli_runtime_usize(

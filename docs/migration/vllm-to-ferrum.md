@@ -14,8 +14,8 @@ This guide is for vLLM users who want to try Ferrum without changing their OpenA
 | `--max-model-len` | `--max-model-len` | Maps to `FERRUM_MAX_MODEL_LEN`. |
 | `--max-num-seqs` | `--max-num-seqs` | Maps to `FERRUM_PAGED_MAX_SEQS`. |
 | `--max-num-batched-tokens` | `--max-num-batched-tokens` | Maps to `FERRUM_MAX_BATCHED_TOKENS`. |
-| `--enable-prefix-caching` | `--enable-prefix-caching` | Maps to `FERRUM_PREFIX_CACHE=1`; G3 will productize stronger cache observability. |
-| `--no-enable-prefix-caching` | `--no-enable-prefix-caching` | Maps to `FERRUM_PREFIX_CACHE=0`. |
+| `--enable-prefix-caching` | `--enable-prefix-caching` / `--enable-prefix-cache` | Requests product prefix-cache behavior and observability. Unsafe engine-level KV prefix reuse is forced off and recorded in effective config until correctness gates prove it safe. |
+| `--no-enable-prefix-caching` | `--no-enable-prefix-caching` / `--disable-prefix-cache` | Disables product prefix cache and records `FERRUM_PREFIX_CACHE=0`. |
 | `--quantization gptq_marlin` | auto-detected | Ferrum auto-detects supported GPTQ / Marlin paths from model metadata. |
 | OpenAI `/v1/chat/completions` | supported | Non-streaming and streaming. |
 | OpenAI streaming SSE | supported | Emits OpenAI-shaped `data:` chunks and one `[DONE]`. |

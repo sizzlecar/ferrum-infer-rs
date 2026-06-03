@@ -55,7 +55,10 @@ struct CachePolicy {
 impl CachePolicy {
     fn current() -> Self {
         Self {
-            prefix_cache_enabled: env_bool("FERRUM_PREFIX_CACHE").unwrap_or(false),
+            prefix_cache_enabled: env_bool("FERRUM_PREFIX_CACHE_PRODUCT")
+                .or_else(|| env_bool("FERRUM_PREFIX_CACHE_REQUESTED"))
+                .or_else(|| env_bool("FERRUM_PREFIX_CACHE"))
+                .unwrap_or(false),
             session_cache_mode: std::env::var("FERRUM_SESSION_CACHE")
                 .unwrap_or_else(|_| "off".to_string())
                 .to_ascii_lowercase(),

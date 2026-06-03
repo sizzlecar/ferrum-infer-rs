@@ -121,18 +121,51 @@ async fn chat(client: &Client, fx: &ServerFixture, content: &str) -> String {
             "model": SMOKE_MODEL,
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.0,
-            "max_tokens": 64
+            "max_tokens": 256
         }))
         .send()
         .await
         .expect("chat post");
     assert_eq!(response.status(), 200);
     let body: Value = response.json().await.expect("chat json");
-    body["choices"][0]["message"]["content"]
+    let content = body["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_else(|| panic!("missing content: {body}"))
         .trim()
-        .to_string()
+        .to_string();
+    assert!(!content.is_empty(), "empty visible content: {body}");
+    content
+}
+
+async fn strict_json_answer(
+    client: &Client,
+    fx: &ServerFixture,
+    prompt: &str,
+    expected: &str,
+) -> Value {
+    let response = client
+        .post(fx.chat_url())
+        .json(&json!({
+            "model": SMOKE_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+            "max_tokens": 512,
+            "response_format": strict_answer_schema()
+        }))
+        .send()
+        .await
+        .expect("strict answer post");
+    let status = response.status();
+    let raw = response.text().await.expect("strict answer body");
+    assert_eq!(status, 200, "strict answer failed: {raw}");
+    let body: Value = serde_json::from_str(&raw).expect("strict answer json");
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing strict content: {body}"));
+    let parsed: Value = serde_json::from_str(content)
+        .unwrap_or_else(|e| panic!("invalid strict JSON {content:?}: {e}"));
+    assert_eq!(parsed["answer"], expected, "body: {body}");
+    parsed
 }
 
 async fn metrics(client: &Client, fx: &ServerFixture) -> String {
@@ -201,12 +234,21 @@ async fn g3_prefix_cache_product_real_model_smoke() {
     let second = chat(&client, &enabled, prompt).await;
     assert_eq!(first, second, "greedy output changed with prefix cache");
 
-    let alpha = chat(&client, &enabled, "Shared prefix: marker request. Reply exactly alpha-token.").await;
-    let beta = chat(&client, &enabled, "Shared prefix: marker request. Reply exactly beta-token.").await;
-    assert!(alpha.contains("alpha") || alpha.contains("alpha-token"), "alpha output: {alpha}");
-    assert!(beta.contains("beta") || beta.contains("beta-token"), "beta output: {beta}");
-    assert!(!alpha.contains("beta-token"), "cross-talk alpha output: {alpha}");
-    assert!(!beta.contains("alpha-token"), "cross-talk beta output: {beta}");
+    let alpha = strict_json_answer(
+        &client,
+        &enabled,
+        "Shared prefix: marker request. Return exactly this JSON object and nothing else: {\"answer\":\"alpha-token\"}",
+        "alpha-token",
+    )
+    .await;
+    let beta = strict_json_answer(
+        &client,
+        &enabled,
+        "Shared prefix: marker request. Return exactly this JSON object and nothing else: {\"answer\":\"beta-token\"}",
+        "beta-token",
+    )
+    .await;
+    assert_ne!(alpha["answer"], beta["answer"], "shared-prefix outputs cross-talked");
 
     let strict = client
         .post(enabled.chat_url())
@@ -214,7 +256,7 @@ async fn g3_prefix_cache_product_real_model_smoke() {
             "model": SMOKE_MODEL,
             "messages": [{"role": "user", "content": "Return exactly this JSON object and nothing else: {\"answer\":\"cache-ok\"}"}],
             "temperature": 0.0,
-            "max_tokens": 128,
+            "max_tokens": 512,
             "response_format": strict_answer_schema()
         }))
         .send()

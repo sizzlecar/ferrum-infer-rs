@@ -132,7 +132,7 @@ async fn chat_with_session(client: &Client, fx: &ServerFixture, session: &str, c
             "model": SMOKE_MODEL,
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.0,
-            "max_tokens": 96
+            "max_tokens": 256
         }))
         .send()
         .await
@@ -162,11 +162,11 @@ async fn g3_session_cache_real_model_smoke() {
     let fx = ServerFixture::spawn().await;
     let client = Client::new();
 
-    let _ = chat_with_session(&client, &fx, "session-a", "Remember this exact secret: ferrum-red. Reply only OK.").await;
-    let recalled = chat_with_session(&client, &fx, "session-a", "What exact secret did I ask you to remember? Reply only the secret.").await;
+    let _ = chat_with_session(&client, &fx, "session-a", "The session secret is ferrum-red. Remember it for the next question.").await;
+    let recalled = chat_with_session(&client, &fx, "session-a", "Based on the previous messages in this same session, what is the exact session secret?").await;
     assert!(recalled.contains("ferrum-red"), "same-session recall failed: {recalled}");
 
-    let isolated = chat_with_session(&client, &fx, "session-b", "What exact secret did I ask you to remember? If none, reply NONE.").await;
+    let isolated = chat_with_session(&client, &fx, "session-b", "Based on previous messages in this session, what is the exact session secret? If none, reply NONE.").await;
     assert!(!isolated.contains("ferrum-red"), "cross-session leak: {isolated}");
 
     let metadata_response = client

@@ -10,8 +10,8 @@ This matrix describes Ferrum's tested vLLM-facing migration surface. It is not a
 | `--max-model-len` | Supported | Maps to `FERRUM_MAX_MODEL_LEN` |
 | `--max-num-seqs` | Supported | Maps to `FERRUM_PAGED_MAX_SEQS` |
 | `--max-num-batched-tokens` | Supported | Maps to `FERRUM_MAX_BATCHED_TOKENS` |
-| `--enable-prefix-caching` | Supported as runtime flag | Full cache productization is G3 |
-| `--no-enable-prefix-caching` | Supported as runtime flag | Effective config reflects `FERRUM_PREFIX_CACHE=0` |
+| `--enable-prefix-caching` | Supported as product cache request | Effective config records the request plus a safety decision that keeps unsafe engine-level KV prefix reuse off until proven safe |
+| `--no-enable-prefix-caching` | Supported as runtime flag | Effective config reflects disabled product/engine prefix cache |
 | `--quantization gptq_marlin` | Auto-detected where supported | Qwen3-30B-A3B GPTQ/Marlin CUDA gates |
 | `/v1/models` | Supported | G1 migration smoke |
 | `/v1/chat/completions` non-streaming | Supported | G1 migration smoke |
