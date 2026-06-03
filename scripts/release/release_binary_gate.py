@@ -17,7 +17,16 @@ import urllib.request
 from pathlib import Path
 
 REPO = "https://github.com/sizzlecar/ferrum-infer-rs"
-BAD_LOG_PATTERNS = ["panicked", "panic", "KV cache overflow", "failed to render model chat template"]
+BAD_LOG_PATTERNS = [
+    "panicked",
+    "panic",
+    "KV cache overflow",
+    "failed to render model chat template",
+    "command encoder",
+    "failed assertion",
+    "<unk>",
+    "[PAD]",
+]
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, input: str | None = None, timeout: int = 120) -> subprocess.CompletedProcess[str]:
