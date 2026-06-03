@@ -151,6 +151,14 @@ pub struct ServeCommand {
     /// Runtime flags/config JSON object embedded in native profile events.
     #[arg(long, value_name = "JSON")]
     pub profile_runtime_flags_json: Option<String>,
+
+    /// Startup-loaded LoRA adapter, formatted as NAME=PATH. May be repeated.
+    #[arg(long = "lora", value_name = "NAME=PATH")]
+    pub lora: Vec<String>,
+
+    /// Public model id template for LoRA adapters. Supports <base> and <name>.
+    #[arg(long, value_name = "TEMPLATE", default_value = "<base>:<name>")]
+    pub lora_model_id_template: String,
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
@@ -183,6 +191,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_model,
         profile_concurrency,
         profile_runtime_flags_json,
+        lora,
+        lora_model_id_template,
     } = cmd;
 
     // Print banner
@@ -301,6 +311,26 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         resolve_model_alias(&model_name)
     };
     println!("{} {}", "Model:".dimmed(), model_id.cyan());
+
+    let lora_specs = parse_lora_specs(&lora)?;
+    let startup_lora_adapters = if lora_specs.is_empty() {
+        Vec::new()
+    } else {
+        ferrum_models::load_startup_lora_adapters(
+            &model_id,
+            Some(&lora_model_id_template),
+            &lora_specs,
+        )?
+    };
+    for adapter in &startup_lora_adapters {
+        println!(
+            "{} {} -> {} ({})",
+            "LoRA:".dimmed(),
+            adapter.name.cyan(),
+            adapter.public_model_id.cyan(),
+            adapter.path.display()
+        );
+    }
 
     let host = host.unwrap_or_else(|| config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
@@ -522,6 +552,17 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         &model_id,
     )?;
 
+    let lora_server_models: Vec<ferrum_server::LoraAdapterModel> = startup_lora_adapters
+        .iter()
+        .map(|adapter| {
+            ferrum_server::LoraAdapterModel::new(
+                adapter.name.clone(),
+                adapter.public_model_id.clone(),
+                adapter.path.display().to_string(),
+            )
+        })
+        .collect();
+
     let server = match arch_for_dispatch {
         Some(ferrum_models::Architecture::Clip) => {
             println!("{}", "Initializing CLIP embedding engine...".dimmed());
@@ -627,6 +668,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         }
     }
     .with_auto_config(startup_auto_config);
+    let server = if lora_server_models.is_empty() {
+        server
+    } else {
+        server.with_lora_adapters(model_id.clone(), lora_server_models)
+    };
 
     // Create server config
     let server_config = ServerConfig {
@@ -732,6 +778,27 @@ fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
     }
     let configured = shellexpand::tilde(&config.models.download.hf_cache_dir).to_string();
     PathBuf::from(configured)
+}
+
+fn parse_lora_specs(values: &[String]) -> Result<Vec<ferrum_models::StartupLoraSpec>> {
+    let mut specs = Vec::with_capacity(values.len());
+    for value in values {
+        let (name, path) = value.split_once('=').ok_or_else(|| {
+            ferrum_types::FerrumError::config(format!(
+                "invalid --lora value {value:?}; expected NAME=PATH"
+            ))
+        })?;
+        if name.is_empty() || path.is_empty() {
+            return Err(ferrum_types::FerrumError::config(format!(
+                "invalid --lora value {value:?}; expected non-empty NAME=PATH"
+            )));
+        }
+        specs.push(ferrum_models::StartupLoraSpec {
+            name: name.to_string(),
+            path: PathBuf::from(shellexpand::tilde(path).to_string()),
+        });
+    }
+    Ok(specs)
 }
 
 fn startup_auto_config(

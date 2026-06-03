@@ -158,6 +158,16 @@ impl AxumServer {
         self
     }
 
+    /// Attach startup-loaded LoRA adapter model ids.
+    pub fn with_lora_adapters(
+        mut self,
+        base_model_id: impl Into<String>,
+        adapters: Vec<LoraAdapterModel>,
+    ) -> Self {
+        self.state = self.state.with_lora_adapters(base_model_id, adapters);
+        self
+    }
+
     /// Build the router with all routes
     fn build_router(&self) -> Router {
         let app_state = self.state.clone();
@@ -195,7 +205,93 @@ pub struct AppState {
     pub tts: Option<Arc<dyn TtsEngine + Send + Sync>>,
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
+    pub lora_registry: Arc<LoraModelRegistry>,
     cache: Arc<CacheRuntimeState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoraAdapterModel {
+    pub name: String,
+    pub model_id: String,
+    pub path: String,
+}
+
+impl LoraAdapterModel {
+    pub fn new(
+        name: impl Into<String>,
+        model_id: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            model_id: model_id.into(),
+            path: path.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LoraModelRegistry {
+    base_model_id: Option<String>,
+    adapters: Vec<LoraAdapterModel>,
+}
+
+#[derive(Clone, Debug)]
+struct LoraModelResolution {
+    base_model_id: String,
+    adapter: Option<LoraAdapterModel>,
+}
+
+impl LoraModelRegistry {
+    pub fn new(base_model_id: impl Into<String>, adapters: Vec<LoraAdapterModel>) -> Self {
+        Self {
+            base_model_id: Some(base_model_id.into()),
+            adapters,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !self.adapters.is_empty()
+    }
+
+    fn adapter_models(&self) -> &[LoraAdapterModel] {
+        &self.adapters
+    }
+
+    fn resolve(
+        &self,
+        request_model: &str,
+        loaded_models: &[ModelId],
+    ) -> std::result::Result<Option<LoraModelResolution>, ServerError> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        let base = self
+            .base_model_id
+            .clone()
+            .or_else(|| loaded_models.first().map(ToString::to_string))
+            .unwrap_or_default();
+        if request_model == base || loaded_models.iter().any(|model| model.0 == request_model) {
+            return Ok(Some(LoraModelResolution {
+                base_model_id: request_model.to_string(),
+                adapter: None,
+            }));
+        }
+        if let Some(adapter) = self
+            .adapters
+            .iter()
+            .find(|adapter| adapter.model_id == request_model)
+        {
+            return Ok(Some(LoraModelResolution {
+                base_model_id: base,
+                adapter: Some(adapter.clone()),
+            }));
+        }
+        Err(ServerError::invalid_request(
+            format!("unknown LoRA adapter model: {request_model}"),
+            Some("model"),
+        ))
+    }
 }
 
 impl AppState {
@@ -223,6 +319,15 @@ impl AppState {
 
     pub fn with_prompt_template(mut self, prompt_template: Option<ModelChatTemplate>) -> Self {
         self.prompt_template = prompt_template.map(Arc::new);
+        self
+    }
+
+    pub fn with_lora_adapters(
+        mut self,
+        base_model_id: impl Into<String>,
+        adapters: Vec<LoraAdapterModel>,
+    ) -> Self {
+        self.lora_registry = Arc::new(LoraModelRegistry::new(base_model_id, adapters));
         self
     }
 
@@ -641,21 +746,28 @@ async fn chat_completions_handler(
     // OpenAI spec requires at least one message. Reject empty arrays at
     // the boundary rather than synthesising a fake prompt downstream.
     validate_chat_request(&request)?;
+    let loaded_models = state.status().await.loaded_models;
+    let lora_resolution = state
+        .lora_registry
+        .resolve(&request.model, &loaded_models)?;
 
     // Convert OpenAI request to internal format
-    let template_model_id = state
-        .status()
-        .await
-        .loaded_models
-        .first()
-        .map(ToString::to_string)
+    let template_model_id = lora_resolution
+        .as_ref()
+        .map(|resolution| resolution.base_model_id.clone())
+        .or_else(|| {
+            loaded_models
+                .first()
+                .map(ToString::to_string)
+        })
         .unwrap_or_else(|| request.model.clone());
-    let inference_request = convert_chat_request_with_template_model(
+    let mut inference_request = convert_chat_request_with_template_model(
         &request,
         &template_model_id,
         state.prompt_template.as_deref(),
     )
     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    apply_lora_resolution(&mut inference_request, lora_resolution.as_ref());
     state
         .cache
         .record_prefix_prompt(&inference_request.prompt, &cache_policy);
@@ -1890,6 +2002,30 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
     }
 }
 
+fn apply_lora_resolution(
+    inference_request: &mut InferenceRequest,
+    resolution: Option<&LoraModelResolution>,
+) {
+    let Some(resolution) = resolution else {
+        return;
+    };
+    if let Some(adapter) = &resolution.adapter {
+        inference_request.model_id = ModelId(resolution.base_model_id.clone());
+        inference_request.metadata.insert(
+            "ferrum_lora_adapter".to_string(),
+            serde_json::json!(adapter.name),
+        );
+        inference_request.metadata.insert(
+            "ferrum_lora_model_id".to_string(),
+            serde_json::json!(adapter.model_id),
+        );
+        inference_request.metadata.insert(
+            "ferrum_lora_path".to_string(),
+            serde_json::json!(adapter.path),
+        );
+    }
+}
+
 async fn handle_completions_sync(
     state: AppState,
     openai_request: CompletionsRequest,
@@ -2043,7 +2179,12 @@ async fn completions_handler(
         ServerError::invalid_request(format!("invalid completions request: {e}"), None)
     })?;
     validate_completion_request(&request)?;
-    let inference_request = convert_completion_request(&request);
+    let loaded_models = state.status().await.loaded_models;
+    let lora_resolution = state
+        .lora_registry
+        .resolve(&request.model, &loaded_models)?;
+    let mut inference_request = convert_completion_request(&request);
+    apply_lora_resolution(&mut inference_request, lora_resolution.as_ref());
     if request.stream.unwrap_or(false) {
         handle_completions_stream(state, request, inference_request).await
     } else {
@@ -2416,7 +2557,7 @@ async fn models_handler(
 ) -> std::result::Result<Response, ServerError> {
     let status = state.status().await;
     let now = chrono::Utc::now().timestamp() as u64;
-    let data = status
+    let mut data: Vec<_> = status
         .loaded_models
         .into_iter()
         .map(|model_id| crate::openai::ModelInfo {
@@ -2429,6 +2570,25 @@ async fn models_handler(
             parent: None,
         })
         .collect();
+    data.extend(state.lora_registry.adapter_models().iter().map(|adapter| {
+        crate::openai::ModelInfo {
+            id: adapter.model_id.clone(),
+            object: "model".to_string(),
+            created: now,
+            owned_by: "ferrum".to_string(),
+            permission: vec![],
+            root: state
+                .lora_registry
+                .base_model_id
+                .as_ref()
+                .cloned(),
+            parent: state
+                .lora_registry
+                .base_model_id
+                .as_ref()
+                .cloned(),
+        }
+    }));
 
     let models = ModelListResponse {
         object: "list".to_string(),
@@ -3254,6 +3414,17 @@ mod tests {
         (router, engine)
     }
 
+    fn router_with_capturing_lora_llm() -> (Router, Arc<CapturingLlm>) {
+        let engine = Arc::new(CapturingLlm::new());
+        let router = AxumServer::from_llm(engine.clone())
+            .with_lora_adapters(
+                "qwen3",
+                vec![LoraAdapterModel::new("sql", "qwen3:sql", "/tmp/sql-adapter")],
+            )
+            .build_router();
+        (router, engine)
+    }
+
     fn router_with_stub_embed() -> Router {
         AxumServer::from_embed(Arc::new(StubEmbed::new())).build_router()
     }
@@ -3409,6 +3580,105 @@ mod tests {
         assert!(data[0]["permission"].as_array().unwrap().is_empty());
         assert!(data[0]["root"].is_null());
         assert!(data[0]["parent"].is_null());
+    }
+
+    #[tokio::test]
+    async fn route_models_lists_startup_lora_adapters() {
+        let router = AxumServer::from_llm(Arc::new(StubLlm::new("ok")))
+            .with_lora_adapters(
+                "stub-model",
+                vec![LoraAdapterModel::new(
+                    "sql",
+                    "stub-model:sql",
+                    "/tmp/sql-adapter",
+                )],
+            )
+            .build_router();
+        let response = get(router, "/v1/models").await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        let data = body["data"].as_array().expect("models data array");
+        let ids: Vec<_> = data
+            .iter()
+            .map(|item| item["id"].as_str().unwrap_or_default())
+            .collect();
+        assert!(ids.contains(&"stub-model"), "body: {body}");
+        assert!(ids.contains(&"stub-model:sql"), "body: {body}");
+        let adapter = data
+            .iter()
+            .find(|item| item["id"] == "stub-model:sql")
+            .expect("adapter model");
+        assert_eq!(adapter["root"], "stub-model");
+        assert_eq!(adapter["parent"], "stub-model");
+    }
+
+    #[tokio::test]
+    async fn route_chat_lora_adapter_maps_internal_request_to_base_model() {
+        let (router, engine) = router_with_capturing_lora_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "qwen3:sql",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 8,
+                "temperature": 0.0
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["model"], "qwen3:sql");
+        let captured = engine.last_request();
+        assert_eq!(captured.model_id, ModelId::new("qwen3"));
+        assert_eq!(captured.metadata["ferrum_lora_adapter"], "sql");
+        assert_eq!(captured.metadata["ferrum_lora_model_id"], "qwen3:sql");
+    }
+
+    #[tokio::test]
+    async fn route_chat_base_model_still_uses_base_path_with_lora_loaded() {
+        let (router, engine) = router_with_capturing_lora_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 8,
+                "temperature": 0.0
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let captured = engine.last_request();
+        assert_eq!(captured.model_id, ModelId::new("qwen3"));
+        assert!(!captured.metadata.contains_key("ferrum_lora_adapter"));
+    }
+
+    #[tokio::test]
+    async fn route_chat_unknown_lora_adapter_returns_openai_model_error() {
+        let (router, _) = router_with_capturing_lora_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "qwen3:missing",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 8
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "model");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown LoRA adapter model"),
+            "body: {body}"
+        );
     }
 
     #[tokio::test]

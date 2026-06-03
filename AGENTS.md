@@ -132,6 +132,9 @@
 - G3 correctness is mandatory: prefix cache must not change greedy byte output for identical requests, must not cross-talk shared-prefix suffixes, and must not corrupt strict JSON or tool calls. Session cache must be opt-in and must not leak content across different session ids.
 - G3 performance claims require `ferrum bench-serve --fail-on-error --require-ci` shared-prefix artifacts. If TTFT improvement is inconclusive, the artifact may say so, but cache hits and saved prefill token counters must still be present and correctness must pass.
 - G3 final evidence must print `G3 CACHE PRODUCT PASS: <artifact_dir>` and record artifacts under `docs/release/g1-g4/g3-cache-product/<timestamp>-<short_sha>/`.
+- G4 LoRA startup serving covers startup-loaded PEFT-style adapters, `--lora NAME=PATH`, `--lora-model-id-template`, `/v1/models` adapter ids, and adapter request model routing. G4 does not include hot-loading, GGUF LoRA, or multi-adapter composition.
+- Any change touching LoRA loader, Linear abstraction, model routing, `/v1/models`, or adapter request routing must run G4 LoRA tests.
+- A G4 claim is invalid unless the final output includes `G4 LORA STARTUP PASS: <artifact_dir>`.
 
 ## Directory Cleanup Policy
 - Before moving, deleting, or archiving files under `crates/`, `docs/`, or `scripts/`, run `python3 scripts/release/inventory_tree.py --out docs/release/cleanup/<YYYYMMDD>-inventory.md` and commit the inventory.
