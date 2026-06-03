@@ -210,6 +210,8 @@ struct OpenAiStreamChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiStreamDelta {
     content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,7 +351,13 @@ impl StreamState {
         if let Some(choices) = chunk.choices {
             if let Some(first) = choices.into_iter().next() {
                 if let Some(delta) = first.delta {
-                    if delta.content.as_deref().is_some_and(|s| !s.is_empty()) {
+                    if delta.content.as_deref().is_some_and(|s| !s.is_empty())
+                        || delta.reasoning.as_deref().is_some_and(|s| !s.is_empty())
+                        || delta
+                            .reasoning_content
+                            .as_deref()
+                            .is_some_and(|s| !s.is_empty())
+                    {
                         let now = Instant::now();
                         if self.first_token_time.is_none() {
                             self.first_token_time = Some(now);
@@ -1269,6 +1277,22 @@ mod tests {
         assert_eq!(
             record.output_token_count_source,
             OutputTokenCountSource::Usage
+        );
+    }
+
+    #[test]
+    fn stream_reasoning_chunk_counts_as_token_event() {
+        let mut state = StreamState::new(Instant::now(), 7);
+        state
+            .handle_payload(r#"{"choices":[{"delta":{"reasoning":"thinking"}}]}"#)
+            .unwrap();
+        state.saw_done = true;
+        let record = state.finish();
+        assert!(record.success);
+        assert_eq!(record.output_tokens, 1);
+        assert_eq!(
+            record.output_token_count_source,
+            OutputTokenCountSource::StreamChunks
         );
     }
 

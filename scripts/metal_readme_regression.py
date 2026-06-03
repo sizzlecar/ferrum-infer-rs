@@ -449,7 +449,7 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 "content": "What is the capital of France? Reply with just the city name.",
             }
         ],
-        "max_tokens": 256,
+        "max_tokens": 384,
         "temperature": 0,
         "stream": False,
     }
@@ -489,7 +489,7 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 "content": "刚才暗号是什么？只回答暗号。",
             },
         ],
-        "max_tokens": 128,
+        "max_tokens": 384,
         "temperature": 0,
         "stream": False,
     }
@@ -527,7 +527,7 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 "content": "请只输出一句中文问候，必须包含“你好”。",
             }
         ],
-        "max_tokens": 256,
+        "max_tokens": 384,
         "temperature": 0,
         "stream": True,
     }
