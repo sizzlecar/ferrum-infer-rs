@@ -202,16 +202,28 @@ def throughput(path: Path) -> float:
     return float(obj["output_throughput_tps"]["mean"])
 
 
-def validate_lora_api(base_url: str, out: Path) -> None:
+def model_ids(base_url: str) -> set[str]:
+    code, models = http_json("GET", base_url + "/v1/models")
+    if code != 200:
+        raise RuntimeError(f"/v1/models failed: {code} {models}")
+    return {item["id"] for item in models.get("data", [])}
+
+
+def validate_lora_api(base_url: str, out: Path) -> tuple[str, str]:
     code, models = http_json("GET", base_url + "/v1/models")
     if code != 200:
         raise RuntimeError(f"/v1/models failed: {code} {models}")
     (out / "models.json").write_text(json.dumps(models, indent=2) + "\n")
     ids = {item["id"] for item in models.get("data", [])}
-    if "qwen3:0.6b:sql" not in ids:
+    adapter_ids = sorted(model_id for model_id in ids if model_id.endswith(":sql"))
+    if not adapter_ids:
         raise RuntimeError(f"adapter id missing from /v1/models: {ids}")
+    adapter_id = adapter_ids[0]
+    base_id = adapter_id.removesuffix(":sql")
+    if base_id not in ids:
+        raise RuntimeError(f"base model id {base_id} missing from /v1/models: {ids}")
 
-    for model in ["qwen3:0.6b", "qwen3:0.6b:sql"]:
+    for model in [base_id, adapter_id]:
         code, body = http_json("POST", base_url + "/v1/chat/completions", {
             "model": model,
             "messages": [{"role": "user", "content": "用一句话解释 LoRA。"}],
@@ -226,13 +238,14 @@ def validate_lora_api(base_url: str, out: Path) -> None:
             raise RuntimeError(f"empty chat content for {model}: {body}")
 
     code, body = http_json("POST", base_url + "/v1/chat/completions", {
-        "model": "qwen3:0.6b:missing",
+        "model": f"{base_id}:missing",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 8,
     })
     (out / "chat-unknown-adapter.json").write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
     if code != 400 or body.get("error", {}).get("param") != "model":
         raise RuntimeError(f"unknown adapter did not return OpenAI model error: code={code} body={body}")
+    return base_id, adapter_id
 
 
 def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[str, Any]:
@@ -248,7 +261,9 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
 
     no_lora, no_lora_base, no_lora_log = start_server(bin_path, args.model, out, log, [])
     try:
-        bench(bin_path, args.model, no_lora_base, out / "bench-base-no-lora.json", out / "bench-base-no-lora.log", log, args)
+        no_lora_ids = model_ids(no_lora_base)
+        no_lora_model = sorted(no_lora_ids)[0] if no_lora_ids else args.model
+        bench(bin_path, no_lora_model, no_lora_base, out / "bench-base-no-lora.json", out / "bench-base-no-lora.log", log, args)
     finally:
         stop_server(no_lora, no_lora_log)
 
@@ -260,9 +275,9 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
         ["--lora", f"sql={fixture}", "--lora-model-id-template", "<base>:<name>"],
     )
     try:
-        validate_lora_api(with_lora_base, out)
-        bench(bin_path, args.model, with_lora_base, out / "bench-base-with-lora.json", out / "bench-base-with-lora.log", log, args)
-        bench(bin_path, f"{args.model}:sql", with_lora_base, out / "bench-adapter.json", out / "bench-adapter.log", log, args)
+        base_model_id, adapter_model_id = validate_lora_api(with_lora_base, out)
+        bench(bin_path, base_model_id, with_lora_base, out / "bench-base-with-lora.json", out / "bench-base-with-lora.log", log, args)
+        bench(bin_path, adapter_model_id, with_lora_base, out / "bench-adapter.json", out / "bench-adapter.log", log, args)
     finally:
         stop_server(with_lora, with_lora_log)
 
