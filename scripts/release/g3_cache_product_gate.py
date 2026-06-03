@@ -129,10 +129,27 @@ def metric_value(metrics: str, name: str) -> float:
     raise RuntimeError(f"missing metric {name}")
 
 
+def tokenizer_dir(path: Path) -> Path | None:
+    if path.is_dir() and path.joinpath("tokenizer.json").is_file():
+        return path
+    if path.is_file() and path.name == "tokenizer.json":
+        return path.parent
+    if path.is_file() and path.name.endswith(".tokenizer.json"):
+        scratch = repo_root() / "target" / "g3-tokenizers" / path.stem
+        scratch.mkdir(parents=True, exist_ok=True)
+        dst = scratch / "tokenizer.json"
+        if not dst.exists() or dst.read_bytes() != path.read_bytes():
+            dst.write_bytes(path.read_bytes())
+        return scratch
+    return None
+
+
 def find_tokenizer(model: str) -> Path:
     env = os.environ.get("G3_TOKENIZER") or os.environ.get("FERRUM_G3_TOKENIZER")
-    if env and Path(env).is_file():
-        return Path(env)
+    if env:
+        resolved = tokenizer_dir(Path(env))
+        if resolved is not None:
+            return resolved
     candidates = [
         Path.home() / "ferrum-bench" / "tokenizers" / "Qwen3-30B-A3B.tokenizer.json",
         Path.home() / "ferrum-bench" / "tokenizers" / "Qwen3-0.6B.tokenizer.json",
@@ -140,9 +157,10 @@ def find_tokenizer(model: str) -> Path:
     hf = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
     candidates.extend(hf.glob("models--Qwen--Qwen3-0.6B/snapshots/*/tokenizer.json"))
     for path in candidates:
-        if path.is_file():
-            return path
-    raise RuntimeError(f"tokenizer not found for {model}; set G3_TOKENIZER=/path/to/tokenizer.json")
+        resolved = tokenizer_dir(path)
+        if resolved is not None:
+            return resolved
+    raise RuntimeError(f"tokenizer not found for {model}; set G3_TOKENIZER=/path/to/tokenizer-dir-or-tokenizer.json")
 
 
 def start_server(bin_path: Path, model: str, args: list[str], out: Path, log: GateLog) -> tuple[subprocess.Popen[bytes], str, Path]:
