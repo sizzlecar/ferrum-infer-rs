@@ -105,6 +105,12 @@ pub struct BenchReport {
 
     pub n_prompt: u32,
     pub n_gen: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_input_tokens: Option<TokenLengthStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_input_tokens_per_request: Option<Vec<Vec<u32>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_count_source: Option<String>,
     pub n_repeats: u32,
     pub n_requests_per_run: u32,
     pub warmup_requests: u32,
@@ -128,6 +134,14 @@ pub struct BenchReport {
     pub env_hash: EnvHash,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenLengthStats {
+    pub requested: u32,
+    pub min: u32,
+    pub max: u32,
+    pub mean: f64,
+}
+
 /// One request's measurements (input to [`compute_metrics`]).
 #[derive(Debug, Clone)]
 pub struct RequestRecord {
@@ -136,9 +150,27 @@ pub struct RequestRecord {
     pub e2e_ms: f64,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub output_token_count_source: OutputTokenCountSource,
     /// Per-token inter-arrival times within this request (decode steps,
     /// `len = output_tokens - 1`). Empty if not measured.
     pub itl_ms: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputTokenCountSource {
+    Usage,
+    StreamChunks,
+    None,
+}
+
+impl OutputTokenCountSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Usage => "usage",
+            Self::StreamChunks => "stream_chunks",
+            Self::None => "none",
+        }
+    }
 }
 
 impl RequestRecord {
@@ -284,6 +316,9 @@ pub fn compute_metrics(
         request_rate,
         n_prompt,
         n_gen,
+        actual_input_tokens: None,
+        actual_input_tokens_per_request: None,
+        output_token_count_source: None,
         n_repeats,
         n_requests_per_run,
         warmup_requests,
@@ -334,6 +369,11 @@ mod tests {
             e2e_ms: e2e,
             input_tokens: in_tok,
             output_tokens: out_tok,
+            output_token_count_source: if out_tok > 0 {
+                OutputTokenCountSource::Usage
+            } else {
+                OutputTokenCountSource::None
+            },
             itl_ms: vec![],
         }
     }
