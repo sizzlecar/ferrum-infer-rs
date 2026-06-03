@@ -1,0 +1,8 @@
+{
+  "status": "pass",
+  "tokenizer": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/g3-tokenizers/Qwen3-30B-A3B.tokenizer",
+  "prefix_hits": 53.0,
+  "prefix_saved_prefill_tokens": 16737.0,
+  "perf_result": "inconclusive",
+  "reason": "G3 keeps unsafe engine-level KV prefix reuse forced off; product cache observability and correctness passed, but TTFT speedup is not claimed."
+}

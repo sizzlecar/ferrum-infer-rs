@@ -1,0 +1,8 @@
+    Finished `release` profile [optimized] target(s) in 0.20s
+     Running tests/server_session_cache.rs (target/release/deps/server_session_cache-4f7317fbcb2ee30c)
+
+running 1 test
+test g3_session_cache_real_model_smoke ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.79s
+
