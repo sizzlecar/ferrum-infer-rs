@@ -33,7 +33,7 @@ python3 scripts/release/release_binary_gate.py homebrew-metal --version <version
 python3 scripts/release/release_binary_gate.py homebrew-cuda-fetch --version <version> --out docs/release/g0/<version>/homebrew-cuda-fetch
 ```
 
-The tarball gates download official GitHub release assets, verify checksums, run CLI multi-turn/math, run serve math/multi-turn/boundary checks, and scan server logs for release-blocking patterns. CUDA tarball also checks `ldd`, strict JSON, tool call, and streaming `[DONE]` behavior.
+The tarball gates download official GitHub release assets, verify checksums, run CLI multi-turn/math, run serve math/multi-turn/boundary checks, run serve strict JSON/tool-call/streaming `[DONE]` checks, and scan server logs for release-blocking patterns. CUDA tarball also checks `ldd`.
 
 ## Summary gate
 
