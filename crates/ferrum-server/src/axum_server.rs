@@ -521,6 +521,15 @@ async fn handle_chat_completions_stream(
                             if tx.send(Ok(sse_event)).is_err() {
                                 break;
                             }
+                        } else if tool_choice_required(&openai_request) {
+                            let error_event = openai_error_sse_event(
+                                "model output did not satisfy required tool_choice",
+                                "invalid_request_error",
+                                Some("tool_choice"),
+                            );
+                            let _ = tx.send(Ok(error_event));
+                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
                         } else if buffer_structured_api_stream
                             && parsed_final.content.trim().is_empty()
                         {
@@ -722,6 +731,11 @@ async fn handle_chat_completions_sync(
                 if let Some(reason) = &chat_response.finish_reason {
                     openai_finish_reason = reason.clone();
                 }
+            } else if tool_choice_required(&openai_request) {
+                return Err(ServerError::invalid_request(
+                    "model output did not satisfy required tool_choice",
+                    Some("tool_choice"),
+                ));
             }
             validate_strict_json_schema_response(&openai_request, &message.content)?;
             let response = ChatCompletionsResponse {
@@ -876,21 +890,20 @@ fn convert_chat_request_with_template_model(
 fn forced_tool_choice_response_format(
     request: &ChatCompletionsRequest,
 ) -> Option<ferrum_types::ResponseFormat> {
-    let ToolChoice::Function {
-        tool_type,
-        function,
-    } = request.tool_choice.as_ref()?
-    else {
-        return None;
+    let selected_tool = match request.tool_choice.as_ref()? {
+        ToolChoice::Function {
+            tool_type,
+            function,
+        } if tool_type == "function" => request
+            .tools
+            .as_ref()?
+            .iter()
+            .find(|tool| tool.function.name == function.name)?,
+        ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
+            request.tools.as_ref()?.first()?
+        }
+        _ => return None,
     };
-    if tool_type != "function" {
-        return None;
-    }
-    let selected_tool = request
-        .tools
-        .as_ref()?
-        .iter()
-        .find(|tool| tool.function.name == function.name)?;
     let schema = serde_json::to_value(&selected_tool.function.parameters).ok()?;
     if schema.is_null() {
         return None;
@@ -1296,10 +1309,12 @@ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Resul
             ToolChoice::Mode(mode)
                 if mode.eq_ignore_ascii_case("auto") || mode.eq_ignore_ascii_case("none") => {}
             ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
-                return Err(ServerError::unsupported_feature(
-                    "required tool_choice is not supported",
-                    Some("tool_choice"),
-                ));
+                if request.tools.as_deref().unwrap_or_default().is_empty() {
+                    return Err(ServerError::invalid_request(
+                        "tool_choice=required requires at least one function tool",
+                        Some("tool_choice"),
+                    ));
+                }
             }
             ToolChoice::Mode(_) => {
                 return Err(ServerError::unsupported_feature(
@@ -1361,6 +1376,13 @@ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Resul
     }
 
     Ok(())
+}
+
+fn tool_choice_required(request: &ChatCompletionsRequest) -> bool {
+    matches!(
+        request.tool_choice.as_ref(),
+        Some(ToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required")
+    )
 }
 
 fn openai_usage_from_token_usage(usage: &TokenUsage) -> Usage {
@@ -3296,6 +3318,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_tool_choice_required_wraps_generated_arguments() {
+        let response = post_json(
+            router_with_stub(r#"{"city":"Paris"}"#),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use a tool."}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "tool_choice": "required"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "weather"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_chat_tool_choice_required_errors_without_valid_tool_call() {
+        let response = post_json(
+            router_with_stub("plain answer"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use a tool."}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }],
+                "tool_choice": "required"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "tool_choice");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("required tool_choice")),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn route_streaming_chat_serializes_generated_tool_call_delta() {
         let response = post_json(
             router_with_stub(
@@ -3451,6 +3538,44 @@ mod tests {
         assert!(
             !body.contains("raw text that should not stream"),
             "structured api_response should suppress raw generated text in tool-call stream: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_tool_choice_required_errors_without_leaking_content() {
+        let response = post_json(
+            router_with_stub("plain answer"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use a tool."}],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }],
+                "tool_choice": "required"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "body: {body}");
+        assert!(
+            body.contains(r#""error":{"message":"model output did not satisfy required tool_choice""#),
+            "stream should emit OpenAI error envelope: {body}"
+        );
+        assert!(
+            body.contains(r#""type":"invalid_request_error""#),
+            "stream should use invalid_request_error: {body}"
+        );
+        assert!(
+            body.contains(r#""param":"tool_choice""#),
+            "stream should include tool_choice param: {body}"
+        );
+        assert!(
+            !body.contains(r#""content":"plain answer""#),
+            "required stream must not leak invalid content before validation: {body}"
         );
     }
 
@@ -3945,16 +4070,6 @@ mod tests {
                         "type": "function",
                         "function": {"name": "weather", "parameters": {"type": "object"}}
                     }],
-                    "tool_choice": "required"
-                }),
-                "tool_choice",
-            ),
-            (
-                json!({
-                    "tools": [{
-                        "type": "function",
-                        "function": {"name": "weather", "parameters": {"type": "object"}}
-                    }],
                     "tool_choice": {
                         "type": "function",
                         "function": {"name": "calendar"}
@@ -4005,6 +4120,24 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "tools");
+    }
+
+    #[tokio::test]
+    async fn route_rejects_tool_choice_required_without_tools() {
+        let response = post_json(
+            router_with_stub("unused"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tool_choice": "required"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "tool_choice");
     }
 
     #[tokio::test]

@@ -124,6 +124,10 @@
 - G1 must preserve real CLI semantics for vLLM-style flags: `--max-model-len` maps to `FERRUM_MAX_MODEL_LEN`, `--max-num-seqs` maps to `FERRUM_PAGED_MAX_SEQS`, `--max-num-batched-tokens` maps to `FERRUM_MAX_BATCHED_TOKENS`, and prefix-cache flags map to `FERRUM_PREFIX_CACHE`.
 - Do not add ignored compatibility flags. If Ferrum cannot implement a vLLM flag, document it in `docs/migration/vllm-compatibility-matrix.md` instead of silently accepting it.
 - G1 acceptance requires `ferrum serve --help` visibility, effective-config JSON entries sourced from `cli`, OpenAI non-stream and stream smoke, exactly one stream `[DONE]`, exactly one usage chunk before `[DONE]`, and a final `G1 VLLM MIGRATION PASS: <artifact_dir>` line.
+- G2 agent-serving compatibility covers strict JSON schema, `response_format`, tools, `tool_choice`, and OpenAI-shaped streaming behavior. Any change touching these paths must run `cargo test -p ferrum-server structured_output` plus the G2 CLI real-model tests before claiming completion.
+- G2 `tool_choice=required` semantics are product behavior: require at least one function tool, steer toward a tool argument schema, return OpenAI-shaped `tool_calls`, and return/stream an OpenAI-shaped error with `param=tool_choice` if no valid tool call is produced.
+- G2 must not leak invalid strict-schema or required-tool content before validation in streaming mode. Buffer first; then emit valid deltas or an OpenAI-shaped SSE error followed by exactly one `[DONE]`.
+- G2 final evidence must print `G2 AGENT SERVING PASS: <artifact_dir>` and record artifacts under `docs/release/g1-g4/g2-agent-serving/<timestamp>-<short_sha>/`.
 
 ## Directory Cleanup Policy
 - Before moving, deleting, or archiving files under `crates/`, `docs/`, or `scripts/`, run `python3 scripts/release/inventory_tree.py --out docs/release/cleanup/<YYYYMMDD>-inventory.md` and commit the inventory.

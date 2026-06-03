@@ -351,6 +351,9 @@ fn forced_tool_choice_name(chat_request: &ApiChatRequest) -> Option<&str> {
         }) if tool_type == "function" && api_tool_name_allowed(chat_request, &function.name) => {
             Some(function.name.as_str())
         }
+        Some(ApiToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required") => {
+            chat_request.tools.first().map(|tool| tool.function.name.as_str())
+        }
         _ => None,
     }
 }

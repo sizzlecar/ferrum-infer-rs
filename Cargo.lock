@@ -1604,6 +1604,7 @@ dependencies = [
  "minijinja",
  "pin-project",
  "regex-lite",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
