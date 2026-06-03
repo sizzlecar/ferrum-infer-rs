@@ -12,9 +12,10 @@ REQUIRED_GROUPS = {
     "metal-source": ["metal.gate.json", "source/metal.gate.json"],
     "metal-tarball": ["metal-tarball/gate.json"],
     "cuda-tarball": ["cuda-tarball/gate.json"],
+    "homebrew-metal": ["homebrew-metal/gate.json"],
     "homebrew-cuda-fetch": ["homebrew-cuda-fetch/gate.json"],
 }
-OPTIONAL = ["homebrew-metal/gate.json", "g0_cuda4090_smoke.gate.json", "g0_cuda4090_full.gate.json"]
+OPTIONAL = ["g0_cuda4090_smoke.gate.json", "g0_cuda4090_full.gate.json"]
 
 
 def load_gate(path: Path) -> tuple[bool, str]:
