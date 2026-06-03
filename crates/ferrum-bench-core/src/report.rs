@@ -241,7 +241,9 @@ fn fmt(stat: &ScalarStats, has_ci: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{compute_metrics, Env, RequestRecord, RunRecord, Scenario, Slo};
+    use crate::{
+        compute_metrics, Env, OutputTokenCountSource, RequestRecord, RunRecord, Scenario, Slo,
+    };
 
     fn make_run(records: Vec<(bool, f64, f64, u32, u32)>, duration_s: f64) -> RunRecord {
         let records = records
@@ -252,6 +254,7 @@ mod tests {
                 e2e_ms: e2e,
                 input_tokens: in_tok,
                 output_tokens: out_tok,
+                output_token_count_source: OutputTokenCountSource::StreamChunks,
                 itl_ms: vec![],
             })
             .collect();

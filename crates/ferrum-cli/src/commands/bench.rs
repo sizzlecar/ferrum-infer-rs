@@ -22,7 +22,8 @@ use chrono::Utc;
 use clap::Args;
 use colored::*;
 use ferrum_bench_core::{
-    compute_metrics, BenchReport, Env, RequestRecord, RunRecord, Scenario, Slo,
+    compute_metrics, BenchReport, Env, OutputTokenCountSource, RequestRecord, RunRecord, Scenario,
+    Slo,
 };
 use ferrum_types::{InferenceRequest, Priority, RequestId, Result, SamplingParams};
 use futures::StreamExt;
@@ -450,6 +451,7 @@ async fn collect_stream(
         e2e_ms,
         input_tokens: 0, // CLI bench doesn't tokenize; left as 0
         output_tokens: token_count,
+        output_token_count_source: OutputTokenCountSource::StreamChunks,
         itl_ms,
     })
 }

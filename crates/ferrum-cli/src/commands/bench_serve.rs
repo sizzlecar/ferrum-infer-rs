@@ -17,11 +17,11 @@
 use clap::Args;
 use colored::*;
 use ferrum_bench_core::{
-    arrivals::poisson_arrival_times, compute_metrics, BenchReport, Env, RequestRecord, RunRecord,
-    Scenario, Slo,
+    arrivals::poisson_arrival_times, compute_metrics, BenchReport, Env, OutputTokenCountSource,
+    RequestRecord, RunRecord, Scenario, Slo, TokenLengthStats,
 };
 use ferrum_types::Result;
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -118,6 +118,22 @@ pub struct BenchServeCommand {
     #[arg(long, default_value_t = 600.0)]
     pub timeout: f64,
 
+    /// Exit non-zero when any measured request errors. Release gates must set this.
+    #[arg(long)]
+    pub fail_on_error: bool,
+
+    /// Maximum measured request error rate allowed when error enforcement is active.
+    #[arg(long)]
+    pub max_error_rate: Option<f64>,
+
+    /// Require n_repeats >= 3 so reports include CI/stddev evidence.
+    #[arg(long)]
+    pub require_ci: bool,
+
+    /// Deterministic prompt-generation seed. Repeat i uses a stable derivation.
+    #[arg(long)]
+    pub seed: Option<u64>,
+
     // ─── Output ────────────────────────────────────────────────────
     /// Output format: `json` (BenchReport), `jsonl` (append one
     /// `BenchReport` per line — used by `scripts/compare-commits.sh`),
@@ -183,6 +199,7 @@ pub(super) fn parse_slo(s: &str) -> std::result::Result<Slo, String> {
 #[derive(Debug, Deserialize)]
 struct OpenAiStreamChunk {
     choices: Option<Vec<OpenAiStreamChoice>>,
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +212,17 @@ struct OpenAiStreamDelta {
     content: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    completion_tokens: Option<u32>,
+}
+
+#[derive(Clone)]
+struct PromptCase {
+    text: String,
+    input_tokens: u32,
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Single-request streamer
 // ─────────────────────────────────────────────────────────────────────
@@ -203,23 +231,20 @@ async fn stream_one(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
-    prompt: String,
-    input_tokens: u32,
+    prompt: PromptCase,
     max_tokens: usize,
     timeout_s: f64,
 ) -> RequestRecord {
     let body = serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": prompt.text}],
         "max_tokens": max_tokens,
         "stream": true,
+        "stream_options": {"include_usage": true},
         "temperature": 0.0,
     });
     let start = Instant::now();
-    let mut first_token_time: Option<Instant> = None;
-    let mut last_token_time: Option<Instant> = None;
-    let mut output_tokens: u32 = 0;
-    let mut itl_ms: Vec<f64> = Vec::new();
+    let mut state = StreamState::new(start, prompt.input_tokens);
 
     let resp = match client
         .post(format!("{}/v1/chat/completions", base_url))
@@ -231,14 +256,14 @@ async fn stream_one(
         Ok(r) => r,
         Err(e) => {
             eprintln!("[err] post: {}", e);
-            return failed_record(input_tokens, start);
+            return failed_record(prompt.input_tokens, start);
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
         let txt = resp.text().await.unwrap_or_default();
         eprintln!("[err] http {}: {}", status, &txt[..txt.len().min(200)]);
-        return failed_record(input_tokens, start);
+        return failed_record(prompt.input_tokens, start);
     }
 
     let mut stream = resp.bytes_stream();
@@ -248,6 +273,7 @@ async fn stream_one(
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[err] stream: {}", e);
+                state.stream_error = Some(e.to_string());
                 break;
             }
         };
@@ -261,52 +287,16 @@ async fn stream_one(
             }
             let payload = line.trim_start_matches("data:").trim();
             if payload == "[DONE]" {
-                let e2e_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let ttft_ms = first_token_time
-                    .map(|t| t.duration_since(start).as_secs_f64() * 1000.0)
-                    .unwrap_or(e2e_ms);
-                return RequestRecord {
-                    success: output_tokens > 0,
-                    ttft_ms,
-                    e2e_ms,
-                    input_tokens,
-                    output_tokens,
-                    itl_ms,
-                };
+                state.saw_done = true;
+                return state.finish();
             }
-            if let Ok(c) = serde_json::from_str::<OpenAiStreamChunk>(payload) {
-                if let Some(choices) = c.choices {
-                    if let Some(first) = choices.into_iter().next() {
-                        if let Some(delta) = first.delta {
-                            if delta.content.is_some() {
-                                let now = Instant::now();
-                                if first_token_time.is_none() {
-                                    first_token_time = Some(now);
-                                } else if let Some(prev) = last_token_time {
-                                    itl_ms.push((now - prev).as_secs_f64() * 1000.0);
-                                }
-                                last_token_time = Some(now);
-                                output_tokens += 1;
-                            }
-                        }
-                    }
-                }
+            if let Err(err) = state.handle_payload(payload) {
+                eprintln!("[err] malformed sse json: {err}");
+                state.stream_error = Some(err);
             }
         }
     }
-    // Stream ended without [DONE] sentinel — still report what we got.
-    let e2e_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let ttft_ms = first_token_time
-        .map(|t| t.duration_since(start).as_secs_f64() * 1000.0)
-        .unwrap_or(e2e_ms);
-    RequestRecord {
-        success: output_tokens > 0,
-        ttft_ms,
-        e2e_ms,
-        input_tokens,
-        output_tokens,
-        itl_ms,
-    }
+    state.finish()
 }
 
 fn failed_record(input_tokens: u32, start: Instant) -> RequestRecord {
@@ -316,7 +306,88 @@ fn failed_record(input_tokens: u32, start: Instant) -> RequestRecord {
         e2e_ms: start.elapsed().as_secs_f64() * 1000.0,
         input_tokens,
         output_tokens: 0,
+        output_token_count_source: OutputTokenCountSource::None,
         itl_ms: vec![],
+    }
+}
+
+struct StreamState {
+    start: Instant,
+    input_tokens: u32,
+    first_token_time: Option<Instant>,
+    last_token_time: Option<Instant>,
+    content_delta_tokens: u32,
+    usage_completion_tokens: Option<u32>,
+    itl_ms: Vec<f64>,
+    saw_done: bool,
+    stream_error: Option<String>,
+}
+
+impl StreamState {
+    fn new(start: Instant, input_tokens: u32) -> Self {
+        Self {
+            start,
+            input_tokens,
+            first_token_time: None,
+            last_token_time: None,
+            content_delta_tokens: 0,
+            usage_completion_tokens: None,
+            itl_ms: Vec::new(),
+            saw_done: false,
+            stream_error: None,
+        }
+    }
+
+    fn handle_payload(&mut self, payload: &str) -> std::result::Result<(), String> {
+        let chunk: OpenAiStreamChunk =
+            serde_json::from_str(payload).map_err(|e| format!("{e}: {payload}"))?;
+        if let Some(usage) = chunk.usage {
+            if let Some(tokens) = usage.completion_tokens {
+                self.usage_completion_tokens = Some(tokens);
+            }
+        }
+        if let Some(choices) = chunk.choices {
+            if let Some(first) = choices.into_iter().next() {
+                if let Some(delta) = first.delta {
+                    if delta.content.as_deref().is_some_and(|s| !s.is_empty()) {
+                        let now = Instant::now();
+                        if self.first_token_time.is_none() {
+                            self.first_token_time = Some(now);
+                        } else if let Some(prev) = self.last_token_time {
+                            self.itl_ms.push((now - prev).as_secs_f64() * 1000.0);
+                        }
+                        self.last_token_time = Some(now);
+                        self.content_delta_tokens += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> RequestRecord {
+        let (output_tokens, source) = match self.usage_completion_tokens {
+            Some(tokens) => (tokens, OutputTokenCountSource::Usage),
+            None if self.content_delta_tokens > 0 => (
+                self.content_delta_tokens,
+                OutputTokenCountSource::StreamChunks,
+            ),
+            None => (0, OutputTokenCountSource::None),
+        };
+        let e2e_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        let ttft_ms = self
+            .first_token_time
+            .map(|t| t.duration_since(self.start).as_secs_f64() * 1000.0)
+            .unwrap_or(e2e_ms);
+        RequestRecord {
+            success: self.saw_done && output_tokens > 0 && self.stream_error.is_none(),
+            ttft_ms,
+            e2e_ms,
+            input_tokens: self.input_tokens,
+            output_tokens,
+            output_token_count_source: source,
+            itl_ms: self.itl_ms,
+        }
     }
 }
 
@@ -325,7 +396,11 @@ fn failed_record(input_tokens: u32, start: Instant) -> RequestRecord {
 // ─────────────────────────────────────────────────────────────────────
 
 /// Draw a random token sequence of exact length `n_tokens`.
-fn gen_random_prompt(tok: &tokenizers::Tokenizer, n_tokens: usize, rng: &mut impl Rng) -> String {
+fn gen_random_prompt(
+    tok: &tokenizers::Tokenizer,
+    n_tokens: usize,
+    rng: &mut (impl Rng + ?Sized),
+) -> String {
     let vocab_size = tok.get_vocab_size(false) as u32;
     let lo: u32 = 256.min(vocab_size.saturating_sub(1));
     let hi: u32 = vocab_size.saturating_sub(1);
@@ -337,31 +412,44 @@ fn gen_random_prompt(tok: &tokenizers::Tokenizer, n_tokens: usize, rng: &mut imp
 fn build_prompts(
     cmd: &BenchServeCommand,
     tok: &tokenizers::Tokenizer,
-    rng: &mut impl Rng,
+    rng: &mut (impl Rng + ?Sized),
     count: usize,
-) -> Result<Vec<String>> {
+) -> Result<Vec<PromptCase>> {
     match cmd.dataset.as_str() {
-        "random" => Ok((0..count)
-            .map(|_| gen_random_prompt(tok, cmd.random_input_len, rng))
-            .collect()),
-        "shared-prefix" => Ok(gen_shared_prefix_prompts(
+        "random" => (0..count)
+            .map(|_| {
+                let text = gen_random_prompt(tok, cmd.random_input_len, rng);
+                prompt_case(tok, text)
+            })
+            .collect(),
+        "shared-prefix" => gen_shared_prefix_prompts(
             tok,
             count,
             cmd.shared_prefix_len,
             cmd.shared_suffix_len,
             rng,
-        )),
+        ),
         "sharegpt" => {
             let p = cmd.sharegpt_path.as_ref().ok_or_else(|| {
                 ferrum_types::FerrumError::model("--dataset sharegpt requires --sharegpt-path PATH")
             })?;
-            load_sharegpt_prompts(p, count, rng)
+            load_sharegpt_prompts(p, tok, count, rng)
         }
         other => Err(ferrum_types::FerrumError::model(format!(
             "unknown --dataset '{}': allowed values are random, sharegpt, shared-prefix",
             other
         ))),
     }
+}
+
+fn prompt_case(tok: &tokenizers::Tokenizer, text: String) -> Result<PromptCase> {
+    let encoding = tok
+        .encode(text.as_str(), false)
+        .map_err(|e| ferrum_types::FerrumError::model(format!("tokenize generated prompt: {e}")))?;
+    Ok(PromptCase {
+        text,
+        input_tokens: encoding.len() as u32,
+    })
 }
 
 /// Generate `count` prompts that all share a 1024-token (or whatever
@@ -378,8 +466,8 @@ fn gen_shared_prefix_prompts(
     count: usize,
     prefix_len: usize,
     suffix_len: usize,
-    rng: &mut impl Rng,
-) -> Vec<String> {
+    rng: &mut (impl Rng + ?Sized),
+) -> Result<Vec<PromptCase>> {
     let vocab_size = tok.get_vocab_size(false) as u32;
     let lo: u32 = 256.min(vocab_size.saturating_sub(1));
     let hi: u32 = vocab_size.saturating_sub(1);
@@ -397,7 +485,7 @@ fn gen_shared_prefix_prompts(
             // Insert a newline so the prefix is a clear boundary — helps
             // server-side prefix-cache hashing key on the same prefix
             // even when suffixes differ.
-            format!("{prefix}\n{suffix}")
+            prompt_case(tok, format!("{prefix}\n{suffix}"))
         })
         .collect()
 }
@@ -414,9 +502,10 @@ fn gen_shared_prefix_prompts(
 /// randomly samples; if `count` > available, cycles with replacement.
 fn load_sharegpt_prompts(
     path: &std::path::Path,
+    tok: &tokenizers::Tokenizer,
     count: usize,
-    rng: &mut impl Rng,
-) -> Result<Vec<String>> {
+    rng: &mut (impl Rng + ?Sized),
+) -> Result<Vec<PromptCase>> {
     use std::io::BufRead;
     let f = std::fs::File::open(path).map_err(|e| {
         ferrum_types::FerrumError::model(format!("open sharegpt {}: {e}", path.display()))
@@ -472,7 +561,7 @@ fn load_sharegpt_prompts(
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let idx = rng.random_range(0..prompts.len());
-        out.push(prompts[idx].clone());
+        out.push(prompt_case(tok, prompts[idx].clone())?);
     }
     Ok(out)
 }
@@ -486,7 +575,6 @@ struct RunContext {
     base_url: Arc<String>,
     model: Arc<String>,
     max_out: usize,
-    input_tokens: u32,
     timeout_s: f64,
 }
 
@@ -495,7 +583,7 @@ struct RunContext {
 /// begins.
 async fn run_closed_loop(
     ctx: &RunContext,
-    prompts: Vec<String>,
+    prompts: Vec<PromptCase>,
     warmup_requests: u32,
     concurrency: u32,
 ) -> RunRecord {
@@ -521,7 +609,6 @@ async fn run_closed_loop(
                     &ctx_c.base_url,
                     &ctx_c.model,
                     p,
-                    ctx_c.input_tokens,
                     ctx_c.max_out,
                     ctx_c.timeout_s,
                 )
@@ -547,7 +634,6 @@ async fn run_closed_loop(
                 &ctx_c.base_url,
                 &ctx_c.model,
                 prompt,
-                ctx_c.input_tokens,
                 ctx_c.max_out,
                 ctx_c.timeout_s,
             )
@@ -571,7 +657,7 @@ async fn run_closed_loop(
 /// before sending so that slow responses don't push later arrivals.
 async fn run_open_loop(
     ctx: &RunContext,
-    prompts: Vec<String>,
+    prompts: Vec<PromptCase>,
     warmup_requests: u32,
     rate: f64,
 ) -> RunRecord {
@@ -586,7 +672,6 @@ async fn run_open_loop(
             &ctx.base_url,
             &ctx.model,
             prompt.clone(),
-            ctx.input_tokens,
             ctx.max_out,
             ctx.timeout_s,
         )
@@ -613,7 +698,6 @@ async fn run_open_loop(
                 &ctx_c.base_url,
                 &ctx_c.model,
                 prompt,
-                ctx_c.input_tokens,
                 ctx_c.max_out,
                 ctx_c.timeout_s,
             )
@@ -640,7 +724,6 @@ impl RunContext {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             max_out: self.max_out,
-            input_tokens: self.input_tokens,
             timeout_s: self.timeout_s,
         }
     }
@@ -710,7 +793,7 @@ async fn execute_cell(
     // run as "cpu" when that env var was unset, polluting bench artifacts.
     let backend = if cfg!(feature = "cuda") {
         "cuda"
-    } else if cfg!(target_os = "macos") {
+    } else if cfg!(feature = "metal") {
         "metal"
     } else {
         "cpu"
@@ -724,13 +807,31 @@ async fn execute_cell(
             e
         ))
     })?;
-    let mut rng = rand::rng();
-
     let total_prompts = (cmd.num_prompts + cmd.warmup_requests) as usize;
 
     let mut runs: Vec<RunRecord> = Vec::with_capacity(cmd.n_repeats as usize);
+    let mut actual_input_lengths: Vec<u32> = Vec::new();
+    let mut actual_input_tokens_per_request: Vec<Vec<u32>> =
+        Vec::with_capacity(cmd.n_repeats as usize);
     for repeat_idx in 0..cmd.n_repeats {
-        let prompts = build_prompts(cmd, &tok, &mut rng, total_prompts)?;
+        let mut seeded_rng;
+        let mut thread_rng;
+        let rng: &mut dyn rand::RngCore = if let Some(seed) = cmd.seed {
+            seeded_rng =
+                StdRng::seed_from_u64(seed ^ ((repeat_idx as u64) << 32) ^ cell_seed(cell));
+            &mut seeded_rng
+        } else {
+            thread_rng = rand::rng();
+            &mut thread_rng
+        };
+        let prompts = build_prompts(cmd, &tok, rng, total_prompts)?;
+        let measured_input_lengths: Vec<u32> = prompts
+            .iter()
+            .skip(cmd.warmup_requests as usize)
+            .map(|p| p.input_tokens)
+            .collect();
+        actual_input_lengths.extend(measured_input_lengths.iter().copied());
+        actual_input_tokens_per_request.push(measured_input_lengths);
         eprintln!(
             "{}",
             format!(
@@ -755,6 +856,8 @@ async fn execute_cell(
         );
         runs.push(run);
     }
+    let actual_input_tokens = input_token_stats(&actual_input_lengths, requested_input_len(cmd));
+    let token_count_source = output_token_count_source_from_runs(&runs);
 
     let env = build_env(cmd, detect_features());
     let slo = cmd.goodput.unwrap_or(Slo {
@@ -772,19 +875,72 @@ async fn execute_cell(
         Cell::Open(r) => (Scenario::OpenLoop, None, Some(r)),
     };
 
-    Ok(compute_metrics(
+    let mut report = compute_metrics(
         model_field,
         backend.to_string(),
         scenario,
         concurrency,
         request_rate,
-        cmd.random_input_len as u32,
+        requested_input_len(cmd),
         cmd.random_output_len as u32,
         cmd.warmup_requests,
         slo,
         runs,
         env,
-    ))
+    );
+    report.actual_input_tokens = Some(actual_input_tokens);
+    report.actual_input_tokens_per_request = Some(actual_input_tokens_per_request);
+    report.output_token_count_source = Some(token_count_source);
+    Ok(report)
+}
+
+fn requested_input_len(cmd: &BenchServeCommand) -> u32 {
+    match cmd.dataset.as_str() {
+        "shared-prefix" => cmd.shared_prefix_len.saturating_add(cmd.shared_suffix_len) as u32,
+        _ => cmd.random_input_len as u32,
+    }
+}
+
+fn input_token_stats(lengths: &[u32], requested: u32) -> TokenLengthStats {
+    let min = lengths.iter().copied().min().unwrap_or(0);
+    let max = lengths.iter().copied().max().unwrap_or(0);
+    let mean = if lengths.is_empty() {
+        0.0
+    } else {
+        lengths.iter().map(|&n| n as f64).sum::<f64>() / lengths.len() as f64
+    };
+    TokenLengthStats {
+        requested,
+        min,
+        max,
+        mean,
+    }
+}
+
+fn output_token_count_source_from_runs(runs: &[RunRecord]) -> String {
+    let mut saw_usage = false;
+    let mut saw_stream_chunks = false;
+    let mut saw_none = false;
+    for record in runs.iter().flat_map(|run| &run.records) {
+        match record.output_token_count_source {
+            OutputTokenCountSource::Usage => saw_usage = true,
+            OutputTokenCountSource::StreamChunks => saw_stream_chunks = true,
+            OutputTokenCountSource::None => saw_none = true,
+        }
+    }
+    match (saw_usage, saw_stream_chunks, saw_none) {
+        (true, false, false) => "usage".to_string(),
+        (false, true, false) => "stream_chunks".to_string(),
+        (false, false, true) => "none".to_string(),
+        _ => "mixed".to_string(),
+    }
+}
+
+fn cell_seed(cell: Cell) -> u64 {
+    match cell {
+        Cell::Closed(c) => 0xC10C_ED00_0000_0000u64 ^ c as u64,
+        Cell::Open(r) => 0x0FEE_D000_0000_0000u64 ^ r.to_bits(),
+    }
 }
 
 fn cell_label(cell: Cell) -> String {
@@ -799,6 +955,7 @@ fn cell_label(cell: Cell) -> String {
 // ─────────────────────────────────────────────────────────────────────
 
 pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
+    validate_command(&cmd)?;
     eprintln!(
         "{}",
         format!(
@@ -838,7 +995,6 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         base_url: Arc::new(cmd.base_url.clone()),
         model: Arc::new(cmd.model.clone()),
         max_out: cmd.random_output_len,
-        input_tokens: cmd.random_input_len as u32,
         timeout_s: cmd.timeout,
     };
 
@@ -849,6 +1005,8 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         emit_summary_line(&r);
         reports.push(r);
     }
+
+    enforce_error_policy(&cmd, &reports)?;
 
     // Emit final report.
     match cmd.output.as_str() {
@@ -865,6 +1023,91 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
     // PLAYBOOK § 1.5: static globals don't drop on Rust process exit.
     ferrum_bench_core::trace::flush_global_trace();
 
+    Ok(())
+}
+
+fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
+    if let Some(rate) = cmd.request_rate {
+        if rate <= 0.0 || !rate.is_finite() {
+            return Err(ferrum_types::FerrumError::model(
+                "--request-rate must be a positive finite number",
+            ));
+        }
+    }
+    if cmd.timeout <= 0.0 || !cmd.timeout.is_finite() {
+        return Err(ferrum_types::FerrumError::model(
+            "--timeout must be a positive finite number",
+        ));
+    }
+    if cmd.concurrency == 0 {
+        return Err(ferrum_types::FerrumError::model(
+            "--concurrency must be > 0",
+        ));
+    }
+    if cmd.num_prompts == 0 {
+        return Err(ferrum_types::FerrumError::model(
+            "--num-prompts must be > 0",
+        ));
+    }
+    if cmd.random_input_len == 0 {
+        return Err(ferrum_types::FerrumError::model(
+            "--random-input-len must be > 0",
+        ));
+    }
+    if cmd.random_output_len == 0 {
+        return Err(ferrum_types::FerrumError::model(
+            "--random-output-len must be > 0",
+        ));
+    }
+    if cmd.require_ci && cmd.n_repeats < 3 {
+        return Err(ferrum_types::FerrumError::model(
+            "--require-ci requires --n-repeats >= 3",
+        ));
+    }
+    if let Some(max_error_rate) = cmd.max_error_rate {
+        if !(0.0..=1.0).contains(&max_error_rate) || !max_error_rate.is_finite() {
+            return Err(ferrum_types::FerrumError::model(
+                "--max-error-rate must be in [0.0, 1.0]",
+            ));
+        }
+    }
+    for cell in &cmd.concurrency_sweep {
+        if *cell == 0 {
+            return Err(ferrum_types::FerrumError::model(
+                "--concurrency-sweep values must be > 0",
+            ));
+        }
+    }
+    let _total_prompts = cmd
+        .num_prompts
+        .checked_add(cmd.warmup_requests)
+        .ok_or_else(|| {
+            ferrum_types::FerrumError::model("num_prompts + warmup_requests overflow")
+        })?;
+    Ok(())
+}
+
+fn enforce_error_policy(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> {
+    if !cmd.fail_on_error && cmd.max_error_rate.is_none() {
+        return Ok(());
+    }
+    let max_error_rate = cmd.max_error_rate.unwrap_or(0.0);
+    for report in reports {
+        let completed: u32 = report.completed_per_run.iter().copied().sum();
+        let errored: u32 = report.errored_per_run.iter().copied().sum();
+        let total = completed + errored;
+        let error_rate = if total == 0 {
+            1.0
+        } else {
+            errored as f64 / total as f64
+        };
+        if error_rate > max_error_rate {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "bench-serve error rate {:.4} exceeds max {:.4} for {}",
+                error_rate, max_error_rate, report.model
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1008,5 +1251,75 @@ mod tests {
     #[test]
     fn slo_rejects_unknown_key() {
         assert!(parse_slo("ttft:500 tpot:50 e2el:30000 bogus:1").is_err());
+    }
+
+    #[test]
+    fn stream_done_with_usage_succeeds() {
+        let mut state = StreamState::new(Instant::now(), 7);
+        state
+            .handle_payload(r#"{"choices":[{"delta":{"content":"hello"}}],"usage":null}"#)
+            .unwrap();
+        state
+            .handle_payload(r#"{"choices":[],"usage":{"completion_tokens":3}}"#)
+            .unwrap();
+        state.saw_done = true;
+        let record = state.finish();
+        assert!(record.success);
+        assert_eq!(record.output_tokens, 3);
+        assert_eq!(
+            record.output_token_count_source,
+            OutputTokenCountSource::Usage
+        );
+    }
+
+    #[test]
+    fn stream_error_after_chunk_fails() {
+        let mut state = StreamState::new(Instant::now(), 7);
+        state
+            .handle_payload(r#"{"choices":[{"delta":{"content":"hello"}}]}"#)
+            .unwrap();
+        state.stream_error = Some("broken stream".into());
+        state.saw_done = true;
+        let record = state.finish();
+        assert!(!record.success);
+        assert_eq!(
+            record.output_token_count_source,
+            OutputTokenCountSource::StreamChunks
+        );
+    }
+
+    #[test]
+    fn eof_before_done_after_chunk_fails() {
+        let mut state = StreamState::new(Instant::now(), 7);
+        state
+            .handle_payload(r#"{"choices":[{"delta":{"content":"hello"}}]}"#)
+            .unwrap();
+        let record = state.finish();
+        assert!(!record.success);
+        assert_eq!(record.output_tokens, 1);
+    }
+
+    #[test]
+    fn malformed_sse_json_fails() {
+        let mut state = StreamState::new(Instant::now(), 7);
+        assert!(state.handle_payload("{bad json}").is_err());
+        state.stream_error = Some("malformed json".into());
+        state.saw_done = true;
+        let record = state.finish();
+        assert!(!record.success);
+        assert_eq!(record.output_tokens, 0);
+    }
+
+    #[test]
+    fn done_with_zero_content_tokens_fails() {
+        let mut state = StreamState::new(Instant::now(), 7);
+        state.saw_done = true;
+        let record = state.finish();
+        assert!(!record.success);
+        assert_eq!(record.output_tokens, 0);
+        assert_eq!(
+            record.output_token_count_source,
+            OutputTokenCountSource::None
+        );
     }
 }

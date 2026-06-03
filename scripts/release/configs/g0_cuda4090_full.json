@@ -1,0 +1,43 @@
+{
+  "name": "g0-cuda4090-full",
+  "out_root": "/workspace/g0-cuda4090-full",
+  "model_dir": "/workspace/hf-cache/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+  "hf_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+  "bin": "./target/release/ferrum",
+  "build": false,
+  "features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source",
+  "preset": "m3_qwen3_30b_a3b_int4",
+  "port_base": 19100,
+  "concurrency_cells": [1, 4, 16, 32],
+  "repeats": 3,
+  "num_prompts": 128,
+  "warmup_requests": 10,
+  "baseline_case": "baseline",
+  "gates": {
+    "paris": true,
+    "multi_turn": true,
+    "multi_turn_3round": true
+  },
+  "validation": {
+    "change_type": "default_path",
+    "touched_areas": ["model_forward", "runtime_defaults", "openai_server_api"],
+    "performance_regression_required": true,
+    "required_correctness_gates": ["paris", "multi_turn_paris", "multi_turn_3round_paris", "bench_completion"],
+    "required_concurrency_cells": [1, 4, 16, 32]
+  },
+  "performance_gates": {
+    "enabled": true,
+    "throughput_min_delta_pct": -3.0,
+    "c32_throughput_min_delta_pct": -3.0,
+    "ttft_max_regression_pct": 10.0,
+    "tpot_max_regression_pct": 5.0,
+    "itl_p95_max_regression_pct": 10.0
+  },
+  "base_env": {
+    "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}"
+  },
+  "cases": [
+    {"name": "baseline", "port": 19100, "env": {}},
+    {"name": "candidate", "port": 19101, "env": {}}
+  ]
+}
