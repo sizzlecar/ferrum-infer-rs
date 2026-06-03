@@ -66,6 +66,7 @@ def make_summary_artifact(root: Path) -> None:
         "source/metal.gate.json",
         "metal-tarball/gate.json",
         "cuda-tarball/gate.json",
+        "homebrew-metal/gate.json",
         "homebrew-cuda-fetch/gate.json",
     ]:
         write_json(root / rel, {"status": "pass"})

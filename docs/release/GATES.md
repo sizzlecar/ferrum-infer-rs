@@ -47,6 +47,8 @@ The summary gate verifies required child `gate.json` files and prints:
 G0 RELEASE PASS: docs/release/g0/<version>
 ```
 
+Required release children are `unit`, `metal-source`, `metal-tarball`, `cuda-tarball`, `homebrew-metal`, and `homebrew-cuda-fetch`. CUDA smoke/full source gates may be attached as additional evidence.
+
 ## Canonical performance client
 
 `ferrum bench-serve` is the only canonical release HTTP performance client for `/v1/chat/completions`. Release performance invocations must use:
