@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 - This repository is a Rust workspace. Root configuration lives in `Cargo.toml`, with crates under `crates/`.
-- Core contracts are in `crates/ferrum-types` and `crates/ferrum-interfaces`; implementations live in crates like `ferrum-engine`, `ferrum-runtime`, `ferrum-models`, `ferrum-cli`, and `ferrum-server`.
+- Core contracts are in `crates/ferrum-types` and `crates/ferrum-interfaces`; implementations live in crates like `ferrum-engine`, `ferrum-models`, `ferrum-cli`, and `ferrum-server`.
 - Integration tests are primarily in `crates/*/tests` (for example, `crates/ferrum-types/tests`).
 - CI configuration is in `.github/workflows/ci.yml`; local runtime defaults are in `ferrum.toml`.
 
@@ -109,6 +109,33 @@
 - Do not validate release behavior by hand-assembling hidden env-var combinations that users will not know to set. Correctness, streaming, multi-turn, and README performance gates must exercise product defaults for `ferrum run` / `ferrum serve`; move required sizing/scheduler choices into typed auto-profile defaults or documented presets.
 - Do not hard-code model-family prompt hacks such as forced empty Qwen3 `<think>` blocks. Prefer model-provided chat templates from GGUF/HF metadata, and make template rendering shared between `run` and `serve`.
 - Do not hide invalid model output by filtering decoded text. If `<unk>`, `[PAD...]`, or tokenizer-reserved IDs appear, trace token IDs and fix sampling/logit masking or KV/logits state before accepting the regression.
+
+## Release Gate Policy
+- `cargo test --workspace --all-targets` is the first source gate.
+- Metal source releases must use `scripts/metal_readme_regression.py` plus `scripts/release/validate_metal_readme_regression.py`; do not replace this runner with a private all-in-one script.
+- CUDA source releases must use `scripts/m3_ab_runner.py` plus `scripts/m3_validate_runner_artifact.py` with the G0 configs under `scripts/release/configs/`.
+- Official release asset validation must use `scripts/release/release_binary_gate.py` for Metal tarball, CUDA tarball, Homebrew Metal, and Homebrew CUDA fetch gates.
+- Every release gate must print an explicit `PASS` line and return non-zero on failure. A silent successful command is not enough release evidence.
+- If a change touches shared model, scheduler, runtime default, tokenizer/template, CLI, or server code, both Metal and CUDA must be regressed. Backend-local CUDA changes require CUDA full/smoke plus a Metal smoke; backend-local Metal changes require Metal full plus a CUDA smoke.
+
+## Directory Cleanup Policy
+- Before moving, deleting, or archiving files under `crates/`, `docs/`, or `scripts/`, run `python3 scripts/release/inventory_tree.py --out docs/release/cleanup/<YYYYMMDD>-inventory.md` and commit the inventory.
+- Do not delete benchmark or release evidence unless the cleanup manifest lists the file, category, reference count, and reason.
+- Keep workspace crate membership in `Cargo.toml` synchronized with actual `crates/*/Cargo.toml` directories.
+- Prefer adding `scripts/README.md` classifications and archive candidates before doing physical moves; avoid large script-layout churn in the same PR as gate logic changes.
+
+## bench-serve Policy
+- `ferrum bench-serve` is the canonical HTTP performance client for `/v1/chat/completions`; do not add a second release throughput path for the same endpoint.
+- Release performance claims must use streaming with `stream_options.include_usage=true`, require `output_token_count_source=\"usage\"`, and run with `--fail-on-error --require-ci --seed 9271`.
+- Smoke runs may omit `--require-ci`, but must still use `--fail-on-error`.
+- A streaming request is successful only when it receives `data: [DONE]`, emits at least one output token, and has no stream/JSON error.
+- Reports must use actual tokenizer-counted input lengths for `random`, `sharegpt`, and `shared-prefix` prompts; do not reuse `random_input_len` for non-random datasets.
+
+## GPU Cost Policy
+- CUDA G0 gates target one RTX 4090 and `Qwen/Qwen3-30B-A3B-GPTQ-Int4`; do not broaden paid GPU release gates to multiple GPUs or multiple CUDA models without explicit approval.
+- Before using a paid GPU, state the lane, expected runtime/cost, stop condition, correctness gate, and performance command.
+- Do not leave paid GPU instances idle. Stop or destroy them after validation evidence is collected unless the user explicitly asks to keep them running.
+- If CUDA validation fails, collect the exact failing artifact/log, stop unnecessary processes, and avoid repeated full sweeps until the failure mode is understood.
 
 ## Commit & Pull Request Guidelines
 - Follow the existing commit style: conventional prefixes plus scope when useful, e.g. `feat(cli): ...`, `refactor(engine): ...`, `feat(cli, models): ...`.
