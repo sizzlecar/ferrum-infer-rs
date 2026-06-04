@@ -901,6 +901,7 @@ fn runtime_preset_entries(
             ("FERRUM_GREEDY_ARGMAX", "1"),
             ("FERRUM_KV_MAX_BLOCKS", "2048"),
             ("FERRUM_PAGED_MAX_SEQS", "32"),
+            ("FERRUM_KV_CAPACITY", "2048"),
             ("FERRUM_MOE_GRAPH", "1"),
             ("FERRUM_VLLM_MOE", "1"),
             ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
@@ -1853,9 +1854,10 @@ mod tests {
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
         assert_eq!(entry("FERRUM_VLLM_MOE_PAIR_IDS").effective_value, "1");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_BACKEND").source, RuntimeConfigSource::Cli);
-        assert_eq!(snapshot.entries.len(), 11);
+        assert_eq!(snapshot.entries.len(), 12);
     }
 
     #[test]
@@ -1874,6 +1876,7 @@ mod tests {
 
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
         assert_eq!(
             entry("FERRUM_MOE_GRAPH").source,
             RuntimeConfigSource::Default
