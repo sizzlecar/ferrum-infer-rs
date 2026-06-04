@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -169,11 +170,16 @@ def model_config_path(model: str) -> Path | None:
     return candidates[-1] if candidates else None
 
 
-def qkv_lora_shape(model: str) -> tuple[int, int]:
+def model_lora_shapes(model: str) -> dict[str, tuple[int, int]]:
     config_path = model_config_path(model)
     if config_path is None:
         if model in {"qwen3:0.6b", "qwen3-0.6b", "Qwen/Qwen3-0.6B"}:
-            return 1024, 4096
+            return {
+                "qkv_proj": (1024, 4096),
+                "o_proj": (2048, 1024),
+                "gate_up_proj": (1024, 6144),
+                "down_proj": (3072, 1024),
+            }
         raise RuntimeError(
             "model config not found for LoRA fixture; set "
             "G4_MODEL_CONFIG=/path/to/config.json"
@@ -183,55 +189,86 @@ def qkv_lora_shape(model: str) -> tuple[int, int]:
     heads = int(cfg["num_attention_heads"])
     kv_heads = int(cfg.get("num_key_value_heads", heads))
     head_dim = int(cfg.get("head_dim") or hidden // heads)
+    q_dim = heads * head_dim
     qkv_out = (heads + 2 * kv_heads) * head_dim
-    return hidden, qkv_out
-
-
-def write_safetensors(path: Path, in_features: int, out_features: int, rank: int) -> None:
-    a_values = [0.0] * (rank * in_features)
-    # Activate a deterministic subset of hidden dimensions. Keep values small
-    # so the adapter perturbs logits without destabilizing tiny smoke prompts.
-    for r in range(rank):
-        for offset in range(r, in_features, max(1, in_features // 32)):
-            a_values[r * in_features + offset] = 0.01
-    b_values = [0.0] * (out_features * rank)
-    for row in range(0, out_features, max(1, out_features // 64)):
-        for r in range(rank):
-            b_values[row * rank + r] = 0.01
-    a = f32_bytes(a_values)
-    b = f32_bytes(b_values)
-    header = {
-        "base_model.model.layers.0.self_attn.qkv_proj.lora_A.weight": {
-            "dtype": "F32",
-            "shape": [rank, in_features],
-            "data_offsets": [0, len(a)],
-        },
-        "base_model.model.layers.0.self_attn.qkv_proj.lora_B.weight": {
-            "dtype": "F32",
-            "shape": [out_features, rank],
-            "data_offsets": [len(a), len(a) + len(b)],
-        },
+    intermediate = int(cfg["intermediate_size"])
+    return {
+        "qkv_proj": (hidden, qkv_out),
+        "o_proj": (q_dim, hidden),
+        "gate_up_proj": (hidden, 2 * intermediate),
+        "down_proj": (intermediate, hidden),
     }
+
+
+def fixture_values(rows: int, cols: int, sign: float, amplitude: float) -> list[float]:
+    values: list[float] = []
+    for row in range(rows):
+        for col in range(cols):
+            if (row + col) % 29 == 0 or (row * 7 + col * 3) % 113 == 0:
+                direction = sign if (row + 2 * col) % 2 == 0 else -sign
+                values.append(direction * amplitude)
+            else:
+                values.append(0.0)
+    return values
+
+
+def write_safetensors(
+    path: Path,
+    shapes: dict[str, tuple[int, int]],
+    rank: int,
+    *,
+    sign: float,
+) -> None:
+    chunks: list[tuple[str, list[int], bytes]] = []
+    for target, (in_features, out_features) in shapes.items():
+        if target in {"qkv_proj", "o_proj"}:
+            module_path = f"self_attn.{target}"
+        else:
+            module_path = f"mlp.{target}"
+        prefix = f"base_model.model.layers.0.{module_path}"
+        a_values = fixture_values(rank, in_features, 1.0, 0.08)
+        b_values = fixture_values(out_features, rank, sign, 0.08)
+        chunks.append((f"{prefix}.lora_A.weight", [rank, in_features], f32_bytes(a_values)))
+        chunks.append((f"{prefix}.lora_B.weight", [out_features, rank], f32_bytes(b_values)))
+
+    header: dict[str, dict[str, Any]] = {}
+    offset = 0
+    payload = b""
+    for name, shape, data in chunks:
+        header[name] = {
+            "dtype": "F32",
+            "shape": shape,
+            "data_offsets": [offset, offset + len(data)],
+        }
+        payload += data
+        offset += len(data)
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + a + b)
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + payload)
 
 
-def write_lora_fixture(path: Path, model: str) -> dict[str, Any]:
+def write_lora_fixture(path: Path, model: str, *, sign: float) -> dict[str, Any]:
     path.mkdir(parents=True, exist_ok=True)
-    rank = 1
-    in_features, out_features = qkv_lora_shape(model)
+    rank = 4
+    shapes = model_lora_shapes(model)
+    lora_alpha = 64
     (path / "adapter_config.json").write_text(json.dumps({
         "r": rank,
-        "lora_alpha": rank,
-        "target_modules": ["qkv_proj"],
+        "lora_alpha": lora_alpha,
+        "target_modules": list(shapes.keys()),
         "base_model_name_or_path": model,
     }, indent=2) + "\n")
-    write_safetensors(path / "adapter_model.safetensors", in_features, out_features, rank)
+    write_safetensors(path / "adapter_model.safetensors", shapes, rank, sign=sign)
     return {
-        "target": "model.layers.0.self_attn.qkv_proj",
+        "targets": {
+            target: {
+                "layer": 0,
+                "in_features": in_features,
+                "out_features": out_features,
+            }
+            for target, (in_features, out_features) in shapes.items()
+        },
         "rank": rank,
-        "in_features": in_features,
-        "out_features": out_features,
+        "lora_alpha": lora_alpha,
         "position": "real-inference",
     }
 
@@ -311,7 +348,7 @@ def response_text(body: dict[str, Any]) -> str:
     )
 
 
-def validate_lora_api(base_url: str, out: Path) -> tuple[str, str]:
+def validate_lora_api(base_url: str, out: Path) -> tuple[str, str, dict[str, Any]]:
     code, models = http_json("GET", base_url + "/v1/models")
     if code != 200:
         raise RuntimeError(f"/v1/models failed: {code} {models}")
@@ -321,17 +358,21 @@ def validate_lora_api(base_url: str, out: Path) -> tuple[str, str]:
     if not adapter_ids:
         raise RuntimeError(f"adapter id missing from /v1/models: {ids}")
     adapter_id = adapter_ids[0]
+    peer_adapter_id = next((model_id for model_id in sorted(ids) if model_id.endswith(":analytics")), None)
     base_id = adapter_id.removesuffix(":sql")
     if base_id not in ids:
         raise RuntimeError(f"base model id {base_id} missing from /v1/models: {ids}")
 
     chat_outputs: dict[str, dict[str, Any]] = {}
-    for model in [base_id, adapter_id]:
+    models_to_probe = [base_id, adapter_id]
+    if peer_adapter_id:
+        models_to_probe.append(peer_adapter_id)
+    for model in models_to_probe:
         code, body = http_json("POST", base_url + "/v1/chat/completions", {
             "model": model,
             "messages": [{"role": "user", "content": "不要展开推理，直接用一句话解释 LoRA。"}],
             "temperature": 0,
-            "max_tokens": 256,
+            "max_tokens": 128,
         })
         (out / f"chat-{safe_artifact_name(model)}.json").write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
         if code != 200:
@@ -343,19 +384,54 @@ def validate_lora_api(base_url: str, out: Path) -> tuple[str, str]:
 
     base_text = chat_outputs[base_id]["text"]
     adapter_text = chat_outputs[adapter_id]["text"]
+    peer_text = chat_outputs.get(peer_adapter_id or "", {}).get("text")
+    code, base_after_body = http_json("POST", base_url + "/v1/chat/completions", {
+        "model": base_id,
+        "messages": [{"role": "user", "content": "不要展开推理，直接用一句话解释 LoRA。"}],
+        "temperature": 0,
+        "max_tokens": 128,
+    })
+    (out / "chat-base-after-adapter.json").write_text(
+        json.dumps(base_after_body, ensure_ascii=False, indent=2) + "\n"
+    )
+    if code != 200:
+        raise RuntimeError(f"base-after-adapter chat failed: {code} {base_after_body}")
+    base_after_text = response_text(base_after_body)
+    (out / "chat-base.json").write_text(
+        (out / f"chat-{safe_artifact_name(base_id)}.json").read_text()
+    )
+    (out / "chat-adapter.json").write_text(
+        (out / f"chat-{safe_artifact_name(adapter_id)}.json").read_text()
+    )
     correctness = {
         "position": "real-inference",
         "base_model_id": base_id,
         "adapter_model_id": adapter_id,
+        "peer_adapter_model_id": peer_adapter_id,
         "base_text": base_text,
         "adapter_text": adapter_text,
+        "peer_adapter_text": peer_text,
+        "base_after_adapter_text": base_after_text,
         "adapter_output_differs_from_base": adapter_text != base_text,
+        "peer_adapter_output_differs_from_base": bool(peer_text and peer_text != base_text),
+        "adapters_differ_from_each_other": bool(peer_text and peer_text != adapter_text),
+        "base_after_adapter_matches_base": base_after_text == base_text,
         "base_usage": chat_outputs[base_id].get("usage"),
         "adapter_usage": chat_outputs[adapter_id].get("usage"),
+        "peer_adapter_usage": chat_outputs.get(peer_adapter_id or "", {}).get("usage"),
+        "base_after_adapter_usage": base_after_body.get("usage"),
     }
     (out / "lora-runtime-correctness.json").write_text(
         json.dumps(correctness, ensure_ascii=False, indent=2) + "\n"
     )
+    if not correctness["adapter_output_differs_from_base"]:
+        raise RuntimeError("LoRA adapter-active deterministic output matched base output")
+    if peer_adapter_id and not correctness["peer_adapter_output_differs_from_base"]:
+        raise RuntimeError("second LoRA adapter deterministic output matched base output")
+    if peer_adapter_id and not correctness["adapters_differ_from_each_other"]:
+        raise RuntimeError("two LoRA adapters produced identical deterministic output")
+    if not correctness["base_after_adapter_matches_base"]:
+        raise RuntimeError("base output changed after adapter request, indicating adapter pollution")
 
     code, health = http_json("GET", base_url + "/health")
     if code != 200:
@@ -379,7 +455,7 @@ def validate_lora_api(base_url: str, out: Path) -> tuple[str, str]:
     (out / "chat-unknown-adapter.json").write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
     if code != 400 or body.get("error", {}).get("param") != "model":
         raise RuntimeError(f"unknown adapter did not return OpenAI model error: code={code} body={body}")
-    return base_id, adapter_id
+    return base_id, adapter_id, correctness
 
 
 def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[str, Any]:
@@ -390,7 +466,11 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
 
     bin_path = args.ferrum_bin
     fixture = out / "fixtures" / "sql-adapter"
-    fixture_manifest = write_lora_fixture(fixture, args.model)
+    peer_fixture = out / "fixtures" / "analytics-adapter"
+    fixture_manifest = {
+        "sql": write_lora_fixture(fixture, args.model, sign=1.0),
+        "analytics": write_lora_fixture(peer_fixture, args.model, sign=-1.0),
+    }
     (out / "lora-fixture.json").write_text(json.dumps(fixture_manifest, indent=2) + "\n")
     run(release_build_cmd(args), out / "release-build.log", log, timeout=1200)
 
@@ -407,12 +487,21 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
         args.model,
         out,
         log,
-        ["--lora", f"sql={fixture}", "--lora-model-id-template", "<base>:<name>"],
+        [
+            "--lora",
+            f"sql={fixture}",
+            "--lora",
+            f"analytics={peer_fixture}",
+            "--lora-model-id-template",
+            "<base>:<name>",
+        ],
     )
     try:
-        base_model_id, adapter_model_id = validate_lora_api(with_lora_base, out)
+        base_model_id, adapter_model_id, lora_correctness = validate_lora_api(with_lora_base, out)
         bench(bin_path, base_model_id, with_lora_base, out / "bench-base-with-lora.json", out / "bench-base-with-lora.log", log, args)
         bench(bin_path, adapter_model_id, with_lora_base, out / "bench-adapter.json", out / "bench-adapter.log", log, args)
+        shutil.copy2(out / "bench-adapter.json", out / "bench-adapter-active.json")
+        shutil.copy2(out / "bench-adapter.log", out / "bench-adapter-active.log")
     finally:
         stop_server(with_lora, with_lora_log)
 
@@ -432,7 +521,9 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
         "adapter_output_tps": adapter,
         "base_regression_pct": base_regression_pct,
         "adapter_to_base_ratio": adapter_ratio,
+        "adapter_active_correctness_result": lora_correctness,
         "fixture": str(fixture),
+        "peer_fixture": str(peer_fixture),
         "lora_release_position": "real-inference",
         "fixture_manifest": fixture_manifest,
     }
@@ -459,7 +550,7 @@ def write_manifest(
                 "cargo test -p ferrum-server lora",
                 "cargo test -p ferrum-cli --test server_lora_startup",
                 " ".join(release_build_cmd(args)),
-                "ferrum bench-serve c=1 no-lora/base-with-lora/adapter",
+                "ferrum bench-serve c=1 no-lora/base-with-lora/adapter-active",
             ],
             started_at_utc=started_at_utc,
             binary_path=args.ferrum_bin,
@@ -491,8 +582,9 @@ def write_manifest(
         "- PEFT adapter loader tests\n"
         "- server adapter model routing tests\n"
         "- CLI startup LoRA tests\n"
-        "- `/v1/models`, base chat, adapter chat with observed output perturbation, unknown adapter error\n"
-        "- c=1 bench smoke for base/no-lora, base/with-lora, and adapter model id\n"
+        "- `/v1/models`, base chat, two adapter chats with deterministic output perturbation, unknown adapter error\n"
+        "- base chat after adapter request remains unchanged, proving request-scoped activation\n"
+        "- c=1 bench smoke for base/no-lora, base/with-lora, and adapter-active model id\n"
     )
 
 
@@ -526,6 +618,7 @@ def main() -> int:
         run(["cargo", "test", "--workspace", "--all-targets"], out / "cargo-test.log", log, timeout=2400)
         checks["cargo_workspace_all_targets"] = True
     run(["cargo", "test", "-p", "ferrum-quantization", "--test", "lora_linear_ref"], out / "lora-linear-ref.log", log)
+    shutil.copy2(out / "lora-linear-ref.log", out / "lora-reference.log")
     checks["lora_linear_ref"] = True
     run(["cargo", "test", "-p", "ferrum-models", "--test", "lora_loader"], out / "lora-loader.log", log)
     checks["lora_loader"] = True
