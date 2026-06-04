@@ -1800,6 +1800,59 @@ impl Backend for CudaBackend {
         .expect("add_inplace (residual_add_inplace) launch");
     }
 
+    fn scaled_add_inplace(
+        ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        src: &Self::Buffer,
+        scale: f32,
+        len: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let dst_dtype = dst.dtype();
+        let src_dtype = src.dtype();
+        assert_eq!(
+            dst_dtype,
+            src_dtype,
+            "CudaBackend::scaled_add_inplace dtype mismatch: dst={} src={}",
+            dst_dtype.name(),
+            src_dtype.name()
+        );
+        assert!(
+            len <= dst.len() && len <= src.len(),
+            "CudaBackend::scaled_add_inplace len={len} exceeds dst_len={} src_len={}",
+            dst.len(),
+            src.len()
+        );
+        let fn_name = match dst_dtype {
+            crate::backend::Dtype::F16 => "scaled_add_inplace_f16",
+            crate::backend::Dtype::F32 => "scaled_add_inplace_f32",
+            other => panic!(
+                "CudaBackend::scaled_add_inplace unsupported dtype {}",
+                other.name()
+            ),
+        };
+        let func = ctx.func("scaled_add_inplace", ptx::SCALED_ADD_INPLACE, fn_name);
+        let n_i32 = len as i32;
+        let block = 256u32;
+        let grid = ((len as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(dst);
+        b.arg(src);
+        b.arg(&scale);
+        b.arg(&n_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("scaled_add_inplace launch");
+    }
+
     fn fused_silu_mul_split_strided(
         ctx: &mut Self::Context,
         gate_up: &Self::Buffer,

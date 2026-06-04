@@ -10,6 +10,7 @@ const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/rope.cu",
     "kernels/decode_attention.cu",
     "kernels/residual_add.cu",
+    "kernels/scaled_add_inplace.cu",
     "kernels/flash_decode_attention.cu",
     "kernels/paged_decode_attention.cu",
     "kernels/paged_varlen_attention.cu",
