@@ -13,7 +13,7 @@ use async_openai::{
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::fs;
+use std::fs::{self, File};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -65,10 +65,51 @@ fn python_bin() -> String {
         .unwrap_or_else(|_| "python3".to_string())
 }
 
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
 struct ServerFixture {
     base_url: String,
     effective_config_json: PathBuf,
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
     child: Child,
+}
+
+fn log_tail(path: &PathBuf) -> String {
+    const MAX_CHARS: usize = 16_000;
+    let Ok(text) = fs::read_to_string(path) else {
+        return format!("unable to read {}", path.display());
+    };
+    if text.chars().count() <= MAX_CHARS {
+        return text;
+    }
+    let tail = text
+        .chars()
+        .rev()
+        .take(MAX_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("... truncated ...\n{tail}")
+}
+
+fn spawn_diag(bin: &PathBuf) -> String {
+    let env_value = |key: &str| std::env::var(key).unwrap_or_else(|_| "<unset>".to_string());
+    format!(
+        "ferrum_bin={}\nHOME={}\nHF_HOME={}\nXDG_CACHE_HOME={}\nCARGO_BIN_EXE_ferrum={}",
+        bin.display(),
+        env_value("HOME"),
+        env_value("HF_HOME"),
+        env_value("XDG_CACHE_HOME"),
+        env_value("CARGO_BIN_EXE_ferrum")
+    )
 }
 
 impl ServerFixture {
@@ -76,9 +117,13 @@ impl ServerFixture {
         let port = free_port();
         let base_url = format!("http://127.0.0.1:{port}");
         let effective_config_json = unique_path("effective-config");
+        let stdout_log = unique_path("serve-stdout");
+        let stderr_log = unique_path("serve-stderr");
         let model = smoke_model();
         let port = port.to_string();
-        let child = Command::new(ferrum_bin())
+        let bin = ferrum_bin();
+        let diag = spawn_diag(&bin);
+        let mut child = Command::new(&bin)
             .args([
                 "serve",
                 model.as_str(),
@@ -96,9 +141,14 @@ impl ServerFixture {
                 "--effective-config-json",
                 effective_config_json.to_str().expect("utf8 temp path"),
             ])
+            .current_dir(workspace_root())
             .env("NO_COLOR", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::from(
+                File::create(&stdout_log).expect("create server stdout log"),
+            ))
+            .stderr(Stdio::from(
+                File::create(&stderr_log).expect("create server stderr log"),
+            ))
             .spawn()
             .expect("spawn ferrum serve");
 
@@ -107,7 +157,20 @@ impl ServerFixture {
         let start = Instant::now();
         loop {
             if start.elapsed() > STARTUP_TIMEOUT {
-                panic!("server did not become healthy within {STARTUP_TIMEOUT:?}");
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "server did not become healthy within {STARTUP_TIMEOUT:?}\n{diag}\nstdout:\n{}\nstderr:\n{}",
+                    log_tail(&stdout_log),
+                    log_tail(&stderr_log)
+                );
+            }
+            if let Some(status) = child.try_wait().expect("poll ferrum serve child") {
+                panic!(
+                    "server exited before healthy: {status}\n{diag}\nstdout:\n{}\nstderr:\n{}",
+                    log_tail(&stdout_log),
+                    log_tail(&stderr_log)
+                );
             }
             let ok = client
                 .get(&healthz)
@@ -125,6 +188,8 @@ impl ServerFixture {
         Self {
             base_url,
             effective_config_json,
+            stdout_log,
+            stderr_log,
             child,
         }
     }
@@ -150,6 +215,8 @@ impl Drop for ServerFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.effective_config_json);
+        let _ = fs::remove_file(&self.stdout_log);
+        let _ = fs::remove_file(&self.stderr_log);
     }
 }
 
