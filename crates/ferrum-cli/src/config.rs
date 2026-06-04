@@ -223,9 +223,7 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub fa_layout_varlen: Option<bool>,
 
-    /// Retired source-linked FA2 policy, equivalent to `FERRUM_FA2_SOURCE`.
-    /// Currently rejected by auto-config until a source-owned FA2 kernel has
-    /// release evidence.
+    /// Source-linked FA2 policy, equivalent to `FERRUM_FA2_SOURCE`.
     #[serde(default)]
     pub fa2_source: Option<bool>,
 

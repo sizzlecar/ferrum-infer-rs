@@ -21,7 +21,7 @@ This directory keeps release gates, CUDA/M3 runners, benchmark utilities, and mi
 ## FA2 special gates
 
 - `scripts/m3_fa2_direct_ffi_ab.sh`: FA2 direct/source A/B wrapper. Use only for FA2/direct/source path changes.
-- `scripts/m3_fa2_source_allcells_ab.sh`: retired FA2-source wrapper. It now fails clearly until a source-owned FA2 kernel has release evidence.
+- `scripts/m3_fa2_source_allcells_ab.sh`: all-cell source-linked FA2 wrapper. It delegates to the shared M3 runner through `scripts/m3_fa2_direct_ffi_ab.sh` with `FA2_SOURCE=1`.
 - `scripts/microbenches/build_fa2_ferrum_source_shim.sh` and related `fa2_*` probes: microbench/build aids, not release gates by themselves.
 
 ## Benchmark/report utilities

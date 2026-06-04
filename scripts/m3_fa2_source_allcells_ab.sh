@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Retired all-cell A/B wrapper for the old source-linked FA2 path.
+# All-cell A/B wrapper for the source-linked FA2 path.
 #
 # Usage on a GPU pod from the repo root:
 #   OUT_ROOT=/workspace/m3-fa2-source-allcells-n3 \
@@ -8,9 +8,6 @@
 #   bash scripts/m3_fa2_source_allcells_ab.sh
 
 set -euo pipefail
-
-echo "m3_fa2_source_allcells_ab.sh is retired: FERRUM_FA2_SOURCE is rejected until a source-owned FA2 kernel has release evidence." >&2
-exit 1
 
 OUT_ROOT="${OUT_ROOT:-/workspace/m3-fa2-source-allcells-ab-$(date +%Y%m%d_%H%M%S)}"
 REPEATS="${REPEATS:-3}"

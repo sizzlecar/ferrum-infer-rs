@@ -727,10 +727,28 @@ impl FerrumConfigBuilder {
                 "FA layout requires vLLM paged attention layout",
             );
         }
-        if fa2_source {
-            return self.unsupported(
-                "attention_prefill_mixed_backend",
-                "FERRUM_FA2_SOURCE is retired until a source-owned FA2 kernel has release evidence; use FERRUM_FA_LAYOUT_VARLEN for the in-repo FA-layout path",
+        if fa2_source && !self.hardware.compiled_features.fa2_source {
+            return self.invalid(
+                "FERRUM_FA2_SOURCE",
+                "source-linked FA2 support is not compiled",
+            );
+        }
+        if fa2_source && !self.is_cuda_backend() {
+            return self.invalid(
+                "FERRUM_FA2_SOURCE",
+                "source-linked FA2 requires CUDA backend",
+            );
+        }
+        if fa2_source && !use_vllm_paged_attn {
+            return self.invalid(
+                "FERRUM_FA2_SOURCE",
+                "source-linked FA2 requires vLLM paged attention layout",
+            );
+        }
+        if fa2_source && self.cuda_compute_capability_at_least(8, 0) == Some(false) {
+            return self.invalid(
+                "FERRUM_FA2_SOURCE",
+                "source-linked FA2 requires CUDA compute capability >= 8.0",
             );
         }
         if fa2_direct_ffi && !self.hardware.compiled_features.fa2_direct_ffi {
@@ -950,7 +968,7 @@ impl FerrumConfigBuilder {
             self.rejected_except(
                 selected,
                 [
-                    ("fa2_source", "retired source FA2 path not selected"),
+                    ("fa2_source", "source-linked FA2 path not selected"),
                     ("fa2_direct_ffi", "diagnostic direct FFI shim not selected"),
                     ("fa_layout_varlen", "FA-compatible layout not selected"),
                     ("vllm_paged_varlen", "vLLM paged varlen bridge not selected"),
@@ -1386,30 +1404,6 @@ mod tests {
         }
     }
 
-    fn expect_unsupported_selection_with_hardware(
-        vars: &[(&str, &str)],
-        selection: &str,
-        reason_fragment: &str,
-        hardware: HardwareCapabilities,
-    ) {
-        let err = m3_with_hardware(vars, hardware)
-            .resolve()
-            .expect_err("override should fail");
-        match err {
-            AutoConfigError::UnsupportedCombination {
-                selection: actual,
-                reason,
-            } => {
-                assert_eq!(actual, selection);
-                assert!(
-                    reason.contains(reason_fragment),
-                    "reason {reason:?} did not contain {reason_fragment:?}"
-                );
-            }
-            other => panic!("expected unsupported combination for {selection}, got {other:?}"),
-        }
-    }
-
     fn cpu_hardware_with_features(features: CompiledKernelFeatures) -> HardwareCapabilities {
         HardwareCapabilities {
             backend: "cpu".to_string(),
@@ -1452,20 +1446,25 @@ mod tests {
     }
 
     #[test]
-    fn source_fa2_is_rejected_until_source_owned_kernel_has_evidence() {
-        let error = m3(
+    fn source_fa2_selects_source_linked_attention_when_compiled() {
+        let resolved = m3(
             &[("FERRUM_FA2_SOURCE", "1")],
             CompiledKernelFeatures::m3_fast_path_with_source_fa2(),
         )
         .resolve()
-        .unwrap_err();
-        match error {
-            AutoConfigError::UnsupportedCombination { selection, reason } => {
-                assert_eq!(selection, "attention_prefill_mixed_backend");
-                assert!(reason.contains("retired"), "unexpected reason: {reason}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+
+        assert_eq!(decisions["attention_prefill_mixed_backend"], "fa2_source");
+    }
+
+    #[test]
+    fn source_fa2_is_rejected_when_not_compiled() {
+        expect_invalid_key(&[("FERRUM_FA2_SOURCE", "1")], "FERRUM_FA2_SOURCE");
     }
 
     #[test]
@@ -1511,21 +1510,15 @@ mod tests {
             "FERRUM_GREEDY_ARGMAX",
             cpu.clone(),
         );
-        expect_unsupported_selection_with_hardware(
-            &[("FERRUM_FA2_SOURCE", "1")],
-            "attention_prefill_mixed_backend",
-            "retired",
-            cpu,
-        );
+        expect_invalid_key_with_hardware(&[("FERRUM_FA2_SOURCE", "1")], "FERRUM_FA2_SOURCE", cpu);
 
         let mut old_cuda = HardwareCapabilities::rtx4090_cuda(
             CompiledKernelFeatures::m3_fast_path_with_source_fa2(),
         );
         old_cuda.compute_capability = Some("7.5".to_string());
-        expect_unsupported_selection_with_hardware(
+        expect_invalid_key_with_hardware(
             &[("FERRUM_FA2_SOURCE", "1")],
-            "attention_prefill_mixed_backend",
-            "retired",
+            "FERRUM_FA2_SOURCE",
             old_cuda,
         );
     }

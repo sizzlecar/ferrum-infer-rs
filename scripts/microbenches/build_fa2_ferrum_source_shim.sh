@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build the retired external FlashAttention-2 C ABI diagnostic shim for Ferrum.
+# Build the FlashAttention-2 C ABI diagnostic source shim for Ferrum.
 #
 # This is deliberately different from build_fa2_ferrum_shim.sh: it does not
 # link vLLM's _vllm_fa2_C Torch extension and does not require libtorch,

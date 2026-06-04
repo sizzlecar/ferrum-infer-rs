@@ -78,7 +78,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         }
         if paged
             && self.use_vllm_paged_attn
-            && (self.runtime_env.fa_layout_varlen || self.runtime_env.fa2_direct_ffi)
+            && (self.runtime_env.fa_layout_varlen
+                || self.runtime_env.fa2_direct_ffi
+                || self.runtime_env.fa2_source)
             && self.paged_fa_pools.is_none()
         {
             let mut pools = Vec::with_capacity(self.cfg.base.num_layers);
