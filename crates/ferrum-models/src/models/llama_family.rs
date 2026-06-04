@@ -2571,6 +2571,15 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
                  QKV kernels. Engine will fall back to per-item dispatch.",
             ));
         }
+        if items
+            .iter()
+            .any(|(cache_id, _, _, _)| self.active_lora_adapter_for_cache(cache_id).is_some())
+        {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "LlamaFamilyModel::unified_forward: active LoRA adapter routes through \
+                 per-item dispatch until unified LoRA supports row-selective adapters.",
+            ));
+        }
         self.ensure_kv(&items[0].0);
         if self.paged_pools.is_none() {
             return Err(ferrum_types::FerrumError::unsupported(
