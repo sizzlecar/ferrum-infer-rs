@@ -510,6 +510,7 @@ def main() -> int:
         out / "server-session-cache.log",
         log,
         timeout=1800,
+        env={"FERRUM_G3_SMOKE_MODEL": args.model},
         scan_runtime=True,
     )
     checks["server_session_cache"] = True

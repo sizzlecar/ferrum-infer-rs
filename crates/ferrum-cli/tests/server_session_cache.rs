@@ -11,8 +11,12 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SMOKE_MODEL: &str = "qwen3:0.6b";
+const DEFAULT_SMOKE_MODEL: &str = "qwen3:0.6b";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn smoke_model() -> String {
+    std::env::var("FERRUM_G3_SMOKE_MODEL").unwrap_or_else(|_| DEFAULT_SMOKE_MODEL.to_string())
+}
 
 fn ferrum_bin() -> PathBuf {
     if let Ok(bin) = std::env::var("CARGO_BIN_EXE_ferrum") {
@@ -56,7 +60,7 @@ impl ServerFixture {
         let child = Command::new(ferrum_bin())
             .args([
                 "serve",
-                SMOKE_MODEL,
+                smoke_model().as_str(),
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -129,7 +133,7 @@ async fn chat_with_session(client: &Client, fx: &ServerFixture, session: &str, c
         .post(fx.chat_url())
         .header("X-Ferrum-Session", session)
         .json(&json!({
-            "model": SMOKE_MODEL,
+            "model": smoke_model(),
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.0,
             "max_tokens": 256
@@ -172,7 +176,7 @@ async fn g3_session_cache_real_model_smoke() {
     let metadata_response = client
         .post(fx.chat_url())
         .json(&json!({
-            "model": SMOKE_MODEL,
+            "model": smoke_model(),
             "metadata": {"ferrum_session_id": "session-c"},
             "messages": [{"role": "user", "content": "Remember this exact secret: ferrum-green. Reply only OK."}],
             "temperature": 0.0,
