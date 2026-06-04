@@ -639,12 +639,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             );
             let mut engine_config = ferrum_types::EngineConfig::default();
             engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            engine_config.kv_cache.cache_type = serve_kv_cache_type_for_device(&device);
             engine_config.backend.device = device;
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
             engine_config
                 .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
                 .map_err(ferrum_types::FerrumError::config)?;
-            engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
             engine_config.backend.backend_options.insert(
                 "model_path".to_string(),
                 serde_json::Value::String(engine_model_path.clone()),
@@ -1041,6 +1041,13 @@ fn push_cli_runtime_usize(entries: &mut Vec<RuntimeConfigEntry>, key: &str, valu
             value.to_string(),
             RuntimeConfigSource::Cli,
         ));
+    }
+}
+
+fn serve_kv_cache_type_for_device(device: &ferrum_types::Device) -> ferrum_types::KvCacheType {
+    match device {
+        ferrum_types::Device::CPU => ferrum_types::KvCacheType::Contiguous,
+        _ => ferrum_types::KvCacheType::Paged,
     }
 }
 
@@ -1555,6 +1562,28 @@ mod tests {
         assert!(entry("FERRUM_PROFILE_JSONL")
             .affects
             .contains(&ferrum_types::RuntimeConfigEffect::Diagnostics));
+    }
+
+    #[test]
+    fn cpu_serve_uses_contiguous_kv_cache() {
+        assert!(matches!(
+            serve_kv_cache_type_for_device(&ferrum_types::Device::CPU),
+            ferrum_types::KvCacheType::Contiguous
+        ));
+    }
+
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "cuda"))]
+    #[test]
+    fn accelerator_serve_uses_paged_kv_cache() {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let device = ferrum_types::Device::Metal;
+        #[cfg(all(feature = "cuda", not(all(target_os = "macos", feature = "metal"))))]
+        let device = ferrum_types::Device::CUDA(0);
+
+        assert!(matches!(
+            serve_kv_cache_type_for_device(&device),
+            ferrum_types::KvCacheType::Paged
+        ));
     }
 
     #[test]

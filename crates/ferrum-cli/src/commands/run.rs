@@ -268,6 +268,11 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         &ferrum_types::RuntimeConfigSnapshot::capture_current(),
     );
 
+    // Select device before model resolution so CPU runs do not materialize
+    // GPU/Metal chat-profile defaults such as paged KV.
+    let device = select_device(&cmd.backend);
+    let autosize = run_autosize_for_device(&device, cmd.gpu_memory_utilization);
+
     // Resolve the model through the central source resolver. Handles
     // .gguf paths, local model dirs, HF cache hits, and HF download in
     // one entry; runs the chat-profile GPU autosize + (for GGUF) sets
@@ -281,10 +286,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         &cmd.model,
         &cache_dir,
         crate::source_resolver::DownloadPolicy::AutoDownload,
-        Some((
-            crate::gpu_mem_autosize::AutoSizeProfile::Chat,
-            cmd.gpu_memory_utilization,
-        )),
+        autosize,
     )
     .await?;
     let source = resolved.source;
@@ -294,8 +296,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     let engine_model_path = source.local_path.to_string_lossy().to_string();
 
-    // Select device
-    let device = select_device(&cmd.backend);
     let device_label = format!("{device:?}");
     eprintln!("{}", format!("Using {device_label} backend").dimmed());
     let metal_moe_entries = crate::source_resolver::metal_gguf_moe_correctness_entries(
@@ -661,6 +661,19 @@ fn runtime_config_bool(snapshot: &RuntimeConfigSnapshot, key: &str) -> Option<bo
             "" | "1" | "true" | "yes" | "on"
         )
     })
+}
+
+fn run_autosize_for_device(
+    device: &ferrum_types::Device,
+    gpu_memory_utilization: f32,
+) -> Option<(crate::gpu_mem_autosize::AutoSizeProfile, f32)> {
+    match device {
+        ferrum_types::Device::CPU => None,
+        _ => Some((
+            crate::gpu_mem_autosize::AutoSizeProfile::Chat,
+            gpu_memory_utilization,
+        )),
+    }
 }
 
 fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
@@ -1249,6 +1262,26 @@ mod tests {
         let cmd = test_run_cmd();
         assert_eq!(build_sampling_params(&cmd).temperature, 0.0);
         assert_eq!(build_sampling_params(&cmd).max_tokens, 1024);
+    }
+
+    #[test]
+    fn cpu_run_skips_gpu_chat_autosize_defaults() {
+        assert!(run_autosize_for_device(&ferrum_types::Device::CPU, 0.9).is_none());
+    }
+
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "cuda"))]
+    #[test]
+    fn accelerator_run_keeps_chat_autosize_defaults() {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let device = ferrum_types::Device::Metal;
+        #[cfg(all(feature = "cuda", not(all(target_os = "macos", feature = "metal"))))]
+        let device = ferrum_types::Device::CUDA(0);
+
+        let autosize = run_autosize_for_device(&device, 0.75);
+        assert_eq!(
+            autosize,
+            Some((crate::gpu_mem_autosize::AutoSizeProfile::Chat, 0.75))
+        );
     }
 
     #[test]
