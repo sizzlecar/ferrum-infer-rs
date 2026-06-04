@@ -48,8 +48,9 @@ pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;
 pub use loader::SafeTensorsLoader;
 pub use lora::{
-    default_lora_model_id, load_startup_lora_adapter, load_startup_lora_adapters,
-    render_lora_model_id, LoraAdapterConfig, StartupLoraAdapter, StartupLoraSpec,
+    default_lora_model_id, load_runtime_lora_adapter, load_startup_lora_adapter,
+    load_startup_lora_adapters, render_lora_model_id, ActiveLoraAdapter, LoraAdapterConfig,
+    RuntimeLoraAdapter, StartupLoraAdapter, StartupLoraSpec,
 };
 pub use multimodal::{BertModelWrapper, ClipModelWrapper, WhisperModelWrapper};
 pub use registry::{

@@ -20,6 +20,8 @@ pub struct PrefillInput {
     pub position_ids: Option<TensorRef>,
     /// Pre-allocated KV cache handle (optional, for paged attention)
     pub kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    /// Request metadata that can affect model execution.
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 impl PrefillInput {
@@ -30,12 +32,19 @@ impl PrefillInput {
             attention_mask: None,
             position_ids: None,
             kv_cache: None,
+            metadata: HashMap::new(),
         }
     }
 
     /// Create prefill input with a pre-allocated KV cache handle.
     pub fn with_kv_cache(mut self, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
         self.kv_cache = Some(kv_cache);
+        self
+    }
+
+    /// Attach request metadata.
+    pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
+        self.metadata = metadata;
         self
     }
 
@@ -119,6 +128,8 @@ pub struct DecodeInput {
     pub kv_cache: Arc<dyn KvCacheHandle>,
     /// Position IDs for current step [batch_size, 1] (optional)
     pub position_ids: Option<TensorRef>,
+    /// Request metadata that can affect model execution.
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 impl DecodeInput {
@@ -128,12 +139,19 @@ impl DecodeInput {
             input_ids,
             kv_cache,
             position_ids: None,
+            metadata: HashMap::new(),
         }
     }
 
     /// Add position IDs
     pub fn with_position_ids(mut self, positions: TensorRef) -> Self {
         self.position_ids = Some(positions);
+        self
+    }
+
+    /// Attach request metadata.
+    pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
+        self.metadata = metadata;
         self
     }
 
@@ -174,6 +192,8 @@ pub struct UnifiedBatchItem {
     /// returned for sampling. Intermediate prefill chunks set this false
     /// to skip the lm_head + sampling path.
     pub is_final_chunk: bool,
+    /// Request metadata that can affect model execution.
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 impl std::fmt::Debug for UnifiedBatchItem {
@@ -246,6 +266,12 @@ impl DecodeOutput {
 pub trait ModelExecutor: Send + Sync {
     /// Get model information and metadata
     fn info(&self) -> &ModelInfo;
+
+    /// Per-request KV capacity in tokens when the executor owns a smaller
+    /// runtime cache window than the model's declared context length.
+    fn kv_capacity(&self) -> Option<usize> {
+        None
+    }
 
     /// Execute prefill phase (process initial prompt)
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput>;
@@ -354,6 +380,20 @@ pub trait ModelExecutor: Send + Sync {
 
     /// Get current executor status
     fn status(&self) -> ExecutorStatus;
+
+    /// Optional model/executor cache metrics.
+    ///
+    /// Concrete LLM executors use this for model-level paged KV prefix reuse
+    /// counters. Default implementations keep non-autoregressive executors
+    /// and tests from needing cache-specific plumbing.
+    fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Optional LoRA runtime metrics.
+    fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
 
     /// Warm up executor (load model, allocate memory, etc.)
     async fn warmup(&mut self) -> Result<()> {

@@ -71,6 +71,25 @@ def default_out_dir() -> Path:
     return repo_root() / "docs" / "release" / "g1-g4" / "g3-cache-product" / f"{stamp}-{short}"
 
 
+def default_cargo_features() -> str:
+    return "metal" if sys.platform == "darwin" else ""
+
+
+def cargo_feature_list(features: str) -> list[str]:
+    return [feature.strip() for feature in features.split(",") if feature.strip()]
+
+
+def release_build_cmd(args: argparse.Namespace) -> list[str]:
+    cmd = ["cargo", "build", "--release", "-p", "ferrum-cli", "--bin", "ferrum"]
+    if args.cargo_features:
+        cmd.extend(["--features", args.cargo_features])
+    return cmd
+
+
+def cargo_features_args(args: argparse.Namespace) -> list[str]:
+    return ["--features", args.cargo_features] if args.cargo_features else []
+
+
 def run(cmd: list[str], out: Path, log: GateLog, *, timeout: int = 1200, env: dict[str, str] | None = None, scan_runtime: bool = False) -> subprocess.CompletedProcess[str]:
     log.write("RUN " + " ".join(cmd))
     proc = subprocess.run(
@@ -121,6 +140,11 @@ def http_get_text(url: str) -> str:
         return response.read().decode("utf-8", "replace")
 
 
+def http_get_json(url: str) -> dict[str, Any]:
+    with urllib.request.urlopen(url, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
 def metric_value(metrics: str, name: str) -> float:
     for line in metrics.splitlines():
         if not line or line.startswith("#"):
@@ -129,6 +153,56 @@ def metric_value(metrics: str, name: str) -> float:
         if len(parts) >= 2 and parts[0] == name:
             return float(parts[1])
     raise RuntimeError(f"missing metric {name}")
+
+
+def bench_report(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text())
+    if isinstance(data, list):
+        if not data:
+            raise RuntimeError(f"empty bench report list: {path}")
+        data = data[0]
+    if not isinstance(data, dict):
+        raise RuntimeError(f"unexpected bench report shape in {path}")
+    return data
+
+
+def scalar_mean(report: dict[str, Any], key: str) -> float:
+    value = report.get(key)
+    if not isinstance(value, dict) or "mean" not in value:
+        raise RuntimeError(f"missing scalar mean {key} in bench report")
+    return float(value["mean"])
+
+
+def percentile_mean(report: dict[str, Any], metric: str, percentile: str) -> float:
+    value = report.get(metric)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"missing metric {metric} in bench report")
+    cell = value.get(percentile)
+    if isinstance(cell, dict) and "mean" in cell:
+        return float(cell["mean"])
+    if isinstance(cell, (int, float)):
+        return float(cell)
+    raise RuntimeError(f"missing percentile mean {metric}.{percentile} in bench report")
+
+
+def pct_improvement_lower_is_better(baseline: float, candidate: float) -> float:
+    if baseline <= 0:
+        return 0.0
+    return 100.0 * (baseline - candidate) / baseline
+
+
+def pct_improvement_higher_is_better(baseline: float, candidate: float) -> float:
+    if baseline <= 0:
+        return 0.0
+    return 100.0 * (candidate - baseline) / baseline
+
+
+def cache_artifact(health: dict[str, Any], metrics: str) -> dict[str, Any]:
+    prefix = ((health.get("cache") or {}).get("prefix_cache") or {})
+    return {
+        "health_prefix_cache": prefix,
+        "metrics": {name: metric_value(metrics, name) for name in REQUIRED_METRICS},
+    }
 
 
 def tokenizer_dir(path: Path) -> Path | None:
@@ -196,7 +270,6 @@ def run_bench_pair(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
 
     tokenizer = find_tokenizer(args.model)
     bin_path = args.ferrum_bin
-    run(["cargo", "build", "--release", "-p", "ferrum-cli", "--bin", "ferrum"], out / "release-build.log", log, timeout=1200)
 
     bench_shape = [
         "bench-serve",
@@ -219,16 +292,37 @@ def run_bench_pair(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
     disabled_proc, disabled_base, disabled_log = start_server(bin_path, args.model, ["--disable-prefix-cache", "--session-cache", "off"], out, log)
     try:
         run([str(bin_path), *bench_shape, "--base-url", disabled_base, "--out", str(out / "bench-disabled.json")], out / "bench-disabled.log", log, timeout=args.bench_timeout)
+        disabled_health = http_get_json(disabled_base + "/health")
+        disabled_metrics = http_get_text(disabled_base + "/metrics")
+        (out / "bench-disabled-metrics.txt").write_text(disabled_metrics)
+        (out / "cache-disabled.json").write_text(
+            json.dumps(cache_artifact(disabled_health, disabled_metrics), ensure_ascii=False, indent=2) + "\n"
+        )
     finally:
         stop_server(disabled_proc, disabled_log)
 
     enabled_proc, enabled_base, enabled_log = start_server(bin_path, args.model, ["--enable-prefix-cache", "--session-cache", "off"], out, log)
     try:
         run([str(bin_path), *bench_shape, "--base-url", enabled_base, "--out", str(out / "bench-enabled.json")], out / "bench-enabled.log", log, timeout=args.bench_timeout)
+        health = http_get_json(enabled_base + "/health")
         metrics = http_get_text(enabled_base + "/metrics")
         (out / "bench-enabled-metrics.txt").write_text(metrics)
+        (out / "cache-enabled.json").write_text(
+            json.dumps(cache_artifact(health, metrics), ensure_ascii=False, indent=2) + "\n"
+        )
     finally:
         stop_server(enabled_proc, enabled_log)
+
+    disabled_cache = json.loads((out / "cache-disabled.json").read_text())
+    disabled_hits = disabled_cache["metrics"]["ferrum_prefix_cache_hits_total"]
+    if disabled_hits != 0:
+        raise RuntimeError(f"disabled prefix cache recorded hits: {disabled_hits}")
+
+    health = json.loads((out / "cache-enabled.json").read_text())["health_prefix_cache"]
+    if health.get("position") != "real-kv-reuse":
+        raise RuntimeError(f"enabled prefix cache did not report real-kv-reuse position: {health}")
+    if health.get("enabled") is not True:
+        raise RuntimeError(f"enabled prefix cache health did not report enabled=true: {health}")
 
     metrics = (out / "bench-enabled-metrics.txt").read_text()
     for name in REQUIRED_METRICS:
@@ -239,13 +333,45 @@ def run_bench_pair(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
     if hits <= 0 or saved <= 0:
         raise RuntimeError(f"enabled bench did not record prefix hits/saved tokens: hits={hits} saved={saved}")
 
+    disabled_report = bench_report(out / "bench-disabled.json")
+    enabled_report = bench_report(out / "bench-enabled.json")
+    disabled_ttft_p50 = percentile_mean(disabled_report, "ttft_ms", "p50")
+    enabled_ttft_p50 = percentile_mean(enabled_report, "ttft_ms", "p50")
+    disabled_output_tps = scalar_mean(disabled_report, "output_throughput_tps")
+    enabled_output_tps = scalar_mean(enabled_report, "output_throughput_tps")
+    ttft_improvement_pct = pct_improvement_lower_is_better(disabled_ttft_p50, enabled_ttft_p50)
+    output_tps_improvement_pct = pct_improvement_higher_is_better(
+        disabled_output_tps, enabled_output_tps
+    )
+    perf_pass = max(ttft_improvement_pct, output_tps_improvement_pct) >= args.min_perf_improvement_pct
+    comparison = {
+        "status": "pass" if perf_pass else "fail",
+        "min_perf_improvement_pct": args.min_perf_improvement_pct,
+        "disabled_ttft_p50_ms": disabled_ttft_p50,
+        "enabled_ttft_p50_ms": enabled_ttft_p50,
+        "ttft_improvement_pct": ttft_improvement_pct,
+        "disabled_output_throughput_tps": disabled_output_tps,
+        "enabled_output_throughput_tps": enabled_output_tps,
+        "output_throughput_improvement_pct": output_tps_improvement_pct,
+        "prefix_hits": hits,
+        "prefix_saved_prefill_tokens": saved,
+        "cache_position": health.get("position"),
+    }
+    (out / "cache-comparison.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=2) + "\n")
+    if not perf_pass:
+        raise RuntimeError(
+            "cache-enabled bench did not meet performance improvement threshold: "
+            f"ttft={ttft_improvement_pct:.2f}% output_tps={output_tps_improvement_pct:.2f}% "
+            f"threshold={args.min_perf_improvement_pct:.2f}%"
+        )
+
     summary = {
         "status": "pass",
         "tokenizer": str(tokenizer),
+        "cache_position": health.get("position"),
         "prefix_hits": hits,
         "prefix_saved_prefill_tokens": saved,
-        "perf_result": "inconclusive",
-        "reason": "G3 keeps unsafe engine-level KV prefix reuse forced off; product cache observability and correctness passed, but TTFT speedup is not claimed.",
+        "performance": comparison,
     }
     (out / "bench-summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
     return summary
@@ -269,12 +395,12 @@ def write_artifacts(
                 "cargo test -p ferrum-server cache_metrics_contract",
                 "cargo test --release -p ferrum-cli --test server_prefix_cache_product -- --ignored --test-threads=1",
                 "cargo test --release -p ferrum-cli --test server_session_cache -- --ignored --test-threads=1",
-                "cargo build --release -p ferrum-cli --bin ferrum",
+                " ".join(release_build_cmd(args)),
                 "ferrum bench-serve shared-prefix disabled/enabled",
             ],
             started_at_utc=started_at_utc,
             binary_path=args.ferrum_bin,
-            features=[],
+            features=cargo_feature_list(args.cargo_features),
         ),
         "goal": "G3",
         "name": "cache-product",
@@ -301,7 +427,9 @@ def write_artifacts(
         "- real-model prefix cache product correctness\n"
         "- real-model session cache correctness\n"
         "- shared-prefix `bench-serve --fail-on-error --require-ci` disabled/enabled runs, unless explicitly skipped\n"
-        "- enabled metrics include prefix hits and saved prefill tokens\n",
+        "- `/health.cache.prefix_cache.position == real-kv-reuse`\n"
+        "- enabled metrics include prefix hits and saved prefill tokens\n"
+        "- cache-enabled performance meets the configured improvement threshold\n",
     )
 
 
@@ -311,6 +439,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--model", default="qwen3:0.6b")
     parser.add_argument("--ferrum-bin", type=Path, default=repo_root() / "target" / "release" / "ferrum")
+    parser.add_argument("--cargo-features", default=default_cargo_features())
     parser.add_argument("--skip-workspace-test", action="store_true")
     parser.add_argument("--skip-bench", action="store_true")
     parser.add_argument("--shared-prefix-len", type=int, default=256)
@@ -321,6 +450,7 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--n-repeats", type=int, default=3)
     parser.add_argument("--bench-timeout", type=int, default=2400)
+    parser.add_argument("--min-perf-improvement-pct", type=float, default=1.0)
     args = parser.parse_args()
 
     out = (args.out or default_out_dir()).resolve()
@@ -338,10 +468,50 @@ def main() -> int:
     run(["cargo", "test", "-p", "ferrum-server", "cache_metrics_contract"], out / "cache-metrics-contract.log", log, timeout=600)
     checks["cache_metrics_contract"] = True
 
-    run(["cargo", "test", "--release", "-p", "ferrum-cli", "--test", "server_prefix_cache_product", "--", "--ignored", "--test-threads=1"], out / "server-prefix-cache-product.log", log, timeout=1800, scan_runtime=True)
+    run(release_build_cmd(args), out / "release-build.log", log, timeout=1200)
+    checks["release_build"] = True
+
+    run(
+        [
+            "cargo",
+            "test",
+            "--release",
+            "-p",
+            "ferrum-cli",
+            *cargo_features_args(args),
+            "--test",
+            "server_prefix_cache_product",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+        ],
+        out / "server-prefix-cache-product.log",
+        log,
+        timeout=1800,
+        env={"FERRUM_G3_SMOKE_MODEL": args.model},
+        scan_runtime=True,
+    )
     checks["server_prefix_cache_product"] = True
 
-    run(["cargo", "test", "--release", "-p", "ferrum-cli", "--test", "server_session_cache", "--", "--ignored", "--test-threads=1"], out / "server-session-cache.log", log, timeout=1800, scan_runtime=True)
+    run(
+        [
+            "cargo",
+            "test",
+            "--release",
+            "-p",
+            "ferrum-cli",
+            *cargo_features_args(args),
+            "--test",
+            "server_session_cache",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+        ],
+        out / "server-session-cache.log",
+        log,
+        timeout=1800,
+        scan_runtime=True,
+    )
     checks["server_session_cache"] = True
 
     checks["bench"] = run_bench_pair(args, out, log)

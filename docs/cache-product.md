@@ -18,7 +18,7 @@ Flags map to runtime config entries and appear in `--effective-config-json`:
 
 | Flag | Runtime key |
 |---|---|
-| `--enable-prefix-cache` | `FERRUM_PREFIX_CACHE_REQUESTED=1`, `FERRUM_PREFIX_CACHE_PRODUCT=1` |
+| `--enable-prefix-cache` | `FERRUM_PREFIX_CACHE_REQUESTED=1`, `FERRUM_PREFIX_CACHE_PRODUCT=1`, `FERRUM_PREFIX_CACHE=1` |
 | `--disable-prefix-cache` | `FERRUM_PREFIX_CACHE=0` |
 | `--session-cache off` | `FERRUM_SESSION_CACHE=off` |
 | `--session-cache memory` | `FERRUM_SESSION_CACHE=memory` |
@@ -28,11 +28,11 @@ Flags map to runtime config entries and appear in `--effective-config-json`:
 The vLLM-compatible `--enable-prefix-caching` and
 `--no-enable-prefix-caching` flags remain supported aliases for migration.
 
-Correctness is prioritized over raw cache speed. On paths where engine-level KV
-prefix reuse is not yet proven safe, Ferrum records
-`FERRUM_PREFIX_CACHE_SAFETY=engine_forced_off_product_observed` and keeps
-`FERRUM_PREFIX_CACHE=0` while still exposing product-level cache policy,
-session behavior, and observability metrics.
+Correctness is prioritized over raw cache speed. `FERRUM_PREFIX_CACHE=1` enables
+model-level paged-KV prefix reuse on supported decoder models. `/health` labels
+those metrics with `position=real-kv-reuse`; unsupported or disabled paths fall
+back to product-level prompt observability while preserving the same health and
+metrics contract.
 
 ## Session API
 
@@ -63,7 +63,13 @@ Rules:
 ```json
 {
   "cache": {
-    "prefix_cache": {"enabled": true, "entries": 12, "hits": 34, "misses": 8},
+    "prefix_cache": {
+      "enabled": true,
+      "position": "real-kv-reuse",
+      "entries": 12,
+      "hits": 34,
+      "misses": 8
+    },
     "session_cache": {"mode": "memory", "entries": 3}
   }
 }

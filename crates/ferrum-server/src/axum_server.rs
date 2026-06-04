@@ -529,7 +529,12 @@ impl CacheRuntimeState {
         let entries = sessions.len() as u64;
         let tokens = sessions
             .values()
-            .map(|messages| messages.iter().map(|msg| approx_tokens(&msg.content)).sum::<usize>())
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|msg| approx_tokens(&msg.content))
+                    .sum::<usize>()
+            })
             .sum::<usize>() as u64;
         let mut stats = self.stats.lock().expect("cache stats lock");
         stats.session_entries = entries;
@@ -543,22 +548,45 @@ impl CacheRuntimeState {
         stats.session_entries = sessions.len() as u64;
         stats.session_tokens = sessions
             .values()
-            .map(|messages| messages.iter().map(|msg| approx_tokens(&msg.content)).sum::<usize>())
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|msg| approx_tokens(&msg.content))
+                    .sum::<usize>()
+            })
             .sum::<usize>() as u64;
         stats
     }
 
-    fn health_json(&self, policy: &CachePolicy) -> serde_json::Value {
+    fn health_json(
+        &self,
+        policy: &CachePolicy,
+        engine_prefix_cache: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
         let stats = self.stats();
+        let prefix_hits = engine_u64(engine_prefix_cache, "hits").unwrap_or(stats.prefix_hits);
+        let prefix_misses =
+            engine_u64(engine_prefix_cache, "misses").unwrap_or(stats.prefix_misses);
+        let prefix_evictions =
+            engine_u64(engine_prefix_cache, "evictions").unwrap_or(stats.prefix_evictions);
+        let prefix_saved = engine_u64(engine_prefix_cache, "saved_prefill_tokens")
+            .unwrap_or(stats.prefix_saved_prefill_tokens);
+        let prefix_entries =
+            engine_u64(engine_prefix_cache, "entries").unwrap_or(stats.prefix_entries);
+        let prefix_bytes = engine_u64(engine_prefix_cache, "bytes").unwrap_or(stats.prefix_bytes);
         serde_json::json!({
             "prefix_cache": {
-                "enabled": policy.prefix_cache_enabled,
-                "entries": stats.prefix_entries,
-                "hits": stats.prefix_hits,
-                "misses": stats.prefix_misses,
-                "evictions": stats.prefix_evictions,
-                "saved_prefill_tokens": stats.prefix_saved_prefill_tokens,
-                "bytes": stats.prefix_bytes,
+                "enabled": engine_bool(engine_prefix_cache, "enabled").unwrap_or(policy.prefix_cache_enabled),
+                "position": engine_str(engine_prefix_cache, "position").unwrap_or("product-observability"),
+                "source": engine_str(engine_prefix_cache, "source").unwrap_or("server-prompt-lcp-observability"),
+                "entries": prefix_entries,
+                "hits": prefix_hits,
+                "misses": prefix_misses,
+                "evictions": prefix_evictions,
+                "saved_prefill_tokens": prefix_saved,
+                "bytes": prefix_bytes,
+                "block_size": engine_u64(engine_prefix_cache, "block_size"),
+                "kv_dtype": engine_str(engine_prefix_cache, "kv_dtype"),
             },
             "session_cache": {
                 "mode": policy.session_cache_mode,
@@ -573,8 +601,18 @@ impl CacheRuntimeState {
         })
     }
 
-    fn prometheus_metrics(&self) -> String {
+    fn prometheus_metrics(&self, engine_prefix_cache: Option<&serde_json::Value>) -> String {
         let stats = self.stats();
+        let prefix_hits = engine_u64(engine_prefix_cache, "hits").unwrap_or(stats.prefix_hits);
+        let prefix_misses =
+            engine_u64(engine_prefix_cache, "misses").unwrap_or(stats.prefix_misses);
+        let prefix_evictions =
+            engine_u64(engine_prefix_cache, "evictions").unwrap_or(stats.prefix_evictions);
+        let prefix_saved = engine_u64(engine_prefix_cache, "saved_prefill_tokens")
+            .unwrap_or(stats.prefix_saved_prefill_tokens);
+        let prefix_entries =
+            engine_u64(engine_prefix_cache, "entries").unwrap_or(stats.prefix_entries);
+        let prefix_bytes = engine_u64(engine_prefix_cache, "bytes").unwrap_or(stats.prefix_bytes);
         format!(
             concat!(
                 "ferrum_prefix_cache_hits_total {}\n",
@@ -589,12 +627,12 @@ impl CacheRuntimeState {
                 "ferrum_session_cache_entries {}\n",
                 "ferrum_session_cache_tokens {}\n"
             ),
-            stats.prefix_hits,
-            stats.prefix_misses,
-            stats.prefix_evictions,
-            stats.prefix_saved_prefill_tokens,
-            stats.prefix_entries,
-            stats.prefix_bytes,
+            prefix_hits,
+            prefix_misses,
+            prefix_evictions,
+            prefix_saved,
+            prefix_entries,
+            prefix_bytes,
             stats.session_hits,
             stats.session_misses,
             stats.session_evictions,
@@ -602,6 +640,18 @@ impl CacheRuntimeState {
             stats.session_tokens,
         )
     }
+}
+
+fn engine_u64(snapshot: Option<&serde_json::Value>, key: &str) -> Option<u64> {
+    snapshot?.get(key)?.as_u64()
+}
+
+fn engine_bool(snapshot: Option<&serde_json::Value>, key: &str) -> Option<bool> {
+    snapshot?.get(key)?.as_bool()
+}
+
+fn engine_str<'a>(snapshot: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    snapshot?.get(key)?.as_str()
 }
 
 fn request_session_id(headers: &HeaderMap, request: &ChatCompletionsRequest) -> Option<String> {
@@ -638,7 +688,11 @@ fn longest_common_prefix_chars(a: &str, b: &str) -> usize {
 fn trim_messages_to_token_budget(messages: &mut Vec<ChatMessage>, max_tokens: usize) {
     let max_tokens = max_tokens.max(1);
     while messages.len() > 1
-        && messages.iter().map(|msg| approx_tokens(&msg.content)).sum::<usize>() > max_tokens
+        && messages
+            .iter()
+            .map(|msg| approx_tokens(&msg.content))
+            .sum::<usize>()
+            > max_tokens
     {
         messages.remove(0);
     }
@@ -755,11 +809,7 @@ async fn chat_completions_handler(
     let template_model_id = lora_resolution
         .as_ref()
         .map(|resolution| resolution.base_model_id.clone())
-        .or_else(|| {
-            loaded_models
-                .first()
-                .map(ToString::to_string)
-        })
+        .or_else(|| loaded_models.first().map(ToString::to_string))
         .unwrap_or_else(|| request.model.clone());
     let mut inference_request = convert_chat_request_with_template_model(
         &request,
@@ -1153,11 +1203,9 @@ async fn handle_chat_completions_sync(
                 ));
             }
             validate_strict_json_schema_response(&openai_request, &message.content)?;
-            state.cache.update_session(
-                session_context,
-                message.clone(),
-                &CachePolicy::current(),
-            );
+            state
+                .cache
+                .update_session(session_context, message.clone(), &CachePolicy::current());
             let response = ChatCompletionsResponse {
                 id: Uuid::new_v4().to_string(),
                 object: "chat.completion".to_string(),
@@ -2577,16 +2625,8 @@ async fn models_handler(
             created: now,
             owned_by: "ferrum".to_string(),
             permission: vec![],
-            root: state
-                .lora_registry
-                .base_model_id
-                .as_ref()
-                .cloned(),
-            parent: state
-                .lora_registry
-                .base_model_id
-                .as_ref()
-                .cloned(),
+            root: state.lora_registry.base_model_id.as_ref().cloned(),
+            parent: state.lora_registry.base_model_id.as_ref().cloned(),
         }
     }));
 
@@ -2605,6 +2645,14 @@ async fn health_handler(
     let scheduler_metrics = state.metrics();
     let runtime_config = RuntimeConfigSnapshot::capture_current();
     let cache_policy = CachePolicy::current();
+    let engine_cache = state
+        .llm
+        .as_ref()
+        .and_then(|engine| engine.cache_metrics_snapshot());
+    let engine_lora = state
+        .llm
+        .as_ref()
+        .and_then(|engine| engine.lora_metrics_snapshot());
     let auto_config = match state.auto_config.clone() {
         Some(auto_config) => serde_json::to_value(auto_config).unwrap_or_else(|err| {
             serde_json::json!({
@@ -2642,14 +2690,24 @@ async fn health_handler(
         },
         "config": runtime_config,
         "auto_config": auto_config,
-        "cache": state.cache.health_json(&cache_policy),
+        "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
+        "lora": engine_lora.unwrap_or_else(|| serde_json::json!({
+            "enabled": state.lora_registry.is_enabled(),
+            "adapter_count": state.lora_registry.adapter_models().len() as u64,
+            "active_cache_bindings": 0u64,
+            "projection_applications": 0u64,
+            "position": "startup-routing",
+            "source": "server-lora-registry",
+        })),
     });
 
     Ok(Json(health).into_response())
 }
 
 /// Prometheus metrics endpoint — returns metrics in Prometheus text format.
-async fn metrics_handler(State(state): State<AppState>) -> std::result::Result<Response, ServerError> {
+async fn metrics_handler(
+    State(state): State<AppState>,
+) -> std::result::Result<Response, ServerError> {
     let mut body = match PROM_HANDLE.get() {
         Some(handle) => handle.render(),
         None => "# Prometheus recorder not initialized\n".to_string(),
@@ -2657,7 +2715,11 @@ async fn metrics_handler(State(state): State<AppState>) -> std::result::Result<R
     if !body.ends_with('\n') {
         body.push('\n');
     }
-    body.push_str(&state.cache.prometheus_metrics());
+    let engine_cache = state
+        .llm
+        .as_ref()
+        .and_then(|engine| engine.cache_metrics_snapshot());
+    body.push_str(&state.cache.prometheus_metrics(engine_cache.as_ref()));
 
     Ok((
         [(
@@ -2863,6 +2925,7 @@ mod tests {
         text: String,
         stream_usage: Option<TokenUsage>,
         api_response: Option<ferrum_types::ApiResponse>,
+        lora_metrics: Option<Value>,
     }
 
     impl StubLlm {
@@ -2874,6 +2937,7 @@ mod tests {
                 text: text.to_string(),
                 stream_usage: Some(TokenUsage::new(5, 1)),
                 api_response: None,
+                lora_metrics: None,
             }
         }
 
@@ -2887,6 +2951,13 @@ mod tests {
         fn with_api_response(text: &str, api_response: ferrum_types::ApiResponse) -> Self {
             Self {
                 api_response: Some(api_response),
+                ..Self::new(text)
+            }
+        }
+
+        fn with_lora_metrics(text: &str, lora_metrics: Value) -> Self {
+            Self {
+                lora_metrics: Some(lora_metrics),
                 ..Self::new(text)
             }
         }
@@ -3012,6 +3083,10 @@ mod tests {
 
         async fn health_check(&self) -> EngineHealthStatus {
             EngineHealthStatus::healthy()
+        }
+
+        fn lora_metrics_snapshot(&self) -> Option<Value> {
+            self.lora_metrics.clone()
         }
     }
 
@@ -3419,7 +3494,11 @@ mod tests {
         let router = AxumServer::from_llm(engine.clone())
             .with_lora_adapters(
                 "qwen3",
-                vec![LoraAdapterModel::new("sql", "qwen3:sql", "/tmp/sql-adapter")],
+                vec![LoraAdapterModel::new(
+                    "sql",
+                    "qwen3:sql",
+                    "/tmp/sql-adapter",
+                )],
             )
             .build_router();
         (router, engine)
@@ -3563,6 +3642,38 @@ mod tests {
             body["auto_config"]["decisions"].is_array() || body["auto_config"]["error"].is_string(),
             "body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn route_health_includes_engine_lora_metrics_snapshot() {
+        let router = AxumServer::from_llm(Arc::new(StubLlm::with_lora_metrics(
+            "ok",
+            json!({
+                "enabled": true,
+                "adapter_count": 1,
+                "active_cache_bindings": 0,
+                "projection_applications": 7,
+                "position": "real-inference",
+                "source": "test-lora",
+            }),
+        )))
+        .with_lora_adapters(
+            "stub-model",
+            vec![LoraAdapterModel::new(
+                "sql",
+                "stub-model:sql",
+                "/tmp/sql-adapter",
+            )],
+        )
+        .build_router();
+        let response = get(router, "/health").await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["lora"]["enabled"], true);
+        assert_eq!(body["lora"]["adapter_count"], 1);
+        assert_eq!(body["lora"]["projection_applications"], 7);
+        assert_eq!(body["lora"]["position"], "real-inference");
+        assert_eq!(body["lora"]["source"], "test-lora");
     }
 
     #[tokio::test]
@@ -4146,7 +4257,9 @@ mod tests {
         let body = response_text(response).await;
         assert_eq!(body.matches("data: [DONE]").count(), 1, "body: {body}");
         assert!(
-            body.contains(r#""error":{"message":"model output did not satisfy required tool_choice""#),
+            body.contains(
+                r#""error":{"message":"model output did not satisfy required tool_choice""#
+            ),
             "stream should emit OpenAI error envelope: {body}"
         );
         assert!(
@@ -5363,9 +5476,13 @@ mod tests {
     #[tokio::test]
     async fn chat_rejects_n_not_one_with_openai_error_param() {
         let request = chat_request(json!({"n": 2}));
-        let err = chat_completions_handler(State(state_with_stub("unused")), HeaderMap::new(), Ok(Json(request)))
-            .await
-            .expect_err("n=2 should reject");
+        let err = chat_completions_handler(
+            State(state_with_stub("unused")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect_err("n=2 should reject");
         let (status, body) = error_json(err).await;
         assert_eq!(status, AxumStatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
@@ -5380,9 +5497,13 @@ mod tests {
             (json!({"top_logprobs": 2}), "top_logprobs"),
         ] {
             let request = chat_request(extra);
-            let err = chat_completions_handler(State(state_with_stub("unused")), HeaderMap::new(), Ok(Json(request)))
-                .await
-                .expect_err("unsupported field should reject");
+            let err = chat_completions_handler(
+                State(state_with_stub("unused")),
+                HeaderMap::new(),
+                Ok(Json(request)),
+            )
+            .await
+            .expect_err("unsupported field should reject");
             let (status, body) = error_json(err).await;
             assert_eq!(status, AxumStatusCode::BAD_REQUEST);
             assert_eq!(body["error"]["param"], param);
@@ -5396,9 +5517,13 @@ mod tests {
             "stream": true,
             "stream_options": {"include_usage": true}
         }));
-        let response = chat_completions_handler(State(state_with_stub("ok")), HeaderMap::new(), Ok(Json(request)))
-            .await
-            .expect("stream response");
+        let response = chat_completions_handler(
+            State(state_with_stub("ok")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect("stream response");
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_text(response).await;
         assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
@@ -5416,9 +5541,13 @@ mod tests {
         );
 
         let request = chat_request(json!({"stream": true}));
-        let response = chat_completions_handler(State(state_with_stub("ok")), HeaderMap::new(), Ok(Json(request)))
-            .await
-            .expect("stream response");
+        let response = chat_completions_handler(
+            State(state_with_stub("ok")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect("stream response");
         let body = response_text(response).await;
         assert!(
             !body.contains("\"usage\":{\"prompt_tokens\""),
@@ -5785,9 +5914,13 @@ mod tests {
     #[tokio::test]
     async fn stream_options_without_stream_is_invalid() {
         let request = chat_request(json!({"stream_options": {"include_usage": true}}));
-        let err = chat_completions_handler(State(state_with_stub("unused")), HeaderMap::new(), Ok(Json(request)))
-            .await
-            .expect_err("stream_options without stream should reject");
+        let err = chat_completions_handler(
+            State(state_with_stub("unused")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect_err("stream_options without stream should reject");
         let (status, body) = error_json(err).await;
         assert_eq!(status, AxumStatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["param"], "stream_options");
@@ -5821,10 +5954,13 @@ mod tests {
         let request = chat_request(json!({
             "response_format": {"type": "json_object"}
         }));
-        let response =
-            chat_completions_handler(State(state_with_stub("not json")), HeaderMap::new(), Ok(Json(request)))
-                .await
-                .expect("json_object remains best-effort");
+        let response = chat_completions_handler(
+            State(state_with_stub("not json")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect("json_object remains best-effort");
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["choices"][0]["message"]["content"], "not json");
@@ -5842,9 +5978,13 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(State(state_with_stub("unused")), HeaderMap::new(), Ok(Json(request)))
-            .await
-            .expect_err("unsupported strict schema should reject");
+        let err = chat_completions_handler(
+            State(state_with_stub("unused")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect_err("unsupported strict schema should reject");
         let (status, body) = error_json(err).await;
         assert_eq!(status, AxumStatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["param"], "response_format.json_schema");
@@ -5862,9 +6002,13 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(State(state_with_stub("unused")), HeaderMap::new(), Ok(Json(request)))
-            .await
-            .expect_err("missing strict schema should reject");
+        let err = chat_completions_handler(
+            State(state_with_stub("unused")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect_err("missing strict schema should reject");
         let (status, body) = error_json(err).await;
         assert_eq!(status, AxumStatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["param"], "response_format.json_schema");
@@ -6061,6 +6205,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cache_metrics_use_engine_real_kv_snapshot_when_available() {
+        let cache = CacheRuntimeState::default();
+        let policy = CachePolicy {
+            prefix_cache_enabled: true,
+            session_cache_mode: "memory".to_string(),
+            session_cache_max_entries: 128,
+            session_cache_max_tokens: 4096,
+        };
+        cache.record_prefix_prompt("alpha beta gamma", &policy);
+        cache.record_prefix_prompt("alpha beta delta", &policy);
+
+        let engine_snapshot = json!({
+            "position": "real-kv-reuse",
+            "source": "llama-family-paged-block-prefix-cache",
+            "enabled": true,
+            "hits": 7,
+            "misses": 3,
+            "evictions": 1,
+            "saved_prefill_tokens": 64,
+            "entries": 5,
+            "bytes": 8192,
+            "block_size": 16,
+            "kv_dtype": "fp16",
+        });
+
+        let health = cache.health_json(&policy, Some(&engine_snapshot));
+        let prefix = &health["prefix_cache"];
+        assert_eq!(prefix["position"], "real-kv-reuse");
+        assert_eq!(prefix["source"], "llama-family-paged-block-prefix-cache");
+        assert_eq!(prefix["hits"], 7);
+        assert_eq!(prefix["misses"], 3);
+        assert_eq!(prefix["evictions"], 1);
+        assert_eq!(prefix["saved_prefill_tokens"], 64);
+        assert_eq!(prefix["entries"], 5);
+        assert_eq!(prefix["bytes"], 8192);
+        assert_eq!(prefix["block_size"], 16);
+        assert_eq!(prefix["kv_dtype"], "fp16");
+
+        let metrics = cache.prometheus_metrics(Some(&engine_snapshot));
+        assert!(metrics.contains("ferrum_prefix_cache_hits_total 7\n"));
+        assert!(metrics.contains("ferrum_prefix_cache_misses_total 3\n"));
+        assert!(metrics.contains("ferrum_prefix_cache_saved_prefill_tokens_total 64\n"));
+        assert!(metrics.contains("ferrum_prefix_cache_entries 5\n"));
+        assert!(metrics.contains("ferrum_prefix_cache_bytes 8192\n"));
+    }
+
     #[tokio::test]
     async fn strict_json_schema_invalid_model_output_fails_before_response() {
         let request = chat_request(json!({
@@ -6077,9 +6268,13 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(State(state_with_stub("not json")), HeaderMap::new(), Ok(Json(request)))
-            .await
-            .expect_err("invalid strict response should fail");
+        let err = chat_completions_handler(
+            State(state_with_stub("not json")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect_err("invalid strict response should fail");
         let (status, body) = error_json(err).await;
         assert_eq!(status, AxumStatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"]["type"], "internal_server_error");

@@ -149,6 +149,13 @@ impl EngineInner {
         // scheduler so its metrics reflect actual progress. True cross-
         // iteration interleaving with decode is a follow-up refactor.
         let chunk_size = self.runtime_config.chunked_prefill_size_for(num_tokens);
+        let request_metadata = {
+            let sequences = self.sequences.read();
+            sequences
+                .get(request_id)
+                .map(|seq| seq.original_request.metadata.clone())
+                .unwrap_or_default()
+        };
 
         let prefill_output = if let Some(csz) = chunk_size {
             let mut current_kv = kv_handle;
@@ -162,7 +169,8 @@ impl EngineInner {
                     .collect();
                 let chunk_tensor = self.tokens_to_tensor(&chunk_ids)?;
                 let input = ferrum_interfaces::model_executor::PrefillInput::new(chunk_tensor)
-                    .with_kv_cache(current_kv.clone());
+                    .with_kv_cache(current_kv.clone())
+                    .with_metadata(request_metadata.clone());
                 let out = self.model_executor.prefill(&input).await?;
                 current_kv = out.kv_cache.clone();
 
@@ -184,7 +192,8 @@ impl EngineInner {
                 self.tokens_to_tensor(&token_u32s)?
             };
             let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor)
-                .with_kv_cache(kv_handle);
+                .with_kv_cache(kv_handle)
+                .with_metadata(request_metadata);
             self.model_executor.prefill(&prefill_input).await?
         };
 
@@ -280,6 +289,7 @@ impl EngineInner {
             RequestId,
             Vec<TokenId>,
             Arc<dyn ferrum_interfaces::KvCacheHandle>,
+            std::collections::HashMap<String, serde_json::Value>,
         )> = Vec::new();
 
         let model_info = self.model_executor.info();
@@ -294,12 +304,16 @@ impl EngineInner {
         let skip_prefix_cache = !self.runtime_config.prefix_cache_enabled;
 
         for rid in request_ids {
-            let (input_tokens, num_tokens) = {
+            let (input_tokens, num_tokens, metadata) = {
                 let sequences = self.sequences.read();
                 let Some(seq) = sequences.get(rid) else {
                     continue; // request gone (cancelled mid-batch)
                 };
-                (seq.input_tokens.clone(), seq.input_tokens.len())
+                (
+                    seq.input_tokens.clone(),
+                    seq.input_tokens.len(),
+                    seq.original_request.metadata.clone(),
+                )
             };
 
             // Prefix cache hit short-circuit (mirrors run_prefill_inner).
@@ -373,7 +387,7 @@ impl EngineInner {
                     }
                 }
             };
-            to_prefill.push((rid.clone(), input_tokens, kv_handle));
+            to_prefill.push((rid.clone(), input_tokens, kv_handle, metadata));
         }
 
         if to_prefill.is_empty() {
@@ -383,10 +397,12 @@ impl EngineInner {
         // ── Phase 1b: ONE batched model_executor.batch_prefill call ──
         let inputs: Vec<PrefillInput> = to_prefill
             .iter()
-            .map(|(_, tokens, kv)| {
+            .map(|(_, tokens, kv, metadata)| {
                 let token_u32s: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
                 let tensor = self.tokens_to_tensor(&token_u32s)?;
-                Ok(PrefillInput::new(tensor).with_kv_cache(kv.clone()))
+                Ok(PrefillInput::new(tensor)
+                    .with_kv_cache(kv.clone())
+                    .with_metadata(metadata.clone()))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -400,7 +416,7 @@ impl EngineInner {
         }
 
         // ── Phase 1c: per-item post-process (sample, update seq, stream, stop) ──
-        for ((rid, input_tokens, _), prefill_output) in to_prefill.iter().zip(outputs.iter()) {
+        for ((rid, input_tokens, _, _), prefill_output) in to_prefill.iter().zip(outputs.iter()) {
             let num_tokens = input_tokens.len();
             let last_logits = prefill_output.last_token_logits()?;
             let logits_vec = last_logits.to_vec_f32()?;

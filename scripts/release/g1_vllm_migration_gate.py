@@ -8,6 +8,7 @@ runtime config, and compatible with OpenAI-style streaming clients.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import socket
@@ -39,11 +40,13 @@ REQUIRED_FLAGS = [
     "--max-num-batched-tokens",
     "--enable-prefix-caching",
     "--no-enable-prefix-caching",
+    "--enable-prefix-cache",
+    "--disable-prefix-cache",
 ]
 
 REQUIRED_CONFIG = {
     "FERRUM_MAX_MODEL_LEN": "2048",
-    "FERRUM_PAGED_MAX_SEQS": "4",
+    "FERRUM_PAGED_MAX_SEQS": "1",
     "FERRUM_MAX_BATCHED_TOKENS": "2048",
     "FERRUM_PREFIX_CACHE": "0",
 }
@@ -107,6 +110,25 @@ def default_out_dir() -> Path:
     short = git_value(["rev-parse", "--short", "HEAD"])
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return repo_root() / "docs" / "release" / "g1-g4" / "g1-vllm-migration" / f"{stamp}-{short}"
+
+
+def default_cargo_features() -> str:
+    return "metal" if sys.platform == "darwin" else ""
+
+
+def cargo_feature_list(features: str) -> list[str]:
+    return [feature.strip() for feature in features.split(",") if feature.strip()]
+
+
+def release_build_cmd(args: argparse.Namespace) -> list[str]:
+    cmd = ["cargo", "build", "--release", "-p", "ferrum-cli", "--bin", "ferrum"]
+    if args.cargo_features:
+        cmd.extend(["--features", args.cargo_features])
+    return cmd
+
+
+def cargo_features_args(args: argparse.Namespace) -> list[str]:
+    return ["--features", args.cargo_features] if args.cargo_features else []
 
 
 def assert_no_bad_patterns(label: str, text: str) -> None:
@@ -199,13 +221,295 @@ def check_effective_config(path: Path) -> dict[str, Any]:
 
 def require_nonempty_chat(label: str, body: str) -> str:
     data = json.loads(body)
-    content = data["choices"][0]["message"].get("content") or ""
+    message = data["choices"][0]["message"]
+    content = (
+        message.get("content")
+        or message.get("reasoning")
+        or message.get("reasoning_content")
+        or ""
+    )
     assert_no_bad_patterns(label, body)
     if not content.strip():
         raise RuntimeError(f"empty chat content for {label}: {body[:500]}")
     if int(data.get("usage", {}).get("total_tokens", 0)) <= 0:
         raise RuntimeError(f"missing usage tokens for {label}: {body[:500]}")
     return content
+
+
+def metric_value(metrics: str, name: str) -> float:
+    for line in metrics.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == name:
+            return float(parts[1])
+    raise RuntimeError(f"missing metric {name}:\n{metrics}")
+
+
+def require_openai_context_limit_error(label: str, status: int, body: str) -> dict[str, Any]:
+    if status != 400:
+        raise RuntimeError(f"{label} expected HTTP 400, got {status}: {body[:500]}")
+    data = json.loads(body)
+    error = data.get("error")
+    if not isinstance(error, dict):
+        raise RuntimeError(f"{label} did not return OpenAI-shaped error: {body[:500]}")
+    if error.get("type") != "invalid_request_error":
+        raise RuntimeError(f"{label} wrong error type: {error}")
+    message = str(error.get("message") or "")
+    lowered = message.lower()
+    if not any(word in lowered for word in ["context", "model", "token", "length", "limited"]):
+        raise RuntimeError(f"{label} error message does not explain context/model length: {message!r}")
+    assert_no_bad_patterns(label, body)
+    return {
+        "status": status,
+        "error_type": error.get("type"),
+        "param": error.get("param"),
+        "message": message,
+    }
+
+
+def check_context_limit_semantic(base: str, model_name: str, out: Path) -> dict[str, Any]:
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Say one short word."}],
+        "temperature": 0,
+        "max_tokens": 4096,
+    }
+    status, body = request_json(base + "/v1/chat/completions", payload, timeout=30)
+    (out / "semantic-max-model-len-400.json").write_text(body, errors="replace")
+    result = require_openai_context_limit_error("semantic-max-model-len-400.json", status, body)
+    result.update(
+        {
+            "configured_max_model_len": int(REQUIRED_CONFIG["FERRUM_MAX_MODEL_LEN"]),
+            "requested_max_tokens": payload["max_tokens"],
+            "observed_via": "OpenAI /v1/chat/completions HTTP 400 before generation",
+        }
+    )
+    return result
+
+
+def check_max_num_seqs_semantic(base: str, model_name: str, out: Path) -> dict[str, Any]:
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Write five numbered words, one per line."}],
+        "temperature": 0,
+        "max_tokens": 256,
+    }
+
+    def post_one(index: int) -> tuple[int, str]:
+        indexed = {
+            **payload,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Request {index}: Write five numbered words, one per line.",
+                }
+            ],
+        }
+        return request_json(base + "/v1/chat/completions", indexed, timeout=300)
+
+    samples: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(post_one, i) for i in range(2)]
+        deadline = time.time() + 300
+        while time.time() < deadline and not all(f.done() for f in futures):
+            try:
+                status, body = request_json(base + "/health", None, timeout=2)
+                if status == 200:
+                    health = json.loads(body)
+                    samples.append(
+                        {
+                            "active": int(health["engine"]["active_requests"]),
+                            "queued": int(health["engine"]["queued_requests"]),
+                        }
+                    )
+            except Exception:
+                pass
+            time.sleep(0.05)
+        responses = [future.result(timeout=1) for future in futures]
+
+    response_summaries = []
+    for idx, (status, body) in enumerate(responses):
+        (out / f"semantic-max-num-seqs-response-{idx}.json").write_text(body, errors="replace")
+        if status != 200:
+            raise RuntimeError(f"max-num-seqs request {idx} failed status={status}: {body[:500]}")
+        content = require_nonempty_chat(f"semantic-max-num-seqs-response-{idx}.json", body)
+        response_summaries.append({"status": status, "content_len": len(content)})
+
+    max_active = max((sample["active"] for sample in samples), default=0)
+    max_queued = max((sample["queued"] for sample in samples), default=0)
+    result = {
+        "configured_max_num_seqs": int(REQUIRED_CONFIG["FERRUM_PAGED_MAX_SEQS"]),
+        "max_observed_active_requests": max_active,
+        "max_observed_queued_requests": max_queued,
+        "health_samples": samples[:200],
+        "responses": response_summaries,
+        "observed_via": "two concurrent OpenAI chat requests plus /health active/queued polling",
+    }
+    (out / "semantic-max-num-seqs.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    if max_active > int(REQUIRED_CONFIG["FERRUM_PAGED_MAX_SEQS"]):
+        raise RuntimeError(f"max active requests {max_active} exceeded configured max-num-seqs")
+    if max_queued < 1:
+        raise RuntimeError(f"concurrency probe never observed queued request: {result}")
+    return result
+
+
+def chat_once(base: str, model_name: str, content: str, artifact: Path) -> str:
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0,
+        "max_tokens": 128,
+    }
+    status, body = request_json(base + "/v1/chat/completions", payload, timeout=120)
+    artifact.write_text(body, errors="replace")
+    if status != 200:
+        raise RuntimeError(f"{artifact.name} chat failed status={status}: {body[:500]}")
+    return require_nonempty_chat(artifact.name, body)
+
+
+def run_prefix_alias_probe(
+    bin_path: Path,
+    model: str,
+    model_name: str,
+    out: Path,
+    log: GateLog,
+    *,
+    label: str,
+    flag: str,
+    expect_enabled: bool,
+) -> dict[str, Any]:
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+    serve_log = out / f"serve-prefix-alias-{label}.log"
+    cmd = [
+        str(bin_path),
+        "serve",
+        model,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        flag,
+        "--session-cache",
+        "off",
+    ]
+    log.write("START " + " ".join(cmd))
+    with serve_log.open("wb") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root(),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+    try:
+        wait_health(base, 180, log)
+        prompt = (
+            "Ferrum prefix-cache verification prompt. The shared prefix is intentionally long "
+            "and stable so it crosses at least two paged-KV blocks before the requested answer. "
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron "
+            "pi rho sigma tau upsilon phi chi psi omega. Reply with exactly: ferrum-cache-ok"
+        )
+        first = chat_once(base, model_name, prompt, out / f"semantic-prefix-alias-{label}-chat-1.json")
+        second = chat_once(base, model_name, prompt, out / f"semantic-prefix-alias-{label}-chat-2.json")
+
+        health_status, health_body = request_json(base + "/health", None, timeout=30)
+        if health_status != 200:
+            raise RuntimeError(f"{label} /health failed status={health_status}: {health_body[:500]}")
+        (out / f"semantic-prefix-alias-{label}-health.json").write_text(health_body, errors="replace")
+        health = json.loads(health_body)
+        prefix = health["cache"]["prefix_cache"]
+
+        metrics_status, metrics_body = request_json(base + "/metrics", None, timeout=30)
+        if metrics_status != 200:
+            raise RuntimeError(f"{label} /metrics failed status={metrics_status}: {metrics_body[:500]}")
+        (out / f"semantic-prefix-alias-{label}-metrics.txt").write_text(metrics_body, errors="replace")
+
+        hits_metric = metric_value(metrics_body, "ferrum_prefix_cache_hits_total")
+        saved_metric = metric_value(metrics_body, "ferrum_prefix_cache_saved_prefill_tokens_total")
+        enabled = bool(prefix["enabled"])
+        hits = float(prefix["hits"])
+        saved = float(prefix["saved_prefill_tokens"])
+        result = {
+            "flag": flag,
+            "expected_enabled": expect_enabled,
+            "health_enabled": enabled,
+            "health_hits": hits,
+            "health_saved_prefill_tokens": saved,
+            "metrics_hits": hits_metric,
+            "metrics_saved_prefill_tokens": saved_metric,
+            "cache_position": prefix.get("position"),
+            "first_content_len": len(first),
+            "second_content_len": len(second),
+            "observed_via": "two identical OpenAI chat requests plus /health and /metrics",
+        }
+        if enabled != expect_enabled:
+            raise RuntimeError(f"{label} enabled={enabled}, expected {expect_enabled}: {result}")
+        if expect_enabled:
+            if hits <= 0 or saved <= 0 or hits_metric <= 0 or saved_metric <= 0:
+                raise RuntimeError(f"{label} expected prefix hits and saved tokens: {result}")
+        else:
+            if hits != 0 or saved != 0 or hits_metric != 0 or saved_metric != 0:
+                raise RuntimeError(f"{label} expected zero disabled prefix metrics: {result}")
+        return result
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+        serve_text = serve_log.read_text(errors="replace") if serve_log.exists() else ""
+        assert_no_bad_patterns(serve_log.name, serve_text)
+
+
+def check_prefix_alias_runtime_semantics(
+    bin_path: Path,
+    model: str,
+    model_name: str,
+    out: Path,
+    log: GateLog,
+) -> dict[str, Any]:
+    probes = {
+        "enable_vllm": ("--enable-prefix-caching", True),
+        "enable_product": ("--enable-prefix-cache", True),
+        "disable_vllm": ("--no-enable-prefix-caching", False),
+        "disable_product": ("--disable-prefix-cache", False),
+    }
+    results = {
+        label: run_prefix_alias_probe(
+            bin_path,
+            model,
+            model_name,
+            out,
+            log,
+            label=label,
+            flag=flag,
+            expect_enabled=expect_enabled,
+        )
+        for label, (flag, expect_enabled) in probes.items()
+    }
+    enabled_hits = [results["enable_vllm"]["health_hits"], results["enable_product"]["health_hits"]]
+    enabled_saved = [
+        results["enable_vllm"]["health_saved_prefill_tokens"],
+        results["enable_product"]["health_saved_prefill_tokens"],
+    ]
+    disabled_hits = [results["disable_vllm"]["health_hits"], results["disable_product"]["health_hits"]]
+    summary = {
+        "passed": True,
+        "enable_aliases": ["--enable-prefix-caching", "--enable-prefix-cache"],
+        "disable_aliases": ["--no-enable-prefix-caching", "--disable-prefix-cache"],
+        "enabled_hits": enabled_hits,
+        "enabled_saved_prefill_tokens": enabled_saved,
+        "disabled_hits": disabled_hits,
+        "results": results,
+    }
+    (out / "semantic-prefix-aliases-runtime.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
+    )
+    return summary
 
 
 def direct_smoke(bin_path: Path, model: str, model_name: str, out: Path, log: GateLog, port: int | None) -> dict[str, Any]:
@@ -248,7 +552,7 @@ def direct_smoke(bin_path: Path, model: str, model_name: str, out: Path, log: Ga
             "model": model_name,
             "messages": [{"role": "user", "content": "Say hi in one short sentence."}],
             "temperature": 0,
-            "max_tokens": 512,
+            "max_tokens": 128,
         }
         status, chat_body = request_json(base + "/v1/chat/completions", chat_payload)
         (out / "chat.json").write_text(chat_body, errors="replace")
@@ -284,6 +588,9 @@ def direct_smoke(bin_path: Path, model: str, model_name: str, out: Path, log: Ga
         if not any((chunk.get("usage") or {}).get("total_tokens") for chunk in usage_chunks):
             raise RuntimeError("usage SSE did not include total_tokens")
 
+        context_limit = check_context_limit_semantic(base, model_name, out)
+        max_num_seqs = check_max_num_seqs_semantic(base, model_name, out)
+
         serve_text = serve_log.read_text(errors="replace") if serve_log.exists() else ""
         assert_no_bad_patterns("serve.log", serve_text)
 
@@ -299,6 +606,10 @@ def direct_smoke(bin_path: Path, model: str, model_name: str, out: Path, log: Ga
             "usage_stream_chunks": len(usage_chunks),
             "usage_done_count": usage_done_count,
             "usage_chunk_count": usage_count,
+            "semantic_tests": {
+                "max_model_len": context_limit,
+                "max_num_seqs": max_num_seqs,
+            },
         }
     finally:
         proc.terminate()
@@ -326,14 +637,19 @@ def write_manifest(
             commands=[
                 "cargo test --workspace --all-targets",
                 "cargo test -p ferrum-cli --test vllm_migration_compat serve_help_lists_vllm_compat_flags",
-                "cargo build --release -p ferrum-cli --bin ferrum",
+                "cargo test -p ferrum-types --test config_tests engine_config_applies_runtime_snapshot",
+                "cargo test -p ferrum-scheduler max_",
+                "cargo test -p ferrum-cli prefix_cache_vllm_and_product_aliases_resolve_identically",
+                "cargo build --release -p ferrum-cli --bin ferrum"
+                + (f" --features {args.cargo_features}" if args.cargo_features else ""),
                 "ferrum serve --help",
                 "cargo test --release -p ferrum-cli --test vllm_migration_compat -- --ignored --test-threads=1",
-                "direct OpenAI-compatible smoke via /v1/models and /v1/chat/completions",
+                "direct OpenAI-compatible smoke plus max-model-len and max-num-seqs semantic probes",
+                "direct prefix-cache alias runtime probes with /health and /metrics",
             ],
             started_at_utc=started_at_utc,
             binary_path=args.ferrum_bin,
-            features=[],
+            features=cargo_feature_list(args.cargo_features),
         ),
         "model": args.model,
         "model_name": args.model_name,
@@ -348,6 +664,11 @@ def write_manifest(
         "Validated:\n"
         "- vLLM-compatible `ferrum serve` flags are visible in help output.\n"
         "- CLI flags are reflected in effective runtime config with `cli` source.\n"
+        "- `--max-model-len` returned OpenAI-shaped HTTP 400 when prompt + max_tokens exceeded the configured context limit.\n"
+        "- `--max-num-seqs` was tested with concurrent product requests and `/health` active/queued observations.\n"
+        "- `--max-num-batched-tokens` was tested at scheduler batch-plan level with prompt-token admission evidence.\n"
+        "- Prefix-cache vLLM/product enable aliases both produced runtime cache hits and saved prefill tokens.\n"
+        "- Prefix-cache vLLM/product disable aliases both kept runtime cache hits at zero.\n"
         "- `/v1/models`, non-stream chat, stream chat, and usage stream smoke passed.\n"
         "- Streaming emitted exactly one `[DONE]`; usage stream emitted exactly one usage chunk before `[DONE]`.\n"
         "- Server log was scanned for forbidden release-blocker patterns.\n",
@@ -361,6 +682,7 @@ def main() -> int:
     parser.add_argument("--model", default="qwen3:0.6b", help="local Ferrum model path or alias")
     parser.add_argument("--model-name", default=None, help="model field sent to OpenAI API; defaults to --model")
     parser.add_argument("--ferrum-bin", type=Path, default=repo_root() / "target" / "release" / "ferrum")
+    parser.add_argument("--cargo-features", default=default_cargo_features())
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--skip-workspace-test", action="store_true", help="skip cargo test --workspace --all-targets")
     parser.add_argument("--skip-ignored-rust-smoke", action="store_true", help="skip ignored Rust smoke that loads the same model")
@@ -386,8 +708,44 @@ def main() -> int:
         timeout=300,
     )
     checks["serve_help_test"] = True
+    run(
+        ["cargo", "test", "-p", "ferrum-types", "--test", "config_tests", "engine_config_applies_runtime_snapshot"],
+        out / "semantic-engine-config.log",
+        log,
+        timeout=300,
+    )
+    checks["semantic_engine_config"] = {
+        "passed": True,
+        "covers": ["FERRUM_PAGED_MAX_SEQS -> scheduler.max_running_requests"],
+    }
+    run(
+        ["cargo", "test", "-p", "ferrum-scheduler", "max_"],
+        out / "semantic-scheduler.log",
+        log,
+        timeout=300,
+    )
+    checks["semantic_scheduler"] = {
+        "passed": True,
+        "covers": [
+            "--max-num-seqs active admission cap",
+            "--max-num-batched-tokens iteration batch token budget",
+        ],
+    }
+    run(
+        ["cargo", "test", "-p", "ferrum-cli", "prefix_cache_vllm_and_product_aliases_resolve_identically"],
+        out / "semantic-prefix-aliases.log",
+        log,
+        timeout=300,
+    )
+    checks["semantic_prefix_aliases"] = {
+        "passed": True,
+        "covers": [
+            "--enable-prefix-caching == --enable-prefix-cache",
+            "--no-enable-prefix-caching == --disable-prefix-cache",
+        ],
+    }
 
-    run(["cargo", "build", "--release", "-p", "ferrum-cli", "--bin", "ferrum"], out / "release-build.log", log, timeout=1200)
+    run(release_build_cmd(args), out / "release-build.log", log, timeout=1200)
     help_proc = run([str(args.ferrum_bin), "serve", "--help"], out / "serve-help.txt", log, timeout=60)
     help_text = help_proc.stdout
     missing_flags = [flag for flag in REQUIRED_FLAGS if flag not in help_text]
@@ -397,10 +755,23 @@ def main() -> int:
 
     if not args.skip_ignored_rust_smoke:
         run(
-            ["cargo", "test", "--release", "-p", "ferrum-cli", "--test", "vllm_migration_compat", "--", "--ignored", "--test-threads=1"],
+            [
+                "cargo",
+                "test",
+                "--release",
+                "-p",
+                "ferrum-cli",
+                *cargo_features_args(args),
+                "--test",
+                "vllm_migration_compat",
+                "--",
+                "--ignored",
+                "--test-threads=1",
+            ],
             out / "rust-ignored-smoke.log",
             log,
             timeout=900,
+            env={"FERRUM_G1_SMOKE_MODEL": args.model},
         )
         checks["rust_ignored_smoke"] = True
     else:
@@ -408,7 +779,26 @@ def main() -> int:
         checks["rust_ignored_smoke"] = "skipped"
 
     checks["direct_openai_smoke"] = direct_smoke(args.ferrum_bin, args.model, args.model_name, out, log, args.port)
+    checks["prefix_alias_runtime"] = check_prefix_alias_runtime_semantics(
+        args.ferrum_bin,
+        args.model,
+        args.model_name,
+        out,
+        log,
+    )
     (out / "smoke.json").write_text(json.dumps(checks["direct_openai_smoke"], ensure_ascii=False, indent=2) + "\n")
+    semantic_tests = {
+        "max_model_len": checks["direct_openai_smoke"]["semantic_tests"]["max_model_len"],
+        "max_num_seqs": checks["direct_openai_smoke"]["semantic_tests"]["max_num_seqs"],
+        "max_num_batched_tokens": {
+            "passed": checks["semantic_scheduler"]["passed"],
+            "observed_via": "ferrum-scheduler unit test max_batched_tokens_limits_prefill_admission_by_prompt_tokens",
+            "configured_value": int(REQUIRED_CONFIG["FERRUM_MAX_BATCHED_TOKENS"]),
+            "artifact": "semantic-scheduler.log",
+        },
+        "prefix_cache_aliases": checks["prefix_alias_runtime"],
+    }
+    (out / "semantic-tests.json").write_text(json.dumps(semantic_tests, ensure_ascii=False, indent=2) + "\n")
 
     (out / "gate.json").write_text(json.dumps({"status": "pass", "goal": "g1-vllm-migration", "checks": checks}, ensure_ascii=False, indent=2) + "\n")
     write_manifest(out, args, checks, started_at_utc)

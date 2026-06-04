@@ -957,16 +957,9 @@ fn serve_cli_runtime_entries(
         ));
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_PREFIX_CACHE",
-            "0",
+            if enabled { "1" } else { "0" },
             RuntimeConfigSource::Cli,
         ));
-        if enabled {
-            entries.push(RuntimeConfigEntry::new(
-                "FERRUM_PREFIX_CACHE_SAFETY",
-                "engine_forced_off_product_observed",
-                RuntimeConfigSource::Cli,
-            ));
-        }
     }
     push_cli_runtime_entry(&mut entries, "FERRUM_SESSION_CACHE", session_cache);
     push_cli_runtime_usize(
@@ -1615,11 +1608,7 @@ mod tests {
         let env_snapshot = RuntimeConfigSnapshot::from_entries([
             RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "2048", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "4", RuntimeConfigSource::Env),
-            RuntimeConfigEntry::new(
-                "FERRUM_MAX_BATCHED_TOKENS",
-                "256",
-                RuntimeConfigSource::Env,
-            ),
+            RuntimeConfigEntry::new("FERRUM_MAX_BATCHED_TOKENS", "256", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new("FERRUM_PREFIX_CACHE", "1", RuntimeConfigSource::Env),
         ]);
 
@@ -2117,6 +2106,94 @@ mod tests {
             .unwrap();
         assert_eq!(kv.effective_value, "bf16");
         assert_eq!(kv.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn prefix_cache_vllm_and_product_aliases_resolve_identically() {
+        assert_eq!(
+            prefix_cache_cli_override(true, false, false, false),
+            Some(true)
+        );
+        assert_eq!(
+            prefix_cache_cli_override(false, false, true, false),
+            Some(true)
+        );
+        assert_eq!(
+            prefix_cache_cli_override(false, true, false, false),
+            Some(false)
+        );
+        assert_eq!(
+            prefix_cache_cli_override(false, false, false, true),
+            Some(false)
+        );
+
+        let enabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
+            None,
+            None,
+            prefix_cache_cli_override(true, false, false, false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let product_enabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
+            None,
+            None,
+            prefix_cache_cli_override(false, false, true, false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let disabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
+            None,
+            None,
+            prefix_cache_cli_override(false, true, false, false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let product_disabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
+            None,
+            None,
+            prefix_cache_cli_override(false, false, false, true),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(enabled_entries, product_enabled_entries);
+        assert_eq!(disabled_entries, product_disabled_entries);
     }
 
     #[test]

@@ -19,8 +19,12 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SMOKE_MODEL: &str = "qwen3:0.6b";
+const DEFAULT_SMOKE_MODEL: &str = "qwen3:0.6b";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn smoke_model() -> String {
+    std::env::var("FERRUM_G1_SMOKE_MODEL").unwrap_or_else(|_| DEFAULT_SMOKE_MODEL.to_string())
+}
 
 fn ferrum_bin() -> PathBuf {
     if let Ok(bin) = std::env::var("CARGO_BIN_EXE_ferrum") {
@@ -49,7 +53,10 @@ fn unique_path(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    std::env::temp_dir().join(format!("ferrum-g1-{name}-{}-{now}.json", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "ferrum-g1-{name}-{}-{now}.json",
+        std::process::id()
+    ))
 }
 
 fn python_bin() -> String {
@@ -69,14 +76,16 @@ impl ServerFixture {
         let port = free_port();
         let base_url = format!("http://127.0.0.1:{port}");
         let effective_config_json = unique_path("effective-config");
+        let model = smoke_model();
+        let port = port.to_string();
         let child = Command::new(ferrum_bin())
             .args([
                 "serve",
-                SMOKE_MODEL,
+                model.as_str(),
                 "--host",
                 "127.0.0.1",
                 "--port",
-                &port.to_string(),
+                port.as_str(),
                 "--max-model-len",
                 "2048",
                 "--max-num-seqs",
@@ -183,7 +192,7 @@ fn assert_effective_config(path: &PathBuf) {
     assert_eq!(entry("FERRUM_PREFIX_CACHE")["source"], "cli");
 }
 
-async fn assert_python_openai_sdk_if_available(base_url: &str) {
+async fn assert_python_openai_sdk_if_available(base_url: &str, model: &str) {
     let python = python_bin();
     let import_status = Command::new(&python)
         .arg("-c")
@@ -203,7 +212,7 @@ model = os.environ["FERRUM_OPENAI_MODEL"]
 response = client.chat.completions.create(
     model=model,
     messages=[{"role":"user","content":"Say hi in one short sentence."}],
-    max_tokens=512,
+    max_tokens=128,
     temperature=0,
 )
 if not (response.choices[0].message.content or "").strip():
@@ -211,7 +220,7 @@ if not (response.choices[0].message.content or "").strip():
 stream = client.chat.completions.create(
     model=model,
     messages=[{"role":"user","content":"Say hi in one short sentence."}],
-    max_tokens=512,
+    max_tokens=128,
     temperature=0,
     stream=True,
     stream_options={"include_usage": True},
@@ -234,7 +243,7 @@ if chunks == 0 or not "".join(content).strip() or usage != 1:
         .arg("-c")
         .arg(script)
         .env("FERRUM_OPENAI_BASE_URL", base_url)
-        .env("FERRUM_OPENAI_MODEL", SMOKE_MODEL)
+        .env("FERRUM_OPENAI_MODEL", model)
         .output()
         .expect("run Python OpenAI SDK smoke");
     assert!(
@@ -260,7 +269,10 @@ fn serve_help_lists_vllm_compat_flags() {
         "--enable-prefix-caching",
         "--no-enable-prefix-caching",
     ] {
-        assert!(stdout.contains(flag), "missing {flag} in serve --help:\n{stdout}");
+        assert!(
+            stdout.contains(flag),
+            "missing {flag} in serve --help:\n{stdout}"
+        );
     }
 }
 
@@ -269,6 +281,7 @@ fn serve_help_lists_vllm_compat_flags() {
 async fn g1_vllm_migration_smoke() {
     let fx = ServerFixture::spawn().await;
     let client = Client::new();
+    let model = smoke_model();
 
     assert_effective_config(&fx.effective_config_json);
 
@@ -282,16 +295,18 @@ async fn g1_vllm_migration_smoke() {
         .expect("models JSON");
     assert_eq!(models["object"], "list");
     assert!(
-        models["data"].as_array().is_some_and(|items| !items.is_empty()),
+        models["data"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
         "models list is empty: {models}"
     );
 
     let chat: Value = client
         .post(fx.chat_url())
         .json(&json!({
-            "model": SMOKE_MODEL,
+            "model": model.clone(),
             "messages": [{"role": "user", "content": "Say hi in one short sentence."}],
-            "max_tokens": 512,
+            "max_tokens": 128,
             "temperature": 0.0
         }))
         .send()
@@ -312,9 +327,9 @@ async fn g1_vllm_migration_smoke() {
     let stream_body = client
         .post(fx.chat_url())
         .json(&json!({
-            "model": SMOKE_MODEL,
+            "model": model.clone(),
             "messages": [{"role": "user", "content": "Say hi in one short sentence."}],
-            "max_tokens": 512,
+            "max_tokens": 128,
             "temperature": 0.0,
             "stream": true
         }))
@@ -331,14 +346,17 @@ async fn g1_vllm_migration_smoke() {
         .iter()
         .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
         .collect::<String>();
-    assert!(!content.trim().is_empty(), "empty stream content: {stream_body}");
+    assert!(
+        !content.trim().is_empty(),
+        "empty stream content: {stream_body}"
+    );
 
     let usage_stream_body = client
         .post(fx.chat_url())
         .json(&json!({
-            "model": SMOKE_MODEL,
+            "model": model.clone(),
             "messages": [{"role": "user", "content": "Say hi in one short sentence."}],
-            "max_tokens": 512,
+            "max_tokens": 128,
             "temperature": 0.0,
             "stream": true,
             "stream_options": {"include_usage": true}
@@ -360,17 +378,23 @@ async fn g1_vllm_migration_smoke() {
 
     let openai = fx.openai_client();
     let request = CreateChatCompletionRequestArgs::default()
-        .model(SMOKE_MODEL)
-        .messages([async_openai::types::ChatCompletionRequestUserMessageArgs::default()
-            .content("Say hi in one short sentence.")
-            .build()
-            .expect("build user msg")
-            .into()])
-        .max_tokens(512u32)
+        .model(model.clone())
+        .messages([
+            async_openai::types::ChatCompletionRequestUserMessageArgs::default()
+                .content("Say hi in one short sentence.")
+                .build()
+                .expect("build user msg")
+                .into(),
+        ])
+        .max_tokens(128u32)
         .temperature(0.0)
         .build()
         .expect("build async-openai request");
-    let response = openai.chat().create(request).await.expect("async-openai chat");
+    let response = openai
+        .chat()
+        .create(request)
+        .await
+        .expect("async-openai chat");
     assert!(
         response.choices[0]
             .message
@@ -381,13 +405,15 @@ async fn g1_vllm_migration_smoke() {
     );
 
     let stream_request = CreateChatCompletionRequestArgs::default()
-        .model(SMOKE_MODEL)
-        .messages([async_openai::types::ChatCompletionRequestUserMessageArgs::default()
-            .content("Say hi in one short sentence.")
-            .build()
-            .expect("build user msg")
-            .into()])
-        .max_tokens(512u32)
+        .model(model.clone())
+        .messages([
+            async_openai::types::ChatCompletionRequestUserMessageArgs::default()
+                .content("Say hi in one short sentence.")
+                .build()
+                .expect("build user msg")
+                .into(),
+        ])
+        .max_tokens(128u32)
         .temperature(0.0)
         .stream(true)
         .stream_options(ChatCompletionStreamOptions {
@@ -413,8 +439,11 @@ async fn g1_vllm_migration_smoke() {
             }
         }
     }
-    assert!(!async_content.trim().is_empty(), "empty async stream content");
+    assert!(
+        !async_content.trim().is_empty(),
+        "empty async stream content"
+    );
     assert_eq!(async_usage_chunks, 1, "expected one async usage chunk");
 
-    assert_python_openai_sdk_if_available(&fx.base_url).await;
+    assert_python_openai_sdk_if_available(&fx.base_url, &model).await;
 }

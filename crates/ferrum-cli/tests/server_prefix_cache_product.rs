@@ -11,15 +11,22 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SMOKE_MODEL: &str = "qwen3:0.6b";
+const DEFAULT_SMOKE_MODEL: &str = "qwen3:0.6b";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn smoke_model() -> String {
+    std::env::var("FERRUM_G3_SMOKE_MODEL").unwrap_or_else(|_| DEFAULT_SMOKE_MODEL.to_string())
+}
 
 fn ferrum_bin() -> PathBuf {
     if let Ok(bin) = std::env::var("CARGO_BIN_EXE_ferrum") {
         return PathBuf::from(bin);
     }
     let current = std::env::current_exe().expect("test exe path");
-    let dir = current.parent().and_then(|p| p.parent()).expect("target dir");
+    let dir = current
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("target dir");
     let mut bin = dir.join("ferrum");
     if cfg!(windows) {
         bin.set_extension("exe");
@@ -53,12 +60,18 @@ impl ServerFixture {
         let base_url = format!("http://127.0.0.1:{port}");
         let log_path = unique_log_path(name);
         let log = fs::File::create(&log_path).expect("create server log");
-        let mut args = vec!["serve", SMOKE_MODEL, "--host", "127.0.0.1", "--port"];
+        let mut args = vec![
+            "serve".to_string(),
+            smoke_model(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+        ];
         let port_string = port.to_string();
-        args.push(&port_string);
-        args.extend_from_slice(extra_args);
+        args.push(port_string);
+        args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
         let child = Command::new(ferrum_bin())
-            .args(args)
+            .args(&args)
             .env("NO_COLOR", "1")
             .stdout(Stdio::from(log.try_clone().expect("clone server log")))
             .stderr(Stdio::from(log))
@@ -99,6 +112,10 @@ impl ServerFixture {
     fn metrics_url(&self) -> String {
         format!("{}/metrics", self.base_url)
     }
+
+    fn health_url(&self) -> String {
+        format!("{}/health", self.base_url)
+    }
 }
 
 impl Drop for ServerFixture {
@@ -106,7 +123,13 @@ impl Drop for ServerFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Ok(text) = fs::read_to_string(&self.log_path) {
-            for bad in ["panicked", "KV cache overflow", "failed to render model chat template", "<unk>", "[PAD]"] {
+            for bad in [
+                "panicked",
+                "KV cache overflow",
+                "failed to render model chat template",
+                "<unk>",
+                "[PAD]",
+            ] {
                 assert!(!text.contains(bad), "server log contains {bad}: {text}");
             }
         }
@@ -118,7 +141,7 @@ async fn chat(client: &Client, fx: &ServerFixture, content: &str) -> String {
     let response = client
         .post(fx.chat_url())
         .json(&json!({
-            "model": SMOKE_MODEL,
+            "model": smoke_model(),
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.0,
             "max_tokens": 256
@@ -128,13 +151,16 @@ async fn chat(client: &Client, fx: &ServerFixture, content: &str) -> String {
         .expect("chat post");
     assert_eq!(response.status(), 200);
     let body: Value = response.json().await.expect("chat json");
-    let content = body["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing content: {body}"))
-        .trim()
-        .to_string();
-    assert!(!content.is_empty(), "empty visible content: {body}");
-    content
+    let message = &body["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or_default().trim();
+    let reasoning = message["reasoning"].as_str().unwrap_or_default().trim();
+    let output = [reasoning, content]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!output.is_empty(), "empty chat output: {body}");
+    output
 }
 
 async fn strict_json_answer(
@@ -146,10 +172,10 @@ async fn strict_json_answer(
     let response = client
         .post(fx.chat_url())
         .json(&json!({
-            "model": SMOKE_MODEL,
+            "model": smoke_model(),
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
-            "max_tokens": 512,
+            "max_tokens": 384,
             "response_format": strict_answer_schema()
         }))
         .send()
@@ -179,13 +205,26 @@ async fn metrics(client: &Client, fx: &ServerFixture) -> String {
         .expect("metrics text")
 }
 
+async fn health(client: &Client, fx: &ServerFixture) -> Value {
+    client
+        .get(fx.health_url())
+        .send()
+        .await
+        .expect("health")
+        .json()
+        .await
+        .expect("health json")
+}
+
 fn metric_value(metrics: &str, name: &str) -> f64 {
     metrics
         .lines()
         .filter(|line| !line.starts_with('#'))
         .find_map(|line| {
             let mut parts = line.split_whitespace();
-            (parts.next()? == name).then(|| parts.next()?.parse::<f64>().ok()).flatten()
+            (parts.next()? == name)
+                .then(|| parts.next()?.parse::<f64>().ok())
+                .flatten()
         })
         .unwrap_or_else(|| panic!("missing metric {name}:\n{metrics}"))
 }
@@ -224,15 +263,38 @@ fn calc_tool() -> Value {
 async fn g3_prefix_cache_product_real_model_smoke() {
     let client = Client::new();
     let enabled = ServerFixture::spawn(
-        &["--enable-prefix-cache", "--session-cache", "off", "--session-cache-max-entries", "32"],
+        &[
+            "--enable-prefix-cache",
+            "--session-cache",
+            "off",
+            "--session-cache-max-entries",
+            "32",
+        ],
         "prefix-enabled",
     )
     .await;
 
-    let prompt = "Reply with exactly: ferrum-cache-ok";
+    let prompt = concat!(
+        "Ferrum prefix-cache verification prompt. The shared prefix is intentionally long ",
+        "and stable so it crosses at least two paged-KV blocks before the requested answer. ",
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron ",
+        "pi rho sigma tau upsilon phi chi psi omega. Reply with exactly: ferrum-cache-ok"
+    );
     let first = chat(&client, &enabled, prompt).await;
     let second = chat(&client, &enabled, prompt).await;
     assert_eq!(first, second, "greedy output changed with prefix cache");
+    let repeated_metrics = metrics(&client, &enabled).await;
+    assert!(
+        metric_value(&repeated_metrics, "ferrum_prefix_cache_hits_total") > 0.0,
+        "repeating an identical long prompt did not hit prefix cache:\n{repeated_metrics}"
+    );
+    assert!(
+        metric_value(
+            &repeated_metrics,
+            "ferrum_prefix_cache_saved_prefill_tokens_total"
+        ) > 0.0,
+        "repeating an identical long prompt did not save prefill tokens:\n{repeated_metrics}"
+    );
 
     let alpha = strict_json_answer(
         &client,
@@ -248,15 +310,18 @@ async fn g3_prefix_cache_product_real_model_smoke() {
         "beta-token",
     )
     .await;
-    assert_ne!(alpha["answer"], beta["answer"], "shared-prefix outputs cross-talked");
+    assert_ne!(
+        alpha["answer"], beta["answer"],
+        "shared-prefix outputs cross-talked"
+    );
 
     let strict = client
         .post(enabled.chat_url())
         .json(&json!({
-            "model": SMOKE_MODEL,
+            "model": smoke_model(),
             "messages": [{"role": "user", "content": "Return exactly this JSON object and nothing else: {\"answer\":\"cache-ok\"}"}],
             "temperature": 0.0,
-            "max_tokens": 512,
+            "max_tokens": 384,
             "response_format": strict_answer_schema()
         }))
         .send()
@@ -264,13 +329,15 @@ async fn g3_prefix_cache_product_real_model_smoke() {
         .expect("strict post");
     assert_eq!(strict.status(), 200);
     let strict_body: Value = strict.json().await.expect("strict json");
-    let strict_content = strict_body["choices"][0]["message"]["content"].as_str().unwrap();
+    let strict_content = strict_body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap();
     assert!(serde_json::from_str::<Value>(strict_content).is_ok());
 
     let tool = client
         .post(enabled.chat_url())
         .json(&json!({
-            "model": SMOKE_MODEL,
+            "model": smoke_model(),
             "messages": [{"role": "user", "content": "Use the calc tool. Return only JSON arguments: {\"expression\":\"123+456\"}"}],
             "tools": [calc_tool()],
             "tool_choice": "required",
@@ -286,12 +353,34 @@ async fn g3_prefix_cache_product_real_model_smoke() {
 
     let enabled_metrics = metrics(&client, &enabled).await;
     assert!(metric_value(&enabled_metrics, "ferrum_prefix_cache_hits_total") > 0.0);
-    assert!(metric_value(&enabled_metrics, "ferrum_prefix_cache_saved_prefill_tokens_total") > 0.0);
+    assert!(
+        metric_value(
+            &enabled_metrics,
+            "ferrum_prefix_cache_saved_prefill_tokens_total"
+        ) > 0.0
+    );
+    let enabled_health = health(&client, &enabled).await;
+    let prefix = &enabled_health["cache"]["prefix_cache"];
+    assert_eq!(prefix["enabled"], true);
+    assert_eq!(prefix["position"], "real-kv-reuse");
+    assert!(
+        prefix["saved_prefill_tokens"].as_u64().unwrap_or(0) > 0,
+        "real KV prefix cache did not report saved tokens: {enabled_health}"
+    );
     drop(enabled);
 
-    let disabled = ServerFixture::spawn(&["--disable-prefix-cache", "--session-cache", "off"], "prefix-disabled").await;
+    let disabled = ServerFixture::spawn(
+        &["--disable-prefix-cache", "--session-cache", "off"],
+        "prefix-disabled",
+    )
+    .await;
     let _ = chat(&client, &disabled, prompt).await;
     let _ = chat(&client, &disabled, prompt).await;
     let disabled_metrics = metrics(&client, &disabled).await;
-    assert_eq!(metric_value(&disabled_metrics, "ferrum_prefix_cache_hits_total"), 0.0);
+    assert_eq!(
+        metric_value(&disabled_metrics, "ferrum_prefix_cache_hits_total"),
+        0.0
+    );
+    let disabled_health = health(&client, &disabled).await;
+    assert_eq!(disabled_health["cache"]["prefix_cache"]["enabled"], false);
 }

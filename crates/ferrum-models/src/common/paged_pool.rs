@@ -157,7 +157,7 @@ impl BlockAllocator {
     /// to return it to the pool, or call `acquire()` for additional
     /// sharers.
     pub fn allocate(&mut self) -> Result<u32> {
-        match self.free_list.pop() {
+        match self.pop_free_block_preferring_unhashed() {
             Some(b) => {
                 debug_assert!(
                     self.ref_counts[b as usize] == 0,
@@ -176,6 +176,19 @@ impl BlockAllocator {
                 "paged KV pool exhausted (capacity={} blocks, all in use)",
                 self.capacity
             ))),
+        }
+    }
+
+    fn pop_free_block_preferring_unhashed(&mut self) -> Option<u32> {
+        let pos = self
+            .free_list
+            .iter()
+            .rposition(|&block| self.block_to_hash[block as usize].is_none())
+            .unwrap_or_else(|| self.free_list.len().saturating_sub(1));
+        if self.free_list.is_empty() {
+            None
+        } else {
+            Some(self.free_list.swap_remove(pos))
         }
     }
 
@@ -206,7 +219,9 @@ impl BlockAllocator {
         }
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            let b = self.free_list.pop().unwrap();
+            let b = self
+                .pop_free_block_preferring_unhashed()
+                .expect("free_list length checked above");
             debug_assert!(
                 self.ref_counts[b as usize] == 0,
                 "allocate_n yielded block {b} with non-zero ref_count"
@@ -634,16 +649,32 @@ mod tests {
         // because its content is about to be overwritten.
         let mut a = BlockAllocator::new(2);
         let b1 = a.allocate().unwrap();
+        let _held_clean_block = a.allocate().unwrap();
         let h = 0x1234u64;
         a.register_block_hash(b1, h);
         a.free(&[b1]); // soft-free
         assert_eq!(a.hash_table_size(), 1);
-        // Allocate to consume the only free block — should recycle b1
-        // and evict its hash.
+        // Allocate to consume the only free block — should recycle b1 and
+        // evict its hash.
         let b2 = a.allocate().unwrap();
-        assert_eq!(b2, b1, "LIFO should reuse b1");
+        assert_eq!(b2, b1, "must reuse b1 when no clean free block exists");
         assert_eq!(a.hash_table_size(), 0, "stale hash erased on realloc");
         assert_eq!(a.try_acquire_by_hash(h), None);
+    }
+
+    #[test]
+    fn allocator_prefers_unhashed_free_block_over_soft_cached_hash() {
+        let mut a = BlockAllocator::new(3);
+        let cached = a.allocate().unwrap();
+        let h = 0xCAFE_BABEu64;
+        a.register_block_hash(cached, h);
+        a.free(&[cached]);
+        assert_eq!(a.hash_table_size(), 1);
+
+        let fresh = a.allocate().unwrap();
+        assert_ne!(fresh, cached, "clean free block should be used first");
+        assert_eq!(a.hash_table_size(), 1, "cached block hash must survive");
+        assert_eq!(a.try_acquire_by_hash(h), Some(cached));
     }
 
     #[test]

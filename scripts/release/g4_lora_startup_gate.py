@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""G4 startup LoRA serving release gate."""
+"""G4 LoRA inference serving release gate."""
 from __future__ import annotations
 
 import argparse
@@ -35,7 +35,22 @@ def git_value(args: list[str], default: str = "unknown") -> str:
 def default_out_dir() -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     short = git_value(["rev-parse", "--short", "HEAD"])
-    return repo_root() / "docs" / "release" / "g1-g4" / "g4-lora-startup" / f"{stamp}-{short}"
+    return repo_root() / "docs" / "release" / "g1-g4" / "g4-lora-inference" / f"{stamp}-{short}"
+
+
+def default_cargo_features() -> str:
+    return "metal" if sys.platform == "darwin" else ""
+
+
+def cargo_feature_list(features: str) -> list[str]:
+    return [feature.strip() for feature in features.split(",") if feature.strip()]
+
+
+def release_build_cmd(args: argparse.Namespace) -> list[str]:
+    cmd = ["cargo", "build", "--release", "-p", "ferrum-cli", "--bin", "ferrum"]
+    if args.cargo_features:
+        cmd.extend(["--features", args.cargo_features])
+    return cmd
 
 
 class GateLog:
@@ -130,26 +145,95 @@ def f32_bytes(values: list[float]) -> bytes:
     return b"".join(struct.pack("<f", value) for value in values)
 
 
-def write_safetensors(path: Path) -> None:
-    a = f32_bytes([0.0] * 6)
-    b = f32_bytes([0.0] * 8)
+def model_config_path(model: str) -> Path | None:
+    env = os.environ.get("G4_MODEL_CONFIG") or os.environ.get("FERRUM_G4_MODEL_CONFIG")
+    if env:
+        path = Path(env)
+        if path.is_dir():
+            path = path / "config.json"
+        if path.is_file():
+            return path
+    model_path = Path(model)
+    if model_path.is_dir() and model_path.joinpath("config.json").is_file():
+        return model_path / "config.json"
+    if model_path.is_file() and model_path.name == "config.json":
+        return model_path
+    model_id = {
+        "qwen3:0.6b": "Qwen/Qwen3-0.6B",
+        "qwen3-0.6b": "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3-0.6B": "Qwen/Qwen3-0.6B",
+    }.get(model, model)
+    hf = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+    repo_dir = "models--" + model_id.replace("/", "--")
+    candidates = sorted(hf.glob(f"{repo_dir}/snapshots/*/config.json"))
+    return candidates[-1] if candidates else None
+
+
+def qkv_lora_shape(model: str) -> tuple[int, int]:
+    config_path = model_config_path(model)
+    if config_path is None:
+        if model in {"qwen3:0.6b", "qwen3-0.6b", "Qwen/Qwen3-0.6B"}:
+            return 1024, 4096
+        raise RuntimeError(
+            "model config not found for LoRA fixture; set "
+            "G4_MODEL_CONFIG=/path/to/config.json"
+        )
+    cfg = json.loads(config_path.read_text())
+    hidden = int(cfg["hidden_size"])
+    heads = int(cfg["num_attention_heads"])
+    kv_heads = int(cfg.get("num_key_value_heads", heads))
+    head_dim = int(cfg.get("head_dim") or hidden // heads)
+    qkv_out = (heads + 2 * kv_heads) * head_dim
+    return hidden, qkv_out
+
+
+def write_safetensors(path: Path, in_features: int, out_features: int, rank: int) -> None:
+    a_values = [0.0] * (rank * in_features)
+    # Activate a deterministic subset of hidden dimensions. Keep values small
+    # so the adapter perturbs logits without destabilizing tiny smoke prompts.
+    for r in range(rank):
+        for offset in range(r, in_features, max(1, in_features // 32)):
+            a_values[r * in_features + offset] = 0.01
+    b_values = [0.0] * (out_features * rank)
+    for row in range(0, out_features, max(1, out_features // 64)):
+        for r in range(rank):
+            b_values[row * rank + r] = 0.01
+    a = f32_bytes(a_values)
+    b = f32_bytes(b_values)
     header = {
-        "linear.lora_A.weight": {"dtype": "F32", "shape": [2, 3], "data_offsets": [0, len(a)]},
-        "linear.lora_B.weight": {"dtype": "F32", "shape": [4, 2], "data_offsets": [len(a), len(a) + len(b)]},
+        "base_model.model.layers.0.self_attn.qkv_proj.lora_A.weight": {
+            "dtype": "F32",
+            "shape": [rank, in_features],
+            "data_offsets": [0, len(a)],
+        },
+        "base_model.model.layers.0.self_attn.qkv_proj.lora_B.weight": {
+            "dtype": "F32",
+            "shape": [out_features, rank],
+            "data_offsets": [len(a), len(a) + len(b)],
+        },
     }
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
     path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + a + b)
 
 
-def write_lora_fixture(path: Path) -> None:
+def write_lora_fixture(path: Path, model: str) -> dict[str, Any]:
     path.mkdir(parents=True, exist_ok=True)
+    rank = 1
+    in_features, out_features = qkv_lora_shape(model)
     (path / "adapter_config.json").write_text(json.dumps({
-        "r": 2,
-        "lora_alpha": 4,
-        "target_modules": ["linear"],
-        "base_model_name_or_path": "qwen3:0.6b",
+        "r": rank,
+        "lora_alpha": rank,
+        "target_modules": ["qkv_proj"],
+        "base_model_name_or_path": model,
     }, indent=2) + "\n")
-    write_safetensors(path / "adapter_model.safetensors")
+    write_safetensors(path / "adapter_model.safetensors", in_features, out_features, rank)
+    return {
+        "target": "model.layers.0.self_attn.qkv_proj",
+        "rank": rank,
+        "in_features": in_features,
+        "out_features": out_features,
+        "position": "real-inference",
+    }
 
 
 def tokenizer_dir() -> Path:
@@ -215,6 +299,18 @@ def model_ids(base_url: str) -> set[str]:
     return {item["id"] for item in models.get("data", [])}
 
 
+def response_text(body: dict[str, Any]) -> str:
+    message = body["choices"][0]["message"]
+    return "\n".join(
+        part.strip()
+        for part in [
+            message.get("reasoning") or "",
+            message.get("content") or "",
+        ]
+        if part.strip()
+    )
+
+
 def validate_lora_api(base_url: str, out: Path) -> tuple[str, str]:
     code, models = http_json("GET", base_url + "/v1/models")
     if code != 200:
@@ -229,6 +325,7 @@ def validate_lora_api(base_url: str, out: Path) -> tuple[str, str]:
     if base_id not in ids:
         raise RuntimeError(f"base model id {base_id} missing from /v1/models: {ids}")
 
+    chat_outputs: dict[str, dict[str, Any]] = {}
     for model in [base_id, adapter_id]:
         code, body = http_json("POST", base_url + "/v1/chat/completions", {
             "model": model,
@@ -239,11 +336,40 @@ def validate_lora_api(base_url: str, out: Path) -> tuple[str, str]:
         (out / f"chat-{safe_artifact_name(model)}.json").write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
         if code != 200:
             raise RuntimeError(f"chat failed for {model}: {code} {body}")
-        message = body["choices"][0]["message"]
-        content = message.get("content") or ""
-        reasoning = message.get("reasoning") or ""
-        if not (content.strip() or reasoning.strip()):
+        text = response_text(body)
+        if not text:
             raise RuntimeError(f"empty chat output for {model}: {body}")
+        chat_outputs[model] = {"text": text, "usage": body.get("usage")}
+
+    base_text = chat_outputs[base_id]["text"]
+    adapter_text = chat_outputs[adapter_id]["text"]
+    correctness = {
+        "position": "real-inference",
+        "base_model_id": base_id,
+        "adapter_model_id": adapter_id,
+        "base_text": base_text,
+        "adapter_text": adapter_text,
+        "adapter_output_differs_from_base": adapter_text != base_text,
+        "base_usage": chat_outputs[base_id].get("usage"),
+        "adapter_usage": chat_outputs[adapter_id].get("usage"),
+    }
+    (out / "lora-runtime-correctness.json").write_text(
+        json.dumps(correctness, ensure_ascii=False, indent=2) + "\n"
+    )
+
+    code, health = http_json("GET", base_url + "/health")
+    if code != 200:
+        raise RuntimeError(f"/health failed after LoRA chat: {code} {health}")
+    (out / "lora-health-after-chat.json").write_text(
+        json.dumps(health, ensure_ascii=False, indent=2) + "\n"
+    )
+    lora = health.get("lora") or {}
+    if lora.get("enabled") is not True:
+        raise RuntimeError(f"LoRA health did not report enabled=true: {lora}")
+    if int(lora.get("adapter_count") or 0) <= 0:
+        raise RuntimeError(f"LoRA health did not report loaded adapters: {lora}")
+    if int(lora.get("projection_applications") or 0) <= 0:
+        raise RuntimeError(f"LoRA projection was not applied during adapter chat: {lora}")
 
     code, body = http_json("POST", base_url + "/v1/chat/completions", {
         "model": f"{base_id}:missing",
@@ -264,8 +390,9 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
 
     bin_path = args.ferrum_bin
     fixture = out / "fixtures" / "sql-adapter"
-    write_lora_fixture(fixture)
-    run(["cargo", "build", "--release", "-p", "ferrum-cli", "--bin", "ferrum"], out / "release-build.log", log, timeout=1200)
+    fixture_manifest = write_lora_fixture(fixture, args.model)
+    (out / "lora-fixture.json").write_text(json.dumps(fixture_manifest, indent=2) + "\n")
+    run(release_build_cmd(args), out / "release-build.log", log, timeout=1200)
 
     no_lora, no_lora_base, no_lora_log = start_server(bin_path, args.model, out, log, [])
     try:
@@ -306,6 +433,8 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
         "base_regression_pct": base_regression_pct,
         "adapter_to_base_ratio": adapter_ratio,
         "fixture": str(fixture),
+        "lora_release_position": "real-inference",
+        "fixture_manifest": fixture_manifest,
     }
     (out / "bench-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
@@ -321,7 +450,7 @@ def write_manifest(
         **required_manifest_fields(
             repo=repo_root(),
             goal="G4",
-            name="lora-startup",
+            name="lora-inference",
             models=[args.model],
             commands=[
                 "cargo test --workspace --all-targets",
@@ -329,15 +458,15 @@ def write_manifest(
                 "cargo test -p ferrum-models --test lora_loader",
                 "cargo test -p ferrum-server lora",
                 "cargo test -p ferrum-cli --test server_lora_startup",
-                "cargo build --release -p ferrum-cli --bin ferrum",
+                " ".join(release_build_cmd(args)),
                 "ferrum bench-serve c=1 no-lora/base-with-lora/adapter",
             ],
             started_at_utc=started_at_utc,
             binary_path=args.ferrum_bin,
-            features=[],
+            features=cargo_feature_list(args.cargo_features),
         ),
         "goal": "G4",
-        "name": "lora-startup",
+        "name": "lora-inference",
         "status": "pass",
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "repo": {
@@ -351,9 +480,9 @@ def write_manifest(
         "artifacts": sorted(p.name for p in out.iterdir() if p.is_file()),
     }
     (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-    (out / "gate.json").write_text(json.dumps({"status": "pass", "goal": "g4-lora-startup", "checks": checks}, indent=2) + "\n")
+    (out / "gate.json").write_text(json.dumps({"status": "pass", "goal": "g4-lora-inference", "checks": checks}, indent=2) + "\n")
     (out / "summary.md").write_text(
-        "# G4 LoRA Startup Gate\n\n"
+        "# G4 LoRA Inference Gate\n\n"
         "Status: PASS\n\n"
         f"Model: `{args.model}`\n\n"
         "Validated:\n"
@@ -362,7 +491,7 @@ def write_manifest(
         "- PEFT adapter loader tests\n"
         "- server adapter model routing tests\n"
         "- CLI startup LoRA tests\n"
-        "- `/v1/models`, base chat, adapter chat, unknown adapter error\n"
+        "- `/v1/models`, base chat, adapter chat with observed output perturbation, unknown adapter error\n"
         "- c=1 bench smoke for base/no-lora, base/with-lora, and adapter model id\n"
     )
 
@@ -373,6 +502,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--model", default="qwen3:0.6b")
     parser.add_argument("--ferrum-bin", type=Path, default=repo_root() / "target" / "release" / "ferrum")
+    parser.add_argument("--cargo-features", default=default_cargo_features())
     parser.add_argument("--skip-workspace-test", action="store_true")
     parser.add_argument("--skip-bench", action="store_true")
     parser.add_argument("--num-prompts", type=int, default=24)
@@ -405,7 +535,7 @@ def main() -> int:
     checks["server_lora_startup"] = True
     checks["bench"] = run_bench_gate(args, out, log)
     write_manifest(out, args, checks, started_at_utc)
-    print(f"G4 LORA STARTUP PASS: {out}")
+    print(f"G4 LORA INFERENCE PASS: {out}")
     return 0
 
 
@@ -413,5 +543,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:  # noqa: BLE001
-        print(f"G4 LORA STARTUP FAIL: {exc}", file=sys.stderr)
+        print(f"G4 LORA INFERENCE FAIL: {exc}", file=sys.stderr)
         raise
