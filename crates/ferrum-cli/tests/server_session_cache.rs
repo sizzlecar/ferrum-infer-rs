@@ -5,7 +5,7 @@
 
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::fs;
+use std::fs::{self, File};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -23,7 +23,10 @@ fn ferrum_bin() -> PathBuf {
         return PathBuf::from(bin);
     }
     let current = std::env::current_exe().expect("test exe path");
-    let dir = current.parent().and_then(|p| p.parent()).expect("target dir");
+    let dir = current
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("target dir");
     let mut bin = dir.join("ferrum");
     if cfg!(windows) {
         bin.set_extension("exe");
@@ -45,6 +48,45 @@ fn unique_log_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("ferrum-g3-{name}-{}-{now}.log", std::process::id()))
 }
 
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn log_tail(path: &PathBuf) -> String {
+    const MAX_CHARS: usize = 16_000;
+    let Ok(text) = fs::read_to_string(path) else {
+        return format!("unable to read {}", path.display());
+    };
+    if text.chars().count() <= MAX_CHARS {
+        return text;
+    }
+    let tail = text
+        .chars()
+        .rev()
+        .take(MAX_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("... truncated ...\n{tail}")
+}
+
+fn spawn_diag(bin: &PathBuf) -> String {
+    let env_value = |key: &str| std::env::var(key).unwrap_or_else(|_| "<unset>".to_string());
+    format!(
+        "ferrum_bin={}\nHOME={}\nHF_HOME={}\nXDG_CACHE_HOME={}\nCARGO_BIN_EXE_ferrum={}",
+        bin.display(),
+        env_value("HOME"),
+        env_value("HF_HOME"),
+        env_value("XDG_CACHE_HOME"),
+        env_value("CARGO_BIN_EXE_ferrum")
+    )
+}
+
 struct ServerFixture {
     base_url: String,
     child: Child,
@@ -56,8 +98,10 @@ impl ServerFixture {
         let port = free_port();
         let base_url = format!("http://127.0.0.1:{port}");
         let log_path = unique_log_path("session-cache-server");
-        let log = fs::File::create(&log_path).expect("create server log");
-        let child = Command::new(ferrum_bin())
+        let log = File::create(&log_path).expect("create server log");
+        let bin = ferrum_bin();
+        let diag = spawn_diag(&bin);
+        let mut child = Command::new(&bin)
             .args([
                 "serve",
                 smoke_model().as_str(),
@@ -73,6 +117,7 @@ impl ServerFixture {
                 "--session-cache-max-tokens",
                 "1024",
             ])
+            .current_dir(workspace_root())
             .env("NO_COLOR", "1")
             .stdout(Stdio::from(log.try_clone().expect("clone server log")))
             .stderr(Stdio::from(log))
@@ -84,7 +129,18 @@ impl ServerFixture {
         let start = Instant::now();
         loop {
             if start.elapsed() > STARTUP_TIMEOUT {
-                panic!("server did not become healthy within {STARTUP_TIMEOUT:?}");
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "server did not become healthy within {STARTUP_TIMEOUT:?}\n{diag}\nlog:\n{}",
+                    log_tail(&log_path)
+                );
+            }
+            if let Some(status) = child.try_wait().expect("poll ferrum serve child") {
+                panic!(
+                    "server exited before healthy: {status}\n{diag}\nlog:\n{}",
+                    log_tail(&log_path)
+                );
             }
             let ok = client
                 .get(&healthz)
@@ -120,7 +176,13 @@ impl Drop for ServerFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Ok(text) = fs::read_to_string(&self.log_path) {
-            for bad in ["panicked", "KV cache overflow", "failed to render model chat template", "<unk>", "[PAD]"] {
+            for bad in [
+                "panicked",
+                "KV cache overflow",
+                "failed to render model chat template",
+                "<unk>",
+                "[PAD]",
+            ] {
                 assert!(!text.contains(bad), "server log contains {bad}: {text}");
             }
         }
@@ -128,7 +190,12 @@ impl Drop for ServerFixture {
     }
 }
 
-async fn chat_with_session(client: &Client, fx: &ServerFixture, session: &str, content: &str) -> String {
+async fn chat_with_session(
+    client: &Client,
+    fx: &ServerFixture,
+    session: &str,
+    content: &str,
+) -> String {
     let response = client
         .post(fx.chat_url())
         .header("X-Ferrum-Session", session)
@@ -155,7 +222,9 @@ fn metric_value(metrics: &str, name: &str) -> f64 {
         .filter(|line| !line.starts_with('#'))
         .find_map(|line| {
             let mut parts = line.split_whitespace();
-            (parts.next()? == name).then(|| parts.next()?.parse::<f64>().ok()).flatten()
+            (parts.next()? == name)
+                .then(|| parts.next()?.parse::<f64>().ok())
+                .flatten()
         })
         .unwrap_or_else(|| panic!("missing metric {name}:\n{metrics}"))
 }
@@ -166,12 +235,30 @@ async fn g3_session_cache_real_model_smoke() {
     let fx = ServerFixture::spawn().await;
     let client = Client::new();
 
-    let _ = chat_with_session(&client, &fx, "session-a", "The session secret is ferrum-red. Remember it for the next question.").await;
-    let recalled = chat_with_session(&client, &fx, "session-a", "Based on the previous messages in this same session, what is the exact session secret?").await;
-    assert!(recalled.contains("ferrum-red"), "same-session recall failed: {recalled}");
+    let _ = chat_with_session(
+        &client,
+        &fx,
+        "session-a",
+        "The session secret is ferrum-red. Remember it for the next question.",
+    )
+    .await;
+    let recalled = chat_with_session(
+        &client,
+        &fx,
+        "session-a",
+        "Based on the previous messages in this same session, what is the exact session secret?",
+    )
+    .await;
+    assert!(
+        recalled.contains("ferrum-red"),
+        "same-session recall failed: {recalled}"
+    );
 
     let isolated = chat_with_session(&client, &fx, "session-b", "Based on previous messages in this session, what is the exact session secret? If none, reply NONE.").await;
-    assert!(!isolated.contains("ferrum-red"), "cross-session leak: {isolated}");
+    assert!(
+        !isolated.contains("ferrum-red"),
+        "cross-session leak: {isolated}"
+    );
 
     let metadata_response = client
         .post(fx.chat_url())

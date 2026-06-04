@@ -5,7 +5,7 @@
 
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::fs;
+use std::fs::{self, File};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -48,6 +48,45 @@ fn unique_log_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("ferrum-g3-{name}-{}-{now}.log", std::process::id()))
 }
 
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn log_tail(path: &PathBuf) -> String {
+    const MAX_CHARS: usize = 16_000;
+    let Ok(text) = fs::read_to_string(path) else {
+        return format!("unable to read {}", path.display());
+    };
+    if text.chars().count() <= MAX_CHARS {
+        return text;
+    }
+    let tail = text
+        .chars()
+        .rev()
+        .take(MAX_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("... truncated ...\n{tail}")
+}
+
+fn spawn_diag(bin: &PathBuf) -> String {
+    let env_value = |key: &str| std::env::var(key).unwrap_or_else(|_| "<unset>".to_string());
+    format!(
+        "ferrum_bin={}\nHOME={}\nHF_HOME={}\nXDG_CACHE_HOME={}\nCARGO_BIN_EXE_ferrum={}",
+        bin.display(),
+        env_value("HOME"),
+        env_value("HF_HOME"),
+        env_value("XDG_CACHE_HOME"),
+        env_value("CARGO_BIN_EXE_ferrum")
+    )
+}
+
 struct ServerFixture {
     base_url: String,
     child: Child,
@@ -59,7 +98,7 @@ impl ServerFixture {
         let port = free_port();
         let base_url = format!("http://127.0.0.1:{port}");
         let log_path = unique_log_path(name);
-        let log = fs::File::create(&log_path).expect("create server log");
+        let log = File::create(&log_path).expect("create server log");
         let mut args = vec![
             "serve".to_string(),
             smoke_model(),
@@ -70,8 +109,11 @@ impl ServerFixture {
         let port_string = port.to_string();
         args.push(port_string);
         args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
-        let child = Command::new(ferrum_bin())
+        let bin = ferrum_bin();
+        let diag = spawn_diag(&bin);
+        let mut child = Command::new(&bin)
             .args(&args)
+            .current_dir(workspace_root())
             .env("NO_COLOR", "1")
             .stdout(Stdio::from(log.try_clone().expect("clone server log")))
             .stderr(Stdio::from(log))
@@ -83,7 +125,18 @@ impl ServerFixture {
         let start = Instant::now();
         loop {
             if start.elapsed() > STARTUP_TIMEOUT {
-                panic!("server did not become healthy within {STARTUP_TIMEOUT:?}");
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "server did not become healthy within {STARTUP_TIMEOUT:?}\n{diag}\nlog:\n{}",
+                    log_tail(&log_path)
+                );
+            }
+            if let Some(status) = child.try_wait().expect("poll ferrum serve child") {
+                panic!(
+                    "server exited before healthy: {status}\n{diag}\nlog:\n{}",
+                    log_tail(&log_path)
+                );
             }
             let ok = client
                 .get(&healthz)
