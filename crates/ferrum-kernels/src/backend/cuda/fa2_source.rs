@@ -39,27 +39,49 @@ extern "C" {
     ) -> c_int;
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn paged_varlen_attention_fa2_source(
-    stream: &Arc<CudaStream>,
-    q: &CudaSlice<f16>,
-    k_pool: &CudaSlice<f16>,
-    v_pool: &CudaSlice<f16>,
-    out: &mut CudaSlice<f16>,
-    lse: &mut CudaSlice<f32>,
-    cu_seqlens_q: &CudaSlice<u32>,
-    seq_lens: &CudaSlice<u32>,
-    block_tables: &CudaSlice<u32>,
-    num_seqs: usize,
-    total_q_tokens: usize,
-    max_q_len: usize,
-    max_kv_len: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    block_size: usize,
-    max_blocks_per_seq: usize,
-) -> Result<()> {
+pub(crate) struct Fa2SourcePagedVarlenArgs<'a> {
+    pub(crate) stream: &'a Arc<CudaStream>,
+    pub(crate) q: &'a CudaSlice<f16>,
+    pub(crate) k_pool: &'a CudaSlice<f16>,
+    pub(crate) v_pool: &'a CudaSlice<f16>,
+    pub(crate) out: &'a mut CudaSlice<f16>,
+    pub(crate) lse: &'a mut CudaSlice<f32>,
+    pub(crate) cu_seqlens_q: &'a CudaSlice<u32>,
+    pub(crate) seq_lens: &'a CudaSlice<u32>,
+    pub(crate) block_tables: &'a CudaSlice<u32>,
+    pub(crate) num_seqs: usize,
+    pub(crate) total_q_tokens: usize,
+    pub(crate) max_q_len: usize,
+    pub(crate) max_kv_len: usize,
+    pub(crate) num_heads: usize,
+    pub(crate) num_kv_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) block_size: usize,
+    pub(crate) max_blocks_per_seq: usize,
+}
+
+pub(crate) fn paged_varlen_attention_fa2_source(args: Fa2SourcePagedVarlenArgs<'_>) -> Result<()> {
+    let Fa2SourcePagedVarlenArgs {
+        stream,
+        q,
+        k_pool,
+        v_pool,
+        out,
+        lse,
+        cu_seqlens_q,
+        seq_lens,
+        block_tables,
+        num_seqs,
+        total_q_tokens,
+        max_q_len,
+        max_kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        block_size,
+        max_blocks_per_seq,
+    } = args;
+
     unsafe {
         call_paged_varlen_fn(
             ferrum_fa2_paged_varlen_fwd,
