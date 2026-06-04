@@ -676,6 +676,172 @@ def validate_goal_artifact(path: Path, expected_goal: str) -> dict[str, Any]:
     return manifest_data
 
 
+def load_json_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise RuntimeError(f"missing required JSON file: {path}")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{path} must contain a JSON object")
+    return data
+
+
+def require_status_pass(path: Path, data: dict[str, Any]) -> None:
+    if data.get("status") != "pass":
+        raise RuntimeError(f"{path} status is not pass: {data.get('status')!r}")
+
+
+def require_true_fields(label: str, data: dict[str, Any], fields: list[str]) -> None:
+    missing = [field for field in fields if data.get(field) is not True]
+    if missing:
+        raise RuntimeError(f"{label} missing true fields: {missing}")
+
+
+def validate_log_file(path: Path) -> None:
+    if not path.is_file():
+        raise RuntimeError(f"missing required log file: {path}")
+    assert_no_bad_patterns(path.name, path.read_text(errors="replace"))
+
+
+def validate_cpu_root(cpu_root: Path) -> dict[str, Any]:
+    required = [
+        "cpu-cli.log",
+        "cpu-serve.log",
+        "cpu-correctness.json",
+    ]
+    missing = [name for name in required if not (cpu_root / name).is_file()]
+    if missing:
+        raise RuntimeError(f"CPU root {cpu_root} missing {missing}")
+    validate_log_file(cpu_root / "cpu-cli.log")
+    validate_log_file(cpu_root / "cpu-serve.log")
+    correctness_path = cpu_root / "cpu-correctness.json"
+    correctness = load_json_object(correctness_path)
+    require_status_pass(correctness_path, correctness)
+    if correctness.get("backend") != "cpu":
+        raise RuntimeError(f"{correctness_path} backend is not cpu: {correctness.get('backend')!r}")
+    require_true_fields(
+        "cpu-correctness.json",
+        correctness,
+        [
+            "ferrum_run_one_shot",
+            "ferrum_serve_chat",
+            "openai_nonstream",
+            "openai_stream",
+            "context_limit_400",
+        ],
+    )
+    if int(correctness.get("stream_done_count", 0)) != 1:
+        raise RuntimeError(f"{correctness_path} expected exactly one stream [DONE]")
+    return {"root": str(cpu_root), "required_files": required, "correctness": correctness}
+
+
+def validate_simple_gate(cuda_root: Path, rel: str, label: str) -> dict[str, Any]:
+    path = cuda_root / rel
+    data = load_json_object(path)
+    require_status_pass(path, data)
+    return {"label": label, "path": str(path), "status": data.get("status")}
+
+
+def validate_cuda_full_m3_artifact(cuda_root: Path) -> dict[str, Any]:
+    full_root = cuda_root / "g0-cuda-full"
+    gate = validate_simple_gate(
+        cuda_root,
+        "g0-cuda-full/g0_cuda4090_full.gate.json",
+        "g0_cuda4090_full",
+    )
+    manifest = load_json_object(full_root / "manifest.json")
+    if manifest.get("artifact_verdict") != "pass":
+        raise RuntimeError(
+            f"{full_root / 'manifest.json'} artifact_verdict is not pass: "
+            f"{manifest.get('artifact_verdict')!r}"
+        )
+    summary = load_json_object(full_root / "summary.json")
+    perf_gates = summary.get("performance_regression_gates")
+    if not isinstance(perf_gates, dict):
+        raise RuntimeError(f"{full_root / 'summary.json'} missing performance_regression_gates")
+    required_cells = {1, 4, 16, 32}
+    observed = {
+        int(cell)
+        for cell in perf_gates.get("observed_concurrency_cells", [])
+        if isinstance(cell, int) and not isinstance(cell, bool)
+    }
+    if not required_cells.issubset(observed) or perf_gates.get("concurrency_cells_ok") is not True:
+        raise RuntimeError(
+            f"{full_root / 'summary.json'} missing full CUDA concurrency cells: "
+            f"required={sorted(required_cells)} observed={sorted(observed)}"
+        )
+    cases = perf_gates.get("cases")
+    if isinstance(cases, dict) and cases:
+        failed = [name for name, case in cases.items() if not isinstance(case, dict) or case.get("ok") is not True]
+        if failed:
+            raise RuntimeError(f"{full_root / 'summary.json'} performance gate failures: {failed}")
+    return {
+        **gate,
+        "manifest": str(full_root / "manifest.json"),
+        "summary": str(full_root / "summary.json"),
+        "observed_concurrency_cells": sorted(observed),
+    }
+
+
+def validate_cuda_root(cuda_root: Path) -> dict[str, Any]:
+    required = [
+        "cuda-cli.log",
+        "cuda-serve.log",
+        "cuda-correctness.json",
+        "cuda-performance.json",
+    ]
+    missing = [name for name in required if not (cuda_root / name).is_file()]
+    if missing:
+        raise RuntimeError(f"CUDA root {cuda_root} missing {missing}")
+    validate_log_file(cuda_root / "cuda-cli.log")
+    validate_log_file(cuda_root / "cuda-serve.log")
+
+    correctness_path = cuda_root / "cuda-correctness.json"
+    correctness = load_json_object(correctness_path)
+    require_status_pass(correctness_path, correctness)
+    if correctness.get("backend") != "cuda":
+        raise RuntimeError(f"{correctness_path} backend is not cuda: {correctness.get('backend')!r}")
+    require_true_fields(
+        "cuda-correctness.json",
+        correctness,
+        [
+            "ferrum_run_one_shot",
+            "ferrum_serve_chat",
+            "openai_nonstream",
+            "openai_stream",
+            "context_limit_400",
+            "g1_vllm_migration",
+            "g3_cache_product",
+            "g4_lora_inference",
+        ],
+    )
+    if int(correctness.get("stream_done_count", 0)) != 1:
+        raise RuntimeError(f"{correctness_path} expected exactly one stream [DONE]")
+
+    performance_path = cuda_root / "cuda-performance.json"
+    performance = load_json_object(performance_path)
+    require_status_pass(performance_path, performance)
+    if performance.get("backend") != "cuda":
+        raise RuntimeError(f"{performance_path} backend is not cuda: {performance.get('backend')!r}")
+    performance_text = json.dumps(performance, ensure_ascii=False)
+    if "Qwen3-30B-A3B-GPTQ-Int4" not in performance_text:
+        raise RuntimeError(f"{performance_path} does not identify the CUDA 30B performance model")
+
+    gates = [
+        validate_simple_gate(cuda_root, "g1-vllm-migration/gate.json", "g1_vllm_migration"),
+        validate_simple_gate(cuda_root, "g3-cache-product-small/gate.json", "g3_cache_product"),
+        validate_simple_gate(cuda_root, "g4-lora-inference-small/gate.json", "g4_lora_inference"),
+        validate_simple_gate(cuda_root, "g0-cuda-smoke/g0_cuda4090_smoke.gate.json", "g0_cuda4090_smoke"),
+        validate_cuda_full_m3_artifact(cuda_root),
+    ]
+    return {
+        "root": str(cuda_root),
+        "required_files": required,
+        "correctness": correctness,
+        "performance": performance,
+        "required_gates": gates,
+    }
+
+
 def copy_goal_summaries(out: Path, g1: Path, g3: Path, g4: Path) -> None:
     shutil.copy2(g1 / "semantic-tests.json", out / "g1-semantics.json")
     shutil.copy2(g3 / "cache-comparison.json", out / "g3-cache-comparison.json")
@@ -773,32 +939,17 @@ def main() -> int:
     }
     if args.cpu_root:
         cpu_root = args.cpu_root.resolve()
-        required = [
-            "cpu-cli.log",
-            "cpu-serve.log",
-            "cpu-correctness.json",
-        ]
-        missing = [name for name in required if not (cpu_root / name).is_file()]
-        if missing:
-            raise RuntimeError(f"CPU root {cpu_root} missing {missing}")
-        for name in required:
+        cpu_check = validate_cpu_root(cpu_root)
+        for name in cpu_check["required_files"]:
             shutil.copy2(cpu_root / name, out / name)
-        checks["cpu"] = {"root": str(cpu_root), "required_files": required}
+        checks["cpu"] = cpu_check
 
     if args.cuda_root:
         cuda_root = args.cuda_root.resolve()
-        required = [
-            "cuda-cli.log",
-            "cuda-serve.log",
-            "cuda-correctness.json",
-            "cuda-performance.json",
-        ]
-        missing = [name for name in required if not (cuda_root / name).is_file()]
-        if missing:
-            raise RuntimeError(f"CUDA root {cuda_root} missing {missing}")
-        for name in required:
+        cuda_check = validate_cuda_root(cuda_root)
+        for name in cuda_check["required_files"]:
             shutil.copy2(cuda_root / name, out / name)
-        checks["cuda"] = {"root": str(cuda_root), "required_files": required}
+        checks["cuda"] = cuda_check
 
     final = bool(args.cpu_root and args.cuda_root)
 
