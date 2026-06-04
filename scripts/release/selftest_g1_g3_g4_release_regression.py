@@ -10,6 +10,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+TEST_SHA = "0123456789abcdef0123456789abcdef01234567"
+
 from g1_g3_g4_release_regression import validate_cpu_root, validate_cuda_root
 
 
@@ -28,6 +30,7 @@ def make_cpu_root(root: Path) -> Path:
         {
             "status": "pass",
             "backend": "cpu",
+            "git_sha": TEST_SHA,
             "ferrum_run_one_shot": True,
             "ferrum_serve_chat": True,
             "openai_nonstream": True,
@@ -49,6 +52,7 @@ def make_cuda_root(root: Path) -> Path:
         {
             "status": "pass",
             "backend": "cuda",
+            "git_sha": TEST_SHA,
             "ferrum_run_one_shot": True,
             "ferrum_serve_chat": True,
             "openai_nonstream": True,
@@ -65,6 +69,7 @@ def make_cuda_root(root: Path) -> Path:
         {
             "status": "pass",
             "backend": "cuda",
+            "git_sha": TEST_SHA,
             "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
             "concurrency_cells": [1, 4, 16, 32],
         },
@@ -105,8 +110,9 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-g1g3g4-selftest-") as td:
         root = Path(td)
         cpu = make_cpu_root(root)
-        cpu_check = validate_cpu_root(cpu)
+        cpu_check = validate_cpu_root(cpu, expected_git_sha=TEST_SHA)
         assert cpu_check["correctness"]["backend"] == "cpu"
+        expect_failure(lambda: validate_cpu_root(cpu, expected_git_sha="different"), "git_sha")
         cpu_bad = make_cpu_root(root / "cpu-bad-root")
         write_json(
             cpu_bad / "cpu-correctness.json",
@@ -118,8 +124,9 @@ def main() -> None:
         expect_failure(lambda: validate_cpu_root(cpu_bad), "exactly one stream")
 
         cuda = make_cuda_root(root)
-        cuda_check = validate_cuda_root(cuda)
+        cuda_check = validate_cuda_root(cuda, expected_git_sha=TEST_SHA)
         assert len(cuda_check["required_gates"]) == 5
+        expect_failure(lambda: validate_cuda_root(cuda, expected_git_sha="different"), "git_sha")
         cuda_bad = make_cuda_root(root / "cuda-bad-root")
         write_json(
             cuda_bad / "g0-cuda-full/summary.json",

@@ -662,7 +662,32 @@ def run_lora_regression(
         server.stop()
 
 
-def validate_goal_artifact(path: Path, expected_goal: str) -> dict[str, Any]:
+def artifact_git_sha(data: dict[str, Any]) -> str | None:
+    value = data.get("git_sha")
+    if isinstance(value, str) and value:
+        return value
+    repo = data.get("repo")
+    if isinstance(repo, dict):
+        value = repo.get("head")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def validate_artifact_git_sha(label: str, data: dict[str, Any], expected_git_sha: str | None) -> None:
+    if not expected_git_sha:
+        return
+    actual = artifact_git_sha(data)
+    if actual != expected_git_sha:
+        raise RuntimeError(f"{label} git_sha {actual!r} != current HEAD {expected_git_sha!r}")
+
+
+def validate_goal_artifact(
+    path: Path,
+    expected_goal: str,
+    *,
+    expected_git_sha: str | None = None,
+) -> dict[str, Any]:
     gate = path / "gate.json"
     manifest = path / "manifest.json"
     if not gate.is_file() or not manifest.is_file():
@@ -673,6 +698,7 @@ def validate_goal_artifact(path: Path, expected_goal: str) -> dict[str, Any]:
         raise RuntimeError(f"{path} gate status is not pass")
     if manifest_data.get("goal") != expected_goal:
         raise RuntimeError(f"{path} manifest goal {manifest_data.get('goal')} != {expected_goal}")
+    validate_artifact_git_sha(str(manifest), manifest_data, expected_git_sha)
     return manifest_data
 
 
@@ -702,7 +728,7 @@ def validate_log_file(path: Path) -> None:
     assert_no_bad_patterns(path.name, path.read_text(errors="replace"))
 
 
-def validate_cpu_root(cpu_root: Path) -> dict[str, Any]:
+def validate_cpu_root(cpu_root: Path, *, expected_git_sha: str | None = None) -> dict[str, Any]:
     required = [
         "cpu-cli.log",
         "cpu-serve.log",
@@ -716,6 +742,7 @@ def validate_cpu_root(cpu_root: Path) -> dict[str, Any]:
     correctness_path = cpu_root / "cpu-correctness.json"
     correctness = load_json_object(correctness_path)
     require_status_pass(correctness_path, correctness)
+    validate_artifact_git_sha(str(correctness_path), correctness, expected_git_sha)
     if correctness.get("backend") != "cpu":
         raise RuntimeError(f"{correctness_path} backend is not cpu: {correctness.get('backend')!r}")
     require_true_fields(
@@ -782,7 +809,7 @@ def validate_cuda_full_m3_artifact(cuda_root: Path) -> dict[str, Any]:
     }
 
 
-def validate_cuda_root(cuda_root: Path) -> dict[str, Any]:
+def validate_cuda_root(cuda_root: Path, *, expected_git_sha: str | None = None) -> dict[str, Any]:
     required = [
         "cuda-cli.log",
         "cuda-serve.log",
@@ -798,6 +825,7 @@ def validate_cuda_root(cuda_root: Path) -> dict[str, Any]:
     correctness_path = cuda_root / "cuda-correctness.json"
     correctness = load_json_object(correctness_path)
     require_status_pass(correctness_path, correctness)
+    validate_artifact_git_sha(str(correctness_path), correctness, expected_git_sha)
     if correctness.get("backend") != "cuda":
         raise RuntimeError(f"{correctness_path} backend is not cuda: {correctness.get('backend')!r}")
     require_true_fields(
@@ -820,6 +848,7 @@ def validate_cuda_root(cuda_root: Path) -> dict[str, Any]:
     performance_path = cuda_root / "cuda-performance.json"
     performance = load_json_object(performance_path)
     require_status_pass(performance_path, performance)
+    validate_artifact_git_sha(str(performance_path), performance, expected_git_sha)
     if performance.get("backend") != "cuda":
         raise RuntimeError(f"{performance_path} backend is not cuda: {performance.get('backend')!r}")
     performance_text = json.dumps(performance, ensure_ascii=False)
@@ -880,15 +909,16 @@ def main() -> int:
     out = (args.out or default_out_dir()).resolve()
     out.mkdir(parents=True, exist_ok=True)
     log = GateLog(out / "gate.log")
+    current_head = git_value(["rev-parse", "HEAD"])
 
     g1 = (args.g1_artifact or latest_artifact("g1-vllm-migration")).resolve()
     g3 = (args.g3_artifact or latest_artifact("g3-cache-product")).resolve()
     g4 = (args.g4_artifact or latest_artifact("g4-lora-inference")).resolve()
 
     manifests = {
-        "g1": validate_goal_artifact(g1, "G1"),
-        "g3": validate_goal_artifact(g3, "G3"),
-        "g4": validate_goal_artifact(g4, "G4"),
+        "g1": validate_goal_artifact(g1, "G1", expected_git_sha=current_head),
+        "g3": validate_goal_artifact(g3, "G3", expected_git_sha=current_head),
+        "g4": validate_goal_artifact(g4, "G4", expected_git_sha=current_head),
     }
     copy_goal_summaries(out, g1, g3, g4)
 
@@ -939,14 +969,14 @@ def main() -> int:
     }
     if args.cpu_root:
         cpu_root = args.cpu_root.resolve()
-        cpu_check = validate_cpu_root(cpu_root)
+        cpu_check = validate_cpu_root(cpu_root, expected_git_sha=current_head)
         for name in cpu_check["required_files"]:
             shutil.copy2(cpu_root / name, out / name)
         checks["cpu"] = cpu_check
 
     if args.cuda_root:
         cuda_root = args.cuda_root.resolve()
-        cuda_check = validate_cuda_root(cuda_root)
+        cuda_check = validate_cuda_root(cuda_root, expected_git_sha=current_head)
         for name in cuda_check["required_files"]:
             shutil.copy2(cuda_root / name, out / name)
         checks["cuda"] = cuda_check
