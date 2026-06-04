@@ -1,0 +1,7 @@
+[2026-06-04 19:29:08] RUN cargo build --release -p ferrum-cli --bin ferrum --features metal
+[2026-06-04 19:29:09] RUN /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum run Qwen/Qwen3-0.6B --backend metal --prompt Answer with exactly: Paris --max-tokens 96 --temperature 0 --output-format jsonl
+[2026-06-04 19:29:13] RUN /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum run Qwen/Qwen3-0.6B --backend metal --max-tokens 192 --temperature 0 --output-format jsonl
+[2026-06-04 19:29:18] START /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum serve Qwen/Qwen3-0.6B --host 127.0.0.1 --port 50241 --enable-prefix-cache --session-cache memory --session-cache-max-entries 32
+[2026-06-04 19:29:20] health OK
+[2026-06-04 19:29:35] START /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum serve Qwen/Qwen3-0.6B --host 127.0.0.1 --port 50284 --lora sql=/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g4-lora-inference/20260604-qwen3-06b-real-inference-b3e7611-rerun1/fixtures/sql-adapter --lora-model-id-template <base>:<name>
+[2026-06-04 19:29:37] health OK

@@ -1,0 +1,1 @@
+{"error":{"message":"This model context is limited to 512 tokens, but this request needs 13 input tokens + 4096 output tokens. Reduce max_tokens or shorten the messages.","type":"invalid_request_error","param":null,"code":null}}
