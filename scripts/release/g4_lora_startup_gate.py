@@ -19,6 +19,15 @@ from typing import Any
 
 from g1_g4_manifest import required_manifest_fields, utc_now
 
+FORBIDDEN_RUNTIME_PATTERNS = [
+    "panicked",
+    "KV cache overflow",
+    "<unk>",
+    "[PAD]",
+    "invalid UTF-8",
+    "mojibake",
+]
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -128,18 +137,34 @@ def start_server(bin_path: Path, model: str, out: Path, log: GateLog, extra: lis
     return proc, base, server_log
 
 
-def stop_server(proc: subprocess.Popen[bytes], server_log: Path) -> None:
+def scan_runtime_log(server_log: Path, label: str) -> dict[str, Any]:
+    text = server_log.read_text(errors="replace") if server_log.exists() else ""
+    matches = [
+        pattern
+        for pattern in FORBIDDEN_RUNTIME_PATTERNS
+        if pattern.lower() in text.lower()
+    ]
+    return {
+        "label": label,
+        "path": str(server_log),
+        "status": "pass" if not matches else "fail",
+        "forbidden_patterns": FORBIDDEN_RUNTIME_PATTERNS,
+        "matches": matches,
+    }
+
+
+def stop_server(proc: subprocess.Popen[bytes], server_log: Path, label: str) -> dict[str, Any]:
     proc.terminate()
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=10)
-    text = server_log.read_text(errors="replace") if server_log.exists() else ""
-    forbidden = ["panicked", "KV cache overflow", "<unk>", "[PAD]"]
-    for pattern in forbidden:
-        if pattern.lower() in text.lower():
-            raise RuntimeError(f"forbidden runtime pattern {pattern!r} in {server_log}")
+    scan = scan_runtime_log(server_log, label)
+    if scan["matches"]:
+        pattern = scan["matches"][0]
+        raise RuntimeError(f"forbidden runtime pattern {pattern!r} in {server_log}")
+    return scan
 
 
 def f32_bytes(values: list[float]) -> bytes:
@@ -467,6 +492,7 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
     bin_path = args.ferrum_bin
     fixture = out / "fixtures" / "sql-adapter"
     peer_fixture = out / "fixtures" / "analytics-adapter"
+    blocker_scans: list[dict[str, Any]] = []
     fixture_manifest = {
         "sql": write_lora_fixture(fixture, args.model, sign=1.0),
         "analytics": write_lora_fixture(peer_fixture, args.model, sign=-1.0),
@@ -480,7 +506,8 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
         no_lora_model = sorted(no_lora_ids)[0] if no_lora_ids else args.model
         bench(bin_path, no_lora_model, no_lora_base, out / "bench-base-no-lora.json", out / "bench-base-no-lora.log", log, args)
     finally:
-        stop_server(no_lora, no_lora_log)
+        blocker_scans.append(stop_server(no_lora, no_lora_log, "base-no-lora"))
+        shutil.copy2(no_lora_log, out / "serve-base.log")
 
     with_lora, with_lora_base, with_lora_log = start_server(
         bin_path,
@@ -503,7 +530,14 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
         shutil.copy2(out / "bench-adapter.json", out / "bench-adapter-active.json")
         shutil.copy2(out / "bench-adapter.log", out / "bench-adapter-active.log")
     finally:
-        stop_server(with_lora, with_lora_log)
+        blocker_scans.append(stop_server(with_lora, with_lora_log, "with-lora"))
+        shutil.copy2(with_lora_log, out / "serve-lora.log")
+
+    blocker_scan = {
+        "status": "pass",
+        "scans": blocker_scans,
+    }
+    (out / "blocker-scan.json").write_text(json.dumps(blocker_scan, indent=2) + "\n")
 
     base_no_lora = throughput(out / "bench-base-no-lora.json")
     base_with_lora = throughput(out / "bench-base-with-lora.json")
@@ -526,6 +560,7 @@ def run_bench_gate(args: argparse.Namespace, out: Path, log: GateLog) -> dict[st
         "peer_fixture": str(peer_fixture),
         "lora_release_position": "real-inference",
         "fixture_manifest": fixture_manifest,
+        "blocker_scan": blocker_scan,
     }
     (out / "bench-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
