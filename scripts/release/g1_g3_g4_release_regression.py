@@ -3,9 +3,9 @@
 
 This script runs the local Metal release-regression slice and packages the
 required top-level files from the goal document. It intentionally prints a
-Metal-only PASS unless CUDA artifacts are explicitly supplied; the final
-`G1-G3-G4 RELEASE REGRESSION PASS` is reserved for a complete CPU/Metal/CUDA
-artifact.
+Metal-only PASS unless CPU and CUDA artifacts are explicitly supplied; the
+final `G1-G3-G4 RELEASE REGRESSION PASS` is reserved for a complete
+CPU/Metal/CUDA artifact.
 """
 from __future__ import annotations
 
@@ -802,22 +802,25 @@ def main() -> int:
 
     final = bool(args.cpu_root and args.cuda_root)
 
+    manifest_base = required_manifest_fields(
+        repo=repo_root(),
+        goal="G1-G3-G4",
+        name="release-regression",
+        models=[args.model],
+        commands=[
+            "cargo build --release -p ferrum-cli --bin ferrum --features metal",
+            "ferrum run Metal one-shot",
+            "ferrum run Metal piped multi-turn",
+            "ferrum serve Metal OpenAI/caches/LoRA smoke",
+        ],
+        started_at_utc=started_at_utc,
+        binary_path=args.ferrum_bin,
+        features=["metal"],
+    )
+    if not final:
+        manifest_base["status"] = "metal-pass"
     manifest = {
-        **required_manifest_fields(
-            repo=repo_root(),
-            goal="G1-G3-G4",
-            name="release-regression",
-            models=[args.model],
-            commands=[
-                "cargo build --release -p ferrum-cli --bin ferrum --features metal",
-                "ferrum run Metal one-shot",
-                "ferrum run Metal piped multi-turn",
-                "ferrum serve Metal OpenAI/caches/LoRA smoke",
-            ],
-            started_at_utc=started_at_utc,
-            binary_path=args.ferrum_bin,
-            features=["metal"],
-        ),
+        **manifest_base,
         "final": final,
         "checks": checks,
         "artifacts": sorted(path.name for path in out.iterdir() if path.is_file()),
