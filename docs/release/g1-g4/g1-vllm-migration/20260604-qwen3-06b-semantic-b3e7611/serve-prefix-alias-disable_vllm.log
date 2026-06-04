@@ -1,0 +1,41 @@
+
+  ______                            
+ |  ____|                           
+ | |__ ___ _ __ _ __ _   _ _ __ ___  
+ |  __/ _ \ '__| '__| | | | '_ ` _ \ 
+ | | |  __/ |  | |  | |_| | | | | | 
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.5
+
+Model: Qwen/Qwen3-0.6B
+Path: /Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+Device: Metal
+
+Initializing engine (continuous batching)...
+2026-06-04T11:12:15.484591Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-04T11:12:15.484603Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-04T11:12:15.484646Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer.json"
+2026-06-04T11:12:15.660090Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-04T11:12:15.660147Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-04T11:12:15.660158Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-04T11:12:15.660165Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-04T11:12:15.660244Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca (format: safetensors)
+2026-06-04T11:12:15.660344Z  INFO ferrum_engine::registry:   Architecture: Qwen3, Layers: 28, Vocab: 151936
+2026-06-04T11:12:15.707665Z  INFO ferrum_engine::registry: Building model...
+2026-06-04T11:12:15.707798Z  INFO ferrum_engine::registry: Loading Qwen3 via LlamaFamilyModel (QK-norm on)
+2026-06-04T11:12:15.707811Z  INFO ferrum_engine::registry:   Backend: Metal (weights f32), KV: fp16
+
+🚀 Server running at http://127.0.0.1:65387
+
+Endpoints:
+  POST /v1/chat/completions      - OpenAI-compatible chat
+  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)
+  POST /v1/audio/speech          - Text-to-speech (TTS)
+  POST /v1/embeddings            - Text/image embeddings
+  GET  /v1/models                - List models
+  GET  /health                   - Health check
+
+Press Ctrl+C to stop.
+

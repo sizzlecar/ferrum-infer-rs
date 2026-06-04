@@ -1,0 +1,16 @@
+ferrum bench-serve — dataset=shared-prefix num_prompts=16 warmup=2 n_repeats=3
+→ closed_loop c=4
+  cell closed_loop c=4 — repeat 1/3 (18 prompts including 2 warmup)
+    16 completed / 0 errored / 7.2s
+  cell closed_loop c=4 — repeat 2/3 (18 prompts including 2 warmup)
+    16 completed / 0 errored / 7.1s
+  cell closed_loop c=4 — repeat 3/3 (18 prompts including 2 warmup)
+    16 completed / 0 errored / 7.0s
+    summary c=4 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=351.0±74.8  p95=419.4±64.0  p99=431.5±36.6
+      TPOT_ms  p50=47.3±2.0  p95=51.6±7.3  p99=52.0±8.7
+      ITL_ms   p50=46.8±1.2  p95=48.3±1.2  p99=95.8±190.2
+      throughput      69.8 ± 1.5 tok/s
+      goodput         2.25 ± 0.05 req/s
+
+→ wrote /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g3-cache-product/20260604-qwen3-06b-real-kv-b3e7611/bench-enabled.json

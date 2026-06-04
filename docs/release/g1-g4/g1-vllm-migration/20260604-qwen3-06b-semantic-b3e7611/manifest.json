@@ -1,0 +1,669 @@
+{
+  "goal": "G1",
+  "name": "vllm-migration",
+  "status": "pass",
+  "passed": true,
+  "git_sha": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+  "git_dirty": true,
+  "binary_sha256": "sha256:f5118cbacd7b75bfb91d36275ec8302b1f0a6c2b8efe94699f0b14d159f674b2",
+  "features": [
+    "metal"
+  ],
+  "models": [
+    "Qwen/Qwen3-0.6B"
+  ],
+  "commands": [
+    "cargo test --workspace --all-targets",
+    "cargo test -p ferrum-cli --test vllm_migration_compat serve_help_lists_vllm_compat_flags",
+    "cargo test -p ferrum-types --test config_tests engine_config_applies_runtime_snapshot",
+    "cargo test -p ferrum-scheduler max_",
+    "cargo test -p ferrum-cli prefix_cache_vllm_and_product_aliases_resolve_identically",
+    "cargo build --release -p ferrum-cli --bin ferrum --features metal",
+    "ferrum serve --help",
+    "cargo test --release -p ferrum-cli --test vllm_migration_compat -- --ignored --test-threads=1",
+    "direct OpenAI-compatible smoke plus max-model-len and max-num-seqs semantic probes",
+    "direct prefix-cache alias runtime probes with /health and /metrics"
+  ],
+  "started_at_utc": "2026-06-04T11:11:26Z",
+  "finished_at_utc": "2026-06-04T11:12:26Z",
+  "created_at": "2026-06-04T11:12:26Z",
+  "repo": {
+    "head": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+    "short_head": "b3e7611",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "model": "Qwen/Qwen3-0.6B",
+  "model_name": "Qwen/Qwen3-0.6B",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "serve_help_test": true,
+    "semantic_engine_config": {
+      "passed": true,
+      "covers": [
+        "FERRUM_PAGED_MAX_SEQS -> scheduler.max_running_requests"
+      ]
+    },
+    "semantic_scheduler": {
+      "passed": true,
+      "covers": [
+        "--max-num-seqs active admission cap",
+        "--max-num-batched-tokens iteration batch token budget"
+      ]
+    },
+    "semantic_prefix_aliases": {
+      "passed": true,
+      "covers": [
+        "--enable-prefix-caching == --enable-prefix-cache",
+        "--no-enable-prefix-caching == --disable-prefix-cache"
+      ]
+    },
+    "serve_help_flags": [
+      "--max-model-len",
+      "--max-num-seqs",
+      "--max-num-batched-tokens",
+      "--enable-prefix-caching",
+      "--no-enable-prefix-caching",
+      "--enable-prefix-cache",
+      "--disable-prefix-cache"
+    ],
+    "rust_ignored_smoke": true,
+    "direct_openai_smoke": {
+      "passed": true,
+      "base_url": "http://127.0.0.1:65110",
+      "model": "Qwen/Qwen3-0.6B",
+      "model_name": "Qwen/Qwen3-0.6B",
+      "effective_config": {
+        "FERRUM_MAX_MODEL_LEN": {
+          "effective_value": "2048",
+          "source": "cli"
+        },
+        "FERRUM_PAGED_MAX_SEQS": {
+          "effective_value": "1",
+          "source": "cli"
+        },
+        "FERRUM_MAX_BATCHED_TOKENS": {
+          "effective_value": "2048",
+          "source": "cli"
+        },
+        "FERRUM_PREFIX_CACHE": {
+          "effective_value": "0",
+          "source": "cli"
+        }
+      },
+      "chat_content_len": 9,
+      "stream_chunks": 114,
+      "stream_done_count": 1,
+      "usage_stream_chunks": 115,
+      "usage_done_count": 1,
+      "usage_chunk_count": 1,
+      "semantic_tests": {
+        "max_model_len": {
+          "status": 400,
+          "error_type": "invalid_request_error",
+          "param": null,
+          "message": "This model context is limited to 512 tokens, but this request needs 13 input tokens + 4096 output tokens. Reduce max_tokens or shorten the messages.",
+          "configured_max_model_len": 2048,
+          "requested_max_tokens": 4096,
+          "observed_via": "OpenAI /v1/chat/completions HTTP 400 before generation"
+        },
+        "max_num_seqs": {
+          "configured_max_num_seqs": 1,
+          "max_observed_active_requests": 1,
+          "max_observed_queued_requests": 1,
+          "health_samples": [
+            {
+              "active": 0,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 1
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            },
+            {
+              "active": 1,
+              "queued": 0
+            }
+          ],
+          "responses": [
+            {
+              "status": 200,
+              "content_len": 906
+            },
+            {
+              "status": 200,
+              "content_len": 1027
+            }
+          ],
+          "observed_via": "two concurrent OpenAI chat requests plus /health active/queued polling"
+        }
+      }
+    },
+    "prefix_alias_runtime": {
+      "passed": true,
+      "enable_aliases": [
+        "--enable-prefix-caching",
+        "--enable-prefix-cache"
+      ],
+      "disable_aliases": [
+        "--no-enable-prefix-caching",
+        "--disable-prefix-cache"
+      ],
+      "enabled_hits": [
+        1.0,
+        1.0
+      ],
+      "enabled_saved_prefill_tokens": [
+        64.0,
+        64.0
+      ],
+      "disabled_hits": [
+        0.0,
+        0.0
+      ],
+      "results": {
+        "enable_vllm": {
+          "flag": "--enable-prefix-caching",
+          "expected_enabled": true,
+          "health_enabled": true,
+          "health_hits": 1.0,
+          "health_saved_prefill_tokens": 64.0,
+          "metrics_hits": 1.0,
+          "metrics_saved_prefill_tokens": 64.0,
+          "cache_position": "real-kv-reuse",
+          "first_content_len": 610,
+          "second_content_len": 610,
+          "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+        },
+        "enable_product": {
+          "flag": "--enable-prefix-cache",
+          "expected_enabled": true,
+          "health_enabled": true,
+          "health_hits": 1.0,
+          "health_saved_prefill_tokens": 64.0,
+          "metrics_hits": 1.0,
+          "metrics_saved_prefill_tokens": 64.0,
+          "cache_position": "real-kv-reuse",
+          "first_content_len": 610,
+          "second_content_len": 610,
+          "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+        },
+        "disable_vllm": {
+          "flag": "--no-enable-prefix-caching",
+          "expected_enabled": false,
+          "health_enabled": false,
+          "health_hits": 0.0,
+          "health_saved_prefill_tokens": 0.0,
+          "metrics_hits": 0.0,
+          "metrics_saved_prefill_tokens": 0.0,
+          "cache_position": "real-kv-reuse",
+          "first_content_len": 610,
+          "second_content_len": 610,
+          "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+        },
+        "disable_product": {
+          "flag": "--disable-prefix-cache",
+          "expected_enabled": false,
+          "health_enabled": false,
+          "health_hits": 0.0,
+          "health_saved_prefill_tokens": 0.0,
+          "metrics_hits": 0.0,
+          "metrics_saved_prefill_tokens": 0.0,
+          "cache_position": "real-kv-reuse",
+          "first_content_len": 610,
+          "second_content_len": 610,
+          "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+        }
+      }
+    }
+  },
+  "artifacts": [
+    "cargo-test.log",
+    "chat.json",
+    "effective-config.json",
+    "gate.json",
+    "gate.log",
+    "models.json",
+    "release-build.log",
+    "rust-ignored-smoke.log",
+    "semantic-engine-config.log",
+    "semantic-max-model-len-400.json",
+    "semantic-max-num-seqs-response-0.json",
+    "semantic-max-num-seqs-response-1.json",
+    "semantic-max-num-seqs.json",
+    "semantic-prefix-alias-disable_product-chat-1.json",
+    "semantic-prefix-alias-disable_product-chat-2.json",
+    "semantic-prefix-alias-disable_product-health.json",
+    "semantic-prefix-alias-disable_product-metrics.txt",
+    "semantic-prefix-alias-disable_vllm-chat-1.json",
+    "semantic-prefix-alias-disable_vllm-chat-2.json",
+    "semantic-prefix-alias-disable_vllm-health.json",
+    "semantic-prefix-alias-disable_vllm-metrics.txt",
+    "semantic-prefix-alias-enable_product-chat-1.json",
+    "semantic-prefix-alias-enable_product-chat-2.json",
+    "semantic-prefix-alias-enable_product-health.json",
+    "semantic-prefix-alias-enable_product-metrics.txt",
+    "semantic-prefix-alias-enable_vllm-chat-1.json",
+    "semantic-prefix-alias-enable_vllm-chat-2.json",
+    "semantic-prefix-alias-enable_vllm-health.json",
+    "semantic-prefix-alias-enable_vllm-metrics.txt",
+    "semantic-prefix-aliases-runtime.json",
+    "semantic-prefix-aliases.log",
+    "semantic-scheduler.log",
+    "semantic-tests.json",
+    "serve-help-test.log",
+    "serve-help.txt",
+    "serve-prefix-alias-disable_product.log",
+    "serve-prefix-alias-disable_vllm.log",
+    "serve-prefix-alias-enable_product.log",
+    "serve-prefix-alias-enable_vllm.log",
+    "serve.log",
+    "smoke.json",
+    "stream.sse",
+    "usage_stream.sse"
+  ]
+}

@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running tests/server_lora_startup.rs (target/debug/deps/server_lora_startup-14c9846cd249a1fe)
+
+running 2 tests
+test serve_help_lists_lora_startup_flags ... ok
+test serve_rejects_invalid_lora_arg_before_model_load ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.06s
+
