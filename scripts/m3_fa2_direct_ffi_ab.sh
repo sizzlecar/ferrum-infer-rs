@@ -22,10 +22,13 @@ if [[ -z "${FA2_EXTRA_LD_LIBRARY_PATH+x}" ]]; then
     FA2_EXTRA_LD_LIBRARY_PATH="${TORCH_LIB}:${FA2_DIR}"
 fi
 
-FEATURES="${FEATURES:-cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin}"
 if [[ "$FA2_SOURCE" == "1" ]]; then
-    FEATURES="${FEATURES},fa2-source"
-elif [[ ! -r "$FA2_SHIM" ]]; then
+    echo "FA2_SOURCE=1 is retired: FERRUM_FA2_SOURCE is rejected until a source-owned FA2 kernel has release evidence." >&2
+    exit 1
+fi
+
+FEATURES="${FEATURES:-cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin}"
+if [[ ! -r "$FA2_SHIM" ]]; then
     echo "FA2_SHIM is not readable: $FA2_SHIM" >&2
     echo "build it with: bash scripts/microbenches/build_fa2_ferrum_shim.sh" >&2
     exit 1

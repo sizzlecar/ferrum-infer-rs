@@ -8,7 +8,6 @@ use ferrum_types::RuntimeConfigSnapshot;
 pub(crate) struct Qwen3MoeRuntimeEnv {
     pub(crate) decode_op_profile: bool,
     pub(crate) fa2_direct_ffi: bool,
-    pub(crate) fa2_source: bool,
     pub(crate) fa_layout_varlen: bool,
     pub(crate) greedy_argmax: bool,
     pub(crate) initial_scratch_tokens: usize,
@@ -65,7 +64,6 @@ impl Qwen3MoeRuntimeEnv {
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect();
-        let fa2_source = trueish(vars.get("FERRUM_FA2_SOURCE"));
         let fa2_direct_ffi = match vars.get("FERRUM_FA2_DIRECT_FFI").map(String::as_str) {
             Some("0" | "false" | "FALSE" | "off" | "OFF") => false,
             Some("1" | "true" | "TRUE" | "on" | "ON") => true,
@@ -77,7 +75,6 @@ impl Qwen3MoeRuntimeEnv {
         Self {
             decode_op_profile: vars.contains_key("FERRUM_DECODE_OP_PROFILE"),
             fa2_direct_ffi,
-            fa2_source,
             fa_layout_varlen: vars
                 .get("FERRUM_FA_LAYOUT_VARLEN")
                 .is_some_and(|v| v == "1"),
@@ -216,7 +213,6 @@ mod tests {
 
         assert!(env.decode_op_profile);
         assert!(env.fa2_direct_ffi);
-        assert!(!env.fa2_source);
         assert!(env.fa_layout_varlen);
         assert!(env.greedy_argmax);
         assert_eq!(env.initial_scratch_tokens, 4096);
@@ -270,11 +266,11 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_moe_runtime_env_keeps_fa2_source_distinct_from_direct_ffi() {
+    fn qwen3_moe_runtime_env_does_not_enable_retired_fa2_source_path() {
         let env = Qwen3MoeRuntimeEnv::from_env_vars([("FERRUM_FA2_SOURCE", "1")]);
 
-        assert!(env.fa2_source);
         assert!(!env.fa2_direct_ffi);
+        assert!(!env.fa_layout_varlen);
     }
 
     #[test]
@@ -310,7 +306,6 @@ mod tests {
         let env = Qwen3MoeRuntimeEnv::from_runtime_config_snapshot(&snapshot);
 
         assert!(env.fa_layout_varlen);
-        assert!(env.fa2_source);
         assert!(!env.fa2_direct_ffi);
         assert_eq!(env.initial_scratch_tokens, 3072);
         assert!(env.moe_graph_requested);

@@ -37,7 +37,6 @@ struct CudaPagedRuntimeConfig {
     kv_capacity: usize,
     paged_flash_splits: Option<usize>,
     split_k_attn: Option<bool>,
-    fa2_source: bool,
     paged_flash: bool,
 }
 
@@ -56,7 +55,6 @@ impl CudaPagedRuntimeConfig {
             kv_capacity: 512,
             paged_flash_splits: None,
             split_k_attn: None,
-            fa2_source: false,
             paged_flash: true,
         };
         for (name, value) in vars {
@@ -76,9 +74,6 @@ impl CudaPagedRuntimeConfig {
                         "0" => Some(false),
                         _ => None,
                     };
-                }
-                "FERRUM_FA2_SOURCE" => {
-                    config.fa2_source = matches!(value, "1" | "true" | "TRUE" | "on" | "ON");
                 }
                 "FERRUM_PAGED_FLASH" => config.paged_flash = value != "0",
                 _ => {}
@@ -102,14 +97,12 @@ mod tests {
             ("FERRUM_KV_CAPACITY", "4096"),
             ("FERRUM_PAGED_FLASH_SPLITS", "4"),
             ("FERRUM_SPLIT_K_ATTN", "1"),
-            ("FERRUM_FA2_SOURCE", "on"),
             ("FERRUM_PAGED_FLASH", "0"),
         ]);
 
         assert_eq!(config.kv_capacity, 4096);
         assert_eq!(config.paged_flash_splits, Some(4));
         assert_eq!(config.split_k_attn, Some(true));
-        assert!(config.fa2_source);
         assert!(!config.paged_flash);
         assert_eq!(config.shared_kv_for(8192), 8192);
     }
@@ -120,13 +113,11 @@ mod tests {
             ("FERRUM_KV_CAPACITY", "bad"),
             ("FERRUM_PAGED_FLASH_SPLITS", "bad"),
             ("FERRUM_SPLIT_K_ATTN", "auto"),
-            ("FERRUM_FA2_SOURCE", "trueish"),
         ]);
 
         assert_eq!(config.kv_capacity, 512);
         assert_eq!(config.paged_flash_splits, None);
         assert_eq!(config.split_k_attn, None);
-        assert!(!config.fa2_source);
         assert!(config.paged_flash);
         assert_eq!(config.shared_kv_for(128), 512);
     }
@@ -884,30 +875,6 @@ impl BackendPagedKv for CudaBackend {
         block_size: usize,
         max_blocks_per_seq: usize,
     ) -> Result<()> {
-        #[cfg(feature = "fa2-source")]
-        if cuda_paged_runtime_config().fa2_source {
-            return super::fa2_source::paged_varlen_attention_fa2_source(
-                &ctx.stream,
-                q.as_f16(),
-                k_pool.as_f16(),
-                v_pool.as_f16(),
-                out.as_f16_mut(),
-                lse.as_f32_mut(),
-                cu_seqlens_q.as_u32(),
-                seq_lens.as_u32(),
-                block_tables.as_u32(),
-                num_seqs,
-                total_q_tokens,
-                max_q_len,
-                max_kv_len,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                block_size,
-                max_blocks_per_seq,
-            );
-        }
-
         super::fa2_ffi::paged_varlen_attention_fa2_ffi(
             &ctx.stream,
             q.as_f16(),

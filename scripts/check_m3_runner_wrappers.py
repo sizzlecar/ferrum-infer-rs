@@ -21,6 +21,9 @@ DIRECT_RUNNER = "scripts/m3_ab_runner.py"
 ALLOWED_DELEGATE_WRAPPERS = {
     "scripts/m3_fa2_source_allcells_ab.sh": ("scripts/m3_fa2_direct_ffi_ab.sh",),
 }
+RETIRED_WRAPPER_MARKERS = {
+    "scripts/m3_fa2_source_allcells_ab.sh": "FERRUM_FA2_SOURCE is rejected",
+}
 
 FORBIDDEN_PATTERNS = (
     (
@@ -67,6 +70,10 @@ def check_wrapper(path: Path, root: Path) -> list[str]:
     text = path.read_text()
     active = _active_shell_text(text)
     errors: list[str] = []
+
+    retired_marker = RETIRED_WRAPPER_MARKERS.get(rel)
+    if retired_marker and retired_marker in active:
+        return errors
 
     for description, pattern in FORBIDDEN_PATTERNS:
         if pattern.search(active):
@@ -121,7 +128,8 @@ python3 scripts/m3_ab_runner.py --config "$CONFIG"
             root / "scripts/m3_fa2_source_allcells_ab.sh",
             """#!/usr/bin/env bash
 set -euo pipefail
-bash scripts/m3_fa2_direct_ffi_ab.sh
+echo "m3_fa2_source_allcells_ab.sh is retired: FERRUM_FA2_SOURCE is rejected until a source-owned FA2 kernel has release evidence." >&2
+exit 1
 """,
         )
         errors = check_root(root)

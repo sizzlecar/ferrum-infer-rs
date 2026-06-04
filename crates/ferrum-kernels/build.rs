@@ -263,11 +263,11 @@ fn main() {
         compile_vllm_paged_attn(&out_dir_clone);
     }
 
-    // Source-built FlashAttention-2 paged-varlen bridge for the Qwen3 M3
-    // shape. Unlike the runtime FFI shim, this links the FA2 templates into
-    // ferrum-kernels and needs no vLLM/Torch/Python library at runtime.
+    // Retired FA2-source compatibility marker. Historical release feature
+    // sets still include `fa2-source`, but there is no external
+    // FlashAttention source checkout or static library to build/link.
     if env::var_os("CARGO_FEATURE_FA2_SOURCE").is_some() {
-        compile_fa2_source(&out_dir_clone);
+        emit_fa2_source_in_repo_marker();
     }
 }
 
@@ -458,218 +458,26 @@ fn compile_core_ptx(out_dir: &Path) {
     write_core_ptx_bindings(out_dir);
 }
 
-fn find_cutlass_include_dir() -> Option<PathBuf> {
-    println!("cargo:rerun-if-env-changed=FERRUM_CUTLASS_INCLUDE_DIR");
-    println!("cargo:rerun-if-env-changed=CUTLASS_INCLUDE_DIR");
-    for key in ["FERRUM_CUTLASS_INCLUDE_DIR", "CUTLASS_INCLUDE_DIR"] {
-        if let Some(value) = env::var_os(key) {
-            let path = PathBuf::from(value);
-            if path.join("cute").join("tensor.hpp").is_file()
-                && path.join("cutlass").join("cutlass.h").is_file()
-            {
-                return Some(path);
-            }
-        }
-    }
-    for candidate in [
-        "/workspace/vllm-venv/lib/python3.12/site-packages/flashinfer/data/cutlass/include",
-        "/workspace/vllm-venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include",
-        "/workspace/vllm-venv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/include",
-    ] {
-        let path = PathBuf::from(candidate);
-        if path.join("cute").join("tensor.hpp").is_file()
-            && path.join("cutlass").join("cutlass.h").is_file()
-        {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn compile_fa2_source(out_dir: &PathBuf) {
-    println!("cargo:rerun-if-env-changed=FERRUM_FA2_SRC_DIR");
-    println!("cargo:rerun-if-env-changed=FA_SRC_DIR");
-    let fa_src_dir = env::var_os("FERRUM_FA2_SRC_DIR")
-        .or_else(|| env::var_os("FA_SRC_DIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/workspace/vllm-flash-attention-f5bc33c"));
-    let fa_src = fa_src_dir.join("csrc/flash_attn/src");
-    if !fa_src.join("flash.h").is_file() {
-        panic!(
-            "[fa2-source] FlashAttention source not found at {}. Set FERRUM_FA2_SRC_DIR.",
-            fa_src_dir.display()
-        );
-    }
-    let cutlass_include = find_cutlass_include_dir().unwrap_or_else(|| {
-        panic!("[fa2-source] CUTLASS headers not found; set FERRUM_CUTLASS_INCLUDE_DIR")
-    });
-    let stub_dir = PathBuf::from("kernels/fa2_source/stubs");
-    let stub_files = [
-        stub_dir.join("ferrum_fa2_prelude.h"),
-        stub_dir.join("ATen/cuda/CUDAGeneratorImpl.h"),
-        stub_dir.join("ATen/cuda/detail/UnpackRaw.cuh"),
-        stub_dir.join("c10/cuda/CUDAException.h"),
+fn emit_fa2_source_in_repo_marker() {
+    let deps: &[&str] = &[
+        "kernels/paged_varlen_attention.cu",
+        "kernels/split_qkv_norm_rope_into_paged_cache.cu",
+        "kernels/split_qkv_norm_rope_into_paged_cache_vllm.cu",
+        "kernels/common.cuh",
     ];
-
-    let local_src = "../../scripts/microbenches/fa2_ferrum_source_shim.cu";
-    let external_sources = [
-        fa_src
-            .join("flash_fwd_split_hdim128_fp16_sm80.cu")
-            .display()
-            .to_string(),
-        fa_src
-            .join("flash_fwd_split_hdim128_fp16_causal_sm80.cu")
-            .display()
-            .to_string(),
-    ];
-    let cu_files: Vec<String> = std::iter::once(local_src.to_string())
-        .chain(external_sources.iter().cloned())
-        .collect();
-    let header_files: Vec<String> = [
-        fa_src.join("flash.h"),
-        fa_src.join("flash_fwd_launch_template.h"),
-        fa_src.join("flash_fwd_kernel.h"),
-        fa_src.join("kernel_traits.h"),
-        fa_src.join("utils.h"),
-        fa_src.join("softmax.h"),
-        fa_src.join("mask.h"),
-        fa_src.join("block_info.h"),
-        fa_src.join("dropout.h"),
-        fa_src.join("rotary.h"),
-        fa_src.join("hardware_info.h"),
-        fa_src.join("namespace_config.h"),
-        fa_src.join("philox_unpack.cuh"),
-    ]
-    .iter()
-    .map(|p| p.display().to_string())
-    .collect();
-    let stub_files: Vec<String> = stub_files.iter().map(|p| p.display().to_string()).collect();
-    for f in cu_files
-        .iter()
-        .chain(header_files.iter())
-        .chain(stub_files.iter())
-    {
+    for f in deps {
         println!("cargo:rerun-if-changed={f}");
     }
-
-    let cuda_root = cuda_root_from_env();
-    let nvcc = cuda_root
-        .as_ref()
-        .map(|r| r.join("bin").join("nvcc"))
-        .unwrap_or_else(|| PathBuf::from("nvcc"));
-    if !nvcc.exists() && cuda_root.is_some() {
-        panic!("[fa2-source] nvcc not found at {nvcc:?}");
-    }
-
-    let compute_cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "89".to_string());
-    let nvcc_threads = env::var("FERRUM_NVCC_THREADS").unwrap_or_else(|_| "0".to_string());
-    let flags = vec![
-        format!("nvcc={}", nvcc.display()),
-        format!("arch=sm_{compute_cap}"),
-        format!("threads={nvcc_threads}"),
-        format!("-I{}", stub_dir.display()),
-        format!("-I{}", fa_src.display()),
-        format!("-I{}", cutlass_include.display()),
-        "-std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda"
-            .to_string(),
-        "-Xcompiler -fPIC -Xcompiler -fvisibility=hidden".to_string(),
-    ];
-    let deps: Vec<&str> = cu_files
-        .iter()
-        .chain(header_files.iter())
-        .chain(stub_files.iter())
-        .map(String::as_str)
-        .collect();
-    let signature = static_lib_signature("fa2-source", &deps, &flags);
-    let metadata_hash_signature = metadata_hash_static_lib_signature("fa2-source", &deps, &flags);
-    let metadata_signature = metadata_static_lib_signature("fa2-source", &deps, &flags);
-    let build_start = Instant::now();
-    let cache_state = static_lib_cache_state(
-        out_dir,
-        "fa2_source",
-        &signature,
-        &[&metadata_hash_signature, &metadata_signature],
+    let signature = static_lib_signature(
+        "fa2-source-retired",
+        deps,
+        &["feature=fa2-source".to_string(), "link=none".to_string()],
     );
-    let build_reason = match cache_state {
-        CacheState::Fresh(reason) => {
-            emit_cuda_build_summary(
-                "fa2_source",
-                "cache_hit",
-                reason,
-                build_start.elapsed(),
-                &signature,
-            );
-            emit_cuda_static_link(out_dir, "fa2_source", cuda_root.as_ref(), true);
-            return;
-        }
-        CacheState::Stale(reason) => reason,
-    };
-
-    let mut object_files: Vec<PathBuf> = Vec::new();
-    for src in &cu_files {
-        let stem = Path::new(src)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .expect("cu filename");
-        let obj = out_dir.join(format!("fa2_source_{stem}.o"));
-        eprintln!("[fa2-source] compiling {src} -> {}", obj.display());
-        let status = std::process::Command::new(&nvcc)
-            .args(["-c", src, "-o"])
-            .arg(obj.to_str().unwrap())
-            .args([
-                &format!("-arch=sm_{compute_cap}"),
-                "-std=c++17",
-                "-O3",
-                "--use_fast_math",
-                "--expt-relaxed-constexpr",
-                "--expt-extended-lambda",
-                "-Xcompiler",
-                "-fPIC",
-                "-Xcompiler",
-                "-fvisibility=hidden",
-                "--threads",
-                nvcc_threads.as_str(),
-                "-I",
-                stub_dir.to_str().unwrap(),
-                "-I",
-                fa_src.to_str().unwrap(),
-                "-I",
-                cutlass_include.to_str().unwrap(),
-                "-include",
-                stub_dir
-                    .join("ferrum_fa2_prelude.h")
-                    .to_str()
-                    .expect("prelude path"),
-            ])
-            .status()
-            .unwrap_or_else(|e| panic!("[fa2-source] nvcc spawn failed for {src}: {e}"));
-        if !status.success() {
-            panic!("[fa2-source] nvcc failed compiling {src}");
-        }
-        object_files.push(obj);
-    }
-
-    let lib_file = out_dir.join("libfa2_source.a");
-    let mut ar_args: Vec<String> = vec!["rcs".to_string(), lib_file.display().to_string()];
-    for o in &object_files {
-        ar_args.push(o.display().to_string());
-    }
-    let ar_status = std::process::Command::new("ar")
-        .args(&ar_args)
-        .status()
-        .unwrap_or_else(|e| panic!("[fa2-source] ar spawn failed: {e}"));
-    if !ar_status.success() {
-        panic!("[fa2-source] ar failed to bundle {lib_file:?}");
-    }
-
-    write_static_lib_stamp(out_dir, "fa2_source", &signature);
-    emit_cuda_static_link(out_dir, "fa2_source", cuda_root.as_ref(), true);
-    eprintln!("[fa2-source] static lib built: {}", lib_file.display());
     emit_cuda_build_summary(
         "fa2_source",
-        "built",
-        build_reason,
-        build_start.elapsed(),
+        "cache_hit",
+        "retired-no-link",
+        Instant::now().elapsed(),
         &signature,
     );
 }

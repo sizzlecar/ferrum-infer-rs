@@ -3,11 +3,12 @@ set -euo pipefail
 
 # Build the out-of-tree C ABI shim used by FERRUM_FA2_DIRECT_FFI=1.
 #
-# Defaults target the M3 Vast pod. Override VLLM_PYTHON, FA_SRC_DIR, or OUT_SO
-# if the vLLM virtualenv / flash-attention checkout lives elsewhere.
+# This legacy diagnostic is not used by product or release builds. VLLM_PYTHON
+# and FA_SRC_DIR must be explicit when the vLLM virtualenv / FlashAttention
+# checkout lives outside the defaults below.
 
 VLLM_PYTHON="${VLLM_PYTHON:-/workspace/vllm-venv/bin/python}"
-FA_SRC_DIR="${FA_SRC_DIR:-/workspace/vllm-flash-attention-f5bc33c}"
+FA_SRC_DIR="${FA_SRC_DIR:-}"
 FA_GIT_URL="${FA_GIT_URL:-https://github.com/vllm-project/flash-attention.git}"
 FA_GIT_REV="${FA_GIT_REV:-f5bc33cfc02c744d24a2e9d50e6db656de40611c}"
 SRC="${SRC:-scripts/microbenches/fa2_ferrum_shim.cpp}"
@@ -16,6 +17,11 @@ CXX="${CXX:-g++}"
 
 if [[ ! -x "$VLLM_PYTHON" ]]; then
   echo "VLLM_PYTHON is not executable: $VLLM_PYTHON" >&2
+  exit 1
+fi
+
+if [[ -z "$FA_SRC_DIR" ]]; then
+  echo "FA_SRC_DIR must point at a FlashAttention source checkout for this legacy diagnostic" >&2
   exit 1
 fi
 
