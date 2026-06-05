@@ -109,11 +109,12 @@ PROCESS_ENV_WRITE_CLASSIFICATIONS = (
     {
         "path": "crates/ferrum-cli/src/runtime_env.rs",
         "call": "std::env::set_var",
-        "expected_count": 1,
+        "expected_count": 2,
         "classification": "runtime_config_compatibility_bridge",
         "reason": (
             "centralized CLI bridge materializing typed RuntimeConfigEntry "
-            "defaults for backend paths that still consume process env"
+            "defaults/effective startup config for backend paths that still "
+            "consume process env"
         ),
     },
     {
