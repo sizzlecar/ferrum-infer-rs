@@ -848,11 +848,14 @@ async fn handle_chat_completions_stream(
         .as_ref()
         .and_then(|opts| opts.include_usage)
         .unwrap_or(false);
+    let buffer_json_object_stream = response_format_is_json_object(&openai_request);
     let buffer_strict_json_schema_stream = strict_json_schema_string(&openai_request)?.is_some();
     let stream_api_request = api_chat_request(&openai_request);
     let buffer_structured_api_stream =
         ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
-    let buffer_stream_output = buffer_strict_json_schema_stream || buffer_structured_api_stream;
+    let buffer_stream_output = buffer_json_object_stream
+        || buffer_strict_json_schema_stream
+        || buffer_structured_api_stream;
     let mut stream = match engine.infer_stream(inference_request).await {
         Ok(stream) => stream,
         Err(e) => {
@@ -885,12 +888,15 @@ async fn handle_chat_completions_stream(
                         current_text.push_str(&chunk.text);
 
                         if !buffer_stream_output {
+                            if should_defer_reasoning_stream_delta(&current_text) {
+                                continue;
+                            }
                             let parsed = parse_reasoning_response(&current_text);
                             let full_reasoning = parsed.reasoning.as_deref().unwrap_or("");
-                            let reasoning_delta = full_reasoning[sent_reasoning_len..].to_string();
-                            sent_reasoning_len = full_reasoning.len();
-                            let content_delta = parsed.content[sent_content_len..].to_string();
-                            sent_content_len = parsed.content.len();
+                            let reasoning_delta =
+                                stream_text_delta(full_reasoning, &mut sent_reasoning_len);
+                            let content_delta =
+                                stream_text_delta(&parsed.content, &mut sent_content_len);
                             if reasoning_delta.is_empty() && content_delta.is_empty() {
                                 continue;
                             }
@@ -1250,11 +1256,12 @@ fn convert_chat_request_with_template_model(
 ) -> ferrum_types::Result<InferenceRequest> {
     let tools = request.tools.as_deref().unwrap_or_default();
     let functions = request.functions.as_deref().unwrap_or_default();
+    let render_messages = render_messages_with_response_format_instruction(request);
     let prompt = if tools.is_empty() && functions.is_empty() {
-        render_chat_prompt_with_model_template(&request.messages, template_model_id, model_template)
+        render_chat_prompt_with_model_template(&render_messages, template_model_id, model_template)
     } else {
         render_chat_prompt_with_tools(
-            &request.messages,
+            &render_messages,
             template_model_id,
             tools,
             request.tool_choice.as_ref(),
@@ -1322,28 +1329,8 @@ fn convert_chat_request_with_template_model(
             tfs: None,
             typical_p: None,
             mirostat: None,
-            response_format: forced_tool_choice_response_format(request).unwrap_or_else(|| {
-                match &request.response_format {
-                    Some(rf) if rf.format_type == "json_object" => {
-                        ferrum_types::ResponseFormat::JsonObject
-                    }
-                    Some(rf)
-                        if rf.format_type == "json_schema"
-                            && rf
-                                .json_schema
-                                .as_ref()
-                                .and_then(|schema| schema.strict)
-                                .unwrap_or(false) =>
-                    {
-                        // Strict json_schema still gets hard validation after
-                        // generation. Use JSON-object steering here instead of
-                        // regex hard-masking because GPU greedy sentinels can
-                        // bypass host logits processors on the first token.
-                        ferrum_types::ResponseFormat::JsonObject
-                    }
-                    _ => ferrum_types::ResponseFormat::Text,
-                }
-            }),
+            response_format: forced_tool_choice_response_format(request)
+                .unwrap_or(ferrum_types::ResponseFormat::Text),
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal, // Default priority
@@ -1353,6 +1340,44 @@ fn convert_chat_request_with_template_model(
         api_request: Some(ferrum_types::ApiRequest::Chat(api_chat_request(request))),
         metadata,
     })
+}
+
+fn render_messages_with_response_format_instruction(
+    request: &ChatCompletionsRequest,
+) -> Vec<ChatMessage> {
+    let Some(instruction) = response_format_prompt_instruction(request) else {
+        return request.messages.clone();
+    };
+    let mut messages = Vec::with_capacity(request.messages.len() + 1);
+    messages.push(ChatMessage {
+        role: MessageRole::System,
+        content: instruction,
+        reasoning: None,
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        function_call: None,
+    });
+    messages.extend(request.messages.clone());
+    messages
+}
+
+fn response_format_prompt_instruction(request: &ChatCompletionsRequest) -> Option<String> {
+    let format = request.response_format.as_ref()?;
+    match format.format_type.as_str() {
+        "json_object" => Some(
+            "The response_format requires a single valid JSON object. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
+                .to_string(),
+        ),
+        "json_schema" => {
+            let schema = format.json_schema.as_ref()?.schema.as_ref()?;
+            let schema_text = serde_json::to_string(schema).ok()?;
+            Some(format!(
+                "The response_format requires a single valid JSON object satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn forced_tool_choice_response_format(
@@ -1387,6 +1412,24 @@ fn has_unclosed_thinking_block(prompt: &str) -> bool {
         (Some(_), None) => true,
         _ => false,
     }
+}
+
+fn should_defer_reasoning_stream_delta(text: &str) -> bool {
+    let candidate = text.trim_start_matches(['\r', '\n']);
+    if candidate.is_empty() {
+        return true;
+    }
+    THINK_START_TAG.starts_with(candidate) || THINK_END_TAG.starts_with(candidate)
+}
+
+fn stream_text_delta(text: &str, sent_len: &mut usize) -> String {
+    if *sent_len <= text.len() && text.is_char_boundary(*sent_len) {
+        let delta = text[*sent_len..].to_string();
+        *sent_len = text.len();
+        return delta;
+    }
+    *sent_len = text.len();
+    String::new()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1456,6 +1499,13 @@ fn normalize_structured_response_content(
         }
         _ => content.to_string(),
     }
+}
+
+fn response_format_is_json_object(request: &ChatCompletionsRequest) -> bool {
+    request
+        .response_format
+        .as_ref()
+        .is_some_and(|format| format.format_type == "json_object")
 }
 
 fn extract_json_object_text(text: &str) -> Option<String> {
@@ -2923,6 +2973,7 @@ mod tests {
     struct StubLlm {
         config: EngineConfig,
         text: String,
+        stream_chunks: Option<Vec<String>>,
         stream_usage: Option<TokenUsage>,
         api_response: Option<ferrum_types::ApiResponse>,
         lora_metrics: Option<Value>,
@@ -2935,6 +2986,7 @@ mod tests {
             Self {
                 config,
                 text: text.to_string(),
+                stream_chunks: None,
                 stream_usage: Some(TokenUsage::new(5, 1)),
                 api_response: None,
                 lora_metrics: None,
@@ -2945,6 +2997,14 @@ mod tests {
             Self {
                 stream_usage: None,
                 ..Self::new(text)
+            }
+        }
+
+        fn with_stream_chunks(chunks: &[&str]) -> Self {
+            Self {
+                text: chunks.concat(),
+                stream_chunks: Some(chunks.iter().map(|chunk| (*chunk).to_string()).collect()),
+                ..Self::new("")
             }
         }
 
@@ -3369,6 +3429,30 @@ mod tests {
         ) -> ferrum_types::Result<
             Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>,
         > {
+            if let Some(chunks) = &self.stream_chunks {
+                let last = chunks.len().saturating_sub(1);
+                let request_id = request.id;
+                let stream_chunks = chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| {
+                        Ok(StreamChunk {
+                            request_id: request_id.clone(),
+                            text: text.clone(),
+                            token: Some(TokenId::new(11 + index as u32)),
+                            finish_reason: (index == last).then_some(FinishReason::Stop),
+                            usage: (index == last).then(|| self.stream_usage.clone()).flatten(),
+                            created_at: chrono::Utc::now(),
+                            metadata: HashMap::new(),
+                            api_response: (index == last)
+                                .then(|| self.api_response.clone())
+                                .flatten(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Box::pin(stream::iter(stream_chunks)));
+            }
+
             let chunk = StreamChunk {
                 request_id: request.id,
                 text: self.text.clone(),
@@ -3457,6 +3541,10 @@ mod tests {
 
     fn router_with_stub(text: &str) -> Router {
         AxumServer::from_llm(Arc::new(StubLlm::new(text))).build_router()
+    }
+
+    fn router_with_stub_stream_chunks(chunks: &[&str]) -> Router {
+        AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(chunks))).build_router()
     }
 
     fn router_with_stub_api_response(
@@ -3923,6 +4011,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_serializes_qwen3_function_parameters_tool_json() {
+        let response = post_json(
+            router_with_stub(
+                r#"{"function":"get_weather","parameters":{"city":"北京","unit":"c"}}"#,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "北京现在天气怎么样？"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"},
+                                "unit": {"type": "string", "enum": ["c", "f"]}
+                            },
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"北京\",\"unit\":\"c\"}"
+        );
+    }
+
+    #[tokio::test]
     async fn route_chat_honors_specific_tool_choice_for_generated_tool_call_json() {
         let response = post_json(
             router_with_stub(r#"{"name":"weather","arguments":{"city":"Paris"}}"#),
@@ -4121,6 +4251,52 @@ mod tests {
         assert!(
             !body.contains(r#""content":"{\"tool_calls\""#),
             "raw tool-call JSON should not be streamed as assistant content: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_serializes_qwen3_function_parameters_tool_delta() {
+        let response = post_json(
+            router_with_stub(
+                r#"{"function":"get_weather","parameters":{"city":"深圳","unit":"c"}}"#,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "深圳天气？"}],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"},
+                                "unit": {"type": "string", "enum": ["c", "f"]}
+                            },
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""finish_reason":"tool_calls""#),
+            "stream should finish with tool_calls: {body}"
+        );
+        assert!(
+            body.contains(r#""function":{"name":"get_weather","arguments":"{\"city\":\"深圳\",\"unit\":\"c\"}"}"#),
+            "stream should emit parsed Qwen3 function parameters as tool args: {body}"
+        );
+        assert!(
+            !body.contains(r#""content":"{\"function\""#),
+            "raw Qwen3 tool JSON should not leak as assistant content: {body}"
         );
     }
 
@@ -4756,6 +4932,35 @@ mod tests {
         assert_eq!(message["content"], "final answer");
         assert_eq!(message["reasoning"], "\nreasoning\n");
         assert!(message.get("reasoning_content").is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_reasoning_prefix_chunks_do_not_panic_or_leak_content() {
+        let response = post_json(
+            router_with_stub_stream_chunks(&["<", "think", ">\nreason", "\n</think>\n\nfinal"]),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "think then answer"}],
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""reasoning":"\nreason"#),
+            "stream should emit reasoning delta after full think prefix: {body}"
+        );
+        assert!(
+            body.contains(r#""content":"final""#),
+            "stream should emit visible content after think close: {body}"
+        );
+        assert!(
+            !body.contains(r#""content":"<"#),
+            "partial think prefix must not leak as content: {body}"
+        );
     }
 
     #[tokio::test]
@@ -5950,6 +6155,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_json_object_buffers_thinking_and_emits_clean_json_content() {
+        let response = post_json(
+            router_with_stub_stream_chunks(&[
+                "<think>\n好的，我需要输出 JSON。",
+                "\n</think>\n\n",
+                "{\"name\":\"李四\",\"age\":30}",
+            ]),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "输出JSON(name,age)：李四,30岁"}],
+                "stream": true,
+                "response_format": {"type": "json_object"}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""content":"{\"name\":\"李四\",\"age\":30}""#),
+            "stream should emit clean JSON content: {body}"
+        );
+        assert!(
+            body.contains(r#""reasoning":"\n好的，我需要输出 JSON。\n""#),
+            "stream should keep thinking in reasoning field: {body}"
+        );
+        assert!(
+            !body.contains(r#""content":"<think"#)
+                && !body.contains(r#""content":"好的"#)
+                && !body.contains(r#""content":"我需要"#),
+            "thinking text must not leak as streamed content: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn json_object_remains_best_effort_not_strict_validation() {
         let request = chat_request(json!({
             "response_format": {"type": "json_object"}
@@ -6034,6 +6275,18 @@ mod tests {
 
         validate_chat_request(&request).expect("non-strict schema should not boundary reject");
         let internal = convert_chat_request(&request).expect("convert non-strict schema");
+        assert!(
+            internal
+                .prompt
+                .contains("response_format requires a single valid JSON object"),
+            "response_format instruction should reach the model prompt: {}",
+            internal.prompt
+        );
+        assert!(
+            internal.prompt.contains("\"oneOf\""),
+            "schema should reach the model prompt: {}",
+            internal.prompt
+        );
         assert_eq!(
             internal.sampling_params.response_format,
             ferrum_types::ResponseFormat::Text,
@@ -6048,6 +6301,64 @@ mod tests {
                 .and_then(|format| format.json_schema.as_ref())
                 .and_then(|schema| schema.strict),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn json_object_response_format_instruction_reaches_model_prompt() {
+        let request = chat_request(json!({
+            "response_format": {"type": "json_object"}
+        }));
+
+        let internal = convert_chat_request(&request).expect("convert json_object");
+        assert!(
+            internal
+                .prompt
+                .contains("response_format requires a single valid JSON object"),
+            "response_format instruction should reach the model prompt: {}",
+            internal.prompt
+        );
+        assert!(
+            internal.prompt.contains("Output only JSON"),
+            "JSON-only instruction should reach the model prompt: {}",
+            internal.prompt
+        );
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+            "json_object response_format should use prompt instruction and final JSON cleanup, not engine-wide JSON soft bias"
+        );
+    }
+
+    #[test]
+    fn strict_json_schema_response_format_uses_text_sampling_mode() {
+        let request = chat_request(json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"]
+                    }
+                }
+            }
+        }));
+
+        let internal = convert_chat_request(&request).expect("convert strict json_schema");
+        assert!(
+            internal
+                .prompt
+                .contains("response_format requires a single valid JSON object"),
+            "response_format instruction should reach the model prompt: {}",
+            internal.prompt
+        );
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+            "strict json_schema is validated after generation instead of applying JSON soft bias during Qwen3 thinking"
         );
     }
 
@@ -6083,6 +6394,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_json_schema_validates_non_streaming_response_after_reasoning_block() {
+        let request = chat_request(json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"]
+                    }
+                }
+            }
+        }));
+        let response = chat_completions_handler(
+            State(state_with_stub(
+                "<think>\nreasoning\n</think>\n\n{\"answer\":\"yes\"}",
+            )),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect("strict response with reasoning");
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "{\"answer\":\"yes\"}"
+        );
+        assert_eq!(body["choices"][0]["message"]["reasoning"], "\nreasoning\n");
+    }
+
+    #[tokio::test]
     async fn strict_json_schema_validates_streaming_final_response() {
         let response = post_json(
             router_with_stub("{\"answer\":\"yes\"}"),
@@ -6112,6 +6457,51 @@ mod tests {
         assert!(
             body.contains("\\\"answer\\\":\\\"yes\\\""),
             "strict streaming content missing: {body}"
+        );
+        assert!(
+            !body.contains("\"error\""),
+            "valid strict streaming response should not emit error: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_json_schema_validates_streaming_final_response_after_reasoning_block() {
+        let response = post_json(
+            router_with_stub_stream_chunks(&[
+                "<think>\nreasoning",
+                "\n</think>\n\n",
+                "{\"answer\":\"yes\"}",
+            ]),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Return an answer object."}],
+                "stream": true,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "strict": true,
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "string"}},
+                            "required": ["answer"]
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains("\\\"answer\\\":\\\"yes\\\""),
+            "strict streaming content missing: {body}"
+        );
+        assert!(
+            body.contains(r#""reasoning":"\nreasoning\n""#),
+            "strict streaming should keep reasoning separate: {body}"
         );
         assert!(
             !body.contains("\"error\""),

@@ -90,8 +90,8 @@ impl LoraLinearRef {
             for r in 0..self.rank {
                 let mut acc = 0.0f32;
                 for i in 0..self.in_features {
-                    acc += input[m * self.in_features + i]
-                        * self.a_weight[r * self.in_features + i];
+                    acc +=
+                        input[m * self.in_features + i] * self.a_weight[r * self.in_features + i];
                 }
                 low_rank[m * self.rank + r] = acc;
             }

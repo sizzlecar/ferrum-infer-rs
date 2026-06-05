@@ -298,11 +298,20 @@ fn parse_tool_call_value(
         return None;
     }
     let function = value.get("function").unwrap_or(value);
-    let name = function.get("name").and_then(|value| value.as_str())?;
+    let name = function
+        .as_str()
+        .or_else(|| function.get("name").and_then(|value| value.as_str()))
+        .or_else(|| value.get("name").and_then(|value| value.as_str()))?;
     if !api_tool_name_allowed(chat_request, name) {
         return None;
     }
-    let arguments = api_arguments_to_string(function.get("arguments"));
+    let arguments = api_arguments_to_string(
+        function
+            .get("arguments")
+            .or_else(|| function.get("parameters"))
+            .or_else(|| value.get("arguments"))
+            .or_else(|| value.get("parameters")),
+    );
     let id = value
         .get("id")
         .and_then(|value| value.as_str())
@@ -324,7 +333,7 @@ fn parse_forced_tool_arguments_value(
     index: usize,
     chat_request: &ApiChatRequest,
 ) -> Option<ApiToolCall> {
-    let name = forced_tool_choice_name(chat_request)?;
+    let tool = unwrapped_tool_arguments_target(chat_request, value)?;
     if value.get("tool_calls").is_some()
         || value.get("tool_call").is_some()
         || value.get("function").is_some()
@@ -337,10 +346,58 @@ fn parse_forced_tool_arguments_value(
         id: format!("call_{index}"),
         tool_type: "function".to_string(),
         function: ApiFunctionCall {
-            name: name.to_string(),
+            name: tool.function.name.clone(),
             arguments: serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()),
         },
     })
+}
+
+fn unwrapped_tool_arguments_target<'a>(
+    chat_request: &'a ApiChatRequest,
+    value: &serde_json::Value,
+) -> Option<&'a ApiTool> {
+    if let Some(name) = forced_tool_choice_name(chat_request) {
+        return chat_request
+            .tools
+            .iter()
+            .find(|tool| tool.tool_type == "function" && tool.function.name == name);
+    }
+
+    if matches!(
+        chat_request.tool_choice.as_ref(),
+        Some(ApiToolChoice::Mode(mode)) if !mode.eq_ignore_ascii_case("auto")
+    ) {
+        return None;
+    }
+
+    let mut function_tools = chat_request
+        .tools
+        .iter()
+        .filter(|tool| tool.tool_type == "function");
+    let tool = function_tools.next()?;
+    if function_tools.next().is_some() || !value_looks_like_tool_arguments(value, tool) {
+        return None;
+    }
+    Some(tool)
+}
+
+fn value_looks_like_tool_arguments(value: &serde_json::Value, tool: &ApiTool) -> bool {
+    let Some(arguments) = value.as_object() else {
+        return false;
+    };
+    if arguments.is_empty() {
+        return false;
+    }
+    let Some(properties) = tool
+        .function
+        .parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get("properties"))
+        .and_then(|properties| properties.as_object())
+    else {
+        return false;
+    };
+    arguments.keys().all(|key| properties.contains_key(key))
 }
 
 fn forced_tool_choice_name(chat_request: &ApiChatRequest) -> Option<&str> {
@@ -351,9 +408,10 @@ fn forced_tool_choice_name(chat_request: &ApiChatRequest) -> Option<&str> {
         }) if tool_type == "function" && api_tool_name_allowed(chat_request, &function.name) => {
             Some(function.name.as_str())
         }
-        Some(ApiToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required") => {
-            chat_request.tools.first().map(|tool| tool.function.name.as_str())
-        }
+        Some(ApiToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required") => chat_request
+            .tools
+            .first()
+            .map(|tool| tool.function.name.as_str()),
         _ => None,
     }
 }

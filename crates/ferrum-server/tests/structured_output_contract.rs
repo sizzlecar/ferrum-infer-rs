@@ -240,7 +240,10 @@ async fn structured_output_stream_buffers_until_valid_strict_json() {
         .iter()
         .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
         .collect::<String>();
-    assert_eq!(serde_json::from_str::<Value>(&content).unwrap()["answer"], "ok");
+    assert_eq!(
+        serde_json::from_str::<Value>(&content).unwrap()["answer"],
+        "ok"
+    );
     let usage_chunks = chunks
         .iter()
         .filter(|chunk| chunk.get("usage").is_some_and(|usage| !usage.is_null()))

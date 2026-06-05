@@ -21,7 +21,10 @@ fn ferrum_bin() -> PathBuf {
         return PathBuf::from(bin);
     }
     let current = std::env::current_exe().expect("test exe path");
-    let dir = current.parent().and_then(|p| p.parent()).expect("target dir");
+    let dir = current
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("target dir");
     let mut bin = dir.join("ferrum");
     if cfg!(windows) {
         bin.set_extension("exe");
@@ -56,7 +59,14 @@ impl ServerFixture {
         let log_path = unique_log_path("structured-output-server");
         let log = fs::File::create(&log_path).expect("create server log");
         let child = Command::new(ferrum_bin())
-            .args(["serve", SMOKE_MODEL, "--host", "127.0.0.1", "--port", &port.to_string()])
+            .args([
+                "serve",
+                SMOKE_MODEL,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
             .env("NO_COLOR", "1")
             .stdout(Stdio::from(log.try_clone().expect("clone server log")))
             .stderr(Stdio::from(log))
@@ -100,7 +110,13 @@ impl Drop for ServerFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Ok(text) = fs::read_to_string(&self.log_path) {
-            for bad in ["panicked", "KV cache overflow", "failed to render model chat template", "<unk>", "[PAD]"] {
+            for bad in [
+                "panicked",
+                "KV cache overflow",
+                "failed to render model chat template",
+                "<unk>",
+                "[PAD]",
+            ] {
                 assert!(!text.contains(bad), "server log contains {bad}: {text}");
             }
         }
@@ -180,7 +196,10 @@ async fn g2_structured_output_real_model_smoke() {
             .unwrap_or_else(|| panic!("missing content iteration {i}: {body}"));
         let parsed: Value = serde_json::from_str(content)
             .unwrap_or_else(|e| panic!("invalid JSON iteration {i}: {content:?}: {e}"));
-        assert!(parsed["answer"].as_str().is_some(), "iteration {i}: {parsed}");
+        assert!(
+            parsed["answer"].as_str().is_some(),
+            "iteration {i}: {parsed}"
+        );
     }
 
     let stream = client
@@ -207,7 +226,10 @@ async fn g2_structured_output_real_model_smoke() {
         .collect::<String>();
     let parsed: Value = serde_json::from_str(&content)
         .unwrap_or_else(|e| panic!("stream emitted invalid JSON content {content:?}: {e}"));
-    assert!(parsed["answer"].as_str().is_some(), "stream parsed: {parsed}");
+    assert!(
+        parsed["answer"].as_str().is_some(),
+        "stream parsed: {parsed}"
+    );
     let usage_chunks = chunks
         .iter()
         .filter(|chunk| chunk.get("usage").is_some_and(|usage| !usage.is_null()))

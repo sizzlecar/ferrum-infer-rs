@@ -24,11 +24,8 @@ fn lora_linear_ref_matches_manual_f32() {
 
     let expected = vec![
         // row 0: base=[2, 2.5], A=[4, -1], B(A)=[9, 0.5], scale=2
-        20.0,
-        3.5,
-        // row 1: base=[-2, 2.25], A=[1, -1.5], B(A)=[3.5, -1.75]
-        5.0,
-        -2.25,
+        20.0, 3.5, // row 1: base=[-2, 2.25], A=[1, -1.5], B(A)=[3.5, -1.75]
+        5.0, -2.25,
     ];
     for (idx, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
         assert!(

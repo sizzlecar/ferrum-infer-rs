@@ -14,7 +14,11 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
     out
 }
 
-fn write_adapter(dir: &Path, config: &LoraAdapterConfig, tensors: Vec<(&str, Vec<usize>, Vec<f32>)>) {
+fn write_adapter(
+    dir: &Path,
+    config: &LoraAdapterConfig,
+    tensors: Vec<(&str, Vec<usize>, Vec<f32>)>,
+) {
     std::fs::write(
         dir.join("adapter_config.json"),
         serde_json::to_vec_pretty(config).unwrap(),
@@ -31,8 +35,12 @@ fn write_adapter(dir: &Path, config: &LoraAdapterConfig, tensors: Vec<(&str, Vec
             )
         })
         .collect();
-    serialize_to_file(encoded, &None::<HashMap<String, String>>, &dir.join("adapter_model.safetensors"))
-        .unwrap();
+    serialize_to_file(
+        encoded,
+        &None::<HashMap<String, String>>,
+        &dir.join("adapter_model.safetensors"),
+    )
+    .unwrap();
 }
 
 fn valid_config() -> LoraAdapterConfig {

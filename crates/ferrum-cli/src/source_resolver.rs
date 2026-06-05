@@ -65,7 +65,7 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
 /// (dense vs MoE — works for both GGUF files and safetensors snapshot
 /// dirs) and materializes missing compatibility env vars for:
 ///
-///   - `FERRUM_KV_CAPACITY`     — 8192 dense / 2048 MoE
+///   - `FERRUM_KV_CAPACITY`     — 8192 dense / 4096 MoE
 ///   - `FERRUM_METAL_PAGED_KV`  — 0 dense GGUF / 1 dense safetensors / 1 MoE.
 ///     Paged-KV is a hard requirement for the Qwen3-MoE GPU dispatch path
 ///     (without it decode emits ~0.1 tok/s of garbage on Metal). Dense
@@ -112,13 +112,22 @@ pub fn chat_profile_runtime_entries(
             .map(|e| e.eq_ignore_ascii_case("gguf"))
             .unwrap_or(false);
     let is_moe = detect_moe_arch(snapshot_path);
+    chat_profile_runtime_entries_for_arch(is_gguf, is_moe, current, source)
+}
+
+fn chat_profile_runtime_entries_for_arch(
+    is_gguf: bool,
+    is_moe: bool,
+    current: &RuntimeConfigSnapshot,
+    source: RuntimeConfigSource,
+) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
 
     push_missing_entry(
         &mut entries,
         current,
         "FERRUM_KV_CAPACITY",
-        if is_moe { "2048" } else { "8192" },
+        if is_moe { "4096" } else { "8192" },
         source,
     );
     // Dense GGUF: contig path works, no need to allocate the pool.
@@ -133,7 +142,8 @@ pub fn chat_profile_runtime_entries(
     );
     // Single-user REPL pool sizing — dense safetensors keeps a spare
     // sequence, while MoE uses one long interactive session. Keeping MoE at
-    // 512 tokens overflows after a few normal Qwen3-30B-A3B turns.
+    // 2048 tokens forces Qwen3-30B-A3B thinking-mode chats to shrink answers
+    // after a few turns.
     if !is_gguf || is_moe {
         for (k, v) in [
             ("FERRUM_PAGED_MAX_SEQS", if is_moe { "1" } else { "2" }),
@@ -767,7 +777,7 @@ mod tests {
 
         assert_eq!(
             value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
-            Some("2048")
+            Some("4096")
         );
         assert_eq!(
             value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
@@ -783,6 +793,30 @@ mod tests {
             Some("2")
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_profile_defaults_moe_gguf_as_typed_entries() {
+        let entries = chat_profile_runtime_entries_for_arch(
+            true,
+            true,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
+            Some("4096")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("1")
+        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::config::CliConfig;
 use chrono::Utc;
 use clap::{Args, ValueEnum};
 use colored::*;
+use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::{ModelChatTemplate, PromptMessage};
 use ferrum_types::{
@@ -11,8 +12,13 @@ use ferrum_types::{
     RuntimeConfigSnapshot, SamplingParams,
 };
 use futures::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
+#[cfg(unix)]
+use std::mem;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -175,9 +181,9 @@ pub struct RunCommand {
     pub max_tokens: u32,
 
     /// Disable CLI context shift. By default, `ferrum run` keeps the REPL
-    /// alive by dropping the oldest history when the rendered prompt no
-    /// longer fits the KV cache, and clamps this turn's max output tokens to
-    /// the remaining context budget.
+    /// alive by dropping the oldest history before shrinking this turn's output
+    /// budget, then clamps only when the current turn itself leaves too little
+    /// room in KV.
     #[arg(long)]
     pub no_context_shift: bool,
 
@@ -443,8 +449,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     // If stdin is not a TTY (piped input), don't print prompts and just consume lines.
     // This enables: `printf "hi\n/bye\n" | ferrum run ...` for automation/profiling.
-    let stdin_is_tty = io::stdin().is_terminal();
-    let mut stdin = io::stdin().lock();
+    let stdin_handle = io::stdin();
+    let stdin_is_tty = stdin_handle.is_terminal();
+    let term = stdin_is_tty.then(Term::stdout);
+    let mut stdin = stdin_handle.lock();
 
     loop {
         if stdin_is_tty {
@@ -455,7 +463,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
         // Read input
         let mut input = String::new();
-        match stdin.read_line(&mut input) {
+        match read_repl_input_line(term.as_ref(), &mut stdin, &mut input) {
             Ok(0) => break, // EOF
             Ok(_) => {
                 let input = input.trim();
@@ -526,13 +534,33 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 .is_some();
                 let (clean_response, finish_reason, token_count, chunk_count) = match format {
                     OutputFormat::Text => {
-                        let mut stream = engine.infer_stream(request).await?;
+                        let mut first_token_indicator = start_first_token_indicator(stdin_is_tty);
+                        let mut stream = match engine.infer_stream(request).await {
+                            Ok(stream) => stream,
+                            Err(e) => {
+                                clear_first_token_indicator(&mut first_token_indicator);
+                                return Err(e);
+                            }
+                        };
                         let mut raw_response_text = String::new();
                         let mut finish_reason = None;
                         let mut token_count = 0usize;
                         let mut chunk_count = 0usize;
                         while let Some(chunk) = stream.next().await {
-                            let chunk = chunk?;
+                            let chunk = match chunk {
+                                Ok(chunk) => chunk,
+                                Err(e) => {
+                                    clear_first_token_indicator(&mut first_token_indicator);
+                                    return Err(e);
+                                }
+                            };
+                            if first_token_indicator.is_some()
+                                && (!chunk.text.is_empty()
+                                    || chunk.token.is_some()
+                                    || chunk.finish_reason.is_some())
+                            {
+                                clear_first_token_indicator(&mut first_token_indicator);
+                            }
                             if trace_tokens {
                                 if let Some(token) = chunk.token {
                                     eprintln!(
@@ -558,6 +586,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                                 finish_reason = chunk.finish_reason;
                             }
                         }
+                        clear_first_token_indicator(&mut first_token_indicator);
                         (
                             display_response_text(&raw_response_text),
                             finish_reason,
@@ -634,6 +663,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 }
                 turn += 1;
             }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                exit_reason = "interrupt";
+                break;
+            }
             Err(e) => {
                 eprintln!("{} {}", "Error reading input:".red(), e);
                 exit_reason = "read_error";
@@ -652,6 +685,177 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     }
     engine.shutdown().await?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn read_repl_input_line<R: BufRead + AsRawFd>(
+    term: Option<&Term>,
+    stdin: &mut R,
+    input: &mut String,
+) -> io::Result<usize> {
+    if let Some(term) = term {
+        let Some(line) = read_tty_input_line(term, stdin)? else {
+            return Ok(0);
+        };
+        input.push_str(&line);
+        return Ok(input.len().max(1));
+    }
+    stdin.read_line(input)
+}
+
+#[cfg(not(unix))]
+fn read_repl_input_line<R: BufRead>(
+    term: Option<&Term>,
+    stdin: &mut R,
+    input: &mut String,
+) -> io::Result<usize> {
+    if let Some(term) = term {
+        let Some(line) = read_tty_input_line(term)? else {
+            return Ok(0);
+        };
+        input.push_str(&line);
+        return Ok(input.len().max(1));
+    }
+    stdin.read_line(input)
+}
+
+#[cfg(unix)]
+struct RawModeGuard {
+    fd: RawFd,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl RawModeGuard {
+    fn new(fd: RawFd) -> io::Result<Self> {
+        let mut termios = mem::MaybeUninit::uninit();
+        if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let original = unsafe { termios.assume_init() };
+        let mut raw = original;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        raw.c_oflag = original.c_oflag;
+        if unsafe { libc::tcsetattr(fd, libc::TCSADRAIN, &raw) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd, original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSADRAIN, &self.original);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_tty_input_line<R: AsRawFd>(term: &Term, stdin: &mut R) -> io::Result<Option<String>> {
+    let _raw_mode = RawModeGuard::new(stdin.as_raw_fd())?;
+    let mut chars: Vec<char> = Vec::new();
+    loop {
+        match term.read_key_raw()? {
+            Key::Backspace => {
+                if let Some(ch) = chars.pop() {
+                    let width = measure_text_width(&ch.to_string());
+                    if width > 0 {
+                        term.clear_chars(width)?;
+                    }
+                    term.flush()?;
+                }
+            }
+            Key::Char('\u{4}') => {
+                term.write_str("\n")?;
+                term.flush()?;
+                if chars.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            Key::CtrlC | Key::Char('\u{3}') => {
+                term.write_str("^C\n")?;
+                term.flush()?;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
+            }
+            Key::Enter => {
+                term.write_str("\n")?;
+                term.flush()?;
+                break;
+            }
+            Key::Char(ch) if !ch.is_ascii_control() => {
+                chars.push(ch);
+                term.write_str(&ch.to_string())?;
+                term.flush()?;
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(chars.into_iter().collect()))
+}
+
+#[cfg(not(unix))]
+fn read_tty_input_line(term: &Term) -> io::Result<Option<String>> {
+    let mut chars: Vec<char> = Vec::new();
+    loop {
+        match term.read_key()? {
+            Key::Backspace => {
+                if let Some(ch) = chars.pop() {
+                    let width = measure_text_width(&ch.to_string());
+                    if width > 0 {
+                        term.clear_chars(width)?;
+                    }
+                    term.flush()?;
+                }
+            }
+            Key::Char('\u{4}') => {
+                term.write_str("\n")?;
+                term.flush()?;
+                if chars.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            Key::CtrlC | Key::Char('\u{3}') => {
+                term.write_str("^C\n")?;
+                term.flush()?;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
+            }
+            Key::Enter => {
+                term.write_str("\n")?;
+                term.flush()?;
+                break;
+            }
+            Key::Char(ch) if !ch.is_ascii_control() => {
+                chars.push(ch);
+                term.write_str(&ch.to_string())?;
+                term.flush()?;
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(chars.into_iter().collect()))
+}
+
+fn start_first_token_indicator(enabled: bool) -> Option<ProgressBar> {
+    if !enabled {
+        return None;
+    }
+    let progress = ProgressBar::new_spinner();
+    let style = ProgressStyle::with_template("{spinner} Working ({elapsed})")
+        .unwrap_or_else(|_| ProgressStyle::default_spinner());
+    progress.set_style(style);
+    progress.enable_steady_tick(std::time::Duration::from_millis(120));
+    progress.tick();
+    Some(progress)
+}
+
+fn clear_first_token_indicator(progress: &mut Option<ProgressBar>) {
+    if let Some(progress) = progress.take() {
+        progress.finish_and_clear();
+    }
 }
 
 fn runtime_config_bool(snapshot: &RuntimeConfigSnapshot, key: &str) -> Option<bool> {
@@ -768,6 +972,10 @@ fn build_run_prompt_plan(
 
         if prompt_tokens < kv_capacity {
             let remaining = kv_capacity - prompt_tokens;
+            if base_sampling.max_tokens > remaining && history_start < history.len() {
+                history_start = next_context_shift_history_start(history, history_start);
+                continue;
+            }
             let mut sampling_params = base_sampling.clone();
             let max_tokens_clamped_from = if sampling_params.max_tokens > remaining {
                 let old = sampling_params.max_tokens;
@@ -1312,6 +1520,25 @@ mod tests {
         assert_eq!(plan.dropped_history_messages, 2);
         assert_eq!(plan.dropped_history_turns, 1);
         assert!(plan.prompt_tokens.unwrap() < 64);
+    }
+
+    #[test]
+    fn context_shift_drops_history_before_clamping_output_budget() {
+        let mut cmd = test_run_cmd();
+        cmd.max_tokens = 32;
+        let budget = whitespace_budget(64);
+        let medium = std::iter::repeat_n("old", 12).collect::<Vec<_>>().join(" ");
+        let history = vec![
+            ("user".to_string(), medium.clone()),
+            ("assistant".to_string(), medium),
+        ];
+        let plan = build_run_prompt_plan(&history, "demo", None, "tinyllama", None, &cmd, &budget)
+            .unwrap();
+
+        assert_eq!(plan.dropped_history_messages, 2);
+        assert_eq!(plan.dropped_history_turns, 1);
+        assert_eq!(plan.max_tokens_clamped_from, None);
+        assert_eq!(plan.sampling_params.max_tokens, 32);
     }
 
     #[test]

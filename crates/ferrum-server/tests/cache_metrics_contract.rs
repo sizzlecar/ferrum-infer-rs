@@ -183,7 +183,9 @@ fn metric_value(metrics: &str, name: &str) -> f64 {
         .filter(|line| !line.starts_with('#'))
         .find_map(|line| {
             let mut parts = line.split_whitespace();
-            (parts.next()? == name).then(|| parts.next()?.parse::<f64>().ok()).flatten()
+            (parts.next()? == name)
+                .then(|| parts.next()?.parse::<f64>().ok())
+                .flatten()
         })
         .unwrap_or_else(|| panic!("missing metric {name}:\n{metrics}"))
 }

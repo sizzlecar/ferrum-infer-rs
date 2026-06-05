@@ -21,7 +21,10 @@ fn ferrum_bin() -> PathBuf {
         return PathBuf::from(bin);
     }
     let current = std::env::current_exe().expect("test exe path");
-    let dir = current.parent().and_then(|p| p.parent()).expect("target dir");
+    let dir = current
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("target dir");
     let mut bin = dir.join("ferrum");
     if cfg!(windows) {
         bin.set_extension("exe");
@@ -56,7 +59,14 @@ impl ServerFixture {
         let log_path = unique_log_path("agent-tools-server");
         let log = fs::File::create(&log_path).expect("create server log");
         let child = Command::new(ferrum_bin())
-            .args(["serve", SMOKE_MODEL, "--host", "127.0.0.1", "--port", &port.to_string()])
+            .args([
+                "serve",
+                SMOKE_MODEL,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
             .env("NO_COLOR", "1")
             .stdout(Stdio::from(log.try_clone().expect("clone server log")))
             .stderr(Stdio::from(log))
@@ -100,7 +110,13 @@ impl Drop for ServerFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Ok(text) = fs::read_to_string(&self.log_path) {
-            for bad in ["panicked", "KV cache overflow", "failed to render model chat template", "<unk>", "[PAD]"] {
+            for bad in [
+                "panicked",
+                "KV cache overflow",
+                "failed to render model chat template",
+                "<unk>",
+                "[PAD]",
+            ] {
                 assert!(!text.contains(bad), "server log contains {bad}: {text}");
             }
         }
@@ -191,7 +207,10 @@ async fn g2_agent_tools_real_model_smoke() {
             .unwrap_or_else(|e| panic!("post tool iteration {i}: {e}"));
         assert_eq!(response.status(), 200, "iteration {i}");
         let body: Value = response.json().await.expect("tool json");
-        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls", "iteration {i}: {body}");
+        assert_eq!(
+            body["choices"][0]["finish_reason"], "tool_calls",
+            "iteration {i}: {body}"
+        );
         let call = &body["choices"][0]["message"]["tool_calls"][0];
         assert_eq!(call["type"], "function", "iteration {i}: {body}");
         assert_eq!(call["function"]["name"], "calc", "iteration {i}: {body}");
@@ -223,11 +242,15 @@ async fn g2_agent_tools_real_model_smoke() {
     let (chunks, done) = parse_sse(&stream_body);
     assert_eq!(done, 1, "stream body: {stream_body}");
     assert!(
-        chunks.iter().any(|chunk| chunk["choices"][0]["delta"].get("tool_calls").is_some()),
+        chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["delta"].get("tool_calls").is_some()),
         "missing tool_calls delta: {stream_body}"
     );
     assert!(
-        chunks.iter().any(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls"),
+        chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls"),
         "missing tool_calls finish: {stream_body}"
     );
 }
