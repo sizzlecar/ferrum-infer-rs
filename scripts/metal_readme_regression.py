@@ -15,6 +15,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CHAT_CHECK_MAX_TOKENS = 1024
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,7 @@ class ModelCase:
     key: str
     label: str
     gguf: str
+    tokenizer: str
     moe: bool
     cells: tuple[Cell, ...]
 
@@ -49,6 +52,7 @@ CASES = (
         key="llama31_8b",
         label="Llama-3.1-8B",
         gguf="Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        tokenizer="Meta-Llama-3.1-8B-Instruct.tokenizer.json",
         moe=False,
         cells=(
             Cell(concurrency=1, prompts=8, baseline_tps=29.1),
@@ -60,6 +64,7 @@ CASES = (
         key="qwen3_8b",
         label="Qwen3-8B",
         gguf="Qwen3-8B-Q4_K_M.gguf",
+        tokenizer="Qwen3-8B.tokenizer.json",
         moe=False,
         cells=(Cell(concurrency=16, prompts=32, baseline_tps=93.2),),
     ),
@@ -67,6 +72,7 @@ CASES = (
         key="qwen3_30b_a3b",
         label="Qwen3-30B-A3B",
         gguf="Qwen3-30B-A3B-Q4_K_M.gguf",
+        tokenizer="Qwen3-30B-A3B.tokenizer.json",
         moe=True,
         cells=(Cell(concurrency=16, prompts=32, baseline_tps=72.5),),
     ),
@@ -132,6 +138,10 @@ def start_server(
     out_dir: Path,
 ) -> subprocess.Popen[str]:
     env = os.environ.copy()
+    needed_seqs = max((cell.concurrency for cell in case.cells), default=1)
+    current_seqs = int(env.get("FERRUM_PAGED_MAX_SEQS", "0") or "0")
+    env["FERRUM_PAGED_MAX_SEQS"] = str(max(current_seqs, needed_seqs))
+    env.setdefault("FERRUM_METAL_PAGED_KV", "1")
     stdout = (out_dir / f"{case.key}.server.stdout").open("w", encoding="utf-8")
     stderr = (out_dir / f"{case.key}.server.stderr").open("w", encoding="utf-8")
     proc = subprocess.Popen(
@@ -440,27 +450,30 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 "content": "What is the capital of France? Reply with just the city name.",
             }
         ],
-        "max_tokens": 256,
-        "temperature": 0,
+        "max_tokens": CHAT_CHECK_MAX_TOKENS,
         "stream": False,
     }
     status, body = post_json(base, paris_payload)
     write(out_dir / f"{case.key}.paris_payload.json", json.dumps(paris_payload, indent=2))
     write(out_dir / f"{case.key}.paris_response.json", body)
     content = ""
+    finish_reason = None
     try:
-        content = json.loads(body)["choices"][0]["message"]["content"]
+        parsed = json.loads(body)
+        content = parsed["choices"][0]["message"]["content"]
+        finish_reason = parsed["choices"][0].get("finish_reason")
     except Exception:
         content = body[:300]
-    paris_pass = status == 200 and "paris" in content.lower()
+    paris_pass = status == 200 and finish_reason != "length" and "paris" in content.lower()
     result["paris"] = {
         "status": status,
         "passed": paris_pass,
         "content": content,
+        "finish_reason": finish_reason,
     }
     write(
         out_dir / f"{case.key}.paris_verdict.txt",
-        f"content={content}\npassed={str(paris_pass).lower()}\n",
+        f"content={content}\nfinish_reason={finish_reason}\npassed={str(paris_pass).lower()}\n",
     )
 
     multiturn_payload = {
@@ -480,8 +493,7 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 "content": "刚才暗号是什么？只回答暗号。",
             },
         ],
-        "max_tokens": 512,
-        "temperature": 0,
+        "max_tokens": CHAT_CHECK_MAX_TOKENS,
         "stream": False,
     }
     status, body = post_json(base, multiturn_payload)
@@ -491,19 +503,23 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
     )
     write(out_dir / f"{case.key}.multiturn_response.json", body)
     content = ""
+    finish_reason = None
     try:
-        content = json.loads(body)["choices"][0]["message"]["content"]
+        parsed = json.loads(body)
+        content = parsed["choices"][0]["message"]["content"]
+        finish_reason = parsed["choices"][0].get("finish_reason")
     except Exception:
         content = body[:300]
-    multiturn_pass = status == 200 and "蓝色月亮" in content
+    multiturn_pass = status == 200 and finish_reason != "length" and "蓝色月亮" in content
     result["multiturn"] = {
         "status": status,
         "passed": multiturn_pass,
         "content": content,
+        "finish_reason": finish_reason,
     }
     write(
         out_dir / f"{case.key}.multiturn_verdict.txt",
-        f"content={content}\npassed={str(multiturn_pass).lower()}\n",
+        f"content={content}\nfinish_reason={finish_reason}\npassed={str(multiturn_pass).lower()}\n",
     )
 
     stream_payload = {
@@ -511,11 +527,10 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
         "messages": [
             {
                 "role": "user",
-                "content": "你好，请用一句中文打招呼。",
+                "content": "请用一句话打招呼，必须包含“你好”。",
             }
         ],
-        "max_tokens": 96,
-        "temperature": 0,
+        "max_tokens": CHAT_CHECK_MAX_TOKENS,
         "stream": True,
     }
     stream_chunks = 0
@@ -572,33 +587,48 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
 
 
 def run_bench_cell(
-    bench_py: Path,
+    ferrum_bin: Path,
     port: int,
     case: ModelCase,
     cell: Cell,
     out_dir: Path,
+    tokenizers_dir: Path,
     timeout_sec: int,
 ) -> dict[str, Any]:
     prefix = f"{case.key}.c{cell.concurrency}"
     result_file = out_dir / f"{prefix}.json"
     log_file = out_dir / f"{prefix}.bench.log"
     write(out_dir / f"{prefix}.swap_before.txt", swapusage() + "\n")
+    token_dir = out_dir / f"{case.key}.tokenizer"
+    token_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(tokenizers_dir / case.tokenizer, token_dir / "tokenizer.json")
     cmd = [
-        sys.executable,
-        str(bench_py),
+        str(ferrum_bin),
+        "bench-serve",
         "--base-url",
         f"http://127.0.0.1:{port}",
         "--model",
         case.label,
+        "--tokenizer",
+        str(token_dir),
         "--num-prompts",
         str(cell.prompts),
-        "--max-concurrency",
+        "--concurrency",
         str(cell.concurrency),
-        "--max-tokens",
+        "--random-input-len",
         "64",
-        "--ignore-eos",
-        "--deterministic-prompts",
-        "--result-file",
+        "--random-output-len",
+        "64",
+        "--warmup-requests",
+        "1",
+        "--n-repeats",
+        "1",
+        "--fail-on-error",
+        "--seed",
+        "9271",
+        "--output",
+        "json",
+        "--out",
         str(result_file),
     ]
     row: dict[str, Any] = {
@@ -643,9 +673,10 @@ def run_bench_cell(
         write(out_dir / f"{prefix}.swap_after.txt", swapusage() + "\n")
     if result_file.is_file():
         data = json.loads(result_file.read_text(encoding="utf-8"))
-        tps = data.get("output_throughput_tok_s")
-        completed = data.get("completed")
-        failed = data.get("failed")
+        tps_stat = data.get("output_throughput_tps") or {}
+        tps = tps_stat.get("mean") if isinstance(tps_stat, dict) else None
+        completed = sum(data.get("completed_per_run") or [])
+        failed = sum(data.get("errored_per_run") or [])
         ratio = tps / cell.baseline_tps if isinstance(tps, (int, float)) else None
         row.update(
             {
@@ -667,7 +698,7 @@ def run_bench_cell(
 
 
 def markdown_summary(report: dict[str, Any]) -> str:
-    out = ["# Metal README Regression - 2026-06-02", ""]
+    out = ["# Metal README Regression - 2026-06-03", ""]
     out.append("Scope: README Apple Silicon rows with correctness, multi-turn, concurrency throughput, and swap evidence.")
     out.append("")
     out.append(f"Ferrum: `{report['ferrum_version'].strip()}`")
@@ -711,7 +742,7 @@ def markdown_summary(report: dict[str, Any]) -> str:
     out.append("")
     out.append("Notes:")
     out.append("- Performance gate is `current >= 0.90 * README baseline`, plus all requests completed.")
-    out.append("- Throughput cells request `ignore_eos=true` and streaming usage so runs are max-token and token-count comparable to the README harness.")
+    out.append("- Throughput cells use canonical `ferrum bench-serve` with streaming usage token accounting.")
     out.append("- `run` coverage includes JSONL multi-turn plus default text-mode long multi-turn to catch streaming and KV overflow regressions.")
     out.append("- This runner records correctness failures and still collects performance data.")
     out.append("- Active swap means results are release-regression evidence, not clean marketing numbers.")
@@ -723,7 +754,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--ferrum-bin", type=Path, default=ROOT / "target/release/ferrum")
     parser.add_argument("--models-dir", type=Path, default=Path("/Users/chejinxuan/ferrum-bench/models"))
-    parser.add_argument("--bench-py", type=Path, default=ROOT / "bench/scripts/bench_serving.py")
+    parser.add_argument("--tokenizers-dir", type=Path, default=Path("/Users/chejinxuan/ferrum-bench/tokenizers"))
     parser.add_argument("--port", type=int, default=18181)
     parser.add_argument("--bench-timeout-sec", type=int, default=300)
     parser.add_argument("--run-timeout-sec", type=int, default=300)
@@ -766,11 +797,12 @@ def main() -> int:
                 for cell in case.cells:
                     model_report["cells"].append(
                         run_bench_cell(
-                            args.bench_py,
+                            args.ferrum_bin,
                             args.port,
                             case,
                             cell,
                             args.out,
+                            args.tokenizers_dir,
                             args.bench_timeout_sec,
                         )
                     )

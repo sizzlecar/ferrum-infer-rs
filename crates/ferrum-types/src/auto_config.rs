@@ -730,19 +730,25 @@ impl FerrumConfigBuilder {
         if fa2_source && !self.hardware.compiled_features.fa2_source {
             return self.invalid(
                 "FERRUM_FA2_SOURCE",
-                "source-built FA2 support is not compiled",
+                "source-linked FA2 support is not compiled",
             );
         }
         if fa2_source && !self.is_cuda_backend() {
             return self.invalid(
                 "FERRUM_FA2_SOURCE",
-                "source-built FA2 requires CUDA backend",
+                "source-linked FA2 requires CUDA backend",
+            );
+        }
+        if fa2_source && !use_vllm_paged_attn {
+            return self.invalid(
+                "FERRUM_FA2_SOURCE",
+                "source-linked FA2 requires vLLM paged attention layout",
             );
         }
         if fa2_source && self.cuda_compute_capability_at_least(8, 0) == Some(false) {
             return self.invalid(
                 "FERRUM_FA2_SOURCE",
-                "source-built FA2 requires CUDA compute capability >= 8.0",
+                "source-linked FA2 requires CUDA compute capability >= 8.0",
             );
         }
         if fa2_direct_ffi && !self.hardware.compiled_features.fa2_direct_ffi {
@@ -962,7 +968,7 @@ impl FerrumConfigBuilder {
             self.rejected_except(
                 selected,
                 [
-                    ("fa2_source", "source-built FA2 not selected"),
+                    ("fa2_source", "source-linked FA2 path not selected"),
                     ("fa2_direct_ffi", "diagnostic direct FFI shim not selected"),
                     ("fa_layout_varlen", "FA-compatible layout not selected"),
                     ("vllm_paged_varlen", "vLLM paged varlen bridge not selected"),
@@ -1440,19 +1446,24 @@ mod tests {
     }
 
     #[test]
-    fn source_fa2_selects_only_when_compiled() {
+    fn source_fa2_selects_source_linked_attention_when_compiled() {
         let resolved = m3(
             &[("FERRUM_FA2_SOURCE", "1")],
             CompiledKernelFeatures::m3_fast_path_with_source_fa2(),
         )
         .resolve()
         .unwrap();
-        let prefill = resolved
+        let decisions: BTreeMap<_, _> = resolved
             .decisions
             .iter()
-            .find(|decision| decision.selection == "attention_prefill_mixed_backend")
-            .unwrap();
-        assert_eq!(prefill.selected, "fa2_source");
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+
+        assert_eq!(decisions["attention_prefill_mixed_backend"], "fa2_source");
+    }
+
+    #[test]
+    fn source_fa2_is_rejected_when_not_compiled() {
         expect_invalid_key(&[("FERRUM_FA2_SOURCE", "1")], "FERRUM_FA2_SOURCE");
     }
 

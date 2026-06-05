@@ -39,7 +39,7 @@ const CHUNKED_PREFILL_ENV: &str = "FERRUM_CHUNKED_PREFILL";
 const KV_CAPACITY_ENV: &str = "FERRUM_KV_CAPACITY";
 const MAX_MODEL_LEN_ENV: &str = "FERRUM_MAX_MODEL_LEN";
 const NEXT_BATCH_PROF_ENV: &str = "FERRUM_NEXT_BATCH_PROF";
-const PREFIX_CACHE_ENV: &str = "FERRUM_PREFIX_CACHE";
+const WHOLE_PROMPT_PREFIX_CACHE_ENV: &str = "FERRUM_WHOLE_PROMPT_PREFIX_CACHE";
 const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
 const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
 const GENERATION_POLICY_SCAN_LIMIT: usize = 262_144;
@@ -96,7 +96,9 @@ impl ContinuousEngineRuntimeConfig {
             kv_capacity: parse_positive_usize_env(&vars, KV_CAPACITY_ENV),
             max_model_len: parse_positive_usize_env(&vars, MAX_MODEL_LEN_ENV),
             next_batch_prof: vars.contains_key(NEXT_BATCH_PROF_ENV),
-            prefix_cache_enabled: vars.get(PREFIX_CACHE_ENV).is_some_and(|v| v == "1"),
+            prefix_cache_enabled: vars
+                .get(WHOLE_PROMPT_PREFIX_CACHE_ENV)
+                .is_some_and(|v| v == "1"),
             rbd_prof: vars.contains_key(RBD_PROF_ENV),
             unified_post_prof: vars.contains_key(UNIFIED_POST_PROF_ENV),
         }
@@ -116,9 +118,11 @@ fn parse_positive_usize_env(vars: &HashMap<String, String>, name: &str) -> Optio
 fn effective_request_context_capacity(
     config: &EngineConfig,
     runtime_config: &ContinuousEngineRuntimeConfig,
+    executor_kv_capacity: Option<usize>,
 ) -> Option<usize> {
     let kv_capacity = runtime_config
         .kv_capacity
+        .or(executor_kv_capacity)
         .or_else(|| (config.kv_cache.max_blocks > 0).then_some(config.kv_cache.max_blocks));
     let max_model_len = runtime_config.max_model_len.or_else(|| {
         config
@@ -142,8 +146,11 @@ fn validate_request_context_budget(
     input_tokens: usize,
     config: &EngineConfig,
     runtime_config: &ContinuousEngineRuntimeConfig,
+    executor_kv_capacity: Option<usize>,
 ) -> Result<()> {
-    let Some(capacity) = effective_request_context_capacity(config, runtime_config) else {
+    let Some(capacity) =
+        effective_request_context_capacity(config, runtime_config, executor_kv_capacity)
+    else {
         return Ok(());
     };
     let output_tokens = request.sampling_params.max_tokens;
@@ -161,6 +168,7 @@ fn clamp_default_max_tokens_to_context(
     input_tokens: usize,
     config: &EngineConfig,
     runtime_config: &ContinuousEngineRuntimeConfig,
+    executor_kv_capacity: Option<usize>,
 ) {
     let default_max_tokens = request
         .metadata
@@ -170,7 +178,9 @@ fn clamp_default_max_tokens_to_context(
     if !default_max_tokens {
         return;
     }
-    let Some(capacity) = effective_request_context_capacity(config, runtime_config) else {
+    let Some(capacity) =
+        effective_request_context_capacity(config, runtime_config, executor_kv_capacity)
+    else {
         return;
     };
     let available_output_tokens = capacity.saturating_sub(input_tokens);
@@ -853,12 +863,14 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             input_tokens.len(),
             &self.inner.config,
             &self.inner.runtime_config,
+            self.inner.model_executor.kv_capacity(),
         );
         validate_request_context_budget(
             &request,
             input_tokens.len(),
             &self.inner.config,
             &self.inner.runtime_config,
+            self.inner.model_executor.kv_capacity(),
         )?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
@@ -922,12 +934,14 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             input_tokens.len(),
             &self.inner.config,
             &self.inner.runtime_config,
+            self.inner.model_executor.kv_capacity(),
         );
         validate_request_context_budget(
             &request,
             input_tokens.len(),
             &self.inner.config,
             &self.inner.runtime_config,
+            self.inner.model_executor.kv_capacity(),
         )?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
@@ -1013,6 +1027,31 @@ impl InferenceEngine for ContinuousBatchEngine {
             error_stats: Default::default(),
             performance_breakdown: Default::default(),
         }
+    }
+
+    fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        if let Some(snapshot) = self.inner.model_executor.cache_metrics_snapshot() {
+            return Some(snapshot);
+        }
+
+        let stats = self.inner.prefix_cache.stats();
+        Some(serde_json::json!({
+            "position": "engine-whole-prompt-debug-cache",
+            "source": "continuous-engine-whole-prompt-prefix-cache",
+            "enabled": self.inner.runtime_config.prefix_cache_enabled,
+            "hits": stats.hits as u64,
+            "misses": stats.misses as u64,
+            "evictions": stats.evictions as u64,
+            "saved_prefill_tokens": self.inner.prefix_cache_hits.load(Ordering::Relaxed),
+            "entries": stats.active_prefixes as u64,
+            "bytes": 0u64,
+            "cached_tokens": stats.total_cached_tokens as u64,
+            "hit_rate": stats.hit_rate,
+        }))
+    }
+
+    fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        self.inner.model_executor.lora_metrics_snapshot()
     }
 
     async fn health_check(&self) -> ferrum_types::HealthStatus {
@@ -1157,7 +1196,7 @@ mod tests {
                 (KV_CAPACITY_ENV, "2048"),
                 (MAX_MODEL_LEN_ENV, "4096"),
                 (NEXT_BATCH_PROF_ENV, "1"),
-                (PREFIX_CACHE_ENV, "1"),
+                (WHOLE_PROMPT_PREFIX_CACHE_ENV, "1"),
                 (RBD_PROF_ENV, "1"),
                 (UNIFIED_POST_PROF_ENV, "1"),
             ],
@@ -1181,13 +1220,29 @@ mod tests {
     fn continuous_engine_runtime_config_keeps_invalid_chunk_presence() {
         let cfg = ContinuousEngineRuntimeConfig::from_env_vars(
             None,
-            [(CHUNKED_PREFILL_ENV, "invalid"), (PREFIX_CACHE_ENV, "0")],
+            [
+                (CHUNKED_PREFILL_ENV, "invalid"),
+                (WHOLE_PROMPT_PREFIX_CACHE_ENV, "0"),
+            ],
         );
 
         assert!(cfg.chunked_prefill_present);
         assert_eq!(cfg.chunked_prefill_size, None);
         assert_eq!(cfg.chunked_prefill_size_for(200), None);
         assert!(!cfg.prefix_cache_enabled);
+    }
+
+    #[test]
+    fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
+        let mut config = EngineConfig::default();
+        config.kv_cache.max_blocks = 2048;
+        let runtime =
+            ContinuousEngineRuntimeConfig::from_env_vars(None, Vec::<(&str, &str)>::new());
+
+        assert_eq!(
+            effective_request_context_capacity(&config, &runtime, Some(512)),
+            Some(512)
+        );
     }
 
     #[test]

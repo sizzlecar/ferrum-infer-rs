@@ -1,0 +1,938 @@
+{
+  "goal": "G1-G3-G4",
+  "name": "release-regression",
+  "status": "metal-pass",
+  "passed": true,
+  "git_sha": "867d2aa900d159f723daa6f703bdee4cd32aeea8",
+  "git_dirty": true,
+  "binary_sha256": "sha256:d6f0179d264827985079243d93604639ce01128c7f5fbc0d4a80d8a3d0fd7657",
+  "features": [
+    "metal"
+  ],
+  "models": [
+    "Qwen/Qwen3-0.6B"
+  ],
+  "commands": [
+    "cargo build --release -p ferrum-cli --bin ferrum --features metal",
+    "ferrum run Metal one-shot",
+    "ferrum run Metal piped multi-turn",
+    "ferrum serve Metal OpenAI/caches/LoRA smoke"
+  ],
+  "started_at_utc": "2026-06-04T11:29:08Z",
+  "finished_at_utc": "2026-06-04T11:29:40Z",
+  "created_at": "2026-06-04T11:29:40Z",
+  "repo": {
+    "head": "867d2aa900d159f723daa6f703bdee4cd32aeea8",
+    "short_head": "867d2aa",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "final": false,
+  "checks": {
+    "g1_artifact": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g1-vllm-migration/20260604-qwen3-06b-semantic-b3e7611",
+    "g3_artifact": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g3-cache-product/20260604-qwen3-06b-real-kv-b3e7611",
+    "g4_artifact": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g4-lora-inference/20260604-qwen3-06b-real-inference-b3e7611-rerun1",
+    "goal_manifests": {
+      "g1": {
+        "goal": "G1",
+        "name": "vllm-migration",
+        "status": "pass",
+        "passed": true,
+        "git_sha": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+        "git_dirty": true,
+        "binary_sha256": "sha256:f5118cbacd7b75bfb91d36275ec8302b1f0a6c2b8efe94699f0b14d159f674b2",
+        "features": [
+          "metal"
+        ],
+        "models": [
+          "Qwen/Qwen3-0.6B"
+        ],
+        "commands": [
+          "cargo test --workspace --all-targets",
+          "cargo test -p ferrum-cli --test vllm_migration_compat serve_help_lists_vllm_compat_flags",
+          "cargo test -p ferrum-types --test config_tests engine_config_applies_runtime_snapshot",
+          "cargo test -p ferrum-scheduler max_",
+          "cargo test -p ferrum-cli prefix_cache_vllm_and_product_aliases_resolve_identically",
+          "cargo build --release -p ferrum-cli --bin ferrum --features metal",
+          "ferrum serve --help",
+          "cargo test --release -p ferrum-cli --test vllm_migration_compat -- --ignored --test-threads=1",
+          "direct OpenAI-compatible smoke plus max-model-len and max-num-seqs semantic probes",
+          "direct prefix-cache alias runtime probes with /health and /metrics"
+        ],
+        "started_at_utc": "2026-06-04T11:11:26Z",
+        "finished_at_utc": "2026-06-04T11:12:26Z",
+        "created_at": "2026-06-04T11:12:26Z",
+        "repo": {
+          "head": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+          "short_head": "b3e7611",
+          "branch": "codex/source-regression-gates",
+          "dirty": true
+        },
+        "model": "Qwen/Qwen3-0.6B",
+        "model_name": "Qwen/Qwen3-0.6B",
+        "checks": {
+          "cargo_workspace_all_targets": true,
+          "serve_help_test": true,
+          "semantic_engine_config": {
+            "passed": true,
+            "covers": [
+              "FERRUM_PAGED_MAX_SEQS -> scheduler.max_running_requests"
+            ]
+          },
+          "semantic_scheduler": {
+            "passed": true,
+            "covers": [
+              "--max-num-seqs active admission cap",
+              "--max-num-batched-tokens iteration batch token budget"
+            ]
+          },
+          "semantic_prefix_aliases": {
+            "passed": true,
+            "covers": [
+              "--enable-prefix-caching == --enable-prefix-cache",
+              "--no-enable-prefix-caching == --disable-prefix-cache"
+            ]
+          },
+          "serve_help_flags": [
+            "--max-model-len",
+            "--max-num-seqs",
+            "--max-num-batched-tokens",
+            "--enable-prefix-caching",
+            "--no-enable-prefix-caching",
+            "--enable-prefix-cache",
+            "--disable-prefix-cache"
+          ],
+          "rust_ignored_smoke": true,
+          "direct_openai_smoke": {
+            "passed": true,
+            "base_url": "http://127.0.0.1:65110",
+            "model": "Qwen/Qwen3-0.6B",
+            "model_name": "Qwen/Qwen3-0.6B",
+            "effective_config": {
+              "FERRUM_MAX_MODEL_LEN": {
+                "effective_value": "2048",
+                "source": "cli"
+              },
+              "FERRUM_PAGED_MAX_SEQS": {
+                "effective_value": "1",
+                "source": "cli"
+              },
+              "FERRUM_MAX_BATCHED_TOKENS": {
+                "effective_value": "2048",
+                "source": "cli"
+              },
+              "FERRUM_PREFIX_CACHE": {
+                "effective_value": "0",
+                "source": "cli"
+              }
+            },
+            "chat_content_len": 9,
+            "stream_chunks": 114,
+            "stream_done_count": 1,
+            "usage_stream_chunks": 115,
+            "usage_done_count": 1,
+            "usage_chunk_count": 1,
+            "semantic_tests": {
+              "max_model_len": {
+                "status": 400,
+                "error_type": "invalid_request_error",
+                "param": null,
+                "message": "This model context is limited to 512 tokens, but this request needs 13 input tokens + 4096 output tokens. Reduce max_tokens or shorten the messages.",
+                "configured_max_model_len": 2048,
+                "requested_max_tokens": 4096,
+                "observed_via": "OpenAI /v1/chat/completions HTTP 400 before generation"
+              },
+              "max_num_seqs": {
+                "configured_max_num_seqs": 1,
+                "max_observed_active_requests": 1,
+                "max_observed_queued_requests": 1,
+                "health_samples": [
+                  {
+                    "active": 0,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 1
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  },
+                  {
+                    "active": 1,
+                    "queued": 0
+                  }
+                ],
+                "responses": [
+                  {
+                    "status": 200,
+                    "content_len": 906
+                  },
+                  {
+                    "status": 200,
+                    "content_len": 1027
+                  }
+                ],
+                "observed_via": "two concurrent OpenAI chat requests plus /health active/queued polling"
+              }
+            }
+          },
+          "prefix_alias_runtime": {
+            "passed": true,
+            "enable_aliases": [
+              "--enable-prefix-caching",
+              "--enable-prefix-cache"
+            ],
+            "disable_aliases": [
+              "--no-enable-prefix-caching",
+              "--disable-prefix-cache"
+            ],
+            "enabled_hits": [
+              1.0,
+              1.0
+            ],
+            "enabled_saved_prefill_tokens": [
+              64.0,
+              64.0
+            ],
+            "disabled_hits": [
+              0.0,
+              0.0
+            ],
+            "results": {
+              "enable_vllm": {
+                "flag": "--enable-prefix-caching",
+                "expected_enabled": true,
+                "health_enabled": true,
+                "health_hits": 1.0,
+                "health_saved_prefill_tokens": 64.0,
+                "metrics_hits": 1.0,
+                "metrics_saved_prefill_tokens": 64.0,
+                "cache_position": "real-kv-reuse",
+                "first_content_len": 610,
+                "second_content_len": 610,
+                "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+              },
+              "enable_product": {
+                "flag": "--enable-prefix-cache",
+                "expected_enabled": true,
+                "health_enabled": true,
+                "health_hits": 1.0,
+                "health_saved_prefill_tokens": 64.0,
+                "metrics_hits": 1.0,
+                "metrics_saved_prefill_tokens": 64.0,
+                "cache_position": "real-kv-reuse",
+                "first_content_len": 610,
+                "second_content_len": 610,
+                "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+              },
+              "disable_vllm": {
+                "flag": "--no-enable-prefix-caching",
+                "expected_enabled": false,
+                "health_enabled": false,
+                "health_hits": 0.0,
+                "health_saved_prefill_tokens": 0.0,
+                "metrics_hits": 0.0,
+                "metrics_saved_prefill_tokens": 0.0,
+                "cache_position": "real-kv-reuse",
+                "first_content_len": 610,
+                "second_content_len": 610,
+                "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+              },
+              "disable_product": {
+                "flag": "--disable-prefix-cache",
+                "expected_enabled": false,
+                "health_enabled": false,
+                "health_hits": 0.0,
+                "health_saved_prefill_tokens": 0.0,
+                "metrics_hits": 0.0,
+                "metrics_saved_prefill_tokens": 0.0,
+                "cache_position": "real-kv-reuse",
+                "first_content_len": 610,
+                "second_content_len": 610,
+                "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+              }
+            }
+          }
+        },
+        "artifacts": [
+          "cargo-test.log",
+          "chat.json",
+          "effective-config.json",
+          "gate.json",
+          "gate.log",
+          "models.json",
+          "release-build.log",
+          "rust-ignored-smoke.log",
+          "semantic-engine-config.log",
+          "semantic-max-model-len-400.json",
+          "semantic-max-num-seqs-response-0.json",
+          "semantic-max-num-seqs-response-1.json",
+          "semantic-max-num-seqs.json",
+          "semantic-prefix-alias-disable_product-chat-1.json",
+          "semantic-prefix-alias-disable_product-chat-2.json",
+          "semantic-prefix-alias-disable_product-health.json",
+          "semantic-prefix-alias-disable_product-metrics.txt",
+          "semantic-prefix-alias-disable_vllm-chat-1.json",
+          "semantic-prefix-alias-disable_vllm-chat-2.json",
+          "semantic-prefix-alias-disable_vllm-health.json",
+          "semantic-prefix-alias-disable_vllm-metrics.txt",
+          "semantic-prefix-alias-enable_product-chat-1.json",
+          "semantic-prefix-alias-enable_product-chat-2.json",
+          "semantic-prefix-alias-enable_product-health.json",
+          "semantic-prefix-alias-enable_product-metrics.txt",
+          "semantic-prefix-alias-enable_vllm-chat-1.json",
+          "semantic-prefix-alias-enable_vllm-chat-2.json",
+          "semantic-prefix-alias-enable_vllm-health.json",
+          "semantic-prefix-alias-enable_vllm-metrics.txt",
+          "semantic-prefix-aliases-runtime.json",
+          "semantic-prefix-aliases.log",
+          "semantic-scheduler.log",
+          "semantic-tests.json",
+          "serve-help-test.log",
+          "serve-help.txt",
+          "serve-prefix-alias-disable_product.log",
+          "serve-prefix-alias-disable_vllm.log",
+          "serve-prefix-alias-enable_product.log",
+          "serve-prefix-alias-enable_vllm.log",
+          "serve.log",
+          "smoke.json",
+          "stream.sse",
+          "usage_stream.sse"
+        ]
+      },
+      "g3": {
+        "goal": "G3",
+        "name": "cache-product",
+        "status": "pass",
+        "passed": true,
+        "git_sha": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+        "git_dirty": true,
+        "binary_sha256": "sha256:f5118cbacd7b75bfb91d36275ec8302b1f0a6c2b8efe94699f0b14d159f674b2",
+        "features": [
+          "metal"
+        ],
+        "models": [
+          "Qwen/Qwen3-0.6B"
+        ],
+        "commands": [
+          "cargo test --workspace --all-targets",
+          "cargo test -p ferrum-server cache_metrics_contract",
+          "cargo test --release -p ferrum-cli --test server_prefix_cache_product -- --ignored --test-threads=1",
+          "cargo test --release -p ferrum-cli --test server_session_cache -- --ignored --test-threads=1",
+          "cargo build --release -p ferrum-cli --bin ferrum --features metal",
+          "ferrum bench-serve shared-prefix disabled/enabled"
+        ],
+        "started_at_utc": "2026-06-04T11:12:31Z",
+        "finished_at_utc": "2026-06-04T11:14:20Z",
+        "created_at": "2026-06-04T19:14:20",
+        "repo": {
+          "head": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+          "short_head": "b3e7611",
+          "branch": "codex/source-regression-gates",
+          "dirty": true
+        },
+        "model": "Qwen/Qwen3-0.6B",
+        "checks": {
+          "cargo_workspace_all_targets": true,
+          "cache_metrics_contract": true,
+          "release_build": true,
+          "server_prefix_cache_product": true,
+          "server_session_cache": true,
+          "bench": {
+            "status": "pass",
+            "tokenizer": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/g3-tokenizers/Qwen3-30B-A3B.tokenizer",
+            "cache_position": "real-kv-reuse",
+            "prefix_hits": 51.0,
+            "prefix_saved_prefill_tokens": 13600.0,
+            "performance": {
+              "status": "pass",
+              "min_perf_improvement_pct": 1.0,
+              "disabled_ttft_p50_ms": 798.0917711666667,
+              "enabled_ttft_p50_ms": 350.953757,
+              "ttft_improvement_pct": 56.02588954313253,
+              "disabled_output_throughput_tps": 50.9998049527537,
+              "enabled_output_throughput_tps": 69.820950353041,
+              "output_throughput_improvement_pct": 36.90434780627738,
+              "prefix_hits": 51.0,
+              "prefix_saved_prefill_tokens": 13600.0,
+              "cache_position": "real-kv-reuse"
+            }
+          }
+        },
+        "artifacts": [
+          "bench-disabled-metrics.txt",
+          "bench-disabled.json",
+          "bench-disabled.log",
+          "bench-enabled-metrics.txt",
+          "bench-enabled.json",
+          "bench-enabled.log",
+          "bench-summary.json",
+          "cache-comparison.json",
+          "cache-disabled.json",
+          "cache-enabled.json",
+          "cache-metrics-contract.log",
+          "cargo-test.log",
+          "gate.json",
+          "gate.log",
+          "release-build.log",
+          "serve-49179.log",
+          "serve-49309.log",
+          "server-prefix-cache-product.log",
+          "server-session-cache.log"
+        ]
+      },
+      "g4": {
+        "goal": "G4",
+        "name": "lora-inference",
+        "status": "pass",
+        "passed": true,
+        "git_sha": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+        "git_dirty": true,
+        "binary_sha256": "sha256:d6f0179d264827985079243d93604639ce01128c7f5fbc0d4a80d8a3d0fd7657",
+        "features": [
+          "metal"
+        ],
+        "models": [
+          "Qwen/Qwen3-0.6B"
+        ],
+        "commands": [
+          "cargo test --workspace --all-targets",
+          "cargo test -p ferrum-quantization --test lora_linear_ref",
+          "cargo test -p ferrum-models --test lora_loader",
+          "cargo test -p ferrum-server lora",
+          "cargo test -p ferrum-cli --test server_lora_startup",
+          "cargo build --release -p ferrum-cli --bin ferrum --features metal",
+          "ferrum bench-serve c=1 no-lora/base-with-lora/adapter"
+        ],
+        "started_at_utc": "2026-06-04T11:15:23Z",
+        "finished_at_utc": "2026-06-04T11:16:03Z",
+        "created_at": "2026-06-04T19:16:03",
+        "repo": {
+          "head": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+          "short_head": "b3e7611",
+          "branch": "codex/source-regression-gates",
+          "dirty": true
+        },
+        "model": "Qwen/Qwen3-0.6B",
+        "checks": {
+          "cargo_workspace_all_targets": true,
+          "lora_linear_ref": true,
+          "lora_loader": true,
+          "server_lora_routing": true,
+          "server_lora_startup": true,
+          "bench": {
+            "status": "pass",
+            "base_no_lora_output_tps": 43.69991191280738,
+            "base_with_lora_output_tps": 44.1308635370057,
+            "adapter_output_tps": 41.8083938053357,
+            "base_regression_pct": 0.0,
+            "adapter_to_base_ratio": 0.9473731183682252,
+            "fixture": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g4-lora-inference/20260604-qwen3-06b-real-inference-b3e7611-rerun1/fixtures/sql-adapter",
+            "lora_release_position": "real-inference",
+            "fixture_manifest": {
+              "target": "model.layers.0.self_attn.qkv_proj",
+              "rank": 1,
+              "in_features": 1024,
+              "out_features": 4096,
+              "position": "real-inference"
+            }
+          }
+        },
+        "artifacts": [
+          "bench-adapter.json",
+          "bench-adapter.log",
+          "bench-base-no-lora.json",
+          "bench-base-no-lora.log",
+          "bench-base-with-lora.json",
+          "bench-base-with-lora.log",
+          "bench-summary.json",
+          "cargo-test.log",
+          "chat-Qwen--Qwen3-0.6B-sql.json",
+          "chat-Qwen--Qwen3-0.6B.json",
+          "chat-unknown-adapter.json",
+          "gate.log",
+          "lora-fixture.json",
+          "lora-health-after-chat.json",
+          "lora-linear-ref.log",
+          "lora-loader.log",
+          "lora-runtime-correctness.json",
+          "models.json",
+          "release-build.log",
+          "serve-49655.log",
+          "serve-49735.log",
+          "server-lora-routing.log",
+          "server-lora-startup.log"
+        ]
+      }
+    },
+    "metal_correctness": {
+      "backend": "metal",
+      "model": "Qwen/Qwen3-0.6B",
+      "single_turn_chat": true,
+      "context_limit_400": true,
+      "stream_chunks": 115,
+      "stream_text_chunks": 112,
+      "stream_done_count": 1,
+      "stream_usage_chunks": 1,
+      "stream_event_count": 116,
+      "stream_first_to_done_ms": 1339.2808437347412,
+      "openai_nonstream": true,
+      "openai_stream": true,
+      "structured_output": true,
+      "tool_calling": true,
+      "prefix_cache_hits": 1.0,
+      "prefix_cache_saved_prefill_tokens": 64.0,
+      "session_cache": true,
+      "lora_adapter_active": true,
+      "base_path_with_lora_loaded": true,
+      "projection_applications": 117,
+      "position": "real-inference",
+      "ferrum_run_one_shot": true,
+      "ferrum_run_multi_turn": true,
+      "default_sampling_params": true,
+      "deterministic_diagnostic": true,
+      "long_output": true
+    },
+    "metal_performance": {
+      "backend": "metal",
+      "serve_single_request_latency_ms": 1562.5262260437012,
+      "serve_concurrent_completed": 4,
+      "serve_concurrent_failed": 0,
+      "serve_concurrent_latency_p50_ms": 3099.8778343200684,
+      "serve_concurrent_latency_max_ms": 3100.111961364746,
+      "cli_one_shot_tok_s": 66.22602600784619,
+      "cli_multi_turn_tok_s": 77.21118151793088,
+      "cli_one_shot_tokens": 96,
+      "cli_multi_turn_tokens": 297
+    }
+  },
+  "artifacts": [
+    "context-limit-400.json",
+    "curl-openai-nonstream.json",
+    "curl-openai-stream.sse",
+    "curl-structured-output.json",
+    "curl-tool-call.json",
+    "g1-semantics.json",
+    "g3-cache-comparison.json",
+    "g4-lora-comparison.json",
+    "gate.log",
+    "lora-adapter-chat.json",
+    "lora-base-chat.json",
+    "lora-health-after-chat.json",
+    "metal-cli-multiturn.jsonl",
+    "metal-cli-single.jsonl",
+    "metal-cli.log",
+    "metal-correctness.json",
+    "metal-lora-serve.log",
+    "metal-metrics.txt",
+    "metal-performance.json",
+    "metal-serve.log",
+    "prefix-chat-1.json",
+    "prefix-chat-2.json",
+    "release-build.log",
+    "session-chat-1.json",
+    "session-chat-2.json"
+  ]
+}

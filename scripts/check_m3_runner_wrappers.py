@@ -121,7 +121,7 @@ python3 scripts/m3_ab_runner.py --config "$CONFIG"
             root / "scripts/m3_fa2_source_allcells_ab.sh",
             """#!/usr/bin/env bash
 set -euo pipefail
-bash scripts/m3_fa2_direct_ffi_ab.sh
+FA2_SOURCE=1 bash scripts/m3_fa2_direct_ffi_ab.sh
 """,
         )
         errors = check_root(root)

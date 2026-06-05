@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/ferrum_scheduler-4069b6389d4abfb5)
+
+running 2 tests
+test implementations::continuous::tests::max_batched_tokens_limits_prefill_admission_by_prompt_tokens ... ok
+test implementations::continuous::tests::max_running_requests_limits_waiting_admission ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.00s
+

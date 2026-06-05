@@ -122,6 +122,11 @@ pub struct Qwen3MoeModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     pub(crate) batched_graph_failed: bool,
     pub(crate) batched_graph_keys_seen: std::collections::HashSet<u64>,
 
+    // ── Real paged-KV prefix cache counters ─────────────────────────────
+    pub(crate) prefix_cache_hits: u64,
+    pub(crate) prefix_cache_misses: u64,
+    pub(crate) prefix_cache_saved_prefill_tokens: u64,
+
     // ── vLLM paged_attention_v2 opt-in ──────────────────────────────────
     //
     // True when (a) the backend reports `supports_vllm_paged_attn() == true`

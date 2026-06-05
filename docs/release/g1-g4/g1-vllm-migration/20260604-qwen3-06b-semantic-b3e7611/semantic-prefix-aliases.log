@@ -1,0 +1,105 @@
+   Compiling ferrum-cli v0.7.5 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.20s
+     Running unittests src/lib.rs (target/debug/deps/ferrum_cli-5685016fd1069391)
+
+running 1 test
+test commands::serve::tests::prefix_cache_vllm_and_product_aliases_resolve_identically ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 54 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/ferrum-0764fec44e3194d6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/chat_pty.rs (target/debug/deps/chat_pty-3a24a51a5859fc89)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/chat_smoke.rs (target/debug/deps/chat_smoke-496f9ba2dbc5f348)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/chat_stress.rs (target/debug/deps/chat_stress-b3f81cf5381ad6bb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/cli_e2e.rs (target/debug/deps/cli_e2e-b94f81869eb91c66)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/quant_kl.rs (target/debug/deps/quant_kl-d2ee3baf68a2742b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/reference_match.rs (target/debug/deps/reference_match-5f9a85815241c514)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/server_agent_tools.rs (target/debug/deps/server_agent_tools-28b2d9b406d69490)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/server_lora_startup.rs (target/debug/deps/server_lora_startup-14c9846cd249a1fe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/server_openai_compat.rs (target/debug/deps/server_openai_compat-5bcd08738e95d6c9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/server_prefix_cache_product.rs (target/debug/deps/server_prefix_cache_product-55263c4a538562bc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/server_session_cache.rs (target/debug/deps/server_session_cache-4f49a40ee99cd4eb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/server_smoke.rs (target/debug/deps/server_smoke-41cc9ed36b9ca6bb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/server_stress.rs (target/debug/deps/server_stress-c41a67a5272e4d20)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/server_structured_output.rs (target/debug/deps/server_structured_output-626fc4f34a3aa387)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/vllm_migration_compat.rs (target/debug/deps/vllm_migration_compat-8cc81fe2483e9f49)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+

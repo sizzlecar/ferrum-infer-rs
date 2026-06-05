@@ -1,0 +1,17 @@
+{
+  "status": "pass",
+  "base_no_lora_output_tps": 43.69991191280738,
+  "base_with_lora_output_tps": 44.1308635370057,
+  "adapter_output_tps": 41.8083938053357,
+  "base_regression_pct": 0.0,
+  "adapter_to_base_ratio": 0.9473731183682252,
+  "fixture": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g4-lora-inference/20260604-qwen3-06b-real-inference-b3e7611-rerun1/fixtures/sql-adapter",
+  "lora_release_position": "real-inference",
+  "fixture_manifest": {
+    "target": "model.layers.0.self_attn.qkv_proj",
+    "rank": 1,
+    "in_features": 1024,
+    "out_features": 4096,
+    "position": "real-inference"
+  }
+}

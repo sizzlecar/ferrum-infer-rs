@@ -19,6 +19,7 @@ fn engine_config_applies_runtime_snapshot() {
             "8192",
             RuntimeConfigSource::Env,
         ),
+        RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "7", RuntimeConfigSource::Env),
         RuntimeConfigEntry::new(
             "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
             "1",
@@ -31,6 +32,7 @@ fn engine_config_applies_runtime_snapshot() {
 
     assert_eq!(cfg.kv_cache.max_blocks, 4096);
     assert_eq!(cfg.batching.max_num_batched_tokens, 8192);
+    assert_eq!(cfg.scheduler.max_running_requests, 7);
     assert!(cfg.scheduler.prompt_token_estimate);
 }
 

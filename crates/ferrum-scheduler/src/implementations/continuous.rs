@@ -490,10 +490,15 @@ impl ContinuousBatchScheduler {
 
         // Check if we should admit new requests from waiting queue
         let waiting_queue = self.waiting_queue.read();
-        let available_slots = self
+        let active_capacity = self
+            .config
+            .max_running_requests
+            .saturating_sub(self.active_count());
+        let decode_capacity = self
             .cb_config
             .max_decode_batch
             .saturating_sub(self.decoding_count());
+        let available_slots = active_capacity.min(decode_capacity);
 
         let requests_to_admit: Vec<RequestId> = waiting_queue
             .iter()
@@ -1153,6 +1158,77 @@ mod tests {
             })
             .unwrap();
         assert_eq!(batch.requests.len(), 8);
+    }
+
+    #[test]
+    fn max_running_requests_limits_waiting_admission() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 1,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..3 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 1);
+        assert_eq!(scheduler.prefilling_count(), 1);
+        assert_eq!(scheduler.waiting_count(), 2);
+
+        let active_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(active_batch.requests.len(), 1);
+        assert_eq!(
+            active_batch.requests[0].request.id, first_batch.requests[0].request.id,
+            "scheduler must not admit another waiting request while the active cap is full"
+        );
+        assert_eq!(scheduler.prefilling_count(), 1);
+        assert_eq!(scheduler.waiting_count(), 2);
+    }
+
+    #[test]
+    fn max_batched_tokens_limits_prefill_admission_by_prompt_tokens() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 8,
+                max_tokens: 512,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+
+        assert_eq!(batch.requests.len(), 2);
+        assert_eq!(batch.resource_requirements.gpu_memory, 512 * 16);
+        assert_eq!(
+            scheduler.prefilling_count(),
+            4,
+            "max_tokens limits the emitted iteration batch, not waiting-to-prefill promotion"
+        );
+        assert_eq!(scheduler.waiting_count(), 0);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+[2026-06-04 19:11:26] RUN cargo test --workspace --all-targets
+[2026-06-04 19:11:36] RUN cargo test -p ferrum-cli --test vllm_migration_compat serve_help_lists_vllm_compat_flags
+[2026-06-04 19:11:39] RUN cargo test -p ferrum-types --test config_tests engine_config_applies_runtime_snapshot
+[2026-06-04 19:11:39] RUN cargo test -p ferrum-scheduler max_
+[2026-06-04 19:11:40] RUN cargo test -p ferrum-cli prefix_cache_vllm_and_product_aliases_resolve_identically
+[2026-06-04 19:11:42] RUN cargo build --release -p ferrum-cli --bin ferrum --features metal
+[2026-06-04 19:11:42] RUN /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum serve --help
+[2026-06-04 19:11:42] RUN cargo test --release -p ferrum-cli --features metal --test vllm_migration_compat -- --ignored --test-threads=1
+[2026-06-04 19:11:52] START /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum serve Qwen/Qwen3-0.6B --host 127.0.0.1 --port 65110 --max-model-len 2048 --max-num-seqs 1 --max-num-batched-tokens 2048 --no-enable-prefix-caching --effective-config-json /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g1-vllm-migration/20260604-qwen3-06b-semantic-b3e7611/effective-config.json
+[2026-06-04 19:11:54] health OK
+[2026-06-04 19:12:04] START /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum serve Qwen/Qwen3-0.6B --host 127.0.0.1 --port 65346 --enable-prefix-caching --session-cache off
+[2026-06-04 19:12:06] health OK
+[2026-06-04 19:12:10] START /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum serve Qwen/Qwen3-0.6B --host 127.0.0.1 --port 65367 --enable-prefix-cache --session-cache off
+[2026-06-04 19:12:12] health OK
+[2026-06-04 19:12:15] START /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum serve Qwen/Qwen3-0.6B --host 127.0.0.1 --port 65387 --no-enable-prefix-caching --session-cache off
+[2026-06-04 19:12:17] health OK
+[2026-06-04 19:12:20] START /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum serve Qwen/Qwen3-0.6B --host 127.0.0.1 --port 65408 --disable-prefix-cache --session-cache off
+[2026-06-04 19:12:22] health OK

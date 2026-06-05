@@ -57,6 +57,7 @@ impl EngineInner {
                     kv_cache,
                     pos_offset,
                     is_final_chunk: true,
+                    metadata: seq.original_request.metadata.clone(),
                 });
             }
         }
@@ -219,6 +220,7 @@ impl EngineInner {
                 .unwrap_or(TokenId::new(0));
             let tensor = self.tokens_to_tensor(&[last_token.get()])?;
             ferrum_interfaces::model_executor::DecodeInput::new(tensor, kv_cache)
+                .with_metadata(seq.original_request.metadata.clone())
         };
 
         let decode_output = self.model_executor.decode(&decode_input).await?;

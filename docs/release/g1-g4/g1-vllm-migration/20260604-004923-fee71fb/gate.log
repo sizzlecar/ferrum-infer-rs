@@ -1,0 +1,7 @@
+[2026-06-04 00:49:23] RUN cargo test --workspace --all-targets
+[2026-06-04 00:49:32] RUN cargo test -p ferrum-cli --test vllm_migration_compat serve_help_lists_vllm_compat_flags
+[2026-06-04 00:49:33] RUN cargo build --release -p ferrum-cli --bin ferrum
+[2026-06-04 00:49:34] RUN /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum serve --help
+[2026-06-04 00:49:34] RUN cargo test --release -p ferrum-cli --test vllm_migration_compat -- --ignored --test-threads=1
+[2026-06-04 00:53:42] START /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum serve qwen3:0.6b --host 127.0.0.1 --port 56247 --max-model-len 2048 --max-num-seqs 4 --max-num-batched-tokens 2048 --no-enable-prefix-caching --effective-config-json /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g1-vllm-migration/20260604-004923-fee71fb/effective-config.json
+[2026-06-04 00:53:44] health OK

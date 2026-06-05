@@ -18,9 +18,11 @@ run_unit() {
     scripts/release/validate_metal_readme_regression.py \
     scripts/release/release_binary_gate.py \
     scripts/release/g0_release_summary.py \
-    scripts/release/selftest_g0_validators.py | tee "$OUT_ROOT/release-scripts-pycompile.log"
+    scripts/release/selftest_g0_validators.py \
+    scripts/release/selftest_g1_g3_g4_release_regression.py | tee "$OUT_ROOT/release-scripts-pycompile.log"
   bash -n scripts/release/g0_source_gate.sh | tee "$OUT_ROOT/g0-source-bashn.log"
   python3 scripts/release/selftest_g0_validators.py | tee "$OUT_ROOT/g0-validator-selftest.log"
+  python3 scripts/release/selftest_g1_g3_g4_release_regression.py | tee "$OUT_ROOT/g1-g3-g4-validator-selftest.log"
   echo '{"status":"pass","lane":"unit"}' > "$OUT_ROOT/unit.gate.json"
   pass unit
 }

@@ -1,0 +1,475 @@
+{
+  "passed": true,
+  "base_url": "http://127.0.0.1:65110",
+  "model": "Qwen/Qwen3-0.6B",
+  "model_name": "Qwen/Qwen3-0.6B",
+  "effective_config": {
+    "FERRUM_MAX_MODEL_LEN": {
+      "effective_value": "2048",
+      "source": "cli"
+    },
+    "FERRUM_PAGED_MAX_SEQS": {
+      "effective_value": "1",
+      "source": "cli"
+    },
+    "FERRUM_MAX_BATCHED_TOKENS": {
+      "effective_value": "2048",
+      "source": "cli"
+    },
+    "FERRUM_PREFIX_CACHE": {
+      "effective_value": "0",
+      "source": "cli"
+    }
+  },
+  "chat_content_len": 9,
+  "stream_chunks": 114,
+  "stream_done_count": 1,
+  "usage_stream_chunks": 115,
+  "usage_done_count": 1,
+  "usage_chunk_count": 1,
+  "semantic_tests": {
+    "max_model_len": {
+      "status": 400,
+      "error_type": "invalid_request_error",
+      "param": null,
+      "message": "This model context is limited to 512 tokens, but this request needs 13 input tokens + 4096 output tokens. Reduce max_tokens or shorten the messages.",
+      "configured_max_model_len": 2048,
+      "requested_max_tokens": 4096,
+      "observed_via": "OpenAI /v1/chat/completions HTTP 400 before generation"
+    },
+    "max_num_seqs": {
+      "configured_max_num_seqs": 1,
+      "max_observed_active_requests": 1,
+      "max_observed_queued_requests": 1,
+      "health_samples": [
+        {
+          "active": 0,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 1
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        },
+        {
+          "active": 1,
+          "queued": 0
+        }
+      ],
+      "responses": [
+        {
+          "status": 200,
+          "content_len": 906
+        },
+        {
+          "status": 200,
+          "content_len": 1027
+        }
+      ],
+      "observed_via": "two concurrent OpenAI chat requests plus /health active/queued polling"
+    }
+  }
+}

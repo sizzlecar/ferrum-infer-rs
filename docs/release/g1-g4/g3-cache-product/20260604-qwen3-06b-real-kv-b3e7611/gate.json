@@ -1,0 +1,31 @@
+{
+  "status": "pass",
+  "goal": "g3-cache-product",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "cache_metrics_contract": true,
+    "release_build": true,
+    "server_prefix_cache_product": true,
+    "server_session_cache": true,
+    "bench": {
+      "status": "pass",
+      "tokenizer": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/g3-tokenizers/Qwen3-30B-A3B.tokenizer",
+      "cache_position": "real-kv-reuse",
+      "prefix_hits": 51.0,
+      "prefix_saved_prefill_tokens": 13600.0,
+      "performance": {
+        "status": "pass",
+        "min_perf_improvement_pct": 1.0,
+        "disabled_ttft_p50_ms": 798.0917711666667,
+        "enabled_ttft_p50_ms": 350.953757,
+        "ttft_improvement_pct": 56.02588954313253,
+        "disabled_output_throughput_tps": 50.9998049527537,
+        "enabled_output_throughput_tps": 69.820950353041,
+        "output_throughput_improvement_pct": 36.90434780627738,
+        "prefix_hits": 51.0,
+        "prefix_saved_prefill_tokens": 13600.0,
+        "cache_position": "real-kv-reuse"
+      }
+    }
+  }
+}

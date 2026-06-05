@@ -1,0 +1,23 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "run",
+    "Qwen/Qwen3-0.6B",
+    "--backend",
+    "metal",
+    "--output-format",
+    "jsonl",
+    "--max-tokens",
+    "1",
+    "--temperature",
+    "0"
+  ],
+  "returncode": 0,
+  "elapsed_s": 3.545,
+  "saw_prompt": true,
+  "saw_user_ok_jsonl": true,
+  "saw_deleted_chinese_in_user_jsonl": false,
+  "saw_assistant": true,
+  "saw_exit": true,
+  "passed": true
+}

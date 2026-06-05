@@ -34,6 +34,10 @@ impl EngineConfig {
             self.batching.max_num_batched_tokens =
                 parse_required_positive_usize("FERRUM_MAX_BATCHED_TOKENS", value)?;
         }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PAGED_MAX_SEQS") {
+            self.scheduler.max_running_requests =
+                parse_required_positive_usize("FERRUM_PAGED_MAX_SEQS", value)?;
+        }
         Ok(())
     }
 }

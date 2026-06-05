@@ -39,7 +39,9 @@ def write_json(path: Path, value: Any) -> None:
 
 def resolve(path: str, root: Path) -> Path:
     p = Path(path)
-    return p if p.is_absolute() else root / p
+    if p.is_absolute() or p.exists():
+        return p
+    return root / p
 
 
 def publishability_for_verdict(verdict: str) -> tuple[bool, str | None]:
@@ -316,6 +318,12 @@ def aggregate(
 
 def self_test() -> None:
     from m3_validate_runner_artifact import REQUIRED_DECISIONS, validate_artifact
+
+    with tempfile.TemporaryDirectory(dir=Path.cwd()) as td:
+        root = Path(td).relative_to(Path.cwd())
+        cell_root = root / "c1"
+        write_json(cell_root / "summary.json", {"ok": True})
+        assert resolve(str(cell_root / "summary.json"), cell_root) == cell_root / "summary.json"
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)

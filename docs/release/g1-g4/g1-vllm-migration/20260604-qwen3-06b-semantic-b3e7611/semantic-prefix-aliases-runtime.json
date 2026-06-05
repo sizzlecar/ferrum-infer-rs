@@ -1,0 +1,77 @@
+{
+  "passed": true,
+  "enable_aliases": [
+    "--enable-prefix-caching",
+    "--enable-prefix-cache"
+  ],
+  "disable_aliases": [
+    "--no-enable-prefix-caching",
+    "--disable-prefix-cache"
+  ],
+  "enabled_hits": [
+    1.0,
+    1.0
+  ],
+  "enabled_saved_prefill_tokens": [
+    64.0,
+    64.0
+  ],
+  "disabled_hits": [
+    0.0,
+    0.0
+  ],
+  "results": {
+    "enable_vllm": {
+      "flag": "--enable-prefix-caching",
+      "expected_enabled": true,
+      "health_enabled": true,
+      "health_hits": 1.0,
+      "health_saved_prefill_tokens": 64.0,
+      "metrics_hits": 1.0,
+      "metrics_saved_prefill_tokens": 64.0,
+      "cache_position": "real-kv-reuse",
+      "first_content_len": 610,
+      "second_content_len": 610,
+      "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+    },
+    "enable_product": {
+      "flag": "--enable-prefix-cache",
+      "expected_enabled": true,
+      "health_enabled": true,
+      "health_hits": 1.0,
+      "health_saved_prefill_tokens": 64.0,
+      "metrics_hits": 1.0,
+      "metrics_saved_prefill_tokens": 64.0,
+      "cache_position": "real-kv-reuse",
+      "first_content_len": 610,
+      "second_content_len": 610,
+      "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+    },
+    "disable_vllm": {
+      "flag": "--no-enable-prefix-caching",
+      "expected_enabled": false,
+      "health_enabled": false,
+      "health_hits": 0.0,
+      "health_saved_prefill_tokens": 0.0,
+      "metrics_hits": 0.0,
+      "metrics_saved_prefill_tokens": 0.0,
+      "cache_position": "real-kv-reuse",
+      "first_content_len": 610,
+      "second_content_len": 610,
+      "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+    },
+    "disable_product": {
+      "flag": "--disable-prefix-cache",
+      "expected_enabled": false,
+      "health_enabled": false,
+      "health_hits": 0.0,
+      "health_saved_prefill_tokens": 0.0,
+      "metrics_hits": 0.0,
+      "metrics_saved_prefill_tokens": 0.0,
+      "cache_position": "real-kv-reuse",
+      "first_content_len": 610,
+      "second_content_len": 610,
+      "observed_via": "two identical OpenAI chat requests plus /health and /metrics"
+    }
+  }
+}

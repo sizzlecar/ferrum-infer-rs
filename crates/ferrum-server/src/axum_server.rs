@@ -14,7 +14,7 @@ use crate::{
 use async_trait::async_trait;
 use axum::{
     extract::{multipart::MultipartRejection, rejection::JsonRejection, State},
-    http::StatusCode as AxumStatusCode,
+    http::{HeaderMap, StatusCode as AxumStatusCode},
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
@@ -25,7 +25,10 @@ use ferrum_types::{
     InferenceRequest, InferenceResponse, ModelId, Priority, RequestId, ResolvedFerrumConfig,
     RuntimeConfigSnapshot, SamplingParams, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tower::ServiceBuilder;
@@ -39,6 +42,47 @@ const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 512;
 const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const THINK_START_TAG: &str = "<think>";
 const THINK_END_TAG: &str = "</think>";
+const FERRUM_SESSION_HEADER: &str = "x-ferrum-session";
+
+#[derive(Debug, Clone)]
+struct CachePolicy {
+    prefix_cache_enabled: bool,
+    session_cache_mode: String,
+    session_cache_max_entries: usize,
+    session_cache_max_tokens: usize,
+}
+
+impl CachePolicy {
+    fn current() -> Self {
+        Self {
+            prefix_cache_enabled: env_bool("FERRUM_PREFIX_CACHE_PRODUCT")
+                .or_else(|| env_bool("FERRUM_PREFIX_CACHE_REQUESTED"))
+                .or_else(|| env_bool("FERRUM_PREFIX_CACHE"))
+                .unwrap_or(false),
+            session_cache_mode: std::env::var("FERRUM_SESSION_CACHE")
+                .unwrap_or_else(|_| "off".to_string())
+                .to_ascii_lowercase(),
+            session_cache_max_entries: env_usize("FERRUM_SESSION_CACHE_MAX_ENTRIES").unwrap_or(128),
+            session_cache_max_tokens: env_usize("FERRUM_SESSION_CACHE_MAX_TOKENS").unwrap_or(4096),
+        }
+    }
+
+    fn session_memory_enabled(&self) -> bool {
+        self.session_cache_mode == "memory"
+    }
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    match std::env::var(key).ok()?.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.parse().ok()
+}
 
 /// Shared Prometheus recorder handle for rendering metrics.
 static PROM_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
@@ -114,6 +158,16 @@ impl AxumServer {
         self
     }
 
+    /// Attach startup-loaded LoRA adapter model ids.
+    pub fn with_lora_adapters(
+        mut self,
+        base_model_id: impl Into<String>,
+        adapters: Vec<LoraAdapterModel>,
+    ) -> Self {
+        self.state = self.state.with_lora_adapters(base_model_id, adapters);
+        self
+    }
+
     /// Build the router with all routes
     fn build_router(&self) -> Router {
         let app_state = self.state.clone();
@@ -151,6 +205,93 @@ pub struct AppState {
     pub tts: Option<Arc<dyn TtsEngine + Send + Sync>>,
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
+    pub lora_registry: Arc<LoraModelRegistry>,
+    cache: Arc<CacheRuntimeState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoraAdapterModel {
+    pub name: String,
+    pub model_id: String,
+    pub path: String,
+}
+
+impl LoraAdapterModel {
+    pub fn new(
+        name: impl Into<String>,
+        model_id: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            model_id: model_id.into(),
+            path: path.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LoraModelRegistry {
+    base_model_id: Option<String>,
+    adapters: Vec<LoraAdapterModel>,
+}
+
+#[derive(Clone, Debug)]
+struct LoraModelResolution {
+    base_model_id: String,
+    adapter: Option<LoraAdapterModel>,
+}
+
+impl LoraModelRegistry {
+    pub fn new(base_model_id: impl Into<String>, adapters: Vec<LoraAdapterModel>) -> Self {
+        Self {
+            base_model_id: Some(base_model_id.into()),
+            adapters,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !self.adapters.is_empty()
+    }
+
+    fn adapter_models(&self) -> &[LoraAdapterModel] {
+        &self.adapters
+    }
+
+    fn resolve(
+        &self,
+        request_model: &str,
+        loaded_models: &[ModelId],
+    ) -> std::result::Result<Option<LoraModelResolution>, ServerError> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        let base = self
+            .base_model_id
+            .clone()
+            .or_else(|| loaded_models.first().map(ToString::to_string))
+            .unwrap_or_default();
+        if request_model == base || loaded_models.iter().any(|model| model.0 == request_model) {
+            return Ok(Some(LoraModelResolution {
+                base_model_id: request_model.to_string(),
+                adapter: None,
+            }));
+        }
+        if let Some(adapter) = self
+            .adapters
+            .iter()
+            .find(|adapter| adapter.model_id == request_model)
+        {
+            return Ok(Some(LoraModelResolution {
+                base_model_id: base,
+                adapter: Some(adapter.clone()),
+            }));
+        }
+        Err(ServerError::invalid_request(
+            format!("unknown LoRA adapter model: {request_model}"),
+            Some("model"),
+        ))
+    }
 }
 
 impl AppState {
@@ -178,6 +319,15 @@ impl AppState {
 
     pub fn with_prompt_template(mut self, prompt_template: Option<ModelChatTemplate>) -> Self {
         self.prompt_template = prompt_template.map(Arc::new);
+        self
+    }
+
+    pub fn with_lora_adapters(
+        mut self,
+        base_model_id: impl Into<String>,
+        adapters: Vec<LoraAdapterModel>,
+    ) -> Self {
+        self.lora_registry = Arc::new(LoraModelRegistry::new(base_model_id, adapters));
         self
     }
 
@@ -243,6 +393,308 @@ impl AppState {
             error_stats: Default::default(),
             performance_breakdown: Default::default(),
         }
+    }
+}
+
+#[derive(Default)]
+struct CacheRuntimeState {
+    stats: Mutex<CacheStats>,
+    prefix_prompts: Mutex<HashMap<String, usize>>,
+    sessions: Mutex<HashMap<String, Vec<ChatMessage>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CacheStats {
+    prefix_hits: u64,
+    prefix_misses: u64,
+    prefix_evictions: u64,
+    prefix_saved_prefill_tokens: u64,
+    prefix_entries: u64,
+    prefix_bytes: u64,
+    session_hits: u64,
+    session_misses: u64,
+    session_evictions: u64,
+    session_entries: u64,
+    session_tokens: u64,
+}
+
+#[derive(Clone)]
+struct SessionContext {
+    id: String,
+    prior_messages: Vec<ChatMessage>,
+    incoming_messages: Vec<ChatMessage>,
+}
+
+impl CacheRuntimeState {
+    fn record_prefix_prompt(&self, prompt: &str, policy: &CachePolicy) {
+        if !policy.prefix_cache_enabled {
+            return;
+        }
+
+        let prompt_tokens = approx_tokens(prompt);
+        let mut prompts = self.prefix_prompts.lock().expect("prefix cache lock");
+        let saved_tokens = prompts
+            .keys()
+            .map(|seen| approx_tokens_for_chars(longest_common_prefix_chars(seen, prompt)))
+            .max()
+            .unwrap_or(0);
+
+        let mut stats = self.stats.lock().expect("cache stats lock");
+        if saved_tokens > 0 {
+            stats.prefix_hits += 1;
+            stats.prefix_saved_prefill_tokens += saved_tokens as u64;
+        } else {
+            stats.prefix_misses += 1;
+        }
+
+        let max_entries = policy.session_cache_max_entries.max(1);
+        if !prompts.contains_key(prompt) && prompts.len() >= max_entries {
+            if let Some(key) = prompts.keys().next().cloned() {
+                prompts.remove(&key);
+                stats.prefix_evictions += 1;
+            }
+        }
+        prompts.insert(prompt.to_string(), prompt_tokens);
+        stats.prefix_entries = prompts.len() as u64;
+        stats.prefix_bytes = prompts.keys().map(|key| key.len() as u64).sum();
+    }
+
+    fn prepare_session_request(
+        &self,
+        request: &mut ChatCompletionsRequest,
+        headers: &HeaderMap,
+        policy: &CachePolicy,
+    ) -> Option<SessionContext> {
+        let session_id = request_session_id(headers, request)?;
+        if !policy.session_memory_enabled() {
+            return None;
+        }
+
+        let incoming_messages = request.messages.clone();
+        let prior_messages = {
+            let sessions = self.sessions.lock().expect("session cache lock");
+            sessions.get(&session_id).cloned().unwrap_or_default()
+        };
+        {
+            let mut stats = self.stats.lock().expect("cache stats lock");
+            if prior_messages.is_empty() {
+                stats.session_misses += 1;
+            } else {
+                stats.session_hits += 1;
+                let mut merged = prior_messages.clone();
+                merged.extend(request.messages.clone());
+                request.messages = merged;
+            }
+        }
+
+        Some(SessionContext {
+            id: session_id,
+            prior_messages,
+            incoming_messages,
+        })
+    }
+
+    fn update_session(
+        &self,
+        context: Option<SessionContext>,
+        assistant_message: ChatMessage,
+        policy: &CachePolicy,
+    ) {
+        let Some(context) = context else {
+            return;
+        };
+        if !policy.session_memory_enabled() {
+            return;
+        }
+
+        let mut history = context.prior_messages;
+        history.extend(context.incoming_messages);
+        history.push(assistant_message);
+        trim_messages_to_token_budget(&mut history, policy.session_cache_max_tokens);
+
+        let mut sessions = self.sessions.lock().expect("session cache lock");
+        if !sessions.contains_key(&context.id)
+            && sessions.len() >= policy.session_cache_max_entries.max(1)
+        {
+            if let Some(evict_key) = sessions.keys().next().cloned() {
+                sessions.remove(&evict_key);
+                self.stats
+                    .lock()
+                    .expect("cache stats lock")
+                    .session_evictions += 1;
+            }
+        }
+        sessions.insert(context.id, history);
+
+        let entries = sessions.len() as u64;
+        let tokens = sessions
+            .values()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|msg| approx_tokens(&msg.content))
+                    .sum::<usize>()
+            })
+            .sum::<usize>() as u64;
+        let mut stats = self.stats.lock().expect("cache stats lock");
+        stats.session_entries = entries;
+        stats.session_tokens = tokens;
+    }
+
+    fn stats(&self) -> CacheStats {
+        let mut stats = self.stats.lock().expect("cache stats lock").clone();
+        stats.prefix_entries = self.prefix_prompts.lock().expect("prefix cache lock").len() as u64;
+        let sessions = self.sessions.lock().expect("session cache lock");
+        stats.session_entries = sessions.len() as u64;
+        stats.session_tokens = sessions
+            .values()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|msg| approx_tokens(&msg.content))
+                    .sum::<usize>()
+            })
+            .sum::<usize>() as u64;
+        stats
+    }
+
+    fn health_json(
+        &self,
+        policy: &CachePolicy,
+        engine_prefix_cache: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
+        let stats = self.stats();
+        let prefix_hits = engine_u64(engine_prefix_cache, "hits").unwrap_or(stats.prefix_hits);
+        let prefix_misses =
+            engine_u64(engine_prefix_cache, "misses").unwrap_or(stats.prefix_misses);
+        let prefix_evictions =
+            engine_u64(engine_prefix_cache, "evictions").unwrap_or(stats.prefix_evictions);
+        let prefix_saved = engine_u64(engine_prefix_cache, "saved_prefill_tokens")
+            .unwrap_or(stats.prefix_saved_prefill_tokens);
+        let prefix_entries =
+            engine_u64(engine_prefix_cache, "entries").unwrap_or(stats.prefix_entries);
+        let prefix_bytes = engine_u64(engine_prefix_cache, "bytes").unwrap_or(stats.prefix_bytes);
+        serde_json::json!({
+            "prefix_cache": {
+                "enabled": engine_bool(engine_prefix_cache, "enabled").unwrap_or(policy.prefix_cache_enabled),
+                "position": engine_str(engine_prefix_cache, "position").unwrap_or("product-observability"),
+                "source": engine_str(engine_prefix_cache, "source").unwrap_or("server-prompt-lcp-observability"),
+                "entries": prefix_entries,
+                "hits": prefix_hits,
+                "misses": prefix_misses,
+                "evictions": prefix_evictions,
+                "saved_prefill_tokens": prefix_saved,
+                "bytes": prefix_bytes,
+                "block_size": engine_u64(engine_prefix_cache, "block_size"),
+                "kv_dtype": engine_str(engine_prefix_cache, "kv_dtype"),
+            },
+            "session_cache": {
+                "mode": policy.session_cache_mode,
+                "entries": stats.session_entries,
+                "hits": stats.session_hits,
+                "misses": stats.session_misses,
+                "evictions": stats.session_evictions,
+                "tokens": stats.session_tokens,
+                "max_entries": policy.session_cache_max_entries,
+                "max_tokens": policy.session_cache_max_tokens,
+            }
+        })
+    }
+
+    fn prometheus_metrics(&self, engine_prefix_cache: Option<&serde_json::Value>) -> String {
+        let stats = self.stats();
+        let prefix_hits = engine_u64(engine_prefix_cache, "hits").unwrap_or(stats.prefix_hits);
+        let prefix_misses =
+            engine_u64(engine_prefix_cache, "misses").unwrap_or(stats.prefix_misses);
+        let prefix_evictions =
+            engine_u64(engine_prefix_cache, "evictions").unwrap_or(stats.prefix_evictions);
+        let prefix_saved = engine_u64(engine_prefix_cache, "saved_prefill_tokens")
+            .unwrap_or(stats.prefix_saved_prefill_tokens);
+        let prefix_entries =
+            engine_u64(engine_prefix_cache, "entries").unwrap_or(stats.prefix_entries);
+        let prefix_bytes = engine_u64(engine_prefix_cache, "bytes").unwrap_or(stats.prefix_bytes);
+        format!(
+            concat!(
+                "ferrum_prefix_cache_hits_total {}\n",
+                "ferrum_prefix_cache_misses_total {}\n",
+                "ferrum_prefix_cache_evictions_total {}\n",
+                "ferrum_prefix_cache_saved_prefill_tokens_total {}\n",
+                "ferrum_prefix_cache_entries {}\n",
+                "ferrum_prefix_cache_bytes {}\n",
+                "ferrum_session_cache_hits_total {}\n",
+                "ferrum_session_cache_misses_total {}\n",
+                "ferrum_session_cache_evictions_total {}\n",
+                "ferrum_session_cache_entries {}\n",
+                "ferrum_session_cache_tokens {}\n"
+            ),
+            prefix_hits,
+            prefix_misses,
+            prefix_evictions,
+            prefix_saved,
+            prefix_entries,
+            prefix_bytes,
+            stats.session_hits,
+            stats.session_misses,
+            stats.session_evictions,
+            stats.session_entries,
+            stats.session_tokens,
+        )
+    }
+}
+
+fn engine_u64(snapshot: Option<&serde_json::Value>, key: &str) -> Option<u64> {
+    snapshot?.get(key)?.as_u64()
+}
+
+fn engine_bool(snapshot: Option<&serde_json::Value>, key: &str) -> Option<bool> {
+    snapshot?.get(key)?.as_bool()
+}
+
+fn engine_str<'a>(snapshot: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    snapshot?.get(key)?.as_str()
+}
+
+fn request_session_id(headers: &HeaderMap, request: &ChatCompletionsRequest) -> Option<String> {
+    headers
+        .get(FERRUM_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            request
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("ferrum_session_id"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn approx_tokens(text: &str) -> usize {
+    approx_tokens_for_chars(text.chars().count())
+}
+
+fn approx_tokens_for_chars(chars: usize) -> usize {
+    (chars / 4).max(1)
+}
+
+fn longest_common_prefix_chars(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count()
+}
+
+fn trim_messages_to_token_budget(messages: &mut Vec<ChatMessage>, max_tokens: usize) {
+    let max_tokens = max_tokens.max(1);
+    while messages.len() > 1
+        && messages
+            .iter()
+            .map(|msg| approx_tokens(&msg.content))
+            .sum::<usize>()
+            > max_tokens
+    {
+        messages.remove(0);
     }
 }
 
@@ -324,11 +776,17 @@ impl HttpServer for AxumServer {
 /// Main chat completions handler
 async fn chat_completions_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
-    let Json(request) = request.map_err(|e| {
+    let Json(mut request) = request.map_err(|e| {
         ServerError::invalid_request(format!("invalid chat completions request: {e}"), None)
     })?;
+    let cache_policy = CachePolicy::current();
+    let session_context =
+        state
+            .cache
+            .prepare_session_request(&mut request, &headers, &cache_policy);
 
     let span = span!(Level::INFO, "chat_completions", model = %request.model);
     let _enter = span.enter();
@@ -342,27 +800,33 @@ async fn chat_completions_handler(
     // OpenAI spec requires at least one message. Reject empty arrays at
     // the boundary rather than synthesising a fake prompt downstream.
     validate_chat_request(&request)?;
+    let loaded_models = state.status().await.loaded_models;
+    let lora_resolution = state
+        .lora_registry
+        .resolve(&request.model, &loaded_models)?;
 
     // Convert OpenAI request to internal format
-    let template_model_id = state
-        .status()
-        .await
-        .loaded_models
-        .first()
-        .map(ToString::to_string)
+    let template_model_id = lora_resolution
+        .as_ref()
+        .map(|resolution| resolution.base_model_id.clone())
+        .or_else(|| loaded_models.first().map(ToString::to_string))
         .unwrap_or_else(|| request.model.clone());
-    let inference_request = convert_chat_request_with_template_model(
+    let mut inference_request = convert_chat_request_with_template_model(
         &request,
         &template_model_id,
         state.prompt_template.as_deref(),
     )
     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    apply_lora_resolution(&mut inference_request, lora_resolution.as_ref());
+    state
+        .cache
+        .record_prefix_prompt(&inference_request.prompt, &cache_policy);
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
         handle_chat_completions_stream(state, request, inference_request).await
     } else {
-        handle_chat_completions_sync(state, request, inference_request).await
+        handle_chat_completions_sync(state, request, inference_request, session_context).await
     }
 }
 
@@ -384,11 +848,14 @@ async fn handle_chat_completions_stream(
         .as_ref()
         .and_then(|opts| opts.include_usage)
         .unwrap_or(false);
+    let buffer_json_object_stream = response_format_is_json_object(&openai_request);
     let buffer_strict_json_schema_stream = strict_json_schema_string(&openai_request)?.is_some();
     let stream_api_request = api_chat_request(&openai_request);
     let buffer_structured_api_stream =
         ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
-    let buffer_stream_output = buffer_strict_json_schema_stream || buffer_structured_api_stream;
+    let buffer_stream_output = buffer_json_object_stream
+        || buffer_strict_json_schema_stream
+        || buffer_structured_api_stream;
     let mut stream = match engine.infer_stream(inference_request).await {
         Ok(stream) => stream,
         Err(e) => {
@@ -421,12 +888,15 @@ async fn handle_chat_completions_stream(
                         current_text.push_str(&chunk.text);
 
                         if !buffer_stream_output {
+                            if should_defer_reasoning_stream_delta(&current_text) {
+                                continue;
+                            }
                             let parsed = parse_reasoning_response(&current_text);
                             let full_reasoning = parsed.reasoning.as_deref().unwrap_or("");
-                            let reasoning_delta = full_reasoning[sent_reasoning_len..].to_string();
-                            sent_reasoning_len = full_reasoning.len();
-                            let content_delta = parsed.content[sent_content_len..].to_string();
-                            sent_content_len = parsed.content.len();
+                            let reasoning_delta =
+                                stream_text_delta(full_reasoning, &mut sent_reasoning_len);
+                            let content_delta =
+                                stream_text_delta(&parsed.content, &mut sent_content_len);
                             if reasoning_delta.is_empty() && content_delta.is_empty() {
                                 continue;
                             }
@@ -521,6 +991,15 @@ async fn handle_chat_completions_stream(
                             if tx.send(Ok(sse_event)).is_err() {
                                 break;
                             }
+                        } else if tool_choice_required(&openai_request) {
+                            let error_event = openai_error_sse_event(
+                                "model output did not satisfy required tool_choice",
+                                "invalid_request_error",
+                                Some("tool_choice"),
+                            );
+                            let _ = tx.send(Ok(error_event));
+                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
                         } else if buffer_structured_api_stream
                             && parsed_final.content.trim().is_empty()
                         {
@@ -646,6 +1125,7 @@ async fn handle_chat_completions_sync(
     state: AppState,
     openai_request: ChatCompletionsRequest,
     inference_request: InferenceRequest,
+    session_context: Option<SessionContext>,
 ) -> std::result::Result<Response, ServerError> {
     info!("Processing non-streaming chat completion");
 
@@ -722,8 +1202,16 @@ async fn handle_chat_completions_sync(
                 if let Some(reason) = &chat_response.finish_reason {
                     openai_finish_reason = reason.clone();
                 }
+            } else if tool_choice_required(&openai_request) {
+                return Err(ServerError::invalid_request(
+                    "model output did not satisfy required tool_choice",
+                    Some("tool_choice"),
+                ));
             }
             validate_strict_json_schema_response(&openai_request, &message.content)?;
+            state
+                .cache
+                .update_session(session_context, message.clone(), &CachePolicy::current());
             let response = ChatCompletionsResponse {
                 id: Uuid::new_v4().to_string(),
                 object: "chat.completion".to_string(),
@@ -768,11 +1256,12 @@ fn convert_chat_request_with_template_model(
 ) -> ferrum_types::Result<InferenceRequest> {
     let tools = request.tools.as_deref().unwrap_or_default();
     let functions = request.functions.as_deref().unwrap_or_default();
+    let render_messages = render_messages_with_response_format_instruction(request);
     let prompt = if tools.is_empty() && functions.is_empty() {
-        render_chat_prompt_with_model_template(&request.messages, template_model_id, model_template)
+        render_chat_prompt_with_model_template(&render_messages, template_model_id, model_template)
     } else {
         render_chat_prompt_with_tools(
-            &request.messages,
+            &render_messages,
             template_model_id,
             tools,
             request.tool_choice.as_ref(),
@@ -840,28 +1329,8 @@ fn convert_chat_request_with_template_model(
             tfs: None,
             typical_p: None,
             mirostat: None,
-            response_format: forced_tool_choice_response_format(request).unwrap_or_else(|| {
-                match &request.response_format {
-                    Some(rf) if rf.format_type == "json_object" => {
-                        ferrum_types::ResponseFormat::JsonObject
-                    }
-                    Some(rf)
-                        if rf.format_type == "json_schema"
-                            && rf
-                                .json_schema
-                                .as_ref()
-                                .and_then(|schema| schema.strict)
-                                .unwrap_or(false) =>
-                    {
-                        // Strict json_schema still gets hard validation after
-                        // generation. Use JSON-object steering here instead of
-                        // regex hard-masking because GPU greedy sentinels can
-                        // bypass host logits processors on the first token.
-                        ferrum_types::ResponseFormat::JsonObject
-                    }
-                    _ => ferrum_types::ResponseFormat::Text,
-                }
-            }),
+            response_format: forced_tool_choice_response_format(request)
+                .unwrap_or(ferrum_types::ResponseFormat::Text),
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal, // Default priority
@@ -873,24 +1342,61 @@ fn convert_chat_request_with_template_model(
     })
 }
 
+fn render_messages_with_response_format_instruction(
+    request: &ChatCompletionsRequest,
+) -> Vec<ChatMessage> {
+    let Some(instruction) = response_format_prompt_instruction(request) else {
+        return request.messages.clone();
+    };
+    let mut messages = Vec::with_capacity(request.messages.len() + 1);
+    messages.push(ChatMessage {
+        role: MessageRole::System,
+        content: instruction,
+        reasoning: None,
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        function_call: None,
+    });
+    messages.extend(request.messages.clone());
+    messages
+}
+
+fn response_format_prompt_instruction(request: &ChatCompletionsRequest) -> Option<String> {
+    let format = request.response_format.as_ref()?;
+    match format.format_type.as_str() {
+        "json_object" => Some(
+            "The response_format requires a single valid JSON object. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
+                .to_string(),
+        ),
+        "json_schema" => {
+            let schema = format.json_schema.as_ref()?.schema.as_ref()?;
+            let schema_text = serde_json::to_string(schema).ok()?;
+            Some(format!(
+                "The response_format requires a single valid JSON object satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn forced_tool_choice_response_format(
     request: &ChatCompletionsRequest,
 ) -> Option<ferrum_types::ResponseFormat> {
-    let ToolChoice::Function {
-        tool_type,
-        function,
-    } = request.tool_choice.as_ref()?
-    else {
-        return None;
+    let selected_tool = match request.tool_choice.as_ref()? {
+        ToolChoice::Function {
+            tool_type,
+            function,
+        } if tool_type == "function" => request
+            .tools
+            .as_ref()?
+            .iter()
+            .find(|tool| tool.function.name == function.name)?,
+        ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
+            request.tools.as_ref()?.first()?
+        }
+        _ => return None,
     };
-    if tool_type != "function" {
-        return None;
-    }
-    let selected_tool = request
-        .tools
-        .as_ref()?
-        .iter()
-        .find(|tool| tool.function.name == function.name)?;
     let schema = serde_json::to_value(&selected_tool.function.parameters).ok()?;
     if schema.is_null() {
         return None;
@@ -906,6 +1412,24 @@ fn has_unclosed_thinking_block(prompt: &str) -> bool {
         (Some(_), None) => true,
         _ => false,
     }
+}
+
+fn should_defer_reasoning_stream_delta(text: &str) -> bool {
+    let candidate = text.trim_start_matches(['\r', '\n']);
+    if candidate.is_empty() {
+        return true;
+    }
+    THINK_START_TAG.starts_with(candidate) || THINK_END_TAG.starts_with(candidate)
+}
+
+fn stream_text_delta(text: &str, sent_len: &mut usize) -> String {
+    if *sent_len <= text.len() && text.is_char_boundary(*sent_len) {
+        let delta = text[*sent_len..].to_string();
+        *sent_len = text.len();
+        return delta;
+    }
+    *sent_len = text.len();
+    String::new()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -975,6 +1499,13 @@ fn normalize_structured_response_content(
         }
         _ => content.to_string(),
     }
+}
+
+fn response_format_is_json_object(request: &ChatCompletionsRequest) -> bool {
+    request
+        .response_format
+        .as_ref()
+        .is_some_and(|format| format.format_type == "json_object")
 }
 
 fn extract_json_object_text(text: &str) -> Option<String> {
@@ -1296,10 +1827,12 @@ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Resul
             ToolChoice::Mode(mode)
                 if mode.eq_ignore_ascii_case("auto") || mode.eq_ignore_ascii_case("none") => {}
             ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
-                return Err(ServerError::unsupported_feature(
-                    "required tool_choice is not supported",
-                    Some("tool_choice"),
-                ));
+                if request.tools.as_deref().unwrap_or_default().is_empty() {
+                    return Err(ServerError::invalid_request(
+                        "tool_choice=required requires at least one function tool",
+                        Some("tool_choice"),
+                    ));
+                }
             }
             ToolChoice::Mode(_) => {
                 return Err(ServerError::unsupported_feature(
@@ -1361,6 +1894,13 @@ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Resul
     }
 
     Ok(())
+}
+
+fn tool_choice_required(request: &ChatCompletionsRequest) -> bool {
+    matches!(
+        request.tool_choice.as_ref(),
+        Some(ToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required")
+    )
 }
 
 fn openai_usage_from_token_usage(usage: &TokenUsage) -> Usage {
@@ -1560,6 +2100,30 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
     }
 }
 
+fn apply_lora_resolution(
+    inference_request: &mut InferenceRequest,
+    resolution: Option<&LoraModelResolution>,
+) {
+    let Some(resolution) = resolution else {
+        return;
+    };
+    if let Some(adapter) = &resolution.adapter {
+        inference_request.model_id = ModelId(resolution.base_model_id.clone());
+        inference_request.metadata.insert(
+            "ferrum_lora_adapter".to_string(),
+            serde_json::json!(adapter.name),
+        );
+        inference_request.metadata.insert(
+            "ferrum_lora_model_id".to_string(),
+            serde_json::json!(adapter.model_id),
+        );
+        inference_request.metadata.insert(
+            "ferrum_lora_path".to_string(),
+            serde_json::json!(adapter.path),
+        );
+    }
+}
+
 async fn handle_completions_sync(
     state: AppState,
     openai_request: CompletionsRequest,
@@ -1713,7 +2277,12 @@ async fn completions_handler(
         ServerError::invalid_request(format!("invalid completions request: {e}"), None)
     })?;
     validate_completion_request(&request)?;
-    let inference_request = convert_completion_request(&request);
+    let loaded_models = state.status().await.loaded_models;
+    let lora_resolution = state
+        .lora_registry
+        .resolve(&request.model, &loaded_models)?;
+    let mut inference_request = convert_completion_request(&request);
+    apply_lora_resolution(&mut inference_request, lora_resolution.as_ref());
     if request.stream.unwrap_or(false) {
         handle_completions_stream(state, request, inference_request).await
     } else {
@@ -2086,7 +2655,7 @@ async fn models_handler(
 ) -> std::result::Result<Response, ServerError> {
     let status = state.status().await;
     let now = chrono::Utc::now().timestamp() as u64;
-    let data = status
+    let mut data: Vec<_> = status
         .loaded_models
         .into_iter()
         .map(|model_id| crate::openai::ModelInfo {
@@ -2099,6 +2668,17 @@ async fn models_handler(
             parent: None,
         })
         .collect();
+    data.extend(state.lora_registry.adapter_models().iter().map(|adapter| {
+        crate::openai::ModelInfo {
+            id: adapter.model_id.clone(),
+            object: "model".to_string(),
+            created: now,
+            owned_by: "ferrum".to_string(),
+            permission: vec![],
+            root: state.lora_registry.base_model_id.as_ref().cloned(),
+            parent: state.lora_registry.base_model_id.as_ref().cloned(),
+        }
+    }));
 
     let models = ModelListResponse {
         object: "list".to_string(),
@@ -2114,6 +2694,15 @@ async fn health_handler(
     let engine_status = state.status().await;
     let scheduler_metrics = state.metrics();
     let runtime_config = RuntimeConfigSnapshot::capture_current();
+    let cache_policy = CachePolicy::current();
+    let engine_cache = state
+        .llm
+        .as_ref()
+        .and_then(|engine| engine.cache_metrics_snapshot());
+    let engine_lora = state
+        .llm
+        .as_ref()
+        .and_then(|engine| engine.lora_metrics_snapshot());
     let auto_config = match state.auto_config.clone() {
         Some(auto_config) => serde_json::to_value(auto_config).unwrap_or_else(|err| {
             serde_json::json!({
@@ -2151,17 +2740,36 @@ async fn health_handler(
         },
         "config": runtime_config,
         "auto_config": auto_config,
+        "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
+        "lora": engine_lora.unwrap_or_else(|| serde_json::json!({
+            "enabled": state.lora_registry.is_enabled(),
+            "adapter_count": state.lora_registry.adapter_models().len() as u64,
+            "active_cache_bindings": 0u64,
+            "projection_applications": 0u64,
+            "position": "startup-routing",
+            "source": "server-lora-registry",
+        })),
     });
 
     Ok(Json(health).into_response())
 }
 
 /// Prometheus metrics endpoint — returns metrics in Prometheus text format.
-async fn metrics_handler() -> std::result::Result<Response, ServerError> {
-    let body = match PROM_HANDLE.get() {
+async fn metrics_handler(
+    State(state): State<AppState>,
+) -> std::result::Result<Response, ServerError> {
+    let mut body = match PROM_HANDLE.get() {
         Some(handle) => handle.render(),
         None => "# Prometheus recorder not initialized\n".to_string(),
     };
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    let engine_cache = state
+        .llm
+        .as_ref()
+        .and_then(|engine| engine.cache_metrics_snapshot());
+    body.push_str(&state.cache.prometheus_metrics(engine_cache.as_ref()));
 
     Ok((
         [(
@@ -2365,8 +2973,10 @@ mod tests {
     struct StubLlm {
         config: EngineConfig,
         text: String,
+        stream_chunks: Option<Vec<String>>,
         stream_usage: Option<TokenUsage>,
         api_response: Option<ferrum_types::ApiResponse>,
+        lora_metrics: Option<Value>,
     }
 
     impl StubLlm {
@@ -2376,8 +2986,10 @@ mod tests {
             Self {
                 config,
                 text: text.to_string(),
+                stream_chunks: None,
                 stream_usage: Some(TokenUsage::new(5, 1)),
                 api_response: None,
+                lora_metrics: None,
             }
         }
 
@@ -2388,9 +3000,24 @@ mod tests {
             }
         }
 
+        fn with_stream_chunks(chunks: &[&str]) -> Self {
+            Self {
+                text: chunks.concat(),
+                stream_chunks: Some(chunks.iter().map(|chunk| (*chunk).to_string()).collect()),
+                ..Self::new("")
+            }
+        }
+
         fn with_api_response(text: &str, api_response: ferrum_types::ApiResponse) -> Self {
             Self {
                 api_response: Some(api_response),
+                ..Self::new(text)
+            }
+        }
+
+        fn with_lora_metrics(text: &str, lora_metrics: Value) -> Self {
+            Self {
+                lora_metrics: Some(lora_metrics),
                 ..Self::new(text)
             }
         }
@@ -2516,6 +3143,10 @@ mod tests {
 
         async fn health_check(&self) -> EngineHealthStatus {
             EngineHealthStatus::healthy()
+        }
+
+        fn lora_metrics_snapshot(&self) -> Option<Value> {
+            self.lora_metrics.clone()
         }
     }
 
@@ -2798,6 +3429,30 @@ mod tests {
         ) -> ferrum_types::Result<
             Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>,
         > {
+            if let Some(chunks) = &self.stream_chunks {
+                let last = chunks.len().saturating_sub(1);
+                let request_id = request.id;
+                let stream_chunks = chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| {
+                        Ok(StreamChunk {
+                            request_id: request_id.clone(),
+                            text: text.clone(),
+                            token: Some(TokenId::new(11 + index as u32)),
+                            finish_reason: (index == last).then_some(FinishReason::Stop),
+                            usage: (index == last).then(|| self.stream_usage.clone()).flatten(),
+                            created_at: chrono::Utc::now(),
+                            metadata: HashMap::new(),
+                            api_response: (index == last)
+                                .then(|| self.api_response.clone())
+                                .flatten(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Box::pin(stream::iter(stream_chunks)));
+            }
+
             let chunk = StreamChunk {
                 request_id: request.id,
                 text: self.text.clone(),
@@ -2888,6 +3543,10 @@ mod tests {
         AxumServer::from_llm(Arc::new(StubLlm::new(text))).build_router()
     }
 
+    fn router_with_stub_stream_chunks(chunks: &[&str]) -> Router {
+        AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(chunks))).build_router()
+    }
+
     fn router_with_stub_api_response(
         text: &str,
         api_response: ferrum_types::ApiResponse,
@@ -2915,6 +3574,21 @@ mod tests {
     fn router_with_capturing_llm() -> (Router, Arc<CapturingLlm>) {
         let engine = Arc::new(CapturingLlm::new());
         let router = AxumServer::from_llm(engine.clone()).build_router();
+        (router, engine)
+    }
+
+    fn router_with_capturing_lora_llm() -> (Router, Arc<CapturingLlm>) {
+        let engine = Arc::new(CapturingLlm::new());
+        let router = AxumServer::from_llm(engine.clone())
+            .with_lora_adapters(
+                "qwen3",
+                vec![LoraAdapterModel::new(
+                    "sql",
+                    "qwen3:sql",
+                    "/tmp/sql-adapter",
+                )],
+            )
+            .build_router();
         (router, engine)
     }
 
@@ -3059,6 +3733,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_health_includes_engine_lora_metrics_snapshot() {
+        let router = AxumServer::from_llm(Arc::new(StubLlm::with_lora_metrics(
+            "ok",
+            json!({
+                "enabled": true,
+                "adapter_count": 1,
+                "active_cache_bindings": 0,
+                "projection_applications": 7,
+                "position": "real-inference",
+                "source": "test-lora",
+            }),
+        )))
+        .with_lora_adapters(
+            "stub-model",
+            vec![LoraAdapterModel::new(
+                "sql",
+                "stub-model:sql",
+                "/tmp/sql-adapter",
+            )],
+        )
+        .build_router();
+        let response = get(router, "/health").await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["lora"]["enabled"], true);
+        assert_eq!(body["lora"]["adapter_count"], 1);
+        assert_eq!(body["lora"]["projection_applications"], 7);
+        assert_eq!(body["lora"]["position"], "real-inference");
+        assert_eq!(body["lora"]["source"], "test-lora");
+    }
+
+    #[tokio::test]
     async fn route_models_lists_loaded_stub_model() {
         let response = get(router_with_stub("ok"), "/v1/models").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
@@ -3073,6 +3779,105 @@ mod tests {
         assert!(data[0]["permission"].as_array().unwrap().is_empty());
         assert!(data[0]["root"].is_null());
         assert!(data[0]["parent"].is_null());
+    }
+
+    #[tokio::test]
+    async fn route_models_lists_startup_lora_adapters() {
+        let router = AxumServer::from_llm(Arc::new(StubLlm::new("ok")))
+            .with_lora_adapters(
+                "stub-model",
+                vec![LoraAdapterModel::new(
+                    "sql",
+                    "stub-model:sql",
+                    "/tmp/sql-adapter",
+                )],
+            )
+            .build_router();
+        let response = get(router, "/v1/models").await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        let data = body["data"].as_array().expect("models data array");
+        let ids: Vec<_> = data
+            .iter()
+            .map(|item| item["id"].as_str().unwrap_or_default())
+            .collect();
+        assert!(ids.contains(&"stub-model"), "body: {body}");
+        assert!(ids.contains(&"stub-model:sql"), "body: {body}");
+        let adapter = data
+            .iter()
+            .find(|item| item["id"] == "stub-model:sql")
+            .expect("adapter model");
+        assert_eq!(adapter["root"], "stub-model");
+        assert_eq!(adapter["parent"], "stub-model");
+    }
+
+    #[tokio::test]
+    async fn route_chat_lora_adapter_maps_internal_request_to_base_model() {
+        let (router, engine) = router_with_capturing_lora_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "qwen3:sql",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 8,
+                "temperature": 0.0
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["model"], "qwen3:sql");
+        let captured = engine.last_request();
+        assert_eq!(captured.model_id, ModelId::new("qwen3"));
+        assert_eq!(captured.metadata["ferrum_lora_adapter"], "sql");
+        assert_eq!(captured.metadata["ferrum_lora_model_id"], "qwen3:sql");
+    }
+
+    #[tokio::test]
+    async fn route_chat_base_model_still_uses_base_path_with_lora_loaded() {
+        let (router, engine) = router_with_capturing_lora_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "qwen3",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 8,
+                "temperature": 0.0
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let captured = engine.last_request();
+        assert_eq!(captured.model_id, ModelId::new("qwen3"));
+        assert!(!captured.metadata.contains_key("ferrum_lora_adapter"));
+    }
+
+    #[tokio::test]
+    async fn route_chat_unknown_lora_adapter_returns_openai_model_error() {
+        let (router, _) = router_with_capturing_lora_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "qwen3:missing",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 8
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "model");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown LoRA adapter model"),
+            "body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -3206,6 +4011,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_serializes_qwen3_function_parameters_tool_json() {
+        let response = post_json(
+            router_with_stub(
+                r#"{"function":"get_weather","parameters":{"city":"北京","unit":"c"}}"#,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "北京现在天气怎么样？"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"},
+                                "unit": {"type": "string", "enum": ["c", "f"]}
+                            },
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"北京\",\"unit\":\"c\"}"
+        );
+    }
+
+    #[tokio::test]
     async fn route_chat_honors_specific_tool_choice_for_generated_tool_call_json() {
         let response = post_json(
             router_with_stub(r#"{"name":"weather","arguments":{"city":"Paris"}}"#),
@@ -3296,6 +4143,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_tool_choice_required_wraps_generated_arguments() {
+        let response = post_json(
+            router_with_stub(r#"{"city":"Paris"}"#),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use a tool."}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "tool_choice": "required"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "weather"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_chat_tool_choice_required_errors_without_valid_tool_call() {
+        let response = post_json(
+            router_with_stub("plain answer"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use a tool."}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }],
+                "tool_choice": "required"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "tool_choice");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("required tool_choice")),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn route_streaming_chat_serializes_generated_tool_call_delta() {
         let response = post_json(
             router_with_stub(
@@ -3339,6 +4251,52 @@ mod tests {
         assert!(
             !body.contains(r#""content":"{\"tool_calls\""#),
             "raw tool-call JSON should not be streamed as assistant content: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_serializes_qwen3_function_parameters_tool_delta() {
+        let response = post_json(
+            router_with_stub(
+                r#"{"function":"get_weather","parameters":{"city":"深圳","unit":"c"}}"#,
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "深圳天气？"}],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"},
+                                "unit": {"type": "string", "enum": ["c", "f"]}
+                            },
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""finish_reason":"tool_calls""#),
+            "stream should finish with tool_calls: {body}"
+        );
+        assert!(
+            body.contains(r#""function":{"name":"get_weather","arguments":"{\"city\":\"深圳\",\"unit\":\"c\"}"}"#),
+            "stream should emit parsed Qwen3 function parameters as tool args: {body}"
+        );
+        assert!(
+            !body.contains(r#""content":"{\"function\""#),
+            "raw Qwen3 tool JSON should not leak as assistant content: {body}"
         );
     }
 
@@ -3451,6 +4409,46 @@ mod tests {
         assert!(
             !body.contains("raw text that should not stream"),
             "structured api_response should suppress raw generated text in tool-call stream: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_tool_choice_required_errors_without_leaking_content() {
+        let response = post_json(
+            router_with_stub("plain answer"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use a tool."}],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }],
+                "tool_choice": "required"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "body: {body}");
+        assert!(
+            body.contains(
+                r#""error":{"message":"model output did not satisfy required tool_choice""#
+            ),
+            "stream should emit OpenAI error envelope: {body}"
+        );
+        assert!(
+            body.contains(r#""type":"invalid_request_error""#),
+            "stream should use invalid_request_error: {body}"
+        );
+        assert!(
+            body.contains(r#""param":"tool_choice""#),
+            "stream should include tool_choice param: {body}"
+        );
+        assert!(
+            !body.contains(r#""content":"plain answer""#),
+            "required stream must not leak invalid content before validation: {body}"
         );
     }
 
@@ -3937,18 +4935,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_chat_reasoning_prefix_chunks_do_not_panic_or_leak_content() {
+        let response = post_json(
+            router_with_stub_stream_chunks(&["<", "think", ">\nreason", "\n</think>\n\nfinal"]),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "think then answer"}],
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""reasoning":"\nreason"#),
+            "stream should emit reasoning delta after full think prefix: {body}"
+        );
+        assert!(
+            body.contains(r#""content":"final""#),
+            "stream should emit visible content after think close: {body}"
+        );
+        assert!(
+            !body.contains(r#""content":"<"#),
+            "partial think prefix must not leak as content: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn route_rejects_unsupported_tool_and_function_selection() {
         for (extra, param) in [
-            (
-                json!({
-                    "tools": [{
-                        "type": "function",
-                        "function": {"name": "weather", "parameters": {"type": "object"}}
-                    }],
-                    "tool_choice": "required"
-                }),
-                "tool_choice",
-            ),
             (
                 json!({
                     "tools": [{
@@ -4005,6 +5022,24 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["param"], "tools");
+    }
+
+    #[tokio::test]
+    async fn route_rejects_tool_choice_required_without_tools() {
+        let response = post_json(
+            router_with_stub("unused"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tool_choice": "required"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "tool_choice");
     }
 
     #[tokio::test]
@@ -4646,9 +5681,13 @@ mod tests {
     #[tokio::test]
     async fn chat_rejects_n_not_one_with_openai_error_param() {
         let request = chat_request(json!({"n": 2}));
-        let err = chat_completions_handler(State(state_with_stub("unused")), Ok(Json(request)))
-            .await
-            .expect_err("n=2 should reject");
+        let err = chat_completions_handler(
+            State(state_with_stub("unused")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect_err("n=2 should reject");
         let (status, body) = error_json(err).await;
         assert_eq!(status, AxumStatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "invalid_request_error");
@@ -4663,9 +5702,13 @@ mod tests {
             (json!({"top_logprobs": 2}), "top_logprobs"),
         ] {
             let request = chat_request(extra);
-            let err = chat_completions_handler(State(state_with_stub("unused")), Ok(Json(request)))
-                .await
-                .expect_err("unsupported field should reject");
+            let err = chat_completions_handler(
+                State(state_with_stub("unused")),
+                HeaderMap::new(),
+                Ok(Json(request)),
+            )
+            .await
+            .expect_err("unsupported field should reject");
             let (status, body) = error_json(err).await;
             assert_eq!(status, AxumStatusCode::BAD_REQUEST);
             assert_eq!(body["error"]["param"], param);
@@ -4679,9 +5722,13 @@ mod tests {
             "stream": true,
             "stream_options": {"include_usage": true}
         }));
-        let response = chat_completions_handler(State(state_with_stub("ok")), Ok(Json(request)))
-            .await
-            .expect("stream response");
+        let response = chat_completions_handler(
+            State(state_with_stub("ok")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect("stream response");
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_text(response).await;
         assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
@@ -4699,9 +5746,13 @@ mod tests {
         );
 
         let request = chat_request(json!({"stream": true}));
-        let response = chat_completions_handler(State(state_with_stub("ok")), Ok(Json(request)))
-            .await
-            .expect("stream response");
+        let response = chat_completions_handler(
+            State(state_with_stub("ok")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect("stream response");
         let body = response_text(response).await;
         assert!(
             !body.contains("\"usage\":{\"prompt_tokens\""),
@@ -5068,9 +6119,13 @@ mod tests {
     #[tokio::test]
     async fn stream_options_without_stream_is_invalid() {
         let request = chat_request(json!({"stream_options": {"include_usage": true}}));
-        let err = chat_completions_handler(State(state_with_stub("unused")), Ok(Json(request)))
-            .await
-            .expect_err("stream_options without stream should reject");
+        let err = chat_completions_handler(
+            State(state_with_stub("unused")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect_err("stream_options without stream should reject");
         let (status, body) = error_json(err).await;
         assert_eq!(status, AxumStatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["param"], "stream_options");
@@ -5084,6 +6139,7 @@ mod tests {
         }));
         let response = chat_completions_handler(
             State(state_with_stub("```json\n{\"answer\":\"yes\"}\n```")),
+            HeaderMap::new(),
             Ok(Json(request)),
         )
         .await
@@ -5099,14 +6155,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_json_object_buffers_thinking_and_emits_clean_json_content() {
+        let response = post_json(
+            router_with_stub_stream_chunks(&[
+                "<think>\n好的，我需要输出 JSON。",
+                "\n</think>\n\n",
+                "{\"name\":\"李四\",\"age\":30}",
+            ]),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "输出JSON(name,age)：李四,30岁"}],
+                "stream": true,
+                "response_format": {"type": "json_object"}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#""content":"{\"name\":\"李四\",\"age\":30}""#),
+            "stream should emit clean JSON content: {body}"
+        );
+        assert!(
+            body.contains(r#""reasoning":"\n好的，我需要输出 JSON。\n""#),
+            "stream should keep thinking in reasoning field: {body}"
+        );
+        assert!(
+            !body.contains(r#""content":"<think"#)
+                && !body.contains(r#""content":"好的"#)
+                && !body.contains(r#""content":"我需要"#),
+            "thinking text must not leak as streamed content: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn json_object_remains_best_effort_not_strict_validation() {
         let request = chat_request(json!({
             "response_format": {"type": "json_object"}
         }));
-        let response =
-            chat_completions_handler(State(state_with_stub("not json")), Ok(Json(request)))
-                .await
-                .expect("json_object remains best-effort");
+        let response = chat_completions_handler(
+            State(state_with_stub("not json")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect("json_object remains best-effort");
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["choices"][0]["message"]["content"], "not json");
@@ -5124,9 +6219,13 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(State(state_with_stub("unused")), Ok(Json(request)))
-            .await
-            .expect_err("unsupported strict schema should reject");
+        let err = chat_completions_handler(
+            State(state_with_stub("unused")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect_err("unsupported strict schema should reject");
         let (status, body) = error_json(err).await;
         assert_eq!(status, AxumStatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["param"], "response_format.json_schema");
@@ -5144,9 +6243,13 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(State(state_with_stub("unused")), Ok(Json(request)))
-            .await
-            .expect_err("missing strict schema should reject");
+        let err = chat_completions_handler(
+            State(state_with_stub("unused")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect_err("missing strict schema should reject");
         let (status, body) = error_json(err).await;
         assert_eq!(status, AxumStatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["param"], "response_format.json_schema");
@@ -5172,6 +6275,18 @@ mod tests {
 
         validate_chat_request(&request).expect("non-strict schema should not boundary reject");
         let internal = convert_chat_request(&request).expect("convert non-strict schema");
+        assert!(
+            internal
+                .prompt
+                .contains("response_format requires a single valid JSON object"),
+            "response_format instruction should reach the model prompt: {}",
+            internal.prompt
+        );
+        assert!(
+            internal.prompt.contains("\"oneOf\""),
+            "schema should reach the model prompt: {}",
+            internal.prompt
+        );
         assert_eq!(
             internal.sampling_params.response_format,
             ferrum_types::ResponseFormat::Text,
@@ -5186,6 +6301,64 @@ mod tests {
                 .and_then(|format| format.json_schema.as_ref())
                 .and_then(|schema| schema.strict),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn json_object_response_format_instruction_reaches_model_prompt() {
+        let request = chat_request(json!({
+            "response_format": {"type": "json_object"}
+        }));
+
+        let internal = convert_chat_request(&request).expect("convert json_object");
+        assert!(
+            internal
+                .prompt
+                .contains("response_format requires a single valid JSON object"),
+            "response_format instruction should reach the model prompt: {}",
+            internal.prompt
+        );
+        assert!(
+            internal.prompt.contains("Output only JSON"),
+            "JSON-only instruction should reach the model prompt: {}",
+            internal.prompt
+        );
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+            "json_object response_format should use prompt instruction and final JSON cleanup, not engine-wide JSON soft bias"
+        );
+    }
+
+    #[test]
+    fn strict_json_schema_response_format_uses_text_sampling_mode() {
+        let request = chat_request(json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"]
+                    }
+                }
+            }
+        }));
+
+        let internal = convert_chat_request(&request).expect("convert strict json_schema");
+        assert!(
+            internal
+                .prompt
+                .contains("response_format requires a single valid JSON object"),
+            "response_format instruction should reach the model prompt: {}",
+            internal.prompt
+        );
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+            "strict json_schema is validated after generation instead of applying JSON soft bias during Qwen3 thinking"
         );
     }
 
@@ -5207,6 +6380,7 @@ mod tests {
         }));
         let response = chat_completions_handler(
             State(state_with_stub("{\"answer\":\"yes\"}")),
+            HeaderMap::new(),
             Ok(Json(request)),
         )
         .await
@@ -5217,6 +6391,40 @@ mod tests {
             body["choices"][0]["message"]["content"],
             "{\"answer\":\"yes\"}"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_json_schema_validates_non_streaming_response_after_reasoning_block() {
+        let request = chat_request(json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"]
+                    }
+                }
+            }
+        }));
+        let response = chat_completions_handler(
+            State(state_with_stub(
+                "<think>\nreasoning\n</think>\n\n{\"answer\":\"yes\"}",
+            )),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect("strict response with reasoning");
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "{\"answer\":\"yes\"}"
+        );
+        assert_eq!(body["choices"][0]["message"]["reasoning"], "\nreasoning\n");
     }
 
     #[tokio::test]
@@ -5249,6 +6457,51 @@ mod tests {
         assert!(
             body.contains("\\\"answer\\\":\\\"yes\\\""),
             "strict streaming content missing: {body}"
+        );
+        assert!(
+            !body.contains("\"error\""),
+            "valid strict streaming response should not emit error: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_json_schema_validates_streaming_final_response_after_reasoning_block() {
+        let response = post_json(
+            router_with_stub_stream_chunks(&[
+                "<think>\nreasoning",
+                "\n</think>\n\n",
+                "{\"answer\":\"yes\"}",
+            ]),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Return an answer object."}],
+                "stream": true,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "strict": true,
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "string"}},
+                            "required": ["answer"]
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains("\\\"answer\\\":\\\"yes\\\""),
+            "strict streaming content missing: {body}"
+        );
+        assert!(
+            body.contains(r#""reasoning":"\nreasoning\n""#),
+            "strict streaming should keep reasoning separate: {body}"
         );
         assert!(
             !body.contains("\"error\""),
@@ -5342,6 +6595,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cache_metrics_use_engine_real_kv_snapshot_when_available() {
+        let cache = CacheRuntimeState::default();
+        let policy = CachePolicy {
+            prefix_cache_enabled: true,
+            session_cache_mode: "memory".to_string(),
+            session_cache_max_entries: 128,
+            session_cache_max_tokens: 4096,
+        };
+        cache.record_prefix_prompt("alpha beta gamma", &policy);
+        cache.record_prefix_prompt("alpha beta delta", &policy);
+
+        let engine_snapshot = json!({
+            "position": "real-kv-reuse",
+            "source": "llama-family-paged-block-prefix-cache",
+            "enabled": true,
+            "hits": 7,
+            "misses": 3,
+            "evictions": 1,
+            "saved_prefill_tokens": 64,
+            "entries": 5,
+            "bytes": 8192,
+            "block_size": 16,
+            "kv_dtype": "fp16",
+        });
+
+        let health = cache.health_json(&policy, Some(&engine_snapshot));
+        let prefix = &health["prefix_cache"];
+        assert_eq!(prefix["position"], "real-kv-reuse");
+        assert_eq!(prefix["source"], "llama-family-paged-block-prefix-cache");
+        assert_eq!(prefix["hits"], 7);
+        assert_eq!(prefix["misses"], 3);
+        assert_eq!(prefix["evictions"], 1);
+        assert_eq!(prefix["saved_prefill_tokens"], 64);
+        assert_eq!(prefix["entries"], 5);
+        assert_eq!(prefix["bytes"], 8192);
+        assert_eq!(prefix["block_size"], 16);
+        assert_eq!(prefix["kv_dtype"], "fp16");
+
+        let metrics = cache.prometheus_metrics(Some(&engine_snapshot));
+        assert!(metrics.contains("ferrum_prefix_cache_hits_total 7\n"));
+        assert!(metrics.contains("ferrum_prefix_cache_misses_total 3\n"));
+        assert!(metrics.contains("ferrum_prefix_cache_saved_prefill_tokens_total 64\n"));
+        assert!(metrics.contains("ferrum_prefix_cache_entries 5\n"));
+        assert!(metrics.contains("ferrum_prefix_cache_bytes 8192\n"));
+    }
+
     #[tokio::test]
     async fn strict_json_schema_invalid_model_output_fails_before_response() {
         let request = chat_request(json!({
@@ -5358,9 +6658,13 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(State(state_with_stub("not json")), Ok(Json(request)))
-            .await
-            .expect_err("invalid strict response should fail");
+        let err = chat_completions_handler(
+            State(state_with_stub("not json")),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await
+        .expect_err("invalid strict response should fail");
         let (status, body) = error_json(err).await;
         assert_eq!(status, AxumStatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"]["type"], "internal_server_error");
@@ -5388,6 +6692,7 @@ mod tests {
         }));
         let err = chat_completions_handler(
             State(state_with_stub("```json\n{\"answer\":\"yes\"}\n```")),
+            HeaderMap::new(),
             Ok(Json(request)),
         )
         .await

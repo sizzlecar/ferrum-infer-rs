@@ -38,6 +38,42 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
 
+    /// Optional model-level cache metrics.
+    ///
+    /// Models with real paged-KV prefix reuse override this so the executor
+    /// and HTTP server can distinguish true KV reuse from product-level
+    /// prompt observability.
+    fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Optional runtime LoRA metrics.
+    fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Bind or clear a startup LoRA adapter for a model-side KV cache id.
+    ///
+    /// The executor calls this before prefill/decode based on request
+    /// metadata. Models that implement real LoRA inference override it and
+    /// keep the adapter scoped to `cache_id`; unsupported models return an
+    /// explicit error instead of silently serving the base model.
+    fn set_lora_adapter_for_cache(
+        &mut self,
+        cache_id: &str,
+        adapter: Option<crate::lora::ActiveLoraAdapter>,
+    ) -> std::result::Result<(), ferrum_types::FerrumError> {
+        let _ = cache_id;
+        if let Some(adapter) = adapter {
+            return Err(ferrum_types::FerrumError::unsupported(format!(
+                "LoRA inference is not supported by this model/backend for adapter {} at {}",
+                adapter.name,
+                adapter.path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Hint that an upcoming `prefill` / `decode` sequence on
     /// `cache_id` will have at most `max_tokens` tokens per call. Lets
     /// the model eagerly grow its internal scratch buffers AND allocate

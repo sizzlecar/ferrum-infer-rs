@@ -1,0 +1,11 @@
+    Finished `release` profile [optimized] target(s) in 0.24s
+     Running tests/vllm_migration_compat.rs (target/release/deps/vllm_migration_compat-170498d9482b8b36)
+
+running 1 test
+test g1_vllm_migration_smoke ... Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'openai'
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 9.10s
+

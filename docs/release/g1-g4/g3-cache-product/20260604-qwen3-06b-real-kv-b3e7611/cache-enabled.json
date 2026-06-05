@@ -1,0 +1,28 @@
+{
+  "health_prefix_cache": {
+    "block_size": 16,
+    "bytes": 326631424,
+    "enabled": true,
+    "entries": 178,
+    "evictions": 0,
+    "hits": 51,
+    "kv_dtype": "fp16",
+    "misses": 3,
+    "position": "real-kv-reuse",
+    "saved_prefill_tokens": 13600,
+    "source": "llama-family-paged-block-prefix-cache"
+  },
+  "metrics": {
+    "ferrum_prefix_cache_hits_total": 51.0,
+    "ferrum_prefix_cache_misses_total": 3.0,
+    "ferrum_prefix_cache_evictions_total": 0.0,
+    "ferrum_prefix_cache_saved_prefill_tokens_total": 13600.0,
+    "ferrum_prefix_cache_entries": 178.0,
+    "ferrum_prefix_cache_bytes": 326631424.0,
+    "ferrum_session_cache_hits_total": 0.0,
+    "ferrum_session_cache_misses_total": 0.0,
+    "ferrum_session_cache_evictions_total": 0.0,
+    "ferrum_session_cache_entries": 0.0,
+    "ferrum_session_cache_tokens": 0.0
+  }
+}

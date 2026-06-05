@@ -1,0 +1,7 @@
+{
+  "target": "model.layers.0.self_attn.qkv_proj",
+  "rank": 1,
+  "in_features": 1024,
+  "out_features": 4096,
+  "position": "real-inference"
+}

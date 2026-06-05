@@ -253,7 +253,9 @@ def require_keys(where: str, value: dict[str, Any], required: set[str]) -> None:
 
 def resolve(path: str, root: Path) -> Path:
     p = Path(path)
-    return p if p.is_absolute() else root / p
+    if p.is_absolute() or p.exists():
+        return p
+    return root / p
 
 
 def validate_runtime_snapshot(case_name: str, snapshot: dict[str, Any]) -> None:
@@ -1298,6 +1300,11 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def self_test() -> None:
+    with tempfile.TemporaryDirectory(dir=Path.cwd()) as td:
+        root = Path(td).relative_to(Path.cwd())
+        write_json(root / "summary.json", {"ok": True})
+        assert resolve(str(root / "summary.json"), root) == root / "summary.json"
+
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         effective_entries = [

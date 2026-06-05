@@ -19,16 +19,22 @@ FA2_SOURCE="${FA2_SOURCE:-0}"
 TORCH_LIB="${TORCH_LIB:-/workspace/vllm-venv/lib/python3.12/site-packages/torch/lib}"
 FA2_DIR="${FA2_DIR:-/workspace/vllm-venv/lib/python3.12/site-packages/vllm/vllm_flash_attn}"
 if [[ -z "${FA2_EXTRA_LD_LIBRARY_PATH+x}" ]]; then
-    FA2_EXTRA_LD_LIBRARY_PATH="${TORCH_LIB}:${FA2_DIR}"
+    if [[ "$FA2_SOURCE" == "1" ]]; then
+        FA2_EXTRA_LD_LIBRARY_PATH=""
+    else
+        FA2_EXTRA_LD_LIBRARY_PATH="${TORCH_LIB}:${FA2_DIR}"
+    fi
 fi
 
-FEATURES="${FEATURES:-cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin}"
 if [[ "$FA2_SOURCE" == "1" ]]; then
-    FEATURES="${FEATURES},fa2-source"
-elif [[ ! -r "$FA2_SHIM" ]]; then
-    echo "FA2_SHIM is not readable: $FA2_SHIM" >&2
-    echo "build it with: bash scripts/microbenches/build_fa2_ferrum_shim.sh" >&2
-    exit 1
+    FEATURES="${FEATURES:-cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source}"
+else
+    FEATURES="${FEATURES:-cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin}"
+    if [[ ! -r "$FA2_SHIM" ]]; then
+        echo "FA2_SHIM is not readable: $FA2_SHIM" >&2
+        echo "build it with: bash scripts/microbenches/build_fa2_ferrum_shim.sh" >&2
+        exit 1
+    fi
 fi
 
 export MODEL_DIR HF_MODEL BIN OUT_ROOT REPEATS PORT_BASE NUM_PROMPTS WARMUP_REQUESTS CONCURRENCY

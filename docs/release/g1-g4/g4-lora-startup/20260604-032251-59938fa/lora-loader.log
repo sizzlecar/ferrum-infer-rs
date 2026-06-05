@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running tests/lora_loader.rs (target/debug/deps/lora_loader-1fc45aa32001e202)
+
+running 4 tests
+test lora_loader_unknown_target_fails ... ok
+test lora_loader_reads_config_and_safetensors ... ok
+test lora_loader_duplicate_names_fail ... ok
+test lora_loader_shape_mismatch_fails ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

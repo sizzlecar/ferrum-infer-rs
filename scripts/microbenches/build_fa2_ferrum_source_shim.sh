@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build a source-owned FlashAttention-2 C ABI shim for Ferrum.
+# Build the FlashAttention-2 C ABI diagnostic source shim for Ferrum.
 #
 # This is deliberately different from build_fa2_ferrum_shim.sh: it does not
 # link vLLM's _vllm_fa2_C Torch extension and does not require libtorch,
@@ -10,12 +10,11 @@ set -euo pipefail
 #   - hdim128 fp16 split-K, causal=false
 #   - hdim128 fp16 split-K, causal=true
 #
-# The default paths target the Vast M3 pod. CUTLASS_INCLUDE_DIR must point at a
-# CUTLASS 3.x include tree. The current pod already has one through FlashInfer;
-# for a production Ferrum build this include tree should be vendored or supplied
-# by a dedicated kernel dependency, not discovered through Python packages.
+# This script is not used by product or release builds. FA_SRC_DIR must point at
+# an explicit FlashAttention checkout when running this legacy diagnostic.
+# CUTLASS_INCLUDE_DIR must point at a CUTLASS 3.x include tree.
 
-FA_SRC_DIR="${FA_SRC_DIR:-/workspace/vllm-flash-attention-f5bc33c}"
+FA_SRC_DIR="${FA_SRC_DIR:-}"
 FA_GIT_URL="${FA_GIT_URL:-https://github.com/vllm-project/flash-attention.git}"
 FA_GIT_REV="${FA_GIT_REV:-f5bc33cfc02c744d24a2e9d50e6db656de40611c}"
 CUTLASS_INCLUDE_DIR="${CUTLASS_INCLUDE_DIR:-}"
@@ -25,6 +24,11 @@ BUILD_DIR="${BUILD_DIR:-/tmp/ferrum-fa2-source-shim-build}"
 CUDA_ROOT="${CUDA_ROOT:-/usr/local/cuda}"
 CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP:-89}"
 NVCC_THREADS="${FERRUM_NVCC_THREADS:-0}"
+
+if [[ -z "$FA_SRC_DIR" ]]; then
+  echo "FA_SRC_DIR must point at a FlashAttention source checkout for this legacy diagnostic" >&2
+  exit 1
+fi
 
 if [[ ! -d "$FA_SRC_DIR/.git" ]]; then
   echo "[fa2-source-shim] cloning FlashAttention source to $FA_SRC_DIR"

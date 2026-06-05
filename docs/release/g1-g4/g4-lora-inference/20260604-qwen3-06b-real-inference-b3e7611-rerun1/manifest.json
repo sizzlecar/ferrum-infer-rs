@@ -1,0 +1,83 @@
+{
+  "goal": "G4",
+  "name": "lora-inference",
+  "status": "pass",
+  "passed": true,
+  "git_sha": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+  "git_dirty": true,
+  "binary_sha256": "sha256:d6f0179d264827985079243d93604639ce01128c7f5fbc0d4a80d8a3d0fd7657",
+  "features": [
+    "metal"
+  ],
+  "models": [
+    "Qwen/Qwen3-0.6B"
+  ],
+  "commands": [
+    "cargo test --workspace --all-targets",
+    "cargo test -p ferrum-quantization --test lora_linear_ref",
+    "cargo test -p ferrum-models --test lora_loader",
+    "cargo test -p ferrum-server lora",
+    "cargo test -p ferrum-cli --test server_lora_startup",
+    "cargo build --release -p ferrum-cli --bin ferrum --features metal",
+    "ferrum bench-serve c=1 no-lora/base-with-lora/adapter"
+  ],
+  "started_at_utc": "2026-06-04T11:15:23Z",
+  "finished_at_utc": "2026-06-04T11:16:03Z",
+  "created_at": "2026-06-04T19:16:03",
+  "repo": {
+    "head": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+    "short_head": "b3e7611",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "model": "Qwen/Qwen3-0.6B",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "lora_linear_ref": true,
+    "lora_loader": true,
+    "server_lora_routing": true,
+    "server_lora_startup": true,
+    "bench": {
+      "status": "pass",
+      "base_no_lora_output_tps": 43.69991191280738,
+      "base_with_lora_output_tps": 44.1308635370057,
+      "adapter_output_tps": 41.8083938053357,
+      "base_regression_pct": 0.0,
+      "adapter_to_base_ratio": 0.9473731183682252,
+      "fixture": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g4-lora-inference/20260604-qwen3-06b-real-inference-b3e7611-rerun1/fixtures/sql-adapter",
+      "lora_release_position": "real-inference",
+      "fixture_manifest": {
+        "target": "model.layers.0.self_attn.qkv_proj",
+        "rank": 1,
+        "in_features": 1024,
+        "out_features": 4096,
+        "position": "real-inference"
+      }
+    }
+  },
+  "artifacts": [
+    "bench-adapter.json",
+    "bench-adapter.log",
+    "bench-base-no-lora.json",
+    "bench-base-no-lora.log",
+    "bench-base-with-lora.json",
+    "bench-base-with-lora.log",
+    "bench-summary.json",
+    "cargo-test.log",
+    "chat-Qwen--Qwen3-0.6B-sql.json",
+    "chat-Qwen--Qwen3-0.6B.json",
+    "chat-unknown-adapter.json",
+    "gate.log",
+    "lora-fixture.json",
+    "lora-health-after-chat.json",
+    "lora-linear-ref.log",
+    "lora-loader.log",
+    "lora-runtime-correctness.json",
+    "models.json",
+    "release-build.log",
+    "serve-49655.log",
+    "serve-49735.log",
+    "server-lora-routing.log",
+    "server-lora-startup.log"
+  ]
+}

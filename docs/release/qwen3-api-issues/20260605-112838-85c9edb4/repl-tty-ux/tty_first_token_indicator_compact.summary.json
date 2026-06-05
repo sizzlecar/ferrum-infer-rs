@@ -1,0 +1,21 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "run",
+    "Qwen/Qwen3-0.6B",
+    "--backend",
+    "metal",
+    "--max-tokens",
+    "1",
+    "--temperature",
+    "0"
+  ],
+  "returncode": 0,
+  "elapsed_s": 7.186,
+  "saw_prompt": true,
+  "saw_compact_indicator": true,
+  "saw_old_long_indicator": false,
+  "saw_stats": true,
+  "saw_exit_prompt_or_exit": true,
+  "passed": true
+}
