@@ -1,0 +1,8 @@
+{
+  "r": 1,
+  "lora_alpha": 1,
+  "target_modules": [
+    "qkv_proj"
+  ],
+  "base_model_name_or_path": "Qwen/Qwen3-0.6B"
+}

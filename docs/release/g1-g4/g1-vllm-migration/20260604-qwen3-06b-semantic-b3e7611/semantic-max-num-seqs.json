@@ -1,0 +1,434 @@
+{
+  "configured_max_num_seqs": 1,
+  "max_observed_active_requests": 1,
+  "max_observed_queued_requests": 1,
+  "health_samples": [
+    {
+      "active": 0,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 1
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    },
+    {
+      "active": 1,
+      "queued": 0
+    }
+  ],
+  "responses": [
+    {
+      "status": 200,
+      "content_len": 906
+    },
+    {
+      "status": 200,
+      "content_len": 1027
+    }
+  ],
+  "observed_via": "two concurrent OpenAI chat requests plus /health active/queued polling"
+}

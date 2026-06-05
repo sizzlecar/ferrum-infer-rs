@@ -1,0 +1,16 @@
+ferrum bench-serve — dataset=random num_prompts=8 warmup=2 n_repeats=3
+→ closed_loop c=1
+  cell closed_loop c=1 — repeat 1/3 (10 prompts including 2 warmup)
+    8 completed / 0 errored / 1.3s
+  cell closed_loop c=1 — repeat 2/3 (10 prompts including 2 warmup)
+    8 completed / 0 errored / 1.3s
+  cell closed_loop c=1 — repeat 3/3 (10 prompts including 2 warmup)
+    8 completed / 0 errored / 1.4s
+    summary c=1 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=88.4±5.8  p95=94.1±3.7  p99=94.9±3.2
+      TPOT_ms  p50=13.0±0.8  p95=14.3±1.3  p99=14.5±1.8
+      ITL_ms   p50=12.3±0.8  p95=16.8±3.4  p99=19.1±3.6
+      throughput      41.8 ± 2.2 tok/s
+      goodput         5.97 ± 0.31 req/s
+
+→ wrote /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g4-lora-inference/20260604-qwen3-06b-real-inference-b3e7611-rerun1/bench-adapter.json

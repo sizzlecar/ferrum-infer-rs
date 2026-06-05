@@ -1,6 +1,50 @@
 use super::*;
 
 impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
+    pub(crate) fn record_prefix_cache_probe(&mut self, saved_tokens: usize) {
+        if saved_tokens > 0 {
+            self.prefix_cache_hits += 1;
+            self.prefix_cache_saved_prefill_tokens += saved_tokens as u64;
+        } else {
+            self.prefix_cache_misses += 1;
+        }
+    }
+
+    pub(crate) fn prefix_cache_snapshot_json(&self) -> serde_json::Value {
+        let (entries, block_size) = self
+            .paged_block_alloc
+            .as_ref()
+            .and_then(|alloc| {
+                let alloc = alloc.lock().ok()?;
+                let block_size = self
+                    .kv_caches
+                    .values()
+                    .find_map(|layers| layers.first().map(|cache| cache.block_size))
+                    .unwrap_or(16);
+                Some((alloc.hash_table_size() as u64, block_size))
+            })
+            .unwrap_or((0, 16));
+        let bytes_per_entry = (block_size
+            * self.cfg.base.num_layers
+            * self.cfg.base.num_kv_heads
+            * self.cfg.base.head_dim
+            * K::BYTES_PER_ELEM
+            * 2) as u64;
+        serde_json::json!({
+            "position": "real-kv-reuse",
+            "source": "qwen3-moe-paged-block-prefix-cache",
+            "enabled": self.runtime_env.prefix_cache,
+            "hits": self.prefix_cache_hits,
+            "misses": self.prefix_cache_misses,
+            "evictions": 0u64,
+            "saved_prefill_tokens": self.prefix_cache_saved_prefill_tokens,
+            "entries": entries,
+            "bytes": entries.saturating_mul(bytes_per_entry),
+            "block_size": block_size,
+            "kv_dtype": K::NAME,
+        })
+    }
+
     /// Block-level prefix cache: try to splice cached prefix blocks into
     /// `cache_id`'s KV state. Hashes `tokens` block-by-block, looks each
     /// hash up in the shared `paged_block_alloc`'s hash table, and on

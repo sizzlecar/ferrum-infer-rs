@@ -18,6 +18,17 @@ pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<S
     materialized
 }
 
+pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Vec<String> {
+    let mut materialized = Vec::new();
+    for entry in &snapshot.entries {
+        if entry.source != RuntimeConfigSource::Env {
+            std::env::set_var(&entry.key, &entry.effective_value);
+            materialized.push(entry.key.clone());
+        }
+    }
+    materialized
+}
+
 /// Default-ON graph-clean MoE path for Qwen3-MoE startup profiles.
 ///
 /// The returned entries are only values absent from `current`. This preserves

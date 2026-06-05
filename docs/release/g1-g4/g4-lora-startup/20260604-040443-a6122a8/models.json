@@ -1,0 +1,23 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Qwen/Qwen3-0.6B",
+      "object": "model",
+      "created": 1780517336,
+      "owned_by": "ferrum",
+      "permission": [],
+      "root": null,
+      "parent": null
+    },
+    {
+      "id": "Qwen/Qwen3-0.6B:sql",
+      "object": "model",
+      "created": 1780517336,
+      "owned_by": "ferrum",
+      "permission": [],
+      "root": "Qwen/Qwen3-0.6B",
+      "parent": "Qwen/Qwen3-0.6B"
+    }
+  ]
+}

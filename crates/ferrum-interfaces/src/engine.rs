@@ -32,6 +32,20 @@ pub trait InferenceEngine: Send + Sync {
 
     /// Health check.
     async fn health_check(&self) -> ferrum_types::HealthStatus;
+
+    /// Optional cache metrics emitted by concrete LLM engines.
+    ///
+    /// The default keeps non-LLM and stub engines source-compatible. Real
+    /// engines can expose prefix/session cache counters without forcing those
+    /// fields into every modality's core metrics type.
+    fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Optional LoRA runtime metrics emitted by concrete LLM engines.
+    fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 /// LLM text-generation engine.

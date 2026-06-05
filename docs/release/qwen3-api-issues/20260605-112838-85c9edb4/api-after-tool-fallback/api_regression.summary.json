@@ -1,0 +1,160 @@
+{
+  "passed": true,
+  "case_count": 5,
+  "cases": [
+    {
+      "status": 200,
+      "elapsed_s": 15.602,
+      "replacement_char": false,
+      "response": {
+        "id": "5b210f66-2181-4c83-b0e9-47137a5b8371",
+        "object": "chat.completion",
+        "created": 1780631773,
+        "model": "Qwen3-30B-A3B-Q4_K_M",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "{\"name\": \"张三\", \"age\": 28, \"city\": \"上海\", \"job\": \"工程师\"}",
+              "reasoning": "\n好的，我需要从用户提供的句子中提取出特定的JSON格式。用户给的句子是：“张三今年28岁，住在上海，是工程师。” 首先，我要仔细分析这句话，找出其中的各个成分。\n\n首先，句子中的名字是“张三”，这应该对应到JSON中的\"name\"字段。接下来是“28岁”，这里的“岁”字可以忽略，直接取数字28作为年龄，对应\"age\"。然后是“住在上海”，这里“上海”是城市名，所以\"city\"应该是“上海”。最后，“是工程师”中的“工程师”就是职业，对应\"job\"。\n\n接下来，我需要确保这些提取的信息符合用户提供的JSON Schema。根据Schema，必须包含name、age、city、job这四个字段，且类型分别是字符串、整数、字符串和字符串。所以，我需要检查每个提取的值是否符合类型要求。例如，年龄必须是整数，不能是字符串，所以28应该转换为整数类型，而其他字段都是字符串类型。\n\n另外，用户特别强调输出只能是JSON，不能有其他内容，比如解释或markdown格式。因此，我需要确保生成的JSON是严格符合要求的，没有多余的空格或字符。同时，要确保没有添加任何额外的属性，比如性别或其他信息，因为Schema中不允许额外的属性。\n\n可能需要注意的细节是，中文的“岁”字是否会被误认为是年龄的一部分，但根据例子，用户可能希望直接提取数字部分。另外，城市名称“上海”是否正确识别，没有多余的字。职业“工程师”是否正确提取，没有遗漏或错误。\n\n最后，生成JSON的时候，要确保键名正确，比如\"city\"而不是\"cityname\"，\"job\"而不是\"occupation\"。同时，检查是否有拼写错误，比如\"age\"是否正确，而不是\"ag\"或者其他的拼写错误。\n\n总结一下，我需要从句子中正确提取四个字段，确保类型正确，格式符合Schema，并且不添加任何额外信息。这样生成的JSON应该满足用户的需求。\n"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 118,
+          "completion_tokens": 472,
+          "total_tokens": 590
+        }
+      },
+      "parsed_json": {
+        "name": "张三",
+        "age": 28,
+        "city": "上海",
+        "job": "工程师"
+      },
+      "passed": true
+    },
+    {
+      "status": 200,
+      "elapsed_s": 17.006,
+      "replacement_char": false,
+      "content": "{\"name\":\"李四\",\"age\":30}",
+      "reasoning": "\n好的，用户给了一个任务，需要从句子“李四30岁”中提取JSON数据。首先，我需要理解用户的需求。他们希望将中文文本中的名字和年龄信息转换成符合特定JSON结构的对象。根据提供的schema，JSON对象必须包含name（字符串）和age（整数）两个必填字段，且不能有其他属性。\n\n接下来，我需要分析输入的句子。句子是“李四30岁”，这里“李四”显然是名字，而“30岁”中的“30”是年龄。但需要确认用户是否希望年龄字段是整数类型，而不是字符串。因为原句中的年龄是带有“岁”字的，所以可能需要提取数字部分并转换为整数。\n\n然后，我需要确保输出的JSON严格符合schema。例如，name字段必须是字符串，而age必须是整数。所以，正确的处理是将“30”转换为整数30，而不是字符串“30”。同时，必须检查是否有其他可能的错误，比如如果输入中没有年龄信息，或者年龄不是数字，但在这个例子中，用户提供的输入是明确的。\n\n另外，用户特别强调输出只能是JSON，没有其他内容，比如解释或Markdown格式。因此，我需要确保生成的JSON是干净的，没有额外的文本或注释。同时，要确保键名正确，即“name”和“age”，并且顺序可能不重要，但通常按照schema中的顺序排列。\n\n可能的错误点包括：如果用户输入中年龄部分不是数字，比如“三十岁”，这时候可能需要处理，但根据用户提供的例子，输入是“30岁”，所以可以直接提取数字部分。此外，需要确保没有额外的属性被添加，比如性别或其他信息，这些在schema中没有定义，所以必须忽略。\n\n最后，验证生成的JSON是否符合schema。例如，{\"name\": \"李四\", \"age\": 30} 是符合的，而如果age是字符串则不符合。因此，正确的处理是将年龄转换为整数类型。\n",
+      "tool_calls": [],
+      "errors": [],
+      "done_count": 1,
+      "finish_reasons": [
+        "stop"
+      ],
+      "parsed_json": {
+        "name": "李四",
+        "age": 30
+      },
+      "passed": true
+    },
+    {
+      "status": 200,
+      "elapsed_s": 11.955,
+      "replacement_char": false,
+      "content": "{\"name\": \"李四\", \"age\": \"30岁\"}",
+      "reasoning": "\n好的，用户让我输出一个JSON对象，包含name和age两个字段，对应的值是李四和30岁。首先，我需要确认用户的需求是否明确。他们提到“输出JSON(name,age)：李四,30岁”，看起来是希望生成类似{\"name\": \"李四\", \"age\": 30}这样的JSON结构。\n\n接下来，我要检查是否有潜在的问题。比如，年龄通常是数字类型，但用户写的是“30岁”，这里可能需要处理成整数30还是保持字符串“30岁”。根据常见的JSON结构，年龄可能更倾向于数字，所以可能需要提取数字部分。不过用户可能只是举例，所以可能需要严格按照提供的文本处理。\n\n另外，用户特别强调输出必须是单个有效的JSON对象，不能有其他多余的内容，比如markdown格式或者解释性文字。所以必须确保输出仅包含JSON，没有额外的文本或注释。\n\n然后，我需要考虑用户可能的场景。他们可能在处理数据转换，或者需要将中文名称和带单位的年龄转换为JSON，可能用于数据交换或配置文件。也有可能用户对JSON格式不太熟悉，所以需要确保生成的JSON是严格符合规范的，比如键名用双引号，字符串值也用双引号，数字不加引号。\n\n还有，用户提到“输出只有JSON”，所以必须避免任何额外的解释或错误信息。即使输入中有歧义，比如年龄是30还是“30岁”，也需要按照用户给出的内容直接转换。这时候可能需要确认，但根据用户指令，必须直接输出，所以可能直接使用用户提供的值。\n\n最后，生成正确的JSON结构，确保没有语法错误，比如逗号是否正确，括号是否闭合。例如，正确的应该是{\"name\": \"李四\", \"age\": \"30岁\"}或者如果年龄是数字的话，{\"name\": \"李四\", \"age\": 30}。但根据用户给出的例子中的“30岁”，可能更倾向于字符串，所以应该保持原样。\n",
+      "tool_calls": [],
+      "errors": [],
+      "done_count": 1,
+      "finish_reasons": [
+        "stop"
+      ],
+      "parsed_json": {
+        "name": "李四",
+        "age": "30岁"
+      },
+      "content_leak_terms": [],
+      "passed": true
+    },
+    {
+      "status": 200,
+      "elapsed_s": 9.88,
+      "replacement_char": false,
+      "response": {
+        "id": "ae07d6eb-c6cc-416e-9b75-2881b6bc61ca",
+        "object": "chat.completion",
+        "created": 1780631812,
+        "model": "Qwen3-30B-A3B-Q4_K_M",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "",
+              "reasoning": "\n好的，用户问北京现在的天气怎么样，并且要求用摄氏度。首先，我需要确认用户需要的是天气信息，而且单位是摄氏度。查看可用的工具，有一个get_weather函数，参数包括city和unit，其中unit的枚举值是c和f。用户明确要求摄氏度，所以unit应该是\"c\"。接下来，我需要构造一个符合要求的JSON响应，调用这个函数。确保参数正确，城市是北京，单位是c。然后，按照格式要求，用JSON格式返回，不包含其他内容。检查一遍参数是否正确，避免拼写错误，比如city是\"北京\"，unit是\"c\"。确认无误后，生成响应。\n",
+              "tool_calls": [
+                {
+                  "id": "call_0",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"北京\",\"unit\":\"c\"}"
+                  }
+                }
+              ]
+            },
+            "finish_reason": "tool_calls"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 108,
+          "completion_tokens": 167,
+          "total_tokens": 275
+        }
+      },
+      "tool_name": "get_weather",
+      "tool_arguments": {
+        "city": "北京",
+        "unit": "c"
+      },
+      "passed": true
+    },
+    {
+      "status": 200,
+      "elapsed_s": 7.607,
+      "replacement_char": false,
+      "content": "",
+      "reasoning": "\n好的，用户问的是“深圳天气？”，我需要调用天气获取工具。首先，确定用户需要的是深圳的天气，但问题中没有提到温度单位。根据工具的参数要求，unit是必填的，而且只能是c或f。这时候可能需要默认值，比如c，因为用户可能在中国，通常使用摄氏度。不过，也有可能用户没有明确说明，是否需要进一步询问？但根据指令，当需要工具时，直接返回JSON，不需要额外回答。所以应该按照默认单位处理，可能选择c。然后生成对应的JSON调用get_weather函数，参数是city: \"深圳\"，unit: \"c\"。这样应该符合要求了。\n",
+      "tool_calls": [
+        {
+          "index": 0,
+          "id": "call_0",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"深圳\",\"unit\":\"c\"}"
+          }
+        }
+      ],
+      "errors": [],
+      "done_count": 1,
+      "finish_reasons": [
+        "tool_calls"
+      ],
+      "merged_tool_calls": [
+        {
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"深圳\",\"unit\":\"c\"}"
+          },
+          "id": "call_0",
+          "type": "function"
+        }
+      ],
+      "tool_name": "get_weather",
+      "tool_arguments": {
+        "city": "深圳",
+        "unit": "c"
+      },
+      "raw_tool_json_leaked_in_content": false,
+      "passed": true
+    }
+  ]
+}

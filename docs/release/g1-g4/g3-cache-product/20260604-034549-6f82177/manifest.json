@@ -1,0 +1,62 @@
+{
+  "goal": "G3",
+  "name": "cache-product",
+  "status": "pass",
+  "passed": true,
+  "git_sha": "6f821771a1915fdb8f6574b72c829fdad300217f",
+  "git_dirty": true,
+  "binary_sha256": "sha256:e25c99e41a59c47faf1bda21e4a421082a17469d4ef1d84efcec8797ee687572",
+  "features": [],
+  "models": [
+    "qwen3:0.6b"
+  ],
+  "commands": [
+    "cargo test --workspace --all-targets",
+    "cargo test -p ferrum-server cache_metrics_contract",
+    "cargo test --release -p ferrum-cli --test server_prefix_cache_product -- --ignored --test-threads=1",
+    "cargo test --release -p ferrum-cli --test server_session_cache -- --ignored --test-threads=1",
+    "cargo build --release -p ferrum-cli --bin ferrum",
+    "ferrum bench-serve shared-prefix disabled/enabled"
+  ],
+  "started_at_utc": "2026-06-03T19:45:49Z",
+  "finished_at_utc": "2026-06-03T19:57:46Z",
+  "created_at": "2026-06-04T03:57:46",
+  "repo": {
+    "head": "6f821771a1915fdb8f6574b72c829fdad300217f",
+    "short_head": "6f82177",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "model": "qwen3:0.6b",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "cache_metrics_contract": true,
+    "server_prefix_cache_product": true,
+    "server_session_cache": true,
+    "bench": {
+      "status": "pass",
+      "tokenizer": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/g3-tokenizers/Qwen3-30B-A3B.tokenizer",
+      "prefix_hits": 53.0,
+      "prefix_saved_prefill_tokens": 16737.0,
+      "perf_result": "inconclusive",
+      "reason": "G3 keeps unsafe engine-level KV prefix reuse forced off; product cache observability and correctness passed, but TTFT speedup is not claimed."
+    }
+  },
+  "artifacts": [
+    "bench-disabled.json",
+    "bench-disabled.log",
+    "bench-enabled-metrics.txt",
+    "bench-enabled.json",
+    "bench-enabled.log",
+    "bench-summary.json",
+    "cache-metrics-contract.log",
+    "cargo-test.log",
+    "gate.json",
+    "gate.log",
+    "release-build.log",
+    "serve-59513.log",
+    "serve-59662.log",
+    "server-prefix-cache-product.log",
+    "server-session-cache.log"
+  ]
+}

@@ -38,7 +38,6 @@ const LEGACY_LONG_SIGNATURES: &[&str] = &[
     "crates/ferrum-kernels/src/backend/cuda/cuda_decode.rs::impl CudaDecodeRunner::method launch_paged_varlen_attention (18)",
     "crates/ferrum-kernels/src/backend/cuda/fa2_ffi.rs::<root>::fn call_paged_varlen_fn (19)",
     "crates/ferrum-kernels/src/backend/cuda/fa2_ffi.rs::<root>::fn paged_varlen_attention_fa2_ffi (18)",
-    "crates/ferrum-kernels/src/backend/cuda/fa2_source.rs::<root>::fn paged_varlen_attention_fa2_source (18)",
     "crates/ferrum-kernels/src/backend/cuda/marlin.rs::<root>::fn marlin_gemm_moe_vllm (16)",
     "crates/ferrum-kernels/src/backend/cuda/mod.rs::impl CudaBackend::method split_qkv_norm_rope (16)",
     "crates/ferrum-kernels/src/backend/cuda/paged.rs::<root>::fn paged_varlen_split_k_dispatch (16)",

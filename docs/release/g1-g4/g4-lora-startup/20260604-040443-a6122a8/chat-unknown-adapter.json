@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "unknown LoRA adapter model: Qwen/Qwen3-0.6B:missing",
+    "type": "invalid_request_error",
+    "param": "model",
+    "code": null
+  }
+}

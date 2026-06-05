@@ -1008,17 +1008,27 @@ class Runner:
     def run_gates(self, case: dict[str, Any], paths: RunPaths, port: int) -> list[dict[str, Any]]:
         gates: list[dict[str, Any]] = []
         gate_config = self.config.get("gates", {})
+        gate_max_tokens = int(gate_config.get("max_tokens", 1024))
         if gate_config.get("paris", True):
             payload = {
                 "model": self.hf_model,
                 "messages": [{"role": "user", "content": "What is the capital of France?"}],
-                "max_tokens": 64,
+                "max_tokens": gate_max_tokens,
                 "temperature": 0.0,
             }
             data = self.post_chat(port, payload, paths.case_dir / "paris.json")
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            ok = "Paris" in content
-            gates.append({"name": "paris", "ok": ok, "content": content})
+            choice = data.get("choices", [{}])[0]
+            content = choice.get("message", {}).get("content", "")
+            finish_reason = choice.get("finish_reason")
+            ok = finish_reason != "length" and "Paris" in content
+            gates.append(
+                {
+                    "name": "paris",
+                    "ok": ok,
+                    "content": content,
+                    "finish_reason": finish_reason,
+                }
+            )
             print(f"PARIS_CONTENT= {content}", flush=True)
             if not ok:
                 raise RuntimeError("Paris gate failed")
@@ -1031,13 +1041,22 @@ class Runner:
                     {"role": "assistant", "content": "Paris"},
                     {"role": "user", "content": "Reply with only that city name."},
                 ],
-                "max_tokens": 32,
+                "max_tokens": gate_max_tokens,
                 "temperature": 0.0,
             }
             data = self.post_chat(port, payload, paths.case_dir / "multiturn.json")
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            ok = "Paris" in content
-            gates.append({"name": "multi_turn_paris", "ok": ok, "content": content})
+            choice = data.get("choices", [{}])[0]
+            content = choice.get("message", {}).get("content", "")
+            finish_reason = choice.get("finish_reason")
+            ok = finish_reason != "length" and "Paris" in content
+            gates.append(
+                {
+                    "name": "multi_turn_paris",
+                    "ok": ok,
+                    "content": content,
+                    "finish_reason": finish_reason,
+                }
+            )
             print(f"MULTITURN_CONTENT= {content}", flush=True)
             if not ok:
                 raise RuntimeError("multi-turn Paris gate failed")
@@ -1052,13 +1071,22 @@ class Runner:
                     {"role": "assistant", "content": "P"},
                     {"role": "user", "content": "Reply with the full city name again, and nothing else."},
                 ],
-                "max_tokens": 32,
+                "max_tokens": gate_max_tokens,
                 "temperature": 0.0,
             }
             data = self.post_chat(port, payload, paths.case_dir / "multiturn_3round.json")
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            ok = "Paris" in content
-            gates.append({"name": "multi_turn_3round_paris", "ok": ok, "content": content})
+            choice = data.get("choices", [{}])[0]
+            content = choice.get("message", {}).get("content", "")
+            finish_reason = choice.get("finish_reason")
+            ok = finish_reason != "length" and "Paris" in content
+            gates.append(
+                {
+                    "name": "multi_turn_3round_paris",
+                    "ok": ok,
+                    "content": content,
+                    "finish_reason": finish_reason,
+                }
+            )
             print(f"MULTITURN_3ROUND_CONTENT= {content}", flush=True)
             if not ok:
                 raise RuntimeError("three-round multi-turn Paris gate failed")

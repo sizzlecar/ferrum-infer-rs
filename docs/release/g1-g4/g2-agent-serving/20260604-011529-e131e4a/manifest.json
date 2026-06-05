@@ -1,0 +1,27 @@
+{
+  "goal": "G2",
+  "name": "agent-serving",
+  "status": "pass",
+  "created_at": "2026-06-04T01:21:06",
+  "repo": {
+    "head": "e131e4a104add71fc4f5e2bdf31aa544061a9b26",
+    "short_head": "e131e4a",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "model": "qwen3:0.6b",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "ferrum_server_structured_output": true,
+    "strict_schema_real_model_20x": true,
+    "required_tool_call_real_model_10x": true
+  },
+  "artifacts": [
+    "cargo-test.log",
+    "gate.json",
+    "gate.log",
+    "server-agent-tools-real-model.log",
+    "server-structured-output-real-model.log",
+    "server-structured-output.log"
+  ]
+}

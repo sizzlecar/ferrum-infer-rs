@@ -1,0 +1,56 @@
+{
+  "passed": true,
+  "rc": 0,
+  "elapsed_s": 101.31,
+  "assistant_count": 4,
+  "assistant_summaries": [
+    {
+      "turn": 1,
+      "n_tokens": 753,
+      "ms": 20177.854375,
+      "tok_s": 37.31814027426789,
+      "preview": "<think>  好的，用户问“rust是什么”，我需要先确定用户指的是什么。Rust可能指编程语言，也可能指金属生锈，但根据上下文，用户可能是在问编程语言。不过，为了确保准确，我应该先确认用户的需求。  首先，考虑用户可能的背景。如果用户是开发者或对编程感兴趣，那么他们可能是在问Rust编程语言。但如果是普通用户，可能指的是金属锈。不过，通常在技术问题中，"
+    },
+    {
+      "turn": 2,
+      "n_tokens": 1024,
+      "ms": 28627.936792,
+      "tok_s": 35.769256004720326,
+      "preview": "<think> 好的，用户问“为什么要不可变”，我需要先理解这个问题的上下文。用户之前问过Rust是什么，现在可能是在学习Rust或者编程中的不可变性概念。用户可能对Rust中的不可变变量或者不可变数据结构感兴趣。  首先，我需要确定用户的问题具体指的是什么。不可变性在编程中有多种应用，比如在Rust中，变量默认是不可变的，这可能和用户的问题相关。另外，不可"
+    },
+    {
+      "turn": 3,
+      "n_tokens": 262,
+      "ms": 13292.166333000001,
+      "tok_s": 19.71085776661865,
+      "preview": "<think> 好的，用户问“我的第一个问题是什么”，我需要先回顾之前的对话历史。用户之前问过“rust是什么”，然后我详细解释了Rust编程语言和金属氧化的两种含义。接着用户问“为什么要不可变”，我解释了不可变性的优点，比如安全性、并发、性能等。  现在用户问“我的第一个问题是什么”，看起来是在询问自己最初的问题是什么。根据对话历史，用户最初的问题确实是“"
+    },
+    {
+      "turn": 4,
+      "n_tokens": 1024,
+      "ms": 37126.571875,
+      "tok_s": 27.581323787385095,
+      "preview": "<think> 好的，用户问“你还没有解释 为什么 要不可变”，我需要回顾之前的对话。用户之前问过“Rust是什么”，然后我解释了Rust编程语言和金属锈两种情况。接着用户问“为什么要不可变”，我详细回答了不可变性的原因，包括安全性、并发、性能、代码复杂度等。现在用户可能觉得之前的回答不够完整，或者想再确认一下。  用户现在的问题是“你还没有解释 为什么 要"
+    }
+  ],
+  "json_errors": [],
+  "bad_terms": [],
+  "mojibake": false,
+  "orphan_think_turns": [],
+  "short_nonrecall": [],
+  "context_shift_lines": [],
+  "small_context_shift_clamps": [],
+  "recall_ok": true,
+  "immutability_ok": true,
+  "jsonl_perf": {
+    "completion_tokens": 3063,
+    "ms": 99224.52937500001,
+    "tok_s": 30.86938299726251
+  },
+  "artifacts": {
+    "stdin": "docs/release/qwen3-api-issues/20260605-112838-85c9edb4/run-multiturn-final/run_multiturn.stdin",
+    "stdout_jsonl": "docs/release/qwen3-api-issues/20260605-112838-85c9edb4/run-multiturn-final/run_multiturn.stdout.jsonl",
+    "stderr": "docs/release/qwen3-api-issues/20260605-112838-85c9edb4/run-multiturn-final/run_multiturn.stderr",
+    "command": "docs/release/qwen3-api-issues/20260605-112838-85c9edb4/run-multiturn-final/run_multiturn.command.json"
+  }
+}

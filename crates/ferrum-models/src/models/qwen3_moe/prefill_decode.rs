@@ -9,14 +9,19 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
     /// and only the unmatched suffix is actually prefilled.
     pub fn prefill_internal(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
         assert!(!tokens.is_empty());
-        self.ensure_scratch(tokens.len());
         self.ensure_kv(cache_id);
 
         // Block-level prefix cache. Env-gated for cautious rollout — the
         // engine's older whole-prompt PrefixCache (continuous_engine.rs)
         // still owns the default path; this knob opt-in switches the
         // model layer to block-level matching too.
-        let cached_prefix_tokens = if self.runtime_env.prefix_cache {
+        let cache_len_before = self
+            .kv_caches
+            .get(cache_id)
+            .and_then(|layers| layers.first())
+            .map(|c| c.len)
+            .unwrap_or(0);
+        let cached_prefix_tokens = if self.runtime_env.prefix_cache && cache_len_before == 0 {
             self.try_acquire_prefix_cache(cache_id, tokens)
         } else {
             0
@@ -41,6 +46,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         } else {
             cached_prefix_tokens
         };
+        if self.runtime_env.prefix_cache && cache_len_before == 0 {
+            self.record_prefix_cache_probe(cached_prefix_tokens);
+        }
 
         // Sync cache.len down if we rolled back. Cheap: 1 u32 write per layer.
         if cached_prefix_tokens > 0 {
@@ -60,6 +68,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let suffix_tokens: &[u32] = &tokens[cached_prefix_tokens..];
         let seq_len = suffix_tokens.len();
         assert!(seq_len > 0, "prefix cache must leave ≥1 suffix token");
+        self.ensure_scratch(seq_len);
 
         let pos_offset = self
             .kv_caches

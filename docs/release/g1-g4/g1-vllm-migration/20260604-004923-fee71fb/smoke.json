@@ -1,0 +1,30 @@
+{
+  "passed": true,
+  "base_url": "http://127.0.0.1:56247",
+  "model": "qwen3:0.6b",
+  "model_name": "qwen3:0.6b",
+  "effective_config": {
+    "FERRUM_MAX_MODEL_LEN": {
+      "effective_value": "2048",
+      "source": "cli"
+    },
+    "FERRUM_PAGED_MAX_SEQS": {
+      "effective_value": "4",
+      "source": "cli"
+    },
+    "FERRUM_MAX_BATCHED_TOKENS": {
+      "effective_value": "2048",
+      "source": "cli"
+    },
+    "FERRUM_PREFIX_CACHE": {
+      "effective_value": "0",
+      "source": "cli"
+    }
+  },
+  "chat_content_len": 9,
+  "stream_chunks": 114,
+  "stream_done_count": 1,
+  "usage_stream_chunks": 115,
+  "usage_done_count": 1,
+  "usage_chunk_count": 1
+}

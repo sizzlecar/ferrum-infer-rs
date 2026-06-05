@@ -33,6 +33,7 @@ pub struct AutoSizeResult {
     pub free_gpu_bytes: u64,
     pub weight_bytes: u64,
     pub kv_block_bytes: u64,
+    pub kv_pool_copies: u64,
     pub max_blocks: usize,
     pub reserved_for_scratch: u64,
 }
@@ -46,9 +47,15 @@ impl AutoSizeResult {
             gb(self.free_gpu_bytes),
             gb(self.weight_bytes),
             gb(self.reserved_for_scratch),
-            gb((self.max_blocks as u64) * self.kv_block_bytes),
+            gb((self.max_blocks as u64) * self.kv_block_bytes * self.kv_pool_copies),
             self.max_blocks,
         );
+        if self.kv_pool_copies > 1 {
+            eprintln!(
+                "[auto-size] KV pool copies={} (FA-compatible attention path)",
+                self.kv_pool_copies
+            );
+        }
     }
 }
 
@@ -57,7 +64,16 @@ impl AutoSizeResult {
 /// Returns None when any input is unavailable — caller leaves the
 /// static default in place.
 pub fn auto_size_kv_blocks(model_dir: &Path, gpu_util: f32) -> Option<AutoSizeResult> {
+    auto_size_kv_blocks_with_pool_copies(model_dir, gpu_util, 1)
+}
+
+pub fn auto_size_kv_blocks_with_pool_copies(
+    model_dir: &Path,
+    gpu_util: f32,
+    kv_pool_copies: u64,
+) -> Option<AutoSizeResult> {
     let gpu_util = gpu_util.clamp(0.1, 1.0);
+    let kv_pool_copies = kv_pool_copies.max(1);
 
     // 1. Query GPU total + free via nvidia-smi (most portable across
     //    cudarc versions and works pre-cuda-driver-load).
@@ -106,7 +122,10 @@ pub fn auto_size_kv_blocks(model_dir: &Path, gpu_util: f32) -> Option<AutoSizeRe
                 .map(|ext| ext == "safetensors" || ext == "bin")
                 .unwrap_or(false);
             if is_weight {
-                if let Ok(meta) = entry.metadata() {
+                // HuggingFace snapshot files are commonly symlinks into the
+                // blob cache. `DirEntry::metadata` reports the symlink itself;
+                // `std::fs::metadata` follows it and gives the real shard size.
+                if let Ok(meta) = std::fs::metadata(&p) {
                     weight_bytes += meta.len();
                 }
             }
@@ -132,13 +151,14 @@ pub fn auto_size_kv_blocks(model_dir: &Path, gpu_util: f32) -> Option<AutoSizeRe
     if block_bytes == 0 {
         return None;
     }
-    let max_blocks = (avail_for_kv / block_bytes) as usize;
+    let max_blocks = (avail_for_kv / (block_bytes * kv_pool_copies)) as usize;
 
     Some(AutoSizeResult {
         total_gpu_bytes: total_bytes,
         free_gpu_bytes: free_bytes,
         weight_bytes,
         kv_block_bytes: block_bytes,
+        kv_pool_copies,
         max_blocks,
         reserved_for_scratch: SCRATCH_RESERVE_BYTES,
     })
@@ -220,7 +240,9 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         crate::runtime_env::materialize_runtime_env_defaults(&entries);
         return;
     }
-    let Some(result) = auto_size_kv_blocks(model_dir, gpu_util) else {
+    let kv_pool_copies = kv_pool_copies_from_snapshot(&current);
+    let Some(result) = auto_size_kv_blocks_with_pool_copies(model_dir, gpu_util, kv_pool_copies)
+    else {
         crate::runtime_env::materialize_runtime_env_defaults(&entries);
         return;
     };
@@ -330,4 +352,54 @@ fn snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<
         .iter()
         .find(|entry| entry.key == key)
         .map(|entry| entry.effective_value.as_str())
+}
+
+fn snapshot_bool(snapshot: &RuntimeConfigSnapshot, key: &str) -> Option<bool> {
+    snapshot_value(snapshot, key).map(|value| matches!(value, "1" | "true" | "TRUE" | "on" | "ON"))
+}
+
+fn kv_pool_copies_from_snapshot(snapshot: &RuntimeConfigSnapshot) -> u64 {
+    let fa_layout = snapshot_bool(snapshot, "FERRUM_FA_LAYOUT_VARLEN").unwrap_or(false);
+    let fa2_source = snapshot_bool(snapshot, "FERRUM_FA2_SOURCE").unwrap_or(false);
+    let fa2_direct_ffi = snapshot_bool(snapshot, "FERRUM_FA2_DIRECT_FFI")
+        .unwrap_or_else(|| snapshot_value(snapshot, "FERRUM_FA2_DIRECT_FFI_SHIM").is_some());
+
+    if fa_layout || fa2_source || fa2_direct_ffi {
+        2
+    } else {
+        1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(vars: &[(&str, &str)]) -> RuntimeConfigSnapshot {
+        RuntimeConfigSnapshot::from_env_vars(vars.iter().copied())
+    }
+
+    #[test]
+    fn fa_compatible_attention_paths_count_two_kv_pool_copies() {
+        assert_eq!(kv_pool_copies_from_snapshot(&snapshot(&[])), 1);
+        assert_eq!(
+            kv_pool_copies_from_snapshot(&snapshot(&[("FERRUM_FA_LAYOUT_VARLEN", "1")])),
+            2
+        );
+        assert_eq!(
+            kv_pool_copies_from_snapshot(&snapshot(&[("FERRUM_FA2_SOURCE", "1")])),
+            2
+        );
+        assert_eq!(
+            kv_pool_copies_from_snapshot(&snapshot(&[("FERRUM_FA2_DIRECT_FFI_SHIM", "/tmp/x.so")])),
+            2
+        );
+        assert_eq!(
+            kv_pool_copies_from_snapshot(&snapshot(&[
+                ("FERRUM_FA2_DIRECT_FFI", "0"),
+                ("FERRUM_FA2_DIRECT_FFI_SHIM", "/tmp/x.so"),
+            ])),
+            1
+        );
+    }
 }

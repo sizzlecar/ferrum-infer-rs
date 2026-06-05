@@ -1,0 +1,70 @@
+Start the inference HTTP server
+
+Usage: ferrum serve [OPTIONS] [MODEL]
+
+Arguments:
+  [MODEL]  Model to serve (default: from config)
+
+Options:
+  -m, --model <MODEL>
+          Model to serve (default: from config)
+      --host <HOST>
+          Host to bind to
+  -p, --port <PORT>
+          Port to listen on
+      --tts-slots <TTS_SLOTS>
+          Number of TTS concurrent slots (default: 2) [default: 2]
+      --spec-draft <MODEL>
+          Speculative decoding: draft model id (same family as target). Example: `--spec-draft qwen3:0.6b` when serving `qwen3:4b`. The draft model must share the tokenizer + vocabulary
+      --spec-tokens <SPEC_TOKENS>
+          Number of speculative tokens per draft forward pass (default: 4). Only active when --spec-draft is set [default: 4]
+      --gpu-memory-utilization <GPU_MEMORY_UTILIZATION>
+          Fraction of GPU memory ferrum is allowed to use (mirrors vLLM's `--gpu-memory-utilization`). Auto-sizes the KV pool to fit weights + scratch + KV inside `total_mem * util`. Default 0.9. Set 1.0 for an exclusive GPU; lower if you share the card [default: 0.9]
+      --max-model-len <N>
+          vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`
+      --max-num-seqs <N>
+          vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`
+      --max-num-batched-tokens <N>
+          vLLM-compatible alias for `FERRUM_MAX_BATCHED_TOKENS`
+      --enable-prefix-caching
+          Enable prefix caching (`FERRUM_PREFIX_CACHE=1`)
+  -v, --verbose
+          Verbose output
+      --no-enable-prefix-caching
+          Disable prefix caching (`FERRUM_PREFIX_CACHE=0`)
+      --enable-prefix-cache
+          Enable prefix cache (`FERRUM_PREFIX_CACHE=1`)
+      --disable-prefix-cache
+          Disable prefix cache (`FERRUM_PREFIX_CACHE=0`)
+      --session-cache <MODE>
+          Session cache mode (`off` or `memory`) [possible values: off, memory]
+      --session-cache-max-entries <N>
+          Maximum in-memory session cache entries
+      --session-cache-max-tokens <N>
+          Approximate maximum tokens retained per session
+      --kv-dtype <DTYPE>
+          KV cache element dtype (Dim 5 polymorphism point). Accepts `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8 require model wire-up; today only the kernel + type layer ships. Override via `FERRUM_KV_DTYPE` env var
+      --runtime-preset <PRESET>
+          Named startup/runtime preset, for example `m3_qwen3_30b_a3b_int4`
+      --effective-config-json <PATH>
+          Write the startup effective runtime config JSON artifact
+      --decision-trace-jsonl <PATH>
+          Write the startup auto-config decision trace JSONL artifact
+      --profile-jsonl <PATH>
+          Write native structured profile events to this JSONL path
+      --profile-commit-sha <SHA>
+          Git commit stamped into native structured profile events
+      --profile-env-hash <SHA256>
+          Runtime environment hash stamped into native structured profile events
+      --profile-model <MODEL>
+          Model label stamped into native structured profile events
+      --profile-concurrency <N>
+          Concurrency stamped into native structured profile events
+      --profile-runtime-flags-json <JSON>
+          Runtime flags/config JSON object embedded in native profile events
+      --lora <NAME=PATH>
+          Startup-loaded LoRA adapter, formatted as NAME=PATH. May be repeated
+      --lora-model-id-template <TEMPLATE>
+          Public model id template for LoRA adapters. Supports <base> and <name> [default: <base>:<name>]
+  -h, --help
+          Print help

@@ -1,0 +1,141 @@
+{
+  "artifact_verdict": "pass",
+  "cases": [
+    {
+      "manifest": "/workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1/c32/baseline_c32_n1/manifest.json",
+      "name": "baseline"
+    },
+    {
+      "manifest": "/workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1/c32/candidate_c32_n1/manifest.json",
+      "name": "candidate"
+    }
+  ],
+  "created_at": "2026-06-03T16:19:48.338229+00:00",
+  "finished_at": "2026-06-03T16:20:52.310835+00:00",
+  "name": "g0-cuda4090-smoke",
+  "not_publishable": false,
+  "not_publishable_reason": null,
+  "preflight": {
+    "bin": "target/release/ferrum",
+    "binary_sha256": "sha256:c92739717305885e93e017a9d73ebd49e749f0c432482f27a48af9989ce64fc6",
+    "date": "2026-06-03T16:19:48.140851+00:00",
+    "features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source",
+    "git_head": "fdb9d1583f3f6b8ec29620867f39c09747036922",
+    "git_status_short": [
+      "?? scripts/__pycache__/"
+    ],
+    "gpu_process_state": "    PID    PPID STAT     ELAPSED CMD\n      1       0 Ss      01:13:58 /bin/sh -c while [ ! -e /.launch ]; do sleep 1; done; bash /.launch\n     51       1 S       01:13:57 bash /.launch\n    366       1 S       01:13:51 bash /.launch\n    371     366 S       01:13:51 bash /root/onstart.sh\n    372     366 S       01:13:51 tee -a /var/log/onstart.log\n    375       1 Ss      01:13:51 sshd: /usr/sbin/sshd -E /proc/1/fd/1 [listener] 0 of 10-100 startups\n    381      51 S       01:13:51 ssh -i /etc/forward_key -R *:30732:localhost:22 -R *:30733:localhost:8080 -N -o TCPKeepAlive=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 ubuntu@ssh9.vast.ai -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o RequestTTY=no -o ExitOnForwardFailure=yes\n   5567     371 S       01:13:34 sleep infinity\n  14551       1 Ss         01:57 tmux new-session -d -s ferrum-cuda-smoke set -euo pipefail; . /root/.cargo/env; export HF_HOME=/workspace/hf-cache; export FERRUM_FA2_SRC_DIR=/workspace/vllm-flash-attention-f5bc33c; export FERRUM_CUTLASS_INCLUDE_DIR=/workspace/cutlass/include; cd /workspace/ferrum-infer-rs; scripts/release/g0_source_gate.sh cuda-smoke /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1 2>&1 | tee /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1.session.log\n  14552   14551 Ss+        01:57 bash -c set -euo pipefail; . /root/.cargo/env; export HF_HOME=/workspace/hf-cache; export FERRUM_FA2_SRC_DIR=/workspace/vllm-flash-attention-f5bc33c; export FERRUM_CUTLASS_INCLUDE_DIR=/workspace/cutlass/include; cd /workspace/ferrum-infer-rs; scripts/release/g0_source_gate.sh cuda-smoke /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1 2>&1 | tee /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1.session.log\n  14554   14552 S+         01:57 bash scripts/release/g0_source_gate.sh cuda-smoke /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1\n  14555   14552 S+         01:57 tee /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1.session.log\n  14829   14554 S+         00:00 python3 scripts/m3_ab_runner.py --config /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1/g0_cuda4090_smoke-c32.json\n  14837   14829 R+         00:00 ps -eo pid,ppid,stat,etime,cmd\n",
+    "hf_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+    "host": "6850a22344e5",
+    "model_dir": "/workspace/hf-cache/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+    "nvidia_smi": "Wed Jun  3 16:19:48 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 580.159.03             Driver Version: 580.159.03     CUDA Version: 13.0     |\n+-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA GeForce RTX 4090        On  |   00000000:03:00.0 Off |                  Off |\n|100%   49C    P0            100W /  450W |     281MiB /  24564MiB |     39%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n\n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|  No running processes found                                                             |\n+-----------------------------------------------------------------------------------------+\n",
+    "preset": "m3_qwen3_30b_a3b_int4",
+    "repo": "/workspace/ferrum-infer-rs"
+  },
+  "runner": "scripts/m3_ab_runner.py",
+  "runtime_preset": "m3_qwen3_30b_a3b_int4",
+  "schema_version": 1,
+  "summary_json": "/workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1/c32/summary.json",
+  "validation_checklist": {
+    "baseline_case": "baseline",
+    "bench_completion": {
+      "completed": null,
+      "errored": null,
+      "ok": null,
+      "required": true
+    },
+    "case": null,
+    "change_type": "diagnostic",
+    "local_gates": [],
+    "observed_correctness_gates": [],
+    "performance_regression_gates": {
+      "baseline_case": "baseline",
+      "cases": {
+        "candidate": {
+          "baseline_case": "baseline",
+          "metrics": [
+            {
+              "baseline": 1144.371307971716,
+              "candidate": 1158.2980087424096,
+              "delta_pct": 1.2169739553656855,
+              "metric": "throughput_mean",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "min_delta_pct",
+                "value": -20.0
+              }
+            },
+            {
+              "baseline": 985.521698,
+              "candidate": 931.377493,
+              "delta_pct": -5.493963766589749,
+              "metric": "ttft_p50",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 50.0
+              }
+            },
+            {
+              "baseline": 19.656131313492068,
+              "candidate": 19.708448596706663,
+              "delta_pct": 0.2661626663975625,
+              "metric": "tpot_p50",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 50.0
+              }
+            },
+            {
+              "baseline": 23.786049499999997,
+              "candidate": 23.6352508,
+              "delta_pct": -0.6339795937950754,
+              "metric": "itl_p95",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 80.0
+              }
+            }
+          ],
+          "ok": true
+        }
+      },
+      "concurrency_cells_ok": true,
+      "enabled": true,
+      "observed_concurrency_cells": [
+        32
+      ],
+      "required_concurrency_cells": [
+        32
+      ],
+      "schema_version": 1,
+      "thresholds": {
+        "enabled": true,
+        "itl_p95_max_regression_pct": 80.0,
+        "throughput_min_delta_pct": -20.0,
+        "tpot_max_regression_pct": 50.0,
+        "ttft_max_regression_pct": 50.0
+      }
+    },
+    "performance_regression_required": false,
+    "required_correctness_gates": [
+      "paris",
+      "multi_turn_paris",
+      "multi_turn_3round_paris",
+      "bench_completion"
+    ],
+    "schema_version": 1,
+    "skipped_gates": [],
+    "touched_areas": [
+      "model_forward",
+      "runtime_defaults",
+      "openai_server_api"
+    ]
+  }
+}

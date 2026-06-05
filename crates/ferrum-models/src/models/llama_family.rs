@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::{atomic::AtomicU64, OnceLock};
 
-use ferrum_interfaces::kv_dtype::{KvFp16, KvInt8};
+use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendInt8KvOps, BackendMoeFused, BackendPagedKv, BackendQuantGguf,
     BackendQuantMarlin, KvCache, KvLayer, LlmBackend, MoeLlmBackend, QuantLlmBackend,
@@ -47,7 +47,9 @@ pub(crate) static OTHER_CALLS: AtomicU64 = AtomicU64::new(0);
 use ferrum_quantization::{Linear, WeightLoader};
 use ferrum_types::Result;
 
+use crate::common::paged_pool::block_hash_chain;
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
+use crate::lora::{load_runtime_lora_adapter, ActiveLoraAdapter, RuntimeLoraAdapter};
 
 const DEFAULT_KV_CAPACITY: usize = 512;
 
@@ -58,6 +60,7 @@ struct LlamaFamilyRuntimeEnv {
     paged_max_seqs: usize,
     decode_op_profile: bool,
     prefill_op_profile: bool,
+    prefix_cache: bool,
     cuda_graph: bool,
     decode_layer_profile: bool,
 }
@@ -79,6 +82,7 @@ impl LlamaFamilyRuntimeEnv {
             paged_max_seqs: 32,
             decode_op_profile: false,
             prefill_op_profile: false,
+            prefix_cache: false,
             cuda_graph: false,
             decode_layer_profile: false,
         };
@@ -94,6 +98,7 @@ impl LlamaFamilyRuntimeEnv {
                 }
                 "FERRUM_DECODE_OP_PROFILE" => config.decode_op_profile = true,
                 "FERRUM_PREFILL_OP_PROFILE" => config.prefill_op_profile = true,
+                "FERRUM_PREFIX_CACHE" => config.prefix_cache = value == "1",
                 "FERRUM_CUDA_GRAPH" => config.cuda_graph = true,
                 "FERRUM_DECODE_LAYER_PROFILE" => config.decode_layer_profile = true,
                 _ => {}
@@ -727,6 +732,16 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     pub(crate) unified_graph_warmup: usize,
     pub(crate) unified_graph_failed: bool,
     pub(crate) unified_graph_keys_seen: std::collections::HashSet<u64>,
+
+    // ── Real paged-KV prefix cache counters ─────────────────────────────
+    prefix_cache_hits: u64,
+    prefix_cache_misses: u64,
+    prefix_cache_saved_prefill_tokens: u64,
+
+    // ── Startup LoRA runtime state ──────────────────────────────────────
+    lora_adapters: HashMap<String, RuntimeLoraAdapter<B>>,
+    lora_cache_adapters: HashMap<String, String>,
+    lora_projection_applications: u64,
 }
 
 impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
@@ -840,6 +855,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             unified_graph_warmup: 0,
             unified_graph_failed: false,
             unified_graph_keys_seen: std::collections::HashSet::new(),
+            prefix_cache_hits: 0,
+            prefix_cache_misses: 0,
+            prefix_cache_saved_prefill_tokens: 0,
+            lora_adapters: HashMap::new(),
+            lora_cache_adapters: HashMap::new(),
+            lora_projection_applications: 0,
         })
     }
 
@@ -924,6 +945,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             unified_graph_warmup: 0,
             unified_graph_failed: false,
             unified_graph_keys_seen: std::collections::HashSet::new(),
+            prefix_cache_hits: 0,
+            prefix_cache_misses: 0,
+            prefix_cache_saved_prefill_tokens: 0,
+            lora_adapters: HashMap::new(),
+            lora_cache_adapters: HashMap::new(),
+            lora_projection_applications: 0,
         })
     }
 
@@ -1127,6 +1154,258 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.kv_caches.insert(cache_id.to_string(), caches);
     }
 
+    fn record_prefix_cache_probe(&mut self, saved_tokens: usize) {
+        if saved_tokens > 0 {
+            self.prefix_cache_hits += 1;
+            self.prefix_cache_saved_prefill_tokens += saved_tokens as u64;
+        } else {
+            self.prefix_cache_misses += 1;
+        }
+    }
+
+    fn try_acquire_prefix_cache(&mut self, cache_id: &str, tokens: &[u32]) -> usize {
+        let Some(alloc_arc) = self.paged_block_alloc.as_ref() else {
+            return 0;
+        };
+        let caches = match self.kv_caches.get(cache_id) {
+            Some(caches) => caches,
+            None => return 0,
+        };
+        let block_size = caches.first().map(K::block_size).unwrap_or(0);
+        if block_size == 0 {
+            return 0;
+        }
+
+        let token_ids: Vec<ferrum_types::TokenId> = tokens
+            .iter()
+            .map(|&token| ferrum_types::TokenId::new(token))
+            .collect();
+        let hashes = block_hash_chain(&token_ids, block_size);
+        if hashes.is_empty() {
+            return 0;
+        }
+
+        let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let mut matched = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            match alloc.try_acquire_by_hash(hash) {
+                Some(block) => matched.push(block),
+                None => break,
+            }
+        }
+        if matched.is_empty() {
+            return 0;
+        }
+        let n_matched = matched.len();
+
+        let displaced = caches
+            .first()
+            .map(|cache| K::paged_block_indices(cache)[..n_matched].to_vec())
+            .unwrap_or_default();
+        alloc.free(&displaced);
+        drop(alloc);
+
+        let caches_mut = self.kv_caches.get_mut(cache_id).expect("cache present");
+        let max_blocks = caches_mut
+            .first()
+            .map(|cache| K::paged_block_indices(cache).len())
+            .unwrap_or(0);
+        let new_len = n_matched * block_size;
+        let mut ctx = B::new_context();
+        for cache in caches_mut.iter_mut() {
+            {
+                let indices = K::paged_block_indices_mut(cache);
+                for (idx, &block) in matched.iter().enumerate() {
+                    indices[idx] = block;
+                }
+            }
+            K::set_len(cache, new_len);
+            let padded = {
+                let mut padded = K::paged_block_indices(cache).to_vec();
+                padded.resize(max_blocks, 0);
+                padded
+            };
+            if let Some(block_table) = K::block_table_mut(cache) {
+                B::write_typed::<u32>(&mut ctx, block_table, &padded);
+            }
+            if let Some(context_lens) = K::context_lens_mut(cache) {
+                B::write_typed::<u32>(&mut ctx, context_lens, &[new_len as u32]);
+            }
+        }
+        B::sync(&mut ctx);
+
+        new_len
+    }
+
+    fn register_prefix_cache(
+        &mut self,
+        cache_id: &str,
+        all_tokens: &[u32],
+        prior_cached_tokens: usize,
+    ) {
+        let Some(alloc_arc) = self.paged_block_alloc.as_ref() else {
+            return;
+        };
+        let caches = match self.kv_caches.get(cache_id) {
+            Some(caches) => caches,
+            None => return,
+        };
+        let cache0 = match caches.first() {
+            Some(cache) => cache,
+            None => return,
+        };
+        let block_size = K::block_size(cache0);
+        if block_size == 0 {
+            return;
+        }
+
+        let token_ids: Vec<ferrum_types::TokenId> = all_tokens
+            .iter()
+            .map(|&token| ferrum_types::TokenId::new(token))
+            .collect();
+        let hashes = block_hash_chain(&token_ids, block_size);
+        if hashes.is_empty() {
+            return;
+        }
+
+        let start_block = prior_cached_tokens / block_size;
+        let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+        for i in start_block..hashes.len().min(K::paged_block_indices(cache0).len()) {
+            let block_end_token = (i + 1) * block_size;
+            if block_end_token > K::len(cache0) {
+                break;
+            }
+            alloc.register_block_hash(K::paged_block_indices(cache0)[i], hashes[i]);
+        }
+    }
+
+    fn prefix_cache_snapshot_json(&self) -> serde_json::Value {
+        let (entries, block_size) = self
+            .paged_block_alloc
+            .as_ref()
+            .and_then(|alloc| {
+                let alloc = alloc.lock().ok()?;
+                let block_size = self
+                    .kv_caches
+                    .values()
+                    .find_map(|layers| layers.first().map(K::block_size))
+                    .unwrap_or(16);
+                Some((alloc.hash_table_size() as u64, block_size))
+            })
+            .unwrap_or((0, 16));
+        let bytes_per_entry = (block_size
+            * self.cfg.num_layers
+            * self.cfg.num_kv_heads
+            * self.cfg.head_dim
+            * K::BYTES_PER_ELEM
+            * 2) as u64;
+        serde_json::json!({
+            "position": "real-kv-reuse",
+            "source": "llama-family-paged-block-prefix-cache",
+            "enabled": llama_family_runtime_env().prefix_cache,
+            "hits": self.prefix_cache_hits,
+            "misses": self.prefix_cache_misses,
+            "evictions": 0u64,
+            "saved_prefill_tokens": self.prefix_cache_saved_prefill_tokens,
+            "entries": entries,
+            "bytes": entries.saturating_mul(bytes_per_entry),
+            "block_size": block_size,
+            "kv_dtype": K::NAME,
+        })
+    }
+
+    fn lora_projection_shape(
+        &self,
+        layer_index: usize,
+        target_module: &str,
+    ) -> Option<(usize, usize)> {
+        let layer = self.layers.get(layer_index)?;
+        match target_module {
+            "qkv_proj" => Some((layer.qkv_proj.in_features(), layer.qkv_proj.out_features())),
+            "o_proj" => Some((layer.o_proj.in_features(), layer.o_proj.out_features())),
+            "gate_up_proj" => Some((
+                layer.gate_up_proj.in_features(),
+                layer.gate_up_proj.out_features(),
+            )),
+            "down_proj" => Some((
+                layer.down_proj.in_features(),
+                layer.down_proj.out_features(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn validate_lora_adapter(&self, adapter: &RuntimeLoraAdapter<B>) -> Result<()> {
+        if adapter.linears.is_empty() {
+            return Err(ferrum_types::FerrumError::config(format!(
+                "LoRA adapter {} has no runtime tensors",
+                adapter.name
+            )));
+        }
+        for linear in &adapter.linears {
+            let layer_index = linear.layer_index.ok_or_else(|| {
+                ferrum_types::FerrumError::config(format!(
+                    "LoRA tensor for target {} must include model.layers.<N> in its tensor name",
+                    linear.target_module
+                ))
+            })?;
+            let Some((expected_in, expected_out)) =
+                self.lora_projection_shape(layer_index, &linear.target_module)
+            else {
+                return Err(ferrum_types::FerrumError::unsupported(format!(
+                    "LoRA target {} is not supported by Llama-family runtime; supported targets: qkv_proj, o_proj, gate_up_proj, down_proj",
+                    linear.target_module
+                )));
+            };
+            if linear.in_features != expected_in || linear.out_features != expected_out {
+                return Err(ferrum_types::FerrumError::config(format!(
+                    "LoRA tensor shape mismatch for layer {} target {}: got out={} in={}, expected out={} in={}",
+                    layer_index,
+                    linear.target_module,
+                    linear.out_features,
+                    linear.in_features,
+                    expected_out,
+                    expected_in
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_lora_adapter_loaded(&mut self, adapter: ActiveLoraAdapter) -> Result<()> {
+        if self.lora_adapters.contains_key(&adapter.name) {
+            return Ok(());
+        }
+        let runtime = load_runtime_lora_adapter::<B>(&adapter)?;
+        self.validate_lora_adapter(&runtime)?;
+        self.lora_adapters.insert(adapter.name.clone(), runtime);
+        Ok(())
+    }
+
+    fn active_lora_adapter_for_cache(&self, cache_id: &str) -> Option<&RuntimeLoraAdapter<B>> {
+        let adapter_name = self.lora_cache_adapters.get(cache_id)?;
+        self.lora_adapters.get(adapter_name)
+    }
+
+    fn active_lora_adapter_ptr_for_cache(
+        &self,
+        cache_id: &str,
+    ) -> Option<*const RuntimeLoraAdapter<B>> {
+        self.active_lora_adapter_for_cache(cache_id)
+            .map(|adapter| adapter as *const RuntimeLoraAdapter<B>)
+    }
+
+    fn lora_metrics_snapshot_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": !self.lora_adapters.is_empty(),
+            "adapter_count": self.lora_adapters.len() as u64,
+            "active_cache_bindings": self.lora_cache_adapters.len() as u64,
+            "projection_applications": self.lora_projection_applications,
+            "position": "real-inference",
+            "source": "llama-family-runtime-lora",
+        })
+    }
+
     /// Run one transformer layer. Mutates `residual` in place.
     ///
     /// `pos_offset` is the absolute position of token 0 in this batch
@@ -1190,6 +1469,21 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             &mut self.scratch.qkv_out,
             tokens,
         );
+        if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
+            // SAFETY: `lora_adapters` is not mutated during a forward pass;
+            // the pointer is used only for this immediate read-only call.
+            let applied = unsafe { &*adapter }
+                .apply_projection(
+                    ctx,
+                    li,
+                    "qkv_proj",
+                    &self.scratch.norm_out,
+                    &mut self.scratch.qkv_out,
+                    tokens,
+                )
+                .expect("validated LoRA qkv_proj");
+            self.lora_projection_applications += applied as u64;
+        }
         if let Some(t0) = _t0 {
             B::sync(ctx);
             MATMUL_TIME_US.fetch_add(
@@ -1318,7 +1612,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             )
             .expect("K::paged_decode_attention");
 
-            return self.forward_layer_post_attn(ctx, li, residual, tokens);
+            return self.forward_layer_post_attn(ctx, li, cache_id, residual, tokens);
         }
 
         // Non-paged (contig) path. INT8 path doesn't reach here:
@@ -1401,7 +1695,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        self.forward_layer_post_attn(ctx, li, residual, tokens);
+        self.forward_layer_post_attn(ctx, li, cache_id, residual, tokens);
     }
 
     /// Post-attention tail of `forward_layer`: untranspose Q (if needed),
@@ -1412,6 +1706,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         &mut self,
         ctx: &mut B::Context,
         li: usize,
+        cache_id: &str,
         residual: &mut B::Buffer,
         tokens: usize,
     ) {
@@ -1442,6 +1737,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         layer
             .o_proj
             .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
+        if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
+            // SAFETY: see qkv_proj LoRA application above.
+            let applied = unsafe { &*adapter }
+                .apply_projection(
+                    ctx,
+                    li,
+                    "o_proj",
+                    attn_token_major,
+                    &mut self.scratch.o_proj_out,
+                    tokens,
+                )
+                .expect("validated LoRA o_proj");
+            self.lora_projection_applications += applied as u64;
+        }
 
         // 9. Fused residual-add + post-attention RMSNorm.
         B::fused_add_rms_norm(
@@ -1462,6 +1771,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             &mut self.scratch.gate_up_out,
             tokens,
         );
+        if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
+            // SAFETY: see qkv_proj LoRA application above.
+            let applied = unsafe { &*adapter }
+                .apply_projection(
+                    ctx,
+                    li,
+                    "gate_up_proj",
+                    &self.scratch.norm_out,
+                    &mut self.scratch.gate_up_out,
+                    tokens,
+                )
+                .expect("validated LoRA gate_up_proj");
+            self.lora_projection_applications += applied as u64;
+        }
 
         // 11. SwiGLU: silu(gate) * up.
         B::fused_silu_mul_split(
@@ -1479,6 +1802,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             &mut self.scratch.mlp_out,
             tokens,
         );
+        if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
+            // SAFETY: see qkv_proj LoRA application above.
+            let applied = unsafe { &*adapter }
+                .apply_projection(
+                    ctx,
+                    li,
+                    "down_proj",
+                    &self.scratch.silu_out,
+                    &mut self.scratch.mlp_out,
+                    tokens,
+                )
+                .expect("validated LoRA down_proj");
+            self.lora_projection_applications += applied as u64;
+        }
 
         // 13. Final residual add.
         B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
@@ -1567,10 +1904,61 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// `[kv_len, kv_len + tokens.len())` so RoPE and causal masking stay
     /// aligned. Used by the engine's chunked-prefill path.
     pub fn prefill_internal(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
-        let seq_len = tokens.len();
-        assert!(seq_len > 0, "prefill called with empty token list");
-        self.ensure_scratch(seq_len);
+        assert!(!tokens.is_empty(), "prefill called with empty token list");
         self.ensure_kv(cache_id);
+
+        let cache_len_before = self
+            .kv_caches
+            .get(cache_id)
+            .and_then(|layers| layers.first())
+            .map(K::len)
+            .unwrap_or(0);
+        let mut cached_prefix_tokens =
+            if llama_family_runtime_env().prefix_cache && cache_len_before == 0 {
+                self.try_acquire_prefix_cache(cache_id, tokens)
+            } else {
+                0
+            };
+        if cached_prefix_tokens >= tokens.len() {
+            let block_size = self
+                .kv_caches
+                .get(cache_id)
+                .and_then(|layers| layers.first())
+                .map(K::block_size)
+                .unwrap_or(16);
+            cached_prefix_tokens = cached_prefix_tokens
+                .saturating_sub(block_size)
+                .min(tokens.len() - 1);
+        }
+        if llama_family_runtime_env().prefix_cache && cache_len_before == 0 {
+            self.record_prefix_cache_probe(cached_prefix_tokens);
+        }
+
+        if cached_prefix_tokens > 0 {
+            let caches_mut = self.kv_caches.get_mut(cache_id).expect("cache present");
+            let mut ctx_tmp = B::new_context();
+            for cache in caches_mut.iter_mut() {
+                if K::len(cache) != cached_prefix_tokens {
+                    K::set_len(cache, cached_prefix_tokens);
+                    if let Some(context_lens) = K::context_lens_mut(cache) {
+                        B::write_typed::<u32>(
+                            &mut ctx_tmp,
+                            context_lens,
+                            &[cached_prefix_tokens as u32],
+                        );
+                    }
+                }
+            }
+            B::sync(&mut ctx_tmp);
+        }
+
+        let suffix_tokens = &tokens[cached_prefix_tokens..];
+        let seq_len = suffix_tokens.len();
+        assert!(
+            seq_len > 0,
+            "prefix cache must leave at least one suffix token"
+        );
+        self.ensure_scratch(seq_len);
 
         // Starting position for this chunk — 0 for a fresh prefill, kv_len
         // for the second+ chunk of a split prefill.
@@ -1600,7 +1988,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .embed
             .as_ref()
             .expect("prefill_internal called on backbone-only model (no embed)");
-        B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
+        B::embedding_lookup(&mut ctx, embed, suffix_tokens, &mut residual, h);
 
         let prefill_profile = llama_family_runtime_env().prefill_op_profile;
         let prefill_t0 = if prefill_profile {
@@ -1692,6 +2080,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // Restore residual into scratch for reuse on the next call.
         self.scratch.residual = Some(residual);
+        if llama_family_runtime_env().prefix_cache && cache_len_before == 0 {
+            self.register_prefix_cache(cache_id, tokens, cached_prefix_tokens);
+        }
 
         B::to_vec(&self.scratch.logits, vocab)
     }
@@ -2095,6 +2486,29 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         &self.runtime_cfg
     }
 
+    fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        Some(self.prefix_cache_snapshot_json())
+    }
+
+    fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        Some(self.lora_metrics_snapshot_json())
+    }
+
+    fn set_lora_adapter_for_cache(
+        &mut self,
+        cache_id: &str,
+        adapter: Option<ActiveLoraAdapter>,
+    ) -> std::result::Result<(), ferrum_types::FerrumError> {
+        if let Some(adapter) = adapter {
+            self.ensure_lora_adapter_loaded(adapter.clone())?;
+            self.lora_cache_adapters
+                .insert(cache_id.to_string(), adapter.name);
+        } else {
+            self.lora_cache_adapters.remove(cache_id);
+        }
+        Ok(())
+    }
+
     fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
         self.ensure_scratch(max_tokens);
         self.ensure_kv(cache_id);
@@ -2140,10 +2554,30 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        if llama_family_runtime_env().prefix_cache
+            && items
+                .iter()
+                .any(|(_, tokens, pos_offset, _)| *pos_offset == 0 && tokens.len() > 1)
+        {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "LlamaFamilyModel::unified_forward: fresh prefill with prefix cache enabled \
+                 routes through prefill_internal so real paged-block KV reuse can probe and \
+                 register block hashes",
+            ));
+        }
         if !B::supports_varlen_qkv() {
             return Err(ferrum_types::FerrumError::unsupported(
                 "LlamaFamilyModel::unified_forward: backend lacks varlen \
                  QKV kernels. Engine will fall back to per-item dispatch.",
+            ));
+        }
+        if items
+            .iter()
+            .any(|(cache_id, _, _, _)| self.active_lora_adapter_for_cache(cache_id).is_some())
+        {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "LlamaFamilyModel::unified_forward: active LoRA adapter routes through \
+                 per-item dispatch until unified LoRA supports row-selective adapters.",
             ));
         }
         self.ensure_kv(&items[0].0);
@@ -2188,6 +2622,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         B::sync(&mut ctx);
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
+        self.lora_cache_adapters.remove(cache_id);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
                 let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -2216,6 +2651,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         self.batched_graph_failed = false;
         self.kv_caches.clear();
         self.kv_free_pool.clear();
+        self.lora_cache_adapters.clear();
     }
 }
 
@@ -2225,6 +2661,29 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B, KvInt8> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
+    }
+
+    fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        Some(self.prefix_cache_snapshot_json())
+    }
+
+    fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        Some(self.lora_metrics_snapshot_json())
+    }
+
+    fn set_lora_adapter_for_cache(
+        &mut self,
+        cache_id: &str,
+        adapter: Option<ActiveLoraAdapter>,
+    ) -> std::result::Result<(), ferrum_types::FerrumError> {
+        if let Some(adapter) = adapter {
+            self.ensure_lora_adapter_loaded(adapter.clone())?;
+            self.lora_cache_adapters
+                .insert(cache_id.to_string(), adapter.name);
+        } else {
+            self.lora_cache_adapters.remove(cache_id);
+        }
+        Ok(())
     }
 
     fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
@@ -2286,6 +2745,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         B::sync(&mut ctx);
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
+        self.lora_cache_adapters.remove(cache_id);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
                 let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -2311,6 +2771,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         self.graph_capture_failed = false;
         self.kv_caches.clear();
         self.kv_free_pool.clear();
+        self.lora_cache_adapters.clear();
     }
 }
 

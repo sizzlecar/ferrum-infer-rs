@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Scoped all-cell A/B for the in-repo source-linked FlashAttention-2 path.
+# All-cell A/B wrapper for the source-linked FA2 path.
 #
 # Usage on a GPU pod from the repo root:
 #   OUT_ROOT=/workspace/m3-fa2-source-allcells-n3 \

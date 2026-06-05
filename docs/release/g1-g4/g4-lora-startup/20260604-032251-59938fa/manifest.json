@@ -1,0 +1,51 @@
+{
+  "goal": "G4",
+  "name": "lora-startup",
+  "status": "pass",
+  "created_at": "2026-06-04T03:27:51",
+  "repo": {
+    "head": "59938faf1bb6250c9608c734aedb30fe77fde5ae",
+    "short_head": "59938fa",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "model": "qwen3:0.6b",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "lora_linear_ref": true,
+    "lora_loader": true,
+    "server_lora_routing": true,
+    "server_lora_startup": true,
+    "bench": {
+      "status": "pass",
+      "base_no_lora_output_tps": 11.134662029837854,
+      "base_with_lora_output_tps": 11.238231418557348,
+      "adapter_output_tps": 11.215001500643316,
+      "base_regression_pct": 0.0,
+      "adapter_to_base_ratio": 0.9979329560810011,
+      "fixture": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g4-lora-startup/20260604-032251-59938fa/fixtures/sql-adapter"
+    }
+  },
+  "artifacts": [
+    "bench-adapter.json",
+    "bench-adapter.log",
+    "bench-base-no-lora.json",
+    "bench-base-no-lora.log",
+    "bench-base-with-lora.json",
+    "bench-base-with-lora.log",
+    "bench-summary.json",
+    "cargo-test.log",
+    "chat-Qwen--Qwen3-0.6B-sql.json",
+    "chat-Qwen--Qwen3-0.6B.json",
+    "chat-unknown-adapter.json",
+    "gate.log",
+    "lora-linear-ref.log",
+    "lora-loader.log",
+    "models.json",
+    "release-build.log",
+    "serve-58817.log",
+    "serve-58901.log",
+    "server-lora-routing.log",
+    "server-lora-startup.log"
+  ]
+}

@@ -1,0 +1,126 @@
+{
+  "performance_regression_gates": {
+    "baseline_case": "baseline",
+    "cases": {
+      "candidate": {
+        "baseline_case": "baseline",
+        "metrics": [
+          {
+            "baseline": 149.81066628667898,
+            "candidate": 148.67510624256252,
+            "delta_pct": -0.7579967917260566,
+            "metric": "throughput_mean",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "min_delta_pct",
+              "value": -20.0
+            }
+          },
+          {
+            "baseline": 61.8853615,
+            "candidate": 62.7186925,
+            "delta_pct": 1.3465720807011916,
+            "metric": "ttft_p50",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 50.0
+            }
+          },
+          {
+            "baseline": 6.267688308586426,
+            "candidate": 6.2896889484126985,
+            "delta_pct": 0.35101681422371467,
+            "metric": "tpot_p50",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 50.0
+            }
+          },
+          {
+            "baseline": 6.4073907,
+            "candidate": 6.390036,
+            "delta_pct": -0.2708544056787332,
+            "metric": "itl_p95",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 80.0
+            }
+          }
+        ],
+        "ok": true
+      }
+    },
+    "concurrency_cells_ok": true,
+    "enabled": true,
+    "observed_concurrency_cells": [
+      1
+    ],
+    "required_concurrency_cells": [
+      1
+    ],
+    "schema_version": 1,
+    "thresholds": {
+      "enabled": true,
+      "itl_p95_max_regression_pct": 80.0,
+      "throughput_min_delta_pct": -20.0,
+      "tpot_max_regression_pct": 50.0,
+      "ttft_max_regression_pct": 50.0
+    }
+  },
+  "rows": [
+    {
+      "artifact_verdict": "pass",
+      "completed": 32,
+      "concurrency": 1,
+      "env_hash": "sha256:25dd587d1a929b3579b3ad501cad7492f9c7abdaa039a97bc0d57e08b0aea804",
+      "errored": 0,
+      "itl_p95": 6.4073907,
+      "name": "baseline",
+      "not_publishable": false,
+      "runtime_config_entry_count": 14,
+      "status": "pass",
+      "throughput_ci95_hw": null,
+      "throughput_mean": 149.81066628667898,
+      "throughput_stddev": null,
+      "tpot_p50": 6.267688308586426,
+      "ttft_p50": 61.8853615
+    },
+    {
+      "artifact_verdict": "pass",
+      "completed": 32,
+      "concurrency": 1,
+      "env_hash": "sha256:25dd587d1a929b3579b3ad501cad7492f9c7abdaa039a97bc0d57e08b0aea804",
+      "errored": 0,
+      "itl_p95": 6.390036,
+      "name": "candidate",
+      "not_publishable": false,
+      "performance_gate_ok": true,
+      "runtime_config_entry_count": 14,
+      "status": "pass",
+      "throughput_ci95_hw": null,
+      "throughput_mean": 148.67510624256252,
+      "throughput_stddev": null,
+      "tpot_p50": 6.2896889484126985,
+      "ttft_p50": 62.7186925
+    }
+  ],
+  "runtime_config_diff_vs_baseline": {
+    "candidate": {
+      "added": [],
+      "baseline_env_hash": "sha256:25dd587d1a929b3579b3ad501cad7492f9c7abdaa039a97bc0d57e08b0aea804",
+      "candidate_env_hash": "sha256:25dd587d1a929b3579b3ad501cad7492f9c7abdaa039a97bc0d57e08b0aea804",
+      "changed": [],
+      "removed": []
+    }
+  },
+  "throughput_delta_pct_vs_baseline": {
+    "candidate": -0.7579967917260566
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "goal": "G3",
+  "name": "cache-product",
+  "status": "pass",
+  "created_at": "2026-06-04T02:37:16",
+  "repo": {
+    "head": "393a4ebe9b719956b0e6627a703017c792c790bb",
+    "short_head": "393a4eb",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "model": "qwen3:0.6b",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "cache_metrics_contract": true,
+    "server_prefix_cache_product": true,
+    "server_session_cache": true,
+    "bench": {
+      "status": "pass",
+      "tokenizer": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/g3-tokenizers/Qwen3-30B-A3B.tokenizer",
+      "prefix_hits": 53.0,
+      "prefix_saved_prefill_tokens": 16737.0,
+      "perf_result": "inconclusive",
+      "reason": "G3 keeps unsafe engine-level KV prefix reuse forced off; product cache observability and correctness passed, but TTFT speedup is not claimed."
+    }
+  },
+  "artifacts": [
+    "bench-disabled.json",
+    "bench-disabled.log",
+    "bench-enabled-metrics.txt",
+    "bench-enabled.json",
+    "bench-enabled.log",
+    "bench-summary.json",
+    "cache-metrics-contract.log",
+    "cargo-test.log",
+    "gate.json",
+    "gate.log",
+    "release-build.log",
+    "serve-57777.log",
+    "serve-57924.log",
+    "server-prefix-cache-product.log",
+    "server-session-cache.log"
+  ]
+}

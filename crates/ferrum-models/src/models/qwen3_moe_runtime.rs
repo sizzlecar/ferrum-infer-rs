@@ -216,7 +216,6 @@ mod tests {
 
         assert!(env.decode_op_profile);
         assert!(env.fa2_direct_ffi);
-        assert!(!env.fa2_source);
         assert!(env.fa_layout_varlen);
         assert!(env.greedy_argmax);
         assert_eq!(env.initial_scratch_tokens, 4096);
@@ -310,7 +309,6 @@ mod tests {
         let env = Qwen3MoeRuntimeEnv::from_runtime_config_snapshot(&snapshot);
 
         assert!(env.fa_layout_varlen);
-        assert!(env.fa2_source);
         assert!(!env.fa2_direct_ffi);
         assert_eq!(env.initial_scratch_tokens, 3072);
         assert!(env.moe_graph_requested);

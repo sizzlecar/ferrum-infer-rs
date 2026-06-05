@@ -60,6 +60,7 @@ config = { workspace = true }
 [dev-dependencies]
 tokio-test = "0.4"
 hyper = "1.0"
+reqwest = { workspace = true }
 
 [features]
 default = []

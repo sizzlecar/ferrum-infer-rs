@@ -63,7 +63,8 @@ Ferrum 面向这些开发和部署场景：
 
 Ferrum 面向现代加速器上的高吞吐 serving 场景，并把原始 benchmark 日志和证据保存到仓库，而不是只给摘要数字。
 
-RTX 4090 + `Qwen3-30B-A3B-GPTQ-Int4` same-pod 吞吐：
+RTX 4090 + `Qwen3-30B-A3B-GPTQ-Int4` 的历史 same-pod 吞吐，
+对应 opt-in FA2 direct-FFI 路径：
 
 | 并发 | Ferrum tok/s | vLLM 0.20.2 tok/s | Ferrum / vLLM |
 | ---: | ---: | ---: | ---: |
@@ -72,7 +73,11 @@ RTX 4090 + `Qwen3-30B-A3B-GPTQ-Int4` same-pod 吞吐：
 | 16 | `1185.1 +/- 12.3` | `1331.9 +/- 5.7` | `0.890x` |
 | 32 | `1641.9 +/- 4.8` | `1972.9 +/- 18.6` | `0.832x` |
 
-完整 CUDA 方法和原始证据见 [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)。
+这组历史对比的完整 CUDA 方法和原始证据见
+[`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)。
+不要把这张表当作当前 source-linked/default release gate 的宣传数字；
+release candidate 必须以当前 G0/G1-G4 CUDA artifacts 里的 binary、git SHA、
+runtime config 和 same-hardware 结果为准。
 
 Release 和 Metal gates：
 

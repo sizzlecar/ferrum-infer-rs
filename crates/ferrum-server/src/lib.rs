@@ -45,4 +45,4 @@ pub use middleware::{
     RateLimitConfig as MiddlewareRateLimitConfig,
 };
 
-pub use axum_server::{init_prometheus_recorder, AxumServer};
+pub use axum_server::{init_prometheus_recorder, AxumServer, LoraAdapterModel};

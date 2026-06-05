@@ -1,0 +1,53 @@
+{
+  "scope": "targeted qwen3 api issues + metal run multiturn regression",
+  "release_gate": "not a G0 release gate; no G0 PASS claimed",
+  "api_after_tool_fallback": {
+    "passed": true,
+    "case_count": 5,
+    "artifact_dir": "docs/release/qwen3-api-issues/20260605-112838-85c9edb4/api-after-tool-fallback",
+    "cases": [
+      {
+        "name": "case1_strict_schema_nonstream",
+        "passed": true,
+        "status": 200,
+        "replacement_char": false
+      },
+      {
+        "name": "case2_strict_schema_stream",
+        "passed": true,
+        "status": 200,
+        "replacement_char": false
+      },
+      {
+        "name": "case3_json_object_stream",
+        "passed": true,
+        "status": 200,
+        "replacement_char": false
+      },
+      {
+        "name": "case4_tool_auto_nonstream",
+        "passed": true,
+        "status": 200,
+        "replacement_char": false
+      },
+      {
+        "name": "case5_tool_auto_stream",
+        "passed": true,
+        "status": 200,
+        "replacement_char": false
+      }
+    ]
+  },
+  "run_multiturn_final": {
+    "passed": true,
+    "assistant_count": 4,
+    "context_shift_lines": [],
+    "mojibake": false,
+    "orphan_think_turns": [],
+    "recall_ok": true,
+    "immutability_ok": true,
+    "completion_tokens": 3063,
+    "tok_s": 30.86938299726251,
+    "artifact_dir": "docs/release/qwen3-api-issues/20260605-112838-85c9edb4/run-multiturn-final"
+  }
+}

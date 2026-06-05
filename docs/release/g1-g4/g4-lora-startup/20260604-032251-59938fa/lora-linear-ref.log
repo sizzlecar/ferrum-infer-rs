@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running tests/lora_linear_ref.rs (target/debug/deps/lora_linear_ref-6f5290404107b925)
+
+running 2 tests
+test lora_linear_ref_rejects_shape_mismatch ... ok
+test lora_linear_ref_matches_manual_f32 ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

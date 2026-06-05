@@ -62,6 +62,52 @@ pub struct ServeCommand {
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
+    /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
+    #[arg(long, value_name = "N")]
+    pub max_model_len: Option<usize>,
+
+    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`.
+    #[arg(long, value_name = "N")]
+    pub max_num_seqs: Option<usize>,
+
+    /// vLLM-compatible alias for `FERRUM_MAX_BATCHED_TOKENS`.
+    #[arg(long, value_name = "N")]
+    pub max_num_batched_tokens: Option<usize>,
+
+    /// Enable prefix caching (`FERRUM_PREFIX_CACHE=1`).
+    #[arg(
+        long,
+        conflicts_with_all = ["no_enable_prefix_caching", "disable_prefix_cache"]
+    )]
+    pub enable_prefix_caching: bool,
+
+    /// Disable prefix caching (`FERRUM_PREFIX_CACHE=0`).
+    #[arg(long, conflicts_with = "enable_prefix_cache")]
+    pub no_enable_prefix_caching: bool,
+
+    /// Enable prefix cache (`FERRUM_PREFIX_CACHE=1`).
+    #[arg(
+        long,
+        conflicts_with_all = ["no_enable_prefix_caching", "disable_prefix_cache"]
+    )]
+    pub enable_prefix_cache: bool,
+
+    /// Disable prefix cache (`FERRUM_PREFIX_CACHE=0`).
+    #[arg(long, conflicts_with_all = ["enable_prefix_caching", "enable_prefix_cache"])]
+    pub disable_prefix_cache: bool,
+
+    /// Session cache mode (`off` or `memory`).
+    #[arg(long, value_name = "MODE", value_parser = ["off", "memory"])]
+    pub session_cache: Option<String>,
+
+    /// Maximum in-memory session cache entries.
+    #[arg(long, value_name = "N")]
+    pub session_cache_max_entries: Option<usize>,
+
+    /// Approximate maximum tokens retained per session.
+    #[arg(long, value_name = "N")]
+    pub session_cache_max_tokens: Option<usize>,
+
     /// KV cache element dtype (Dim 5 polymorphism point). Accepts
     /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
     /// require model wire-up; today only the kernel + type layer ships.
@@ -105,6 +151,14 @@ pub struct ServeCommand {
     /// Runtime flags/config JSON object embedded in native profile events.
     #[arg(long, value_name = "JSON")]
     pub profile_runtime_flags_json: Option<String>,
+
+    /// Startup-loaded LoRA adapter, formatted as NAME=PATH. May be repeated.
+    #[arg(long = "lora", value_name = "NAME=PATH")]
+    pub lora: Vec<String>,
+
+    /// Public model id template for LoRA adapters. Supports <base> and <name>.
+    #[arg(long, value_name = "TEMPLATE", default_value = "<base>:<name>")]
+    pub lora_model_id_template: String,
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
@@ -117,6 +171,16 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         spec_draft,
         spec_tokens,
         gpu_memory_utilization,
+        max_model_len,
+        max_num_seqs,
+        max_num_batched_tokens,
+        enable_prefix_caching,
+        no_enable_prefix_caching,
+        enable_prefix_cache,
+        disable_prefix_cache,
+        session_cache,
+        session_cache_max_entries,
+        session_cache_max_tokens,
         kv_dtype,
         runtime_preset,
         effective_config_json,
@@ -127,6 +191,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_model,
         profile_concurrency,
         profile_runtime_flags_json,
+        lora,
+        lora_model_id_template,
     } = cmd;
 
     // Print banner
@@ -245,6 +311,26 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         resolve_model_alias(&model_name)
     };
     println!("{} {}", "Model:".dimmed(), model_id.cyan());
+
+    let lora_specs = parse_lora_specs(&lora)?;
+    let startup_lora_adapters = if lora_specs.is_empty() {
+        Vec::new()
+    } else {
+        ferrum_models::load_startup_lora_adapters(
+            &model_id,
+            Some(&lora_model_id_template),
+            &lora_specs,
+        )?
+    };
+    for adapter in &startup_lora_adapters {
+        println!(
+            "{} {} -> {} ({})",
+            "LoRA:".dimmed(),
+            adapter.name.cyan(),
+            adapter.public_model_id.cyan(),
+            adapter.path.display()
+        );
+    }
 
     let host = host.unwrap_or_else(|| config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
@@ -419,6 +505,18 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
 
     let startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
+        max_model_len,
+        max_num_seqs,
+        max_num_batched_tokens,
+        prefix_cache_cli_override(
+            enable_prefix_caching,
+            no_enable_prefix_caching,
+            enable_prefix_cache,
+            disable_prefix_cache,
+        ),
+        session_cache.as_deref(),
+        session_cache_max_entries,
+        session_cache_max_tokens,
         profile_jsonl.as_ref(),
         profile_commit_sha.as_deref(),
         profile_env_hash.as_deref(),
@@ -435,6 +533,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         materialized_runtime_keys,
         startup_cli_runtime_entries,
     )?;
+    crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
     write_startup_config_artifacts(
         &startup_auto_config,
         effective_config_json.as_deref(),
@@ -452,6 +551,17 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         &startup_auto_config,
         &model_id,
     )?;
+
+    let lora_server_models: Vec<ferrum_server::LoraAdapterModel> = startup_lora_adapters
+        .iter()
+        .map(|adapter| {
+            ferrum_server::LoraAdapterModel::new(
+                adapter.name.clone(),
+                adapter.public_model_id.clone(),
+                adapter.path.display().to_string(),
+            )
+        })
+        .collect();
 
     let server = match arch_for_dispatch {
         Some(ferrum_models::Architecture::Clip) => {
@@ -529,12 +639,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             );
             let mut engine_config = ferrum_types::EngineConfig::default();
             engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            engine_config.kv_cache.cache_type = serve_kv_cache_type_for_device(&device);
             engine_config.backend.device = device;
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
             engine_config
                 .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
                 .map_err(ferrum_types::FerrumError::config)?;
-            engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
             engine_config.backend.backend_options.insert(
                 "model_path".to_string(),
                 serde_json::Value::String(engine_model_path.clone()),
@@ -558,6 +668,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         }
     }
     .with_auto_config(startup_auto_config);
+    let server = if lora_server_models.is_empty() {
+        server
+    } else {
+        server.with_lora_adapters(model_id.clone(), lora_server_models)
+    };
 
     // Create server config
     let server_config = ServerConfig {
@@ -665,6 +780,27 @@ fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
     PathBuf::from(configured)
 }
 
+fn parse_lora_specs(values: &[String]) -> Result<Vec<ferrum_models::StartupLoraSpec>> {
+    let mut specs = Vec::with_capacity(values.len());
+    for value in values {
+        let (name, path) = value.split_once('=').ok_or_else(|| {
+            ferrum_types::FerrumError::config(format!(
+                "invalid --lora value {value:?}; expected NAME=PATH"
+            ))
+        })?;
+        if name.is_empty() || path.is_empty() {
+            return Err(ferrum_types::FerrumError::config(format!(
+                "invalid --lora value {value:?}; expected non-empty NAME=PATH"
+            )));
+        }
+        specs.push(ferrum_models::StartupLoraSpec {
+            name: name.to_string(),
+            path: PathBuf::from(shellexpand::tilde(path).to_string()),
+        });
+    }
+    Ok(specs)
+}
+
 fn startup_auto_config(
     device: &ferrum_types::Device,
     architecture: Option<ferrum_models::Architecture>,
@@ -765,6 +901,7 @@ fn runtime_preset_entries(
             ("FERRUM_GREEDY_ARGMAX", "1"),
             ("FERRUM_KV_MAX_BLOCKS", "2048"),
             ("FERRUM_PAGED_MAX_SEQS", "32"),
+            ("FERRUM_KV_CAPACITY", "2048"),
             ("FERRUM_MOE_GRAPH", "1"),
             ("FERRUM_VLLM_MOE", "1"),
             ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
@@ -785,6 +922,13 @@ fn runtime_preset_entries(
 
 fn serve_cli_runtime_entries(
     kv_dtype: Option<&str>,
+    max_model_len: Option<usize>,
+    max_num_seqs: Option<usize>,
+    max_num_batched_tokens: Option<usize>,
+    prefix_cache: Option<bool>,
+    session_cache: Option<&str>,
+    session_cache_max_entries: Option<usize>,
+    session_cache_max_tokens: Option<usize>,
     profile_jsonl: Option<&PathBuf>,
     profile_commit_sha: Option<&str>,
     profile_env_hash: Option<&str>,
@@ -794,6 +938,41 @@ fn serve_cli_runtime_entries(
 ) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
     push_cli_runtime_entry(&mut entries, "FERRUM_KV_DTYPE", kv_dtype);
+    push_cli_runtime_usize(&mut entries, "FERRUM_MAX_MODEL_LEN", max_model_len);
+    push_cli_runtime_usize(&mut entries, "FERRUM_PAGED_MAX_SEQS", max_num_seqs);
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_MAX_BATCHED_TOKENS",
+        max_num_batched_tokens,
+    );
+    if let Some(enabled) = prefix_cache {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PREFIX_CACHE_REQUESTED",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PREFIX_CACHE_PRODUCT",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PREFIX_CACHE",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    push_cli_runtime_entry(&mut entries, "FERRUM_SESSION_CACHE", session_cache);
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_SESSION_CACHE_MAX_ENTRIES",
+        session_cache_max_entries,
+    );
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_SESSION_CACHE_MAX_TOKENS",
+        session_cache_max_tokens,
+    );
     if let Some(path) = profile_jsonl {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_PROFILE_JSONL",
@@ -823,6 +1002,21 @@ fn serve_cli_runtime_entries(
     entries
 }
 
+fn prefix_cache_cli_override(
+    enable_vllm: bool,
+    disable_vllm: bool,
+    enable_product: bool,
+    disable_product: bool,
+) -> Option<bool> {
+    if enable_vllm || enable_product {
+        Some(true)
+    } else if disable_vllm || disable_product {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn resolve_effective_kv_dtype<'a>(
     cli_arg: Option<&'a str>,
     env_value: Option<&'a str>,
@@ -838,6 +1032,23 @@ fn push_cli_runtime_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, valu
             value.to_string(),
             RuntimeConfigSource::Cli,
         ));
+    }
+}
+
+fn push_cli_runtime_usize(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<usize>) {
+    if let Some(value) = value {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            value.to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+}
+
+fn serve_kv_cache_type_for_device(device: &ferrum_types::Device) -> ferrum_types::KvCacheType {
+    match device {
+        ferrum_types::Device::CPU => ferrum_types::KvCacheType::Contiguous,
+        _ => ferrum_types::KvCacheType::Paged,
     }
 }
 
@@ -1295,6 +1506,13 @@ mod tests {
     fn serve_cli_runtime_entries_are_cli_sourced_and_classified() {
         let entries = serve_cli_runtime_entries(
             Some("int8"),
+            Some(4096),
+            Some(64),
+            Some(2048),
+            Some(false),
+            Some("memory"),
+            Some(16),
+            Some(1024),
             Some(&PathBuf::from("/tmp/profile.jsonl")),
             Some("abc123"),
             Some("sha256:test"),
@@ -1316,6 +1534,23 @@ mod tests {
         assert!(entry("FERRUM_KV_DTYPE")
             .affects
             .contains(&ferrum_types::RuntimeConfigEffect::Correctness));
+        assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
+        assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
+        assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
+        assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
+        assert_eq!(entry("FERRUM_SESSION_CACHE").effective_value, "memory");
+        assert_eq!(
+            entry("FERRUM_SESSION_CACHE_MAX_ENTRIES").effective_value,
+            "16"
+        );
+        assert_eq!(
+            entry("FERRUM_SESSION_CACHE_MAX_TOKENS").effective_value,
+            "1024"
+        );
+        assert_eq!(
+            entry("FERRUM_MAX_MODEL_LEN").source,
+            RuntimeConfigSource::Cli
+        );
         assert_eq!(
             entry("FERRUM_PROFILE_JSONL").effective_value,
             "/tmp/profile.jsonl"
@@ -1331,14 +1566,50 @@ mod tests {
     }
 
     #[test]
+    fn cpu_serve_uses_contiguous_kv_cache() {
+        assert!(matches!(
+            serve_kv_cache_type_for_device(&ferrum_types::Device::CPU),
+            ferrum_types::KvCacheType::Contiguous
+        ));
+    }
+
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "cuda"))]
+    #[test]
+    fn accelerator_serve_uses_paged_kv_cache() {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let device = ferrum_types::Device::Metal;
+        #[cfg(all(feature = "cuda", not(all(target_os = "macos", feature = "metal"))))]
+        let device = ferrum_types::Device::CUDA(0);
+
+        assert!(matches!(
+            serve_kv_cache_type_for_device(&device),
+            ferrum_types::KvCacheType::Paged
+        ));
+    }
+
+    #[test]
     fn serve_runtime_snapshot_prefers_cli_over_config_file() {
         let config_entries = crate::config::RuntimeCliConfig {
             kv_dtype: Some("fp16".to_string()),
             ..Default::default()
         }
         .runtime_config_entries();
-        let cli_entries =
-            serve_cli_runtime_entries(Some("int8"), None, None, None, None, None, None);
+        let cli_entries = serve_cli_runtime_entries(
+            Some("int8"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
 
         let snapshot = merge_runtime_config_sources(
             config_entries,
@@ -1352,6 +1623,80 @@ mod tests {
             .unwrap();
         assert_eq!(kv.effective_value, "int8");
         assert_eq!(kv.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn vllm_compat_runtime_flags_follow_existing_precedence() {
+        let config_entries = crate::config::RuntimeCliConfig {
+            max_model_len: Some(1024),
+            paged_max_seqs: Some(2),
+            max_batched_tokens: Some(128),
+            prefix_cache: Some(false),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        let env_snapshot = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "2048", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "4", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_MAX_BATCHED_TOKENS", "256", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_PREFIX_CACHE", "1", RuntimeConfigSource::Env),
+        ]);
+
+        let env_over_config =
+            merge_runtime_config_sources(config_entries.clone(), env_snapshot.clone(), Vec::new());
+        fn entry<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> &'a RuntimeConfigEntry {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        }
+        assert_eq!(
+            entry(&env_over_config, "FERRUM_MAX_MODEL_LEN").effective_value,
+            "2048"
+        );
+        assert_eq!(
+            entry(&env_over_config, "FERRUM_PREFIX_CACHE").source,
+            RuntimeConfigSource::Env
+        );
+
+        let cli_entries = serve_cli_runtime_entries(
+            None,
+            Some(4096),
+            Some(8),
+            Some(512),
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let cli_over_env = merge_runtime_config_sources(config_entries, env_snapshot, cli_entries);
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_MAX_MODEL_LEN").effective_value,
+            "4096"
+        );
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_PAGED_MAX_SEQS").effective_value,
+            "8"
+        );
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_MAX_BATCHED_TOKENS").effective_value,
+            "512"
+        );
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_PREFIX_CACHE").effective_value,
+            "0"
+        );
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_PREFIX_CACHE").source,
+            RuntimeConfigSource::Cli
+        );
     }
 
     #[test]
@@ -1509,9 +1854,10 @@ mod tests {
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
         assert_eq!(entry("FERRUM_VLLM_MOE_PAIR_IDS").effective_value, "1");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_BACKEND").source, RuntimeConfigSource::Cli);
-        assert_eq!(snapshot.entries.len(), 11);
+        assert_eq!(snapshot.entries.len(), 12);
     }
 
     #[test]
@@ -1530,6 +1876,7 @@ mod tests {
 
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
         assert_eq!(
             entry("FERRUM_MOE_GRAPH").source,
             RuntimeConfigSource::Default
@@ -1766,8 +2113,22 @@ mod tests {
             "int8",
             RuntimeConfigSource::Env,
         )]);
-        let cli_entries =
-            serve_cli_runtime_entries(Some("bf16"), None, None, None, None, None, None);
+        let cli_entries = serve_cli_runtime_entries(
+            Some("bf16"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
         let kv = snapshot
@@ -1777,6 +2138,94 @@ mod tests {
             .unwrap();
         assert_eq!(kv.effective_value, "bf16");
         assert_eq!(kv.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn prefix_cache_vllm_and_product_aliases_resolve_identically() {
+        assert_eq!(
+            prefix_cache_cli_override(true, false, false, false),
+            Some(true)
+        );
+        assert_eq!(
+            prefix_cache_cli_override(false, false, true, false),
+            Some(true)
+        );
+        assert_eq!(
+            prefix_cache_cli_override(false, true, false, false),
+            Some(false)
+        );
+        assert_eq!(
+            prefix_cache_cli_override(false, false, false, true),
+            Some(false)
+        );
+
+        let enabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
+            None,
+            None,
+            prefix_cache_cli_override(true, false, false, false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let product_enabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
+            None,
+            None,
+            prefix_cache_cli_override(false, false, true, false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let disabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
+            None,
+            None,
+            prefix_cache_cli_override(false, true, false, false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let product_disabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
+            None,
+            None,
+            prefix_cache_cli_override(false, false, false, true),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(enabled_entries, product_enabled_entries);
+        assert_eq!(disabled_entries, product_disabled_entries);
     }
 
     #[test]

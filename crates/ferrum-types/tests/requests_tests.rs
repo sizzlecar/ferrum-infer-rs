@@ -196,7 +196,15 @@ fn chat_request_with_tool(tool_choice: Option<ApiToolChoice>) -> InferenceReques
                 function: ApiFunction {
                     name: "weather".to_string(),
                     description: None,
-                    parameters: None,
+                    parameters: Some(json!({
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "unit": {"type": "string", "enum": ["c", "f"]}
+                        },
+                        "required": ["city", "unit"],
+                        "additionalProperties": false
+                    })),
                     strict: None,
                 },
             }],
@@ -225,6 +233,77 @@ fn generated_tool_call_json_becomes_structured_chat_response() {
     assert_eq!(call.id, "call_1");
     assert_eq!(call.function.name, "weather");
     assert_eq!(call.function.arguments, r#"{"city":"Paris"}"#);
+}
+
+#[test]
+fn qwen3_function_parameters_json_becomes_structured_tool_call() {
+    let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
+    let text = r#"{"function":"weather","parameters":{"city":"深圳","unit":"c"}}"#;
+
+    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+        panic!("expected structured chat tool response");
+    };
+
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(response.message.content, "");
+    assert_eq!(response.message.tool_calls.len(), 1);
+    let call = &response.message.tool_calls[0];
+    assert_eq!(call.function.name, "weather");
+    assert_eq!(call.function.arguments, r#"{"city":"深圳","unit":"c"}"#);
+}
+
+#[test]
+fn qwen3_function_object_with_top_level_parameters_keeps_arguments() {
+    let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
+    let text = r#"{"function":{"name":"weather"},"parameters":{"city":"北京","unit":"c"}}"#;
+
+    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+        panic!("expected structured chat tool response");
+    };
+
+    let call = &response.message.tool_calls[0];
+    assert_eq!(call.function.name, "weather");
+    assert_eq!(call.function.arguments, r#"{"city":"北京","unit":"c"}"#);
+}
+
+#[test]
+fn single_auto_tool_bare_arguments_json_becomes_structured_tool_call() {
+    let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
+    let text = r#"{"city":"深圳","unit":"c"}"#;
+
+    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+        panic!("expected bare arguments to map to the only available tool");
+    };
+
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(response.message.content, "");
+    assert_eq!(response.message.tool_calls.len(), 1);
+    let call = &response.message.tool_calls[0];
+    assert_eq!(call.function.name, "weather");
+    assert_eq!(call.function.arguments, r#"{"city":"深圳","unit":"c"}"#);
+}
+
+#[test]
+fn multi_auto_tool_bare_arguments_json_does_not_guess_tool() {
+    let mut request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+        panic!("expected chat request");
+    };
+    chat.tools.push(ApiTool {
+        tool_type: "function".to_string(),
+        function: ApiFunction {
+            name: "calendar".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            })),
+            strict: None,
+        },
+    });
+
+    assert!(api_response_from_generated_text(&request, r#"{"city":"深圳","unit":"c"}"#).is_none());
 }
 
 #[test]

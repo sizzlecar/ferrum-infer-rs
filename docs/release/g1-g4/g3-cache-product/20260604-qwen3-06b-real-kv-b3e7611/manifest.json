@@ -1,0 +1,81 @@
+{
+  "goal": "G3",
+  "name": "cache-product",
+  "status": "pass",
+  "passed": true,
+  "git_sha": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+  "git_dirty": true,
+  "binary_sha256": "sha256:f5118cbacd7b75bfb91d36275ec8302b1f0a6c2b8efe94699f0b14d159f674b2",
+  "features": [
+    "metal"
+  ],
+  "models": [
+    "Qwen/Qwen3-0.6B"
+  ],
+  "commands": [
+    "cargo test --workspace --all-targets",
+    "cargo test -p ferrum-server cache_metrics_contract",
+    "cargo test --release -p ferrum-cli --test server_prefix_cache_product -- --ignored --test-threads=1",
+    "cargo test --release -p ferrum-cli --test server_session_cache -- --ignored --test-threads=1",
+    "cargo build --release -p ferrum-cli --bin ferrum --features metal",
+    "ferrum bench-serve shared-prefix disabled/enabled"
+  ],
+  "started_at_utc": "2026-06-04T11:12:31Z",
+  "finished_at_utc": "2026-06-04T11:14:20Z",
+  "created_at": "2026-06-04T19:14:20",
+  "repo": {
+    "head": "b3e7611c72c1f8c9b92f53052464937479df98fd",
+    "short_head": "b3e7611",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "model": "Qwen/Qwen3-0.6B",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "cache_metrics_contract": true,
+    "release_build": true,
+    "server_prefix_cache_product": true,
+    "server_session_cache": true,
+    "bench": {
+      "status": "pass",
+      "tokenizer": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/g3-tokenizers/Qwen3-30B-A3B.tokenizer",
+      "cache_position": "real-kv-reuse",
+      "prefix_hits": 51.0,
+      "prefix_saved_prefill_tokens": 13600.0,
+      "performance": {
+        "status": "pass",
+        "min_perf_improvement_pct": 1.0,
+        "disabled_ttft_p50_ms": 798.0917711666667,
+        "enabled_ttft_p50_ms": 350.953757,
+        "ttft_improvement_pct": 56.02588954313253,
+        "disabled_output_throughput_tps": 50.9998049527537,
+        "enabled_output_throughput_tps": 69.820950353041,
+        "output_throughput_improvement_pct": 36.90434780627738,
+        "prefix_hits": 51.0,
+        "prefix_saved_prefill_tokens": 13600.0,
+        "cache_position": "real-kv-reuse"
+      }
+    }
+  },
+  "artifacts": [
+    "bench-disabled-metrics.txt",
+    "bench-disabled.json",
+    "bench-disabled.log",
+    "bench-enabled-metrics.txt",
+    "bench-enabled.json",
+    "bench-enabled.log",
+    "bench-summary.json",
+    "cache-comparison.json",
+    "cache-disabled.json",
+    "cache-enabled.json",
+    "cache-metrics-contract.log",
+    "cargo-test.log",
+    "gate.json",
+    "gate.log",
+    "release-build.log",
+    "serve-49179.log",
+    "serve-49309.log",
+    "server-prefix-cache-product.log",
+    "server-session-cache.log"
+  ]
+}

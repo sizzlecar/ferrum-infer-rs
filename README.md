@@ -63,7 +63,8 @@ Ferrum is built for developers and teams building:
 
 Ferrum is designed for practical high-throughput serving on modern accelerators, with raw benchmark logs checked into the repository instead of only summary claims.
 
-CUDA same-pod throughput on RTX 4090 with `Qwen3-30B-A3B-GPTQ-Int4`:
+Historical CUDA same-pod throughput on RTX 4090 with
+`Qwen3-30B-A3B-GPTQ-Int4` for the opt-in FA2 direct-FFI path:
 
 | Concurrency | Ferrum tok/s | vLLM 0.20.2 tok/s | Ferrum / vLLM |
 | ---: | ---: | ---: | ---: |
@@ -72,7 +73,11 @@ CUDA same-pod throughput on RTX 4090 with `Qwen3-30B-A3B-GPTQ-Int4`:
 | 16 | `1185.1 +/- 12.3` | `1331.9 +/- 5.7` | `0.890x` |
 | 32 | `1641.9 +/- 4.8` | `1972.9 +/- 18.6` | `0.832x` |
 
-Full CUDA methodology and raw artifacts are in [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/).
+Full CUDA methodology and raw artifacts for that historical comparison are in
+[`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/).
+Do not treat this table as a current source-linked/default release-gate claim;
+release candidates must use the current G0/G1-G4 CUDA artifacts for their exact
+binary, git SHA, runtime config, and same-hardware results.
 
 Release and Metal gates:
 

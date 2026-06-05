@@ -26,6 +26,7 @@ use ferrum_interfaces::{
 use ferrum_types::{DataType, FerrumError, ModelInfo, Result};
 
 use crate::common::DecoderOnlyLLM;
+use crate::lora::ActiveLoraAdapter;
 
 use super::common::{self, GenericKvCacheHandle};
 
@@ -66,6 +67,27 @@ impl LlmExecutorRuntimeEnv {
 fn llm_executor_runtime_env() -> &'static LlmExecutorRuntimeEnv {
     static CONFIG: OnceLock<LlmExecutorRuntimeEnv> = OnceLock::new();
     CONFIG.get_or_init(LlmExecutorRuntimeEnv::from_env)
+}
+
+fn active_lora_from_metadata(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<Option<ActiveLoraAdapter>> {
+    let name = metadata
+        .get("ferrum_lora_adapter")
+        .and_then(|value| value.as_str());
+    let path = metadata
+        .get("ferrum_lora_path")
+        .and_then(|value| value.as_str());
+    match (name, path) {
+        (Some(name), Some(path)) => Ok(Some(ActiveLoraAdapter {
+            name: name.to_string(),
+            path: std::path::PathBuf::from(path),
+        })),
+        (None, None) => Ok(None),
+        _ => Err(FerrumError::model(
+            "incomplete LoRA metadata: expected ferrum_lora_adapter and ferrum_lora_path",
+        )),
+    }
 }
 
 /// Map a `ferrum_types::Device` to the matching `candle_core::Device`.
@@ -126,6 +148,10 @@ impl ModelExecutor for LlmExecutor {
         &self.info
     }
 
+    fn kv_capacity(&self) -> Option<usize> {
+        Some(self.model.lock().kv_capacity())
+    }
+
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         let tokens = common::tensor_to_tokens(&input.input_ids)?;
 
@@ -161,6 +187,10 @@ impl ModelExecutor for LlmExecutor {
         // prefill path so contig-KV configs keep their existing behaviour.
         let logits = {
             let mut model = self.model.lock();
+            model.set_lora_adapter_for_cache(
+                &cache_id,
+                active_lora_from_metadata(&input.metadata)?,
+            )?;
             let unified_item = vec![(cache_id.clone(), tokens.clone(), prior_seq_len, true)];
             match model.unified_forward(&unified_item) {
                 Ok(mut per_item) => per_item
@@ -227,6 +257,7 @@ impl ModelExecutor for LlmExecutor {
         let mut cache_ids = Vec::with_capacity(inputs.len());
         let mut prior_seq_lens = Vec::with_capacity(inputs.len());
         let mut tokens_per_input = Vec::with_capacity(inputs.len());
+        let mut lora_per_input = Vec::with_capacity(inputs.len());
         for input in inputs {
             let tokens = common::tensor_to_tokens(&input.input_ids)?;
             let supplied_handle_id = input.kv_cache.as_ref().and_then(|h| {
@@ -249,6 +280,7 @@ impl ModelExecutor for LlmExecutor {
             cache_ids.push(cache_id);
             prior_seq_lens.push(prior_seq_len);
             tokens_per_input.push(tokens);
+            lora_per_input.push(active_lora_from_metadata(&input.metadata)?);
         }
 
         // Build unified items and ONE `unified_forward` call. If the model
@@ -269,6 +301,9 @@ impl ModelExecutor for LlmExecutor {
         let mut took_fallback = false;
         let per_item_logits: Vec<Vec<f32>> = {
             let mut model = self.model.lock();
+            for (cache_id, adapter) in cache_ids.iter().zip(lora_per_input.iter()) {
+                model.set_lora_adapter_for_cache(cache_id, adapter.clone())?;
+            }
             match model.unified_forward(&unified_items) {
                 Ok(per_item) => per_item
                     .into_iter()
@@ -377,6 +412,10 @@ impl ModelExecutor for LlmExecutor {
         // One model forward for all N+1 positions → flat seq_len*vocab.
         let flat = {
             let mut model = self.model.lock();
+            model.set_lora_adapter_for_cache(
+                &cache_id,
+                active_lora_from_metadata(&inputs[0].metadata)?,
+            )?;
             model.forward_verify(&cache_id, &token_ids)
         };
 
@@ -443,6 +482,10 @@ impl ModelExecutor for LlmExecutor {
         // configs that haven't wired unified_forward.
         let logits = {
             let mut model = self.model.lock();
+            model.set_lora_adapter_for_cache(
+                &cache_id,
+                active_lora_from_metadata(&input.metadata)?,
+            )?;
             let unified_item = vec![(cache_id.clone(), vec![token], seq_len, true)];
             match model.unified_forward(&unified_item) {
                 Ok(mut per_item) => per_item
@@ -486,6 +529,7 @@ impl ModelExecutor for LlmExecutor {
             cache_id: String,
             token: u32,
             seq_len: u32,
+            lora: Option<ActiveLoraAdapter>,
             handle: Arc<GenericKvCacheHandle>,
         }
         let mut prepped: Vec<Prep> = Vec::with_capacity(inputs.len());
@@ -505,6 +549,7 @@ impl ModelExecutor for LlmExecutor {
                 cache_id: input_handle.request_cache_id().to_string(),
                 token: tokens[0],
                 seq_len,
+                lora: active_lora_from_metadata(&input.metadata)?,
                 handle: Arc::new(input_handle.with_sequence_length((seq_len + 1) as usize)),
             });
         }
@@ -532,6 +577,9 @@ impl ModelExecutor for LlmExecutor {
             } else {
                 None
             };
+            for p in &prepped {
+                model.set_lora_adapter_for_cache(&p.cache_id, p.lora.clone())?;
+            }
             let unified_items: Vec<(String, Vec<u32>, usize, bool)> = prepped
                 .iter()
                 .map(|p| (p.cache_id.clone(), vec![p.token], p.seq_len as usize, true))
@@ -649,6 +697,12 @@ impl ModelExecutor for LlmExecutor {
             .collect();
         let model_result = {
             let mut model = self.model.lock();
+            for item in &batch.items {
+                model.set_lora_adapter_for_cache(
+                    &item.seq_id,
+                    active_lora_from_metadata(&item.metadata)?,
+                )?;
+            }
             model.unified_forward(&unified_items)
         };
         match model_result {
@@ -691,6 +745,10 @@ impl ModelExecutor for LlmExecutor {
             let mut model = self.model.lock();
             for &i in &prefill_indices {
                 let item = &batch.items[i];
+                model.set_lora_adapter_for_cache(
+                    &item.seq_id,
+                    active_lora_from_metadata(&item.metadata)?,
+                )?;
                 let logits = model.prefill(&item.seq_id, &item.q_tokens);
                 if item.is_final_chunk {
                     results[i] = Some(logits);
@@ -709,6 +767,13 @@ impl ModelExecutor for LlmExecutor {
                 .collect();
             let logits_vec = {
                 let mut model = self.model.lock();
+                for &i in &decode_indices {
+                    let item = &batch.items[i];
+                    model.set_lora_adapter_for_cache(
+                        &item.seq_id,
+                        active_lora_from_metadata(&item.metadata)?,
+                    )?;
+                }
                 model.decode_batch(&tuples)
             };
             for (j, &i) in decode_indices.iter().enumerate() {
@@ -747,6 +812,14 @@ impl ModelExecutor for LlmExecutor {
 
     fn status(&self) -> ExecutorStatus {
         common::default_executor_status()
+    }
+
+    fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        self.model.lock().cache_metrics_snapshot()
+    }
+
+    fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        self.model.lock().lora_metrics_snapshot()
     }
 }
 

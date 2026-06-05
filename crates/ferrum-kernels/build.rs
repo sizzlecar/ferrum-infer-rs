@@ -10,6 +10,7 @@ const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/rope.cu",
     "kernels/decode_attention.cu",
     "kernels/residual_add.cu",
+    "kernels/scaled_add_inplace.cu",
     "kernels/flash_decode_attention.cu",
     "kernels/paged_decode_attention.cu",
     "kernels/paged_varlen_attention.cu",
@@ -263,9 +264,10 @@ fn main() {
         compile_vllm_paged_attn(&out_dir_clone);
     }
 
-    // Source-built FlashAttention-2 paged-varlen bridge for the Qwen3 M3
-    // shape. Unlike the runtime FFI shim, this links the FA2 templates into
-    // ferrum-kernels and needs no vLLM/Torch/Python library at runtime.
+    // Source-linked FlashAttention-2 paged-varlen bridge for the Qwen3 M3
+    // shape. Unlike the runtime FFI shim, this links the Ferrum ABI shim and
+    // FA2 templates into ferrum-kernels and does not load vLLM/Torch/Python
+    // shared objects at runtime.
     if env::var_os("CARGO_FEATURE_FA2_SOURCE").is_some() {
         compile_fa2_source(&out_dir_clone);
     }
@@ -458,50 +460,73 @@ fn compile_core_ptx(out_dir: &Path) {
     write_core_ptx_bindings(out_dir);
 }
 
+fn valid_cutlass_include_dir(path: &Path) -> bool {
+    path.join("cute").join("tensor.hpp").is_file()
+        && path.join("cutlass").join("cutlass.h").is_file()
+}
+
 fn find_cutlass_include_dir() -> Option<PathBuf> {
     println!("cargo:rerun-if-env-changed=FERRUM_CUTLASS_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=CUTLASS_INCLUDE_DIR");
     for key in ["FERRUM_CUTLASS_INCLUDE_DIR", "CUTLASS_INCLUDE_DIR"] {
         if let Some(value) = env::var_os(key) {
             let path = PathBuf::from(value);
-            if path.join("cute").join("tensor.hpp").is_file()
-                && path.join("cutlass").join("cutlass.h").is_file()
-            {
+            if valid_cutlass_include_dir(&path) {
                 return Some(path);
             }
         }
     }
-    for candidate in [
-        "/workspace/vllm-venv/lib/python3.12/site-packages/flashinfer/data/cutlass/include",
-        "/workspace/vllm-venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include",
-        "/workspace/vllm-venv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/include",
-    ] {
-        let path = PathBuf::from(candidate);
-        if path.join("cute").join("tensor.hpp").is_file()
-            && path.join("cutlass").join("cutlass.h").is_file()
-        {
-            return Some(path);
+
+    let vendored = PathBuf::from("kernels/fa2_source/cutlass/include");
+    if valid_cutlass_include_dir(&vendored) {
+        return Some(vendored);
+    }
+    None
+}
+
+fn flash_attn_src_dir_from_root(root: PathBuf) -> Option<PathBuf> {
+    let candidates = [
+        root.clone(),
+        root.join("csrc").join("flash_attn").join("src"),
+        root.join("flash_attn").join("src"),
+    ];
+    candidates
+        .into_iter()
+        .find(|path| path.join("flash.h").is_file())
+}
+
+fn find_fa2_flash_attn_src_dir() -> Option<PathBuf> {
+    println!("cargo:rerun-if-env-changed=FERRUM_FA2_SRC_DIR");
+    println!("cargo:rerun-if-env-changed=FA_SRC_DIR");
+    for key in ["FERRUM_FA2_SRC_DIR", "FA_SRC_DIR"] {
+        if let Some(value) = env::var_os(key) {
+            if let Some(path) = flash_attn_src_dir_from_root(PathBuf::from(value)) {
+                return Some(path);
+            }
         }
+    }
+
+    let vendored = PathBuf::from("kernels/fa2_source/flash_attn/src");
+    if vendored.join("flash.h").is_file() {
+        return Some(vendored);
     }
     None
 }
 
 fn compile_fa2_source(out_dir: &PathBuf) {
-    println!("cargo:rerun-if-env-changed=FERRUM_FA2_SRC_DIR");
-    println!("cargo:rerun-if-env-changed=FA_SRC_DIR");
-    let fa_src_dir = env::var_os("FERRUM_FA2_SRC_DIR")
-        .or_else(|| env::var_os("FA_SRC_DIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/workspace/vllm-flash-attention-f5bc33c"));
-    let fa_src = fa_src_dir.join("csrc/flash_attn/src");
-    if !fa_src.join("flash.h").is_file() {
+    let fa_src = find_fa2_flash_attn_src_dir().unwrap_or_else(|| {
         panic!(
-            "[fa2-source] FlashAttention source not found at {}. Set FERRUM_FA2_SRC_DIR.",
-            fa_src_dir.display()
-        );
-    }
+            "[fa2-source] FlashAttention source not found. Vendor it under \
+             crates/ferrum-kernels/kernels/fa2_source/flash_attn/src or set \
+             FERRUM_FA2_SRC_DIR to a FlashAttention checkout/source dir."
+        )
+    });
     let cutlass_include = find_cutlass_include_dir().unwrap_or_else(|| {
-        panic!("[fa2-source] CUTLASS headers not found; set FERRUM_CUTLASS_INCLUDE_DIR")
+        panic!(
+            "[fa2-source] CUTLASS headers not found. Vendor them under \
+             crates/ferrum-kernels/kernels/fa2_source/cutlass/include or set \
+             FERRUM_CUTLASS_INCLUDE_DIR."
+        )
     });
     let stub_dir = PathBuf::from("kernels/fa2_source/stubs");
     let stub_files = [

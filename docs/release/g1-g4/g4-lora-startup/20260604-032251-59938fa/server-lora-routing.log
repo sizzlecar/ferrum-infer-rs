@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (target/debug/deps/ferrum_server-bd9e2ab3adeb7853)
+
+running 4 tests
+test axum_server::tests::route_models_lists_startup_lora_adapters ... ok
+test axum_server::tests::route_chat_unknown_lora_adapter_returns_openai_model_error ... ok
+test axum_server::tests::route_chat_base_model_still_uses_base_path_with_lora_loaded ... ok
+test axum_server::tests::route_chat_lora_adapter_maps_internal_request_to_base_model ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 122 filtered out; finished in 0.00s
+
+     Running tests/cache_metrics_contract.rs (target/debug/deps/cache_metrics_contract-38924067ce979738)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/structured_output_contract.rs (target/debug/deps/structured_output_contract-43ea9bf16b703844)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+

@@ -26,6 +26,7 @@ pub mod gguf_runtime;
 pub mod hf_download;
 pub mod image_processor;
 pub mod loader;
+pub mod lora;
 pub mod mel;
 pub mod models;
 pub mod moe;
@@ -46,6 +47,11 @@ pub use executor::{
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;
 pub use loader::SafeTensorsLoader;
+pub use lora::{
+    default_lora_model_id, load_runtime_lora_adapter, load_startup_lora_adapter,
+    load_startup_lora_adapters, render_lora_model_id, ActiveLoraAdapter, LoraAdapterConfig,
+    RuntimeLoraAdapter, StartupLoraAdapter, StartupLoraSpec,
+};
 pub use multimodal::{BertModelWrapper, ClipModelWrapper, WhisperModelWrapper};
 pub use registry::{
     Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType,

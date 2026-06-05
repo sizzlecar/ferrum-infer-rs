@@ -1,0 +1,141 @@
+{
+  "artifact_verdict": "pass",
+  "cases": [
+    {
+      "manifest": "/workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1/c1/baseline_c1_n1/manifest.json",
+      "name": "baseline"
+    },
+    {
+      "manifest": "/workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1/c1/candidate_c1_n1/manifest.json",
+      "name": "candidate"
+    }
+  ],
+  "created_at": "2026-06-03T16:17:51.990620+00:00",
+  "finished_at": "2026-06-03T16:19:47.850516+00:00",
+  "name": "g0-cuda4090-smoke",
+  "not_publishable": false,
+  "not_publishable_reason": null,
+  "preflight": {
+    "bin": "target/release/ferrum",
+    "binary_sha256": "sha256:c92739717305885e93e017a9d73ebd49e749f0c432482f27a48af9989ce64fc6",
+    "date": "2026-06-03T16:17:51.749071+00:00",
+    "features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source",
+    "git_head": "fdb9d1583f3f6b8ec29620867f39c09747036922",
+    "git_status_short": [
+      "?? scripts/__pycache__/"
+    ],
+    "gpu_process_state": "    PID    PPID STAT     ELAPSED CMD\n      1       0 Ss      01:12:02 /bin/sh -c while [ ! -e /.launch ]; do sleep 1; done; bash /.launch\n     51       1 S       01:12:01 bash /.launch\n    366       1 S       01:11:55 bash /.launch\n    371     366 S       01:11:55 bash /root/onstart.sh\n    372     366 S       01:11:55 tee -a /var/log/onstart.log\n    375       1 Ss      01:11:55 sshd: /usr/sbin/sshd -E /proc/1/fd/1 [listener] 0 of 10-100 startups\n    381      51 S       01:11:55 ssh -i /etc/forward_key -R *:30732:localhost:22 -R *:30733:localhost:8080 -N -o TCPKeepAlive=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 ubuntu@ssh9.vast.ai -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o RequestTTY=no -o ExitOnForwardFailure=yes\n   5567     371 S       01:11:38 sleep infinity\n  14522     375 Ss         00:07 sshd: root@notty\n  14551       1 Ss         00:01 tmux new-session -d -s ferrum-cuda-smoke set -euo pipefail; . /root/.cargo/env; export HF_HOME=/workspace/hf-cache; export FERRUM_FA2_SRC_DIR=/workspace/vllm-flash-attention-f5bc33c; export FERRUM_CUTLASS_INCLUDE_DIR=/workspace/cutlass/include; cd /workspace/ferrum-infer-rs; scripts/release/g0_source_gate.sh cuda-smoke /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1 2>&1 | tee /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1.session.log\n  14552   14551 Ss+        00:01 bash -c set -euo pipefail; . /root/.cargo/env; export HF_HOME=/workspace/hf-cache; export FERRUM_FA2_SRC_DIR=/workspace/vllm-flash-attention-f5bc33c; export FERRUM_CUTLASS_INCLUDE_DIR=/workspace/cutlass/include; cd /workspace/ferrum-infer-rs; scripts/release/g0_source_gate.sh cuda-smoke /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1 2>&1 | tee /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1.session.log\n  14554   14552 S+         00:01 bash scripts/release/g0_source_gate.sh cuda-smoke /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1\n  14555   14552 S+         00:01 tee /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1.session.log\n  14570   14554 S+         00:01 python3 scripts/m3_ab_runner.py --config /workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1/g0_cuda4090_smoke-c1.json\n  14578   14570 R+         00:00 ps -eo pid,ppid,stat,etime,cmd\n",
+    "hf_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+    "host": "6850a22344e5",
+    "model_dir": "/workspace/hf-cache/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+    "nvidia_smi": "Wed Jun  3 16:17:51 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 580.159.03             Driver Version: 580.159.03     CUDA Version: 13.0     |\n+-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA GeForce RTX 4090        On  |   00000000:03:00.0 Off |                  Off |\n|  0%   46C    P8             29W /  450W |     281MiB /  24564MiB |      0%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n\n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|  No running processes found                                                             |\n+-----------------------------------------------------------------------------------------+\n",
+    "preset": "m3_qwen3_30b_a3b_int4",
+    "repo": "/workspace/ferrum-infer-rs"
+  },
+  "runner": "scripts/m3_ab_runner.py",
+  "runtime_preset": "m3_qwen3_30b_a3b_int4",
+  "schema_version": 1,
+  "summary_json": "/workspace/g0/v0.7.5/source-cuda-smoke-branch-rerun1/c1/summary.json",
+  "validation_checklist": {
+    "baseline_case": "baseline",
+    "bench_completion": {
+      "completed": null,
+      "errored": null,
+      "ok": null,
+      "required": true
+    },
+    "case": null,
+    "change_type": "diagnostic",
+    "local_gates": [],
+    "observed_correctness_gates": [],
+    "performance_regression_gates": {
+      "baseline_case": "baseline",
+      "cases": {
+        "candidate": {
+          "baseline_case": "baseline",
+          "metrics": [
+            {
+              "baseline": 149.81066628667898,
+              "candidate": 148.67510624256252,
+              "delta_pct": -0.7579967917260566,
+              "metric": "throughput_mean",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "min_delta_pct",
+                "value": -20.0
+              }
+            },
+            {
+              "baseline": 61.8853615,
+              "candidate": 62.7186925,
+              "delta_pct": 1.3465720807011916,
+              "metric": "ttft_p50",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 50.0
+              }
+            },
+            {
+              "baseline": 6.267688308586426,
+              "candidate": 6.2896889484126985,
+              "delta_pct": 0.35101681422371467,
+              "metric": "tpot_p50",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 50.0
+              }
+            },
+            {
+              "baseline": 6.4073907,
+              "candidate": 6.390036,
+              "delta_pct": -0.2708544056787332,
+              "metric": "itl_p95",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 80.0
+              }
+            }
+          ],
+          "ok": true
+        }
+      },
+      "concurrency_cells_ok": true,
+      "enabled": true,
+      "observed_concurrency_cells": [
+        1
+      ],
+      "required_concurrency_cells": [
+        1
+      ],
+      "schema_version": 1,
+      "thresholds": {
+        "enabled": true,
+        "itl_p95_max_regression_pct": 80.0,
+        "throughput_min_delta_pct": -20.0,
+        "tpot_max_regression_pct": 50.0,
+        "ttft_max_regression_pct": 50.0
+      }
+    },
+    "performance_regression_required": false,
+    "required_correctness_gates": [
+      "paris",
+      "multi_turn_paris",
+      "multi_turn_3round_paris",
+      "bench_completion"
+    ],
+    "schema_version": 1,
+    "skipped_gates": [],
+    "touched_areas": [
+      "model_forward",
+      "runtime_defaults",
+      "openai_server_api"
+    ]
+  }
+}

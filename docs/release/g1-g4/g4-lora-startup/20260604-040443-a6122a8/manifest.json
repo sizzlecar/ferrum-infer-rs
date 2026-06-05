@@ -1,0 +1,70 @@
+{
+  "goal": "G4",
+  "name": "lora-startup",
+  "status": "pass",
+  "passed": true,
+  "git_sha": "a6122a890aa0e8fd72b0ae8e0b119d18fe226b1c",
+  "git_dirty": true,
+  "binary_sha256": "sha256:e25c99e41a59c47faf1bda21e4a421082a17469d4ef1d84efcec8797ee687572",
+  "features": [],
+  "models": [
+    "qwen3:0.6b"
+  ],
+  "commands": [
+    "cargo test --workspace --all-targets",
+    "cargo test -p ferrum-quantization --test lora_linear_ref",
+    "cargo test -p ferrum-models --test lora_loader",
+    "cargo test -p ferrum-server lora",
+    "cargo test -p ferrum-cli --test server_lora_startup",
+    "cargo build --release -p ferrum-cli --bin ferrum",
+    "ferrum bench-serve c=1 no-lora/base-with-lora/adapter"
+  ],
+  "started_at_utc": "2026-06-03T20:04:43Z",
+  "finished_at_utc": "2026-06-03T20:17:14Z",
+  "created_at": "2026-06-04T04:17:14",
+  "repo": {
+    "head": "a6122a890aa0e8fd72b0ae8e0b119d18fe226b1c",
+    "short_head": "a6122a8",
+    "branch": "codex/source-regression-gates",
+    "dirty": true
+  },
+  "model": "qwen3:0.6b",
+  "checks": {
+    "cargo_workspace_all_targets": true,
+    "lora_linear_ref": true,
+    "lora_loader": true,
+    "server_lora_routing": true,
+    "server_lora_startup": true,
+    "bench": {
+      "status": "pass",
+      "base_no_lora_output_tps": 11.019927176001636,
+      "base_with_lora_output_tps": 11.223827029523662,
+      "adapter_output_tps": 11.224275678741565,
+      "base_regression_pct": 0.0,
+      "adapter_to_base_ratio": 1.0000399729269458,
+      "fixture": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/g1-g4/g4-lora-startup/20260604-040443-a6122a8/fixtures/sql-adapter"
+    }
+  },
+  "artifacts": [
+    "bench-adapter.json",
+    "bench-adapter.log",
+    "bench-base-no-lora.json",
+    "bench-base-no-lora.log",
+    "bench-base-with-lora.json",
+    "bench-base-with-lora.log",
+    "bench-summary.json",
+    "cargo-test.log",
+    "chat-Qwen--Qwen3-0.6B-sql.json",
+    "chat-Qwen--Qwen3-0.6B.json",
+    "chat-unknown-adapter.json",
+    "gate.log",
+    "lora-linear-ref.log",
+    "lora-loader.log",
+    "models.json",
+    "release-build.log",
+    "serve-60114.log",
+    "serve-60320.log",
+    "server-lora-routing.log",
+    "server-lora-startup.log"
+  ]
+}

@@ -5,6 +5,10 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
         &self.runtime_cfg
     }
 
+    fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        Some(self.prefix_cache_snapshot_json())
+    }
+
     fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
         // Eager scratch + KV cache grow + a 1-token forward warmup so
         // the first real prefill / decode doesn't pay the cold-start

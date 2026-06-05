@@ -158,6 +158,7 @@ impl EngineInner {
             rid: RequestId,
             input_tokens: Vec<TokenId>,
             kv_handle: Arc<dyn KvCacheHandle>,
+            metadata: std::collections::HashMap<String, serde_json::Value>,
             fresh_kv: bool,
             chunk_start: usize,
             chunk_len: usize,
@@ -168,7 +169,7 @@ impl EngineInner {
         let has_decode_items = !decode_ids.is_empty();
         let mut unified_prefills: Vec<UnifiedPrefillWork> = Vec::new();
         for rid in &prefill_ids {
-            let (input_tokens, num_tokens, existing_kv, chunk_start) = {
+            let (input_tokens, num_tokens, existing_kv, chunk_start, metadata) = {
                 let sequences = self.sequences.read();
                 let Some(seq) = sequences.get(rid) else {
                     continue;
@@ -178,6 +179,7 @@ impl EngineInner {
                     seq.input_tokens.len(),
                     seq.kv_cache.clone(),
                     seq.prefill_tokens_processed,
+                    seq.original_request.metadata.clone(),
                 )
             };
             if chunk_start >= num_tokens {
@@ -268,6 +270,7 @@ impl EngineInner {
                 rid: rid.clone(),
                 input_tokens,
                 kv_handle,
+                metadata,
                 fresh_kv,
                 chunk_start,
                 chunk_len,
@@ -292,6 +295,7 @@ impl EngineInner {
                 kv_cache: work.kv_handle.clone(),
                 pos_offset: work.chunk_start,
                 is_final_chunk: work.is_final_chunk,
+                metadata: work.metadata.clone(),
             });
             prefill_meta.push(work);
         }
@@ -329,6 +333,7 @@ impl EngineInner {
                     kv_cache: kv,
                     pos_offset,
                     is_final_chunk: true,
+                    metadata: seq.original_request.metadata.clone(),
                 });
                 decode_meta.push(rid.clone());
             }

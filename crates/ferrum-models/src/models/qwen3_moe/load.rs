@@ -141,6 +141,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             batched_graph_warmup: 0,
             batched_graph_failed: false,
             batched_graph_keys_seen: std::collections::HashSet::new(),
+            prefix_cache_hits: 0,
+            prefix_cache_misses: 0,
+            prefix_cache_saved_prefill_tokens: 0,
             use_vllm_paged_attn,
         })
     }
@@ -330,6 +333,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             batched_graph_warmup: 0,
             batched_graph_failed: false,
             batched_graph_keys_seen: std::collections::HashSet::new(),
+            prefix_cache_hits: 0,
+            prefix_cache_misses: 0,
+            prefix_cache_saved_prefill_tokens: 0,
             use_vllm_paged_attn,
         })
     }

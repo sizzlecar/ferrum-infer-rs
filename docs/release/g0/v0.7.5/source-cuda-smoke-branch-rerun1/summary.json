@@ -1,0 +1,213 @@
+{
+  "performance_regression_gates": {
+    "baseline_case": "baseline",
+    "cases": {
+      "candidate": {
+        "baseline_case": "baseline",
+        "metrics": [
+          {
+            "baseline": 149.81066628667898,
+            "candidate": 148.67510624256252,
+            "concurrency": 1,
+            "delta_pct": -0.7579967917260566,
+            "metric": "c1.throughput_mean",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "min_delta_pct",
+              "value": -20.0
+            }
+          },
+          {
+            "baseline": 61.8853615,
+            "candidate": 62.7186925,
+            "concurrency": 1,
+            "delta_pct": 1.3465720807011916,
+            "metric": "c1.ttft_p50",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 50.0
+            }
+          },
+          {
+            "baseline": 6.267688308586426,
+            "candidate": 6.2896889484126985,
+            "concurrency": 1,
+            "delta_pct": 0.35101681422371467,
+            "metric": "c1.tpot_p50",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 50.0
+            }
+          },
+          {
+            "baseline": 6.4073907,
+            "candidate": 6.390036,
+            "concurrency": 1,
+            "delta_pct": -0.2708544056787332,
+            "metric": "c1.itl_p95",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 80.0
+            }
+          },
+          {
+            "baseline": 1144.371307971716,
+            "candidate": 1158.2980087424096,
+            "concurrency": 32,
+            "delta_pct": 1.2169739553656855,
+            "metric": "c32.throughput_mean",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "min_delta_pct",
+              "value": -20.0
+            }
+          },
+          {
+            "baseline": 985.521698,
+            "candidate": 931.377493,
+            "concurrency": 32,
+            "delta_pct": -5.493963766589749,
+            "metric": "c32.ttft_p50",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 50.0
+            }
+          },
+          {
+            "baseline": 19.656131313492068,
+            "candidate": 19.708448596706663,
+            "concurrency": 32,
+            "delta_pct": 0.2661626663975625,
+            "metric": "c32.tpot_p50",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 50.0
+            }
+          },
+          {
+            "baseline": 23.786049499999997,
+            "candidate": 23.6352508,
+            "concurrency": 32,
+            "delta_pct": -0.6339795937950754,
+            "metric": "c32.itl_p95",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 80.0
+            }
+          }
+        ],
+        "ok": true
+      }
+    },
+    "concurrency_cells_ok": false,
+    "enabled": true,
+    "observed_concurrency_cells": [
+      1,
+      32
+    ],
+    "required_concurrency_cells": [
+      1,
+      4,
+      16,
+      32
+    ],
+    "schema_version": 1,
+    "thresholds": {
+      "enabled": true,
+      "itl_p95_max_regression_pct": 80.0,
+      "throughput_min_delta_pct": -20.0,
+      "tpot_max_regression_pct": 50.0,
+      "ttft_max_regression_pct": 50.0
+    }
+  },
+  "rows": [
+    {
+      "artifact_verdict": "pass",
+      "cell": "c1",
+      "completed": 32,
+      "concurrency": 1,
+      "env_hash": "sha256:25dd587d1a929b3579b3ad501cad7492f9c7abdaa039a97bc0d57e08b0aea804",
+      "errored": 0,
+      "itl_p95": 6.4073907,
+      "name": "baseline",
+      "not_publishable": false,
+      "runtime_config_entry_count": 14,
+      "status": "pass",
+      "throughput_ci95_hw": null,
+      "throughput_mean": 149.81066628667898,
+      "throughput_stddev": null,
+      "tpot_p50": 6.267688308586426,
+      "ttft_p50": 61.8853615
+    },
+    {
+      "artifact_verdict": "pass",
+      "cell": "c1",
+      "completed": 32,
+      "concurrency": 1,
+      "env_hash": "sha256:25dd587d1a929b3579b3ad501cad7492f9c7abdaa039a97bc0d57e08b0aea804",
+      "errored": 0,
+      "itl_p95": 6.390036,
+      "name": "candidate",
+      "not_publishable": false,
+      "performance_gate_ok": true,
+      "runtime_config_entry_count": 14,
+      "status": "pass",
+      "throughput_ci95_hw": null,
+      "throughput_mean": 148.67510624256252,
+      "throughput_stddev": null,
+      "tpot_p50": 6.2896889484126985,
+      "ttft_p50": 62.7186925
+    },
+    {
+      "artifact_verdict": "pass",
+      "cell": "c32",
+      "completed": 32,
+      "concurrency": 32,
+      "env_hash": "sha256:25dd587d1a929b3579b3ad501cad7492f9c7abdaa039a97bc0d57e08b0aea804",
+      "errored": 0,
+      "itl_p95": 23.786049499999997,
+      "name": "baseline",
+      "not_publishable": false,
+      "runtime_config_entry_count": 14,
+      "status": "pass",
+      "throughput_ci95_hw": null,
+      "throughput_mean": 1144.371307971716,
+      "throughput_stddev": null,
+      "tpot_p50": 19.656131313492068,
+      "ttft_p50": 985.521698
+    },
+    {
+      "artifact_verdict": "pass",
+      "cell": "c32",
+      "completed": 32,
+      "concurrency": 32,
+      "env_hash": "sha256:25dd587d1a929b3579b3ad501cad7492f9c7abdaa039a97bc0d57e08b0aea804",
+      "errored": 0,
+      "itl_p95": 23.6352508,
+      "name": "candidate",
+      "not_publishable": false,
+      "performance_gate_ok": true,
+      "runtime_config_entry_count": 14,
+      "status": "pass",
+      "throughput_ci95_hw": null,
+      "throughput_mean": 1158.2980087424096,
+      "throughput_stddev": null,
+      "tpot_p50": 19.708448596706663,
+      "ttft_p50": 931.377493
+    }
+  ]
+}

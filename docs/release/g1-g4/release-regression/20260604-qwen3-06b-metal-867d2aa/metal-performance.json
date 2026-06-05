@@ -1,0 +1,12 @@
+{
+  "backend": "metal",
+  "serve_single_request_latency_ms": 1562.5262260437012,
+  "serve_concurrent_completed": 4,
+  "serve_concurrent_failed": 0,
+  "serve_concurrent_latency_p50_ms": 3099.8778343200684,
+  "serve_concurrent_latency_max_ms": 3100.111961364746,
+  "cli_one_shot_tok_s": 66.22602600784619,
+  "cli_multi_turn_tok_s": 77.21118151793088,
+  "cli_one_shot_tokens": 96,
+  "cli_multi_turn_tokens": 297
+}
