@@ -303,12 +303,20 @@ pub fn serve_profile_runtime_entries_for_arch(
     }
 
     let mut entries = Vec::new();
+    let kv_capacity = if is_moe && is_metal {
+        // Metal Qwen3-MoE paged KV is stable for the README c16 path when
+        // total pool blocks stay <= 1024. c16 × 1024 tokens gives exactly
+        // that bound and avoids the repeated-token failure seen at
+        // c16 × 2048.
+        "1024"
+    } else if is_moe {
+        "2048"
+    } else {
+        "512"
+    };
     for (k, v) in [
-        ("FERRUM_KV_CAPACITY", if is_moe { "2048" } else { "512" }),
-        (
-            "FERRUM_METAL_PAGED_KV",
-            if is_moe && is_metal { "0" } else { "1" },
-        ),
+        ("FERRUM_KV_CAPACITY", kv_capacity),
+        ("FERRUM_METAL_PAGED_KV", "1"),
         (
             "FERRUM_PAGED_MAX_SEQS",
             if is_moe {
@@ -664,7 +672,7 @@ mod tests {
 
         assert_eq!(
             value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
-            Some("2048")
+            Some("1024")
         );
         assert_eq!(
             value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
@@ -672,7 +680,7 @@ mod tests {
         );
         assert_eq!(
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
-            Some("0")
+            Some("1")
         );
         assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
@@ -692,6 +700,10 @@ mod tests {
             RuntimeConfigSource::Default,
         );
 
+        assert_eq!(
+            value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
+            Some("2048")
+        );
         assert_eq!(
             value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
             Some("16")
