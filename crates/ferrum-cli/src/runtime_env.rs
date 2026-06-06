@@ -29,7 +29,7 @@ pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Ve
     materialized
 }
 
-/// Default-ON graph-clean MoE path for Qwen3-MoE startup profiles.
+/// Default-OFF MoE CUDA graph policy for Qwen3-MoE startup profiles.
 ///
 /// The returned entries are only values absent from `current`. This preserves
 /// explicit env/config overrides and lets callers keep source attribution when
@@ -42,8 +42,8 @@ pub fn moe_graph_default_entries(
     let moe_graph_enabled = match runtime_snapshot_value(current, "FERRUM_MOE_GRAPH") {
         Some(value) => value == "1",
         None => {
-            entries.push(RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", source));
-            true
+            entries.push(RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "0", source));
+            false
         }
     };
 
@@ -111,19 +111,7 @@ mod tests {
         let resolved = RuntimeConfigSnapshot::from_entries(entries);
         let graph = runtime_snapshot_value(&resolved, "FERRUM_MOE_GRAPH");
 
-        assert_eq!(graph, Some("1"));
-        #[cfg(feature = "vllm-moe-marlin")]
-        {
-            assert_eq!(
-                runtime_snapshot_value(&resolved, "FERRUM_VLLM_MOE"),
-                Some("1")
-            );
-            assert_eq!(
-                runtime_snapshot_value(&resolved, "FERRUM_VLLM_MOE_PAIR_IDS"),
-                Some("1")
-            );
-        }
-        #[cfg(not(feature = "vllm-moe-marlin"))]
+        assert_eq!(graph, Some("0"));
         assert_eq!(resolved.entries.len(), 1);
     }
 

@@ -11,6 +11,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 METAL_VALIDATOR = REPO_ROOT / "scripts/release/validate_metal_readme_regression.py"
 SUMMARY_VALIDATOR = REPO_ROOT / "scripts/release/g0_release_summary.py"
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+from m3_validate_runner_artifact import (  # noqa: E402
+    ValidationError,
+    validate_concurrency_quality_gate,
+    validate_tool_call_gate,
+)
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -34,11 +41,31 @@ def make_metal_artifact(root: Path) -> None:
             "models": [
                 {
                     "key": "qwen3_0_6b",
+                    "default_startup": {
+                        "passed": True,
+                        "max_sequences": 4,
+                        "min_required_max_sequences": 2,
+                        "max_allowed_max_sequences": 4,
+                    },
                     "server_ready": True,
+                    "serve_startup": {
+                        "passed": True,
+                        "max_sequences": 4,
+                        "min_required_max_sequences": 1,
+                    },
                     "chat": {
                         "paris": {"passed": True},
                         "multiturn": {"passed": True},
                         "stream": {"passed": True},
+                    },
+                    "tool_call": {
+                        "status": "pass",
+                        "checks": {
+                            "omitted_tool_choice": {"passed": True},
+                            "explicit_auto_tool_choice": {"passed": True},
+                            "required_tool_choice": {"passed": True},
+                            "tool_result_fill": {"passed": True},
+                        },
                     },
                     "run": {"passed": True},
                     "cells": [
@@ -47,6 +74,16 @@ def make_metal_artifact(root: Path) -> None:
                             "prompts": 2,
                             "completed": 2,
                             "failed": 0,
+                            "quality": {
+                                "passed": True,
+                                "requests": 1,
+                                "status_200": 1,
+                                "marker_ok": 1,
+                                "square_ok": 1,
+                                "format_ok": 1,
+                                "crosstalk": 0,
+                                "length_finishes": 0,
+                            },
                             "output_throughput_tok_s": 42.0,
                             "ratio_to_readme": 1.0,
                             "not_regressed_90pct": True,
@@ -62,8 +99,10 @@ def make_metal_artifact(root: Path) -> None:
 
 def make_summary_artifact(root: Path) -> None:
     for rel in [
-        "unit.gate.json",
-        "source/metal.gate.json",
+        "source-unit/unit.gate.json",
+        "source-metal/metal.gate.json",
+        "source-cuda-full/g0_cuda4090_full.gate.json",
+        "source-cuda-llama-dense/g0_cuda4090_llama_dense.gate.json",
         "metal-tarball/gate.json",
         "cuda-tarball/gate.json",
         "homebrew-metal/gate.json",
@@ -80,6 +119,15 @@ def test_metal_validator() -> None:
         require(ok.returncode == 0, ok.stderr or ok.stdout)
         require("METAL README GATE PASS" in ok.stdout, ok.stdout)
 
+        data = json.loads((root / "summary.json").read_text())
+        data["models"][0]["default_startup"]["max_allowed_max_sequences"] = 3
+        write_json(root / "summary.json", data)
+        bad_default = run([sys.executable, str(METAL_VALIDATOR), str(root)])
+        require(bad_default.returncode != 0, "unsafe default max_sequences unexpectedly passed")
+        require("default max_sequences 4 > allowed 3" in bad_default.stderr, bad_default.stderr)
+
+        data["models"][0]["default_startup"]["max_allowed_max_sequences"] = 4
+        write_json(root / "summary.json", data)
         (root / "qwen3_0_6b.run.stderr").write_text("thread panicked\n")
         bad = run([sys.executable, str(METAL_VALIDATOR), str(root)])
         require(bad.returncode != 0, "bad metal artifact unexpectedly passed")
@@ -101,9 +149,82 @@ def test_summary_validator() -> None:
         require("G0 RELEASE FAIL" in bad.stderr, bad.stderr)
 
 
+def test_m3_quality_gate_artifact_validators() -> None:
+    with tempfile.TemporaryDirectory(prefix="ferrum-m3-gates-") as tmp:
+        root = Path(tmp)
+        tool = root / "tool_call_regression.json"
+        write_json(
+            tool,
+            {
+                "status": "pass",
+                "checks": {
+                    "omitted_tool_choice": {"passed": True},
+                    "explicit_auto_tool_choice": {"passed": True},
+                    "required_tool_choice": {"passed": True},
+                    "tool_result_fill": {"passed": True},
+                },
+            },
+        )
+        validate_tool_call_gate("case", tool)
+
+        bad_tool = root / "bad_tool_call_regression.json"
+        write_json(
+            bad_tool,
+            {
+                "status": "pass",
+                "checks": {
+                    "omitted_tool_choice": {"passed": True},
+                    "explicit_auto_tool_choice": {"passed": True},
+                    "required_tool_choice": {"passed": True},
+                    "tool_result_fill": {"passed": False},
+                },
+            },
+        )
+        try:
+            validate_tool_call_gate("case", bad_tool)
+            raise AssertionError("bad tool-call gate unexpectedly passed")
+        except ValidationError:
+            pass
+
+        quality = root / "concurrency_quality_regression.json"
+        write_json(
+            quality,
+            {
+                "status": "pass",
+                "cells": [
+                    {
+                        "concurrency": 4,
+                        "requests": 4,
+                        "status_200": 4,
+                        "json_ok": 4,
+                        "marker_ok": 4,
+                        "square_ok": 4,
+                        "format_ok": 4,
+                        "crosstalk": 0,
+                        "length_finishes": 0,
+                        "forbidden_count": 0,
+                        "passed": True,
+                    }
+                ],
+            },
+        )
+        validate_concurrency_quality_gate("case", quality)
+
+        bad_quality = root / "bad_concurrency_quality_regression.json"
+        bad = json.loads(quality.read_text())
+        bad["cells"][0]["format_ok"] = 3
+        write_json(bad_quality, bad)
+        try:
+            validate_concurrency_quality_gate("case", bad_quality)
+            raise AssertionError("bad concurrency-quality gate unexpectedly passed")
+        except ValidationError:
+            pass
+
+
 def main() -> int:
     test_metal_validator()
     test_summary_validator()
+    test_m3_quality_gate_artifact_validators()
     print("G0 VALIDATOR SELFTEST PASS")
     return 0
 

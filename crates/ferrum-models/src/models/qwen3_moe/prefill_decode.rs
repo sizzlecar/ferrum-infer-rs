@@ -232,6 +232,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             self.register_prefix_cache(cache_id, tokens, cached_prefix_tokens);
         }
 
+        B::sync_before_host_readback(&mut ctx);
         B::to_vec(&self.scratch.logits, vocab)
     }
 
@@ -485,6 +486,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             }
         }
 
+        B::sync_before_host_readback(&mut ctx);
         B::to_vec(&self.scratch.logits, vocab)
     }
 }

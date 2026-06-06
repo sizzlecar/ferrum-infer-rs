@@ -77,9 +77,10 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
 ///   - `FERRUM_PAGED_MAX_SEQS=2` dense / `1` MoE, `FERRUM_MAX_BATCH=1` — single-user REPL.
 ///     Keeps the paged pool at ~1.7 GB for `cap=8192` dense; without this
 ///     cap the default `max_seqs=32` makes the pool ~30 GB on a 32 GB Mac.
-///   - `FERRUM_MOE_BATCHED=1`, `FERRUM_MOE_BATCHED_DECODE=1`,
-///     `FERRUM_MOE_BATCH_THRESHOLD=2` — MoE only. Match the published
-///     `docs/bench/macos-2026-05-02` c=1 30B-A3B → 42 tok/s defaults.
+///   - `FERRUM_MOE_BATCHED=0`, `FERRUM_MOE_BATCHED_DECODE=0`,
+///     `FERRUM_MOE_BATCH_THRESHOLD=2` — MoE only. `run` is an interactive
+///     single-session path, so do not engage unneeded multi-sequence MoE
+///     batching.
 ///
 /// Idempotent: if a user explicitly sets one of these env vars before
 /// invoking `ferrum run`, that value wins (we only set when unset).
@@ -154,8 +155,8 @@ fn chat_profile_runtime_entries_for_arch(
     }
     if is_moe {
         for (k, v) in [
-            ("FERRUM_MOE_BATCHED", "1"),
-            ("FERRUM_MOE_BATCHED_DECODE", "1"),
+            ("FERRUM_MOE_BATCHED", "0"),
+            ("FERRUM_MOE_BATCHED_DECODE", "0"),
             ("FERRUM_MOE_BATCH_THRESHOLD", "2"),
         ] {
             push_missing_entry(&mut entries, current, k, v, source);
@@ -257,12 +258,10 @@ pub fn metal_gguf_moe_correctness_entries(
 /// explicit profile, Qwen3-30B-A3B falls back to the model default
 /// `FERRUM_KV_CAPACITY=512`, which can make a normal sequence of OpenAI
 /// requests (sync correctness, multi-turn, then stream) end the stream
-/// immediately with an empty EOS. Keep this product path safe by default:
-/// enough context for Qwen3 thinking-mode responses and enough slots for the
-/// validated serving rows. Metal GGUF MoE is intentionally kept to one paged
-/// sequence today because the multi-slot path corrupts thinking-mode logits.
-/// Bench-only overrides remain possible, but users should not need any env var
-/// combination for normal serve.
+/// immediately with an empty EOS. Keep this product path correct by default:
+/// enough context for Qwen3 thinking-mode responses and a multi-request pool
+/// for dense GGUF models. Metal GGUF MoE is intentionally single-sequence
+/// until its multi-sequence path passes a content-quality gate.
 pub fn serve_profile_runtime_entries(
     snapshot_path: &Path,
     device: &ferrum_types::Device,
@@ -316,19 +315,27 @@ pub fn serve_profile_runtime_entries_for_arch(
                 "1"
             } else if is_moe {
                 "16"
+            } else if is_metal {
+                "16"
             } else {
                 "32"
             },
         ),
-        ("FERRUM_MAX_BATCH", "16"),
+        (
+            "FERRUM_MAX_BATCH",
+            if is_moe && is_metal { "1" } else { "16" },
+        ),
     ] {
         push_missing_entry(&mut entries, current, k, v, source);
     }
     if is_moe {
         for (k, v) in [
             ("FERRUM_MAX_BATCHED_TOKENS", "2048"),
-            ("FERRUM_MOE_BATCHED", "1"),
-            ("FERRUM_MOE_BATCHED_DECODE", "1"),
+            ("FERRUM_MOE_BATCHED", if is_metal { "0" } else { "1" }),
+            (
+                "FERRUM_MOE_BATCHED_DECODE",
+                if is_metal { "0" } else { "1" },
+            ),
             ("FERRUM_MOE_BATCH_THRESHOLD", "2"),
         ] {
             push_missing_entry(&mut entries, current, k, v, source);
@@ -654,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_profile_defaults_gguf_moe_without_user_env() {
+    fn serve_profile_defaults_metal_gguf_moe_without_user_env() {
         let entries = serve_profile_runtime_entries_for_arch(
             true,
             true,
@@ -671,8 +678,12 @@ mod tests {
             value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
             Some("1")
         );
-        assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
+        assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("1"));
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
+        assert_eq!(
+            value(&entries, "FERRUM_MOE_BATCHED_DECODE").as_deref(),
+            Some("0")
+        );
     }
 
     #[test]
@@ -688,6 +699,12 @@ mod tests {
         assert_eq!(
             value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
             Some("16")
+        );
+        assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
+        assert_eq!(
+            value(&entries, "FERRUM_MOE_BATCHED_DECODE").as_deref(),
+            Some("1")
         );
     }
 
@@ -707,7 +724,11 @@ mod tests {
         );
         assert_eq!(
             value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
-            Some("32")
+            Some("16")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("1")
         );
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
     }
@@ -787,7 +808,11 @@ mod tests {
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
             Some("1")
         );
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
+        assert_eq!(
+            value(&entries, "FERRUM_MOE_BATCHED_DECODE").as_deref(),
+            Some("0")
+        );
         assert_eq!(
             value(&entries, "FERRUM_MOE_BATCH_THRESHOLD").as_deref(),
             Some("2")
@@ -816,7 +841,11 @@ mod tests {
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
             Some("1")
         );
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
+        assert_eq!(
+            value(&entries, "FERRUM_MOE_BATCHED_DECODE").as_deref(),
+            Some("0")
+        );
     }
 
     #[test]
@@ -833,7 +862,7 @@ mod tests {
 
         assert_eq!(value(&entries, "FERRUM_KV_CAPACITY"), None);
         assert_eq!(value(&entries, "FERRUM_MOE_BATCH_THRESHOLD"), None);
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -65,7 +65,7 @@ impl ModelCapabilities {
             // GPUs to be downgraded before startup allocation.
             estimated_weight_bytes: Some(18 * GIB),
             supported_dtypes: vec!["fp16".to_string()],
-            graph_safe_moe: true,
+            graph_safe_moe: false,
         }
     }
 }
@@ -186,6 +186,20 @@ impl WorkloadProfile {
             output_length_class: "unknown".to_string(),
             priority: WorkloadPriority::Balanced,
         }
+    }
+
+    pub fn serving_default_for_hardware(hardware: &HardwareCapabilities) -> Self {
+        let mut profile = Self::serving_default();
+        if hardware.backend.eq_ignore_ascii_case("cuda")
+            || hardware.backend.eq_ignore_ascii_case("metal")
+        {
+            profile.target_concurrency = hardware
+                .vram_bytes
+                .map(vram_default_max_sequences)
+                .unwrap_or(4)
+                .max(1);
+        }
+        profile
     }
 
     pub fn m3_qwen3_30b_a3b_int4() -> Self {
@@ -388,14 +402,7 @@ impl FerrumConfigBuilder {
             vllm_moe.value,
             AutoConfigSource::WorkloadPreset,
         )?;
-        let graph = self.bool_value(
-            "FERRUM_MOE_GRAPH",
-            self.workload.is_m3_preset()
-                && vllm_moe.value
-                && self.hardware.graph_support
-                && self.hardware.compiled_features.cuda_graph,
-            AutoConfigSource::WorkloadPreset,
-        )?;
+        let graph = self.bool_value("FERRUM_MOE_GRAPH", false, AutoConfigSource::WorkloadPreset)?;
         let greedy = self.bool_value(
             "FERRUM_GREEDY_ARGMAX",
             self.workload.is_m3_preset()
@@ -1436,7 +1443,7 @@ mod tests {
             decisions["moe_implementation"],
             "vllm_marlin_moe_device_route_pair_ids"
         );
-        assert_eq!(decisions["moe_graph_policy"], "graph_clean_decode");
+        assert_eq!(decisions["moe_graph_policy"], "graph_disabled");
         assert_eq!(decisions["prefix_cache_policy"], "prefix_cache_disabled");
         assert_eq!(decisions["sampling_readback_path"], "gpu_greedy_argmax");
         assert_eq!(
@@ -1635,6 +1642,38 @@ mod tests {
         assert_eq!(vram_default_max_sequences(16 * 1024 * 1024 * 1024), 16);
         assert_eq!(vram_default_max_sequences(8 * 1024 * 1024 * 1024), 8);
         assert_eq!(vram_default_max_sequences(6 * 1024 * 1024 * 1024), 4);
+    }
+
+    #[test]
+    fn accelerator_serving_default_uses_hardware_concurrency_budget() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        assert_eq!(workload.target_concurrency, 32);
+
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let max_sequences = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "max_sequences")
+            .unwrap();
+        assert_eq!(max_sequences.selected, "32");
+    }
+
+    #[test]
+    fn cpu_serving_default_keeps_single_sequence_budget() {
+        let hardware = HardwareCapabilities {
+            backend: "cpu".to_string(),
+            supported_dtypes: vec!["fp32".to_string()],
+            ..HardwareCapabilities::unknown()
+        };
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        assert_eq!(workload.target_concurrency, 1);
     }
 
     #[test]

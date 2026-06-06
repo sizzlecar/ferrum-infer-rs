@@ -111,6 +111,12 @@ pub struct ChatCompletionsRequest {
     /// the `X-Ferrum-Session` header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
+
+    /// vLLM-compatible chat-template variables. Ferrum forwards supported
+    /// values to the model-provided chat template; templates that do not read
+    /// a variable are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// OpenAI streaming options.

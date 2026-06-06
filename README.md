@@ -84,8 +84,8 @@ Release and Metal gates:
 | Target | Model / workload | Result | Evidence |
 | --- | --- | --- | --- |
 | CUDA release binary | Qwen3-30B-A3B GPTQ-Int4, c=32 smoke | `16/16` requests, `0` errors; Paris, multi-turn, and three-round chat gates passed | [`CUDA release-binary validation`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/) |
-| Apple Silicon Metal | Qwen3/LLaMA 8B and Qwen3-30B-A3B | Correctness, multi-turn, and concurrency gates covered | [`metal-readme-regression-20260601-release-candidate-rerun3`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/) |
-| Apple Silicon Metal limitation | Qwen3-30B-A3B, c=16 | Ferrum `72.5 tok/s`; recorded llama.cpp `83.4 tok/s` | Same Metal report above |
+| Apple Silicon Metal | Llama/Qwen3 8B and Qwen3-30B-A3B, canonical random `16/64` streaming chat workload | Current G0 gate requires default `serve` startup evidence, `run` and `serve` correctness, concurrent marker/square content-quality probes, plus throughput rows with actual tokenizer-counted input lengths. Qwen3-30B-A3B Metal GGUF currently gates the correctness-safe single-sequence path; multi-sequence MoE decode is not release evidence until it passes content-quality gates. | `scripts/metal_readme_regression.py` + `scripts/release/validate_metal_readme_regression.py` |
+| Apple Silicon Metal historical report | Older near-empty-prompt README rows | Historical evidence only; do not use those numbers as current release-gate claims | [`metal-readme-regression-20260601-release-candidate-rerun3`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/) |
 
 ## API Compatibility
 
@@ -129,7 +129,7 @@ cargo build --release -p ferrum-cli --bin ferrum
 ## Benchmarks / Docs
 
 - CUDA vLLM comparison: [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)
-- Apple Silicon regression report: [`docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/)
+- Apple Silicon regression gate: `scripts/metal_readme_regression.py` and `scripts/release/validate_metal_readme_regression.py`
 - OpenAI API compatibility: [`docs/openai-api-compatibility.md`](docs/openai-api-compatibility.md)
 - Module status notes: [`docs/status/`](docs/status/)
 
@@ -212,7 +212,7 @@ What works today:
 - CLI chat, OpenAI-compatible HTTP server with streaming
 - Continuous batching, PagedAttention (CUDA + Metal pools), prefix caching, preemption
 - Custom CUDA decode runner (Qwen3, LLaMA): 2× over Candle baseline
-- Apple Silicon MoE inference (Qwen3-30B-A3B) — correctness, multi-turn, and concurrency gates covered; c=16 is currently below the recorded llama.cpp row
+- Apple Silicon MoE inference (Qwen3-30B-A3B) — correctness, multi-turn, default serve startup, and safe single-sequence serving gates covered; Metal multi-sequence MoE decode remains blocked until concurrent content-quality probes pass
 - INT4 GPTQ with Marlin fused kernel (Blackwell + Ampere); also Triton w4a16
 - Tensor parallelism (multi-GPU NCCL, persistent per-rank threads)
 - Speculative decoding (`--spec-draft <MODEL>` DeepMind accept/reject)
