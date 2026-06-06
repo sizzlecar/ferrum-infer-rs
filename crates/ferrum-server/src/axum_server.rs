@@ -1171,7 +1171,7 @@ async fn handle_chat_completions_sync(
                 _ => output_text,
             };
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
-            let content = strip_trailing_stop(&after_fence, &stop_sequences);
+            let content = strip_after_stop(&after_fence, &stop_sequences);
             let parsed = parse_reasoning_response(&content);
             let visible_content =
                 normalize_structured_response_content(&openai_request, &parsed.content);
@@ -2330,12 +2330,12 @@ async fn handle_completions_sync(
                 ..
             } = output;
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
-            let mut text = strip_trailing_stop(&output_text, &stop_sequences);
+            let mut text = strip_after_stop(&output_text, &stop_sequences);
             let mut openai_finish_reason = finish_reason_to_string(&finish_reason);
             if let Some(ferrum_types::ApiResponse::Completion(completion_response)) =
                 api_response.as_ref()
             {
-                text = strip_trailing_stop(&completion_response.text, &stop_sequences);
+                text = strip_after_stop(&completion_response.text, &stop_sequences);
                 if let Some(reason) = &completion_response.finish_reason {
                     openai_finish_reason = reason.clone();
                 }
@@ -3065,24 +3065,23 @@ impl std::fmt::Display for MessageRole {
     }
 }
 
-/// Strip a single trailing occurrence of any user-supplied stop sequence
-/// from `text`. Mirrors OpenAI's convention that `stop` strings act as
-/// boundaries that are NOT included in the returned completion. We only
-/// strip from the suffix (not all occurrences) because a stop sequence
-/// the model produced legitimately mid-response shouldn't be redacted.
-fn strip_trailing_stop(text: &str, stops: &[String]) -> String {
-    let mut out = text.to_string();
-    let trimmed = out.trim_end();
+/// Strip model output at the first user-supplied stop sequence.
+/// OpenAI-compatible `stop` strings are generation boundaries and must not
+/// be returned to the caller, even if the model continued after the boundary.
+fn strip_after_stop(text: &str, stops: &[String]) -> String {
+    let mut first: Option<usize> = None;
     for stop in stops {
         if stop.is_empty() {
             continue;
         }
-        if let Some(prefix) = trimmed.strip_suffix(stop.as_str()) {
-            out = prefix.to_string();
-            break;
+        if let Some(idx) = text.find(stop.as_str()) {
+            first = Some(first.map_or(idx, |current| current.min(idx)));
         }
     }
-    out
+    match first {
+        Some(idx) => text[..idx].to_string(),
+        None => text.to_string(),
+    }
 }
 
 /// When `response_format = json_object` is set, the model is meant to
@@ -3143,6 +3142,17 @@ mod tests {
         sync::{Arc, Mutex},
     };
     use tower::ServiceExt;
+
+    #[test]
+    fn strip_after_stop_removes_first_boundary() {
+        assert_eq!(
+            strip_after_stop(
+                "KS0214Z\nS0225\nEND0214Z0214Z\nS0225\n",
+                &["END0214Z".to_string()]
+            ),
+            "KS0214Z\nS0225\n"
+        );
+    }
 
     struct StubLlm {
         config: EngineConfig,

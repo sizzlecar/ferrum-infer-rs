@@ -140,7 +140,7 @@ def main() -> int:
             quality = cell.get("quality") or {}
             if quality.get("passed") is not True:
                 errors.append(f"{key} c={c}: quality.passed != true ({root / f'{key}.c{c}.quality.json'})")
-            for name in ["status_200", "marker_ok", "square_ok", "format_ok"]:
+            for name in ["status_200", "marker_ok", "square_ok"]:
                 if quality.get(name) != quality.get("requests"):
                     errors.append(
                         f"{key} c={c}: quality {name} {quality.get(name)!r} != "

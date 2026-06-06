@@ -212,13 +212,12 @@ impl EngineInner {
                     self.scheduler.mark_prefill_complete(rid, num_tokens);
                     self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
                     counter!("ferrum.engine.prefix_cache_hits").increment(1);
-                    self.send_stream_update(rid, first_token).await;
-                    let should_stop = {
-                        let sequences = self.sequences.read();
-                        sequences.get(rid).is_none_or(|s| s.should_stop())
-                    };
-                    if should_stop {
-                        self.complete_request(rid, FinishReason::EOS).await?;
+                    let stop_reason = self.stop_reason_for_request(rid);
+                    if self.should_stream_generated_token(stop_reason) {
+                        self.send_stream_update(rid, first_token).await;
+                    }
+                    if let Some(reason) = stop_reason {
+                        self.complete_request(rid, reason).await?;
                     }
                     continue;
                 }
@@ -456,13 +455,12 @@ impl EngineInner {
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);
             counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
             counter!("ferrum.engine.prefills_total").increment(1);
-            self.send_stream_update(&work.rid, first_token).await;
-            let should_stop = {
-                let sequences = self.sequences.read();
-                sequences.get(&work.rid).is_none_or(|s| s.should_stop())
-            };
-            if should_stop {
-                self.complete_request(&work.rid, FinishReason::EOS).await?;
+            let stop_reason = self.stop_reason_for_request(&work.rid);
+            if self.should_stream_generated_token(stop_reason) {
+                self.send_stream_update(&work.rid, first_token).await;
+            }
+            if let Some(reason) = stop_reason {
+                self.complete_request(&work.rid, reason).await?;
             }
         }
         for (j, rid) in decode_meta.into_iter().enumerate() {
@@ -525,7 +523,10 @@ impl EngineInner {
             } else {
                 None
             };
-            self.send_stream_update(&rid, next_token).await;
+            let stop_reason = self.stop_reason_for_request(&rid);
+            if self.should_stream_generated_token(stop_reason) {
+                self.send_stream_update(&rid, next_token).await;
+            }
             if let Some(t0) = t0_stream {
                 t_decode_stream_us += t0.elapsed().as_micros() as u64;
             }
@@ -534,32 +535,16 @@ impl EngineInner {
             } else {
                 None
             };
-            let should_stop = {
-                let sequences = self.sequences.read();
-                sequences.get(&rid).is_none_or(|s| s.should_stop())
-            };
             if let Some(t0) = t0_stop {
                 t_decode_stop_us += t0.elapsed().as_micros() as u64;
             }
-            if should_stop {
+            if let Some(reason) = stop_reason {
                 let t0_complete = if unified_prof {
                     Some(Instant::now())
                 } else {
                     None
                 };
-                let finish_reason = {
-                    let sequences = self.sequences.read();
-                    match sequences.get(&rid) {
-                        Some(seq)
-                            if seq.generated_tokens.len() >= seq.sampling_params.max_tokens =>
-                        {
-                            FinishReason::Length
-                        }
-                        Some(_) => FinishReason::EOS,
-                        None => FinishReason::Error,
-                    }
-                };
-                self.complete_request(&rid, finish_reason).await?;
+                self.complete_request(&rid, reason).await?;
                 if let Some(t0) = t0_complete {
                     t_decode_complete_us += t0.elapsed().as_micros() as u64;
                 }
