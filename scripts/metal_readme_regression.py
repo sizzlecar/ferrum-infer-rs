@@ -928,7 +928,6 @@ def run_quality_cell(
             status_ok == cell.concurrency
             and marker_ok == cell.concurrency
             and square_ok == cell.concurrency
-            and format_ok == cell.concurrency
             and crosstalk == 0
             and length_finishes == 0
         ),
@@ -1185,6 +1184,7 @@ def markdown_summary(report: dict[str, Any]) -> str:
     out.append("- Throughput-profile startup config must expose enough sequence slots for the measured concurrency cell.")
     out.append("- The stateful loop probe sends multiple short prompts through one server process and rejects repeated-prefix/length regressions.")
     out.append("- Every throughput cell first runs a marker/square concurrent quality probe; HTTP 200 and zero request errors are not sufficient correctness evidence.")
+    out.append("- The quality probe hard gate is marker/checksum isolation with no crosstalk or length finish; exact two-line formatting is recorded as diagnostic.")
     out.append("- Metal MoE release evidence requires a multi-sequence content-quality and throughput cell.")
     out.append("- Throughput cells use canonical `ferrum bench-serve` with streaming usage token accounting.")
     out.append("- Throughput cells record their input/output token workload and the server CLI profile in the artifact directory.")

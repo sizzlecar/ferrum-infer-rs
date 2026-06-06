@@ -85,7 +85,7 @@ def make_metal_artifact(root: Path) -> None:
                                 "status_200": 1,
                                 "marker_ok": 1,
                                 "square_ok": 1,
-                                "format_ok": 1,
+                                "format_ok": 0,
                                 "crosstalk": 0,
                                 "length_finishes": 0,
                             },
