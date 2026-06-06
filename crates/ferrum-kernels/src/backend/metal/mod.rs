@@ -493,9 +493,6 @@ impl Backend for MetalBackend {
     fn make_timer() -> Self::Timer {
         crate::backend::timer::MetalTimer::new()
     }
-    fn is_metal_backend() -> bool {
-        true
-    }
     // type GptqStore: removed in Phase C step 4e. Metal has no Marlin
     // GPTQ path (GGUF is the quant story on Metal). Adding GPTQ later
     // means impl-ing MarlinExpertStack<MetalBackend> + load_gptq_stacked.
@@ -508,6 +505,12 @@ impl Backend for MetalBackend {
     }
     fn sync(ctx: &mut Self::Context) {
         ctx.flush();
+    }
+    fn sync_before_host_readback(ctx: &mut Self::Context) {
+        Self::sync(ctx);
+    }
+    fn activation_elem_size_bytes() -> usize {
+        std::mem::size_of::<f32>()
     }
 
     // ── Q4_K_M ────────────────────────────────────────────────────────

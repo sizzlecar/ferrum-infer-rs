@@ -90,6 +90,15 @@ fn active_lora_from_metadata(
     }
 }
 
+fn metadata_requires_full_logits(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> bool {
+    metadata
+        .get("ferrum_require_full_logits")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 /// Map a `ferrum_types::Device` to the matching `candle_core::Device`.
 /// Used when materialising KV cache handles so downstream readers see
 /// the real backend the model runs on (Metal / CUDA / CPU) rather than
@@ -530,6 +539,7 @@ impl ModelExecutor for LlmExecutor {
             token: u32,
             seq_len: u32,
             lora: Option<ActiveLoraAdapter>,
+            requires_full_logits: bool,
             handle: Arc<GenericKvCacheHandle>,
         }
         let mut prepped: Vec<Prep> = Vec::with_capacity(inputs.len());
@@ -550,6 +560,7 @@ impl ModelExecutor for LlmExecutor {
                 token: tokens[0],
                 seq_len,
                 lora: active_lora_from_metadata(&input.metadata)?,
+                requires_full_logits: metadata_requires_full_logits(&input.metadata),
                 handle: Arc::new(input_handle.with_sequence_length((seq_len + 1) as usize)),
             });
         }
@@ -608,7 +619,8 @@ impl ModelExecutor for LlmExecutor {
                         .iter()
                         .map(|p| (p.cache_id.clone(), p.token, p.seq_len))
                         .collect();
-                    model.decode_batch(&tuples)
+                    let force_full_logits = prepped.iter().any(|p| p.requires_full_logits);
+                    model.decode_batch_with_full_logits(&tuples, force_full_logits)
                 }
                 Err(e) => return Err(e),
             };
@@ -774,7 +786,10 @@ impl ModelExecutor for LlmExecutor {
                         active_lora_from_metadata(&item.metadata)?,
                     )?;
                 }
-                model.decode_batch(&tuples)
+                let force_full_logits = decode_indices
+                    .iter()
+                    .any(|&i| metadata_requires_full_logits(&batch.items[i].metadata));
+                model.decode_batch_with_full_logits(&tuples, force_full_logits)
             };
             for (j, &i) in decode_indices.iter().enumerate() {
                 results[i] = Some(logits_vec[j].clone());

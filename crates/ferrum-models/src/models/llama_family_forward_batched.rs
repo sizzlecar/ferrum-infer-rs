@@ -138,7 +138,13 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let kv_dim = nkv * hd;
 
         let layer = &self.layers[li];
-        let qk_mode: i32 = if cfg.has_qk_norm { 1 } else { 2 };
+        let qk_mode: i32 = if cfg.has_qk_norm {
+            1
+        } else if cfg.rope_interleaved {
+            3
+        } else {
+            2
+        };
         let dummy_w = &layer.input_ln_w;
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
@@ -234,18 +240,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 item_state.push((cache.len as u32, cache.paged_block_indices.clone()));
             }
 
-            // Take block_table buffer ptrs ahead of the dispatch loop —
-            // we need both per-cache block_table (to write into) and
-            // self.scratch.paged_batch_q (to write Q stacks into).
-            // f16 buffers (CudaSlice<f16> / Metal half) — 2 bytes per
-            // element. Earlier `size_of::<f32>()` was 2× too large; for
-            // tokens=1 batched decode the per-item Q stack still landed
-            // at the right offset because the caller's stride is q_dim
-            // and i==0..m gives base+i*q_dim, but split-fused with
-            // q_token_offset>0 (chunked prefill) tripped on the bad
-            // offset by skipping every other token row.
-            let q_head_major_size_bytes = (q_dim * std::mem::size_of::<half::f16>()) as u64;
-            let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
+            let elem_size = B::activation_elem_size_bytes();
+            let q_head_major_size_bytes = (q_dim * elem_size) as u64;
+            let qkv_stride_bytes = (qkv_stride * elem_size) as u64;
             let _t_qkr = if _bp {
                 B::sync(ctx);
                 Some(std::time::Instant::now())
@@ -307,19 +304,19 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
 
-            // Step 2: bump cache.len and build the stacked block_tables +
-            // context_lens host-side, then upload to device scratch.
+            // Step 2: build the stacked block_tables + post-append
+            // context_lens host-side, then upload to device scratch. Do not
+            // mutate cache.len here: decode_batch_internal does one central
+            // bump after all layers so eager and graph replay stay in sync.
             let mut stacked_bt: Vec<u32> = vec![0u32; m * max_blocks_per_seq];
             let mut stacked_cl: Vec<u32> = vec![0u32; m];
             for (i, (cache_id, _, _)) in batch.iter().enumerate() {
                 let caches = self
                     .kv_caches
-                    .get_mut(cache_id)
+                    .get(cache_id)
                     .expect("paged batched: cache not present");
-                let cache = &mut caches[li];
-                cache.len += 1;
-                let len = cache.len as u32;
-                stacked_cl[i] = len;
+                let cache = &caches[li];
+                stacked_cl[i] = (cache.len + 1) as u32;
                 let blocks = &cache.paged_block_indices;
                 let n_to_copy = blocks.len().min(max_blocks_per_seq);
                 stacked_bt[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
@@ -1757,6 +1754,14 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
     ///
     /// Returns M logit vectors in the same order as `batch`.
     pub fn decode_batch_internal(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        self.decode_batch_internal_with_full_logits(batch, false)
+    }
+
+    pub fn decode_batch_internal_with_full_logits(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
         let m = batch.len();
         if m == 0 {
             return Vec::new();
@@ -1765,15 +1770,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             let (cid, tok, pos) = &batch[0];
             return vec![self.decode_internal(cid, *tok, *pos)];
         }
-        if B::is_metal_backend() {
-            // Metal LLaMA-family batched decode currently produces incorrect
-            // follow-up logits after the first generated token under
-            // concurrent serving: single-request decode emits EOS and stops,
-            // while m>1 batched decode continues with corrupted tails such as
-            // repeated assistant/control fragments. Preserve correctness for
-            // the user-facing serving path by falling back to the known-good
-            // per-item decode path on Metal until the batched kernel path has
-            // a dedicated correctness fix.
+        if !B::supports_llama_family_batched_decode() {
+            // Some backends do not yet produce correct follow-up logits in
+            // the optimized dense batched decode path under concurrent
+            // serving. Preserve user-visible correctness by falling back to
+            // the known-good per-item decode path until that backend's
+            // batched kernels pass the dedicated multi-turn gate.
             return batch
                 .iter()
                 .map(|(cid, tok, pos)| self.decode_internal(cid, *tok, *pos))
@@ -2059,7 +2061,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Saves ~5 ms / iter at c=32 on Qwen3 vocab=152064. Engine has a
         // matching size-1-Vec fast path in run_batch_decode that picks
         // `logits[0] as u32` and skips sample_with_processors entirely.
-        let greedy = llama_batched_runtime_config().greedy_argmax;
+        let greedy = llama_batched_runtime_config().greedy_argmax && !force_full_logits;
         if greedy {
             let tokens = B::argmax_rows_f16(&mut ctx, &self.scratch.batch_logits, m, vocab)
                 .expect("argmax_rows_f16");

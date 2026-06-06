@@ -1,7 +1,7 @@
 {
   "name": "g0-cuda4090-smoke",
   "out_root": "/workspace/g0-cuda4090-smoke",
-  "model_dir": "/workspace/hf-cache/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+  "model_dir": "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
   "hf_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
   "bin": "./target/release/ferrum",
   "build": false,
@@ -14,15 +14,18 @@
   "warmup_requests": 4,
   "baseline_case": "baseline",
   "gates": {
+    "max_tokens": 128,
     "paris": true,
     "multi_turn": true,
-    "multi_turn_3round": true
+    "multi_turn_3round": true,
+    "tool_call": true,
+    "concurrency_quality": true
   },
   "validation": {
     "change_type": "diagnostic",
     "touched_areas": ["model_forward", "runtime_defaults", "openai_server_api"],
     "performance_regression_required": false,
-    "required_correctness_gates": ["paris", "multi_turn_paris", "multi_turn_3round_paris", "bench_completion"],
+    "required_correctness_gates": ["paris", "multi_turn_paris", "multi_turn_3round_paris", "tool_call_regression", "concurrency_quality", "bench_completion"],
     "required_concurrency_cells": [1, 32]
   },
   "performance_gates": {

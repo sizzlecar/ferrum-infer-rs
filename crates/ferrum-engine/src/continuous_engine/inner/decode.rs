@@ -57,7 +57,7 @@ impl EngineInner {
                     kv_cache,
                     pos_offset,
                     is_final_chunk: true,
-                    metadata: seq.original_request.metadata.clone(),
+                    metadata: seq.model_decode_metadata(),
                 });
             }
         }
@@ -134,35 +134,22 @@ impl EngineInner {
                 t_sched_us += t0.elapsed().as_micros() as u64;
             }
 
+            let stop_reason = self.stop_reason_for_request(rid);
             let t0_stream = if prof { Some(Instant::now()) } else { None };
-            self.send_stream_update(rid, next_token).await;
+            if self.should_stream_generated_token(stop_reason) {
+                self.send_stream_update(rid, next_token).await;
+            }
             if let Some(t0) = t0_stream {
                 t_stream_us += t0.elapsed().as_micros() as u64;
             }
 
             let t0_stop = if prof { Some(Instant::now()) } else { None };
-            let should_stop = {
-                let sequences = self.sequences.read();
-                sequences.get(rid).is_none_or(|s| s.should_stop())
-            };
             if let Some(t0) = t0_stop {
                 t_stop_us += t0.elapsed().as_micros() as u64;
             }
-            if should_stop {
+            if let Some(reason) = stop_reason {
                 let t0_comp = if prof { Some(Instant::now()) } else { None };
-                let finish_reason = {
-                    let sequences = self.sequences.read();
-                    match sequences.get(rid) {
-                        Some(seq)
-                            if seq.generated_tokens.len() >= seq.sampling_params.max_tokens =>
-                        {
-                            FinishReason::Length
-                        }
-                        Some(_) => FinishReason::EOS,
-                        None => FinishReason::Error,
-                    }
-                };
-                self.complete_request(rid, finish_reason).await?;
+                self.complete_request(rid, reason).await?;
                 if let Some(t0) = t0_comp {
                     t_complete_us += t0.elapsed().as_micros() as u64;
                 }
@@ -251,25 +238,13 @@ impl EngineInner {
         self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
         counter!("ferrum.engine.decode_tokens_total").increment(1);
 
-        self.send_stream_update(request_id, next_token).await;
+        let stop_reason = self.stop_reason_for_request(request_id);
+        if self.should_stream_generated_token(stop_reason) {
+            self.send_stream_update(request_id, next_token).await;
+        }
 
-        let should_stop = {
-            let sequences = self.sequences.read();
-            sequences.get(request_id).is_none_or(|s| s.should_stop())
-        };
-
-        if should_stop {
-            let finish_reason = {
-                let sequences = self.sequences.read();
-                match sequences.get(request_id) {
-                    Some(seq) if seq.generated_tokens.len() >= seq.sampling_params.max_tokens => {
-                        FinishReason::Length
-                    }
-                    Some(_) => FinishReason::EOS,
-                    None => FinishReason::Error,
-                }
-            };
-            self.complete_request(request_id, finish_reason).await?;
+        if let Some(reason) = stop_reason {
+            self.complete_request(request_id, reason).await?;
         }
 
         Ok(())
@@ -473,26 +448,12 @@ impl EngineInner {
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.decode_tokens_total").increment(1);
 
-            self.send_stream_update(request_id, tok).await;
-
-            let should_stop = {
-                let sequences = self.sequences.read();
-                sequences.get(request_id).map_or(true, |s| s.should_stop())
-            };
-            if should_stop {
-                let finish_reason = {
-                    let sequences = self.sequences.read();
-                    match sequences.get(request_id) {
-                        Some(seq)
-                            if seq.generated_tokens.len() >= seq.sampling_params.max_tokens =>
-                        {
-                            FinishReason::Length
-                        }
-                        Some(_) => FinishReason::EOS,
-                        None => FinishReason::Error,
-                    }
-                };
-                self.complete_request(request_id, finish_reason).await?;
+            let stop_reason = self.stop_reason_for_request(request_id);
+            if self.should_stream_generated_token(stop_reason) {
+                self.send_stream_update(request_id, tok).await;
+            }
+            if let Some(reason) = stop_reason {
+                self.complete_request(request_id, reason).await?;
                 return Ok(());
             }
         }

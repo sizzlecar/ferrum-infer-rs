@@ -3,6 +3,21 @@ use super::*;
 impl EngineInner {
     // ── stream helper ──────────────────────────────────────────────────
 
+    pub(super) fn stop_reason_for_request(&self, request_id: &RequestId) -> Option<FinishReason> {
+        let sequences = self.sequences.read();
+        match sequences.get(request_id) {
+            Some(seq) => seq.stop_reason(Some(self.tokenizer.as_ref())),
+            None => Some(FinishReason::Error),
+        }
+    }
+
+    pub(super) fn should_stream_generated_token(&self, stop_reason: Option<FinishReason>) -> bool {
+        !matches!(
+            stop_reason,
+            Some(FinishReason::Stop) | Some(FinishReason::EOS) | Some(FinishReason::Error)
+        )
+    }
+
     pub(super) async fn send_stream_update(&self, request_id: &RequestId, token: TokenId) {
         // Decode the full generated-token history (skip_special=true matches
         // the final-response decode in `complete_request`) and emit only
