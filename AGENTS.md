@@ -144,7 +144,7 @@ Regression selection rules:
 
 ## Release Asset Gate Policy
 
-Source gates do not validate official release assets. After publishing or staging release assets, run the appropriate release binary gates.
+Source gates do not validate official release assets. Before creating an official release tag, manually stage production-path Metal and CUDA binaries with `workflow_dispatch` and `publish_release=false`, then run the appropriate tarball gates against those staged assets. After publishing or staging release assets, run the appropriate release binary gates.
 
 Metal tarball:
 
@@ -154,6 +154,8 @@ python3 scripts/release/release_binary_gate.py metal-tarball \
   --out docs/release/g0/<VERSION>/metal-tarball
 ```
 
+For a staged pre-tag tarball, add `--asset-path <PATH_TO_TARBALL>` and provide the adjacent `.sha256` file or `--sha256 <SHA256>`.
+
 CUDA tarball:
 
 ```bash
@@ -161,6 +163,8 @@ python3 scripts/release/release_binary_gate.py cuda-tarball \
   --version <VERSION> \
   --out docs/release/g0/<VERSION>/cuda-tarball
 ```
+
+For a staged pre-tag tarball, add `--asset-path <PATH_TO_TARBALL>` and provide the adjacent `.sha256` file or `--sha256 <SHA256>`.
 
 Homebrew Metal:
 

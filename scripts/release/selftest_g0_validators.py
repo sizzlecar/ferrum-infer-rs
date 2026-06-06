@@ -2,15 +2,19 @@
 """Self-test the G0 release gate validators with tiny synthetic artifacts."""
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 METAL_VALIDATOR = REPO_ROOT / "scripts/release/validate_metal_readme_regression.py"
 SUMMARY_VALIDATOR = REPO_ROOT / "scripts/release/g0_release_summary.py"
+RELEASE_BINARY_GATE = REPO_ROOT / "scripts/release/release_binary_gate.py"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from m3_validate_runner_artifact import (  # noqa: E402
@@ -116,6 +120,14 @@ def make_summary_artifact(root: Path) -> None:
         write_json(root / rel, {"status": "pass"})
 
 
+def load_release_binary_gate():
+    spec = importlib.util.spec_from_file_location("release_binary_gate", RELEASE_BINARY_GATE)
+    require(spec is not None and spec.loader is not None, "failed to load release binary gate")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_metal_validator() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-metal-gate-") as tmp:
         root = Path(tmp)
@@ -160,6 +172,40 @@ def test_summary_validator() -> None:
         bad = run([sys.executable, str(SUMMARY_VALIDATOR), str(root)])
         require(bad.returncode != 0, "bad release summary unexpectedly passed")
         require("G0 RELEASE FAIL" in bad.stderr, bad.stderr)
+
+
+def test_release_binary_gate_staged_asset_path() -> None:
+    gate = load_release_binary_gate()
+    with tempfile.TemporaryDirectory(prefix="ferrum-release-binary-gate-") as tmp:
+        root = Path(tmp)
+        payload = root / "payload"
+        payload.mkdir()
+        (payload / "ferrum").write_text("#!/bin/sh\necho ferrum 0.7.6\n")
+        asset = root / "ferrum-macos-aarch64.tar.gz"
+        with tarfile.open(asset, "w:gz") as tf:
+            tf.add(payload / "ferrum", arcname="ferrum")
+        digest = hashlib.sha256(asset.read_bytes()).hexdigest()
+        (root / f"{asset.name}.sha256").write_text(f"{digest}  {asset.name}\n")
+
+        out = root / "out"
+        bin_path = gate.prepare_tarball("0.7.6", asset.name, out, None, asset)
+        require(bin_path.is_file(), "staged asset extraction did not produce ferrum binary")
+        require((out / asset.name).is_file(), "staged asset tarball was not copied")
+        require((out / f"{asset.name}.sha256").is_file(), "staged asset sha256 was not copied")
+
+        no_sha = root / "no-sha.tar.gz"
+        no_sha.write_bytes(asset.read_bytes())
+        try:
+            gate.prepare_tarball("0.7.6", no_sha.name, root / "no-sha-out", None, no_sha)
+            raise AssertionError("local staged asset without sha256 unexpectedly passed")
+        except RuntimeError as e:
+            require("missing sha256 for local asset" in str(e), str(e))
+
+        try:
+            gate.prepare_tarball("0.7.6", asset.name, root / "bad-sha-out", "0" * 64, asset)
+            raise AssertionError("local staged asset with bad sha256 unexpectedly passed")
+        except RuntimeError as e:
+            require("sha256 mismatch" in str(e), str(e))
 
 
 def test_m3_quality_gate_artifact_validators() -> None:
@@ -237,6 +283,7 @@ def test_m3_quality_gate_artifact_validators() -> None:
 def main() -> int:
     test_metal_validator()
     test_summary_validator()
+    test_release_binary_gate_staged_asset_path()
     test_m3_quality_gate_artifact_validators()
     print("G0 VALIDATOR SELFTEST PASS")
     return 0
