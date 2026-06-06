@@ -57,6 +57,11 @@ def make_metal_artifact(root: Path) -> None:
                         "paris": {"passed": True},
                         "multiturn": {"passed": True},
                         "stream": {"passed": True},
+                        "stateful_loop": {
+                            "passed": True,
+                            "length_finishes": 0,
+                            "repeated_prefixes": 0,
+                        },
                     },
                     "tool_call": {
                         "status": "pass",
@@ -127,6 +132,14 @@ def test_metal_validator() -> None:
         require("default max_sequences 4 > allowed 3" in bad_default.stderr, bad_default.stderr)
 
         data["models"][0]["default_startup"]["max_allowed_max_sequences"] = 4
+        write_json(root / "summary.json", data)
+        data["models"][0]["chat"]["stateful_loop"]["repeated_prefixes"] = 1
+        write_json(root / "summary.json", data)
+        bad_loop = run([sys.executable, str(METAL_VALIDATOR), str(root)])
+        require(bad_loop.returncode != 0, "stateful loop regression unexpectedly passed")
+        require("stateful_loop repeated_prefixes != 0" in bad_loop.stderr, bad_loop.stderr)
+
+        data["models"][0]["chat"]["stateful_loop"]["repeated_prefixes"] = 0
         write_json(root / "summary.json", data)
         (root / "qwen3_0_6b.run.stderr").write_text("thread panicked\n")
         bad = run([sys.executable, str(METAL_VALIDATOR), str(root)])

@@ -77,9 +77,20 @@ def main() -> int:
                 f"max cell concurrency {max_cell_concurrency} ({root / (key + '.effective_config.json')})"
             )
         chat = model.get("chat") or {}
-        for gate in ["paris", "multiturn", "stream"]:
+        for gate in ["paris", "multiturn", "stream", "stateful_loop"]:
             if (chat.get(gate) or {}).get("passed") is not True:
                 errors.append(f"{key}: chat.{gate}.passed != true ({root / (key + '.' + gate + '_verdict.txt')})")
+        stateful_loop = chat.get("stateful_loop") or {}
+        if stateful_loop.get("length_finishes") not in (0, None):
+            errors.append(
+                f"{key}: chat.stateful_loop length_finishes != 0 "
+                f"({root / (key + '.stateful_loop_verdict.txt')})"
+            )
+        if stateful_loop.get("repeated_prefixes") not in (0, None):
+            errors.append(
+                f"{key}: chat.stateful_loop repeated_prefixes != 0 "
+                f"({root / (key + '.stateful_loop_verdict.txt')})"
+            )
         tool_call = model.get("tool_call") or {}
         if tool_call.get("status") != "pass":
             errors.append(
