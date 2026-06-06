@@ -556,29 +556,56 @@ impl SequenceState {
         self.input_tokens.len() + self.generated_tokens.len()
     }
 
-    /// Should this sequence stop generating?
-    ///
-    /// Checks: (1) max-tokens budget exhausted, (2) last generated token is in
-    /// the resolved `stop_token_ids` set (model EOS + any single-token
-    /// `stop_sequences`). The pre-2026-05 placeholder ("last token id near
-    /// top of vocab") was wrong for every real model — Qwen3 EOS is 151645
-    /// in a 151936-vocab, Llama-3 EOT is 128009 in a 128256-vocab, etc. —
-    /// causing chat to never stop until KV overflow.
-    ///
-    /// Multi-token text stop sequences (`stop_text_seqs`) are NOT checked
-    /// here; the chat REPL only uses single-token EOS markers, and adding
-    /// a per-step decode just to support a rare case is not free. Callers
-    /// that need text stops can layer that check on top.
-    pub fn should_stop(&self) -> bool {
-        if self.generated_tokens.len() >= self.sampling_params.max_tokens {
-            return true;
+    pub fn model_decode_metadata(&self) -> HashMap<String, serde_json::Value> {
+        let mut metadata = self.original_request.metadata.clone();
+        if self.json_processor.is_some() || self.regex_processor.is_some() {
+            metadata.insert(
+                "ferrum_require_full_logits".to_string(),
+                serde_json::json!(true),
+            );
         }
+        metadata
+    }
+
+    /// Return the reason this sequence should stop, if any.
+    ///
+    /// Checks: (1) last generated token is in the resolved `stop_token_ids`
+    /// set (model EOS + any single-token `stop_sequences`), (2) decoded text
+    /// contains a multi-token user stop sequence, (3) max-tokens budget is
+    /// exhausted. Text-stop decoding only runs for requests that supplied a
+    /// multi-token stop string, so the common EOS path stays cheap.
+    pub fn stop_reason(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+    ) -> Option<FinishReason> {
         if let Some(&last_token) = self.generated_tokens.last() {
             if self.stop_token_ids.contains(&last_token.get()) {
-                return true;
+                return Some(FinishReason::Stop);
             }
         }
-        false
+        if !self.stop_text_seqs.is_empty() {
+            if let Some(tok) = tokenizer {
+                if let Ok(text) = tok.decode(&self.generated_tokens, true) {
+                    if self
+                        .stop_text_seqs
+                        .iter()
+                        .any(|stop| !stop.is_empty() && text.contains(stop))
+                    {
+                        return Some(FinishReason::Stop);
+                    }
+                }
+            }
+        }
+        if self.generated_tokens.len() >= self.sampling_params.max_tokens {
+            return Some(FinishReason::Length);
+        }
+        None
+    }
+
+    /// Cheap stop check for tests and callers that do not have tokenizer
+    /// access. Engine hot paths use `stop_reason` through `EngineInner`.
+    pub fn should_stop(&self) -> bool {
+        self.stop_reason(None).is_some()
     }
 
     /// Sample next token with full processor chain (temperature, top-k/p,
@@ -1267,6 +1294,44 @@ mod tests {
         assert_eq!(state.phase, RequestPhase::Waiting);
         assert_eq!(state.total_tokens(), 2);
         assert!(!state.prefill_complete);
+    }
+
+    #[test]
+    fn sequence_state_detects_text_stop_before_length() {
+        let tokenizer = PolicyTokenizer::new(8, &[("OK", 5), ("<END>", 6), ("TAIL", 7)]);
+        let mut request = policy_request();
+        request.sampling_params.max_tokens = 3;
+        let mut state = SequenceState::new(request, vec![TokenId::new(0)]);
+        state.generated_tokens = vec![TokenId::new(5), TokenId::new(6), TokenId::new(7)];
+        state.stop_text_seqs = vec!["<END>".to_string()];
+
+        assert_eq!(
+            state.stop_reason(Some(&tokenizer)),
+            Some(FinishReason::Stop)
+        );
+    }
+
+    #[test]
+    fn model_decode_metadata_marks_structured_requests_for_full_logits() {
+        let plain = SequenceState::new(policy_request(), vec![TokenId::new(0)]);
+        assert_eq!(
+            plain
+                .model_decode_metadata()
+                .get("ferrum_require_full_logits")
+                .and_then(|value| value.as_bool()),
+            None
+        );
+
+        let mut request = policy_request();
+        request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
+        let structured = SequenceState::new(request, vec![TokenId::new(0)]);
+        assert_eq!(
+            structured
+                .model_decode_metadata()
+                .get("ferrum_require_full_logits")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]

@@ -34,8 +34,6 @@ env:
   CARGO_INCREMENTAL: 0
   CUDA_HOME: /usr/local/cuda
   CUDA_ROOT: /usr/local/cuda
-  FERRUM_FA2_SRC_DIR: /tmp/vllm-flash-attention-f5bc33c
-  FERRUM_CUTLASS_INCLUDE_DIR: /tmp/vllm-flash-attention-f5bc33c/csrc/cutlass/include
 
 jobs:
   linux-x86_64-cuda:
@@ -62,20 +60,11 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
-      - name: Fetch FlashAttention source for fa2-source build
+      - name: Verify vendored FA2 source for fa2-source build
         run: |
-          rm -rf "$FERRUM_FA2_SRC_DIR" /tmp/cutlass
-          git clone --filter=blob:none https://github.com/vllm-project/flash-attention.git "$FERRUM_FA2_SRC_DIR"
-          git -C "$FERRUM_FA2_SRC_DIR" checkout -q f5bc33cfc02c744d24a2e9d50e6db656de40611c
-          git -C "$FERRUM_FA2_SRC_DIR" submodule update --init --depth 1 csrc/cutlass || true
-          if [[ ! -f "$FERRUM_CUTLASS_INCLUDE_DIR/cute/tensor.hpp" ]]; then
-            git clone --depth 1 https://github.com/NVIDIA/cutlass.git /tmp/cutlass
-            echo "FERRUM_CUTLASS_INCLUDE_DIR=/tmp/cutlass/include" >> "$GITHUB_ENV"
-            export FERRUM_CUTLASS_INCLUDE_DIR=/tmp/cutlass/include
-          fi
-          test -f "$FERRUM_FA2_SRC_DIR/csrc/flash_attn/src/flash.h"
-          test -f "$FERRUM_CUTLASS_INCLUDE_DIR/cute/tensor.hpp"
-          test -f "$FERRUM_CUTLASS_INCLUDE_DIR/cutlass/cutlass.h"
+          test -f crates/ferrum-kernels/kernels/fa2_source/flash_attn/src/flash.h
+          test -f crates/ferrum-kernels/kernels/fa2_source/cutlass/include/cute/tensor.hpp
+          test -f crates/ferrum-kernels/kernels/fa2_source/cutlass/include/cutlass/cutlass.h
 
       - name: Resolve version and CUDA target
         id: version

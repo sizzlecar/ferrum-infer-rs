@@ -80,11 +80,19 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
     // legacy loop; `FERRUM_MOE_BATCH_THRESHOLD` remains an escape hatch
     // for future hardware/backends.
     fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        self.decode_batch_with_full_logits(batch, false)
+    }
+
+    fn decode_batch_with_full_logits(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
         let m = batch.len();
         let opted_in = self.runtime_env.moe_batched_enabled;
         let threshold = self.runtime_env.moe_batch_threshold;
         if opted_in && m >= threshold {
-            self.decode_batch_internal(batch)
+            self.decode_batch_internal_with_full_logits(batch, force_full_logits)
         } else {
             batch
                 .iter()
@@ -199,22 +207,19 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
             }
             // In paged mode the cache metadata (block_table/context_lens)
             // is tiny compared with the shared K/V pools. Reusing that
-            // metadata on Metal GGUF MoE can leak stale per-request state
-            // across independent HTTP requests, producing empty completions
-            // or repeated `<think>` tokens after the first request. Drop it
+            // metadata can leak stale per-request state across independent
+            // HTTP requests, producing empty completions or corrupted
+            // batched-decode output after the first request. Drop metadata
             // after returning physical blocks; the next ensure_kv allocates
-            // fresh metadata while reusing the shared pools.
+            // fresh metadata.
             if !paged_cache {
                 self.kv_free_pool.push(caches);
             }
-            if paged_cache && self.runtime_env.paged_max_seqs <= 1 {
-                // Product Metal GGUF MoE serve currently uses one active
-                // paged sequence for correctness. In that mode there cannot
-                // be another live request sharing captured graph/model state,
-                // so reset graph/KV bookkeeping after each completed request
-                // to avoid stale paged state leaking into the next HTTP
-                // request. This keeps `ferrum serve` correct without asking
-                // users to manage env combinations.
+            if paged_cache && self.kv_caches.is_empty() {
+                // Reset only when the model is idle. That prevents stale
+                // paged/unified/batched scratch from leaking into the next
+                // independent request while preserving active concurrent
+                // requests that still own model cache IDs.
                 self.reset();
             }
         }

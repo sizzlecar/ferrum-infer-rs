@@ -99,14 +99,12 @@ impl EngineInner {
                     first_token.get()
                 );
 
-                self.send_stream_update(request_id, first_token).await;
-
-                let should_stop = {
-                    let sequences = self.sequences.read();
-                    sequences.get(request_id).is_none_or(|s| s.should_stop())
-                };
-                if should_stop {
-                    self.complete_request(request_id, FinishReason::EOS).await?;
+                let stop_reason = self.stop_reason_for_request(request_id);
+                if self.should_stream_generated_token(stop_reason) {
+                    self.send_stream_update(request_id, first_token).await;
+                }
+                if let Some(reason) = stop_reason {
+                    self.complete_request(request_id, reason).await?;
                 }
 
                 return Ok(());
@@ -238,14 +236,12 @@ impl EngineInner {
             first_token.get()
         );
 
-        self.send_stream_update(request_id, first_token).await;
-
-        let should_stop = {
-            let sequences = self.sequences.read();
-            sequences.get(request_id).is_none_or(|s| s.should_stop())
-        };
-        if should_stop {
-            self.complete_request(request_id, FinishReason::EOS).await?;
+        let stop_reason = self.stop_reason_for_request(request_id);
+        if self.should_stream_generated_token(stop_reason) {
+            self.send_stream_update(request_id, first_token).await;
+        }
+        if let Some(reason) = stop_reason {
+            self.complete_request(request_id, reason).await?;
         }
 
         Ok(())
@@ -344,13 +340,12 @@ impl EngineInner {
                     self.scheduler.mark_prefill_complete(rid, num_tokens);
                     self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
                     counter!("ferrum.engine.prefix_cache_hits").increment(1);
-                    self.send_stream_update(rid, first_token).await;
-                    let should_stop = {
-                        let sequences = self.sequences.read();
-                        sequences.get(rid).is_none_or(|s| s.should_stop())
-                    };
-                    if should_stop {
-                        self.complete_request(rid, FinishReason::EOS).await?;
+                    let stop_reason = self.stop_reason_for_request(rid);
+                    if self.should_stream_generated_token(stop_reason) {
+                        self.send_stream_update(rid, first_token).await;
+                    }
+                    if let Some(reason) = stop_reason {
+                        self.complete_request(rid, reason).await?;
                     }
                     continue;
                 }
@@ -447,13 +442,12 @@ impl EngineInner {
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);
             counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
             counter!("ferrum.engine.prefills_total").increment(1);
-            self.send_stream_update(rid, first_token).await;
-            let should_stop = {
-                let sequences = self.sequences.read();
-                sequences.get(rid).is_none_or(|s| s.should_stop())
-            };
-            if should_stop {
-                self.complete_request(rid, FinishReason::EOS).await?;
+            let stop_reason = self.stop_reason_for_request(rid);
+            if self.should_stream_generated_token(stop_reason) {
+                self.send_stream_update(rid, first_token).await;
+            }
+            if let Some(reason) = stop_reason {
+                self.complete_request(rid, reason).await?;
             }
         }
         Ok(())

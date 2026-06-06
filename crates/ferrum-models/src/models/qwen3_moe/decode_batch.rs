@@ -15,6 +15,14 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
     /// add to residual explicitly. Each layer's leading rms_norm runs
     /// at m=M, which is one fused dispatch on M rows — cheap.
     pub fn decode_batch_internal(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        self.decode_batch_internal_with_full_logits(batch, false)
+    }
+
+    pub fn decode_batch_internal_with_full_logits(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
         let m = batch.len();
         if m == 0 {
             return Vec::new();
@@ -38,6 +46,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
 
         let h = self.cfg.base.hidden_size;
         let vocab = self.cfg.base.vocab_size;
+        let num_layers = self.cfg.base.num_layers;
+        let central_paged_len_bump = self.paged_pools.is_some() && !B::supports_varlen_qkv();
         let mut ctx = B::new_context();
 
         // 0. Embed all M tokens into residual [M, H]
@@ -154,7 +164,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         if !did_pure_replay {
             // 1..num_layers: batched forward for each layer.
             // Records into graph if capture is active above.
-            for li in 0..self.cfg.base.num_layers {
+            for li in 0..num_layers {
                 self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m)
                     .expect("forward_layer_batched_decode");
             }
@@ -179,6 +189,18 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             );
         }
         let loop_us = t_loop.map(|t| t.elapsed().as_micros() as u64);
+
+        if central_paged_len_bump {
+            for (cid, _, _) in batch.iter() {
+                let caches = self
+                    .kv_caches
+                    .get_mut(cid)
+                    .expect("paged batched: cache missing for central len bump");
+                for cache in caches.iter_mut().take(num_layers) {
+                    cache.len += 1;
+                }
+            }
+        }
 
         if should_capture && !self.batched_graph_failed {
             if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
@@ -213,7 +235,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         // The engine has a complementary fast path that interprets a
         // size-1 Vec<f32> as `TokenId::new(logits[0] as u32)`, skipping
         // sample_with_processors entirely.
-        let greedy = self.runtime_env.greedy_argmax;
+        let greedy = self.runtime_env.greedy_argmax && !force_full_logits;
         // One-shot log on first decode call so the bench / smoke tests
         // can confirm the env var actually wired through. Cheap atomic
         // bool fence; no per-call cost after first hit.
@@ -587,11 +609,14 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             let mut metal_pos_offsets_host: Option<Vec<u32>> = None;
             if !B::supports_varlen_qkv() {
                 // Historical Metal path from PR #81: gather per-seq
-                // metadata, bump this layer's cache length, and upload the
-                // batched block/context tensors before the per-item QKV
-                // writes. CUDA does this once outside the layer loop via
+                // metadata and upload the batched block/context tensors
+                // before the per-item QKV writes. CUDA does this once
+                // outside the layer loop via
                 // populate_paged_batch_scratch_decode; Metal has no varlen
-                // QKV kernel and must keep the per-layer flow.
+                // QKV kernel and must keep the per-layer flow. Do not bump
+                // cache.len here; decode_batch_internal does one central
+                // post-forward bump so all layers see the same pre-step
+                // position.
                 let mut stacked_bt: Vec<u32> = vec![0u32; m * max_blocks_per_seq];
                 let mut stacked_cl: Vec<u32> = vec![0u32; m];
                 let mut pos_offsets_host: Vec<u32> = vec![0u32; m];
@@ -606,8 +631,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                     let n_to_copy = blocks.len().min(max_blocks_per_seq);
                     stacked_bt[i * max_blocks_per_seq..i * max_blocks_per_seq + n_to_copy]
                         .copy_from_slice(&blocks[..n_to_copy]);
-                    cache.len += 1;
-                    stacked_cl[i] = cache.len as u32;
+                    stacked_cl[i] = (cache.len + 1) as u32;
                 }
 
                 let bt_buf = self
@@ -683,11 +707,13 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 )
                 .expect("split_qkv_norm_rope_into_paged_cache_varlen (batched)");
             } else {
-                // Per-item fallback. The known-good Metal PR #81 path used
-                // FP16 byte strides here (matching llama_family batched
-                // decode). Keep this exactly aligned with fbdfcfe.
-                let qkv_stride_bytes = (qkv_stride * std::mem::size_of::<half::f16>()) as u64;
-                let q_head_major_size_bytes = (q_dim * std::mem::size_of::<half::f16>()) as u64;
+                // Per-item fallback. Match LlamaFamily's paged batched
+                // decode and derive byte strides from the backend
+                // activation element size; qkv_out/paged_batch_q layouts
+                // can be f16 or f32 depending on backend/model path.
+                let elem_size = B::activation_elem_size_bytes();
+                let qkv_stride_bytes = (qkv_stride * elem_size) as u64;
+                let q_head_major_size_bytes = (q_dim * elem_size) as u64;
                 let pos_offsets_host = metal_pos_offsets_host
                     .as_ref()
                     .expect("Metal per-item fallback pos_offsets missing");

@@ -115,6 +115,18 @@ pub struct ServeCommand {
     #[arg(long, value_name = "DTYPE")]
     pub kv_dtype: Option<String>,
 
+    /// Per-sequence KV token capacity (`FERRUM_KV_CAPACITY`).
+    #[arg(long, value_name = "N")]
+    pub kv_capacity: Option<usize>,
+
+    /// Use GPU argmax for greedy decoding (`FERRUM_GREEDY_ARGMAX=1`).
+    #[arg(long, conflicts_with = "disable_greedy_argmax")]
+    pub greedy_argmax: bool,
+
+    /// Disable GPU argmax for greedy decoding (`FERRUM_GREEDY_ARGMAX=0`).
+    #[arg(long, conflicts_with = "greedy_argmax")]
+    pub disable_greedy_argmax: bool,
+
     /// Named startup/runtime preset, for example
     /// `m3_qwen3_30b_a3b_int4`.
     #[arg(long, value_name = "PRESET")]
@@ -182,6 +194,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         session_cache_max_entries,
         session_cache_max_tokens,
         kv_dtype,
+        kv_capacity,
+        greedy_argmax,
+        disable_greedy_argmax,
         runtime_preset,
         effective_config_json,
         decision_trace_jsonl,
@@ -505,9 +520,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
 
     let startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
+        kv_capacity,
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
+        greedy_argmax_cli_override(greedy_argmax, disable_greedy_argmax),
         prefix_cache_cli_override(
             enable_prefix_caching,
             no_enable_prefix_caching,
@@ -828,7 +845,7 @@ fn startup_auto_config(
         None if is_m3_qwen3_30b_a3b(architecture, model_definition) => {
             WorkloadProfile::m3_qwen3_30b_a3b_int4()
         }
-        None => WorkloadProfile::serving_default(),
+        None => WorkloadProfile::serving_default_for_hardware(&hardware),
     };
 
     FerrumConfigBuilder::new(runtime_config)
@@ -901,8 +918,8 @@ fn runtime_preset_entries(
             ("FERRUM_GREEDY_ARGMAX", "1"),
             ("FERRUM_KV_MAX_BLOCKS", "2048"),
             ("FERRUM_PAGED_MAX_SEQS", "32"),
-            ("FERRUM_KV_CAPACITY", "2048"),
-            ("FERRUM_MOE_GRAPH", "1"),
+            ("FERRUM_KV_CAPACITY", "512"),
+            ("FERRUM_MOE_GRAPH", "0"),
             ("FERRUM_VLLM_MOE", "1"),
             ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
             ("FERRUM_USE_VLLM_PAGED_ATTN", "1"),
@@ -922,9 +939,11 @@ fn runtime_preset_entries(
 
 fn serve_cli_runtime_entries(
     kv_dtype: Option<&str>,
+    kv_capacity: Option<usize>,
     max_model_len: Option<usize>,
     max_num_seqs: Option<usize>,
     max_num_batched_tokens: Option<usize>,
+    greedy_argmax: Option<bool>,
     prefix_cache: Option<bool>,
     session_cache: Option<&str>,
     session_cache_max_entries: Option<usize>,
@@ -938,6 +957,7 @@ fn serve_cli_runtime_entries(
 ) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
     push_cli_runtime_entry(&mut entries, "FERRUM_KV_DTYPE", kv_dtype);
+    push_cli_runtime_usize(&mut entries, "FERRUM_KV_CAPACITY", kv_capacity);
     push_cli_runtime_usize(&mut entries, "FERRUM_MAX_MODEL_LEN", max_model_len);
     push_cli_runtime_usize(&mut entries, "FERRUM_PAGED_MAX_SEQS", max_num_seqs);
     push_cli_runtime_usize(
@@ -945,6 +965,13 @@ fn serve_cli_runtime_entries(
         "FERRUM_MAX_BATCHED_TOKENS",
         max_num_batched_tokens,
     );
+    if let Some(enabled) = greedy_argmax {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_GREEDY_ARGMAX",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
     if let Some(enabled) = prefix_cache {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_PREFIX_CACHE_REQUESTED",
@@ -1011,6 +1038,16 @@ fn prefix_cache_cli_override(
     if enable_vllm || enable_product {
         Some(true)
     } else if disable_vllm || disable_product {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn greedy_argmax_cli_override(enable: bool, disable: bool) -> Option<bool> {
+    if enable {
+        Some(true)
+    } else if disable {
         Some(false)
     } else {
         None
@@ -1208,7 +1245,7 @@ fn model_capabilities_from_definition(
         kv_heads: definition.num_key_value_heads,
         estimated_weight_bytes: estimated_weight_bytes_from_definition(definition),
         supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
-        graph_safe_moe: definition.architecture == ferrum_models::Architecture::Qwen3Moe,
+        graph_safe_moe: false,
     }
 }
 
@@ -1506,9 +1543,11 @@ mod tests {
     fn serve_cli_runtime_entries_are_cli_sourced_and_classified() {
         let entries = serve_cli_runtime_entries(
             Some("int8"),
+            Some(1024),
             Some(4096),
             Some(64),
             Some(2048),
+            Some(true),
             Some(false),
             Some("memory"),
             Some(16),
@@ -1535,8 +1574,10 @@ mod tests {
             .affects
             .contains(&ferrum_types::RuntimeConfigEffect::Correctness));
         assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "1024");
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
+        assert_eq!(entry("FERRUM_GREEDY_ARGMAX").effective_value, "1");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_SESSION_CACHE").effective_value, "memory");
         assert_eq!(
@@ -1609,6 +1650,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(
@@ -1662,9 +1705,11 @@ mod tests {
 
         let cli_entries = serve_cli_runtime_entries(
             None,
+            Some(1024),
             Some(4096),
             Some(8),
             Some(512),
+            Some(false),
             Some(false),
             None,
             None,
@@ -1680,6 +1725,10 @@ mod tests {
         assert_eq!(
             entry(&cli_over_env, "FERRUM_MAX_MODEL_LEN").effective_value,
             "4096"
+        );
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_KV_CAPACITY").effective_value,
+            "1024"
         );
         assert_eq!(
             entry(&cli_over_env, "FERRUM_PAGED_MAX_SEQS").effective_value,
@@ -1851,10 +1900,10 @@ mod tests {
         };
 
         assert_eq!(entry("FERRUM_BACKEND").effective_value, "cuda");
-        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
+        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "0");
         assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
         assert_eq!(entry("FERRUM_VLLM_MOE_PAIR_IDS").effective_value, "1");
-        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "512");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_BACKEND").source, RuntimeConfigSource::Cli);
         assert_eq!(snapshot.entries.len(), 12);
@@ -1874,9 +1923,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {key}"))
         };
 
-        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
+        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "0");
         assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
-        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "512");
         assert_eq!(
             entry("FERRUM_MOE_GRAPH").source,
             RuntimeConfigSource::Default
@@ -1902,18 +1951,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {key}"))
         };
 
-        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
+        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "0");
         assert_eq!(
             entry("FERRUM_MOE_GRAPH").source,
             RuntimeConfigSource::Default
         );
-        #[cfg(feature = "vllm-moe-marlin")]
-        {
-            assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
-            assert_eq!(entry("FERRUM_VLLM_MOE_PAIR_IDS").effective_value, "1");
-            assert_eq!(snapshot.entries.len(), 3);
-        }
-        #[cfg(not(feature = "vllm-moe-marlin"))]
         assert_eq!(snapshot.entries.len(), 1);
     }
 
@@ -2128,6 +2170,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -2164,6 +2208,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             prefix_cache_cli_override(true, false, false, false),
             None,
             None,
@@ -2176,6 +2222,8 @@ mod tests {
             None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
             None,
             None,
             None,
@@ -2196,6 +2244,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             prefix_cache_cli_override(false, true, false, false),
             None,
             None,
@@ -2208,6 +2258,8 @@ mod tests {
             None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
             None,
             None,
             None,

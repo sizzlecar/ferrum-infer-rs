@@ -126,6 +126,9 @@ impl Backend for CpuBackend {
 
     fn new_context() -> Self::Context {}
     fn sync(_ctx: &mut Self::Context) {}
+    fn activation_elem_size_bytes() -> usize {
+        std::mem::size_of::<f32>()
+    }
 
     /// Phase D step 2+3: typed alloc. CPU Buffer is Vec<f32> — bytes
     /// are dtype-erased, so we size the underlying Vec to hold `n`

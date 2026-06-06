@@ -280,9 +280,27 @@ fn parse_tool_calls_from_generated_text(
     if let Some(tool_call) = value.get("tool_call") {
         return parse_tool_call_value(tool_call, 0, chat_request).map(|call| vec![call]);
     }
+    if let Some(tool_call) = parse_wrapped_tool_call_value(&value, 0, chat_request) {
+        return Some(vec![tool_call]);
+    }
     parse_tool_call_value(&value, 0, chat_request)
         .or_else(|| parse_forced_tool_arguments_value(&value, 0, chat_request))
         .map(|call| vec![call])
+}
+
+fn parse_wrapped_tool_call_value(
+    value: &serde_json::Value,
+    index: usize,
+    chat_request: &ApiChatRequest,
+) -> Option<ApiToolCall> {
+    for key in ["auto", "tool", "tool_call", "auto_tool_response"] {
+        if let Some(wrapped) = value.get(key) {
+            if let Some(call) = parse_tool_call_value(wrapped, index, chat_request) {
+                return Some(call);
+            }
+        }
+    }
+    None
 }
 
 fn parse_tool_call_value(
@@ -301,6 +319,7 @@ fn parse_tool_call_value(
     let name = function
         .as_str()
         .or_else(|| function.get("name").and_then(|value| value.as_str()))
+        .or_else(|| function.get("tool").and_then(|value| value.as_str()))
         .or_else(|| value.get("name").and_then(|value| value.as_str()))?;
     if !api_tool_name_allowed(chat_request, name) {
         return None;

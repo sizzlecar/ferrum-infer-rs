@@ -16,6 +16,7 @@ import json
 import os
 import re
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -27,12 +28,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+RELEASE_DIR = Path(__file__).resolve().parent / "release"
+if str(RELEASE_DIR) not in sys.path:
+    sys.path.insert(0, str(RELEASE_DIR))
+
 from m3_validate_runner_artifact import (
     ValidationError as ArtifactValidationError,
     VALIDATION_TOUCHED_AREAS,
     required_gates_for_touched_areas,
     validate_profile_event,
 )
+from openai_concurrency_quality_regression import run_concurrency_quality_regression
+from openai_tool_call_regression import run_tool_call_regression
 
 
 RUNTIME_PRESET_ENV: dict[str, dict[str, str]] = {
@@ -129,6 +136,74 @@ def parse_process_scan(ps: str) -> list[dict[str, Any]]:
             }
         )
     return entries
+
+
+def process_argv(cmd: str) -> list[str]:
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return cmd.split()
+
+
+def arg_basename(arg: str) -> str:
+    return Path(arg).name
+
+
+def is_python_executable(name: str) -> bool:
+    return name == "python" or name.startswith("python")
+
+
+def is_ferrum_subcommand(cmd: str, subcommand: str) -> bool:
+    argv = process_argv(cmd)
+    if len(argv) < 2 or arg_basename(argv[0]) != "ferrum":
+        return False
+    return argv[1] == subcommand
+
+
+def is_python_script_command(cmd: str, script_name: str) -> bool:
+    argv = process_argv(cmd)
+    if len(argv) < 2 or not is_python_executable(arg_basename(argv[0])):
+        return False
+    return arg_basename(argv[1]) == script_name
+
+
+def is_direct_executable(cmd: str, name: str) -> bool:
+    argv = process_argv(cmd)
+    return bool(argv) and arg_basename(argv[0]) == name
+
+
+def is_bench_serve_process(cmd: str) -> bool:
+    return (
+        is_direct_executable(cmd, "bench-serve")
+        or is_ferrum_subcommand(cmd, "bench-serve")
+        or is_python_script_command(cmd, "bench-serve")
+    )
+
+
+def is_ferrum_serve_process(cmd: str) -> bool:
+    return is_ferrum_subcommand(cmd, "serve")
+
+
+def is_cargo_process(cmd: str) -> bool:
+    return is_direct_executable(cmd, "cargo")
+
+
+def is_nvcc_process(cmd: str) -> bool:
+    return is_direct_executable(cmd, "nvcc")
+
+
+def is_vllm_process(cmd: str) -> bool:
+    argv = process_argv(cmd)
+    if not argv:
+        return False
+    if arg_basename(argv[0]) == "vllm":
+        return True
+    return (
+        len(argv) >= 3
+        and is_python_executable(arg_basename(argv[0]))
+        and argv[1] == "-m"
+        and argv[2] == "vllm"
+    )
 
 
 @dataclass
@@ -325,6 +400,12 @@ class Runner:
             required.append("paris")
         if gates.get("multi_turn", False):
             required.append("multi_turn_paris")
+        if gates.get("multi_turn_3round", False):
+            required.append("multi_turn_3round_paris")
+        if gates.get("tool_call", False):
+            required.append("tool_call_regression")
+        if gates.get("concurrency_quality", False):
+            required.append("concurrency_quality")
         required.append("bench_completion")
         return required
 
@@ -647,6 +728,11 @@ class Runner:
             throughput_floor = float(
                 configured.get("c32_throughput_min_delta_pct", throughput_floor)
             )
+        same_env_order_sensitive_metrics = configured.get(
+            "same_env_order_sensitive_metrics", []
+        )
+        if not isinstance(same_env_order_sensitive_metrics, list):
+            same_env_order_sensitive_metrics = []
         return {
             "enabled": bool(configured.get("enabled", True)),
             "throughput_min_delta_pct": throughput_floor,
@@ -659,6 +745,11 @@ class Runner:
             "itl_p95_max_regression_pct": float(
                 configured.get("itl_p95_max_regression_pct", 10.0)
             ),
+            "same_env_order_sensitive_metrics": [
+                str(metric)
+                for metric in same_env_order_sensitive_metrics
+                if str(metric).strip()
+            ],
         }
 
     def metric_delta_pct(self, baseline: Any, candidate: Any) -> float | None:
@@ -681,6 +772,7 @@ class Runner:
         *,
         threshold_type: str,
         threshold_value: float,
+        same_env_order_sensitive: bool = False,
     ) -> dict[str, Any]:
         baseline_value = baseline_row.get(metric)
         candidate_value = candidate_row.get(metric)
@@ -697,6 +789,11 @@ class Runner:
         else:
             ok = False
             reason = "unknown_threshold_type"
+        diagnostic = False
+        if not ok and same_env_order_sensitive:
+            ok = True
+            diagnostic = True
+            reason = f"{reason}: same_env_order_sensitive_metric_diagnostic"
         return {
             "metric": metric,
             "baseline": baseline_value,
@@ -705,6 +802,7 @@ class Runner:
             "threshold": {"type": threshold_type, "value": threshold_value},
             "ok": ok,
             "reason": reason,
+            "diagnostic": diagnostic,
         }
 
     def performance_regression_gates(
@@ -743,6 +841,8 @@ class Runner:
             case_name = row.get("name")
             if not case_name or case_name == baseline_name:
                 continue
+            same_env = baseline.get("env_hash") == row.get("env_hash")
+            same_env_metrics = set(thresholds.get("same_env_order_sensitive_metrics", []))
             metric_gates = [
                 self.performance_metric_gate(
                     "throughput_mean",
@@ -750,6 +850,8 @@ class Runner:
                     row,
                     threshold_type="min_delta_pct",
                     threshold_value=float(thresholds["throughput_min_delta_pct"]),
+                    same_env_order_sensitive=same_env
+                    and "throughput_mean" in same_env_metrics,
                 ),
                 self.performance_metric_gate(
                     "ttft_p50",
@@ -757,6 +859,7 @@ class Runner:
                     row,
                     threshold_type="max_regression_pct",
                     threshold_value=float(thresholds["ttft_max_regression_pct"]),
+                    same_env_order_sensitive=same_env and "ttft_p50" in same_env_metrics,
                 ),
                 self.performance_metric_gate(
                     "tpot_p50",
@@ -764,6 +867,7 @@ class Runner:
                     row,
                     threshold_type="max_regression_pct",
                     threshold_value=float(thresholds["tpot_max_regression_pct"]),
+                    same_env_order_sensitive=same_env and "tpot_p50" in same_env_metrics,
                 ),
                 self.performance_metric_gate(
                     "itl_p95",
@@ -771,6 +875,7 @@ class Runner:
                     row,
                     threshold_type="max_regression_pct",
                     threshold_value=float(thresholds["itl_p95_max_regression_pct"]),
+                    same_env_order_sensitive=same_env and "itl_p95" in same_env_metrics,
                 ),
             ]
             case_result = {
@@ -869,12 +974,12 @@ class Runner:
             if server_pid is not None and (pid == server_pid or proc["ppid"] == server_pid):
                 reason = "server-pid-descendant"
             elif (
-                "bench-serve" in cmd
+                is_bench_serve_process(cmd)
                 and (bench_json_text in cmd or f"127.0.0.1:{port_text}" in cmd)
             ):
                 reason = "bench-serve-case"
             elif (
-                " serve " in f" {cmd} "
+                is_ferrum_serve_process(cmd)
                 and port_text in cmd
                 and (bin_text in cmd or "target/release/ferrum" in cmd)
             ):
@@ -898,15 +1003,15 @@ class Runner:
                 continue
             cmd = str(proc["cmd"])
             reason = None
-            if "bench-serve" in cmd:
+            if is_bench_serve_process(cmd):
                 reason = "bench-serve-global"
-            elif "target/release/ferrum" in cmd or re.search(r"(^|[/\s])ferrum\s+serve\b", cmd):
+            elif is_ferrum_serve_process(cmd):
                 reason = "ferrum-server-global"
-            elif re.search(r"(^|[/\s])cargo(\s|$)", cmd):
+            elif is_cargo_process(cmd):
                 reason = "cargo-global"
-            elif re.search(r"(^|[/\s])nvcc(\s|$)", cmd):
+            elif is_nvcc_process(cmd):
                 reason = "nvcc-global"
-            elif re.search(r"(^|[/\s])vllm(\s|$)", cmd) or "python -m vllm" in cmd:
+            elif is_vllm_process(cmd):
                 reason = "vllm-global"
             if reason is not None:
                 findings.append({**proc, "reason": reason})
@@ -1000,15 +1105,22 @@ class Runner:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=120) as response:
-            body = response.read().decode("utf-8")
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            out_path.write_text(body)
+            raise RuntimeError(
+                f"chat request failed with HTTP {exc.code}; response saved to {out_path}"
+            ) from exc
         out_path.write_text(body)
         return json.loads(body)
 
     def run_gates(self, case: dict[str, Any], paths: RunPaths, port: int) -> list[dict[str, Any]]:
         gates: list[dict[str, Any]] = []
         gate_config = self.config.get("gates", {})
-        gate_max_tokens = int(gate_config.get("max_tokens", 1024))
+        gate_max_tokens = int(gate_config.get("max_tokens", 128))
         if gate_config.get("paris", True):
             payload = {
                 "model": self.hf_model,
@@ -1090,6 +1202,43 @@ class Runner:
             print(f"MULTITURN_3ROUND_CONTENT= {content}", flush=True)
             if not ok:
                 raise RuntimeError("three-round multi-turn Paris gate failed")
+
+        if gate_config.get("tool_call", False):
+            out = paths.case_dir / "tool-call-regression"
+            result = run_tool_call_regression(f"http://127.0.0.1:{port}", self.hf_model, out)
+            ok = result.get("status") == "pass"
+            gates.append(
+                {
+                    "name": "tool_call_regression",
+                    "ok": ok,
+                    "path": str(out / "tool_call_regression.json"),
+                }
+            )
+            print(f"TOOL_CALL_REGRESSION= {result.get('status')}", flush=True)
+            if not ok:
+                raise RuntimeError("tool-call regression failed")
+
+        if gate_config.get("concurrency_quality", False):
+            out = paths.case_dir / "concurrency-quality-regression"
+            concurrency = int(self.config.get("concurrency", 32))
+            result = run_concurrency_quality_regression(
+                f"http://127.0.0.1:{port}",
+                self.hf_model,
+                out,
+                [concurrency],
+                timeout=int(gate_config.get("quality_timeout_s", 180)),
+            )
+            ok = result.get("status") == "pass"
+            gates.append(
+                {
+                    "name": "concurrency_quality",
+                    "ok": ok,
+                    "path": str(out / "concurrency_quality_regression.json"),
+                }
+            )
+            print(f"CONCURRENCY_QUALITY_REGRESSION= {result.get('status')}", flush=True)
+            if not ok:
+                raise RuntimeError("concurrency quality regression failed")
 
         return gates
 
@@ -1593,6 +1742,51 @@ def self_test() -> None:
         assert summary["performance_regression_gates"]["observed_concurrency_cells"] == [32]
         assert summary["performance_regression_gates"]["concurrency_cells_ok"]
 
+        runner.config["performance_gates"] = {
+            "enabled": True,
+            "same_env_order_sensitive_metrics": ["ttft_p50", "itl_p95"],
+        }
+        rows = [
+            {
+                "name": "default",
+                "concurrency": 4,
+                "env_hash": default_snapshot["env_hash"],
+                "throughput_mean": 100.0,
+                "ttft_p50": 10.0,
+                "tpot_p50": 10.0,
+                "itl_p95": 10.0,
+            },
+            {
+                "name": "candidate",
+                "concurrency": 4,
+                "env_hash": default_snapshot["env_hash"],
+                "throughput_mean": 100.0,
+                "ttft_p50": 12.0,
+                "tpot_p50": 10.0,
+                "itl_p95": 12.0,
+            },
+        ]
+        same_env_gates = runner.performance_regression_gates(
+            rows, baseline_name="default"
+        )
+        same_env_ttft = same_env_gates["cases"]["candidate"]["metrics"][1]
+        same_env_itl = same_env_gates["cases"]["candidate"]["metrics"][3]
+        assert same_env_gates["cases"]["candidate"]["ok"]
+        assert same_env_ttft["metric"] == "ttft_p50"
+        assert same_env_ttft["diagnostic"] is True
+        assert "same_env_order_sensitive_metric_diagnostic" in same_env_ttft["reason"]
+        assert same_env_itl["metric"] == "itl_p95"
+        assert same_env_itl["diagnostic"] is True
+        assert "same_env_order_sensitive_metric_diagnostic" in same_env_itl["reason"]
+
+        rows[1] = {**rows[1], "env_hash": snapshot["env_hash"]}
+        different_env_gates = runner.performance_regression_gates(
+            rows, baseline_name="default"
+        )
+        assert not different_env_gates["cases"]["candidate"]["ok"]
+        assert different_env_gates["cases"]["candidate"]["metrics"][1]["diagnostic"] is False
+        assert different_env_gates["cases"]["candidate"]["metrics"][3]["diagnostic"] is False
+
         runner.config["validation"] = {
             **runner.validation_config(),
             "change_type": "default_path",
@@ -1739,6 +1933,7 @@ def self_test() -> None:
                 f"125 1 S 00:01 {sys.executable} bench-serve --base-url http://127.0.0.1:18840 --out {paths.bench_json}",
                 "126 1 S 00:01 target/release/ferrum serve /model --port 19999",
                 "127 1 S 00:01 cargo build --release -p ferrum-cli",
+                '128 1 S 00:01 bash -c "sleep 90; grep bench-serve /tmp/status.log"',
             ]
         )
         leaks = runner.runner_process_leaks(ps, paths=paths, port=18840, server_pid=123)

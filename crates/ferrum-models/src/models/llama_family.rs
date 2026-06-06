@@ -2544,7 +2544,15 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
     }
 
     fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
-        self.decode_batch_internal(batch)
+        self.decode_batch_with_full_logits(batch, false)
+    }
+
+    fn decode_batch_with_full_logits(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
+        self.decode_batch_internal_with_full_logits(batch, force_full_logits)
     }
 
     fn unified_forward(
