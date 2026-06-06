@@ -90,15 +90,13 @@ CASES = (
         gguf="Qwen3-30B-A3B-Q4_K_M.gguf",
         tokenizer="Qwen3-30B-A3B.tokenizer.json",
         moe=True,
-        cells=(Cell(concurrency=1, prompts=8, baseline_tps=42.0),),
-        default_min_max_seqs=1,
-        default_max_max_seqs=1,
+        cells=(Cell(concurrency=16, prompts=32, baseline_tps=72.5),),
+        default_min_max_seqs=16,
         serve_args=(
             "--kv-capacity",
             "512",
             "--greedy-argmax",
         ),
-        unsafe_batch_probe=Cell(concurrency=4, prompts=4, baseline_tps=0.0),
     ),
 )
 
@@ -1116,10 +1114,10 @@ def markdown_summary(report: dict[str, Any]) -> str:
     out.append("")
     out.append("Notes:")
     out.append("- Performance gate is `current >= 0.90 * README baseline`, plus all requests completed.")
-    out.append("- Default startup config must be captured without benchmark CLI overrides; Qwen3-30B-A3B Metal default is safe single-sequence until multi-sequence MoE decode passes content-quality gates.")
+    out.append("- Default startup config must be captured without benchmark CLI overrides and must expose enough sequence slots for the release cell.")
     out.append("- Throughput-profile startup config must expose enough sequence slots for the measured concurrency cell.")
     out.append("- Every throughput cell first runs a marker/square concurrent quality probe; HTTP 200 and zero request errors are not sufficient correctness evidence.")
-    out.append("- Metal MoE includes an unsafe multi-sequence diagnostic probe so known batch-decode corruption is visible without making it the product default.")
+    out.append("- Metal MoE release evidence requires a multi-sequence content-quality and throughput cell.")
     out.append("- Throughput cells use canonical `ferrum bench-serve` with streaming usage token accounting.")
     out.append("- Throughput cells record their input/output token workload and the server CLI profile in the artifact directory.")
     out.append("- `run` coverage includes JSONL multi-turn plus default text-mode long multi-turn to catch streaming and KV overflow regressions.")

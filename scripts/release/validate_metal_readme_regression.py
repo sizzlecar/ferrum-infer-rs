@@ -98,20 +98,26 @@ def main() -> int:
                     f"({root / (key + '.tool-call-regression/tool_call_regression.json')})"
                 )
         if model.get("moe") is True:
+            has_multi_seq_cell = any(
+                int(cell.get("concurrency") or 0) >= 2
+                for cell in model.get("cells", [])
+            )
             probe = model.get("unsafe_batch_probe") or {}
-            if probe.get("enabled") is not True:
+            if not has_multi_seq_cell and probe.get("enabled") is not True:
                 errors.append(f"{key}: unsafe_batch_probe missing or disabled")
-            if probe.get("product_default") is not False:
+            if probe.get("enabled") is True and probe.get("product_default") is not False:
                 errors.append(f"{key}: unsafe_batch_probe must be marked non-product-default")
             startup = probe.get("startup") or {}
             max_sequences = startup.get("max_sequences")
-            if not isinstance(max_sequences, int) or max_sequences < 2:
+            if probe.get("enabled") is True and (
+                not isinstance(max_sequences, int) or max_sequences < 2
+            ):
                 errors.append(
                     f"{key}: unsafe_batch_probe did not exercise multi-sequence startup "
                     f"({root / (key + '.unsafe_batch.effective_config.json')})"
                 )
             quality = probe.get("quality") or {}
-            if not isinstance(quality.get("passed"), bool):
+            if probe.get("enabled") is True and not isinstance(quality.get("passed"), bool):
                 errors.append(
                     f"{key}: unsafe_batch_probe quality result missing "
                     f"({root / (key + '.unsafe_batch.c4.quality.json')})"
