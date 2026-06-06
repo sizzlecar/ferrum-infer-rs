@@ -65,11 +65,28 @@ def official_asset(version: str, asset: str) -> str:
     return f"{REPO}/releases/download/v{version}/{asset}"
 
 
-def prepare_tarball(version: str, asset: str, out: Path, expected_sha: str | None) -> Path:
+def prepare_tarball(
+    version: str,
+    asset: str,
+    out: Path,
+    expected_sha: str | None,
+    asset_path: Path | None,
+) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     tar_path = out / asset
     sha_path = out / f"{asset}.sha256"
-    download(official_asset(version, asset), tar_path)
+    if asset_path is not None:
+        if not asset_path.is_file():
+            raise RuntimeError(f"asset path does not exist: {asset_path}")
+        shutil.copy2(asset_path, tar_path)
+        local_sha_path = asset_path.with_name(f"{asset_path.name}.sha256")
+        if expected_sha is None and local_sha_path.is_file():
+            shutil.copy2(local_sha_path, sha_path)
+            expected_sha = sha_path.read_text().split()[0]
+    else:
+        download(official_asset(version, asset), tar_path)
+    if expected_sha is None and asset_path is not None:
+        raise RuntimeError(f"missing sha256 for local asset: pass --sha256 or provide {sha_path.name}")
     if expected_sha is None:
         download(official_asset(version, f"{asset}.sha256"), sha_path)
         expected_sha = sha_path.read_text().split()[0]
@@ -160,7 +177,7 @@ def serve_gate(bin_path: Path, model_path: str, model_name: str, out: Path, port
             raise RuntimeError("serve boundary gate did not return 400")
         if api_extra:
             schema = {"type": "json_schema", "json_schema": {"name": "Answer", "strict": True, "schema": {"type": "object", "additionalProperties": False, "properties": {"answer": {"type": "integer"}}, "required": ["answer"]}}}
-            s4, b4 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "计算 123+456。最终答案必须只用 JSON 对象表示，格式为 {\"answer\":579}，不要 Markdown。"}], "response_format": schema, "max_tokens": 1024})
+            s4, b4 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "计算 123+456。最终答案必须只用 JSON 对象表示，格式为 {\"answer\":579}，不要 Markdown。"}], "response_format": schema, "max_tokens": 256})
             msg = json.loads(b4)["choices"][0]["message"].get("content", "") if s4 == 200 else b4
             assert_no_bad_patterns("serve strict-json response", msg)
             if s4 != 200 or json.loads(msg).get("answer") != 579:
@@ -201,7 +218,7 @@ def write_gate(out: Path, mode: str, version: str, checks: dict) -> None:
 
 
 def gate_tarball(args, *, asset: str, default_model: str, model_name: str, cuda: bool) -> None:
-    bin_path = prepare_tarball(args.version, asset, args.out, args.sha256)
+    bin_path = prepare_tarball(args.version, asset, args.out, args.sha256, args.asset_path)
     assert_version(bin_path, args.version)
     if cuda:
         check_ldd(bin_path, args.out)
@@ -246,6 +263,7 @@ def main() -> int:
         p.add_argument("--version", required=True)
         p.add_argument("--out", required=True, type=Path)
         p.add_argument("--sha256")
+        p.add_argument("--asset-path", type=Path)
         p.add_argument("--model")
         p.add_argument("--model-name")
         p.add_argument("--port", type=int, default=18080)
