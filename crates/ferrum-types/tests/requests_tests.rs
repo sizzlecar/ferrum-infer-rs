@@ -267,6 +267,23 @@ fn qwen3_function_object_with_top_level_parameters_keeps_arguments() {
 }
 
 #[test]
+fn llama_auto_tool_wrapper_becomes_structured_tool_call() {
+    let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
+    let text = r#"{"auto":{"tool":"weather","parameters":{"city":"beijing","unit":"c"}}}<|reserved_special_token_55|>"#;
+
+    let Some(ApiResponse::Chat(response)) = api_response_from_generated_text(&request, text) else {
+        panic!("expected llama auto/tool wrapper to map to a structured tool call");
+    };
+
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(response.message.content, "");
+    assert_eq!(response.message.tool_calls.len(), 1);
+    let call = &response.message.tool_calls[0];
+    assert_eq!(call.function.name, "weather");
+    assert_eq!(call.function.arguments, r#"{"city":"beijing","unit":"c"}"#);
+}
+
+#[test]
 fn single_auto_tool_bare_arguments_json_becomes_structured_tool_call() {
     let request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
     let text = r#"{"city":"深圳","unit":"c"}"#;

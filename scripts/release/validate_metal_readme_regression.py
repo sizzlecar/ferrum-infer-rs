@@ -37,16 +37,102 @@ def main() -> int:
     errors: list[str] = []
     for model in data.get("models", []):
         key = model.get("key", "<unknown>")
+        default_startup = model.get("default_startup") or {}
+        if default_startup.get("passed") is not True:
+            errors.append(
+                f"{key}: default_startup.passed != true "
+                f"({root / (key + '.default.effective_config.json')})"
+            )
+        max_sequences = default_startup.get("max_sequences")
+        min_required = default_startup.get("min_required_max_sequences")
+        max_allowed = default_startup.get("max_allowed_max_sequences")
+        if not isinstance(max_sequences, int) or not isinstance(min_required, int):
+            errors.append(f"{key}: default startup max sequence evidence missing")
+        elif max_sequences < min_required:
+            errors.append(
+                f"{key}: default max_sequences {max_sequences} < required {min_required} "
+                f"({root / (key + '.default.effective_config.json')})"
+            )
+        elif isinstance(max_allowed, int) and max_sequences > max_allowed:
+            errors.append(
+                f"{key}: default max_sequences {max_sequences} > allowed {max_allowed} "
+                f"({root / (key + '.default.effective_config.json')})"
+            )
+
         if model.get("server_ready") is not True:
             errors.append(f"{key}: server_ready != true ({root / (key + '.models.json')})")
+        serve_startup = model.get("serve_startup") or {}
+        serve_max_sequences = serve_startup.get("max_sequences")
+        max_cell_concurrency = max(
+            (int(cell.get("concurrency") or 0) for cell in model.get("cells", [])),
+            default=0,
+        )
+        if serve_startup.get("passed") is not True:
+            errors.append(
+                f"{key}: serve_startup.passed != true ({root / (key + '.effective_config.json')})"
+            )
+        if not isinstance(serve_max_sequences, int) or serve_max_sequences < max_cell_concurrency:
+            errors.append(
+                f"{key}: benchmark serve max_sequences {serve_max_sequences!r} < "
+                f"max cell concurrency {max_cell_concurrency} ({root / (key + '.effective_config.json')})"
+            )
         chat = model.get("chat") or {}
         for gate in ["paris", "multiturn", "stream"]:
             if (chat.get(gate) or {}).get("passed") is not True:
                 errors.append(f"{key}: chat.{gate}.passed != true ({root / (key + '.' + gate + '_verdict.txt')})")
+        tool_call = model.get("tool_call") or {}
+        if tool_call.get("status") != "pass":
+            errors.append(
+                f"{key}: tool_call.status != pass "
+                f"({root / (key + '.tool-call-regression/tool_call_regression.json')})"
+            )
+        for gate in [
+            "omitted_tool_choice",
+            "explicit_auto_tool_choice",
+            "required_tool_choice",
+            "tool_result_fill",
+        ]:
+            if ((tool_call.get("checks") or {}).get(gate) or {}).get("passed") is not True:
+                errors.append(
+                    f"{key}: tool_call.{gate}.passed != true "
+                    f"({root / (key + '.tool-call-regression/tool_call_regression.json')})"
+                )
+        if model.get("moe") is True:
+            probe = model.get("unsafe_batch_probe") or {}
+            if probe.get("enabled") is not True:
+                errors.append(f"{key}: unsafe_batch_probe missing or disabled")
+            if probe.get("product_default") is not False:
+                errors.append(f"{key}: unsafe_batch_probe must be marked non-product-default")
+            startup = probe.get("startup") or {}
+            max_sequences = startup.get("max_sequences")
+            if not isinstance(max_sequences, int) or max_sequences < 2:
+                errors.append(
+                    f"{key}: unsafe_batch_probe did not exercise multi-sequence startup "
+                    f"({root / (key + '.unsafe_batch.effective_config.json')})"
+                )
+            quality = probe.get("quality") or {}
+            if not isinstance(quality.get("passed"), bool):
+                errors.append(
+                    f"{key}: unsafe_batch_probe quality result missing "
+                    f"({root / (key + '.unsafe_batch.c4.quality.json')})"
+                )
         if (model.get("run") or {}).get("passed") is not True:
             errors.append(f"{key}: run.passed != true ({root / (key + '.run.verdict.txt')})")
         for cell in model.get("cells", []):
             c = cell.get("concurrency")
+            quality = cell.get("quality") or {}
+            if quality.get("passed") is not True:
+                errors.append(f"{key} c={c}: quality.passed != true ({root / f'{key}.c{c}.quality.json'})")
+            for name in ["status_200", "marker_ok", "square_ok", "format_ok"]:
+                if quality.get(name) != quality.get("requests"):
+                    errors.append(
+                        f"{key} c={c}: quality {name} {quality.get(name)!r} != "
+                        f"requests {quality.get('requests')!r} ({root / f'{key}.c{c}.quality.json'})"
+                    )
+            if quality.get("crosstalk") != 0:
+                errors.append(f"{key} c={c}: quality crosstalk != 0 ({root / f'{key}.c{c}.quality.json'})")
+            if quality.get("length_finishes") != 0:
+                errors.append(f"{key} c={c}: quality length_finishes != 0 ({root / f'{key}.c{c}.quality.json'})")
             if cell.get("completed") != cell.get("prompts"):
                 errors.append(f"{key} c={c}: completed != prompts ({root / f'{key}.c{c}.json'})")
             if cell.get("failed") != 0:

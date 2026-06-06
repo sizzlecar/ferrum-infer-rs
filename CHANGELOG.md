@@ -7,37 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## [0.7.6] - 2026-06-05
+
 ### Added
-- Initial project setup with comprehensive development workflow
-- Command-line interface with clap
-- Calculator module with basic arithmetic operations
-- Utility functions for configuration management
-- Comprehensive test suite with unit tests
-- Performance benchmarks using criterion
-- Code quality tools (rustfmt, clippy)
-- Git hooks for pre-commit validation
-- GitHub Actions CI/CD pipeline
-- Multi-platform build support
-- Security audit workflow
-- Code coverage reporting
-- Documentation generation
-- Development guides and contribution guidelines
-
-### Changed
-- N/A
-
-### Deprecated
-- N/A
-
-### Removed
-- N/A
+- G0 release validation now requires an accelerator model matrix that covers both Qwen3-30B-A3B MoE/GPTQ and a Llama 8B-class dense model.
+- Added a supplemental CUDA Llama dense release gate for `ferrum run`, `ferrum serve`, streaming usage, and `bench-serve` performance evidence.
 
 ### Fixed
-- N/A
+- Fixed Qwen3 OpenAI-compatible API regressions for structured output, tool-call fallback behavior, streaming, and REPL input handling.
+- Hardened release validators and binary gates to scan response bodies and logs for release-blocking patterns.
+- Fixed runtime environment registry CI coverage so source gates account for documented runtime knobs.
 
-### Security
-- Added cargo-audit for dependency vulnerability scanning
-- Configured security-focused clippy lints
+### Changed
+- Metal G0 validation is documented and enforced as both a correctness gate and README performance gate.
+- Final G0 release summary now treats CUDA Qwen full and CUDA Llama dense evidence as required official release inputs.
 
 ## [0.1.0] - 2024-01-01
 

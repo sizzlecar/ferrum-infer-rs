@@ -832,6 +832,82 @@ def validate_profile_manifest(
             raise ValidationError(f"{case_name}: profile.{key} is not empty: {value!r}")
 
 
+def validate_tool_call_gate(case_name: str, path: Path) -> None:
+    data = load_json(path)
+    if data.get("status") != "pass":
+        raise ValidationError(f"{case_name}: tool_call_regression did not pass: {path}")
+    checks = data.get("checks")
+    if not isinstance(checks, dict):
+        raise ValidationError(f"{case_name}: tool_call_regression.checks missing: {path}")
+    for name in (
+        "omitted_tool_choice",
+        "explicit_auto_tool_choice",
+        "required_tool_choice",
+        "tool_result_fill",
+    ):
+        check = checks.get(name)
+        if not isinstance(check, dict) or check.get("passed") is not True:
+            raise ValidationError(
+                f"{case_name}: tool_call_regression.{name}.passed is not true: {path}"
+            )
+
+
+def validate_concurrency_quality_gate(case_name: str, path: Path) -> None:
+    data = load_json(path)
+    if data.get("status") != "pass":
+        raise ValidationError(f"{case_name}: concurrency_quality did not pass: {path}")
+    cells = data.get("cells")
+    if not isinstance(cells, list) or not cells:
+        raise ValidationError(f"{case_name}: concurrency_quality.cells missing: {path}")
+    for cell in cells:
+        if not isinstance(cell, dict):
+            raise ValidationError(f"{case_name}: concurrency_quality cell is not object: {path}")
+        concurrency = cell.get("concurrency")
+        requests = cell.get("requests")
+        if (
+            not isinstance(concurrency, int)
+            or isinstance(concurrency, bool)
+            or concurrency <= 0
+            or requests != concurrency
+        ):
+            raise ValidationError(
+                f"{case_name}: invalid concurrency_quality cell shape: {cell!r}"
+            )
+        if cell.get("passed") is not True:
+            raise ValidationError(
+                f"{case_name}: concurrency_quality c={concurrency} did not pass: {path}"
+            )
+        for key in ("status_200", "json_ok", "marker_ok", "square_ok", "format_ok"):
+            if cell.get(key) != requests:
+                raise ValidationError(
+                    f"{case_name}: concurrency_quality c={concurrency} {key} "
+                    f"{cell.get(key)!r} != requests {requests!r}: {path}"
+                )
+        for key in ("crosstalk", "length_finishes", "forbidden_count"):
+            if cell.get(key) != 0:
+                raise ValidationError(
+                    f"{case_name}: concurrency_quality c={concurrency} {key} "
+                    f"{cell.get(key)!r} != 0: {path}"
+                )
+
+
+def validate_correctness_gate_artifacts(root: Path, case_name: str, gates: list[dict[str, Any]]) -> None:
+    for gate in gates:
+        name = gate.get("name")
+        if name not in {"tool_call_regression", "concurrency_quality"}:
+            continue
+        path_text = gate.get("path")
+        if not isinstance(path_text, str) or not path_text.strip():
+            raise ValidationError(f"{case_name}: {name} gate missing path")
+        path = resolve(path_text, root)
+        if not path.exists():
+            raise ValidationError(f"{case_name}: {name} gate artifact missing: {path}")
+        if name == "tool_call_regression":
+            validate_tool_call_gate(case_name, path)
+        elif name == "concurrency_quality":
+            validate_concurrency_quality_gate(case_name, path)
+
+
 def validate_decision_event(where: str, event: dict[str, Any]) -> None:
     require_keys(where, event, DECISION_TRACE_REQUIRED)
     if event.get("schema_version") != 1:
@@ -1121,6 +1197,43 @@ def validate_effective_config(
     return data
 
 
+def decision_selected_int(data: dict[str, Any], selection: str) -> int | None:
+    for decision in data.get("decisions", []):
+        if decision.get("selection") != selection:
+            continue
+        try:
+            return int(decision.get("selected"))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def validate_effective_concurrency_capacity(
+    case_name: str,
+    effective_config: dict[str, Any],
+    metrics: dict[str, Any],
+) -> None:
+    concurrency = metrics.get("concurrency")
+    if not isinstance(concurrency, int) or isinstance(concurrency, bool) or concurrency <= 0:
+        return
+    max_sequences = decision_selected_int(effective_config, "max_sequences")
+    if max_sequences is None or max_sequences < concurrency:
+        raise ValidationError(
+            f"{case_name}: effective max_sequences {max_sequences!r} < bench concurrency "
+            f"{concurrency}"
+        )
+    target_concurrency = effective_config.get("workload_profile", {}).get("target_concurrency")
+    if (
+        not isinstance(target_concurrency, int)
+        or isinstance(target_concurrency, bool)
+        or target_concurrency < concurrency
+    ):
+        raise ValidationError(
+            f"{case_name}: workload target_concurrency {target_concurrency!r} < bench "
+            f"concurrency {concurrency}"
+        )
+
+
 def validate_case(
     root: Path,
     case_ref: dict[str, Any],
@@ -1178,12 +1291,16 @@ def validate_case(
             f"does not match decision trace count {len(decision_events)}"
         )
 
+    metrics = case.get("metrics") or {}
+    validate_effective_concurrency_capacity(case["name"], effective_config, metrics)
+
     gates = case.get("correctness_gates") or []
     if not gates:
         raise ValidationError(f"{case['name']}: no correctness gates recorded")
     failed = [gate for gate in gates if not gate.get("ok")]
     if failed:
         raise ValidationError(f"{case['name']}: failed gates: {failed}")
+    validate_correctness_gate_artifacts(root, case["name"], gates)
 
     cleanup = case.get("cleanup_status") or {}
     if cleanup.get("sent_kill"):
@@ -1206,7 +1323,6 @@ def validate_case(
     bench_path = resolve(case["bench_json"], root)
     if require_bench and not bench_path.exists():
         raise ValidationError(f"{case['name']}: bench_json missing: {bench_path}")
-    metrics = case.get("metrics") or {}
     if require_bench:
         if metrics.get("completed") is None:
             raise ValidationError(f"{case['name']}: completed metric missing")
@@ -1375,10 +1491,10 @@ def self_test() -> None:
             {
                 "schema_version": 1,
                 "selection": selection,
-                "selected": "selected",
+                "selected": "32" if selection == "max_sequences" else "selected",
                 "source": "default",
                 "source_key": None,
-                "candidates": ["selected"],
+                "candidates": ["32"] if selection == "max_sequences" else ["selected"],
                 "rejected": [],
                 "affects": ["performance"],
             }
@@ -1500,7 +1616,8 @@ def self_test() -> None:
                     "global_process_hygiene_ok": True,
                     "global_process_findings": [],
                 },
-                "metrics": {
+                    "metrics": {
+                    "concurrency": 32,
                     "completed": 1,
                     "errored": 0,
                     "throughput_mean": 1.0,
@@ -1581,6 +1698,38 @@ def self_test() -> None:
         )
         result = validate_artifact(root, require_bench=True, require_profile_events=False)
         assert result["ok"]
+
+        bad_effective_config = load_json(case_dir / "effective_config.json")
+        bad_decisions = [dict(decision) for decision in bad_effective_config["decisions"]]
+        for decision in bad_decisions:
+            if decision["selection"] == "max_sequences":
+                decision["selected"] = "1"
+                decision["candidates"] = ["1"]
+        bad_effective_config["decisions"] = bad_decisions
+        write_json(case_dir / "effective_config.json", bad_effective_config)
+        (case_dir / "decision_trace.jsonl").write_text(
+            "".join(json.dumps(decision, sort_keys=True) + "\n" for decision in bad_decisions)
+        )
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=False)
+        except ValidationError as exc:
+            assert "max_sequences" in str(exc)
+        else:
+            raise AssertionError("undersized max_sequences unexpectedly passed")
+        write_json(
+            case_dir / "effective_config.json",
+            {
+                "schema_version": 1,
+                "preset": snapshot["preset"],
+                "env_hash": snapshot["env_hash"],
+                "entries": effective_entries,
+                **auto_config_inputs,
+                "decisions": decisions,
+            },
+        )
+        (case_dir / "decision_trace.jsonl").write_text(
+            "".join(json.dumps(decision, sort_keys=True) + "\n" for decision in decisions)
+        )
 
         case_manifest = load_json(case_dir / "manifest.json")
         case_manifest["auto_config_decision_count"] = len(decisions) - 1

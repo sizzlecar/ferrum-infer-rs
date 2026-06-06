@@ -8,14 +8,32 @@ import sys
 from pathlib import Path
 
 REQUIRED_GROUPS = {
-    "unit": ["unit.gate.json", "source/unit.gate.json"],
-    "metal-source": ["metal.gate.json", "source/metal.gate.json"],
+    "unit": ["unit.gate.json", "source/unit.gate.json", "source-unit/unit.gate.json"],
+    "metal-source": ["metal.gate.json", "source/metal.gate.json", "source-metal/metal.gate.json"],
+    "cuda-qwen-full": [
+        "g0_cuda4090_full.gate.json",
+        "source/g0_cuda4090_full.gate.json",
+        "source-cuda-full/g0_cuda4090_full.gate.json",
+        "cuda-full/g0_cuda4090_full.gate.json",
+    ],
+    "cuda-llama-dense": [
+        "g0_cuda4090_llama_dense.gate.json",
+        "source/g0_cuda4090_llama_dense.gate.json",
+        "source-cuda-llama-dense/g0_cuda4090_llama_dense.gate.json",
+        "source-cuda-llama-dense/gate.json",
+        "cuda-llama-dense/g0_cuda4090_llama_dense.gate.json",
+        "cuda-llama-dense/gate.json",
+    ],
     "metal-tarball": ["metal-tarball/gate.json"],
     "cuda-tarball": ["cuda-tarball/gate.json"],
     "homebrew-metal": ["homebrew-metal/gate.json"],
     "homebrew-cuda-fetch": ["homebrew-cuda-fetch/gate.json"],
 }
-OPTIONAL = ["g0_cuda4090_smoke.gate.json", "g0_cuda4090_full.gate.json"]
+OPTIONAL = [
+    "g0_cuda4090_smoke.gate.json",
+    "source-cuda-smoke/g0_cuda4090_smoke.gate.json",
+    "cuda-smoke/g0_cuda4090_smoke.gate.json",
+]
 
 
 def load_gate(path: Path) -> tuple[bool, str]:

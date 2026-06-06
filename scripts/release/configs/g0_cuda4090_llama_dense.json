@@ -1,0 +1,17 @@
+{
+  "name": "g0-cuda4090-llama-dense",
+  "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+  "model_architecture": "llama_dense",
+  "tokenizer": "auto",
+  "port": 19300,
+  "max_model_len": 2048,
+  "kv_capacity": 2048,
+  "max_num_seqs": 32,
+  "concurrency_cells": [1, 4, 16, 32],
+  "num_prompts": 96,
+  "warmup_requests": 10,
+  "n_repeats": 3,
+  "random_input_len": 256,
+  "random_output_len": 128,
+  "seed": 9271
+}

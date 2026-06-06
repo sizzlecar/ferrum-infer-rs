@@ -1,8 +1,10 @@
 use crate::openai::{
     ChatFunction, ChatMessage, ChatTool, FunctionCallChoice, MessageRole, ToolChoice,
 };
-use minijinja::{context, Environment};
+use minijinja::Environment;
+use serde::ser::SerializeStruct;
 use serde::Serialize;
+use serde_json::Value;
 use tracing::warn;
 
 /// Model-provided chat template, usually from GGUF `tokenizer.chat_template`
@@ -26,13 +28,116 @@ impl ModelChatTemplate {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChatTemplateOptions {
+    pub enable_thinking: Option<bool>,
+}
+
+impl ChatTemplateOptions {
+    pub fn default_for_template(model_template: Option<&ModelChatTemplate>) -> Self {
+        if model_template_supports_enable_thinking(model_template) {
+            return Self {
+                enable_thinking: Some(false),
+            };
+        }
+        Self::default()
+    }
+}
+
+fn model_template_supports_enable_thinking(model_template: Option<&ModelChatTemplate>) -> bool {
+    model_template
+        .map(|template| template.template.contains("enable_thinking"))
+        .unwrap_or(false)
+}
+
 /// Common prompt-message shape used by both CLI `run` and OpenAI `serve`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct PromptMessage {
     pub role: String,
     pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    pub name: Option<String>,
+    pub tool_calls: Option<Vec<PromptToolCall>>,
+    pub tool_call_id: Option<String>,
+    pub function_call: Option<crate::openai::ChatFunctionCall>,
+}
+
+impl Serialize for PromptMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut len = 2;
+        len += usize::from(self.reasoning_content.is_some());
+        len += usize::from(self.name.is_some());
+        len += usize::from(self.tool_calls.is_some());
+        len += usize::from(self.tool_call_id.is_some());
+        len += usize::from(self.function_call.is_some());
+        let mut state = serializer.serialize_struct("PromptMessage", len)?;
+        state.serialize_field("role", &self.role)?;
+        let content = template_content_value(&self.content);
+        state.serialize_field("content", &content)?;
+        if let Some(reasoning_content) = &self.reasoning_content {
+            state.serialize_field("reasoning_content", reasoning_content)?;
+        }
+        if let Some(name) = &self.name {
+            state.serialize_field("name", name)?;
+        }
+        if let Some(tool_calls) = &self.tool_calls {
+            state.serialize_field("tool_calls", tool_calls)?;
+        }
+        if let Some(tool_call_id) = &self.tool_call_id {
+            state.serialize_field("tool_call_id", tool_call_id)?;
+        }
+        if let Some(function_call) = &self.function_call {
+            state.serialize_field("function_call", function_call)?;
+        }
+        state.end()
+    }
+}
+
+/// Tool-call shape exposed to model chat templates.
+///
+/// OpenAI's wire format serializes `function.arguments` as a JSON string, but
+/// HuggingFace chat templates generally expect a parsed mapping so they can
+/// apply `tojson`, `items`, and similar template operations. Keep that internal
+/// shape separate from the API response type.
+#[derive(Clone, Debug, Serialize)]
+pub struct PromptToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: PromptFunctionCall,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PromptFunctionCall {
+    pub name: String,
+    pub arguments: Value,
+}
+
+impl From<&crate::openai::ChatToolCall> for PromptToolCall {
+    fn from(call: &crate::openai::ChatToolCall) -> Self {
+        Self {
+            index: call.index,
+            id: call.id.clone(),
+            tool_type: call.tool_type.clone(),
+            function: PromptFunctionCall {
+                name: call.function.name.clone(),
+                arguments: parse_template_arguments(&call.function.arguments),
+            },
+        }
+    }
+}
+
+fn parse_template_arguments(arguments: &str) -> Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+}
+
+fn template_content_value(content: &str) -> Value {
+    Value::String(content.to_string())
 }
 
 impl PromptMessage {
@@ -45,13 +150,36 @@ impl PromptMessage {
                 role,
                 content,
                 reasoning_content,
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                function_call: None,
             };
         }
         Self {
             role,
             content,
             reasoning_content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            function_call: None,
         }
+    }
+
+    fn from_chat_message(message: &ChatMessage) -> Self {
+        let mut prompt = Self::new(template_role(message), message.content.clone());
+        if matches!(message.role, MessageRole::Assistant) && message.reasoning.is_some() {
+            prompt.reasoning_content = message.reasoning.clone();
+        }
+        prompt.name = message.name.clone();
+        prompt.tool_calls = message
+            .tool_calls
+            .as_ref()
+            .map(|calls| calls.iter().map(PromptToolCall::from).collect());
+        prompt.tool_call_id = message.tool_call_id.clone();
+        prompt.function_call = message.function_call.clone();
+        prompt
     }
 }
 
@@ -80,8 +208,22 @@ pub fn render_prompt_messages(
     model_id: &str,
     model_template: Option<&ModelChatTemplate>,
 ) -> String {
+    render_prompt_messages_with_options(
+        messages,
+        model_id,
+        model_template,
+        &ChatTemplateOptions::default(),
+    )
+}
+
+pub fn render_prompt_messages_with_options(
+    messages: &[PromptMessage],
+    model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    options: &ChatTemplateOptions,
+) -> String {
     if let Some(model_template) = model_template {
-        match render_model_template(messages, model_template) {
+        match render_model_template(messages, model_template, options, None, None, None, None) {
             Ok(prompt) if !prompt.trim().is_empty() => return prompt,
             Ok(_) => warn!(
                 "model chat template rendered an empty prompt; falling back to legacy renderer"
@@ -95,9 +237,32 @@ pub fn render_prompt_messages(
     render_fallback_prompt(messages, model_id, None)
 }
 
+#[derive(Serialize)]
+struct ModelTemplateContext<'a> {
+    messages: &'a [PromptMessage],
+    add_generation_prompt: bool,
+    bos_token: &'a str,
+    eos_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [ChatTool]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    functions: Option<&'a [ChatFunction]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_call: Option<&'a FunctionCallChoice>,
+}
+
 fn render_model_template(
     messages: &[PromptMessage],
     model_template: &ModelChatTemplate,
+    options: &ChatTemplateOptions,
+    tools: Option<&[ChatTool]>,
+    tool_choice: Option<&ToolChoice>,
+    functions: Option<&[ChatFunction]>,
+    function_call: Option<&FunctionCallChoice>,
 ) -> std::result::Result<String, minijinja::Error> {
     let mut env = Environment::new();
     env.add_filter("trim_newlines", |s: String| {
@@ -136,11 +301,16 @@ fn render_model_template(
     let template = normalize_hf_chat_template(&model_template.template);
     env.add_template("chat", &template)?;
     let tmpl = env.get_template("chat")?;
-    tmpl.render(context! {
-        messages => messages,
-        add_generation_prompt => true,
-        bos_token => model_template.bos_token.as_deref().unwrap_or(""),
-        eos_token => model_template.eos_token.as_deref().unwrap_or(""),
+    tmpl.render(ModelTemplateContext {
+        messages,
+        add_generation_prompt: true,
+        bos_token: model_template.bos_token.as_deref().unwrap_or(""),
+        eos_token: model_template.eos_token.as_deref().unwrap_or(""),
+        enable_thinking: options.enable_thinking,
+        tools,
+        tool_choice,
+        functions,
+        function_call,
     })
 }
 
@@ -189,11 +359,25 @@ pub fn render_chat_prompt_with_model_template(
     model_id: &str,
     model_template: Option<&ModelChatTemplate>,
 ) -> String {
+    render_chat_prompt_with_model_template_options(
+        messages,
+        model_id,
+        model_template,
+        &ChatTemplateOptions::default(),
+    )
+}
+
+pub fn render_chat_prompt_with_model_template_options(
+    messages: &[ChatMessage],
+    model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    options: &ChatTemplateOptions,
+) -> String {
     let prompt_messages = messages
         .iter()
-        .map(|msg| PromptMessage::new(template_role(msg), template_content(msg)))
+        .map(PromptMessage::from_chat_message)
         .collect::<Vec<_>>();
-    render_prompt_messages(&prompt_messages, model_id, model_template)
+    render_prompt_messages_with_options(&prompt_messages, model_id, model_template, options)
 }
 
 fn render_fallback_prompt(
@@ -270,6 +454,51 @@ pub fn render_chat_prompt_with_tools(
         &prompt_messages,
         model_id,
         render_tool_spec(tools, tool_choice, functions, function_call),
+    )
+}
+
+pub fn render_chat_prompt_with_tools_and_model_template(
+    messages: &[ChatMessage],
+    model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    options: &ChatTemplateOptions,
+    tools: &[ChatTool],
+    tool_choice: Option<&ToolChoice>,
+    functions: &[ChatFunction],
+    function_call: Option<&FunctionCallChoice>,
+) -> String {
+    if let Some(model_template) = model_template {
+        let prompt_messages = messages
+            .iter()
+            .map(PromptMessage::from_chat_message)
+            .collect::<Vec<_>>();
+        match render_model_template(
+            &prompt_messages,
+            model_template,
+            options,
+            (!tools.is_empty()).then_some(tools),
+            tool_choice,
+            (!functions.is_empty()).then_some(functions),
+            function_call,
+        ) {
+            Ok(prompt) if !prompt.trim().is_empty() => return prompt,
+            Ok(_) => warn!(
+                "model chat template rendered an empty tool prompt; falling back to legacy renderer"
+            ),
+            Err(e) => warn!(
+                "failed to render tool prompt with model chat template from {}: {}; falling back to legacy renderer",
+                model_template.source, e
+            ),
+        }
+    }
+
+    render_chat_prompt_with_tools(
+        messages,
+        model_id,
+        tools,
+        tool_choice,
+        functions,
+        function_call,
     )
 }
 
@@ -405,6 +634,142 @@ mod tests {
     }
 
     #[test]
+    fn model_template_is_used_for_tool_requests() {
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tools>{% for tool in tools %}{{ tool.function.name }}{% endfor %}</tools>{% endif %}{% for message in messages %}[{{ message.role }}]{{ message.content }}{% if message.tool_calls %}{% for tool_call in message.tool_calls %}<tool_call>{{ tool_call.function.name }}:{{ tool_call.function.arguments }}</tool_call>{% endfor %}{% endif %}{% if message.tool_call_id %}<tool_response id=\"{{ message.tool_call_id }}\">{{ message.content }}</tool_response>{% endif %}{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
+            "tool-template",
+        );
+        let mut assistant = msg(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![crate::openai::ChatToolCall {
+            index: None,
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::openai::ChatFunctionCall {
+                name: "weather".to_string(),
+                arguments: "{\"city\":\"Paris\"}".to_string(),
+            },
+        }]);
+        let mut tool_result = msg(MessageRole::Tool, "sunny");
+        tool_result.tool_call_id = Some("call_1".to_string());
+
+        let out = render_chat_prompt_with_tools_and_model_template(
+            &[
+                msg(MessageRole::User, "Use weather."),
+                assistant,
+                tool_result,
+            ],
+            "served-hash-id",
+            Some(&template),
+            &ChatTemplateOptions::default(),
+            &[tool("weather")],
+            Some(&ToolChoice::Mode("auto".to_string())),
+            &[],
+            None,
+        );
+
+        assert!(out.contains("<tools>weather</tools>"));
+        assert!(out.contains("<tool_call>weather:"), "{out}");
+        assert!(out.contains("\"city\""), "{out}");
+        assert!(out.contains("Paris"), "{out}");
+        assert!(out.contains("<tool_response id=\"call_1\">sunny</tool_response>"));
+        assert!(out.ends_with("[assistant]"));
+        assert!(
+            !out.contains("<|assistant|>"),
+            "tool requests with model templates must not use generic fallback: {out}"
+        );
+    }
+
+    #[test]
+    fn model_template_tools_supports_qwen3_template_primitives() {
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tools>{% for tool in tools %}{{ tool | tojson }}{% endfor %}</tools>{% endif %}{% for message in messages[::-1] %}[{{ message.role }}]{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
+            "qwen3-tool-primitives",
+        );
+        let out = render_chat_prompt_with_tools_and_model_template(
+            &[
+                msg(MessageRole::User, "Use weather."),
+                msg(MessageRole::Assistant, "ok"),
+            ],
+            "served-hash-id",
+            Some(&template),
+            &ChatTemplateOptions::default(),
+            &[tool("weather")],
+            Some(&ToolChoice::Mode("auto".to_string())),
+            &[],
+            None,
+        );
+
+        assert!(out.contains("\"name\":\"weather\""), "{out}");
+        assert!(out.contains("[assistant][user][assistant]"), "{out}");
+    }
+
+    #[test]
+    fn model_template_tool_arguments_are_parsed_for_hf_templates() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% if message.tool_calls %}{% set tool_call = message.tool_calls[0].function %}{{ tool_call.arguments | tojson }}{% for name, value in tool_call.arguments | items %}[{{ name }}={{ value }}]{% endfor %}{% endif %}{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
+            "llama-tool-primitives",
+        );
+        let mut assistant = msg(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![crate::openai::ChatToolCall {
+            index: None,
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::openai::ChatFunctionCall {
+                name: "weather".to_string(),
+                arguments: "{\"city\":\"Paris\",\"unit\":\"celsius\"}".to_string(),
+            },
+        }]);
+
+        let out = render_chat_prompt_with_tools_and_model_template(
+            &[msg(MessageRole::User, "Use weather."), assistant],
+            "served-hash-id",
+            Some(&template),
+            &ChatTemplateOptions::default(),
+            &[tool("weather")],
+            Some(&ToolChoice::Mode("auto".to_string())),
+            &[],
+            None,
+        );
+
+        assert!(out.contains("\"city\""), "{out}");
+        assert!(out.contains("\"Paris\""), "{out}");
+        assert!(out.contains("[city=Paris]"), "{out}");
+        assert!(out.contains("[unit=celsius]"), "{out}");
+        assert!(out.ends_with("[assistant]"));
+    }
+
+    #[test]
+    fn model_template_tool_result_content_stays_string_for_hf_templates() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% if message.role == 'tool' %}{% if message.content is string %}<tool_response>{{ message.content }}</tool_response>{% else %}not-string{% endif %}{% endif %}{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
+            "qwen-tool-result-primitives",
+        );
+        let mut tool_result = msg(
+            MessageRole::Tool,
+            "{\"city\":\"北京\",\"temp\":22,\"desc\":\"晴\"}",
+        );
+        tool_result.tool_call_id = Some("call_1".to_string());
+
+        let out = render_chat_prompt_with_tools_and_model_template(
+            &[msg(MessageRole::User, "Use weather."), tool_result],
+            "served-hash-id",
+            Some(&template),
+            &ChatTemplateOptions::default(),
+            &[tool("weather")],
+            Some(&ToolChoice::Mode("auto".to_string())),
+            &[],
+            None,
+        );
+
+        assert!(out.contains("\"temp\""), "{out}");
+        assert!(out.contains("22"), "{out}");
+        assert!(out.contains("\"desc\":\"晴\""), "{out}");
+        assert!(out.contains("<tool_response>"), "{out}");
+        assert!(!out.contains("not-string"), "{out}");
+        assert!(out.ends_with("[assistant]"));
+    }
+
+    #[test]
     fn qwen_style_model_template_does_not_force_empty_think() {
         let template = ModelChatTemplate::new(
             "{%- for message in messages %}{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}",
@@ -420,6 +785,57 @@ mod tests {
             "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
         );
         assert!(!out.contains("<think>"));
+    }
+
+    #[test]
+    fn enable_thinking_false_is_model_template_controlled() {
+        let template = ModelChatTemplate::new(
+            "{%- for message in messages %}{{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\n\n</think>\n\n' }}{%- endif %}{%- endif %}",
+            "thinking-template",
+        );
+        let options = ChatTemplateOptions::default_for_template(Some(&template));
+        assert_eq!(options.enable_thinking, Some(false));
+        let out = render_chat_prompt_with_model_template_options(
+            &[msg(MessageRole::User, "Hi")],
+            "served-model-alias",
+            Some(&template),
+            &options,
+        );
+        assert!(out.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn explicit_enable_thinking_overrides_template_default() {
+        let template = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}",
+            "thinking-template",
+        );
+        let out = render_chat_prompt_with_model_template_options(
+            &[msg(MessageRole::User, "Hi")],
+            "Qwen/Qwen3-0.6B",
+            Some(&template),
+            &ChatTemplateOptions {
+                enable_thinking: Some(true),
+            },
+        );
+        assert_eq!(out, "<assistant>");
+    }
+
+    #[test]
+    fn template_without_enable_thinking_does_not_get_thinking_default() {
+        let template = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant>{% endif %}",
+            "plain-template",
+        );
+        let options = ChatTemplateOptions::default_for_template(Some(&template));
+        assert_eq!(options.enable_thinking, None);
+        let out = render_chat_prompt_with_model_template_options(
+            &[msg(MessageRole::User, "Hi")],
+            "Qwen/Qwen3-0.6B",
+            Some(&template),
+            &options,
+        );
+        assert_eq!(out, "<assistant>");
     }
 
     #[test]
@@ -450,6 +866,10 @@ mod tests {
                 role: "assistant".to_string(),
                 content: "<think>\nreason\n</think>\n\nanswer".to_string(),
                 reasoning_content: None,
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                function_call: None,
             }],
             "qwen3",
             Some(&template),
@@ -468,6 +888,10 @@ mod tests {
                 role: "assistant".to_string(),
                 content: "<think>\nreason\n</think>\n\nanswer".to_string(),
                 reasoning_content: None,
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                function_call: None,
             }],
             "qwen3",
             Some(&template),

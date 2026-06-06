@@ -6,7 +6,7 @@ use clap::{Args, ValueEnum};
 use colored::*;
 use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
-use ferrum_server::chat_template::{ModelChatTemplate, PromptMessage};
+use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
 use ferrum_types::{
     FerrumError, FinishReason, InferenceRequest, Priority, RequestId, Result,
     RuntimeConfigSnapshot, SamplingParams,
@@ -95,12 +95,19 @@ fn emit_jsonl_exit(reason: &str) {
     println!("{record}");
 }
 
-fn run_request_metadata(prompt: &str) -> HashMap<String, serde_json::Value> {
+fn run_request_metadata(
+    prompt: &str,
+    chat_template_options: &ChatTemplateOptions,
+) -> HashMap<String, serde_json::Value> {
     let mut metadata = HashMap::new();
     if !has_unclosed_thinking_block(prompt) {
+        let mut forbidden = vec![serde_json::Value::String(THINK_END_TAG.to_string())];
+        if chat_template_options.enable_thinking == Some(false) {
+            forbidden.push(serde_json::Value::String(THINK_START_TAG.to_string()));
+        }
         metadata.insert(
             RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY.to_string(),
-            serde_json::Value::Array(vec![serde_json::Value::String(THINK_END_TAG.to_string())]),
+            serde_json::Value::Array(forbidden),
         );
     }
     metadata
@@ -179,6 +186,14 @@ pub struct RunCommand {
     /// Maximum tokens to generate
     #[arg(long, default_value = "1024")]
     pub max_tokens: u32,
+
+    /// Enable model reasoning for chat templates that support it.
+    #[arg(long, conflicts_with = "disable_thinking")]
+    pub enable_thinking: bool,
+
+    /// Disable model reasoning for chat templates that support it.
+    #[arg(long, conflicts_with = "enable_thinking")]
+    pub disable_thinking: bool,
 
     /// Disable CLI context shift. By default, `ferrum run` keeps the REPL
     /// alive by dropping the oldest history before shrinking this turn's output
@@ -298,6 +313,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let source = resolved.source;
     let model_id = source.original.clone();
     let model_chat_template = crate::source_resolver::load_model_chat_template(&source.local_path);
+    let chat_template_options = build_chat_template_options(&cmd, model_chat_template.as_ref());
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 
     let engine_model_path = source.local_path.to_string_lossy().to_string();
@@ -365,11 +381,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             cmd.system.as_deref(),
             &model_id,
             model_chat_template.as_ref(),
+            &chat_template_options,
             &cmd,
             &run_budget,
         )?;
         maybe_warn_context_shift(&plan, format);
-        let metadata = run_request_metadata(&plan.prompt);
+        let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
         let request = InferenceRequest {
             id: RequestId(Uuid::new_v4()),
             model_id: ferrum_types::ModelId(model_id.clone()),
@@ -506,11 +523,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     cmd.system.as_deref(),
                     &model_id,
                     model_chat_template.as_ref(),
+                    &chat_template_options,
                     &cmd,
                     &run_budget,
                 )?;
                 maybe_warn_context_shift(&plan, format);
-                let metadata = run_request_metadata(&plan.prompt);
+                let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
                 // Create request
                 let request = InferenceRequest {
                     id: RequestId(Uuid::new_v4()),
@@ -902,19 +920,40 @@ fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
     }
 }
 
+fn build_chat_template_options(
+    cmd: &RunCommand,
+    model_template: Option<&ModelChatTemplate>,
+) -> ChatTemplateOptions {
+    let mut options = ChatTemplateOptions::default_for_template(model_template);
+    if cmd.enable_thinking {
+        options.enable_thinking = Some(true);
+    } else if cmd.disable_thinking {
+        options.enable_thinking = Some(false);
+    }
+    options
+}
+
 fn build_run_prompt_plan(
     history: &[(String, String)],
     user_input: &str,
     system: Option<&str>,
     model_id: &str,
     model_template: Option<&ModelChatTemplate>,
+    chat_template_options: &ChatTemplateOptions,
     cmd: &RunCommand,
     budget: &RunBudget,
 ) -> Result<RunPromptPlan> {
     let base_sampling = build_sampling_params(cmd);
 
     if cmd.no_context_shift {
-        let prompt = build_chat_prompt(history, user_input, system, model_id, model_template);
+        let prompt = build_chat_prompt(
+            history,
+            user_input,
+            system,
+            model_id,
+            model_template,
+            chat_template_options,
+        );
         let prompt_tokens = budget.prompt_tokens(&prompt);
         if !fits_kv_budget(&base_sampling, prompt_tokens, budget.kv_capacity) {
             return Err(FerrumError::invalid_request(format!(
@@ -944,6 +983,7 @@ fn build_run_prompt_plan(
             system,
             model_id,
             model_template,
+            chat_template_options,
         );
         let prompt_tokens = budget.prompt_tokens(&prompt);
 
@@ -1336,6 +1376,7 @@ fn build_chat_prompt(
     system: Option<&str>,
     model_id: &str,
     model_template: Option<&ModelChatTemplate>,
+    chat_template_options: &ChatTemplateOptions,
 ) -> String {
     let mut messages = Vec::new();
     if let Some(sys) = system {
@@ -1345,7 +1386,12 @@ fn build_chat_prompt(
         messages.push(PromptMessage::new(role, content));
     }
     messages.push(PromptMessage::new("user", user_input));
-    ferrum_server::chat_template::render_prompt_messages(&messages, model_id, model_template)
+    ferrum_server::chat_template::render_prompt_messages_with_options(
+        &messages,
+        model_id,
+        model_template,
+        chat_template_options,
+    )
 }
 
 /// Apply the resolved `--kv-dtype` / runtime-config override to an engine
@@ -1406,6 +1452,8 @@ mod tests {
             system: None,
             max_tokens: 1024,
             no_context_shift: false,
+            enable_thinking: false,
+            disable_thinking: false,
             temperature: 0.0,
             backend: "auto".to_string(),
             prompt: None,
@@ -1430,9 +1478,14 @@ mod tests {
         }
     }
 
+    fn default_template_options() -> ChatTemplateOptions {
+        ChatTemplateOptions::default()
+    }
+
     #[test]
     fn run_metadata_forbids_initial_thinking_close_without_open_block() {
-        let metadata = run_request_metadata("<|im_start|>assistant\n");
+        let metadata =
+            run_request_metadata("<|im_start|>assistant\n", &ChatTemplateOptions::default());
         let forbidden = metadata
             .get(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY)
             .and_then(|value| value.as_array())
@@ -1444,8 +1497,32 @@ mod tests {
     }
 
     #[test]
+    fn run_metadata_forbids_initial_thinking_start_when_template_disables_thinking() {
+        let metadata = run_request_metadata(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            &ChatTemplateOptions {
+                enable_thinking: Some(false),
+            },
+        );
+        let forbidden = metadata
+            .get(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY)
+            .and_then(|value| value.as_array())
+            .expect("initial forbidden token texts");
+        assert_eq!(
+            forbidden,
+            &[
+                serde_json::Value::String(THINK_END_TAG.to_string()),
+                serde_json::Value::String(THINK_START_TAG.to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn run_metadata_allows_thinking_close_when_prompt_opened_block() {
-        let metadata = run_request_metadata("<|im_start|>assistant\n<think>\n");
+        let metadata = run_request_metadata(
+            "<|im_start|>assistant\n<think>\n",
+            &ChatTemplateOptions::default(),
+        );
         assert!(!metadata.contains_key(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
     }
 
@@ -1496,8 +1573,18 @@ mod tests {
     fn context_shift_clamps_output_to_remaining_kv_budget() {
         let cmd = test_run_cmd();
         let budget = whitespace_budget(64);
-        let plan =
-            build_run_prompt_plan(&[], "demo", None, "tinyllama", None, &cmd, &budget).unwrap();
+        let options = default_template_options();
+        let plan = build_run_prompt_plan(
+            &[],
+            "demo",
+            None,
+            "tinyllama",
+            None,
+            &options,
+            &cmd,
+            &budget,
+        )
+        .unwrap();
 
         let prompt_tokens = plan.prompt_tokens.unwrap();
         assert!(prompt_tokens < 64);
@@ -1514,8 +1601,18 @@ mod tests {
             ("user".to_string(), long.clone()),
             ("assistant".to_string(), long),
         ];
-        let plan = build_run_prompt_plan(&history, "demo", None, "tinyllama", None, &cmd, &budget)
-            .unwrap();
+        let options = default_template_options();
+        let plan = build_run_prompt_plan(
+            &history,
+            "demo",
+            None,
+            "tinyllama",
+            None,
+            &options,
+            &cmd,
+            &budget,
+        )
+        .unwrap();
 
         assert_eq!(plan.dropped_history_messages, 2);
         assert_eq!(plan.dropped_history_turns, 1);
@@ -1532,8 +1629,18 @@ mod tests {
             ("user".to_string(), medium.clone()),
             ("assistant".to_string(), medium),
         ];
-        let plan = build_run_prompt_plan(&history, "demo", None, "tinyllama", None, &cmd, &budget)
-            .unwrap();
+        let options = default_template_options();
+        let plan = build_run_prompt_plan(
+            &history,
+            "demo",
+            None,
+            "tinyllama",
+            None,
+            &options,
+            &cmd,
+            &budget,
+        )
+        .unwrap();
 
         assert_eq!(plan.dropped_history_messages, 2);
         assert_eq!(plan.dropped_history_turns, 1);

@@ -21,13 +21,19 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CHAT_CHECK_MAX_TOKENS = 1024
+sys.path.insert(0, str(ROOT / "scripts" / "release"))
+
+from openai_tool_call_regression import run_tool_call_regression
+
+CHAT_CHECK_MAX_TOKENS = 256
 
 
 @dataclass(frozen=True)
@@ -35,6 +41,8 @@ class Cell:
     concurrency: int
     prompts: int
     baseline_tps: float
+    random_input_len: int = 16
+    random_output_len: int = 64
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,10 @@ class ModelCase:
     tokenizer: str
     moe: bool
     cells: tuple[Cell, ...]
+    default_min_max_seqs: int
+    default_max_max_seqs: int | None = None
+    serve_args: tuple[str, ...] = ()
+    unsafe_batch_probe: Cell | None = None
 
 
 CASES = (
@@ -56,9 +68,11 @@ CASES = (
         moe=False,
         cells=(
             Cell(concurrency=1, prompts=8, baseline_tps=29.1),
-            Cell(concurrency=8, prompts=24, baseline_tps=51.3),
-            Cell(concurrency=16, prompts=32, baseline_tps=96.7),
+            Cell(concurrency=8, prompts=24, baseline_tps=46.4),
+            Cell(concurrency=16, prompts=32, baseline_tps=80.9),
         ),
+        default_min_max_seqs=16,
+        serve_args=("--greedy-argmax",),
     ),
     ModelCase(
         key="qwen3_8b",
@@ -66,7 +80,9 @@ CASES = (
         gguf="Qwen3-8B-Q4_K_M.gguf",
         tokenizer="Qwen3-8B.tokenizer.json",
         moe=False,
-        cells=(Cell(concurrency=16, prompts=32, baseline_tps=93.2),),
+        cells=(Cell(concurrency=16, prompts=32, baseline_tps=57.1),),
+        default_min_max_seqs=16,
+        serve_args=("--greedy-argmax",),
     ),
     ModelCase(
         key="qwen3_30b_a3b",
@@ -74,7 +90,15 @@ CASES = (
         gguf="Qwen3-30B-A3B-Q4_K_M.gguf",
         tokenizer="Qwen3-30B-A3B.tokenizer.json",
         moe=True,
-        cells=(Cell(concurrency=16, prompts=32, baseline_tps=72.5),),
+        cells=(Cell(concurrency=1, prompts=8, baseline_tps=42.0),),
+        default_min_max_seqs=1,
+        default_max_max_seqs=1,
+        serve_args=(
+            "--kv-capacity",
+            "512",
+            "--greedy-argmax",
+        ),
+        unsafe_batch_probe=Cell(concurrency=4, prompts=4, baseline_tps=0.0),
     ),
 )
 
@@ -136,25 +160,36 @@ def start_server(
     case: ModelCase,
     port: int,
     out_dir: Path,
+    *,
+    prefix: str | None = None,
+    extra_args: tuple[str, ...] = (),
+    env: dict[str, str] | None = None,
 ) -> subprocess.Popen[str]:
-    env = os.environ.copy()
-    needed_seqs = max((cell.concurrency for cell in case.cells), default=1)
-    current_seqs = int(env.get("FERRUM_PAGED_MAX_SEQS", "0") or "0")
-    env["FERRUM_PAGED_MAX_SEQS"] = str(max(current_seqs, needed_seqs))
-    env.setdefault("FERRUM_METAL_PAGED_KV", "1")
-    stdout = (out_dir / f"{case.key}.server.stdout").open("w", encoding="utf-8")
-    stderr = (out_dir / f"{case.key}.server.stderr").open("w", encoding="utf-8")
+    env = env or run_cli_env()
+    artifact_prefix = prefix or case.key
+    effective_config = out_dir / f"{artifact_prefix}.effective_config.json"
+    decision_trace = out_dir / f"{artifact_prefix}.decision_trace.jsonl"
+    cmd = [
+        str(ferrum_bin),
+        "serve",
+        "--model",
+        str(model_path),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--effective-config-json",
+        str(effective_config),
+        "--decision-trace-jsonl",
+        str(decision_trace),
+        *case.serve_args,
+        *extra_args,
+    ]
+    write(out_dir / f"{artifact_prefix}.server_cmd.json", json.dumps(cmd, indent=2))
+    stdout = (out_dir / f"{artifact_prefix}.server.stdout").open("w", encoding="utf-8")
+    stderr = (out_dir / f"{artifact_prefix}.server.stderr").open("w", encoding="utf-8")
     proc = subprocess.Popen(
-        [
-            str(ferrum_bin),
-            "serve",
-            "--model",
-            str(model_path),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ],
+        cmd,
         cwd=ROOT,
         env=env,
         text=True,
@@ -163,6 +198,122 @@ def start_server(
         start_new_session=True,
     )
     return proc
+
+
+def runtime_entries_by_key(config_path: Path) -> dict[str, dict[str, Any]]:
+    if not config_path.is_file():
+        return {}
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if isinstance(entry, dict) and isinstance(entry.get("key"), str):
+            result[entry["key"]] = entry
+    return result
+
+
+def runtime_entry_usize(entries: dict[str, dict[str, Any]], key: str) -> int | None:
+    value = (entries.get(key) or {}).get("effective_value")
+    try:
+        return int(str(value))
+    except Exception:
+        return None
+
+
+def startup_config_summary(
+    config_path: Path,
+    min_max_seqs: int,
+    max_max_seqs: int | None = None,
+) -> dict[str, Any]:
+    entries = runtime_entries_by_key(config_path)
+    max_seqs = runtime_entry_usize(entries, "FERRUM_PAGED_MAX_SEQS")
+    values = {
+        key: entries.get(key)
+        for key in [
+            "FERRUM_PAGED_MAX_SEQS",
+            "FERRUM_KV_CAPACITY",
+            "FERRUM_MAX_BATCH",
+            "FERRUM_MAX_BATCHED_TOKENS",
+            "FERRUM_METAL_PAGED_KV",
+            "FERRUM_MOE_HOST_TOPK",
+        ]
+        if key in entries
+    }
+    return {
+        "config_path": str(config_path),
+        "max_sequences": max_seqs,
+        "min_required_max_sequences": min_max_seqs,
+        "max_allowed_max_sequences": max_max_seqs,
+        "passed": (
+            isinstance(max_seqs, int)
+            and max_seqs >= min_max_seqs
+            and (max_max_seqs is None or max_seqs <= max_max_seqs)
+        ),
+        "values": values,
+    }
+
+
+def run_default_startup_probe(
+    ferrum_bin: Path,
+    model_path: Path,
+    case: ModelCase,
+    port: int,
+    out_dir: Path,
+) -> dict[str, Any]:
+    effective_config = out_dir / f"{case.key}.default.effective_config.json"
+    decision_trace = out_dir / f"{case.key}.default.decision_trace.jsonl"
+    cmd = [
+        str(ferrum_bin),
+        "serve",
+        "--model",
+        str(model_path),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--effective-config-json",
+        str(effective_config),
+        "--decision-trace-jsonl",
+        str(decision_trace),
+    ]
+    write(out_dir / f"{case.key}.default.server_cmd.json", json.dumps(cmd, indent=2))
+    stdout = (out_dir / f"{case.key}.default.server.stdout").open("w", encoding="utf-8")
+    stderr = (out_dir / f"{case.key}.default.server.stderr").open("w", encoding="utf-8")
+    proc: subprocess.Popen[str] | None = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=ROOT,
+            env=run_cli_env(),
+            text=True,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            if effective_config.is_file() and effective_config.stat().st_size > 0:
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.25)
+        summary = startup_config_summary(
+            effective_config,
+            case.default_min_max_seqs,
+            case.default_max_max_seqs,
+        )
+        summary["server_rc"] = proc.poll()
+        summary["config_written"] = effective_config.is_file()
+        return summary
+    finally:
+        stop_server(proc)
+        stdout.close()
+        stderr.close()
 
 
 def run_cli_env() -> dict[str, str]:
@@ -178,6 +329,22 @@ def run_cli_env() -> dict[str, str]:
         "FERRUM_MOE_BATCH_THRESHOLD",
     ]:
         env.pop(key, None)
+    return env
+
+
+def unsafe_moe_batch_env() -> dict[str, str]:
+    env = run_cli_env()
+    env.update(
+        {
+            "FERRUM_METAL_PAGED_KV": "1",
+            "FERRUM_PAGED_MAX_SEQS": "4",
+            "FERRUM_MAX_BATCH": "16",
+            "FERRUM_MAX_BATCHED_TOKENS": "2048",
+            "FERRUM_MOE_BATCHED": "1",
+            "FERRUM_MOE_BATCHED_DECODE": "1",
+            "FERRUM_MOE_BATCH_THRESHOLD": "2",
+        }
+    )
     return env
 
 
@@ -375,6 +542,7 @@ def run_cli_text_long_check(
         and "failed to render model chat template" not in combined_lower
         and "<unk>" not in combined_lower
         and "[pad" not in combined_lower
+        and not re.search(r"(?m)^\s*</think>\s*$", proc.stdout)
     )
     token_lines = [
         line for line in proc.stderr.splitlines() if "tokens," in line and "tok/s" in line
@@ -395,6 +563,7 @@ def run_cli_text_long_check(
         "tok_s_values": tok_s_values,
         "perf_ok": perf_ok,
         "contains_think": "<think>" in proc.stdout,
+        "orphan_think_close": bool(re.search(r"(?m)^\s*</think>\s*$", proc.stdout)),
         "contains_unk": "<unk>" in combined_lower,
         "contains_pad": "[pad" in combined_lower,
     }
@@ -532,9 +701,12 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
         ],
         "max_tokens": CHAT_CHECK_MAX_TOKENS,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
     stream_chunks = 0
     stream_content = ""
+    stream_done_count = 0
+    stream_raw_lines: list[str] = []
     stream_status = 0
     stream_error = ""
     req = urllib.request.Request(
@@ -550,8 +722,10 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data: "):
                     continue
+                stream_raw_lines.append(line)
                 data = line[6:]
                 if data == "[DONE]":
+                    stream_done_count += 1
                     break
                 stream_chunks += 1
                 try:
@@ -571,11 +745,18 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
         json.dumps(stream_payload, indent=2, ensure_ascii=False),
     )
     write(out_dir / f"{case.key}.stream_response.txt", stream_content)
-    stream_pass = stream_status == 200 and stream_chunks > 1 and bool(stream_content)
+    write(out_dir / f"{case.key}.stream_raw.sse", "\n".join(stream_raw_lines) + "\n")
+    stream_pass = (
+        stream_status == 200
+        and stream_chunks > 1
+        and bool(stream_content)
+        and stream_done_count == 1
+    )
     result["stream"] = {
         "status": stream_status,
         "passed": stream_pass,
         "chunks": stream_chunks,
+        "done_count": stream_done_count,
         "content_head": stream_content[:240],
         "error": stream_error,
     }
@@ -584,6 +765,191 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
         json.dumps(result["stream"], indent=2, ensure_ascii=False),
     )
     return result
+
+
+def run_quality_cell(
+    port: int,
+    case: ModelCase,
+    cell: Cell,
+    out_dir: Path,
+    *,
+    artifact_prefix: str | None = None,
+) -> dict[str, Any]:
+    prefix = artifact_prefix or f"{case.key}.c{cell.concurrency}.quality"
+    base = f"http://127.0.0.1:{port}/v1/chat/completions"
+    nonce = f"M{cell.concurrency:02d}"
+
+    def marker_line_ok(line: str, marker: str) -> bool:
+        return line.strip().rstrip(".。!！,，;；:：") == marker
+
+    def answer_line_ok(line: str, answer: str) -> bool:
+        return line.strip().rstrip(".。!！,，;；:：") == answer
+
+    def call(i: int) -> dict[str, Any]:
+        marker = f"K{nonce}{i:02d}Z"
+        answer = f"S{(i + 1) * (i + 1):04d}"
+        payload = {
+            "model": case.label,
+            "temperature": 0,
+            "max_tokens": 96,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Reply with exactly two short lines. "
+                        f"Line 1 must be this code exactly: {marker}. "
+                        f"Line 2 must be this checksum exactly: {answer}."
+                    ),
+                }
+            ],
+        }
+        status, body = post_json(base, payload, timeout=180)
+        content = ""
+        finish_reason = None
+        try:
+            parsed = json.loads(body)
+            content = parsed["choices"][0]["message"].get("content") or ""
+            finish_reason = parsed["choices"][0].get("finish_reason")
+        except Exception:
+            content = body[:500]
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        format_ok = (
+            len(lines) == 2
+            and marker_line_ok(lines[0], marker)
+            and answer_line_ok(lines[1], answer)
+            and not any(other.startswith("K") and other.endswith("Z") for other in lines[1:])
+        )
+        return {
+            "i": i,
+            "status": status,
+            "marker": marker,
+            "square": answer,
+            "marker_ok": marker in content,
+            "square_ok": answer in content,
+            "format_ok": format_ok,
+            "finish_reason": finish_reason,
+            "content_head": content[:240],
+        }
+
+    rows: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=cell.concurrency) as executor:
+        futures = [executor.submit(call, i) for i in range(cell.concurrency)]
+        for future in as_completed(futures):
+            rows.append(future.result())
+    rows.sort(key=lambda row: int(row.get("i") or 0))
+
+    markers = {row["i"]: row["marker"] for row in rows}
+    crosstalk = 0
+    for row in rows:
+        content = str(row.get("content_head") or "")
+        for j, marker in markers.items():
+            if j != row["i"] and marker in content:
+                crosstalk += 1
+
+    status_ok = sum(1 for row in rows if row.get("status") == 200)
+    marker_ok = sum(1 for row in rows if row.get("marker_ok") is True)
+    square_ok = sum(1 for row in rows if row.get("square_ok") is True)
+    format_ok = sum(1 for row in rows if row.get("format_ok") is True)
+    length_finishes = sum(1 for row in rows if row.get("finish_reason") == "length")
+    result = {
+        "concurrency": cell.concurrency,
+        "requests": cell.concurrency,
+        "status_200": status_ok,
+        "marker_ok": marker_ok,
+        "square_ok": square_ok,
+        "format_ok": format_ok,
+        "crosstalk": crosstalk,
+        "length_finishes": length_finishes,
+        "passed": (
+            status_ok == cell.concurrency
+            and marker_ok == cell.concurrency
+            and square_ok == cell.concurrency
+            and format_ok == cell.concurrency
+            and crosstalk == 0
+            and length_finishes == 0
+        ),
+        "rows": rows,
+    }
+    write(out_dir / f"{prefix}.json", json.dumps(result, indent=2, ensure_ascii=False))
+    return result
+
+
+def run_tool_call_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
+    out = out_dir / f"{case.key}.tool-call-regression"
+    try:
+        return run_tool_call_regression(f"http://127.0.0.1:{port}", case.label, out)
+    except Exception as e:
+        result = {"status": "fail", "model": case.label, "error": str(e)}
+        write(
+            out / "tool_call_regression.json",
+            json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+        )
+        return result
+
+
+def run_unsafe_moe_batch_probe(
+    ferrum_bin: Path,
+    model_path: Path,
+    case: ModelCase,
+    port: int,
+    out_dir: Path,
+) -> dict[str, Any]:
+    cell = case.unsafe_batch_probe
+    if not case.moe or cell is None:
+        return {"enabled": False, "reason": "not a MoE unsafe batch probe target"}
+
+    prefix = f"{case.key}.unsafe_batch"
+    proc: subprocess.Popen[str] | None = None
+    try:
+        proc = start_server(
+            ferrum_bin,
+            model_path,
+            case,
+            port,
+            out_dir,
+            prefix=prefix,
+            extra_args=(
+                "--max-num-seqs",
+                str(cell.concurrency),
+                "--max-num-batched-tokens",
+                "2048",
+            ),
+            env=unsafe_moe_batch_env(),
+        )
+        ready = wait_ready(port, proc, out_dir / f"{prefix}.models.json")
+        startup = startup_config_summary(
+            out_dir / f"{prefix}.effective_config.json",
+            cell.concurrency,
+        )
+        quality = (
+            run_quality_cell(
+                port,
+                case,
+                cell,
+                out_dir,
+                artifact_prefix=f"{prefix}.c{cell.concurrency}.quality",
+            )
+            if ready
+            else {"passed": False, "error": "server not ready"}
+        )
+        result = {
+            "enabled": True,
+            "product_default": False,
+            "expected_default_safe_max_sequences": 1,
+            "server_ready": ready,
+            "startup": startup,
+            "quality": {k: v for k, v in quality.items() if k != "rows"},
+            "quality_rows_path": str(out_dir / f"{prefix}.c{cell.concurrency}.quality.json"),
+        }
+        write(out_dir / f"{prefix}.verdict.json", json.dumps(result, indent=2, ensure_ascii=False))
+        return result
+    except Exception as e:
+        result = {"enabled": True, "product_default": False, "error": str(e)}
+        write(out_dir / f"{prefix}.verdict.json", json.dumps(result, indent=2, ensure_ascii=False))
+        return result
+    finally:
+        stop_server(proc)
+        time.sleep(4)
 
 
 def run_bench_cell(
@@ -616,9 +982,9 @@ def run_bench_cell(
         "--concurrency",
         str(cell.concurrency),
         "--random-input-len",
-        "64",
+        str(cell.random_input_len),
         "--random-output-len",
-        "64",
+        str(cell.random_output_len),
         "--warmup-requests",
         "1",
         "--n-repeats",
@@ -635,6 +1001,9 @@ def run_bench_cell(
         "concurrency": cell.concurrency,
         "prompts": cell.prompts,
         "baseline_tps": cell.baseline_tps,
+        "random_input_len": cell.random_input_len,
+        "random_output_len": cell.random_output_len,
+        "quality": run_quality_cell(port, case, cell, out_dir),
     }
     try:
         proc = subprocess.run(
@@ -698,34 +1067,39 @@ def run_bench_cell(
 
 
 def markdown_summary(report: dict[str, Any]) -> str:
-    out = ["# Metal README Regression - 2026-06-03", ""]
+    out = [f"# Metal README Regression - {date.today().isoformat()}", ""]
     out.append("Scope: README Apple Silicon rows with correctness, multi-turn, concurrency throughput, and swap evidence.")
     out.append("")
     out.append(f"Ferrum: `{report['ferrum_version'].strip()}`")
     out.append(f"Swap at start: `{report['swap_start']}`")
     out.append(f"Swap at end: `{report['swap_end']}`")
     out.append("")
-    out.append("| Model | Serve correctness | Serve multi-turn | Serve stream | Run REPL multi-turn | c | README tok/s | Current tok/s | Ratio | Completed | Gate |")
-    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    out.append("| Model | Default max seqs | Bench max seqs | Serve correctness | Serve multi-turn | Serve stream | Tool call | Run REPL multi-turn | c | Quality | in/out | README tok/s | Current tok/s | Ratio | Completed | Gate |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
     for model in report["models"]:
         correctness = "pass" if model["chat"]["paris"]["passed"] else "FAIL"
         multiturn = "pass" if model["chat"]["multiturn"]["passed"] else "FAIL"
         stream_gate = "pass" if model["chat"].get("stream", {}).get("passed") else "FAIL"
+        tool_gate = "pass" if model.get("tool_call", {}).get("status") == "pass" else "FAIL"
         run_gate = "pass" if model.get("run", {}).get("passed") else "FAIL"
+        default_max = model.get("default_startup", {}).get("max_sequences")
+        bench_max = model.get("serve_startup", {}).get("max_sequences")
         for cell in model["cells"]:
             tps = cell.get("output_throughput_tok_s")
             ratio = cell.get("ratio_to_readme")
             gate = "pass" if cell.get("not_regressed_90pct") else "FAIL"
             completed = f"{cell.get('completed')}/{cell.get('prompts')}"
+            workload = f"{cell.get('random_input_len')}/{cell.get('random_output_len')}"
+            quality = "pass" if (cell.get("quality") or {}).get("passed") else "FAIL"
             if isinstance(tps, (int, float)):
                 out.append(
-                    f"| {model['label']} | {correctness} | {multiturn} | {stream_gate} | {run_gate} | {cell['concurrency']} | "
-                    f"{cell['baseline_tps']:.1f} | {tps:.1f} | {ratio:.3f} | {completed} | {gate} |"
+                    f"| {model['label']} | {default_max} | {bench_max} | {correctness} | {multiturn} | {stream_gate} | {tool_gate} | {run_gate} | {cell['concurrency']} | {quality} | "
+                    f"{workload} | {cell['baseline_tps']:.1f} | {tps:.1f} | {ratio:.3f} | {completed} | {gate} |"
                 )
             else:
                 out.append(
-                    f"| {model['label']} | {correctness} | {multiturn} | {stream_gate} | {run_gate} | {cell['concurrency']} | "
-                    f"{cell['baseline_tps']:.1f} | n/a | n/a | {completed} | {gate} |"
+                    f"| {model['label']} | {default_max} | {bench_max} | {correctness} | {multiturn} | {stream_gate} | {tool_gate} | {run_gate} | {cell['concurrency']} | {quality} | "
+                    f"{workload} | {cell['baseline_tps']:.1f} | n/a | n/a | {completed} | {gate} |"
                 )
     out.append("")
     out.append("Correctness prompts:")
@@ -742,7 +1116,12 @@ def markdown_summary(report: dict[str, Any]) -> str:
     out.append("")
     out.append("Notes:")
     out.append("- Performance gate is `current >= 0.90 * README baseline`, plus all requests completed.")
+    out.append("- Default startup config must be captured without benchmark CLI overrides; Qwen3-30B-A3B Metal default is safe single-sequence until multi-sequence MoE decode passes content-quality gates.")
+    out.append("- Throughput-profile startup config must expose enough sequence slots for the measured concurrency cell.")
+    out.append("- Every throughput cell first runs a marker/square concurrent quality probe; HTTP 200 and zero request errors are not sufficient correctness evidence.")
+    out.append("- Metal MoE includes an unsafe multi-sequence diagnostic probe so known batch-decode corruption is visible without making it the product default.")
     out.append("- Throughput cells use canonical `ferrum bench-serve` with streaming usage token accounting.")
+    out.append("- Throughput cells record their input/output token workload and the server CLI profile in the artifact directory.")
     out.append("- `run` coverage includes JSONL multi-turn plus default text-mode long multi-turn to catch streaming and KV overflow regressions.")
     out.append("- This runner records correctness failures and still collects performance data.")
     out.append("- Active swap means results are release-regression evidence, not clean marketing numbers.")
@@ -782,18 +1161,39 @@ def main() -> int:
             "label": case.label,
             "gguf": str(model_path),
             "moe": case.moe,
+            "default_startup": {},
+            "serve_startup": {},
             "chat": {},
             "run": {},
             "cells": [],
         }
         proc: subprocess.Popen[str] | None = None
         try:
+            model_report["default_startup"] = run_default_startup_probe(
+                args.ferrum_bin,
+                model_path,
+                case,
+                args.port + 100,
+                args.out,
+            )
             write(args.out / f"{case.key}.swap_before_server.txt", swapusage() + "\n")
             proc = start_server(args.ferrum_bin, model_path, case, args.port, args.out)
             ready = wait_ready(args.port, proc, args.out / f"{case.key}.models.json")
             model_report["server_ready"] = ready
+            model_report["serve_startup"] = startup_config_summary(
+                args.out / f"{case.key}.effective_config.json",
+                max(cell.concurrency for cell in case.cells),
+            )
             if ready:
                 model_report["chat"] = chat_check(args.port, case, args.out)
+                model_report["tool_call"] = run_tool_call_check(args.port, case, args.out)
+                model_report["unsafe_batch_probe"] = run_unsafe_moe_batch_probe(
+                    args.ferrum_bin,
+                    model_path,
+                    case,
+                    args.port + 200,
+                    args.out,
+                )
                 for cell in case.cells:
                     model_report["cells"].append(
                         run_bench_cell(

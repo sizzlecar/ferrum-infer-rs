@@ -1,7 +1,7 @@
 {
   "name": "g0-cuda4090-full",
   "out_root": "/workspace/g0-cuda4090-full",
-  "model_dir": "/workspace/hf-cache/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+  "model_dir": "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
   "hf_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
   "bin": "./target/release/ferrum",
   "build": false,
@@ -14,15 +14,18 @@
   "warmup_requests": 10,
   "baseline_case": "baseline",
   "gates": {
+    "max_tokens": 128,
     "paris": true,
     "multi_turn": true,
-    "multi_turn_3round": true
+    "multi_turn_3round": true,
+    "tool_call": true,
+    "concurrency_quality": true
   },
   "validation": {
     "change_type": "default_path",
     "touched_areas": ["model_forward", "runtime_defaults", "openai_server_api"],
     "performance_regression_required": true,
-    "required_correctness_gates": ["paris", "multi_turn_paris", "multi_turn_3round_paris", "bench_completion"],
+    "required_correctness_gates": ["paris", "multi_turn_paris", "multi_turn_3round_paris", "tool_call_regression", "concurrency_quality", "bench_completion"],
     "required_concurrency_cells": [1, 4, 16, 32]
   },
   "performance_gates": {
@@ -31,7 +34,8 @@
     "c32_throughput_min_delta_pct": -3.0,
     "ttft_max_regression_pct": 10.0,
     "tpot_max_regression_pct": 5.0,
-    "itl_p95_max_regression_pct": 10.0
+    "itl_p95_max_regression_pct": 10.0,
+    "same_env_order_sensitive_metrics": ["itl_p95"]
   },
   "base_env": {
     "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}"

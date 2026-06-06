@@ -7,6 +7,7 @@
 - Validate both product entrypoints when a change can affect user-visible behavior: `ferrum run` and `ferrum serve`.
 - Do not validate product behavior with hidden environment-variable combinations that users will not know to set. Required product behavior must be wired through typed defaults, CLI/config options, or documented presets.
 - Correctness gates must pass before performance measurements are treated as evidence.
+- Official accelerator release evidence must cover both correctness and performance on each shipped accelerator backend, and must include at least one Llama 8B-class dense model in addition to the Qwen3-30B-A3B MoE/GPTQ model.
 - Paid GPU work requires a stated lane, expected runtime/cost, stop condition, correctness gate, and performance command before starting.
 - Prefer small, surgical changes. Do not combine release gate changes, kernel/model changes, and large repository cleanup in the same patch unless the goal explicitly asks for that.
 
@@ -36,12 +37,13 @@
 These scripts are the current source of truth for G0 release validation.
 
 - `scripts/release/g0_source_gate.sh`
-  - Lanes: `unit`, `metal`, `cuda-smoke`, `cuda-full`, `all-source`.
+  - Lanes: `unit`, `metal`, `cuda-smoke`, `cuda-full`, `cuda-llama-dense`, `all-source`.
   - Required PASS lines:
     - `G0 SOURCE unit PASS: <out_root>`
     - `G0 SOURCE metal PASS: <out_root>`
     - `G0 SOURCE g0_cuda4090_smoke PASS: <out_root>`
     - `G0 SOURCE g0_cuda4090_full PASS: <out_root>`
+    - `G0 SOURCE g0_cuda4090_llama_dense PASS: <out_root>`
     - `G0 SOURCE all-source PASS: <out_root>`
 - `scripts/release/validate_metal_readme_regression.py`
   - Validates artifacts from `scripts/metal_readme_regression.py`.
@@ -74,6 +76,7 @@ scripts/release/g0_source_gate.sh unit <out_root>
 scripts/release/g0_source_gate.sh metal <out_root>
 scripts/release/g0_source_gate.sh cuda-smoke <out_root>
 scripts/release/g0_source_gate.sh cuda-full <out_root>
+scripts/release/g0_source_gate.sh cuda-llama-dense <out_root>
 scripts/release/g0_source_gate.sh all-source <out_root>
 ```
 
@@ -96,6 +99,10 @@ Lane rules:
   - Uses `scripts/release/configs/g0_cuda4090_full.json`.
   - Covers c=1/4/16/32 with repeats and default-path performance regression checks.
   - Use this before official CUDA release-ready claims or when default-path performance/runtime behavior changes.
+- `cuda-llama-dense`
+  - Uses `scripts/release/configs/g0_cuda4090_llama_dense.json`.
+  - Covers a Llama 8B-class dense CUDA model with `ferrum run`, `ferrum serve`, streaming usage, and `bench-serve --fail-on-error --require-ci`.
+  - Use this as required supplemental official CUDA release evidence; it does not replace Qwen3 MoE/GPTQ CUDA full.
 - `all-source`
   - Runs `unit`.
   - Runs `metal` only on macOS.
@@ -110,14 +117,18 @@ Regression selection rules:
 
 ## CUDA G0 Policy
 
-- CUDA G0 gates target exactly one RTX 4090 and `Qwen/Qwen3-30B-A3B-GPTQ-Int4`.
+- CUDA G0 gates target exactly one RTX 4090.
+- Official CUDA release validation must include at least two same-hardware architecture lanes:
+  - `Qwen/Qwen3-30B-A3B-GPTQ-Int4` for MoE/GPTQ behavior.
+  - A Llama 8B-class dense model for dense transformer behavior.
+- If the named G0 CUDA configs do not cover the full official release model matrix, add a supplemental release artifact with its own PASS line before making any CUDA release-ready claim.
 - The smoke config is `scripts/release/configs/g0_cuda4090_smoke.json`.
   - It covers c=1 and c=32.
   - It is diagnostic/smoke evidence, not a full release performance claim.
 - The full config is `scripts/release/configs/g0_cuda4090_full.json`.
   - It covers c=1/4/16/32.
   - It is the required default-path CUDA performance gate before official CUDA release-ready claims.
-- Do not broaden paid CUDA G0 to multiple GPUs or multiple CUDA models without explicit user approval.
+- Do not broaden paid CUDA G0 beyond one RTX 4090 or beyond the official Qwen3 MoE/GPTQ plus Llama dense matrix without explicit user approval.
 - Do not rerun expensive full sweeps repeatedly after a failure. Collect the failing artifact, stop extra processes, inspect the failure, and propose a targeted fix/gate.
 
 ## Metal G0 Policy
@@ -126,6 +137,8 @@ Regression selection rules:
   1. `scripts/metal_readme_regression.py`
   2. `scripts/release/validate_metal_readme_regression.py`
 - The Metal validator is the hard gate. The runner alone is not enough release evidence.
+- Metal source release validation is both a correctness gate and a README performance gate. Do not call Metal release-ready unless the validator accepts the performance rows for the advertised models.
+- Official Metal release validation must include at least one Llama 8B-class dense model and the Qwen3-30B-A3B MoE model when both are shipped or advertised.
 - Metal evidence must include `ferrum run` multi-turn correctness, `serve` Paris/multi-turn/stream correctness, throughput rows, completed/failed request counts, and log scans.
 - Metal gate failures must point to the exact model/cell/artifact path before any fix is claimed complete.
 
@@ -238,15 +251,6 @@ Rules:
 - Product goal completion claims must include the PASS line defined by that goal document and the artifact directory produced by its gate.
 - Product feature gates do not imply tagging, publishing, Cargo release, Homebrew release, or GitHub release unless the user explicitly asks for those release steps.
 
-Current product goal families:
-
-- G1: vLLM migration compatibility.
-- G2: agent / structured output / tool calling reliability.
-- G3: prefix / session cache productization.
-- G4: LoRA startup serving.
-
-These names are routing labels only. Their concrete requirements must live outside `AGENTS.md`.
-
 ## GPU Cost Policy
 
 - Before using a paid GPU, state:
@@ -269,6 +273,7 @@ These names are routing labels only. Their concrete requirements must live outsi
 - If code changes after CUDA validation, rerun a CUDA quick regression before calling the release ready.
 - Do not publish or tag after a failed local product-path smoke. Fix the failed path, rerun Metal locally, rerun CUDA remotely when needed, then record evidence.
 - Do not hard-code model-family prompt hacks such as forced empty Qwen3 `<think>` blocks. Prefer model-provided chat templates from GGUF/HF metadata, and keep template rendering shared between `run` and `serve`.
+- Do not infer release readiness for one model architecture from another. Dense Llama-style models and Qwen3 MoE/GPTQ models exercise different scheduler, KV, attention, quantization, tokenizer, and chat-template paths.
 - Do not hide invalid model output by filtering decoded text. If `<unk>`, `[PAD...]`, tokenizer-reserved IDs, invalid UTF-8, or mojibake appear, trace token IDs and fix sampling/logit masking or KV/logits state before accepting the regression.
 - Release blocker scans should include panic, KV cache overflow, `<unk>`, `[PAD]`, invalid UTF-8/mojibake, missing or duplicate `[DONE]`, stream bulk-flush behavior, strict-schema failures, required-tool failures, and silent fallback from a requested feature to base behavior.
 

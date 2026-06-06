@@ -176,6 +176,10 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub kv_max_blocks: Option<usize>,
 
+    /// Per-sequence KV token capacity, equivalent to `FERRUM_KV_CAPACITY`.
+    #[serde(default)]
+    pub kv_capacity: Option<usize>,
+
     /// Maximum paged-KV sequence count, equivalent to
     /// `FERRUM_PAGED_MAX_SEQS`.
     #[serde(default)]
@@ -252,6 +256,7 @@ impl RuntimeCliConfig {
         let mut entries = Vec::new();
         push_string_entry(&mut entries, "FERRUM_KV_DTYPE", self.kv_dtype.as_deref());
         push_usize_entry(&mut entries, "FERRUM_KV_MAX_BLOCKS", self.kv_max_blocks);
+        push_usize_entry(&mut entries, "FERRUM_KV_CAPACITY", self.kv_capacity);
         push_usize_entry(&mut entries, "FERRUM_PAGED_MAX_SEQS", self.paged_max_seqs);
         push_usize_entry(
             &mut entries,
@@ -513,6 +518,7 @@ mod tests {
             preset: Some("m3_qwen3_30b_a3b_int4".to_string()),
             kv_dtype: Some("int8".to_string()),
             kv_max_blocks: Some(4096),
+            kv_capacity: Some(2048),
             paged_max_seqs: Some(64),
             max_batched_tokens: Some(2048),
             prefix_cache: Some(false),
@@ -531,7 +537,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 17);
+        assert_eq!(entries.len(), 18);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -547,6 +553,7 @@ mod tests {
             .affects
             .contains(&RuntimeConfigEffect::Correctness));
         assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
