@@ -757,6 +757,77 @@ def chat_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
         out_dir / f"{case.key}.stream_verdict.txt",
         json.dumps(result["stream"], indent=2, ensure_ascii=False),
     )
+    result["stateful_loop"] = stateful_loop_check(base, case, out_dir)
+    return result
+
+
+def repeated_prefix_run(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text.lower())
+    if len(compact) < 12:
+        return False
+    for width in range(1, min(16, len(compact) // 3) + 1):
+        prefix = compact[:width]
+        if prefix and compact.startswith(prefix * 3):
+            return True
+    return False
+
+
+def stateful_loop_check(base: str, case: ModelCase, out_dir: Path) -> dict[str, Any]:
+    prompts = [
+        ("paris", "What is the capital of France? Reply with just the city name.", "paris"),
+        ("tokyo", "What is the capital of Japan? Reply with just the city name.", "tokyo"),
+        ("math4", "What is 2+2? Reply with just the number.", "4"),
+        ("blue", "What color is a clear daytime sky? Reply with one word.", "blue"),
+        ("math25", "What is 5 times 5? Reply with just the number.", "25"),
+        ("rome", "What is the capital of Italy? Reply with just the city name.", "rome"),
+    ]
+    rows: list[dict[str, Any]] = []
+    for name, prompt, expected in prompts:
+        payload = {
+            "model": case.label,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 32,
+            "stream": False,
+        }
+        status, body = post_json(base, payload, timeout=120)
+        content = ""
+        finish_reason = None
+        try:
+            parsed = json.loads(body)
+            content = parsed["choices"][0]["message"].get("content") or ""
+            finish_reason = parsed["choices"][0].get("finish_reason")
+        except Exception:
+            content = body[:300]
+        lower = content.lower()
+        row = {
+            "name": name,
+            "status": status,
+            "expected": expected,
+            "expected_ok": expected in lower,
+            "finish_reason": finish_reason,
+            "length_finish": finish_reason == "length",
+            "repeated_prefix": repeated_prefix_run(content),
+            "content_head": content[:240],
+        }
+        row["passed"] = (
+            row["status"] == 200
+            and row["expected_ok"] is True
+            and row["length_finish"] is False
+            and row["repeated_prefix"] is False
+        )
+        rows.append(row)
+    result = {
+        "passed": all(bool(row.get("passed")) for row in rows),
+        "requests": len(rows),
+        "failed": sum(1 for row in rows if not row.get("passed")),
+        "length_finishes": sum(1 for row in rows if row.get("length_finish") is True),
+        "repeated_prefixes": sum(1 for row in rows if row.get("repeated_prefix") is True),
+        "rows": rows,
+    }
+    write(
+        out_dir / f"{case.key}.stateful_loop_verdict.txt",
+        json.dumps(result, indent=2, ensure_ascii=False),
+    )
     return result
 
 
@@ -1067,12 +1138,13 @@ def markdown_summary(report: dict[str, Any]) -> str:
     out.append(f"Swap at start: `{report['swap_start']}`")
     out.append(f"Swap at end: `{report['swap_end']}`")
     out.append("")
-    out.append("| Model | Default max seqs | Bench max seqs | Serve correctness | Serve multi-turn | Serve stream | Tool call | Run REPL multi-turn | c | Quality | in/out | README tok/s | Current tok/s | Ratio | Completed | Gate |")
-    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    out.append("| Model | Default max seqs | Bench max seqs | Serve correctness | Serve multi-turn | Serve stream | Stateful loop | Tool call | Run REPL multi-turn | c | Quality | in/out | README tok/s | Current tok/s | Ratio | Completed | Gate |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
     for model in report["models"]:
         correctness = "pass" if model["chat"]["paris"]["passed"] else "FAIL"
         multiturn = "pass" if model["chat"]["multiturn"]["passed"] else "FAIL"
         stream_gate = "pass" if model["chat"].get("stream", {}).get("passed") else "FAIL"
+        stateful_gate = "pass" if model["chat"].get("stateful_loop", {}).get("passed") else "FAIL"
         tool_gate = "pass" if model.get("tool_call", {}).get("status") == "pass" else "FAIL"
         run_gate = "pass" if model.get("run", {}).get("passed") else "FAIL"
         default_max = model.get("default_startup", {}).get("max_sequences")
@@ -1086,12 +1158,12 @@ def markdown_summary(report: dict[str, Any]) -> str:
             quality = "pass" if (cell.get("quality") or {}).get("passed") else "FAIL"
             if isinstance(tps, (int, float)):
                 out.append(
-                    f"| {model['label']} | {default_max} | {bench_max} | {correctness} | {multiturn} | {stream_gate} | {tool_gate} | {run_gate} | {cell['concurrency']} | {quality} | "
+                    f"| {model['label']} | {default_max} | {bench_max} | {correctness} | {multiturn} | {stream_gate} | {stateful_gate} | {tool_gate} | {run_gate} | {cell['concurrency']} | {quality} | "
                     f"{workload} | {cell['baseline_tps']:.1f} | {tps:.1f} | {ratio:.3f} | {completed} | {gate} |"
                 )
             else:
                 out.append(
-                    f"| {model['label']} | {default_max} | {bench_max} | {correctness} | {multiturn} | {stream_gate} | {tool_gate} | {run_gate} | {cell['concurrency']} | {quality} | "
+                    f"| {model['label']} | {default_max} | {bench_max} | {correctness} | {multiturn} | {stream_gate} | {stateful_gate} | {tool_gate} | {run_gate} | {cell['concurrency']} | {quality} | "
                     f"{workload} | {cell['baseline_tps']:.1f} | n/a | n/a | {completed} | {gate} |"
                 )
     out.append("")
@@ -1111,6 +1183,7 @@ def markdown_summary(report: dict[str, Any]) -> str:
     out.append("- Performance gate is `current >= 0.90 * README baseline`, plus all requests completed.")
     out.append("- Default startup config must be captured without benchmark CLI overrides and must expose enough sequence slots for the release cell.")
     out.append("- Throughput-profile startup config must expose enough sequence slots for the measured concurrency cell.")
+    out.append("- The stateful loop probe sends multiple short prompts through one server process and rejects repeated-prefix/length regressions.")
     out.append("- Every throughput cell first runs a marker/square concurrent quality probe; HTTP 200 and zero request errors are not sufficient correctness evidence.")
     out.append("- Metal MoE release evidence requires a multi-sequence content-quality and throughput cell.")
     out.append("- Throughput cells use canonical `ferrum bench-serve` with streaming usage token accounting.")

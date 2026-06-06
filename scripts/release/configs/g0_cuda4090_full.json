@@ -35,7 +35,7 @@
     "ttft_max_regression_pct": 10.0,
     "tpot_max_regression_pct": 5.0,
     "itl_p95_max_regression_pct": 10.0,
-    "same_env_order_sensitive_metrics": ["itl_p95"]
+    "same_env_order_sensitive_metrics": ["ttft_p50", "itl_p95"]
   },
   "base_env": {
     "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}"
