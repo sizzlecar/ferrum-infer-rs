@@ -21,7 +21,7 @@ scripts/release/g0_source_gate.sh cuda-llama-dense /workspace/g0/<version>/sourc
 ```
 
 - `unit`: runs `cargo test --workspace --all-targets`, release-script Python compile checks, shell syntax checks, and `scripts/release/selftest_g0_validators.py`.
-- `metal`: builds Metal, runs `scripts/metal_readme_regression.py`, then validates the artifact with `scripts/release/validate_metal_readme_regression.py`. The artifact must include default `serve` startup config evidence, benchmark-profile startup config evidence, and concurrent marker/square content-quality probes before throughput rows are accepted. Qwen3-30B-A3B Metal GGUF is correctness-safe single-sequence evidence until multi-sequence MoE decode passes those probes.
+- `metal`: builds Metal, runs `scripts/metal_readme_regression.py`, then validates the artifact with `scripts/release/validate_metal_readme_regression.py`. The artifact must include default `serve` startup config evidence, benchmark-profile startup config evidence, and concurrent marker/square content-quality probes before throughput rows are accepted. Qwen3-30B-A3B Metal GGUF evidence must include a multi-sequence MoE content-quality and throughput cell.
 - `cuda-smoke`: builds CUDA features, runs `scripts/m3_ab_runner.py` through `scripts/release/configs/g0_cuda4090_smoke.json`, then runs `scripts/m3_validate_runner_artifact.py`.
 - `cuda-full`: same as smoke, but covers c=1/4/16/32 with repeats >= 3 using `scripts/release/configs/g0_cuda4090_full.json`.
 - `cuda-llama-dense`: supplemental CUDA release gate for a Llama 8B-class dense model. It runs `ferrum run`, `ferrum serve`, streaming usage checks, and `ferrum bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`.
