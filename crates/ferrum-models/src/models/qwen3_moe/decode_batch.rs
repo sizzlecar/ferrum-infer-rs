@@ -15,6 +15,14 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
     /// add to residual explicitly. Each layer's leading rms_norm runs
     /// at m=M, which is one fused dispatch on M rows — cheap.
     pub fn decode_batch_internal(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        self.decode_batch_internal_with_full_logits(batch, false)
+    }
+
+    pub fn decode_batch_internal_with_full_logits(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
         let m = batch.len();
         if m == 0 {
             return Vec::new();
@@ -227,7 +235,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         // The engine has a complementary fast path that interprets a
         // size-1 Vec<f32> as `TokenId::new(logits[0] as u32)`, skipping
         // sample_with_processors entirely.
-        let greedy = self.runtime_env.greedy_argmax;
+        let greedy = self.runtime_env.greedy_argmax && !force_full_logits;
         // One-shot log on first decode call so the bench / smoke tests
         // can confirm the env var actually wired through. Cheap atomic
         // bool fence; no per-call cost after first hit.

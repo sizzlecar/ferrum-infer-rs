@@ -135,6 +135,14 @@ pub trait DecoderOnlyLLM: Send + Sync {
             .collect()
     }
 
+    fn decode_batch_with_full_logits(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        _force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
+        self.decode_batch(batch)
+    }
+
     /// Multi-position decode-verify: run a single forward over `tokens`
     /// starting at the current KV end, append their K/V in place, and
     /// return `seq_len * vocab_size` logits (row-major, position-first).

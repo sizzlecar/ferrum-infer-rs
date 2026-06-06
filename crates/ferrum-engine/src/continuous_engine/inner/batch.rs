@@ -333,7 +333,7 @@ impl EngineInner {
                     kv_cache: kv,
                     pos_offset,
                     is_final_chunk: true,
-                    metadata: seq.original_request.metadata.clone(),
+                    metadata: seq.model_decode_metadata(),
                 });
                 decode_meta.push(rid.clone());
             }

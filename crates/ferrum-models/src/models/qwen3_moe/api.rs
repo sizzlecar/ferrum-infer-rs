@@ -80,11 +80,19 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
     // legacy loop; `FERRUM_MOE_BATCH_THRESHOLD` remains an escape hatch
     // for future hardware/backends.
     fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        self.decode_batch_with_full_logits(batch, false)
+    }
+
+    fn decode_batch_with_full_logits(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
         let m = batch.len();
         let opted_in = self.runtime_env.moe_batched_enabled;
         let threshold = self.runtime_env.moe_batch_threshold;
         if opted_in && m >= threshold {
-            self.decode_batch_internal(batch)
+            self.decode_batch_internal_with_full_logits(batch, force_full_logits)
         } else {
             batch
                 .iter()

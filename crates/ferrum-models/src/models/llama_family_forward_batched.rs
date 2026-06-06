@@ -1754,6 +1754,14 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
     ///
     /// Returns M logit vectors in the same order as `batch`.
     pub fn decode_batch_internal(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        self.decode_batch_internal_with_full_logits(batch, false)
+    }
+
+    pub fn decode_batch_internal_with_full_logits(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
         let m = batch.len();
         if m == 0 {
             return Vec::new();
@@ -2053,7 +2061,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Saves ~5 ms / iter at c=32 on Qwen3 vocab=152064. Engine has a
         // matching size-1-Vec fast path in run_batch_decode that picks
         // `logits[0] as u32` and skips sample_with_processors entirely.
-        let greedy = llama_batched_runtime_config().greedy_argmax;
+        let greedy = llama_batched_runtime_config().greedy_argmax && !force_full_logits;
         if greedy {
             let tokens = B::argmax_rows_f16(&mut ctx, &self.scratch.batch_logits, m, vocab)
                 .expect("argmax_rows_f16");
