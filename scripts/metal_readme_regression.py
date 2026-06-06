@@ -92,11 +92,6 @@ CASES = (
         moe=True,
         cells=(Cell(concurrency=16, prompts=32, baseline_tps=72.5),),
         default_min_max_seqs=16,
-        serve_args=(
-            "--kv-capacity",
-            "512",
-            "--greedy-argmax",
-        ),
     ),
 )
 
