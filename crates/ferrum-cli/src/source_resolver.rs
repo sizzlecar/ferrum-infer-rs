@@ -66,14 +66,12 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
 /// dirs) and materializes missing compatibility env vars for:
 ///
 ///   - `FERRUM_KV_CAPACITY`     — 8192 dense / 4096 MoE
-///   - `FERRUM_METAL_PAGED_KV`  — 0 dense GGUF / 1 dense safetensors / 1 MoE.
-///     Paged-KV is a hard requirement for the Qwen3-MoE GPU dispatch path
-///     (without it decode emits ~0.1 tok/s of garbage on Metal). Dense
-///     safetensors *also* requires paged on Metal: the contiguous-KV
-///     attention path produces token noise from the very first decode step
-///     for safetensors-loaded Qwen3. Dense GGUF (candle-transformers
-///     loader) works on the contig path and keeps `0` to avoid allocating
-///     a pool it doesn't need.
+///   - `FERRUM_METAL_PAGED_KV`  — 0 GGUF / 1 dense safetensors.
+///     The Metal Qwen3-MoE GGUF paged-KV decode path can repeat the first
+///     generated token until `max_tokens`; keep GGUF on the contiguous path
+///     until that kernel path is fixed. Dense safetensors still requires
+///     paged on Metal: the contiguous-KV attention path produces token noise
+///     from the very first decode step for safetensors-loaded Qwen3.
 ///   - `FERRUM_PAGED_MAX_SEQS=2` dense / `1` MoE, `FERRUM_MAX_BATCH=1` — single-user REPL.
 ///     Keeps the paged pool at ~1.7 GB for `cap=8192` dense; without this
 ///     cap the default `max_seqs=32` makes the pool ~30 GB on a 32 GB Mac.
@@ -131,9 +129,9 @@ fn chat_profile_runtime_entries_for_arch(
         if is_moe { "4096" } else { "8192" },
         source,
     );
-    // Dense GGUF: contig path works, no need to allocate the pool.
-    // Dense safetensors + MoE: paged required for correctness on Metal.
-    let need_paged = is_moe || !is_gguf;
+    // GGUF: contiguous path is the correctness baseline. Dense safetensors
+    // still needs paged-KV on Metal.
+    let need_paged = !is_gguf;
     push_missing_entry(
         &mut entries,
         current,
@@ -307,7 +305,10 @@ pub fn serve_profile_runtime_entries_for_arch(
     let mut entries = Vec::new();
     for (k, v) in [
         ("FERRUM_KV_CAPACITY", if is_moe { "2048" } else { "512" }),
-        ("FERRUM_METAL_PAGED_KV", "1"),
+        (
+            "FERRUM_METAL_PAGED_KV",
+            if is_moe && is_metal { "0" } else { "1" },
+        ),
         (
             "FERRUM_PAGED_MAX_SEQS",
             if is_moe {
@@ -669,6 +670,10 @@ mod tests {
             value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
             Some("16")
         );
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("0")
+        );
         assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
         assert_eq!(
@@ -690,6 +695,10 @@ mod tests {
         assert_eq!(
             value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
             Some("16")
+        );
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("1")
         );
         assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
@@ -830,7 +839,7 @@ mod tests {
         );
         assert_eq!(
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
-            Some("1")
+            Some("0")
         );
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
         assert_eq!(
