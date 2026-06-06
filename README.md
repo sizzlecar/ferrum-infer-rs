@@ -91,6 +91,95 @@ Release and Metal gates:
 
 Ferrum exposes OpenAI-shaped chat completions for local and private deployments. The endpoint contract, explicit rejections, tool-field status, usage accounting, and structured-output limits are documented in [`docs/openai-api-compatibility.md`](docs/openai-api-compatibility.md).
 
+### Tool Calling
+
+`/v1/chat/completions` accepts OpenAI-style function tools. Tool execution is
+caller-owned: Ferrum renders tool definitions into the model prompt and returns
+model-emitted calls as OpenAI-shaped `tool_calls` in non-streaming responses and
+streaming deltas.
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3:4b",
+    "messages": [{"role": "user", "content": "Call calc for 123+456"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "calc",
+        "description": "Evaluate an arithmetic expression.",
+        "parameters": {
+          "type": "object",
+          "properties": {"expression": {"type": "string"}},
+          "required": ["expression"]
+        }
+      }
+    }],
+    "tool_choice": "required",
+    "max_tokens": 128
+  }'
+```
+
+Supported tool choices include `auto`, `none`, `required`, and a specific
+function selector. Non-function tool types and undeclared forced tools are
+rejected with OpenAI-style 400 errors instead of being silently ignored.
+
+### Structured Output
+
+Ferrum supports OpenAI `response_format` for text, best-effort `json_object`,
+and strict `json_schema` validation for a conservative schema subset.
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3:4b",
+    "messages": [{"role": "user", "content": "Return the sum of 123+456."}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "Answer",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {"answer": {"type": "integer"}},
+          "required": ["answer"]
+        }
+      }
+    },
+    "max_tokens": 128
+  }'
+```
+
+Strict schemas are validated before non-streaming responses return. Strict
+schema streaming buffers generated content until validation passes, then emits
+valid content and one final `[DONE]`. Unsupported schema constructs fail fast
+with `param=response_format.json_schema`.
+
+### Prefix and Session Cache
+
+Prefix cache is an explicit serving option for repeated or shared-prefix
+workloads. Session cache is also opt-in and uses caller-provided session ids.
+
+```bash
+ferrum serve qwen3:4b \
+  --enable-prefix-cache \
+  --session-cache memory \
+  --session-cache-max-entries 128 \
+  --session-cache-max-tokens 4096
+
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Ferrum-Session: agent-session-1" \
+  -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Remember ferrum-blue."}]}'
+```
+
+`/health` reports whether prefix cache is active and whether the path is real
+KV reuse. `/metrics` exposes prefix hit/miss, saved prefill token, entry, byte,
+and session-cache counters. Details are in [`docs/cache-product.md`](docs/cache-product.md).
+
 ## Installation
 
 Homebrew:
@@ -131,6 +220,7 @@ cargo build --release -p ferrum-cli --bin ferrum
 - CUDA vLLM comparison: [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)
 - Apple Silicon regression gate: `scripts/metal_readme_regression.py` and `scripts/release/validate_metal_readme_regression.py`
 - OpenAI API compatibility: [`docs/openai-api-compatibility.md`](docs/openai-api-compatibility.md)
+- Prefix/session cache product surface: [`docs/cache-product.md`](docs/cache-product.md)
 - Module status notes: [`docs/status/`](docs/status/)
 
 ## Supported Models
@@ -211,6 +301,7 @@ Architecture v2 (Model-as-Code) means the model layer is an explicit Rust generi
 What works today:
 - CLI chat, OpenAI-compatible HTTP server with streaming
 - Continuous batching, PagedAttention (CUDA + Metal pools), prefix caching, preemption
+- OpenAI-style function tool calling, including required tool calls and streaming `tool_calls` deltas
 - Custom CUDA decode runner (Qwen3, LLaMA): 2× over Candle baseline
 - Apple Silicon MoE inference (Qwen3-30B-A3B) — correctness, multi-turn, default serve startup, and multi-sequence serving gates covered by the Metal README gate
 - INT4 GPTQ with Marlin fused kernel (Blackwell + Ampere); also Triton w4a16
