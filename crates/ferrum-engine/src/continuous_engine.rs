@@ -556,6 +556,17 @@ impl SequenceState {
         self.input_tokens.len() + self.generated_tokens.len()
     }
 
+    pub fn model_decode_metadata(&self) -> HashMap<String, serde_json::Value> {
+        let mut metadata = self.original_request.metadata.clone();
+        if self.json_processor.is_some() || self.regex_processor.is_some() {
+            metadata.insert(
+                "ferrum_require_full_logits".to_string(),
+                serde_json::json!(true),
+            );
+        }
+        metadata
+    }
+
     /// Should this sequence stop generating?
     ///
     /// Checks: (1) max-tokens budget exhausted, (2) last generated token is in
@@ -1267,6 +1278,29 @@ mod tests {
         assert_eq!(state.phase, RequestPhase::Waiting);
         assert_eq!(state.total_tokens(), 2);
         assert!(!state.prefill_complete);
+    }
+
+    #[test]
+    fn model_decode_metadata_marks_structured_requests_for_full_logits() {
+        let plain = SequenceState::new(policy_request(), vec![TokenId::new(0)]);
+        assert_eq!(
+            plain
+                .model_decode_metadata()
+                .get("ferrum_require_full_logits")
+                .and_then(|value| value.as_bool()),
+            None
+        );
+
+        let mut request = policy_request();
+        request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
+        let structured = SequenceState::new(request, vec![TokenId::new(0)]);
+        assert_eq!(
+            structured
+                .model_decode_metadata()
+                .get("ferrum_require_full_logits")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]
