@@ -213,6 +213,11 @@ pub struct RunCommand {
     #[arg(long, default_value = "auto")]
     pub backend: String,
 
+    /// CUDA GPU ids to use, comma-separated. Multi-GPU requests fail until
+    /// the real layer-split loader is implemented.
+    #[arg(long, value_name = "IDS")]
+    pub gpu_devices: Option<String>,
+
     /// One-shot prompt (skip interactive REPL). When supplied, ferrum runs a
     /// single prefill+decode and exits — useful for benchmarking and shell
     /// scripting. For `.gguf` paths, omitting this drops into the GGUF REPL.
@@ -300,7 +305,18 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     // Select device before model resolution so CPU runs do not materialize
     // GPU/Metal chat-profile defaults such as paged KV.
-    let device = select_device(&cmd.backend);
+    let mut device = select_device(&cmd.backend);
+    let gpu_selection =
+        crate::gpu_devices::resolve_cuda_gpu_devices(cmd.gpu_devices.as_deref(), &device)?;
+    if let Some(selection) = &gpu_selection {
+        device = selection.primary_device();
+        eprintln!(
+            "{} {} ({})",
+            "CUDA GPUs:".dimmed(),
+            selection.selected_csv(),
+            selection.selected_distributed_strategy
+        );
+    }
     let autosize = run_autosize_for_device(&device, cmd.gpu_memory_utilization);
 
     // Resolve the model through the central source resolver. Handles
@@ -356,8 +372,14 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         serde_json::Value::String(engine_model_path),
     );
     let runtime_config = RuntimeConfigSnapshot::capture_current();
-    let effective_runtime_config =
-        run_effective_runtime_config(&runtime_config, cmd.kv_dtype.as_deref());
+    if let Some(selection) = &gpu_selection {
+        selection.insert_backend_options(&mut engine_config.backend.backend_options);
+    }
+    let effective_runtime_config = run_effective_runtime_config(
+        &runtime_config,
+        cmd.kv_dtype.as_deref(),
+        gpu_selection.as_ref(),
+    );
     let startup_auto_config = run_startup_auto_config(
         &device,
         model_definition_for_config.as_ref(),
@@ -1431,6 +1453,7 @@ async fn load_run_model_definition(
 fn run_effective_runtime_config(
     runtime_config: &RuntimeConfigSnapshot,
     kv_dtype: Option<&str>,
+    gpu_selection: Option<&crate::gpu_devices::GpuDeviceSelection>,
 ) -> RuntimeConfigSnapshot {
     let mut snapshot = runtime_config.clone();
     if let Some(value) = kv_dtype.filter(|value| !value.trim().is_empty()) {
@@ -1439,6 +1462,11 @@ fn run_effective_runtime_config(
             value.to_string(),
             RuntimeConfigSource::Cli,
         ));
+    }
+    if let Some(selection) = gpu_selection {
+        for entry in selection.runtime_config_entries() {
+            snapshot.upsert_entry(entry);
+        }
     }
     snapshot
 }
@@ -1523,6 +1551,7 @@ mod tests {
             disable_thinking: false,
             temperature: 0.0,
             backend: "auto".to_string(),
+            gpu_devices: None,
             prompt: None,
             tokenizer: None,
             bench_mode: false,
@@ -1554,7 +1583,7 @@ mod tests {
     #[test]
     fn run_effective_runtime_config_records_cli_kv_dtype() {
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
-        let effective = run_effective_runtime_config(&snapshot, Some("int8"));
+        let effective = run_effective_runtime_config(&snapshot, Some("int8"), None);
         let entry = effective
             .entries
             .iter()
@@ -1562,6 +1591,33 @@ mod tests {
             .expect("missing kv dtype entry");
         assert_eq!(entry.effective_value, "int8");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_gpu_device_selection() {
+        let selection = crate::gpu_devices::GpuDeviceSelection {
+            raw_cli_value: "1".to_string(),
+            requested_gpu_devices: vec![1],
+            selected_gpu_devices: vec![1],
+            selected_distributed_strategy: "single_gpu".to_string(),
+        };
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let effective = run_effective_runtime_config(&snapshot, None, Some(&selection));
+        let entry = |key: &str| {
+            effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("FERRUM_BACKEND").effective_value, "cuda");
+        assert_eq!(entry("FERRUM_REQUESTED_GPU_DEVICES").effective_value, "1");
+        assert_eq!(entry("FERRUM_SELECTED_GPU_DEVICES").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_SELECTED_DISTRIBUTED_STRATEGY").effective_value,
+            "single_gpu"
+        );
     }
 
     #[test]

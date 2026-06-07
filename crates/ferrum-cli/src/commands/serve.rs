@@ -44,6 +44,15 @@ pub struct ServeCommand {
     #[arg(long, default_value = "2")]
     pub tts_slots: usize,
 
+    /// Backend: auto, cpu, metal, cuda.
+    #[arg(long, default_value = "auto")]
+    pub backend: String,
+
+    /// CUDA GPU ids to use, comma-separated. Multi-GPU requests fail until
+    /// the real layer-split loader is implemented.
+    #[arg(long, value_name = "IDS")]
+    pub gpu_devices: Option<String>,
+
     /// Speculative decoding: draft model id (same family as target).
     /// Example: `--spec-draft qwen3:0.6b` when serving `qwen3:4b`.
     /// The draft model must share the tokenizer + vocabulary.
@@ -180,6 +189,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         host,
         port,
         tts_slots,
+        backend,
+        gpu_devices,
         spec_draft,
         spec_tokens,
         gpu_memory_utilization,
@@ -428,7 +439,18 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     }
 
     // Select device
-    let device = select_device();
+    let mut device = super::run::select_device(&backend);
+    let gpu_selection =
+        crate::gpu_devices::resolve_cuda_gpu_devices(gpu_devices.as_deref(), &device)?;
+    if let Some(selection) = &gpu_selection {
+        device = selection.primary_device();
+        println!(
+            "{} {} ({})",
+            "CUDA GPUs:".dimmed(),
+            selection.selected_csv(),
+            selection.selected_distributed_strategy
+        );
+    }
     println!("{} {:?}", "Device:".dimmed(), device);
     let serve_profile_entries = crate::source_resolver::serve_profile_runtime_entries(
         &source.local_path,
@@ -518,7 +540,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         materialized_runtime_keys.dedup();
     }
 
-    let startup_cli_runtime_entries = serve_cli_runtime_entries(
+    let mut startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
         kv_capacity,
         max_model_len,
@@ -541,6 +563,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_concurrency,
         profile_runtime_flags_json.as_deref(),
     );
+    if let Some(selection) = &gpu_selection {
+        startup_cli_runtime_entries.extend(selection.runtime_config_entries());
+    }
     let startup_auto_config = startup_auto_config(
         &device,
         arch_for_dispatch,
@@ -593,6 +618,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             let mut engine_config = ferrum_types::EngineConfig::default();
             engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
             engine_config.backend.device = device;
+            if let Some(selection) = &gpu_selection {
+                selection.insert_backend_options(&mut engine_config.backend.backend_options);
+            }
             let engine: Arc<dyn ferrum_engine::EmbedEngine + Send + Sync> = Arc::new(
                 ferrum_engine::embedding_engine::EmbeddingEngine::new(executor, engine_config)
                     .with_tokenizer(tokenizer),
@@ -610,6 +638,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             let mut engine_config = ferrum_types::EngineConfig::default();
             engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
             engine_config.backend.device = device;
+            if let Some(selection) = &gpu_selection {
+                selection.insert_backend_options(&mut engine_config.backend.backend_options);
+            }
             let engine: Arc<dyn ferrum_engine::TranscribeEngine + Send + Sync> = Arc::new(
                 ferrum_engine::transcription_engine::TranscriptionEngine::new(
                     executor,
@@ -666,6 +697,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 "model_path".to_string(),
                 serde_json::Value::String(engine_model_path.clone()),
             );
+            if let Some(selection) = &gpu_selection {
+                selection.insert_backend_options(&mut engine_config.backend.backend_options);
+            }
             if let Some(draft_path) = engine_spec_draft_path.as_ref() {
                 engine_config.backend.backend_options.insert(
                     "spec_draft".to_string(),
@@ -1507,21 +1541,6 @@ fn is_m3_qwen3_30b_a3b(
 // HF cache walk + format detection have a single source of truth across
 // `run` / `serve` / `bench`. Use `crate::source_resolver::find_cached_model`
 // / `crate::source_resolver::detect_format` directly.
-
-fn select_device() -> ferrum_types::Device {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    {
-        return ferrum_types::Device::Metal;
-    }
-
-    #[cfg(feature = "cuda")]
-    {
-        return ferrum_types::Device::CUDA(0);
-    }
-
-    #[allow(unreachable_code)]
-    ferrum_types::Device::CPU
-}
 
 fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
     match device {
