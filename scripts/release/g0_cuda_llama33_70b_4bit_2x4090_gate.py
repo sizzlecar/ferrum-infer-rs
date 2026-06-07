@@ -375,7 +375,7 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
         "--gpu-devices",
         ",".join(str(device) for device in REQUIRED_GPU_DEVICES),
         "--max-tokens",
-        "256",
+        str(cfg.get("run_max_tokens", 64)),
         "--stop",
         "\n",
         "--output-format",
@@ -955,8 +955,8 @@ def update_metadata_status(root: Path, status: str, error: str | None = None) ->
 def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     input_text = "\n".join(
         [
-            f"请记住方括号里的精确代码：[{RECALL_MARKER}]。只回答 OK。",
-            "只输出上一条用户消息方括号里的精确代码，不要解释，不要替换，不要改大小写。",
+            f"Output only the exact token inside brackets: [{RECALL_MARKER}].",
+            "Output only the exact token inside brackets from the previous user message.",
             "/bye",
             "",
         ]
