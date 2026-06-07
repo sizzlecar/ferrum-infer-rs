@@ -47,6 +47,7 @@ BAD_PATTERNS = [
     "<|tool|>",
 ]
 DEFAULT_LAYER_SPLIT_PLAN = "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
+RECALL_MARKER = "ferrum-9271-zeta"
 BENCH_QUALITY_COUNT_FIELDS = (
     "bad_output_per_run",
     "malformed_stream_per_run",
@@ -924,8 +925,8 @@ def update_metadata_status(root: Path, status: str, error: str | None = None) ->
 def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     input_text = "\n".join(
         [
-            "请记住完整短语 ferrum-blue。这个短语包含连字符和颜色。只回答 OK。",
-            "上一条用户消息里的完整短语是什么？必须逐字输出完整短语，包含连字符后面的颜色，不要只输出前缀。",
+            f"请记住方括号里的精确代码：[{RECALL_MARKER}]。只回答 OK。",
+            "只输出上一条用户消息方括号里的精确代码，不要解释，不要替换，不要改大小写。",
             "/bye",
             "",
         ]
@@ -964,7 +965,7 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
         if turn.get("finish_reason") == "length":
             raise RuntimeError(f"ferrum run assistant turn finished by length: {turn}")
     recall = strip_think(str(turns[-1].get("content") or ""))
-    if "ferrum-blue" not in recall:
+    if RECALL_MARKER not in recall:
         raise RuntimeError(f"ferrum run recall failed: {recall[:500]!r}")
     effective = require_effective_config(root / "run.effective_config.json", "run")
     return {
@@ -1035,12 +1036,12 @@ def serve_multiturn(root: Path, base_url: str, model: str) -> dict[str, Any]:
         "messages": [
             {
                 "role": "user",
-                "content": "请记住完整短语 ferrum-blue。这个短语包含连字符和颜色。只回答 OK。",
+                "content": f"请记住方括号里的精确代码：[{RECALL_MARKER}]。只回答 OK。",
             },
             {"role": "assistant", "content": "OK"},
             {
                 "role": "user",
-                "content": "上一条用户消息里的完整短语是什么？必须逐字输出完整短语，包含连字符后面的颜色，不要只输出前缀。",
+                "content": "只输出上一条用户消息方括号里的精确代码，不要解释，不要替换，不要改大小写。",
             },
         ],
         "max_tokens": 128,
@@ -1051,7 +1052,7 @@ def serve_multiturn(root: Path, base_url: str, model: str) -> dict[str, Any]:
     data = parsed_response("serve multiturn", status, body)
     content, finish_reason = first_message_content(data)
     assert_no_bad_patterns("serve multiturn", content)
-    if "ferrum-blue" not in strip_think(content):
+    if RECALL_MARKER not in strip_think(content):
         raise RuntimeError(f"serve multiturn recall failed: {content[:500]!r}")
     if finish_reason == "length":
         raise RuntimeError("serve multiturn finished by length")
