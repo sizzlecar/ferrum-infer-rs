@@ -339,6 +339,43 @@ pub struct LlamaFamilyLayer<B: QuantLlmBackend + BackendMoeFused> {
     pub down_proj: Box<dyn Linear<B>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlamaFamilyLayerStageConfig {
+    pub source_layers: Range<usize>,
+    pub load_embedding: bool,
+    pub load_lm_head: bool,
+}
+
+impl LlamaFamilyLayerStageConfig {
+    pub fn full(num_layers: usize) -> Self {
+        Self {
+            source_layers: 0..num_layers,
+            load_embedding: true,
+            load_lm_head: true,
+        }
+    }
+
+    pub fn backbone(num_layers: usize) -> Self {
+        Self {
+            source_layers: 0..num_layers,
+            load_embedding: false,
+            load_lm_head: false,
+        }
+    }
+
+    pub fn pipeline_stage(
+        source_layers: Range<usize>,
+        is_first_stage: bool,
+        is_last_stage: bool,
+    ) -> Self {
+        Self {
+            source_layers,
+            load_embedding: is_first_stage,
+            load_lm_head: is_last_stage,
+        }
+    }
+}
+
 fn load_llama_family_layers<B: MoeLlmBackend>(
     cfg: &LlamaFamilyConfig,
     loader: &dyn WeightLoader<B>,
@@ -385,6 +422,40 @@ fn load_llama_family_layers<B: MoeLlmBackend>(
         });
     }
     Ok(layers)
+}
+
+fn load_llama_family_lm_head<B: MoeLlmBackend>(
+    cfg: &LlamaFamilyConfig,
+    loader: &dyn WeightLoader<B>,
+) -> Result<Box<dyn Linear<B>>> {
+    // LM head: either dedicated `lm_head.weight` or tied to embedding.
+    // Many models (Qwen3-4B, Llama-3.2-1B, some Qwen2.5) use TIED
+    // embeddings — lm_head shares weights with model.embed_tokens. When
+    // no dedicated lm_head tensor exists, re-load the embed tensor as a
+    // DenseLinear. This duplicates the buffer (memory cost = vocab*h*2
+    // bytes, e.g. ~770MB for Qwen3-4B) but keeps the Linear trait's
+    // owned-weights invariant. Sharing via Arc is a future optimisation.
+    let lm_head = if loader.has_tensor("lm_head.weight") {
+        loader.load_linear("lm_head")?
+    } else {
+        tracing::info!(
+            "LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head"
+        );
+        let as_linear = loader.load_linear("model.embed_tokens")?;
+        // Sanity check: shape must be [vocab, hidden].
+        if as_linear.out_features() != cfg.vocab_size || as_linear.in_features() != cfg.hidden_size
+        {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "tied embed shape mismatch: got [{}, {}], expected [{}, {}]",
+                as_linear.out_features(),
+                as_linear.in_features(),
+                cfg.vocab_size,
+                cfg.hidden_size
+            )));
+        }
+        as_linear
+    };
+    Ok(lm_head)
 }
 
 /// Precomputed RoPE cos/sin tables (shape `[max_seq, head_dim / 2]` each).
@@ -803,88 +874,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// The loader decides per-projection whether to instantiate DenseLinear,
     /// GptqLinear, etc. — this code doesn't care.
     pub fn new(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
-        // Invalidate any graph from a previously-loaded model. The captured
-        // graph references the old model's scratch buffers; a fresh model
-        // gets fresh scratch, so reusing the graph would read/write freed
-        // pointers. Matters for test suites where multiple models coexist.
-        {
-            let mut ctx = B::new_context();
-            B::reset_all_graphs(&mut ctx);
-        }
-        let rope = build_rope_cache::<B>(&cfg);
-        let scratch = LlamaFamilyScratch::alloc(&cfg, 1); // decode-sized; prefill resizes
-
-        // Embedding: plain tensor (no projection math, just lookup).
-        let embed = loader.load_tensor("model.embed_tokens.weight")?;
-
-        // Per-layer weights.
-        let layers = load_llama_family_layers(&cfg, loader, 0..cfg.num_layers)?;
-
-        let final_norm_w = loader.load_tensor("model.norm.weight")?;
-
-        // LM head: either dedicated `lm_head.weight` or tied to embedding.
-        // Many models (Qwen3-4B, Llama-3.2-1B, some Qwen2.5) use TIED
-        // embeddings — lm_head shares weights with model.embed_tokens. When
-        // no dedicated lm_head tensor exists, re-load the embed tensor as a
-        // DenseLinear. This duplicates the buffer (memory cost = vocab*h*2
-        // bytes, e.g. ~770MB for Qwen3-4B) but keeps the Linear trait's
-        // owned-weights invariant. Sharing via Arc is a future optimisation.
-        let lm_head = if loader.has_tensor("lm_head.weight") {
-            loader.load_linear("lm_head")?
-        } else {
-            tracing::info!(
-                "LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head"
-            );
-            let as_linear = loader.load_linear("model.embed_tokens")?;
-            // Sanity check: shape must be [vocab, hidden].
-            if as_linear.out_features() != cfg.vocab_size
-                || as_linear.in_features() != cfg.hidden_size
-            {
-                return Err(ferrum_types::FerrumError::model(format!(
-                    "tied embed shape mismatch: got [{}, {}], expected [{}, {}]",
-                    as_linear.out_features(),
-                    as_linear.in_features(),
-                    cfg.vocab_size,
-                    cfg.hidden_size
-                )));
-            }
-            as_linear
-        };
-
-        let layer_source_end = cfg.num_layers;
-        let runtime_cfg = cfg.to_runtime();
-        Ok(Self {
-            cfg,
-            runtime_cfg,
-            embed: Some(embed),
-            layer_source_start: 0,
-            layer_source_end,
-            layers,
-            final_norm_w,
-            lm_head: Some(lm_head),
-            rope,
-            scratch,
-            kv_caches: HashMap::new(),
-            kv_free_pool: Vec::new(),
-            paged_pools: None,
-            paged_block_alloc: None,
-            paged_dims: None,
-            graph_warmup: 0,
-            graph_capture_failed: false,
-            batched_graph_warmup: 0,
-            batched_graph_failed: false,
-            batched_graph_keys_seen: std::collections::HashSet::new(),
-            batched_pointers_for: None,
-            unified_graph_warmup: 0,
-            unified_graph_failed: false,
-            unified_graph_keys_seen: std::collections::HashSet::new(),
-            prefix_cache_hits: 0,
-            prefix_cache_misses: 0,
-            prefix_cache_saved_prefill_tokens: 0,
-            lora_adapters: HashMap::new(),
-            lora_cache_adapters: HashMap::new(),
-            lora_projection_applications: 0,
-        })
+        let num_layers = cfg.num_layers;
+        Self::new_with_stage_config(cfg, loader, LlamaFamilyLayerStageConfig::full(num_layers))
     }
 
     /// Build a backbone-only Qwen3 transformer stack (no embed, no lm_head).
@@ -899,29 +890,78 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// the final `model.norm.weight`. `model.embed_tokens` and `lm_head`
     /// are NOT read.
     pub fn new_backbone_only(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
-        // See `new` — invalidate stale graph referring to prior model's scratch.
+        let num_layers = cfg.num_layers;
+        Self::new_with_stage_config(
+            cfg,
+            loader,
+            LlamaFamilyLayerStageConfig::backbone(num_layers),
+        )
+    }
+
+    /// Build a layer-split pipeline stage. The stage always loads its local
+    /// transformer layers and final norm; embedding and lm_head are loaded only
+    /// for the first and last stages respectively.
+    pub fn new_layer_stage(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+        stage: LlamaFamilyLayerStageConfig,
+    ) -> Result<Self> {
+        Self::new_with_stage_config(cfg, loader, stage)
+    }
+
+    fn new_with_stage_config(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+        stage: LlamaFamilyLayerStageConfig,
+    ) -> Result<Self> {
+        if stage.source_layers.is_empty() {
+            return Err(ferrum_types::FerrumError::model(
+                "llama layer stage must include at least one source layer",
+            ));
+        }
+        if stage.source_layers.end > cfg.num_layers {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "llama layer stage range {}..{} is outside model layer count {}",
+                stage.source_layers.start, stage.source_layers.end, cfg.num_layers
+            )));
+        }
+
+        // Invalidate any graph from a previously-loaded model. The captured
+        // graph references the old model's scratch buffers; a fresh model
+        // gets fresh scratch, so reusing the graph would read/write freed
+        // pointers. Matters for test suites where multiple models coexist.
         {
             let mut ctx = B::new_context();
             B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg);
         let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
+        let embed = if stage.load_embedding {
+            Some(loader.load_tensor("model.embed_tokens.weight")?)
+        } else {
+            None
+        };
+        let layers = load_llama_family_layers(&cfg, loader, stage.source_layers.clone())?;
 
-        let layers = load_llama_family_layers(&cfg, loader, 0..cfg.num_layers)?;
-
+        let lm_head = if stage.load_lm_head {
+            Some(load_llama_family_lm_head(&cfg, loader)?)
+        } else {
+            None
+        };
         let final_norm_w = loader.load_tensor("model.norm.weight")?;
 
-        let layer_source_end = cfg.num_layers;
+        let layer_source_start = stage.source_layers.start;
+        let layer_source_end = stage.source_layers.end;
         let runtime_cfg = cfg.to_runtime();
         Ok(Self {
             cfg,
             runtime_cfg,
-            embed: None,
-            layer_source_start: 0,
+            embed,
+            layer_source_start,
             layer_source_end,
             layers,
             final_norm_w,
-            lm_head: None,
+            lm_head,
             rope,
             scratch,
             kv_caches: HashMap::new(),
@@ -2881,8 +2921,8 @@ mod tests {
     use ferrum_types::Result;
 
     use super::{
-        load_llama_family_layers, LlamaFamilyConfig, LlamaFamilyModel, LlamaFamilyRuntimeEnv,
-        DEFAULT_KV_CAPACITY,
+        load_llama_family_layers, LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel,
+        LlamaFamilyRuntimeEnv, DEFAULT_KV_CAPACITY,
     };
 
     #[derive(Default)]
@@ -3001,6 +3041,54 @@ mod tests {
         assert_eq!(
             model.kv_caches["test-cache"].len(),
             model.local_layer_count()
+        );
+    }
+
+    #[test]
+    fn llama_family_layer_stage_loads_only_requested_weights() {
+        let cfg = test_llama_config(5, false);
+        let loader = RecordingLoader::default();
+
+        let model = LlamaFamilyModel::<CpuBackend>::new_layer_stage(
+            cfg,
+            &loader,
+            LlamaFamilyLayerStageConfig::pipeline_stage(2..5, false, true),
+        )
+        .unwrap();
+
+        assert_eq!(model.source_layer_range(), 2..5);
+        assert_eq!(model.local_layer_count(), 3);
+        assert!(model.embed.is_none());
+        assert!(model.lm_head.is_some());
+        assert_eq!(
+            loader.tensors.into_inner().unwrap(),
+            vec![
+                "model.layers.2.input_layernorm.weight",
+                "model.layers.2.post_attention_layernorm.weight",
+                "model.layers.3.input_layernorm.weight",
+                "model.layers.3.post_attention_layernorm.weight",
+                "model.layers.4.input_layernorm.weight",
+                "model.layers.4.post_attention_layernorm.weight",
+                "model.norm.weight",
+            ]
+        );
+        assert_eq!(
+            loader.linears.into_inner().unwrap(),
+            vec![
+                "model.layers.2.self_attn.qkv_proj",
+                "model.layers.2.self_attn.o_proj",
+                "model.layers.2.mlp.gate_up_proj",
+                "model.layers.2.mlp.down_proj",
+                "model.layers.3.self_attn.qkv_proj",
+                "model.layers.3.self_attn.o_proj",
+                "model.layers.3.mlp.gate_up_proj",
+                "model.layers.3.mlp.down_proj",
+                "model.layers.4.self_attn.qkv_proj",
+                "model.layers.4.self_attn.o_proj",
+                "model.layers.4.mlp.gate_up_proj",
+                "model.layers.4.mlp.down_proj",
+                "model.embed_tokens",
+            ]
         );
     }
 
