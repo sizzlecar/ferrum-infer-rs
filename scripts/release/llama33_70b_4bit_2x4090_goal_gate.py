@@ -197,6 +197,8 @@ def validate_llama33_artifact(artifact: Path) -> dict[str, Any]:
     validate_runtime_effective_config(load_json(artifact / "serve.effective_config.json"), "serve")
     validate_hardware(load_json(artifact / "hardware.json"))
     validate_json_status_files(artifact)
+    validate_bench_reports(load_json(artifact / "bench-serve.json"))
+    validate_optional_vllm_baseline(load_json(artifact / "vllm-baseline.json"))
     validate_comparison(load_json(artifact / "comparison.json"))
 
     for rel in ["nvidia-smi.before.txt", "nvidia-smi.during.txt", "nvidia-smi.after.txt"]:
@@ -295,10 +297,84 @@ def validate_json_status_files(artifact: Path) -> None:
         "serve.structured_output.json",
         "serve.tool_call.json",
         "concurrency_quality_regression.json",
-        "bench-serve.json",
-        "vllm-baseline.json",
     ]:
         status_pass(artifact / rel)
+
+
+def validate_bench_reports(data: Any) -> None:
+    reports = data if isinstance(data, list) else [data]
+    if not reports or not all(isinstance(report, dict) for report in reports):
+        raise ValidationError("bench-serve.json must contain a BenchReport object or list")
+    rows: dict[int, dict[str, Any]] = {}
+    for report in reports:
+        concurrency = int(report.get("concurrency") or 0)
+        if concurrency <= 0:
+            raise ValidationError("bench-serve report missing positive concurrency")
+        completed = sum(int(v) for v in report.get("completed_per_run", []))
+        errored = sum(int(v) for v in report.get("errored_per_run", []))
+        if completed <= 0:
+            raise ValidationError(f"bench-serve c{concurrency} completed must be > 0")
+        if errored != 0:
+            raise ValidationError(f"bench-serve c{concurrency} errored must be 0")
+        if int(report.get("n_repeats") or 0) < 3:
+            raise ValidationError(f"bench-serve c{concurrency} n_repeats must be >= 3")
+        if report.get("output_token_count_source") != "usage":
+            raise ValidationError(f"bench-serve c{concurrency} output_token_count_source must be usage")
+        for metric, key in [
+            ("output_throughput_tps", None),
+            ("ttft_ms", "p50"),
+            ("tpot_ms", "p50"),
+            ("e2e_ms", "p95"),
+        ]:
+            if positive_metric_value(report, metric, key) is None:
+                suffix = f".{key}" if key else ""
+                raise ValidationError(f"bench-serve c{concurrency} {metric}{suffix} must be positive")
+        for field in [
+            "bad_output_per_run",
+            "malformed_stream_per_run",
+            "missing_done_per_run",
+            "duplicate_done_per_run",
+            "zero_output_tokens_per_run",
+            "stream_bulk_flush_per_run",
+            "http_500_per_run",
+            "panic_per_run",
+        ]:
+            values = report.get(field)
+            if not isinstance(values, list):
+                raise ValidationError(f"bench-serve c{concurrency} missing {field}")
+            if sum(int(v) for v in values) != 0:
+                raise ValidationError(f"bench-serve c{concurrency} {field} must sum to 0")
+        rows[concurrency] = report
+    missing = sorted(REQUIRED_CONCURRENCY_CELLS - set(rows))
+    if missing:
+        raise ValidationError(f"bench-serve.json missing cells: {missing}")
+
+
+def positive_metric_value(report: dict[str, Any], metric: str, percentile: str | None) -> float | None:
+    value: Any = report.get(metric)
+    if percentile:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(percentile)
+    if isinstance(value, dict):
+        value = value.get("mean")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def validate_optional_vllm_baseline(data: Any) -> None:
+    if not isinstance(data, dict):
+        raise ValidationError("vllm-baseline.json must contain a JSON object")
+    status = data.get("status")
+    if status in (None, "pass"):
+        return
+    if status not in {"skipped", "diagnostic"}:
+        raise ValidationError(f"vllm-baseline.json status is not accepted: {status!r}")
+    if not isinstance(data.get("reason"), str) or not data["reason"].strip():
+        raise ValidationError("skipped vllm-baseline.json must include a reason")
 
 
 def validate_comparison(data: Any) -> None:
@@ -308,6 +384,9 @@ def validate_comparison(data: Any) -> None:
     missing = sorted(REQUIRED_CONCURRENCY_CELLS - set(cells))
     if missing:
         raise ValidationError(f"comparison.json missing cells: {missing}")
+    if data.get("mode") == "ferrum_only":
+        validate_ferrum_only_comparison(cells)
+        return
     for c in sorted(REQUIRED_CONCURRENCY_CELLS):
         cell = cells[c]
         if cell.get("status") not in (None, "pass"):
@@ -334,6 +413,28 @@ def validate_comparison(data: Any) -> None:
             1.50,
             f"comparison c{c} TPOT ratio",
         )
+        if int(cell.get("bad_output_count", 0)) != 0:
+            raise ValidationError(f"comparison c{c} bad_output_count must be 0")
+        if int(cell.get("malformed_stream_count", 0)) != 0:
+            raise ValidationError(f"comparison c{c} malformed_stream_count must be 0")
+
+
+def validate_ferrum_only_comparison(cells: dict[int, dict[str, Any]]) -> None:
+    for c in sorted(REQUIRED_CONCURRENCY_CELLS):
+        cell = cells[c]
+        if cell.get("status") not in (None, "pass"):
+            raise ValidationError(f"comparison c{c} status is not pass")
+        if cell.get("mode") not in (None, "ferrum_only"):
+            raise ValidationError(f"comparison c{c} mode must be ferrum_only")
+        for key in [
+            "ferrum_output_throughput_tps",
+            "ferrum_ttft_p50_ms",
+            "ferrum_tpot_p50_ms",
+            "p95_end_to_end_latency_ms",
+        ]:
+            value = first_number(cell, [key])
+            if value is None or value <= 0:
+                raise ValidationError(f"comparison c{c} {key} must be positive")
         if int(cell.get("bad_output_count", 0)) != 0:
             raise ValidationError(f"comparison c{c} bad_output_count must be 0")
         if int(cell.get("malformed_stream_count", 0)) != 0:
@@ -535,20 +636,55 @@ def make_llama33_artifact(root: Path) -> None:
     write_json(root / "serve.effective_config.json", effective)
     write_json(root / "hardware.json", {"gpu_names": ["RTX 4090", "RTX 4090"]})
     write_json(
+        root / "bench-serve.json",
+        [
+            {
+                "concurrency": c,
+                "completed_per_run": [2, 2, 2],
+                "errored_per_run": [0, 0, 0],
+                "n_repeats": 3,
+                "output_token_count_source": "usage",
+                "output_throughput_tps": {"mean": 20.0},
+                "ttft_ms": {"p50": {"mean": 500.0}},
+                "tpot_ms": {"p50": {"mean": 50.0}},
+                "e2e_ms": {"p95": {"mean": 5000.0}},
+                "bad_output_per_run": [0, 0, 0],
+                "malformed_stream_per_run": [0, 0, 0],
+                "missing_done_per_run": [0, 0, 0],
+                "duplicate_done_per_run": [0, 0, 0],
+                "zero_output_tokens_per_run": [0, 0, 0],
+                "stream_bulk_flush_per_run": [0, 0, 0],
+                "http_500_per_run": [0, 0, 0],
+                "panic_per_run": [0, 0, 0],
+            }
+            for c in sorted(REQUIRED_CONCURRENCY_CELLS)
+        ],
+    )
+    write_json(
         root / "comparison.json",
         {
+            "status": "pass",
+            "mode": "ferrum_only",
+            "baseline": "not_run",
+            "reason": "selftest Ferrum-only path",
             "cells": {
                 f"c{c}": {
                     "status": "pass",
-                    "output_throughput_ratio_to_vllm": 0.75,
-                    "ttft_ratio_to_vllm": 1.25,
-                    "tpot_ratio_to_vllm": 1.25,
+                    "mode": "ferrum_only",
+                    "ferrum_output_throughput_tps": 20.0,
+                    "ferrum_ttft_p50_ms": 500.0,
+                    "ferrum_tpot_p50_ms": 50.0,
+                    "p95_end_to_end_latency_ms": 5000.0,
                     "bad_output_count": 0,
                     "malformed_stream_count": 0,
                 }
                 for c in sorted(REQUIRED_CONCURRENCY_CELLS)
             }
         },
+    )
+    write_json(
+        root / "vllm-baseline.json",
+        {"status": "skipped", "reason": "selftest Ferrum-only path"},
     )
 
 
