@@ -26,6 +26,7 @@ from typing import Any
 
 LANE = "g0_cuda2x4090_llama33_70b_4bit"
 PASS_LINE_PREFIX = f"G0 SOURCE {LANE} PASS"
+SMOKE_LANE = "g0_cuda2x4090_llama33_70b_4bit_smoke"
 REQUIRED_GPU_DEVICES = [0, 1]
 BAD_PATTERNS = [
     "panic",
@@ -314,7 +315,7 @@ def build_serve_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root:
 
 def build_bench_serve_command(ferrum_bin: Path, cfg: dict[str, Any], root: Path) -> list[str]:
     port = int(cfg.get("port", 19400))
-    return [
+    cmd = [
         str(ferrum_bin),
         "bench-serve",
         "--base-url",
@@ -324,7 +325,6 @@ def build_bench_serve_command(ferrum_bin: Path, cfg: dict[str, Any], root: Path)
         "--tokenizer",
         str(cfg.get("tokenizer_path") or cfg.get("tokenizer") or cfg["model"]),
         "--fail-on-error",
-        "--require-ci",
         "--seed",
         str(cfg.get("seed", 9271)),
         "--n-repeats",
@@ -344,6 +344,9 @@ def build_bench_serve_command(ferrum_bin: Path, cfg: dict[str, Any], root: Path)
         "--out",
         str(root / "bench-serve.json"),
     ]
+    if cfg.get("require_ci", True):
+        cmd.insert(cmd.index("--seed"), "--require-ci")
+    return cmd
 
 
 def build_vllm_baseline_command(cfg: dict[str, Any]) -> list[str]:
@@ -364,6 +367,10 @@ def write_planned_command_artifacts(root: Path, ferrum_bin: Path, cfg: dict[str,
     serve_cmd = build_serve_command(ferrum_bin, cfg["model"], cfg, root)
     bench_cmd = build_bench_serve_command(ferrum_bin, cfg, root)
     vllm_cmd = build_vllm_baseline_command(cfg)
+    required_bench_flags = ["--fail-on-error"]
+    if cfg.get("require_ci", True):
+        required_bench_flags.append("--require-ci")
+    required_bench_flags.extend(["--seed", "--n-repeats"])
     write_json(
         root / "serve.command.json",
         {
@@ -378,7 +385,7 @@ def write_planned_command_artifacts(root: Path, ferrum_bin: Path, cfg: dict[str,
         {
             "status": "planned",
             "cmd": bench_cmd,
-            "required_flags": ["--fail-on-error", "--require-ci", "--seed", "--n-repeats"],
+            "required_flags": required_bench_flags,
         },
     )
     write_json(
@@ -600,6 +607,14 @@ def self_test() -> int:
     assert "--fail-on-error" in bench_cmd
     assert "--require-ci" in bench_cmd
     assert "--n-repeats" in bench_cmd
+    smoke_cfg = {**cfg, "require_ci": False, "n_repeats": 1, "concurrency_cells": [1, 4]}
+    smoke_bench_cmd = build_bench_serve_command(
+        Path("./target/release/ferrum"),
+        smoke_cfg,
+        Path("/tmp/out"),
+    )
+    assert "--fail-on-error" in smoke_bench_cmd
+    assert "--require-ci" not in smoke_bench_cmd
     hardware = query_hardware(Path("/tmp"), "")
     assert "gpu_names" in hardware
     with tempfile.TemporaryDirectory(prefix="ferrum-llama33-source-gate-") as tmp:
@@ -621,12 +636,17 @@ def self_test() -> int:
 
 
 def main() -> int:
+    global LANE, PASS_LINE_PREFIX
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--ferrum-bin", type=Path, default=Path("./target/release/ferrum"))
+    parser.add_argument("--lane-name", default=LANE, choices=[LANE, SMOKE_LANE])
     args = parser.parse_args()
+    LANE = args.lane_name
+    PASS_LINE_PREFIX = f"G0 SOURCE {LANE} PASS"
     if args.self_test:
         return self_test()
     if args.config is None or args.out is None:
