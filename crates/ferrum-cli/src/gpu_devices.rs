@@ -32,6 +32,17 @@ impl GpuDeviceSelection {
         join_gpu_devices(&self.selected_gpu_devices)
     }
 
+    pub fn apply_model_layer_count(&mut self, num_layers: usize) -> Result<bool> {
+        if self.selected_gpu_devices.len() <= 1 {
+            return Ok(false);
+        }
+        self.selected_layer_split_plan = Some(even_layer_split_plan_for_layers(
+            &self.selected_gpu_devices,
+            num_layers,
+        )?);
+        Ok(true)
+    }
+
     pub fn runtime_config_entries(&self) -> Vec<RuntimeConfigEntry> {
         vec![
             RuntimeConfigEntry::new("FERRUM_BACKEND", "cuda", RuntimeConfigSource::Cli),
@@ -206,6 +217,37 @@ fn even_layer_split_plan_placeholder(devices: &[usize]) -> String {
         .join(";")
 }
 
+pub fn even_layer_split_plan_for_layers(devices: &[usize], num_layers: usize) -> Result<String> {
+    if devices.is_empty() {
+        return Err(FerrumError::config(
+            "layer split requires at least one CUDA device",
+        ));
+    }
+    if num_layers == 0 {
+        return Err(FerrumError::config(
+            "layer split requires a model with at least one transformer layer",
+        ));
+    }
+    if num_layers < devices.len() {
+        return Err(FerrumError::config(format!(
+            "layer split requires at least as many transformer layers ({num_layers}) as CUDA devices ({})",
+            devices.len()
+        )));
+    }
+
+    let base = num_layers / devices.len();
+    let remainder = num_layers % devices.len();
+    let mut start = 0usize;
+    let mut stages = Vec::with_capacity(devices.len());
+    for (idx, device) in devices.iter().enumerate() {
+        let count = base + usize::from(idx < remainder);
+        let end = start + count - 1;
+        stages.push(format!("stage{idx}:cuda:{device}:layers={start}-{end}"));
+        start = end + 1;
+    }
+    Ok(stages.join(";"))
+}
+
 #[cfg(feature = "cuda")]
 fn available_cuda_device_count() -> Result<usize> {
     candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
@@ -255,6 +297,29 @@ mod tests {
     }
 
     #[test]
+    fn layer_split_plan_assigns_contiguous_model_layers() {
+        let plan = even_layer_split_plan_for_layers(&[0, 1], 80).unwrap();
+        assert_eq!(plan, "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79");
+    }
+
+    #[test]
+    fn layer_split_plan_distributes_remainder_to_earlier_devices() {
+        let plan = even_layer_split_plan_for_layers(&[0, 1, 2], 10).unwrap();
+        assert_eq!(
+            plan,
+            "stage0:cuda:0:layers=0-3;stage1:cuda:1:layers=4-6;stage2:cuda:2:layers=7-9"
+        );
+    }
+
+    #[test]
+    fn layer_split_plan_rejects_more_devices_than_layers() {
+        let err = even_layer_split_plan_for_layers(&[0, 1], 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least as many transformer layers"));
+    }
+
+    #[test]
     fn runtime_entries_record_raw_requested_selected_and_strategy() {
         let selection = GpuDeviceSelection {
             raw_cli_value: "1".to_string(),
@@ -287,7 +352,7 @@ mod tests {
 
     #[test]
     fn runtime_entries_record_layer_split_plan_for_multi_gpu() {
-        let selection = GpuDeviceSelection {
+        let mut selection = GpuDeviceSelection {
             raw_cli_value: "0,1".to_string(),
             requested_gpu_devices: vec![0, 1],
             selected_gpu_devices: vec![0, 1],
@@ -295,6 +360,7 @@ mod tests {
             selected_distributed_strategy: "layer_split".to_string(),
             selected_layer_split_plan: Some(even_layer_split_plan_placeholder(&[0, 1])),
         };
+        assert!(selection.apply_model_layer_count(80).unwrap());
         let snapshot =
             ferrum_types::RuntimeConfigSnapshot::from_entries(selection.runtime_config_entries());
         let entry = |key: &str| {
@@ -311,8 +377,9 @@ mod tests {
             entry(SELECTED_DISTRIBUTED_STRATEGY_KEY).effective_value,
             "layer_split"
         );
-        assert!(entry(SELECTED_LAYER_SPLIT_PLAN_KEY)
-            .effective_value
-            .contains("stage0:cuda:0"));
+        assert_eq!(
+            entry(SELECTED_LAYER_SPLIT_PLAN_KEY).effective_value,
+            "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79"
+        );
     }
 }

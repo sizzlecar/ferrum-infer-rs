@@ -306,7 +306,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // Select device before model resolution so CPU runs do not materialize
     // GPU/Metal chat-profile defaults such as paged KV.
     let mut device = select_device(&cmd.backend);
-    let gpu_selection =
+    let mut gpu_selection =
         crate::gpu_devices::resolve_cuda_gpu_devices(cmd.gpu_devices.as_deref(), &device)?;
     if let Some(selection) = &gpu_selection {
         device = selection.primary_device();
@@ -338,6 +338,15 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let source = resolved.source;
     let model_id = source.original.clone();
     let model_definition_for_config = load_run_model_definition(&source).await?;
+    if let (Some(selection), Some(definition)) =
+        (gpu_selection.as_mut(), model_definition_for_config.as_ref())
+    {
+        if selection.apply_model_layer_count(definition.num_hidden_layers)? {
+            if let Some(plan) = selection.selected_layer_split_plan.as_deref() {
+                eprintln!("{}", format!("CUDA layer split plan: {plan}").dimmed());
+            }
+        }
+    }
     let model_chat_template = crate::source_resolver::load_model_chat_template(&source.local_path);
     let chat_template_options = build_chat_template_options(&cmd, model_chat_template.as_ref());
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
