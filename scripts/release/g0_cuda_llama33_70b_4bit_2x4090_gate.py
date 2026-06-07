@@ -922,8 +922,8 @@ def update_metadata_status(root: Path, status: str, error: str | None = None) ->
 def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     input_text = "\n".join(
         [
-            "请记住短语 ferrum-blue。只回答 OK。",
-            "第一条用户消息里的 ferrum 开头短语是什么？只输出短语。",
+            "请记住完整短语 ferrum-blue。这个短语包含连字符和颜色。只回答 OK。",
+            "上一条用户消息里的完整短语是什么？必须逐字输出完整短语，包含连字符后面的颜色，不要只输出前缀。",
             "/bye",
             "",
         ]
