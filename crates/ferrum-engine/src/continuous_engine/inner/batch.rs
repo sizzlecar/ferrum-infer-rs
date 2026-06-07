@@ -201,7 +201,10 @@ impl EngineInner {
                             jp.reset();
                         }
                         let mut logits = cached_logits;
-                        let token = seq.sample_with_processors(&mut logits)?;
+                        let token = seq.sample_with_processors_with_tokenizer(
+                            &mut logits,
+                            Some(self.tokenizer.as_ref()),
+                        )?;
                         seq.generated_tokens.push(token);
                         seq.model_cache_id = Some(cloned_kv.cache_id());
                         seq.kv_cache = Some(cloned_kv);
@@ -440,7 +443,10 @@ impl EngineInner {
                 let token = if logits.len() == 1 {
                     TokenId::new(logits[0] as u32)
                 } else {
-                    seq.sample_with_processors(&mut logits)?
+                    seq.sample_with_processors_with_tokenizer(
+                        &mut logits,
+                        Some(self.tokenizer.as_ref()),
+                    )?
                 };
                 seq.generated_tokens.push(token);
                 seq.model_cache_id = Some(kv_handle.cache_id());
@@ -483,7 +489,10 @@ impl EngineInner {
                 let token = if logits.len() == 1 {
                     TokenId::new(logits[0] as u32)
                 } else {
-                    seq.sample_with_processors(&mut logits)?
+                    seq.sample_with_processors_with_tokenizer(
+                        &mut logits,
+                        Some(self.tokenizer.as_ref()),
+                    )?
                 };
                 seq.generated_tokens.push(token);
                 seq.tokens_this_iteration += 1;

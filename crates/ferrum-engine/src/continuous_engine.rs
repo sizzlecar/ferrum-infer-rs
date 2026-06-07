@@ -43,6 +43,7 @@ const WHOLE_PROMPT_PREFIX_CACHE_ENV: &str = "FERRUM_WHOLE_PROMPT_PREFIX_CACHE";
 const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
 const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
 const GENERATION_POLICY_SCAN_LIMIT: usize = 262_144;
+const FORBIDDEN_DECODE_RESAMPLE_LIMIT: usize = 64;
 const GENERATED_CONTROL_TOKEN_TEXTS: &[&str] = &[
     "<think>",
     "</think>",
@@ -370,6 +371,18 @@ fn is_forbidden_generation_token_text(text: &str) -> bool {
         || lower.contains("unused")
 }
 
+fn decoded_output_has_forbidden_quality(text: &str) -> bool {
+    text.contains('\u{FFFD}')
+        || contains_replacement_char_mojibake(text)
+        || text.contains("<unk>")
+        || text.contains("[PAD")
+        || text.contains("<pad>")
+        || text.contains("<|endoftext|>")
+        || text.contains("<|im_start|>")
+        || text.contains("<|im_end|>")
+        || text.contains("<|reserved_special_token")
+}
+
 fn contains_replacement_char_mojibake(text: &str) -> bool {
     let mut chars = text.chars();
     let mut a = chars.next();
@@ -645,6 +658,14 @@ impl SequenceState {
     /// Sample next token with full processor chain (temperature, top-k/p,
     /// repetition penalty, JSON mode, regex-guided mask).
     pub fn sample_with_processors(&mut self, logits: &mut [f32]) -> Result<TokenId> {
+        self.sample_with_processors_with_tokenizer(logits, None)
+    }
+
+    pub fn sample_with_processors_with_tokenizer(
+        &mut self,
+        logits: &mut [f32],
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+    ) -> Result<TokenId> {
         use ferrum_interfaces::sampler::{SamplingConfig, SamplingContext};
 
         // Regex-guided mask runs FIRST: it's a hard constraint (sets invalid
@@ -698,20 +719,55 @@ impl SequenceState {
         let config = SamplingConfig::from_params(&self.sampling_params);
         let step = self.generated_tokens.len();
         let vocab_size = logits.len();
-        let ctx = SamplingContext::new(
-            step,
-            &self.sampling_params,
-            logits,
-            &self.generated_tokens,
-            &self.token_frequencies,
-            vocab_size,
-        );
-        let token = config.sample(ctx, &mut self.rng)?;
+        let token = {
+            let mut ctx = SamplingContext::new(
+                step,
+                &self.sampling_params,
+                logits,
+                &self.generated_tokens,
+                &self.token_frequencies,
+                vocab_size,
+            );
+            config.processor_chain.process(&mut ctx)?;
+            let mut attempts = 0usize;
+            loop {
+                let token = config.sampler.sample_with_context(&ctx, &mut self.rng)?;
+                if !self.sample_candidate_decodes_to_forbidden_output(tokenizer, token) {
+                    break token;
+                }
+                if let Some(logit) = ctx.logits.get_mut(usize::from(token)) {
+                    *logit = f32::NEG_INFINITY;
+                }
+                attempts += 1;
+                if attempts >= FORBIDDEN_DECODE_RESAMPLE_LIMIT {
+                    return Err(FerrumError::model(
+                        "sampling candidates decoded to forbidden output",
+                    ));
+                }
+            }
+        };
 
         // Update frequency tracking
         *self.token_frequencies.entry(token).or_insert(0) += 1;
 
         Ok(token)
+    }
+
+    fn sample_candidate_decodes_to_forbidden_output(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+    ) -> bool {
+        let Some(tokenizer) = tokenizer else {
+            return false;
+        };
+        let mut tokens = Vec::with_capacity(self.generated_tokens.len() + 1);
+        tokens.extend_from_slice(&self.generated_tokens);
+        tokens.push(token);
+        tokenizer
+            .decode(&tokens, true)
+            .map(|text| decoded_output_has_forbidden_quality(&text))
+            .unwrap_or(true)
     }
 }
 
@@ -1189,18 +1245,29 @@ mod tests {
         }
 
         fn decode(&self, tokens: &[TokenId], _skip_special: bool) -> Result<String> {
-            Ok(tokens
-                .iter()
-                .filter_map(|token| self.token_text(*token))
-                .map(|text| {
-                    if text == "byte-fallback" {
-                        "\u{FFFD}"
-                    } else {
-                        text
+            let mut output = String::new();
+            let mut pending_bad_byte = false;
+            for token in tokens {
+                let Some(text) = self.token_text(*token) else {
+                    continue;
+                };
+                match text {
+                    "byte-fallback" => output.push('\u{FFFD}'),
+                    "bad-byte-lead" => pending_bad_byte = true,
+                    "valid-byte-cont" if pending_bad_byte => {
+                        output.push('好');
+                        pending_bad_byte = false;
                     }
-                })
-                .collect::<Vec<_>>()
-                .join(""))
+                    text => {
+                        if pending_bad_byte {
+                            output.push('\u{FFFD}');
+                            pending_bad_byte = false;
+                        }
+                        output.push_str(text);
+                    }
+                }
+            }
+            Ok(output)
         }
 
         fn decode_incremental(&self, _prev: &[TokenId], next: TokenId) -> Result<String> {
@@ -1433,6 +1500,40 @@ mod tests {
         for token_id in [1usize, 2, 4, 5, 8, 9] {
             assert_eq!(logits[token_id], f32::NEG_INFINITY);
         }
+    }
+
+    #[test]
+    fn sample_resamples_candidate_that_would_flush_replacement_char() {
+        let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+            8,
+            &[
+                ("normal", 0),
+                ("<s>", 1),
+                ("<unk>", 2),
+                ("</s>", 3),
+                ("<pad>", 4),
+                ("bad-byte-lead", 5),
+                ("ok", 6),
+                ("valid-byte-cont", 7),
+            ],
+        ));
+        let mut state = SequenceState::new_with_tokenizer(
+            policy_request(),
+            vec![TokenId::new(0)],
+            Some(tokenizer.clone()),
+        );
+        state.generated_tokens.push(TokenId::new(5));
+
+        let mut logits = vec![0.0f32; 8];
+        logits[6] = 100.0;
+        logits[7] = 1.0;
+
+        let token = state
+            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .unwrap();
+
+        assert_eq!(token.get(), 7);
+        assert_eq!(logits[6], f32::NEG_INFINITY);
     }
 
     #[test]
