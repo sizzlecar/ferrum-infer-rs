@@ -298,7 +298,15 @@ fn cached_forbidden_generation_tokens(
     }
 
     for text in [
-        "<unk", "<unk>", "[UNK]", "<pad>", "[PAD]", "<|pad|>", "<mask>", "[MASK]",
+        "<unk",
+        "<unk>",
+        "[UNK]",
+        "<pad>",
+        "[PAD]",
+        "<|pad|>",
+        "<mask>",
+        "[MASK]",
+        "\u{00ef}\u{00bf}\u{00bd}",
     ] {
         if let Some(token) = tok.token_id(text) {
             if !allowed_generated_controls.contains(&token.get()) {
