@@ -7,9 +7,9 @@
 //! - `GptqStoreCuda` enum + cfg-gated alias — chooses Marlin (default)
 //!   vs Triton-rs w4a16 store at runtime via `FERRUM_TRITON_INT4=1`.
 //! - `use_triton_int4()` / `use_vllm_moe()` env-var dispatch toggles.
-//! - `MarlinGatherScratch` + `marlin_gather_scratch_slot` +
+//! - `MarlinGatherScratch` + `marlin_gather_scratch_slots` +
 //!   `with_marlin_gather_scratch` + `pregrow_marlin_gather_scratch_helper`
-//!   — process-global staging buffer for desc_act perm-aware Marlin
+//!   — per-device staging buffers for desc_act perm-aware Marlin
 //!   (avoids per-call cudarc alloc that grew unboundedly).
 //! - `moe_gemm_phase_fused_impl` (Stage 12 fused MoE Marlin one-launch-per-bucket).
 //! - `marlin_gemm_with_perm` — perm-aware dispatcher used by both
@@ -23,6 +23,7 @@
 //! preserve the historical `crate::backend::cuda::*` paths used by
 //! `quant_linear::cuda_marlin` and parity tests.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{
@@ -32,7 +33,7 @@ use cudarc::driver::{
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 
-use super::{default_stream, ensure_module, CudaBackend, CudaState};
+use super::{current_device_ordinal, default_stream, CudaBackend, CudaState};
 use crate::backend::{Backend, BackendQuantGguf, BackendQuantMarlin};
 use crate::ptx;
 
@@ -176,11 +177,13 @@ struct MarlinGatherScratch {
 unsafe impl Send for MarlinGatherScratch {}
 unsafe impl Sync for MarlinGatherScratch {}
 
-static MARLIN_GATHER_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<MarlinGatherScratch>>> =
-    std::sync::OnceLock::new();
+static MARLIN_GATHER_SCRATCH: std::sync::OnceLock<
+    std::sync::RwLock<HashMap<usize, MarlinGatherScratch>>,
+> = std::sync::OnceLock::new();
 
-fn marlin_gather_scratch_slot() -> &'static std::sync::RwLock<Option<MarlinGatherScratch>> {
-    MARLIN_GATHER_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+fn marlin_gather_scratch_slots() -> &'static std::sync::RwLock<HashMap<usize, MarlinGatherScratch>>
+{
+    MARLIN_GATHER_SCRATCH.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 /// Run `body` with a mut ref to a Marlin-gather scratch buffer of at
@@ -196,62 +199,77 @@ fn marlin_gather_scratch_slot() -> &'static std::sync::RwLock<Option<MarlinGathe
 /// re-use the existing slot's pointer.
 #[cfg(feature = "marlin")]
 pub fn pregrow_marlin_gather_scratch(stream: &Arc<CudaStream>, required: usize) {
-    let slot = marlin_gather_scratch_slot();
+    pregrow_marlin_gather_scratch_for_ordinal(current_device_ordinal(), stream, required);
+}
+
+fn pregrow_marlin_gather_scratch_for_ordinal(
+    ordinal: usize,
+    stream: &Arc<CudaStream>,
+    required: usize,
+) {
+    let slots = marlin_gather_scratch_slots();
     {
-        let g = slot.read().expect("MARLIN_GATHER_SCRATCH poisoned");
-        if let Some(ref s) = *g {
+        let g = slots.read().expect("MARLIN_GATHER_SCRATCH poisoned");
+        if let Some(s) = g.get(&ordinal) {
             if s.capacity >= required {
                 return;
             }
         }
     }
-    let mut w = slot.write().expect("MARLIN_GATHER_SCRATCH poisoned");
-    let need_new = match &*w {
+    let mut w = slots.write().expect("MARLIN_GATHER_SCRATCH poisoned");
+    let need_new = match w.get(&ordinal) {
         Some(s) => s.capacity < required,
         None => true,
     };
     if need_new {
         let buf = unsafe { stream.alloc::<f16>(required) }
             .expect("MARLIN_GATHER_SCRATCH pregrow alloc failed");
-        *w = Some(MarlinGatherScratch {
-            buf,
-            capacity: required,
-        });
+        w.insert(
+            ordinal,
+            MarlinGatherScratch {
+                buf,
+                capacity: required,
+            },
+        );
     }
 }
 
 fn with_marlin_gather_scratch<R>(
     stream: &Arc<CudaStream>,
+    ordinal: usize,
     required: usize,
     body: impl FnOnce(&mut CudaSlice<f16>) -> R,
 ) -> R {
-    let slot = marlin_gather_scratch_slot();
+    let slots = marlin_gather_scratch_slots();
     {
-        let g = slot.read().expect("MARLIN_GATHER_SCRATCH poisoned");
-        if let Some(ref s) = *g {
+        let g = slots.read().expect("MARLIN_GATHER_SCRATCH poisoned");
+        if let Some(s) = g.get(&ordinal) {
             if s.capacity >= required {
                 drop(g);
-                let mut w = slot.write().expect("MARLIN_GATHER_SCRATCH poisoned");
-                let s = w.as_mut().expect("just observed Some");
+                let mut w = slots.write().expect("MARLIN_GATHER_SCRATCH poisoned");
+                let s = w.get_mut(&ordinal).expect("just observed Some");
                 return body(&mut s.buf);
             }
         }
     }
     // Need to (re)allocate.
-    let mut w = slot.write().expect("MARLIN_GATHER_SCRATCH poisoned");
-    let need_new = match &*w {
+    let mut w = slots.write().expect("MARLIN_GATHER_SCRATCH poisoned");
+    let need_new = match w.get(&ordinal) {
         Some(s) => s.capacity < required,
         None => true,
     };
     if need_new {
         let buf =
             unsafe { stream.alloc::<f16>(required) }.expect("MARLIN_GATHER_SCRATCH alloc failed");
-        *w = Some(MarlinGatherScratch {
-            buf,
-            capacity: required,
-        });
+        w.insert(
+            ordinal,
+            MarlinGatherScratch {
+                buf,
+                capacity: required,
+            },
+        );
     }
-    let s = w.as_mut().expect("just allocated");
+    let s = w.get_mut(&ordinal).expect("just allocated");
     body(&mut s.buf)
 }
 // ────────────────────────────────────────────────────────────────────────
@@ -391,7 +409,7 @@ pub fn marlin_gemm_with_perm(
         // caller's Marlin work also serialises on this stream — so
         // even a weaker single-slot pool is correct as long as we
         // don't leave the function before the kernel queues complete.
-        with_marlin_gather_scratch(&stream, m * k, |a_gathered| -> Result<()> {
+        with_marlin_gather_scratch(&stream, ctx.ordinal, m * k, |a_gathered| -> Result<()> {
             let mut b = stream.launch_builder(&func);
             b.arg(a);
             b.arg(perm);
@@ -511,7 +529,7 @@ impl BackendQuantMarlin for CudaBackend {
         #[cfg(feature = "marlin")]
         {
             let stream = ctx.stream.clone();
-            pregrow_marlin_gather_scratch(&stream, required);
+            pregrow_marlin_gather_scratch_for_ordinal(ctx.ordinal, &stream, required);
         }
         #[cfg(not(feature = "marlin"))]
         {
@@ -1031,7 +1049,7 @@ pub(crate) fn moe_gemm_phase_vllm_impl(
 
     // c_tmp moved process-global (was per-ctx lazy-alloc). Captured
     // graph kernel args stay valid across `new_context()` calls now.
-    crate::backend::cuda::with_vllm_moe_c_tmp(&stream, |c_tmp_mut| {
+    crate::backend::cuda::with_vllm_moe_c_tmp(&stream, ctx.ordinal, |c_tmp_mut| {
         crate::marlin::marlin_gemm_moe_vllm(
             &stream,
             input.as_f16(),

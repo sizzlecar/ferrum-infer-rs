@@ -19,6 +19,7 @@
 //! All helpers stay private to this module; the trait impl is the
 //! only public surface.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{
@@ -154,33 +155,34 @@ struct SplitKScratch {
 unsafe impl Send for SplitKScratch {}
 unsafe impl Sync for SplitKScratch {}
 
-static SPLIT_K_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<SplitKScratch>>> =
+static SPLIT_K_SCRATCH: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, SplitKScratch>>> =
     std::sync::OnceLock::new();
 
-fn split_k_scratch_slot() -> &'static std::sync::RwLock<Option<SplitKScratch>> {
-    SPLIT_K_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+fn split_k_scratch_slots() -> &'static std::sync::RwLock<HashMap<usize, SplitKScratch>> {
+    SPLIT_K_SCRATCH.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 fn with_split_k_scratch<R>(
     stream: &Arc<CudaStream>,
+    ordinal: usize,
     out_required: usize,
     ml_required: usize,
     body: impl FnOnce(&mut CudaSlice<f32>, &mut CudaSlice<f32>, &mut CudaSlice<f32>) -> R,
 ) -> R {
-    let slot = split_k_scratch_slot();
+    let slots = split_k_scratch_slots();
     {
-        let g = slot.read().expect("SPLIT_K_SCRATCH poisoned");
-        if let Some(ref s) = *g {
+        let g = slots.read().expect("SPLIT_K_SCRATCH poisoned");
+        if let Some(s) = g.get(&ordinal) {
             if s.out_capacity >= out_required && s.ml_capacity >= ml_required {
                 drop(g);
-                let mut w = slot.write().expect("SPLIT_K_SCRATCH poisoned");
-                let s = w.as_mut().expect("just observed Some");
+                let mut w = slots.write().expect("SPLIT_K_SCRATCH poisoned");
+                let s = w.get_mut(&ordinal).expect("just observed Some");
                 return body(&mut s.partial_out, &mut s.partial_m, &mut s.partial_l);
             }
         }
     }
-    let mut w = slot.write().expect("SPLIT_K_SCRATCH poisoned");
-    let need_new = match &*w {
+    let mut w = slots.write().expect("SPLIT_K_SCRATCH poisoned");
+    let need_new = match w.get(&ordinal) {
         Some(s) => s.out_capacity < out_required || s.ml_capacity < ml_required,
         None => true,
     };
@@ -191,15 +193,18 @@ fn with_split_k_scratch<R>(
             unsafe { stream.alloc::<f32>(ml_required) }.expect("SPLIT_K_SCRATCH partial_m alloc");
         let partial_l =
             unsafe { stream.alloc::<f32>(ml_required) }.expect("SPLIT_K_SCRATCH partial_l alloc");
-        *w = Some(SplitKScratch {
-            partial_out,
-            partial_m,
-            partial_l,
-            out_capacity: out_required,
-            ml_capacity: ml_required,
-        });
+        w.insert(
+            ordinal,
+            SplitKScratch {
+                partial_out,
+                partial_m,
+                partial_l,
+                out_capacity: out_required,
+                ml_capacity: ml_required,
+            },
+        );
     }
-    let s = w.as_mut().expect("just allocated");
+    let s = w.get_mut(&ordinal).expect("just allocated");
     body(&mut s.partial_out, &mut s.partial_m, &mut s.partial_l)
 }
 
@@ -257,6 +262,7 @@ fn paged_varlen_split_k_dispatch(
 
     with_split_k_scratch(
         &stream,
+        ctx.ordinal,
         out_required,
         ml_required,
         |partial_out, partial_m, partial_l| {
@@ -451,6 +457,7 @@ fn paged_batched_flash_dispatch(
 
     with_split_k_scratch(
         &stream,
+        ctx.ordinal,
         out_required,
         ml_required,
         |partial_out, partial_m, partial_l| {
@@ -1527,6 +1534,7 @@ impl BackendPagedKv for CudaBackend {
         let stream = ctx.stream.clone();
         super::vllm_paged_attn::dispatch_paged_attention_v2(
             &stream,
+            ctx.ordinal,
             out.as_f16_mut(),
             q.as_f16(),
             k_pool.as_f16(),
