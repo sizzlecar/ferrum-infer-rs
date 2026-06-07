@@ -3,7 +3,7 @@ set -euo pipefail
 
 LANE="${1:-}"
 if [[ -z "$LANE" ]]; then
-  echo "usage: scripts/release/g0_source_gate.sh {unit|metal|cuda-smoke|cuda-full|cuda-llama-dense|all-source} [OUT_ROOT]" >&2
+  echo "usage: scripts/release/g0_source_gate.sh {unit|metal|cuda-smoke|cuda-full|cuda-llama-dense|cuda-llama33-70b-4bit-2x4090|all-source} [OUT_ROOT]" >&2
   exit 2
 fi
 OUT_ROOT="${2:-docs/release/g0/source-$(date +%Y%m%d-%H%M%S)}"
@@ -20,6 +20,7 @@ run_unit() {
     scripts/release/release_binary_gate.py \
     scripts/release/g0_release_summary.py \
     scripts/release/g0_cuda_llama_dense_gate.py \
+    scripts/release/g0_cuda_llama33_70b_4bit_2x4090_gate.py \
     scripts/release/backend_runtime_preset_goal_gate.py \
     scripts/release/llama33_70b_4bit_2x4090_goal_gate.py \
     scripts/release/backend_boundary_audit.py \
@@ -103,12 +104,21 @@ run_cuda_llama_dense() {
   pass g0_cuda4090_llama_dense
 }
 
+run_cuda_llama33_70b_4bit_2x4090() {
+  python3 scripts/release/g0_cuda_llama33_70b_4bit_2x4090_gate.py \
+    --config scripts/release/configs/g0_cuda2x4090_llama33_70b_4bit.json \
+    --out "$OUT_ROOT" \
+    --ferrum-bin ./target/release/ferrum | tee "$OUT_ROOT/cuda-llama33-70b-4bit-2x4090.log"
+  pass g0_cuda2x4090_llama33_70b_4bit
+}
+
 case "$LANE" in
   unit) run_unit ;;
   metal) run_metal ;;
   cuda-smoke) cuda_build; run_cuda_template scripts/release/configs/g0_cuda4090_smoke.json g0_cuda4090_smoke ;;
   cuda-full) cuda_build; run_cuda_template scripts/release/configs/g0_cuda4090_full.json g0_cuda4090_full ;;
   cuda-llama-dense) cuda_build; run_cuda_llama_dense ;;
+  cuda-llama33-70b-4bit-2x4090) cuda_build; run_cuda_llama33_70b_4bit_2x4090 ;;
   all-source)
     run_unit
     if [[ "$(uname -s)" == "Darwin" ]]; then
