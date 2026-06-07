@@ -39,9 +39,11 @@ TOOLS = [
     }
 ]
 
+WEATHER_CODE = "WX-FERRUM-9271"
 TOOL_USER_PROMPT = (
     "北京现在天气怎么样？请先调用 get_weather 工具查询，"
-    "得到工具结果后用一句中文回答，unit 使用 celsius。"
+    "得到工具结果后用一句中文回答，并包含工具返回的 weather_code 原文。"
+    "unit 使用 celsius。"
 )
 TOOL_REQUIRED_PROMPT = "只调用 get_weather 工具查询北京天气，unit 使用 celsius。不要输出自然语言。"
 
@@ -225,7 +227,13 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": json.dumps(
-                        {"city": "北京", "temp": 22, "unit": "celsius", "desc": "晴"},
+                        {
+                            "city": "北京",
+                            "temp": 22,
+                            "unit": "celsius",
+                            "desc": "晴",
+                            "weather_code": WEATHER_CODE,
+                        },
                         ensure_ascii=False,
                     ),
                 },
@@ -241,7 +249,7 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
     assert_not_duplicate_answer("tool_result_fill", fill_text)
     if not fill_text.strip():
         raise RuntimeError("tool_result_fill: final answer is empty")
-    if "22" not in fill_text or "晴" not in fill_text:
+    if "22" not in fill_text or WEATHER_CODE not in fill_text:
         raise RuntimeError(f"tool_result_fill: answer did not use tool result: {fill_text[:500]}")
     if fill.get("finish_reason") not in {"stop", "length"}:
         raise RuntimeError(f"tool_result_fill: unexpected finish_reason: {fill}")
