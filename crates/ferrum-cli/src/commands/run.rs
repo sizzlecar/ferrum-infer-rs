@@ -1599,7 +1599,9 @@ mod tests {
             raw_cli_value: "1".to_string(),
             requested_gpu_devices: vec![1],
             selected_gpu_devices: vec![1],
+            cuda_device_count: 2,
             selected_distributed_strategy: "single_gpu".to_string(),
+            selected_layer_split_plan: None,
         };
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let effective = run_effective_runtime_config(&snapshot, None, Some(&selection));

@@ -6,13 +6,17 @@ pub const GPU_DEVICES_RAW_KEY: &str = "FERRUM_GPU_DEVICES_RAW";
 pub const REQUESTED_GPU_DEVICES_KEY: &str = "FERRUM_REQUESTED_GPU_DEVICES";
 pub const SELECTED_GPU_DEVICES_KEY: &str = "FERRUM_SELECTED_GPU_DEVICES";
 pub const SELECTED_DISTRIBUTED_STRATEGY_KEY: &str = "FERRUM_SELECTED_DISTRIBUTED_STRATEGY";
+pub const CUDA_DEVICE_COUNT_KEY: &str = "FERRUM_CUDA_DEVICE_COUNT";
+pub const SELECTED_LAYER_SPLIT_PLAN_KEY: &str = "FERRUM_SELECTED_LAYER_SPLIT_PLAN";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuDeviceSelection {
     pub raw_cli_value: String,
     pub requested_gpu_devices: Vec<usize>,
     pub selected_gpu_devices: Vec<usize>,
+    pub cuda_device_count: usize,
     pub selected_distributed_strategy: String,
+    pub selected_layer_split_plan: Option<String>,
 }
 
 impl GpuDeviceSelection {
@@ -51,7 +55,21 @@ impl GpuDeviceSelection {
                 self.selected_distributed_strategy.clone(),
                 RuntimeConfigSource::Cli,
             ),
+            RuntimeConfigEntry::new(
+                CUDA_DEVICE_COUNT_KEY,
+                self.cuda_device_count.to_string(),
+                RuntimeConfigSource::Cli,
+            ),
         ]
+        .into_iter()
+        .chain(self.selected_layer_split_plan.as_ref().map(|plan| {
+            RuntimeConfigEntry::new(
+                SELECTED_LAYER_SPLIT_PLAN_KEY,
+                plan.clone(),
+                RuntimeConfigSource::Cli,
+            )
+        }))
+        .collect()
     }
 
     pub fn insert_backend_options(&self, options: &mut HashMap<String, Value>) {
@@ -71,6 +89,16 @@ impl GpuDeviceSelection {
             "selected_distributed_strategy".to_string(),
             Value::String(self.selected_distributed_strategy.clone()),
         );
+        options.insert(
+            "cuda_device_count".to_string(),
+            serde_json::json!(self.cuda_device_count),
+        );
+        if let Some(plan) = &self.selected_layer_split_plan {
+            options.insert(
+                "selected_layer_split_plan".to_string(),
+                Value::String(plan.clone()),
+            );
+        }
     }
 }
 
@@ -90,18 +118,21 @@ pub fn resolve_cuda_gpu_devices(
     let requested = parse_gpu_devices(raw)?;
     let available = available_cuda_device_count()?;
     validate_gpu_devices_exist(&requested, available)?;
-    if requested.len() > 1 {
-        return Err(FerrumError::unsupported(format!(
-            "multi-GPU layer_split is not implemented yet for --gpu-devices {}; refusing to silently use one GPU",
-            join_gpu_devices(&requested)
-        )));
-    }
+    let selected_distributed_strategy = if requested.len() > 1 {
+        "layer_split"
+    } else {
+        "single_gpu"
+    };
+    let selected_layer_split_plan =
+        (requested.len() > 1).then(|| even_layer_split_plan_placeholder(&requested));
 
     Ok(Some(GpuDeviceSelection {
         raw_cli_value: raw.to_string(),
         requested_gpu_devices: requested.clone(),
         selected_gpu_devices: requested,
-        selected_distributed_strategy: "single_gpu".to_string(),
+        cuda_device_count: available,
+        selected_distributed_strategy: selected_distributed_strategy.to_string(),
+        selected_layer_split_plan,
     }))
 }
 
@@ -166,6 +197,15 @@ pub fn join_gpu_devices(devices: &[usize]) -> String {
         .join(",")
 }
 
+fn even_layer_split_plan_placeholder(devices: &[usize]) -> String {
+    devices
+        .iter()
+        .enumerate()
+        .map(|(idx, device)| format!("stage{idx}:cuda:{device}:layers=auto"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 #[cfg(feature = "cuda")]
 fn available_cuda_device_count() -> Result<usize> {
     candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
@@ -220,7 +260,9 @@ mod tests {
             raw_cli_value: "1".to_string(),
             requested_gpu_devices: vec![1],
             selected_gpu_devices: vec![1],
+            cuda_device_count: 2,
             selected_distributed_strategy: "single_gpu".to_string(),
+            selected_layer_split_plan: None,
         };
         let snapshot =
             ferrum_types::RuntimeConfigSnapshot::from_entries(selection.runtime_config_entries());
@@ -240,5 +282,37 @@ mod tests {
             entry(SELECTED_DISTRIBUTED_STRATEGY_KEY).effective_value,
             "single_gpu"
         );
+        assert_eq!(entry(CUDA_DEVICE_COUNT_KEY).effective_value, "2");
+    }
+
+    #[test]
+    fn runtime_entries_record_layer_split_plan_for_multi_gpu() {
+        let selection = GpuDeviceSelection {
+            raw_cli_value: "0,1".to_string(),
+            requested_gpu_devices: vec![0, 1],
+            selected_gpu_devices: vec![0, 1],
+            cuda_device_count: 2,
+            selected_distributed_strategy: "layer_split".to_string(),
+            selected_layer_split_plan: Some(even_layer_split_plan_placeholder(&[0, 1])),
+        };
+        let snapshot =
+            ferrum_types::RuntimeConfigSnapshot::from_entries(selection.runtime_config_entries());
+        let entry = |key: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry(REQUESTED_GPU_DEVICES_KEY).effective_value, "0,1");
+        assert_eq!(entry(SELECTED_GPU_DEVICES_KEY).effective_value, "0,1");
+        assert_eq!(
+            entry(SELECTED_DISTRIBUTED_STRATEGY_KEY).effective_value,
+            "layer_split"
+        );
+        assert!(entry(SELECTED_LAYER_SPLIT_PLAN_KEY)
+            .effective_value
+            .contains("stage0:cuda:0"));
     }
 }
