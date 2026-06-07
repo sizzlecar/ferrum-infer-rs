@@ -938,10 +938,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
 ///     PR C (see `docs/dim5-model-wireup-plan.md`).
 pub struct LlmExecutorFactory;
 
-fn resolve_llama_layer_stage_config(
+fn resolve_llama_layer_split_plan(
     config: &ComponentConfig,
     num_layers: usize,
-) -> Result<Option<ferrum_models::models::llama_family::LlamaFamilyLayerStageConfig>> {
+) -> Result<Option<crate::layer_split::ParsedLayerSplitPlan>> {
     if config
         .get_string_option("selected_distributed_strategy")
         .as_deref()
@@ -972,6 +972,16 @@ fn resolve_llama_layer_stage_config(
             parsed_plan.total_layers()
         )));
     }
+    Ok(Some(parsed_plan))
+}
+
+fn resolve_llama_layer_stage_config(
+    config: &ComponentConfig,
+    num_layers: usize,
+) -> Result<Option<ferrum_models::models::llama_family::LlamaFamilyLayerStageConfig>> {
+    let Some(parsed_plan) = resolve_llama_layer_split_plan(config, num_layers)? else {
+        return Ok(None);
+    };
     let device_id = match &config.device {
         Device::CUDA(device_id) => *device_id,
         other => {
@@ -999,21 +1009,22 @@ fn build_llm<B, K>(
     qcfg: ferrum_models::models::LlamaFamilyConfig,
     moe_cfg: Option<ferrum_models::moe_config::Qwen3MoeConfig>,
     model_path: &str,
-    llama_layer_stage: Option<ferrum_models::models::llama_family::LlamaFamilyLayerStageConfig>,
+    llama_layer_split_plan: Option<crate::layer_split::ParsedLayerSplitPlan>,
 ) -> Result<Box<dyn ferrum_models::common::DecoderOnlyLLM>>
 where
     B: ferrum_kernels::backend::MoeLlmBackend,
     K: ferrum_kernels::backend::KvLayer<B>,
     ferrum_models::models::LlamaFamilyModel<B, K>: ferrum_models::common::DecoderOnlyLLM,
+    ferrum_models::models::LlamaFamilyPipelineModel<B, K>: ferrum_models::common::DecoderOnlyLLM,
 {
-    let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open(model_path)?;
     if matches!(arch, ferrum_models::Architecture::Qwen3Moe) {
-        if llama_layer_stage.is_some() {
+        if llama_layer_split_plan.is_some() {
             return Err(FerrumError::unsupported(
                 "CUDA layer_split stage loading is wired only for Llama-family dense models; \
                  Qwen3MoeModel requires a separate MoE stage loader.",
             ));
         }
+        let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open(model_path)?;
         let mc = moe_cfg.ok_or_else(|| {
             FerrumError::internal(
                 "Qwen3Moe arch reached build_llm without Qwen3MoeConfig (caller bug)",
@@ -1023,16 +1034,42 @@ where
             ferrum_models::models::Qwen3MoeModel::<B, K>::new_safetensors(mc, &weight_loader)?,
         ))
     } else {
-        let model = if let Some(stage) = llama_layer_stage {
-            ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage(
-                qcfg,
-                &weight_loader,
-                stage,
-            )?
+        if llama_layer_split_plan.is_some() && !B::supports_device_ordinal_scope() {
+            return Err(FerrumError::unsupported(
+                "selected_distributed_strategy=layer_split requires a backend with \
+                 device-scoped execution; refusing to silently use the default device",
+            ));
+        }
+        let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open(model_path)?;
+        if let Some(plan) = llama_layer_split_plan {
+            let stage_configs = plan.to_llama_stage_configs();
+            let stage_device_ordinals = plan
+                .stages
+                .iter()
+                .map(|stage| Some(stage.device))
+                .collect::<Vec<_>>();
+            let mut stages = Vec::with_capacity(stage_configs.len());
+            for stage_config in stage_configs {
+                stages.push(
+                    ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage(
+                        qcfg.clone(),
+                        &weight_loader,
+                        stage_config,
+                    )?,
+                );
+            }
+            Ok(Box::new(ferrum_models::models::LlamaFamilyPipelineModel::<
+                B,
+                K,
+            >::new_with_backend_device_ordinals(
+                stages,
+                stage_device_ordinals,
+            )?))
         } else {
-            ferrum_models::models::LlamaFamilyModel::<B, K>::new(qcfg, &weight_loader)?
-        };
-        Ok(Box::new(model))
+            Ok(Box::new(
+                ferrum_models::models::LlamaFamilyModel::<B, K>::new(qcfg, &weight_loader)?,
+            ))
+        }
     }
 }
 
@@ -1204,7 +1241,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
 
                 let model_info =
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
-                let llama_layer_stage = resolve_llama_layer_stage_config(config, qcfg.num_layers)?;
+                let llama_layer_split_plan =
+                    resolve_llama_layer_split_plan(config, qcfg.num_layers)?;
 
                 // (Dim 4, Dim 5) cascade: pick `B` from device, `K` from
                 // kv-dtype, and dispatch to the generic `build_llm` helper.
@@ -1225,7 +1263,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                 qcfg,
                                 moe_cfg,
                                 &model_path,
-                                llama_layer_stage,
+                                llama_layer_split_plan,
                             )?
                         }
                         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1242,7 +1280,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     qcfg,
                                     moe_cfg,
                                     &model_path,
-                                    llama_layer_stage,
+                                    llama_layer_split_plan,
                                 )?
                             }
                             #[cfg(not(feature = "metal"))]
@@ -1261,7 +1299,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     qcfg,
                                     moe_cfg,
                                     &model_path,
-                                    llama_layer_stage,
+                                    llama_layer_split_plan,
                                 )?
                             }
                             #[cfg(not(feature = "cuda"))]
@@ -1293,7 +1331,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     qcfg,
                                     moe_cfg,
                                     &model_path,
-                                    llama_layer_stage,
+                                    llama_layer_split_plan,
                                 )?
                             }
                             #[cfg(not(feature = "cuda"))]
@@ -1577,6 +1615,47 @@ mod tests {
             .to_string();
 
         assert!(err.contains("covers 80 layers but model has 81"));
+    }
+
+    #[test]
+    fn build_llm_rejects_layer_split_before_weight_open_without_device_scope() {
+        use ferrum_interfaces::kv_dtype::KvFp16;
+        use ferrum_models::models::LlamaFamilyConfig;
+
+        let qcfg = LlamaFamilyConfig {
+            hidden_size: 1,
+            intermediate_size: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            num_layers: 2,
+            vocab_size: 1,
+            max_seq_len: 8,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            rope_scaling: None,
+            rope_interleaved: false,
+            has_qk_norm: false,
+            sliding_window: 0,
+        };
+        let plan = crate::layer_split::parse_layer_split_plan(
+            "stage0:cuda:0:layers=0-0;stage1:cuda:1:layers=1-1",
+        )
+        .unwrap();
+
+        let err = match build_llm::<ferrum_kernels::backend::cpu::CpuBackend, KvFp16>(
+            ferrum_models::Architecture::Llama,
+            qcfg,
+            None,
+            "/missing/model/path",
+            Some(plan),
+        ) {
+            Ok(_) => panic!("layer_split build unexpectedly succeeded"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("device-scoped execution"));
+        assert!(err.contains("refusing to silently use the default device"));
     }
 
     #[test]

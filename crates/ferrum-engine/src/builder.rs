@@ -271,7 +271,7 @@ impl EngineBuilder {
         let executor_name = self.resolve_executor_name();
 
         let component_config = ComponentConfig::from_engine_config(&self.config);
-        reject_unsupported_layer_split(&component_config)?;
+        validate_layer_split_plan(&component_config)?;
         let typed_model_path = component_config.get_string_option("model_path");
         let has_model_path =
             typed_model_path.is_some() || engine_builder_runtime_env().has_model_path();
@@ -454,7 +454,7 @@ impl EngineBuilder {
     }
 }
 
-fn reject_unsupported_layer_split(component_config: &ComponentConfig) -> Result<()> {
+fn validate_layer_split_plan(component_config: &ComponentConfig) -> Result<()> {
     if component_config
         .get_string_option("selected_distributed_strategy")
         .as_deref()
@@ -492,12 +492,13 @@ fn reject_unsupported_layer_split(component_config: &ComponentConfig) -> Result<
         .collect::<Vec<_>>()
         .join(",");
     let plan_label = plan_raw.unwrap_or_else(|| format!("{:?}", parsed_plan.stages));
-    Err(FerrumError::unsupported(format!(
-        "CUDA layer_split execution is not implemented yet; requested_gpu_devices={requested:?} selected_gpu_devices={selected:?} selected_layer_split_plan={plan_label} total_layers={} pipeline_stages={} stage_ranges={stage_ranges} communication_backend={}. Refusing to fall back to a single GPU.",
+    tracing::info!(
+        "validated CUDA layer_split plan: requested_gpu_devices={requested:?} selected_gpu_devices={selected:?} selected_layer_split_plan={plan_label} total_layers={} pipeline_stages={} stage_ranges={stage_ranges} communication_backend={}",
         parsed_plan.total_layers(),
         execution_plan.parallel_config.pipeline_parallel_size,
         execution_plan.parallel_config.communication_backend,
-    )))
+    );
+    Ok(())
 }
 
 /// Create an engine with the default configuration and registry
@@ -578,8 +579,8 @@ mod tests {
         assert_eq!(component_config.get_option::<usize>("spec_n"), Some(6));
     }
 
-    #[tokio::test]
-    async fn test_builder_rejects_layer_split_until_executor_supports_it() {
+    #[test]
+    fn test_builder_validates_layer_split_plan_without_executor_reject() {
         let mut config = EngineConfig::default();
         config.backend.backend_options.insert(
             "model_path".to_string(),
@@ -610,19 +611,9 @@ mod tests {
                 {"stage": 1, "device": 1, "layer_start": 40, "layer_end": 79}
             ]),
         );
+        let component_config = ComponentConfig::from_engine_config(&config);
 
-        let err = match EngineBuilder::new(config).build().await {
-            Ok(_) => panic!("layer_split build unexpectedly succeeded"),
-            Err(err) => err,
-        };
-        assert!(err
-            .to_string()
-            .contains("layer_split execution is not implemented yet"));
-        assert!(err.to_string().contains("selected_gpu_devices=[0, 1]"));
-        assert!(err.to_string().contains("total_layers=80"));
-        assert!(err.to_string().contains("pipeline_stages=2"));
-        assert!(err.to_string().contains("stage_ranges=0-39,40-79"));
-        assert!(err.to_string().contains("communication_backend=cuda-peer"));
+        validate_layer_split_plan(&component_config).unwrap();
     }
 
     #[tokio::test]
