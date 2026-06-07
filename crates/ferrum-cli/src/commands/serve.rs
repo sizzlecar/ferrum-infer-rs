@@ -298,30 +298,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let mut materialized_runtime_keys =
         crate::runtime_env::materialize_runtime_env_defaults(&non_env_runtime_entries);
 
-    let autosize_env_before = RuntimeConfigSnapshot::capture_current();
-    // GPU-memory auto-sizing: scale FERRUM_KV_MAX_BLOCKS so weights +
-    // KV pool + 4 GB scratch reserve fit in `total_gpu_mem * gpu_util`.
-    // Skipped on Mac / when nvidia-smi is missing; respects user-set
-    // FERRUM_KV_MAX_BLOCKS overrides.
-    if let Some(p) = local_dir_path.as_ref() {
-        crate::gpu_mem_autosize::apply_auto_size(p, gpu_memory_utilization);
-    }
-    let autosize_runtime_entries = runtime_entries_added_by_snapshot(
-        &autosize_env_before,
-        &RuntimeConfigSnapshot::capture_current(),
-        SERVE_AUTOSIZE_RUNTIME_KEYS,
-        RuntimeConfigSource::MemoryProfile,
-    );
-    materialized_runtime_keys.extend(
-        autosize_runtime_entries
-            .iter()
-            .map(|entry| entry.key.clone()),
-    );
-    non_env_runtime_entries.extend(autosize_runtime_entries);
-    non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-    materialized_runtime_keys.sort();
-    materialized_runtime_keys.dedup();
-
     let model_id = if let Some(p) = gguf_path.as_ref() {
         // Use the GGUF stem as the OpenAI model id — the user sees this
         // back in /v1/models responses + chat completion `model` field.
@@ -574,6 +550,31 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     if let Some(selection) = &gpu_selection {
         startup_cli_runtime_entries.extend(selection.runtime_config_entries());
     }
+    if !startup_cli_runtime_entries.is_empty() {
+        crate::runtime_env::materialize_runtime_env_effective(
+            &RuntimeConfigSnapshot::from_entries(startup_cli_runtime_entries.clone()),
+        );
+    }
+    let autosize_env_before = RuntimeConfigSnapshot::capture_current();
+    // GPU-memory auto-sizing must run after the model source resolves.
+    // HF-cache models are not `local_dir_path`, but they still need the same
+    // KV block sizing as direct local safetensors directories.
+    crate::gpu_mem_autosize::apply_auto_size(&source.local_path, gpu_memory_utilization);
+    let autosize_runtime_entries = runtime_entries_added_by_snapshot(
+        &autosize_env_before,
+        &RuntimeConfigSnapshot::capture_current(),
+        SERVE_AUTOSIZE_RUNTIME_KEYS,
+        RuntimeConfigSource::MemoryProfile,
+    );
+    materialized_runtime_keys.extend(
+        autosize_runtime_entries
+            .iter()
+            .map(|entry| entry.key.clone()),
+    );
+    non_env_runtime_entries.extend(autosize_runtime_entries);
+    non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
+    materialized_runtime_keys.sort();
+    materialized_runtime_keys.dedup();
     let startup_auto_config = startup_auto_config(
         &device,
         arch_for_dispatch,
