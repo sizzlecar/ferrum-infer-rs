@@ -1070,9 +1070,11 @@ where
             Ok(Box::new(ferrum_models::models::LlamaFamilyPipelineModel::<
                 B,
                 K,
-            >::new_with_backend_device_ordinals(
+            >::new_with_placement(
                 stages,
-                stage_device_ordinals,
+                ferrum_models::models::LlamaPipelinePlacement::from_backend_device_ordinals(
+                    stage_device_ordinals,
+                ),
             )?))
         } else {
             Ok(Box::new(
