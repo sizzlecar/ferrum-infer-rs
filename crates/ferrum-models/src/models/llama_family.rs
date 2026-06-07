@@ -17,6 +17,7 @@
 //! sees a uniform `qkv_proj` / `gate_up_proj` Linear.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{atomic::AtomicU64, OnceLock};
 
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
@@ -336,6 +337,54 @@ pub struct LlamaFamilyLayer<B: QuantLlmBackend + BackendMoeFused> {
     pub post_ln_w: B::Buffer,
     pub gate_up_proj: Box<dyn Linear<B>>,
     pub down_proj: Box<dyn Linear<B>>,
+}
+
+fn load_llama_family_layers<B: MoeLlmBackend>(
+    cfg: &LlamaFamilyConfig,
+    loader: &dyn WeightLoader<B>,
+    source_layers: Range<usize>,
+) -> Result<Vec<LlamaFamilyLayer<B>>> {
+    if source_layers.start > source_layers.end || source_layers.end > cfg.num_layers {
+        return Err(ferrum_types::FerrumError::model(format!(
+            "llama layer range {}..{} is outside model layer count {}",
+            source_layers.start, source_layers.end, cfg.num_layers
+        )));
+    }
+
+    let mut layers = Vec::with_capacity(source_layers.end.saturating_sub(source_layers.start));
+    for li in source_layers {
+        let prefix = format!("model.layers.{li}");
+        let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
+        let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
+        let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
+        let post_ln_w = loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
+        let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
+        let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
+
+        let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
+            let q = loader
+                .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
+                .ok();
+            let k = loader
+                .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
+                .ok();
+            (q, k)
+        } else {
+            (None, None)
+        };
+
+        layers.push(LlamaFamilyLayer {
+            input_ln_w,
+            qkv_proj,
+            q_norm_w,
+            k_norm_w,
+            o_proj,
+            post_ln_w,
+            gate_up_proj,
+            down_proj,
+        });
+    }
+    Ok(layers)
 }
 
 /// Precomputed RoPE cos/sin tables (shape `[max_seq, head_dim / 2]` each).
@@ -765,40 +814,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let embed = loader.load_tensor("model.embed_tokens.weight")?;
 
         // Per-layer weights.
-        let mut layers = Vec::with_capacity(cfg.num_layers);
-        for li in 0..cfg.num_layers {
-            let prefix = format!("model.layers.{li}");
-            let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
-            let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
-            let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
-            let post_ln_w =
-                loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
-            let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
-
-            let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
-                let q = loader
-                    .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
-                    .ok();
-                let k = loader
-                    .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
-                    .ok();
-                (q, k)
-            } else {
-                (None, None)
-            };
-
-            layers.push(LlamaFamilyLayer {
-                input_ln_w,
-                qkv_proj,
-                q_norm_w,
-                k_norm_w,
-                o_proj,
-                post_ln_w,
-                gate_up_proj,
-                down_proj,
-            });
-        }
+        let layers = load_llama_family_layers(&cfg, loader, 0..cfg.num_layers)?;
 
         let final_norm_w = loader.load_tensor("model.norm.weight")?;
 
@@ -884,40 +900,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let rope = build_rope_cache::<B>(&cfg);
         let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
 
-        let mut layers = Vec::with_capacity(cfg.num_layers);
-        for li in 0..cfg.num_layers {
-            let prefix = format!("model.layers.{li}");
-            let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
-            let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
-            let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
-            let post_ln_w =
-                loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
-            let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
-
-            let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
-                let q = loader
-                    .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
-                    .ok();
-                let k = loader
-                    .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
-                    .ok();
-                (q, k)
-            } else {
-                (None, None)
-            };
-
-            layers.push(LlamaFamilyLayer {
-                input_ln_w,
-                qkv_proj,
-                q_norm_w,
-                k_norm_w,
-                o_proj,
-                post_ln_w,
-                gate_up_proj,
-                down_proj,
-            });
-        }
+        let layers = load_llama_family_layers(&cfg, loader, 0..cfg.num_layers)?;
 
         let final_norm_w = loader.load_tensor("model.norm.weight")?;
 
@@ -2848,7 +2831,117 @@ fn scale_llama3_rope_freq(
 
 #[cfg(test)]
 mod tests {
-    use super::{LlamaFamilyRuntimeEnv, DEFAULT_KV_CAPACITY};
+    use std::sync::Mutex;
+
+    use ferrum_kernels::backend::cpu::CpuBackend;
+    use ferrum_quantization::{DenseLinear, QuantConfig, WeightLoader};
+    use ferrum_types::Result;
+
+    use super::{
+        load_llama_family_layers, LlamaFamilyConfig, LlamaFamilyRuntimeEnv, DEFAULT_KV_CAPACITY,
+    };
+
+    #[derive(Default)]
+    struct RecordingLoader {
+        tensors: Mutex<Vec<String>>,
+        linears: Mutex<Vec<String>>,
+    }
+
+    impl WeightLoader<CpuBackend> for RecordingLoader {
+        fn load_tensor(&self, name: &str) -> Result<Vec<f32>> {
+            self.tensors.lock().unwrap().push(name.to_string());
+            Ok(vec![1.0])
+        }
+
+        fn load_linear(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+            self.linears.lock().unwrap().push(name.to_string());
+            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(&[1.0], 1, 1)))
+        }
+
+        fn has_tensor(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn quant_config(&self) -> Option<&QuantConfig> {
+            None
+        }
+    }
+
+    fn test_llama_config(num_layers: usize, has_qk_norm: bool) -> LlamaFamilyConfig {
+        LlamaFamilyConfig {
+            hidden_size: 1,
+            intermediate_size: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            num_layers,
+            vocab_size: 1,
+            max_seq_len: 1,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            rope_scaling: None,
+            rope_interleaved: false,
+            has_qk_norm,
+            sliding_window: 0,
+        }
+    }
+
+    #[test]
+    fn llama_family_layer_loader_uses_source_layer_range() {
+        let cfg = test_llama_config(5, true);
+        let loader = RecordingLoader::default();
+
+        let layers = load_llama_family_layers(&cfg, &loader, 2..4).unwrap();
+
+        assert_eq!(layers.len(), 2);
+        assert!(layers.iter().all(|layer| layer.q_norm_w.is_some()));
+        assert!(layers.iter().all(|layer| layer.k_norm_w.is_some()));
+        assert_eq!(
+            loader.tensors.into_inner().unwrap(),
+            vec![
+                "model.layers.2.input_layernorm.weight",
+                "model.layers.2.post_attention_layernorm.weight",
+                "model.layers.2.self_attn.q_norm.weight",
+                "model.layers.2.self_attn.k_norm.weight",
+                "model.layers.3.input_layernorm.weight",
+                "model.layers.3.post_attention_layernorm.weight",
+                "model.layers.3.self_attn.q_norm.weight",
+                "model.layers.3.self_attn.k_norm.weight",
+            ]
+        );
+        assert_eq!(
+            loader.linears.into_inner().unwrap(),
+            vec![
+                "model.layers.2.self_attn.qkv_proj",
+                "model.layers.2.self_attn.o_proj",
+                "model.layers.2.mlp.gate_up_proj",
+                "model.layers.2.mlp.down_proj",
+                "model.layers.3.self_attn.qkv_proj",
+                "model.layers.3.self_attn.o_proj",
+                "model.layers.3.mlp.gate_up_proj",
+                "model.layers.3.mlp.down_proj",
+            ]
+        );
+    }
+
+    #[test]
+    fn llama_family_layer_loader_rejects_out_of_bounds_range() {
+        let cfg = test_llama_config(2, false);
+        let loader = RecordingLoader::default();
+
+        let err = match load_llama_family_layers(&cfg, &loader, 1..3) {
+            Ok(_) => panic!("expected out-of-bounds layer range to fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("outside model layer count"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn llama_family_runtime_env_parses_startup_knobs() {
