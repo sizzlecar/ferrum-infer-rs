@@ -906,9 +906,6 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         if payload.get("tools"):
             self.send_tool_call()
             return
-        if payload.get("response_format"):
-            self.send_chat('{"answer":"scenario-ok"}')
-            return
         messages = payload.get("messages", [])
         prompt = " ".join(str(msg.get("content") or "") for msg in messages)
         last_user = ""
@@ -919,7 +916,14 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         marker = re.search(r"\b(ferrum\d{2}\d{2})\b", prompt)
         square = re.search(r"(S\d{4})", prompt)
         if marker and square:
-            self.send_chat(f"{marker.group(1)}\n{square.group(1)}")
+            self.send_chat(
+                json.dumps(
+                    {"marker": marker.group(1), "checksum": square.group(1)},
+                    separators=(",", ":"),
+                )
+            )
+        elif payload.get("response_format"):
+            self.send_chat('{"answer":"scenario-ok"}')
         elif "remembered code" in last_user.lower() or "secret code" in last_user.lower():
             self.send_chat("ferrum-blue ferrum-loop-blue")
         elif "remember code" in last_user.lower() or "secret" in last_user.lower():
