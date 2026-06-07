@@ -129,11 +129,17 @@ def run_concurrency_quality_regression(
                 "tool_choice": "required",
                 "messages": [
                     {
+                        "role": "system",
+                        "content": (
+                            "You must call the provided function exactly once. "
+                            "Do not write natural language."
+                        ),
+                    },
+                    {
                         "role": "user",
                         "content": (
-                            "Call capture_quality_marker with marker "
-                            f"{marker!r} and checksum {answer!r}. "
-                            "Do not output natural language."
+                            "Call capture_quality_marker exactly once with this JSON arguments "
+                            f"object: {{\"marker\":\"{marker}\",\"checksum\":\"{answer}\"}}"
                         ),
                     }
                 ],
