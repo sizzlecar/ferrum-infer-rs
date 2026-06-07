@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "path": "crates/ferrum-types/src/auto_config.rs",
+      "reason": "Runtime preset resolver is allowed to branch on backend while resolving typed availability and product defaults.",
+      "owner": "runtime",
+      "review_condition": "Review when RuntimePreset/BackendPreset availability moves out of ferrum-types auto_config or backend candidate status no longer needs string comparisons."
+    },
+    {
+      "path": "scripts/m3_ab_runner.py",
+      "reason": "M3 release runner self-test fixture asserts CUDA hardware capability serialization.",
+      "owner": "release",
+      "review_condition": "Review when M3 runner fixtures are replaced by generated backend preset snapshots."
+    }
+  ]
+}

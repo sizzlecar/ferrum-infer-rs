@@ -15,6 +15,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 METAL_VALIDATOR = REPO_ROOT / "scripts/release/validate_metal_readme_regression.py"
 SUMMARY_VALIDATOR = REPO_ROOT / "scripts/release/g0_release_summary.py"
 RELEASE_BINARY_GATE = REPO_ROOT / "scripts/release/release_binary_gate.py"
+RUN_GATE = REPO_ROOT / "scripts/release/run_gate.py"
+RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
+BACKEND_RUNTIME_GOAL_GATE = REPO_ROOT / "scripts/release/backend_runtime_preset_goal_gate.py"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from m3_validate_runner_artifact import (  # noqa: E402
@@ -208,6 +211,24 @@ def test_release_binary_gate_staged_asset_path() -> None:
             require("sha256 mismatch" in str(e), str(e))
 
 
+def test_run_gate_selftest() -> None:
+    ok = run([sys.executable, str(RUN_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("FERRUM RUN GATE SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_run_scenarios_selftest() -> None:
+    ok = run([sys.executable, str(RUN_SCENARIOS), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("BACKEND SCENARIO RUNNER SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_backend_runtime_goal_gate_selftest() -> None:
+    ok = run([sys.executable, str(BACKEND_RUNTIME_GOAL_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("BACKEND RUNTIME PRESET GOAL SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_m3_quality_gate_artifact_validators() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-m3-gates-") as tmp:
         root = Path(tmp)
@@ -284,6 +305,9 @@ def main() -> int:
     test_metal_validator()
     test_summary_validator()
     test_release_binary_gate_staged_asset_path()
+    test_run_gate_selftest()
+    test_run_scenarios_selftest()
+    test_backend_runtime_goal_gate_selftest()
     test_m3_quality_gate_artifact_validators()
     print("G0 VALIDATOR SELFTEST PASS")
     return 0
