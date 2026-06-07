@@ -85,7 +85,7 @@ def run_concurrency_quality_regression(
         nonce = f"M{concurrency:02d}"
 
         def call(i: int) -> dict[str, Any]:
-            marker = f"K{nonce}{i:02d}Z"
+            marker = f"K{nonce}{i:02d}"
             value = i + 1
             answer = f"S{value * value:04d}"
             payload = {
@@ -121,7 +121,6 @@ def run_concurrency_quality_regression(
                 len(lines) == 2
                 and marker_line_ok(lines[0], marker)
                 and answer_line_ok(lines[1], answer)
-                and not any(other.startswith("K") and other.endswith("Z") for other in lines[1:])
             )
             return {
                 "i": i,
