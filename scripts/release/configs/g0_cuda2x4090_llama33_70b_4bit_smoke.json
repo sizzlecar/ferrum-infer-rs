@@ -17,6 +17,7 @@
   "warmup_requests": 4,
   "n_repeats": 1,
   "require_ci": false,
+  "run_vllm_baseline": false,
   "random_input_len": 256,
   "random_output_len": 128,
   "seed": 9271
