@@ -708,6 +708,10 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// Qwen3-TTS Talker, which embeds inputs externally and feeds via
     /// `prefill_from_embeds`).
     pub embed: Option<B::Buffer>,
+    /// Source checkpoint layer range loaded into `layers`. Full LLM models
+    /// use `0..cfg.num_layers`; layer-split stages load a contiguous subset.
+    pub layer_source_start: usize,
+    pub layer_source_end: usize,
     pub layers: Vec<LlamaFamilyLayer<B>>,
     pub final_norm_w: B::Buffer,
     /// LM output head. `None` for backbone-only models.
@@ -847,11 +851,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             as_linear
         };
 
+        let layer_source_end = cfg.num_layers;
         let runtime_cfg = cfg.to_runtime();
         Ok(Self {
             cfg,
             runtime_cfg,
             embed: Some(embed),
+            layer_source_start: 0,
+            layer_source_end,
             layers,
             final_norm_w,
             lm_head: Some(lm_head),
@@ -904,11 +911,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         let final_norm_w = loader.load_tensor("model.norm.weight")?;
 
+        let layer_source_end = cfg.num_layers;
         let runtime_cfg = cfg.to_runtime();
         Ok(Self {
             cfg,
             runtime_cfg,
             embed: None,
+            layer_source_start: 0,
+            layer_source_end,
             layers,
             final_norm_w,
             lm_head: None,
@@ -935,6 +945,31 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             lora_cache_adapters: HashMap::new(),
             lora_projection_applications: 0,
         })
+    }
+
+    pub fn source_layer_range(&self) -> Range<usize> {
+        self.layer_source_start..self.layer_source_end
+    }
+
+    pub fn local_layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn local_layer_indices(&self) -> Range<usize> {
+        0..self.local_layer_count()
+    }
+
+    fn source_layer_index(&self, local_layer_index: usize) -> usize {
+        self.layer_source_start + local_layer_index
+    }
+
+    fn local_layer_index_for_source(&self, source_layer_index: usize) -> Option<usize> {
+        if source_layer_index < self.layer_source_start
+            || source_layer_index >= self.layer_source_end
+        {
+            return None;
+        }
+        Some(source_layer_index - self.layer_source_start)
     }
 
     /// Grow scratch buffers if `tokens` exceeds the current sizing.
@@ -1031,8 +1066,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // = 8 GB total. Sized this large only because `max_seqs=16`
         // is the default; lower it via env to shrink.
         if paged && self.paged_pools.is_none() {
-            let mut pools = Vec::with_capacity(self.cfg.num_layers);
-            for _ in 0..self.cfg.num_layers {
+            let mut pools = Vec::with_capacity(self.local_layer_count());
+            for _ in self.local_layer_indices() {
                 let pool_floats = total_pool_blocks * nkv * PAGED_BLOCK_SIZE * hd;
                 pools.push((B::alloc(pool_floats), B::alloc(pool_floats)));
             }
@@ -1062,7 +1097,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // model's K marker. INT8 supports paged mode only — KvInt8::alloc_contig
         // panics, surfacing the misconfiguration here at first ensure_kv.
         let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
-            (0..self.cfg.num_layers)
+            self.local_layer_indices()
                 .map(|_| {
                     if paged {
                         K::alloc_paged(max_blocks_per_seq, PAGED_BLOCK_SIZE, nkv, hd)
@@ -1277,7 +1312,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             })
             .unwrap_or((0, 16));
         let bytes_per_entry = (block_size
-            * self.cfg.num_layers
+            * self.local_layer_count()
             * self.cfg.num_kv_heads
             * self.cfg.head_dim
             * K::BYTES_PER_ELEM
@@ -1302,7 +1337,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         layer_index: usize,
         target_module: &str,
     ) -> Option<(usize, usize)> {
-        let layer = self.layers.get(layer_index)?;
+        let local_layer_index = self.local_layer_index_for_source(layer_index)?;
+        let layer = self.layers.get(local_layer_index)?;
         match target_module {
             "qkv_proj" => Some((layer.qkv_proj.in_features(), layer.qkv_proj.out_features())),
             "o_proj" => Some((layer.o_proj.in_features(), layer.o_proj.out_features())),
@@ -1332,6 +1368,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     linear.target_module
                 ))
             })?;
+            if layer_index < self.cfg.num_layers
+                && !self.source_layer_range().contains(&layer_index)
+            {
+                continue;
+            }
             let Some((expected_in, expected_out)) =
                 self.lora_projection_shape(layer_index, &linear.target_module)
             else {
@@ -1403,6 +1444,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         pos_offset: usize,
         tokens: usize,
     ) {
+        let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -1458,7 +1500,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let applied = unsafe { &*adapter }
                 .apply_projection(
                     ctx,
-                    li,
+                    source_li,
                     "qkv_proj",
                     &self.scratch.norm_out,
                     &mut self.scratch.qkv_out,
@@ -1535,7 +1577,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // otherwise corrupt the cache + adjacent allocations).
         if cache_len_before + tokens > cache_capacity {
             panic!(
-                "KV cache overflow on layer {li}: would write tokens [{cache_len_before}..{}) but capacity is {cache_capacity} (cache_id={cache_id:?}). Increase FERRUM_KV_CAPACITY or call /clear in the REPL.",
+                "KV cache overflow on source layer {source_li} (local layer {li}): would write tokens [{cache_len_before}..{}) but capacity is {cache_capacity} (cache_id={cache_id:?}). Increase FERRUM_KV_CAPACITY or call /clear in the REPL.",
                 cache_len_before + tokens
             );
         }
@@ -1693,6 +1735,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         residual: &mut B::Buffer,
         tokens: usize,
     ) {
+        let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -1725,7 +1768,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let applied = unsafe { &*adapter }
                 .apply_projection(
                     ctx,
-                    li,
+                    source_li,
                     "o_proj",
                     attn_token_major,
                     &mut self.scratch.o_proj_out,
@@ -1759,7 +1802,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let applied = unsafe { &*adapter }
                 .apply_projection(
                     ctx,
-                    li,
+                    source_li,
                     "gate_up_proj",
                     &self.scratch.norm_out,
                     &mut self.scratch.gate_up_out,
@@ -1790,7 +1833,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let applied = unsafe { &*adapter }
                 .apply_projection(
                     ctx,
-                    li,
+                    source_li,
                     "down_proj",
                     &self.scratch.silu_out,
                     &mut self.scratch.mlp_out,
@@ -1844,7 +1887,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .expect("forward_verify called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
         }
 
@@ -1981,7 +2024,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             None
         };
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
         }
 
@@ -2139,12 +2182,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // localise non-matmul bottlenecks during perf work.
         let layer_profile = llama_family_runtime_env().decode_layer_profile;
         let mut layer_times = if layer_profile {
-            Some(Vec::with_capacity(self.cfg.num_layers))
+            Some(Vec::with_capacity(self.local_layer_count()))
         } else {
             None
         };
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             if layer_profile {
                 let t0 = std::time::Instant::now();
                 self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
@@ -2307,7 +2350,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let embed_buf = B::from_slice(embeds);
         B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, seq_len * h);
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, 0, seq_len);
         }
 
@@ -2350,7 +2393,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let embed_buf = B::from_slice(embed);
         B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, h);
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
         }
 
@@ -2400,7 +2443,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let embed_buf = B::from_slice(embeds);
         B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, seq_len * h);
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
         }
 
@@ -2444,7 +2487,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let embed_buf = B::from_slice(embed);
         B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, h);
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
         }
 
@@ -2838,7 +2881,8 @@ mod tests {
     use ferrum_types::Result;
 
     use super::{
-        load_llama_family_layers, LlamaFamilyConfig, LlamaFamilyRuntimeEnv, DEFAULT_KV_CAPACITY,
+        load_llama_family_layers, LlamaFamilyConfig, LlamaFamilyModel, LlamaFamilyRuntimeEnv,
+        DEFAULT_KV_CAPACITY,
     };
 
     #[derive(Default)]
@@ -2940,6 +2984,23 @@ mod tests {
         assert!(
             err.to_string().contains("outside model layer count"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn llama_family_full_model_records_source_layer_range() {
+        let cfg = test_llama_config(3, false);
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
+
+        assert_eq!(model.source_layer_range(), 0..3);
+        assert_eq!(model.local_layer_count(), 3);
+        assert_eq!(model.source_layer_index(2), 2);
+
+        model.ensure_kv("test-cache");
+        assert_eq!(
+            model.kv_caches["test-cache"].len(),
+            model.local_layer_count()
         );
     }
 
