@@ -50,7 +50,7 @@ BACKEND RUNTIME PRESET GOAL PASS: <out_dir>
 - 不为了 70B 单模型破坏 Llama 8B dense 或 Qwen3-30B-A3B MoE/GPTQ 路径。
 - 不新增第二套 HTTP 性能入口；HTTP 性能仍然使用 `ferrum bench-serve`。
 - 不接受 silent CPU fallback、silent single-GPU fallback 或 silent non-4bit fallback。
-- 不在没有同硬件 A/B artifact 的情况下做性能宣称。
+- 不在没有同硬件 artifact 的情况下做性能宣称；vLLM 相对性能宣称必须另有当前兼容 vLLM baseline。
 
 ## 模型与硬件
 
@@ -381,7 +381,7 @@ c32 是 stretch cell。若 c32 因显存或 admission 被拒绝，可以作为 d
 
 #### C2.6 性能
 
-性能必须使用 `ferrum bench-serve`，并保存同硬件 A/B artifact。
+性能必须使用 `ferrum bench-serve`，并保存同硬件 Ferrum artifact。
 
 必需命令形态：
 
@@ -395,24 +395,32 @@ ferrum bench-serve \
   ...
 ```
 
-必须额外保存同一台 2x4090 机器上的 vLLM baseline，使用同模型、同 tokenizer、同量化格式、同输入/输出长度、同并发 cells。
+vLLM baseline 不是本目标的必需完成条件。只有当同一台 2x4090 机器可以运行当前兼容的 vLLM 版本，并且使用同模型、同 tokenizer、同量化格式、同输入/输出长度、同并发 cells 时，才保存 vLLM baseline 并生成相对性能 comparison。
+
+如果当前 vLLM 依赖栈与机器驱动/CUDA 组合不兼容，或者只能安装明显过旧、不能代表当前 vLLM 的版本，本目标只测试 Ferrum 自己的服务路径。artifact 必须保存跳过原因，且不得做 vLLM 相对性能宣称。
 
 性能量化阈值：
 
 - 每个 required cell 都有 Ferrum report。
-- 每个 required cell 都有 vLLM baseline report。
 - Ferrum 每个 run completed > 0。
 - Ferrum 每个 run errored == 0。
 - Ferrum 每个 report `n_repeats >= 3`。
 - Ferrum 每个 report `output_token_count_source == "usage"`。
-- Ferrum 每个 required cell 平均 output throughput >= 同硬件 vLLM baseline 的 70%。
-- Ferrum 每个 required cell 平均 TTFT <= 同硬件 vLLM baseline 的 150%。
-- Ferrum 每个 required cell 平均 TPOT <= 同硬件 vLLM baseline 的 150%。
+- Ferrum 每个 required cell 平均 output throughput 必须为有限正数。
+- Ferrum 每个 required cell 平均 TTFT 必须为有限正数。
+- Ferrum 每个 required cell 平均 TPOT 必须为有限正数。
 - p95 end-to-end latency 必须为有限正数。
 - bad output count == 0。
 - malformed stream count == 0。
 
-如果 vLLM 无法在同一模型/量化格式/2x4090 上成功跑完 baseline，则该性能结果只能标记为 diagnostic，不能作为本目标完成证据。
+如果保存了 vLLM baseline，则额外要求：
+
+- 每个 required cell 都有 vLLM baseline report。
+- Ferrum 每个 required cell 平均 output throughput >= 同硬件 vLLM baseline 的 70%。
+- Ferrum 每个 required cell 平均 TTFT <= 同硬件 vLLM baseline 的 150%。
+- Ferrum 每个 required cell 平均 TPOT <= 同硬件 vLLM baseline 的 150%。
+
+如果 vLLM 无法在同一模型/量化格式/2x4090 上以当前兼容版本成功跑完 baseline，则 `vllm-baseline.json` 必须标记为 skipped/diagnostic 并写明原因；`comparison.json` 必须标记为 Ferrum-only，只检查 Ferrum 自身性能与质量阈值。
 
 ## Artifact 要求
 
@@ -447,8 +455,8 @@ ferrum bench-serve \
 - `bench-serve.json`
 - `bench-serve.stdout`
 - `bench-serve.stderr`
-- `vllm-baseline.command.json`
-- `vllm-baseline.json`
+- `vllm-baseline.command.json`，若跳过则必须包含原因。
+- `vllm-baseline.json`，若跳过则必须包含原因。
 - `comparison.json`
 
 `metadata.json` 必须包含：

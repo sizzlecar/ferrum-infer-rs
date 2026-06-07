@@ -785,6 +785,36 @@ def compare_benchmarks(
     return {"status": "pass", "cells": cells}
 
 
+def ferrum_only_comparison(
+    ferrum_rows: dict[int, dict[str, Any]],
+    required_cells: list[int],
+    reason: str,
+) -> dict[str, Any]:
+    cells: dict[str, Any] = {}
+    for concurrency in required_cells:
+        ferrum = ferrum_rows[concurrency]
+        cells[f"c{concurrency}"] = {
+            "status": "pass",
+            "mode": "ferrum_only",
+            "baseline": "not_run",
+            "reason": reason,
+            "concurrency": concurrency,
+            "ferrum_output_throughput_tps": ferrum["output_throughput_tps"],
+            "ferrum_ttft_p50_ms": ferrum["ttft_p50_ms"],
+            "ferrum_tpot_p50_ms": ferrum["tpot_p50_ms"],
+            "p95_end_to_end_latency_ms": ferrum["e2e_p95_ms"],
+            "bad_output_count": ferrum.get("bad_output", 0),
+            "malformed_stream_count": ferrum.get("malformed_stream", 0),
+        }
+    return {
+        "status": "pass",
+        "mode": "ferrum_only",
+        "baseline": "not_run",
+        "reason": reason,
+        "cells": cells,
+    }
+
+
 def copy_if_present(src: Path, dst: Path) -> None:
     if src.is_file():
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1356,29 +1386,29 @@ def run_vllm_baseline_gate(
         terminate_process_group(proc)
 
 
-def write_diagnostic_vllm_skip(root: Path, cfg: dict[str, Any], reason: str) -> dict[str, Any]:
+def write_diagnostic_vllm_skip(
+    root: Path,
+    cfg: dict[str, Any],
+    ferrum_rows: dict[int, dict[str, Any]],
+    reason: str,
+) -> dict[str, Any]:
     write_json(
         root / "vllm-baseline.command.json",
         {
-            "status": "diagnostic",
+            "status": "skipped",
             "reason": reason,
             "server_cmd": build_vllm_server_command(cfg),
             "same_hardware_required": True,
         },
     )
-    result = {"status": "diagnostic", "reason": reason}
+    result = {"status": "skipped", "reason": reason}
     write_json(root / "vllm-baseline.json", result)
-    write_json(
-        root / "comparison.json",
-        {
-            "status": "diagnostic",
-            "reason": reason,
-            "cells": {
-                f"c{int(c)}": {"status": "diagnostic", "reason": reason}
-                for c in cfg.get("concurrency_cells", [])
-            },
-        },
+    comparison = ferrum_only_comparison(
+        ferrum_rows,
+        [int(c) for c in cfg.get("concurrency_cells", [1, 4, 8, 16])],
+        reason,
     )
+    write_json(root / "comparison.json", comparison)
     return result
 
 
@@ -1521,6 +1551,11 @@ def self_test() -> int:
         )
         comparison = compare_benchmarks(ferrum_rows, vllm_rows, [1])
         assert comparison["cells"]["c1"]["status"] == "pass"
+        ferrum_only = ferrum_only_comparison(ferrum_rows, [1], "selftest")
+        assert ferrum_only["status"] == "pass"
+        assert ferrum_only["mode"] == "ferrum_only"
+        skip = write_diagnostic_vllm_skip(root, bench_cfg, ferrum_rows, "selftest")
+        assert skip["status"] == "skipped"
     print("G0 CUDA LLAMA33 70B 4BIT 2X4090 GATE SELFTEST PASS")
     return 0
 
@@ -1635,8 +1670,12 @@ def main() -> int:
             write_json(root / "comparison.json", comparison)
             checks["comparison"] = comparison
         else:
-            reason = "smoke config sets run_vllm_baseline=false; not valid as final goal evidence"
-            checks["vllm_baseline"] = write_diagnostic_vllm_skip(root, cfg, reason)
+            reason = (
+                "config sets run_vllm_baseline=false; Ferrum-only service evidence is required "
+                "for this lane and no vLLM-relative performance claim is made"
+            )
+            checks["vllm_baseline"] = write_diagnostic_vllm_skip(root, cfg, ferrum_rows, reason)
+            checks["comparison"] = load_json(root / "comparison.json")
 
         require_effective_config(root / "effective_config.json", "top-level")
     except Exception as exc:

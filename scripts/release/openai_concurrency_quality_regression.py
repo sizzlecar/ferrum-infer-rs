@@ -124,12 +124,9 @@ def run_concurrency_quality_regression(
             payload = {
                 "model": model,
                 "temperature": 0,
-                "max_tokens": 64,
+                "max_tokens": 128,
                 "tools": [marker_tool(marker, answer)],
-                "tool_choice": {
-                    "type": "function",
-                    "function": {"name": "capture_quality_marker"},
-                },
+                "tool_choice": "required",
                 "messages": [
                     {
                         "role": "user",
