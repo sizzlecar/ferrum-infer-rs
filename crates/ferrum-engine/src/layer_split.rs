@@ -1,4 +1,5 @@
 use ferrum_types::{FerrumError, Result};
+use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedLayerSplitPlan {
@@ -26,6 +27,46 @@ pub(crate) struct LayerSplitStage {
     pub(crate) layer_end: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct StageDocument {
+    stage: usize,
+    device: usize,
+    layer_start: usize,
+    layer_end: usize,
+}
+
+pub(crate) fn parse_layer_split_stage_documents(
+    value: &serde_json::Value,
+) -> Result<ParsedLayerSplitPlan> {
+    let docs: Vec<StageDocument> = serde_json::from_value(value.clone()).map_err(|err| {
+        FerrumError::config(format!("invalid selected_layer_split_stages: {err}"))
+    })?;
+    let stages = docs
+        .into_iter()
+        .map(|doc| LayerSplitStage {
+            stage_index: doc.stage,
+            device: doc.device,
+            layer_start: doc.layer_start,
+            layer_end: doc.layer_end,
+        })
+        .collect::<Vec<_>>();
+    validate_stage_positions(&stages)?;
+    validate_contiguous_layers(&stages)?;
+    Ok(ParsedLayerSplitPlan { stages })
+}
+
+fn validate_stage_positions(stages: &[LayerSplitStage]) -> Result<()> {
+    for (position, stage) in stages.iter().enumerate() {
+        if stage.stage_index != position {
+            return Err(FerrumError::config(format!(
+                "layer split stage index {} must match position {}",
+                stage.stage_index, position
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_layer_split_plan(raw: &str) -> Result<ParsedLayerSplitPlan> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -39,6 +80,7 @@ pub(crate) fn parse_layer_split_plan(raw: &str) -> Result<ParsedLayerSplitPlan> 
         let stage = parse_stage(part.trim(), position)?;
         stages.push(stage);
     }
+    validate_stage_positions(&stages)?;
     validate_contiguous_layers(&stages)?;
     Ok(ParsedLayerSplitPlan { stages })
 }
@@ -187,5 +229,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("do not match selected_gpu_devices"));
+    }
+
+    #[test]
+    fn parses_structured_stage_documents() {
+        let value = serde_json::json!([
+            {"stage": 0, "device": 0, "layer_start": 0, "layer_end": 39},
+            {"stage": 1, "device": 1, "layer_start": 40, "layer_end": 79}
+        ]);
+        let plan = parse_layer_split_stage_documents(&value).unwrap();
+        assert_eq!(plan.selected_devices(), vec![0, 1]);
+        assert_eq!(plan.total_layers(), 80);
     }
 }

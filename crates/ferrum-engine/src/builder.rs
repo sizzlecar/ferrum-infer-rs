@@ -468,17 +468,24 @@ fn reject_unsupported_layer_split(component_config: &ComponentConfig) -> Result<
     let selected = component_config
         .get_option::<Vec<usize>>("selected_gpu_devices")
         .unwrap_or_default();
-    let plan_raw = component_config
-        .get_string_option("selected_layer_split_plan")
-        .ok_or_else(|| {
+    let plan_raw = component_config.get_string_option("selected_layer_split_plan");
+    let parsed_plan = if let Some(stages) = component_config
+        .component_options
+        .get("selected_layer_split_stages")
+    {
+        crate::layer_split::parse_layer_split_stage_documents(stages)?
+    } else {
+        let plan_raw = plan_raw.as_deref().ok_or_else(|| {
             FerrumError::config(
                 "selected_distributed_strategy=layer_split requires selected_layer_split_plan",
             )
         })?;
-    let parsed_plan = crate::layer_split::parse_layer_split_plan(&plan_raw)?;
+        crate::layer_split::parse_layer_split_plan(plan_raw)?
+    };
     crate::layer_split::validate_layer_split_plan_for_devices(&parsed_plan, &selected)?;
+    let plan_label = plan_raw.unwrap_or_else(|| format!("{:?}", parsed_plan.stages));
     Err(FerrumError::unsupported(format!(
-        "CUDA layer_split execution is not implemented yet; requested_gpu_devices={requested:?} selected_gpu_devices={selected:?} selected_layer_split_plan={plan_raw} total_layers={}. Refusing to fall back to a single GPU.",
+        "CUDA layer_split execution is not implemented yet; requested_gpu_devices={requested:?} selected_gpu_devices={selected:?} selected_layer_split_plan={plan_label} total_layers={}. Refusing to fall back to a single GPU.",
         parsed_plan.total_layers()
     )))
 }
@@ -585,6 +592,13 @@ mod tests {
             serde_json::Value::String(
                 "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79".to_string(),
             ),
+        );
+        config.backend.backend_options.insert(
+            "selected_layer_split_stages".to_string(),
+            serde_json::json!([
+                {"stage": 0, "device": 0, "layer_start": 0, "layer_end": 39},
+                {"stage": 1, "device": 1, "layer_start": 40, "layer_end": 79}
+            ]),
         );
 
         let err = match EngineBuilder::new(config).build().await {

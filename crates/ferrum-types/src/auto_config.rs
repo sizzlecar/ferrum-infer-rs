@@ -281,6 +281,8 @@ impl ResolvedFerrumConfig {
             });
         let selected_layer_split_plan =
             self.runtime_entry_value("FERRUM_SELECTED_LAYER_SPLIT_PLAN");
+        let selected_layer_split_stages =
+            self.runtime_json_value("FERRUM_SELECTED_LAYER_SPLIT_STAGES");
         serde_json::json!({
             "schema_version": 1,
             "preset": self.preset,
@@ -291,6 +293,7 @@ impl ResolvedFerrumConfig {
             "cuda_device_count": cuda_device_count,
             "selected_distributed_strategy": selected_distributed_strategy.clone(),
             "selected_layer_split_plan": selected_layer_split_plan.clone(),
+            "selected_layer_split_stages": selected_layer_split_stages,
             "selected_weight_placement": if selected_layer_split_plan.is_some() { "layer_split" } else { "single_device" },
             "selected_kv_layout": if backend.eq_ignore_ascii_case("cpu") { "contiguous" } else { "paged" },
             "selected_attention_impl": self.selected_string("attention_decode_backend"),
@@ -403,6 +406,10 @@ impl ResolvedFerrumConfig {
             out.push(value.parse().ok()?);
         }
         Some(out)
+    }
+
+    fn runtime_json_value(&self, key: &str) -> Option<serde_json::Value> {
+        serde_json::from_str(&self.runtime_entry_value(key)?).ok()
     }
 }
 
@@ -1658,7 +1665,12 @@ mod tests {
             ),
             (
                 "FERRUM_SELECTED_LAYER_SPLIT_PLAN",
-                "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto",
+                "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "FERRUM_SELECTED_LAYER_SPLIT_STAGES",
+                r#"[{"stage":0,"device":0,"layer_start":0,"layer_end":39},{"stage":1,"device":1,"layer_start":40,"layer_end":79}]"#,
                 RuntimeConfigSource::Cli,
             ),
             ("FERRUM_KV_CAPACITY", "512", RuntimeConfigSource::Cli),
@@ -1677,7 +1689,14 @@ mod tests {
         assert_eq!(doc["selected_distributed_strategy"], "layer_split");
         assert_eq!(
             doc["selected_layer_split_plan"],
-            "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
+            "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79"
+        );
+        assert_eq!(
+            doc["selected_layer_split_stages"],
+            serde_json::json!([
+                {"stage": 0, "device": 0, "layer_start": 0, "layer_end": 39},
+                {"stage": 1, "device": 1, "layer_start": 40, "layer_end": 79}
+            ])
         );
         assert_eq!(doc["selected_weight_placement"], "layer_split");
         assert_eq!(doc["selected_kv_capacity"], 512);

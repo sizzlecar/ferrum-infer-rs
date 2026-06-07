@@ -1611,6 +1611,7 @@ mod tests {
             cuda_device_count: 2,
             selected_distributed_strategy: "single_gpu".to_string(),
             selected_layer_split_plan: None,
+            selected_layer_split_stages: None,
         };
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let effective = run_effective_runtime_config(&snapshot, None, Some(&selection));

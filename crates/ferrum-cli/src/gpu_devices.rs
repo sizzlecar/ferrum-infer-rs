@@ -1,4 +1,5 @@
 use ferrum_types::{Device, FerrumError, Result, RuntimeConfigEntry, RuntimeConfigSource};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 
@@ -8,6 +9,15 @@ pub const SELECTED_GPU_DEVICES_KEY: &str = "FERRUM_SELECTED_GPU_DEVICES";
 pub const SELECTED_DISTRIBUTED_STRATEGY_KEY: &str = "FERRUM_SELECTED_DISTRIBUTED_STRATEGY";
 pub const CUDA_DEVICE_COUNT_KEY: &str = "FERRUM_CUDA_DEVICE_COUNT";
 pub const SELECTED_LAYER_SPLIT_PLAN_KEY: &str = "FERRUM_SELECTED_LAYER_SPLIT_PLAN";
+pub const SELECTED_LAYER_SPLIT_STAGES_KEY: &str = "FERRUM_SELECTED_LAYER_SPLIT_STAGES";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CudaLayerSplitStage {
+    pub stage: usize,
+    pub device: usize,
+    pub layer_start: usize,
+    pub layer_end: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuDeviceSelection {
@@ -17,6 +27,7 @@ pub struct GpuDeviceSelection {
     pub cuda_device_count: usize,
     pub selected_distributed_strategy: String,
     pub selected_layer_split_plan: Option<String>,
+    pub selected_layer_split_stages: Option<Vec<CudaLayerSplitStage>>,
 }
 
 impl GpuDeviceSelection {
@@ -36,10 +47,9 @@ impl GpuDeviceSelection {
         if self.selected_gpu_devices.len() <= 1 {
             return Ok(false);
         }
-        self.selected_layer_split_plan = Some(even_layer_split_plan_for_layers(
-            &self.selected_gpu_devices,
-            num_layers,
-        )?);
+        let stages = even_layer_split_stages_for_layers(&self.selected_gpu_devices, num_layers)?;
+        self.selected_layer_split_plan = Some(format_layer_split_plan(&stages));
+        self.selected_layer_split_stages = Some(stages);
         Ok(true)
     }
 
@@ -80,6 +90,13 @@ impl GpuDeviceSelection {
                 RuntimeConfigSource::Cli,
             )
         }))
+        .chain(self.selected_layer_split_stages.as_ref().map(|stages| {
+            RuntimeConfigEntry::new(
+                SELECTED_LAYER_SPLIT_STAGES_KEY,
+                serde_json::to_string(stages).expect("serialize layer split stages"),
+                RuntimeConfigSource::Cli,
+            )
+        }))
         .collect()
     }
 
@@ -108,6 +125,12 @@ impl GpuDeviceSelection {
             options.insert(
                 "selected_layer_split_plan".to_string(),
                 Value::String(plan.clone()),
+            );
+        }
+        if let Some(stages) = &self.selected_layer_split_stages {
+            options.insert(
+                "selected_layer_split_stages".to_string(),
+                serde_json::to_value(stages).expect("serialize layer split stages"),
             );
         }
     }
@@ -144,6 +167,7 @@ pub fn resolve_cuda_gpu_devices(
         cuda_device_count: available,
         selected_distributed_strategy: selected_distributed_strategy.to_string(),
         selected_layer_split_plan,
+        selected_layer_split_stages: None,
     }))
 }
 
@@ -218,6 +242,14 @@ fn even_layer_split_plan_placeholder(devices: &[usize]) -> String {
 }
 
 pub fn even_layer_split_plan_for_layers(devices: &[usize], num_layers: usize) -> Result<String> {
+    even_layer_split_stages_for_layers(devices, num_layers)
+        .map(|stages| format_layer_split_plan(&stages))
+}
+
+pub fn even_layer_split_stages_for_layers(
+    devices: &[usize],
+    num_layers: usize,
+) -> Result<Vec<CudaLayerSplitStage>> {
     if devices.is_empty() {
         return Err(FerrumError::config(
             "layer split requires at least one CUDA device",
@@ -242,10 +274,28 @@ pub fn even_layer_split_plan_for_layers(devices: &[usize], num_layers: usize) ->
     for (idx, device) in devices.iter().enumerate() {
         let count = base + usize::from(idx < remainder);
         let end = start + count - 1;
-        stages.push(format!("stage{idx}:cuda:{device}:layers={start}-{end}"));
+        stages.push(CudaLayerSplitStage {
+            stage: idx,
+            device: *device,
+            layer_start: start,
+            layer_end: end,
+        });
         start = end + 1;
     }
-    Ok(stages.join(";"))
+    Ok(stages)
+}
+
+pub fn format_layer_split_plan(stages: &[CudaLayerSplitStage]) -> String {
+    stages
+        .iter()
+        .map(|stage| {
+            format!(
+                "stage{}:cuda:{}:layers={}-{}",
+                stage.stage, stage.device, stage.layer_start, stage.layer_end
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 #[cfg(feature = "cuda")]
@@ -328,6 +378,7 @@ mod tests {
             cuda_device_count: 2,
             selected_distributed_strategy: "single_gpu".to_string(),
             selected_layer_split_plan: None,
+            selected_layer_split_stages: None,
         };
         let snapshot =
             ferrum_types::RuntimeConfigSnapshot::from_entries(selection.runtime_config_entries());
@@ -359,6 +410,7 @@ mod tests {
             cuda_device_count: 2,
             selected_distributed_strategy: "layer_split".to_string(),
             selected_layer_split_plan: Some(even_layer_split_plan_placeholder(&[0, 1])),
+            selected_layer_split_stages: None,
         };
         assert!(selection.apply_model_layer_count(80).unwrap());
         let snapshot =
@@ -380,6 +432,15 @@ mod tests {
         assert_eq!(
             entry(SELECTED_LAYER_SPLIT_PLAN_KEY).effective_value,
             "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79"
+        );
+        let stages: serde_json::Value =
+            serde_json::from_str(&entry(SELECTED_LAYER_SPLIT_STAGES_KEY).effective_value).unwrap();
+        assert_eq!(
+            stages,
+            serde_json::json!([
+                {"stage": 0, "device": 0, "layer_start": 0, "layer_end": 39},
+                {"stage": 1, "device": 1, "layer_start": 40, "layer_end": 79}
+            ])
         );
     }
 }
