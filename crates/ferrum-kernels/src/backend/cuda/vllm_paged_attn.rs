@@ -12,6 +12,7 @@
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use ferrum_types::{FerrumError, Result};
 use half::f16;
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 extern "C" {
@@ -76,7 +77,7 @@ struct PagedAttnCapacity {
     head_dim: usize,
 }
 
-static PA_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<PagedAttnScratch>>> =
+static PA_SCRATCH: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, PagedAttnScratch>>> =
     std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,8 +111,8 @@ fn vllm_paged_attn_runtime_config() -> &'static VllmPagedAttnRuntimeConfig {
     CONFIG.get_or_init(VllmPagedAttnRuntimeConfig::from_env)
 }
 
-fn pa_scratch_slot() -> &'static std::sync::RwLock<Option<PagedAttnScratch>> {
-    PA_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+fn pa_scratch_slots() -> &'static std::sync::RwLock<HashMap<usize, PagedAttnScratch>> {
+    PA_SCRATCH.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 fn pa_v1_short_enabled() -> bool {
@@ -120,6 +121,7 @@ fn pa_v1_short_enabled() -> bool {
 
 fn ensure_pa_scratch(
     stream: &Arc<CudaStream>,
+    ordinal: usize,
     num_seqs: usize,
     num_heads: usize,
     max_partitions: usize,
@@ -132,8 +134,8 @@ fn ensure_pa_scratch(
         head_dim,
     };
     {
-        let g = pa_scratch_slot().read().expect("PA_SCRATCH poisoned");
-        if let Some(s) = g.as_ref() {
+        let g = pa_scratch_slots().read().expect("PA_SCRATCH poisoned");
+        if let Some(s) = g.get(&ordinal) {
             if s.capacity.num_seqs >= need.num_seqs
                 && s.capacity.num_heads >= need.num_heads
                 && s.capacity.max_partitions >= need.max_partitions
@@ -155,13 +157,16 @@ fn ensure_pa_scratch(
     let exp_sums = unsafe { stream.alloc::<f32>(n_floats) }.expect("PA exp_sums alloc");
     let max_logits = unsafe { stream.alloc::<f32>(n_floats) }.expect("PA max_logits alloc");
     let tmp_out = unsafe { stream.alloc::<f16>(n_halves) }.expect("PA tmp_out alloc");
-    let mut w = pa_scratch_slot().write().expect("PA_SCRATCH poisoned");
-    *w = Some(PagedAttnScratch {
-        exp_sums,
-        max_logits,
-        tmp_out,
-        capacity: cap,
-    });
+    let mut w = pa_scratch_slots().write().expect("PA_SCRATCH poisoned");
+    w.insert(
+        ordinal,
+        PagedAttnScratch {
+            exp_sums,
+            max_logits,
+            tmp_out,
+            capacity: cap,
+        },
+    );
 }
 
 /// Dispatch vLLM paged attention for the FP16 / HEAD=128 / BLOCK=16 shape.
@@ -174,6 +179,7 @@ fn ensure_pa_scratch(
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_paged_attention_v2(
     stream: &Arc<CudaStream>,
+    ordinal: usize,
     out: &mut CudaSlice<f16>,
     q: &CudaSlice<f16>,
     k_cache: &CudaSlice<f16>,
@@ -240,11 +246,19 @@ pub fn dispatch_paged_attention_v2(
     }
 
     let max_partitions = max_seq_len.div_ceil(PARTITION_SIZE).max(1);
-    ensure_pa_scratch(stream, num_seqs, num_heads, max_partitions, head_dim);
+    ensure_pa_scratch(
+        stream,
+        ordinal,
+        num_seqs,
+        num_heads,
+        max_partitions,
+        head_dim,
+    );
 
-    let slot = pa_scratch_slot();
-    let mut sg = slot.write().expect("PA_SCRATCH poisoned");
-    let scratch = sg.as_mut().expect("ensure_pa_scratch must have populated");
+    let mut sg = pa_scratch_slots().write().expect("PA_SCRATCH poisoned");
+    let scratch = sg
+        .get_mut(&ordinal)
+        .expect("ensure_pa_scratch must have populated");
 
     // SAFETY: all pointers come from CudaSlice (device pointers via cudarc).
     //   The kernel reads/writes them on `stream` and we issue a launch on
