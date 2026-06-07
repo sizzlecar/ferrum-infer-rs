@@ -60,12 +60,14 @@ def parse_cells(raw: str) -> list[int]:
     return cells
 
 
-def marker_line_ok(line: str, marker: str) -> bool:
-    return line.strip().rstrip(".。!！,，;；:：") == marker
-
-
-def answer_line_ok(line: str, answer: str) -> bool:
-    return line.strip().rstrip(".。!！,，;；:：") == answer
+def parse_marker_response(content: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(strip_think(content))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value
 
 
 def run_concurrency_quality_regression(
@@ -89,18 +91,31 @@ def run_concurrency_quality_regression(
             payload = {
                 "model": model,
                 "temperature": 0,
-                "max_tokens": 96,
+                "max_tokens": 64,
                 "messages": [
                     {
                         "role": "user",
                         "content": (
-                            "Copy this exact two-line block and nothing else. "
-                            "Do not add labels or change any character:\n"
-                            f"{marker}\n"
-                            f"{answer}"
+                            "Return one JSON object. Set marker to "
+                            f"{marker!r} and checksum to {answer!r}."
                         ),
                     }
                 ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "ConcurrencyQualityMarker",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "marker": {"enum": [marker]},
+                                "checksum": {"enum": [answer]},
+                            },
+                            "required": ["marker", "checksum"],
+                        },
+                    },
+                },
             }
             status, body = post_json(base_url, payload, timeout=timeout)
             content = ""
@@ -115,20 +130,22 @@ def run_concurrency_quality_regression(
             except Exception:
                 content = body[:500]
             forbidden = has_forbidden_text(content)
-            lines = [line.strip() for line in content.splitlines() if line.strip()]
-            format_ok = (
-                len(lines) == 2
-                and marker_line_ok(lines[0], marker)
-                and answer_line_ok(lines[1], answer)
-            )
+            marker_response = parse_marker_response(content)
+            parsed_marker = marker_response.get("marker") if marker_response else None
+            parsed_checksum = marker_response.get("checksum") if marker_response else None
+            marker_ok = parsed_marker == marker
+            square_ok = parsed_checksum == answer
+            format_ok = marker_ok and square_ok
             return {
                 "i": i,
                 "status": status,
                 "json_ok": json_ok,
                 "marker": marker,
                 "square": answer,
-                "marker_ok": marker in content,
-                "square_ok": answer in content,
+                "parsed_marker": parsed_marker,
+                "parsed_checksum": parsed_checksum,
+                "marker_ok": marker_ok,
+                "square_ok": square_ok,
                 "format_ok": format_ok,
                 "finish_reason": finish_reason,
                 "forbidden_text": forbidden,
