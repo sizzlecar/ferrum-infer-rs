@@ -22,7 +22,10 @@ pub mod qwen3_moe_profile;
 pub mod qwen3_moe_runtime;
 
 pub use llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
-pub use llama_family_pipeline::LlamaFamilyPipelineModel;
+pub use llama_family_pipeline::{
+    LlamaFamilyPipelineModel, LlamaPipelinePlacement, LlamaPipelineStagePlacement,
+    LlamaPipelineTransport,
+};
 pub use qwen3_moe::Qwen3MoeModel;
 pub mod llama_family_forward_batched;
 pub mod qwen3_moe_forward_unified;
