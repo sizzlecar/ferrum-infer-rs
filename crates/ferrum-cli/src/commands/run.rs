@@ -10,7 +10,7 @@ use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, Promp
 use ferrum_types::{
     FerrumConfigBuilder, FerrumError, FinishReason, InferenceRequest, ModelCapabilities, Priority,
     RequestId, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
-    RuntimeConfigSource, SamplingParams, WorkloadProfile,
+    SamplingParams, WorkloadProfile,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -1592,6 +1592,7 @@ pub fn apply_kv_dtype_override(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_types::RuntimeConfigSource;
 
     fn default_params(max_tokens: usize) -> SamplingParams {
         SamplingParams {
