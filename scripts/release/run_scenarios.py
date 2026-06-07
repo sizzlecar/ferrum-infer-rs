@@ -916,7 +916,7 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(msg, dict) and msg.get("role") == "user":
                 last_user = str(msg.get("content") or "")
                 break
-        marker = re.search(r"\b(KM\d{2}\d{2})\b", prompt)
+        marker = re.search(r"\b(ferrum\d{2}\d{2})\b", prompt)
         square = re.search(r"(S\d{4})", prompt)
         if marker and square:
             self.send_chat(f"{marker.group(1)}\n{square.group(1)}")
