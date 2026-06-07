@@ -18,6 +18,7 @@ RELEASE_BINARY_GATE = REPO_ROOT / "scripts/release/release_binary_gate.py"
 RUN_GATE = REPO_ROOT / "scripts/release/run_gate.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
 BACKEND_RUNTIME_GOAL_GATE = REPO_ROOT / "scripts/release/backend_runtime_preset_goal_gate.py"
+LLAMA33_GOAL_GATE = REPO_ROOT / "scripts/release/llama33_70b_4bit_2x4090_goal_gate.py"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from m3_validate_runner_artifact import (  # noqa: E402
@@ -229,6 +230,12 @@ def test_backend_runtime_goal_gate_selftest() -> None:
     require("BACKEND RUNTIME PRESET GOAL SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_llama33_goal_gate_selftest() -> None:
+    ok = run([sys.executable, str(LLAMA33_GOAL_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("LLAMA33_70B_4BIT_2X4090 GOAL SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_m3_quality_gate_artifact_validators() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-m3-gates-") as tmp:
         root = Path(tmp)
@@ -308,6 +315,7 @@ def main() -> int:
     test_run_gate_selftest()
     test_run_scenarios_selftest()
     test_backend_runtime_goal_gate_selftest()
+    test_llama33_goal_gate_selftest()
     test_m3_quality_gate_artifact_validators()
     print("G0 VALIDATOR SELFTEST PASS")
     return 0
