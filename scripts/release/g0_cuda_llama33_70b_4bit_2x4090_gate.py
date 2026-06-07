@@ -382,6 +382,14 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
         "--decision-trace-jsonl",
         str(root / "run.decision_trace.jsonl"),
     ]
+    if cfg.get("max_model_len") is not None:
+        cmd.extend(["--max-model-len", str(cfg["max_model_len"])])
+    if cfg.get("kv_capacity") is not None:
+        cmd.extend(["--kv-capacity", str(cfg["kv_capacity"])])
+    if cfg.get("max_num_seqs") is not None:
+        cmd.extend(["--max-num-seqs", str(cfg["max_num_seqs"])])
+    if cfg.get("max_num_batched_tokens") is not None:
+        cmd.extend(["--max-num-batched-tokens", str(cfg["max_num_batched_tokens"])])
     return cmd
 
 
@@ -1406,6 +1414,10 @@ def self_test() -> int:
         "gpu_devices": [0, 1],
         "distributed_strategy": "layer_split",
         "num_hidden_layers": 80,
+        "max_model_len": 8192,
+        "kv_capacity": 2048,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 1024,
     }
     validate_config(cfg)
     assert (
@@ -1416,6 +1428,14 @@ def self_test() -> int:
     assert "--gpu-devices" in cmd
     assert "0,1" in cmd
     assert "--effective-config-json" in cmd
+    assert "--max-model-len" in cmd
+    assert "8192" in cmd
+    assert "--kv-capacity" in cmd
+    assert "2048" in cmd
+    assert "--max-num-seqs" in cmd
+    assert "8" in cmd
+    assert "--max-num-batched-tokens" in cmd
+    assert "1024" in cmd
     serve_cmd = build_serve_command(Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out"))
     assert serve_cmd[1] == "serve"
     assert "--gpu-devices" in serve_cmd
