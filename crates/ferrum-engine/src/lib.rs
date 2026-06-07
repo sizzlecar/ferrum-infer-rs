@@ -49,6 +49,7 @@
 pub mod builder;
 pub mod continuous_engine;
 pub mod embedding_engine;
+pub(crate) mod layer_split;
 pub mod modality_stubs;
 pub mod parallel;
 pub mod pipeline;

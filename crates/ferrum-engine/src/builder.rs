@@ -468,11 +468,18 @@ fn reject_unsupported_layer_split(component_config: &ComponentConfig) -> Result<
     let selected = component_config
         .get_option::<Vec<usize>>("selected_gpu_devices")
         .unwrap_or_default();
-    let plan = component_config
+    let plan_raw = component_config
         .get_string_option("selected_layer_split_plan")
-        .unwrap_or_else(|| "missing".to_string());
+        .ok_or_else(|| {
+            FerrumError::config(
+                "selected_distributed_strategy=layer_split requires selected_layer_split_plan",
+            )
+        })?;
+    let parsed_plan = crate::layer_split::parse_layer_split_plan(&plan_raw)?;
+    crate::layer_split::validate_layer_split_plan_for_devices(&parsed_plan, &selected)?;
     Err(FerrumError::unsupported(format!(
-        "CUDA layer_split execution is not implemented yet; requested_gpu_devices={requested:?} selected_gpu_devices={selected:?} selected_layer_split_plan={plan}. Refusing to fall back to a single GPU."
+        "CUDA layer_split execution is not implemented yet; requested_gpu_devices={requested:?} selected_gpu_devices={selected:?} selected_layer_split_plan={plan_raw} total_layers={}. Refusing to fall back to a single GPU.",
+        parsed_plan.total_layers()
     )))
 }
 
@@ -576,7 +583,7 @@ mod tests {
         config.backend.backend_options.insert(
             "selected_layer_split_plan".to_string(),
             serde_json::Value::String(
-                "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto".to_string(),
+                "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79".to_string(),
             ),
         );
 
@@ -588,6 +595,40 @@ mod tests {
             .to_string()
             .contains("layer_split execution is not implemented yet"));
         assert!(err.to_string().contains("selected_gpu_devices=[0, 1]"));
+        assert!(err.to_string().contains("total_layers=80"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_invalid_layer_split_plan_before_executor_build() {
+        let mut config = EngineConfig::default();
+        config.backend.backend_options.insert(
+            "model_path".to_string(),
+            serde_json::Value::String("/models/target".to_string()),
+        );
+        config.backend.backend_options.insert(
+            "selected_distributed_strategy".to_string(),
+            serde_json::Value::String("layer_split".to_string()),
+        );
+        config.backend.backend_options.insert(
+            "requested_gpu_devices".to_string(),
+            serde_json::json!([0, 1]),
+        );
+        config.backend.backend_options.insert(
+            "selected_gpu_devices".to_string(),
+            serde_json::json!([0, 1]),
+        );
+        config.backend.backend_options.insert(
+            "selected_layer_split_plan".to_string(),
+            serde_json::Value::String(
+                "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto".to_string(),
+            ),
+        );
+
+        let err = match EngineBuilder::new(config).build().await {
+            Ok(_) => panic!("layer_split build unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("expected START-END"));
     }
 
     #[test]
