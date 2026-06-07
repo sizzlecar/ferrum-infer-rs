@@ -344,6 +344,9 @@ fn is_forbidden_generation_token_text(text: &str) -> bool {
     if text.contains('\u{FFFD}') {
         return true;
     }
+    if contains_replacement_char_mojibake(text) {
+        return true;
+    }
 
     let lower = text.to_ascii_lowercase();
     let lower = lower.as_str();
@@ -365,6 +368,27 @@ fn is_forbidden_generation_token_text(text: &str) -> bool {
         || lower.contains("mask")
         || lower.contains("reserved")
         || lower.contains("unused")
+}
+
+fn contains_replacement_char_mojibake(text: &str) -> bool {
+    let mut chars = text.chars();
+    let mut a = chars.next();
+    let mut b = chars.next();
+    let mut c = chars.next();
+    loop {
+        if matches!(
+            (a, b, c),
+            (Some('\u{00ef}'), Some('\u{00bf}'), Some('\u{00bd}'))
+        ) {
+            return true;
+        }
+        if c.is_none() {
+            return false;
+        }
+        a = b;
+        b = c;
+        c = chars.next();
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1375,7 +1399,7 @@ mod tests {
     #[test]
     fn sample_masks_unknown_pad_reserved_and_bos_tokens() {
         let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
-            9,
+            10,
             &[
                 ("normal", 0),
                 ("<s>", 1),
@@ -1386,6 +1410,7 @@ mod tests {
                 ("ok", 6),
                 ("other", 7),
                 ("byte-fallback", 8),
+                ("\u{00ef}\u{00bf}\u{00bd}", 9),
             ],
         ));
         let mut state = SequenceState::new_with_tokenizer(
@@ -1393,18 +1418,19 @@ mod tests {
             vec![TokenId::new(0)],
             Some(tokenizer),
         );
-        let mut logits = vec![0.0f32; 9];
+        let mut logits = vec![0.0f32; 10];
         logits[1] = 100.0;
         logits[2] = 99.0;
         logits[4] = 98.0;
         logits[5] = 97.0;
         logits[8] = 96.0;
+        logits[9] = 95.0;
         logits[6] = 1.0;
 
         let token = state.sample_with_processors(&mut logits).unwrap();
 
         assert_eq!(token.get(), 6);
-        for token_id in [1usize, 2, 4, 5, 8] {
+        for token_id in [1usize, 2, 4, 5, 8, 9] {
             assert_eq!(logits[token_id], f32::NEG_INFINITY);
         }
     }
