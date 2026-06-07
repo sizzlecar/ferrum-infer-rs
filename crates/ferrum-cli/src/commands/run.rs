@@ -188,6 +188,10 @@ pub struct RunCommand {
     #[arg(long, default_value = "1024")]
     pub max_tokens: u32,
 
+    /// Stop generation when this text appears. Can be provided multiple times.
+    #[arg(long, value_name = "TEXT")]
+    pub stop: Vec<String>,
+
     /// Enable model reasoning for chat templates that support it.
     #[arg(long, conflicts_with = "disable_thinking")]
     pub enable_thinking: bool,
@@ -972,6 +976,12 @@ fn run_autosize_for_device(
 
 fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
     let greedy = cmd.temperature <= 0.0;
+    let mut stop_sequences = vec![
+        "<|im_end|>".to_string(),
+        "</s>".to_string(),
+        "<|endoftext|>".to_string(),
+    ];
+    stop_sequences.extend(cmd.stop.iter().filter(|stop| !stop.is_empty()).cloned());
     SamplingParams {
         max_tokens: cmd.max_tokens as usize,
         temperature: cmd.temperature,
@@ -982,11 +992,7 @@ fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
             Some(cmd.top_k)
         },
         repetition_penalty: cmd.repeat_penalty,
-        stop_sequences: vec![
-            "<|im_end|>".to_string(),
-            "</s>".to_string(),
-            "<|endoftext|>".to_string(),
-        ],
+        stop_sequences,
         seed: cmd.seed,
         ..Default::default()
     }
@@ -1606,6 +1612,7 @@ mod tests {
             model: "tinyllama".to_string(),
             system: None,
             max_tokens: 1024,
+            stop: Vec::new(),
             no_context_shift: false,
             enable_thinking: false,
             disable_thinking: false,
@@ -1802,6 +1809,16 @@ mod tests {
         let cmd = test_run_cmd();
         assert_eq!(build_sampling_params(&cmd).temperature, 0.0);
         assert_eq!(build_sampling_params(&cmd).max_tokens, 1024);
+    }
+
+    #[test]
+    fn run_sampling_params_include_cli_stop_sequences() {
+        let mut cmd = test_run_cmd();
+        cmd.stop = vec!["\n".to_string(), String::new(), "END".to_string()];
+        let params = build_sampling_params(&cmd);
+        assert!(params.stop_sequences.contains(&"\n".to_string()));
+        assert!(params.stop_sequences.contains(&"END".to_string()));
+        assert!(!params.stop_sequences.contains(&String::new()));
     }
 
     #[test]
