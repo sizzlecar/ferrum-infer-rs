@@ -311,10 +311,15 @@ fn cached_forbidden_generation_tokens(
         if allowed_generated_controls.contains(&id) {
             continue;
         }
-        if tok
-            .token_text(TokenId::new(id))
-            .is_some_and(is_forbidden_generation_token_text)
-        {
+        let token = TokenId::new(id);
+        let raw_text_forbidden = tok
+            .token_text(token)
+            .is_some_and(is_forbidden_generation_token_text);
+        let decoded_text_forbidden = tok
+            .decode(&[token], true)
+            .map(|text| is_forbidden_generation_token_text(&text))
+            .unwrap_or(true);
+        if raw_text_forbidden || decoded_text_forbidden {
             forbidden.insert(id);
         }
     }
@@ -335,6 +340,9 @@ fn is_forbidden_generation_token_text(text: &str) -> bool {
     let text = text.trim();
     if text.is_empty() {
         return false;
+    }
+    if text.contains('\u{FFFD}') {
+        return true;
     }
 
     let lower = text.to_ascii_lowercase();
@@ -558,7 +566,9 @@ impl SequenceState {
 
     pub fn model_decode_metadata(&self) -> HashMap<String, serde_json::Value> {
         let mut metadata = self.original_request.metadata.clone();
-        if self.json_processor.is_some() || self.regex_processor.is_some() {
+        let needs_sampling_masks = !self.forbidden_token_ids.is_empty()
+            || (self.generated_tokens.is_empty() && !self.initial_forbidden_token_ids.is_empty());
+        if self.json_processor.is_some() || self.regex_processor.is_some() || needs_sampling_masks {
             metadata.insert(
                 "ferrum_require_full_logits".to_string(),
                 serde_json::json!(true),
@@ -1158,6 +1168,13 @@ mod tests {
             Ok(tokens
                 .iter()
                 .filter_map(|token| self.token_text(*token))
+                .map(|text| {
+                    if text == "byte-fallback" {
+                        "\u{FFFD}"
+                    } else {
+                        text
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(""))
         }
@@ -1335,9 +1352,30 @@ mod tests {
     }
 
     #[test]
+    fn model_decode_metadata_marks_sampling_masks_for_full_logits() {
+        let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+            4,
+            &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
+        ));
+        let state = SequenceState::new_with_tokenizer(
+            policy_request(),
+            vec![TokenId::new(0)],
+            Some(tokenizer),
+        );
+
+        assert_eq!(
+            state
+                .model_decode_metadata()
+                .get("ferrum_require_full_logits")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn sample_masks_unknown_pad_reserved_and_bos_tokens() {
         let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
-            8,
+            9,
             &[
                 ("normal", 0),
                 ("<s>", 1),
@@ -1347,6 +1385,7 @@ mod tests {
                 ("<|reserved_special_token_0|>", 5),
                 ("ok", 6),
                 ("other", 7),
+                ("byte-fallback", 8),
             ],
         ));
         let mut state = SequenceState::new_with_tokenizer(
@@ -1354,17 +1393,18 @@ mod tests {
             vec![TokenId::new(0)],
             Some(tokenizer),
         );
-        let mut logits = vec![0.0f32; 8];
+        let mut logits = vec![0.0f32; 9];
         logits[1] = 100.0;
         logits[2] = 99.0;
         logits[4] = 98.0;
         logits[5] = 97.0;
+        logits[8] = 96.0;
         logits[6] = 1.0;
 
         let token = state.sample_with_processors(&mut logits).unwrap();
 
         assert_eq!(token.get(), 6);
-        for token_id in [1usize, 2, 4, 5] {
+        for token_id in [1usize, 2, 4, 5, 8] {
             assert_eq!(logits[token_id], f32::NEG_INFINITY);
         }
     }

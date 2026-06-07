@@ -856,7 +856,7 @@ fn startup_auto_config(
         .map_err(|err| ferrum_types::FerrumError::config(format!("invalid auto config: {err}")))
 }
 
-fn merge_runtime_config_sources(
+pub(crate) fn merge_runtime_config_sources(
     config_file_entries: Vec<RuntimeConfigEntry>,
     env_snapshot: RuntimeConfigSnapshot,
     cli_entries: Vec<RuntimeConfigEntry>,
@@ -881,14 +881,14 @@ fn remove_materialized_config_env_entries(
     env_snapshot
 }
 
-const SERVE_AUTOSIZE_RUNTIME_KEYS: &[&str] = &[
+pub(crate) const SERVE_AUTOSIZE_RUNTIME_KEYS: &[&str] = &[
     "FERRUM_MAX_BATCHED_TOKENS",
     "FERRUM_KV_MAX_BLOCKS",
     "FERRUM_PAGED_MAX_SEQS",
     "FERRUM_KV_CAPACITY",
 ];
 
-fn runtime_entries_added_by_snapshot(
+pub(crate) fn runtime_entries_added_by_snapshot(
     before: &RuntimeConfigSnapshot,
     after: &RuntimeConfigSnapshot,
     keys: &[&str],
@@ -906,7 +906,7 @@ fn runtime_entries_added_by_snapshot(
         .collect()
 }
 
-fn runtime_preset_entries(
+pub(crate) fn runtime_preset_entries(
     preset: &str,
     source: RuntimeConfigSource,
 ) -> Result<Vec<RuntimeConfigEntry>> {
@@ -1089,7 +1089,7 @@ fn serve_kv_cache_type_for_device(device: &ferrum_types::Device) -> ferrum_types
     }
 }
 
-fn write_startup_config_artifacts(
+pub(crate) fn write_startup_config_artifacts(
     auto_config: &ResolvedFerrumConfig,
     effective_config_json: Option<&std::path::Path>,
     decision_trace_jsonl: Option<&std::path::Path>,
@@ -1184,7 +1184,7 @@ fn configure_profile_sink(
     Ok(())
 }
 
-fn model_capabilities_from_definition(
+pub(crate) fn model_capabilities_from_definition(
     definition: &ferrum_models::ModelDefinition,
 ) -> ModelCapabilities {
     let architecture = match definition.architecture {
@@ -1279,7 +1279,9 @@ fn estimated_weight_bytes_from_definition(
     Some(params.saturating_mul(bits_per_param).div_ceil(8))
 }
 
-fn hardware_capabilities_for_device(device: &ferrum_types::Device) -> HardwareCapabilities {
+pub(crate) fn hardware_capabilities_for_device(
+    device: &ferrum_types::Device,
+) -> HardwareCapabilities {
     let features = compiled_kernel_features();
     match device {
         ferrum_types::Device::CUDA(id) => {

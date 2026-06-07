@@ -18,7 +18,7 @@ use clap::Args;
 use colored::*;
 use ferrum_bench_core::{
     arrivals::poisson_arrival_times, compute_metrics, BenchReport, Env, OutputTokenCountSource,
-    RequestRecord, RunRecord, Scenario, Slo, TokenLengthStats,
+    QualityIssueCounts, RequestRecord, RunRecord, Scenario, Slo, TokenLengthStats,
 };
 use ferrum_types::Result;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -258,14 +258,23 @@ async fn stream_one(
         Ok(r) => r,
         Err(e) => {
             eprintln!("[err] post: {}", e);
-            return failed_record(prompt.input_tokens, start);
+            let mut quality_issues = QualityIssueCounts::default();
+            quality_issues.malformed_stream = 1;
+            return failed_record(prompt.input_tokens, start, quality_issues);
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
         let txt = resp.text().await.unwrap_or_default();
         eprintln!("[err] http {}: {}", status, &txt[..txt.len().min(200)]);
-        return failed_record(prompt.input_tokens, start);
+        let mut quality_issues = QualityIssueCounts::default();
+        if status.as_u16() == 500 {
+            quality_issues.http_500 = 1;
+        }
+        if looks_like_panic(&txt) {
+            quality_issues.panic = 1;
+        }
+        return failed_record(prompt.input_tokens, start, quality_issues);
     }
 
     let mut stream = resp.bytes_stream();
@@ -276,10 +285,19 @@ async fn stream_one(
             Err(e) => {
                 eprintln!("[err] stream: {}", e);
                 state.stream_error = Some(e.to_string());
+                state.quality_issues.malformed_stream = 1;
                 break;
             }
         };
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        let before_content_events = state.content_delta_tokens;
+        match std::str::from_utf8(&chunk) {
+            Ok(text) => buf.push_str(text),
+            Err(_) => {
+                state.quality_issues.malformed_stream = 1;
+                state.quality_issues.bad_output = 1;
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        }
         loop {
             let Some(nl) = buf.find('\n') else { break };
             let line = buf[..nl].trim().to_string();
@@ -289,19 +307,34 @@ async fn stream_one(
             }
             let payload = line.trim_start_matches("data:").trim();
             if payload == "[DONE]" {
-                state.saw_done = true;
-                return state.finish();
+                state.done_count += 1;
+                if state.done_count > 1 {
+                    state.quality_issues.duplicate_done = 1;
+                }
+                continue;
             }
             if let Err(err) = state.handle_payload(payload) {
                 eprintln!("[err] malformed sse json: {err}");
                 state.stream_error = Some(err);
+                state.quality_issues.malformed_stream = 1;
             }
+        }
+        if state
+            .content_delta_tokens
+            .saturating_sub(before_content_events)
+            > 1
+        {
+            state.quality_issues.stream_bulk_flush = 1;
         }
     }
     state.finish()
 }
 
-fn failed_record(input_tokens: u32, start: Instant) -> RequestRecord {
+fn failed_record(
+    input_tokens: u32,
+    start: Instant,
+    quality_issues: QualityIssueCounts,
+) -> RequestRecord {
     RequestRecord {
         success: false,
         ttft_ms: 0.0,
@@ -309,6 +342,7 @@ fn failed_record(input_tokens: u32, start: Instant) -> RequestRecord {
         input_tokens,
         output_tokens: 0,
         output_token_count_source: OutputTokenCountSource::None,
+        quality_issues,
         itl_ms: vec![],
     }
 }
@@ -321,8 +355,9 @@ struct StreamState {
     content_delta_tokens: u32,
     usage_completion_tokens: Option<u32>,
     itl_ms: Vec<f64>,
-    saw_done: bool,
+    done_count: u32,
     stream_error: Option<String>,
+    quality_issues: QualityIssueCounts,
 }
 
 impl StreamState {
@@ -335,8 +370,9 @@ impl StreamState {
             content_delta_tokens: 0,
             usage_completion_tokens: None,
             itl_ms: Vec::new(),
-            saw_done: false,
+            done_count: 0,
             stream_error: None,
+            quality_issues: QualityIssueCounts::default(),
         }
     }
 
@@ -351,13 +387,7 @@ impl StreamState {
         if let Some(choices) = chunk.choices {
             if let Some(first) = choices.into_iter().next() {
                 if let Some(delta) = first.delta {
-                    if delta.content.as_deref().is_some_and(|s| !s.is_empty())
-                        || delta.reasoning.as_deref().is_some_and(|s| !s.is_empty())
-                        || delta
-                            .reasoning_content
-                            .as_deref()
-                            .is_some_and(|s| !s.is_empty())
-                    {
+                    if let Some(text) = first_non_empty_delta_text(&delta) {
                         let now = Instant::now();
                         if self.first_token_time.is_none() {
                             self.first_token_time = Some(now);
@@ -366,6 +396,16 @@ impl StreamState {
                         }
                         self.last_token_time = Some(now);
                         self.content_delta_tokens += 1;
+                        if let Some(reason) = bad_output_reason(text) {
+                            eprintln!(
+                                "[err] bad output {reason}: {}",
+                                clipped_debug_text(text, 160)
+                            );
+                            self.quality_issues.bad_output = 1;
+                        }
+                        if looks_like_panic(text) {
+                            self.quality_issues.panic = 1;
+                        }
                     }
                 }
             }
@@ -373,7 +413,7 @@ impl StreamState {
         Ok(())
     }
 
-    fn finish(self) -> RequestRecord {
+    fn finish(mut self) -> RequestRecord {
         let (output_tokens, source) = match self.usage_completion_tokens {
             Some(tokens) => (tokens, OutputTokenCountSource::Usage),
             None if self.content_delta_tokens > 0 => (
@@ -382,21 +422,102 @@ impl StreamState {
             ),
             None => (0, OutputTokenCountSource::None),
         };
+        if self.done_count == 0 {
+            self.quality_issues.missing_done = 1;
+        } else if self.done_count > 1 {
+            self.quality_issues.duplicate_done = 1;
+        }
+        if output_tokens == 0 {
+            self.quality_issues.zero_output_tokens = 1;
+        }
         let e2e_ms = self.start.elapsed().as_secs_f64() * 1000.0;
         let ttft_ms = self
             .first_token_time
             .map(|t| t.duration_since(self.start).as_secs_f64() * 1000.0)
             .unwrap_or(e2e_ms);
+        let success = self.done_count == 1
+            && output_tokens > 0
+            && self.stream_error.is_none()
+            && self.quality_issues.request_error_count() == 0;
         RequestRecord {
-            success: self.saw_done && output_tokens > 0 && self.stream_error.is_none(),
+            success,
             ttft_ms,
             e2e_ms,
             input_tokens: self.input_tokens,
             output_tokens,
             output_token_count_source: source,
+            quality_issues: self.quality_issues,
             itl_ms: self.itl_ms,
         }
     }
+}
+
+fn first_non_empty_delta_text(delta: &OpenAiStreamDelta) -> Option<&str> {
+    delta
+        .content
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| delta.reasoning.as_deref().filter(|s| !s.is_empty()))
+        .or_else(|| delta.reasoning_content.as_deref().filter(|s| !s.is_empty()))
+}
+
+#[cfg(test)]
+fn has_bad_output_text(text: &str) -> bool {
+    bad_output_reason(text).is_some()
+}
+
+fn bad_output_reason(text: &str) -> Option<&'static str> {
+    const BAD_FRAGMENTS: &[(&str, &str)] = &[
+        ("<unk>", "reserved-token"),
+        ("[PAD", "reserved-token"),
+        ("<pad>", "reserved-token"),
+        ("<|endoftext|>", "reserved-token"),
+        ("<|im_start|>", "reserved-token"),
+        ("<|im_end|>", "reserved-token"),
+        ("<|reserved_special_token", "reserved-token"),
+        ("\u{fffd}", "invalid-utf8"),
+    ];
+    for (fragment, reason) in BAD_FRAGMENTS {
+        if text.contains(fragment) {
+            return Some(reason);
+        }
+    }
+    contains_mojibake_sequence(text).then_some("mojibake")
+}
+
+fn contains_mojibake_sequence(text: &str) -> bool {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            // Common UTF-8-as-Latin-1/Windows-1252 mojibake starts. Treat
+            // standalone lead characters as ordinary text; require the
+            // following non-ASCII continuation to avoid false positives from
+            // tokenizer byte-fallback fragments in random benchmark prompts.
+            '\u{00c2}' | '\u{00c3}' => {
+                if chars.peek().is_some_and(|next| !next.is_ascii()) {
+                    return true;
+                }
+            }
+            // Most smart quote, dash, ellipsis, and bullet mojibake starts
+            // with "â€" after UTF-8 bytes are decoded through Windows-1252.
+            '\u{00e2}' => {
+                if chars.peek().is_some_and(|next| *next == '\u{20ac}') {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn clipped_debug_text(text: &str, max_chars: usize) -> String {
+    text.escape_debug().take(max_chars).collect()
+}
+
+fn looks_like_panic(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("panicked at") || lower.contains("thread '") && lower.contains("panicked")
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1014,23 +1135,31 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         reports.push(r);
     }
 
-    enforce_error_policy(&cmd, &reports)?;
+    emit_then_enforce_error_policy(&cmd, &reports)
+}
 
-    // Emit final report.
+fn emit_then_enforce_error_policy(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> {
+    // Emit final report before enforcing error policy so failed release cells
+    // still leave quality/error-count evidence in --out artifacts.
+    emit_reports(cmd, reports)?;
+
+    // PLAYBOOK § 1.5: static globals don't drop on Rust process exit.
+    ferrum_bench_core::trace::flush_global_trace();
+
+    enforce_error_policy(cmd, reports)
+}
+
+fn emit_reports(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> {
     match cmd.output.as_str() {
-        "json" => emit_json(&cmd, &reports)?,
-        "jsonl" => emit_jsonl(&cmd, &reports)?,
-        "md" => emit_markdown(&cmd, &reports)?,
+        "json" => emit_json(cmd, reports)?,
+        "jsonl" => emit_jsonl(cmd, reports)?,
+        "md" => emit_markdown(cmd, reports)?,
         other => {
             return Err(ferrum_types::FerrumError::model(format!(
                 "unknown --output '{other}': allowed values are json, jsonl, md"
             )))
         }
     }
-
-    // PLAYBOOK § 1.5: static globals don't drop on Rust process exit.
-    ferrum_bench_core::trace::flush_global_trace();
-
     Ok(())
 }
 
@@ -1270,7 +1399,7 @@ mod tests {
         state
             .handle_payload(r#"{"choices":[],"usage":{"completion_tokens":3}}"#)
             .unwrap();
-        state.saw_done = true;
+        state.done_count = 1;
         let record = state.finish();
         assert!(record.success);
         assert_eq!(record.output_tokens, 3);
@@ -1286,7 +1415,7 @@ mod tests {
         state
             .handle_payload(r#"{"choices":[{"delta":{"reasoning":"thinking"}}]}"#)
             .unwrap();
-        state.saw_done = true;
+        state.done_count = 1;
         let record = state.finish();
         assert!(record.success);
         assert_eq!(record.output_tokens, 1);
@@ -1303,7 +1432,7 @@ mod tests {
             .handle_payload(r#"{"choices":[{"delta":{"content":"hello"}}]}"#)
             .unwrap();
         state.stream_error = Some("broken stream".into());
-        state.saw_done = true;
+        state.done_count = 1;
         let record = state.finish();
         assert!(!record.success);
         assert_eq!(
@@ -1321,6 +1450,7 @@ mod tests {
         let record = state.finish();
         assert!(!record.success);
         assert_eq!(record.output_tokens, 1);
+        assert_eq!(record.quality_issues.missing_done, 1);
     }
 
     #[test]
@@ -1328,22 +1458,153 @@ mod tests {
         let mut state = StreamState::new(Instant::now(), 7);
         assert!(state.handle_payload("{bad json}").is_err());
         state.stream_error = Some("malformed json".into());
-        state.saw_done = true;
+        state.quality_issues.malformed_stream = 1;
+        state.done_count = 1;
         let record = state.finish();
         assert!(!record.success);
         assert_eq!(record.output_tokens, 0);
+        assert_eq!(record.quality_issues.malformed_stream, 1);
     }
 
     #[test]
     fn done_with_zero_content_tokens_fails() {
         let mut state = StreamState::new(Instant::now(), 7);
-        state.saw_done = true;
+        state.done_count = 1;
         let record = state.finish();
         assert!(!record.success);
         assert_eq!(record.output_tokens, 0);
+        assert_eq!(record.quality_issues.zero_output_tokens, 1);
         assert_eq!(
             record.output_token_count_source,
             OutputTokenCountSource::None
         );
+    }
+
+    #[test]
+    fn duplicate_done_fails() {
+        let mut state = StreamState::new(Instant::now(), 7);
+        state
+            .handle_payload(r#"{"choices":[{"delta":{"content":"hello"}}]}"#)
+            .unwrap();
+        state.done_count = 2;
+        let record = state.finish();
+        assert!(!record.success);
+        assert_eq!(record.quality_issues.duplicate_done, 1);
+    }
+
+    #[test]
+    fn bad_output_text_fails() {
+        let mut state = StreamState::new(Instant::now(), 7);
+        state
+            .handle_payload(r#"{"choices":[{"delta":{"content":"<unk>"}}]}"#)
+            .unwrap();
+        state.done_count = 1;
+        let record = state.finish();
+        assert!(!record.success);
+        assert_eq!(record.quality_issues.bad_output, 1);
+    }
+
+    #[test]
+    fn mojibake_sequences_fail_but_standalone_leads_do_not() {
+        assert!(has_bad_output_text("caf\u{00c3}\u{00a9}"));
+        assert!(has_bad_output_text("copyright \u{00c2}\u{00a9}"));
+        assert!(has_bad_output_text("quote\u{00e2}\u{20ac}\u{2122}"));
+        assert!(!has_bad_output_text("\u{00c2}"));
+        assert!(!has_bad_output_text("\u{00c3}"));
+        assert!(!has_bad_output_text("Grade \u{00c2} report"));
+    }
+
+    #[test]
+    fn fail_on_error_still_writes_json_report() {
+        let out = std::env::temp_dir().join(format!(
+            "ferrum-bench-serve-failed-report-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&out);
+
+        let mut failed_quality = QualityIssueCounts::default();
+        failed_quality.http_500 = 1;
+        let run = RunRecord {
+            records: vec![
+                RequestRecord {
+                    success: true,
+                    ttft_ms: 10.0,
+                    e2e_ms: 30.0,
+                    input_tokens: 4,
+                    output_tokens: 3,
+                    output_token_count_source: OutputTokenCountSource::Usage,
+                    quality_issues: QualityIssueCounts::default(),
+                    itl_ms: vec![10.0, 10.0],
+                },
+                RequestRecord {
+                    success: false,
+                    ttft_ms: 0.0,
+                    e2e_ms: 50.0,
+                    input_tokens: 4,
+                    output_tokens: 0,
+                    output_token_count_source: OutputTokenCountSource::None,
+                    quality_issues: failed_quality,
+                    itl_ms: vec![],
+                },
+            ],
+            duration_s: 1.0,
+        };
+        let report = compute_metrics(
+            "test-model".to_string(),
+            "test-backend".to_string(),
+            Scenario::ClosedLoop,
+            Some(2),
+            None,
+            2,
+            3,
+            0,
+            Slo::default(),
+            vec![run],
+            Env::default(),
+        );
+        let cmd = BenchServeCommand {
+            base_url: "http://127.0.0.1:9".to_string(),
+            model: "test-model".to_string(),
+            tokenizer: std::path::PathBuf::from("."),
+            concurrency: 2,
+            concurrency_sweep: vec![],
+            request_rate: None,
+            dataset: "random".to_string(),
+            random_input_len: 4,
+            random_output_len: 3,
+            sharegpt_path: None,
+            shared_prefix_len: 1024,
+            shared_suffix_len: 64,
+            num_prompts: 2,
+            warmup_requests: 0,
+            n_repeats: 1,
+            goodput: None,
+            timeout: 1.0,
+            fail_on_error: true,
+            max_error_rate: None,
+            require_ci: false,
+            seed: Some(9271),
+            output: "json".to_string(),
+            out: Some(out.clone()),
+            hw_id: None,
+            commit_sha: None,
+            tag: None,
+        };
+
+        let err = emit_then_enforce_error_policy(&cmd, &[report]).expect_err("error policy");
+        assert!(
+            err.to_string().contains("bench-serve error rate"),
+            "unexpected error: {err}"
+        );
+        let raw = std::fs::read_to_string(&out).expect("report written before error");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("json report");
+        assert_eq!(json["completed_per_run"], serde_json::json!([1]));
+        assert_eq!(json["errored_per_run"], serde_json::json!([1]));
+        assert_eq!(json["http_500_per_run"], serde_json::json!([1]));
+        let _ = std::fs::remove_file(out);
     }
 }
