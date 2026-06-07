@@ -123,7 +123,7 @@ fn object_pattern(node: &Value) -> Result<String> {
         return Ok(r"\{\s*\}".to_string());
     }
 
-    let mut fields: Vec<String> = Vec::with_capacity(keys.len());
+    let mut fields: Vec<(String, String)> = Vec::with_capacity(keys.len());
     for key in keys {
         let sub = props.get(key).ok_or_else(|| {
             FerrumError::invalid_request(format!(
@@ -132,10 +132,57 @@ fn object_pattern(node: &Value) -> Result<String> {
         })?;
         let sub_pat = translate(sub)?;
         let key_literal = regex_escape(&format!("\"{key}\""));
-        fields.push(format!(r"\s*{key_literal}\s*:\s*{sub_pat}"));
+        fields.push((key_literal, sub_pat));
     }
 
-    Ok(format!(r"\{{{}\s*\}}", fields.join(r"\s*,")))
+    let field_pattern = object_field_order_pattern(&fields);
+    Ok(format!(r"\{{{field_pattern}\s*\}}"))
+}
+
+fn object_field_order_pattern(fields: &[(String, String)]) -> String {
+    const MAX_PERMUTED_OBJECT_FIELDS: usize = 6;
+    if fields.len() > MAX_PERMUTED_OBJECT_FIELDS {
+        return object_fields_sequence_pattern(fields);
+    }
+
+    let mut orders = Vec::new();
+    let mut indices = (0..fields.len()).collect::<Vec<_>>();
+    permute_indices(0, &mut indices, &mut orders);
+    let alternatives = orders
+        .iter()
+        .map(|order| {
+            let ordered = order
+                .iter()
+                .map(|&idx| fields[idx].clone())
+                .collect::<Vec<_>>();
+            object_fields_sequence_pattern(&ordered)
+        })
+        .collect::<Vec<_>>();
+    if alternatives.len() == 1 {
+        alternatives[0].clone()
+    } else {
+        format!("(?:{})", alternatives.join("|"))
+    }
+}
+
+fn object_fields_sequence_pattern(fields: &[(String, String)]) -> String {
+    fields
+        .iter()
+        .map(|(key_literal, sub_pat)| format!(r"\s*{key_literal}\s*:\s*{sub_pat}"))
+        .collect::<Vec<_>>()
+        .join(r"\s*,")
+}
+
+fn permute_indices(start: usize, indices: &mut [usize], out: &mut Vec<Vec<usize>>) {
+    if start == indices.len() {
+        out.push(indices.to_vec());
+        return;
+    }
+    for i in start..indices.len() {
+        indices.swap(start, i);
+        permute_indices(start + 1, indices, out);
+        indices.swap(start, i);
+    }
 }
 
 fn regex_escape(s: &str) -> String {
@@ -237,8 +284,9 @@ mod tests {
         let re = compile(&schema_to_regex(schema).unwrap());
         assert!(re.is_match(r#"{"name": "Alice", "age": 30}"#));
         assert!(re.is_match(r#"{ "name":"Bob" , "age":7 }"#));
+        assert!(re.is_match(r#"{"age": 30, "name": "Alice"}"#));
         assert!(!re.is_match(r#"{"name": "Alice"}"#));
-        assert!(!re.is_match(r#"{"age": 30, "name": "Alice"}"#));
+        assert!(!re.is_match(r#"{"age": 30}"#));
     }
 
     #[test]
