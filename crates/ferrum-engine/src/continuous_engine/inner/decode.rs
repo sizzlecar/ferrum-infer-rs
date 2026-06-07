@@ -210,7 +210,7 @@ impl EngineInner {
                 .unwrap_or(TokenId::new(0));
             let tensor = self.tokens_to_tensor(&[last_token.get()])?;
             ferrum_interfaces::model_executor::DecodeInput::new(tensor, kv_cache)
-                .with_metadata(seq.original_request.metadata.clone())
+                .with_metadata(seq.model_decode_metadata())
         };
 
         let decode_output = self.model_executor.decode(&decode_input).await?;
