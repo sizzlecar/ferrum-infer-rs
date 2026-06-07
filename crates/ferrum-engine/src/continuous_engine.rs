@@ -371,16 +371,21 @@ fn is_forbidden_generation_token_text(text: &str) -> bool {
         || lower.contains("unused")
 }
 
-fn decoded_output_has_forbidden_quality(text: &str) -> bool {
-    text.contains('\u{FFFD}')
-        || contains_replacement_char_mojibake(text)
-        || text.contains("<unk>")
-        || text.contains("[PAD")
-        || text.contains("<pad>")
-        || text.contains("<|endoftext|>")
-        || text.contains("<|im_start|>")
-        || text.contains("<|im_end|>")
-        || text.contains("<|reserved_special_token")
+fn decoded_delta_has_forbidden_quality(full_text: &str, previous_text_len: usize) -> bool {
+    if previous_text_len > full_text.len() || !full_text.is_char_boundary(previous_text_len) {
+        return true;
+    }
+    let delta = &full_text[previous_text_len..];
+    if delta.is_empty() {
+        return false;
+    }
+    if contains_replacement_char_mojibake(delta) {
+        return true;
+    }
+    if delta.contains('\u{FFFD}') && !full_text.ends_with('\u{FFFD}') {
+        return true;
+    }
+    false
 }
 
 fn contains_replacement_char_mojibake(text: &str) -> bool {
@@ -719,6 +724,13 @@ impl SequenceState {
         let config = SamplingConfig::from_params(&self.sampling_params);
         let step = self.generated_tokens.len();
         let vocab_size = logits.len();
+        let previous_decoded_text = tokenizer.and_then(|tok| {
+            if self.generated_tokens.is_empty() {
+                Some(String::new())
+            } else {
+                tok.decode(&self.generated_tokens, true).ok()
+            }
+        });
         let token = {
             let mut ctx = SamplingContext::new(
                 step,
@@ -732,7 +744,11 @@ impl SequenceState {
             let mut attempts = 0usize;
             loop {
                 let token = config.sampler.sample_with_context(&ctx, &mut self.rng)?;
-                if !self.sample_candidate_decodes_to_forbidden_output(tokenizer, token) {
+                if !self.sample_candidate_decodes_to_forbidden_output(
+                    tokenizer,
+                    previous_decoded_text.as_deref(),
+                    token,
+                ) {
                     break token;
                 }
                 if let Some(logit) = ctx.logits.get_mut(usize::from(token)) {
@@ -756,9 +772,11 @@ impl SequenceState {
     fn sample_candidate_decodes_to_forbidden_output(
         &self,
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        previous_decoded_text: Option<&str>,
         token: TokenId,
     ) -> bool {
-        let Some(tokenizer) = tokenizer else {
+        let (Some(tokenizer), Some(previous_decoded_text)) = (tokenizer, previous_decoded_text)
+        else {
             return false;
         };
         let mut tokens = Vec::with_capacity(self.generated_tokens.len() + 1);
@@ -766,7 +784,7 @@ impl SequenceState {
         tokens.push(token);
         tokenizer
             .decode(&tokens, true)
-            .map(|text| decoded_output_has_forbidden_quality(&text))
+            .map(|text| decoded_delta_has_forbidden_quality(&text, previous_decoded_text.len()))
             .unwrap_or(true)
     }
 }
