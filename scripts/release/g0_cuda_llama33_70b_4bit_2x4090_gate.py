@@ -375,6 +375,8 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
         ",".join(str(device) for device in REQUIRED_GPU_DEVICES),
         "--max-tokens",
         "256",
+        "--stop",
+        "\n",
         "--output-format",
         "jsonl",
         "--effective-config-json",
