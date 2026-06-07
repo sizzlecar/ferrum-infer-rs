@@ -67,6 +67,23 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// Create a new execution context (begin accumulating work).
     fn new_context() -> Self::Context;
 
+    /// Run `body` while binding context-free backend operations to an
+    /// explicit device ordinal when the backend supports multi-device scopes.
+    ///
+    /// Most backends have no per-ordinal concept and use the default no-op
+    /// implementation. CUDA overrides this once its stream/context caches are
+    /// device-keyed, allowing layer-split stages to load and execute on their
+    /// selected GPU instead of relying on process-global defaults.
+    fn with_device_ordinal<R>(_device_ordinal: Option<usize>, body: impl FnOnce() -> R) -> R {
+        body()
+    }
+
+    /// Whether [`Self::with_device_ordinal`] actually switches backend
+    /// execution to the requested ordinal.
+    fn supports_device_ordinal_scope() -> bool {
+        false
+    }
+
     /// Flush accumulated work and wait for completion.
     /// CPU: no-op. Metal: commit + waitUntilCompleted. CUDA: stream sync.
     fn sync(ctx: &mut Self::Context);
