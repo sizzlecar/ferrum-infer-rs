@@ -7,14 +7,37 @@ use super::llama_family::LlamaFamilyModel;
 
 pub struct LlamaFamilyPipelineModel<B: MoeLlmBackend, K: KvLayer<B>> {
     stages: Vec<LlamaFamilyModel<B, K>>,
+    stage_device_ordinals: Vec<Option<usize>>,
     runtime_cfg: LlmRuntimeConfig,
 }
 
 impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyPipelineModel<B, K> {
     pub fn new(stages: Vec<LlamaFamilyModel<B, K>>) -> Result<Self> {
+        let stage_device_ordinals = vec![None; stages.len()];
+        Self::new_with_backend_device_ordinals(stages, stage_device_ordinals)
+    }
+
+    pub fn new_with_backend_device_ordinals(
+        stages: Vec<LlamaFamilyModel<B, K>>,
+        stage_device_ordinals: Vec<Option<usize>>,
+    ) -> Result<Self> {
         if stages.is_empty() {
             return Err(FerrumError::model(
                 "LlamaFamilyPipelineModel requires at least one stage",
+            ));
+        }
+        if stage_device_ordinals.len() != stages.len() {
+            return Err(FerrumError::model(format!(
+                "Llama pipeline stage device count {} must match stage count {}",
+                stage_device_ordinals.len(),
+                stages.len()
+            )));
+        }
+        if stage_device_ordinals.iter().any(Option::is_some) && !B::supports_device_ordinal_scope()
+        {
+            return Err(FerrumError::unsupported(
+                "Llama layer-split pipeline requested explicit backend device ordinals, \
+                 but the selected backend does not support device-scoped execution",
             ));
         }
         if stages.first().is_some_and(|stage| stage.embed.is_none()) {
@@ -59,12 +82,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyPipelineModel<B, K> {
 
         Ok(Self {
             stages,
+            stage_device_ordinals,
             runtime_cfg,
         })
     }
 
     pub fn stages(&self) -> &[LlamaFamilyModel<B, K>] {
         &self.stages
+    }
+
+    pub fn stage_device_ordinals(&self) -> &[Option<usize>] {
+        &self.stage_device_ordinals
     }
 
     fn last_hidden_row<'a>(&self, hidden: &'a [f32], seq_len: usize) -> &'a [f32] {
@@ -87,14 +115,18 @@ where
         Some(serde_json::json!({
             "position": "llama-layer-split-pipeline",
             "stage_count": self.stages.len() as u64,
+            "stage_device_ordinals": self.stage_device_ordinals,
             "transport": "host-hidden-bridge",
         }))
     }
 
     fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
-        for stage in &mut self.stages {
-            stage.ensure_scratch(max_tokens);
-            stage.ensure_kv(cache_id);
+        for (idx, stage) in self.stages.iter_mut().enumerate() {
+            let device = self.stage_device_ordinals[idx];
+            B::with_device_ordinal(device, || {
+                stage.ensure_scratch(max_tokens);
+                stage.ensure_kv(cache_id);
+            });
         }
     }
 
@@ -109,45 +141,64 @@ where
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
         assert!(!tokens.is_empty(), "pipeline prefill called with no tokens");
         let pos_offset = self.stages[0].cache_len(cache_id);
-        let mut hidden =
-            self.stages[0].prefill_stage_tokens_to_hidden(cache_id, tokens, pos_offset);
-        for stage in self.stages.iter_mut().skip(1) {
-            hidden =
-                stage.prefill_stage_hidden_from_host(cache_id, &hidden, tokens.len(), pos_offset);
+        let mut hidden = B::with_device_ordinal(self.stage_device_ordinals[0], || {
+            self.stages[0].prefill_stage_tokens_to_hidden(cache_id, tokens, pos_offset)
+        });
+        for idx in 1..self.stages.len() {
+            let device = self.stage_device_ordinals[idx];
+            hidden = B::with_device_ordinal(device, || {
+                self.stages[idx].prefill_stage_hidden_from_host(
+                    cache_id,
+                    &hidden,
+                    tokens.len(),
+                    pos_offset,
+                )
+            });
         }
         let last_hidden = self.last_hidden_row(&hidden, tokens.len()).to_vec();
-        self.stages
-            .last_mut()
-            .expect("validated non-empty stages")
-            .logits_from_hidden(&last_hidden)
+        let last_idx = self.stages.len() - 1;
+        B::with_device_ordinal(self.stage_device_ordinals[last_idx], || {
+            self.stages[last_idx].logits_from_hidden(&last_hidden)
+        })
     }
 
     fn decode(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
-        let mut hidden = self.stages[0].decode_stage_token_to_hidden(cache_id, token, pos);
-        for stage in self.stages.iter_mut().skip(1) {
-            hidden = stage.decode_stage_hidden_from_host(cache_id, &hidden, pos);
+        let mut hidden = B::with_device_ordinal(self.stage_device_ordinals[0], || {
+            self.stages[0].decode_stage_token_to_hidden(cache_id, token, pos)
+        });
+        for idx in 1..self.stages.len() {
+            let device = self.stage_device_ordinals[idx];
+            hidden = B::with_device_ordinal(device, || {
+                self.stages[idx].decode_stage_hidden_from_host(cache_id, &hidden, pos)
+            });
         }
-        self.stages
-            .last_mut()
-            .expect("validated non-empty stages")
-            .logits_from_hidden(&hidden)
+        let last_idx = self.stages.len() - 1;
+        B::with_device_ordinal(self.stage_device_ordinals[last_idx], || {
+            self.stages[last_idx].logits_from_hidden(&hidden)
+        })
     }
 
     fn release(&mut self, cache_id: &str) {
-        for stage in &mut self.stages {
-            stage.release(cache_id);
+        for (idx, stage) in self.stages.iter_mut().enumerate() {
+            B::with_device_ordinal(self.stage_device_ordinals[idx], || {
+                stage.release(cache_id);
+            });
         }
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
-        for stage in &mut self.stages {
-            stage.truncate_kv(cache_id, new_len);
+        for (idx, stage) in self.stages.iter_mut().enumerate() {
+            B::with_device_ordinal(self.stage_device_ordinals[idx], || {
+                stage.truncate_kv(cache_id, new_len);
+            });
         }
     }
 
     fn reset(&mut self) {
-        for stage in &mut self.stages {
-            stage.reset();
+        for (idx, stage) in self.stages.iter_mut().enumerate() {
+            B::with_device_ordinal(self.stage_device_ordinals[idx], || {
+                stage.reset();
+            });
         }
     }
 }
@@ -229,6 +280,7 @@ mod tests {
 
         assert_eq!(pipeline.config().num_layers, 2);
         assert_eq!(pipeline.stages().len(), 2);
+        assert_eq!(pipeline.stage_device_ordinals(), &[None, None]);
         assert_eq!(full_logits.len(), pipeline_logits.len());
         assert!((full_logits[0] - pipeline_logits[0]).abs() < 1e-5);
     }
@@ -259,5 +311,33 @@ mod tests {
 
         assert_eq!(full_logits.len(), pipeline_logits.len());
         assert!((full_logits[0] - pipeline_logits[0]).abs() < 1e-5);
+    }
+
+    #[test]
+    fn pipeline_rejects_device_ordinals_without_backend_scope_support() {
+        let cfg = tiny_config(2);
+        let loader = TinyLoader;
+        let stage0 = LlamaFamilyModel::<CpuBackend, KvFp16>::new_layer_stage(
+            cfg.clone(),
+            &loader,
+            LlamaFamilyLayerStageConfig::pipeline_stage(0..1, true, false),
+        )
+        .unwrap();
+        let stage1 = LlamaFamilyModel::<CpuBackend, KvFp16>::new_layer_stage(
+            cfg,
+            &loader,
+            LlamaFamilyLayerStageConfig::pipeline_stage(1..2, false, true),
+        )
+        .unwrap();
+
+        let err = match LlamaFamilyPipelineModel::new_with_backend_device_ordinals(
+            vec![stage0, stage1],
+            vec![Some(0), Some(1)],
+        ) {
+            Ok(_) => panic!("pipeline unexpectedly accepted unsupported device ordinals"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("does not support device-scoped execution"));
     }
 }
