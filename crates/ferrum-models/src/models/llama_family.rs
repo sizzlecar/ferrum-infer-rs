@@ -995,6 +995,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.layers.len()
     }
 
+    pub fn cache_len(&self, cache_id: &str) -> usize {
+        self.kv_caches
+            .get(cache_id)
+            .and_then(|layers| layers.first())
+            .map(K::len)
+            .unwrap_or(0)
+    }
+
     fn local_layer_indices(&self) -> Range<usize> {
         0..self.local_layer_count()
     }
@@ -2350,6 +2358,62 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.scratch.residual = Some(residual);
 
         B::to_vec(&self.scratch.logits, vocab)
+    }
+
+    fn stage_tokens_to_hidden(
+        &mut self,
+        cache_id: &str,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Vec<f32> {
+        let seq_len = tokens.len();
+        assert!(seq_len > 0, "stage token forward called with zero length");
+        self.ensure_scratch(seq_len);
+        self.ensure_kv(cache_id);
+
+        let h = self.cfg.hidden_size;
+        let mut ctx = B::new_context();
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("stage token forward called on stage without embedding");
+        B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
+
+        for li in self.local_layer_indices() {
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
+        }
+
+        B::sync(&mut ctx);
+        let out = B::to_vec(&residual, seq_len * h);
+        self.scratch.residual = Some(residual);
+        out
+    }
+
+    /// Run the first layer-split stage over prompt tokens and return all
+    /// output hidden states for the next stage.
+    pub fn prefill_stage_tokens_to_hidden(
+        &mut self,
+        cache_id: &str,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Vec<f32> {
+        self.stage_tokens_to_hidden(cache_id, tokens, pos_offset)
+    }
+
+    /// Decode-side first-stage token forward. Returns one hidden row for the
+    /// next stage.
+    pub fn decode_stage_token_to_hidden(
+        &mut self,
+        cache_id: &str,
+        token: u32,
+        pos: u32,
+    ) -> Vec<f32> {
+        self.stage_tokens_to_hidden(cache_id, &[token], pos as usize)
     }
 
     fn stage_hidden_from_host(
