@@ -103,7 +103,10 @@ impl EngineInner {
                 let token = if logits.len() == 1 {
                     TokenId::new(logits[0] as u32)
                 } else {
-                    seq.sample_with_processors(&mut logits)?
+                    seq.sample_with_processors_with_tokenizer(
+                        &mut logits,
+                        Some(self.tokenizer.as_ref()),
+                    )?
                 };
                 seq.generated_tokens.push(token);
                 seq.tokens_this_iteration += 1;
@@ -219,7 +222,10 @@ impl EngineInner {
                 .get_mut(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
             let mut logits = logits_vec;
-            let token = seq.sample_with_processors(&mut logits)?;
+            let token = seq.sample_with_processors_with_tokenizer(
+                &mut logits,
+                Some(self.tokenizer.as_ref()),
+            )?;
             seq.generated_tokens.push(token);
             seq.kv_cache = Some(decode_output.kv_cache.clone());
             seq.tokens_this_iteration += 1;

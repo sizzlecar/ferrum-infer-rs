@@ -80,7 +80,10 @@ impl EngineInner {
                         jp.reset();
                     }
                     let mut logits = cached_logits;
-                    let token = seq.sample_with_processors(&mut logits)?;
+                    let token = seq.sample_with_processors_with_tokenizer(
+                        &mut logits,
+                        Some(self.tokenizer.as_ref()),
+                    )?;
                     seq.generated_tokens.push(token);
                     seq.model_cache_id = Some(cloned_kv.cache_id());
                     seq.kv_cache = Some(cloned_kv);
@@ -214,7 +217,10 @@ impl EngineInner {
                 jp.reset();
             }
             let mut logits = logits_vec;
-            let token = seq.sample_with_processors(&mut logits)?;
+            let token = seq.sample_with_processors_with_tokenizer(
+                &mut logits,
+                Some(self.tokenizer.as_ref()),
+            )?;
             seq.generated_tokens.push(token);
             seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
             seq.kv_cache = Some(prefill_output.kv_cache.clone());
@@ -329,7 +335,10 @@ impl EngineInner {
                             jp.reset();
                         }
                         let mut logits = cached_logits;
-                        let token = seq.sample_with_processors(&mut logits)?;
+                        let token = seq.sample_with_processors_with_tokenizer(
+                            &mut logits,
+                            Some(self.tokenizer.as_ref()),
+                        )?;
                         seq.generated_tokens.push(token);
                         seq.model_cache_id = Some(cloned_kv.cache_id());
                         seq.kv_cache = Some(cloned_kv);
@@ -429,7 +438,10 @@ impl EngineInner {
                     jp.reset();
                 }
                 let mut logits = logits_vec;
-                let token = seq.sample_with_processors(&mut logits)?;
+                let token = seq.sample_with_processors_with_tokenizer(
+                    &mut logits,
+                    Some(self.tokenizer.as_ref()),
+                )?;
                 seq.generated_tokens.push(token);
                 seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
                 seq.kv_cache = Some(prefill_output.kv_cache.clone());
