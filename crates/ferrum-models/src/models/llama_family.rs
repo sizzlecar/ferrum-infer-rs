@@ -2352,6 +2352,110 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         B::to_vec(&self.scratch.logits, vocab)
     }
 
+    fn stage_hidden_from_host(
+        &mut self,
+        cache_id: &str,
+        hidden: &[f32],
+        seq_len: usize,
+        pos_offset: usize,
+    ) -> Vec<f32> {
+        let h = self.cfg.hidden_size;
+        assert_eq!(
+            hidden.len(),
+            seq_len * h,
+            "hidden length {} != seq_len * hidden_size {}",
+            hidden.len(),
+            seq_len * h
+        );
+        assert!(seq_len > 0, "stage hidden forward called with zero length");
+
+        self.ensure_scratch(seq_len);
+        self.ensure_kv(cache_id);
+
+        let mut ctx = B::new_context();
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+
+        let hidden_buf = B::from_slice(hidden);
+        B::copy_slice(&mut ctx, &hidden_buf, 0, &mut residual, 0, seq_len * h);
+
+        for li in self.local_layer_indices() {
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
+        }
+
+        B::sync(&mut ctx);
+        let out = B::to_vec(&residual, seq_len * h);
+        self.scratch.residual = Some(residual);
+        out
+    }
+
+    /// Run this layer-split stage over prefill hidden states supplied by the
+    /// previous stage. Returns all output hidden states in row-major
+    /// `[seq_len, hidden_size]` form for the next stage.
+    pub fn prefill_stage_hidden_from_host(
+        &mut self,
+        cache_id: &str,
+        hidden: &[f32],
+        seq_len: usize,
+        pos_offset: usize,
+    ) -> Vec<f32> {
+        self.stage_hidden_from_host(cache_id, hidden, seq_len, pos_offset)
+    }
+
+    /// Decode-side companion for one hidden state row supplied by the previous
+    /// stage. Returns this stage's output hidden row.
+    pub fn decode_stage_hidden_from_host(
+        &mut self,
+        cache_id: &str,
+        hidden: &[f32],
+        pos: u32,
+    ) -> Vec<f32> {
+        self.stage_hidden_from_host(cache_id, hidden, 1, pos as usize)
+    }
+
+    /// Apply final norm + lm_head to one hidden row. Used by the last pipeline
+    /// stage after local transformer layers have produced the final hidden
+    /// state for sampling.
+    pub fn logits_from_hidden(&mut self, hidden: &[f32]) -> Vec<f32> {
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        assert_eq!(
+            hidden.len(),
+            h,
+            "hidden length {} != hidden_size {}",
+            hidden.len(),
+            h
+        );
+        self.ensure_scratch(1);
+
+        let mut ctx = B::new_context();
+        let hidden_buf = B::from_slice(hidden);
+        B::rms_norm(
+            &mut ctx,
+            &hidden_buf,
+            &self.final_norm_w,
+            self.cfg.rms_norm_eps,
+            &mut self.scratch.last_normed,
+            1,
+            h,
+        );
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .expect("logits_from_hidden called on stage without lm_head");
+        lm_head.forward(
+            &mut ctx,
+            &self.scratch.last_normed,
+            &mut self.scratch.logits,
+            1,
+        );
+        B::sync(&mut ctx);
+        B::to_vec(&self.scratch.logits, vocab)
+    }
+
     /// Prefill with pre-computed embeddings instead of token IDs.
     ///
     /// Used by models that embed inputs outside the LLM (e.g. Qwen3-TTS
@@ -3090,6 +3194,44 @@ mod tests {
                 "model.embed_tokens",
             ]
         );
+    }
+
+    #[test]
+    fn llama_family_layer_stage_runs_hidden_forward_bridge() {
+        let cfg = test_llama_config(1, false);
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new_layer_stage(
+            cfg,
+            &loader,
+            LlamaFamilyLayerStageConfig::pipeline_stage(0..1, false, false),
+        )
+        .unwrap();
+
+        let hidden = model.prefill_stage_hidden_from_host("stage-cache", &[1.0], 1, 0);
+
+        assert_eq!(hidden.len(), 1);
+        assert!(hidden[0].is_finite());
+        assert_eq!(
+            model.kv_caches["stage-cache"].len(),
+            model.local_layer_count()
+        );
+    }
+
+    #[test]
+    fn llama_family_last_stage_projects_hidden_to_logits() {
+        let cfg = test_llama_config(1, false);
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new_layer_stage(
+            cfg,
+            &loader,
+            LlamaFamilyLayerStageConfig::pipeline_stage(0..1, false, true),
+        )
+        .unwrap();
+
+        let logits = model.logits_from_hidden(&[2.0]);
+
+        assert_eq!(logits.len(), 1);
+        assert!(logits[0].is_finite());
     }
 
     #[test]
