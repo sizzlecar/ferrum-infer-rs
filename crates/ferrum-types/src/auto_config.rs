@@ -253,7 +253,52 @@ impl ResolvedFerrumConfig {
             "model_capabilities": self.model_capabilities,
             "hardware_capabilities": self.hardware_capabilities,
             "workload_profile": self.workload_profile,
+            "admission": self.admission_summary_document(),
             "decisions": self.decisions,
+        })
+    }
+
+    pub fn admission_summary_document(&self) -> serde_json::Value {
+        let max_sequences = self.selected_usize("max_sequences");
+        let kv_blocks = self.selected_usize("kv_block_count");
+        let max_batched_tokens = self.selected_usize("max_batched_tokens");
+        let max_model_len = self.selected_usize("max_model_len");
+        let kv_capacity_tokens =
+            kv_blocks.map(|blocks| blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS));
+        let kv_bytes_per_token = kv_cache_bytes_per_token_for_model(&self.model_capabilities);
+        let scheduler_policy = self
+            .selected_string("scheduler_admission_policy")
+            .unwrap_or_else(|| "unknown".to_string());
+        serde_json::json!({
+            "schema_version": 1,
+            "backend": self.hardware_capabilities.backend,
+            "model_architecture": self.model_capabilities.architecture,
+            "scheduler_policy": scheduler_policy,
+            "effective_max_concurrent": max_sequences,
+            "queue_depth": 0u64,
+            "active_prefill": 0u64,
+            "active_decode": 0u64,
+            "current_batch_size": 0u64,
+            "rejected_requests_total": 0u64,
+            "failed_requests_total": 0u64,
+            "completed_requests_total": 0u64,
+            "max_sequences": max_sequences,
+            "kv_block_count": kv_blocks,
+            "kv_block_size_tokens": DEFAULT_KV_BLOCK_SIZE_TOKENS,
+            "kv_capacity_tokens": kv_capacity_tokens,
+            "max_model_length": max_model_len,
+            "max_batched_tokens": max_batched_tokens,
+            "memory_estimate": {
+                "vram_bytes": self.hardware_capabilities.vram_bytes,
+                "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
+                "kv_bytes_per_token": kv_bytes_per_token,
+                "kv_capacity_bytes": match (kv_capacity_tokens, kv_bytes_per_token) {
+                    (Some(tokens), Some(bytes_per_token)) => {
+                        (tokens as u64).checked_mul(bytes_per_token)
+                    }
+                    _ => None,
+                },
+            },
         })
     }
 
@@ -272,6 +317,17 @@ impl ResolvedFerrumConfig {
         let bytes = serde_json::to_vec(&self.runtime_config.entries).unwrap_or_default();
         let digest = Sha256::digest(bytes);
         format!("sha256:{digest:x}")
+    }
+
+    fn selected_usize(&self, selection: &str) -> Option<usize> {
+        self.selected_string(selection)?.parse().ok()
+    }
+
+    fn selected_string(&self, selection: &str) -> Option<String> {
+        self.decisions
+            .iter()
+            .find(|decision| decision.selection == selection)
+            .map(|decision| decision.selected.clone())
     }
 }
 
@@ -628,14 +684,7 @@ impl FerrumConfigBuilder {
     }
 
     fn kv_cache_bytes_per_token(&self) -> Option<u64> {
-        let layers = self.model.num_hidden_layers? as u64;
-        let kv_heads = self.model.kv_heads? as u64;
-        let head_dim = self.model.head_dim? as u64;
-        layers
-            .checked_mul(2)?
-            .checked_mul(kv_heads)?
-            .checked_mul(head_dim)?
-            .checked_mul(2)
+        kv_cache_bytes_per_token_for_model(&self.model)
     }
 
     fn bool_value(
@@ -1300,6 +1349,17 @@ impl FerrumConfigBuilder {
             Ok(())
         }
     }
+}
+
+fn kv_cache_bytes_per_token_for_model(model: &ModelCapabilities) -> Option<u64> {
+    let layers = model.num_hidden_layers? as u64;
+    let kv_heads = model.kv_heads? as u64;
+    let head_dim = model.head_dim? as u64;
+    layers
+        .checked_mul(2)?
+        .checked_mul(kv_heads)?
+        .checked_mul(head_dim)?
+        .checked_mul(2)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1980,6 +2040,19 @@ mod tests {
             effective["workload_profile"]["priority"].as_str(),
             Some("throughput")
         );
+        let admission = &effective["admission"];
+        for field in [
+            "effective_max_concurrent",
+            "queue_depth",
+            "active_prefill",
+            "active_decode",
+            "current_batch_size",
+            "rejected_requests_total",
+            "failed_requests_total",
+            "completed_requests_total",
+        ] {
+            assert!(admission[field].is_number(), "admission.{field} missing");
+        }
 
         let trace = resolved.decision_trace_jsonl().unwrap();
         let trace_decisions: Vec<AutoConfigDecision> = trace

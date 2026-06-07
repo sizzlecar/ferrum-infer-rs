@@ -8,8 +8,9 @@ use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
 use ferrum_types::{
-    FerrumError, FinishReason, InferenceRequest, Priority, RequestId, Result,
-    RuntimeConfigSnapshot, SamplingParams,
+    FerrumConfigBuilder, FerrumError, FinishReason, InferenceRequest, ModelCapabilities, Priority,
+    RequestId, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
+    RuntimeConfigSource, SamplingParams, WorkloadProfile,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -271,6 +272,14 @@ pub struct RunCommand {
     #[arg(long, value_name = "DTYPE")]
     pub kv_dtype: Option<String>,
 
+    /// Write resolved startup runtime config JSON and exit artifacts.
+    #[arg(long)]
+    pub effective_config_json: Option<PathBuf>,
+
+    /// Write one auto-config decision JSON record per line.
+    #[arg(long)]
+    pub decision_trace_jsonl: Option<PathBuf>,
+
     /// Output format. `text` (default) — streaming text + stats UX.
     /// `jsonl` — one JSON record per event on stdout; used by tests and scripts.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -312,6 +321,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     .await?;
     let source = resolved.source;
     let model_id = source.original.clone();
+    let model_definition_for_config = load_run_model_definition(&source).await?;
     let model_chat_template = crate::source_resolver::load_model_chat_template(&source.local_path);
     let chat_template_options = build_chat_template_options(&cmd, model_chat_template.as_ref());
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
@@ -339,13 +349,25 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let load_start = std::time::Instant::now();
     let mut engine_config = ferrum_types::EngineConfig::default();
     engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
-    engine_config.backend.device = device;
+    engine_config.backend.device = device.clone();
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
     engine_config.backend.backend_options.insert(
         "model_path".to_string(),
         serde_json::Value::String(engine_model_path),
     );
     let runtime_config = RuntimeConfigSnapshot::capture_current();
+    let effective_runtime_config =
+        run_effective_runtime_config(&runtime_config, cmd.kv_dtype.as_deref());
+    let startup_auto_config = run_startup_auto_config(
+        &device,
+        model_definition_for_config.as_ref(),
+        effective_runtime_config,
+    )?;
+    crate::commands::serve::write_startup_config_artifacts(
+        &startup_auto_config,
+        cmd.effective_config_json.as_deref(),
+        cmd.decision_trace_jsonl.as_deref(),
+    )?;
     let run_budget = RunBudget::from_source(&source.local_path, &runtime_config);
     engine_config
         .apply_runtime_config_snapshot(&runtime_config)
@@ -1394,6 +1416,51 @@ fn build_chat_prompt(
     )
 }
 
+async fn load_run_model_definition(
+    source: &ResolvedModelSource,
+) -> Result<Option<ferrum_models::ModelDefinition>> {
+    if source.format != ModelFormat::SafeTensors {
+        return Ok(None);
+    }
+    let mut config_manager = ferrum_models::ConfigManager::new();
+    Ok(Some(
+        config_manager.load_from_path(&source.local_path).await?,
+    ))
+}
+
+fn run_effective_runtime_config(
+    runtime_config: &RuntimeConfigSnapshot,
+    kv_dtype: Option<&str>,
+) -> RuntimeConfigSnapshot {
+    let mut snapshot = runtime_config.clone();
+    if let Some(value) = kv_dtype.filter(|value| !value.trim().is_empty()) {
+        snapshot.upsert_entry(RuntimeConfigEntry::new(
+            "FERRUM_KV_DTYPE",
+            value.to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    snapshot
+}
+
+fn run_startup_auto_config(
+    device: &ferrum_types::Device,
+    model_definition: Option<&ferrum_models::ModelDefinition>,
+    runtime_config: RuntimeConfigSnapshot,
+) -> Result<ResolvedFerrumConfig> {
+    let model = model_definition
+        .map(crate::commands::serve::model_capabilities_from_definition)
+        .unwrap_or_else(ModelCapabilities::unknown);
+    let hardware = crate::commands::serve::hardware_capabilities_for_device(device);
+    let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+    FerrumConfigBuilder::new(runtime_config)
+        .with_model_capabilities(model)
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .map_err(|err| ferrum_types::FerrumError::config(format!("invalid auto config: {err}")))
+}
+
 /// Apply the resolved `--kv-dtype` / runtime-config override to an engine
 /// config, validating early. Default is FP16 (the production-validated path on
 /// every backend); selecting INT8 / FP8 is rejected with a helpful message
@@ -1466,6 +1533,8 @@ mod tests {
             seed: None,
             gpu_memory_utilization: 0.9,
             kv_dtype: None,
+            effective_config_json: None,
+            decision_trace_jsonl: None,
             output_format: OutputFormat::Text,
         }
     }
@@ -1480,6 +1549,36 @@ mod tests {
 
     fn default_template_options() -> ChatTemplateOptions {
         ChatTemplateOptions::default()
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_cli_kv_dtype() {
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let effective = run_effective_runtime_config(&snapshot, Some("int8"));
+        let entry = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_KV_DTYPE")
+            .expect("missing kv dtype entry");
+        assert_eq!(entry.effective_value, "int8");
+        assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_startup_auto_config_renders_effective_config_schema() {
+        let resolved = run_startup_auto_config(
+            &ferrum_types::Device::CPU,
+            None,
+            RuntimeConfigSnapshot::from_entries(Vec::new()),
+        )
+        .expect("auto config");
+        let doc = resolved.effective_config_document();
+        assert_eq!(doc["schema_version"], 1);
+        assert!(doc["entries"].is_array());
+        assert!(doc["model_capabilities"].is_object());
+        assert!(doc["hardware_capabilities"].is_object());
+        assert!(doc["workload_profile"].is_object());
+        assert!(doc["decisions"].is_array());
     }
 
     #[test]

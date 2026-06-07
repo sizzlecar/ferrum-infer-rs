@@ -173,15 +173,29 @@ fn write_metrics_block(s: &mut String, r: &BenchReport) {
 fn write_completion_block(s: &mut String, r: &BenchReport) {
     writeln!(s, "## Per-run breakdown").ok();
     writeln!(s).ok();
-    writeln!(s, "| run | completed | errored |").ok();
-    writeln!(s, "|---|---|---|").ok();
-    for (i, (c, e)) in r
-        .completed_per_run
-        .iter()
-        .zip(r.errored_per_run.iter())
-        .enumerate()
-    {
-        writeln!(s, "| {} | {} | {} |", i + 1, c, e).ok();
+    writeln!(
+        s,
+        "| run | completed | errored | bad_output | malformed_stream | missing_done | duplicate_done | zero_output_tokens | http_500 | panic | stream_bulk_flush |"
+    )
+    .ok();
+    writeln!(s, "|---|---|---|---|---|---|---|---|---|---|---|").ok();
+    for i in 0..r.completed_per_run.len() {
+        writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            i + 1,
+            r.completed_per_run[i],
+            r.errored_per_run.get(i).copied().unwrap_or(0),
+            r.bad_output_per_run.get(i).copied().unwrap_or(0),
+            r.malformed_stream_per_run.get(i).copied().unwrap_or(0),
+            r.missing_done_per_run.get(i).copied().unwrap_or(0),
+            r.duplicate_done_per_run.get(i).copied().unwrap_or(0),
+            r.zero_output_tokens_per_run.get(i).copied().unwrap_or(0),
+            r.http_500_per_run.get(i).copied().unwrap_or(0),
+            r.panic_per_run.get(i).copied().unwrap_or(0),
+            r.stream_bulk_flush_per_run.get(i).copied().unwrap_or(0),
+        )
+        .ok();
     }
     writeln!(s).ok();
 }
@@ -255,6 +269,7 @@ mod tests {
                 input_tokens: in_tok,
                 output_tokens: out_tok,
                 output_token_count_source: OutputTokenCountSource::StreamChunks,
+                quality_issues: Default::default(),
                 itl_ms: vec![],
             })
             .collect();

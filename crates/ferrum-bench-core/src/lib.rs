@@ -129,6 +129,24 @@ pub struct BenchReport {
 
     pub completed_per_run: Vec<u32>,
     pub errored_per_run: Vec<u32>,
+    #[serde(default)]
+    pub bad_output_per_run: Vec<u32>,
+    #[serde(default)]
+    pub malformed_stream_per_run: Vec<u32>,
+    #[serde(default)]
+    pub missing_done_per_run: Vec<u32>,
+    #[serde(default)]
+    pub duplicate_done_per_run: Vec<u32>,
+    #[serde(default)]
+    pub zero_output_tokens_per_run: Vec<u32>,
+    #[serde(default)]
+    pub stream_bulk_flush_per_run: Vec<u32>,
+    #[serde(default)]
+    pub http_500_per_run: Vec<u32>,
+    #[serde(default)]
+    pub panic_per_run: Vec<u32>,
+    #[serde(default)]
+    pub quality_issues_per_run: Vec<QualityIssueCounts>,
 
     pub env: Env,
     pub env_hash: EnvHash,
@@ -151,9 +169,45 @@ pub struct RequestRecord {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub output_token_count_source: OutputTokenCountSource,
+    pub quality_issues: QualityIssueCounts,
     /// Per-token inter-arrival times within this request (decode steps,
     /// `len = output_tokens - 1`). Empty if not measured.
     pub itl_ms: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QualityIssueCounts {
+    pub bad_output: u32,
+    pub malformed_stream: u32,
+    pub missing_done: u32,
+    pub duplicate_done: u32,
+    pub zero_output_tokens: u32,
+    pub stream_bulk_flush: u32,
+    pub http_500: u32,
+    pub panic: u32,
+}
+
+impl QualityIssueCounts {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.bad_output += other.bad_output;
+        self.malformed_stream += other.malformed_stream;
+        self.missing_done += other.missing_done;
+        self.duplicate_done += other.duplicate_done;
+        self.zero_output_tokens += other.zero_output_tokens;
+        self.stream_bulk_flush += other.stream_bulk_flush;
+        self.http_500 += other.http_500;
+        self.panic += other.panic;
+    }
+
+    pub fn request_error_count(&self) -> u32 {
+        self.bad_output
+            + self.malformed_stream
+            + self.missing_done
+            + self.duplicate_done
+            + self.zero_output_tokens
+            + self.http_500
+            + self.panic
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,11 +319,33 @@ pub fn compute_metrics(
 
     let mut completed_per_run = Vec::with_capacity(runs.len());
     let mut errored_per_run = Vec::with_capacity(runs.len());
+    let mut quality_issues_per_run = Vec::with_capacity(runs.len());
+    let mut bad_output_per_run = Vec::with_capacity(runs.len());
+    let mut malformed_stream_per_run = Vec::with_capacity(runs.len());
+    let mut missing_done_per_run = Vec::with_capacity(runs.len());
+    let mut duplicate_done_per_run = Vec::with_capacity(runs.len());
+    let mut zero_output_tokens_per_run = Vec::with_capacity(runs.len());
+    let mut stream_bulk_flush_per_run = Vec::with_capacity(runs.len());
+    let mut http_500_per_run = Vec::with_capacity(runs.len());
+    let mut panic_per_run = Vec::with_capacity(runs.len());
 
     for run in &runs {
         let success: Vec<&RequestRecord> = run.records.iter().filter(|r| r.success).collect();
         completed_per_run.push(success.len() as u32);
         errored_per_run.push((run.records.len() - success.len()) as u32);
+        let mut quality = QualityIssueCounts::default();
+        for record in &run.records {
+            quality.add_assign(&record.quality_issues);
+        }
+        bad_output_per_run.push(quality.bad_output);
+        malformed_stream_per_run.push(quality.malformed_stream);
+        missing_done_per_run.push(quality.missing_done);
+        duplicate_done_per_run.push(quality.duplicate_done);
+        zero_output_tokens_per_run.push(quality.zero_output_tokens);
+        stream_bulk_flush_per_run.push(quality.stream_bulk_flush);
+        http_500_per_run.push(quality.http_500);
+        panic_per_run.push(quality.panic);
+        quality_issues_per_run.push(quality);
 
         let ttfts: Vec<f64> = success.iter().map(|r| r.ttft_ms).collect();
         let tpots: Vec<f64> = success.iter().filter_map(|r| r.tpot_ms()).collect();
@@ -353,6 +429,15 @@ pub fn compute_metrics(
         slo,
         completed_per_run,
         errored_per_run,
+        bad_output_per_run,
+        malformed_stream_per_run,
+        missing_done_per_run,
+        duplicate_done_per_run,
+        zero_output_tokens_per_run,
+        stream_bulk_flush_per_run,
+        http_500_per_run,
+        panic_per_run,
+        quality_issues_per_run,
         env,
         env_hash,
     }
@@ -374,6 +459,7 @@ mod tests {
             } else {
                 OutputTokenCountSource::None
             },
+            quality_issues: QualityIssueCounts::default(),
             itl_ms: vec![],
         }
     }
@@ -443,6 +529,8 @@ mod tests {
         );
         assert_eq!(report.n_repeats, 3);
         assert_eq!(report.n_requests_per_run, 4);
+        assert_eq!(report.bad_output_per_run, vec![0, 0, 0]);
+        assert_eq!(report.malformed_stream_per_run, vec![0, 0, 0]);
         // All three runs identical → stddev = 0, ci95 = 0.
         assert_eq!(report.ttft_ms.p50.stddev, 0.0);
         // Mean p50 of [100, 120, 140, 160] = 130 (linear interp at q=0.5 of 4 elems).
@@ -516,5 +604,33 @@ mod tests {
         assert_eq!(parsed.n_repeats, 3);
         assert_eq!(parsed.concurrency, Some(2));
         assert_eq!(parsed.request_rate, None);
+        assert_eq!(parsed.quality_issues_per_run.len(), 3);
+    }
+
+    #[test]
+    fn aggregates_quality_issues_per_run() {
+        let mut bad = req(false, 100.0, 200.0, 10, 0);
+        bad.quality_issues.bad_output = 1;
+        bad.quality_issues.missing_done = 1;
+        let mut malformed = req(false, 100.0, 200.0, 10, 0);
+        malformed.quality_issues.malformed_stream = 1;
+        malformed.quality_issues.http_500 = 1;
+        let report = compute_metrics(
+            "test".into(),
+            "cpu".into(),
+            Scenario::ClosedLoop,
+            Some(2),
+            None,
+            10,
+            10,
+            0,
+            Slo::default(),
+            vec![make_run(vec![bad], 1.0), make_run(vec![malformed], 1.0)],
+            Env::default(),
+        );
+        assert_eq!(report.bad_output_per_run, vec![1, 0]);
+        assert_eq!(report.malformed_stream_per_run, vec![0, 1]);
+        assert_eq!(report.missing_done_per_run, vec![1, 0]);
+        assert_eq!(report.http_500_per_run, vec![0, 1]);
     }
 }

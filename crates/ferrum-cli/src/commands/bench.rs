@@ -452,6 +452,7 @@ async fn collect_stream(
         input_tokens: 0, // CLI bench doesn't tokenize; left as 0
         output_tokens: token_count,
         output_token_count_source: OutputTokenCountSource::StreamChunks,
+        quality_issues: Default::default(),
         itl_ms,
     })
 }
