@@ -270,12 +270,28 @@ pub struct RunCommand {
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
+    /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
+    #[arg(long, value_name = "N")]
+    pub max_model_len: Option<usize>,
+
+    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`.
+    #[arg(long, value_name = "N")]
+    pub max_num_seqs: Option<usize>,
+
+    /// vLLM-compatible alias for `FERRUM_MAX_BATCHED_TOKENS`.
+    #[arg(long, value_name = "N")]
+    pub max_num_batched_tokens: Option<usize>,
+
     /// KV cache element dtype (Dim 5 polymorphism point). Accepts
     /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
     /// require model wire-up; today only the kernel + type layer ships.
     /// Override via `FERRUM_KV_DTYPE` env var.
     #[arg(long, value_name = "DTYPE")]
     pub kv_dtype: Option<String>,
+
+    /// Per-sequence KV token capacity (`FERRUM_KV_CAPACITY`).
+    #[arg(long, value_name = "N")]
+    pub kv_capacity: Option<usize>,
 
     /// Write resolved startup runtime config JSON and exit artifacts.
     #[arg(long)]
@@ -317,6 +333,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             selection.selected_distributed_strategy
         );
     }
+    let mut startup_cli_runtime_entries =
+        run_startup_cli_runtime_entries(&cmd, gpu_selection.as_ref());
+    materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
     let autosize = run_autosize_for_device(&device, cmd.gpu_memory_utilization);
 
     // Resolve the model through the central source resolver. Handles
@@ -345,6 +364,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             if let Some(plan) = selection.selected_layer_split_plan.as_deref() {
                 eprintln!("{}", format!("CUDA layer split plan: {plan}").dimmed());
             }
+            startup_cli_runtime_entries =
+                run_startup_cli_runtime_entries(&cmd, gpu_selection.as_ref());
+            materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
         }
     }
     let model_chat_template = crate::source_resolver::load_model_chat_template(&source.local_path);
@@ -384,11 +406,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     if let Some(selection) = &gpu_selection {
         selection.insert_backend_options(&mut engine_config.backend.backend_options);
     }
-    let effective_runtime_config = run_effective_runtime_config(
-        &runtime_config,
-        cmd.kv_dtype.as_deref(),
-        gpu_selection.as_ref(),
-    );
+    let effective_runtime_config =
+        run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
     let startup_auto_config = run_startup_auto_config(
         &device,
         model_definition_for_config.as_ref(),
@@ -1461,23 +1480,54 @@ async fn load_run_model_definition(
 
 fn run_effective_runtime_config(
     runtime_config: &RuntimeConfigSnapshot,
-    kv_dtype: Option<&str>,
-    gpu_selection: Option<&crate::gpu_devices::GpuDeviceSelection>,
+    cli_runtime_entries: &[RuntimeConfigEntry],
 ) -> RuntimeConfigSnapshot {
     let mut snapshot = runtime_config.clone();
-    if let Some(value) = kv_dtype.filter(|value| !value.trim().is_empty()) {
-        snapshot.upsert_entry(RuntimeConfigEntry::new(
-            "FERRUM_KV_DTYPE",
-            value.to_string(),
-            RuntimeConfigSource::Cli,
-        ));
-    }
-    if let Some(selection) = gpu_selection {
-        for entry in selection.runtime_config_entries() {
-            snapshot.upsert_entry(entry);
-        }
+    for entry in cli_runtime_entries {
+        snapshot.upsert_entry(entry.clone());
     }
     snapshot
+}
+
+fn run_startup_cli_runtime_entries(
+    cmd: &RunCommand,
+    gpu_selection: Option<&crate::gpu_devices::GpuDeviceSelection>,
+) -> Vec<RuntimeConfigEntry> {
+    let mut entries = Vec::new();
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_KV_DTYPE",
+        cmd.kv_dtype.as_deref(),
+    );
+    crate::runtime_env::push_cli_runtime_usize(&mut entries, "FERRUM_KV_CAPACITY", cmd.kv_capacity);
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_MAX_MODEL_LEN",
+        cmd.max_model_len,
+    );
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_PAGED_MAX_SEQS",
+        cmd.max_num_seqs,
+    );
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_MAX_BATCHED_TOKENS",
+        cmd.max_num_batched_tokens,
+    );
+    if let Some(selection) = gpu_selection {
+        entries.extend(selection.runtime_config_entries());
+    }
+    entries
+}
+
+fn materialize_run_cli_runtime_entries(entries: &[RuntimeConfigEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    crate::runtime_env::materialize_runtime_env_effective(&RuntimeConfigSnapshot::from_entries(
+        entries.to_vec(),
+    ));
 }
 
 fn run_startup_auto_config(
@@ -1570,7 +1620,11 @@ mod tests {
             repeat_last_n: 64,
             seed: None,
             gpu_memory_utilization: 0.9,
+            max_model_len: None,
+            max_num_seqs: None,
+            max_num_batched_tokens: None,
             kv_dtype: None,
+            kv_capacity: None,
             effective_config_json: None,
             decision_trace_jsonl: None,
             output_format: OutputFormat::Text,
@@ -1592,7 +1646,10 @@ mod tests {
     #[test]
     fn run_effective_runtime_config_records_cli_kv_dtype() {
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
-        let effective = run_effective_runtime_config(&snapshot, Some("int8"), None);
+        let mut cmd = test_run_cmd();
+        cmd.kv_dtype = Some("int8".to_string());
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
         let entry = effective
             .entries
             .iter()
@@ -1614,7 +1671,9 @@ mod tests {
             selected_layer_split_stages: None,
         };
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
-        let effective = run_effective_runtime_config(&snapshot, None, Some(&selection));
+        let cmd = test_run_cmd();
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, Some(&selection));
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
         let entry = |key: &str| {
             effective
                 .entries
@@ -1629,6 +1688,34 @@ mod tests {
         assert_eq!(
             entry("FERRUM_SELECTED_DISTRIBUTED_STRATEGY").effective_value,
             "single_gpu"
+        );
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_cli_runtime_limits() {
+        let mut cmd = test_run_cmd();
+        cmd.kv_capacity = Some(2048);
+        cmd.max_model_len = Some(8192);
+        cmd.max_num_seqs = Some(8);
+        cmd.max_num_batched_tokens = Some(1024);
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let entry = |key: &str| {
+            effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
+        assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "8192");
+        assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "8");
+        assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "1024");
+        assert_eq!(
+            entry("FERRUM_MAX_MODEL_LEN").source,
+            RuntimeConfigSource::Cli
         );
     }
 

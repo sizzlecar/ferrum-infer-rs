@@ -32,8 +32,13 @@ pub struct AutoSizeResult {
     pub total_gpu_bytes: u64,
     pub free_gpu_bytes: u64,
     pub weight_bytes: u64,
+    pub budgeted_weight_bytes: u64,
+    pub weight_budget_shards: u64,
+    pub budgeted_layer_count: u64,
     pub kv_block_bytes: u64,
     pub kv_pool_copies: u64,
+    pub estimated_budget_blocks: usize,
+    pub requested_min_blocks: usize,
     pub max_blocks: usize,
     pub reserved_for_scratch: u64,
 }
@@ -42,18 +47,32 @@ impl AutoSizeResult {
     pub fn print_summary(&self) {
         let gb = |b: u64| (b as f64) / 1024.0 / 1024.0 / 1024.0;
         eprintln!(
-            "[auto-size] gpu={:.1} GB total / {:.1} GB free | weights={:.1} GB | scratch reserve={:.1} GB | KV pool budget {:.1} GB → max_blocks={}",
+            "[auto-size] gpu={:.1} GB total / {:.1} GB free | weights={:.1} GB budget / {:.1} GB total | layers={} budget | scratch reserve={:.1} GB | KV pool budget {:.1} GB → max_blocks={}",
             gb(self.total_gpu_bytes),
             gb(self.free_gpu_bytes),
+            gb(self.budgeted_weight_bytes),
             gb(self.weight_bytes),
+            self.budgeted_layer_count,
             gb(self.reserved_for_scratch),
             gb((self.max_blocks as u64) * self.kv_block_bytes * self.kv_pool_copies),
             self.max_blocks,
         );
+        if self.weight_budget_shards > 1 {
+            eprintln!(
+                "[auto-size] weight budget shards={} (distributed strategy)",
+                self.weight_budget_shards
+            );
+        }
         if self.kv_pool_copies > 1 {
             eprintln!(
                 "[auto-size] KV pool copies={} (FA-compatible attention path)",
                 self.kv_pool_copies
+            );
+        }
+        if self.requested_min_blocks > self.estimated_budget_blocks {
+            eprintln!(
+                "[auto-size] requested runtime floor requires KV_MAX_BLOCKS={} above estimated budget {}; honoring explicit runtime limits",
+                self.requested_min_blocks, self.estimated_budget_blocks
             );
         }
     }
@@ -71,6 +90,16 @@ pub fn auto_size_kv_blocks_with_pool_copies(
     model_dir: &Path,
     gpu_util: f32,
     kv_pool_copies: u64,
+) -> Option<AutoSizeResult> {
+    let current = RuntimeConfigSnapshot::capture_current();
+    auto_size_kv_blocks_with_pool_copies_for_snapshot(model_dir, gpu_util, kv_pool_copies, &current)
+}
+
+fn auto_size_kv_blocks_with_pool_copies_for_snapshot(
+    model_dir: &Path,
+    gpu_util: f32,
+    kv_pool_copies: u64,
+    runtime_config: &RuntimeConfigSnapshot,
 ) -> Option<AutoSizeResult> {
     let gpu_util = gpu_util.clamp(0.1, 1.0);
     let kv_pool_copies = kv_pool_copies.max(1);
@@ -135,6 +164,9 @@ pub fn auto_size_kv_blocks_with_pool_copies(
         // Couldn't find weights — bail to static defaults.
         return None;
     }
+    let weight_budget_shards = weight_budget_shard_count(runtime_config);
+    let budgeted_weight_bytes = ceil_div_u64(weight_bytes, weight_budget_shards);
+    let budgeted_layer_count = layer_count_for_memory_budget(num_layers, runtime_config);
 
     // 4. Compute KV budget. Reserve `(1 - util)` of total mem as host-
     //    bookkeeping margin, plus a fixed scratch reserve covering all
@@ -142,23 +174,31 @@ pub fn auto_size_kv_blocks_with_pool_copies(
     //    forward intermediates, embedding, lm_head, etc).
     let target_used = (total_bytes as f64 * gpu_util as f64) as u64;
     let avail_for_kv = target_used
-        .saturating_sub(weight_bytes)
+        .saturating_sub(budgeted_weight_bytes)
         .saturating_sub(SCRATCH_RESERVE_BYTES);
 
     // KV per block: num_layers × num_kv_heads × block_size × head_dim
     //              × 2 (K and V) × dtype_bytes
-    let block_bytes = num_layers * num_kv_heads * PAGED_BLOCK_SIZE * head_dim * 2 * KV_DTYPE_BYTES;
+    let block_bytes =
+        budgeted_layer_count * num_kv_heads * PAGED_BLOCK_SIZE * head_dim * 2 * KV_DTYPE_BYTES;
     if block_bytes == 0 {
         return None;
     }
-    let max_blocks = (avail_for_kv / (block_bytes * kv_pool_copies)) as usize;
+    let estimated_budget_blocks = (avail_for_kv / (block_bytes * kv_pool_copies)) as usize;
+    let requested_min_blocks = requested_min_kv_blocks_from_snapshot(runtime_config);
+    let max_blocks = estimated_budget_blocks.max(requested_min_blocks);
 
     Some(AutoSizeResult {
         total_gpu_bytes: total_bytes,
         free_gpu_bytes: free_bytes,
         weight_bytes,
+        budgeted_weight_bytes,
+        weight_budget_shards,
+        budgeted_layer_count,
         kv_block_bytes: block_bytes,
         kv_pool_copies,
+        estimated_budget_blocks,
+        requested_min_blocks,
         max_blocks,
         reserved_for_scratch: SCRATCH_RESERVE_BYTES,
     })
@@ -346,12 +386,89 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     );
 }
 
+fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
+    if divisor == 0 {
+        return value;
+    }
+    value.div_ceil(divisor)
+}
+
+fn ceil_div_usize(value: usize, divisor: usize) -> usize {
+    if divisor == 0 {
+        return value;
+    }
+    value.div_ceil(divisor)
+}
+
+fn weight_budget_shard_count(snapshot: &RuntimeConfigSnapshot) -> u64 {
+    match snapshot_value(
+        snapshot,
+        crate::gpu_devices::SELECTED_DISTRIBUTED_STRATEGY_KEY,
+    ) {
+        Some("layer_split") => selected_gpu_device_count(snapshot).max(1) as u64,
+        // Tensor-parallel support should extend this match with its own
+        // weight/KV placement rules instead of treating all multi-GPU
+        // strategies as identical.
+        _ => 1,
+    }
+}
+
+fn layer_count_for_memory_budget(num_layers: u64, snapshot: &RuntimeConfigSnapshot) -> u64 {
+    match snapshot_value(
+        snapshot,
+        crate::gpu_devices::SELECTED_DISTRIBUTED_STRATEGY_KEY,
+    ) {
+        Some("layer_split") => {
+            let shards = selected_gpu_device_count(snapshot).max(1) as u64;
+            ceil_div_u64(num_layers, shards).max(1)
+        }
+        _ => num_layers,
+    }
+}
+
+fn selected_gpu_device_count(snapshot: &RuntimeConfigSnapshot) -> usize {
+    snapshot_value(snapshot, crate::gpu_devices::SELECTED_GPU_DEVICES_KEY)
+        .map(|value| {
+            value
+                .split(',')
+                .filter(|part| !part.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(1)
+}
+
+fn requested_min_kv_blocks_from_snapshot(snapshot: &RuntimeConfigSnapshot) -> usize {
+    let max_model_len_blocks = snapshot_usize(snapshot, "FERRUM_MAX_MODEL_LEN")
+        .map(|value| ceil_div_usize(value, PAGED_BLOCK_SIZE as usize))
+        .unwrap_or(0);
+    let max_batched_token_blocks = snapshot_usize(snapshot, "FERRUM_MAX_BATCHED_TOKENS")
+        .map(|value| ceil_div_usize(value, PAGED_BLOCK_SIZE as usize))
+        .unwrap_or(0);
+    let paged_pool_blocks = match (
+        snapshot_usize(snapshot, "FERRUM_PAGED_MAX_SEQS"),
+        snapshot_usize(snapshot, "FERRUM_KV_CAPACITY"),
+    ) {
+        (Some(max_seqs), Some(kv_capacity)) => {
+            max_seqs.saturating_mul(ceil_div_usize(kv_capacity, PAGED_BLOCK_SIZE as usize))
+        }
+        _ => 0,
+    };
+
+    max_model_len_blocks
+        .max(max_batched_token_blocks)
+        .max(paged_pool_blocks)
+}
+
 fn snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
     snapshot
         .entries
         .iter()
         .find(|entry| entry.key == key)
         .map(|entry| entry.effective_value.as_str())
+}
+
+fn snapshot_usize(snapshot: &RuntimeConfigSnapshot, key: &str) -> Option<usize> {
+    snapshot_value(snapshot, key).and_then(|value| value.parse::<usize>().ok())
 }
 
 fn snapshot_bool(snapshot: &RuntimeConfigSnapshot, key: &str) -> Option<bool> {
@@ -401,5 +518,46 @@ mod tests {
             ])),
             1
         );
+    }
+
+    #[test]
+    fn layer_split_scopes_weight_and_layer_budget_to_selected_devices() {
+        let snapshot = snapshot(&[
+            (
+                crate::gpu_devices::SELECTED_DISTRIBUTED_STRATEGY_KEY,
+                "layer_split",
+            ),
+            (crate::gpu_devices::SELECTED_GPU_DEVICES_KEY, "0,1"),
+        ]);
+
+        assert_eq!(weight_budget_shard_count(&snapshot), 2);
+        assert_eq!(layer_count_for_memory_budget(80, &snapshot), 40);
+        assert_eq!(ceil_div_u64(37, weight_budget_shard_count(&snapshot)), 19);
+    }
+
+    #[test]
+    fn unknown_multi_gpu_strategy_keeps_single_device_budget_until_wired() {
+        let snapshot = snapshot(&[
+            (
+                crate::gpu_devices::SELECTED_DISTRIBUTED_STRATEGY_KEY,
+                "tensor_parallel",
+            ),
+            (crate::gpu_devices::SELECTED_GPU_DEVICES_KEY, "0,1"),
+        ]);
+
+        assert_eq!(weight_budget_shard_count(&snapshot), 1);
+        assert_eq!(layer_count_for_memory_budget(80, &snapshot), 80);
+    }
+
+    #[test]
+    fn requested_runtime_limits_define_kv_block_floor() {
+        let snapshot = snapshot(&[
+            ("FERRUM_MAX_MODEL_LEN", "8192"),
+            ("FERRUM_MAX_BATCHED_TOKENS", "1024"),
+            ("FERRUM_PAGED_MAX_SEQS", "8"),
+            ("FERRUM_KV_CAPACITY", "2048"),
+        ]);
+
+        assert_eq!(requested_min_kv_blocks_from_snapshot(&snapshot), 1024);
     }
 }
