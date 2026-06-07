@@ -179,7 +179,7 @@ impl EngineInner {
                     seq.input_tokens.len(),
                     seq.kv_cache.clone(),
                     seq.prefill_tokens_processed,
-                    seq.original_request.metadata.clone(),
+                    seq.model_decode_metadata(),
                 )
             };
             if chunk_start >= num_tokens {

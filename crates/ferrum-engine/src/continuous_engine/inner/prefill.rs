@@ -154,7 +154,7 @@ impl EngineInner {
             let sequences = self.sequences.read();
             sequences
                 .get(request_id)
-                .map(|seq| seq.original_request.metadata.clone())
+                .map(|seq| seq.model_decode_metadata())
                 .unwrap_or_default()
         };
 
@@ -314,7 +314,7 @@ impl EngineInner {
                 (
                     seq.input_tokens.clone(),
                     seq.input_tokens.len(),
-                    seq.original_request.metadata.clone(),
+                    seq.model_decode_metadata(),
                 )
             };
 
