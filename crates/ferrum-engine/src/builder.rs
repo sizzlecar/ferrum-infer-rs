@@ -271,6 +271,7 @@ impl EngineBuilder {
         let executor_name = self.resolve_executor_name();
 
         let component_config = ComponentConfig::from_engine_config(&self.config);
+        reject_unsupported_layer_split(&component_config)?;
         let typed_model_path = component_config.get_string_option("model_path");
         let has_model_path =
             typed_model_path.is_some() || engine_builder_runtime_env().has_model_path();
@@ -453,6 +454,28 @@ impl EngineBuilder {
     }
 }
 
+fn reject_unsupported_layer_split(component_config: &ComponentConfig) -> Result<()> {
+    if component_config
+        .get_string_option("selected_distributed_strategy")
+        .as_deref()
+        != Some("layer_split")
+    {
+        return Ok(());
+    }
+    let requested = component_config
+        .get_option::<Vec<usize>>("requested_gpu_devices")
+        .unwrap_or_default();
+    let selected = component_config
+        .get_option::<Vec<usize>>("selected_gpu_devices")
+        .unwrap_or_default();
+    let plan = component_config
+        .get_string_option("selected_layer_split_plan")
+        .unwrap_or_else(|| "missing".to_string());
+    Err(FerrumError::unsupported(format!(
+        "CUDA layer_split execution is not implemented yet; requested_gpu_devices={requested:?} selected_gpu_devices={selected:?} selected_layer_split_plan={plan}. Refusing to fall back to a single GPU."
+    )))
+}
+
 /// Create an engine with the default configuration and registry
 pub async fn create_engine(
     config: EngineConfig,
@@ -529,6 +552,42 @@ mod tests {
             Some("/models/draft")
         );
         assert_eq!(component_config.get_option::<usize>("spec_n"), Some(6));
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_layer_split_until_executor_supports_it() {
+        let mut config = EngineConfig::default();
+        config.backend.backend_options.insert(
+            "model_path".to_string(),
+            serde_json::Value::String("/models/target".to_string()),
+        );
+        config.backend.backend_options.insert(
+            "selected_distributed_strategy".to_string(),
+            serde_json::Value::String("layer_split".to_string()),
+        );
+        config.backend.backend_options.insert(
+            "requested_gpu_devices".to_string(),
+            serde_json::json!([0, 1]),
+        );
+        config.backend.backend_options.insert(
+            "selected_gpu_devices".to_string(),
+            serde_json::json!([0, 1]),
+        );
+        config.backend.backend_options.insert(
+            "selected_layer_split_plan".to_string(),
+            serde_json::Value::String(
+                "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto".to_string(),
+            ),
+        );
+
+        let err = match EngineBuilder::new(config).build().await {
+            Ok(_) => panic!("layer_split build unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("layer_split execution is not implemented yet"));
+        assert!(err.to_string().contains("selected_gpu_devices=[0, 1]"));
     }
 
     #[test]

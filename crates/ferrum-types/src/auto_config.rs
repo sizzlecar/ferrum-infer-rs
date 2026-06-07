@@ -245,10 +245,60 @@ pub struct ResolvedFerrumConfig {
 
 impl ResolvedFerrumConfig {
     pub fn effective_config_document(&self) -> serde_json::Value {
+        let backend = self.hardware_capabilities.backend.clone();
+        let requested_gpu_devices = self
+            .runtime_csv_usize("FERRUM_REQUESTED_GPU_DEVICES")
+            .or_else(|| default_gpu_devices_for_backend(&backend));
+        let selected_gpu_devices = self
+            .runtime_csv_usize("FERRUM_SELECTED_GPU_DEVICES")
+            .or_else(|| requested_gpu_devices.clone())
+            .or_else(|| default_gpu_devices_for_backend(&backend));
+        let cuda_device_count = self
+            .runtime_usize("FERRUM_CUDA_DEVICE_COUNT")
+            .or_else(|| {
+                backend.eq_ignore_ascii_case("cuda").then(|| {
+                    selected_gpu_devices
+                        .as_ref()
+                        .map(|devices| devices.len())
+                        .unwrap_or(1)
+                })
+            })
+            .unwrap_or(0);
+        let selected_distributed_strategy = self
+            .runtime_entry_value("FERRUM_SELECTED_DISTRIBUTED_STRATEGY")
+            .unwrap_or_else(|| {
+                if selected_gpu_devices
+                    .as_ref()
+                    .map(|devices| devices.len() > 1)
+                    .unwrap_or(false)
+                {
+                    "layer_split".to_string()
+                } else if backend.eq_ignore_ascii_case("cuda") {
+                    "single_gpu".to_string()
+                } else {
+                    "none".to_string()
+                }
+            });
+        let selected_layer_split_plan =
+            self.runtime_entry_value("FERRUM_SELECTED_LAYER_SPLIT_PLAN");
         serde_json::json!({
             "schema_version": 1,
             "preset": self.preset,
             "env_hash": self.runtime_env_hash(),
+            "backend": backend.clone(),
+            "requested_gpu_devices": requested_gpu_devices.clone(),
+            "selected_gpu_devices": selected_gpu_devices.clone(),
+            "cuda_device_count": cuda_device_count,
+            "selected_distributed_strategy": selected_distributed_strategy.clone(),
+            "selected_layer_split_plan": selected_layer_split_plan.clone(),
+            "selected_weight_placement": if selected_layer_split_plan.is_some() { "layer_split" } else { "single_device" },
+            "selected_kv_layout": if backend.eq_ignore_ascii_case("cpu") { "contiguous" } else { "paged" },
+            "selected_attention_impl": self.selected_string("attention_decode_backend"),
+            "selected_graph_mode": self.selected_string("moe_graph_policy"),
+            "selected_max_sequences": self.selected_usize("max_sequences"),
+            "selected_max_model_len": self.selected_usize("max_model_len"),
+            "selected_kv_capacity": self.runtime_usize("FERRUM_KV_CAPACITY"),
+            "selected_max_batched_tokens": self.selected_usize("max_batched_tokens"),
             "entries": self.runtime_config.entries,
             "model_capabilities": self.model_capabilities,
             "hardware_capabilities": self.hardware_capabilities,
@@ -328,6 +378,31 @@ impl ResolvedFerrumConfig {
             .iter()
             .find(|decision| decision.selection == selection)
             .map(|decision| decision.selected.clone())
+    }
+
+    fn runtime_entry_value(&self, key: &str) -> Option<String> {
+        self.runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.effective_value.clone())
+    }
+
+    fn runtime_usize(&self, key: &str) -> Option<usize> {
+        self.runtime_entry_value(key)?.parse().ok()
+    }
+
+    fn runtime_csv_usize(&self, key: &str) -> Option<Vec<usize>> {
+        let raw = self.runtime_entry_value(key)?;
+        let mut out = Vec::new();
+        for part in raw.split(',') {
+            let value = part.trim();
+            if value.is_empty() {
+                return None;
+            }
+            out.push(value.parse().ok()?);
+        }
+        Some(out)
     }
 }
 
@@ -1387,6 +1462,10 @@ fn vram_default_max_sequences(vram_bytes: u64) -> usize {
     }
 }
 
+fn default_gpu_devices_for_backend(backend: &str) -> Option<Vec<usize>> {
+    backend.eq_ignore_ascii_case("cuda").then(|| vec![0])
+}
+
 fn ceil_div(value: usize, divisor: usize) -> usize {
     value.div_ceil(divisor)
 }
@@ -1556,6 +1635,52 @@ mod tests {
         assert_eq!(decisions["moe_implementation"], "legacy_moe");
         assert_eq!(decisions["moe_graph_policy"], "graph_disabled");
         assert_eq!(decisions["sampling_readback_path"], "logits_readback");
+    }
+
+    #[test]
+    fn effective_config_document_records_cuda_gpu_device_selection() {
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[
+            (
+                "FERRUM_REQUESTED_GPU_DEVICES",
+                "0,1",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "FERRUM_SELECTED_GPU_DEVICES",
+                "0,1",
+                RuntimeConfigSource::Cli,
+            ),
+            ("FERRUM_CUDA_DEVICE_COUNT", "2", RuntimeConfigSource::Cli),
+            (
+                "FERRUM_SELECTED_DISTRIBUTED_STRATEGY",
+                "layer_split",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "FERRUM_SELECTED_LAYER_SPLIT_PLAN",
+                "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto",
+                RuntimeConfigSource::Cli,
+            ),
+            ("FERRUM_KV_CAPACITY", "512", RuntimeConfigSource::Cli),
+        ]))
+        .with_hardware_capabilities(HardwareCapabilities::rtx4090_cuda(
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        ))
+        .resolve()
+        .unwrap();
+
+        let doc = resolved.effective_config_document();
+        assert_eq!(doc["backend"], "cuda");
+        assert_eq!(doc["requested_gpu_devices"], serde_json::json!([0, 1]));
+        assert_eq!(doc["selected_gpu_devices"], serde_json::json!([0, 1]));
+        assert_eq!(doc["cuda_device_count"], 2);
+        assert_eq!(doc["selected_distributed_strategy"], "layer_split");
+        assert_eq!(
+            doc["selected_layer_split_plan"],
+            "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
+        );
+        assert_eq!(doc["selected_weight_placement"], "layer_split");
+        assert_eq!(doc["selected_kv_capacity"], 512);
     }
 
     #[test]
