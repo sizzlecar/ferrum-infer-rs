@@ -67,6 +67,16 @@ VALIDATION_CHANGE_TYPES = {
     "build_loop",
 }
 DEFAULT_PATH_REQUIRED_CONCURRENCY_CELLS = {1, 4, 16, 32}
+BENCH_QUALITY_COUNT_FIELDS = (
+    "bad_output_per_run",
+    "malformed_stream_per_run",
+    "missing_done_per_run",
+    "duplicate_done_per_run",
+    "zero_output_tokens_per_run",
+    "stream_bulk_flush_per_run",
+    "http_500_per_run",
+    "panic_per_run",
+)
 
 VALIDATION_TOUCHED_AREAS = {
     "attention_decode_path",
@@ -243,6 +253,39 @@ class ValidationError(Exception):
 def load_json(path: Path) -> Any:
     with path.open() as handle:
         return json.load(handle)
+
+
+def bench_reports(value: Any) -> list[dict[str, Any]]:
+    reports = value if isinstance(value, list) else [value]
+    return [report for report in reports if isinstance(report, dict)]
+
+
+def validate_bench_report_quality(case_name: str, bench_path: Path) -> None:
+    data = load_json(bench_path)
+    for idx, report in enumerate(bench_reports(data), start=1):
+        is_bench_report = any(
+            key in report
+            for key in ("completed_per_run", "errored_per_run", "output_throughput_tps")
+        )
+        if not is_bench_report:
+            continue
+        label = f"{case_name}: bench report {idx}"
+        output_source = report.get("output_token_count_source")
+        if output_source != "usage":
+            raise ValidationError(
+                f"{label}: output_token_count_source must be 'usage', got {output_source!r}"
+            )
+        for field in BENCH_QUALITY_COUNT_FIELDS:
+            values = report.get(field)
+            if not isinstance(values, list):
+                raise ValidationError(f"{label}: missing {field}")
+            bad_values = [
+                value
+                for value in values
+                if isinstance(value, bool) or not isinstance(value, int) or value != 0
+            ]
+            if bad_values:
+                raise ValidationError(f"{label}: {field} contains non-zero counts {values!r}")
 
 
 def require_keys(where: str, value: dict[str, Any], required: set[str]) -> None:
@@ -1330,6 +1373,7 @@ def validate_case(
             raise ValidationError(f"{case['name']}: errored metric missing")
         if metrics.get("errored") != 0:
             raise ValidationError(f"{case['name']}: errored metric is {metrics.get('errored')}")
+        validate_bench_report_quality(case["name"], bench_path)
     validate_validation_checklist(
         f"{case['name']} manifest",
         case["validation_checklist"],
@@ -1559,7 +1603,23 @@ def self_test() -> None:
         (case_dir / "decision_trace.jsonl").write_text(
             "".join(json.dumps(decision, sort_keys=True) + "\n" for decision in decisions)
         )
-        write_json(case_dir / "bench.json", {"ok": True})
+        write_json(
+            case_dir / "bench.json",
+            {
+                "output_throughput_tps": {"mean": 1.0},
+                "completed_per_run": [1],
+                "errored_per_run": [0],
+                "output_token_count_source": "usage",
+                "bad_output_per_run": [0],
+                "malformed_stream_per_run": [0],
+                "missing_done_per_run": [0],
+                "duplicate_done_per_run": [0],
+                "zero_output_tokens_per_run": [0],
+                "stream_bulk_flush_per_run": [0],
+                "http_500_per_run": [0],
+                "panic_per_run": [0],
+            },
+        )
         validation_checklist = {
             "schema_version": 1,
             "change_type": "opt_in_experiment",
@@ -1698,6 +1758,18 @@ def self_test() -> None:
         )
         result = validate_artifact(root, require_bench=True, require_profile_events=False)
         assert result["ok"]
+
+        bad_bench = load_json(case_dir / "bench.json")
+        bad_bench["bad_output_per_run"] = [1]
+        write_json(case_dir / "bench.json", bad_bench)
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=False)
+        except ValidationError as exc:
+            assert "bad_output_per_run" in str(exc)
+        else:
+            raise AssertionError("bench bad_output count unexpectedly passed")
+        bad_bench["bad_output_per_run"] = [0]
+        write_json(case_dir / "bench.json", bad_bench)
 
         bad_effective_config = load_json(case_dir / "effective_config.json")
         bad_decisions = [dict(decision) for decision in bad_effective_config["decisions"]]

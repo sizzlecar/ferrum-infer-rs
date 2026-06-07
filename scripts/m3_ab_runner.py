@@ -57,6 +57,16 @@ VALIDATION_CHANGE_TYPES = {
     "build_loop",
 }
 DEFAULT_PATH_REQUIRED_CONCURRENCY_CELLS = [1, 4, 16, 32]
+BENCH_QUALITY_COUNT_FIELDS = (
+    "bad_output_per_run",
+    "malformed_stream_per_run",
+    "missing_done_per_run",
+    "duplicate_done_per_run",
+    "zero_output_tokens_per_run",
+    "stream_bulk_flush_per_run",
+    "http_500_per_run",
+    "panic_per_run",
+)
 LOG_SNIPPET_PROFILE_KEYS = {
     "snippet_regex",
     "required_patterns",
@@ -1270,7 +1280,10 @@ class Runner:
             "json",
             "--out",
             str(paths.bench_json),
+            "--fail-on-error",
         ]
+        if int(self.config.get("repeats", 1)) >= 3 or self.config.get("require_ci", False):
+            cmd.append("--require-ci")
         with paths.bench_log.open("w") as log:
             subprocess.run(cmd, text=True, stdout=log, stderr=subprocess.STDOUT, check=True)
 
@@ -1342,6 +1355,14 @@ class Runner:
             completed = sum(data["completed_per_run"])
         if errored is None and isinstance(data.get("errored_per_run"), list):
             errored = sum(data["errored_per_run"])
+        quality_counts: dict[str, int] = {}
+        for field in BENCH_QUALITY_COUNT_FIELDS:
+            values = data.get(field)
+            metric_name = field.removesuffix("_per_run")
+            if isinstance(values, list) and all(
+                isinstance(value, int) and not isinstance(value, bool) for value in values
+            ):
+                quality_counts[metric_name] = sum(values)
         return {
             "throughput_mean": throughput.get("mean", data.get("output_throughput")),
             "throughput_stddev": throughput.get("stddev", throughput.get("std")),
@@ -1351,6 +1372,7 @@ class Runner:
             "itl_p95": (itl.get("p95") or {}).get("mean"),
             "completed": completed,
             "errored": errored,
+            **quality_counts,
         }
 
     def count_decision_trace(self, path: Path) -> int:
@@ -1807,12 +1829,23 @@ def self_test() -> None:
                 "itl_ms": {"p95": {"mean": 5.0}},
                 "completed_per_run": [6],
                 "errored_per_run": [0],
+                "output_token_count_source": "usage",
+                "bad_output_per_run": [0],
+                "malformed_stream_per_run": [0],
+                "missing_done_per_run": [0],
+                "duplicate_done_per_run": [0],
+                "zero_output_tokens_per_run": [0],
+                "stream_bulk_flush_per_run": [0],
+                "http_500_per_run": [0],
+                "panic_per_run": [0],
             },
         )
         metrics = runner.extract_metrics(bench)
         assert metrics["throughput_mean"] == 1.0
         assert metrics["completed"] == 6
         assert metrics["errored"] == 0
+        assert metrics["bad_output"] == 0
+        assert metrics["malformed_stream"] == 0
         paths = RunPaths(
             case_dir=root / "case",
             server_log=root / "case" / "server.log",

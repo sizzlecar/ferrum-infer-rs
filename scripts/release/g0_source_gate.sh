@@ -20,10 +20,16 @@ run_unit() {
     scripts/release/release_binary_gate.py \
     scripts/release/g0_release_summary.py \
     scripts/release/g0_cuda_llama_dense_gate.py \
+    scripts/release/backend_runtime_preset_goal_gate.py \
+    scripts/release/backend_boundary_audit.py \
+    scripts/release/backend_runtime_preset_snapshot.py \
     scripts/release/openai_concurrency_quality_regression.py \
     scripts/release/openai_tool_call_regression.py \
+    scripts/release/run_gate.py \
+    scripts/release/run_scenarios.py \
     scripts/release/selftest_g0_validators.py \
-    scripts/release/selftest_g1_g3_g4_release_regression.py | tee "$OUT_ROOT/release-scripts-pycompile.log"
+    scripts/release/selftest_g1_g3_g4_release_regression.py \
+    scripts/release/validate_release_completion_manifest.py | tee "$OUT_ROOT/release-scripts-pycompile.log"
   bash -n scripts/release/g0_source_gate.sh | tee "$OUT_ROOT/g0-source-bashn.log"
   python3 scripts/release/selftest_g0_validators.py | tee "$OUT_ROOT/g0-validator-selftest.log"
   python3 scripts/release/selftest_g1_g3_g4_release_regression.py | tee "$OUT_ROOT/g1-g3-g4-validator-selftest.log"
