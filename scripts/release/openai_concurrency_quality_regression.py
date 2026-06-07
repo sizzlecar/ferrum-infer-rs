@@ -60,14 +60,47 @@ def parse_cells(raw: str) -> list[int]:
     return cells
 
 
-def parse_marker_response(content: str) -> dict[str, Any] | None:
+def marker_tool(marker: str, answer: str) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "capture_quality_marker",
+            "description": "Record one concurrency quality marker.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "marker": {"type": "string", "enum": [marker]},
+                    "checksum": {"type": "string", "enum": [answer]},
+                },
+                "required": ["marker", "checksum"],
+            },
+        },
+    }
+
+
+def tool_arguments_from_choice(choice: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    msg = choice.get("message")
+    if not isinstance(msg, dict):
+        return None, None
+    calls = msg.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        return None, None
+    call = calls[0]
+    if not isinstance(call, dict):
+        return None, None
+    function = call.get("function")
+    if not isinstance(function, dict):
+        return None, None
+    args_raw = function.get("arguments")
+    if not isinstance(args_raw, str):
+        return str(function.get("name") or ""), None
     try:
-        value = json.loads(strip_think(content))
+        args = json.loads(args_raw)
     except json.JSONDecodeError:
-        return None
-    if not isinstance(value, dict):
-        return None
-    return value
+        return str(function.get("name") or ""), None
+    if not isinstance(args, dict):
+        return str(function.get("name") or ""), None
+    return str(function.get("name") or ""), args
 
 
 def run_concurrency_quality_regression(
@@ -92,56 +125,57 @@ def run_concurrency_quality_regression(
                 "model": model,
                 "temperature": 0,
                 "max_tokens": 64,
+                "tools": [marker_tool(marker, answer)],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "capture_quality_marker"},
+                },
                 "messages": [
                     {
                         "role": "user",
                         "content": (
-                            "Return one JSON object. Set marker to "
-                            f"{marker!r} and checksum to {answer!r}."
+                            "Call capture_quality_marker with marker "
+                            f"{marker!r} and checksum {answer!r}. "
+                            "Do not output natural language."
                         ),
                     }
                 ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "ConcurrencyQualityMarker",
-                        "strict": True,
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "marker": {"enum": [marker]},
-                                "checksum": {"enum": [answer]},
-                            },
-                            "required": ["marker", "checksum"],
-                        },
-                    },
-                },
             }
             status, body = post_json(base_url, payload, timeout=timeout)
             content = ""
             finish_reason = None
             json_ok = False
+            tool_name = None
+            marker_response = None
             try:
                 parsed = json.loads(body)
                 json_ok = True
-                choice = parsed["choices"][0]
-                content = strip_think(choice["message"].get("content") or "")
-                finish_reason = choice.get("finish_reason")
+                if status == 200:
+                    choice = parsed["choices"][0]
+                    finish_reason = choice.get("finish_reason")
+                    msg = choice.get("message") or {}
+                    content = strip_think(str(msg.get("content") or ""))
+                    tool_name, marker_response = tool_arguments_from_choice(choice)
             except Exception:
                 content = body[:500]
-            forbidden = has_forbidden_text(content)
-            marker_response = parse_marker_response(content)
+            forbidden = has_forbidden_text(f"{body}\n{content}")
             parsed_marker = marker_response.get("marker") if marker_response else None
             parsed_checksum = marker_response.get("checksum") if marker_response else None
             marker_ok = parsed_marker == marker
             square_ok = parsed_checksum == answer
-            format_ok = marker_ok and square_ok
+            format_ok = (
+                finish_reason == "tool_calls"
+                and tool_name == "capture_quality_marker"
+                and marker_ok
+                and square_ok
+            )
             return {
                 "i": i,
                 "status": status,
                 "json_ok": json_ok,
                 "marker": marker,
                 "square": answer,
+                "tool_name": tool_name,
                 "parsed_marker": parsed_marker,
                 "parsed_checksum": parsed_checksum,
                 "marker_ok": marker_ok,
@@ -149,7 +183,7 @@ def run_concurrency_quality_regression(
                 "format_ok": format_ok,
                 "finish_reason": finish_reason,
                 "forbidden_text": forbidden,
-                "content_head": content[:500],
+                "content_head": body[:500],
             }
 
         rows: list[dict[str, Any]] = []
