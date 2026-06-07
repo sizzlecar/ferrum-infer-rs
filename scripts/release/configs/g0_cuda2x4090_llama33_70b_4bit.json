@@ -2,6 +2,7 @@
   "name": "g0-cuda2x4090-llama33-70b-4bit",
   "model": "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
   "model_architecture": "llama_dense",
+  "num_hidden_layers": 80,
   "quant_format": "gptq_int4",
   "tokenizer": "auto",
   "port": 19400,

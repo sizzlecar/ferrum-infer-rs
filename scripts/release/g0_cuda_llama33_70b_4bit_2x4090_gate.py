@@ -39,7 +39,7 @@ BAD_PATTERNS = [
     "CPU fallback",
     "single-GPU fallback",
 ]
-LAYER_SPLIT_PLAN = "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
+DEFAULT_LAYER_SPLIT_PLAN = "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
 REQUIRED_ARTIFACT_FILES = {
     "gate.json",
     "metadata.json",
@@ -225,6 +225,34 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise RuntimeError("config quant_format must identify a 4bit format")
 
 
+def even_layer_split_plan_for_layers(devices: list[int], num_layers: int) -> str:
+    if not devices:
+        raise RuntimeError("layer split requires at least one CUDA device")
+    if num_layers < len(devices):
+        raise RuntimeError(
+            f"layer split requires at least as many transformer layers ({num_layers}) as CUDA devices ({len(devices)})"
+        )
+    base = num_layers // len(devices)
+    remainder = num_layers % len(devices)
+    start = 0
+    stages = []
+    for idx, device in enumerate(devices):
+        count = base + (1 if idx < remainder else 0)
+        end = start + count - 1
+        stages.append(f"stage{idx}:cuda:{device}:layers={start}-{end}")
+        start = end + 1
+    return ";".join(stages)
+
+
+def layer_split_plan_from_config(cfg: dict[str, Any]) -> str:
+    if isinstance(cfg.get("layer_split_plan"), str) and cfg["layer_split_plan"].strip():
+        return cfg["layer_split_plan"]
+    num_layers = cfg.get("num_hidden_layers")
+    if isinstance(num_layers, int):
+        return even_layer_split_plan_for_layers(REQUIRED_GPU_DEVICES, num_layers)
+    return DEFAULT_LAYER_SPLIT_PLAN
+
+
 def model_manifest(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     model = str(cfg["model"])
     path = Path(model)
@@ -378,6 +406,7 @@ def write_planned_command_artifacts(root: Path, ferrum_bin: Path, cfg: dict[str,
             "cmd": serve_cmd,
             "expected_gpu_devices": REQUIRED_GPU_DEVICES,
             "expected_distributed_strategy": "layer_split",
+            "expected_layer_split_plan": layer_split_plan_from_config(cfg),
         },
     )
     write_json(
@@ -428,7 +457,7 @@ def write_metadata(
         "model_id": cfg["model"],
         "quant_format": cfg["quant_format"],
         "distributed_strategy": "layer_split",
-        "layer_split_plan": LAYER_SPLIT_PLAN,
+        "layer_split_plan": layer_split_plan_from_config(cfg),
         "sanitized_env": {
             key: value
             for key, value in sorted(os.environ.items())
@@ -534,6 +563,7 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
             "cmd": cmd,
             "expected_gpu_devices": REQUIRED_GPU_DEVICES,
             "expected_distributed_strategy": "layer_split",
+            "expected_layer_split_plan": layer_split_plan_from_config(cfg),
             "config": {
                 "max_model_len": cfg.get("max_model_len"),
                 "kv_capacity": cfg.get("kv_capacity"),
@@ -594,8 +624,13 @@ def self_test() -> int:
         "quant_format": "gptq_int4",
         "gpu_devices": [0, 1],
         "distributed_strategy": "layer_split",
+        "num_hidden_layers": 80,
     }
     validate_config(cfg)
+    assert (
+        layer_split_plan_from_config(cfg)
+        == "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79"
+    )
     cmd = build_run_command(Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out"))
     assert "--gpu-devices" in cmd
     assert "0,1" in cmd
