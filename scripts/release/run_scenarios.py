@@ -900,12 +900,6 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                 {"error": {"type": "invalid_request_error", "message": "context limit"}},
             )
             return
-        if payload.get("tools") and any(msg.get("role") == "tool" for msg in payload.get("messages", [])):
-            self.send_chat("北京 22 celsius 晴")
-            return
-        if payload.get("tools"):
-            self.send_tool_call()
-            return
         messages = payload.get("messages", [])
         prompt = " ".join(str(msg.get("content") or "") for msg in messages)
         last_user = ""
@@ -915,6 +909,21 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                 break
         marker = re.search(r"\b(ferrum\d{2}\d{2})\b", prompt)
         square = re.search(r"(S\d{4})", prompt)
+        if payload.get("tools") and marker and square:
+            self.send_tool_call(
+                "capture_quality_marker",
+                json.dumps(
+                    {"marker": marker.group(1), "checksum": square.group(1)},
+                    separators=(",", ":"),
+                ),
+            )
+            return
+        if payload.get("tools") and any(msg.get("role") == "tool" for msg in payload.get("messages", [])):
+            self.send_chat("北京 22 celsius 晴")
+            return
+        if payload.get("tools"):
+            self.send_tool_call()
+            return
         if marker and square:
             self.send_chat(
                 json.dumps(
@@ -962,7 +971,11 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
             },
         )
 
-    def send_tool_call(self) -> None:
+    def send_tool_call(
+        self,
+        name: str = "get_weather",
+        arguments: str = '{"city":"北京","unit":"celsius"}',
+    ) -> None:
         self.send_json(
             200,
             {
@@ -977,8 +990,8 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                                     "id": "call_mock",
                                     "type": "function",
                                     "function": {
-                                        "name": "get_weather",
-                                        "arguments": '{"city":"北京","unit":"celsius"}',
+                                        "name": name,
+                                        "arguments": arguments,
                                     },
                                 }
                             ],
