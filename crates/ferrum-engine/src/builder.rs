@@ -483,10 +483,20 @@ fn reject_unsupported_layer_split(component_config: &ComponentConfig) -> Result<
         crate::layer_split::parse_layer_split_plan(plan_raw)?
     };
     crate::layer_split::validate_layer_split_plan_for_devices(&parsed_plan, &selected)?;
+    let execution_plan = parsed_plan.to_execution_plan();
+    let stage_ranges = execution_plan
+        .layer_distribution
+        .stage_layers
+        .iter()
+        .map(|range| format!("{}-{}", range.start, range.end.saturating_sub(1)))
+        .collect::<Vec<_>>()
+        .join(",");
     let plan_label = plan_raw.unwrap_or_else(|| format!("{:?}", parsed_plan.stages));
     Err(FerrumError::unsupported(format!(
-        "CUDA layer_split execution is not implemented yet; requested_gpu_devices={requested:?} selected_gpu_devices={selected:?} selected_layer_split_plan={plan_label} total_layers={}. Refusing to fall back to a single GPU.",
-        parsed_plan.total_layers()
+        "CUDA layer_split execution is not implemented yet; requested_gpu_devices={requested:?} selected_gpu_devices={selected:?} selected_layer_split_plan={plan_label} total_layers={} pipeline_stages={} stage_ranges={stage_ranges} communication_backend={}. Refusing to fall back to a single GPU.",
+        parsed_plan.total_layers(),
+        execution_plan.parallel_config.pipeline_parallel_size,
+        execution_plan.parallel_config.communication_backend,
     )))
 }
 
@@ -610,6 +620,9 @@ mod tests {
             .contains("layer_split execution is not implemented yet"));
         assert!(err.to_string().contains("selected_gpu_devices=[0, 1]"));
         assert!(err.to_string().contains("total_layers=80"));
+        assert!(err.to_string().contains("pipeline_stages=2"));
+        assert!(err.to_string().contains("stage_ranges=0-39,40-79"));
+        assert!(err.to_string().contains("communication_backend=cuda-peer"));
     }
 
     #[tokio::test]

@@ -1,5 +1,13 @@
+use crate::parallel::{LayerDistribution, LayerRange, ParallelConfig, ParallelismType};
+use ferrum_types::Device;
 use ferrum_types::{FerrumError, Result};
 use serde::Deserialize;
+
+#[derive(Debug, Clone)]
+pub(crate) struct CudaLayerSplitExecutionPlan {
+    pub(crate) parallel_config: ParallelConfig,
+    pub(crate) layer_distribution: LayerDistribution,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedLayerSplitPlan {
@@ -16,6 +24,33 @@ impl ParsedLayerSplitPlan {
             .last()
             .map(|stage| stage.layer_end + 1)
             .unwrap_or(0)
+    }
+
+    pub(crate) fn to_execution_plan(&self) -> CudaLayerSplitExecutionPlan {
+        let devices = self
+            .stages
+            .iter()
+            .map(|stage| Device::CUDA(stage.device))
+            .collect::<Vec<_>>();
+        let stage_layers = self
+            .stages
+            .iter()
+            .map(|stage| LayerRange::new(stage.layer_start, stage.layer_end + 1))
+            .collect::<Vec<_>>();
+        CudaLayerSplitExecutionPlan {
+            parallel_config: ParallelConfig {
+                parallelism_type: ParallelismType::Pipeline,
+                devices,
+                tensor_parallel_size: 1,
+                pipeline_parallel_size: self.stages.len(),
+                communication_backend: "cuda-peer".to_string(),
+                ..ParallelConfig::default()
+            },
+            layer_distribution: LayerDistribution {
+                stage_layers,
+                stage_memory: vec![0; self.stages.len()],
+            },
+        }
     }
 }
 
@@ -240,5 +275,29 @@ mod tests {
         let plan = parse_layer_split_stage_documents(&value).unwrap();
         assert_eq!(plan.selected_devices(), vec![0, 1]);
         assert_eq!(plan.total_layers(), 80);
+    }
+
+    #[test]
+    fn converts_to_pipeline_execution_plan() {
+        let plan =
+            parse_layer_split_plan("stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79").unwrap();
+        let execution = plan.to_execution_plan();
+
+        assert_eq!(
+            execution.parallel_config.parallelism_type,
+            ParallelismType::Pipeline
+        );
+        assert_eq!(
+            execution.parallel_config.devices,
+            vec![Device::CUDA(0), Device::CUDA(1)]
+        );
+        assert_eq!(execution.parallel_config.tensor_parallel_size, 1);
+        assert_eq!(execution.parallel_config.pipeline_parallel_size, 2);
+        assert_eq!(execution.parallel_config.communication_backend, "cuda-peer");
+        assert_eq!(execution.layer_distribution.stage_layers.len(), 2);
+        assert_eq!(execution.layer_distribution.stage_layers[0].start, 0);
+        assert_eq!(execution.layer_distribution.stage_layers[0].end, 40);
+        assert_eq!(execution.layer_distribution.stage_layers[1].start, 40);
+        assert_eq!(execution.layer_distribution.stage_layers[1].end, 80);
     }
 }
