@@ -82,10 +82,8 @@ def run_concurrency_quality_regression(
 
     for concurrency in concurrency_cells:
         prefix = f"c{concurrency}.quality"
-        nonce = f"M{concurrency:02d}"
-
         def call(i: int) -> dict[str, Any]:
-            marker = f"K{nonce}{i:02d}"
+            marker = f"ferrum{concurrency:02d}{i:02d}"
             value = i + 1
             answer = f"S{value * value:04d}"
             payload = {
@@ -96,9 +94,10 @@ def run_concurrency_quality_regression(
                     {
                         "role": "user",
                         "content": (
-                            "Reply with exactly two short lines. "
-                            f"Line 1 must be this code exactly: {marker}. "
-                            f"Line 2 must be this checksum exactly: {answer}."
+                            "Copy this exact two-line block and nothing else. "
+                            "Do not add labels or change any character:\n"
+                            f"{marker}\n"
+                            f"{answer}"
                         ),
                     }
                 ],
