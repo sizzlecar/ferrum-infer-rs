@@ -748,6 +748,7 @@ impl SequenceState {
             );
             config.processor_chain.process(&mut ctx)?;
             let mut attempts = 0usize;
+            let mut rejected_tokens = Vec::new();
             loop {
                 let token = config.sampler.sample_with_context(&ctx, &mut self.rng)?;
                 if !self.sample_candidate_decodes_to_forbidden_output(
@@ -757,11 +758,19 @@ impl SequenceState {
                 ) {
                     break token;
                 }
+                if rejected_tokens.len() < 8 {
+                    rejected_tokens.push(token);
+                }
                 if let Some(logit) = ctx.logits.get_mut(usize::from(token)) {
                     *logit = f32::NEG_INFINITY;
                 }
                 attempts += 1;
                 if attempts >= FORBIDDEN_DECODE_RESAMPLE_LIMIT {
+                    self.log_forbidden_decode_resample_failure(
+                        tokenizer,
+                        previous_streamed_text_len,
+                        &rejected_tokens,
+                    );
                     return Err(FerrumError::model(
                         "sampling candidates decoded to forbidden output",
                     ));
@@ -798,6 +807,50 @@ impl SequenceState {
             })
             .unwrap_or(true)
     }
+
+    fn log_forbidden_decode_resample_failure(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        previous_streamed_text_len: usize,
+        rejected_tokens: &[TokenId],
+    ) {
+        let generated_tail: Vec<String> = self
+            .generated_tokens
+            .iter()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|token| describe_token_for_log(tokenizer, *token))
+            .collect();
+        let rejected: Vec<String> = rejected_tokens
+            .iter()
+            .map(|token| describe_token_for_log(tokenizer, *token))
+            .collect();
+        warn!(
+            request_id = %self.request_id,
+            generated_len = self.generated_tokens.len(),
+            previous_streamed_text_len,
+            generated_tail = ?generated_tail,
+            rejected_candidates = ?rejected,
+            "sampling candidates decoded to forbidden output"
+        );
+    }
+}
+
+fn describe_token_for_log(
+    tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+    token: TokenId,
+) -> String {
+    let Some(tokenizer) = tokenizer else {
+        return token.get().to_string();
+    };
+    let raw = tokenizer.token_text(token).unwrap_or("<missing>");
+    let decoded = tokenizer
+        .decode(&[token], true)
+        .unwrap_or_else(|_| "<decode-error>".to_string());
+    format!("{} raw={:?} decoded={:?}", token.get(), raw, decoded)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
