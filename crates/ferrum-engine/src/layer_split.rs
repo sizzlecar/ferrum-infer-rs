@@ -1,4 +1,5 @@
 use crate::parallel::{LayerDistribution, LayerRange, ParallelConfig, ParallelismType};
+use ferrum_models::models::llama_family::LlamaFamilyLayerStageConfig;
 use ferrum_types::Device;
 use ferrum_types::{FerrumError, Result};
 use serde::Deserialize;
@@ -51,6 +52,38 @@ impl ParsedLayerSplitPlan {
                 stage_memory: vec![0; self.stages.len()],
             },
         }
+    }
+
+    pub(crate) fn to_llama_stage_configs(&self) -> Vec<LlamaFamilyLayerStageConfig> {
+        self.stages
+            .iter()
+            .enumerate()
+            .map(|(position, stage)| {
+                LlamaFamilyLayerStageConfig::pipeline_stage(
+                    stage.layer_start..stage.layer_end + 1,
+                    position == 0,
+                    position + 1 == self.stages.len(),
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn llama_stage_config_for_device(
+        &self,
+        device: usize,
+    ) -> Result<LlamaFamilyLayerStageConfig> {
+        let stage_configs = self.to_llama_stage_configs();
+        let (position, _stage) = self
+            .stages
+            .iter()
+            .enumerate()
+            .find(|(_, stage)| stage.device == device)
+            .ok_or_else(|| {
+                FerrumError::config(format!(
+                    "selected_layer_split_plan does not include CUDA device {device}"
+                ))
+            })?;
+        Ok(stage_configs[position].clone())
     }
 }
 
@@ -299,5 +332,31 @@ mod tests {
         assert_eq!(execution.layer_distribution.stage_layers[0].end, 40);
         assert_eq!(execution.layer_distribution.stage_layers[1].start, 40);
         assert_eq!(execution.layer_distribution.stage_layers[1].end, 80);
+    }
+
+    #[test]
+    fn converts_to_llama_stage_configs() {
+        let plan =
+            parse_layer_split_plan("stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79").unwrap();
+        let stages = plan.to_llama_stage_configs();
+
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].source_layers, 0..40);
+        assert!(stages[0].load_embedding);
+        assert!(!stages[0].load_lm_head);
+        assert_eq!(stages[1].source_layers, 40..80);
+        assert!(!stages[1].load_embedding);
+        assert!(stages[1].load_lm_head);
+    }
+
+    #[test]
+    fn selects_llama_stage_config_for_cuda_device() {
+        let plan =
+            parse_layer_split_plan("stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79").unwrap();
+        let stage = plan.llama_stage_config_for_device(1).unwrap();
+
+        assert_eq!(stage.source_layers, 40..80);
+        assert!(!stage.load_embedding);
+        assert!(stage.load_lm_head);
     }
 }
