@@ -1049,14 +1049,23 @@ where
                 .map(|stage| Some(stage.device))
                 .collect::<Vec<_>>();
             let mut stages = Vec::with_capacity(stage_configs.len());
-            for stage_config in stage_configs {
-                stages.push(
+            for (idx, (stage_config, device_ordinal)) in stage_configs
+                .into_iter()
+                .zip(stage_device_ordinals.iter().copied())
+                .enumerate()
+            {
+                tracing::info!(
+                    "Loading Llama layer_split stage {idx} on backend device {:?}",
+                    device_ordinal
+                );
+                let stage = B::with_device_ordinal(device_ordinal, || {
                     ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage(
                         qcfg.clone(),
                         &weight_loader,
                         stage_config,
-                    )?,
-                );
+                    )
+                })?;
+                stages.push(stage);
             }
             Ok(Box::new(ferrum_models::models::LlamaFamilyPipelineModel::<
                 B,
