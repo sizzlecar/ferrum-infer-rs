@@ -29,6 +29,7 @@ SOURCE_LANES = {
     "cuda-smoke": "cuda-smoke",
     "cuda-full": "cuda-full",
     "cuda-llama-dense": "cuda-llama-dense",
+    "cuda-llama33-70b-4bit-2x4090": "cuda-llama33-70b-4bit-2x4090",
 }
 BINARY_LANES = {
     "metal-tarball",
@@ -42,6 +43,7 @@ LANES = (
     "cuda-smoke",
     "cuda-full",
     "cuda-llama-dense",
+    "cuda-llama33-70b-4bit-2x4090",
     "metal-tarball",
     "cuda-tarball",
     "homebrew-metal",
@@ -207,6 +209,8 @@ def model_for_source_lane(lane: str) -> str | None:
         return "Qwen/Qwen3-30B-A3B-GPTQ-Int4"
     if lane == "cuda-llama-dense":
         return "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
+    if lane == "cuda-llama33-70b-4bit-2x4090":
+        return "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4"
     return None
 
 
@@ -217,6 +221,7 @@ def source_pass_line(lane: str, out_dir: Path) -> str:
         "cuda-smoke": "g0_cuda4090_smoke",
         "cuda-full": "g0_cuda4090_full",
         "cuda-llama-dense": "g0_cuda4090_llama_dense",
+        "cuda-llama33-70b-4bit-2x4090": "g0_cuda2x4090_llama33_70b_4bit",
     }[lane]
     return f"G0 SOURCE {delegated} PASS: {out_dir}"
 
