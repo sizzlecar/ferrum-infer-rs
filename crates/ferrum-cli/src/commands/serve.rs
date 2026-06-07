@@ -440,7 +440,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
 
     // Select device
     let mut device = super::run::select_device(&backend);
-    let gpu_selection =
+    let mut gpu_selection =
         crate::gpu_devices::resolve_cuda_gpu_devices(gpu_devices.as_deref(), &device)?;
     if let Some(selection) = &gpu_selection {
         device = selection.primary_device();
@@ -499,6 +499,14 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let arch_for_dispatch = model_definition
         .as_ref()
         .map(|model_def| model_def.architecture);
+    if let (Some(selection), Some(definition)) = (gpu_selection.as_mut(), model_definition.as_ref())
+    {
+        if selection.apply_model_layer_count(definition.num_hidden_layers)? {
+            if let Some(plan) = selection.selected_layer_split_plan.as_deref() {
+                println!("{}", format!("CUDA layer split plan: {plan}").dimmed());
+            }
+        }
+    }
     let mut selected_runtime_preset_name = selected_runtime_preset_name;
     if selected_runtime_preset_name.is_none()
         && is_m3_qwen3_30b_a3b(arch_for_dispatch, model_definition.as_ref())
