@@ -661,6 +661,7 @@ def summarize_pipeline_cache_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "selected_stage_bridge": metrics.get("selected_stage_bridge"),
         "pipeline_hidden": metrics.get("pipeline_hidden"),
         "pipeline_decode": metrics.get("pipeline_decode"),
+        "executor_model_lock": metrics.get("executor_model_lock"),
     }
 
 
@@ -889,6 +890,22 @@ def validate_pipeline_cache_metrics(
             )
     if not all(isinstance(value, int) and value > 0 for value in decode["stage_us_total"]):
         raise ValidationError(f"{label}: pipeline_decode.stage_us_total values must be > 0")
+    model_lock = metrics.get("executor_model_lock")
+    if not isinstance(model_lock, dict):
+        raise ValidationError(f"{label}: cache metrics missing executor_model_lock object")
+    if model_lock.get("schema_version") != 1:
+        raise ValidationError(f"{label}: executor_model_lock.schema_version must be 1")
+    if not isinstance(model_lock.get("samples"), int) or model_lock["samples"] <= 0:
+        raise ValidationError(f"{label}: executor_model_lock.samples must be > 0")
+    if (
+        not isinstance(model_lock.get("total_wait_time_us"), int)
+        or model_lock["total_wait_time_us"] < 0
+    ):
+        raise ValidationError(f"{label}: executor_model_lock.total_wait_time_us must be >= 0")
+    json_non_negative_number(
+        model_lock.get("avg_wait_time_ms"),
+        f"{label}: executor_model_lock.avg_wait_time_ms",
+    )
     metrics = dict(metrics)
     metrics["_source"] = str(source)
     return metrics
@@ -2128,6 +2145,12 @@ def make_perf_artifact(
                         "total_us_last": 0,
                         "total_us_avg": None,
                     },
+                    "executor_model_lock": {
+                        "schema_version": 1,
+                        "samples": 0,
+                        "total_wait_time_us": 0,
+                        "avg_wait_time_ms": 0.0,
+                    },
                 }
             },
         },
@@ -2198,6 +2221,12 @@ def make_perf_artifact(
                         "total_us_total": 22000,
                         "total_us_last": 2750,
                         "total_us_avg": 2750,
+                    },
+                    "executor_model_lock": {
+                        "schema_version": 1,
+                        "samples": 384,
+                        "total_wait_time_us": 0,
+                        "avg_wait_time_ms": 0.0,
                     },
                 }
             },
@@ -3194,6 +3223,28 @@ def run_self_test() -> None:
             raise AssertionError("zero-profile candidate unexpectedly passed")
         except ValidationError as exc:
             if "pipeline_decode.calls" not in str(exc):
+                raise
+
+        missing_model_lock_profile = root / "missing-model-lock-profile"
+        make_perf_artifact(
+            missing_model_lock_profile,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        health = load_json(missing_model_lock_profile / "serve.health.after.json")
+        health["cache"]["prefix_cache"].pop("executor_model_lock", None)
+        write_json(missing_model_lock_profile / "serve.health.after.json", health)
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-model-lock-profile-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_model_lock_profile,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing model-lock profile candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "executor_model_lock" not in str(exc):
                 raise
 
         bench_mismatch = root / "bench-mismatch"

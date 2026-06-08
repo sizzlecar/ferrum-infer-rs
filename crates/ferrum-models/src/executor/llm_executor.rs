@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use tracing::debug;
 
 use ferrum_interfaces::{
@@ -124,6 +124,8 @@ pub struct LlmExecutor {
     model: Mutex<Box<dyn DecoderOnlyLLM>>,
     info: ModelInfo,
     next_cache_id: AtomicU64,
+    total_model_lock_wait_us: AtomicU64,
+    model_lock_wait_samples: AtomicU64,
 }
 
 impl LlmExecutor {
@@ -132,6 +134,51 @@ impl LlmExecutor {
             model: Mutex::new(model),
             info,
             next_cache_id: AtomicU64::new(0),
+            total_model_lock_wait_us: AtomicU64::new(0),
+            model_lock_wait_samples: AtomicU64::new(0),
+        }
+    }
+
+    fn lock_model(&self) -> MutexGuard<'_, Box<dyn DecoderOnlyLLM>> {
+        let start = std::time::Instant::now();
+        let guard = self.model.lock();
+        self.record_model_lock_wait(start.elapsed());
+        guard
+    }
+
+    fn record_model_lock_wait(&self, duration: std::time::Duration) {
+        self.total_model_lock_wait_us.fetch_add(
+            duration.as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        self.model_lock_wait_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn model_lock_metrics_json(&self) -> serde_json::Value {
+        let samples = self.model_lock_wait_samples.load(Ordering::Relaxed);
+        let total_us = self.total_model_lock_wait_us.load(Ordering::Relaxed);
+        serde_json::json!({
+            "schema_version": 1,
+            "samples": samples,
+            "total_wait_time_us": total_us,
+            "avg_wait_time_ms": if samples == 0 {
+                0.0
+            } else {
+                total_us as f64 / samples as f64 / 1000.0
+            },
+        })
+    }
+
+    fn attach_model_lock_metrics(&self, mut snapshot: serde_json::Value) -> serde_json::Value {
+        let lock_metrics = self.model_lock_metrics_json();
+        if let Some(obj) = snapshot.as_object_mut() {
+            obj.insert("executor_model_lock".to_string(), lock_metrics);
+            snapshot
+        } else {
+            serde_json::json!({
+                "cache_metrics": snapshot,
+                "executor_model_lock": lock_metrics,
+            })
         }
     }
 
@@ -146,7 +193,7 @@ impl LlmExecutor {
     /// Used by speculative decoding on partial rejection. The caller must
     /// supply a `GenericKvCacheHandle` whose seq_len is also updated.
     pub fn truncate_kv_for_cache_id(&self, cache_id: &str, new_len: usize) {
-        let mut model = self.model.lock();
+        let mut model = self.lock_model();
         model.truncate_kv(cache_id, new_len);
     }
 }
@@ -158,7 +205,7 @@ impl ModelExecutor for LlmExecutor {
     }
 
     fn kv_capacity(&self) -> Option<usize> {
-        Some(self.model.lock().kv_capacity())
+        Some(self.lock_model().kv_capacity())
     }
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
@@ -195,7 +242,7 @@ impl ModelExecutor for LlmExecutor {
         // them; unified_forward currently has no per-item metadata channel.
         let force_full_logits = metadata_requires_full_logits(&input.metadata);
         let logits = {
-            let mut model = self.model.lock();
+            let mut model = self.lock_model();
             model.set_lora_adapter_for_cache(
                 &cache_id,
                 active_lora_from_metadata(&input.metadata)?,
@@ -224,7 +271,7 @@ impl ModelExecutor for LlmExecutor {
             .map_err(|e| FerrumError::model(format!("unsqueeze2: {e}")))?;
         let logits_ref = common::wrap_tensor(logits_tensor);
 
-        let cfg = self.model.lock().config().clone();
+        let cfg = self.lock_model().config().clone();
         // Sequence-length tracking across chunks: if the caller supplied a
         // GenericKvCacheHandle (chunked prefill continuation), add this
         // chunk's tokens to the prior length. Otherwise this is a fresh
@@ -316,7 +363,7 @@ impl ModelExecutor for LlmExecutor {
         };
         let mut took_fallback = false;
         let per_item_logits: Vec<Vec<f32>> = {
-            let mut model = self.model.lock();
+            let mut model = self.lock_model();
             for (cache_id, adapter) in cache_ids.iter().zip(lora_per_input.iter()) {
                 model.set_lora_adapter_for_cache(cache_id, adapter.clone())?;
             }
@@ -356,7 +403,7 @@ impl ModelExecutor for LlmExecutor {
             );
         }
 
-        let cfg = self.model.lock().config().clone();
+        let cfg = self.lock_model().config().clone();
         let mut outputs = Vec::with_capacity(inputs.len());
         for (i, logits) in per_item_logits.into_iter().enumerate() {
             let logits_tensor = candle_core::Tensor::new(&logits[..], &candle_core::Device::Cpu)
@@ -395,7 +442,7 @@ impl ModelExecutor for LlmExecutor {
     ) -> Result<()> {
         if let Some(g) = kv_cache.as_any().downcast_ref::<GenericKvCacheHandle>() {
             let cache_id = g.request_cache_id();
-            self.model.lock().truncate_kv(cache_id, new_len);
+            self.lock_model().truncate_kv(cache_id, new_len);
         }
         Ok(())
     }
@@ -436,7 +483,7 @@ impl ModelExecutor for LlmExecutor {
 
         // One model forward for all N+1 positions → flat seq_len*vocab.
         let flat = {
-            let mut model = self.model.lock();
+            let mut model = self.lock_model();
             model.set_lora_adapter_for_cache(
                 &cache_id,
                 active_lora_from_metadata(&inputs[0].metadata)?,
@@ -444,7 +491,7 @@ impl ModelExecutor for LlmExecutor {
             model.forward_verify(&cache_id, &token_ids)
         };
 
-        let cfg = self.model.lock().config().clone();
+        let cfg = self.lock_model().config().clone();
         let vocab = cfg.vocab_size;
 
         // Record the actual backend device so downstream code that reads
@@ -505,7 +552,7 @@ impl ModelExecutor for LlmExecutor {
         // masks/processors. The direct decode path returns vocabulary logits.
         let force_full_logits = metadata_requires_full_logits(&input.metadata);
         let logits = {
-            let mut model = self.model.lock();
+            let mut model = self.lock_model();
             model.set_lora_adapter_for_cache(
                 &cache_id,
                 active_lora_from_metadata(&input.metadata)?,
@@ -600,7 +647,7 @@ impl ModelExecutor for LlmExecutor {
             } else {
                 None
             };
-            let mut model = self.model.lock();
+            let mut model = self.lock_model();
             let lock_acq = lock_t0.map(|t| t.elapsed());
             let model_t0 = if prof {
                 Some(std::time::Instant::now())
@@ -736,7 +783,7 @@ impl ModelExecutor for LlmExecutor {
             .any(|item| metadata_requires_full_logits(&item.metadata));
         if !force_full_logits {
             let model_result = {
-                let mut model = self.model.lock();
+                let mut model = self.lock_model();
                 for item in &batch.items {
                     model.set_lora_adapter_for_cache(
                         &item.seq_id,
@@ -783,7 +830,7 @@ impl ModelExecutor for LlmExecutor {
         // all prefills in this batch (we may revisit per-call locking
         // when chunked-prefill becomes the perf-critical path).
         if !prefill_indices.is_empty() {
-            let mut model = self.model.lock();
+            let mut model = self.lock_model();
             for &i in &prefill_indices {
                 let item = &batch.items[i];
                 model.set_lora_adapter_for_cache(
@@ -807,7 +854,7 @@ impl ModelExecutor for LlmExecutor {
                 })
                 .collect();
             let logits_vec = {
-                let mut model = self.model.lock();
+                let mut model = self.lock_model();
                 for &i in &decode_indices {
                     let item = &batch.items[i];
                     model.set_lora_adapter_for_cache(
@@ -829,11 +876,11 @@ impl ModelExecutor for LlmExecutor {
     }
 
     fn release_cache(&self, cache_id: &str) {
-        self.model.lock().release(cache_id);
+        self.lock_model().release(cache_id);
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
-        let cfg = self.model.lock().config().clone();
+        let cfg = self.lock_model().config().clone();
         ExecutorCapabilities {
             max_batch_size: 256,
             max_sequence_length: cfg.max_seq_len,
@@ -859,11 +906,12 @@ impl ModelExecutor for LlmExecutor {
     }
 
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
-        self.model.lock().cache_metrics_snapshot()
+        let snapshot = self.lock_model().cache_metrics_snapshot()?;
+        Some(self.attach_model_lock_metrics(snapshot))
     }
 
     fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
-        self.model.lock().lora_metrics_snapshot()
+        self.lock_model().lora_metrics_snapshot()
     }
 }
 
@@ -945,6 +993,12 @@ mod tests {
         }
 
         fn release(&mut self, _cache_id: &str) {}
+
+        fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "position": "recording-test-cache",
+            }))
+        }
     }
 
     fn test_model_info() -> ModelInfo {
@@ -1068,5 +1122,31 @@ mod tests {
         let calls = calls.lock();
         assert_eq!(calls.unified_forward, 0);
         assert_eq!(calls.decode_batch_force_full_logits, vec![true]);
+    }
+
+    #[test]
+    fn cache_metrics_snapshot_includes_model_lock_wait_metrics() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor(calls);
+
+        assert_eq!(executor.kv_capacity(), Some(16));
+        let metrics = executor.cache_metrics_snapshot().unwrap();
+
+        assert_eq!(metrics["position"], "recording-test-cache");
+        assert_eq!(metrics["executor_model_lock"]["schema_version"], 1);
+        assert!(
+            metrics["executor_model_lock"]["samples"].as_u64().unwrap() >= 2,
+            "metrics: {metrics}"
+        );
+        assert!(
+            metrics["executor_model_lock"]["total_wait_time_us"]
+                .as_u64()
+                .is_some(),
+            "metrics: {metrics}"
+        );
+        assert!(
+            metrics["executor_model_lock"]["avg_wait_time_ms"].is_number(),
+            "metrics: {metrics}"
+        );
     }
 }
