@@ -711,13 +711,19 @@ impl SequenceState {
         // tokens to -inf). Subsequent temperature / top-k / top-p stay
         // correct because -inf tokens can't make it through any softmax.
         if let Some(ref rp) = self.regex_processor {
-            let best_non_stop = best_finite_non_stop_token(logits, &self.stop_token_ids);
+            let best_non_control =
+                best_finite_excluding_tokens(logits, &self.allowed_extended_token_ids);
             rp.advance_with_tokens_public(&self.generated_tokens);
             rp.mask_logits(logits);
+            mask_non_stop_control_token_logits(
+                logits,
+                &self.allowed_extended_token_ids,
+                &self.stop_token_ids,
+            );
             if !rp.can_accept() {
                 mask_stop_token_logits(logits, &self.stop_token_ids);
                 if !logits.iter().any(|logit| logit.is_finite()) {
-                    if let Some(token) = best_non_stop {
+                    if let Some(token) = best_non_control {
                         force_only_token(logits, token);
                     }
                 }
@@ -892,11 +898,29 @@ fn mask_stop_token_logits(logits: &mut [f32], stop_token_ids: &HashSet<u32>) {
     }
 }
 
-fn best_finite_non_stop_token(logits: &[f32], stop_token_ids: &HashSet<u32>) -> Option<usize> {
+fn mask_non_stop_control_token_logits(
+    logits: &mut [f32],
+    control_token_ids: &HashSet<u32>,
+    stop_token_ids: &HashSet<u32>,
+) {
+    for &token_id in control_token_ids {
+        if stop_token_ids.contains(&token_id) {
+            continue;
+        }
+        if let Some(logit) = logits.get_mut(token_id as usize) {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+}
+
+fn best_finite_excluding_tokens(
+    logits: &[f32],
+    excluded_token_ids: &HashSet<u32>,
+) -> Option<usize> {
     logits
         .iter()
         .enumerate()
-        .filter(|(idx, logit)| logit.is_finite() && !stop_token_ids.contains(&(*idx as u32)))
+        .filter(|(idx, logit)| logit.is_finite() && !excluded_token_ids.contains(&(*idx as u32)))
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(idx, _)| idx)
 }
