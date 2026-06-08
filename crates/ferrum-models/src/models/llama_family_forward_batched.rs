@@ -1803,7 +1803,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         if m == 0 {
             return Vec::new();
         }
-        if m == 1 {
+        if m == 1 && !force_full_logits {
             let (cid, tok, pos) = &batch[0];
             return vec![self.decode_internal(cid, *tok, *pos)];
         }

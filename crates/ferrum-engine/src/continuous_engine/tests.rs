@@ -281,6 +281,20 @@ fn model_decode_metadata_marks_structured_requests_for_full_logits() {
             .and_then(|value| value.as_bool()),
         Some(true)
     );
+
+    let mut request = policy_request();
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
+        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
+            .to_string(),
+    );
+    let json_schema_without_tokenizer = SequenceState::new(request, vec![TokenId::new(0)]);
+    assert_eq!(
+        json_schema_without_tokenizer
+            .model_decode_metadata()
+            .get("ferrum_require_full_logits")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
 }
 
 #[test]

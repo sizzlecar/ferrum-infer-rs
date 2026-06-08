@@ -1011,7 +1011,7 @@ where
         if batch.is_empty() {
             return Vec::new();
         }
-        if batch.len() == 1 {
+        if batch.len() == 1 && !force_full_logits {
             let (cache_id, token, pos) = &batch[0];
             return vec![self.decode(cache_id, *token, *pos)];
         }

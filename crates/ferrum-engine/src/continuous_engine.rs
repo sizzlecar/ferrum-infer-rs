@@ -620,15 +620,37 @@ impl SequenceState {
 
     pub fn model_decode_metadata(&self) -> HashMap<String, serde_json::Value> {
         let mut metadata = self.original_request.metadata.clone();
-        let needs_sampling_masks = !self.forbidden_token_ids.is_empty()
-            || (self.generated_tokens.is_empty() && !self.initial_forbidden_token_ids.is_empty());
-        if self.json_processor.is_some() || self.regex_processor.is_some() || needs_sampling_masks {
+        if self.requires_full_logits_for_sampling() {
             metadata.insert(
                 "ferrum_require_full_logits".to_string(),
                 serde_json::json!(true),
             );
         }
         metadata
+    }
+
+    pub fn requires_full_logits_for_sampling(&self) -> bool {
+        use ferrum_types::ResponseFormat;
+
+        let needs_sampling_masks = !self.forbidden_token_ids.is_empty()
+            || (self.generated_tokens.is_empty() && !self.initial_forbidden_token_ids.is_empty());
+        self.json_processor.is_some()
+            || self.regex_processor.is_some()
+            || matches!(
+                self.sampling_params.response_format,
+                ResponseFormat::JsonSchema(_)
+            )
+            || needs_sampling_masks
+    }
+
+    pub fn reset_guided_processors(&self) -> Result<()> {
+        if let Some(ref jp) = self.json_processor {
+            jp.reset();
+        }
+        if let Some(ref rp) = self.regex_processor {
+            rp.reset()?;
+        }
+        Ok(())
     }
 
     /// Return the reason this sequence should stop, if any.

@@ -101,6 +101,11 @@ impl EngineInner {
                 // (Qwen3), the host argmax scan is ~150 µs per item and
                 // dominates the engine's per-iter overhead at c=32.
                 let token = if logits.len() == 1 {
+                    if seq.requires_full_logits_for_sampling() {
+                        return Err(FerrumError::model(
+                            "model returned greedy token sentinel for request requiring full logits",
+                        ));
+                    }
                     TokenId::new(logits[0] as u32)
                 } else {
                     seq.sample_with_processors_with_tokenizer(
