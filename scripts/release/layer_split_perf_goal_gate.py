@@ -788,7 +788,11 @@ def validate_pipeline_cache_metrics(
 
 def command_list(path: Path, label: str) -> list[str]:
     data = load_json(path)
-    raw = data.get("cmd") if isinstance(data, dict) else data
+    raw = None
+    if isinstance(data, dict):
+        raw = data.get("cmd") or data.get("bench_cmd")
+    else:
+        raw = data
     if not isinstance(raw, list) or not raw:
         raise ValidationError(f"{label}: command must be a non-empty list")
     return [str(part) for part in raw]
@@ -846,14 +850,40 @@ def require_product_command(path: Path, label: str, subcommand: str, pipeline_mo
     }
 
 
-def require_bench_command(path: Path, label: str) -> dict[str, str]:
-    return require_bench_command_file(path / "bench-serve.command.json", label)
+def require_bench_command(path: Path, label: str, expected_model: str) -> dict[str, str]:
+    return require_bench_command_file(
+        path / "bench-serve.command.json",
+        label,
+        expected_model=expected_model,
+        expected_output_name="bench-serve.json",
+    )
 
 
-def require_bench_command_file(path: Path, label: str) -> dict[str, str]:
+def require_bench_command_file(
+    path: Path,
+    label: str,
+    *,
+    expected_model: str,
+    expected_output_name: str,
+) -> dict[str, str]:
     cmd = command_list(path, label)
     if "bench-serve" not in cmd:
         raise ValidationError(f"{label}: command is not ferrum bench-serve")
+    base_url = flag_value(cmd, "--base-url")
+    if base_url is None or not (
+        base_url.startswith("http://127.0.0.1:") or base_url.startswith("http://localhost:")
+    ):
+        raise ValidationError(f"{label}: bench command must use localhost --base-url")
+    if flag_value(cmd, "--model") != expected_model:
+        raise ValidationError(f"{label}: bench command --model must be {expected_model}")
+    tokenizer = flag_value(cmd, "--tokenizer")
+    if tokenizer is None or not tokenizer.strip():
+        raise ValidationError(f"{label}: bench command missing --tokenizer")
+    out_file = flag_value(cmd, "--out")
+    if out_file is None or Path(out_file).name != expected_output_name:
+        raise ValidationError(
+            f"{label}: bench command --out must write {expected_output_name}"
+        )
     for flag in ["--fail-on-error", "--require-ci"]:
         if flag not in cmd:
             raise ValidationError(f"{label}: bench command missing {flag}")
@@ -878,6 +908,8 @@ def require_bench_command_file(path: Path, label: str) -> dict[str, str]:
         if flag_value(cmd, flag) != expected:
             raise ValidationError(f"{label}: bench command must use {flag} {expected}")
     return {
+        "model": flag_value(cmd, "--model") or "",
+        "tokenizer": tokenizer,
         "dataset": flag_value(cmd, "--dataset") or "",
         "random_input_len": flag_value(cmd, "--random-input-len") or "",
         "random_output_len": flag_value(cmd, "--random-output-len") or "",
@@ -890,10 +922,13 @@ def require_bench_command_file(path: Path, label: str) -> dict[str, str]:
     }
 
 
-def validate_vllm_bench_artifact(path: Path) -> dict[str, Any]:
+def validate_vllm_bench_artifact(path: Path, expected_model: str) -> dict[str, Any]:
     path = require_dir(path, "vllm artifact")
     command_signature = require_bench_command_file(
-        path / "vllm-baseline.command.json", "vllm"
+        path / "vllm-baseline.command.json",
+        "vllm",
+        expected_model=expected_model,
+        expected_output_name="vllm-baseline.json",
     )
     reports = reports_from_json(load_json(path / "vllm-baseline.json"), "vllm")
     rows: dict[int, dict[str, Any]] = {}
@@ -1120,8 +1155,8 @@ def validate_report(
     return concurrency, throughput
 
 
-def validate_bench_artifact(path: Path, label: str) -> dict[str, Any]:
-    command_signature = require_bench_command(path, label)
+def validate_bench_artifact(path: Path, label: str, expected_model: str) -> dict[str, Any]:
+    command_signature = require_bench_command(path, label, expected_model)
     reports = reports_from_json(load_json(path / "bench-serve.json"), label)
     rows: dict[int, dict[str, Any]] = {}
     throughput: dict[int, float] = {}
@@ -1313,8 +1348,12 @@ def validate_perf_goal(
         candidate_artifact, "candidate", candidate_config
     )
 
-    baseline_bench = validate_bench_artifact(baseline_artifact, "baseline")
-    candidate_bench = validate_bench_artifact(candidate_artifact, "candidate")
+    baseline_bench = validate_bench_artifact(
+        baseline_artifact, "baseline", model_identity(baseline_metadata)
+    )
+    candidate_bench = validate_bench_artifact(
+        candidate_artifact, "candidate", model_identity(candidate_metadata)
+    )
     if baseline_bench["command_signature"] != candidate_bench["command_signature"]:
         raise ValidationError("baseline and candidate bench command parameters differ")
     baseline_correctness = validate_correctness_artifact(
@@ -1336,7 +1375,9 @@ def validate_perf_goal(
         vllm_metadata = validate_optional_vllm_metadata(
             optional_vllm_artifact, candidate_metadata
         )
-        vllm_bench = validate_vllm_bench_artifact(optional_vllm_artifact)
+        vllm_bench = validate_vllm_bench_artifact(
+            optional_vllm_artifact, model_identity(candidate_metadata)
+        )
         if vllm_bench["command_signature"] != candidate_bench["command_signature"]:
             raise ValidationError("vllm and candidate bench command parameters differ")
         vllm_tps = float(vllm_bench["max_target_tps"])
@@ -1780,6 +1821,14 @@ def make_perf_artifact(
             "cmd": [
                 "ferrum",
                 "bench-serve",
+                "--base-url",
+                "http://127.0.0.1:19400",
+                "--model",
+                metadata["model_id"],
+                "--tokenizer",
+                "/models/clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "--dataset",
+                "random",
                 "--fail-on-error",
                 "--require-ci",
                 "--seed",
@@ -1788,8 +1837,6 @@ def make_perf_artifact(
                 "3",
                 "--concurrency-sweep",
                 "1,4,8,16",
-                "--dataset",
-                "random",
                 "--random-input-len",
                 "256",
                 "--random-output-len",
@@ -1800,6 +1847,10 @@ def make_perf_artifact(
                 "10",
                 "--output",
                 "json",
+                "--out",
+                str(root / "bench-serve.json"),
+                "--tag",
+                "cuda-llama33-70b-4bit-2x4090",
             ]
         },
     )
@@ -1862,9 +1913,25 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
     write_json(
         root / "vllm-baseline.command.json",
         {
-            "cmd": [
+            "status": "run",
+            "server_cmd": [
+                "vllm",
+                "serve",
+                "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "--tensor-parallel-size",
+                "2",
+            ],
+            "bench_cmd": [
                 "ferrum",
                 "bench-serve",
+                "--base-url",
+                "http://127.0.0.1:19401",
+                "--model",
+                "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "--tokenizer",
+                "/models/clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "--dataset",
+                "random",
                 "--fail-on-error",
                 "--require-ci",
                 "--seed",
@@ -1873,8 +1940,6 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
                 "3",
                 "--concurrency-sweep",
                 "1,4,8,16",
-                "--dataset",
-                "random",
                 "--random-input-len",
                 "256",
                 "--random-output-len",
@@ -1885,7 +1950,12 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
                 "10",
                 "--output",
                 "json",
-            ]
+                "--out",
+                str(root / "vllm-baseline.json"),
+                "--tag",
+                "vllm-llama33-70b-4bit-2x4090",
+            ],
+            "same_hardware_required": True,
         },
     )
     write_json(
@@ -2393,6 +2463,52 @@ def run_self_test() -> None:
             raise AssertionError("bench-mismatch candidate unexpectedly passed")
         except ValidationError as exc:
             if "random-output-len" not in str(exc) and "bench command" not in str(exc):
+                raise
+
+        wrong_bench_model = root / "wrong-bench-model"
+        make_perf_artifact(
+            wrong_bench_model,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        command = load_json(wrong_bench_model / "bench-serve.command.json")
+        idx = command["cmd"].index("--model")
+        command["cmd"][idx + 1] = "other/model"
+        write_json(wrong_bench_model / "bench-serve.command.json", command)
+        try:
+            validate_perf_goal(
+                out_dir=root / "wrong-bench-model-out",
+                baseline_artifact=baseline,
+                candidate_artifact=wrong_bench_model,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("wrong-bench-model candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "--model" not in str(exc):
+                raise
+
+        missing_base_url = root / "missing-base-url"
+        make_perf_artifact(
+            missing_base_url,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        command = load_json(missing_base_url / "bench-serve.command.json")
+        idx = command["cmd"].index("--base-url")
+        del command["cmd"][idx : idx + 2]
+        write_json(missing_base_url / "bench-serve.command.json", command)
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-base-url-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_base_url,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing-base-url candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "base-url" not in str(exc):
                 raise
 
         missing_ci = root / "missing-ci"
