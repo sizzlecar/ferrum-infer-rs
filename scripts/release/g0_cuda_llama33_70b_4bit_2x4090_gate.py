@@ -1745,6 +1745,7 @@ def serve_correctness(root: Path, base_url: str, model: str) -> dict[str, Any]:
         "messages": [{"role": "user", "content": "123+456 等于多少？只输出数字。"}],
         "max_tokens": 128,
     }
+    write_json(root / "serve.correctness.request.json", payload)
     status, body = post_json(base_url, payload, timeout=300)
     write_text(root / "serve.correctness.response.json", body)
     data = parsed_response("serve correctness", status, body)
@@ -1782,6 +1783,7 @@ def serve_multiturn(root: Path, base_url: str, model: str) -> dict[str, Any]:
         "max_tokens": 128,
         "stop": ["\n"],
     }
+    write_json(root / "serve.multiturn.request.json", payload)
     status, body = post_json(base_url, payload, timeout=300)
     write_text(root / "serve.multiturn.response.json", body)
     data = parsed_response("serve multiturn", status, body)
@@ -1825,6 +1827,7 @@ def serve_structured_output(root: Path, base_url: str, model: str) -> dict[str, 
             },
         },
     }
+    write_json(root / "serve.structured_output.request.json", payload)
     status, body = post_json(base_url, payload, timeout=300)
     write_text(root / "serve.structured_output.response.json", body)
     data = parsed_response("serve structured output", status, body)
@@ -1865,6 +1868,7 @@ def serve_streaming(root: Path, base_url: str, model: str) -> dict[str, Any]:
         "messages": [{"role": "user", "content": "用一句中文解释 Ferrum 是什么。"}],
         "max_tokens": 128,
     }
+    write_json(root / "serve.streaming.request.json", payload)
     status, body = post_json(base_url, payload, timeout=300)
     write_text(root / "serve.streaming.sse", body)
     if status != 200:
