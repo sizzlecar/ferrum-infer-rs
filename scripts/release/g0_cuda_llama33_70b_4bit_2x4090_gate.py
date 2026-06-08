@@ -2328,6 +2328,37 @@ def self_test() -> int:
             8: 1,
             16: 1,
         }
+        write_text(
+            root / "nvidia-smi.bench.samples.jsonl",
+            "".join(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "bench_concurrency": concurrency,
+                        "bench_concurrency_sweep": [1, 4, 8, 16],
+                        "gpus": [
+                            {
+                                **gpu_rows[0],
+                                "utilization_gpu_percent": 80 + concurrency,
+                            },
+                            {
+                                **gpu_rows[1],
+                                "utilization_gpu_percent": 83 + concurrency,
+                            },
+                        ],
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+                for concurrency in [1, 4, 8]
+            ),
+        )
+        try:
+            validate_structured_hardware_evidence(root, hardware_doc, [1, 4, 8, 16])
+            raise AssertionError("missing c16 GPU sample unexpectedly passed")
+        except RuntimeError as exc:
+            assert "missing concurrency cells" in str(exc)
     with tempfile.TemporaryDirectory(prefix="ferrum-llama33-vllm-metadata-") as tmp:
         root = Path(tmp)
         hardware_doc = {

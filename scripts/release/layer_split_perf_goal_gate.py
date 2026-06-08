@@ -2616,6 +2616,34 @@ def run_self_test() -> None:
             if "non-zero utilization" not in str(exc):
                 raise
 
+        missing_gpu_cell = root / "missing-gpu-cell"
+        make_perf_artifact(
+            missing_gpu_cell,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        lines = []
+        for line in (missing_gpu_cell / "nvidia-smi.bench.samples.jsonl").read_text().splitlines():
+            sample = json.loads(line)
+            if sample.get("bench_concurrency") != 16:
+                lines.append(line)
+        write_text(
+            missing_gpu_cell / "nvidia-smi.bench.samples.jsonl",
+            "\n".join(lines) + "\n",
+        )
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-gpu-cell-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_gpu_cell,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing GPU cell candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "missing concurrency cells" not in str(exc):
+                raise
+
         missing_admission = root / "missing-admission"
         make_perf_artifact(
             missing_admission,
