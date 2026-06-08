@@ -534,6 +534,98 @@ def summarize_pipeline_cache_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def json_int(value: Any, label: str, *, minimum: int = 0) -> int:
+    if not isinstance(value, int):
+        raise ValidationError(f"{label} must be an integer")
+    if value < minimum:
+        raise ValidationError(f"{label} must be >= {minimum}")
+    return value
+
+
+def validate_admission_health(
+    path: Path,
+    label: str,
+    effective_config: dict[str, Any],
+) -> dict[str, Any]:
+    health = None
+    for rel in ["serve.health.after.json", "server.health.after.json", "health.after.json"]:
+        candidate = path / rel
+        if candidate.is_file():
+            health = load_json(candidate)
+            break
+    if not isinstance(health, dict):
+        raise ValidationError(f"{label}: missing post-bench health JSON")
+    if health.get("status") not in {"healthy", "pass", None}:
+        raise ValidationError(f"{label}: post-bench health status is not healthy")
+    admission = health.get("admission")
+    if not isinstance(admission, dict):
+        raise ValidationError(f"{label}: post-bench health missing admission object")
+    if admission.get("schema_version") != 1:
+        raise ValidationError(f"{label}: admission schema_version must be 1")
+    effective_max = json_int(
+        admission.get("effective_max_concurrent"),
+        f"{label}: admission.effective_max_concurrent",
+        minimum=1,
+    )
+    if effective_max != effective_config["selected_admission_limit"]:
+        raise ValidationError(
+            f"{label}: admission effective_max_concurrent does not match effective config"
+        )
+    summary = {
+        "effective_max_concurrent": effective_max,
+        "queue_depth": json_int(admission.get("queue_depth"), f"{label}: admission.queue_depth"),
+        "active_prefill": json_int(
+            admission.get("active_prefill"), f"{label}: admission.active_prefill"
+        ),
+        "active_decode": json_int(
+            admission.get("active_decode"), f"{label}: admission.active_decode"
+        ),
+        "current_batch_size": json_int(
+            admission.get("current_batch_size"), f"{label}: admission.current_batch_size"
+        ),
+        "rejected_requests_total": json_int(
+            admission.get("rejected_requests_total"),
+            f"{label}: admission.rejected_requests_total",
+        ),
+        "failed_requests_total": json_int(
+            admission.get("failed_requests_total"),
+            f"{label}: admission.failed_requests_total",
+        ),
+        "completed_requests_total": json_int(
+            admission.get("completed_requests_total"),
+            f"{label}: admission.completed_requests_total",
+        ),
+        "scheduler_policy": admission.get("scheduler_policy"),
+    }
+    if summary["rejected_requests_total"] != 0:
+        raise ValidationError(f"{label}: admission rejected_requests_total must be 0")
+    if summary["failed_requests_total"] != 0:
+        raise ValidationError(f"{label}: admission failed_requests_total must be 0")
+    if summary["completed_requests_total"] <= 0:
+        raise ValidationError(f"{label}: admission completed_requests_total must be > 0")
+
+    scheduler = health.get("scheduler")
+    if not isinstance(scheduler, dict):
+        raise ValidationError(f"{label}: post-bench health missing scheduler object")
+    scheduler_summary = {
+        "total_requests": json_int(
+            scheduler.get("total_requests"), f"{label}: scheduler.total_requests"
+        ),
+        "successful_requests": json_int(
+            scheduler.get("successful_requests"), f"{label}: scheduler.successful_requests"
+        ),
+        "failed_requests": json_int(
+            scheduler.get("failed_requests"), f"{label}: scheduler.failed_requests"
+        ),
+    }
+    if scheduler_summary["failed_requests"] != 0:
+        raise ValidationError(f"{label}: scheduler failed_requests must be 0")
+    if scheduler_summary["successful_requests"] <= 0:
+        raise ValidationError(f"{label}: scheduler successful_requests must be > 0")
+    summary["scheduler"] = scheduler_summary
+    return summary
+
+
 def validate_pipeline_cache_metrics(
     path: Path, label: str, effective_config: dict[str, Any]
 ) -> dict[str, Any]:
@@ -947,6 +1039,12 @@ def validate_perf_goal(
         raise ValidationError("baseline selected_pipeline_mode must be batch")
     if candidate_config["selected_pipeline_mode"] != "overlapped":
         raise ValidationError("candidate selected_pipeline_mode must be overlapped")
+    baseline_admission = validate_admission_health(
+        baseline_artifact, "baseline", baseline_config
+    )
+    candidate_admission = validate_admission_health(
+        candidate_artifact, "candidate", candidate_config
+    )
     baseline_run_command = require_product_command(
         baseline_artifact, "baseline", "run", baseline_config["selected_pipeline_mode"]
     )
@@ -1030,6 +1128,8 @@ def validate_perf_goal(
             "serve": candidate_serve_command,
         },
         "bench_command_signature": candidate_bench["command_signature"],
+        "baseline_admission": baseline_admission,
+        "candidate_admission": candidate_admission,
         "baseline_pipeline_cache_metrics": summarize_pipeline_cache_metrics(
             baseline_cache_metrics
         ),
@@ -1174,7 +1274,9 @@ def make_perf_artifact(
         },
     )
     for snapshot_label, util in [("before", 0), ("during", 82), ("after", 5)]:
-        snapshot_rows = [dict(row, utilization_gpu_percent=util + idx) for idx, row in enumerate(gpu_rows)]
+        snapshot_rows = [
+            dict(row, utilization_gpu_percent=util + idx) for idx, row in enumerate(gpu_rows)
+        ]
         write_json(
             root / f"nvidia-smi.{snapshot_label}.json",
             {
@@ -1305,6 +1407,24 @@ def make_perf_artifact(
         root / "serve.health.after.json",
         {
             "status": "healthy",
+            "admission": {
+                "schema_version": 1,
+                "effective_max_concurrent": effective["selected_admission_limit"],
+                "queue_depth": 0,
+                "active_prefill": 0,
+                "active_decode": 0,
+                "current_batch_size": 0,
+                "rejected_requests_total": 0,
+                "failed_requests_total": 0,
+                "completed_requests_total": 384,
+                "scheduler_policy": "active_decode_prefill_chunk:64",
+            },
+            "scheduler": {
+                "total_requests": 384,
+                "successful_requests": 384,
+                "failed_requests": 0,
+                "throughput_rps": 3.5,
+            },
             "cache": {
                 "prefix_cache": {
                     "position": "llama-layer-split-pipeline",
@@ -1535,6 +1655,28 @@ def run_self_test() -> None:
             raise AssertionError("missing hardware snapshot candidate unexpectedly passed")
         except ValidationError as exc:
             if "nvidia-smi" not in str(exc):
+                raise
+
+        missing_admission = root / "missing-admission"
+        make_perf_artifact(
+            missing_admission,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        health = load_json(missing_admission / "serve.health.after.json")
+        health.pop("admission", None)
+        write_json(missing_admission / "serve.health.after.json", health)
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-admission-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_admission,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing admission candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "admission" not in str(exc):
                 raise
 
         binary_mismatch = root / "binary-mismatch"
