@@ -318,8 +318,9 @@ def run_goal(args: argparse.Namespace) -> int:
     run_step("baseline_batch", plan["commands"]["baseline_batch"], repo, out_root)
     run_step("candidate_overlapped", plan["commands"]["candidate_overlapped"], repo, out_root)
     final = run_step("final_validator", plan["commands"]["final_validator"], repo, out_root)
-    if PASS_PREFIX not in final.stdout:
-        raise RuntimeError(f"final validator output missing {PASS_PREFIX!r}")
+    expected_pass_line = f"{PASS_PREFIX}: {plan['final_artifact']}"
+    if expected_pass_line not in final.stdout.splitlines():
+        raise RuntimeError(f"final validator output missing exact PASS line: {expected_pass_line}")
     print(final.stdout.strip())
     return 0
 
@@ -357,6 +358,9 @@ def self_test() -> int:
     plan = command_plan(repo, Path("./target/release/ferrum"), out, None)
     assert plan["baseline_artifact"] == str(out / "baseline-batch")
     assert plan["candidate_artifact"] == str(out / "candidate-overlapped")
+    assert f"{PASS_PREFIX}: {plan['final_artifact']}" == (
+        "LAYER_SPLIT_PERF GOAL PASS: /tmp/layer-split-perf/final"
+    )
     baseline_cmd = plan["commands"]["baseline_batch"]
     candidate_cmd = plan["commands"]["candidate_overlapped"]
     final_cmd = plan["commands"]["final_validator"]
