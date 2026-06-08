@@ -1221,7 +1221,12 @@ impl InferenceEngine for ContinuousBatchEngine {
             p99_request_latency_ms: 0.0,
             throughput_rps: sm.throughput_rps as f32,
             tokens_per_second: 0.0,
-            queue_metrics: Default::default(),
+            queue_metrics: ferrum_types::QueueMetrics {
+                current_queue_length: sm.waiting_requests,
+                avg_queue_wait_time_ms: sm.avg_wait_time_ms,
+                queue_throughput_rps: sm.throughput_rps as f32,
+                queue_rejection_rate: 0.0,
+            },
             resource_utilization: Default::default(),
             error_stats: Default::default(),
             performance_breakdown: Default::default(),

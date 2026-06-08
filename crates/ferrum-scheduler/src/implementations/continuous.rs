@@ -161,6 +161,8 @@ pub struct ContinuousBatchScheduler {
     failed_counter: AtomicU64,
     cancelled_counter: AtomicU64,
     preempted_counter: AtomicU64,
+    admitted_counter: AtomicU64,
+    total_wait_time_us: AtomicU64,
 
     /// Start time
     start_time: Instant,
@@ -276,6 +278,8 @@ impl ContinuousBatchScheduler {
             failed_counter: AtomicU64::new(0),
             cancelled_counter: AtomicU64::new(0),
             preempted_counter: AtomicU64::new(0),
+            admitted_counter: AtomicU64::new(0),
+            total_wait_time_us: AtomicU64::new(0),
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
             cb_config,
@@ -316,7 +320,16 @@ impl ContinuousBatchScheduler {
             let mut req = waiting_queue.remove(pos).unwrap();
             req.phase = RequestPhase::Prefilling;
             req.inner.state = RequestState::Running;
-            req.inner.started_at = Some(chrono::Utc::now());
+            let started_at = chrono::Utc::now();
+            let wait_us = started_at
+                .signed_duration_since(req.inner.submitted_at)
+                .num_microseconds()
+                .unwrap_or(0)
+                .max(0) as u64;
+            req.inner.started_at = Some(started_at);
+            self.total_wait_time_us
+                .fetch_add(wait_us, Ordering::Relaxed);
+            self.admitted_counter.fetch_add(1, Ordering::Relaxed);
 
             request_index.insert(request_id.clone(), RequestPhase::Prefilling);
             prefill_queue.push_back(req);
@@ -865,6 +878,8 @@ impl Scheduler for ContinuousBatchScheduler {
         let failed_count = self.failed_counter.load(Ordering::Relaxed);
         let cancelled_count = self.cancelled_counter.load(Ordering::Relaxed);
         let preempted_count = self.preempted_counter.load(Ordering::Relaxed);
+        let admitted_count = self.admitted_counter.load(Ordering::Relaxed);
+        let total_wait_time_us = self.total_wait_time_us.load(Ordering::Relaxed);
 
         let uptime_secs = self.start_time.elapsed().as_secs_f64();
         let throughput = if uptime_secs > 0.0 {
@@ -874,6 +889,11 @@ impl Scheduler for ContinuousBatchScheduler {
         };
 
         let queue_utilization = waiting_count as f32 / self.config.max_waiting_requests as f32;
+        let avg_wait_time_ms = if admitted_count > 0 {
+            total_wait_time_us as f64 / admitted_count as f64 / 1000.0
+        } else {
+            0.0
+        };
 
         ferrum_types::SchedulerStats {
             waiting_requests: waiting_count,
@@ -882,7 +902,7 @@ impl Scheduler for ContinuousBatchScheduler {
             completed_requests: completed_count,
             failed_requests: failed_count,
             cancelled_requests: cancelled_count,
-            avg_wait_time_ms: 0.0, // TODO: track wait times
+            avg_wait_time_ms,
             avg_execution_time_ms: 0.0,
             throughput_rps: throughput,
             queue_utilization,
@@ -1336,6 +1356,28 @@ mod tests {
 
         let metrics = scheduler.metrics();
         assert_eq!(metrics.waiting_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_track_queue_wait_time_on_admission() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        scheduler
+            .submit(create_test_request(Priority::Normal))
+            .await
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let batch = scheduler.next_batch(BatchHint::simple(1)).await;
+        assert!(batch.is_some());
+
+        let metrics = scheduler.metrics();
+        assert_eq!(metrics.waiting_requests, 0);
+        assert_eq!(metrics.running_requests, 1);
+        assert!(
+            metrics.avg_wait_time_ms >= 1.0,
+            "expected non-zero wait time, got {}",
+            metrics.avg_wait_time_ms
+        );
     }
 
     #[test]
