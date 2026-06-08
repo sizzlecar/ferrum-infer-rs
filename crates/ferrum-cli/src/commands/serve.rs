@@ -48,10 +48,14 @@ pub struct ServeCommand {
     #[arg(long, default_value = "auto")]
     pub backend: String,
 
-    /// CUDA GPU ids to use, comma-separated. Multi-GPU requests fail until
-    /// the real layer-split loader is implemented.
+    /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
+    /// layer-split for supported Llama-family safetensors models.
     #[arg(long, value_name = "IDS")]
     pub gpu_devices: Option<String>,
+
+    /// Layer-split decode pipeline mode for multi-GPU CUDA serving.
+    #[arg(long, value_enum)]
+    pub layer_split_pipeline_mode: Option<crate::layer_split_pipeline::LayerSplitPipelineModeArg>,
 
     /// Speculative decoding: draft model id (same family as target).
     /// Example: `--spec-draft qwen3:0.6b` when serving `qwen3:4b`.
@@ -191,6 +195,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         tts_slots,
         backend,
         gpu_devices,
+        layer_split_pipeline_mode,
         spec_draft,
         spec_tokens,
         gpu_memory_utilization,
@@ -546,6 +551,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_model.as_deref(),
         profile_concurrency,
         profile_runtime_flags_json.as_deref(),
+        layer_split_pipeline_mode,
     );
     if let Some(selection) = &gpu_selection {
         startup_cli_runtime_entries.extend(selection.runtime_config_entries());
@@ -709,6 +715,10 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             if let Some(selection) = &gpu_selection {
                 selection.insert_backend_options(&mut engine_config.backend.backend_options);
             }
+            crate::layer_split_pipeline::insert_backend_option_from_runtime(
+                &startup_auto_config.runtime_config,
+                &mut engine_config.backend.backend_options,
+            )?;
             if let Some(draft_path) = engine_spec_draft_path.as_ref() {
                 engine_config.backend.backend_options.insert(
                     "spec_draft".to_string(),
@@ -997,6 +1007,7 @@ fn serve_cli_runtime_entries(
     profile_model: Option<&str>,
     profile_concurrency: Option<u32>,
     profile_runtime_flags_json: Option<&str>,
+    layer_split_pipeline_mode: Option<crate::layer_split_pipeline::LayerSplitPipelineModeArg>,
 ) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
     push_cli_runtime_entry(&mut entries, "FERRUM_KV_DTYPE", kv_dtype);
@@ -1069,6 +1080,7 @@ fn serve_cli_runtime_entries(
         "FERRUM_PROFILE_RUNTIME_FLAGS_JSON",
         profile_runtime_flags_json,
     );
+    crate::layer_split_pipeline::push_cli_runtime_entry(&mut entries, layer_split_pipeline_mode);
     entries
 }
 
@@ -1588,6 +1600,7 @@ mod tests {
             Some("Qwen/Qwen3-30B-A3B-GPTQ-Int4"),
             Some(32),
             Some("{\"schema_version\":1}"),
+            Some(crate::layer_split_pipeline::LayerSplitPipelineModeArg::Batch),
         );
         let snapshot = RuntimeConfigSnapshot::from_entries(entries);
         let entry = |key: &str| {
@@ -1631,6 +1644,10 @@ mod tests {
             "sha256:test"
         );
         assert_eq!(entry("FERRUM_PROFILE_CONCURRENCY").effective_value, "32");
+        assert_eq!(
+            entry(crate::layer_split_pipeline::LAYER_SPLIT_PIPELINE_MODE_KEY).effective_value,
+            "batch"
+        );
         assert!(entry("FERRUM_PROFILE_JSONL")
             .affects
             .contains(&ferrum_types::RuntimeConfigEffect::Diagnostics));
@@ -1667,6 +1684,7 @@ mod tests {
         .runtime_config_entries();
         let cli_entries = serve_cli_runtime_entries(
             Some("int8"),
+            None,
             None,
             None,
             None,
@@ -1741,6 +1759,7 @@ mod tests {
             Some(512),
             Some(false),
             Some(false),
+            None,
             None,
             None,
             None,
@@ -2202,6 +2221,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -2250,6 +2270,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
             None,
@@ -2259,6 +2280,7 @@ mod tests {
             None,
             None,
             prefix_cache_cli_override(false, false, true, false),
+            None,
             None,
             None,
             None,
@@ -2286,6 +2308,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
             None,
@@ -2295,6 +2318,7 @@ mod tests {
             None,
             None,
             prefix_cache_cli_override(false, false, false, true),
+            None,
             None,
             None,
             None,

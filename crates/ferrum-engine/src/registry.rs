@@ -975,6 +975,22 @@ fn resolve_llama_layer_split_plan(
     Ok(Some(parsed_plan))
 }
 
+fn resolve_llama_layer_split_pipeline_mode(
+    config: &ComponentConfig,
+    stage_count: usize,
+) -> Result<ferrum_models::models::LlamaPipelineMode> {
+    let Some(mode) = config.get_string_option("layer_split_pipeline_mode") else {
+        return Ok(ferrum_models::models::LlamaPipelineMode::default_for_stage_count(stage_count));
+    };
+    let mode = ferrum_models::models::LlamaPipelineMode::from_config_value(&mode)?;
+    if mode == ferrum_models::models::LlamaPipelineMode::Overlapped && stage_count != 2 {
+        return Err(FerrumError::config(
+            "layer_split_pipeline_mode=overlapped requires exactly two pipeline stages",
+        ));
+    }
+    Ok(mode)
+}
+
 #[cfg(test)]
 fn resolve_llama_layer_stage_config(
     config: &ComponentConfig,
@@ -1011,6 +1027,7 @@ fn build_llm<B, K>(
     moe_cfg: Option<ferrum_models::moe_config::Qwen3MoeConfig>,
     model_path: &str,
     llama_layer_split_plan: Option<crate::layer_split::ParsedLayerSplitPlan>,
+    llama_layer_split_pipeline_mode: Option<ferrum_models::models::LlamaPipelineMode>,
 ) -> Result<Box<dyn ferrum_models::common::DecoderOnlyLLM>>
 where
     B: ferrum_kernels::backend::MoeLlmBackend,
@@ -1075,6 +1092,9 @@ where
                 stages,
                 ferrum_models::models::LlamaPipelinePlacement::from_backend_device_ordinals(
                     stage_device_ordinals,
+                )
+                .with_pipeline_mode(
+                    llama_layer_split_pipeline_mode.expect("layer split pipeline mode resolved"),
                 ),
             )?))
         } else {
@@ -1255,6 +1275,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                     model_def.to_model_info(config.engine_config.model.model_id.to_string());
                 let llama_layer_split_plan =
                     resolve_llama_layer_split_plan(config, qcfg.num_layers)?;
+                let llama_layer_split_pipeline_mode = llama_layer_split_plan
+                    .as_ref()
+                    .map(|plan| resolve_llama_layer_split_pipeline_mode(config, plan.stages.len()))
+                    .transpose()?;
 
                 // (Dim 4, Dim 5) cascade: pick `B` from device, `K` from
                 // kv-dtype, and dispatch to the generic `build_llm` helper.
@@ -1276,6 +1300,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                 moe_cfg,
                                 &model_path,
                                 llama_layer_split_plan,
+                                llama_layer_split_pipeline_mode,
                             )?
                         }
                         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1293,6 +1318,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     moe_cfg,
                                     &model_path,
                                     llama_layer_split_plan,
+                                    llama_layer_split_pipeline_mode,
                                 )?
                             }
                             #[cfg(not(feature = "metal"))]
@@ -1312,6 +1338,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     moe_cfg,
                                     &model_path,
                                     llama_layer_split_plan,
+                                    llama_layer_split_pipeline_mode,
                                 )?
                             }
                             #[cfg(not(feature = "cuda"))]
@@ -1344,6 +1371,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     moe_cfg,
                                     &model_path,
                                     llama_layer_split_plan,
+                                    llama_layer_split_pipeline_mode,
                                 )?
                             }
                             #[cfg(not(feature = "cuda"))]
@@ -1619,6 +1647,25 @@ mod tests {
     }
 
     #[test]
+    fn resolves_layer_split_pipeline_mode_default_and_explicit_batch() {
+        let mut config = layer_split_component_config_for_device(0);
+
+        assert_eq!(
+            resolve_llama_layer_split_pipeline_mode(&config, 2).unwrap(),
+            ferrum_models::models::LlamaPipelineMode::Overlapped
+        );
+
+        config.component_options.insert(
+            "layer_split_pipeline_mode".to_string(),
+            serde_json::Value::String("batch".to_string()),
+        );
+        assert_eq!(
+            resolve_llama_layer_split_pipeline_mode(&config, 2).unwrap(),
+            ferrum_models::models::LlamaPipelineMode::Batch
+        );
+    }
+
+    #[test]
     fn rejects_llama_stage_config_when_plan_layer_count_mismatches_model() {
         let config = layer_split_component_config_for_device(0);
 
@@ -1661,6 +1708,7 @@ mod tests {
             None,
             "/missing/model/path",
             Some(plan),
+            Some(ferrum_models::models::LlamaPipelineMode::Overlapped),
         ) {
             Ok(_) => panic!("layer_split build unexpectedly succeeded"),
             Err(err) => err.to_string(),

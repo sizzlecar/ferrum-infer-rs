@@ -577,20 +577,29 @@ impl CacheRuntimeState {
         let prefix_entries =
             engine_u64(engine_prefix_cache, "entries").unwrap_or(stats.prefix_entries);
         let prefix_bytes = engine_u64(engine_prefix_cache, "bytes").unwrap_or(stats.prefix_bytes);
+        let mut prefix_cache = serde_json::json!({
+            "enabled": engine_bool(engine_prefix_cache, "enabled").unwrap_or(policy.prefix_cache_enabled),
+            "position": engine_str(engine_prefix_cache, "position").unwrap_or("product-observability"),
+            "source": engine_str(engine_prefix_cache, "source").unwrap_or("server-prompt-lcp-observability"),
+            "entries": prefix_entries,
+            "hits": prefix_hits,
+            "misses": prefix_misses,
+            "evictions": prefix_evictions,
+            "saved_prefill_tokens": prefix_saved,
+            "bytes": prefix_bytes,
+            "block_size": engine_u64(engine_prefix_cache, "block_size"),
+            "kv_dtype": engine_str(engine_prefix_cache, "kv_dtype"),
+        });
+        if let (Some(engine), Some(prefix)) = (
+            engine_prefix_cache.and_then(|value| value.as_object()),
+            prefix_cache.as_object_mut(),
+        ) {
+            for (key, value) in engine {
+                prefix.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
         serde_json::json!({
-            "prefix_cache": {
-                "enabled": engine_bool(engine_prefix_cache, "enabled").unwrap_or(policy.prefix_cache_enabled),
-                "position": engine_str(engine_prefix_cache, "position").unwrap_or("product-observability"),
-                "source": engine_str(engine_prefix_cache, "source").unwrap_or("server-prompt-lcp-observability"),
-                "entries": prefix_entries,
-                "hits": prefix_hits,
-                "misses": prefix_misses,
-                "evictions": prefix_evictions,
-                "saved_prefill_tokens": prefix_saved,
-                "bytes": prefix_bytes,
-                "block_size": engine_u64(engine_prefix_cache, "block_size"),
-                "kv_dtype": engine_str(engine_prefix_cache, "kv_dtype"),
-            },
+            "prefix_cache": prefix_cache,
             "session_cache": {
                 "mode": policy.session_cache_mode,
                 "entries": stats.session_entries,
@@ -7424,6 +7433,9 @@ mod tests {
             "bytes": 8192,
             "block_size": 16,
             "kv_dtype": "fp16",
+            "selected_pipeline_mode": "batch",
+            "selected_stage_bridge": "host",
+            "stage_count": 2,
         });
 
         let health = cache.health_json(&policy, Some(&engine_snapshot));
@@ -7438,6 +7450,9 @@ mod tests {
         assert_eq!(prefix["bytes"], 8192);
         assert_eq!(prefix["block_size"], 16);
         assert_eq!(prefix["kv_dtype"], "fp16");
+        assert_eq!(prefix["selected_pipeline_mode"], "batch");
+        assert_eq!(prefix["selected_stage_bridge"], "host");
+        assert_eq!(prefix["stage_count"], 2);
 
         let metrics = cache.prometheus_metrics(Some(&engine_snapshot));
         assert!(metrics.contains("ferrum_prefix_cache_hits_total 7\n"));

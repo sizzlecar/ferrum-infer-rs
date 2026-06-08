@@ -283,6 +283,42 @@ impl ResolvedFerrumConfig {
             self.runtime_entry_value("FERRUM_SELECTED_LAYER_SPLIT_PLAN");
         let selected_layer_split_stages =
             self.runtime_json_value("FERRUM_SELECTED_LAYER_SPLIT_STAGES");
+        let selected_layer_split_stage_count = selected_layer_split_stages
+            .as_ref()
+            .and_then(|value| value.as_array().map(|stages| stages.len()))
+            .or_else(|| {
+                selected_layer_split_plan
+                    .as_ref()
+                    .and_then(|_| selected_gpu_devices.as_ref().map(Vec::len))
+            });
+        let requested_pipeline_mode = self.runtime_entry_value("FERRUM_LAYER_SPLIT_PIPELINE_MODE");
+        let selected_pipeline_mode = if selected_layer_split_plan.is_some() {
+            requested_pipeline_mode.unwrap_or_else(|| {
+                if selected_layer_split_stage_count == Some(2) {
+                    "overlapped".to_string()
+                } else {
+                    "batch".to_string()
+                }
+            })
+        } else {
+            "sequential".to_string()
+        };
+        let selected_max_sequences = self.selected_usize("max_sequences");
+        let selected_microbatch_size = if selected_layer_split_plan.is_some() {
+            selected_max_sequences.map(|max_sequences| {
+                if selected_pipeline_mode == "overlapped" {
+                    max_sequences.div_ceil(2).max(1)
+                } else {
+                    max_sequences
+                }
+            })
+        } else {
+            Some(1)
+        };
+        let selected_stage_bridge = selected_layer_split_plan.as_ref().map(|_| "host");
+        let selected_max_model_len = self.selected_usize("max_model_len");
+        let selected_kv_capacity = self.runtime_usize("FERRUM_KV_CAPACITY");
+        let selected_max_batched_tokens = self.selected_usize("max_batched_tokens");
         serde_json::json!({
             "schema_version": 1,
             "preset": self.preset,
@@ -294,14 +330,18 @@ impl ResolvedFerrumConfig {
             "selected_distributed_strategy": selected_distributed_strategy.clone(),
             "selected_layer_split_plan": selected_layer_split_plan.clone(),
             "selected_layer_split_stages": selected_layer_split_stages,
+            "selected_pipeline_mode": selected_pipeline_mode,
+            "selected_microbatch_size": selected_microbatch_size,
+            "selected_stage_bridge": selected_stage_bridge,
             "selected_weight_placement": if selected_layer_split_plan.is_some() { "layer_split" } else { "single_device" },
             "selected_kv_layout": if backend.eq_ignore_ascii_case("cpu") { "contiguous" } else { "paged" },
             "selected_attention_impl": self.selected_string("attention_decode_backend"),
             "selected_graph_mode": self.selected_string("moe_graph_policy"),
-            "selected_max_sequences": self.selected_usize("max_sequences"),
-            "selected_max_model_len": self.selected_usize("max_model_len"),
-            "selected_kv_capacity": self.runtime_usize("FERRUM_KV_CAPACITY"),
-            "selected_max_batched_tokens": self.selected_usize("max_batched_tokens"),
+            "selected_max_sequences": selected_max_sequences,
+            "selected_max_model_len": selected_max_model_len,
+            "selected_kv_capacity": selected_kv_capacity,
+            "selected_max_batched_tokens": selected_max_batched_tokens,
+            "selected_admission_limit": selected_max_sequences,
             "entries": self.runtime_config.entries,
             "model_capabilities": self.model_capabilities,
             "hardware_capabilities": self.hardware_capabilities,
@@ -599,6 +639,7 @@ impl FerrumConfigBuilder {
             max_model_len.as_ref().map(|value| value.value),
         )?;
         self.validate_dtypes()?;
+        self.validate_layer_split_pipeline_mode()?;
         self.validate_sampling(greedy.value)?;
 
         decisions.push(self.attention_prefill_decision(
@@ -1063,6 +1104,19 @@ impl FerrumConfigBuilder {
             }
         }
         Ok(())
+    }
+
+    fn validate_layer_split_pipeline_mode(&self) -> Result<(), AutoConfigError> {
+        let Some(mode) = self.raw("FERRUM_LAYER_SPLIT_PIPELINE_MODE") else {
+            return Ok(());
+        };
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "batch" | "overlapped" => Ok(()),
+            _ => self.invalid(
+                "FERRUM_LAYER_SPLIT_PIPELINE_MODE",
+                "must be batch or overlapped",
+            ),
+        }
     }
 
     fn attention_prefill_decision(
@@ -1699,7 +1753,67 @@ mod tests {
             ])
         );
         assert_eq!(doc["selected_weight_placement"], "layer_split");
+        assert_eq!(doc["selected_pipeline_mode"], "overlapped");
+        assert_eq!(doc["selected_stage_bridge"], "host");
+        assert_eq!(
+            doc["selected_microbatch_size"],
+            serde_json::json!(doc["selected_max_sequences"].as_u64().unwrap().div_ceil(2))
+        );
+        assert_eq!(
+            doc["selected_admission_limit"],
+            doc["selected_max_sequences"]
+        );
         assert_eq!(doc["selected_kv_capacity"], 512);
+    }
+
+    #[test]
+    fn effective_config_document_honors_explicit_layer_split_batch_mode() {
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[
+            (
+                "FERRUM_REQUESTED_GPU_DEVICES",
+                "0,1",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "FERRUM_SELECTED_GPU_DEVICES",
+                "0,1",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "FERRUM_SELECTED_DISTRIBUTED_STRATEGY",
+                "layer_split",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "FERRUM_SELECTED_LAYER_SPLIT_PLAN",
+                "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "FERRUM_LAYER_SPLIT_PIPELINE_MODE",
+                "batch",
+                RuntimeConfigSource::Cli,
+            ),
+            ("FERRUM_PAGED_MAX_SEQS", "16", RuntimeConfigSource::Cli),
+        ]))
+        .with_hardware_capabilities(HardwareCapabilities::rtx4090_cuda(
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        ))
+        .resolve()
+        .unwrap();
+
+        let doc = resolved.effective_config_document();
+        assert_eq!(doc["selected_pipeline_mode"], "batch");
+        assert_eq!(doc["selected_microbatch_size"], 16);
+    }
+
+    #[test]
+    fn invalid_layer_split_pipeline_mode_is_rejected() {
+        expect_invalid_key_with_hardware(
+            &[("FERRUM_LAYER_SPLIT_PIPELINE_MODE", "serial")],
+            "FERRUM_LAYER_SPLIT_PIPELINE_MODE",
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2()),
+        );
     }
 
     #[test]
