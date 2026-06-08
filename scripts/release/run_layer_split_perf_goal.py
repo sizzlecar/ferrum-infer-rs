@@ -268,6 +268,7 @@ def print_run_plan(plan: dict[str, Any]) -> None:
     print(f"Correctness gate: {plan['correctness_gate']}")
     print(f"Performance command: {plan['performance_command']}")
     print(f"Final artifact: {plan['final_artifact']}")
+    sys.stdout.flush()
 
 
 def run_step(name: str, cmd: list[str], repo: Path, out_root: Path) -> subprocess.CompletedProcess[str]:
