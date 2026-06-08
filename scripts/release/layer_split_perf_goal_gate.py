@@ -321,6 +321,10 @@ def validate_hardware_evidence(
         raise ValidationError(f"{label}: missing nvidia-smi.bench.samples.jsonl")
     sample_count = 0
     max_gpu_utilization = [0, 0]
+    max_gpu_utilization_by_concurrency = {
+        cell: [0, 0] for cell in sorted(REQUIRED_CONCURRENCY_CELLS)
+    }
+    sample_count_by_concurrency = {cell: 0 for cell in sorted(REQUIRED_CONCURRENCY_CELLS)}
     for line_no, line in enumerate(samples_path.read_text().splitlines(), start=1):
         if not line.strip():
             continue
@@ -340,15 +344,42 @@ def validate_hardware_evidence(
             metadata,
         )
         sample_count += 1
+        sample_concurrency = sample.get("bench_concurrency")
+        if isinstance(sample_concurrency, str) and sample_concurrency.isdigit():
+            sample_concurrency = int(sample_concurrency)
+        if sample_concurrency in REQUIRED_CONCURRENCY_CELLS:
+            sample_count_by_concurrency[int(sample_concurrency)] += 1
         for idx, row in enumerate(sample_rows):
             max_gpu_utilization[idx] = max(
                 max_gpu_utilization[idx], row["utilization_gpu_percent"]
             )
+            if sample_concurrency in REQUIRED_CONCURRENCY_CELLS:
+                max_gpu_utilization_by_concurrency[int(sample_concurrency)][idx] = max(
+                    max_gpu_utilization_by_concurrency[int(sample_concurrency)][idx],
+                    row["utilization_gpu_percent"],
+                )
     if sample_count <= 0:
         raise ValidationError(f"{label}: missing passing bench-period GPU samples")
     if any(value <= 0 for value in max_gpu_utilization):
         raise ValidationError(
             f"{label}: bench-period GPU samples must show non-zero utilization on both GPUs"
+        )
+    missing_cells = [
+        cell for cell, count in sorted(sample_count_by_concurrency.items()) if count <= 0
+    ]
+    if missing_cells:
+        raise ValidationError(
+            f"{label}: bench-period GPU samples missing concurrency cells {missing_cells}"
+        )
+    zero_cells = [
+        cell
+        for cell, values in sorted(max_gpu_utilization_by_concurrency.items())
+        if any(value <= 0 for value in values)
+    ]
+    if zero_cells:
+        raise ValidationError(
+            f"{label}: bench-period GPU samples must show non-zero utilization "
+            f"on both GPUs for concurrency cells {zero_cells}"
         )
     return {
         "gpu_names": metadata.get("gpu_names"),
@@ -359,6 +390,10 @@ def validate_hardware_evidence(
         "snapshots": snapshots,
         "bench_sample_count": sample_count,
         "bench_max_gpu_utilization_percent": max_gpu_utilization,
+        "bench_sample_count_by_concurrency": sample_count_by_concurrency,
+        "bench_max_gpu_utilization_percent_by_concurrency": (
+            max_gpu_utilization_by_concurrency
+        ),
     }
 
 
@@ -1288,6 +1323,14 @@ def format_bench_cell_summary(label: str, summary: dict[str, Any]) -> str:
     )
 
 
+def format_gpu_utilization_by_concurrency(hardware: dict[str, Any]) -> str:
+    values = hardware["bench_max_gpu_utilization_percent_by_concurrency"]
+    return ", ".join(
+        f"c{concurrency}={util[0]}/{util[1]}%"
+        for concurrency, util in sorted(values.items())
+    )
+
+
 def validate_correctness_artifact(path: Path, label: str = "correctness artifact") -> dict[str, Any]:
     path = require_dir(path, label)
     data = first_json(path, ["correctness.json", "gate.json", "gate.manifest.json"], label)
@@ -1691,6 +1734,10 @@ def validate_perf_goal(
                 f"- Baseline throughput by concurrency: {baseline_tps_summary}",
                 f"- Candidate throughput by concurrency: {candidate_tps_summary}",
                 f"- Same-pod vLLM throughput by concurrency: {vllm_tps_summary}",
+                "- Baseline GPU max utilization by concurrency: "
+                + format_gpu_utilization_by_concurrency(baseline_hardware),
+                "- Candidate GPU max utilization by concurrency: "
+                + format_gpu_utilization_by_concurrency(candidate_hardware),
                 *bench_summary_lines,
                 "",
                 pass_line,
@@ -1829,20 +1876,25 @@ def make_perf_artifact(
         )
     write_text(
         root / "nvidia-smi.bench.samples.jsonl",
-        json.dumps(
-            {
-                "schema_version": 1,
-                "status": "pass",
-                "sample_phase": "bench",
-                "elapsed_sec": 15.0,
-                "gpus": [
-                    dict(gpu_rows[0], utilization_gpu_percent=84),
-                    dict(gpu_rows[1], utilization_gpu_percent=87),
-                ],
-            },
-            sort_keys=True,
-        )
-        + "\n",
+        "".join(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "pass",
+                    "sample_phase": "bench",
+                    "elapsed_sec": float(15 * idx),
+                    "bench_concurrency": concurrency,
+                    "bench_concurrency_sweep": sorted(REQUIRED_CONCURRENCY_CELLS),
+                    "gpus": [
+                        dict(gpu_rows[0], utilization_gpu_percent=80 + concurrency),
+                        dict(gpu_rows[1], utilization_gpu_percent=83 + concurrency),
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n"
+            for idx, concurrency in enumerate(sorted(REQUIRED_CONCURRENCY_CELLS), start=1)
+        ),
     )
     write_json(
         root / "model_manifest.json",
@@ -2226,6 +2278,17 @@ def run_self_test() -> None:
             raise AssertionError("selftest expected candidate c8 completed total")
         if candidate_c8["errored_total"] != 0 or candidate_c8["bad_output_total"] != 0:
             raise AssertionError("selftest expected candidate c8 zero bad counts")
+        if result["hardware_evidence"]["bench_sample_count_by_concurrency"] != {
+            1: 1,
+            4: 1,
+            8: 1,
+            16: 1,
+        }:
+            raise AssertionError("selftest expected per-concurrency GPU sample counts")
+        if result["hardware_evidence"][
+            "bench_max_gpu_utilization_percent_by_concurrency"
+        ][16] != [96, 99]:
+            raise AssertionError("selftest expected c16 GPU utilization summary")
         final_json = load_json(root / "out" / "layer_split_perf_goal_gate.json")
         if (
             final_json["candidate_bench_summary_by_concurrency"]["8"][
@@ -2234,6 +2297,8 @@ def run_self_test() -> None:
             != "usage"
         ):
             raise AssertionError("selftest expected persisted bench summary usage source")
+        if final_json["hardware_evidence"]["bench_sample_count_by_concurrency"]["16"] != 1:
+            raise AssertionError("selftest expected persisted c16 GPU sample count")
         summary = (root / "out" / "summary.md").read_text()
         for expected in [
             "Baseline source gate:",
@@ -2246,6 +2311,8 @@ def run_self_test() -> None:
             "Candidate throughput by concurrency:",
             "Same-pod vLLM output throughput:",
             "Same-pod vLLM throughput by concurrency:",
+            "Candidate GPU max utilization by concurrency:",
+            "c16=96/99%",
             "Candidate c8 bench:",
             "TTFT p50=",
             "TPOT p50=",

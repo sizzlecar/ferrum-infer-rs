@@ -316,6 +316,44 @@ def write_gpu_bench_sample(root: Path, sample: dict[str, Any]) -> None:
     write_json(root / "nvidia-smi.during.json", sample)
 
 
+def flag_value(cmd: list[str], flag: str) -> str | None:
+    prefix = flag + "="
+    for idx, part in enumerate(cmd):
+        if part == flag and idx + 1 < len(cmd):
+            return cmd[idx + 1]
+        if part.startswith(prefix):
+            return part[len(prefix) :]
+    return None
+
+
+def concurrency_sweep_from_cmd(cmd: list[str]) -> list[int]:
+    value = flag_value(cmd, "--concurrency-sweep")
+    if not value:
+        value = flag_value(cmd, "--concurrency")
+    if not value:
+        return []
+    cells: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            cells.append(int(part))
+        except ValueError:
+            continue
+    return cells
+
+
+def active_bench_concurrency(stderr_path: Path) -> int | None:
+    if not stderr_path.is_file():
+        return None
+    text = stderr_path.read_text(errors="replace")[-20000:]
+    matches = re.findall(r"closed_loop c=(\d+)", text)
+    if not matches:
+        return None
+    return int(matches[-1])
+
+
 def run_with_gpu_samples(
     cmd: list[str],
     *,
@@ -329,6 +367,7 @@ def run_with_gpu_samples(
     stdout_tmp = root / "bench-serve.stdout.tmp"
     stderr_tmp = root / "bench-serve.stderr.tmp"
     next_sample_at = start
+    concurrency_cells = concurrency_sweep_from_cmd(cmd)
     with stdout_tmp.open("w", encoding="utf-8") as stdout_file, stderr_tmp.open(
         "w", encoding="utf-8"
     ) as stderr_file:
@@ -345,6 +384,7 @@ def run_with_gpu_samples(
             sample["created_at"] = iso_now()
             sample["elapsed_sec"] = 0.0
             sample["sample_phase"] = "bench-start-failed"
+            sample["bench_concurrency_sweep"] = concurrency_cells
             write_gpu_bench_sample(root, sample)
             return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
@@ -356,6 +396,10 @@ def run_with_gpu_samples(
                 sample["created_at"] = iso_now()
                 sample["elapsed_sec"] = round(now - start, 3)
                 sample["sample_phase"] = "bench"
+                sample["bench_concurrency_sweep"] = concurrency_cells
+                current_concurrency = active_bench_concurrency(stderr_tmp)
+                if current_concurrency is not None:
+                    sample["bench_concurrency"] = current_concurrency
                 write_gpu_bench_sample(root, sample)
                 next_sample_at = now + sample_interval_sec
             if now - start > timeout:
@@ -370,6 +414,10 @@ def run_with_gpu_samples(
             sample["created_at"] = iso_now()
             sample["elapsed_sec"] = round(time.time() - start, 3)
             sample["sample_phase"] = "bench-finished-before-first-sample"
+            sample["bench_concurrency_sweep"] = concurrency_cells
+            current_concurrency = active_bench_concurrency(stderr_tmp)
+            if current_concurrency is not None:
+                sample["bench_concurrency"] = current_concurrency
             write_gpu_bench_sample(root, sample)
 
     stdout = stdout_tmp.read_text(errors="replace") if stdout_tmp.is_file() else ""
@@ -477,7 +525,11 @@ def require_structured_hardware_snapshot(snapshot: dict[str, Any], label: str) -
             raise RuntimeError(f"{label}: GPU {idx} pcie_link_width_current must be > 0")
 
 
-def validate_structured_hardware_evidence(root: Path, hardware: dict[str, Any]) -> dict[str, Any]:
+def validate_structured_hardware_evidence(
+    root: Path,
+    hardware: dict[str, Any],
+    expected_concurrency_cells: list[int] | None = None,
+) -> dict[str, Any]:
     if hardware.get("status") != "pass":
         raise RuntimeError("hardware.json status must be pass")
     gpus = hardware.get("gpus")
@@ -520,6 +572,11 @@ def validate_structured_hardware_evidence(root: Path, hardware: dict[str, Any]) 
         raise RuntimeError("missing nvidia-smi.bench.samples.jsonl")
     sample_count = 0
     max_gpu_utilization = [0, 0]
+    expected_cells = set(expected_concurrency_cells or [])
+    max_gpu_utilization_by_concurrency = {
+        cell: [0, 0] for cell in sorted(expected_cells)
+    }
+    sample_count_by_concurrency = {cell: 0 for cell in sorted(expected_cells)}
     for line_no, line in enumerate(samples_path.read_text().splitlines(), start=1):
         if not line.strip():
             continue
@@ -537,14 +594,44 @@ def validate_structured_hardware_evidence(root: Path, hardware: dict[str, Any]) 
             sample, f"nvidia-smi.bench.samples.jsonl line {line_no}"
         )
         sample_count += 1
+        sample_concurrency = sample.get("bench_concurrency")
+        if isinstance(sample_concurrency, str) and sample_concurrency.isdigit():
+            sample_concurrency = int(sample_concurrency)
+        if expected_cells and sample_concurrency in expected_cells:
+            sample_count_by_concurrency[int(sample_concurrency)] += 1
         for idx, gpu in enumerate(sample["gpus"]):
             max_gpu_utilization[idx] = max(
                 max_gpu_utilization[idx], gpu["utilization_gpu_percent"]
             )
+            if expected_cells and sample_concurrency in expected_cells:
+                max_gpu_utilization_by_concurrency[int(sample_concurrency)][idx] = max(
+                    max_gpu_utilization_by_concurrency[int(sample_concurrency)][idx],
+                    gpu["utilization_gpu_percent"],
+                )
     if sample_count <= 0:
         raise RuntimeError("missing passing bench-period GPU samples")
     if any(value <= 0 for value in max_gpu_utilization):
         raise RuntimeError("bench-period GPU samples must show non-zero utilization on both GPUs")
+    if expected_cells:
+        missing_cells = [
+            cell for cell, count in sorted(sample_count_by_concurrency.items()) if count <= 0
+        ]
+        if missing_cells:
+            raise RuntimeError(
+                "bench-period GPU samples missing concurrency cells "
+                + ",".join(str(cell) for cell in missing_cells)
+            )
+        zero_cells = [
+            cell
+            for cell, values in sorted(max_gpu_utilization_by_concurrency.items())
+            if any(value <= 0 for value in values)
+        ]
+        if zero_cells:
+            raise RuntimeError(
+                "bench-period GPU samples must show non-zero utilization on both GPUs "
+                "for concurrency cells "
+                + ",".join(str(cell) for cell in zero_cells)
+            )
     return {
         "status": "pass",
         "pcie_link_width_current": hardware.get("pcie_link_width_current"),
@@ -554,6 +641,10 @@ def validate_structured_hardware_evidence(root: Path, hardware: dict[str, Any]) 
         "snapshots": snapshots,
         "bench_sample_count": sample_count,
         "bench_max_gpu_utilization_percent": max_gpu_utilization,
+        "bench_sample_count_by_concurrency": sample_count_by_concurrency,
+        "bench_max_gpu_utilization_percent_by_concurrency": (
+            max_gpu_utilization_by_concurrency
+        ),
     }
 
 
@@ -2201,23 +2292,42 @@ def self_test() -> int:
             )
         write_text(
             root / "nvidia-smi.bench.samples.jsonl",
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "status": "pass",
-                    "gpus": [
-                        {**gpu_rows[0], "utilization_gpu_percent": 85},
-                        {**gpu_rows[1], "utilization_gpu_percent": 88},
-                    ],
-                },
-                sort_keys=True,
-            )
-            + "\n",
+            "".join(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "bench_concurrency": concurrency,
+                        "bench_concurrency_sweep": [1, 4, 8, 16],
+                        "gpus": [
+                            {
+                                **gpu_rows[0],
+                                "utilization_gpu_percent": 80 + concurrency,
+                            },
+                            {
+                                **gpu_rows[1],
+                                "utilization_gpu_percent": 83 + concurrency,
+                            },
+                        ],
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+                for concurrency in [1, 4, 8, 16]
+            ),
         )
-        summary = validate_structured_hardware_evidence(root, hardware_doc)
+        summary = validate_structured_hardware_evidence(
+            root, hardware_doc, [1, 4, 8, 16]
+        )
         assert summary["status"] == "pass"
         assert summary["pcie_link_width_current"] == [16, 16]
-        assert summary["bench_max_gpu_utilization_percent"] == [85, 88]
+        assert summary["bench_max_gpu_utilization_percent"] == [96, 99]
+        assert summary["bench_sample_count_by_concurrency"] == {
+            1: 1,
+            4: 1,
+            8: 1,
+            16: 1,
+        }
     with tempfile.TemporaryDirectory(prefix="ferrum-llama33-vllm-metadata-") as tmp:
         root = Path(tmp)
         hardware_doc = {
@@ -2443,7 +2553,11 @@ def main() -> int:
             capture_nvidia_smi(root, "during")
 
     capture_nvidia_smi(root, "after")
-    checks["hardware_snapshots"] = validate_structured_hardware_evidence(root, hardware)
+    checks["hardware_snapshots"] = validate_structured_hardware_evidence(
+        root,
+        hardware,
+        [int(c) for c in cfg.get("concurrency_cells", [1, 4, 8, 16])],
+    )
     return gate_pass(root, checks)
 
 
