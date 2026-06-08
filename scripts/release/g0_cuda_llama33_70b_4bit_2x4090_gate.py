@@ -515,6 +515,36 @@ def validate_structured_hardware_evidence(root: Path, hardware: dict[str, Any]) 
                 gpu["pcie_link_width_current"] for gpu in snapshot["gpus"]
             ],
         }
+    samples_path = root / "nvidia-smi.bench.samples.jsonl"
+    if not samples_path.is_file():
+        raise RuntimeError("missing nvidia-smi.bench.samples.jsonl")
+    sample_count = 0
+    max_gpu_utilization = [0, 0]
+    for line_no, line in enumerate(samples_path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"invalid nvidia-smi.bench.samples.jsonl line {line_no}: {exc}"
+            ) from exc
+        if not isinstance(sample, dict):
+            raise RuntimeError(f"nvidia-smi.bench.samples.jsonl line {line_no} must be an object")
+        if sample.get("status") != "pass":
+            continue
+        require_structured_hardware_snapshot(
+            sample, f"nvidia-smi.bench.samples.jsonl line {line_no}"
+        )
+        sample_count += 1
+        for idx, gpu in enumerate(sample["gpus"]):
+            max_gpu_utilization[idx] = max(
+                max_gpu_utilization[idx], gpu["utilization_gpu_percent"]
+            )
+    if sample_count <= 0:
+        raise RuntimeError("missing passing bench-period GPU samples")
+    if any(value <= 0 for value in max_gpu_utilization):
+        raise RuntimeError("bench-period GPU samples must show non-zero utilization on both GPUs")
     return {
         "status": "pass",
         "pcie_link_width_current": hardware.get("pcie_link_width_current"),
@@ -522,6 +552,8 @@ def validate_structured_hardware_evidence(root: Path, hardware: dict[str, Any]) 
         "gpu_utilization_percent": hardware.get("gpu_utilization_percent"),
         "gpu_memory_utilization_percent": hardware.get("gpu_memory_utilization_percent"),
         "snapshots": snapshots,
+        "bench_sample_count": sample_count,
+        "bench_max_gpu_utilization_percent": max_gpu_utilization,
     }
 
 
@@ -2167,9 +2199,25 @@ def self_test() -> int:
                     "gpus": gpu_rows,
                 },
             )
+        write_text(
+            root / "nvidia-smi.bench.samples.jsonl",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "pass",
+                    "gpus": [
+                        {**gpu_rows[0], "utilization_gpu_percent": 85},
+                        {**gpu_rows[1], "utilization_gpu_percent": 88},
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+        )
         summary = validate_structured_hardware_evidence(root, hardware_doc)
         assert summary["status"] == "pass"
         assert summary["pcie_link_width_current"] == [16, 16]
+        assert summary["bench_max_gpu_utilization_percent"] == [85, 88]
     with tempfile.TemporaryDirectory(prefix="ferrum-llama33-vllm-metadata-") as tmp:
         root = Path(tmp)
         hardware_doc = {
