@@ -249,6 +249,96 @@ def model_identity(metadata: dict[str, Any]) -> str:
     return str(value) if value else ""
 
 
+def is_sha256_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
+def validate_file_manifest_item(item: Any, label: str) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        raise ValidationError(f"{label}: file manifest item must be an object")
+    path = item.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise ValidationError(f"{label}: file manifest item missing path")
+    try:
+        size = int(item.get("size_bytes"))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{label}: file manifest item has invalid size_bytes") from exc
+    if size <= 0:
+        raise ValidationError(f"{label}: file manifest item size_bytes must be > 0")
+    if not is_sha256_digest(item.get("sha256")):
+        raise ValidationError(f"{label}: file manifest item missing SHA256")
+    return item
+
+
+def validate_model_manifest(
+    path: Path,
+    label: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    manifest_path = path / "model_manifest.json"
+    if not manifest_path.is_file():
+        raise ValidationError(f"{label}: missing model_manifest.json")
+    manifest = status_pass_obj(load_json(manifest_path), f"{label} model manifest")
+    if manifest.get("diagnostic_only") is True:
+        raise ValidationError(f"{label}: model manifest is diagnostic-only")
+    if manifest.get("model") != model_identity(metadata):
+        raise ValidationError(f"{label}: model manifest identity does not match metadata")
+    if not isinstance(manifest.get("model_path"), str) or not manifest["model_path"].strip():
+        raise ValidationError(f"{label}: model manifest missing model_path")
+    for key in [
+        "config_sha256",
+        "tokenizer_sha256",
+        "tokenizer_metadata_sha256",
+        "weight_manifest_sha256",
+    ]:
+        if not is_sha256_digest(manifest.get(key)):
+            raise ValidationError(f"{label}: model manifest missing {key}")
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValidationError(f"{label}: model manifest missing file list")
+    for item in files:
+        validate_file_manifest_item(item, f"{label} model manifest")
+    tokenizer_files = manifest.get("tokenizer_files")
+    if not isinstance(tokenizer_files, list) or not tokenizer_files:
+        raise ValidationError(f"{label}: model manifest missing tokenizer metadata files")
+    for item in tokenizer_files:
+        validate_file_manifest_item(item, f"{label} tokenizer manifest")
+    if int(manifest.get("weight_file_count") or 0) <= 0:
+        raise ValidationError(f"{label}: model manifest missing weight files")
+    return {
+        "model": manifest.get("model"),
+        "model_path": manifest.get("model_path"),
+        "resolved_from": manifest.get("resolved_from"),
+        "config_sha256": manifest.get("config_sha256"),
+        "tokenizer_sha256": manifest.get("tokenizer_sha256"),
+        "tokenizer_metadata_sha256": manifest.get("tokenizer_metadata_sha256"),
+        "weight_manifest_sha256": manifest.get("weight_manifest_sha256"),
+        "file_count": len(files),
+        "tokenizer_file_count": len(tokenizer_files),
+        "weight_file_count": int(manifest.get("weight_file_count") or 0),
+    }
+
+
+def validate_model_manifests_match(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+) -> None:
+    for key in [
+        "model",
+        "config_sha256",
+        "tokenizer_sha256",
+        "tokenizer_metadata_sha256",
+        "weight_manifest_sha256",
+        "weight_file_count",
+    ]:
+        if baseline.get(key) != candidate.get(key):
+            raise ValidationError(f"baseline and candidate model manifest {key} differ")
+
+
 def validate_effective_config(path: Path, label: str) -> dict[str, Any]:
     config = first_json(
         path,
@@ -729,6 +819,13 @@ def validate_perf_goal(
 
     baseline_metadata = validate_metadata(baseline_artifact, "baseline")
     candidate_metadata = validate_metadata(candidate_artifact, "candidate")
+    baseline_model_manifest = validate_model_manifest(
+        baseline_artifact, "baseline", baseline_metadata
+    )
+    candidate_model_manifest = validate_model_manifest(
+        candidate_artifact, "candidate", candidate_metadata
+    )
+    validate_model_manifests_match(baseline_model_manifest, candidate_model_manifest)
     baseline_config = validate_effective_config(baseline_artifact, "baseline")
     candidate_config = validate_effective_config(candidate_artifact, "candidate")
     if model_identity(baseline_metadata) != model_identity(candidate_metadata):
@@ -807,6 +904,7 @@ def validate_perf_goal(
         "driver_version": candidate_metadata.get("driver_version"),
         "gpu_names": candidate_metadata.get("gpu_names"),
         "gpu_uuids": candidate_metadata.get("gpu_uuids"),
+        "model_manifest": candidate_model_manifest,
         "selected_layer_split_plan": candidate_config["selected_layer_split_plan"],
         "selected_pipeline_mode": candidate_config["selected_pipeline_mode"],
         "selected_microbatch_size": candidate_config["selected_microbatch_size"],
@@ -920,6 +1018,41 @@ def make_perf_artifact(
         "diagnostic_only": diagnostic,
     }
     write_json(root / "metadata.json", metadata)
+    write_json(
+        root / "model_manifest.json",
+        {
+            "schema_version": 2,
+            "status": "pass",
+            "model": metadata["model_id"],
+            "model_id": metadata["model_id"],
+            "model_path": "/models/clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+            "resolved_from": "hf_cache_snapshot",
+            "quant_format": "gptq_int4",
+            "tokenizer_path": "/models/clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+            "config_sha256": "b" * 64,
+            "tokenizer_sha256": "c" * 64,
+            "tokenizer_metadata_sha256": "d" * 64,
+            "weight_manifest_sha256": "e" * 64,
+            "weight_file_count": 2,
+            "files": [
+                {"path": "config.json", "size_bytes": 20, "sha256": "b" * 64},
+                {"path": "tokenizer.json", "size_bytes": 30, "sha256": "c" * 64},
+                {
+                    "path": "model-00001-of-00002.safetensors",
+                    "size_bytes": 40,
+                    "sha256": "f" * 64,
+                },
+                {
+                    "path": "model-00002-of-00002.safetensors",
+                    "size_bytes": 40,
+                    "sha256": "1" * 64,
+                },
+            ],
+            "tokenizer_files": [
+                {"path": "tokenizer.json", "size_bytes": 30, "sha256": "c" * 64}
+            ],
+        },
+    )
     for subcommand in ["run", "serve"]:
         write_json(
             root / f"{subcommand}.command.json",
@@ -1194,6 +1327,29 @@ def run_self_test() -> None:
             raise AssertionError("diagnostic candidate unexpectedly passed")
         except ValidationError as exc:
             if "diagnostic" not in str(exc):
+                raise
+
+        pending_model_manifest = root / "pending-model-manifest"
+        make_perf_artifact(
+            pending_model_manifest,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        manifest = load_json(pending_model_manifest / "model_manifest.json")
+        manifest["status"] = "pending_model_resolution"
+        manifest["config_sha256"] = None
+        write_json(pending_model_manifest / "model_manifest.json", manifest)
+        try:
+            validate_perf_goal(
+                out_dir=root / "pending-model-manifest-out",
+                baseline_artifact=baseline,
+                candidate_artifact=pending_model_manifest,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("pending model manifest candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "model manifest" not in str(exc):
                 raise
 
         binary_mismatch = root / "binary-mismatch"

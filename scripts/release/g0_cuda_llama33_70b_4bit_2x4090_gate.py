@@ -48,6 +48,15 @@ BAD_PATTERNS = [
 ]
 DEFAULT_LAYER_SPLIT_PLAN = "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
 RECALL_MARKER = "ferrum-9271-zeta"
+MODEL_MANIFEST_INTERESTING_SUFFIXES = {".json", ".model", ".safetensors", ".gguf"}
+TOKENIZER_METADATA_FILE_NAMES = {
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "generation_config.json",
+    "chat_template.json",
+}
 BENCH_QUALITY_COUNT_FIELDS = (
     "bad_output_per_run",
     "malformed_stream_per_run",
@@ -333,34 +342,78 @@ def layer_split_plan_from_config(cfg: dict[str, Any]) -> str:
     return DEFAULT_LAYER_SPLIT_PLAN
 
 
+def latest_hf_snapshot_for_model(model: str) -> Path | None:
+    repo = hf_cache_dir(model)
+    if repo is None:
+        return None
+    snapshots = sorted(
+        (repo / "snapshots").glob("*"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return snapshots[0] if snapshots else None
+
+
+def resolve_model_manifest_path(model: str) -> tuple[Path | None, str]:
+    path = Path(model)
+    if path.exists():
+        return path, "local_path"
+    snapshot = latest_hf_snapshot_for_model(model)
+    if snapshot is not None:
+        return snapshot, "hf_cache_snapshot"
+    return None, "unresolved"
+
+
+def tokenizer_manifest_path(cfg: dict[str, Any], model_source: Path) -> Path:
+    tokenizer = cfg.get("tokenizer_path") or cfg.get("tokenizer")
+    if tokenizer is not None and str(tokenizer) != "auto":
+        path = Path(str(tokenizer))
+        return path.parent if path.is_file() else path
+    return model_source.parent if model_source.is_file() else model_source
+
+
+def is_sha256_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
 def model_manifest(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     model = str(cfg["model"])
-    path = Path(model)
+    path, resolved_from = resolve_model_manifest_path(model)
     manifest: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "pending_model_resolution",
         "model": model,
+        "model_id": model if "/" in model and not Path(model).exists() else None,
+        "model_path": str(path) if path is not None else None,
+        "resolved_from": resolved_from,
         "quant_format": cfg["quant_format"],
+        "tokenizer_path": None,
         "config_sha256": None,
         "tokenizer_sha256": None,
+        "tokenizer_metadata_sha256": None,
+        "tokenizer_files": [],
         "weight_manifest_sha256": None,
+        "weight_file_count": 0,
         "files": [],
     }
-    if not path.exists():
+    if path is None:
         write_json(root / "model_manifest.json", manifest)
         return manifest
 
     files: list[dict[str, Any]] = []
-    interesting_suffixes = {".json", ".model", ".safetensors", ".gguf"}
     candidates = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
     base = path.parent if path.is_file() else path
+    manifest["tokenizer_path"] = str(tokenizer_manifest_path(cfg, path))
     for file in candidates:
-        if file.suffix not in interesting_suffixes:
+        if file.suffix not in MODEL_MANIFEST_INTERESTING_SUFFIXES:
             continue
         rel = file.relative_to(base).as_posix()
         digest = sha256(file)
         files.append({"path": rel, "size_bytes": file.stat().st_size, "sha256": digest})
-    manifest["status"] = "pass"
     manifest["files"] = files
     for item in files:
         file_name = Path(str(item["path"])).name
@@ -368,11 +421,72 @@ def model_manifest(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
             manifest["config_sha256"] = item["sha256"]
         elif file_name in {"tokenizer.json", "tokenizer.model"}:
             manifest["tokenizer_sha256"] = item["sha256"]
+    tokenizer_files = [
+        item for item in files if Path(str(item["path"])).name in TOKENIZER_METADATA_FILE_NAMES
+    ]
+    manifest["tokenizer_files"] = tokenizer_files
+    if tokenizer_files:
+        tokenizer_payload = json.dumps(tokenizer_files, sort_keys=True).encode("utf-8")
+        manifest["tokenizer_metadata_sha256"] = hashlib.sha256(tokenizer_payload).hexdigest()
     weight_items = [item for item in files if str(item["path"]).endswith((".safetensors", ".gguf"))]
-    weight_payload = json.dumps(weight_items, sort_keys=True).encode("utf-8")
-    manifest["weight_manifest_sha256"] = hashlib.sha256(weight_payload).hexdigest()
+    manifest["weight_file_count"] = len(weight_items)
+    if weight_items:
+        weight_payload = json.dumps(weight_items, sort_keys=True).encode("utf-8")
+        manifest["weight_manifest_sha256"] = hashlib.sha256(weight_payload).hexdigest()
+    missing = [
+        key
+        for key in [
+            "config_sha256",
+            "tokenizer_sha256",
+            "tokenizer_metadata_sha256",
+            "weight_manifest_sha256",
+        ]
+        if not is_sha256_digest(manifest.get(key))
+    ]
+    if not weight_items:
+        missing.append("weight files")
+    manifest["status"] = "pass" if not missing else "incomplete"
+    if missing:
+        manifest["missing_required"] = missing
     write_json(root / "model_manifest.json", manifest)
     return manifest
+
+
+def require_release_model_manifest(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    manifest = model_manifest(root, cfg)
+    errors: list[str] = []
+    if manifest.get("status") != "pass":
+        errors.append(f"status={manifest.get('status')!r}")
+    if not isinstance(manifest.get("model_path"), str) or not manifest["model_path"]:
+        errors.append("missing model_path")
+    for key in [
+        "config_sha256",
+        "tokenizer_sha256",
+        "tokenizer_metadata_sha256",
+        "weight_manifest_sha256",
+    ]:
+        if not is_sha256_digest(manifest.get(key)):
+            errors.append(f"missing {key}")
+    if int(manifest.get("weight_file_count") or 0) <= 0:
+        errors.append("missing weight files")
+    if not isinstance(manifest.get("files"), list) or not manifest["files"]:
+        errors.append("missing file manifest")
+    if not isinstance(manifest.get("tokenizer_files"), list) or not manifest["tokenizer_files"]:
+        errors.append("missing tokenizer metadata files")
+    if errors:
+        raise RuntimeError("model_manifest incomplete for release evidence: " + "; ".join(errors))
+    return {
+        "status": "pass",
+        "model": manifest.get("model"),
+        "model_path": manifest.get("model_path"),
+        "resolved_from": manifest.get("resolved_from"),
+        "file_count": len(manifest.get("files", [])),
+        "weight_file_count": manifest.get("weight_file_count"),
+        "config_sha256": manifest.get("config_sha256"),
+        "tokenizer_sha256": manifest.get("tokenizer_sha256"),
+        "tokenizer_metadata_sha256": manifest.get("tokenizer_metadata_sha256"),
+        "weight_manifest_sha256": manifest.get("weight_manifest_sha256"),
+    }
 
 
 def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: Path) -> list[str]:
@@ -1644,6 +1758,46 @@ def self_test() -> int:
     }
     validate_config(cfg)
     assert pipeline_mode_from_config(cfg) == "overlapped"
+    with tempfile.TemporaryDirectory(prefix="ferrum-model-manifest-local-") as tmp:
+        root = Path(tmp)
+        model_dir = root / "model"
+        model_dir.mkdir()
+        write_json(model_dir / "config.json", {"model_type": "llama"})
+        write_json(model_dir / "tokenizer.json", {"version": "1.0"})
+        write_json(model_dir / "tokenizer_config.json", {"chat_template": "{{ messages }}"})
+        write_json(model_dir / "special_tokens_map.json", {"eos_token": "</s>"})
+        write_text(model_dir / "model-00001-of-00001.safetensors", "weights")
+        manifest = model_manifest(root, {**cfg, "model": str(model_dir)})
+        assert manifest["status"] == "pass"
+        assert manifest["resolved_from"] == "local_path"
+        assert is_sha256_digest(manifest["config_sha256"])
+        assert is_sha256_digest(manifest["tokenizer_sha256"])
+        assert is_sha256_digest(manifest["tokenizer_metadata_sha256"])
+        assert is_sha256_digest(manifest["weight_manifest_sha256"])
+        assert require_release_model_manifest(root, {**cfg, "model": str(model_dir)})[
+            "weight_file_count"
+        ] == 1
+    with tempfile.TemporaryDirectory(prefix="ferrum-model-manifest-hf-") as tmp:
+        root = Path(tmp)
+        hf_home = root / "hf"
+        snapshot = hf_home / "hub" / "models--org--repo" / "snapshots" / "abcdef"
+        snapshot.mkdir(parents=True)
+        write_json(snapshot / "config.json", {"model_type": "llama"})
+        write_json(snapshot / "tokenizer.json", {"version": "1.0"})
+        write_json(snapshot / "tokenizer_config.json", {"chat_template": "{{ messages }}"})
+        write_text(snapshot / "model.safetensors", "weights")
+        previous_hf_home = os.environ.get("HF_HOME")
+        os.environ["HF_HOME"] = str(hf_home)
+        try:
+            manifest = model_manifest(root, {**cfg, "model": "org/repo"})
+        finally:
+            if previous_hf_home is None:
+                os.environ.pop("HF_HOME", None)
+            else:
+                os.environ["HF_HOME"] = previous_hf_home
+        assert manifest["status"] == "pass"
+        assert manifest["resolved_from"] == "hf_cache_snapshot"
+        assert manifest["model_path"] == str(snapshot)
     bad_mode_cfg = {**cfg, "layer_split_pipeline_mode": "serial"}
     try:
         validate_config(bad_mode_cfg)
@@ -1909,6 +2063,7 @@ def main() -> int:
         log_text = serve_log.read_text(errors="replace")
         assert_no_bad_patterns("serve.log", log_text)
         checks["goal_correctness"] = write_goal_correctness_artifact(root, checks)
+        checks["model_manifest"] = require_release_model_manifest(root, cfg)
 
         ferrum_rows = validate_bench_reports(
             root / "bench-serve.json",
