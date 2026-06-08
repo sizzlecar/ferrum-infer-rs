@@ -103,7 +103,10 @@ impl EngineInner {
                 let token = if logits.len() == 1 {
                     TokenId::new(logits[0] as u32)
                 } else {
-                    seq.sample_with_processors(&mut logits)?
+                    seq.sample_with_processors_with_tokenizer(
+                        &mut logits,
+                        Some(self.tokenizer.as_ref()),
+                    )?
                 };
                 seq.generated_tokens.push(token);
                 seq.tokens_this_iteration += 1;
@@ -207,7 +210,7 @@ impl EngineInner {
                 .unwrap_or(TokenId::new(0));
             let tensor = self.tokens_to_tensor(&[last_token.get()])?;
             ferrum_interfaces::model_executor::DecodeInput::new(tensor, kv_cache)
-                .with_metadata(seq.original_request.metadata.clone())
+                .with_metadata(seq.model_decode_metadata())
         };
 
         let decode_output = self.model_executor.decode(&decode_input).await?;
@@ -219,7 +222,10 @@ impl EngineInner {
                 .get_mut(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
             let mut logits = logits_vec;
-            let token = seq.sample_with_processors(&mut logits)?;
+            let token = seq.sample_with_processors_with_tokenizer(
+                &mut logits,
+                Some(self.tokenizer.as_ref()),
+            )?;
             seq.generated_tokens.push(token);
             seq.kv_cache = Some(decode_output.kv_cache.clone());
             seq.tokens_this_iteration += 1;

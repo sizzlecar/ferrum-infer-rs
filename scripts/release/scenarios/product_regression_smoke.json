@@ -1,0 +1,53 @@
+{
+  "backend": "auto",
+  "ferrum_bin": "target/release/ferrum",
+  "model": "Qwen/Qwen3-0.6B",
+  "schema_version": 1,
+  "server": {
+    "args": [
+      "--session-cache",
+      "memory",
+      "--session-cache-max-entries",
+      "32"
+    ],
+    "mode": "external"
+  },
+  "timeout_sec": 120,
+  "scenarios": [
+    {
+      "name": "run_multiturn_recall",
+      "type": "run_multiturn",
+      "secret": "ferrum-blue",
+      "expected_recall": "ferrum-blue",
+      "min_assistant_turns": 2
+    },
+    {
+      "name": "serve_concurrency_quality",
+      "type": "serve_concurrency_quality",
+      "concurrency_cells": [
+        1,
+        4
+      ]
+    },
+    {
+      "name": "serve_multiturn_recall",
+      "type": "serve_multiturn_recall",
+      "secret": "ferrum-blue"
+    },
+    {
+      "name": "serve_stream_done_usage",
+      "type": "serve_stream"
+    },
+    {
+      "name": "serve_tool_call",
+      "type": "serve_tool_call"
+    },
+    {
+      "name": "serve_structured_output",
+      "type": "serve_structured_output",
+      "expected_object": {
+        "answer": "scenario-ok"
+      }
+    }
+  ]
+}

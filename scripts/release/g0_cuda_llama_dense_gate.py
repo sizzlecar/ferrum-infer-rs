@@ -31,6 +31,16 @@ BAD_PATTERNS = [
     "[PAD]",
     "Internal Server Error",
 ]
+BENCH_QUALITY_COUNT_FIELDS = (
+    "bad_output_per_run",
+    "malformed_stream_per_run",
+    "missing_done_per_run",
+    "duplicate_done_per_run",
+    "zero_output_tokens_per_run",
+    "stream_bulk_flush_per_run",
+    "http_500_per_run",
+    "panic_per_run",
+)
 
 
 def run(
@@ -64,6 +74,23 @@ def assert_no_bad_patterns(label: str, text: str) -> None:
     for pat in BAD_PATTERNS:
         if pat.lower() in lower:
             raise RuntimeError(f"forbidden pattern {pat!r} in {label}")
+
+
+def validate_bench_quality(report: dict[str, Any], *, label: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for field in BENCH_QUALITY_COUNT_FIELDS:
+        values = report.get(field)
+        if not isinstance(values, list):
+            raise RuntimeError(f"{label}: missing {field}")
+        total = 0
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise RuntimeError(f"{label}: {field} contains non-integer {value!r}")
+            total += value
+        if total != 0:
+            raise RuntimeError(f"{label}: {field} total={total} values={values!r}")
+        counts[field.removesuffix("_per_run")] = total
+    return counts
 
 
 def sha256(path: Path) -> str | None:
@@ -373,6 +400,7 @@ def run_bench_gate(
             raise RuntimeError(f"c={concurrency}: invalid throughput={throughput}")
         if output_source != "usage":
             raise RuntimeError(f"c={concurrency}: output_token_count_source={output_source!r}")
+        quality_counts = validate_bench_quality(report, label=f"c={concurrency}")
         rows.append(
             {
                 "concurrency": concurrency,
@@ -380,6 +408,7 @@ def run_bench_gate(
                 "errored": errored,
                 "throughput_tok_s": throughput,
                 "output_token_count_source": output_source,
+                **quality_counts,
             }
         )
     missing = sorted(required - seen)

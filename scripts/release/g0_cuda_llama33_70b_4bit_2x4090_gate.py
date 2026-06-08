@@ -1,0 +1,1695 @@
+#!/usr/bin/env python3
+"""CUDA source gate for Llama 3.3 70B 4bit on 2x RTX 4090."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from openai_concurrency_quality_regression import run_concurrency_quality_regression
+from openai_tool_call_regression import run_tool_call_regression
+
+
+LANE = "g0_cuda2x4090_llama33_70b_4bit"
+PASS_LINE_PREFIX = f"G0 SOURCE {LANE} PASS"
+SMOKE_LANE = "g0_cuda2x4090_llama33_70b_4bit_smoke"
+REQUIRED_GPU_DEVICES = [0, 1]
+BAD_PATTERNS = [
+    "panic",
+    "CUDA illegal memory access",
+    "NCCL error",
+    "OOM",
+    "KV cache overflow",
+    "missing tokenizer",
+    "chat template render failure",
+    "CPU fallback",
+    "single-GPU fallback",
+    "<unk>",
+    "[PAD]",
+    "<|reserved_special_token_",
+    "<|assistant|>",
+    "<|tool|>",
+]
+DEFAULT_LAYER_SPLIT_PLAN = "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
+RECALL_MARKER = "ferrum-9271-zeta"
+BENCH_QUALITY_COUNT_FIELDS = (
+    "bad_output_per_run",
+    "malformed_stream_per_run",
+    "missing_done_per_run",
+    "duplicate_done_per_run",
+    "zero_output_tokens_per_run",
+    "stream_bulk_flush_per_run",
+    "http_500_per_run",
+    "panic_per_run",
+)
+REQUIRED_ARTIFACT_FILES = {
+    "gate.json",
+    "metadata.json",
+    "effective_config.json",
+    "decision_trace.jsonl",
+    "hardware.json",
+    "nvidia-smi.before.txt",
+    "nvidia-smi.during.txt",
+    "nvidia-smi.after.txt",
+    "model_manifest.json",
+    "run.command.json",
+    "run.effective_config.json",
+    "run.stdin",
+    "run.stdout",
+    "run.stderr",
+    "serve.command.json",
+    "serve.effective_config.json",
+    "serve.log",
+    "serve.health.json",
+    "serve.models.json",
+    "serve.correctness.json",
+    "serve.multiturn.json",
+    "serve.structured_output.json",
+    "serve.tool_call.json",
+    "serve.streaming.sse",
+    "concurrency_quality_regression.json",
+    "bench-serve.command.json",
+    "bench-serve.json",
+    "bench-serve.stdout",
+    "bench-serve.stderr",
+    "vllm-baseline.command.json",
+    "vllm-baseline.json",
+    "comparison.json",
+}
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def run(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    input_text: str | None = None,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+
+
+def post_json(base_url: str, payload: dict[str, Any], timeout: int = 180) -> tuple[int, str]:
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.status, response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+
+
+def get_url(url: str, timeout: int = 30) -> tuple[int, str]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.status, response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+
+
+def wait_health(base_url: str, timeout_sec: int = 1200) -> None:
+    deadline = time.time() + timeout_sec
+    last = ""
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(base_url.rstrip("/") + "/health", timeout=3) as response:
+                if response.status == 200:
+                    return
+                last = f"status={response.status}"
+        except Exception as exc:
+            last = str(exc)
+            time.sleep(2)
+    raise RuntimeError(f"server did not become healthy within {timeout_sec}s: {last}")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", errors="replace")
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text())
+
+
+def sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def git_output(args: list[str], repo: Path) -> str:
+    proc = run(["git", *args], cwd=repo, timeout=30)
+    return proc.stdout.strip() if proc.returncode == 0 else "unknown"
+
+
+def sanitized_env_summary() -> dict[str, str]:
+    out: dict[str, str] = {}
+    secret_fragments = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL")
+    allowed_exact = {"CUDA_VISIBLE_DEVICES", "HF_HOME", "LD_LIBRARY_PATH", "RUST_LOG"}
+    for key, value in sorted(os.environ.items()):
+        if not (key.startswith("FERRUM_") or key in allowed_exact):
+            continue
+        if any(fragment in key.upper() for fragment in secret_fragments):
+            out[key] = "<redacted>"
+        elif len(value) > 512:
+            out[key] = f"{value[:512]}...<truncated>"
+        else:
+            out[key] = value
+    return out
+
+
+def capture_nvidia_smi(root: Path, label: str) -> str:
+    proc = run(["nvidia-smi"], cwd=root, timeout=30)
+    body = proc.stdout if proc.returncode == 0 else proc.stderr
+    text = body or f"nvidia-smi rc={proc.returncode}\n"
+    write_text(root / f"nvidia-smi.{label}.txt", text)
+    return text
+
+
+def parse_nvidia_smi_versions(text: str) -> dict[str, str]:
+    driver = "unknown"
+    cuda = "unknown"
+    driver_match = re.search(r"Driver Version:\s*([^\s|]+)", text)
+    cuda_match = re.search(r"CUDA Version:\s*([^\s|]+)", text)
+    if driver_match:
+        driver = driver_match.group(1)
+    if cuda_match:
+        cuda = cuda_match.group(1)
+    return {"driver_version": driver, "cuda_version": cuda}
+
+
+def query_hardware(repo: Path, nvidia_smi_text: str) -> dict[str, Any]:
+    versions = parse_nvidia_smi_versions(nvidia_smi_text)
+    proc = run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,uuid,driver_version,memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        cwd=repo,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        return {
+            "schema_version": 1,
+            "status": "unavailable",
+            "error": proc.stderr.strip() or proc.stdout.strip() or f"nvidia-smi rc={proc.returncode}",
+            "cuda_device_count": 0,
+            "cuda_version": versions["cuda_version"],
+            "driver_version": versions["driver_version"],
+            "gpu_names": [],
+            "gpu_uuids": [],
+            "gpus": [],
+        }
+
+    rows: list[dict[str, Any]] = []
+    reader = csv.reader(proc.stdout.splitlines())
+    for row in reader:
+        parts = [part.strip() for part in row]
+        if len(parts) < 6:
+            continue
+        index, name, uuid, driver_version, memory_total, memory_used = parts[:6]
+        rows.append(
+            {
+                "index": int(index) if index.isdigit() else index,
+                "name": name,
+                "uuid": uuid,
+                "driver_version": driver_version,
+                "memory_total_mib": int(memory_total) if memory_total.isdigit() else memory_total,
+                "memory_used_mib": int(memory_used) if memory_used.isdigit() else memory_used,
+            }
+        )
+
+    driver_version = rows[0]["driver_version"] if rows else versions["driver_version"]
+    return {
+        "schema_version": 1,
+        "status": "pass" if len(rows) == 2 else "fail",
+        "cuda_device_count": len(rows),
+        "cuda_version": versions["cuda_version"],
+        "driver_version": driver_version,
+        "gpu_names": [str(row["name"]) for row in rows],
+        "gpu_uuids": [str(row["uuid"]) for row in rows],
+        "gpus": rows,
+    }
+
+
+def write_hardware(root: Path, repo: Path, nvidia_smi_text: str) -> dict[str, Any]:
+    hardware = query_hardware(repo, nvidia_smi_text)
+    write_json(root / "hardware.json", hardware)
+    return hardware
+
+
+def validate_config(cfg: dict[str, Any]) -> None:
+    if cfg.get("gpu_devices") != REQUIRED_GPU_DEVICES:
+        raise RuntimeError(f"config gpu_devices must be {REQUIRED_GPU_DEVICES}")
+    if cfg.get("distributed_strategy") != "layer_split":
+        raise RuntimeError("config distributed_strategy must be layer_split")
+    model = cfg.get("model")
+    if not isinstance(model, str) or not model:
+        raise RuntimeError("config model must be a non-empty model id/path")
+    quant = str(cfg.get("quant_format", "")).lower()
+    if not any(marker in quant for marker in ("gptq", "awq", "q4")):
+        raise RuntimeError("config quant_format must identify a 4bit format")
+
+
+def even_layer_split_plan_for_layers(devices: list[int], num_layers: int) -> str:
+    if not devices:
+        raise RuntimeError("layer split requires at least one CUDA device")
+    if num_layers < len(devices):
+        raise RuntimeError(
+            f"layer split requires at least as many transformer layers ({num_layers}) as CUDA devices ({len(devices)})"
+        )
+    base = num_layers // len(devices)
+    remainder = num_layers % len(devices)
+    start = 0
+    stages = []
+    for idx, device in enumerate(devices):
+        count = base + (1 if idx < remainder else 0)
+        end = start + count - 1
+        stages.append(f"stage{idx}:cuda:{device}:layers={start}-{end}")
+        start = end + 1
+    return ";".join(stages)
+
+
+def layer_split_plan_from_config(cfg: dict[str, Any]) -> str:
+    if isinstance(cfg.get("layer_split_plan"), str) and cfg["layer_split_plan"].strip():
+        return cfg["layer_split_plan"]
+    num_layers = cfg.get("num_hidden_layers")
+    if isinstance(num_layers, int):
+        return even_layer_split_plan_for_layers(REQUIRED_GPU_DEVICES, num_layers)
+    return DEFAULT_LAYER_SPLIT_PLAN
+
+
+def model_manifest(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    model = str(cfg["model"])
+    path = Path(model)
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "pending_model_resolution",
+        "model": model,
+        "quant_format": cfg["quant_format"],
+        "config_sha256": None,
+        "tokenizer_sha256": None,
+        "weight_manifest_sha256": None,
+        "files": [],
+    }
+    if not path.exists():
+        write_json(root / "model_manifest.json", manifest)
+        return manifest
+
+    files: list[dict[str, Any]] = []
+    interesting_suffixes = {".json", ".model", ".safetensors", ".gguf"}
+    candidates = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
+    base = path.parent if path.is_file() else path
+    for file in candidates:
+        if file.suffix not in interesting_suffixes:
+            continue
+        rel = file.relative_to(base).as_posix()
+        digest = sha256(file)
+        files.append({"path": rel, "size_bytes": file.stat().st_size, "sha256": digest})
+    manifest["status"] = "pass"
+    manifest["files"] = files
+    for item in files:
+        file_name = Path(str(item["path"])).name
+        if file_name == "config.json":
+            manifest["config_sha256"] = item["sha256"]
+        elif file_name in {"tokenizer.json", "tokenizer.model"}:
+            manifest["tokenizer_sha256"] = item["sha256"]
+    weight_items = [item for item in files if str(item["path"]).endswith((".safetensors", ".gguf"))]
+    weight_payload = json.dumps(weight_items, sort_keys=True).encode("utf-8")
+    manifest["weight_manifest_sha256"] = hashlib.sha256(weight_payload).hexdigest()
+    write_json(root / "model_manifest.json", manifest)
+    return manifest
+
+
+def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: Path) -> list[str]:
+    cmd = [
+        str(ferrum_bin),
+        "run",
+        model,
+        "--backend",
+        "cuda",
+        "--gpu-devices",
+        ",".join(str(device) for device in REQUIRED_GPU_DEVICES),
+        "--max-tokens",
+        str(cfg.get("run_max_tokens", 64)),
+        "--stop",
+        "\n",
+        "--output-format",
+        "jsonl",
+        "--effective-config-json",
+        str(root / "run.effective_config.json"),
+        "--decision-trace-jsonl",
+        str(root / "run.decision_trace.jsonl"),
+    ]
+    if cfg.get("max_model_len") is not None:
+        cmd.extend(["--max-model-len", str(cfg["max_model_len"])])
+    if cfg.get("kv_capacity") is not None:
+        cmd.extend(["--kv-capacity", str(cfg["kv_capacity"])])
+    if cfg.get("max_num_seqs") is not None:
+        cmd.extend(["--max-num-seqs", str(cfg["max_num_seqs"])])
+    if cfg.get("max_num_batched_tokens") is not None:
+        cmd.extend(["--max-num-batched-tokens", str(cfg["max_num_batched_tokens"])])
+    return cmd
+
+
+def build_serve_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: Path) -> list[str]:
+    cmd = [
+        str(ferrum_bin),
+        "serve",
+        "--model",
+        model,
+        "--backend",
+        "cuda",
+        "--gpu-devices",
+        ",".join(str(device) for device in REQUIRED_GPU_DEVICES),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(cfg.get("port", 19400)),
+        "--effective-config-json",
+        str(root / "serve.effective_config.json"),
+        "--decision-trace-jsonl",
+        str(root / "serve.decision_trace.jsonl"),
+    ]
+    if cfg.get("max_model_len") is not None:
+        cmd.extend(["--max-model-len", str(cfg["max_model_len"])])
+    if cfg.get("kv_capacity") is not None:
+        cmd.extend(["--kv-capacity", str(cfg["kv_capacity"])])
+    if cfg.get("max_num_seqs") is not None:
+        cmd.extend(["--max-num-seqs", str(cfg["max_num_seqs"])])
+    if cfg.get("max_num_batched_tokens") is not None:
+        cmd.extend(["--max-num-batched-tokens", str(cfg["max_num_batched_tokens"])])
+    return cmd
+
+
+def build_bench_serve_command(ferrum_bin: Path, cfg: dict[str, Any], root: Path) -> list[str]:
+    port = int(cfg.get("port", 19400))
+    cmd = [
+        str(ferrum_bin),
+        "bench-serve",
+        "--base-url",
+        f"http://127.0.0.1:{port}",
+        "--model",
+        str(cfg["model"]),
+        "--tokenizer",
+        str(cfg.get("tokenizer_path") or cfg.get("tokenizer") or cfg["model"]),
+        "--dataset",
+        "random",
+        "--fail-on-error",
+        "--seed",
+        str(cfg.get("seed", 9271)),
+        "--n-repeats",
+        str(cfg.get("n_repeats", 3)),
+        "--num-prompts",
+        str(cfg.get("num_prompts", 96)),
+        "--warmup-requests",
+        str(cfg.get("warmup_requests", 10)),
+        "--concurrency-sweep",
+        ",".join(str(cell) for cell in cfg.get("concurrency_cells", [1, 4, 8, 16])),
+        "--random-input-len",
+        str(cfg.get("random_input_len", 256)),
+        "--random-output-len",
+        str(cfg.get("random_output_len", 128)),
+        "--output",
+        "json",
+        "--out",
+        str(root / "bench-serve.json"),
+        "--tag",
+        "cuda-llama33-70b-4bit-2x4090",
+    ]
+    if cfg.get("require_ci", True):
+        cmd.insert(cmd.index("--seed"), "--require-ci")
+    return cmd
+
+
+def build_vllm_baseline_command(cfg: dict[str, Any]) -> list[str]:
+    return [
+        "vllm",
+        "serve",
+        str(cfg["model"]),
+        "--tensor-parallel-size",
+        "2",
+        "--port",
+        str(int(cfg.get("port", 19400)) + 1),
+        "--quantization",
+        str(cfg.get("quant_format", "gptq_int4")).split("_")[0],
+    ]
+
+
+def write_planned_command_artifacts(root: Path, ferrum_bin: Path, cfg: dict[str, Any]) -> None:
+    serve_cmd = build_serve_command(ferrum_bin, cfg["model"], cfg, root)
+    bench_cmd = build_bench_serve_command(ferrum_bin, cfg, root)
+    vllm_cmd = build_vllm_baseline_command(cfg)
+    required_bench_flags = ["--fail-on-error"]
+    if cfg.get("require_ci", True):
+        required_bench_flags.append("--require-ci")
+    required_bench_flags.extend(["--seed", "--n-repeats"])
+    write_json(
+        root / "serve.command.json",
+        {
+            "status": "planned",
+            "cmd": serve_cmd,
+            "expected_gpu_devices": REQUIRED_GPU_DEVICES,
+            "expected_distributed_strategy": "layer_split",
+            "expected_layer_split_plan": layer_split_plan_from_config(cfg),
+        },
+    )
+    write_json(
+        root / "bench-serve.command.json",
+        {
+            "status": "planned",
+            "cmd": bench_cmd,
+            "required_flags": required_bench_flags,
+        },
+    )
+    write_json(
+        root / "vllm-baseline.command.json",
+        {
+            "status": "planned",
+            "cmd": vllm_cmd,
+            "same_hardware_required": True,
+        },
+    )
+
+
+def write_metadata(
+    root: Path,
+    repo: Path,
+    ferrum_bin: Path,
+    cfg: dict[str, Any],
+    hardware: dict[str, Any],
+    command_line: list[str],
+) -> dict[str, Any]:
+    metadata = {
+        "schema_version": 1,
+        "lane": LANE,
+        "status": "running",
+        "created_at": iso_now(),
+        "git_sha": git_output(["rev-parse", "HEAD"], repo),
+        "dirty_status": {
+            "is_dirty": bool(git_output(["status", "--short"], repo)),
+            "status_short": git_output(["status", "--short"], repo).splitlines(),
+        },
+        "binary_sha256": sha256(ferrum_bin),
+        "command_line": command_line,
+        "build_features": ["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2", "fa2-source"],
+        "cuda_version": hardware.get("cuda_version", "unknown"),
+        "driver_version": hardware.get("driver_version", "unknown"),
+        "gpu_names": hardware.get("gpu_names", []),
+        "gpu_uuids": hardware.get("gpu_uuids", []),
+        "requested_gpu_devices": REQUIRED_GPU_DEVICES,
+        "selected_gpu_devices": REQUIRED_GPU_DEVICES,
+        "model_id": cfg["model"],
+        "quant_format": cfg["quant_format"],
+        "distributed_strategy": "layer_split",
+        "layer_split_plan": layer_split_plan_from_config(cfg),
+        "sanitized_env": sanitized_env_summary(),
+    }
+    write_json(root / "metadata.json", metadata)
+    return metadata
+
+
+def assert_no_bad_patterns(label: str, text: str) -> None:
+    lower = text.lower()
+    for pattern in BAD_PATTERNS:
+        if pattern.lower() in lower:
+            raise RuntimeError(f"forbidden pattern {pattern!r} in {label}")
+
+
+def strip_think(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+
+
+def assistant_text_from_jsonl(stdout: str) -> list[dict[str, Any]]:
+    turns: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("event") == "assistant":
+            turns.append(row)
+    return turns
+
+
+def parsed_response(label: str, status: int, body: str) -> dict[str, Any]:
+    if status != 200:
+        raise RuntimeError(f"{label}: expected HTTP 200, got {status}: {body[:500]}")
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{label}: invalid JSON: {exc}: {body[:500]}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{label}: response must be a JSON object")
+    return data
+
+
+def first_message_content(data: dict[str, Any]) -> tuple[str, str | None]:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(f"missing choices: {data}")
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise RuntimeError(f"invalid choice: {choice!r}")
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise RuntimeError(f"missing message: {choice}")
+    return str(message.get("content") or ""), choice.get("finish_reason")
+
+
+def parse_sse(body: str) -> tuple[list[dict[str, Any]], int, int]:
+    chunks: list[dict[str, Any]] = []
+    done_count = 0
+    malformed = 0
+    for line in body.splitlines():
+        if not line.startswith("data: "):
+            continue
+        data = line.removeprefix("data: ").strip()
+        if not data:
+            continue
+        if data == "[DONE]":
+            done_count += 1
+            continue
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            malformed += 1
+            continue
+        if isinstance(parsed, dict):
+            chunks.append(parsed)
+        else:
+            malformed += 1
+    return chunks, done_count, malformed
+
+
+def hf_cache_dir(model: str) -> Path | None:
+    if "/" not in model:
+        return None
+    hf_home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+    repo_dir = hf_home / "hub" / ("models--" + model.replace("/", "--"))
+    return repo_dir if repo_dir.is_dir() else None
+
+
+def resolve_tokenizer(tokenizer: str, model: str) -> Path:
+    if tokenizer != "auto":
+        path = Path(tokenizer)
+        if path.is_file() and path.name == "tokenizer.json":
+            return path.parent
+        if (path / "tokenizer.json").is_file():
+            return path
+        raise RuntimeError(f"tokenizer not found: {path}")
+    model_path = Path(model)
+    if model_path.is_dir() and (model_path / "tokenizer.json").is_file():
+        return model_path
+    repo = hf_cache_dir(model)
+    if repo is not None:
+        snapshots = sorted(
+            (repo / "snapshots").glob("*"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for snap in snapshots:
+            if (snap / "tokenizer.json").is_file():
+                return snap
+    raise RuntimeError("could not auto-resolve tokenizer.json; pass tokenizer in gate config")
+
+
+def report_list(path: Path) -> list[dict[str, Any]]:
+    data = load_json(path)
+    reports = data if isinstance(data, list) else [data]
+    if not all(isinstance(report, dict) for report in reports):
+        raise RuntimeError(f"{path} must contain a BenchReport object or list")
+    return reports
+
+
+def scalar_mean(report: dict[str, Any], key: str) -> float:
+    value = report.get(key)
+    if isinstance(value, dict):
+        value = value.get("mean")
+    if not isinstance(value, (int, float)) or value <= 0:
+        raise RuntimeError(f"invalid {key}: {value!r}")
+    return float(value)
+
+
+def percentile_mean(report: dict[str, Any], metric: str, percentile: str = "p50") -> float:
+    metric_obj = report.get(metric)
+    if not isinstance(metric_obj, dict):
+        raise RuntimeError(f"missing metric {metric}")
+    value = metric_obj.get(percentile)
+    if isinstance(value, dict):
+        value = value.get("mean")
+    if not isinstance(value, (int, float)) or value <= 0:
+        raise RuntimeError(f"invalid {metric}.{percentile}: {value!r}")
+    return float(value)
+
+
+def validate_bench_quality(report: dict[str, Any], *, label: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for field in BENCH_QUALITY_COUNT_FIELDS:
+        values = report.get(field)
+        if not isinstance(values, list):
+            raise RuntimeError(f"{label}: missing {field}")
+        total = 0
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise RuntimeError(f"{label}: {field} contains non-integer {value!r}")
+            total += value
+        if total != 0:
+            raise RuntimeError(f"{label}: {field} total={total} values={values!r}")
+        counts[field.removesuffix("_per_run")] = total
+    return counts
+
+
+def validate_bench_reports(
+    path: Path,
+    cfg: dict[str, Any],
+    *,
+    require_ci: bool,
+    label: str,
+) -> dict[int, dict[str, Any]]:
+    required = {int(c) for c in cfg.get("concurrency_cells", [1, 4, 8, 16])}
+    rows: dict[int, dict[str, Any]] = {}
+    for report in report_list(path):
+        concurrency = int(report.get("concurrency") or 0)
+        if concurrency <= 0:
+            raise RuntimeError(f"{label}: report missing positive concurrency")
+        completed = sum(int(v) for v in report.get("completed_per_run", []))
+        errored = sum(int(v) for v in report.get("errored_per_run", []))
+        n_repeats = int(report.get("n_repeats") or 0)
+        output_source = report.get("output_token_count_source")
+        if require_ci and n_repeats < 3:
+            raise RuntimeError(f"{label} c={concurrency}: n_repeats < 3")
+        if errored != 0 or completed <= 0:
+            raise RuntimeError(f"{label} c={concurrency}: completed={completed} errored={errored}")
+        if output_source != "usage":
+            raise RuntimeError(
+                f"{label} c={concurrency}: output_token_count_source={output_source!r}"
+            )
+        quality_counts = validate_bench_quality(report, label=f"{label} c={concurrency}")
+        rows[concurrency] = {
+            "concurrency": concurrency,
+            "completed": completed,
+            "errored": errored,
+            "n_repeats": n_repeats,
+            "output_token_count_source": output_source,
+            "output_throughput_tps": scalar_mean(report, "output_throughput_tps"),
+            "ttft_p50_ms": percentile_mean(report, "ttft_ms", "p50"),
+            "tpot_p50_ms": percentile_mean(report, "tpot_ms", "p50"),
+            "e2e_p95_ms": percentile_mean(report, "e2e_ms", "p95"),
+            **quality_counts,
+        }
+    missing = sorted(required - set(rows))
+    if missing:
+        raise RuntimeError(f"{label}: missing concurrency cells {missing}")
+    return rows
+
+
+def compare_benchmarks(
+    ferrum_rows: dict[int, dict[str, Any]],
+    vllm_rows: dict[int, dict[str, Any]],
+    required_cells: list[int],
+) -> dict[str, Any]:
+    cells: dict[str, Any] = {}
+    for concurrency in required_cells:
+        ferrum = ferrum_rows[concurrency]
+        vllm = vllm_rows[concurrency]
+        throughput_ratio = ferrum["output_throughput_tps"] / vllm["output_throughput_tps"]
+        ttft_ratio = ferrum["ttft_p50_ms"] / vllm["ttft_p50_ms"]
+        tpot_ratio = ferrum["tpot_p50_ms"] / vllm["tpot_p50_ms"]
+        passed = throughput_ratio >= 0.70 and ttft_ratio <= 1.50 and tpot_ratio <= 1.50
+        cells[f"c{concurrency}"] = {
+            "status": "pass" if passed else "fail",
+            "concurrency": concurrency,
+            "ferrum_output_throughput_tps": ferrum["output_throughput_tps"],
+            "vllm_output_throughput_tps": vllm["output_throughput_tps"],
+            "output_throughput_ratio_to_vllm": throughput_ratio,
+            "ferrum_ttft_p50_ms": ferrum["ttft_p50_ms"],
+            "vllm_ttft_p50_ms": vllm["ttft_p50_ms"],
+            "ttft_ratio_to_vllm": ttft_ratio,
+            "ferrum_tpot_p50_ms": ferrum["tpot_p50_ms"],
+            "vllm_tpot_p50_ms": vllm["tpot_p50_ms"],
+            "tpot_ratio_to_vllm": tpot_ratio,
+            "p95_end_to_end_latency_ms": ferrum["e2e_p95_ms"],
+            "bad_output_count": ferrum.get("bad_output", 0),
+            "malformed_stream_count": ferrum.get("malformed_stream", 0),
+        }
+        if not passed:
+            raise RuntimeError(
+                f"comparison c={concurrency} failed: throughput_ratio={throughput_ratio:.3f} "
+                f"ttft_ratio={ttft_ratio:.3f} tpot_ratio={tpot_ratio:.3f}"
+            )
+    return {"status": "pass", "cells": cells}
+
+
+def ferrum_only_comparison(
+    ferrum_rows: dict[int, dict[str, Any]],
+    required_cells: list[int],
+    reason: str,
+) -> dict[str, Any]:
+    cells: dict[str, Any] = {}
+    for concurrency in required_cells:
+        ferrum = ferrum_rows[concurrency]
+        cells[f"c{concurrency}"] = {
+            "status": "pass",
+            "mode": "ferrum_only",
+            "baseline": "not_run",
+            "reason": reason,
+            "concurrency": concurrency,
+            "ferrum_output_throughput_tps": ferrum["output_throughput_tps"],
+            "ferrum_ttft_p50_ms": ferrum["ttft_p50_ms"],
+            "ferrum_tpot_p50_ms": ferrum["tpot_p50_ms"],
+            "p95_end_to_end_latency_ms": ferrum["e2e_p95_ms"],
+            "bad_output_count": ferrum.get("bad_output", 0),
+            "malformed_stream_count": ferrum.get("malformed_stream", 0),
+        }
+    return {
+        "status": "pass",
+        "mode": "ferrum_only",
+        "baseline": "not_run",
+        "reason": reason,
+        "cells": cells,
+    }
+
+
+def copy_if_present(src: Path, dst: Path) -> None:
+    if src.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+
+
+def normalize_runtime_artifacts(root: Path) -> None:
+    copy_if_present(root / "run.effective_config.json", root / "effective_config.json")
+    copy_if_present(root / "run.decision_trace.jsonl", root / "decision_trace.jsonl")
+
+
+def require_effective_config(path: Path, label: str) -> dict[str, Any]:
+    data = load_json(path)
+    required = {
+        "backend",
+        "requested_gpu_devices",
+        "selected_gpu_devices",
+        "cuda_device_count",
+        "selected_distributed_strategy",
+        "selected_layer_split_plan",
+        "selected_weight_placement",
+        "selected_kv_layout",
+        "selected_attention_impl",
+        "selected_graph_mode",
+        "selected_max_sequences",
+        "selected_max_model_len",
+        "selected_kv_capacity",
+        "selected_max_batched_tokens",
+        "model_capabilities",
+    }
+    missing = sorted(required - set(data))
+    if missing:
+        raise RuntimeError(f"{label} missing effective config fields: {missing}")
+    if data["backend"] != "cuda":
+        raise RuntimeError(f"{label}: backend must be cuda, got {data['backend']!r}")
+    if data["requested_gpu_devices"] != REQUIRED_GPU_DEVICES:
+        raise RuntimeError(
+            f"{label}: requested_gpu_devices must be {REQUIRED_GPU_DEVICES}, "
+            f"got {data['requested_gpu_devices']!r}"
+        )
+    if data["selected_gpu_devices"] != REQUIRED_GPU_DEVICES:
+        raise RuntimeError(
+            f"{label}: selected_gpu_devices must be {REQUIRED_GPU_DEVICES}, "
+            f"got {data['selected_gpu_devices']!r}"
+        )
+    if data["cuda_device_count"] != 2:
+        raise RuntimeError(f"{label}: cuda_device_count must be 2, got {data['cuda_device_count']!r}")
+    if data["selected_distributed_strategy"] != "layer_split":
+        raise RuntimeError(
+            f"{label}: selected_distributed_strategy must be layer_split, "
+            f"got {data['selected_distributed_strategy']!r}"
+        )
+    expected_plan = even_layer_split_plan_for_layers(REQUIRED_GPU_DEVICES, 80)
+    if data["selected_layer_split_plan"] != expected_plan:
+        raise RuntimeError(
+            f"{label}: selected_layer_split_plan must be {expected_plan!r}, "
+            f"got {data['selected_layer_split_plan']!r}"
+        )
+    if data["selected_weight_placement"] != "layer_split":
+        raise RuntimeError(
+            f"{label}: selected_weight_placement must be layer_split, "
+            f"got {data['selected_weight_placement']!r}"
+        )
+    return data
+
+
+def validate_hardware_for_gate(hardware: dict[str, Any]) -> None:
+    if hardware.get("cuda_device_count") != 2:
+        raise RuntimeError(f"expected exactly 2 CUDA devices, got {hardware.get('cuda_device_count')!r}")
+    names = [str(name).lower() for name in hardware.get("gpu_names", [])]
+    if len(names) != 2:
+        raise RuntimeError(f"expected two GPU names, got {hardware.get('gpu_names')!r}")
+    if any("4090" not in name for name in names):
+        raise RuntimeError(f"expected two RTX 4090 GPUs, got {hardware.get('gpu_names')!r}")
+
+
+def ensure_failure_artifacts(root: Path, error: str) -> None:
+    json_defaults = {
+        "metadata.json": {"status": "fail", "error": error, "lane": LANE},
+        "effective_config.json": {"status": "fail", "error": error},
+        "hardware.json": {"status": "fail", "error": error, "gpu_names": [], "gpus": []},
+        "model_manifest.json": {"status": "fail", "error": error},
+        "run.command.json": {"status": "fail", "error": error},
+        "run.effective_config.json": {"status": "fail", "error": error},
+        "serve.command.json": {"status": "not_run", "blocked_by": error},
+        "serve.effective_config.json": {"status": "not_run", "blocked_by": error},
+        "serve.health.json": {"status": "not_run", "blocked_by": error},
+        "serve.models.json": {"status": "not_run", "blocked_by": error},
+        "serve.correctness.json": {"status": "not_run", "blocked_by": error},
+        "serve.multiturn.json": {"status": "not_run", "blocked_by": error},
+        "serve.structured_output.json": {"status": "not_run", "blocked_by": error},
+        "serve.tool_call.json": {"status": "not_run", "blocked_by": error},
+        "concurrency_quality_regression.json": {"status": "not_run", "blocked_by": error},
+        "bench-serve.command.json": {"status": "not_run", "blocked_by": error},
+        "bench-serve.json": {"status": "not_run", "blocked_by": error},
+        "vllm-baseline.command.json": {"status": "not_run", "blocked_by": error},
+        "vllm-baseline.json": {"status": "not_run", "blocked_by": error},
+        "comparison.json": {"status": "not_run", "blocked_by": error, "cells": {}},
+    }
+    text_defaults = {
+        "decision_trace.jsonl": json.dumps({"status": "fail", "error": error}) + "\n",
+        "nvidia-smi.before.txt": f"not captured: {error}\n",
+        "nvidia-smi.during.txt": f"not captured: {error}\n",
+        "nvidia-smi.after.txt": f"not captured: {error}\n",
+        "run.stdin": "",
+        "run.stdout": "",
+        "run.stderr": f"not run: {error}\n",
+        "serve.log": f"not run: {error}\n",
+        "serve.streaming.sse": f"not run: {error}\n",
+        "bench-serve.stdout": "",
+        "bench-serve.stderr": f"not run: {error}\n",
+    }
+    for rel, data in json_defaults.items():
+        path = root / rel
+        if not path.exists():
+            write_json(path, data)
+    for rel, text in text_defaults.items():
+        path = root / rel
+        if not path.exists():
+            write_text(path, text)
+
+
+def update_metadata_status(root: Path, status: str, error: str | None = None) -> None:
+    path = root / "metadata.json"
+    if not path.is_file():
+        return
+    try:
+        data = load_json(path)
+    except Exception:
+        return
+    data["status"] = status
+    data["finished_at"] = iso_now()
+    if error:
+        data["error"] = error
+    write_json(path, data)
+
+
+def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    input_text = "\n".join(
+        [
+            f"Output only the exact token inside brackets: [{RECALL_MARKER}].",
+            "Output only the exact token inside brackets from the previous user message.",
+            "/bye",
+            "",
+        ]
+    )
+    cmd = build_run_command(ferrum_bin, cfg["model"], cfg, root)
+    write_json(
+        root / "run.command.json",
+        {
+            "cmd": cmd,
+            "expected_gpu_devices": REQUIRED_GPU_DEVICES,
+            "expected_distributed_strategy": "layer_split",
+            "expected_layer_split_plan": layer_split_plan_from_config(cfg),
+            "config": {
+                "max_model_len": cfg.get("max_model_len"),
+                "kv_capacity": cfg.get("kv_capacity"),
+                "max_num_seqs": cfg.get("max_num_seqs"),
+                "max_num_batched_tokens": cfg.get("max_num_batched_tokens"),
+            },
+        },
+    )
+    write_text(root / "run.stdin", input_text)
+    proc = run(cmd, cwd=repo, input_text=input_text, timeout=1800)
+    write_text(root / "run.stdout", proc.stdout)
+    write_text(root / "run.stderr", proc.stderr)
+    normalize_runtime_artifacts(root)
+    assert_no_bad_patterns("ferrum run stdout/stderr", proc.stdout + "\n" + proc.stderr)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ferrum run layer_split probe failed rc={proc.returncode}")
+    turns = assistant_text_from_jsonl(proc.stdout)
+    if len(turns) < 2:
+        raise RuntimeError(f"ferrum run expected at least 2 assistant turns, got {len(turns)}")
+    for turn in turns:
+        content = strip_think(str(turn.get("content") or ""))
+        if not content:
+            raise RuntimeError(f"ferrum run assistant turn is empty: {turn}")
+        if turn.get("finish_reason") == "length":
+            raise RuntimeError(f"ferrum run assistant turn finished by length: {turn}")
+    recall = strip_think(str(turns[-1].get("content") or ""))
+    if RECALL_MARKER not in recall:
+        raise RuntimeError(f"ferrum run recall failed: {recall[:500]!r}")
+    effective = require_effective_config(root / "run.effective_config.json", "run")
+    return {
+        "status": "pass",
+        "returncode": proc.returncode,
+        "assistant_turns": len(turns),
+        "has_precise_recall": True,
+        "selected_layer_split_plan": effective["selected_layer_split_plan"],
+    }
+
+
+def capture_health(root: Path, base_url: str) -> dict[str, Any]:
+    status, body = get_url(base_url.rstrip("/") + "/health", timeout=30)
+    write_text(root / "serve.health.json", body)
+    data = parsed_response("serve health", status, body)
+    assert_no_bad_patterns("serve health", body)
+    result = {"status": "pass", "http_status": status, "version": data.get("version")}
+    write_json(root / "serve.health.json", {**data, **result})
+    return result
+
+
+def capture_models(root: Path, base_url: str, model: str) -> dict[str, Any]:
+    status, body = get_url(base_url.rstrip("/") + "/v1/models", timeout=30)
+    write_text(root / "serve.models.raw.json", body)
+    data = parsed_response("serve models", status, body)
+    model_ids = []
+    for item in data.get("data", []):
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            model_ids.append(item["id"])
+    accepted_ids = {model, Path(model).name}
+    if not any(model_id in accepted_ids or model_id == model for model_id in model_ids):
+        raise RuntimeError(f"/v1/models does not include target model {model!r}: {model_ids!r}")
+    result = {"status": "pass", "http_status": status, "model_ids": model_ids}
+    write_json(root / "serve.models.json", result)
+    return result
+
+
+def serve_correctness(root: Path, base_url: str, model: str) -> dict[str, Any]:
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "123+456 等于多少？只输出数字。"}],
+        "max_tokens": 128,
+    }
+    status, body = post_json(base_url, payload, timeout=300)
+    write_text(root / "serve.correctness.response.json", body)
+    data = parsed_response("serve correctness", status, body)
+    content, finish_reason = first_message_content(data)
+    assert_no_bad_patterns("serve correctness", content)
+    if "579" not in strip_think(content):
+        raise RuntimeError(f"serve correctness expected 579, got {content[:500]!r}")
+    if finish_reason == "length":
+        raise RuntimeError("serve correctness finished by length")
+    result = {
+        "status": "pass",
+        "http_status": status,
+        "contains_expected_answer": True,
+        "finish_reason": finish_reason,
+    }
+    write_json(root / "serve.correctness.json", result)
+    return result
+
+
+def serve_multiturn(root: Path, base_url: str, model: str) -> dict[str, Any]:
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": f"请记住方括号里的精确代码：[{RECALL_MARKER}]。只回答 OK。",
+            },
+            {"role": "assistant", "content": "OK"},
+            {
+                "role": "user",
+                "content": "只输出上一条用户消息方括号里的精确代码，不要解释，不要替换，不要改大小写。",
+            },
+        ],
+        "max_tokens": 128,
+        "stop": ["\n"],
+    }
+    status, body = post_json(base_url, payload, timeout=300)
+    write_text(root / "serve.multiturn.response.json", body)
+    data = parsed_response("serve multiturn", status, body)
+    content, finish_reason = first_message_content(data)
+    assert_no_bad_patterns("serve multiturn", content)
+    if RECALL_MARKER not in strip_think(content):
+        raise RuntimeError(f"serve multiturn recall failed: {content[:500]!r}")
+    if finish_reason == "length":
+        raise RuntimeError("serve multiturn finished by length")
+    result = {
+        "status": "pass",
+        "http_status": status,
+        "has_precise_recall": True,
+        "finish_reason": finish_reason,
+    }
+    write_json(root / "serve.multiturn.json", result)
+    return result
+
+
+def serve_structured_output(root: Path, base_url: str, model: str) -> dict[str, Any]:
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Return JSON for the answer to 123+456. Use answer string 579.",
+            }
+        ],
+        "max_tokens": 128,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "Answer",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                },
+            },
+        },
+    }
+    status, body = post_json(base_url, payload, timeout=300)
+    write_text(root / "serve.structured_output.response.json", body)
+    data = parsed_response("serve structured output", status, body)
+    content, finish_reason = first_message_content(data)
+    assert_no_bad_patterns("serve structured output", content)
+    try:
+        parsed_content = json.loads(strip_think(content))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"structured output content is not JSON: {content[:500]!r}") from exc
+    if parsed_content.get("answer") != "579":
+        raise RuntimeError(f"structured output answer mismatch: {parsed_content!r}")
+    if finish_reason == "length":
+        raise RuntimeError("serve structured output finished by length")
+    result = {
+        "status": "pass",
+        "http_status": status,
+        "json_ok": True,
+        "schema_ok": True,
+        "finish_reason": finish_reason,
+    }
+    write_json(root / "serve.structured_output.json", result)
+    return result
+
+
+def serve_tool_call(root: Path, base_url: str, model: str) -> dict[str, Any]:
+    subdir = root / "tool-call-regression"
+    result = run_tool_call_regression(base_url, model, subdir)
+    write_json(root / "serve.tool_call.json", result)
+    return result
+
+
+def serve_streaming(root: Path, base_url: str, model: str) -> dict[str, Any]:
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "messages": [{"role": "user", "content": "用一句中文解释 Ferrum 是什么。"}],
+        "max_tokens": 128,
+    }
+    status, body = post_json(base_url, payload, timeout=300)
+    write_text(root / "serve.streaming.sse", body)
+    if status != 200:
+        raise RuntimeError(f"serve streaming expected HTTP 200, got {status}: {body[:500]}")
+    assert_no_bad_patterns("serve streaming", body)
+    chunks, done_count, malformed = parse_sse(body)
+    content = "".join(
+        str(chunk.get("choices", [{}])[0].get("delta", {}).get("content") or "")
+        for chunk in chunks
+        if isinstance(chunk.get("choices"), list) and chunk.get("choices")
+    )
+    usage_chunks = sum(1 for chunk in chunks if chunk.get("usage") not in (None, {}))
+    if done_count != 1:
+        raise RuntimeError(f"serve streaming expected exactly one [DONE], got {done_count}")
+    if malformed != 0:
+        raise RuntimeError(f"serve streaming malformed SSE JSON count={malformed}")
+    if not content.strip():
+        raise RuntimeError("serve streaming emitted no content delta")
+    if usage_chunks != 1:
+        raise RuntimeError(f"serve streaming expected one usage chunk, got {usage_chunks}")
+    return {
+        "status": "pass",
+        "http_status": status,
+        "done_count": done_count,
+        "malformed_sse_json_count": malformed,
+        "usage_chunk_count": usage_chunks,
+        "content_delta_nonempty": True,
+    }
+
+
+def run_concurrency_gate(root: Path, base_url: str, model: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    cells = [int(c) for c in cfg.get("concurrency_cells", [1, 4, 8, 16])]
+    subdir = root / "concurrency-quality-regression"
+    result = run_concurrency_quality_regression(base_url, model, subdir, cells, timeout=300)
+    copy_if_present(
+        subdir / "concurrency_quality_regression.json",
+        root / "concurrency_quality_regression.json",
+    )
+    return result
+
+
+def bench_command_for_base_url(
+    ferrum_bin: Path,
+    cfg: dict[str, Any],
+    *,
+    base_url: str,
+    model: str,
+    tokenizer_dir: Path,
+    out_file: Path,
+    tag: str,
+) -> list[str]:
+    cmd = [
+        str(ferrum_bin),
+        "bench-serve",
+        "--base-url",
+        base_url.rstrip("/"),
+        "--model",
+        model,
+        "--tokenizer",
+        str(tokenizer_dir),
+        "--dataset",
+        "random",
+        "--random-input-len",
+        str(cfg.get("random_input_len", 256)),
+        "--random-output-len",
+        str(cfg.get("random_output_len", 128)),
+        "--num-prompts",
+        str(cfg.get("num_prompts", 96)),
+        "--warmup-requests",
+        str(cfg.get("warmup_requests", 10)),
+        "--n-repeats",
+        str(cfg.get("n_repeats", 3)),
+        "--concurrency-sweep",
+        ",".join(str(cell) for cell in cfg.get("concurrency_cells", [1, 4, 8, 16])),
+        "--fail-on-error",
+        "--seed",
+        str(cfg.get("seed", 9271)),
+        "--output",
+        "json",
+        "--out",
+        str(out_file),
+        "--tag",
+        tag,
+    ]
+    if cfg.get("require_ci", True):
+        cmd.insert(cmd.index("--seed"), "--require-ci")
+    return cmd
+
+
+def run_ferrum_bench_gate(
+    root: Path,
+    repo: Path,
+    ferrum_bin: Path,
+    cfg: dict[str, Any],
+    base_url: str,
+    model: str,
+) -> dict[str, Any]:
+    tokenizer_dir = resolve_tokenizer(str(cfg.get("tokenizer", "auto")), model)
+    cmd = bench_command_for_base_url(
+        ferrum_bin,
+        cfg,
+        base_url=base_url,
+        model=model,
+        tokenizer_dir=tokenizer_dir,
+        out_file=root / "bench-serve.json",
+        tag="cuda-llama33-70b-4bit-2x4090",
+    )
+    write_json(root / "bench-serve.command.json", {"status": "run", "cmd": cmd})
+    proc = run(cmd, cwd=repo, timeout=int(cfg.get("bench_timeout_sec", 7200)))
+    write_text(root / "bench-serve.stdout", proc.stdout)
+    write_text(root / "bench-serve.stderr", proc.stderr)
+    assert_no_bad_patterns("bench-serve output", proc.stdout + "\n" + proc.stderr)
+    if proc.returncode != 0:
+        raise RuntimeError(f"bench-serve failed rc={proc.returncode}")
+    rows = validate_bench_reports(
+        root / "bench-serve.json",
+        cfg,
+        require_ci=bool(cfg.get("require_ci", True)),
+        label="ferrum bench-serve",
+    )
+    return {"status": "pass", "rows": list(rows.values())}
+
+
+def build_vllm_server_command(cfg: dict[str, Any]) -> list[str]:
+    port = int(cfg.get("port", 19400)) + int(cfg.get("vllm_port_offset", 1))
+    cmd = [
+        "vllm",
+        "serve",
+        str(cfg["model"]),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--tensor-parallel-size",
+        "2",
+        "--served-model-name",
+        str(cfg["model"]),
+    ]
+    quant = str(cfg.get("quant_format", "gptq_int4")).lower()
+    if "gptq" in quant:
+        cmd.extend(["--quantization", "gptq"])
+    elif "awq" in quant:
+        cmd.extend(["--quantization", "awq"])
+    if cfg.get("max_model_len") is not None:
+        cmd.extend(["--max-model-len", str(cfg["max_model_len"])])
+    if cfg.get("max_num_seqs") is not None:
+        cmd.extend(["--max-num-seqs", str(cfg["max_num_seqs"])])
+    if cfg.get("gpu_memory_utilization") is not None:
+        cmd.extend(["--gpu-memory-utilization", str(cfg["gpu_memory_utilization"])])
+    return cmd
+
+
+def terminate_process_group(proc: subprocess.Popen[str] | None, *, sig: int = signal.SIGINT) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=45)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=15)
+
+
+def run_vllm_baseline_gate(
+    root: Path,
+    repo: Path,
+    ferrum_bin: Path,
+    cfg: dict[str, Any],
+    model: str,
+) -> dict[str, Any]:
+    tokenizer_dir = resolve_tokenizer(str(cfg.get("tokenizer", "auto")), model)
+    port = int(cfg.get("port", 19400)) + int(cfg.get("vllm_port_offset", 1))
+    base_url = f"http://127.0.0.1:{port}"
+    server_cmd = build_vllm_server_command(cfg)
+    bench_cmd = bench_command_for_base_url(
+        ferrum_bin,
+        cfg,
+        base_url=base_url,
+        model=model,
+        tokenizer_dir=tokenizer_dir,
+        out_file=root / "vllm-baseline.json",
+        tag="vllm-llama33-70b-4bit-2x4090",
+    )
+    write_json(
+        root / "vllm-baseline.command.json",
+        {
+            "status": "run",
+            "server_cmd": server_cmd,
+            "bench_cmd": bench_cmd,
+            "same_hardware_required": True,
+        },
+    )
+    proc: subprocess.Popen[str] | None = None
+    log_path = root / "vllm-baseline.log"
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            proc = subprocess.Popen(
+                server_cmd,
+                cwd=repo,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+                start_new_session=True,
+            )
+        wait_health(base_url, timeout_sec=int(cfg.get("vllm_startup_timeout_sec", 1800)))
+        bench = run(bench_cmd, cwd=repo, timeout=int(cfg.get("bench_timeout_sec", 7200)))
+        write_text(root / "vllm-baseline.stdout", bench.stdout)
+        write_text(root / "vllm-baseline.stderr", bench.stderr)
+        assert_no_bad_patterns("vLLM bench output", bench.stdout + "\n" + bench.stderr)
+        if bench.returncode != 0:
+            raise RuntimeError(f"vLLM baseline bench failed rc={bench.returncode}")
+        rows = validate_bench_reports(
+            root / "vllm-baseline.json",
+            cfg,
+            require_ci=bool(cfg.get("require_ci", True)),
+            label="vLLM baseline",
+        )
+        return {"status": "pass", "rows": list(rows.values())}
+    finally:
+        terminate_process_group(proc)
+
+
+def write_diagnostic_vllm_skip(
+    root: Path,
+    cfg: dict[str, Any],
+    ferrum_rows: dict[int, dict[str, Any]],
+    reason: str,
+) -> dict[str, Any]:
+    write_json(
+        root / "vllm-baseline.command.json",
+        {
+            "status": "skipped",
+            "reason": reason,
+            "server_cmd": build_vllm_server_command(cfg),
+            "same_hardware_required": True,
+        },
+    )
+    result = {"status": "skipped", "reason": reason}
+    write_json(root / "vllm-baseline.json", result)
+    comparison = ferrum_only_comparison(
+        ferrum_rows,
+        [int(c) for c in cfg.get("concurrency_cells", [1, 4, 8, 16])],
+        reason,
+    )
+    write_json(root / "comparison.json", comparison)
+    return result
+
+
+def gate_fail(root: Path, error: str, checks: dict[str, Any]) -> int:
+    ensure_failure_artifacts(root, error)
+    update_metadata_status(root, "fail", error)
+    write_json(
+        root / "gate.json",
+        {
+            "schema_version": 1,
+            "status": "fail",
+            "lane": LANE,
+            "error": error,
+            "checks": checks,
+            "pass_line": None,
+        },
+    )
+    print(f"G0 CUDA LLAMA33 70B 4BIT 2X4090 GATE FAIL: {error}", file=sys.stderr)
+    return 1
+
+
+def gate_pass(root: Path, checks: dict[str, Any]) -> int:
+    pass_line = f"{PASS_LINE_PREFIX}: {root}"
+    update_metadata_status(root, "pass")
+    write_json(
+        root / "gate.json",
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "lane": LANE,
+            "checks": checks,
+            "pass_line": pass_line,
+        },
+    )
+    print(pass_line)
+    return 0
+
+
+def self_test() -> int:
+    cfg = {
+        "model": "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+        "quant_format": "gptq_int4",
+        "gpu_devices": [0, 1],
+        "distributed_strategy": "layer_split",
+        "num_hidden_layers": 80,
+        "max_model_len": 8192,
+        "kv_capacity": 2048,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 1024,
+    }
+    validate_config(cfg)
+    assert (
+        layer_split_plan_from_config(cfg)
+        == "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79"
+    )
+    cmd = build_run_command(Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out"))
+    assert "--gpu-devices" in cmd
+    assert "0,1" in cmd
+    assert "--effective-config-json" in cmd
+    assert "--max-model-len" in cmd
+    assert "8192" in cmd
+    assert "--kv-capacity" in cmd
+    assert "2048" in cmd
+    assert "--max-num-seqs" in cmd
+    assert "8" in cmd
+    assert "--max-num-batched-tokens" in cmd
+    assert "1024" in cmd
+    serve_cmd = build_serve_command(Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out"))
+    assert serve_cmd[1] == "serve"
+    assert "--gpu-devices" in serve_cmd
+    bench_cmd = build_bench_serve_command(Path("./target/release/ferrum"), cfg, Path("/tmp/out"))
+    assert "--fail-on-error" in bench_cmd
+    assert "--require-ci" in bench_cmd
+    assert "--n-repeats" in bench_cmd
+    smoke_cfg = {**cfg, "require_ci": False, "n_repeats": 1, "concurrency_cells": [1, 4]}
+    smoke_bench_cmd = build_bench_serve_command(
+        Path("./target/release/ferrum"),
+        smoke_cfg,
+        Path("/tmp/out"),
+    )
+    assert "--fail-on-error" in smoke_bench_cmd
+    assert "--require-ci" not in smoke_bench_cmd
+    hardware = query_hardware(Path("/tmp"), "")
+    assert "gpu_names" in hardware
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-source-gate-") as tmp:
+        root = Path(tmp)
+        ensure_failure_artifacts(root, "selftest failure")
+        write_json(
+            root / "gate.json",
+            {
+                "schema_version": 1,
+                "status": "fail",
+                "lane": LANE,
+                "pass_line": None,
+            },
+        )
+        missing = sorted(name for name in REQUIRED_ARTIFACT_FILES if not (root / name).exists())
+        assert not missing, missing
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-bench-") as tmp:
+        root = Path(tmp)
+        bench_report = {
+            "concurrency": 1,
+            "completed_per_run": [2, 2, 2],
+            "errored_per_run": [0, 0, 0],
+            "n_repeats": 3,
+            "output_token_count_source": "usage",
+            "output_throughput_tps": {"mean": 70.0},
+            "ttft_ms": {"p50": {"mean": 120.0}},
+            "tpot_ms": {"p50": {"mean": 12.0}},
+            "e2e_ms": {"p95": {"mean": 800.0}},
+            "bad_output_per_run": [0, 0, 0],
+            "malformed_stream_per_run": [0, 0, 0],
+            "missing_done_per_run": [0, 0, 0],
+            "duplicate_done_per_run": [0, 0, 0],
+            "zero_output_tokens_per_run": [0, 0, 0],
+            "stream_bulk_flush_per_run": [0, 0, 0],
+            "http_500_per_run": [0, 0, 0],
+            "panic_per_run": [0, 0, 0],
+        }
+        vllm_report = {
+            **bench_report,
+            "output_throughput_tps": {"mean": 100.0},
+            "ttft_ms": {"p50": {"mean": 100.0}},
+            "tpot_ms": {"p50": {"mean": 10.0}},
+        }
+        write_json(root / "ferrum.json", [bench_report])
+        write_json(root / "vllm.json", [vllm_report])
+        bench_cfg = {**cfg, "concurrency_cells": [1], "require_ci": True}
+        ferrum_rows = validate_bench_reports(
+            root / "ferrum.json",
+            bench_cfg,
+            require_ci=True,
+            label="selftest ferrum",
+        )
+        vllm_rows = validate_bench_reports(
+            root / "vllm.json",
+            bench_cfg,
+            require_ci=True,
+            label="selftest vllm",
+        )
+        comparison = compare_benchmarks(ferrum_rows, vllm_rows, [1])
+        assert comparison["cells"]["c1"]["status"] == "pass"
+        ferrum_only = ferrum_only_comparison(ferrum_rows, [1], "selftest")
+        assert ferrum_only["status"] == "pass"
+        assert ferrum_only["mode"] == "ferrum_only"
+        skip = write_diagnostic_vllm_skip(root, bench_cfg, ferrum_rows, "selftest")
+        assert skip["status"] == "skipped"
+    print("G0 CUDA LLAMA33 70B 4BIT 2X4090 GATE SELFTEST PASS")
+    return 0
+
+
+def main() -> int:
+    global LANE, PASS_LINE_PREFIX
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--ferrum-bin", type=Path, default=Path("./target/release/ferrum"))
+    parser.add_argument("--lane-name", default=LANE, choices=[LANE, SMOKE_LANE])
+    args = parser.parse_args()
+    LANE = args.lane_name
+    PASS_LINE_PREFIX = f"G0 SOURCE {LANE} PASS"
+    if args.self_test:
+        return self_test()
+    if args.config is None or args.out is None:
+        parser.error("--config and --out are required")
+
+    repo = Path(__file__).resolve().parents[2]
+    root = args.out
+    root.mkdir(parents=True, exist_ok=True)
+    checks: dict[str, Any] = {}
+    proc: subprocess.Popen[str] | None = None
+    try:
+        cfg = load_json(args.config)
+        validate_config(cfg)
+        checks["config"] = {"status": "pass", "path": str(args.config)}
+        before_smi = capture_nvidia_smi(root, "before")
+        hardware = write_hardware(root, repo, before_smi)
+        validate_hardware_for_gate(hardware)
+        checks["hardware"] = {
+            "status": "pass",
+            "cuda_device_count": hardware.get("cuda_device_count"),
+            "gpu_names": hardware.get("gpu_names", []),
+        }
+        model_manifest(root, cfg)
+        write_planned_command_artifacts(root, args.ferrum_bin, cfg)
+        write_metadata(root, repo, args.ferrum_bin, cfg, hardware, sys.argv)
+        checks["run"] = run_cli_probe(root, repo, args.ferrum_bin, cfg)
+
+        model = str(cfg["model"])
+        port = int(cfg.get("port", 19400))
+        base_url = f"http://127.0.0.1:{port}"
+        serve_cmd = build_serve_command(args.ferrum_bin, model, cfg, root)
+        write_json(
+            root / "serve.command.json",
+            {
+                "status": "run",
+                "cmd": serve_cmd,
+                "expected_gpu_devices": REQUIRED_GPU_DEVICES,
+                "expected_distributed_strategy": "layer_split",
+                "expected_layer_split_plan": layer_split_plan_from_config(cfg),
+            },
+        )
+        serve_log = root / "serve.log"
+        with serve_log.open("w", encoding="utf-8") as log:
+            proc = subprocess.Popen(
+                serve_cmd,
+                cwd=repo,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+                start_new_session=True,
+            )
+        wait_health(base_url, timeout_sec=int(cfg.get("serve_startup_timeout_sec", 1800)))
+        capture_nvidia_smi(root, "during")
+        require_effective_config(root / "serve.effective_config.json", "serve")
+        checks["serve_health"] = capture_health(root, base_url)
+        checks["serve_models"] = capture_models(root, base_url, model)
+        checks["serve_correctness"] = serve_correctness(root, base_url, model)
+        checks["serve_multiturn"] = serve_multiturn(root, base_url, model)
+        checks["serve_structured_output"] = serve_structured_output(root, base_url, model)
+        checks["serve_tool_call"] = serve_tool_call(root, base_url, model)
+        checks["serve_streaming"] = serve_streaming(root, base_url, model)
+        checks["concurrency_quality"] = run_concurrency_gate(root, base_url, model, cfg)
+        checks["bench_serve"] = run_ferrum_bench_gate(root, repo, args.ferrum_bin, cfg, base_url, model)
+
+        terminate_process_group(proc)
+        proc = None
+        log_text = serve_log.read_text(errors="replace")
+        assert_no_bad_patterns("serve.log", log_text)
+
+        ferrum_rows = validate_bench_reports(
+            root / "bench-serve.json",
+            cfg,
+            require_ci=bool(cfg.get("require_ci", True)),
+            label="ferrum bench-serve",
+        )
+        if cfg.get("run_vllm_baseline", True):
+            checks["vllm_baseline"] = run_vllm_baseline_gate(
+                root,
+                repo,
+                args.ferrum_bin,
+                cfg,
+                model,
+            )
+            vllm_rows = validate_bench_reports(
+                root / "vllm-baseline.json",
+                cfg,
+                require_ci=bool(cfg.get("require_ci", True)),
+                label="vLLM baseline",
+            )
+            comparison = compare_benchmarks(
+                ferrum_rows,
+                vllm_rows,
+                [int(c) for c in cfg.get("concurrency_cells", [1, 4, 8, 16])],
+            )
+            write_json(root / "comparison.json", comparison)
+            checks["comparison"] = comparison
+        else:
+            reason = (
+                "config sets run_vllm_baseline=false; Ferrum-only service evidence is required "
+                "for this lane and no vLLM-relative performance claim is made"
+            )
+            checks["vllm_baseline"] = write_diagnostic_vllm_skip(root, cfg, ferrum_rows, reason)
+            checks["comparison"] = load_json(root / "comparison.json")
+
+        require_effective_config(root / "effective_config.json", "top-level")
+    except Exception as exc:
+        terminate_process_group(proc, sig=signal.SIGKILL)
+        capture_nvidia_smi(root, "after")
+        return gate_fail(root, str(exc), checks)
+    finally:
+        terminate_process_group(proc, sig=signal.SIGKILL)
+        if not (root / "nvidia-smi.during.txt").exists():
+            capture_nvidia_smi(root, "during")
+
+    capture_nvidia_smi(root, "after")
+    return gate_pass(root, checks)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

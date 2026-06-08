@@ -36,14 +36,23 @@
 
 These scripts are the current source of truth for G0 release validation.
 
+- `scripts/release/run_gate.py`
+  - Unified gate entrypoint. Use `python3 scripts/release/run_gate.py --list-lanes` to list lanes.
+  - Lanes: `unit`, `metal`, `cuda-smoke`, `cuda-full`, `cuda-llama-dense`, `cuda-llama33-70b-4bit-2x4090-smoke`, `cuda-llama33-70b-4bit-2x4090`, `metal-tarball`, `cuda-tarball`, `homebrew-metal`, `homebrew-cuda-fetch`, `release-summary`, `release-complete`.
+  - Each run writes `<out_dir>/gate.manifest.json` with lane, status, command line, git SHA, dirty status, artifact dir, timestamps, duration, binary SHA256 when available, model id/path when applicable, sanitized env, and PASS line.
+  - Self-test: `python3 scripts/release/run_gate.py --self-test`; this is also run by `scripts/release/selftest_g0_validators.py`.
+  - Required PASS line: `FERRUM GATE <lane> PASS: <out_dir>`.
+  - `scripts/release.sh` is only a compatibility wrapper and intentionally fails; do not use it as a release source of truth.
 - `scripts/release/g0_source_gate.sh`
-  - Lanes: `unit`, `metal`, `cuda-smoke`, `cuda-full`, `cuda-llama-dense`, `all-source`.
+  - Lanes: `unit`, `metal`, `cuda-smoke`, `cuda-full`, `cuda-llama-dense`, `cuda-llama33-70b-4bit-2x4090-smoke`, `cuda-llama33-70b-4bit-2x4090`, `all-source`.
   - Required PASS lines:
     - `G0 SOURCE unit PASS: <out_root>`
     - `G0 SOURCE metal PASS: <out_root>`
     - `G0 SOURCE g0_cuda4090_smoke PASS: <out_root>`
     - `G0 SOURCE g0_cuda4090_full PASS: <out_root>`
     - `G0 SOURCE g0_cuda4090_llama_dense PASS: <out_root>`
+    - `G0 SOURCE g0_cuda2x4090_llama33_70b_4bit_smoke PASS: <out_root>`
+    - `G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS: <out_root>`
     - `G0 SOURCE all-source PASS: <out_root>`
 - `scripts/release/validate_metal_readme_regression.py`
   - Validates artifacts from `scripts/metal_readme_regression.py`.
@@ -58,6 +67,30 @@ These scripts are the current source of truth for G0 release validation.
 - `scripts/release/g0_release_summary.py`
   - Aggregates required G0 gate artifacts.
   - Required final release PASS line: `G0 RELEASE PASS: <root>`.
+- `scripts/release/validate_release_completion_manifest.py`
+  - Validates the local release completion manifest shape for the `run_gate.py release-complete` lane.
+  - Required PASS line: `FERRUM RELEASE COMPLETION PASS: <out_dir>`.
+- `scripts/release/backend_boundary_audit.py`
+  - Cheap audit for backend-specific `cuda` / `metal` decisions outside allowed backend, registry, resolver, release, and allowlisted paths.
+  - Checked-in allowlist: `scripts/release/backend_boundary_allowlist.json`.
+  - Required PASS line: `BACKEND BOUNDARY AUDIT PASS: <out_dir>`.
+- `scripts/release/backend_runtime_preset_snapshot.py`
+  - Generates and validates no-weight runtime preset snapshots via `crates/ferrum-types/examples/backend_runtime_preset_snapshot.rs`.
+  - Checked-in snapshots live in `scripts/release/snapshots/backend_runtime_preset/`.
+  - Required PASS line: `BACKEND PRESET SNAPSHOT PASS: <out_dir>`.
+- `scripts/release/backend_runtime_preset_goal_gate.py`
+  - Final validator for backend runtime preset fast-iteration goals.
+  - Aggregates unit, Metal, CUDA, backend boundary, runtime preset snapshot, and product scenario artifacts.
+  - Required PASS line: `BACKEND RUNTIME PRESET GOAL PASS: <out_dir>`.
+- `scripts/release/llama33_70b_4bit_2x4090_goal_gate.py`
+  - Final validator for the Llama 3.3 70B 4bit 2x4090 goal.
+  - Aggregates Metal, existing 1x4090 CUDA full/dense, and the 2x4090 70B artifact.
+  - Required PASS line: `LLAMA33_70B_4BIT_2X4090 GOAL PASS: <out_dir>`.
+- `scripts/release/run_scenarios.py`
+  - Manifest-driven product regression runner for shared `ferrum run` and `ferrum serve` scenarios.
+  - Manifests: `scripts/release/scenarios/product_regression.json` and `scripts/release/scenarios/product_regression_smoke.json`.
+  - Self-test: `python3 scripts/release/run_scenarios.py --self-test`; this is also run by `scripts/release/selftest_g0_validators.py`.
+  - Required PASS line: `BACKEND REGRESSION SMOKE PASS: <out_dir>`.
 - `scripts/release/inventory_tree.py`
   - Required before moving, archiving, or deleting files under `crates/`, `docs/`, or `scripts/`.
   - Required PASS line: `INVENTORY PASS: <out_file>`.
@@ -69,7 +102,17 @@ These scripts are the current source of truth for G0 release validation.
 
 `cargo test --workspace --all-targets` is always the first source gate.
 
-Use `scripts/release/g0_source_gate.sh` instead of private one-off gate wrappers:
+Use `scripts/release/run_gate.py` for unified source, binary, summary, and completion lanes when practical:
+
+```bash
+python3 scripts/release/run_gate.py unit --out <out_root>
+python3 scripts/release/run_gate.py metal --out <out_root>
+python3 scripts/release/run_gate.py cuda-smoke --out <out_root>
+python3 scripts/release/run_gate.py cuda-full --out <out_root>
+python3 scripts/release/run_gate.py cuda-llama-dense --out <out_root>
+```
+
+`scripts/release/g0_source_gate.sh` remains the delegated source gate implementation:
 
 ```bash
 scripts/release/g0_source_gate.sh unit <out_root>
