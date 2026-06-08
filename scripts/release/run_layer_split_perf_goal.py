@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -86,6 +87,78 @@ def require_outside_repo(repo: Path, out_root: Path) -> None:
     )
 
 
+def parse_nvidia_smi_gpu_query(text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    reader = csv.reader(text.splitlines())
+    for row in reader:
+        parts = [part.strip() for part in row]
+        if len(parts) < 3:
+            continue
+        index, name, uuid = parts[:3]
+        rows.append(
+            {
+                "index": int(index) if index.isdigit() else index,
+                "name": name,
+                "uuid": uuid,
+            }
+        )
+    return rows
+
+
+def query_gpu_preflight(repo: Path) -> dict[str, Any]:
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,name,uuid",
+        "--format=csv,noheader",
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "cmd": cmd,
+            "returncode": proc.returncode,
+            "error": proc.stderr.strip() or proc.stdout.strip() or "nvidia-smi failed",
+            "gpus": [],
+        }
+    gpus = parse_nvidia_smi_gpu_query(proc.stdout)
+    status = "pass"
+    errors: list[str] = []
+    if len(gpus) != 2:
+        status = "fail"
+        errors.append(f"expected exactly 2 GPUs, got {len(gpus)}")
+    for idx, gpu in enumerate(gpus):
+        name = str(gpu.get("name", "")).lower()
+        if "4090" not in name:
+            status = "fail"
+            errors.append(f"GPU {idx} is not an RTX 4090: {gpu.get('name')!r}")
+    return {
+        "schema_version": 1,
+        "status": status,
+        "cmd": cmd,
+        "returncode": proc.returncode,
+        "gpus": gpus,
+        "errors": errors,
+    }
+
+
+def require_2x4090_preflight(repo: Path, out_root: Path) -> dict[str, Any]:
+    preflight = query_gpu_preflight(repo)
+    write_json(out_root / "layer_split_perf_gpu_preflight.json", preflight)
+    if preflight.get("status") != "pass":
+        errors = preflight.get("errors")
+        detail = "; ".join(errors) if isinstance(errors, list) and errors else preflight.get("error")
+        raise RuntimeError(f"layer-split perf full lane requires a 2x RTX 4090 host: {detail}")
+    return preflight
+
+
 def source_gate_command(
     repo: Path,
     ferrum_bin: Path,
@@ -151,6 +224,7 @@ def command_plan(
             "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
             "--n-repeats 3 --concurrency-sweep 1,4,8,16"
         ),
+        "hardware_preflight": "nvidia-smi must report exactly two RTX 4090 GPUs before build",
         "build_command": CUDA_BUILD_COMMAND,
         "baseline_artifact": str(baseline),
         "candidate_artifact": str(candidate),
@@ -204,6 +278,7 @@ def run_goal(args: argparse.Namespace) -> int:
     out_root = resolve_out_root(repo, args.out)
     require_outside_repo(repo, out_root)
     out_root.mkdir(parents=True, exist_ok=True)
+    require_2x4090_preflight(repo, out_root)
     ferrum_bin = args.ferrum_bin
     optional_vllm = args.optional_vllm_artifact
     plan = command_plan(repo, ferrum_bin, out_root, optional_vllm)
@@ -229,6 +304,14 @@ def self_test() -> int:
         raise AssertionError("repo-local output unexpectedly accepted")
     except RuntimeError as exc:
         assert "inside the git worktree" in str(exc)
+    gpus = parse_nvidia_smi_gpu_query(
+        "0, NVIDIA GeForce RTX 4090, GPU-selftest-0\n"
+        "1, NVIDIA GeForce RTX 4090, GPU-selftest-1\n"
+    )
+    assert [gpu["index"] for gpu in gpus] == [0, 1]
+    assert all("4090" in gpu["name"] for gpu in gpus)
+    bad_gpus = parse_nvidia_smi_gpu_query("0, NVIDIA GeForce RTX 3090, GPU-selftest-0\n")
+    assert len(bad_gpus) == 1
     plan = command_plan(repo, Path("./target/release/ferrum"), out, None)
     assert plan["baseline_artifact"] == str(out / "baseline-batch")
     assert plan["candidate_artifact"] == str(out / "candidate-overlapped")
@@ -236,6 +319,7 @@ def self_test() -> int:
     candidate_cmd = plan["commands"]["candidate_overlapped"]
     final_cmd = plan["commands"]["final_validator"]
     assert plan["commands"]["build_cuda_release"] == CUDA_BUILD_COMMAND
+    assert "two RTX 4090" in plan["hardware_preflight"]
     assert any(str(BASELINE_CONFIG) in item for item in baseline_cmd)
     assert any(str(CANDIDATE_CONFIG) in item for item in candidate_cmd)
     assert str(out / "candidate-overlapped") in final_cmd
