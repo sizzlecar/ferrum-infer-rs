@@ -967,16 +967,19 @@ def validate_vllm_bench_artifact(path: Path, expected_model: str) -> dict[str, A
     reports = reports_from_json(load_json(path / "vllm-baseline.json"), "vllm")
     rows: dict[int, dict[str, Any]] = {}
     throughput: dict[int, float] = {}
+    summaries: dict[int, dict[str, Any]] = {}
     expected_repeats = int(command_signature["n_repeats"])
     expected_num_prompts = int(command_signature["num_prompts"])
     for report in reports:
-        concurrency, tps = validate_report(
+        concurrency, summary = validate_report(
             report,
             "vllm",
             expected_repeats=expected_repeats,
             expected_num_prompts=expected_num_prompts,
         )
         rows[concurrency] = report
+        summaries[concurrency] = summary
+        tps = summary["output_throughput_tps"]["mean"]
         throughput[concurrency] = tps
     missing = sorted(REQUIRED_CONCURRENCY_CELLS - set(rows))
     if missing:
@@ -984,6 +987,7 @@ def validate_vllm_bench_artifact(path: Path, expected_model: str) -> dict[str, A
     return {
         "command_signature": command_signature,
         "throughput_by_concurrency": throughput,
+        "bench_summary_by_concurrency": summaries,
         "max_target_tps": max(throughput[c] for c in THROUGHPUT_TARGET_CELLS),
     }
 
@@ -1033,12 +1037,16 @@ def require_number(value: Any, label: str, *, positive: bool) -> float:
 
 
 def require_scalar_stats(value: Any, label: str) -> float:
+    return scalar_stats_summary(value, label)["mean"]
+
+
+def scalar_stats_summary(value: Any, label: str) -> dict[str, float]:
     if not isinstance(value, dict):
         raise ValidationError(f"{label} must contain mean/stddev/ci95_hw")
     mean = require_number(value.get("mean"), f"{label}.mean", positive=True)
-    require_number(value.get("stddev"), f"{label}.stddev", positive=False)
-    require_number(value.get("ci95_hw"), f"{label}.ci95_hw", positive=False)
-    return mean
+    stddev = require_number(value.get("stddev"), f"{label}.stddev", positive=False)
+    ci95_hw = require_number(value.get("ci95_hw"), f"{label}.ci95_hw", positive=False)
+    return {"mean": mean, "stddev": stddev, "ci95_hw": ci95_hw}
 
 
 def require_percentile_stats(
@@ -1047,10 +1055,19 @@ def require_percentile_stats(
     percentile: str,
     label: str,
 ) -> None:
+    percentile_stats_summary(report, metric, percentile, label)
+
+
+def percentile_stats_summary(
+    report: dict[str, Any],
+    metric: str,
+    percentile: str,
+    label: str,
+) -> dict[str, float]:
     metric_obj = report.get(metric)
     if not isinstance(metric_obj, dict):
         raise ValidationError(f"{label}: missing {metric}")
-    require_scalar_stats(metric_obj.get(percentile), f"{label}: {metric}.{percentile}")
+    return scalar_stats_summary(metric_obj.get(percentile), f"{label}: {metric}.{percentile}")
 
 
 def list_sum(value: Any) -> int:
@@ -1089,12 +1106,19 @@ def validate_actual_input_tokens(
     label: str,
     expected_repeats: int,
     expected_num_prompts: int,
-) -> None:
+) -> dict[str, Any]:
     stats = report.get("actual_input_tokens")
     if not isinstance(stats, dict):
         raise ValidationError(f"{label}: missing actual_input_tokens stats")
+    summary: dict[str, Any] = {}
     for key in ["min", "max", "mean"]:
-        require_number(stats.get(key), f"{label}: actual_input_tokens.{key}", positive=True)
+        summary[key] = require_number(
+            stats.get(key), f"{label}: actual_input_tokens.{key}", positive=True
+        )
+    if "requested" in stats:
+        summary["requested"] = require_number(
+            stats.get("requested"), f"{label}: actual_input_tokens.requested", positive=True
+        )
     per_request = report.get("actual_input_tokens_per_request")
     if not isinstance(per_request, list):
         raise ValidationError(f"{label}: missing actual_input_tokens_per_request")
@@ -1118,6 +1142,9 @@ def validate_actual_input_tokens(
                 raise ValidationError(
                     f"{label}: actual_input_tokens_per_request contains invalid value {value!r}"
                 )
+    summary["per_request_repeat_count"] = len(per_request)
+    summary["per_request_count_per_repeat"] = [len(values) for values in per_request]
+    return summary
 
 
 def validate_report(
@@ -1126,7 +1153,7 @@ def validate_report(
     *,
     expected_repeats: int,
     expected_num_prompts: int,
-) -> tuple[int, float]:
+) -> tuple[int, dict[str, Any]]:
     try:
         concurrency = int(report.get("concurrency") or report.get("c") or 0)
     except ValueError as exc:
@@ -1160,33 +1187,54 @@ def validate_report(
                 f"{label} c{concurrency}: completed_per_run must be "
                 f"{expected_num_prompts} for every repeat"
             )
-    for field in BAD_COUNT_FIELDS:
+    bad_count_totals: dict[str, int] = {}
+    for field in sorted(BAD_COUNT_FIELDS):
         values = require_int_list(report, field, f"{label} c{concurrency}", n_repeats)
         if sum(values) != 0:
             raise ValidationError(f"{label} c{concurrency}: {field} must sum to 0")
-    for field in OPTIONAL_BAD_COUNT_FIELDS:
+        bad_count_totals[field[: -len("_per_run")]] = sum(values)
+    optional_bad_count_totals: dict[str, int] = {}
+    for field in sorted(OPTIONAL_BAD_COUNT_FIELDS):
         if field not in report:
             continue
         values = require_int_list(report, field, f"{label} c{concurrency}", n_repeats)
         if sum(values) != 0:
             raise ValidationError(f"{label} c{concurrency}: {field} must sum to 0")
-    throughput = require_scalar_stats(
+        optional_bad_count_totals[field[: -len("_per_run")]] = sum(values)
+    throughput_stats = scalar_stats_summary(
         report.get("output_throughput_tps"),
         f"{label} c{concurrency}: output_throughput_tps",
     )
-    for metric, percentile in [
-        ("ttft_ms", "p50"),
-        ("tpot_ms", "p50"),
-        ("e2e_ms", "p95"),
-    ]:
-        require_percentile_stats(report, metric, percentile, f"{label} c{concurrency}")
-    validate_actual_input_tokens(
+    ttft_stats = percentile_stats_summary(
+        report, "ttft_ms", "p50", f"{label} c{concurrency}"
+    )
+    tpot_stats = percentile_stats_summary(
+        report, "tpot_ms", "p50", f"{label} c{concurrency}"
+    )
+    e2e_stats = percentile_stats_summary(report, "e2e_ms", "p95", f"{label} c{concurrency}")
+    input_token_stats = validate_actual_input_tokens(
         report,
         f"{label} c{concurrency}",
         n_repeats,
         expected_num_prompts,
     )
-    return concurrency, throughput
+    return concurrency, {
+        "concurrency": concurrency,
+        "n_repeats": n_repeats,
+        "n_requests_per_run": expected_num_prompts,
+        "completed_total": sum(completed_values),
+        "completed_per_run": completed_values,
+        "failed_total": optional_bad_count_totals.get("failed", 0),
+        "errored_total": bad_count_totals["errored"],
+        "bad_output_total": bad_count_totals["bad_output"],
+        "bad_count_totals": {**bad_count_totals, **optional_bad_count_totals},
+        "output_token_count_source": report.get("output_token_count_source"),
+        "output_throughput_tps": throughput_stats,
+        "ttft_ms_p50": ttft_stats,
+        "tpot_ms_p50": tpot_stats,
+        "e2e_ms_p95": e2e_stats,
+        "actual_input_tokens": input_token_stats,
+    }
 
 
 def validate_bench_artifact(path: Path, label: str, expected_model: str) -> dict[str, Any]:
@@ -1194,16 +1242,19 @@ def validate_bench_artifact(path: Path, label: str, expected_model: str) -> dict
     reports = reports_from_json(load_json(path / "bench-serve.json"), label)
     rows: dict[int, dict[str, Any]] = {}
     throughput: dict[int, float] = {}
+    summaries: dict[int, dict[str, Any]] = {}
     expected_repeats = int(command_signature["n_repeats"])
     expected_num_prompts = int(command_signature["num_prompts"])
     for report in reports:
-        concurrency, tps = validate_report(
+        concurrency, summary = validate_report(
             report,
             label,
             expected_repeats=expected_repeats,
             expected_num_prompts=expected_num_prompts,
         )
         rows[concurrency] = report
+        summaries[concurrency] = summary
+        tps = summary["output_throughput_tps"]["mean"]
         throughput[concurrency] = tps
     missing = sorted(REQUIRED_CONCURRENCY_CELLS - set(rows))
     if missing:
@@ -1211,8 +1262,30 @@ def validate_bench_artifact(path: Path, label: str, expected_model: str) -> dict
     return {
         "command_signature": command_signature,
         "throughput_by_concurrency": throughput,
+        "bench_summary_by_concurrency": summaries,
         "max_target_tps": max(throughput[c] for c in THROUGHPUT_TARGET_CELLS),
     }
+
+
+def format_bench_cell_summary(label: str, summary: dict[str, Any]) -> str:
+    throughput = summary["output_throughput_tps"]
+    ttft = summary["ttft_ms_p50"]
+    tpot = summary["tpot_ms_p50"]
+    e2e = summary["e2e_ms_p95"]
+    input_tokens = summary["actual_input_tokens"]
+    return (
+        f"- {label} c{summary['concurrency']} bench: "
+        f"output={throughput['mean']:.3f} tok/s "
+        f"+/- {throughput['ci95_hw']:.3f} ci95_hw, "
+        f"TTFT p50={ttft['mean']:.3f} ms, "
+        f"TPOT p50={tpot['mean']:.3f} ms, "
+        f"E2E p95={e2e['mean']:.3f} ms, "
+        f"completed={summary['completed_total']}, "
+        f"failed={summary['failed_total']}, "
+        f"errored={summary['errored_total']}, "
+        f"bad={summary['bad_output_total']}, "
+        f"input_tokens_mean={input_tokens['mean']:.3f}"
+    )
 
 
 def validate_correctness_artifact(path: Path, label: str = "correctness artifact") -> dict[str, Any]:
@@ -1502,6 +1575,11 @@ def validate_perf_goal(
         "same_pod_vllm_throughput_by_concurrency": vllm_bench["throughput_by_concurrency"]
         if vllm_bench is not None
         else None,
+        "same_pod_vllm_bench_summary_by_concurrency": vllm_bench[
+            "bench_summary_by_concurrency"
+        ]
+        if vllm_bench is not None
+        else None,
         "same_pod_vllm_metadata": {
             "git_sha": vllm_metadata.get("git_sha"),
             "cuda_version": vllm_metadata.get("cuda_version"),
@@ -1515,6 +1593,12 @@ def validate_perf_goal(
         "candidate_max_c4_c8_c16_output_tps": candidate_max,
         "baseline_throughput_by_concurrency": baseline_bench["throughput_by_concurrency"],
         "candidate_throughput_by_concurrency": candidate_bench["throughput_by_concurrency"],
+        "baseline_bench_summary_by_concurrency": baseline_bench[
+            "bench_summary_by_concurrency"
+        ],
+        "candidate_bench_summary_by_concurrency": candidate_bench[
+            "bench_summary_by_concurrency"
+        ],
         "baseline_correctness": baseline_correctness,
         "candidate_correctness": candidate_correctness,
         "correctness": correctness,
@@ -1549,6 +1633,27 @@ def validate_perf_goal(
     gpu_uuid_summary = ", ".join(
         str(uuid) for uuid in candidate_metadata.get("gpu_uuids", [])
     ) or "not recorded"
+    bench_summary_lines: list[str] = []
+    for concurrency in sorted(THROUGHPUT_TARGET_CELLS):
+        bench_summary_lines.append(
+            format_bench_cell_summary(
+                "Baseline",
+                baseline_bench["bench_summary_by_concurrency"][concurrency],
+            )
+        )
+        bench_summary_lines.append(
+            format_bench_cell_summary(
+                "Candidate",
+                candidate_bench["bench_summary_by_concurrency"][concurrency],
+            )
+        )
+        if vllm_bench is not None:
+            bench_summary_lines.append(
+                format_bench_cell_summary(
+                    "Same-pod vLLM",
+                    vllm_bench["bench_summary_by_concurrency"][concurrency],
+                )
+            )
     write_text(
         out_dir / "summary.md",
         "\n".join(
@@ -1586,6 +1691,7 @@ def validate_perf_goal(
                 f"- Baseline throughput by concurrency: {baseline_tps_summary}",
                 f"- Candidate throughput by concurrency: {candidate_tps_summary}",
                 f"- Same-pod vLLM throughput by concurrency: {vllm_tps_summary}",
+                *bench_summary_lines,
                 "",
                 pass_line,
                 "",
@@ -2111,6 +2217,23 @@ def run_self_test() -> None:
             raise AssertionError("selftest expected fixed public target pass")
         if result["same_pod_vllm_target_passed"] is not True:
             raise AssertionError("selftest expected same-pod vLLM target pass")
+        candidate_c8 = result["candidate_bench_summary_by_concurrency"][8]
+        if candidate_c8["output_throughput_tps"]["mean"] != 28.4:
+            raise AssertionError("selftest expected candidate c8 throughput summary")
+        if candidate_c8["ttft_ms_p50"]["mean"] != 500.0:
+            raise AssertionError("selftest expected candidate c8 TTFT summary")
+        if candidate_c8["completed_total"] != 288:
+            raise AssertionError("selftest expected candidate c8 completed total")
+        if candidate_c8["errored_total"] != 0 or candidate_c8["bad_output_total"] != 0:
+            raise AssertionError("selftest expected candidate c8 zero bad counts")
+        final_json = load_json(root / "out" / "layer_split_perf_goal_gate.json")
+        if (
+            final_json["candidate_bench_summary_by_concurrency"]["8"][
+                "output_token_count_source"
+            ]
+            != "usage"
+        ):
+            raise AssertionError("selftest expected persisted bench summary usage source")
         summary = (root / "out" / "summary.md").read_text()
         for expected in [
             "Baseline source gate:",
@@ -2123,6 +2246,11 @@ def run_self_test() -> None:
             "Candidate throughput by concurrency:",
             "Same-pod vLLM output throughput:",
             "Same-pod vLLM throughput by concurrency:",
+            "Candidate c8 bench:",
+            "TTFT p50=",
+            "TPOT p50=",
+            "E2E p95=",
+            "bad=0",
         ]:
             if expected not in summary:
                 raise AssertionError(f"selftest summary missing {expected}")
