@@ -996,8 +996,58 @@ def require_bench_command_file(
     }
 
 
+def require_vllm_server_command(path: Path, expected_model: str) -> dict[str, str]:
+    data = load_json(path)
+    if not isinstance(data, dict):
+        raise ValidationError("vllm: command artifact must be a JSON object")
+    raw = data.get("server_cmd")
+    if not isinstance(raw, list) or not raw:
+        raise ValidationError("vllm: command artifact missing server_cmd")
+    cmd = [str(part) for part in raw]
+    if Path(cmd[0]).name != "vllm":
+        raise ValidationError("vllm: server_cmd must start with vllm")
+    if "serve" not in cmd:
+        raise ValidationError("vllm: server_cmd must run vllm serve")
+    serve_idx = cmd.index("serve")
+    if serve_idx + 1 >= len(cmd) or cmd[serve_idx + 1] != expected_model:
+        raise ValidationError(f"vllm: server_cmd model must be {expected_model}")
+    if flag_value(cmd, "--served-model-name") != expected_model:
+        raise ValidationError(
+            f"vllm: server_cmd --served-model-name must be {expected_model}"
+        )
+    if flag_value(cmd, "--tensor-parallel-size") != "2":
+        raise ValidationError("vllm: server_cmd must use --tensor-parallel-size 2")
+    if flag_value(cmd, "--host") != "127.0.0.1":
+        raise ValidationError("vllm: server_cmd must bind --host 127.0.0.1")
+    port = flag_value(cmd, "--port")
+    if port is None or not port.isdigit():
+        raise ValidationError("vllm: server_cmd must include numeric --port")
+    quantization = flag_value(cmd, "--quantization")
+    if quantization not in {"gptq", "awq"}:
+        raise ValidationError("vllm: server_cmd must declare gptq or awq quantization")
+    speculative_flags = [part for part in cmd if "speculative" in part.lower()]
+    if speculative_flags:
+        raise ValidationError(
+            "vllm: server_cmd must not enable speculative decoding: "
+            + ", ".join(speculative_flags)
+        )
+    if data.get("same_hardware_required") is not True:
+        raise ValidationError("vllm: command artifact must set same_hardware_required=true")
+    return {
+        "model": expected_model,
+        "host": "127.0.0.1",
+        "port": port,
+        "tensor_parallel_size": "2",
+        "quantization": quantization,
+    }
+
+
 def validate_vllm_bench_artifact(path: Path, expected_model: str) -> dict[str, Any]:
     path = require_dir(path, "vllm artifact")
+    server_signature = require_vllm_server_command(
+        path / "vllm-baseline.command.json",
+        expected_model,
+    )
     command_signature = require_bench_command_file(
         path / "vllm-baseline.command.json",
         "vllm",
@@ -1025,6 +1075,7 @@ def validate_vllm_bench_artifact(path: Path, expected_model: str) -> dict[str, A
     if missing:
         raise ValidationError(f"vllm: bench reports missing cells {missing}")
     return {
+        "server_signature": server_signature,
         "command_signature": command_signature,
         "throughput_by_concurrency": throughput,
         "bench_summary_by_concurrency": summaries,
@@ -1632,6 +1683,9 @@ def validate_perf_goal(
         "same_pod_vllm_throughput_by_concurrency": vllm_bench["throughput_by_concurrency"]
         if vllm_bench is not None
         else None,
+        "same_pod_vllm_server_command_signature": vllm_bench["server_signature"]
+        if vllm_bench is not None
+        else None,
         "same_pod_vllm_bench_summary_by_concurrency": vllm_bench[
             "bench_summary_by_concurrency"
         ]
@@ -1677,6 +1731,14 @@ def validate_perf_goal(
             f"c{concurrency}={tps:.3f}"
             for concurrency, tps in sorted(vllm_bench["throughput_by_concurrency"].items())
         )
+        if vllm_bench is not None
+        else "not provided"
+    )
+    vllm_server_summary = (
+        "tp="
+        + str(vllm_bench["server_signature"]["tensor_parallel_size"])
+        + ", quantization="
+        + str(vllm_bench["server_signature"]["quantization"])
         if vllm_bench is not None
         else "not provided"
     )
@@ -1749,6 +1811,7 @@ def validate_perf_goal(
                 f"- Baseline throughput by concurrency: {baseline_tps_summary}",
                 f"- Candidate throughput by concurrency: {candidate_tps_summary}",
                 f"- Same-pod vLLM throughput by concurrency: {vllm_tps_summary}",
+                f"- Same-pod vLLM server: {vllm_server_summary}",
                 "- Baseline GPU max utilization by concurrency: "
                 + format_gpu_utilization_by_concurrency(baseline_hardware),
                 "- Candidate GPU max utilization by concurrency: "
@@ -2282,8 +2345,16 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
                 "vllm",
                 "serve",
                 "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "19401",
                 "--tensor-parallel-size",
                 "2",
+                "--served-model-name",
+                "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "--quantization",
+                "gptq",
             ],
             "bench_cmd": [
                 "ferrum",
@@ -2368,6 +2439,12 @@ def run_self_test() -> None:
             raise AssertionError("selftest expected fixed public target pass")
         if result["same_pod_vllm_target_passed"] is not True:
             raise AssertionError("selftest expected same-pod vLLM target pass")
+        if result["same_pod_vllm_server_command_signature"][
+            "tensor_parallel_size"
+        ] != "2":
+            raise AssertionError("selftest expected vLLM TP=2 server signature")
+        if result["same_pod_vllm_server_command_signature"]["quantization"] != "gptq":
+            raise AssertionError("selftest expected vLLM gptq quantization")
         candidate_c8 = result["candidate_bench_summary_by_concurrency"][8]
         if candidate_c8["output_throughput_tps"]["mean"] != 28.4:
             raise AssertionError("selftest expected candidate c8 throughput summary")
@@ -2430,6 +2507,8 @@ def run_self_test() -> None:
             "Candidate throughput by concurrency:",
             "Same-pod vLLM output throughput:",
             "Same-pod vLLM throughput by concurrency:",
+            "Same-pod vLLM server:",
+            "tp=2",
             "Candidate GPU max utilization by concurrency:",
             "Same-pod vLLM GPU max utilization by concurrency:",
             "c16=96/99%",
@@ -2905,6 +2984,25 @@ def run_self_test() -> None:
             raise AssertionError("vllm missing command unexpectedly passed")
         except ValidationError as exc:
             if "vllm-baseline.command.json" not in str(exc):
+                raise
+
+        vllm_bad_tp = root / "vllm-bad-tp"
+        make_vllm_artifact(vllm_bad_tp, 40.0)
+        command = load_json(vllm_bad_tp / "vllm-baseline.command.json")
+        idx = command["server_cmd"].index("--tensor-parallel-size")
+        command["server_cmd"][idx + 1] = "1"
+        write_json(vllm_bad_tp / "vllm-baseline.command.json", command)
+        try:
+            validate_perf_goal(
+                out_dir=root / "vllm-bad-tp-out",
+                baseline_artifact=baseline,
+                candidate_artifact=candidate,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=vllm_bad_tp,
+            )
+            raise AssertionError("vllm bad TP unexpectedly passed")
+        except ValidationError as exc:
+            if "tensor-parallel-size" not in str(exc):
                 raise
 
         vllm_missing_gpu_samples = root / "vllm-missing-gpu-samples"
