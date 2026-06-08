@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -271,6 +272,32 @@ def print_run_plan(plan: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def write_failure_summary(
+    out_root: Path,
+    plan: dict[str, Any],
+    failed_step: str,
+    reason: str,
+) -> None:
+    write_json(
+        out_root / "layer_split_perf_failure.json",
+        {
+            "schema_version": 1,
+            "status": "fail",
+            "created_at": iso_now(),
+            "lane": plan["lane"],
+            "failed_step": failed_step,
+            "reason": reason,
+            "stop_condition": plan["stop_condition"],
+            "correctness_gate": plan["correctness_gate"],
+            "performance_command": plan["performance_command"],
+            "baseline_artifact": plan["baseline_artifact"],
+            "candidate_artifact": plan["candidate_artifact"],
+            "final_artifact": plan["final_artifact"],
+            "run_plan": str(out_root / "layer_split_perf_goal_run_plan.json"),
+        },
+    )
+
+
 def run_step(name: str, cmd: list[str], repo: Path, out_root: Path) -> subprocess.CompletedProcess[str]:
     started = iso_now()
     env = os.environ.copy()
@@ -312,15 +339,26 @@ def run_goal(args: argparse.Namespace) -> int:
     plan = command_plan(repo, ferrum_bin, out_root, optional_vllm)
     write_json(out_root / "layer_split_perf_goal_run_plan.json", plan)
     print_run_plan(plan)
-    require_2x4090_preflight(repo, out_root)
+    failed_step = "hardware_preflight"
+    try:
+        require_2x4090_preflight(repo, out_root)
 
-    run_step("build_cuda_release", plan["commands"]["build_cuda_release"], repo, out_root)
-    run_step("baseline_batch", plan["commands"]["baseline_batch"], repo, out_root)
-    run_step("candidate_overlapped", plan["commands"]["candidate_overlapped"], repo, out_root)
-    final = run_step("final_validator", plan["commands"]["final_validator"], repo, out_root)
-    expected_pass_line = f"{PASS_PREFIX}: {plan['final_artifact']}"
-    if expected_pass_line not in final.stdout.splitlines():
-        raise RuntimeError(f"final validator output missing exact PASS line: {expected_pass_line}")
+        failed_step = "build_cuda_release"
+        run_step("build_cuda_release", plan["commands"]["build_cuda_release"], repo, out_root)
+        failed_step = "baseline_batch"
+        run_step("baseline_batch", plan["commands"]["baseline_batch"], repo, out_root)
+        failed_step = "candidate_overlapped"
+        run_step("candidate_overlapped", plan["commands"]["candidate_overlapped"], repo, out_root)
+        failed_step = "final_validator"
+        final = run_step("final_validator", plan["commands"]["final_validator"], repo, out_root)
+        expected_pass_line = f"{PASS_PREFIX}: {plan['final_artifact']}"
+        if expected_pass_line not in final.stdout.splitlines():
+            raise RuntimeError(
+                f"final validator output missing exact PASS line: {expected_pass_line}"
+            )
+    except RuntimeError as exc:
+        write_failure_summary(out_root, plan, failed_step, str(exc))
+        raise
     print(final.stdout.strip())
     return 0
 
@@ -370,6 +408,14 @@ def self_test() -> int:
     assert any(str(CANDIDATE_CONFIG) in item for item in candidate_cmd)
     assert str(out / "candidate-overlapped") in final_cmd
     assert "--correctness-artifact" in final_cmd
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_out = Path(tmp)
+        write_failure_summary(tmp_out, plan, "hardware_preflight", "missing nvidia-smi")
+        failure = json.loads((tmp_out / "layer_split_perf_failure.json").read_text())
+        assert failure["status"] == "fail"
+        assert failure["failed_step"] == "hardware_preflight"
+        assert failure["stop_condition"] == plan["stop_condition"]
+        assert failure["performance_command"] == plan["performance_command"]
     print("LAYER_SPLIT_PERF ORCHESTRATOR SELFTEST PASS")
     return 0
 
