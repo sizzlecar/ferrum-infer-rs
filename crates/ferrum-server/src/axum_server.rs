@@ -2992,6 +2992,12 @@ async fn health_handler(
             "throughput_rps": scheduler_metrics.throughput_rps,
             "avg_wait_time_ms": scheduler_metrics.queue_metrics.avg_queue_wait_time_ms,
             "scheduling_time_ms": scheduler_metrics.performance_breakdown.scheduling_time_ms,
+            "model_execution_time_ms": scheduler_metrics
+                .performance_breakdown
+                .model_execution_time_ms,
+            "iteration_lock_wait_time_ms": scheduler_metrics
+                .performance_breakdown
+                .other_overhead_time_ms,
         },
         "config": runtime_config,
         "auto_config": auto_config,
@@ -4044,6 +4050,8 @@ mod tests {
         assert!(body["admission"]["avg_queue_wait_time_ms"].is_number());
         assert!(body["scheduler"]["avg_wait_time_ms"].is_number());
         assert!(body["scheduler"]["scheduling_time_ms"].is_number());
+        assert!(body["scheduler"]["model_execution_time_ms"].is_number());
+        assert!(body["scheduler"]["iteration_lock_wait_time_ms"].is_number());
         assert!(
             body["auto_config"]["decisions"].is_array() || body["auto_config"]["error"].is_string(),
             "body: {body}"

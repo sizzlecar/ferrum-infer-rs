@@ -771,6 +771,14 @@ def validate_admission_health(
             scheduler.get("scheduling_time_ms"),
             f"{label}: scheduler.scheduling_time_ms",
         ),
+        "model_execution_time_ms": json_non_negative_number(
+            scheduler.get("model_execution_time_ms"),
+            f"{label}: scheduler.model_execution_time_ms",
+        ),
+        "iteration_lock_wait_time_ms": json_non_negative_number(
+            scheduler.get("iteration_lock_wait_time_ms"),
+            f"{label}: scheduler.iteration_lock_wait_time_ms",
+        ),
     }
     if scheduler_summary["failed_requests"] != 0:
         raise ValidationError(f"{label}: scheduler failed_requests must be 0")
@@ -2148,6 +2156,8 @@ def make_perf_artifact(
                 "throughput_rps": 3.5,
                 "avg_wait_time_ms": 0.0,
                 "scheduling_time_ms": 0.0,
+                "model_execution_time_ms": 0.0,
+                "iteration_lock_wait_time_ms": 0.0,
             },
             "cache": {
                 "prefix_cache": {
@@ -2919,6 +2929,28 @@ def run_self_test() -> None:
             raise AssertionError("missing wait metric candidate unexpectedly passed")
         except ValidationError as exc:
             if "avg_queue_wait_time_ms" not in str(exc):
+                raise
+
+        missing_iteration_lock_metric = root / "missing-iteration-lock-metric"
+        make_perf_artifact(
+            missing_iteration_lock_metric,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        health = load_json(missing_iteration_lock_metric / "serve.health.after.json")
+        health["scheduler"].pop("iteration_lock_wait_time_ms", None)
+        write_json(missing_iteration_lock_metric / "serve.health.after.json", health)
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-iteration-lock-metric-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_iteration_lock_metric,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing iteration lock metric candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "iteration_lock_wait_time_ms" not in str(exc):
                 raise
 
         binary_mismatch = root / "binary-mismatch"

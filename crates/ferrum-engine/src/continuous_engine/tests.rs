@@ -163,6 +163,53 @@ fn continuous_engine_runtime_config_keeps_invalid_chunk_presence() {
 }
 
 #[test]
+fn performance_breakdown_reports_engine_timing_counters() {
+    let config = EngineConfig::default();
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
+        Arc::new(ferrum_testkit::MockKvCacheManager::new(256));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
+    let model_executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(ferrum_testkit::MockModelExecutor::instant(128));
+    let engine = ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        model_executor,
+        tensor_factory,
+    );
+
+    engine
+        .inner
+        .record_scheduling_time(Duration::from_micros(1500));
+    engine
+        .inner
+        .record_scheduling_time(Duration::from_micros(2500));
+    engine
+        .inner
+        .record_model_execution_time(Duration::from_micros(10_000));
+    engine
+        .inner
+        .record_model_execution_time(Duration::from_micros(14_000));
+    engine
+        .inner
+        .record_iteration_lock_wait(Duration::from_micros(300));
+    engine
+        .inner
+        .record_iteration_lock_wait(Duration::from_micros(700));
+
+    let breakdown = engine.metrics().performance_breakdown;
+    assert_eq!(breakdown.scheduling_time_ms, 2.0);
+    assert_eq!(breakdown.model_execution_time_ms, 12.0);
+    assert_eq!(breakdown.other_overhead_time_ms, 0.5);
+}
+
+#[test]
 fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 2048;
