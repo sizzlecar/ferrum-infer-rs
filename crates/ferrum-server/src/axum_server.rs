@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::{debug, error, info, span, Level};
+use tracing::{debug, error, info, span, warn, Level};
 use uuid::Uuid;
 
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
@@ -1083,6 +1083,11 @@ async fn handle_chat_completions_stream(
                                 break;
                             }
                         } else if tool_choice_required(&openai_request) {
+                            log_required_tool_choice_failure(
+                                &openai_request,
+                                &parsed_final.content,
+                                parsed_final.reasoning.as_deref(),
+                            );
                             let error_event = openai_error_sse_event(
                                 "model output did not satisfy required tool_choice",
                                 "invalid_request_error",
@@ -1293,6 +1298,11 @@ async fn handle_chat_completions_sync(
                     openai_finish_reason = reason.clone();
                 }
             } else if tool_choice_required(&openai_request) {
+                log_required_tool_choice_failure(
+                    &openai_request,
+                    &parsed.content,
+                    parsed.reasoning.as_deref(),
+                );
                 return Err(ServerError::invalid_request(
                     "model output did not satisfy required tool_choice",
                     Some("tool_choice"),
@@ -1357,7 +1367,9 @@ fn convert_chat_request_with_template_model(
         .as_ref()
         .or(default_tool_choice.as_ref());
     let functions = request.functions.as_deref().unwrap_or_default();
-    let render_messages = render_messages_with_response_format_instruction(request);
+    let forced_response_format = forced_tool_choice_response_format(request);
+    let render_messages =
+        render_messages_with_response_format_instruction(request, forced_response_format.as_ref());
     let chat_template_options = chat_template_options_for_request(request, model_template)?;
     let prompt = if tools.is_empty() && functions.is_empty() {
         render_chat_prompt_with_model_template_options(
@@ -1457,7 +1469,7 @@ fn convert_chat_request_with_template_model(
             tfs: None,
             typical_p: None,
             mirostat: None,
-            response_format: forced_tool_choice_response_format(request)
+            response_format: forced_response_format
                 .or_else(|| inferred_auto_tool_response_format(request))
                 .unwrap_or(ferrum_types::ResponseFormat::Text),
         },
@@ -1524,8 +1536,10 @@ fn chat_template_options_for_request(
 
 fn render_messages_with_response_format_instruction(
     request: &ChatCompletionsRequest,
+    forced_response_format: Option<&ferrum_types::ResponseFormat>,
 ) -> Vec<ChatMessage> {
-    let Some(instruction) = response_format_prompt_instruction(request) else {
+    let Some(instruction) = response_format_prompt_instruction(request, forced_response_format)
+    else {
         return request.messages.clone();
     };
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
@@ -1542,20 +1556,31 @@ fn render_messages_with_response_format_instruction(
     messages
 }
 
-fn response_format_prompt_instruction(request: &ChatCompletionsRequest) -> Option<String> {
-    let format = request.response_format.as_ref()?;
-    match format.format_type.as_str() {
-        "json_object" => Some(
-            "The response_format requires a single valid JSON object. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
+fn response_format_prompt_instruction(
+    request: &ChatCompletionsRequest,
+    forced_response_format: Option<&ferrum_types::ResponseFormat>,
+) -> Option<String> {
+    if let Some(format) = request.response_format.as_ref() {
+        return match format.format_type.as_str() {
+            "json_object" => Some(
+                "The response_format requires a single valid JSON object. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
+                    .to_string(),
+            ),
+            "json_schema" => {
+                let schema = format.json_schema.as_ref()?.schema.as_ref()?;
+                let schema_text = serde_json::to_string(schema).ok()?;
+                Some(format!(
+                    "The response_format requires a single valid JSON object satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
+                ))
+            }
+            _ => None,
+        };
+    }
+    match forced_response_format {
+        Some(ferrum_types::ResponseFormat::JsonSchema(_)) => Some(
+            "The tool_choice requires a function call. Output only a single JSON object containing the selected function arguments, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
                 .to_string(),
         ),
-        "json_schema" => {
-            let schema = format.json_schema.as_ref()?.schema.as_ref()?;
-            let schema_text = serde_json::to_string(schema).ok()?;
-            Some(format!(
-                "The response_format requires a single valid JSON object satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
-            ))
-        }
         _ => None,
     }
 }
@@ -1751,6 +1776,29 @@ fn chat_api_response_from_parsed_generated_text(
         .or_else(|| {
             ferrum_types::chat_api_response_from_generated_text(chat_request, &parsed.content)
         })
+}
+
+fn log_required_tool_choice_failure(
+    request: &ChatCompletionsRequest,
+    content: &str,
+    reasoning: Option<&str>,
+) {
+    warn!(
+        model = %request.model,
+        content_len = content.len(),
+        content_head = %log_excerpt(content, 512),
+        reasoning_len = reasoning.map(str::len).unwrap_or(0),
+        reasoning_head = %reasoning.map(|value| log_excerpt(value, 512)).unwrap_or_default(),
+        "model output did not satisfy required tool_choice"
+    );
+}
+
+fn log_excerpt(value: &str, max_chars: usize) -> String {
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
 }
 
 fn normalize_structured_response_content(
@@ -6573,6 +6621,50 @@ mod tests {
                 assert!(schema.contains(r#""required":["city"]"#), "{schema}");
             }
             ref other => panic!("expected inferred tool json schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_tool_choice_uses_tool_schema_response_format_and_prompt_instruction() {
+        let request: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "served-alias",
+            "messages": [{"role": "user", "content": "Call capture_quality_marker."}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "capture_quality_marker",
+                    "description": "Record one marker.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "marker": {"type": "string", "enum": ["ferrum0401"]},
+                            "checksum": {"type": "string", "enum": ["S0004"]}
+                        },
+                        "required": ["marker", "checksum"]
+                    }
+                }
+            }],
+            "tool_choice": "required"
+        }))
+        .expect("tool request parses");
+
+        validate_chat_request(&request).expect("tool request validates");
+        let internal = convert_chat_request(&request).expect("convert");
+
+        assert!(
+            internal.prompt.contains(
+                "Output only a single JSON object containing the selected function arguments"
+            ),
+            "{}",
+            internal.prompt
+        );
+        assert_eq!(internal.metadata["openai_tool_choice"], "required");
+        match internal.sampling_params.response_format {
+            ferrum_types::ResponseFormat::JsonSchema(ref schema) => {
+                assert!(schema.contains(r#""enum":["ferrum0401"]"#), "{schema}");
+                assert!(schema.contains(r#""enum":["S0004"]"#), "{schema}");
+            }
+            ref other => panic!("expected forced tool json schema, got {other:?}"),
         }
     }
 

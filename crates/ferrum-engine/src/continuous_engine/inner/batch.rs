@@ -197,9 +197,7 @@ impl EngineInner {
                         let Some(seq) = sequences.get_mut(rid) else {
                             continue;
                         };
-                        if let Some(ref jp) = seq.json_processor {
-                            jp.reset();
-                        }
+                        seq.reset_guided_processors()?;
                         let mut logits = cached_logits;
                         let token = seq.sample_with_processors_with_tokenizer(
                             &mut logits,
@@ -436,11 +434,14 @@ impl EngineInner {
                 let Some(seq) = sequences.get_mut(&work.rid) else {
                     continue;
                 };
-                if let Some(ref jp) = seq.json_processor {
-                    jp.reset();
-                }
+                seq.reset_guided_processors()?;
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
+                    if seq.requires_full_logits_for_sampling() {
+                        return Err(FerrumError::model(
+                            "model returned greedy token sentinel for request requiring full logits",
+                        ));
+                    }
                     TokenId::new(logits[0] as u32)
                 } else {
                     seq.sample_with_processors_with_tokenizer(
@@ -487,6 +488,11 @@ impl EngineInner {
                 };
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
+                    if seq.requires_full_logits_for_sampling() {
+                        return Err(FerrumError::model(
+                            "model returned greedy token sentinel for request requiring full logits",
+                        ));
+                    }
                     TokenId::new(logits[0] as u32)
                 } else {
                     seq.sample_with_processors_with_tokenizer(
