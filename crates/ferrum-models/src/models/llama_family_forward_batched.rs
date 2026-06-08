@@ -17,9 +17,10 @@ use ferrum_quantization::Linear;
 use ferrum_types::Result;
 
 use super::llama_family::{
-    LlamaFamilyModel, ATTN_CALLS, ATTN_TIME_US, BATCHED_GRAPH_EAGER_COUNT,
-    BATCHED_GRAPH_REPLAY_COUNT, MATMUL_CALLS, MATMUL_TIME_US, NORM_CALLS, NORM_TIME_US,
-    OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US, SINGLE_ITEM_GRAPH_KEY,
+    elapsed_micros_u64_floor1, LlamaFamilyModel, LlamaStageHiddenBridgeTiming, ATTN_CALLS,
+    ATTN_TIME_US, BATCHED_GRAPH_EAGER_COUNT, BATCHED_GRAPH_REPLAY_COUNT, MATMUL_CALLS,
+    MATMUL_TIME_US, NORM_CALLS, NORM_TIME_US, OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US,
+    SINGLE_ITEM_GRAPH_KEY,
 };
 use super::llama_family_pipeline::{LlamaPipelineStageBatchOps, PipelineHidden};
 
@@ -2157,9 +2158,12 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         &mut self,
         batch: &[(String, u32, u32)],
         hidden: &PipelineHidden<B>,
-    ) -> PipelineHidden<B> {
+    ) -> (PipelineHidden<B>, LlamaStageHiddenBridgeTiming) {
         if batch.is_empty() {
-            return PipelineHidden::host(Vec::new(), 0, self.cfg.hidden_size);
+            return (
+                PipelineHidden::host(Vec::new(), 0, self.cfg.hidden_size),
+                LlamaStageHiddenBridgeTiming::default(),
+            );
         }
         let h = self.cfg.hidden_size;
         let hidden_slice = hidden.host_slice();
@@ -2172,15 +2176,18 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         );
         if batch.len() == 1 || !B::supports_llama_family_batched_decode() {
             let mut out = Vec::with_capacity(hidden_slice.len());
+            let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
             for (row, (cache_id, _, pos)) in batch.iter().enumerate() {
                 let start = row * h;
-                out.extend_from_slice(&self.decode_stage_hidden_from_host(
+                let (row_hidden, row_timing) = self.decode_stage_hidden_from_host_with_timing(
                     cache_id,
                     &hidden_slice[start..start + h],
                     *pos,
-                ));
+                );
+                out.extend_from_slice(&row_hidden);
+                bridge_timing = bridge_timing.add(row_timing);
             }
-            return PipelineHidden::host(out, batch.len(), h);
+            return (PipelineHidden::host(out, batch.len(), h), bridge_timing);
         }
 
         let (m, h, mut ctx) = self.prepare_batched_decode_stage(batch);
@@ -2189,8 +2196,18 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             .residual
             .take()
             .expect("scratch residual missing (previous call didn't restore)");
+        let bridge_t0 = std::time::Instant::now();
+        let host_copy_t0 = std::time::Instant::now();
         let hidden_buf = B::from_slice(hidden_slice);
+        let host_copy_us = elapsed_micros_u64_floor1(host_copy_t0);
+        let device_copy_t0 = std::time::Instant::now();
         B::copy_slice(&mut ctx, &hidden_buf, 0, &mut residual, 0, m * h);
+        let device_copy_us = elapsed_micros_u64_floor1(device_copy_t0);
+        let bridge_timing = LlamaStageHiddenBridgeTiming {
+            bridge_us: elapsed_micros_u64_floor1(bridge_t0),
+            host_copy_us,
+            device_copy_us,
+        };
 
         for li in 0..self.local_layer_count() {
             self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
@@ -2200,7 +2217,7 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         B::sync(&mut ctx);
         let out = B::to_vec(&residual, m * h);
         self.scratch.residual = Some(residual);
-        PipelineHidden::host(out, m, h)
+        (PipelineHidden::host(out, m, h), bridge_timing)
     }
 
     fn logits_from_hidden_batch(

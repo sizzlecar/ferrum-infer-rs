@@ -877,11 +877,39 @@ def validate_pipeline_cache_metrics(
             )
     for key in [
         "host_bridge_bytes_total",
+        "bridge_us_total",
         "logits_us_total",
         "total_us_total",
     ]:
         if not isinstance(decode.get(key), int) or decode[key] <= 0:
             raise ValidationError(f"{label}: pipeline_decode.{key} must be > 0")
+    for key in [
+        "bridge_us_last",
+        "bridge_us_avg",
+        "host_copy_us_total",
+        "host_copy_us_last",
+        "host_copy_us_avg",
+        "device_copy_us_total",
+        "device_copy_us_last",
+        "device_copy_us_avg",
+    ]:
+        if not isinstance(decode.get(key), int) or decode[key] < 0:
+            raise ValidationError(f"{label}: pipeline_decode.{key} must be >= 0")
+    if decode["host_copy_us_total"] + decode["device_copy_us_total"] <= 0:
+        raise ValidationError(
+            f"{label}: pipeline_decode must report host or device copy timing"
+        )
+    if bridge == "host" and decode["host_copy_us_total"] <= 0:
+        raise ValidationError(
+            f"{label}: host bridge must report host_copy_us_total > 0"
+        )
+    if (
+        bridge in {"host", "cuda_peer", "cuda_device_staged"}
+        and decode["device_copy_us_total"] <= 0
+    ):
+        raise ValidationError(
+            f"{label}: selected bridge must report device_copy_us_total > 0"
+        )
     for key in ["stage_us_total", "stage_us_last", "stage_us_avg"]:
         values = decode.get(key)
         if not isinstance(values, list) or len(values) != stage_count:
@@ -2135,6 +2163,15 @@ def make_perf_artifact(
                         "host_bridge_bytes_total": 0,
                         "host_bridge_bytes_last": 0,
                         "host_bridge_bytes_avg": None,
+                        "bridge_us_total": 0,
+                        "bridge_us_last": 0,
+                        "bridge_us_avg": None,
+                        "host_copy_us_total": 0,
+                        "host_copy_us_last": 0,
+                        "host_copy_us_avg": None,
+                        "device_copy_us_total": 0,
+                        "device_copy_us_last": 0,
+                        "device_copy_us_avg": None,
                         "stage_us_total": [0, 0],
                         "stage_us_last": [0, 0],
                         "stage_us_avg": [None, None],
@@ -2212,6 +2249,15 @@ def make_perf_artifact(
                         "host_bridge_bytes_total": 1048576,
                         "host_bridge_bytes_last": 131072,
                         "host_bridge_bytes_avg": 131072,
+                        "bridge_us_total": 1600,
+                        "bridge_us_last": 200,
+                        "bridge_us_avg": 200,
+                        "host_copy_us_total": 960,
+                        "host_copy_us_last": 120,
+                        "host_copy_us_avg": 120,
+                        "device_copy_us_total": 640,
+                        "device_copy_us_last": 80,
+                        "device_copy_us_avg": 80,
                         "stage_us_total": [8000, 9000],
                         "stage_us_last": [1000, 1100],
                         "stage_us_avg": [1000, 1125],
@@ -3223,6 +3269,28 @@ def run_self_test() -> None:
             raise AssertionError("zero-profile candidate unexpectedly passed")
         except ValidationError as exc:
             if "pipeline_decode.calls" not in str(exc):
+                raise
+
+        missing_bridge_timing = root / "missing-bridge-timing"
+        make_perf_artifact(
+            missing_bridge_timing,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        health = load_json(missing_bridge_timing / "serve.health.after.json")
+        health["cache"]["prefix_cache"]["pipeline_decode"].pop("bridge_us_total", None)
+        write_json(missing_bridge_timing / "serve.health.after.json", health)
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-bridge-timing-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_bridge_timing,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing-bridge-timing candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "pipeline_decode.bridge_us_total" not in str(exc):
                 raise
 
         missing_model_lock_profile = root / "missing-model-lock-profile"

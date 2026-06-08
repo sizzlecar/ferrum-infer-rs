@@ -4,7 +4,7 @@ use ferrum_types::{FerrumError, Result};
 
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 
-use super::llama_family::LlamaFamilyModel;
+use super::llama_family::{LlamaFamilyModel, LlamaStageHiddenBridgeTiming};
 
 fn pipeline_decode_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -136,7 +136,7 @@ pub(crate) trait LlamaPipelineStageBatchOps<B: MoeLlmBackend> {
         &mut self,
         batch: &[(String, u32, u32)],
         hidden: &PipelineHidden<B>,
-    ) -> PipelineHidden<B>;
+    ) -> (PipelineHidden<B>, LlamaStageHiddenBridgeTiming);
 
     fn logits_from_hidden_batch(
         &mut self,
@@ -165,7 +165,7 @@ where
         &mut self,
         batch: &[(String, u32, u32)],
         hidden: &PipelineHidden<B>,
-    ) -> PipelineHidden<B> {
+    ) -> (PipelineHidden<B>, LlamaStageHiddenBridgeTiming) {
         let h = self.config().hidden_size;
         let hidden_slice = hidden.host_slice();
         assert_eq!(
@@ -176,15 +176,18 @@ where
             batch.len() * h
         );
         let mut out = Vec::with_capacity(hidden_slice.len());
+        let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
         for (row, (cache_id, _, pos)) in batch.iter().enumerate() {
             let start = row * h;
-            out.extend_from_slice(&self.decode_stage_hidden_from_host(
+            let (row_hidden, row_timing) = self.decode_stage_hidden_from_host_with_timing(
                 cache_id,
                 &hidden_slice[start..start + h],
                 *pos,
-            ));
+            );
+            out.extend_from_slice(&row_hidden);
+            bridge_timing = bridge_timing.add(row_timing);
         }
-        PipelineHidden::host(out, batch.len(), h)
+        (PipelineHidden::host(out, batch.len(), h), bridge_timing)
     }
 
     fn logits_from_hidden_batch(
@@ -296,6 +299,12 @@ struct PipelineDecodeStats {
     queue_depth_last: u64,
     host_bridge_bytes_total: u64,
     host_bridge_bytes_last: u64,
+    bridge_us_total: u64,
+    bridge_us_last: u64,
+    host_copy_us_total: u64,
+    host_copy_us_last: u64,
+    device_copy_us_total: u64,
+    device_copy_us_last: u64,
     stage_us_total: Vec<u64>,
     stage_us_last: Vec<u64>,
     logits_us_total: u64,
@@ -322,6 +331,12 @@ impl PipelineDecodeStats {
             queue_depth_last: 0,
             host_bridge_bytes_total: 0,
             host_bridge_bytes_last: 0,
+            bridge_us_total: 0,
+            bridge_us_last: 0,
+            host_copy_us_total: 0,
+            host_copy_us_last: 0,
+            device_copy_us_total: 0,
+            device_copy_us_last: 0,
             stage_us_total: vec![0; stage_count],
             stage_us_last: vec![0; stage_count],
             logits_us_total: 0,
@@ -340,6 +355,7 @@ impl PipelineDecodeStats {
         queue_depth: usize,
         overlapped: bool,
         host_bridge_bytes: usize,
+        bridge_timing: LlamaStageHiddenBridgeTiming,
         stage_us: &[u64],
         logits_us: u64,
         total_us: u64,
@@ -369,6 +385,16 @@ impl PipelineDecodeStats {
             .host_bridge_bytes_total
             .saturating_add(host_bridge_bytes as u64);
         self.host_bridge_bytes_last = host_bridge_bytes as u64;
+        self.bridge_us_total = self.bridge_us_total.saturating_add(bridge_timing.bridge_us);
+        self.bridge_us_last = bridge_timing.bridge_us;
+        self.host_copy_us_total = self
+            .host_copy_us_total
+            .saturating_add(bridge_timing.host_copy_us);
+        self.host_copy_us_last = bridge_timing.host_copy_us;
+        self.device_copy_us_total = self
+            .device_copy_us_total
+            .saturating_add(bridge_timing.device_copy_us);
+        self.device_copy_us_last = bridge_timing.device_copy_us;
         for (idx, value) in stage_us.iter().copied().enumerate() {
             self.stage_us_total[idx] = self.stage_us_total[idx].saturating_add(value);
             self.stage_us_last[idx] = value;
@@ -406,6 +432,15 @@ impl PipelineDecodeStats {
             "host_bridge_bytes_total": self.host_bridge_bytes_total,
             "host_bridge_bytes_last": self.host_bridge_bytes_last,
             "host_bridge_bytes_avg": self.avg_per_call(self.host_bridge_bytes_total),
+            "bridge_us_total": self.bridge_us_total,
+            "bridge_us_last": self.bridge_us_last,
+            "bridge_us_avg": self.avg_per_call(self.bridge_us_total),
+            "host_copy_us_total": self.host_copy_us_total,
+            "host_copy_us_last": self.host_copy_us_last,
+            "host_copy_us_avg": self.avg_per_call(self.host_copy_us_total),
+            "device_copy_us_total": self.device_copy_us_total,
+            "device_copy_us_last": self.device_copy_us_last,
+            "device_copy_us_avg": self.avg_per_call(self.device_copy_us_total),
             "stage_us_total": self.stage_us_total,
             "stage_us_last": self.stage_us_last,
             "stage_us_avg": stage_us_avg,
@@ -655,6 +690,7 @@ where
         let total_t0 = std::time::Instant::now();
         let mut stage_us: Vec<u64> = Vec::with_capacity(self.stages.len());
         let mut host_bridge_bytes = 0usize;
+        let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
         let stage_bridge = self.placement.stage_bridge();
 
         let stage_t0 = std::time::Instant::now();
@@ -667,9 +703,11 @@ where
             let device = self.placement.stage(idx).backend_device_ordinal;
             host_bridge_bytes = host_bridge_bytes.saturating_add(hidden.len_bytes());
             let stage_t0 = std::time::Instant::now();
-            hidden = B::with_device_ordinal(device, || {
+            let (next_hidden, stage_bridge_timing) = B::with_device_ordinal(device, || {
                 self.stages[idx].decode_stage_hidden_from_host_batch(batch, &hidden)
             });
+            hidden = next_hidden;
+            bridge_timing = bridge_timing.add(stage_bridge_timing);
             stage_us.push(elapsed_micros_u64(stage_t0));
         }
         let last_idx = self.stages.len() - 1;
@@ -688,6 +726,7 @@ where
             0,
             false,
             host_bridge_bytes,
+            bridge_timing,
             &stage_us,
             logits_us,
             total_us,
@@ -698,12 +737,15 @@ where
             let n = PIPELINE_PROFILE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n.is_multiple_of(8) {
                 eprintln!(
-                    "[pipeline-decode-profile] call#{} m={} hidden={:?} mode=batch bridge={} host_bridge_bytes={} stage_us={:?} logits_us={} total_us={}",
+                    "[pipeline-decode-profile] call#{} m={} hidden={:?} mode=batch bridge={} host_bridge_bytes={} bridge_us={} host_copy_us={} device_copy_us={} stage_us={:?} logits_us={} total_us={}",
                     n,
                     batch.len(),
                     hidden.metadata_json(),
                     stage_bridge.as_str(),
                     host_bridge_bytes,
+                    bridge_timing.bridge_us,
+                    bridge_timing.host_copy_us,
+                    bridge_timing.device_copy_us,
                     stage_us,
                     logits_us,
                     total_us,
@@ -748,6 +790,7 @@ where
         let mut stage1_us_total = 0u64;
         let mut logits_us_total = 0u64;
         let mut host_bridge_bytes = 0usize;
+        let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
 
         std::thread::scope(|scope| {
             let worker = scope.spawn(move || {
@@ -771,9 +814,10 @@ where
                 host_bridge_bytes = host_bridge_bytes.saturating_add(hidden.len_bytes());
 
                 let stage_t0 = std::time::Instant::now();
-                let hidden = B::with_device_ordinal(stage1_device, || {
+                let (hidden, stage_bridge_timing) = B::with_device_ordinal(stage1_device, || {
                     stage1.decode_stage_hidden_from_host_batch(&chunk, &hidden)
                 });
+                bridge_timing = bridge_timing.add(stage_bridge_timing);
                 stage1_us_total = stage1_us_total.saturating_add(elapsed_micros_u64(stage_t0));
 
                 let logits_t0 = std::time::Instant::now();
@@ -799,6 +843,7 @@ where
             1,
             true,
             host_bridge_bytes,
+            bridge_timing,
             &stage_us,
             logits_us_total,
             total_us,
@@ -809,13 +854,16 @@ where
             let n = PIPELINE_PROFILE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n.is_multiple_of(8) {
                 eprintln!(
-                    "[pipeline-decode-profile] call#{} m={} mode=overlapped microbatch_size={} microbatch_count={} bridge={} host_bridge_bytes={} stage_us={:?} logits_us={} total_us={}",
+                    "[pipeline-decode-profile] call#{} m={} mode=overlapped microbatch_size={} microbatch_count={} bridge={} host_bridge_bytes={} bridge_us={} host_copy_us={} device_copy_us={} stage_us={:?} logits_us={} total_us={}",
                     n,
                     batch.len(),
                     microbatch_size,
                     chunk_count,
                     stage_bridge.as_str(),
                     host_bridge_bytes,
+                    bridge_timing.bridge_us,
+                    bridge_timing.host_copy_us,
+                    bridge_timing.device_copy_us,
                     stage_us,
                     logits_us_total,
                     total_us,
@@ -910,6 +958,7 @@ where
         let total_t0 = std::time::Instant::now();
         let mut stage_us: Vec<u64> = Vec::with_capacity(self.stages.len());
         let mut host_bridge_bytes = 0usize;
+        let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
 
         let stage_t0 = std::time::Instant::now();
         let mut hidden =
@@ -921,9 +970,11 @@ where
             let device = self.placement.stage(idx).backend_device_ordinal;
             host_bridge_bytes = host_bridge_bytes.saturating_add(hidden.len() * size_of::<f32>());
             let stage_t0 = std::time::Instant::now();
-            hidden = B::with_device_ordinal(device, || {
-                self.stages[idx].decode_stage_hidden_from_host(cache_id, &hidden, pos)
+            let (next_hidden, stage_bridge_timing) = B::with_device_ordinal(device, || {
+                self.stages[idx].decode_stage_hidden_from_host_with_timing(cache_id, &hidden, pos)
             });
+            hidden = next_hidden;
+            bridge_timing = bridge_timing.add(stage_bridge_timing);
             stage_us.push(elapsed_micros_u64(stage_t0));
         }
         let last_idx = self.stages.len() - 1;
@@ -940,6 +991,7 @@ where
             0,
             false,
             host_bridge_bytes,
+            bridge_timing,
             &stage_us,
             elapsed_micros_u64(logits_t0),
             elapsed_micros_u64(total_t0),
@@ -1224,6 +1276,24 @@ mod tests {
                 .unwrap()
                 > 0
         );
+        assert!(
+            metrics["pipeline_decode"]["bridge_us_total"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            metrics["pipeline_decode"]["host_copy_us_total"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            metrics["pipeline_decode"]["device_copy_us_total"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
     }
 
     #[test]
@@ -1279,6 +1349,24 @@ mod tests {
         );
         assert!(
             metrics["pipeline_decode"]["host_bridge_bytes_total"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            metrics["pipeline_decode"]["bridge_us_total"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            metrics["pipeline_decode"]["host_copy_us_total"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            metrics["pipeline_decode"]["device_copy_us_total"]
                 .as_u64()
                 .unwrap()
                 > 0
