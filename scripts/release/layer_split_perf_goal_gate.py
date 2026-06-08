@@ -1522,6 +1522,33 @@ def validate_perf_goal(
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json(out_dir / "layer_split_perf_goal_gate.json", result)
+    baseline_tps_summary = ", ".join(
+        f"c{concurrency}={tps:.3f}"
+        for concurrency, tps in sorted(baseline_bench["throughput_by_concurrency"].items())
+    )
+    candidate_tps_summary = ", ".join(
+        f"c{concurrency}={tps:.3f}"
+        for concurrency, tps in sorted(candidate_bench["throughput_by_concurrency"].items())
+    )
+    vllm_tps_summary = (
+        ", ".join(
+            f"c{concurrency}={tps:.3f}"
+            for concurrency, tps in sorted(vllm_bench["throughput_by_concurrency"].items())
+        )
+        if vllm_bench is not None
+        else "not provided"
+    )
+    same_pod_target_summary = (
+        f"{same_pod_vllm_target_tps:.3f} tok/s"
+        if same_pod_vllm_target_tps is not None
+        else "not applicable"
+    )
+    gpu_name_summary = ", ".join(
+        str(name) for name in candidate_metadata.get("gpu_names", [])
+    ) or "not recorded"
+    gpu_uuid_summary = ", ".join(
+        str(uuid) for uuid in candidate_metadata.get("gpu_uuids", [])
+    ) or "not recorded"
     write_text(
         out_dir / "summary.md",
         "\n".join(
@@ -1529,14 +1556,36 @@ def validate_perf_goal(
                 "# Layer Split Performance Goal Gate",
                 "",
                 f"- Status: pass",
+                f"- Model: {model_identity(candidate_metadata)}",
+                f"- Git SHA: {candidate_metadata['git_sha']}",
+                f"- Binary SHA256: {binary_digest(candidate_metadata)}",
+                f"- Baseline source gate: {baseline_source_gate['pass_line']}",
+                f"- Candidate source gate: {candidate_source_gate['pass_line']}",
+                f"- GPUs: {gpu_name_summary}",
+                f"- GPU UUIDs: {gpu_uuid_summary}",
+                f"- CUDA: {candidate_metadata.get('cuda_version')}",
+                f"- Driver: {candidate_metadata.get('driver_version')}",
+                f"- Layer split plan: {candidate_config['selected_layer_split_plan']}",
+                f"- Pipeline mode: {candidate_config['selected_pipeline_mode']}",
+                f"- Microbatch size: {candidate_config['selected_microbatch_size']}",
+                f"- Stage bridge: {candidate_config['selected_stage_bridge']}",
                 f"- Target mode: {target_mode}",
                 f"- Target pass summary: {target_pass_summary}",
                 f"- Target output throughput: {target_tps:.3f} tok/s",
+                f"- Fixed public lower bound target: {FIXED_PUBLIC_TARGET_TPS:.3f} tok/s",
                 f"- Fixed public lower bound passed: {fixed_public_target_passed}",
+                f"- Same-pod vLLM output throughput: {vllm_tps:.3f} tok/s"
+                if vllm_tps is not None
+                else "- Same-pod vLLM output throughput: not provided",
+                f"- Same-pod vLLM 80% target: {same_pod_target_summary}",
                 f"- Same-pod vLLM 80% passed: {same_pod_vllm_target_passed}",
+                f"- Stretch target: {STRETCH_TARGET_TPS:.3f} tok/s",
                 f"- Baseline max c4/c8/c16: {baseline_max:.3f} tok/s",
                 f"- Candidate max c4/c8/c16: {candidate_max:.3f} tok/s",
                 f"- Stretch passed: {candidate_max >= STRETCH_TARGET_TPS}",
+                f"- Baseline throughput by concurrency: {baseline_tps_summary}",
+                f"- Candidate throughput by concurrency: {candidate_tps_summary}",
+                f"- Same-pod vLLM throughput by concurrency: {vllm_tps_summary}",
                 "",
                 pass_line,
                 "",
@@ -2062,6 +2111,21 @@ def run_self_test() -> None:
             raise AssertionError("selftest expected fixed public target pass")
         if result["same_pod_vllm_target_passed"] is not True:
             raise AssertionError("selftest expected same-pod vLLM target pass")
+        summary = (root / "out" / "summary.md").read_text()
+        for expected in [
+            "Baseline source gate:",
+            "Candidate source gate:",
+            "GPU UUIDs:",
+            "Layer split plan:",
+            "Pipeline mode: overlapped",
+            "Microbatch size:",
+            "Stage bridge:",
+            "Candidate throughput by concurrency:",
+            "Same-pod vLLM output throughput:",
+            "Same-pod vLLM throughput by concurrency:",
+        ]:
+            if expected not in summary:
+                raise AssertionError(f"selftest summary missing {expected}")
 
         no_vllm_result = validate_perf_goal(
             out_dir=root / "no-vllm-out",
