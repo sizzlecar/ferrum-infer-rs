@@ -125,6 +125,11 @@ def status_pass_obj(data: Any, label: str) -> dict[str, Any]:
     return data
 
 
+def require_true(value: Any, label: str) -> None:
+    if value is not True:
+        raise ValidationError(f"{label} must be true")
+
+
 def load_optional_json(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -1141,6 +1146,22 @@ def validate_correctness_artifact(path: Path, label: str = "correctness artifact
         raise ValidationError(f"{label}: missing checks: " + ", ".join(missing))
     for name in sorted(REQUIRED_CORRECTNESS_CHECKS):
         status_pass_obj(checks[name], f"{label} check {name}")
+    run_single = checks["ferrum_run_single"]
+    assistant_turns = run_single.get("assistant_turns")
+    if not isinstance(assistant_turns, int) or assistant_turns < 1:
+        raise ValidationError(f"{label}: ferrum_run_single.assistant_turns must be >= 1")
+    require_true(
+        checks["ferrum_run_multiturn"].get("has_precise_recall"),
+        f"{label}: ferrum_run_multiturn.has_precise_recall",
+    )
+    require_true(
+        checks["ferrum_serve_single"].get("contains_expected_answer"),
+        f"{label}: ferrum_serve_single.contains_expected_answer",
+    )
+    require_true(
+        checks["ferrum_serve_multiturn"].get("has_precise_recall"),
+        f"{label}: ferrum_serve_multiturn.has_precise_recall",
+    )
     streaming_done = checks["streaming_done"]
     if int(streaming_done.get("done_count", 0)) != 1:
         raise ValidationError(f"{label}: streaming_done.done_count must be exactly 1")
@@ -1149,6 +1170,23 @@ def validate_correctness_artifact(path: Path, label: str = "correctness artifact
         raise ValidationError(f"{label}: streaming_usage.include_usage must be true")
     if streaming_usage.get("usage_received") is not True:
         raise ValidationError(f"{label}: streaming usage was not received")
+    if int(streaming_usage.get("usage_chunk_count", 0)) != 1:
+        raise ValidationError(f"{label}: streaming_usage.usage_chunk_count must be exactly 1")
+    tool_calling = checks["tool_calling"]
+    details = tool_calling.get("details")
+    if isinstance(details, dict):
+        status_pass_obj(details, f"{label}: tool_calling.details")
+        detail_checks = details.get("checks")
+        if isinstance(detail_checks, dict):
+            if not detail_checks:
+                raise ValidationError(f"{label}: tool_calling.details.checks must be non-empty")
+            for detail_name, detail in sorted(detail_checks.items()):
+                status_pass_obj(detail, f"{label}: tool_calling.details.{detail_name}")
+    else:
+        require_true(tool_calling.get("tool_call_ok"), f"{label}: tool_calling.tool_call_ok")
+    structured = checks["structured_output"]
+    require_true(structured.get("json_ok"), f"{label}: structured_output.json_ok")
+    require_true(structured.get("schema_ok"), f"{label}: structured_output.schema_ok")
     log_scan = checks["log_scan"]
     if int(log_scan.get("bad_pattern_count", 0)) != 0:
         raise ValidationError(f"{label}: log_scan.bad_pattern_count must be 0")
@@ -1765,9 +1803,25 @@ def make_perf_artifact(
 
 def make_correctness_artifact(root: Path) -> None:
     checks = {name: {"status": "pass"} for name in REQUIRED_CORRECTNESS_CHECKS}
+    checks["ferrum_run_single"]["assistant_turns"] = 2
+    checks["ferrum_run_multiturn"]["has_precise_recall"] = True
+    checks["ferrum_serve_single"]["contains_expected_answer"] = True
+    checks["ferrum_serve_multiturn"]["has_precise_recall"] = True
     checks["streaming_done"]["done_count"] = 1
     checks["streaming_usage"]["include_usage"] = True
     checks["streaming_usage"]["usage_received"] = True
+    checks["streaming_usage"]["usage_chunk_count"] = 1
+    checks["tool_calling"]["details"] = {
+        "status": "pass",
+        "checks": {
+            "omitted_tool_choice": {"passed": True},
+            "explicit_auto_tool_choice": {"passed": True},
+            "required_tool_choice": {"passed": True},
+            "tool_result_fill": {"passed": True},
+        },
+    }
+    checks["structured_output"]["json_ok"] = True
+    checks["structured_output"]["schema_ok"] = True
     checks["log_scan"]["bad_pattern_count"] = 0
     write_json(root / "correctness.json", {"status": "pass", "checks": checks})
 
@@ -1961,6 +2015,92 @@ def run_self_test() -> None:
             raise AssertionError("missing candidate correctness unexpectedly passed")
         except ValidationError as exc:
             if "candidate correctness artifact" not in str(exc):
+                raise
+
+        bad_candidate_recall = root / "bad-candidate-recall"
+        make_perf_artifact(
+            bad_candidate_recall,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        bad_correctness = load_json(bad_candidate_recall / "correctness.json")
+        bad_correctness["checks"]["ferrum_run_multiturn"]["has_precise_recall"] = False
+        write_json(bad_candidate_recall / "correctness.json", bad_correctness)
+        try:
+            validate_perf_goal(
+                out_dir=root / "bad-candidate-recall-out",
+                baseline_artifact=baseline,
+                candidate_artifact=bad_candidate_recall,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("bad candidate recall unexpectedly passed")
+        except ValidationError as exc:
+            if "has_precise_recall" not in str(exc):
+                raise
+
+        bad_streaming_usage = root / "bad-streaming-usage"
+        make_correctness_artifact(bad_streaming_usage)
+        bad_correctness = load_json(bad_streaming_usage / "correctness.json")
+        bad_correctness["checks"]["streaming_usage"]["usage_chunk_count"] = 2
+        write_json(bad_streaming_usage / "correctness.json", bad_correctness)
+        try:
+            validate_perf_goal(
+                out_dir=root / "bad-streaming-usage-out",
+                baseline_artifact=baseline,
+                candidate_artifact=candidate,
+                correctness_artifact=bad_streaming_usage,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("bad streaming usage unexpectedly passed")
+        except ValidationError as exc:
+            if "usage_chunk_count" not in str(exc):
+                raise
+
+        bad_structured = root / "bad-structured"
+        make_perf_artifact(
+            bad_structured,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        bad_correctness = load_json(bad_structured / "correctness.json")
+        bad_correctness["checks"]["structured_output"]["schema_ok"] = False
+        write_json(bad_structured / "correctness.json", bad_correctness)
+        try:
+            validate_perf_goal(
+                out_dir=root / "bad-structured-out",
+                baseline_artifact=baseline,
+                candidate_artifact=bad_structured,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("bad structured output unexpectedly passed")
+        except ValidationError as exc:
+            if "schema_ok" not in str(exc):
+                raise
+
+        bad_tool = root / "bad-tool"
+        make_perf_artifact(
+            bad_tool,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        bad_correctness = load_json(bad_tool / "correctness.json")
+        bad_correctness["checks"]["tool_calling"]["details"]["checks"]["required_tool_choice"][
+            "passed"
+        ] = False
+        write_json(bad_tool / "correctness.json", bad_correctness)
+        try:
+            validate_perf_goal(
+                out_dir=root / "bad-tool-out",
+                baseline_artifact=baseline,
+                candidate_artifact=bad_tool,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("bad tool-call output unexpectedly passed")
+        except ValidationError as exc:
+            if "tool_calling" not in str(exc):
                 raise
 
         pending_model_manifest = root / "pending-model-manifest"
