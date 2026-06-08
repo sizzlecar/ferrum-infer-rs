@@ -310,6 +310,40 @@ def validate_hardware_evidence(
                 row["pcie_link_width_current"] for row in snapshot_rows
             ],
         }
+    samples_path = path / "nvidia-smi.bench.samples.jsonl"
+    if not samples_path.is_file():
+        raise ValidationError(f"{label}: missing nvidia-smi.bench.samples.jsonl")
+    sample_count = 0
+    max_gpu_utilization = [0, 0]
+    for line_no, line in enumerate(samples_path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                f"{label}: invalid nvidia-smi bench sample JSON at line {line_no}"
+            ) from exc
+        if not isinstance(sample, dict):
+            raise ValidationError(f"{label}: bench sample line {line_no} must be an object")
+        if sample.get("status") != "pass":
+            continue
+        sample_rows = validate_gpu_rows(
+            sample.get("gpus"),
+            f"{label} nvidia-smi.bench.samples.jsonl line {line_no}",
+            metadata,
+        )
+        sample_count += 1
+        for idx, row in enumerate(sample_rows):
+            max_gpu_utilization[idx] = max(
+                max_gpu_utilization[idx], row["utilization_gpu_percent"]
+            )
+    if sample_count <= 0:
+        raise ValidationError(f"{label}: missing passing bench-period GPU samples")
+    if any(value <= 0 for value in max_gpu_utilization):
+        raise ValidationError(
+            f"{label}: bench-period GPU samples must show non-zero utilization on both GPUs"
+        )
     return {
         "gpu_names": metadata.get("gpu_names"),
         "gpu_uuids": metadata.get("gpu_uuids"),
@@ -317,6 +351,8 @@ def validate_hardware_evidence(
         "pcie_link_gen_current": [row["pcie_link_gen_current"] for row in rows],
         "memory_total_mib": [row["memory_total_mib"] for row in rows],
         "snapshots": snapshots,
+        "bench_sample_count": sample_count,
+        "bench_max_gpu_utilization_percent": max_gpu_utilization,
     }
 
 
@@ -1285,6 +1321,23 @@ def make_perf_artifact(
                 "gpus": snapshot_rows,
             },
         )
+    write_text(
+        root / "nvidia-smi.bench.samples.jsonl",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "pass",
+                "sample_phase": "bench",
+                "elapsed_sec": 15.0,
+                "gpus": [
+                    dict(gpu_rows[0], utilization_gpu_percent=84),
+                    dict(gpu_rows[1], utilization_gpu_percent=87),
+                ],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
     write_json(
         root / "model_manifest.json",
         {
@@ -1655,6 +1708,32 @@ def run_self_test() -> None:
             raise AssertionError("missing hardware snapshot candidate unexpectedly passed")
         except ValidationError as exc:
             if "nvidia-smi" not in str(exc):
+                raise
+
+        zero_bench_gpu = root / "zero-bench-gpu"
+        make_perf_artifact(
+            zero_bench_gpu,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        sample = load_json(zero_bench_gpu / "nvidia-smi.during.json")
+        for gpu in sample["gpus"]:
+            gpu["utilization_gpu_percent"] = 0
+        write_text(
+            zero_bench_gpu / "nvidia-smi.bench.samples.jsonl",
+            json.dumps(sample, sort_keys=True) + "\n",
+        )
+        try:
+            validate_perf_goal(
+                out_dir=root / "zero-bench-gpu-out",
+                baseline_artifact=baseline,
+                candidate_artifact=zero_bench_gpu,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("zero GPU utilization candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "non-zero utilization" not in str(exc):
                 raise
 
         missing_admission = root / "missing-admission"
