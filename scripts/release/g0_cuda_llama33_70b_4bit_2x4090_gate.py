@@ -1742,6 +1742,7 @@ def serve_correctness(root: Path, base_url: str, model: str) -> dict[str, Any]:
     payload = {
         "model": model,
         "temperature": 0,
+        "seed": 9271,
         "messages": [{"role": "user", "content": "123+456 等于多少？只输出数字。"}],
         "max_tokens": 128,
     }
@@ -1769,15 +1770,16 @@ def serve_multiturn(root: Path, base_url: str, model: str) -> dict[str, Any]:
     payload = {
         "model": model,
         "temperature": 0,
+        "seed": 9271,
         "messages": [
             {
                 "role": "user",
-                "content": f"请记住方括号里的精确代码：[{RECALL_MARKER}]。只回答 OK。",
+                "content": f"请记住这个精确代码：[{RECALL_MARKER}]。只回答 OK。",
             },
             {"role": "assistant", "content": "OK"},
             {
                 "role": "user",
-                "content": "只输出上一条用户消息方括号里的精确代码，不要解释，不要替换，不要改大小写。",
+                "content": "第一条用户消息里的精确代码是什么？只输出完整代码，不要解释，不要改写。",
             },
         ],
         "max_tokens": 128,
@@ -1807,6 +1809,7 @@ def serve_structured_output(root: Path, base_url: str, model: str) -> dict[str, 
     payload = {
         "model": model,
         "temperature": 0,
+        "seed": 9271,
         "messages": [
             {
                 "role": "user",
@@ -1863,6 +1866,7 @@ def serve_streaming(root: Path, base_url: str, model: str) -> dict[str, Any]:
     payload = {
         "model": model,
         "temperature": 0,
+        "seed": 9271,
         "stream": True,
         "stream_options": {"include_usage": True},
         "messages": [{"role": "user", "content": "用一句中文解释 Ferrum 是什么。"}],
