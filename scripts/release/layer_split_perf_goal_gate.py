@@ -14,6 +14,7 @@ from typing import Any
 
 PASS_PREFIX = "LAYER_SPLIT_PERF GOAL PASS"
 SELFTEST_PASS = "LAYER_SPLIT_PERF GOAL SELFTEST PASS"
+SOURCE_GATE_PASS_PREFIX = "G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS"
 REQUIRED_CONCURRENCY_CELLS = {1, 4, 8, 16}
 THROUGHPUT_TARGET_CELLS = {4, 8, 16}
 FIXED_PUBLIC_TARGET_TPS = 27.6
@@ -398,6 +399,39 @@ def validate_hardware_summaries_match(
     ]:
         if baseline.get(key) != candidate.get(key):
             raise ValidationError(f"baseline and candidate hardware {key} differ")
+
+
+def validate_source_gate_artifact(path: Path, label: str) -> dict[str, Any]:
+    gate = first_json(path, ["gate.json"], f"{label} source gate")
+    if gate.get("lane") != "g0_cuda2x4090_llama33_70b_4bit":
+        raise ValidationError(f"{label}: source gate lane mismatch")
+    pass_line = gate.get("pass_line")
+    expected = f"{SOURCE_GATE_PASS_PREFIX}: {path}"
+    if pass_line != expected:
+        raise ValidationError(f"{label}: source gate pass_line must be {expected!r}")
+    checks = gate.get("checks")
+    if not isinstance(checks, dict) or not checks:
+        raise ValidationError(f"{label}: source gate checks must be non-empty")
+    required_checks = {
+        "run",
+        "serve_correctness",
+        "serve_multiturn",
+        "serve_streaming",
+        "bench_serve",
+        "goal_correctness",
+        "model_manifest",
+        "hardware_snapshots",
+    }
+    missing = sorted(required_checks - set(checks))
+    if missing:
+        raise ValidationError(f"{label}: source gate missing checks: {', '.join(missing)}")
+    for name in sorted(required_checks):
+        status_pass_obj(checks[name], f"{label}: source gate check {name}")
+    return {
+        "lane": gate.get("lane"),
+        "pass_line": pass_line,
+        "checks": sorted(checks),
+    }
 
 
 def model_identity(metadata: dict[str, Any]) -> str:
@@ -1296,6 +1330,8 @@ def validate_perf_goal(
     baseline_artifact = require_dir(baseline_artifact, "baseline artifact")
     candidate_artifact = require_dir(candidate_artifact, "candidate artifact")
 
+    baseline_source_gate = validate_source_gate_artifact(baseline_artifact, "baseline")
+    candidate_source_gate = validate_source_gate_artifact(candidate_artifact, "candidate")
     baseline_metadata = validate_metadata(baseline_artifact, "baseline")
     candidate_metadata = validate_metadata(candidate_artifact, "candidate")
     baseline_hardware = validate_hardware_evidence(
@@ -1420,6 +1456,8 @@ def validate_perf_goal(
         "candidate_artifact": str(candidate_artifact),
         "correctness_artifact": str(correctness_artifact),
         "optional_vllm_artifact": str(optional_vllm_artifact) if optional_vllm_artifact else None,
+        "baseline_source_gate": baseline_source_gate,
+        "candidate_source_gate": candidate_source_gate,
         "model": model_identity(candidate_metadata),
         "git_sha": candidate_metadata["git_sha"],
         "binary_sha256": binary_digest(candidate_metadata),
@@ -1559,6 +1597,26 @@ def make_perf_artifact(
         "diagnostic_only": diagnostic,
     }
     write_json(root / "metadata.json", metadata)
+    gate_checks = {
+        "run": {"status": "pass"},
+        "serve_correctness": {"status": "pass"},
+        "serve_multiturn": {"status": "pass"},
+        "serve_streaming": {"status": "pass"},
+        "bench_serve": {"status": "pass"},
+        "goal_correctness": {"status": "pass"},
+        "model_manifest": {"status": "pass"},
+        "hardware_snapshots": {"status": "pass"},
+    }
+    write_json(
+        root / "gate.json",
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "lane": "g0_cuda2x4090_llama33_70b_4bit",
+            "checks": gate_checks,
+            "pass_line": f"{SOURCE_GATE_PASS_PREFIX}: {root}",
+        },
+    )
     gpu_rows = [
         {
             "index": 0,
@@ -2016,6 +2074,49 @@ def run_self_test() -> None:
             raise AssertionError("selftest expected fixed-only target summary without vLLM")
         if no_vllm_result["same_pod_vllm_target_passed"] is not None:
             raise AssertionError("selftest expected no same-pod target without vLLM")
+
+        missing_gate = root / "missing-gate"
+        make_perf_artifact(
+            missing_gate,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        (missing_gate / "gate.json").unlink()
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-gate-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_gate,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing source gate unexpectedly passed")
+        except ValidationError as exc:
+            if "source gate" not in str(exc):
+                raise
+
+        wrong_gate_lane = root / "wrong-gate-lane"
+        make_perf_artifact(
+            wrong_gate_lane,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        gate = load_json(wrong_gate_lane / "gate.json")
+        gate["lane"] = "g0_cuda2x4090_llama33_70b_4bit_smoke"
+        gate["pass_line"] = f"G0 SOURCE {gate['lane']} PASS: {wrong_gate_lane}"
+        write_json(wrong_gate_lane / "gate.json", gate)
+        try:
+            validate_perf_goal(
+                out_dir=root / "wrong-gate-lane-out",
+                baseline_artifact=baseline,
+                candidate_artifact=wrong_gate_lane,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("wrong source gate lane unexpectedly passed")
+        except ValidationError as exc:
+            if "source gate lane" not in str(exc):
+                raise
 
         strong_candidate = root / "strong-candidate"
         strong_vllm = root / "strong-vllm"
