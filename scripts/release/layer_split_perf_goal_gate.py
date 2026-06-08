@@ -53,7 +53,6 @@ REQUIRED_CORRECTNESS_CHECKS = {
     "log_scan",
 }
 BAD_COUNT_FIELDS = {
-    "failed_per_run",
     "errored_per_run",
     "bad_output_per_run",
     "malformed_stream_per_run",
@@ -64,6 +63,7 @@ BAD_COUNT_FIELDS = {
     "http_500_per_run",
     "panic_per_run",
 }
+OPTIONAL_BAD_COUNT_FIELDS = {"failed_per_run"}
 BAD_LOG_PATTERNS = [
     "panic",
     "cuda error",
@@ -880,8 +880,15 @@ def validate_vllm_bench_artifact(path: Path) -> dict[str, Any]:
     reports = reports_from_json(load_json(path / "vllm-baseline.json"), "vllm")
     rows: dict[int, dict[str, Any]] = {}
     throughput: dict[int, float] = {}
+    expected_repeats = int(command_signature["n_repeats"])
+    expected_num_prompts = int(command_signature["num_prompts"])
     for report in reports:
-        concurrency, tps = validate_report(report, "vllm")
+        concurrency, tps = validate_report(
+            report,
+            "vllm",
+            expected_repeats=expected_repeats,
+            expected_num_prompts=expected_num_prompts,
+        )
         rows[concurrency] = report
         throughput[concurrency] = tps
     missing = sorted(REQUIRED_CONCURRENCY_CELLS - set(rows))
@@ -924,6 +931,41 @@ def nested_positive(report: dict[str, Any], key: str, percentile: str) -> bool:
         return False
 
 
+def require_number(value: Any, label: str, *, positive: bool) -> float:
+    if isinstance(value, bool):
+        raise ValidationError(f"{label} must be numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{label} must be numeric") from exc
+    if positive and number <= 0:
+        raise ValidationError(f"{label} must be > 0")
+    if not positive and number < 0:
+        raise ValidationError(f"{label} must be >= 0")
+    return number
+
+
+def require_scalar_stats(value: Any, label: str) -> float:
+    if not isinstance(value, dict):
+        raise ValidationError(f"{label} must contain mean/stddev/ci95_hw")
+    mean = require_number(value.get("mean"), f"{label}.mean", positive=True)
+    require_number(value.get("stddev"), f"{label}.stddev", positive=False)
+    require_number(value.get("ci95_hw"), f"{label}.ci95_hw", positive=False)
+    return mean
+
+
+def require_percentile_stats(
+    report: dict[str, Any],
+    metric: str,
+    percentile: str,
+    label: str,
+) -> None:
+    metric_obj = report.get(metric)
+    if not isinstance(metric_obj, dict):
+        raise ValidationError(f"{label}: missing {metric}")
+    require_scalar_stats(metric_obj.get(percentile), f"{label}: {metric}.{percentile}")
+
+
 def list_sum(value: Any) -> int:
     if value is None:
         return 0
@@ -932,7 +974,72 @@ def list_sum(value: Any) -> int:
     return sum(int(item) for item in value)
 
 
-def validate_report(report: dict[str, Any], label: str) -> tuple[int, float]:
+def require_int_list(
+    report: dict[str, Any],
+    field: str,
+    label: str,
+    expected_len: int,
+) -> list[int]:
+    value = report.get(field)
+    if not isinstance(value, list):
+        raise ValidationError(f"{label}: missing {field}")
+    if len(value) != expected_len:
+        raise ValidationError(
+            f"{label}: {field} length {len(value)} != n_repeats {expected_len}"
+        )
+    ints: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValidationError(f"{label}: {field} contains non-integer {item!r}")
+        if item < 0:
+            raise ValidationError(f"{label}: {field} contains negative value {item}")
+        ints.append(item)
+    return ints
+
+
+def validate_actual_input_tokens(
+    report: dict[str, Any],
+    label: str,
+    expected_repeats: int,
+    expected_num_prompts: int,
+) -> None:
+    stats = report.get("actual_input_tokens")
+    if not isinstance(stats, dict):
+        raise ValidationError(f"{label}: missing actual_input_tokens stats")
+    for key in ["min", "max", "mean"]:
+        require_number(stats.get(key), f"{label}: actual_input_tokens.{key}", positive=True)
+    per_request = report.get("actual_input_tokens_per_request")
+    if not isinstance(per_request, list):
+        raise ValidationError(f"{label}: missing actual_input_tokens_per_request")
+    if len(per_request) != expected_repeats:
+        raise ValidationError(
+            f"{label}: actual_input_tokens_per_request length "
+            f"{len(per_request)} != n_repeats {expected_repeats}"
+        )
+    for repeat_idx, values in enumerate(per_request):
+        if not isinstance(values, list):
+            raise ValidationError(
+                f"{label}: actual_input_tokens_per_request[{repeat_idx}] must be a list"
+            )
+        if len(values) != expected_num_prompts:
+            raise ValidationError(
+                f"{label}: actual_input_tokens_per_request[{repeat_idx}] length "
+                f"{len(values)} != num_prompts {expected_num_prompts}"
+            )
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValidationError(
+                    f"{label}: actual_input_tokens_per_request contains invalid value {value!r}"
+                )
+
+
+def validate_report(
+    report: dict[str, Any],
+    label: str,
+    *,
+    expected_repeats: int,
+    expected_num_prompts: int,
+) -> tuple[int, float]:
     try:
         concurrency = int(report.get("concurrency") or report.get("c") or 0)
     except ValueError as exc:
@@ -941,36 +1048,57 @@ def validate_report(report: dict[str, Any], label: str) -> tuple[int, float]:
         raise ValidationError(f"{label}: missing positive concurrency")
     if report.get("diagnostic_only") is True:
         raise ValidationError(f"{label} c{concurrency}: report is diagnostic-only")
-    if int(report.get("n_repeats") or 0) < 3:
+    n_repeats = int(report.get("n_repeats") or 0)
+    if n_repeats < 3:
         raise ValidationError(f"{label} c{concurrency}: n_repeats must be >= 3")
+    if n_repeats != expected_repeats:
+        raise ValidationError(
+            f"{label} c{concurrency}: n_repeats {n_repeats} != command n_repeats "
+            f"{expected_repeats}"
+        )
+    if int(report.get("n_requests_per_run") or 0) != expected_num_prompts:
+        raise ValidationError(
+            f"{label} c{concurrency}: n_requests_per_run must be {expected_num_prompts}"
+        )
     if report.get("output_token_count_source") != "usage":
         raise ValidationError(
             f"{label} c{concurrency}: output_token_count_source must be usage"
         )
-    completed = list_sum(report.get("completed_per_run"))
-    if completed <= 0:
-        raise ValidationError(f"{label} c{concurrency}: completed requests must be > 0")
+    completed_values = require_int_list(
+        report, "completed_per_run", f"{label} c{concurrency}", n_repeats
+    )
+    for value in completed_values:
+        if value != expected_num_prompts:
+            raise ValidationError(
+                f"{label} c{concurrency}: completed_per_run must be "
+                f"{expected_num_prompts} for every repeat"
+            )
     for field in BAD_COUNT_FIELDS:
-        if field in report and list_sum(report.get(field)) != 0:
+        values = require_int_list(report, field, f"{label} c{concurrency}", n_repeats)
+        if sum(values) != 0:
             raise ValidationError(f"{label} c{concurrency}: {field} must sum to 0")
-    if "failed_per_run" not in report:
-        raise ValidationError(f"{label} c{concurrency}: missing failed_per_run")
-    if "errored_per_run" not in report:
-        raise ValidationError(f"{label} c{concurrency}: missing errored_per_run")
-    throughput = scalar_mean(report, "output_throughput_tps")
-    if throughput is None:
-        raise ValidationError(f"{label} c{concurrency}: missing positive output throughput")
+    for field in OPTIONAL_BAD_COUNT_FIELDS:
+        if field not in report:
+            continue
+        values = require_int_list(report, field, f"{label} c{concurrency}", n_repeats)
+        if sum(values) != 0:
+            raise ValidationError(f"{label} c{concurrency}: {field} must sum to 0")
+    throughput = require_scalar_stats(
+        report.get("output_throughput_tps"),
+        f"{label} c{concurrency}: output_throughput_tps",
+    )
     for metric, percentile in [
         ("ttft_ms", "p50"),
         ("tpot_ms", "p50"),
         ("e2e_ms", "p95"),
     ]:
-        if not nested_positive(report, metric, percentile):
-            raise ValidationError(f"{label} c{concurrency}: missing positive {metric}.{percentile}")
-    if not isinstance(report.get("actual_input_tokens"), dict):
-        raise ValidationError(f"{label} c{concurrency}: missing actual_input_tokens stats")
-    if not isinstance(report.get("actual_input_tokens_per_request"), list):
-        raise ValidationError(f"{label} c{concurrency}: missing actual_input_tokens_per_request")
+        require_percentile_stats(report, metric, percentile, f"{label} c{concurrency}")
+    validate_actual_input_tokens(
+        report,
+        f"{label} c{concurrency}",
+        n_repeats,
+        expected_num_prompts,
+    )
     return concurrency, throughput
 
 
@@ -979,8 +1107,15 @@ def validate_bench_artifact(path: Path, label: str) -> dict[str, Any]:
     reports = reports_from_json(load_json(path / "bench-serve.json"), label)
     rows: dict[int, dict[str, Any]] = {}
     throughput: dict[int, float] = {}
+    expected_repeats = int(command_signature["n_repeats"])
+    expected_num_prompts = int(command_signature["num_prompts"])
     for report in reports:
-        concurrency, tps = validate_report(report, label)
+        concurrency, tps = validate_report(
+            report,
+            label,
+            expected_repeats=expected_repeats,
+            expected_num_prompts=expected_num_prompts,
+        )
         rows[concurrency] = report
         throughput[concurrency] = tps
     missing = sorted(REQUIRED_CONCURRENCY_CELLS - set(rows))
@@ -1283,17 +1418,18 @@ def validate_perf_goal(
 def bench_report(concurrency: int, tps: float) -> dict[str, Any]:
     return {
         "concurrency": concurrency,
-        "completed_per_run": [4, 4, 4],
+        "n_requests_per_run": 96,
+        "completed_per_run": [96, 96, 96],
         "failed_per_run": [0, 0, 0],
         "errored_per_run": [0, 0, 0],
         "n_repeats": 3,
         "output_token_count_source": "usage",
         "output_throughput_tps": {"mean": tps, "stddev": 0.1, "ci95_hw": 0.2},
-        "ttft_ms": {"p50": {"mean": 500.0}},
-        "tpot_ms": {"p50": {"mean": 40.0}},
-        "e2e_ms": {"p95": {"mean": 6000.0}},
-        "actual_input_tokens": {"mean": 512.0, "min": 512, "max": 512},
-        "actual_input_tokens_per_request": [[512, 512, 512, 512]] * 3,
+        "ttft_ms": {"p50": {"mean": 500.0, "stddev": 1.0, "ci95_hw": 2.0}},
+        "tpot_ms": {"p50": {"mean": 40.0, "stddev": 0.1, "ci95_hw": 0.2}},
+        "e2e_ms": {"p95": {"mean": 6000.0, "stddev": 10.0, "ci95_hw": 20.0}},
+        "actual_input_tokens": {"requested": 256, "mean": 256.0, "min": 256, "max": 256},
+        "actual_input_tokens_per_request": [[256] * 96 for _ in range(3)],
         "bad_output_per_run": [0, 0, 0],
         "malformed_stream_per_run": [0, 0, 0],
         "missing_done_per_run": [0, 0, 0],
@@ -2080,6 +2216,50 @@ def run_self_test() -> None:
             raise AssertionError("bench-mismatch candidate unexpectedly passed")
         except ValidationError as exc:
             if "random-output-len" not in str(exc) and "bench command" not in str(exc):
+                raise
+
+        missing_ci = root / "missing-ci"
+        make_perf_artifact(
+            missing_ci,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        reports = load_json(missing_ci / "bench-serve.json")
+        reports[0]["output_throughput_tps"].pop("ci95_hw")
+        write_json(missing_ci / "bench-serve.json", reports)
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-ci-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_ci,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing-ci candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "ci95_hw" not in str(exc):
+                raise
+
+        incomplete_repeat = root / "incomplete-repeat"
+        make_perf_artifact(
+            incomplete_repeat,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        reports = load_json(incomplete_repeat / "bench-serve.json")
+        reports[0]["completed_per_run"][0] = 95
+        write_json(incomplete_repeat / "bench-serve.json", reports)
+        try:
+            validate_perf_goal(
+                out_dir=root / "incomplete-repeat-out",
+                baseline_artifact=baseline,
+                candidate_artifact=incomplete_repeat,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("incomplete-repeat candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "completed_per_run" not in str(exc):
                 raise
 
 
