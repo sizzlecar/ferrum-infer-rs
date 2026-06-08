@@ -42,6 +42,10 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def load_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -185,11 +189,12 @@ def source_gate_command(
     config: Path,
     out_dir: Path,
 ) -> list[str]:
+    config_path = config if config.is_absolute() else repo / config
     return [
         sys.executable,
         str(repo / SOURCE_GATE),
         "--config",
-        str(repo / config),
+        str(config_path),
         "--out",
         str(out_dir),
         "--ferrum-bin",
@@ -221,20 +226,48 @@ def final_gate_command(
     return cmd
 
 
+def candidate_config_for_run(
+    repo: Path,
+    out_root: Path,
+    run_same_pod_vllm_baseline: bool,
+) -> Path:
+    if not run_same_pod_vllm_baseline:
+        return repo / CANDIDATE_CONFIG
+    config = load_json(repo / CANDIDATE_CONFIG)
+    if not isinstance(config, dict):
+        raise RuntimeError(f"candidate config must be a JSON object: {repo / CANDIDATE_CONFIG}")
+    config["run_vllm_baseline"] = True
+    config["same_pod_vllm_baseline"] = True
+    generated = out_root / "configs" / "candidate-overlapped-with-vllm-baseline.json"
+    write_json(generated, config)
+    return generated
+
+
 def command_plan(
     repo: Path,
     ferrum_bin: Path,
     out_root: Path,
+    candidate_config: Path,
     optional_vllm_artifact: Path | None,
+    run_same_pod_vllm_baseline: bool,
 ) -> dict[str, Any]:
     baseline = out_root / "baseline-batch"
     candidate = out_root / "candidate-overlapped"
     final = out_root / "final"
+    final_optional_vllm_artifact = optional_vllm_artifact
+    if run_same_pod_vllm_baseline and final_optional_vllm_artifact is None:
+        final_optional_vllm_artifact = candidate
+    expected_runtime_cost = "2x4090 host, 1-3 hours, prefer about 1 USD/hour"
+    if run_same_pod_vllm_baseline:
+        expected_runtime_cost = (
+            "2x4090 host, 2-4 hours including same-pod vLLM baseline, "
+            "prefer about 1 USD/hour"
+        )
     return {
         "schema_version": 1,
         "created_at": iso_now(),
         "lane": "layer-split-perf-full",
-        "expected_runtime_cost": "2x4090 host, 1-3 hours, prefer about 1 USD/hour",
+        "expected_runtime_cost": expected_runtime_cost,
         "stop_condition": (
             "final PASS, any correctness failure, model load failure, CUDA OOM, "
             "or target miss with enough profiling evidence"
@@ -246,17 +279,23 @@ def command_plan(
         ),
         "hardware_preflight": "nvidia-smi must report exactly two RTX 4090 GPUs before build",
         "build_command": CUDA_BUILD_COMMAND,
+        "baseline_config": str(repo / BASELINE_CONFIG),
+        "candidate_config": str(candidate_config),
+        "run_same_pod_vllm_baseline": run_same_pod_vllm_baseline,
         "baseline_artifact": str(baseline),
         "candidate_artifact": str(candidate),
+        "optional_vllm_artifact": str(final_optional_vllm_artifact)
+        if final_optional_vllm_artifact is not None
+        else None,
         "final_artifact": str(final),
         "commands": {
             "build_cuda_release": CUDA_BUILD_COMMAND,
             "baseline_batch": source_gate_command(repo, ferrum_bin, BASELINE_CONFIG, baseline),
             "candidate_overlapped": source_gate_command(
-                repo, ferrum_bin, CANDIDATE_CONFIG, candidate
+                repo, ferrum_bin, candidate_config, candidate
             ),
             "final_validator": final_gate_command(
-                repo, final, baseline, candidate, optional_vllm_artifact
+                repo, final, baseline, candidate, final_optional_vllm_artifact
             ),
         },
     }
@@ -268,6 +307,10 @@ def print_run_plan(plan: dict[str, Any]) -> None:
     print(f"Stop condition: {plan['stop_condition']}")
     print(f"Correctness gate: {plan['correctness_gate']}")
     print(f"Performance command: {plan['performance_command']}")
+    if plan["run_same_pod_vllm_baseline"]:
+        print("Same-pod vLLM baseline: enabled; final target may use 80% of vLLM")
+    else:
+        print("Same-pod vLLM baseline: not collected by this orchestrator run")
     print(f"Final artifact: {plan['final_artifact']}")
     sys.stdout.flush()
 
@@ -290,8 +333,10 @@ def write_failure_summary(
             "stop_condition": plan["stop_condition"],
             "correctness_gate": plan["correctness_gate"],
             "performance_command": plan["performance_command"],
+            "run_same_pod_vllm_baseline": plan["run_same_pod_vllm_baseline"],
             "baseline_artifact": plan["baseline_artifact"],
             "candidate_artifact": plan["candidate_artifact"],
+            "optional_vllm_artifact": plan["optional_vllm_artifact"],
             "final_artifact": plan["final_artifact"],
             "run_plan": str(out_root / "layer_split_perf_goal_run_plan.json"),
         },
@@ -336,7 +381,21 @@ def run_goal(args: argparse.Namespace) -> int:
     out_root.mkdir(parents=True, exist_ok=True)
     ferrum_bin = args.ferrum_bin
     optional_vllm = args.optional_vllm_artifact
-    plan = command_plan(repo, ferrum_bin, out_root, optional_vllm)
+    if args.run_same_pod_vllm_baseline and optional_vllm is not None:
+        raise RuntimeError(
+            "--run-same-pod-vllm-baseline and --optional-vllm-artifact are mutually exclusive"
+        )
+    candidate_config = candidate_config_for_run(
+        repo, out_root, args.run_same_pod_vllm_baseline
+    )
+    plan = command_plan(
+        repo,
+        ferrum_bin,
+        out_root,
+        candidate_config,
+        optional_vllm,
+        args.run_same_pod_vllm_baseline,
+    )
     write_json(out_root / "layer_split_perf_goal_run_plan.json", plan)
     print_run_plan(plan)
     failed_step = "hardware_preflight"
@@ -393,7 +452,14 @@ def self_test() -> int:
         "1, NVIDIA GeForce RTX 4090, GPU-same\n"
     )
     assert any("UUIDs" in error for error in validate_gpu_preflight_rows(duplicate_uuid))
-    plan = command_plan(repo, Path("./target/release/ferrum"), out, None)
+    plan = command_plan(
+        repo,
+        Path("./target/release/ferrum"),
+        out,
+        repo / CANDIDATE_CONFIG,
+        None,
+        False,
+    )
     assert plan["baseline_artifact"] == str(out / "baseline-batch")
     assert plan["candidate_artifact"] == str(out / "candidate-overlapped")
     assert f"{PASS_PREFIX}: {plan['final_artifact']}" == (
@@ -416,6 +482,37 @@ def self_test() -> int:
         assert failure["failed_step"] == "hardware_preflight"
         assert failure["stop_condition"] == plan["stop_condition"]
         assert failure["performance_command"] == plan["performance_command"]
+    with tempfile.TemporaryDirectory(prefix="ferrum-layer-split-vllm-plan-") as tmp:
+        tmp_repo = Path(tmp) / "repo"
+        tmp_repo.mkdir()
+        config_dir = tmp_repo / CANDIDATE_CONFIG.parent
+        config_dir.mkdir(parents=True)
+        write_json(
+            tmp_repo / CANDIDATE_CONFIG,
+            {
+                "name": "selftest",
+                "model": "selftest/model",
+                "run_vllm_baseline": False,
+            },
+        )
+        tmp_out = Path(tmp) / "out"
+        generated_config = candidate_config_for_run(tmp_repo, tmp_out, True)
+        generated = load_json(generated_config)
+        assert generated["run_vllm_baseline"] is True
+        assert generated["same_pod_vllm_baseline"] is True
+        vllm_plan = command_plan(
+            tmp_repo,
+            Path("./target/release/ferrum"),
+            tmp_out,
+            generated_config,
+            None,
+            True,
+        )
+        assert vllm_plan["run_same_pod_vllm_baseline"] is True
+        assert "2-4 hours" in vllm_plan["expected_runtime_cost"]
+        assert vllm_plan["optional_vllm_artifact"] == str(tmp_out / "candidate-overlapped")
+        assert str(generated_config) in vllm_plan["commands"]["candidate_overlapped"]
+        assert str(tmp_out / "candidate-overlapped") in vllm_plan["commands"]["final_validator"]
     print("LAYER_SPLIT_PERF ORCHESTRATOR SELFTEST PASS")
     return 0
 
@@ -426,6 +523,14 @@ def main() -> int:
     parser.add_argument("--out", type=Path)
     parser.add_argument("--ferrum-bin", type=Path, default=Path("./target/release/ferrum"))
     parser.add_argument("--optional-vllm-artifact", type=Path)
+    parser.add_argument(
+        "--run-same-pod-vllm-baseline",
+        action="store_true",
+        help=(
+            "run vLLM baseline inside the candidate source gate and pass the "
+            "candidate artifact to the final validator as same-pod vLLM evidence"
+        ),
+    )
     args = parser.parse_args()
     if args.self_test:
         return self_test()
