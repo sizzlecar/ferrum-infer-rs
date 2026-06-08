@@ -975,6 +975,7 @@ fn resolve_llama_layer_split_plan(
     Ok(Some(parsed_plan))
 }
 
+#[cfg(test)]
 fn resolve_llama_layer_stage_config(
     config: &ComponentConfig,
     num_layers: usize,
