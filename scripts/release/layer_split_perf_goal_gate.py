@@ -164,7 +164,52 @@ def validate_metadata(path: Path, label: str) -> dict[str, Any]:
     model = model_identity(metadata)
     if not model:
         raise ValidationError(f"{label}: metadata missing model_id or model_path")
+    for key in ["cuda_version", "driver_version"]:
+        value = metadata.get(key)
+        if not isinstance(value, str) or not value.strip() or value == "unknown":
+            raise ValidationError(f"{label}: metadata missing {key}")
+    for key in ["gpu_names", "gpu_uuids"]:
+        value = metadata.get(key)
+        if not isinstance(value, list) or len(value) != 2 or not all(value):
+            raise ValidationError(f"{label}: metadata {key} must contain two GPUs")
+    for key in ["requested_gpu_devices", "selected_gpu_devices"]:
+        if metadata.get(key) != [0, 1]:
+            raise ValidationError(f"{label}: metadata {key} must be [0, 1]")
     return metadata
+
+
+def binary_digest(metadata: dict[str, Any]) -> str:
+    digest = metadata.get("binary_sha256")
+    if digest is None and isinstance(metadata.get("binary"), dict):
+        digest = metadata["binary"].get("sha256")
+    return str(digest or "")
+
+
+def validate_same_metadata_value(
+    baseline_metadata: dict[str, Any],
+    candidate_metadata: dict[str, Any],
+    key: str,
+) -> None:
+    if baseline_metadata.get(key) != candidate_metadata.get(key):
+        raise ValidationError(f"baseline and candidate metadata {key} differ")
+
+
+def validate_baseline_candidate_metadata_match(
+    baseline_metadata: dict[str, Any],
+    candidate_metadata: dict[str, Any],
+) -> None:
+    validate_same_metadata_value(baseline_metadata, candidate_metadata, "git_sha")
+    if binary_digest(baseline_metadata) != binary_digest(candidate_metadata):
+        raise ValidationError("baseline and candidate binary SHA256 differ")
+    for key in [
+        "cuda_version",
+        "driver_version",
+        "gpu_names",
+        "gpu_uuids",
+        "requested_gpu_devices",
+        "selected_gpu_devices",
+    ]:
+        validate_same_metadata_value(baseline_metadata, candidate_metadata, key)
 
 
 def model_identity(metadata: dict[str, Any]) -> str:
@@ -658,8 +703,11 @@ def validate_perf_goal(
     candidate_config = validate_effective_config(candidate_artifact, "candidate")
     if model_identity(baseline_metadata) != model_identity(candidate_metadata):
         raise ValidationError("baseline and candidate model identity differ")
+    validate_baseline_candidate_metadata_match(baseline_metadata, candidate_metadata)
     if baseline_config["selected_layer_split_plan"] != candidate_config["selected_layer_split_plan"]:
         raise ValidationError("baseline and candidate layer split plans differ")
+    if baseline_config["selected_pipeline_mode"] != "batch":
+        raise ValidationError("baseline selected_pipeline_mode must be batch")
     if candidate_config["selected_pipeline_mode"] != "overlapped":
         raise ValidationError("candidate selected_pipeline_mode must be overlapped")
     baseline_run_command = require_product_command(
@@ -720,8 +768,11 @@ def validate_perf_goal(
         "optional_vllm_artifact": str(optional_vllm_artifact) if optional_vllm_artifact else None,
         "model": model_identity(candidate_metadata),
         "git_sha": candidate_metadata["git_sha"],
-        "binary_sha256": candidate_metadata.get("binary_sha256")
-        or candidate_metadata.get("binary", {}).get("sha256"),
+        "binary_sha256": binary_digest(candidate_metadata),
+        "cuda_version": candidate_metadata.get("cuda_version"),
+        "driver_version": candidate_metadata.get("driver_version"),
+        "gpu_names": candidate_metadata.get("gpu_names"),
+        "gpu_uuids": candidate_metadata.get("gpu_uuids"),
         "selected_layer_split_plan": candidate_config["selected_layer_split_plan"],
         "selected_pipeline_mode": candidate_config["selected_pipeline_mode"],
         "selected_microbatch_size": candidate_config["selected_microbatch_size"],
@@ -815,7 +866,10 @@ def make_perf_artifact(
         "dirty_status": {"is_dirty": False, "status_short": []},
         "binary_sha256": "a" * 64,
         "model_id": "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+        "cuda_version": "12.4",
+        "driver_version": "550.54.15",
         "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
+        "gpu_uuids": ["GPU-baseline-0", "GPU-baseline-1"],
         "requested_gpu_devices": [0, 1],
         "selected_gpu_devices": [0, 1],
         "distributed_strategy": "layer_split",
@@ -1079,6 +1133,69 @@ def run_self_test() -> None:
             raise AssertionError("diagnostic candidate unexpectedly passed")
         except ValidationError as exc:
             if "diagnostic" not in str(exc):
+                raise
+
+        binary_mismatch = root / "binary-mismatch"
+        make_perf_artifact(
+            binary_mismatch,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        metadata = load_json(binary_mismatch / "metadata.json")
+        metadata["binary_sha256"] = "b" * 64
+        write_json(binary_mismatch / "metadata.json", metadata)
+        try:
+            validate_perf_goal(
+                out_dir=root / "binary-mismatch-out",
+                baseline_artifact=baseline,
+                candidate_artifact=binary_mismatch,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("binary-mismatch candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "binary SHA256" not in str(exc):
+                raise
+
+        hardware_mismatch = root / "hardware-mismatch"
+        make_perf_artifact(
+            hardware_mismatch,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        metadata = load_json(hardware_mismatch / "metadata.json")
+        metadata["gpu_uuids"] = ["GPU-other-0", "GPU-other-1"]
+        write_json(hardware_mismatch / "metadata.json", metadata)
+        try:
+            validate_perf_goal(
+                out_dir=root / "hardware-mismatch-out",
+                baseline_artifact=baseline,
+                candidate_artifact=hardware_mismatch,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("hardware-mismatch candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "gpu_uuids" not in str(exc):
+                raise
+
+        wrong_baseline = root / "wrong-baseline"
+        make_perf_artifact(
+            wrong_baseline,
+            tps_by_c={1: 20.0, 4: 20.5, 8: 20.7, 16: 20.6},
+            pipeline_mode="overlapped",
+        )
+        try:
+            validate_perf_goal(
+                out_dir=root / "wrong-baseline-out",
+                baseline_artifact=wrong_baseline,
+                candidate_artifact=candidate,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("wrong-baseline candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "baseline selected_pipeline_mode" not in str(exc):
                 raise
 
         bridge_mismatch = root / "bridge-mismatch"
