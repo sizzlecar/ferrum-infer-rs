@@ -147,8 +147,12 @@ def is_clean_dirty_status(value: Any) -> bool:
     return False
 
 
-def validate_metadata(path: Path, label: str) -> dict[str, Any]:
-    metadata = first_json(path, ["metadata.json", "gate.manifest.json"], f"{label} metadata")
+def validate_metadata(path: Path, label: str, rels: list[str] | None = None) -> dict[str, Any]:
+    metadata = first_json(
+        path,
+        rels or ["metadata.json", "gate.manifest.json"],
+        f"{label} metadata",
+    )
     git_sha = metadata.get("git_sha")
     if not isinstance(git_sha, str) or len(git_sha.strip()) < 7:
         raise ValidationError(f"{label}: missing git_sha")
@@ -216,7 +220,13 @@ def validate_optional_vllm_metadata(
     optional_vllm_artifact: Path,
     candidate_metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    metadata = validate_metadata(optional_vllm_artifact, "vllm")
+    metadata = validate_metadata(
+        optional_vllm_artifact,
+        "vllm",
+        rels=["vllm-baseline.metadata.json", "metadata.json", "gate.manifest.json"],
+    )
+    if metadata.get("engine") != "vllm":
+        raise ValidationError("vllm metadata engine must be vllm")
     if model_identity(metadata) != model_identity(candidate_metadata):
         raise ValidationError("vllm and candidate model identity differ")
     for key in [
@@ -1092,10 +1102,11 @@ def make_correctness_artifact(root: Path) -> None:
 
 def make_vllm_artifact(root: Path, tps: float) -> None:
     write_json(
-        root / "metadata.json",
+        root / "vllm-baseline.metadata.json",
         {
             "schema_version": 1,
             "status": "pass",
+            "engine": "vllm",
             "git_sha": "abcdef0123456789abcdef0123456789abcdef01",
             "dirty_status": {"is_dirty": False, "status_short": []},
             "binary_sha256": "a" * 64,
@@ -1250,9 +1261,9 @@ def run_self_test() -> None:
 
         vllm_hardware_mismatch = root / "vllm-hardware-mismatch"
         make_vllm_artifact(vllm_hardware_mismatch, 40.0)
-        metadata = load_json(vllm_hardware_mismatch / "metadata.json")
+        metadata = load_json(vllm_hardware_mismatch / "vllm-baseline.metadata.json")
         metadata["gpu_uuids"] = ["GPU-vllm-other-0", "GPU-vllm-other-1"]
-        write_json(vllm_hardware_mismatch / "metadata.json", metadata)
+        write_json(vllm_hardware_mismatch / "vllm-baseline.metadata.json", metadata)
         try:
             validate_perf_goal(
                 out_dir=root / "vllm-hardware-mismatch-out",

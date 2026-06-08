@@ -568,6 +568,56 @@ def write_metadata(
     return metadata
 
 
+def write_vllm_metadata(
+    root: Path,
+    repo: Path,
+    cfg: dict[str, Any],
+    hardware: dict[str, Any],
+    server_cmd: list[str],
+    bench_cmd: list[str],
+) -> dict[str, Any]:
+    vllm_bin = shutil.which(server_cmd[0]) or server_cmd[0]
+    metadata = {
+        "schema_version": 1,
+        "lane": LANE,
+        "status": "running",
+        "created_at": iso_now(),
+        "engine": "vllm",
+        "git_sha": git_output(["rev-parse", "HEAD"], repo),
+        "dirty_status": {
+            "is_dirty": bool(git_output(["status", "--short"], repo)),
+            "status_short": git_output(["status", "--short"], repo).splitlines(),
+        },
+        "binary_path": vllm_bin,
+        "binary_sha256": sha256(Path(vllm_bin)),
+        "server_command": server_cmd,
+        "bench_command": bench_cmd,
+        "cuda_version": hardware.get("cuda_version", "unknown"),
+        "driver_version": hardware.get("driver_version", "unknown"),
+        "gpu_names": hardware.get("gpu_names", []),
+        "gpu_uuids": hardware.get("gpu_uuids", []),
+        "requested_gpu_devices": REQUIRED_GPU_DEVICES,
+        "selected_gpu_devices": REQUIRED_GPU_DEVICES,
+        "model_id": cfg["model"],
+        "quant_format": cfg["quant_format"],
+        "sanitized_env": sanitized_env_summary(),
+    }
+    write_json(root / "vllm-baseline.metadata.json", metadata)
+    return metadata
+
+
+def update_vllm_metadata_status(root: Path, status: str, error: str | None = None) -> None:
+    path = root / "vllm-baseline.metadata.json"
+    if not path.is_file():
+        return
+    data = load_json(path)
+    data["status"] = status
+    data["finished_at"] = iso_now()
+    if error:
+        data["error"] = error
+    write_json(path, data)
+
+
 def assert_no_bad_patterns(label: str, text: str) -> None:
     lower = text.lower()
     for pattern in BAD_PATTERNS:
@@ -1459,6 +1509,7 @@ def run_vllm_baseline_gate(
     ferrum_bin: Path,
     cfg: dict[str, Any],
     model: str,
+    hardware: dict[str, Any],
 ) -> dict[str, Any]:
     tokenizer_dir = resolve_tokenizer(str(cfg.get("tokenizer", "auto")), model)
     port = int(cfg.get("port", 19400)) + int(cfg.get("vllm_port_offset", 1))
@@ -1482,6 +1533,7 @@ def run_vllm_baseline_gate(
             "same_hardware_required": True,
         },
     )
+    write_vllm_metadata(root, repo, cfg, hardware, server_cmd, bench_cmd)
     proc: subprocess.Popen[str] | None = None
     log_path = root / "vllm-baseline.log"
     try:
@@ -1508,7 +1560,11 @@ def run_vllm_baseline_gate(
             require_ci=bool(cfg.get("require_ci", True)),
             label="vLLM baseline",
         )
+        update_vllm_metadata_status(root, "pass")
         return {"status": "pass", "rows": list(rows.values())}
+    except Exception as exc:
+        update_vllm_metadata_status(root, "fail", str(exc))
+        raise
     finally:
         terminate_process_group(proc)
 
@@ -1677,6 +1733,29 @@ def self_test() -> int:
     assert "--require-ci" not in smoke_bench_cmd
     hardware = query_hardware(Path("/tmp"), "")
     assert "gpu_names" in hardware
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-vllm-metadata-") as tmp:
+        root = Path(tmp)
+        hardware_doc = {
+            "cuda_version": "12.4",
+            "driver_version": "550.54.15",
+            "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
+            "gpu_uuids": ["GPU-selftest-0", "GPU-selftest-1"],
+        }
+        metadata = write_vllm_metadata(
+            root,
+            Path.cwd(),
+            cfg,
+            hardware_doc,
+            [sys.executable, "--version"],
+            [str(Path("./target/release/ferrum")), "bench-serve"],
+        )
+        assert metadata["engine"] == "vllm"
+        assert metadata["model_id"] == cfg["model"]
+        assert metadata["gpu_uuids"] == hardware_doc["gpu_uuids"]
+        assert isinstance(metadata["binary_sha256"], str)
+        assert len(metadata["binary_sha256"]) == 64
+        update_vllm_metadata_status(root, "pass")
+        assert load_json(root / "vllm-baseline.metadata.json")["status"] == "pass"
     with tempfile.TemporaryDirectory(prefix="ferrum-llama33-source-gate-") as tmp:
         root = Path(tmp)
         ensure_failure_artifacts(root, "selftest failure")
@@ -1844,6 +1923,7 @@ def main() -> int:
                 args.ferrum_bin,
                 cfg,
                 model,
+                hardware,
             )
             vllm_rows = validate_bench_reports(
                 root / "vllm-baseline.json",
