@@ -128,14 +128,24 @@ def query_gpu_preflight(repo: Path) -> dict[str, Any]:
         "--query-gpu=index,name,uuid",
         "--format=csv,noheader",
     ]
-    proc = subprocess.run(
-        cmd,
-        cwd=repo,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "cmd": cmd,
+            "returncode": None,
+            "error": str(exc),
+            "gpus": [],
+        }
     if proc.returncode != 0:
         return {
             "schema_version": 1,
