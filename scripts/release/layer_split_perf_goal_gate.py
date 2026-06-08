@@ -387,6 +387,19 @@ def validate_optional_vllm_metadata(
     return metadata
 
 
+def validate_hardware_summaries_match(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+) -> None:
+    for key in [
+        "pcie_link_width_current",
+        "pcie_link_gen_current",
+        "memory_total_mib",
+    ]:
+        if baseline.get(key) != candidate.get(key):
+            raise ValidationError(f"baseline and candidate hardware {key} differ")
+
+
 def model_identity(metadata: dict[str, Any]) -> str:
     value = metadata.get("model_id") or metadata.get("model_path") or metadata.get("model")
     if isinstance(value, dict):
@@ -1256,6 +1269,7 @@ def validate_perf_goal(
     candidate_hardware = validate_hardware_evidence(
         candidate_artifact, "candidate", candidate_metadata
     )
+    validate_hardware_summaries_match(baseline_hardware, candidate_hardware)
     baseline_model_manifest = validate_model_manifest(
         baseline_artifact, "baseline", baseline_metadata
     )
@@ -2236,6 +2250,29 @@ def run_self_test() -> None:
             raise AssertionError("hardware-mismatch candidate unexpectedly passed")
         except ValidationError as exc:
             if "gpu_uuids" not in str(exc) and "uuid" not in str(exc):
+                raise
+
+        pcie_mismatch = root / "pcie-mismatch"
+        make_perf_artifact(
+            pcie_mismatch,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        hardware = load_json(pcie_mismatch / "hardware.json")
+        hardware["gpus"][1]["pcie_link_width_current"] = 8
+        hardware["pcie_link_width_current"] = [16, 8]
+        write_json(pcie_mismatch / "hardware.json", hardware)
+        try:
+            validate_perf_goal(
+                out_dir=root / "pcie-mismatch-out",
+                baseline_artifact=baseline,
+                candidate_artifact=pcie_mismatch,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("pcie-mismatch candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "pcie_link_width_current" not in str(exc):
                 raise
 
         wrong_baseline = root / "wrong-baseline"
