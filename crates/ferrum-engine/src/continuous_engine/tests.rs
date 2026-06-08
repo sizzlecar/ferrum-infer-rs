@@ -316,6 +316,48 @@ fn model_decode_metadata_marks_sampling_masks_for_full_logits() {
 }
 
 #[test]
+fn schema_guided_sampling_masks_extended_stop_tokens_before_accept() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("{", 0),
+            (" ", 1),
+            ("x", 2),
+            ("</s>", 3),
+            ("}", 4),
+            ("\"", 5),
+            ("<|eot_id|>", 8),
+        ],
+    ));
+    let mut request = policy_request();
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
+        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
+            .to_string(),
+    );
+    let mut state =
+        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+
+    assert!(state.regex_processor.is_some());
+    assert!(
+        state.stop_token_ids.contains(&8),
+        "common eot token should be a resolved stop token"
+    );
+
+    let mut logits = vec![f32::NEG_INFINITY; 9];
+    logits[0] = 1.0;
+    logits[1] = 0.5;
+    logits[8] = 100.0;
+
+    let token = state.sample_with_processors(&mut logits).unwrap();
+
+    assert_eq!(token.get(), 0);
+    assert!(
+        logits[8].is_infinite() && logits[8].is_sign_negative(),
+        "schema-guided generation must not sample eot before the schema accepts"
+    );
+}
+
+#[test]
 fn sample_masks_unknown_pad_reserved_and_bos_tokens() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         10,
