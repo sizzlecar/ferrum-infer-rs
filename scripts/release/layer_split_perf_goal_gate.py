@@ -1161,6 +1161,21 @@ def validate_perf_goal(
         raise ValidationError(
             f"candidate max c4/c8/c16 throughput {candidate_max:.3f} < target {target_tps:.3f}"
         )
+    fixed_public_target_passed = candidate_max >= FIXED_PUBLIC_TARGET_TPS
+    same_pod_vllm_target_tps = 0.80 * vllm_tps if vllm_tps is not None else None
+    same_pod_vllm_target_passed = (
+        candidate_max >= same_pod_vllm_target_tps
+        if same_pod_vllm_target_tps is not None
+        else None
+    )
+    if same_pod_vllm_target_passed is True and fixed_public_target_passed:
+        target_pass_summary = "fixed_public_lower_bound_and_same_pod_vllm_80pct"
+    elif same_pod_vllm_target_passed is True:
+        target_pass_summary = "same_pod_vllm_80pct_only"
+    elif fixed_public_target_passed:
+        target_pass_summary = "fixed_public_lower_bound_only"
+    else:
+        target_pass_summary = "none"
 
     pass_line = f"{PASS_PREFIX}: {out_dir}"
     result = {
@@ -1203,7 +1218,12 @@ def validate_perf_goal(
             candidate_cache_metrics
         ),
         "target_mode": target_mode,
+        "target_pass_summary": target_pass_summary,
         "target_output_tps": target_tps,
+        "fixed_public_target_tps": FIXED_PUBLIC_TARGET_TPS,
+        "fixed_public_target_passed": fixed_public_target_passed,
+        "same_pod_vllm_target_tps": same_pod_vllm_target_tps,
+        "same_pod_vllm_target_passed": same_pod_vllm_target_passed,
         "stretch_output_tps": STRETCH_TARGET_TPS,
         "stretch_passed": candidate_max >= STRETCH_TARGET_TPS,
         "same_pod_vllm_output_tps": vllm_tps,
@@ -1236,7 +1256,10 @@ def validate_perf_goal(
                 "",
                 f"- Status: pass",
                 f"- Target mode: {target_mode}",
+                f"- Target pass summary: {target_pass_summary}",
                 f"- Target output throughput: {target_tps:.3f} tok/s",
+                f"- Fixed public lower bound passed: {fixed_public_target_passed}",
+                f"- Same-pod vLLM 80% passed: {same_pod_vllm_target_passed}",
                 f"- Baseline max c4/c8/c16: {baseline_max:.3f} tok/s",
                 f"- Candidate max c4/c8/c16: {candidate_max:.3f} tok/s",
                 f"- Stretch passed: {candidate_max >= STRETCH_TARGET_TPS}",
@@ -1689,6 +1712,52 @@ def run_self_test() -> None:
         )
         if result["target_mode"] != "fixed_public_lower_bound":
             raise AssertionError("selftest expected fixed target mode")
+        if (
+            result["target_pass_summary"]
+            != "fixed_public_lower_bound_and_same_pod_vllm_80pct"
+        ):
+            raise AssertionError("selftest expected both target summary for low vLLM")
+        if result["fixed_public_target_passed"] is not True:
+            raise AssertionError("selftest expected fixed public target pass")
+        if result["same_pod_vllm_target_passed"] is not True:
+            raise AssertionError("selftest expected same-pod vLLM target pass")
+
+        no_vllm_result = validate_perf_goal(
+            out_dir=root / "no-vllm-out",
+            baseline_artifact=baseline,
+            candidate_artifact=candidate,
+            correctness_artifact=correctness,
+            optional_vllm_artifact=None,
+        )
+        if no_vllm_result["target_pass_summary"] != "fixed_public_lower_bound_only":
+            raise AssertionError("selftest expected fixed-only target summary without vLLM")
+        if no_vllm_result["same_pod_vllm_target_passed"] is not None:
+            raise AssertionError("selftest expected no same-pod target without vLLM")
+
+        strong_candidate = root / "strong-candidate"
+        strong_vllm = root / "strong-vllm"
+        make_perf_artifact(
+            strong_candidate,
+            tps_by_c={1: 22.0, 4: 34.0, 8: 34.4, 16: 34.2},
+            pipeline_mode="overlapped",
+        )
+        make_vllm_artifact(strong_vllm, 40.0)
+        strong_result = validate_perf_goal(
+            out_dir=root / "strong-out",
+            baseline_artifact=baseline,
+            candidate_artifact=strong_candidate,
+            correctness_artifact=correctness,
+            optional_vllm_artifact=strong_vllm,
+        )
+        if strong_result["target_mode"] != "same_pod_vllm_80pct":
+            raise AssertionError("selftest expected same-pod vLLM target mode")
+        if (
+            strong_result["target_pass_summary"]
+            != "fixed_public_lower_bound_and_same_pod_vllm_80pct"
+        ):
+            raise AssertionError("selftest expected both target summary")
+        if strong_result["same_pod_vllm_target_passed"] is not True:
+            raise AssertionError("selftest expected same-pod vLLM target pass")
 
         bad = root / "bad-candidate"
         make_perf_artifact(
