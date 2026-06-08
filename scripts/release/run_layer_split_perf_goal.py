@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -183,6 +184,32 @@ def require_2x4090_preflight(repo: Path, out_root: Path) -> dict[str, Any]:
     return preflight
 
 
+def query_vllm_preflight() -> dict[str, Any]:
+    path = shutil.which("vllm")
+    if path is None:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "cmd": ["vllm"],
+            "error": "vllm executable not found on PATH",
+            "path": None,
+        }
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "cmd": ["vllm"],
+        "path": path,
+    }
+
+
+def require_vllm_preflight(out_root: Path) -> dict[str, Any]:
+    preflight = query_vllm_preflight()
+    write_json(out_root / "layer_split_perf_vllm_preflight.json", preflight)
+    if preflight.get("status") != "pass":
+        raise RuntimeError(preflight.get("error") or "vllm preflight failed")
+    return preflight
+
+
 def source_gate_command(
     repo: Path,
     ferrum_bin: Path,
@@ -278,6 +305,11 @@ def command_plan(
             "--n-repeats 3 --concurrency-sweep 1,4,8,16"
         ),
         "hardware_preflight": "nvidia-smi must report exactly two RTX 4090 GPUs before build",
+        "vllm_preflight": (
+            "vllm executable must be on PATH before build"
+            if run_same_pod_vllm_baseline
+            else "not required unless --run-same-pod-vllm-baseline is set"
+        ),
         "build_command": CUDA_BUILD_COMMAND,
         "baseline_config": str(repo / BASELINE_CONFIG),
         "candidate_config": str(candidate_config),
@@ -401,6 +433,9 @@ def run_goal(args: argparse.Namespace) -> int:
     failed_step = "hardware_preflight"
     try:
         require_2x4090_preflight(repo, out_root)
+        if args.run_same_pod_vllm_baseline:
+            failed_step = "vllm_preflight"
+            require_vllm_preflight(out_root)
 
         failed_step = "build_cuda_release"
         run_step("build_cuda_release", plan["commands"]["build_cuda_release"], repo, out_root)
@@ -470,6 +505,7 @@ def self_test() -> int:
     final_cmd = plan["commands"]["final_validator"]
     assert plan["commands"]["build_cuda_release"] == CUDA_BUILD_COMMAND
     assert "two RTX 4090" in plan["hardware_preflight"]
+    assert "not required" in plan["vllm_preflight"]
     assert any(str(BASELINE_CONFIG) in item for item in baseline_cmd)
     assert any(str(CANDIDATE_CONFIG) in item for item in candidate_cmd)
     assert str(out / "candidate-overlapped") in final_cmd
@@ -510,9 +546,39 @@ def self_test() -> int:
         )
         assert vllm_plan["run_same_pod_vllm_baseline"] is True
         assert "2-4 hours" in vllm_plan["expected_runtime_cost"]
+        assert "vllm executable" in vllm_plan["vllm_preflight"]
         assert vllm_plan["optional_vllm_artifact"] == str(tmp_out / "candidate-overlapped")
         assert str(generated_config) in vllm_plan["commands"]["candidate_overlapped"]
         assert str(tmp_out / "candidate-overlapped") in vllm_plan["commands"]["final_validator"]
+    with tempfile.TemporaryDirectory(prefix="ferrum-layer-split-vllm-preflight-") as tmp:
+        tmp_out = Path(tmp)
+        empty_bin_dir = tmp_out / "empty-bin"
+        empty_bin_dir.mkdir()
+        old_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = str(empty_bin_dir)
+            try:
+                require_vllm_preflight(tmp_out)
+                raise AssertionError("missing vllm preflight unexpectedly passed")
+            except RuntimeError as exc:
+                assert "vllm executable not found" in str(exc)
+            missing = load_json(tmp_out / "layer_split_perf_vllm_preflight.json")
+            assert missing["status"] == "fail"
+        finally:
+            os.environ["PATH"] = old_path
+        bin_dir = tmp_out / "bin"
+        bin_dir.mkdir()
+        fake_vllm = bin_dir / "vllm"
+        fake_vllm.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_vllm.chmod(0o755)
+        try:
+            os.environ["PATH"] = str(bin_dir) + os.pathsep + old_path
+            preflight = require_vllm_preflight(tmp_out)
+            assert preflight["status"] == "pass"
+            assert preflight["path"] == str(fake_vllm)
+            assert (tmp_out / "layer_split_perf_vllm_preflight.json").is_file()
+        finally:
+            os.environ["PATH"] = old_path
     print("LAYER_SPLIT_PERF ORCHESTRATOR SELFTEST PASS")
     return 0
 
