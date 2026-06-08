@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 LANE="${1:-}"
 if [[ -z "$LANE" ]]; then
@@ -13,7 +14,7 @@ pass() { echo "G0 SOURCE ${1} PASS: $OUT_ROOT"; }
 
 run_unit() {
   cargo test --workspace --all-targets | tee "$OUT_ROOT/unit.log"
-  python3 -m py_compile \
+  python3 - "$OUT_ROOT/release-scripts-pycompile-cache" \
     scripts/metal_readme_regression.py \
     scripts/release/inventory_tree.py \
     scripts/release/validate_metal_readme_regression.py \
@@ -23,6 +24,8 @@ run_unit() {
     scripts/release/g0_cuda_llama33_70b_4bit_2x4090_gate.py \
     scripts/release/backend_runtime_preset_goal_gate.py \
     scripts/release/llama33_70b_4bit_2x4090_goal_gate.py \
+    scripts/release/layer_split_perf_goal_gate.py \
+    scripts/release/run_layer_split_perf_goal.py \
     scripts/release/backend_boundary_audit.py \
     scripts/release/backend_runtime_preset_snapshot.py \
     scripts/release/openai_concurrency_quality_regression.py \
@@ -31,7 +34,18 @@ run_unit() {
     scripts/release/run_scenarios.py \
     scripts/release/selftest_g0_validators.py \
     scripts/release/selftest_g1_g3_g4_release_regression.py \
-    scripts/release/validate_release_completion_manifest.py | tee "$OUT_ROOT/release-scripts-pycompile.log"
+    scripts/release/validate_release_completion_manifest.py <<'PY' 2>&1 | tee "$OUT_ROOT/release-scripts-pycompile.log"
+import pathlib
+import py_compile
+import sys
+
+cache_dir = pathlib.Path(sys.argv[1])
+cache_dir.mkdir(parents=True, exist_ok=True)
+for raw in sys.argv[2:]:
+    cfile = cache_dir / (raw.replace("/", "__") + ".pyc")
+    py_compile.compile(raw, cfile=str(cfile), doraise=True)
+    print(f"compiled {raw}")
+PY
   bash -n scripts/release/g0_source_gate.sh | tee "$OUT_ROOT/g0-source-bashn.log"
   python3 scripts/release/selftest_g0_validators.py | tee "$OUT_ROOT/g0-validator-selftest.log"
   python3 scripts/release/selftest_g1_g3_g4_release_regression.py | tee "$OUT_ROOT/g1-g3-g4-validator-selftest.log"
