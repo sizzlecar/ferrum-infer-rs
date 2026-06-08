@@ -413,6 +413,8 @@ def validate_optional_vllm_metadata(
     )
     if metadata.get("engine") != "vllm":
         raise ValidationError("vllm metadata engine must be vllm")
+    if metadata.get("git_sha") != candidate_metadata.get("git_sha"):
+        raise ValidationError("vllm and candidate metadata git_sha differ")
     if model_identity(metadata) != model_identity(candidate_metadata):
         raise ValidationError("vllm and candidate model identity differ")
     for key in [
@@ -3021,6 +3023,24 @@ def run_self_test() -> None:
             raise AssertionError("vllm hardware mismatch unexpectedly passed")
         except ValidationError as exc:
             if "vllm and candidate metadata gpu_uuids differ" not in str(exc):
+                raise
+
+        vllm_git_mismatch = root / "vllm-git-mismatch"
+        make_vllm_artifact(vllm_git_mismatch, 40.0)
+        metadata = load_json(vllm_git_mismatch / "vllm-baseline.metadata.json")
+        metadata["git_sha"] = "1234567890abcdef1234567890abcdef12345678"
+        write_json(vllm_git_mismatch / "vllm-baseline.metadata.json", metadata)
+        try:
+            validate_perf_goal(
+                out_dir=root / "vllm-git-mismatch-out",
+                baseline_artifact=baseline,
+                candidate_artifact=candidate,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=vllm_git_mismatch,
+            )
+            raise AssertionError("vllm git mismatch unexpectedly passed")
+        except ValidationError as exc:
+            if "git_sha differ" not in str(exc):
                 raise
 
         vllm_missing_command = root / "vllm-missing-command"
