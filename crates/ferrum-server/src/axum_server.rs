@@ -709,6 +709,7 @@ fn admission_health_json(
         "rejected_requests_total": 0u64,
         "failed_requests_total": scheduler_metrics.failed_requests,
         "completed_requests_total": scheduler_metrics.successful_requests,
+        "avg_queue_wait_time_ms": scheduler_metrics.queue_metrics.avg_queue_wait_time_ms,
         "scheduler_policy": configured
             .and_then(|value| value.get("scheduler_policy"))
             .and_then(|value| value.as_str())
@@ -2989,6 +2990,8 @@ async fn health_handler(
             "successful_requests": scheduler_metrics.successful_requests,
             "failed_requests": scheduler_metrics.failed_requests,
             "throughput_rps": scheduler_metrics.throughput_rps,
+            "avg_wait_time_ms": scheduler_metrics.queue_metrics.avg_queue_wait_time_ms,
+            "scheduling_time_ms": scheduler_metrics.performance_breakdown.scheduling_time_ms,
         },
         "config": runtime_config,
         "auto_config": auto_config,
@@ -4038,6 +4041,9 @@ mod tests {
         assert!(body["admission"]["rejected_requests_total"].is_number());
         assert!(body["admission"]["failed_requests_total"].is_number());
         assert!(body["admission"]["completed_requests_total"].is_number());
+        assert!(body["admission"]["avg_queue_wait_time_ms"].is_number());
+        assert!(body["scheduler"]["avg_wait_time_ms"].is_number());
+        assert!(body["scheduler"]["scheduling_time_ms"].is_number());
         assert!(
             body["auto_config"]["decisions"].is_array() || body["auto_config"]["error"].is_string(),
             "body: {body}"

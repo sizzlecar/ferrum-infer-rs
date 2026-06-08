@@ -670,6 +670,18 @@ def json_int(value: Any, label: str, *, minimum: int = 0) -> int:
     return value
 
 
+def json_non_negative_number(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValidationError(f"{label} must be numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{label} must be numeric") from exc
+    if number < 0:
+        raise ValidationError(f"{label} must be >= 0")
+    return number
+
+
 def validate_admission_health(
     path: Path,
     label: str,
@@ -723,6 +735,10 @@ def validate_admission_health(
             admission.get("completed_requests_total"),
             f"{label}: admission.completed_requests_total",
         ),
+        "avg_queue_wait_time_ms": json_non_negative_number(
+            admission.get("avg_queue_wait_time_ms"),
+            f"{label}: admission.avg_queue_wait_time_ms",
+        ),
         "scheduler_policy": admission.get("scheduler_policy"),
     }
     if summary["rejected_requests_total"] != 0:
@@ -744,6 +760,14 @@ def validate_admission_health(
         ),
         "failed_requests": json_int(
             scheduler.get("failed_requests"), f"{label}: scheduler.failed_requests"
+        ),
+        "avg_wait_time_ms": json_non_negative_number(
+            scheduler.get("avg_wait_time_ms"),
+            f"{label}: scheduler.avg_wait_time_ms",
+        ),
+        "scheduling_time_ms": json_non_negative_number(
+            scheduler.get("scheduling_time_ms"),
+            f"{label}: scheduler.scheduling_time_ms",
         ),
     }
     if scheduler_summary["failed_requests"] != 0:
@@ -2112,6 +2136,7 @@ def make_perf_artifact(
                 "rejected_requests_total": 0,
                 "failed_requests_total": 0,
                 "completed_requests_total": 384,
+                "avg_queue_wait_time_ms": 0.0,
                 "scheduler_policy": "active_decode_prefill_chunk:64",
             },
             "scheduler": {
@@ -2119,6 +2144,8 @@ def make_perf_artifact(
                 "successful_requests": 384,
                 "failed_requests": 0,
                 "throughput_rps": 3.5,
+                "avg_wait_time_ms": 0.0,
+                "scheduling_time_ms": 0.0,
             },
             "cache": {
                 "prefix_cache": {
@@ -2445,6 +2472,10 @@ def run_self_test() -> None:
             raise AssertionError("selftest expected vLLM TP=2 server signature")
         if result["same_pod_vllm_server_command_signature"]["quantization"] != "gptq":
             raise AssertionError("selftest expected vLLM gptq quantization")
+        if result["candidate_admission"]["avg_queue_wait_time_ms"] != 0.0:
+            raise AssertionError("selftest expected candidate admission wait time summary")
+        if result["candidate_admission"]["scheduler"]["avg_wait_time_ms"] != 0.0:
+            raise AssertionError("selftest expected scheduler wait time summary")
         candidate_c8 = result["candidate_bench_summary_by_concurrency"][8]
         if candidate_c8["output_throughput_tps"]["mean"] != 28.4:
             raise AssertionError("selftest expected candidate c8 throughput summary")
@@ -2864,6 +2895,28 @@ def run_self_test() -> None:
             raise AssertionError("missing admission candidate unexpectedly passed")
         except ValidationError as exc:
             if "admission" not in str(exc):
+                raise
+
+        missing_wait_metric = root / "missing-wait-metric"
+        make_perf_artifact(
+            missing_wait_metric,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        health = load_json(missing_wait_metric / "serve.health.after.json")
+        health["admission"].pop("avg_queue_wait_time_ms", None)
+        write_json(missing_wait_metric / "serve.health.after.json", health)
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-wait-metric-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_wait_metric,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing wait metric candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "avg_queue_wait_time_ms" not in str(exc):
                 raise
 
         binary_mismatch = root / "binary-mismatch"
