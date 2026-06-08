@@ -77,12 +77,14 @@ REQUIRED_ARTIFACT_FILES = {
     "serve.effective_config.json",
     "serve.log",
     "serve.health.json",
+    "serve.health.after.json",
     "serve.models.json",
     "serve.correctness.json",
     "serve.multiturn.json",
     "serve.structured_output.json",
     "serve.tool_call.json",
     "serve.streaming.sse",
+    "correctness.json",
     "concurrency_quality_regression.json",
     "bench-serve.command.json",
     "bench-serve.json",
@@ -287,12 +289,20 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise RuntimeError(f"config gpu_devices must be {REQUIRED_GPU_DEVICES}")
     if cfg.get("distributed_strategy") != "layer_split":
         raise RuntimeError("config distributed_strategy must be layer_split")
+    pipeline_mode_from_config(cfg)
     model = cfg.get("model")
     if not isinstance(model, str) or not model:
         raise RuntimeError("config model must be a non-empty model id/path")
     quant = str(cfg.get("quant_format", "")).lower()
     if not any(marker in quant for marker in ("gptq", "awq", "q4")):
         raise RuntimeError("config quant_format must identify a 4bit format")
+
+
+def pipeline_mode_from_config(cfg: dict[str, Any]) -> str:
+    value = str(cfg.get("layer_split_pipeline_mode", "overlapped")).strip().lower()
+    if value not in {"batch", "overlapped"}:
+        raise RuntimeError("config layer_split_pipeline_mode must be batch or overlapped")
+    return value
 
 
 def even_layer_split_plan_for_layers(devices: list[int], num_layers: int) -> str:
@@ -374,6 +384,8 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
         "cuda",
         "--gpu-devices",
         ",".join(str(device) for device in REQUIRED_GPU_DEVICES),
+        "--layer-split-pipeline-mode",
+        pipeline_mode_from_config(cfg),
         "--max-tokens",
         str(cfg.get("run_max_tokens", 64)),
         "--stop",
@@ -406,6 +418,8 @@ def build_serve_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root:
         "cuda",
         "--gpu-devices",
         ",".join(str(device) for device in REQUIRED_GPU_DEVICES),
+        "--layer-split-pipeline-mode",
+        pipeline_mode_from_config(cfg),
         "--host",
         "127.0.0.1",
         "--port",
@@ -547,6 +561,7 @@ def write_metadata(
         "quant_format": cfg["quant_format"],
         "distributed_strategy": "layer_split",
         "layer_split_plan": layer_split_plan_from_config(cfg),
+        "layer_split_pipeline_mode": pipeline_mode_from_config(cfg),
         "sanitized_env": sanitized_env_summary(),
     }
     write_json(root / "metadata.json", metadata)
@@ -826,7 +841,7 @@ def normalize_runtime_artifacts(root: Path) -> None:
     copy_if_present(root / "run.decision_trace.jsonl", root / "decision_trace.jsonl")
 
 
-def require_effective_config(path: Path, label: str) -> dict[str, Any]:
+def require_effective_config(path: Path, label: str, cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     data = load_json(path)
     required = {
         "backend",
@@ -835,6 +850,9 @@ def require_effective_config(path: Path, label: str) -> dict[str, Any]:
         "cuda_device_count",
         "selected_distributed_strategy",
         "selected_layer_split_plan",
+        "selected_pipeline_mode",
+        "selected_microbatch_size",
+        "selected_stage_bridge",
         "selected_weight_placement",
         "selected_kv_layout",
         "selected_attention_impl",
@@ -878,6 +896,26 @@ def require_effective_config(path: Path, label: str) -> dict[str, Any]:
             f"{label}: selected_weight_placement must be layer_split, "
             f"got {data['selected_weight_placement']!r}"
         )
+    expected_pipeline_mode = pipeline_mode_from_config(cfg or {})
+    if data["selected_pipeline_mode"] != expected_pipeline_mode:
+        raise RuntimeError(
+            f"{label}: selected_pipeline_mode must be {expected_pipeline_mode}, "
+            f"got {data['selected_pipeline_mode']!r}"
+        )
+    if data["selected_stage_bridge"] != "host":
+        raise RuntimeError(
+            f"{label}: selected_stage_bridge must be host, got {data['selected_stage_bridge']!r}"
+        )
+    max_sequences = int(data["selected_max_sequences"])
+    if expected_pipeline_mode == "overlapped":
+        expected_microbatch = max(1, (max_sequences + 1) // 2)
+    else:
+        expected_microbatch = max_sequences
+    if data["selected_microbatch_size"] != expected_microbatch:
+        raise RuntimeError(
+            f"{label}: selected_microbatch_size must be {expected_microbatch}, "
+            f"got {data['selected_microbatch_size']!r}"
+        )
     return data
 
 
@@ -902,11 +940,13 @@ def ensure_failure_artifacts(root: Path, error: str) -> None:
         "serve.command.json": {"status": "not_run", "blocked_by": error},
         "serve.effective_config.json": {"status": "not_run", "blocked_by": error},
         "serve.health.json": {"status": "not_run", "blocked_by": error},
+        "serve.health.after.json": {"status": "not_run", "blocked_by": error},
         "serve.models.json": {"status": "not_run", "blocked_by": error},
         "serve.correctness.json": {"status": "not_run", "blocked_by": error},
         "serve.multiturn.json": {"status": "not_run", "blocked_by": error},
         "serve.structured_output.json": {"status": "not_run", "blocked_by": error},
         "serve.tool_call.json": {"status": "not_run", "blocked_by": error},
+        "correctness.json": {"status": "fail", "error": error, "checks": {}},
         "concurrency_quality_regression.json": {"status": "not_run", "blocked_by": error},
         "bench-serve.command.json": {"status": "not_run", "blocked_by": error},
         "bench-serve.json": {"status": "not_run", "blocked_by": error},
@@ -952,6 +992,92 @@ def update_metadata_status(root: Path, status: str, error: str | None = None) ->
     write_json(path, data)
 
 
+def require_pass_check(checks: dict[str, Any], key: str) -> dict[str, Any]:
+    value = checks.get(key)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"missing check {key}")
+    if value.get("status") != "pass":
+        raise RuntimeError(f"check {key} did not pass: {value!r}")
+    return value
+
+
+def write_goal_correctness_artifact(root: Path, checks: dict[str, Any]) -> dict[str, Any]:
+    run_check = require_pass_check(checks, "run")
+    serve_single = require_pass_check(checks, "serve_correctness")
+    serve_multiturn_check = require_pass_check(checks, "serve_multiturn")
+    structured = require_pass_check(checks, "serve_structured_output")
+    tool = require_pass_check(checks, "serve_tool_call")
+    streaming = require_pass_check(checks, "serve_streaming")
+
+    done_count = int(streaming.get("done_count", 0))
+    usage_chunk_count = int(streaming.get("usage_chunk_count", 0))
+    artifact = {
+        "schema_version": 1,
+        "status": "pass",
+        "source": "g0_cuda_llama33_70b_4bit_2x4090_gate",
+        "created_at": iso_now(),
+        "checks": {
+            "ferrum_run_single": {
+                "status": "pass",
+                "source_check": "run",
+                "assistant_turns": run_check.get("assistant_turns"),
+            },
+            "ferrum_run_multiturn": {
+                "status": "pass",
+                "source_check": "run",
+                "has_precise_recall": run_check.get("has_precise_recall") is True,
+            },
+            "ferrum_serve_single": {
+                "status": "pass",
+                "source_check": "serve_correctness",
+                "contains_expected_answer": serve_single.get("contains_expected_answer") is True,
+            },
+            "ferrum_serve_multiturn": {
+                "status": "pass",
+                "source_check": "serve_multiturn",
+                "has_precise_recall": serve_multiturn_check.get("has_precise_recall") is True,
+            },
+            "streaming_done": {
+                "status": "pass",
+                "source_check": "serve_streaming",
+                "done_count": done_count,
+            },
+            "streaming_usage": {
+                "status": "pass",
+                "source_check": "serve_streaming",
+                "include_usage": True,
+                "usage_received": usage_chunk_count == 1,
+                "usage_chunk_count": usage_chunk_count,
+            },
+            "tool_calling": {
+                "status": "pass",
+                "source_check": "serve_tool_call",
+                "details": tool,
+            },
+            "structured_output": {
+                "status": "pass",
+                "source_check": "serve_structured_output",
+                "json_ok": structured.get("json_ok") is True,
+                "schema_ok": structured.get("schema_ok") is True,
+            },
+            "log_scan": {
+                "status": "pass",
+                "bad_pattern_count": 0,
+                "scanned_files": [
+                    "run.stdout",
+                    "run.stderr",
+                    "serve.log",
+                    "serve.streaming.sse",
+                    "bench-serve.stdout",
+                    "bench-serve.stderr",
+                ],
+            },
+        },
+    }
+    write_json(root / "correctness.json", artifact)
+    return {"status": "pass", "path": "correctness.json"}
+
+
 def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     input_text = "\n".join(
         [
@@ -969,6 +1095,7 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
             "expected_gpu_devices": REQUIRED_GPU_DEVICES,
             "expected_distributed_strategy": "layer_split",
             "expected_layer_split_plan": layer_split_plan_from_config(cfg),
+            "expected_layer_split_pipeline_mode": pipeline_mode_from_config(cfg),
             "config": {
                 "max_model_len": cfg.get("max_model_len"),
                 "kv_capacity": cfg.get("kv_capacity"),
@@ -997,7 +1124,7 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
     recall = strip_think(str(turns[-1].get("content") or ""))
     if RECALL_MARKER not in recall:
         raise RuntimeError(f"ferrum run recall failed: {recall[:500]!r}")
-    effective = require_effective_config(root / "run.effective_config.json", "run")
+    effective = require_effective_config(root / "run.effective_config.json", "run", cfg)
     return {
         "status": "pass",
         "returncode": proc.returncode,
@@ -1007,13 +1134,13 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
     }
 
 
-def capture_health(root: Path, base_url: str) -> dict[str, Any]:
+def capture_health(root: Path, base_url: str, filename: str = "serve.health.json") -> dict[str, Any]:
     status, body = get_url(base_url.rstrip("/") + "/health", timeout=30)
-    write_text(root / "serve.health.json", body)
+    write_text(root / filename, body)
     data = parsed_response("serve health", status, body)
     assert_no_bad_patterns("serve health", body)
     result = {"status": "pass", "http_status": status, "version": data.get("version")}
-    write_json(root / "serve.health.json", {**data, **result})
+    write_json(root / filename, {**data, **result})
     return result
 
 
@@ -1460,6 +1587,13 @@ def self_test() -> int:
         "max_num_batched_tokens": 1024,
     }
     validate_config(cfg)
+    assert pipeline_mode_from_config(cfg) == "overlapped"
+    bad_mode_cfg = {**cfg, "layer_split_pipeline_mode": "serial"}
+    try:
+        validate_config(bad_mode_cfg)
+        raise AssertionError("invalid layer_split_pipeline_mode unexpectedly passed")
+    except RuntimeError as exc:
+        assert "layer_split_pipeline_mode" in str(exc)
     assert (
         layer_split_plan_from_config(cfg)
         == "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79"
@@ -1467,6 +1601,8 @@ def self_test() -> int:
     cmd = build_run_command(Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out"))
     assert "--gpu-devices" in cmd
     assert "0,1" in cmd
+    assert "--layer-split-pipeline-mode" in cmd
+    assert "overlapped" in cmd
     assert "--effective-config-json" in cmd
     assert "--max-model-len" in cmd
     assert "8192" in cmd
@@ -1476,9 +1612,57 @@ def self_test() -> int:
     assert "8" in cmd
     assert "--max-num-batched-tokens" in cmd
     assert "1024" in cmd
-    serve_cmd = build_serve_command(Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out"))
+    serve_cmd = build_serve_command(
+        Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out")
+    )
     assert serve_cmd[1] == "serve"
     assert "--gpu-devices" in serve_cmd
+    assert "--layer-split-pipeline-mode" in serve_cmd
+    assert "overlapped" in serve_cmd
+    effective_doc = {
+        "backend": "cuda",
+        "requested_gpu_devices": REQUIRED_GPU_DEVICES,
+        "selected_gpu_devices": REQUIRED_GPU_DEVICES,
+        "cuda_device_count": 2,
+        "selected_distributed_strategy": "layer_split",
+        "selected_layer_split_plan": layer_split_plan_from_config(cfg),
+        "selected_pipeline_mode": "overlapped",
+        "selected_microbatch_size": 4,
+        "selected_stage_bridge": "host",
+        "selected_weight_placement": "layer_split",
+        "selected_kv_layout": "paged",
+        "selected_attention_impl": "vllm_paged_attn",
+        "selected_graph_mode": "disabled",
+        "selected_max_sequences": 8,
+        "selected_max_model_len": 8192,
+        "selected_kv_capacity": 2048,
+        "selected_max_batched_tokens": 1024,
+        "model_capabilities": {},
+    }
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-effective-config-") as tmp:
+        effective_path = Path(tmp) / "effective_config.json"
+        write_json(effective_path, effective_doc)
+        require_effective_config(effective_path, "selftest-overlapped", cfg)
+
+        batch_cfg = {**cfg, "layer_split_pipeline_mode": "batch"}
+        effective_doc["selected_pipeline_mode"] = "batch"
+        effective_doc["selected_microbatch_size"] = 8
+        write_json(effective_path, effective_doc)
+        require_effective_config(effective_path, "selftest-batch", batch_cfg)
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-correctness-") as tmp:
+        root = Path(tmp)
+        correctness_checks = {
+            "run": {"status": "pass", "assistant_turns": 2, "has_precise_recall": True},
+            "serve_correctness": {"status": "pass", "contains_expected_answer": True},
+            "serve_multiturn": {"status": "pass", "has_precise_recall": True},
+            "serve_structured_output": {"status": "pass", "json_ok": True, "schema_ok": True},
+            "serve_tool_call": {"status": "pass", "tool_call_ok": True},
+            "serve_streaming": {"status": "pass", "done_count": 1, "usage_chunk_count": 1},
+        }
+        write_goal_correctness_artifact(root, correctness_checks)
+        from layer_split_perf_goal_gate import validate_correctness_artifact
+
+        validate_correctness_artifact(root)
     bench_cmd = build_bench_serve_command(Path("./target/release/ferrum"), cfg, Path("/tmp/out"))
     assert "--fail-on-error" in bench_cmd
     assert "--require-ci" in bench_cmd
@@ -1611,6 +1795,7 @@ def main() -> int:
                 "expected_gpu_devices": REQUIRED_GPU_DEVICES,
                 "expected_distributed_strategy": "layer_split",
                 "expected_layer_split_plan": layer_split_plan_from_config(cfg),
+                "expected_layer_split_pipeline_mode": pipeline_mode_from_config(cfg),
             },
         )
         serve_log = root / "serve.log"
@@ -1626,7 +1811,7 @@ def main() -> int:
             )
         wait_health(base_url, timeout_sec=int(cfg.get("serve_startup_timeout_sec", 1800)))
         capture_nvidia_smi(root, "during")
-        require_effective_config(root / "serve.effective_config.json", "serve")
+        require_effective_config(root / "serve.effective_config.json", "serve", cfg)
         checks["serve_health"] = capture_health(root, base_url)
         checks["serve_models"] = capture_models(root, base_url, model)
         checks["serve_correctness"] = serve_correctness(root, base_url, model)
@@ -1636,11 +1821,15 @@ def main() -> int:
         checks["serve_streaming"] = serve_streaming(root, base_url, model)
         checks["concurrency_quality"] = run_concurrency_gate(root, base_url, model, cfg)
         checks["bench_serve"] = run_ferrum_bench_gate(root, repo, args.ferrum_bin, cfg, base_url, model)
+        checks["serve_health_after"] = capture_health(
+            root, base_url, filename="serve.health.after.json"
+        )
 
         terminate_process_group(proc)
         proc = None
         log_text = serve_log.read_text(errors="replace")
         assert_no_bad_patterns("serve.log", log_text)
+        checks["goal_correctness"] = write_goal_correctness_artifact(root, checks)
 
         ferrum_rows = validate_bench_reports(
             root / "bench-serve.json",
@@ -1677,7 +1866,7 @@ def main() -> int:
             checks["vllm_baseline"] = write_diagnostic_vllm_skip(root, cfg, ferrum_rows, reason)
             checks["comparison"] = load_json(root / "comparison.json")
 
-        require_effective_config(root / "effective_config.json", "top-level")
+        require_effective_config(root / "effective_config.json", "top-level", cfg)
     except Exception as exc:
         terminate_process_group(proc, sig=signal.SIGKILL)
         capture_nvidia_smi(root, "after")

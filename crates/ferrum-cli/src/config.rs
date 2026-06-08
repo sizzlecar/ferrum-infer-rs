@@ -194,6 +194,11 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub prefix_cache: Option<bool>,
 
+    /// Layer-split decode pipeline mode, equivalent to
+    /// `FERRUM_LAYER_SPLIT_PIPELINE_MODE`.
+    #[serde(default)]
+    pub layer_split_pipeline_mode: Option<String>,
+
     /// MoE CUDA graph policy override, equivalent to `FERRUM_MOE_GRAPH`.
     #[serde(default)]
     pub moe_graph: Option<bool>,
@@ -264,6 +269,11 @@ impl RuntimeCliConfig {
             self.max_batched_tokens,
         );
         push_bool_entry(&mut entries, "FERRUM_PREFIX_CACHE", self.prefix_cache);
+        push_string_entry(
+            &mut entries,
+            "FERRUM_LAYER_SPLIT_PIPELINE_MODE",
+            self.layer_split_pipeline_mode.as_deref(),
+        );
         push_bool_entry(&mut entries, "FERRUM_MOE_GRAPH", self.moe_graph);
         push_bool_entry(
             &mut entries,
@@ -522,6 +532,7 @@ mod tests {
             paged_max_seqs: Some(64),
             max_batched_tokens: Some(2048),
             prefix_cache: Some(false),
+            layer_split_pipeline_mode: Some("batch".to_string()),
             moe_graph: Some(true),
             use_vllm_paged_attn: Some(true),
             vllm_paged_attn_v1_short: Some(false),
@@ -537,7 +548,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 18);
+        assert_eq!(entries.len(), 19);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -556,6 +567,10 @@ mod tests {
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
+        assert_eq!(
+            entry("FERRUM_LAYER_SPLIT_PIPELINE_MODE").effective_value,
+            "batch"
+        );
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_USE_VLLM_PAGED_ATTN").effective_value, "1");

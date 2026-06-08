@@ -8,6 +8,7 @@
   "port": 19400,
   "gpu_devices": [0, 1],
   "distributed_strategy": "layer_split",
+  "layer_split_pipeline_mode": "overlapped",
   "max_model_len": 8192,
   "kv_capacity": 2048,
   "max_num_seqs": 8,

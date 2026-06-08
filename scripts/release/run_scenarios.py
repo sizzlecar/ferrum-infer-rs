@@ -334,19 +334,35 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def wait_health(base_url: str, timeout: int) -> None:
+def wait_health(base_url: str, timeout: int) -> dict[str, Any]:
     deadline = time.time() + timeout
     last = ""
     while time.time() < deadline:
         try:
             status, body = get_url(base_url.rstrip("/") + "/health", timeout=2)
             if status == 200:
-                return
+                try:
+                    data = json.loads(body)
+                except json.JSONDecodeError as exc:
+                    raise ScenarioError(f"health endpoint returned invalid JSON: {exc}") from exc
+                if not isinstance(data, dict):
+                    raise ScenarioError("health endpoint must return a JSON object")
+                return {"status": "pass", "http_status": status, "response": data}
             last = f"status={status} body={body[:200]}"
         except Exception as exc:
             last = repr(exc)
         time.sleep(0.5)
     raise ScenarioError(f"server did not become healthy within {timeout}s; last={last}")
+
+
+def capture_health(
+    base_url: str, out: Path, timeout: int, filename: str = "server.health.json"
+) -> dict[str, Any]:
+    result = wait_health(base_url, timeout)
+    response = result["response"]
+    artifact = {**response, "status": "pass", "http_status": result["http_status"]}
+    write_json(out / filename, artifact)
+    return {"status": "pass", "http_status": result["http_status"]}
 
 
 def selected_scenarios(scenarios: list[dict[str, Any]], only: list[str]) -> list[dict[str, Any]]:
@@ -403,7 +419,7 @@ class ScenarioRunner:
         if not self.needs_serve():
             return
         if self.base_url and not self.should_start_server():
-            wait_health(self.base_url, self.timeout)
+            capture_health(self.base_url, self.out, self.timeout)
             return
         if not self.model:
             raise ScenarioError("serve scenarios require --model or manifest.model")
@@ -427,7 +443,7 @@ class ScenarioRunner:
                 cmd.extend(str(part) for part in extra_args)
         cmd.append(self.model)
         self.started_server = StartedServer(cmd, self.out / "server.log")
-        wait_health(self.base_url, self.timeout)
+        capture_health(self.base_url, self.out, self.timeout)
 
     def run_all(self) -> dict[str, Any]:
         self.out.mkdir(parents=True, exist_ok=True)
@@ -444,6 +460,13 @@ class ScenarioRunner:
                 elif result["status"] == "skipped":
                     skipped += 1
                 results.append(result)
+            if self.needs_serve() and self.base_url:
+                capture_health(
+                    self.base_url,
+                    self.out,
+                    self.timeout,
+                    filename="server.health.after.json",
+                )
         finally:
             if self.started_server is not None:
                 self.started_server.stop()
@@ -1078,6 +1101,12 @@ def self_test() -> int:
             summary = load_json_object(out / "summary.json")
             if summary.get("status") != "pass" or summary.get("scenario_count") != 8:
                 raise AssertionError(summary)
+            health = load_json_object(out / "server.health.json")
+            if health.get("status") != "pass" or health.get("http_status") != 200:
+                raise AssertionError(health)
+            health_after = load_json_object(out / "server.health.after.json")
+            if health_after.get("status") != "pass" or health_after.get("http_status") != 200:
+                raise AssertionError(health_after)
     finally:
         server.shutdown()
         server.server_close()
