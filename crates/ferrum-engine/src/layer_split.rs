@@ -68,6 +68,7 @@ impl ParsedLayerSplitPlan {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn llama_stage_config_for_device(
         &self,
         device: usize,
