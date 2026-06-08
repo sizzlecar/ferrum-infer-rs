@@ -1558,7 +1558,7 @@ fn render_messages_with_response_format_instruction(
 
 fn response_format_prompt_instruction(
     request: &ChatCompletionsRequest,
-    forced_response_format: Option<&ferrum_types::ResponseFormat>,
+    _forced_response_format: Option<&ferrum_types::ResponseFormat>,
 ) -> Option<String> {
     if let Some(format) = request.response_format.as_ref() {
         return match format.format_type.as_str() {
@@ -1576,13 +1576,7 @@ fn response_format_prompt_instruction(
             _ => None,
         };
     }
-    match forced_response_format {
-        Some(ferrum_types::ResponseFormat::JsonSchema(_)) => Some(
-            "The tool_choice requires a function call. Output only a single JSON object containing the selected function arguments, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
-                .to_string(),
-        ),
-        _ => None,
-    }
+    None
 }
 
 fn forced_tool_choice_response_format(
@@ -6625,7 +6619,7 @@ mod tests {
     }
 
     #[test]
-    fn required_tool_choice_uses_tool_schema_response_format_and_prompt_instruction() {
+    fn required_tool_choice_uses_tool_schema_response_format_without_extra_prompt_instruction() {
         let request: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "served-alias",
             "messages": [{"role": "user", "content": "Call capture_quality_marker."}],
@@ -6652,9 +6646,14 @@ mod tests {
         let internal = convert_chat_request(&request).expect("convert");
 
         assert!(
-            internal.prompt.contains(
+            !internal.prompt.contains(
                 "Output only a single JSON object containing the selected function arguments"
             ),
+            "{}",
+            internal.prompt
+        );
+        assert!(
+            internal.prompt.contains("\"tool_choice\":\"required\""),
             "{}",
             internal.prompt
         );
