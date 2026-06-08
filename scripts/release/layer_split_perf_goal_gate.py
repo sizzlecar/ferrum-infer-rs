@@ -993,30 +993,30 @@ def validate_bench_artifact(path: Path, label: str) -> dict[str, Any]:
     }
 
 
-def validate_correctness_artifact(path: Path) -> dict[str, Any]:
-    path = require_dir(path, "correctness artifact")
-    data = first_json(path, ["correctness.json", "gate.json", "gate.manifest.json"], "correctness")
+def validate_correctness_artifact(path: Path, label: str = "correctness artifact") -> dict[str, Any]:
+    path = require_dir(path, label)
+    data = first_json(path, ["correctness.json", "gate.json", "gate.manifest.json"], label)
     if data.get("diagnostic_only") is True:
-        raise ValidationError("correctness artifact is diagnostic-only")
+        raise ValidationError(f"{label}: artifact is diagnostic-only")
     checks = data.get("checks")
     if not isinstance(checks, dict):
-        raise ValidationError("correctness artifact must include checks object")
+        raise ValidationError(f"{label}: must include checks object")
     missing = sorted(REQUIRED_CORRECTNESS_CHECKS - set(checks))
     if missing:
-        raise ValidationError("correctness artifact missing checks: " + ", ".join(missing))
+        raise ValidationError(f"{label}: missing checks: " + ", ".join(missing))
     for name in sorted(REQUIRED_CORRECTNESS_CHECKS):
-        status_pass_obj(checks[name], f"correctness check {name}")
+        status_pass_obj(checks[name], f"{label} check {name}")
     streaming_done = checks["streaming_done"]
     if int(streaming_done.get("done_count", 0)) != 1:
-        raise ValidationError("streaming_done.done_count must be exactly 1")
+        raise ValidationError(f"{label}: streaming_done.done_count must be exactly 1")
     streaming_usage = checks["streaming_usage"]
     if streaming_usage.get("include_usage") is not True:
-        raise ValidationError("streaming_usage.include_usage must be true")
+        raise ValidationError(f"{label}: streaming_usage.include_usage must be true")
     if streaming_usage.get("usage_received") is not True:
-        raise ValidationError("streaming usage was not received")
+        raise ValidationError(f"{label}: streaming usage was not received")
     log_scan = checks["log_scan"]
     if int(log_scan.get("bad_pattern_count", 0)) != 0:
-        raise ValidationError("log_scan.bad_pattern_count must be 0")
+        raise ValidationError(f"{label}: log_scan.bad_pattern_count must be 0")
     return {"checks": sorted(checks)}
 
 
@@ -1130,7 +1130,13 @@ def validate_perf_goal(
     candidate_bench = validate_bench_artifact(candidate_artifact, "candidate")
     if baseline_bench["command_signature"] != candidate_bench["command_signature"]:
         raise ValidationError("baseline and candidate bench command parameters differ")
-    correctness = validate_correctness_artifact(correctness_artifact)
+    baseline_correctness = validate_correctness_artifact(
+        baseline_artifact, "baseline correctness artifact"
+    )
+    candidate_correctness = validate_correctness_artifact(
+        candidate_artifact, "candidate correctness artifact"
+    )
+    correctness = validate_correctness_artifact(correctness_artifact, "correctness artifact")
     scan_artifact_logs(baseline_artifact, "baseline")
     scan_artifact_logs(candidate_artifact, "candidate")
 
@@ -1243,6 +1249,8 @@ def validate_perf_goal(
         "candidate_max_c4_c8_c16_output_tps": candidate_max,
         "baseline_throughput_by_concurrency": baseline_bench["throughput_by_concurrency"],
         "candidate_throughput_by_concurrency": candidate_bench["throughput_by_concurrency"],
+        "baseline_correctness": baseline_correctness,
+        "candidate_correctness": candidate_correctness,
         "correctness": correctness,
         "pass_line": pass_line,
     }
@@ -1616,6 +1624,7 @@ def make_perf_artifact(
     write_text(root / "serve.log", "server ready\n")
     write_text(root / "bench-serve.stdout", "bench ok\n")
     write_text(root / "bench-serve.stderr", "")
+    make_correctness_artifact(root)
 
 
 def make_correctness_artifact(root: Path) -> None:
@@ -1796,6 +1805,26 @@ def run_self_test() -> None:
             raise AssertionError("diagnostic candidate unexpectedly passed")
         except ValidationError as exc:
             if "diagnostic" not in str(exc):
+                raise
+
+        missing_candidate_correctness = root / "missing-candidate-correctness"
+        make_perf_artifact(
+            missing_candidate_correctness,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        (missing_candidate_correctness / "correctness.json").unlink()
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-candidate-correctness-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_candidate_correctness,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing candidate correctness unexpectedly passed")
+        except ValidationError as exc:
+            if "candidate correctness artifact" not in str(exc):
                 raise
 
         pending_model_manifest = root / "pending-model-manifest"
