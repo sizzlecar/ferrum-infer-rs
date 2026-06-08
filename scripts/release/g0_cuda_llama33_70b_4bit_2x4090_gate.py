@@ -207,6 +207,45 @@ def sha256(path: Path) -> str | None:
     return h.hexdigest()
 
 
+def query_vllm_preflight(server_cmd: list[str]) -> dict[str, Any]:
+    executable = server_cmd[0] if server_cmd else "vllm"
+    resolved = shutil.which(executable)
+    if resolved is None:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "cmd": [executable],
+            "error": "vllm executable not found on PATH",
+            "binary_path": None,
+            "binary_sha256": None,
+        }
+    digest = sha256(Path(resolved))
+    if digest is None:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "cmd": [executable],
+            "error": f"vllm executable is not a readable file: {resolved}",
+            "binary_path": resolved,
+            "binary_sha256": None,
+        }
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "cmd": [executable],
+        "binary_path": resolved,
+        "binary_sha256": digest,
+    }
+
+
+def require_vllm_preflight(root: Path, server_cmd: list[str]) -> dict[str, Any]:
+    preflight = query_vllm_preflight(server_cmd)
+    write_json(root / "vllm-baseline.preflight.json", preflight)
+    if preflight.get("status") != "pass":
+        raise RuntimeError(preflight.get("error") or "vllm preflight failed")
+    return preflight
+
+
 def git_output(args: list[str], repo: Path) -> str:
     proc = run(["git", *args], cwd=repo, timeout=30)
     return proc.stdout.strip() if proc.returncode == 0 else "unknown"
@@ -1055,8 +1094,9 @@ def write_vllm_metadata(
     hardware: dict[str, Any],
     server_cmd: list[str],
     bench_cmd: list[str],
+    preflight: dict[str, Any],
 ) -> dict[str, Any]:
-    vllm_bin = shutil.which(server_cmd[0]) or server_cmd[0]
+    vllm_bin = preflight.get("binary_path") or shutil.which(server_cmd[0]) or server_cmd[0]
     metadata = {
         "schema_version": 1,
         "lane": LANE,
@@ -1069,9 +1109,10 @@ def write_vllm_metadata(
             "status_short": git_output(["status", "--short"], repo).splitlines(),
         },
         "binary_path": vllm_bin,
-        "binary_sha256": sha256(Path(vllm_bin)),
+        "binary_sha256": preflight.get("binary_sha256") or sha256(Path(vllm_bin)),
         "server_command": server_cmd,
         "bench_command": bench_cmd,
+        "preflight": preflight,
         "cuda_version": hardware.get("cuda_version", "unknown"),
         "driver_version": hardware.get("driver_version", "unknown"),
         "gpu_names": hardware.get("gpu_names", []),
@@ -2026,7 +2067,8 @@ def run_vllm_baseline_gate(
             "same_hardware_required": True,
         },
     )
-    write_vllm_metadata(root, repo, cfg, hardware, server_cmd, bench_cmd)
+    preflight = require_vllm_preflight(root, server_cmd)
+    write_vllm_metadata(root, repo, cfg, hardware, server_cmd, bench_cmd, preflight)
     proc: subprocess.Popen[str] | None = None
     log_path = root / "vllm-baseline.log"
     try:
@@ -2402,6 +2444,11 @@ def self_test() -> int:
             "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
             "gpu_uuids": ["GPU-selftest-0", "GPU-selftest-1"],
         }
+        preflight = require_vllm_preflight(root, [sys.executable, "--version"])
+        assert preflight["status"] == "pass"
+        assert preflight["binary_path"] == sys.executable
+        assert isinstance(preflight["binary_sha256"], str)
+        assert len(preflight["binary_sha256"]) == 64
         metadata = write_vllm_metadata(
             root,
             Path.cwd(),
@@ -2409,14 +2456,32 @@ def self_test() -> int:
             hardware_doc,
             [sys.executable, "--version"],
             [str(Path("./target/release/ferrum")), "bench-serve"],
+            preflight,
         )
         assert metadata["engine"] == "vllm"
         assert metadata["model_id"] == cfg["model"]
         assert metadata["gpu_uuids"] == hardware_doc["gpu_uuids"]
-        assert isinstance(metadata["binary_sha256"], str)
-        assert len(metadata["binary_sha256"]) == 64
+        assert metadata["binary_sha256"] == preflight["binary_sha256"]
+        assert load_json(root / "vllm-baseline.preflight.json")["status"] == "pass"
         update_vllm_metadata_status(root, "pass")
         assert load_json(root / "vllm-baseline.metadata.json")["status"] == "pass"
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-vllm-preflight-") as tmp:
+        root = Path(tmp)
+        previous_path = os.environ.get("PATH", "")
+        empty_bin = root / "empty-bin"
+        empty_bin.mkdir()
+        try:
+            os.environ["PATH"] = str(empty_bin)
+            try:
+                require_vllm_preflight(root, ["vllm", "serve"])
+                raise AssertionError("missing vllm preflight unexpectedly passed")
+            except RuntimeError as exc:
+                assert "vllm executable not found" in str(exc)
+            failed = load_json(root / "vllm-baseline.preflight.json")
+            assert failed["status"] == "fail"
+            assert failed["binary_sha256"] is None
+        finally:
+            os.environ["PATH"] = previous_path
     with tempfile.TemporaryDirectory(prefix="ferrum-llama33-source-gate-") as tmp:
         root = Path(tmp)
         ensure_failure_artifacts(root, "selftest failure")
@@ -2518,6 +2583,11 @@ def main() -> int:
             "cuda_device_count": hardware.get("cuda_device_count"),
             "gpu_names": hardware.get("gpu_names", []),
         }
+        if cfg.get("run_vllm_baseline", True):
+            checks["vllm_preflight"] = require_vllm_preflight(
+                root,
+                build_vllm_server_command(cfg),
+            )
         model_manifest(root, cfg)
         write_planned_command_artifacts(root, args.ferrum_bin, cfg)
         write_metadata(root, repo, args.ferrum_bin, cfg, hardware, sys.argv)
