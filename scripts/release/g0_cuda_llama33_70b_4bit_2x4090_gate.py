@@ -57,6 +57,18 @@ TOKENIZER_METADATA_FILE_NAMES = {
     "generation_config.json",
     "chat_template.json",
 }
+GPU_QUERY_FIELDS = [
+    "index",
+    "name",
+    "uuid",
+    "driver_version",
+    "memory.total",
+    "memory.used",
+    "utilization.gpu",
+    "utilization.memory",
+    "pcie.link.gen.current",
+    "pcie.link.width.current",
+]
 BENCH_QUALITY_COUNT_FIELDS = (
     "bad_output_per_run",
     "malformed_stream_per_run",
@@ -74,8 +86,11 @@ REQUIRED_ARTIFACT_FILES = {
     "decision_trace.jsonl",
     "hardware.json",
     "nvidia-smi.before.txt",
+    "nvidia-smi.before.json",
     "nvidia-smi.during.txt",
+    "nvidia-smi.during.json",
     "nvidia-smi.after.txt",
+    "nvidia-smi.after.json",
     "model_manifest.json",
     "run.command.json",
     "run.effective_config.json",
@@ -212,11 +227,79 @@ def sanitized_env_summary() -> dict[str, str]:
     return out
 
 
+def parse_gpu_query_int(value: str) -> int | str:
+    text = value.strip()
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def query_gpu_snapshot(cwd: Path) -> dict[str, Any]:
+    proc = run(
+        [
+            "nvidia-smi",
+            "--query-gpu=" + ",".join(GPU_QUERY_FIELDS),
+            "--format=csv,noheader,nounits",
+        ],
+        cwd=cwd,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "error": proc.stderr.strip() or proc.stdout.strip() or f"nvidia-smi rc={proc.returncode}",
+            "query_fields": GPU_QUERY_FIELDS,
+            "gpus": [],
+        }
+
+    rows: list[dict[str, Any]] = []
+    reader = csv.reader(proc.stdout.splitlines())
+    for row in reader:
+        parts = [part.strip() for part in row]
+        if len(parts) < len(GPU_QUERY_FIELDS):
+            continue
+        (
+            index,
+            name,
+            uuid,
+            driver_version,
+            memory_total,
+            memory_used,
+            utilization_gpu,
+            utilization_memory,
+            pcie_link_gen,
+            pcie_link_width,
+        ) = parts[: len(GPU_QUERY_FIELDS)]
+        rows.append(
+            {
+                "index": parse_gpu_query_int(index),
+                "name": name,
+                "uuid": uuid,
+                "driver_version": driver_version,
+                "memory_total_mib": parse_gpu_query_int(memory_total),
+                "memory_used_mib": parse_gpu_query_int(memory_used),
+                "utilization_gpu_percent": parse_gpu_query_int(utilization_gpu),
+                "utilization_memory_percent": parse_gpu_query_int(utilization_memory),
+                "pcie_link_gen_current": parse_gpu_query_int(pcie_link_gen),
+                "pcie_link_width_current": parse_gpu_query_int(pcie_link_width),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "status": "pass" if rows else "fail",
+        "query_fields": GPU_QUERY_FIELDS,
+        "gpus": rows,
+    }
+
+
 def capture_nvidia_smi(root: Path, label: str) -> str:
     proc = run(["nvidia-smi"], cwd=root, timeout=30)
     body = proc.stdout if proc.returncode == 0 else proc.stderr
     text = body or f"nvidia-smi rc={proc.returncode}\n"
     write_text(root / f"nvidia-smi.{label}.txt", text)
+    write_json(root / f"nvidia-smi.{label}.json", query_gpu_snapshot(root))
     return text
 
 
@@ -234,20 +317,12 @@ def parse_nvidia_smi_versions(text: str) -> dict[str, str]:
 
 def query_hardware(repo: Path, nvidia_smi_text: str) -> dict[str, Any]:
     versions = parse_nvidia_smi_versions(nvidia_smi_text)
-    proc = run(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,name,uuid,driver_version,memory.total,memory.used",
-            "--format=csv,noheader,nounits",
-        ],
-        cwd=repo,
-        timeout=30,
-    )
-    if proc.returncode != 0:
+    snapshot = query_gpu_snapshot(repo)
+    if snapshot.get("status") != "pass":
         return {
             "schema_version": 1,
             "status": "unavailable",
-            "error": proc.stderr.strip() or proc.stdout.strip() or f"nvidia-smi rc={proc.returncode}",
+            "error": snapshot.get("error", "structured nvidia-smi query failed"),
             "cuda_device_count": 0,
             "cuda_version": versions["cuda_version"],
             "driver_version": versions["driver_version"],
@@ -256,24 +331,7 @@ def query_hardware(repo: Path, nvidia_smi_text: str) -> dict[str, Any]:
             "gpus": [],
         }
 
-    rows: list[dict[str, Any]] = []
-    reader = csv.reader(proc.stdout.splitlines())
-    for row in reader:
-        parts = [part.strip() for part in row]
-        if len(parts) < 6:
-            continue
-        index, name, uuid, driver_version, memory_total, memory_used = parts[:6]
-        rows.append(
-            {
-                "index": int(index) if index.isdigit() else index,
-                "name": name,
-                "uuid": uuid,
-                "driver_version": driver_version,
-                "memory_total_mib": int(memory_total) if memory_total.isdigit() else memory_total,
-                "memory_used_mib": int(memory_used) if memory_used.isdigit() else memory_used,
-            }
-        )
-
+    rows = snapshot["gpus"]
     driver_version = rows[0]["driver_version"] if rows else versions["driver_version"]
     return {
         "schema_version": 1,
@@ -283,6 +341,12 @@ def query_hardware(repo: Path, nvidia_smi_text: str) -> dict[str, Any]:
         "driver_version": driver_version,
         "gpu_names": [str(row["name"]) for row in rows],
         "gpu_uuids": [str(row["uuid"]) for row in rows],
+        "gpu_utilization_percent": [row.get("utilization_gpu_percent") for row in rows],
+        "gpu_memory_utilization_percent": [
+            row.get("utilization_memory_percent") for row in rows
+        ],
+        "pcie_link_gen_current": [row.get("pcie_link_gen_current") for row in rows],
+        "pcie_link_width_current": [row.get("pcie_link_width_current") for row in rows],
         "gpus": rows,
     }
 
@@ -305,6 +369,81 @@ def validate_config(cfg: dict[str, Any]) -> None:
     quant = str(cfg.get("quant_format", "")).lower()
     if not any(marker in quant for marker in ("gptq", "awq", "q4")):
         raise RuntimeError("config quant_format must identify a 4bit format")
+
+
+def require_structured_hardware_snapshot(snapshot: dict[str, Any], label: str) -> None:
+    if snapshot.get("status") != "pass":
+        raise RuntimeError(f"{label}: structured GPU snapshot status must be pass")
+    gpus = snapshot.get("gpus")
+    if not isinstance(gpus, list) or len(gpus) != 2:
+        raise RuntimeError(f"{label}: structured GPU snapshot must contain exactly two GPUs")
+    for idx, gpu in enumerate(gpus):
+        if not isinstance(gpu, dict):
+            raise RuntimeError(f"{label}: GPU snapshot row {idx} must be an object")
+        for key in [
+            "memory_total_mib",
+            "memory_used_mib",
+            "utilization_gpu_percent",
+            "utilization_memory_percent",
+            "pcie_link_gen_current",
+            "pcie_link_width_current",
+        ]:
+            if not isinstance(gpu.get(key), int) or gpu[key] < 0:
+                raise RuntimeError(f"{label}: GPU {idx} missing non-negative integer {key}")
+        if gpu["memory_total_mib"] <= 0:
+            raise RuntimeError(f"{label}: GPU {idx} memory_total_mib must be > 0")
+        if gpu["pcie_link_gen_current"] <= 0:
+            raise RuntimeError(f"{label}: GPU {idx} pcie_link_gen_current must be > 0")
+        if gpu["pcie_link_width_current"] <= 0:
+            raise RuntimeError(f"{label}: GPU {idx} pcie_link_width_current must be > 0")
+
+
+def validate_structured_hardware_evidence(root: Path, hardware: dict[str, Any]) -> dict[str, Any]:
+    if hardware.get("status") != "pass":
+        raise RuntimeError("hardware.json status must be pass")
+    gpus = hardware.get("gpus")
+    if not isinstance(gpus, list) or len(gpus) != 2:
+        raise RuntimeError("hardware.json must contain exactly two GPU rows")
+    for idx, gpu in enumerate(gpus):
+        if not isinstance(gpu, dict):
+            raise RuntimeError(f"hardware.json GPU row {idx} must be an object")
+        for key in [
+            "memory_total_mib",
+            "memory_used_mib",
+            "utilization_gpu_percent",
+            "utilization_memory_percent",
+            "pcie_link_gen_current",
+            "pcie_link_width_current",
+        ]:
+            if not isinstance(gpu.get(key), int) or gpu[key] < 0:
+                raise RuntimeError(f"hardware.json GPU {idx} missing non-negative integer {key}")
+        if gpu["memory_total_mib"] <= 0:
+            raise RuntimeError(f"hardware.json GPU {idx} memory_total_mib must be > 0")
+        if gpu["pcie_link_gen_current"] <= 0:
+            raise RuntimeError(f"hardware.json GPU {idx} pcie_link_gen_current must be > 0")
+        if gpu["pcie_link_width_current"] <= 0:
+            raise RuntimeError(f"hardware.json GPU {idx} pcie_link_width_current must be > 0")
+    snapshots = {}
+    for label in ["before", "during", "after"]:
+        snapshot = load_json(root / f"nvidia-smi.{label}.json")
+        require_structured_hardware_snapshot(snapshot, f"nvidia-smi.{label}.json")
+        snapshots[label] = {
+            "gpu_utilization_percent": [
+                gpu["utilization_gpu_percent"] for gpu in snapshot["gpus"]
+            ],
+            "memory_used_mib": [gpu["memory_used_mib"] for gpu in snapshot["gpus"]],
+            "pcie_link_width_current": [
+                gpu["pcie_link_width_current"] for gpu in snapshot["gpus"]
+            ],
+        }
+    return {
+        "status": "pass",
+        "pcie_link_width_current": hardware.get("pcie_link_width_current"),
+        "pcie_link_gen_current": hardware.get("pcie_link_gen_current"),
+        "gpu_utilization_percent": hardware.get("gpu_utilization_percent"),
+        "gpu_memory_utilization_percent": hardware.get("gpu_memory_utilization_percent"),
+        "snapshots": snapshots,
+    }
 
 
 def pipeline_mode_from_config(cfg: dict[str, Any]) -> str:
@@ -1098,6 +1237,9 @@ def ensure_failure_artifacts(root: Path, error: str) -> None:
         "metadata.json": {"status": "fail", "error": error, "lane": LANE},
         "effective_config.json": {"status": "fail", "error": error},
         "hardware.json": {"status": "fail", "error": error, "gpu_names": [], "gpus": []},
+        "nvidia-smi.before.json": {"status": "fail", "error": error, "gpus": []},
+        "nvidia-smi.during.json": {"status": "fail", "error": error, "gpus": []},
+        "nvidia-smi.after.json": {"status": "fail", "error": error, "gpus": []},
         "model_manifest.json": {"status": "fail", "error": error},
         "run.command.json": {"status": "fail", "error": error},
         "run.effective_config.json": {"status": "fail", "error": error},
@@ -1887,6 +2029,58 @@ def self_test() -> int:
     assert "--require-ci" not in smoke_bench_cmd
     hardware = query_hardware(Path("/tmp"), "")
     assert "gpu_names" in hardware
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-hardware-") as tmp:
+        root = Path(tmp)
+        gpu_rows = [
+            {
+                "index": 0,
+                "name": "NVIDIA GeForce RTX 4090",
+                "uuid": "GPU-selftest-0",
+                "driver_version": "550.54.15",
+                "memory_total_mib": 24564,
+                "memory_used_mib": 1234,
+                "utilization_gpu_percent": 10,
+                "utilization_memory_percent": 8,
+                "pcie_link_gen_current": 4,
+                "pcie_link_width_current": 16,
+            },
+            {
+                "index": 1,
+                "name": "NVIDIA GeForce RTX 4090",
+                "uuid": "GPU-selftest-1",
+                "driver_version": "550.54.15",
+                "memory_total_mib": 24564,
+                "memory_used_mib": 2345,
+                "utilization_gpu_percent": 12,
+                "utilization_memory_percent": 9,
+                "pcie_link_gen_current": 4,
+                "pcie_link_width_current": 16,
+            },
+        ]
+        hardware_doc = {
+            "schema_version": 1,
+            "status": "pass",
+            "cuda_device_count": 2,
+            "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
+            "gpu_uuids": ["GPU-selftest-0", "GPU-selftest-1"],
+            "gpu_utilization_percent": [10, 12],
+            "gpu_memory_utilization_percent": [8, 9],
+            "pcie_link_gen_current": [4, 4],
+            "pcie_link_width_current": [16, 16],
+            "gpus": gpu_rows,
+        }
+        for label in ["before", "during", "after"]:
+            write_json(
+                root / f"nvidia-smi.{label}.json",
+                {
+                    "schema_version": 1,
+                    "status": "pass",
+                    "gpus": gpu_rows,
+                },
+            )
+        summary = validate_structured_hardware_evidence(root, hardware_doc)
+        assert summary["status"] == "pass"
+        assert summary["pcie_link_width_current"] == [16, 16]
     with tempfile.TemporaryDirectory(prefix="ferrum-llama33-vllm-metadata-") as tmp:
         root = Path(tmp)
         hardware_doc = {
@@ -2112,6 +2306,7 @@ def main() -> int:
             capture_nvidia_smi(root, "during")
 
     capture_nvidia_smi(root, "after")
+    checks["hardware_snapshots"] = validate_structured_hardware_evidence(root, hardware)
     return gate_pass(root, checks)
 
 

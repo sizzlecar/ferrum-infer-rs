@@ -216,6 +216,110 @@ def validate_baseline_candidate_metadata_match(
         validate_same_metadata_value(baseline_metadata, candidate_metadata, key)
 
 
+def require_int_range(value: Any, label: str, *, minimum: int, maximum: int | None = None) -> int:
+    if not isinstance(value, int):
+        raise ValidationError(f"{label} must be an integer")
+    if value < minimum:
+        raise ValidationError(f"{label} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValidationError(f"{label} must be <= {maximum}")
+    return value
+
+
+def validate_gpu_rows(
+    rows: Any,
+    label: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not isinstance(rows, list) or len(rows) != 2:
+        raise ValidationError(f"{label}: must contain exactly two GPU rows")
+    gpu_names = metadata.get("gpu_names")
+    gpu_uuids = metadata.get("gpu_uuids")
+    normalized: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValidationError(f"{label}: GPU row {idx} must be an object")
+        if row.get("name") != gpu_names[idx]:
+            raise ValidationError(f"{label}: GPU row {idx} name does not match metadata")
+        if row.get("uuid") != gpu_uuids[idx]:
+            raise ValidationError(f"{label}: GPU row {idx} uuid does not match metadata")
+        normalized_row = {
+            "index": row.get("index"),
+            "name": row.get("name"),
+            "uuid": row.get("uuid"),
+            "memory_total_mib": require_int_range(
+                row.get("memory_total_mib"), f"{label}: GPU {idx} memory_total_mib", minimum=1
+            ),
+            "memory_used_mib": require_int_range(
+                row.get("memory_used_mib"), f"{label}: GPU {idx} memory_used_mib", minimum=0
+            ),
+            "utilization_gpu_percent": require_int_range(
+                row.get("utilization_gpu_percent"),
+                f"{label}: GPU {idx} utilization_gpu_percent",
+                minimum=0,
+                maximum=100,
+            ),
+            "utilization_memory_percent": require_int_range(
+                row.get("utilization_memory_percent"),
+                f"{label}: GPU {idx} utilization_memory_percent",
+                minimum=0,
+                maximum=100,
+            ),
+            "pcie_link_gen_current": require_int_range(
+                row.get("pcie_link_gen_current"),
+                f"{label}: GPU {idx} pcie_link_gen_current",
+                minimum=1,
+            ),
+            "pcie_link_width_current": require_int_range(
+                row.get("pcie_link_width_current"),
+                f"{label}: GPU {idx} pcie_link_width_current",
+                minimum=1,
+            ),
+        }
+        normalized.append(normalized_row)
+    return normalized
+
+
+def validate_hardware_evidence(
+    path: Path,
+    label: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    hardware = first_json(path, ["hardware.json"], f"{label} hardware")
+    if hardware.get("cuda_device_count") != 2:
+        raise ValidationError(f"{label}: hardware cuda_device_count must be 2")
+    rows = validate_gpu_rows(hardware.get("gpus"), f"{label} hardware.json", metadata)
+    snapshots: dict[str, Any] = {}
+    for snapshot_label in ["before", "during", "after"]:
+        snapshot = first_json(
+            path,
+            [f"nvidia-smi.{snapshot_label}.json"],
+            f"{label} nvidia-smi {snapshot_label} snapshot",
+        )
+        snapshot_rows = validate_gpu_rows(
+            snapshot.get("gpus"),
+            f"{label} nvidia-smi.{snapshot_label}.json",
+            metadata,
+        )
+        snapshots[snapshot_label] = {
+            "gpu_utilization_percent": [
+                row["utilization_gpu_percent"] for row in snapshot_rows
+            ],
+            "memory_used_mib": [row["memory_used_mib"] for row in snapshot_rows],
+            "pcie_link_width_current": [
+                row["pcie_link_width_current"] for row in snapshot_rows
+            ],
+        }
+    return {
+        "gpu_names": metadata.get("gpu_names"),
+        "gpu_uuids": metadata.get("gpu_uuids"),
+        "pcie_link_width_current": [row["pcie_link_width_current"] for row in rows],
+        "pcie_link_gen_current": [row["pcie_link_gen_current"] for row in rows],
+        "memory_total_mib": [row["memory_total_mib"] for row in rows],
+        "snapshots": snapshots,
+    }
+
+
 def validate_optional_vllm_metadata(
     optional_vllm_artifact: Path,
     candidate_metadata: dict[str, Any],
@@ -819,6 +923,12 @@ def validate_perf_goal(
 
     baseline_metadata = validate_metadata(baseline_artifact, "baseline")
     candidate_metadata = validate_metadata(candidate_artifact, "candidate")
+    baseline_hardware = validate_hardware_evidence(
+        baseline_artifact, "baseline", baseline_metadata
+    )
+    candidate_hardware = validate_hardware_evidence(
+        candidate_artifact, "candidate", candidate_metadata
+    )
     baseline_model_manifest = validate_model_manifest(
         baseline_artifact, "baseline", baseline_metadata
     )
@@ -904,6 +1014,8 @@ def validate_perf_goal(
         "driver_version": candidate_metadata.get("driver_version"),
         "gpu_names": candidate_metadata.get("gpu_names"),
         "gpu_uuids": candidate_metadata.get("gpu_uuids"),
+        "baseline_hardware_evidence": baseline_hardware,
+        "hardware_evidence": candidate_hardware,
         "model_manifest": candidate_model_manifest,
         "selected_layer_split_plan": candidate_config["selected_layer_split_plan"],
         "selected_pipeline_mode": candidate_config["selected_pipeline_mode"],
@@ -1018,6 +1130,59 @@ def make_perf_artifact(
         "diagnostic_only": diagnostic,
     }
     write_json(root / "metadata.json", metadata)
+    gpu_rows = [
+        {
+            "index": 0,
+            "name": metadata["gpu_names"][0],
+            "uuid": metadata["gpu_uuids"][0],
+            "driver_version": metadata["driver_version"],
+            "memory_total_mib": 24564,
+            "memory_used_mib": 20480,
+            "utilization_gpu_percent": 25,
+            "utilization_memory_percent": 18,
+            "pcie_link_gen_current": 4,
+            "pcie_link_width_current": 16,
+        },
+        {
+            "index": 1,
+            "name": metadata["gpu_names"][1],
+            "uuid": metadata["gpu_uuids"][1],
+            "driver_version": metadata["driver_version"],
+            "memory_total_mib": 24564,
+            "memory_used_mib": 20480,
+            "utilization_gpu_percent": 27,
+            "utilization_memory_percent": 19,
+            "pcie_link_gen_current": 4,
+            "pcie_link_width_current": 16,
+        },
+    ]
+    write_json(
+        root / "hardware.json",
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "cuda_device_count": 2,
+            "cuda_version": metadata["cuda_version"],
+            "driver_version": metadata["driver_version"],
+            "gpu_names": metadata["gpu_names"],
+            "gpu_uuids": metadata["gpu_uuids"],
+            "gpu_utilization_percent": [25, 27],
+            "gpu_memory_utilization_percent": [18, 19],
+            "pcie_link_gen_current": [4, 4],
+            "pcie_link_width_current": [16, 16],
+            "gpus": gpu_rows,
+        },
+    )
+    for snapshot_label, util in [("before", 0), ("during", 82), ("after", 5)]:
+        snapshot_rows = [dict(row, utilization_gpu_percent=util + idx) for idx, row in enumerate(gpu_rows)]
+        write_json(
+            root / f"nvidia-smi.{snapshot_label}.json",
+            {
+                "schema_version": 1,
+                "status": "pass",
+                "gpus": snapshot_rows,
+            },
+        )
     write_json(
         root / "model_manifest.json",
         {
@@ -1352,6 +1517,26 @@ def run_self_test() -> None:
             if "model manifest" not in str(exc):
                 raise
 
+        missing_hardware_snapshot = root / "missing-hardware-snapshot"
+        make_perf_artifact(
+            missing_hardware_snapshot,
+            tps_by_c={1: 21.0, 4: 29.0, 8: 30.0, 16: 29.5},
+            pipeline_mode="overlapped",
+        )
+        (missing_hardware_snapshot / "nvidia-smi.during.json").unlink()
+        try:
+            validate_perf_goal(
+                out_dir=root / "missing-hardware-snapshot-out",
+                baseline_artifact=baseline,
+                candidate_artifact=missing_hardware_snapshot,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=None,
+            )
+            raise AssertionError("missing hardware snapshot candidate unexpectedly passed")
+        except ValidationError as exc:
+            if "nvidia-smi" not in str(exc):
+                raise
+
         binary_mismatch = root / "binary-mismatch"
         make_perf_artifact(
             binary_mismatch,
@@ -1393,7 +1578,7 @@ def run_self_test() -> None:
             )
             raise AssertionError("hardware-mismatch candidate unexpectedly passed")
         except ValidationError as exc:
-            if "gpu_uuids" not in str(exc):
+            if "gpu_uuids" not in str(exc) and "uuid" not in str(exc):
                 raise
 
         wrong_baseline = root / "wrong-baseline"
