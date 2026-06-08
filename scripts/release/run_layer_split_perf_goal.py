@@ -380,7 +380,11 @@ def main() -> int:
         return self_test()
     if args.out is None:
         parser.error("--out is required")
-    return run_goal(args)
+    try:
+        return run_goal(args)
+    except RuntimeError as exc:
+        print(f"{PASS_PREFIX.replace(' PASS', ' FAIL')}: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
