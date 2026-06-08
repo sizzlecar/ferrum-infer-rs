@@ -310,6 +310,44 @@ Rules:
 - If CUDA validation fails, collect the exact failing artifact/log, stop unnecessary processes, and avoid repeated full sweeps until the failure mode is understood.
 - Prefer CUDA smoke before CUDA full unless the task specifically requires full release evidence.
 
+## Vast GPU Runner Policy
+
+Use Vast only after the paid GPU cost policy has been stated for the lane.
+
+Credential and secret rules:
+
+- Load `VAST_API_KEY` from `.env.local` when present, but never print the value, shell-trace it, commit it, copy it into artifacts, or write it into remote logs.
+- Prefer non-interactive HTTP API calls over the Vast CLI because CLI behavior can drift across versions.
+- Use the user's existing SSH public key, typically `~/.ssh/id_ed25519.pub`, for instance bootstrap. Never copy or print private keys.
+
+Offer selection:
+
+- Search rentable offers through the Vast HTTP API and filter locally for the exact hardware required by the lane, for example a 2x RTX 4090 host when a two-GPU CUDA lane requires it.
+- Prefer low hourly cost only after hardware count, GPU memory, disk capacity, CUDA capability, network bandwidth, and reliability are sufficient for the gate.
+- Do not broaden from the lane's required hardware, model matrix, or GPU count without explicit user approval.
+
+Instance creation:
+
+- Create instances with an NVIDIA CUDA devel image suitable for building Ferrum CUDA binaries, such as `nvidia/cuda:12.4.0-devel-ubuntu22.04`, unless the lane requires a newer CUDA base.
+- Configure SSH access at creation time and install only required bootstrap packages such as `openssh-server`, `git`, `curl`, `ca-certificates`, `build-essential`, `pkg-config`, `libssl-dev`, Python, `jq`, and `rsync`.
+- Request enough disk for source, build outputs, downloaded models, and artifacts. If the model size is uncertain, stop before creating the instance and estimate disk from the goal document or model metadata.
+- Save the selected offer id, created instance id, Vast response metadata, lane, expected runtime/cost, and stop condition in the local artifact notes without secrets.
+
+Remote validation workflow:
+
+- Before running a gate, verify the remote host with `nvidia-smi` and record GPU names, count, driver/CUDA visibility, and GPU memory in the artifact directory.
+- Synchronize the exact local worktree to the instance, including `.git`, while excluding local secrets and build caches such as `.env.local` and `target/`.
+- On the remote host, verify `git rev-parse HEAD` and `git status --short` before collecting evidence. Dirty remote state is not acceptable for performance claims unless the dirty files are explicitly listed in the artifacts.
+- Install Rust and other build dependencies on the instance only as needed for the lane. Keep environment variables and runtime options visible in the saved command log, except for secrets.
+- Run the lane's correctness gate before any performance command. Product-path CUDA evidence must include the required `ferrum run` and `ferrum serve` coverage from the relevant gate or goal document.
+- Run benchmark commands from the goal document or release policy, not ad hoc hidden environment-variable combinations.
+
+Shutdown and artifact handling:
+
+- Always copy back the gate artifact directory, command logs, Vast instance metadata, and any failure logs before destroying the instance.
+- Destroy or stop the Vast instance immediately after PASS, failure triage, or the stated stop condition unless the user explicitly asks to keep it running.
+- After cleanup, verify through the Vast API that the instance is no longer running, and record that cleanup check in the local notes.
+
 ## Release Regression Lessons
 
 - Release readiness must cover both product entrypoints: `ferrum run` and `ferrum serve`.
