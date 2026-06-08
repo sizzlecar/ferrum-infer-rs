@@ -91,6 +91,7 @@ REQUIRED_ARTIFACT_FILES = {
     "nvidia-smi.during.json",
     "nvidia-smi.after.txt",
     "nvidia-smi.after.json",
+    "nvidia-smi.bench.samples.jsonl",
     "model_manifest.json",
     "run.command.json",
     "run.effective_config.json",
@@ -301,6 +302,84 @@ def capture_nvidia_smi(root: Path, label: str) -> str:
     write_text(root / f"nvidia-smi.{label}.txt", text)
     write_json(root / f"nvidia-smi.{label}.json", query_gpu_snapshot(root))
     return text
+
+
+def write_gpu_bench_sample(root: Path, sample: dict[str, Any]) -> None:
+    samples_path = root / "nvidia-smi.bench.samples.jsonl"
+    with samples_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(sample, sort_keys=True) + "\n")
+    during_text = root / "nvidia-smi.during.txt"
+    if not during_text.is_file():
+        proc = run(["nvidia-smi"], cwd=root, timeout=30)
+        body = proc.stdout if proc.returncode == 0 else proc.stderr
+        write_text(during_text, body or f"nvidia-smi rc={proc.returncode}\n")
+    write_json(root / "nvidia-smi.during.json", sample)
+
+
+def run_with_gpu_samples(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    root: Path,
+    timeout: int,
+    sample_interval_sec: int,
+) -> subprocess.CompletedProcess[str]:
+    start = time.time()
+    sample_interval_sec = max(1, sample_interval_sec)
+    stdout_tmp = root / "bench-serve.stdout.tmp"
+    stderr_tmp = root / "bench-serve.stderr.tmp"
+    next_sample_at = start
+    with stdout_tmp.open("w", encoding="utf-8") as stdout_file, stderr_tmp.open(
+        "w", encoding="utf-8"
+    ) as stderr_file:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                text=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+        except FileNotFoundError as exc:
+            sample = query_gpu_snapshot(cwd)
+            sample["created_at"] = iso_now()
+            sample["elapsed_sec"] = 0.0
+            sample["sample_phase"] = "bench-start-failed"
+            write_gpu_bench_sample(root, sample)
+            return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+
+        timed_out = False
+        while proc.poll() is None:
+            now = time.time()
+            if now >= next_sample_at:
+                sample = query_gpu_snapshot(cwd)
+                sample["created_at"] = iso_now()
+                sample["elapsed_sec"] = round(now - start, 3)
+                sample["sample_phase"] = "bench"
+                write_gpu_bench_sample(root, sample)
+                next_sample_at = now + sample_interval_sec
+            if now - start > timeout:
+                timed_out = True
+                proc.kill()
+                proc.wait(timeout=15)
+                break
+            time.sleep(1)
+
+        if not (root / "nvidia-smi.bench.samples.jsonl").is_file():
+            sample = query_gpu_snapshot(cwd)
+            sample["created_at"] = iso_now()
+            sample["elapsed_sec"] = round(time.time() - start, 3)
+            sample["sample_phase"] = "bench-finished-before-first-sample"
+            write_gpu_bench_sample(root, sample)
+
+    stdout = stdout_tmp.read_text(errors="replace") if stdout_tmp.is_file() else ""
+    stderr = stderr_tmp.read_text(errors="replace") if stderr_tmp.is_file() else ""
+    stdout_tmp.unlink(missing_ok=True)
+    stderr_tmp.unlink(missing_ok=True)
+    if timed_out:
+        stderr = (stderr + "\n" if stderr else "") + f"bench command timed out after {timeout}s"
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr)
+    return subprocess.CompletedProcess(cmd, proc.returncode or 0, stdout, stderr)
 
 
 def parse_nvidia_smi_versions(text: str) -> dict[str, str]:
@@ -1265,6 +1344,10 @@ def ensure_failure_artifacts(root: Path, error: str) -> None:
         "nvidia-smi.before.txt": f"not captured: {error}\n",
         "nvidia-smi.during.txt": f"not captured: {error}\n",
         "nvidia-smi.after.txt": f"not captured: {error}\n",
+        "nvidia-smi.bench.samples.jsonl": json.dumps(
+            {"status": "fail", "error": error, "gpus": []}
+        )
+        + "\n",
         "run.stdin": "",
         "run.stdout": "",
         "run.stderr": f"not run: {error}\n",
@@ -1701,7 +1784,13 @@ def run_ferrum_bench_gate(
         tag="cuda-llama33-70b-4bit-2x4090",
     )
     write_json(root / "bench-serve.command.json", {"status": "run", "cmd": cmd})
-    proc = run(cmd, cwd=repo, timeout=int(cfg.get("bench_timeout_sec", 7200)))
+    proc = run_with_gpu_samples(
+        cmd,
+        cwd=repo,
+        root=root,
+        timeout=int(cfg.get("bench_timeout_sec", 7200)),
+        sample_interval_sec=int(cfg.get("bench_gpu_sample_interval_sec", 15)),
+    )
     write_text(root / "bench-serve.stdout", proc.stdout)
     write_text(root / "bench-serve.stderr", proc.stderr)
     assert_no_bad_patterns("bench-serve output", proc.stdout + "\n" + proc.stderr)
@@ -2237,7 +2326,7 @@ def main() -> int:
                 start_new_session=True,
             )
         wait_health(base_url, timeout_sec=int(cfg.get("serve_startup_timeout_sec", 1800)))
-        capture_nvidia_smi(root, "during")
+        capture_nvidia_smi(root, "serve-ready")
         require_effective_config(root / "serve.effective_config.json", "serve", cfg)
         checks["serve_health"] = capture_health(root, base_url)
         checks["serve_models"] = capture_models(root, base_url, model)
