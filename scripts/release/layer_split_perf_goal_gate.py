@@ -290,13 +290,16 @@ def validate_hardware_evidence(
     path: Path,
     label: str,
     metadata: dict[str, Any],
+    *,
+    samples_rel: str = "nvidia-smi.bench.samples.jsonl",
+    snapshot_labels: tuple[str, ...] = ("before", "during", "after"),
 ) -> dict[str, Any]:
     hardware = first_json(path, ["hardware.json"], f"{label} hardware")
     if hardware.get("cuda_device_count") != 2:
         raise ValidationError(f"{label}: hardware cuda_device_count must be 2")
     rows = validate_gpu_rows(hardware.get("gpus"), f"{label} hardware.json", metadata)
     snapshots: dict[str, Any] = {}
-    for snapshot_label in ["before", "during", "after"]:
+    for snapshot_label in snapshot_labels:
         snapshot = first_json(
             path,
             [f"nvidia-smi.{snapshot_label}.json"],
@@ -316,9 +319,9 @@ def validate_hardware_evidence(
                 row["pcie_link_width_current"] for row in snapshot_rows
             ],
         }
-    samples_path = path / "nvidia-smi.bench.samples.jsonl"
+    samples_path = path / samples_rel
     if not samples_path.is_file():
-        raise ValidationError(f"{label}: missing nvidia-smi.bench.samples.jsonl")
+        raise ValidationError(f"{label}: missing {samples_rel}")
     sample_count = 0
     max_gpu_utilization = [0, 0]
     max_gpu_utilization_by_concurrency = {
@@ -332,7 +335,7 @@ def validate_hardware_evidence(
             sample = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ValidationError(
-                f"{label}: invalid nvidia-smi bench sample JSON at line {line_no}"
+                f"{label}: invalid {samples_rel} JSON at line {line_no}"
             ) from exc
         if not isinstance(sample, dict):
             raise ValidationError(f"{label}: bench sample line {line_no} must be an object")
@@ -382,6 +385,8 @@ def validate_hardware_evidence(
             f"on both GPUs for concurrency cells {zero_cells}"
         )
     return {
+        "samples_file": samples_rel,
+        "snapshot_labels": list(snapshot_labels),
         "gpu_names": metadata.get("gpu_names"),
         "gpu_uuids": metadata.get("gpu_uuids"),
         "pcie_link_width_current": [row["pcie_link_width_current"] for row in rows],
@@ -1521,12 +1526,21 @@ def validate_perf_goal(
     vllm_tps = None
     vllm_metadata = None
     vllm_bench = None
+    vllm_hardware = None
     target_tps = FIXED_PUBLIC_TARGET_TPS
     target_mode = "fixed_public_lower_bound"
     if optional_vllm_artifact is not None:
         vllm_metadata = validate_optional_vllm_metadata(
             optional_vllm_artifact, candidate_metadata
         )
+        vllm_hardware = validate_hardware_evidence(
+            optional_vllm_artifact,
+            "vllm",
+            vllm_metadata,
+            samples_rel="vllm-nvidia-smi.bench.samples.jsonl",
+            snapshot_labels=("before", "vllm-during", "after"),
+        )
+        validate_hardware_summaries_match(candidate_hardware, vllm_hardware)
         vllm_bench = validate_vllm_bench_artifact(
             optional_vllm_artifact, model_identity(candidate_metadata)
         )
@@ -1632,6 +1646,7 @@ def validate_perf_goal(
         }
         if vllm_metadata is not None
         else None,
+        "same_pod_vllm_hardware_evidence": vllm_hardware,
         "baseline_max_c4_c8_c16_output_tps": baseline_max,
         "candidate_max_c4_c8_c16_output_tps": candidate_max,
         "baseline_throughput_by_concurrency": baseline_bench["throughput_by_concurrency"],
@@ -1738,6 +1753,12 @@ def validate_perf_goal(
                 + format_gpu_utilization_by_concurrency(baseline_hardware),
                 "- Candidate GPU max utilization by concurrency: "
                 + format_gpu_utilization_by_concurrency(candidate_hardware),
+                "- Same-pod vLLM GPU max utilization by concurrency: "
+                + (
+                    format_gpu_utilization_by_concurrency(vllm_hardware)
+                    if vllm_hardware is not None
+                    else "not provided"
+                ),
                 *bench_summary_lines,
                 "",
                 pass_line,
@@ -2157,23 +2178,101 @@ def make_correctness_artifact(root: Path) -> None:
 
 
 def make_vllm_artifact(root: Path, tps: float) -> None:
+    metadata = {
+        "schema_version": 1,
+        "status": "pass",
+        "engine": "vllm",
+        "git_sha": "abcdef0123456789abcdef0123456789abcdef01",
+        "dirty_status": {"is_dirty": False, "status_short": []},
+        "binary_sha256": "a" * 64,
+        "model_id": "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+        "cuda_version": "12.4",
+        "driver_version": "550.54.15",
+        "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
+        "gpu_uuids": ["GPU-baseline-0", "GPU-baseline-1"],
+        "requested_gpu_devices": [0, 1],
+        "selected_gpu_devices": [0, 1],
+    }
     write_json(
         root / "vllm-baseline.metadata.json",
+        metadata,
+    )
+    gpu_rows = [
+        {
+            "index": 0,
+            "name": metadata["gpu_names"][0],
+            "uuid": metadata["gpu_uuids"][0],
+            "driver_version": metadata["driver_version"],
+            "memory_total_mib": 24564,
+            "memory_used_mib": 20480,
+            "utilization_gpu_percent": 25,
+            "utilization_memory_percent": 18,
+            "pcie_link_gen_current": 4,
+            "pcie_link_width_current": 16,
+        },
+        {
+            "index": 1,
+            "name": metadata["gpu_names"][1],
+            "uuid": metadata["gpu_uuids"][1],
+            "driver_version": metadata["driver_version"],
+            "memory_total_mib": 24564,
+            "memory_used_mib": 20480,
+            "utilization_gpu_percent": 27,
+            "utilization_memory_percent": 19,
+            "pcie_link_gen_current": 4,
+            "pcie_link_width_current": 16,
+        },
+    ]
+    write_json(
+        root / "hardware.json",
         {
             "schema_version": 1,
             "status": "pass",
-            "engine": "vllm",
-            "git_sha": "abcdef0123456789abcdef0123456789abcdef01",
-            "dirty_status": {"is_dirty": False, "status_short": []},
-            "binary_sha256": "a" * 64,
-            "model_id": "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
-            "cuda_version": "12.4",
-            "driver_version": "550.54.15",
-            "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
-            "gpu_uuids": ["GPU-baseline-0", "GPU-baseline-1"],
-            "requested_gpu_devices": [0, 1],
-            "selected_gpu_devices": [0, 1],
+            "cuda_device_count": 2,
+            "cuda_version": metadata["cuda_version"],
+            "driver_version": metadata["driver_version"],
+            "gpu_names": metadata["gpu_names"],
+            "gpu_uuids": metadata["gpu_uuids"],
+            "gpu_utilization_percent": [25, 27],
+            "gpu_memory_utilization_percent": [18, 19],
+            "pcie_link_gen_current": [4, 4],
+            "pcie_link_width_current": [16, 16],
+            "gpus": gpu_rows,
         },
+    )
+    for snapshot_label, util in [("before", 0), ("vllm-during", 72), ("after", 5)]:
+        snapshot_rows = [
+            dict(row, utilization_gpu_percent=util + idx) for idx, row in enumerate(gpu_rows)
+        ]
+        write_json(
+            root / f"nvidia-smi.{snapshot_label}.json",
+            {
+                "schema_version": 1,
+                "status": "pass",
+                "gpus": snapshot_rows,
+            },
+        )
+    write_text(
+        root / "vllm-nvidia-smi.bench.samples.jsonl",
+        "".join(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "pass",
+                    "sample_phase": "vllm-bench",
+                    "elapsed_sec": float(15 * idx),
+                    "bench_concurrency": concurrency,
+                    "bench_concurrency_sweep": sorted(REQUIRED_CONCURRENCY_CELLS),
+                    "gpus": [
+                        dict(gpu_rows[0], utilization_gpu_percent=70 + concurrency),
+                        dict(gpu_rows[1], utilization_gpu_percent=74 + concurrency),
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n"
+            for idx, concurrency in enumerate(sorted(REQUIRED_CONCURRENCY_CELLS), start=1)
+        ),
     )
     write_json(
         root / "vllm-baseline.command.json",
@@ -2289,6 +2388,19 @@ def run_self_test() -> None:
             "bench_max_gpu_utilization_percent_by_concurrency"
         ][16] != [96, 99]:
             raise AssertionError("selftest expected c16 GPU utilization summary")
+        if result["same_pod_vllm_hardware_evidence"][
+            "bench_sample_count_by_concurrency"
+        ] != {
+            1: 1,
+            4: 1,
+            8: 1,
+            16: 1,
+        }:
+            raise AssertionError("selftest expected vLLM per-concurrency GPU sample counts")
+        if result["same_pod_vllm_hardware_evidence"][
+            "bench_max_gpu_utilization_percent_by_concurrency"
+        ][16] != [86, 90]:
+            raise AssertionError("selftest expected vLLM c16 GPU utilization summary")
         final_json = load_json(root / "out" / "layer_split_perf_goal_gate.json")
         if (
             final_json["candidate_bench_summary_by_concurrency"]["8"][
@@ -2299,6 +2411,13 @@ def run_self_test() -> None:
             raise AssertionError("selftest expected persisted bench summary usage source")
         if final_json["hardware_evidence"]["bench_sample_count_by_concurrency"]["16"] != 1:
             raise AssertionError("selftest expected persisted c16 GPU sample count")
+        if (
+            final_json["same_pod_vllm_hardware_evidence"][
+                "bench_sample_count_by_concurrency"
+            ]["16"]
+            != 1
+        ):
+            raise AssertionError("selftest expected persisted vLLM c16 GPU sample count")
         summary = (root / "out" / "summary.md").read_text()
         for expected in [
             "Baseline source gate:",
@@ -2312,7 +2431,9 @@ def run_self_test() -> None:
             "Same-pod vLLM output throughput:",
             "Same-pod vLLM throughput by concurrency:",
             "Candidate GPU max utilization by concurrency:",
+            "Same-pod vLLM GPU max utilization by concurrency:",
             "c16=96/99%",
+            "c16=86/90%",
             "Candidate c8 bench:",
             "TTFT p50=",
             "TPOT p50=",
@@ -2784,6 +2905,48 @@ def run_self_test() -> None:
             raise AssertionError("vllm missing command unexpectedly passed")
         except ValidationError as exc:
             if "vllm-baseline.command.json" not in str(exc):
+                raise
+
+        vllm_missing_gpu_samples = root / "vllm-missing-gpu-samples"
+        make_vllm_artifact(vllm_missing_gpu_samples, 40.0)
+        (vllm_missing_gpu_samples / "vllm-nvidia-smi.bench.samples.jsonl").unlink()
+        try:
+            validate_perf_goal(
+                out_dir=root / "vllm-missing-gpu-samples-out",
+                baseline_artifact=baseline,
+                candidate_artifact=candidate,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=vllm_missing_gpu_samples,
+            )
+            raise AssertionError("vllm missing GPU samples unexpectedly passed")
+        except ValidationError as exc:
+            if "vllm-nvidia-smi.bench.samples.jsonl" not in str(exc):
+                raise
+
+        vllm_missing_gpu_cell = root / "vllm-missing-gpu-cell"
+        make_vllm_artifact(vllm_missing_gpu_cell, 40.0)
+        lines = []
+        for line in (
+            vllm_missing_gpu_cell / "vllm-nvidia-smi.bench.samples.jsonl"
+        ).read_text().splitlines():
+            sample = json.loads(line)
+            if sample.get("bench_concurrency") != 16:
+                lines.append(line)
+        write_text(
+            vllm_missing_gpu_cell / "vllm-nvidia-smi.bench.samples.jsonl",
+            "\n".join(lines) + "\n",
+        )
+        try:
+            validate_perf_goal(
+                out_dir=root / "vllm-missing-gpu-cell-out",
+                baseline_artifact=baseline,
+                candidate_artifact=candidate,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=vllm_missing_gpu_cell,
+            )
+            raise AssertionError("vllm missing GPU cell unexpectedly passed")
+        except ValidationError as exc:
+            if "missing concurrency cells" not in str(exc):
                 raise
 
         bridge_mismatch = root / "bridge-mismatch"

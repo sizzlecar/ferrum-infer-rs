@@ -304,16 +304,22 @@ def capture_nvidia_smi(root: Path, label: str) -> str:
     return text
 
 
-def write_gpu_bench_sample(root: Path, sample: dict[str, Any]) -> None:
-    samples_path = root / "nvidia-smi.bench.samples.jsonl"
+def write_gpu_bench_sample(
+    root: Path,
+    sample: dict[str, Any],
+    *,
+    samples_name: str = "nvidia-smi.bench.samples.jsonl",
+    during_label: str = "during",
+) -> None:
+    samples_path = root / samples_name
     with samples_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(sample, sort_keys=True) + "\n")
-    during_text = root / "nvidia-smi.during.txt"
+    during_text = root / f"nvidia-smi.{during_label}.txt"
     if not during_text.is_file():
         proc = run(["nvidia-smi"], cwd=root, timeout=30)
         body = proc.stdout if proc.returncode == 0 else proc.stderr
         write_text(during_text, body or f"nvidia-smi rc={proc.returncode}\n")
-    write_json(root / "nvidia-smi.during.json", sample)
+    write_json(root / f"nvidia-smi.{during_label}.json", sample)
 
 
 def flag_value(cmd: list[str], flag: str) -> str | None:
@@ -361,11 +367,15 @@ def run_with_gpu_samples(
     root: Path,
     timeout: int,
     sample_interval_sec: int,
+    samples_name: str = "nvidia-smi.bench.samples.jsonl",
+    tmp_stem: str = "bench-serve",
+    sample_phase: str = "bench",
+    during_label: str = "during",
 ) -> subprocess.CompletedProcess[str]:
     start = time.time()
     sample_interval_sec = max(1, sample_interval_sec)
-    stdout_tmp = root / "bench-serve.stdout.tmp"
-    stderr_tmp = root / "bench-serve.stderr.tmp"
+    stdout_tmp = root / f"{tmp_stem}.stdout.tmp"
+    stderr_tmp = root / f"{tmp_stem}.stderr.tmp"
     next_sample_at = start
     concurrency_cells = concurrency_sweep_from_cmd(cmd)
     with stdout_tmp.open("w", encoding="utf-8") as stdout_file, stderr_tmp.open(
@@ -383,9 +393,14 @@ def run_with_gpu_samples(
             sample = query_gpu_snapshot(cwd)
             sample["created_at"] = iso_now()
             sample["elapsed_sec"] = 0.0
-            sample["sample_phase"] = "bench-start-failed"
+            sample["sample_phase"] = f"{sample_phase}-start-failed"
             sample["bench_concurrency_sweep"] = concurrency_cells
-            write_gpu_bench_sample(root, sample)
+            write_gpu_bench_sample(
+                root,
+                sample,
+                samples_name=samples_name,
+                during_label=during_label,
+            )
             return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
         timed_out = False
@@ -395,12 +410,17 @@ def run_with_gpu_samples(
                 sample = query_gpu_snapshot(cwd)
                 sample["created_at"] = iso_now()
                 sample["elapsed_sec"] = round(now - start, 3)
-                sample["sample_phase"] = "bench"
+                sample["sample_phase"] = sample_phase
                 sample["bench_concurrency_sweep"] = concurrency_cells
                 current_concurrency = active_bench_concurrency(stderr_tmp)
                 if current_concurrency is not None:
                     sample["bench_concurrency"] = current_concurrency
-                write_gpu_bench_sample(root, sample)
+                write_gpu_bench_sample(
+                    root,
+                    sample,
+                    samples_name=samples_name,
+                    during_label=during_label,
+                )
                 next_sample_at = now + sample_interval_sec
             if now - start > timeout:
                 timed_out = True
@@ -409,16 +429,21 @@ def run_with_gpu_samples(
                 break
             time.sleep(1)
 
-        if not (root / "nvidia-smi.bench.samples.jsonl").is_file():
+        if not (root / samples_name).is_file():
             sample = query_gpu_snapshot(cwd)
             sample["created_at"] = iso_now()
             sample["elapsed_sec"] = round(time.time() - start, 3)
-            sample["sample_phase"] = "bench-finished-before-first-sample"
+            sample["sample_phase"] = f"{sample_phase}-finished-before-first-sample"
             sample["bench_concurrency_sweep"] = concurrency_cells
             current_concurrency = active_bench_concurrency(stderr_tmp)
             if current_concurrency is not None:
                 sample["bench_concurrency"] = current_concurrency
-            write_gpu_bench_sample(root, sample)
+            write_gpu_bench_sample(
+                root,
+                sample,
+                samples_name=samples_name,
+                during_label=during_label,
+            )
 
     stdout = stdout_tmp.read_text(errors="replace") if stdout_tmp.is_file() else ""
     stderr = stderr_tmp.read_text(errors="replace") if stderr_tmp.is_file() else ""
@@ -2016,7 +2041,17 @@ def run_vllm_baseline_gate(
                 start_new_session=True,
             )
         wait_health(base_url, timeout_sec=int(cfg.get("vllm_startup_timeout_sec", 1800)))
-        bench = run(bench_cmd, cwd=repo, timeout=int(cfg.get("bench_timeout_sec", 7200)))
+        bench = run_with_gpu_samples(
+            bench_cmd,
+            cwd=repo,
+            root=root,
+            timeout=int(cfg.get("bench_timeout_sec", 7200)),
+            sample_interval_sec=int(cfg.get("bench_gpu_sample_interval_sec", 15)),
+            samples_name="vllm-nvidia-smi.bench.samples.jsonl",
+            tmp_stem="vllm-baseline",
+            sample_phase="vllm-bench",
+            during_label="vllm-during",
+        )
         write_text(root / "vllm-baseline.stdout", bench.stdout)
         write_text(root / "vllm-baseline.stderr", bench.stderr)
         assert_no_bad_patterns("vLLM bench output", bench.stdout + "\n" + bench.stderr)
