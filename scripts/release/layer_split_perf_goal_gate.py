@@ -829,7 +829,11 @@ def require_product_command(path: Path, label: str, subcommand: str, pipeline_mo
 
 
 def require_bench_command(path: Path, label: str) -> dict[str, str]:
-    cmd = command_list(path / "bench-serve.command.json", label)
+    return require_bench_command_file(path / "bench-serve.command.json", label)
+
+
+def require_bench_command_file(path: Path, label: str) -> dict[str, str]:
+    cmd = command_list(path, label)
     if "bench-serve" not in cmd:
         raise ValidationError(f"{label}: command is not ferrum bench-serve")
     for flag in ["--fail-on-error", "--require-ci"]:
@@ -865,6 +869,28 @@ def require_bench_command(path: Path, label: str) -> dict[str, str]:
         "concurrency_sweep": sweep,
         "seed": flag_value(cmd, "--seed") or "",
         "output": flag_value(cmd, "--output") or "",
+    }
+
+
+def validate_vllm_bench_artifact(path: Path) -> dict[str, Any]:
+    path = require_dir(path, "vllm artifact")
+    command_signature = require_bench_command_file(
+        path / "vllm-baseline.command.json", "vllm"
+    )
+    reports = reports_from_json(load_json(path / "vllm-baseline.json"), "vllm")
+    rows: dict[int, dict[str, Any]] = {}
+    throughput: dict[int, float] = {}
+    for report in reports:
+        concurrency, tps = validate_report(report, "vllm")
+        rows[concurrency] = report
+        throughput[concurrency] = tps
+    missing = sorted(REQUIRED_CONCURRENCY_CELLS - set(rows))
+    if missing:
+        raise ValidationError(f"vllm: bench reports missing cells {missing}")
+    return {
+        "command_signature": command_signature,
+        "throughput_by_concurrency": throughput,
+        "max_target_tps": max(throughput[c] for c in THROUGHPUT_TARGET_CELLS),
     }
 
 
@@ -1110,13 +1136,17 @@ def validate_perf_goal(
 
     vllm_tps = None
     vllm_metadata = None
+    vllm_bench = None
     target_tps = FIXED_PUBLIC_TARGET_TPS
     target_mode = "fixed_public_lower_bound"
     if optional_vllm_artifact is not None:
         vllm_metadata = validate_optional_vllm_metadata(
             optional_vllm_artifact, candidate_metadata
         )
-        vllm_tps = vllm_tps_from_artifact(optional_vllm_artifact)
+        vllm_bench = validate_vllm_bench_artifact(optional_vllm_artifact)
+        if vllm_bench["command_signature"] != candidate_bench["command_signature"]:
+            raise ValidationError("vllm and candidate bench command parameters differ")
+        vllm_tps = float(vllm_bench["max_target_tps"])
         if vllm_tps > PUBLIC_REFERENCE_TPS:
             target_tps = 0.80 * vllm_tps
             target_mode = "same_pod_vllm_80pct"
@@ -1177,6 +1207,9 @@ def validate_perf_goal(
         "stretch_output_tps": STRETCH_TARGET_TPS,
         "stretch_passed": candidate_max >= STRETCH_TARGET_TPS,
         "same_pod_vllm_output_tps": vllm_tps,
+        "same_pod_vllm_throughput_by_concurrency": vllm_bench["throughput_by_concurrency"]
+        if vllm_bench is not None
+        else None,
         "same_pod_vllm_metadata": {
             "git_sha": vllm_metadata.get("git_sha"),
             "cuda_version": vllm_metadata.get("cuda_version"),
@@ -1591,10 +1624,39 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
         },
     )
     write_json(
+        root / "vllm-baseline.command.json",
+        {
+            "cmd": [
+                "ferrum",
+                "bench-serve",
+                "--fail-on-error",
+                "--require-ci",
+                "--seed",
+                "9271",
+                "--n-repeats",
+                "3",
+                "--concurrency-sweep",
+                "1,4,8,16",
+                "--dataset",
+                "random",
+                "--random-input-len",
+                "256",
+                "--random-output-len",
+                "128",
+                "--num-prompts",
+                "96",
+                "--warmup-requests",
+                "10",
+                "--output",
+                "json",
+            ]
+        },
+    )
+    write_json(
         root / "vllm-baseline.json",
         [
-            {"concurrency": c, "output_throughput": tps if c == 8 else tps - 1.0}
-            for c in sorted(THROUGHPUT_TARGET_CELLS)
+            bench_report(c, tps if c in THROUGHPUT_TARGET_CELLS else tps - 2.0)
+            for c in sorted(REQUIRED_CONCURRENCY_CELLS)
         ],
     )
 
@@ -1837,6 +1899,22 @@ def run_self_test() -> None:
             raise AssertionError("vllm hardware mismatch unexpectedly passed")
         except ValidationError as exc:
             if "vllm and candidate metadata gpu_uuids differ" not in str(exc):
+                raise
+
+        vllm_missing_command = root / "vllm-missing-command"
+        make_vllm_artifact(vllm_missing_command, 40.0)
+        (vllm_missing_command / "vllm-baseline.command.json").unlink()
+        try:
+            validate_perf_goal(
+                out_dir=root / "vllm-missing-command-out",
+                baseline_artifact=baseline,
+                candidate_artifact=candidate,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=vllm_missing_command,
+            )
+            raise AssertionError("vllm missing command unexpectedly passed")
+        except ValidationError as exc:
+            if "vllm-baseline.command.json" not in str(exc):
                 raise
 
         bridge_mismatch = root / "bridge-mismatch"
