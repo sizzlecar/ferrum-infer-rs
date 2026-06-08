@@ -105,6 +105,23 @@ def parse_nvidia_smi_gpu_query(text: str) -> list[dict[str, Any]]:
     return rows
 
 
+def validate_gpu_preflight_rows(gpus: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    if len(gpus) != 2:
+        errors.append(f"expected exactly 2 GPUs, got {len(gpus)}")
+    indices = [gpu.get("index") for gpu in gpus]
+    if indices != [0, 1]:
+        errors.append(f"expected GPU indices [0, 1], got {indices!r}")
+    uuids = [str(gpu.get("uuid", "")).strip() for gpu in gpus]
+    if len(set(uuids)) != len(uuids):
+        errors.append("GPU UUIDs must be unique")
+    for idx, gpu in enumerate(gpus):
+        name = str(gpu.get("name", "")).lower()
+        if "4090" not in name:
+            errors.append(f"GPU {idx} is not an RTX 4090: {gpu.get('name')!r}")
+    return errors
+
+
 def query_gpu_preflight(repo: Path) -> dict[str, Any]:
     cmd = [
         "nvidia-smi",
@@ -129,16 +146,8 @@ def query_gpu_preflight(repo: Path) -> dict[str, Any]:
             "gpus": [],
         }
     gpus = parse_nvidia_smi_gpu_query(proc.stdout)
-    status = "pass"
-    errors: list[str] = []
-    if len(gpus) != 2:
-        status = "fail"
-        errors.append(f"expected exactly 2 GPUs, got {len(gpus)}")
-    for idx, gpu in enumerate(gpus):
-        name = str(gpu.get("name", "")).lower()
-        if "4090" not in name:
-            status = "fail"
-            errors.append(f"GPU {idx} is not an RTX 4090: {gpu.get('name')!r}")
+    errors = validate_gpu_preflight_rows(gpus)
+    status = "fail" if errors else "pass"
     return {
         "schema_version": 1,
         "status": status,
@@ -242,6 +251,15 @@ def command_plan(
     }
 
 
+def print_run_plan(plan: dict[str, Any]) -> None:
+    print(f"Lane: {plan['lane']}")
+    print(f"Expected runtime/cost: {plan['expected_runtime_cost']}")
+    print(f"Stop condition: {plan['stop_condition']}")
+    print(f"Correctness gate: {plan['correctness_gate']}")
+    print(f"Performance command: {plan['performance_command']}")
+    print(f"Final artifact: {plan['final_artifact']}")
+
+
 def run_step(name: str, cmd: list[str], repo: Path, out_root: Path) -> subprocess.CompletedProcess[str]:
     started = iso_now()
     env = os.environ.copy()
@@ -278,11 +296,12 @@ def run_goal(args: argparse.Namespace) -> int:
     out_root = resolve_out_root(repo, args.out)
     require_outside_repo(repo, out_root)
     out_root.mkdir(parents=True, exist_ok=True)
-    require_2x4090_preflight(repo, out_root)
     ferrum_bin = args.ferrum_bin
     optional_vllm = args.optional_vllm_artifact
     plan = command_plan(repo, ferrum_bin, out_root, optional_vllm)
     write_json(out_root / "layer_split_perf_goal_run_plan.json", plan)
+    print_run_plan(plan)
+    require_2x4090_preflight(repo, out_root)
 
     run_step("build_cuda_release", plan["commands"]["build_cuda_release"], repo, out_root)
     run_step("baseline_batch", plan["commands"]["baseline_batch"], repo, out_root)
@@ -310,8 +329,20 @@ def self_test() -> int:
     )
     assert [gpu["index"] for gpu in gpus] == [0, 1]
     assert all("4090" in gpu["name"] for gpu in gpus)
+    assert validate_gpu_preflight_rows(gpus) == []
     bad_gpus = parse_nvidia_smi_gpu_query("0, NVIDIA GeForce RTX 3090, GPU-selftest-0\n")
     assert len(bad_gpus) == 1
+    assert any("not an RTX 4090" in error for error in validate_gpu_preflight_rows(bad_gpus))
+    bad_indices = parse_nvidia_smi_gpu_query(
+        "1, NVIDIA GeForce RTX 4090, GPU-selftest-1\n"
+        "2, NVIDIA GeForce RTX 4090, GPU-selftest-2\n"
+    )
+    assert any("GPU indices" in error for error in validate_gpu_preflight_rows(bad_indices))
+    duplicate_uuid = parse_nvidia_smi_gpu_query(
+        "0, NVIDIA GeForce RTX 4090, GPU-same\n"
+        "1, NVIDIA GeForce RTX 4090, GPU-same\n"
+    )
+    assert any("UUIDs" in error for error in validate_gpu_preflight_rows(duplicate_uuid))
     plan = command_plan(repo, Path("./target/release/ferrum"), out, None)
     assert plan["baseline_artifact"] == str(out / "baseline-batch")
     assert plan["candidate_artifact"] == str(out / "candidate-overlapped")
