@@ -17,6 +17,7 @@
 //! sees a uniform `qkv_proj` / `gate_up_proj` Linear.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{atomic::AtomicU64, OnceLock};
 
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
@@ -336,6 +337,125 @@ pub struct LlamaFamilyLayer<B: QuantLlmBackend + BackendMoeFused> {
     pub post_ln_w: B::Buffer,
     pub gate_up_proj: Box<dyn Linear<B>>,
     pub down_proj: Box<dyn Linear<B>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlamaFamilyLayerStageConfig {
+    pub source_layers: Range<usize>,
+    pub load_embedding: bool,
+    pub load_lm_head: bool,
+}
+
+impl LlamaFamilyLayerStageConfig {
+    pub fn full(num_layers: usize) -> Self {
+        Self {
+            source_layers: 0..num_layers,
+            load_embedding: true,
+            load_lm_head: true,
+        }
+    }
+
+    pub fn backbone(num_layers: usize) -> Self {
+        Self {
+            source_layers: 0..num_layers,
+            load_embedding: false,
+            load_lm_head: false,
+        }
+    }
+
+    pub fn pipeline_stage(
+        source_layers: Range<usize>,
+        is_first_stage: bool,
+        is_last_stage: bool,
+    ) -> Self {
+        Self {
+            source_layers,
+            load_embedding: is_first_stage,
+            load_lm_head: is_last_stage,
+        }
+    }
+}
+
+fn load_llama_family_layers<B: MoeLlmBackend>(
+    cfg: &LlamaFamilyConfig,
+    loader: &dyn WeightLoader<B>,
+    source_layers: Range<usize>,
+) -> Result<Vec<LlamaFamilyLayer<B>>> {
+    if source_layers.start > source_layers.end || source_layers.end > cfg.num_layers {
+        return Err(ferrum_types::FerrumError::model(format!(
+            "llama layer range {}..{} is outside model layer count {}",
+            source_layers.start, source_layers.end, cfg.num_layers
+        )));
+    }
+
+    let mut layers = Vec::with_capacity(source_layers.end.saturating_sub(source_layers.start));
+    for li in source_layers {
+        let prefix = format!("model.layers.{li}");
+        let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
+        let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
+        let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
+        let post_ln_w = loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
+        let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
+        let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
+
+        let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
+            let q = loader
+                .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
+                .ok();
+            let k = loader
+                .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
+                .ok();
+            (q, k)
+        } else {
+            (None, None)
+        };
+
+        layers.push(LlamaFamilyLayer {
+            input_ln_w,
+            qkv_proj,
+            q_norm_w,
+            k_norm_w,
+            o_proj,
+            post_ln_w,
+            gate_up_proj,
+            down_proj,
+        });
+    }
+    Ok(layers)
+}
+
+fn load_llama_family_lm_head<B: MoeLlmBackend>(
+    cfg: &LlamaFamilyConfig,
+    loader: &dyn WeightLoader<B>,
+) -> Result<Box<dyn Linear<B>>> {
+    // LM head: either dedicated `lm_head.weight` or tied to embedding.
+    // Many models (Qwen3-4B, Llama-3.2-1B, some Qwen2.5) use TIED
+    // embeddings — lm_head shares weights with model.embed_tokens. When
+    // no dedicated lm_head tensor exists, re-load the embed tensor as a
+    // DenseLinear. This duplicates the buffer (memory cost = vocab*h*2
+    // bytes, e.g. ~770MB for Qwen3-4B) but keeps the Linear trait's
+    // owned-weights invariant. Sharing via Arc is a future optimisation.
+    let lm_head = if loader.has_tensor("lm_head.weight") {
+        loader.load_linear("lm_head")?
+    } else {
+        tracing::info!(
+            "LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head"
+        );
+        let as_linear = loader.load_linear("model.embed_tokens")?;
+        // Sanity check: shape must be [vocab, hidden].
+        if as_linear.out_features() != cfg.vocab_size || as_linear.in_features() != cfg.hidden_size
+        {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "tied embed shape mismatch: got [{}, {}], expected [{}, {}]",
+                as_linear.out_features(),
+                as_linear.in_features(),
+                cfg.vocab_size,
+                cfg.hidden_size
+            )));
+        }
+        as_linear
+    };
+    Ok(lm_head)
 }
 
 /// Precomputed RoPE cos/sin tables (shape `[max_seq, head_dim / 2]` each).
@@ -659,6 +779,10 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// Qwen3-TTS Talker, which embeds inputs externally and feeds via
     /// `prefill_from_embeds`).
     pub embed: Option<B::Buffer>,
+    /// Source checkpoint layer range loaded into `layers`. Full LLM models
+    /// use `0..cfg.num_layers`; layer-split stages load a contiguous subset.
+    pub layer_source_start: usize,
+    pub layer_source_end: usize,
     pub layers: Vec<LlamaFamilyLayer<B>>,
     pub final_norm_w: B::Buffer,
     /// LM output head. `None` for backbone-only models.
@@ -750,6 +874,58 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// The loader decides per-projection whether to instantiate DenseLinear,
     /// GptqLinear, etc. — this code doesn't care.
     pub fn new(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
+        let num_layers = cfg.num_layers;
+        Self::new_with_stage_config(cfg, loader, LlamaFamilyLayerStageConfig::full(num_layers))
+    }
+
+    /// Build a backbone-only Qwen3 transformer stack (no embed, no lm_head).
+    ///
+    /// Intended for composing the transformer inside a larger model where
+    /// embedding and output-head logic differs from the standard LLM path —
+    /// e.g. Qwen3-TTS Talker uses dual text/codec embeddings with a projection
+    /// MLP, and a codec_head output. The caller drives forward via
+    /// `prefill_from_embeds` / `decode_from_embed`.
+    ///
+    /// Loader must provide: per-layer weights under `model.layers.{i}.*` and
+    /// the final `model.norm.weight`. `model.embed_tokens` and `lm_head`
+    /// are NOT read.
+    pub fn new_backbone_only(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
+        let num_layers = cfg.num_layers;
+        Self::new_with_stage_config(
+            cfg,
+            loader,
+            LlamaFamilyLayerStageConfig::backbone(num_layers),
+        )
+    }
+
+    /// Build a layer-split pipeline stage. The stage always loads its local
+    /// transformer layers and final norm; embedding and lm_head are loaded only
+    /// for the first and last stages respectively.
+    pub fn new_layer_stage(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+        stage: LlamaFamilyLayerStageConfig,
+    ) -> Result<Self> {
+        Self::new_with_stage_config(cfg, loader, stage)
+    }
+
+    fn new_with_stage_config(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+        stage: LlamaFamilyLayerStageConfig,
+    ) -> Result<Self> {
+        if stage.source_layers.is_empty() {
+            return Err(ferrum_types::FerrumError::model(
+                "llama layer stage must include at least one source layer",
+            ));
+        }
+        if stage.source_layers.end > cfg.num_layers {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "llama layer stage range {}..{} is outside model layer count {}",
+                stage.source_layers.start, stage.source_layers.end, cfg.num_layers
+            )));
+        }
+
         // Invalidate any graph from a previously-loaded model. The captured
         // graph references the old model's scratch buffers; a fresh model
         // gets fresh scratch, so reusing the graph would read/write freed
@@ -759,86 +935,33 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg);
-        let scratch = LlamaFamilyScratch::alloc(&cfg, 1); // decode-sized; prefill resizes
+        let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
+        let embed = if stage.load_embedding {
+            Some(loader.load_tensor("model.embed_tokens.weight")?)
+        } else {
+            None
+        };
+        let layers = load_llama_family_layers(&cfg, loader, stage.source_layers.clone())?;
 
-        // Embedding: plain tensor (no projection math, just lookup).
-        let embed = loader.load_tensor("model.embed_tokens.weight")?;
-
-        // Per-layer weights.
-        let mut layers = Vec::with_capacity(cfg.num_layers);
-        for li in 0..cfg.num_layers {
-            let prefix = format!("model.layers.{li}");
-            let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
-            let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
-            let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
-            let post_ln_w =
-                loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
-            let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
-
-            let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
-                let q = loader
-                    .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
-                    .ok();
-                let k = loader
-                    .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
-                    .ok();
-                (q, k)
-            } else {
-                (None, None)
-            };
-
-            layers.push(LlamaFamilyLayer {
-                input_ln_w,
-                qkv_proj,
-                q_norm_w,
-                k_norm_w,
-                o_proj,
-                post_ln_w,
-                gate_up_proj,
-                down_proj,
-            });
-        }
-
+        let lm_head = if stage.load_lm_head {
+            Some(load_llama_family_lm_head(&cfg, loader)?)
+        } else {
+            None
+        };
         let final_norm_w = loader.load_tensor("model.norm.weight")?;
 
-        // LM head: either dedicated `lm_head.weight` or tied to embedding.
-        // Many models (Qwen3-4B, Llama-3.2-1B, some Qwen2.5) use TIED
-        // embeddings — lm_head shares weights with model.embed_tokens. When
-        // no dedicated lm_head tensor exists, re-load the embed tensor as a
-        // DenseLinear. This duplicates the buffer (memory cost = vocab*h*2
-        // bytes, e.g. ~770MB for Qwen3-4B) but keeps the Linear trait's
-        // owned-weights invariant. Sharing via Arc is a future optimisation.
-        let lm_head = if loader.has_tensor("lm_head.weight") {
-            loader.load_linear("lm_head")?
-        } else {
-            tracing::info!(
-                "LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head"
-            );
-            let as_linear = loader.load_linear("model.embed_tokens")?;
-            // Sanity check: shape must be [vocab, hidden].
-            if as_linear.out_features() != cfg.vocab_size
-                || as_linear.in_features() != cfg.hidden_size
-            {
-                return Err(ferrum_types::FerrumError::model(format!(
-                    "tied embed shape mismatch: got [{}, {}], expected [{}, {}]",
-                    as_linear.out_features(),
-                    as_linear.in_features(),
-                    cfg.vocab_size,
-                    cfg.hidden_size
-                )));
-            }
-            as_linear
-        };
-
+        let layer_source_start = stage.source_layers.start;
+        let layer_source_end = stage.source_layers.end;
         let runtime_cfg = cfg.to_runtime();
         Ok(Self {
             cfg,
             runtime_cfg,
-            embed: Some(embed),
+            embed,
+            layer_source_start,
+            layer_source_end,
             layers,
             final_norm_w,
-            lm_head: Some(lm_head),
+            lm_head,
             rope,
             scratch,
             kv_caches: HashMap::new(),
@@ -864,94 +987,37 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         })
     }
 
-    /// Build a backbone-only Qwen3 transformer stack (no embed, no lm_head).
-    ///
-    /// Intended for composing the transformer inside a larger model where
-    /// embedding and output-head logic differs from the standard LLM path —
-    /// e.g. Qwen3-TTS Talker uses dual text/codec embeddings with a projection
-    /// MLP, and a codec_head output. The caller drives forward via
-    /// `prefill_from_embeds` / `decode_from_embed`.
-    ///
-    /// Loader must provide: per-layer weights under `model.layers.{i}.*` and
-    /// the final `model.norm.weight`. `model.embed_tokens` and `lm_head`
-    /// are NOT read.
-    pub fn new_backbone_only(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
-        // See `new` — invalidate stale graph referring to prior model's scratch.
+    pub fn source_layer_range(&self) -> Range<usize> {
+        self.layer_source_start..self.layer_source_end
+    }
+
+    pub fn local_layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn cache_len(&self, cache_id: &str) -> usize {
+        self.kv_caches
+            .get(cache_id)
+            .and_then(|layers| layers.first())
+            .map(K::len)
+            .unwrap_or(0)
+    }
+
+    fn local_layer_indices(&self) -> Range<usize> {
+        0..self.local_layer_count()
+    }
+
+    fn source_layer_index(&self, local_layer_index: usize) -> usize {
+        self.layer_source_start + local_layer_index
+    }
+
+    fn local_layer_index_for_source(&self, source_layer_index: usize) -> Option<usize> {
+        if source_layer_index < self.layer_source_start
+            || source_layer_index >= self.layer_source_end
         {
-            let mut ctx = B::new_context();
-            B::reset_all_graphs(&mut ctx);
+            return None;
         }
-        let rope = build_rope_cache::<B>(&cfg);
-        let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
-
-        let mut layers = Vec::with_capacity(cfg.num_layers);
-        for li in 0..cfg.num_layers {
-            let prefix = format!("model.layers.{li}");
-            let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
-            let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
-            let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
-            let post_ln_w =
-                loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
-            let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
-
-            let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
-                let q = loader
-                    .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
-                    .ok();
-                let k = loader
-                    .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
-                    .ok();
-                (q, k)
-            } else {
-                (None, None)
-            };
-
-            layers.push(LlamaFamilyLayer {
-                input_ln_w,
-                qkv_proj,
-                q_norm_w,
-                k_norm_w,
-                o_proj,
-                post_ln_w,
-                gate_up_proj,
-                down_proj,
-            });
-        }
-
-        let final_norm_w = loader.load_tensor("model.norm.weight")?;
-
-        let runtime_cfg = cfg.to_runtime();
-        Ok(Self {
-            cfg,
-            runtime_cfg,
-            embed: None,
-            layers,
-            final_norm_w,
-            lm_head: None,
-            rope,
-            scratch,
-            kv_caches: HashMap::new(),
-            kv_free_pool: Vec::new(),
-            paged_pools: None,
-            paged_block_alloc: None,
-            paged_dims: None,
-            graph_warmup: 0,
-            graph_capture_failed: false,
-            batched_graph_warmup: 0,
-            batched_graph_failed: false,
-            batched_graph_keys_seen: std::collections::HashSet::new(),
-            batched_pointers_for: None,
-            unified_graph_warmup: 0,
-            unified_graph_failed: false,
-            unified_graph_keys_seen: std::collections::HashSet::new(),
-            prefix_cache_hits: 0,
-            prefix_cache_misses: 0,
-            prefix_cache_saved_prefill_tokens: 0,
-            lora_adapters: HashMap::new(),
-            lora_cache_adapters: HashMap::new(),
-            lora_projection_applications: 0,
-        })
+        Some(source_layer_index - self.layer_source_start)
     }
 
     /// Grow scratch buffers if `tokens` exceeds the current sizing.
@@ -1048,8 +1114,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // = 8 GB total. Sized this large only because `max_seqs=16`
         // is the default; lower it via env to shrink.
         if paged && self.paged_pools.is_none() {
-            let mut pools = Vec::with_capacity(self.cfg.num_layers);
-            for _ in 0..self.cfg.num_layers {
+            let mut pools = Vec::with_capacity(self.local_layer_count());
+            for _ in self.local_layer_indices() {
                 let pool_floats = total_pool_blocks * nkv * PAGED_BLOCK_SIZE * hd;
                 pools.push((B::alloc(pool_floats), B::alloc(pool_floats)));
             }
@@ -1079,7 +1145,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // model's K marker. INT8 supports paged mode only — KvInt8::alloc_contig
         // panics, surfacing the misconfiguration here at first ensure_kv.
         let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
-            (0..self.cfg.num_layers)
+            self.local_layer_indices()
                 .map(|_| {
                     if paged {
                         K::alloc_paged(max_blocks_per_seq, PAGED_BLOCK_SIZE, nkv, hd)
@@ -1294,7 +1360,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             })
             .unwrap_or((0, 16));
         let bytes_per_entry = (block_size
-            * self.cfg.num_layers
+            * self.local_layer_count()
             * self.cfg.num_kv_heads
             * self.cfg.head_dim
             * K::BYTES_PER_ELEM
@@ -1319,7 +1385,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         layer_index: usize,
         target_module: &str,
     ) -> Option<(usize, usize)> {
-        let layer = self.layers.get(layer_index)?;
+        let local_layer_index = self.local_layer_index_for_source(layer_index)?;
+        let layer = self.layers.get(local_layer_index)?;
         match target_module {
             "qkv_proj" => Some((layer.qkv_proj.in_features(), layer.qkv_proj.out_features())),
             "o_proj" => Some((layer.o_proj.in_features(), layer.o_proj.out_features())),
@@ -1349,6 +1416,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     linear.target_module
                 ))
             })?;
+            if layer_index < self.cfg.num_layers
+                && !self.source_layer_range().contains(&layer_index)
+            {
+                continue;
+            }
             let Some((expected_in, expected_out)) =
                 self.lora_projection_shape(layer_index, &linear.target_module)
             else {
@@ -1420,6 +1492,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         pos_offset: usize,
         tokens: usize,
     ) {
+        let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -1475,7 +1548,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let applied = unsafe { &*adapter }
                 .apply_projection(
                     ctx,
-                    li,
+                    source_li,
                     "qkv_proj",
                     &self.scratch.norm_out,
                     &mut self.scratch.qkv_out,
@@ -1552,7 +1625,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // otherwise corrupt the cache + adjacent allocations).
         if cache_len_before + tokens > cache_capacity {
             panic!(
-                "KV cache overflow on layer {li}: would write tokens [{cache_len_before}..{}) but capacity is {cache_capacity} (cache_id={cache_id:?}). Increase FERRUM_KV_CAPACITY or call /clear in the REPL.",
+                "KV cache overflow on source layer {source_li} (local layer {li}): would write tokens [{cache_len_before}..{}) but capacity is {cache_capacity} (cache_id={cache_id:?}). Increase FERRUM_KV_CAPACITY or call /clear in the REPL.",
                 cache_len_before + tokens
             );
         }
@@ -1710,6 +1783,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         residual: &mut B::Buffer,
         tokens: usize,
     ) {
+        let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -1742,7 +1816,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let applied = unsafe { &*adapter }
                 .apply_projection(
                     ctx,
-                    li,
+                    source_li,
                     "o_proj",
                     attn_token_major,
                     &mut self.scratch.o_proj_out,
@@ -1776,7 +1850,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let applied = unsafe { &*adapter }
                 .apply_projection(
                     ctx,
-                    li,
+                    source_li,
                     "gate_up_proj",
                     &self.scratch.norm_out,
                     &mut self.scratch.gate_up_out,
@@ -1807,7 +1881,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let applied = unsafe { &*adapter }
                 .apply_projection(
                     ctx,
-                    li,
+                    source_li,
                     "down_proj",
                     &self.scratch.silu_out,
                     &mut self.scratch.mlp_out,
@@ -1861,7 +1935,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .expect("forward_verify called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
         }
 
@@ -1998,7 +2072,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             None
         };
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
         }
 
@@ -2156,12 +2230,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // localise non-matmul bottlenecks during perf work.
         let layer_profile = llama_family_runtime_env().decode_layer_profile;
         let mut layer_times = if layer_profile {
-            Some(Vec::with_capacity(self.cfg.num_layers))
+            Some(Vec::with_capacity(self.local_layer_count()))
         } else {
             None
         };
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             if layer_profile {
                 let t0 = std::time::Instant::now();
                 self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
@@ -2286,6 +2360,166 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         B::to_vec(&self.scratch.logits, vocab)
     }
 
+    fn stage_tokens_to_hidden(
+        &mut self,
+        cache_id: &str,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Vec<f32> {
+        let seq_len = tokens.len();
+        assert!(seq_len > 0, "stage token forward called with zero length");
+        self.ensure_scratch(seq_len);
+        self.ensure_kv(cache_id);
+
+        let h = self.cfg.hidden_size;
+        let mut ctx = B::new_context();
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("stage token forward called on stage without embedding");
+        B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
+
+        for li in self.local_layer_indices() {
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
+        }
+
+        B::sync(&mut ctx);
+        let out = B::to_vec(&residual, seq_len * h);
+        self.scratch.residual = Some(residual);
+        out
+    }
+
+    /// Run the first layer-split stage over prompt tokens and return all
+    /// output hidden states for the next stage.
+    pub fn prefill_stage_tokens_to_hidden(
+        &mut self,
+        cache_id: &str,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Vec<f32> {
+        self.stage_tokens_to_hidden(cache_id, tokens, pos_offset)
+    }
+
+    /// Decode-side first-stage token forward. Returns one hidden row for the
+    /// next stage.
+    pub fn decode_stage_token_to_hidden(
+        &mut self,
+        cache_id: &str,
+        token: u32,
+        pos: u32,
+    ) -> Vec<f32> {
+        self.stage_tokens_to_hidden(cache_id, &[token], pos as usize)
+    }
+
+    fn stage_hidden_from_host(
+        &mut self,
+        cache_id: &str,
+        hidden: &[f32],
+        seq_len: usize,
+        pos_offset: usize,
+    ) -> Vec<f32> {
+        let h = self.cfg.hidden_size;
+        assert_eq!(
+            hidden.len(),
+            seq_len * h,
+            "hidden length {} != seq_len * hidden_size {}",
+            hidden.len(),
+            seq_len * h
+        );
+        assert!(seq_len > 0, "stage hidden forward called with zero length");
+
+        self.ensure_scratch(seq_len);
+        self.ensure_kv(cache_id);
+
+        let mut ctx = B::new_context();
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+
+        let hidden_buf = B::from_slice(hidden);
+        B::copy_slice(&mut ctx, &hidden_buf, 0, &mut residual, 0, seq_len * h);
+
+        for li in self.local_layer_indices() {
+            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
+        }
+
+        B::sync(&mut ctx);
+        let out = B::to_vec(&residual, seq_len * h);
+        self.scratch.residual = Some(residual);
+        out
+    }
+
+    /// Run this layer-split stage over prefill hidden states supplied by the
+    /// previous stage. Returns all output hidden states in row-major
+    /// `[seq_len, hidden_size]` form for the next stage.
+    pub fn prefill_stage_hidden_from_host(
+        &mut self,
+        cache_id: &str,
+        hidden: &[f32],
+        seq_len: usize,
+        pos_offset: usize,
+    ) -> Vec<f32> {
+        self.stage_hidden_from_host(cache_id, hidden, seq_len, pos_offset)
+    }
+
+    /// Decode-side companion for one hidden state row supplied by the previous
+    /// stage. Returns this stage's output hidden row.
+    pub fn decode_stage_hidden_from_host(
+        &mut self,
+        cache_id: &str,
+        hidden: &[f32],
+        pos: u32,
+    ) -> Vec<f32> {
+        self.stage_hidden_from_host(cache_id, hidden, 1, pos as usize)
+    }
+
+    /// Apply final norm + lm_head to one hidden row. Used by the last pipeline
+    /// stage after local transformer layers have produced the final hidden
+    /// state for sampling.
+    pub fn logits_from_hidden(&mut self, hidden: &[f32]) -> Vec<f32> {
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        assert_eq!(
+            hidden.len(),
+            h,
+            "hidden length {} != hidden_size {}",
+            hidden.len(),
+            h
+        );
+        self.ensure_scratch(1);
+
+        let mut ctx = B::new_context();
+        let hidden_buf = B::from_slice(hidden);
+        B::rms_norm(
+            &mut ctx,
+            &hidden_buf,
+            &self.final_norm_w,
+            self.cfg.rms_norm_eps,
+            &mut self.scratch.last_normed,
+            1,
+            h,
+        );
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .expect("logits_from_hidden called on stage without lm_head");
+        lm_head.forward(
+            &mut ctx,
+            &self.scratch.last_normed,
+            &mut self.scratch.logits,
+            1,
+        );
+        B::sync(&mut ctx);
+        B::to_vec(&self.scratch.logits, vocab)
+    }
+
     /// Prefill with pre-computed embeddings instead of token IDs.
     ///
     /// Used by models that embed inputs outside the LLM (e.g. Qwen3-TTS
@@ -2324,7 +2558,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let embed_buf = B::from_slice(embeds);
         B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, seq_len * h);
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, 0, seq_len);
         }
 
@@ -2367,7 +2601,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let embed_buf = B::from_slice(embed);
         B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, h);
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
         }
 
@@ -2417,7 +2651,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let embed_buf = B::from_slice(embeds);
         B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, seq_len * h);
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
         }
 
@@ -2461,7 +2695,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let embed_buf = B::from_slice(embed);
         B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, h);
 
-        for li in 0..self.cfg.num_layers {
+        for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
         }
 
@@ -2848,7 +3082,221 @@ fn scale_llama3_rope_freq(
 
 #[cfg(test)]
 mod tests {
-    use super::{LlamaFamilyRuntimeEnv, DEFAULT_KV_CAPACITY};
+    use std::sync::Mutex;
+
+    use ferrum_kernels::backend::cpu::CpuBackend;
+    use ferrum_quantization::{DenseLinear, QuantConfig, WeightLoader};
+    use ferrum_types::Result;
+
+    use super::{
+        load_llama_family_layers, LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel,
+        LlamaFamilyRuntimeEnv, DEFAULT_KV_CAPACITY,
+    };
+
+    #[derive(Default)]
+    struct RecordingLoader {
+        tensors: Mutex<Vec<String>>,
+        linears: Mutex<Vec<String>>,
+    }
+
+    impl WeightLoader<CpuBackend> for RecordingLoader {
+        fn load_tensor(&self, name: &str) -> Result<Vec<f32>> {
+            self.tensors.lock().unwrap().push(name.to_string());
+            Ok(vec![1.0])
+        }
+
+        fn load_linear(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+            self.linears.lock().unwrap().push(name.to_string());
+            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(&[1.0], 1, 1)))
+        }
+
+        fn has_tensor(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn quant_config(&self) -> Option<&QuantConfig> {
+            None
+        }
+    }
+
+    fn test_llama_config(num_layers: usize, has_qk_norm: bool) -> LlamaFamilyConfig {
+        LlamaFamilyConfig {
+            hidden_size: 1,
+            intermediate_size: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            num_layers,
+            vocab_size: 1,
+            max_seq_len: 1,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            rope_scaling: None,
+            rope_interleaved: false,
+            has_qk_norm,
+            sliding_window: 0,
+        }
+    }
+
+    #[test]
+    fn llama_family_layer_loader_uses_source_layer_range() {
+        let cfg = test_llama_config(5, true);
+        let loader = RecordingLoader::default();
+
+        let layers = load_llama_family_layers(&cfg, &loader, 2..4).unwrap();
+
+        assert_eq!(layers.len(), 2);
+        assert!(layers.iter().all(|layer| layer.q_norm_w.is_some()));
+        assert!(layers.iter().all(|layer| layer.k_norm_w.is_some()));
+        assert_eq!(
+            loader.tensors.into_inner().unwrap(),
+            vec![
+                "model.layers.2.input_layernorm.weight",
+                "model.layers.2.post_attention_layernorm.weight",
+                "model.layers.2.self_attn.q_norm.weight",
+                "model.layers.2.self_attn.k_norm.weight",
+                "model.layers.3.input_layernorm.weight",
+                "model.layers.3.post_attention_layernorm.weight",
+                "model.layers.3.self_attn.q_norm.weight",
+                "model.layers.3.self_attn.k_norm.weight",
+            ]
+        );
+        assert_eq!(
+            loader.linears.into_inner().unwrap(),
+            vec![
+                "model.layers.2.self_attn.qkv_proj",
+                "model.layers.2.self_attn.o_proj",
+                "model.layers.2.mlp.gate_up_proj",
+                "model.layers.2.mlp.down_proj",
+                "model.layers.3.self_attn.qkv_proj",
+                "model.layers.3.self_attn.o_proj",
+                "model.layers.3.mlp.gate_up_proj",
+                "model.layers.3.mlp.down_proj",
+            ]
+        );
+    }
+
+    #[test]
+    fn llama_family_layer_loader_rejects_out_of_bounds_range() {
+        let cfg = test_llama_config(2, false);
+        let loader = RecordingLoader::default();
+
+        let err = match load_llama_family_layers(&cfg, &loader, 1..3) {
+            Ok(_) => panic!("expected out-of-bounds layer range to fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("outside model layer count"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn llama_family_full_model_records_source_layer_range() {
+        let cfg = test_llama_config(3, false);
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
+
+        assert_eq!(model.source_layer_range(), 0..3);
+        assert_eq!(model.local_layer_count(), 3);
+        assert_eq!(model.source_layer_index(2), 2);
+
+        model.ensure_kv("test-cache");
+        assert_eq!(
+            model.kv_caches["test-cache"].len(),
+            model.local_layer_count()
+        );
+    }
+
+    #[test]
+    fn llama_family_layer_stage_loads_only_requested_weights() {
+        let cfg = test_llama_config(5, false);
+        let loader = RecordingLoader::default();
+
+        let model = LlamaFamilyModel::<CpuBackend>::new_layer_stage(
+            cfg,
+            &loader,
+            LlamaFamilyLayerStageConfig::pipeline_stage(2..5, false, true),
+        )
+        .unwrap();
+
+        assert_eq!(model.source_layer_range(), 2..5);
+        assert_eq!(model.local_layer_count(), 3);
+        assert!(model.embed.is_none());
+        assert!(model.lm_head.is_some());
+        assert_eq!(
+            loader.tensors.into_inner().unwrap(),
+            vec![
+                "model.layers.2.input_layernorm.weight",
+                "model.layers.2.post_attention_layernorm.weight",
+                "model.layers.3.input_layernorm.weight",
+                "model.layers.3.post_attention_layernorm.weight",
+                "model.layers.4.input_layernorm.weight",
+                "model.layers.4.post_attention_layernorm.weight",
+                "model.norm.weight",
+            ]
+        );
+        assert_eq!(
+            loader.linears.into_inner().unwrap(),
+            vec![
+                "model.layers.2.self_attn.qkv_proj",
+                "model.layers.2.self_attn.o_proj",
+                "model.layers.2.mlp.gate_up_proj",
+                "model.layers.2.mlp.down_proj",
+                "model.layers.3.self_attn.qkv_proj",
+                "model.layers.3.self_attn.o_proj",
+                "model.layers.3.mlp.gate_up_proj",
+                "model.layers.3.mlp.down_proj",
+                "model.layers.4.self_attn.qkv_proj",
+                "model.layers.4.self_attn.o_proj",
+                "model.layers.4.mlp.gate_up_proj",
+                "model.layers.4.mlp.down_proj",
+                "model.embed_tokens",
+            ]
+        );
+    }
+
+    #[test]
+    fn llama_family_layer_stage_runs_hidden_forward_bridge() {
+        let cfg = test_llama_config(1, false);
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new_layer_stage(
+            cfg,
+            &loader,
+            LlamaFamilyLayerStageConfig::pipeline_stage(0..1, false, false),
+        )
+        .unwrap();
+
+        let hidden = model.prefill_stage_hidden_from_host("stage-cache", &[1.0], 1, 0);
+
+        assert_eq!(hidden.len(), 1);
+        assert!(hidden[0].is_finite());
+        assert_eq!(
+            model.kv_caches["stage-cache"].len(),
+            model.local_layer_count()
+        );
+    }
+
+    #[test]
+    fn llama_family_last_stage_projects_hidden_to_logits() {
+        let cfg = test_llama_config(1, false);
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new_layer_stage(
+            cfg,
+            &loader,
+            LlamaFamilyLayerStageConfig::pipeline_stage(0..1, false, true),
+        )
+        .unwrap();
+
+        let logits = model.logits_from_hidden(&[2.0]);
+
+        assert_eq!(logits.len(), 1);
+        assert!(logits[0].is_finite());
+    }
 
     #[test]
     fn llama_family_runtime_env_parses_startup_knobs() {

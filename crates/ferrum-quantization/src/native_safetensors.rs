@@ -647,13 +647,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         let in_features = qw_shape[0] * 8;
         let out_features = qw_shape[1];
 
-        // desc_act=true detection. AutoGPTQ writes g_idx[k] = k/group_size
-        // for desc_act=false (trivial). Non-monotonic values → act-order.
-        let is_desc_act = g_idx.as_ref().map_or(false, |gx| {
-            !gx.iter()
-                .enumerate()
-                .all(|(i, &g)| g == (i as i32) / qcfg.group_size as i32)
-        });
+        let is_desc_act = validate_gptq_g_idx(name, qcfg, g_idx.as_deref(), in_features)?;
 
         // Act-order GPTQ. CUDA backend has perm-aware Marlin (load_gptq
         // builds perm = argsort(g_idx) + permutes qweight rows at load;
@@ -753,6 +747,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         let mut total_n_scales = 0usize;
         let mut total_n_zeros = 0usize;
         let mut g_idx: Option<Vec<i32>> = None;
+        let mut g_idx_presence: Vec<(String, bool)> = Vec::with_capacity(parts.len());
         // Segments: (qw_slice, sc_slice, qz_slice) per part, needed for N-major layout concat
         let mut qw_parts: Vec<(Vec<i32>, usize, usize)> = Vec::new(); // (data, rows, cols)
         let mut sc_parts: Vec<(Vec<f32>, usize, usize)> = Vec::new();
@@ -783,9 +778,29 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             sc_parts.push((sc, sc_sh[0], sc_sh[1]));
             qz_parts.push((qz, qz_sh[0], qz_sh[1]));
 
-            // g_idx optional; if first part has it, use that
-            if g_idx.is_none() && self.has(&format!("{p}.g_idx")) {
-                g_idx = Some(self.read_i32(&format!("{p}.g_idx"))?.0);
+            let g_key = format!("{p}.g_idx");
+            if self.has(&g_key) {
+                let (gx, gx_shape) = self.read_i32(&g_key)?;
+                if gx_shape != [qw_rows * 8] {
+                    return Err(FerrumError::model(format!(
+                        "GPTQ fusion '{p}': g_idx shape {gx_shape:?} incompatible with K={}",
+                        qw_rows * 8
+                    )));
+                }
+                match &g_idx {
+                    None => g_idx = Some(gx),
+                    Some(prev) => {
+                        if prev.len() != gx.len() || prev.iter().zip(&gx).any(|(a, b)| a != b) {
+                            return Err(FerrumError::model(format!(
+                                "GPTQ fusion '{p}': g_idx mismatch with first part; \
+                                 fused qkv/gate_up requires identical act-order across parts"
+                            )));
+                        }
+                    }
+                }
+                g_idx_presence.push((p.clone(), true));
+            } else {
+                g_idx_presence.push((p.clone(), false));
             }
         }
 
@@ -812,13 +827,20 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         let in_features = qw_rows * 8;
         let out_features = total_n;
 
-        // desc_act detection — same as load_gptq_linear. Q/K/V (or
-        // gate/up) share K, so g_idx from first part covers all.
-        let is_desc_act = g_idx.as_ref().map_or(false, |gx| {
-            !gx.iter()
-                .enumerate()
-                .all(|(i, &g)| g == (i as i32) / qcfg.group_size as i32)
-        });
+        if g_idx.is_some() {
+            let missing = g_idx_presence
+                .iter()
+                .filter_map(|(part, present)| (!present).then_some(part.as_str()))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(FerrumError::model(format!(
+                    "GPTQ fusion requires all parts to carry g_idx when any part does; \
+                     missing g_idx for {missing:?}"
+                )));
+            }
+        }
+        let fused_name = format!("GPTQ fusion {}", parts.join("+"));
+        let is_desc_act = validate_gptq_g_idx(&fused_name, qcfg, g_idx.as_deref(), in_features)?;
         // CUDA: perm-aware Marlin via load_gptq. CPU/Metal: dequant→Dense.
         #[cfg(not(feature = "cuda"))]
         if is_desc_act {
@@ -929,6 +951,51 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         }
         Ok((total_rows, cols, out))
     }
+}
+
+fn gptq_g_idx_is_desc_act(g_idx: &[i32], group_size: usize) -> bool {
+    g_idx
+        .iter()
+        .enumerate()
+        .any(|(i, &g)| g != (i as i32) / group_size as i32)
+}
+
+fn validate_gptq_g_idx(
+    name: &str,
+    qcfg: &QuantConfig,
+    g_idx: Option<&[i32]>,
+    in_features: usize,
+) -> Result<bool> {
+    if qcfg.desc_act && g_idx.is_none() {
+        return Err(FerrumError::model(format!(
+            "{name}: quantize_config desc_act=true but no g_idx tensor was found"
+        )));
+    }
+
+    let Some(g_idx) = g_idx else {
+        return Ok(false);
+    };
+    if qcfg.group_size == 0 {
+        return Err(FerrumError::model(format!(
+            "{name}: GPTQ g_idx present but group_size is 0"
+        )));
+    }
+    if g_idx.len() != in_features {
+        return Err(FerrumError::model(format!(
+            "{name}: g_idx length {} must match K={in_features}",
+            g_idx.len()
+        )));
+    }
+    let expected_groups = in_features.div_ceil(qcfg.group_size);
+    for (idx, &group) in g_idx.iter().enumerate() {
+        if group < 0 || group as usize >= expected_groups {
+            return Err(FerrumError::model(format!(
+                "{name}: g_idx[{idx}]={group} outside expected group range 0..{}",
+                expected_groups.saturating_sub(1)
+            )));
+        }
+    }
+    Ok(gptq_g_idx_is_desc_act(g_idx, qcfg.group_size))
 }
 
 /// Dequantise GPTQ INT4 weights with desc_act=true (act-order) g_idx and
@@ -1085,4 +1152,58 @@ fn load_quantize_config(dir: &Path) -> Result<Option<QuantConfig>> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gptq_config(desc_act: bool) -> QuantConfig {
+        QuantConfig {
+            method: QuantMethod::Gptq,
+            bits: 4,
+            group_size: 2,
+            desc_act,
+            sym: true,
+        }
+    }
+
+    #[test]
+    fn validate_gptq_g_idx_requires_tensor_when_desc_act_configured() {
+        let err = validate_gptq_g_idx("proj", &gptq_config(true), None, 4)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("desc_act=true"));
+        assert!(err.contains("no g_idx"));
+    }
+
+    #[test]
+    fn validate_gptq_g_idx_accepts_trivial_non_desc_act_order() {
+        let is_desc_act =
+            validate_gptq_g_idx("proj", &gptq_config(false), Some(&[0, 0, 1, 1]), 4).unwrap();
+
+        assert!(!is_desc_act);
+    }
+
+    #[test]
+    fn validate_gptq_g_idx_detects_nontrivial_act_order() {
+        let is_desc_act =
+            validate_gptq_g_idx("proj", &gptq_config(false), Some(&[1, 1, 0, 0]), 4).unwrap();
+
+        assert!(is_desc_act);
+    }
+
+    #[test]
+    fn validate_gptq_g_idx_rejects_invalid_shape_and_group() {
+        let short = validate_gptq_g_idx("proj", &gptq_config(false), Some(&[0, 0, 1]), 4)
+            .unwrap_err()
+            .to_string();
+        assert!(short.contains("must match K=4"));
+
+        let out_of_range = validate_gptq_g_idx("proj", &gptq_config(false), Some(&[0, 0, 2, 1]), 4)
+            .unwrap_err()
+            .to_string();
+        assert!(out_of_range.contains("outside expected group range"));
+    }
 }

@@ -189,25 +189,29 @@ impl ModelExecutor for LlmExecutor {
             })
             .unwrap_or(0);
 
-        // Try the unified_forward path first: when the model has it wired
-        // (paged KV pools allocated), this routes through the chunked-prefill
-        // varlen kernel — the same code that handles mixed prefill+decode
-        // batches. On Unsupported, fall back to the legacy single-item
-        // prefill path so contig-KV configs keep their existing behaviour.
+        // Try the unified_forward path first when the caller can accept the
+        // model's fast readback path. Requests that need logits processors or
+        // token masks require full logits so the engine sampler can enforce
+        // them; unified_forward currently has no per-item metadata channel.
+        let force_full_logits = metadata_requires_full_logits(&input.metadata);
         let logits = {
             let mut model = self.model.lock();
             model.set_lora_adapter_for_cache(
                 &cache_id,
                 active_lora_from_metadata(&input.metadata)?,
             )?;
-            let unified_item = vec![(cache_id.clone(), tokens.clone(), prior_seq_len, true)];
-            match model.unified_forward(&unified_item) {
-                Ok(mut per_item) => per_item
-                    .pop()
-                    .flatten()
-                    .ok_or_else(|| FerrumError::model("unified_forward returned no logits"))?,
-                Err(FerrumError::Unsupported { .. }) => model.prefill(&cache_id, &tokens),
-                Err(e) => return Err(e),
+            if force_full_logits {
+                model.prefill(&cache_id, &tokens)
+            } else {
+                let unified_item = vec![(cache_id.clone(), tokens.clone(), prior_seq_len, true)];
+                match model.unified_forward(&unified_item) {
+                    Ok(mut per_item) => per_item
+                        .pop()
+                        .flatten()
+                        .ok_or_else(|| FerrumError::model("unified_forward returned no logits"))?,
+                    Err(FerrumError::Unsupported { .. }) => model.prefill(&cache_id, &tokens),
+                    Err(e) => return Err(e),
+                }
             }
         };
 
@@ -259,6 +263,9 @@ impl ModelExecutor for LlmExecutor {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
+        let force_full_logits = inputs
+            .iter()
+            .any(|input| metadata_requires_full_logits(&input.metadata));
 
         // Per-input: derive cache_id (reuse supplied handle's id or generate
         // fresh) + prior_seq_len. Mirrors the single-prefill path so chunked
@@ -313,20 +320,29 @@ impl ModelExecutor for LlmExecutor {
             for (cache_id, adapter) in cache_ids.iter().zip(lora_per_input.iter()) {
                 model.set_lora_adapter_for_cache(cache_id, adapter.clone())?;
             }
-            match model.unified_forward(&unified_items) {
-                Ok(per_item) => per_item
-                    .into_iter()
-                    .map(|opt| opt.expect("is_final_chunk=true must yield logits"))
-                    .collect(),
-                Err(FerrumError::Unsupported { .. }) => {
-                    took_fallback = true;
-                    let mut out = Vec::with_capacity(inputs.len());
-                    for (cid, toks) in cache_ids.iter().zip(tokens_per_input.iter()) {
-                        out.push(model.prefill(cid, toks));
-                    }
-                    out
+            if force_full_logits {
+                took_fallback = true;
+                let mut out = Vec::with_capacity(inputs.len());
+                for (cid, toks) in cache_ids.iter().zip(tokens_per_input.iter()) {
+                    out.push(model.prefill(cid, toks));
                 }
-                Err(e) => return Err(e),
+                out
+            } else {
+                match model.unified_forward(&unified_items) {
+                    Ok(per_item) => per_item
+                        .into_iter()
+                        .map(|opt| opt.expect("is_final_chunk=true must yield logits"))
+                        .collect(),
+                    Err(FerrumError::Unsupported { .. }) => {
+                        took_fallback = true;
+                        let mut out = Vec::with_capacity(inputs.len());
+                        for (cid, toks) in cache_ids.iter().zip(tokens_per_input.iter()) {
+                            out.push(model.prefill(cid, toks));
+                        }
+                        out
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         };
         if let Some(t0) = bp_t0 {
@@ -485,26 +501,29 @@ impl ModelExecutor for LlmExecutor {
 
         debug!("LlmExecutor decode: token={token}, pos={seq_len}");
 
-        // Try unified_forward first so paged-KV configs route the single
-        // decode through the same varlen kernel used by batched mixed
-        // batches. Falls back to legacy paged_decode_attention for contig
-        // configs that haven't wired unified_forward.
+        // Try unified_forward first unless the engine needs full logits for
+        // masks/processors. The direct decode path returns vocabulary logits.
+        let force_full_logits = metadata_requires_full_logits(&input.metadata);
         let logits = {
             let mut model = self.model.lock();
             model.set_lora_adapter_for_cache(
                 &cache_id,
                 active_lora_from_metadata(&input.metadata)?,
             )?;
-            let unified_item = vec![(cache_id.clone(), vec![token], seq_len, true)];
-            match model.unified_forward(&unified_item) {
-                Ok(mut per_item) => per_item
-                    .pop()
-                    .flatten()
-                    .ok_or_else(|| FerrumError::model("unified_forward returned no logits"))?,
-                Err(FerrumError::Unsupported { .. }) => {
-                    model.decode(&cache_id, token, seq_len as u32)
+            if force_full_logits {
+                model.decode(&cache_id, token, seq_len as u32)
+            } else {
+                let unified_item = vec![(cache_id.clone(), vec![token], seq_len, true)];
+                match model.unified_forward(&unified_item) {
+                    Ok(mut per_item) => per_item
+                        .pop()
+                        .flatten()
+                        .ok_or_else(|| FerrumError::model("unified_forward returned no logits"))?,
+                    Err(FerrumError::Unsupported { .. }) => {
+                        model.decode(&cache_id, token, seq_len as u32)
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
         };
 
@@ -595,34 +614,38 @@ impl ModelExecutor for LlmExecutor {
                 .iter()
                 .map(|p| (p.cache_id.clone(), vec![p.token], p.seq_len as usize, true))
                 .collect();
-            let logits = match model.unified_forward(&unified_items) {
-                Ok(per_item) => {
-                    if per_item.len() != prepped.len() {
-                        return Err(FerrumError::model(format!(
-                            "unified_forward returned {} entries for {} items",
-                            per_item.len(),
-                            prepped.len(),
-                        )));
+            let tuples: Vec<(String, u32, u32)> = prepped
+                .iter()
+                .map(|p| (p.cache_id.clone(), p.token, p.seq_len))
+                .collect();
+            let force_full_logits = prepped.iter().any(|p| p.requires_full_logits);
+            let logits = if force_full_logits {
+                model.decode_batch_with_full_logits(&tuples, true)
+            } else {
+                match model.unified_forward(&unified_items) {
+                    Ok(per_item) => {
+                        if per_item.len() != prepped.len() {
+                            return Err(FerrumError::model(format!(
+                                "unified_forward returned {} entries for {} items",
+                                per_item.len(),
+                                prepped.len(),
+                            )));
+                        }
+                        let mut out = Vec::with_capacity(prepped.len());
+                        for (i, opt) in per_item.into_iter().enumerate() {
+                            out.push(opt.ok_or_else(|| {
+                                FerrumError::model(format!(
+                                    "unified_forward returned None for decode item {i}"
+                                ))
+                            })?);
+                        }
+                        out
                     }
-                    let mut out = Vec::with_capacity(prepped.len());
-                    for (i, opt) in per_item.into_iter().enumerate() {
-                        out.push(opt.ok_or_else(|| {
-                            FerrumError::model(format!(
-                                "unified_forward returned None for decode item {i}"
-                            ))
-                        })?);
+                    Err(FerrumError::Unsupported { .. }) => {
+                        model.decode_batch_with_full_logits(&tuples, false)
                     }
-                    out
+                    Err(e) => return Err(e),
                 }
-                Err(FerrumError::Unsupported { .. }) => {
-                    let tuples: Vec<(String, u32, u32)> = prepped
-                        .iter()
-                        .map(|p| (p.cache_id.clone(), p.token, p.seq_len))
-                        .collect();
-                    let force_full_logits = prepped.iter().any(|p| p.requires_full_logits);
-                    model.decode_batch_with_full_logits(&tuples, force_full_logits)
-                }
-                Err(e) => return Err(e),
             };
             let model_call = model_t0.map(|t| t.elapsed());
             (logits, lock_acq, model_call)
@@ -707,31 +730,37 @@ impl ModelExecutor for LlmExecutor {
                 )
             })
             .collect();
-        let model_result = {
-            let mut model = self.model.lock();
-            for item in &batch.items {
-                model.set_lora_adapter_for_cache(
-                    &item.seq_id,
-                    active_lora_from_metadata(&item.metadata)?,
-                )?;
-            }
-            model.unified_forward(&unified_items)
-        };
-        match model_result {
-            Ok(per_item) => {
-                if per_item.len() != batch.items.len() {
-                    return Err(FerrumError::model(format!(
-                        "unified_forward returned {} entries for {} items",
-                        per_item.len(),
-                        batch.items.len(),
-                    )));
+        let force_full_logits = batch
+            .items
+            .iter()
+            .any(|item| metadata_requires_full_logits(&item.metadata));
+        if !force_full_logits {
+            let model_result = {
+                let mut model = self.model.lock();
+                for item in &batch.items {
+                    model.set_lora_adapter_for_cache(
+                        &item.seq_id,
+                        active_lora_from_metadata(&item.metadata)?,
+                    )?;
                 }
-                return Ok(per_item);
+                model.unified_forward(&unified_items)
+            };
+            match model_result {
+                Ok(per_item) => {
+                    if per_item.len() != batch.items.len() {
+                        return Err(FerrumError::model(format!(
+                            "unified_forward returned {} entries for {} items",
+                            per_item.len(),
+                            batch.items.len(),
+                        )));
+                    }
+                    return Ok(per_item);
+                }
+                Err(FerrumError::Unsupported { .. }) => {
+                    // Fall through to the dispatch fallback below.
+                }
+                Err(e) => return Err(e),
             }
-            Err(FerrumError::Unsupported { .. }) => {
-                // Fall through to the dispatch fallback below.
-            }
-            Err(e) => return Err(e),
         }
 
         // Partition: pure decode items vs prefill chunks.
@@ -841,6 +870,123 @@ impl ModelExecutor for LlmExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use ferrum_interfaces::model_executor::{DecodeInput, PrefillInput, UnifiedBatchItem};
+    use ferrum_interfaces::KvCacheHandle;
+    use ferrum_testkit::MockTensor;
+    use ferrum_types::{Device, ModelId, ModelType};
+
+    #[derive(Default)]
+    struct RecordingCalls {
+        unified_forward: usize,
+        prefill: usize,
+        decode: usize,
+        decode_batch_force_full_logits: Vec<bool>,
+    }
+
+    struct RecordingLlm {
+        calls: Arc<Mutex<RecordingCalls>>,
+        config: crate::common::LlmRuntimeConfig,
+    }
+
+    impl RecordingLlm {
+        fn new(calls: Arc<Mutex<RecordingCalls>>) -> Self {
+            Self {
+                calls,
+                config: crate::common::LlmRuntimeConfig {
+                    hidden_size: 4,
+                    num_layers: 1,
+                    num_kv_heads: 1,
+                    head_dim: 4,
+                    vocab_size: 4,
+                    max_seq_len: 16,
+                },
+            }
+        }
+    }
+
+    impl DecoderOnlyLLM for RecordingLlm {
+        fn config(&self) -> &crate::common::LlmRuntimeConfig {
+            &self.config
+        }
+
+        fn prefill(&mut self, _cache_id: &str, _tokens: &[u32]) -> Vec<f32> {
+            self.calls.lock().prefill += 1;
+            vec![0.0, 1.0, 2.0, 3.0]
+        }
+
+        fn decode(&mut self, _cache_id: &str, _token: u32, _pos: u32) -> Vec<f32> {
+            self.calls.lock().decode += 1;
+            vec![3.0, 2.0, 1.0, 0.0]
+        }
+
+        fn decode_batch_with_full_logits(
+            &mut self,
+            batch: &[(String, u32, u32)],
+            force_full_logits: bool,
+        ) -> Vec<Vec<f32>> {
+            self.calls
+                .lock()
+                .decode_batch_force_full_logits
+                .push(force_full_logits);
+            batch.iter().map(|_| vec![3.0, 2.0, 1.0, 0.0]).collect()
+        }
+
+        fn unified_forward(
+            &mut self,
+            items: &[(String, Vec<u32>, usize, bool)],
+        ) -> std::result::Result<Vec<Option<Vec<f32>>>, FerrumError> {
+            self.calls.lock().unified_forward += 1;
+            Ok(items
+                .iter()
+                .map(|(_, _, _, is_final_chunk)| is_final_chunk.then_some(vec![99.0]))
+                .collect())
+        }
+
+        fn release(&mut self, _cache_id: &str) {}
+    }
+
+    fn test_model_info() -> ModelInfo {
+        ModelInfo {
+            model_id: ModelId("recording".to_string()),
+            model_type: ModelType::Custom("recording".to_string()),
+            num_parameters: 0,
+            hidden_size: 4,
+            num_layers: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            vocab_size: 4,
+            max_sequence_length: 16,
+            dtype: DataType::FP32,
+            device: Device::CPU,
+            version: None,
+            license: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn recording_executor(calls: Arc<Mutex<RecordingCalls>>) -> LlmExecutor {
+        LlmExecutor::new(Box::new(RecordingLlm::new(calls)), test_model_info())
+    }
+
+    fn full_logits_metadata() -> HashMap<String, serde_json::Value> {
+        HashMap::from([(
+            "ferrum_require_full_logits".to_string(),
+            serde_json::json!(true),
+        )])
+    }
+
+    fn test_kv_handle(cache_id: &str, seq_len: usize) -> Arc<dyn KvCacheHandle> {
+        Arc::new(GenericKvCacheHandle::new(
+            1,
+            1,
+            4,
+            candle_core::Device::Cpu,
+            seq_len,
+            cache_id.to_string(),
+        ))
+    }
 
     #[test]
     fn llm_executor_runtime_env_parses_profile_flags_by_presence() {
@@ -859,5 +1005,68 @@ mod tests {
 
         assert!(!env.batch_prefill_prof);
         assert!(!env.batch_decode_prof);
+    }
+
+    #[test]
+    fn prefill_skips_unified_forward_when_full_logits_required() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor(calls.clone());
+        let input = PrefillInput::new(MockTensor::from_u32(&[1, 2], &[2]).into_ref())
+            .with_metadata(full_logits_metadata());
+
+        let output = tokio_test::block_on(executor.prefill(&input)).unwrap();
+
+        assert_eq!(
+            output
+                .last_token_logits()
+                .unwrap()
+                .to_vec_f32()
+                .unwrap()
+                .len(),
+            4
+        );
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 0);
+        assert_eq!(calls.prefill, 1);
+    }
+
+    #[test]
+    fn decode_skips_unified_forward_when_full_logits_required() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor(calls.clone());
+        let input = DecodeInput::new(
+            MockTensor::from_u32(&[7], &[1]).into_ref(),
+            test_kv_handle("decode-cache", 3),
+        )
+        .with_metadata(full_logits_metadata());
+
+        let output = tokio_test::block_on(executor.decode(&input)).unwrap();
+
+        assert_eq!(output.logits.to_vec_f32().unwrap().len(), 4);
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 0);
+        assert_eq!(calls.decode, 1);
+    }
+
+    #[test]
+    fn unified_decode_skips_unified_forward_when_full_logits_required() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor(calls.clone());
+        let mut batch = UnifiedBatch::new();
+        batch.items.push(UnifiedBatchItem {
+            seq_id: "decode-cache".to_string(),
+            q_tokens: vec![7],
+            kv_cache: test_kv_handle("decode-cache", 3),
+            pos_offset: 3,
+            is_final_chunk: true,
+            metadata: full_logits_metadata(),
+        });
+
+        let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
+
+        assert_eq!(output[0].as_ref().unwrap().len(), 4);
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 0);
+        assert_eq!(calls.decode_batch_force_full_logits, vec![true]);
     }
 }

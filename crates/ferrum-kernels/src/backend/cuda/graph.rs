@@ -21,7 +21,7 @@ use cudarc::driver::CudaStream;
 use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_types::{FerrumError, Result};
 
-use super::{decode_state_slot, CudaBackend};
+use super::{decode_state_slot_for_ordinal, CudaBackend};
 use crate::backend::{Backend, BackendGraph};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +70,9 @@ impl BackendGraph for CudaBackend {
         let valid_kv = (step as i32) + 1;
         let step_i = step as i32;
         let stream = ctx.stream.clone();
-        let mut w = decode_state_slot().write().expect("DECODE_STATE poisoned");
+        let mut w = decode_state_slot_for_ordinal(ctx.ordinal)
+            .write()
+            .expect("DECODE_STATE poisoned");
         let bufs = w.as_mut().expect("DecodeStateBufs not initialised");
         stream
             .memcpy_htod(&[token], &mut bufs.token)

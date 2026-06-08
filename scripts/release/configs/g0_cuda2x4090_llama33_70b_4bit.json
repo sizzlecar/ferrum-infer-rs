@@ -1,0 +1,23 @@
+{
+  "name": "g0-cuda2x4090-llama33-70b-4bit",
+  "model": "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+  "model_architecture": "llama_dense",
+  "num_hidden_layers": 80,
+  "quant_format": "gptq_int4",
+  "tokenizer": "auto",
+  "port": 19400,
+  "gpu_devices": [0, 1],
+  "distributed_strategy": "layer_split",
+  "max_model_len": 8192,
+  "kv_capacity": 2048,
+  "max_num_seqs": 8,
+  "max_num_batched_tokens": 1024,
+  "concurrency_cells": [1, 4, 8, 16],
+  "num_prompts": 96,
+  "warmup_requests": 10,
+  "n_repeats": 3,
+  "run_vllm_baseline": false,
+  "random_input_len": 256,
+  "random_output_len": 128,
+  "seed": 9271
+}

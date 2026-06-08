@@ -43,6 +43,7 @@ const WHOLE_PROMPT_PREFIX_CACHE_ENV: &str = "FERRUM_WHOLE_PROMPT_PREFIX_CACHE";
 const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
 const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
 const GENERATION_POLICY_SCAN_LIMIT: usize = 262_144;
+const FORBIDDEN_DECODE_RESAMPLE_LIMIT: usize = 64;
 const GENERATED_CONTROL_TOKEN_TEXTS: &[&str] = &[
     "<think>",
     "</think>",
@@ -297,7 +298,15 @@ fn cached_forbidden_generation_tokens(
     }
 
     for text in [
-        "<unk", "<unk>", "[UNK]", "<pad>", "[PAD]", "<|pad|>", "<mask>", "[MASK]",
+        "<unk",
+        "<unk>",
+        "[UNK]",
+        "<pad>",
+        "[PAD]",
+        "<|pad|>",
+        "<mask>",
+        "[MASK]",
+        "\u{00ef}\u{00bf}\u{00bd}",
     ] {
         if let Some(token) = tok.token_id(text) {
             if !allowed_generated_controls.contains(&token.get()) {
@@ -311,10 +320,15 @@ fn cached_forbidden_generation_tokens(
         if allowed_generated_controls.contains(&id) {
             continue;
         }
-        if tok
-            .token_text(TokenId::new(id))
-            .is_some_and(is_forbidden_generation_token_text)
-        {
+        let token = TokenId::new(id);
+        let raw_text_forbidden = tok
+            .token_text(token)
+            .is_some_and(is_forbidden_generation_token_text);
+        let decoded_text_forbidden = tok
+            .decode(&[token], true)
+            .map(|text| is_forbidden_generation_token_text(&text))
+            .unwrap_or(true);
+        if raw_text_forbidden || decoded_text_forbidden {
             forbidden.insert(id);
         }
     }
@@ -335,6 +349,12 @@ fn is_forbidden_generation_token_text(text: &str) -> bool {
     let text = text.trim();
     if text.is_empty() {
         return false;
+    }
+    if text.contains('\u{FFFD}') {
+        return true;
+    }
+    if contains_replacement_char_mojibake(text) {
+        return true;
     }
 
     let lower = text.to_ascii_lowercase();
@@ -357,6 +377,48 @@ fn is_forbidden_generation_token_text(text: &str) -> bool {
         || lower.contains("mask")
         || lower.contains("reserved")
         || lower.contains("unused")
+}
+
+fn decoded_delta_has_forbidden_quality(
+    full_text: &str,
+    previous_text_len: usize,
+    candidate_is_stop: bool,
+) -> bool {
+    if previous_text_len > full_text.len() || !full_text.is_char_boundary(previous_text_len) {
+        return true;
+    }
+    let delta = &full_text[previous_text_len..];
+    if delta.is_empty() {
+        return false;
+    }
+    if contains_replacement_char_mojibake(delta) {
+        return true;
+    }
+    if delta.contains('\u{FFFD}') && (candidate_is_stop || !full_text.ends_with('\u{FFFD}')) {
+        return true;
+    }
+    false
+}
+
+fn contains_replacement_char_mojibake(text: &str) -> bool {
+    let mut chars = text.chars();
+    let mut a = chars.next();
+    let mut b = chars.next();
+    let mut c = chars.next();
+    loop {
+        if matches!(
+            (a, b, c),
+            (Some('\u{00ef}'), Some('\u{00bf}'), Some('\u{00bd}'))
+        ) {
+            return true;
+        }
+        if c.is_none() {
+            return false;
+        }
+        a = b;
+        b = c;
+        c = chars.next();
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -558,7 +620,9 @@ impl SequenceState {
 
     pub fn model_decode_metadata(&self) -> HashMap<String, serde_json::Value> {
         let mut metadata = self.original_request.metadata.clone();
-        if self.json_processor.is_some() || self.regex_processor.is_some() {
+        let needs_sampling_masks = !self.forbidden_token_ids.is_empty()
+            || (self.generated_tokens.is_empty() && !self.initial_forbidden_token_ids.is_empty());
+        if self.json_processor.is_some() || self.regex_processor.is_some() || needs_sampling_masks {
             metadata.insert(
                 "ferrum_require_full_logits".to_string(),
                 serde_json::json!(true),
@@ -611,6 +675,14 @@ impl SequenceState {
     /// Sample next token with full processor chain (temperature, top-k/p,
     /// repetition penalty, JSON mode, regex-guided mask).
     pub fn sample_with_processors(&mut self, logits: &mut [f32]) -> Result<TokenId> {
+        self.sample_with_processors_with_tokenizer(logits, None)
+    }
+
+    pub fn sample_with_processors_with_tokenizer(
+        &mut self,
+        logits: &mut [f32],
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+    ) -> Result<TokenId> {
         use ferrum_interfaces::sampler::{SamplingConfig, SamplingContext};
 
         // Regex-guided mask runs FIRST: it's a hard constraint (sets invalid
@@ -664,21 +736,121 @@ impl SequenceState {
         let config = SamplingConfig::from_params(&self.sampling_params);
         let step = self.generated_tokens.len();
         let vocab_size = logits.len();
-        let ctx = SamplingContext::new(
-            step,
-            &self.sampling_params,
-            logits,
-            &self.generated_tokens,
-            &self.token_frequencies,
-            vocab_size,
-        );
-        let token = config.sample(ctx, &mut self.rng)?;
+        let previous_streamed_text_len = self.streamed_text_len;
+        let token = {
+            let mut ctx = SamplingContext::new(
+                step,
+                &self.sampling_params,
+                logits,
+                &self.generated_tokens,
+                &self.token_frequencies,
+                vocab_size,
+            );
+            config.processor_chain.process(&mut ctx)?;
+            let mut attempts = 0usize;
+            let mut rejected_tokens = Vec::new();
+            loop {
+                let token = config.sampler.sample_with_context(&ctx, &mut self.rng)?;
+                if !self.sample_candidate_decodes_to_forbidden_output(
+                    tokenizer,
+                    previous_streamed_text_len,
+                    token,
+                ) {
+                    break token;
+                }
+                if rejected_tokens.len() < 8 {
+                    rejected_tokens.push(token);
+                }
+                if let Some(logit) = ctx.logits.get_mut(usize::from(token)) {
+                    *logit = f32::NEG_INFINITY;
+                }
+                attempts += 1;
+                if attempts >= FORBIDDEN_DECODE_RESAMPLE_LIMIT {
+                    self.log_forbidden_decode_resample_failure(
+                        tokenizer,
+                        previous_streamed_text_len,
+                        &rejected_tokens,
+                    );
+                    return Err(FerrumError::model(
+                        "sampling candidates decoded to forbidden output",
+                    ));
+                }
+            }
+        };
 
         // Update frequency tracking
         *self.token_frequencies.entry(token).or_insert(0) += 1;
 
         Ok(token)
     }
+
+    fn sample_candidate_decodes_to_forbidden_output(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        previous_streamed_text_len: usize,
+        token: TokenId,
+    ) -> bool {
+        let Some(tokenizer) = tokenizer else {
+            return false;
+        };
+        let mut tokens = Vec::with_capacity(self.generated_tokens.len() + 1);
+        tokens.extend_from_slice(&self.generated_tokens);
+        tokens.push(token);
+        tokenizer
+            .decode(&tokens, true)
+            .map(|text| {
+                decoded_delta_has_forbidden_quality(
+                    &text,
+                    previous_streamed_text_len,
+                    self.stop_token_ids.contains(&token.get()),
+                )
+            })
+            .unwrap_or(true)
+    }
+
+    fn log_forbidden_decode_resample_failure(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        previous_streamed_text_len: usize,
+        rejected_tokens: &[TokenId],
+    ) {
+        let generated_tail: Vec<String> = self
+            .generated_tokens
+            .iter()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|token| describe_token_for_log(tokenizer, *token))
+            .collect();
+        let rejected: Vec<String> = rejected_tokens
+            .iter()
+            .map(|token| describe_token_for_log(tokenizer, *token))
+            .collect();
+        warn!(
+            request_id = %self.request_id,
+            generated_len = self.generated_tokens.len(),
+            previous_streamed_text_len,
+            generated_tail = ?generated_tail,
+            rejected_candidates = ?rejected,
+            "sampling candidates decoded to forbidden output"
+        );
+    }
+}
+
+fn describe_token_for_log(
+    tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+    token: TokenId,
+) -> String {
+    let Some(tokenizer) = tokenizer else {
+        return token.get().to_string();
+    };
+    let raw = tokenizer.token_text(token).unwrap_or("<missing>");
+    let decoded = tokenizer
+        .decode(&[token], true)
+        .unwrap_or_else(|_| "<decode-error>".to_string());
+    format!("{} raw={:?} decoded={:?}", token.get(), raw, decoded)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1112,328 +1284,4 @@ impl std::fmt::Debug for ContinuousBatchEngine {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
-
-    struct PolicyTokenizer {
-        vocab_size: usize,
-        special: ferrum_types::SpecialTokens,
-        ids: HashMap<String, TokenId>,
-        texts: Vec<Option<String>>,
-    }
-
-    impl PolicyTokenizer {
-        fn new(vocab_size: usize, pairs: &[(&str, u32)]) -> Self {
-            let max_id = pairs.iter().map(|(_, id)| *id as usize).max().unwrap_or(0);
-            let mut texts = vec![None; max_id + 1];
-            let mut ids = HashMap::new();
-            for (text, id) in pairs {
-                ids.insert((*text).to_string(), TokenId::new(*id));
-                texts[*id as usize] = Some((*text).to_string());
-            }
-            Self {
-                vocab_size,
-                special: ferrum_types::SpecialTokens {
-                    bos_token: Some(TokenId::new(1)),
-                    eos_token: Some(TokenId::new(3)),
-                    unk_token: Some(TokenId::new(2)),
-                    pad_token: Some(TokenId::new(4)),
-                    sep_token: None,
-                    cls_token: None,
-                    mask_token: None,
-                },
-                ids,
-                texts,
-            }
-        }
-    }
-
-    impl Tokenizer for PolicyTokenizer {
-        fn encode(&self, _text: &str, _add_special: bool) -> Result<Vec<TokenId>> {
-            Ok(vec![TokenId::new(0)])
-        }
-
-        fn decode(&self, tokens: &[TokenId], _skip_special: bool) -> Result<String> {
-            Ok(tokens
-                .iter()
-                .filter_map(|token| self.token_text(*token))
-                .collect::<Vec<_>>()
-                .join(""))
-        }
-
-        fn decode_incremental(&self, _prev: &[TokenId], next: TokenId) -> Result<String> {
-            Ok(self.token_text(next).unwrap_or_default().to_string())
-        }
-
-        fn vocab_size(&self) -> usize {
-            self.vocab_size
-        }
-
-        fn special_tokens(&self) -> &ferrum_types::SpecialTokens {
-            &self.special
-        }
-
-        fn token_id(&self, text: &str) -> Option<TokenId> {
-            self.ids.get(text).copied()
-        }
-
-        fn token_text(&self, token_id: TokenId) -> Option<&str> {
-            self.texts
-                .get(token_id.get() as usize)
-                .and_then(|text| text.as_deref())
-        }
-
-        fn info(&self) -> TokenizerInfo {
-            TokenizerInfo {
-                tokenizer_type: TokenizerType::Custom,
-                vocab_size: self.vocab_size,
-                special_tokens: self.special.clone(),
-                supports_incremental: true,
-                supports_chat_template: false,
-                max_token_length: None,
-                model_name: Some("policy-tokenizer-test".to_string()),
-            }
-        }
-    }
-
-    fn policy_request() -> InferenceRequest {
-        InferenceRequest {
-            id: RequestId::new(),
-            prompt: "test".to_string(),
-            model_id: ferrum_types::ModelId::new("test"),
-            sampling_params: SamplingParams::greedy(),
-            stream: false,
-            priority: Priority::Normal,
-            client_id: None,
-            session_id: None,
-            created_at: chrono::Utc::now(),
-            api_request: None,
-            metadata: HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn continuous_engine_runtime_config_parses_env_snapshot() {
-        let cfg = ContinuousEngineRuntimeConfig::from_env_vars(
-            Some(64),
-            [
-                (BATCH_DECODE_PROF_ENV, "1"),
-                (CHUNKED_PREFILL_ENV, "128"),
-                (KV_CAPACITY_ENV, "2048"),
-                (MAX_MODEL_LEN_ENV, "4096"),
-                (NEXT_BATCH_PROF_ENV, "1"),
-                (WHOLE_PROMPT_PREFIX_CACHE_ENV, "1"),
-                (RBD_PROF_ENV, "1"),
-                (UNIFIED_POST_PROF_ENV, "1"),
-            ],
-        );
-
-        assert_eq!(cfg.active_decode_prefill_chunk, Some(64));
-        assert!(cfg.batch_decode_prof);
-        assert!(cfg.chunked_prefill_present);
-        assert_eq!(cfg.chunked_prefill_size, Some(128));
-        assert_eq!(cfg.chunked_prefill_size_for(200), Some(128));
-        assert_eq!(cfg.chunked_prefill_size_for(128), None);
-        assert_eq!(cfg.kv_capacity, Some(2048));
-        assert_eq!(cfg.max_model_len, Some(4096));
-        assert!(cfg.next_batch_prof);
-        assert!(cfg.prefix_cache_enabled);
-        assert!(cfg.rbd_prof);
-        assert!(cfg.unified_post_prof);
-    }
-
-    #[test]
-    fn continuous_engine_runtime_config_keeps_invalid_chunk_presence() {
-        let cfg = ContinuousEngineRuntimeConfig::from_env_vars(
-            None,
-            [
-                (CHUNKED_PREFILL_ENV, "invalid"),
-                (WHOLE_PROMPT_PREFIX_CACHE_ENV, "0"),
-            ],
-        );
-
-        assert!(cfg.chunked_prefill_present);
-        assert_eq!(cfg.chunked_prefill_size, None);
-        assert_eq!(cfg.chunked_prefill_size_for(200), None);
-        assert!(!cfg.prefix_cache_enabled);
-    }
-
-    #[test]
-    fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
-        let mut config = EngineConfig::default();
-        config.kv_cache.max_blocks = 2048;
-        let runtime =
-            ContinuousEngineRuntimeConfig::from_env_vars(None, Vec::<(&str, &str)>::new());
-
-        assert_eq!(
-            effective_request_context_capacity(&config, &runtime, Some(512)),
-            Some(512)
-        );
-    }
-
-    #[test]
-    fn test_sequence_state() {
-        let request = InferenceRequest {
-            id: RequestId::new(),
-            prompt: "test".to_string(),
-            model_id: ferrum_types::ModelId::new("test"),
-            sampling_params: SamplingParams::default(),
-            stream: false,
-            priority: Priority::Normal,
-            client_id: None,
-            session_id: None,
-            created_at: chrono::Utc::now(),
-            api_request: None,
-            metadata: HashMap::new(),
-        };
-
-        let tokens = vec![TokenId::new(1), TokenId::new(2)];
-        let state = SequenceState::new(request, tokens);
-
-        assert_eq!(state.phase, RequestPhase::Waiting);
-        assert_eq!(state.total_tokens(), 2);
-        assert!(!state.prefill_complete);
-    }
-
-    #[test]
-    fn sequence_state_detects_text_stop_before_length() {
-        let tokenizer = PolicyTokenizer::new(8, &[("OK", 5), ("<END>", 6), ("TAIL", 7)]);
-        let mut request = policy_request();
-        request.sampling_params.max_tokens = 3;
-        let mut state = SequenceState::new(request, vec![TokenId::new(0)]);
-        state.generated_tokens = vec![TokenId::new(5), TokenId::new(6), TokenId::new(7)];
-        state.stop_text_seqs = vec!["<END>".to_string()];
-
-        assert_eq!(
-            state.stop_reason(Some(&tokenizer)),
-            Some(FinishReason::Stop)
-        );
-    }
-
-    #[test]
-    fn model_decode_metadata_marks_structured_requests_for_full_logits() {
-        let plain = SequenceState::new(policy_request(), vec![TokenId::new(0)]);
-        assert_eq!(
-            plain
-                .model_decode_metadata()
-                .get("ferrum_require_full_logits")
-                .and_then(|value| value.as_bool()),
-            None
-        );
-
-        let mut request = policy_request();
-        request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
-        let structured = SequenceState::new(request, vec![TokenId::new(0)]);
-        assert_eq!(
-            structured
-                .model_decode_metadata()
-                .get("ferrum_require_full_logits")
-                .and_then(|value| value.as_bool()),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn sample_masks_unknown_pad_reserved_and_bos_tokens() {
-        let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
-            8,
-            &[
-                ("normal", 0),
-                ("<s>", 1),
-                ("<unk>", 2),
-                ("</s>", 3),
-                ("[PAD151935]", 4),
-                ("<|reserved_special_token_0|>", 5),
-                ("ok", 6),
-                ("other", 7),
-            ],
-        ));
-        let mut state = SequenceState::new_with_tokenizer(
-            policy_request(),
-            vec![TokenId::new(0)],
-            Some(tokenizer),
-        );
-        let mut logits = vec![0.0f32; 8];
-        logits[1] = 100.0;
-        logits[2] = 99.0;
-        logits[4] = 98.0;
-        logits[5] = 97.0;
-        logits[6] = 1.0;
-
-        let token = state.sample_with_processors(&mut logits).unwrap();
-
-        assert_eq!(token.get(), 6);
-        for token_id in [1usize, 2, 4, 5] {
-            assert_eq!(logits[token_id], f32::NEG_INFINITY);
-        }
-    }
-
-    #[test]
-    fn sample_allows_generated_control_tokens_above_base_vocab() {
-        let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
-            6,
-            &[
-                ("normal", 0),
-                ("<s>", 1),
-                ("<unk>", 2),
-                ("</s>", 3),
-                ("ok", 4),
-                ("</think>", 5),
-                ("[PAD151935]", 6),
-            ],
-        ));
-        let mut state = SequenceState::new_with_tokenizer(
-            policy_request(),
-            vec![TokenId::new(0)],
-            Some(tokenizer),
-        );
-        let mut logits = vec![0.0f32; 7];
-        logits[4] = 1.0;
-        logits[5] = 90.0;
-        logits[6] = 100.0;
-
-        let token = state.sample_with_processors(&mut logits).unwrap();
-
-        assert_eq!(token.get(), 5);
-        assert_eq!(logits[5], 90.0);
-        assert_eq!(logits[6], f32::NEG_INFINITY);
-    }
-
-    #[test]
-    fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
-        let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
-            6,
-            &[
-                ("normal", 0),
-                ("<s>", 1),
-                ("<unk>", 2),
-                ("</s>", 3),
-                ("ok", 4),
-                ("</think>", 5),
-            ],
-        ));
-        let mut request = policy_request();
-        request.metadata.insert(
-            "ferrum_initial_forbidden_token_texts".to_string(),
-            serde_json::json!(["</think>"]),
-        );
-        let mut state =
-            SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
-
-        let mut first_logits = vec![0.0f32; 6];
-        first_logits[0] = 1.0;
-        first_logits[5] = 100.0;
-        let first = state.sample_with_processors(&mut first_logits).unwrap();
-        assert_eq!(first.get(), 0);
-        assert_eq!(first_logits[5], f32::NEG_INFINITY);
-
-        state.generated_tokens.push(first);
-        let mut next_logits = vec![0.0f32; 6];
-        next_logits[0] = 1.0;
-        next_logits[5] = 100.0;
-        let next = state.sample_with_processors(&mut next_logits).unwrap();
-        assert_eq!(next.get(), 5);
-        assert_eq!(next_logits[5], 100.0);
-    }
-}
+mod tests;

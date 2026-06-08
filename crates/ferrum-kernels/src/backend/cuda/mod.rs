@@ -180,6 +180,46 @@ fn cuda_backend_runtime_env() -> &'static CudaBackendRuntimeEnv {
     CONFIG.get_or_init(CudaBackendRuntimeEnv::from_env)
 }
 
+thread_local! {
+    static CUDA_DEVICE_SCOPE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+struct CudaDeviceScopeGuard {
+    previous: Option<usize>,
+}
+
+impl CudaDeviceScopeGuard {
+    fn enter(ordinal: usize) -> Self {
+        let previous = CUDA_DEVICE_SCOPE.with(|scope| {
+            let previous = scope.get();
+            scope.set(Some(ordinal));
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for CudaDeviceScopeGuard {
+    fn drop(&mut self) {
+        CUDA_DEVICE_SCOPE.with(|scope| scope.set(self.previous));
+    }
+}
+
+pub(super) fn current_device_ordinal() -> usize {
+    CUDA_DEVICE_SCOPE
+        .with(|scope| scope.get())
+        .unwrap_or(cuda_backend_runtime_env().cuda_device)
+}
+
+fn with_cuda_device_ordinal<R>(device_ordinal: Option<usize>, body: impl FnOnce() -> R) -> R {
+    if let Some(ordinal) = device_ordinal {
+        let _guard = CudaDeviceScopeGuard::enter(ordinal);
+        body()
+    } else {
+        body()
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Context
 // ────────────────────────────────────────────────────────────────────────
@@ -190,6 +230,7 @@ fn cuda_backend_runtime_env() -> &'static CudaBackendRuntimeEnv {
 /// bound to that stream, and a lazy cache of PTX modules. All kernels
 /// launch on `stream`; sync'ing `stream` covers all of this backend's work.
 pub struct CudaState {
+    pub ordinal: usize,
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     /// Shared cuBLAS handle (process-global, initialised once). Graph
@@ -283,7 +324,7 @@ pub struct CudaState {
 // original ctx's allocation). Mirrors the pattern already used by
 // `MARLIN_GATHER_SCRATCH`, cuBLAS workspace, and `BATCHED_SCRATCH_*`.
 #[cfg(feature = "vllm-moe-marlin")]
-static VLLM_MOE_C_TMP: std::sync::OnceLock<std::sync::RwLock<Option<CudaSlice<f32>>>> =
+static VLLM_MOE_C_TMP: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, CudaSlice<f32>>>> =
     std::sync::OnceLock::new();
 
 // Greedy-argmax output scratch — see `Backend::argmax_rows_f16`.
@@ -291,44 +332,45 @@ static VLLM_MOE_C_TMP: std::sync::OnceLock<std::sync::RwLock<Option<CudaSlice<f3
 // captured kernel args stays valid for the engine's life. Allocated
 // to MAX_BATCH capacity on first use; the caller passes m ≤ capacity
 // and reads only the first m entries.
-static ARGMAX_OUT: std::sync::OnceLock<std::sync::RwLock<Option<CudaSlice<i32>>>> =
+static ARGMAX_OUT: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, CudaSlice<i32>>>> =
     std::sync::OnceLock::new();
 
-fn argmax_out_slot() -> &'static std::sync::RwLock<Option<CudaSlice<i32>>> {
-    ARGMAX_OUT.get_or_init(|| std::sync::RwLock::new(None))
+fn argmax_out_slots() -> &'static std::sync::RwLock<HashMap<usize, CudaSlice<i32>>> {
+    ARGMAX_OUT.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 fn with_argmax_out<R>(
     stream: &Arc<CudaStream>,
+    ordinal: usize,
     m: usize,
     body: impl FnOnce(&mut CudaSlice<i32>) -> R,
 ) -> R {
-    let slot = argmax_out_slot();
+    let slots = argmax_out_slots();
     // Fast path: existing buffer large enough.
     {
-        let g = slot.read().expect("ARGMAX_OUT poisoned");
-        if let Some(buf) = g.as_ref() {
+        let g = slots.read().expect("ARGMAX_OUT poisoned");
+        if let Some(buf) = g.get(&ordinal) {
             if buf.len() >= m {
                 drop(g);
-                let mut w = slot.write().expect("ARGMAX_OUT poisoned");
-                return body(w.as_mut().expect("just observed Some"));
+                let mut w = slots.write().expect("ARGMAX_OUT poisoned");
+                return body(w.get_mut(&ordinal).expect("just observed Some"));
             }
         }
     }
     // Slow path: allocate / grow. Round up so growth amortises.
     let capacity = m.max(64).next_power_of_two();
-    let mut w = slot.write().expect("ARGMAX_OUT poisoned");
-    let need_alloc = w.as_ref().map(|b| b.len() < m).unwrap_or(true);
+    let mut w = slots.write().expect("ARGMAX_OUT poisoned");
+    let need_alloc = w.get(&ordinal).map(|b| b.len() < m).unwrap_or(true);
     if need_alloc {
         let new = unsafe { stream.alloc::<i32>(capacity) }.expect("argmax_out alloc");
-        *w = Some(new);
+        w.insert(ordinal, new);
     }
-    body(w.as_mut().expect("alloc above"))
+    body(w.get_mut(&ordinal).expect("alloc above"))
 }
 
 #[cfg(feature = "vllm-moe-marlin")]
-fn vllm_moe_c_tmp_slot() -> &'static std::sync::RwLock<Option<CudaSlice<f32>>> {
-    VLLM_MOE_C_TMP.get_or_init(|| std::sync::RwLock::new(None))
+fn vllm_moe_c_tmp_slots() -> &'static std::sync::RwLock<HashMap<usize, CudaSlice<f32>>> {
+    VLLM_MOE_C_TMP.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 /// Run `body` with a `&mut CudaSlice<f32>` pointing at the process-
@@ -339,37 +381,38 @@ fn vllm_moe_c_tmp_slot() -> &'static std::sync::RwLock<Option<CudaSlice<f32>>> {
 #[cfg(feature = "vllm-moe-marlin")]
 pub fn with_vllm_moe_c_tmp<R>(
     stream: &Arc<CudaStream>,
+    ordinal: usize,
     body: impl FnOnce(&mut CudaSlice<f32>) -> R,
 ) -> R {
-    let slot = vllm_moe_c_tmp_slot();
+    let slots = vllm_moe_c_tmp_slots();
     // Fast path: scratch already up. Take the write lock briefly to
     // hand a `&mut` to the body. There is at most one engine forward
     // call serialized on the model's iteration_lock at any time, so
     // contention here is zero in practice.
     {
-        let g = slot.read().expect("VLLM_MOE_C_TMP poisoned");
-        if g.is_some() {
+        let g = slots.read().expect("VLLM_MOE_C_TMP poisoned");
+        if g.contains_key(&ordinal) {
             drop(g);
-            let mut w = slot.write().expect("VLLM_MOE_C_TMP poisoned");
-            let s = w.as_mut().expect("just observed Some");
+            let mut w = slots.write().expect("VLLM_MOE_C_TMP poisoned");
+            let s = w.get_mut(&ordinal).expect("just observed Some");
             return body(s);
         }
     }
     // First-time alloc.
-    let mut w = slot.write().expect("VLLM_MOE_C_TMP poisoned");
-    if w.is_none() {
+    let mut w = slots.write().expect("VLLM_MOE_C_TMP poisoned");
+    if !w.contains_key(&ordinal) {
         const C_TMP_SIZE_F32: usize = 4 * 1024 * 1024;
         let buf = stream
             .alloc_zeros::<f32>(C_TMP_SIZE_F32)
-            .expect("alloc_zeros vllm_moe_c_tmp_f32 (process-global)");
+            .expect("alloc_zeros vllm_moe_c_tmp_f32 (per-device)");
         tracing::info!(
-            "vLLM moe c_tmp scratch allocated (process-global): {} fp32 ({:.1} MB)",
+            "vLLM moe c_tmp scratch allocated (device {ordinal}): {} fp32 ({:.1} MB)",
             C_TMP_SIZE_F32,
             (C_TMP_SIZE_F32 * 4) as f32 / 1e6
         );
-        *w = Some(buf);
+        w.insert(ordinal, buf);
     }
-    body(w.as_mut().unwrap())
+    body(w.get_mut(&ordinal).unwrap())
 }
 
 pub(super) const BATCHED_SCRATCH_CAP: usize = 64;
@@ -462,7 +505,7 @@ impl CudaState {
         // Route through process-global cache — keeps Arc<CudaModule>
         // alive forever so captured CUfunction handles never go stale
         // even after this CudaState drops.
-        let m = ensure_module(&self.ctx, key, ptx_src);
+        let m = ensure_module(self.ordinal, &self.ctx, key, ptx_src);
         self.modules.insert(key, m.clone());
         m
     }
@@ -532,6 +575,7 @@ impl Backend for CudaBackend {
         // `default_stream()` has already lazily spun up a stream. Reusing
         // it here keeps allocations + ops on the SAME stream — no
         // cross-stream synchronization needed.
+        let ordinal = current_device_ordinal();
         let stream = default_stream();
         let ctx = stream.context().clone();
         // Process-global blas handle + workspace. Critical for graph capture:
@@ -557,6 +601,7 @@ impl Backend for CudaBackend {
         }
 
         Self::Context {
+            ordinal,
             ctx,
             stream,
             blas,
@@ -582,6 +627,14 @@ impl Backend for CudaBackend {
             paged_attn_out_tm: None,
             paged_attn_out_tm_capacity: 0,
         }
+    }
+
+    fn with_device_ordinal<R>(device_ordinal: Option<usize>, body: impl FnOnce() -> R) -> R {
+        with_cuda_device_ordinal(device_ordinal, body)
+    }
+
+    fn supports_device_ordinal_scope() -> bool {
+        true
     }
 
     /// Phase D step 2+3 unified typed allocator. Replaces alloc_u32 and
@@ -761,7 +814,7 @@ impl Backend for CudaBackend {
         // VLLM_MOE_C_TMP pattern; the slot is owned process-wide so the
         // GPU address it hands out is stable for the engine's life
         // (graph-capture safe — see vllm_moe_c_tmp's doc for rationale).
-        let host = with_argmax_out(&stream, m, |out_dev| -> Result<Vec<i32>> {
+        let host = with_argmax_out(&stream, ctx.ordinal, m, |out_dev| -> Result<Vec<i32>> {
             let n_i32 = n as i32;
             let mut b = stream.launch_builder(&func);
             b.arg(logits);
@@ -885,36 +938,35 @@ impl Backend for CudaBackend {
         let (a_ptr, _rec_a) = b.as_f16().device_ptr(&ctx.stream); // cuBLAS arg "A" = weight = our `b`
         let (b_ptr, _rec_b) = a.as_f16().device_ptr(&ctx.stream); // cuBLAS arg "B" = input = our `a`
         let (c_ptr, _rec_c) = out.as_f16_mut().device_ptr_mut(&ctx.stream);
-        let blas_guard = blas_slot().read().expect("BLAS poisoned");
-        let slot = blas_guard.as_ref().expect("BLAS not init");
-        let (alpha_ptr, _ga) = slot.alpha_f32.device_ptr(&ctx.stream);
-        let (beta_ptr, _gb) = slot.beta_f32.device_ptr(&ctx.stream);
+        with_blas_scalars(ctx.ordinal, |alpha_f32, beta_f32| {
+            let (alpha_ptr, _ga) = alpha_f32.device_ptr(&ctx.stream);
+            let (beta_ptr, _gb) = beta_f32.device_ptr(&ctx.stream);
 
-        unsafe {
-            gemm_ex(
-                *ctx.blas.handle(),
-                cublasOperation_t::CUBLAS_OP_T,
-                cublasOperation_t::CUBLAS_OP_N,
-                n as i32,
-                m as i32,
-                k as i32,
-                alpha_ptr as *const _,
-                a_ptr as *const _,
-                cudaDataType_t::CUDA_R_16F,
-                k as i32,
-                b_ptr as *const _,
-                cudaDataType_t::CUDA_R_16F,
-                k as i32,
-                beta_ptr as *const _,
-                c_ptr as *mut _,
-                cudaDataType_t::CUDA_R_16F,
-                n as i32,
-                cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
-                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-            )
-        }
-        .expect("gemm (cublasGemmEx, compute=32F_FAST_16F, algo=TENSOR_OP)");
-        // blas_guard dropped at scope end — `_ga`/`_gb` borrow from it.
+            unsafe {
+                gemm_ex(
+                    *ctx.blas.handle(),
+                    cublasOperation_t::CUBLAS_OP_T,
+                    cublasOperation_t::CUBLAS_OP_N,
+                    n as i32,
+                    m as i32,
+                    k as i32,
+                    alpha_ptr as *const _,
+                    a_ptr as *const _,
+                    cudaDataType_t::CUDA_R_16F,
+                    k as i32,
+                    b_ptr as *const _,
+                    cudaDataType_t::CUDA_R_16F,
+                    k as i32,
+                    beta_ptr as *const _,
+                    c_ptr as *mut _,
+                    cudaDataType_t::CUDA_R_16F,
+                    n as i32,
+                    cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+                    cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                )
+            }
+            .expect("gemm (cublasGemmEx, compute=32F_FAST_16F, algo=TENSOR_OP)");
+        });
     }
 
     // ── Attention ───────────────────────────────────────────────────────
@@ -998,7 +1050,11 @@ impl Backend for CudaBackend {
             let stream = ctx.stream.clone();
             // Hold read-guard on global state bufs for the builder's lifetime.
             let dec_guard = if use_dyn {
-                Some(decode_state_slot().read().expect("DECODE_STATE poisoned"))
+                Some(
+                    decode_state_slot_for_ordinal(ctx.ordinal)
+                        .read()
+                        .expect("DECODE_STATE poisoned"),
+                )
             } else {
                 None
             };
@@ -1150,7 +1206,9 @@ impl Backend for CudaBackend {
                 "embedding_lookup_f16_dyn",
             );
             let stream = ctx.stream.clone();
-            let dec_guard = decode_state_slot().read().expect("DECODE_STATE poisoned");
+            let dec_guard = decode_state_slot_for_ordinal(ctx.ordinal)
+                .read()
+                .expect("DECODE_STATE poisoned");
             let bufs = dec_guard.as_ref().expect("DecodeStateBufs");
             let mut b = stream.launch_builder(&func);
             b.arg(table);
@@ -1319,7 +1377,7 @@ impl Backend for CudaBackend {
         let per_item = nkv * hd;
         let block_dim = 256u32;
         let grid_x = (per_item as u32 + block_dim - 1) / block_dim;
-        with_batched_scratch_mut(|slot_g| {
+        with_batched_scratch_mut(ctx.ordinal, |slot_g| {
             for i in 0..m {
                 let (cp, _) = caches[i].as_f16().device_ptr(&stream);
                 slot_g.host_cache_ptrs[host_start + i] = cp;
@@ -1410,7 +1468,7 @@ impl Backend for CudaBackend {
         // `max_valid_kv` already accounting for the +1; sizing also
         // bounded by capacity to mirror the per-item kernel's pattern.
         let shared_bytes = (max_valid_kv.min(capacity).max(1) as u32) * 4;
-        with_batched_scratch_mut(|slot_g| {
+        with_batched_scratch_mut(ctx.ordinal, |slot_g| {
             for i in 0..m {
                 let (kp, _) = k_caches[i].as_f16().device_ptr(&stream);
                 let (vp, _) = v_caches[i].as_f16().device_ptr(&stream);
@@ -1536,7 +1594,11 @@ impl Backend for CudaBackend {
         let pos_offset_i32 = pos_offset as i32;
         let stream = ctx.stream.clone();
         let dec_guard = if use_dyn {
-            Some(decode_state_slot().read().expect("DECODE_STATE poisoned"))
+            Some(
+                decode_state_slot_for_ordinal(ctx.ordinal)
+                    .read()
+                    .expect("DECODE_STATE poisoned"),
+            )
         } else {
             None
         };
@@ -1658,7 +1720,11 @@ impl Backend for CudaBackend {
         };
         let stream = ctx.stream.clone();
         let dec_guard = if use_dyn {
-            Some(decode_state_slot().read().expect("DECODE_STATE poisoned"))
+            Some(
+                decode_state_slot_for_ordinal(ctx.ordinal)
+                    .read()
+                    .expect("DECODE_STATE poisoned"),
+            )
         } else {
             None
         };
@@ -2023,11 +2089,11 @@ impl Backend for CudaBackend {
 // internally calls `ctx.bind_to_thread()` on whichever thread it's
 // invoked from, so sharing one stream across threads is safe.
 
-static GLOBAL_STREAM: std::sync::OnceLock<std::sync::RwLock<Option<Arc<CudaStream>>>> =
+static GLOBAL_STREAMS: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, Arc<CudaStream>>>> =
     std::sync::OnceLock::new();
 
-fn stream_slot() -> &'static std::sync::RwLock<Option<Arc<CudaStream>>> {
-    GLOBAL_STREAM.get_or_init(|| std::sync::RwLock::new(None))
+fn stream_slots() -> &'static std::sync::RwLock<HashMap<usize, Arc<CudaStream>>> {
+    GLOBAL_STREAMS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 /// Return the global stream, lazily creating it if neither `new_context`
@@ -2041,16 +2107,16 @@ fn stream_slot() -> &'static std::sync::RwLock<Option<Arc<CudaStream>>> {
 /// and a dedicated stream. Subsequent `new_context()` calls reuse this
 /// same stream — no divergence.
 pub(super) fn default_stream() -> Arc<CudaStream> {
-    if let Some(s) = stream_slot()
+    let ordinal = current_device_ordinal();
+    if let Some(s) = stream_slots()
         .read()
-        .expect("GLOBAL_STREAM poisoned")
-        .as_ref()
+        .expect("GLOBAL_STREAMS poisoned")
+        .get(&ordinal)
     {
         return s.clone();
     }
-    let mut w = stream_slot().write().expect("GLOBAL_STREAM poisoned");
-    if w.is_none() {
-        let ordinal = cuda_backend_runtime_env().cuda_device;
+    let mut w = stream_slots().write().expect("GLOBAL_STREAMS poisoned");
+    if !w.contains_key(&ordinal) {
         let ctx = CudaContext::new(ordinal).unwrap_or_else(|e| {
             panic!("CudaBackend: failed to init default context {ordinal}: {e}")
         });
@@ -2070,9 +2136,9 @@ pub(super) fn default_stream() -> Arc<CudaStream> {
         let stream = ctx
             .new_stream()
             .unwrap_or_else(|e| panic!("CudaBackend: failed to create default stream: {e}"));
-        *w = Some(stream);
+        w.insert(ordinal, stream);
     }
-    w.as_ref().cloned().expect("just inserted")
+    w.get(&ordinal).cloned().expect("just inserted")
 }
 
 fn with_stream<R>(f: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
@@ -2080,13 +2146,15 @@ fn with_stream<R>(f: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
     f(&stream)
 }
 
-/// Install a stream as the global default for context-free ops.
-/// `new_context` calls this to make its freshly-created stream the
-/// process default — subsequent `alloc`/`from_slice`/`to_vec` calls
-/// route through it. If `default_stream` already lazily created a
-/// stream, this replaces it.
+/// Install a stream as the ordinal-local default for context-free ops.
+/// Subsequent `alloc`/`from_slice`/`to_vec` calls made under the same
+/// device scope route through it. If `default_stream` already lazily
+/// created a stream for that ordinal, this replaces it.
 pub fn install_thread_stream(stream: Arc<CudaStream>) {
-    *stream_slot().write().expect("GLOBAL_STREAM poisoned") = Some(stream);
+    stream_slots()
+        .write()
+        .expect("GLOBAL_STREAMS poisoned")
+        .insert(current_device_ordinal(), stream);
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -2106,31 +2174,46 @@ pub struct DecodeStateBufs {
 unsafe impl Send for DecodeStateBufs {}
 unsafe impl Sync for DecodeStateBufs {}
 
-static DECODE_STATE: std::sync::OnceLock<std::sync::RwLock<Option<DecodeStateBufs>>> =
-    std::sync::OnceLock::new();
+static DECODE_STATES: std::sync::OnceLock<
+    std::sync::RwLock<HashMap<usize, &'static std::sync::RwLock<Option<DecodeStateBufs>>>>,
+> = std::sync::OnceLock::new();
 
-pub(super) fn decode_state_slot() -> &'static std::sync::RwLock<Option<DecodeStateBufs>> {
-    DECODE_STATE.get_or_init(|| std::sync::RwLock::new(None))
+fn decode_state_slots(
+) -> &'static std::sync::RwLock<HashMap<usize, &'static std::sync::RwLock<Option<DecodeStateBufs>>>>
+{
+    DECODE_STATES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+pub(super) fn decode_state_slot_for_ordinal(
+    ordinal: usize,
+) -> &'static std::sync::RwLock<Option<DecodeStateBufs>> {
+    {
+        let g = decode_state_slots().read().expect("DECODE_STATES poisoned");
+        if let Some(slot) = g.get(&ordinal) {
+            return *slot;
+        }
+    }
+    let mut w = decode_state_slots()
+        .write()
+        .expect("DECODE_STATES poisoned");
+    *w.entry(ordinal)
+        .or_insert_with(|| Box::leak(Box::new(std::sync::RwLock::new(None))))
 }
 
 fn ensure_decode_state_bufs(stream: &Arc<CudaStream>) {
-    let guard = decode_state_slot().read().expect("DECODE_STATE poisoned");
+    let slot = decode_state_slot_for_ordinal(current_device_ordinal());
+    let guard = slot.read().expect("DECODE_STATE poisoned");
     if guard.is_some() {
         return;
     }
     drop(guard);
-    let mut w = decode_state_slot().write().expect("DECODE_STATE poisoned");
+    let mut w = slot.write().expect("DECODE_STATE poisoned");
     if w.is_none() {
         let token = unsafe { stream.alloc::<u32>(1) }.expect("token_buf alloc");
         let pos = unsafe { stream.alloc::<i32>(1) }.expect("pos_buf alloc");
         let kv = unsafe { stream.alloc::<i32>(1) }.expect("kv_buf alloc");
         *w = Some(DecodeStateBufs { token, pos, kv });
     }
-}
-
-fn with_decode_state<R>(f: impl FnOnce(&DecodeStateBufs) -> R) -> R {
-    let guard = decode_state_slot().read().expect("DECODE_STATE poisoned");
-    f(guard.as_ref().expect("DecodeStateBufs not initialised"))
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -2153,19 +2236,20 @@ struct BlasSlot {
 unsafe impl Send for BlasSlot {}
 unsafe impl Sync for BlasSlot {}
 
-static BLAS_HANDLE: std::sync::OnceLock<std::sync::RwLock<Option<BlasSlot>>> =
+static BLAS_HANDLES: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, BlasSlot>>> =
     std::sync::OnceLock::new();
 
-fn blas_slot() -> &'static std::sync::RwLock<Option<BlasSlot>> {
-    BLAS_HANDLE.get_or_init(|| std::sync::RwLock::new(None))
+fn blas_slots() -> &'static std::sync::RwLock<HashMap<usize, BlasSlot>> {
+    BLAS_HANDLES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 fn ensure_blas_handle(stream: &Arc<CudaStream>) -> Arc<CudaBlas> {
-    if let Some(slot) = blas_slot().read().expect("BLAS poisoned").as_ref() {
+    let ordinal = current_device_ordinal();
+    if let Some(slot) = blas_slots().read().expect("BLAS poisoned").get(&ordinal) {
         return slot.blas.clone();
     }
-    let mut w = blas_slot().write().expect("BLAS poisoned");
-    if w.is_none() {
+    let mut w = blas_slots().write().expect("BLAS poisoned");
+    if !w.contains_key(&ordinal) {
         const WS_BYTES: usize = 32 * 1024 * 1024;
         let blas = Arc::new(CudaBlas::new(stream.clone()).expect("CudaBlas::new"));
         let workspace = unsafe { stream.alloc::<u8>(WS_BYTES) }.expect("blas ws alloc");
@@ -2195,20 +2279,26 @@ fn ensure_blas_handle(stream: &Arc<CudaStream>) -> Arc<CudaBlas> {
                 "set pointer mode"
             );
         }
-        *w = Some(BlasSlot {
-            blas,
-            _workspace: workspace,
-            alpha_f32,
-            beta_f32,
-        });
+        w.insert(
+            ordinal,
+            BlasSlot {
+                blas,
+                _workspace: workspace,
+                alpha_f32,
+                beta_f32,
+            },
+        );
     }
-    w.as_ref().unwrap().blas.clone()
+    w.get(&ordinal).unwrap().blas.clone()
 }
 
 /// Access the process-global alpha/beta device scalars for cuBLAS.
-fn with_blas_scalars<R>(f: impl FnOnce(&CudaSlice<f32>, &CudaSlice<f32>) -> R) -> R {
-    let g = blas_slot().read().expect("BLAS poisoned");
-    let s = g.as_ref().expect("BLAS not init");
+fn with_blas_scalars<R>(
+    ordinal: usize,
+    f: impl FnOnce(&CudaSlice<f32>, &CudaSlice<f32>) -> R,
+) -> R {
+    let g = blas_slots().read().expect("BLAS poisoned");
+    let s = g.get(&ordinal).expect("BLAS not init");
     f(&s.alpha_f32, &s.beta_f32)
 }
 
@@ -2247,25 +2337,43 @@ struct BatchedScratchSlot {
 unsafe impl Send for BatchedScratchSlot {}
 unsafe impl Sync for BatchedScratchSlot {}
 
-static BATCHED_SCRATCH: std::sync::OnceLock<std::sync::RwLock<Option<BatchedScratchSlot>>> =
-    std::sync::OnceLock::new();
+static BATCHED_SCRATCH: std::sync::OnceLock<
+    std::sync::RwLock<HashMap<usize, &'static std::sync::RwLock<Option<BatchedScratchSlot>>>>,
+> = std::sync::OnceLock::new();
 
-fn batched_scratch_slot() -> &'static std::sync::RwLock<Option<BatchedScratchSlot>> {
-    BATCHED_SCRATCH.get_or_init(|| std::sync::RwLock::new(None))
+fn batched_scratch_slots() -> &'static std::sync::RwLock<
+    HashMap<usize, &'static std::sync::RwLock<Option<BatchedScratchSlot>>>,
+> {
+    BATCHED_SCRATCH.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+fn batched_scratch_slot_for_ordinal(
+    ordinal: usize,
+) -> &'static std::sync::RwLock<Option<BatchedScratchSlot>> {
+    {
+        let g = batched_scratch_slots()
+            .read()
+            .expect("BATCHED_SCRATCH poisoned");
+        if let Some(slot) = g.get(&ordinal) {
+            return *slot;
+        }
+    }
+    let mut w = batched_scratch_slots()
+        .write()
+        .expect("BATCHED_SCRATCH poisoned");
+    *w.entry(ordinal)
+        .or_insert_with(|| Box::leak(Box::new(std::sync::RwLock::new(None))))
 }
 
 fn ensure_batched_scratch(stream: &Arc<CudaStream>) {
+    let slot = batched_scratch_slot_for_ordinal(current_device_ordinal());
     {
-        let g = batched_scratch_slot()
-            .read()
-            .expect("BATCHED_SCRATCH poisoned");
+        let g = slot.read().expect("BATCHED_SCRATCH poisoned");
         if g.is_some() {
             return;
         }
     }
-    let mut w = batched_scratch_slot()
-        .write()
-        .expect("BATCHED_SCRATCH poisoned");
+    let mut w = slot.write().expect("BATCHED_SCRATCH poisoned");
     if w.is_none() {
         let scratch_u64_k = unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
             .expect("batched scratch_u64_k alloc");
@@ -2288,8 +2396,8 @@ fn ensure_batched_scratch(stream: &Arc<CudaStream>) {
 /// captured-or-eager kernel call. Holds the slot's RwLock write guard
 /// for that duration — no other batched op runs concurrently (single
 /// stream, single decode_batch_internal at a time per iteration_lock).
-fn with_batched_scratch_mut<R>(f: impl FnOnce(&mut BatchedScratchSlot) -> R) -> R {
-    let mut g = batched_scratch_slot()
+fn with_batched_scratch_mut<R>(ordinal: usize, f: impl FnOnce(&mut BatchedScratchSlot) -> R) -> R {
+    let mut g = batched_scratch_slot_for_ordinal(ordinal)
         .write()
         .expect("BATCHED_SCRATCH poisoned");
     f(g.as_mut().expect("BatchedScratchSlot not initialised"))
@@ -2315,32 +2423,35 @@ fn with_batched_scratch_mut<R>(f: impl FnOnce(&mut BatchedScratchSlot) -> R) -> 
 // CudaState still keeps its local HashMap as a hot-path cache so that
 // per-kernel launches don't lock the global Mutex.
 
-static MODULES: std::sync::OnceLock<std::sync::Mutex<HashMap<&'static str, Arc<CudaModule>>>> =
-    std::sync::OnceLock::new();
+static MODULES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<(usize, &'static str), Arc<CudaModule>>>,
+> = std::sync::OnceLock::new();
 
-fn modules_cache() -> &'static std::sync::Mutex<HashMap<&'static str, Arc<CudaModule>>> {
+fn modules_cache() -> &'static std::sync::Mutex<HashMap<(usize, &'static str), Arc<CudaModule>>> {
     MODULES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 pub(super) fn ensure_module(
+    ordinal: usize,
     ctx: &Arc<CudaContext>,
     key: &'static str,
     ptx_src: &str,
 ) -> Arc<CudaModule> {
+    let cache_key = (ordinal, key);
     {
         let g = modules_cache().lock().expect("MODULES poisoned");
-        if let Some(m) = g.get(key) {
+        if let Some(m) = g.get(&cache_key) {
             return m.clone();
         }
     }
     let mut g = modules_cache().lock().expect("MODULES poisoned");
-    if let Some(m) = g.get(key) {
+    if let Some(m) = g.get(&cache_key) {
         return m.clone();
     }
     let m = ctx
         .load_module(Ptx::from_src(ptx_src.to_string()))
         .unwrap_or_else(|e| panic!("CudaBackend: load_module({key}): {e}"));
-    g.insert(key, m.clone());
+    g.insert(cache_key, m.clone());
     m
 }
 
@@ -2378,5 +2489,20 @@ mod tests {
         assert_eq!(env.moe_streams, 1);
         assert_eq!(env.cuda_max_kv, None);
         assert_eq!(env.cuda_device, 0);
+    }
+
+    #[test]
+    fn cuda_device_scope_nests_and_restores() {
+        let default = current_device_ordinal();
+
+        with_cuda_device_ordinal(Some(1), || {
+            assert_eq!(current_device_ordinal(), 1);
+            with_cuda_device_ordinal(Some(2), || {
+                assert_eq!(current_device_ordinal(), 2);
+            });
+            assert_eq!(current_device_ordinal(), 1);
+        });
+
+        assert_eq!(current_device_ordinal(), default);
     }
 }

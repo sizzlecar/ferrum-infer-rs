@@ -8,8 +8,9 @@ use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
 use ferrum_types::{
-    FerrumError, FinishReason, InferenceRequest, Priority, RequestId, Result,
-    RuntimeConfigSnapshot, SamplingParams,
+    FerrumConfigBuilder, FerrumError, FinishReason, InferenceRequest, ModelCapabilities, Priority,
+    RequestId, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
+    SamplingParams, WorkloadProfile,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -187,6 +188,10 @@ pub struct RunCommand {
     #[arg(long, default_value = "1024")]
     pub max_tokens: u32,
 
+    /// Stop generation when this text appears. Can be provided multiple times.
+    #[arg(long, value_name = "TEXT")]
+    pub stop: Vec<String>,
+
     /// Enable model reasoning for chat templates that support it.
     #[arg(long, conflicts_with = "disable_thinking")]
     pub enable_thinking: bool,
@@ -211,6 +216,11 @@ pub struct RunCommand {
     /// Backend: auto, cpu, metal (default: auto)
     #[arg(long, default_value = "auto")]
     pub backend: String,
+
+    /// CUDA GPU ids to use, comma-separated. Multi-GPU requests fail until
+    /// the real layer-split loader is implemented.
+    #[arg(long, value_name = "IDS")]
+    pub gpu_devices: Option<String>,
 
     /// One-shot prompt (skip interactive REPL). When supplied, ferrum runs a
     /// single prefill+decode and exits — useful for benchmarking and shell
@@ -264,12 +274,36 @@ pub struct RunCommand {
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
+    /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
+    #[arg(long, value_name = "N")]
+    pub max_model_len: Option<usize>,
+
+    /// vLLM-compatible alias for `FERRUM_PAGED_MAX_SEQS`.
+    #[arg(long, value_name = "N")]
+    pub max_num_seqs: Option<usize>,
+
+    /// vLLM-compatible alias for `FERRUM_MAX_BATCHED_TOKENS`.
+    #[arg(long, value_name = "N")]
+    pub max_num_batched_tokens: Option<usize>,
+
     /// KV cache element dtype (Dim 5 polymorphism point). Accepts
     /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
     /// require model wire-up; today only the kernel + type layer ships.
     /// Override via `FERRUM_KV_DTYPE` env var.
     #[arg(long, value_name = "DTYPE")]
     pub kv_dtype: Option<String>,
+
+    /// Per-sequence KV token capacity (`FERRUM_KV_CAPACITY`).
+    #[arg(long, value_name = "N")]
+    pub kv_capacity: Option<usize>,
+
+    /// Write resolved startup runtime config JSON and exit artifacts.
+    #[arg(long)]
+    pub effective_config_json: Option<PathBuf>,
+
+    /// Write one auto-config decision JSON record per line.
+    #[arg(long)]
+    pub decision_trace_jsonl: Option<PathBuf>,
 
     /// Output format. `text` (default) — streaming text + stats UX.
     /// `jsonl` — one JSON record per event on stdout; used by tests and scripts.
@@ -291,7 +325,21 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     // Select device before model resolution so CPU runs do not materialize
     // GPU/Metal chat-profile defaults such as paged KV.
-    let device = select_device(&cmd.backend);
+    let mut device = select_device(&cmd.backend);
+    let mut gpu_selection =
+        crate::gpu_devices::resolve_cuda_gpu_devices(cmd.gpu_devices.as_deref(), &device)?;
+    if let Some(selection) = &gpu_selection {
+        device = selection.primary_device();
+        eprintln!(
+            "{} {} ({})",
+            "CUDA GPUs:".dimmed(),
+            selection.selected_csv(),
+            selection.selected_distributed_strategy
+        );
+    }
+    let mut startup_cli_runtime_entries =
+        run_startup_cli_runtime_entries(&cmd, gpu_selection.as_ref());
+    materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
     let autosize = run_autosize_for_device(&device, cmd.gpu_memory_utilization);
 
     // Resolve the model through the central source resolver. Handles
@@ -312,6 +360,19 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     .await?;
     let source = resolved.source;
     let model_id = source.original.clone();
+    let model_definition_for_config = load_run_model_definition(&source).await?;
+    if let (Some(selection), Some(definition)) =
+        (gpu_selection.as_mut(), model_definition_for_config.as_ref())
+    {
+        if selection.apply_model_layer_count(definition.num_hidden_layers)? {
+            if let Some(plan) = selection.selected_layer_split_plan.as_deref() {
+                eprintln!("{}", format!("CUDA layer split plan: {plan}").dimmed());
+            }
+            startup_cli_runtime_entries =
+                run_startup_cli_runtime_entries(&cmd, gpu_selection.as_ref());
+            materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
+        }
+    }
     let model_chat_template = crate::source_resolver::load_model_chat_template(&source.local_path);
     let chat_template_options = build_chat_template_options(&cmd, model_chat_template.as_ref());
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
@@ -339,13 +400,28 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let load_start = std::time::Instant::now();
     let mut engine_config = ferrum_types::EngineConfig::default();
     engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
-    engine_config.backend.device = device;
+    engine_config.backend.device = device.clone();
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
     engine_config.backend.backend_options.insert(
         "model_path".to_string(),
         serde_json::Value::String(engine_model_path),
     );
     let runtime_config = RuntimeConfigSnapshot::capture_current();
+    if let Some(selection) = &gpu_selection {
+        selection.insert_backend_options(&mut engine_config.backend.backend_options);
+    }
+    let effective_runtime_config =
+        run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
+    let startup_auto_config = run_startup_auto_config(
+        &device,
+        model_definition_for_config.as_ref(),
+        effective_runtime_config,
+    )?;
+    crate::commands::serve::write_startup_config_artifacts(
+        &startup_auto_config,
+        cmd.effective_config_json.as_deref(),
+        cmd.decision_trace_jsonl.as_deref(),
+    )?;
     let run_budget = RunBudget::from_source(&source.local_path, &runtime_config);
     engine_config
         .apply_runtime_config_snapshot(&runtime_config)
@@ -900,6 +976,12 @@ fn run_autosize_for_device(
 
 fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
     let greedy = cmd.temperature <= 0.0;
+    let mut stop_sequences = vec![
+        "<|im_end|>".to_string(),
+        "</s>".to_string(),
+        "<|endoftext|>".to_string(),
+    ];
+    stop_sequences.extend(cmd.stop.iter().filter(|stop| !stop.is_empty()).cloned());
     SamplingParams {
         max_tokens: cmd.max_tokens as usize,
         temperature: cmd.temperature,
@@ -910,11 +992,7 @@ fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
             Some(cmd.top_k)
         },
         repetition_penalty: cmd.repeat_penalty,
-        stop_sequences: vec![
-            "<|im_end|>".to_string(),
-            "</s>".to_string(),
-            "<|endoftext|>".to_string(),
-        ],
+        stop_sequences,
         seed: cmd.seed,
         ..Default::default()
     }
@@ -1394,6 +1472,88 @@ fn build_chat_prompt(
     )
 }
 
+async fn load_run_model_definition(
+    source: &ResolvedModelSource,
+) -> Result<Option<ferrum_models::ModelDefinition>> {
+    if source.format != ModelFormat::SafeTensors {
+        return Ok(None);
+    }
+    let mut config_manager = ferrum_models::ConfigManager::new();
+    Ok(Some(
+        config_manager.load_from_path(&source.local_path).await?,
+    ))
+}
+
+fn run_effective_runtime_config(
+    runtime_config: &RuntimeConfigSnapshot,
+    cli_runtime_entries: &[RuntimeConfigEntry],
+) -> RuntimeConfigSnapshot {
+    let mut snapshot = runtime_config.clone();
+    for entry in cli_runtime_entries {
+        snapshot.upsert_entry(entry.clone());
+    }
+    snapshot
+}
+
+fn run_startup_cli_runtime_entries(
+    cmd: &RunCommand,
+    gpu_selection: Option<&crate::gpu_devices::GpuDeviceSelection>,
+) -> Vec<RuntimeConfigEntry> {
+    let mut entries = Vec::new();
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_KV_DTYPE",
+        cmd.kv_dtype.as_deref(),
+    );
+    crate::runtime_env::push_cli_runtime_usize(&mut entries, "FERRUM_KV_CAPACITY", cmd.kv_capacity);
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_MAX_MODEL_LEN",
+        cmd.max_model_len,
+    );
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_PAGED_MAX_SEQS",
+        cmd.max_num_seqs,
+    );
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_MAX_BATCHED_TOKENS",
+        cmd.max_num_batched_tokens,
+    );
+    if let Some(selection) = gpu_selection {
+        entries.extend(selection.runtime_config_entries());
+    }
+    entries
+}
+
+fn materialize_run_cli_runtime_entries(entries: &[RuntimeConfigEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    crate::runtime_env::materialize_runtime_env_effective(&RuntimeConfigSnapshot::from_entries(
+        entries.to_vec(),
+    ));
+}
+
+fn run_startup_auto_config(
+    device: &ferrum_types::Device,
+    model_definition: Option<&ferrum_models::ModelDefinition>,
+    runtime_config: RuntimeConfigSnapshot,
+) -> Result<ResolvedFerrumConfig> {
+    let model = model_definition
+        .map(crate::commands::serve::model_capabilities_from_definition)
+        .unwrap_or_else(ModelCapabilities::unknown);
+    let hardware = crate::commands::serve::hardware_capabilities_for_device(device);
+    let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+    FerrumConfigBuilder::new(runtime_config)
+        .with_model_capabilities(model)
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .map_err(|err| ferrum_types::FerrumError::config(format!("invalid auto config: {err}")))
+}
+
 /// Apply the resolved `--kv-dtype` / runtime-config override to an engine
 /// config, validating early. Default is FP16 (the production-validated path on
 /// every backend); selecting INT8 / FP8 is rejected with a helpful message
@@ -1438,6 +1598,7 @@ pub fn apply_kv_dtype_override(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_types::RuntimeConfigSource;
 
     fn default_params(max_tokens: usize) -> SamplingParams {
         SamplingParams {
@@ -1451,11 +1612,13 @@ mod tests {
             model: "tinyllama".to_string(),
             system: None,
             max_tokens: 1024,
+            stop: Vec::new(),
             no_context_shift: false,
             enable_thinking: false,
             disable_thinking: false,
             temperature: 0.0,
             backend: "auto".to_string(),
+            gpu_devices: None,
             prompt: None,
             tokenizer: None,
             bench_mode: false,
@@ -1465,7 +1628,13 @@ mod tests {
             repeat_last_n: 64,
             seed: None,
             gpu_memory_utilization: 0.9,
+            max_model_len: None,
+            max_num_seqs: None,
+            max_num_batched_tokens: None,
             kv_dtype: None,
+            kv_capacity: None,
+            effective_config_json: None,
+            decision_trace_jsonl: None,
             output_format: OutputFormat::Text,
         }
     }
@@ -1480,6 +1649,99 @@ mod tests {
 
     fn default_template_options() -> ChatTemplateOptions {
         ChatTemplateOptions::default()
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_cli_kv_dtype() {
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let mut cmd = test_run_cmd();
+        cmd.kv_dtype = Some("int8".to_string());
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let entry = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_KV_DTYPE")
+            .expect("missing kv dtype entry");
+        assert_eq!(entry.effective_value, "int8");
+        assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_gpu_device_selection() {
+        let selection = crate::gpu_devices::GpuDeviceSelection {
+            raw_cli_value: "1".to_string(),
+            requested_gpu_devices: vec![1],
+            selected_gpu_devices: vec![1],
+            cuda_device_count: 2,
+            selected_distributed_strategy: "single_gpu".to_string(),
+            selected_layer_split_plan: None,
+            selected_layer_split_stages: None,
+        };
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let cmd = test_run_cmd();
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, Some(&selection));
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let entry = |key: &str| {
+            effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("FERRUM_BACKEND").effective_value, "cuda");
+        assert_eq!(entry("FERRUM_REQUESTED_GPU_DEVICES").effective_value, "1");
+        assert_eq!(entry("FERRUM_SELECTED_GPU_DEVICES").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_SELECTED_DISTRIBUTED_STRATEGY").effective_value,
+            "single_gpu"
+        );
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_cli_runtime_limits() {
+        let mut cmd = test_run_cmd();
+        cmd.kv_capacity = Some(2048);
+        cmd.max_model_len = Some(8192);
+        cmd.max_num_seqs = Some(8);
+        cmd.max_num_batched_tokens = Some(1024);
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let entry = |key: &str| {
+            effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
+        assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "8192");
+        assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "8");
+        assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "1024");
+        assert_eq!(
+            entry("FERRUM_MAX_MODEL_LEN").source,
+            RuntimeConfigSource::Cli
+        );
+    }
+
+    #[test]
+    fn run_startup_auto_config_renders_effective_config_schema() {
+        let resolved = run_startup_auto_config(
+            &ferrum_types::Device::CPU,
+            None,
+            RuntimeConfigSnapshot::from_entries(Vec::new()),
+        )
+        .expect("auto config");
+        let doc = resolved.effective_config_document();
+        assert_eq!(doc["schema_version"], 1);
+        assert!(doc["entries"].is_array());
+        assert!(doc["model_capabilities"].is_object());
+        assert!(doc["hardware_capabilities"].is_object());
+        assert!(doc["workload_profile"].is_object());
+        assert!(doc["decisions"].is_array());
     }
 
     #[test]
@@ -1547,6 +1809,16 @@ mod tests {
         let cmd = test_run_cmd();
         assert_eq!(build_sampling_params(&cmd).temperature, 0.0);
         assert_eq!(build_sampling_params(&cmd).max_tokens, 1024);
+    }
+
+    #[test]
+    fn run_sampling_params_include_cli_stop_sequences() {
+        let mut cmd = test_run_cmd();
+        cmd.stop = vec!["\n".to_string(), String::new(), "END".to_string()];
+        let params = build_sampling_params(&cmd);
+        assert!(params.stop_sequences.contains(&"\n".to_string()));
+        assert!(params.stop_sequences.contains(&"END".to_string()));
+        assert!(!params.stop_sequences.contains(&String::new()));
     }
 
     #[test]

@@ -1,0 +1,1126 @@
+#!/usr/bin/env python3
+"""Manifest-driven product regression scenario runner.
+
+The runner is intentionally small and explicit: a scenario manifest names the
+product path (`ferrum run`, external `ferrum serve`, or a server started by this
+script), each scenario writes its own JSON artifact, and the runner writes a
+summary artifact plus one PASS line.
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.server
+import json
+import os
+import pty
+import re
+import select
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from openai_concurrency_quality_regression import run_concurrency_quality_regression
+from openai_tool_call_regression import run_tool_call_regression
+
+
+BAD_TEXT = [
+    "<unk>",
+    "[PAD]",
+    "<|assistant|>",
+    "<|tool|>",
+    "<|start_header_id|>",
+    "<|end_header_id|>",
+    "<|reserved_special_token_",
+    "classname=",
+    "invalid utf-8",
+    "mojibake",
+]
+SERVE_TYPES = {
+    "serve_chat",
+    "serve_multiturn_recall",
+    "serve_stateful_loop",
+    "serve_stream",
+    "serve_structured_output",
+    "serve_context_limit",
+    "serve_concurrency_quality",
+    "serve_tool_call",
+    "serve_python_openai_sdk",
+}
+RUN_TYPES = {
+    "run_multiturn",
+    "run_first_token_ux",
+}
+
+
+class ScenarioError(Exception):
+    pass
+
+
+class StartedServer:
+    def __init__(self, cmd: list[str], log_path: Path) -> None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_path = log_path
+        self.file = log_path.open("wb")
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=self.file,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=10)
+        self.file.close()
+        assert_no_bad_text(self.log_path.name, self.log_path.read_text(errors="replace"))
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def git_output(args: list[str], default: str = "unknown") -> str:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=repo_root(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return default
+    if proc.returncode != 0:
+        return default
+    return proc.stdout.strip() or default
+
+
+def git_dirty_status() -> dict[str, Any]:
+    text = git_output(["status", "--short"], default="")
+    lines = [line for line in text.splitlines() if line.strip()]
+    return {"is_dirty": bool(lines), "status_short": lines}
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def load_json_object(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ScenarioError(f"invalid JSON in {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ScenarioError(f"{path} must contain a JSON object")
+    return data
+
+
+def scenario_slug(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", name.strip()).strip("-")
+    return slug or "scenario"
+
+
+def strip_think(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text)
+
+
+def assert_no_bad_text(label: str, text: str, extra: list[str] | None = None) -> None:
+    lowered = text.lower()
+    for token in [*BAD_TEXT, *(extra or [])]:
+        if token.lower() in lowered:
+            raise ScenarioError(f"{label}: forbidden text {token!r}")
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ScenarioError(message)
+
+
+def post_json(
+    base_url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, str]:
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", **(headers or {})},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.status, response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+
+
+def get_url(url: str, *, timeout: int) -> tuple[int, str]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.status, response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+
+
+def request_sse(
+    base_url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int,
+) -> tuple[int, str, list[float]]:
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        response = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace"), []
+    chunks: list[str] = []
+    event_times: list[float] = []
+    with response:
+        while True:
+            raw = response.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", "replace")
+            chunks.append(line)
+            if line.startswith("data: "):
+                event_times.append(time.time())
+    return response.status, "".join(chunks), event_times
+
+
+def parse_json_response(label: str, status: int, body: str, expected_status: int = 200) -> dict[str, Any]:
+    if status != expected_status:
+        raise ScenarioError(f"{label}: expected HTTP {expected_status}, got {status}: {body[:500]}")
+    assert_no_bad_text(label, body)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ScenarioError(f"{label}: invalid JSON response: {exc}: {body[:500]}") from exc
+    if not isinstance(data, dict):
+        raise ScenarioError(f"{label}: response must be JSON object")
+    return data
+
+
+def first_choice(data: dict[str, Any]) -> dict[str, Any]:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ScenarioError(f"missing first choice: {data}")
+    return choices[0]
+
+
+def message_text(data: dict[str, Any]) -> str:
+    msg = first_choice(data).get("message")
+    if not isinstance(msg, dict):
+        raise ScenarioError(f"missing message: {data}")
+    text = msg.get("content") or msg.get("reasoning") or msg.get("reasoning_content") or ""
+    return strip_think(str(text))
+
+
+def finish_reason(data: dict[str, Any]) -> str | None:
+    value = first_choice(data).get("finish_reason")
+    return str(value) if value is not None else None
+
+
+def chat_payload(
+    model: str,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    temperature: float = 0.0,
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+
+def parse_sse(body: str) -> dict[str, Any]:
+    done_count = 0
+    malformed_json = 0
+    content_delta_count = 0
+    output_text = ""
+    usage_chunks = 0
+    chunks = 0
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data: "):
+            continue
+        data = line.removeprefix("data: ").strip()
+        if data == "[DONE]":
+            done_count += 1
+            continue
+        if not data:
+            continue
+        chunks += 1
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            malformed_json += 1
+            continue
+        if parsed.get("usage"):
+            usage_chunks += 1
+        for choice in parsed.get("choices", []):
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            text = delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content") or ""
+            if str(text):
+                output_text += str(text)
+                content_delta_count += 1
+    return {
+        "done_count": done_count,
+        "malformed_json": malformed_json,
+        "content_delta_count": content_delta_count,
+        "usage_chunks": usage_chunks,
+        "chunk_count": chunks,
+        "output_text": output_text,
+    }
+
+
+def parse_json_events(text: str) -> list[dict[str, Any]]:
+    events = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            events.append(data)
+    return events
+
+
+def assistant_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [event for event in events if event.get("event") == "assistant"]
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def wait_health(base_url: str, timeout: int) -> None:
+    deadline = time.time() + timeout
+    last = ""
+    while time.time() < deadline:
+        try:
+            status, body = get_url(base_url.rstrip("/") + "/health", timeout=2)
+            if status == 200:
+                return
+            last = f"status={status} body={body[:200]}"
+        except Exception as exc:
+            last = repr(exc)
+        time.sleep(0.5)
+    raise ScenarioError(f"server did not become healthy within {timeout}s; last={last}")
+
+
+def selected_scenarios(scenarios: list[dict[str, Any]], only: list[str]) -> list[dict[str, Any]]:
+    if not only:
+        return scenarios
+    allowed = set(only)
+    return [scenario for scenario in scenarios if str(scenario.get("name")) in allowed]
+
+
+class ScenarioRunner:
+    def __init__(self, args: argparse.Namespace, manifest: dict[str, Any]) -> None:
+        self.args = args
+        self.manifest = manifest
+        self.out = args.out
+        self.model = args.model or str(manifest.get("model") or "")
+        self.backend = args.backend or str(manifest.get("backend") or "auto")
+        self.ferrum_bin = Path(args.ferrum_bin or manifest.get("ferrum_bin") or "target/release/ferrum")
+        self.timeout = int(args.timeout or manifest.get("timeout_sec") or 180)
+        self.base_url = args.base_url or self.manifest_base_url()
+        self.started_server: StartedServer | None = None
+
+    def manifest_base_url(self) -> str | None:
+        server = self.manifest.get("server")
+        if isinstance(server, dict):
+            value = server.get("base_url")
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def scenario_types(self) -> set[str]:
+        return {str(scenario.get("type")) for scenario in self.scenarios()}
+
+    def scenarios(self) -> list[dict[str, Any]]:
+        scenarios = self.manifest.get("scenarios")
+        if not isinstance(scenarios, list) or not scenarios:
+            raise ScenarioError("manifest.scenarios must be a non-empty list")
+        for idx, scenario in enumerate(scenarios):
+            if not isinstance(scenario, dict):
+                raise ScenarioError(f"manifest.scenarios[{idx}] must be an object")
+            if not scenario.get("name") or not scenario.get("type"):
+                raise ScenarioError(f"manifest.scenarios[{idx}] must include name and type")
+        return scenarios
+
+    def needs_serve(self) -> bool:
+        return bool(self.scenario_types() & SERVE_TYPES)
+
+    def should_start_server(self) -> bool:
+        if self.args.start_server:
+            return True
+        server = self.manifest.get("server")
+        return isinstance(server, dict) and server.get("mode") == "start"
+
+    def ensure_server(self) -> None:
+        if not self.needs_serve():
+            return
+        if self.base_url and not self.should_start_server():
+            wait_health(self.base_url, self.timeout)
+            return
+        if not self.model:
+            raise ScenarioError("serve scenarios require --model or manifest.model")
+        port = int(self.args.port or self.manifest.get("port") or free_port())
+        self.base_url = f"http://127.0.0.1:{port}"
+        effective = self.out / "server.effective_config.json"
+        cmd = [
+            str(self.ferrum_bin),
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--effective-config-json",
+            str(effective),
+        ]
+        server = self.manifest.get("server")
+        if isinstance(server, dict):
+            extra_args = server.get("args")
+            if isinstance(extra_args, list):
+                cmd.extend(str(part) for part in extra_args)
+        cmd.append(self.model)
+        self.started_server = StartedServer(cmd, self.out / "server.log")
+        wait_health(self.base_url, self.timeout)
+
+    def run_all(self) -> dict[str, Any]:
+        self.out.mkdir(parents=True, exist_ok=True)
+        started_at = iso_now()
+        results: list[dict[str, Any]] = []
+        failures = 0
+        skipped = 0
+        try:
+            self.ensure_server()
+            for scenario in selected_scenarios(self.scenarios(), self.args.only):
+                result = self.run_one(scenario)
+                if result["status"] == "fail":
+                    failures += 1
+                elif result["status"] == "skipped":
+                    skipped += 1
+                results.append(result)
+        finally:
+            if self.started_server is not None:
+                self.started_server.stop()
+        status = "fail" if failures else "pass"
+        summary = {
+            "schema_version": 1,
+            "status": status,
+            "manifest": str(self.args.manifest),
+            "artifact_dir": str(self.out),
+            "model": self.model,
+            "backend": self.backend,
+            "base_url": self.base_url,
+            "git_sha": git_output(["rev-parse", "HEAD"]),
+            "dirty_status": git_dirty_status(),
+            "started_at": started_at,
+            "finished_at": iso_now(),
+            "scenario_count": len(results),
+            "failed": failures,
+            "skipped": skipped,
+            "scenarios": results,
+            "pass_line": f"BACKEND REGRESSION SMOKE PASS: {self.out}" if status == "pass" else None,
+        }
+        write_json(self.out / "summary.json", summary)
+        return summary
+
+    def run_one(self, scenario: dict[str, Any]) -> dict[str, Any]:
+        name = str(scenario["name"])
+        typ = str(scenario["type"])
+        scenario_dir = self.out / scenario_slug(name)
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        try:
+            result = self.dispatch(typ, scenario, scenario_dir)
+            result.update(
+                {
+                    "name": name,
+                    "type": typ,
+                    "status": result.get("status", "pass"),
+                    "artifact": str(scenario_dir / "result.json"),
+                    "duration_sec": time.monotonic() - started,
+                }
+            )
+        except Exception as exc:
+            if scenario.get("optional") is True and is_optional_skip(exc):
+                result = {
+                    "name": name,
+                    "type": typ,
+                    "status": "skipped",
+                    "reason": str(exc),
+                    "artifact": str(scenario_dir / "result.json"),
+                    "duration_sec": time.monotonic() - started,
+                }
+            else:
+                result = {
+                    "name": name,
+                    "type": typ,
+                    "status": "fail",
+                    "error": str(exc),
+                    "artifact": str(scenario_dir / "result.json"),
+                    "duration_sec": time.monotonic() - started,
+                }
+        write_json(scenario_dir / "result.json", result)
+        return result
+
+    def dispatch(self, typ: str, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        if typ == "serve_chat":
+            return self.serve_chat(scenario, out)
+        if typ == "serve_multiturn_recall":
+            return self.serve_multiturn_recall(scenario, out)
+        if typ == "serve_stateful_loop":
+            return self.serve_stateful_loop(scenario, out)
+        if typ == "serve_stream":
+            return self.serve_stream(scenario, out)
+        if typ == "serve_structured_output":
+            return self.serve_structured_output(scenario, out)
+        if typ == "serve_context_limit":
+            return self.serve_context_limit(scenario, out)
+        if typ == "serve_concurrency_quality":
+            return self.serve_concurrency_quality(scenario, out)
+        if typ == "serve_tool_call":
+            return self.serve_tool_call(out)
+        if typ == "serve_python_openai_sdk":
+            return self.serve_python_openai_sdk(scenario, out)
+        if typ == "run_multiturn":
+            return self.run_multiturn(scenario, out)
+        if typ == "run_first_token_ux":
+            return self.run_first_token_ux(scenario, out)
+        raise ScenarioError(f"unknown scenario type: {typ}")
+
+    def require_base_url(self) -> str:
+        if not self.base_url:
+            raise ScenarioError("serve scenario requires --base-url or manifest.server.mode=start")
+        return self.base_url
+
+    def serve_chat(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        prompt = str(scenario.get("prompt") or "Say exactly: ferrum-ok")
+        expected = [str(item) for item in scenario.get("expected_contains", ["ferrum-ok"])]
+        payload = chat_payload(
+            self.model,
+            [{"role": "user", "content": prompt}],
+            max_tokens=int(scenario.get("max_tokens", 128)),
+            temperature=float(scenario.get("temperature", 0)),
+        )
+        status, body = post_json(self.require_base_url(), payload, timeout=self.timeout)
+        (out / "response.json").write_text(body, errors="replace")
+        data = parse_json_response("serve_chat", status, body)
+        text = message_text(data)
+        for needle in expected:
+            require(needle in text, f"serve_chat missing expected text {needle!r}: {text[:500]}")
+        require(finish_reason(data) != "length", "serve_chat finish_reason is length")
+        return {"status": "pass", "http_status": status, "content": text[:1000]}
+
+    def serve_multiturn_recall(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        secret = str(scenario.get("secret") or "ferrum-blue")
+        first = str(scenario.get("first_prompt") or f"Remember this secret code: {secret}. Reply OK.")
+        second = str(scenario.get("second_prompt") or "Reply with only the secret code.")
+        messages = [{"role": "user", "content": first}]
+        first_data = self.post_chat_messages("serve_multiturn_1", messages, out / "turn1.json", scenario)
+        messages.append({"role": "assistant", "content": message_text(first_data)})
+        messages.append({"role": "user", "content": second})
+        second_data = self.post_chat_messages("serve_multiturn_2", messages, out / "turn2.json", scenario)
+        text = message_text(second_data)
+        require(secret in text, f"serve multiturn did not recall {secret!r}: {text[:500]}")
+        require(finish_reason(second_data) != "length", "serve multiturn finish_reason is length")
+        return {"status": "pass", "assistant_turns": 2, "recalled_secret": True}
+
+    def serve_stateful_loop(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        prompts = scenario.get("prompts")
+        if not isinstance(prompts, list) or len(prompts) < 5:
+            prompts = [
+                "Remember code ferrum-loop-blue. Reply OK.",
+                "Say one short word about Paris.",
+                "Reply with only the remembered code.",
+                "Say one short word about Rust.",
+                "Again reply with only the remembered code.",
+            ]
+        messages: list[dict[str, Any]] = []
+        responses: list[str] = []
+        length_finishes = 0
+        isolated_think_close = 0
+        repeated_prefixes = 0
+        previous_prefix = ""
+        for idx, prompt in enumerate(prompts):
+            messages.append({"role": "user", "content": str(prompt)})
+            data = self.post_chat_messages(
+                f"serve_stateful_loop_{idx + 1}",
+                messages,
+                out / f"turn{idx + 1}.json",
+                scenario,
+            )
+            text = message_text(data)
+            if finish_reason(data) == "length":
+                length_finishes += 1
+            if text.strip() == "</think>":
+                isolated_think_close += 1
+            prefix = re.sub(r"\s+", "", text[:64])
+            if prefix and prefix == previous_prefix:
+                repeated_prefixes += 1
+            previous_prefix = prefix
+            if text.strip():
+                responses.append(text)
+                messages.append({"role": "assistant", "content": text})
+        require(len(responses) >= int(scenario.get("min_non_empty_assistant", 4)), "too few responses")
+        require(length_finishes == 0, f"stateful loop length_finishes={length_finishes}")
+        require(isolated_think_close == 0, "stateful loop emitted isolated </think>")
+        require(repeated_prefixes == 0, f"stateful loop repeated_prefixes={repeated_prefixes}")
+        return {
+            "status": "pass",
+            "assistant_responses": len(responses),
+            "length_finishes": length_finishes,
+            "repeated_prefixes": repeated_prefixes,
+        }
+
+    def post_chat_messages(
+        self,
+        label: str,
+        messages: list[dict[str, Any]],
+        path: Path,
+        scenario: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = chat_payload(
+            self.model,
+            messages,
+            max_tokens=int(scenario.get("max_tokens", 192)),
+            temperature=float(scenario.get("temperature", 0)),
+        )
+        status, body = post_json(self.require_base_url(), payload, timeout=self.timeout)
+        path.write_text(body, errors="replace")
+        return parse_json_response(label, status, body)
+
+    def serve_stream(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        payload = chat_payload(
+            self.model,
+            [{"role": "user", "content": str(scenario.get("prompt") or "Say hello briefly.")}],
+            max_tokens=int(scenario.get("max_tokens", 128)),
+            temperature=float(scenario.get("temperature", 0)),
+        )
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+        status, body, event_times = request_sse(self.require_base_url(), payload, timeout=self.timeout)
+        (out / "stream.sse").write_text(body, errors="replace")
+        require(status == 200, f"stream expected HTTP 200, got {status}: {body[:500]}")
+        parsed = parse_sse(body)
+        assert_no_bad_text("serve_stream", parsed["output_text"])
+        require(parsed["done_count"] == 1, f"stream [DONE] count {parsed['done_count']} != 1")
+        require(parsed["content_delta_count"] > 0, "stream emitted no content delta")
+        require(parsed["malformed_json"] == 0, f"stream malformed_json={parsed['malformed_json']}")
+        require(parsed["usage_chunks"] == 1, f"stream usage_chunks={parsed['usage_chunks']} != 1")
+        return {"status": "pass", **parsed, "event_count": len(event_times)}
+
+    def serve_structured_output(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        expected = scenario.get("expected_object") or {"answer": "scenario-ok"}
+        payload = chat_payload(
+            self.model,
+            [
+                {
+                    "role": "user",
+                    "content": "Return exactly this JSON object and nothing else: "
+                    + json.dumps(expected, ensure_ascii=False),
+                }
+            ],
+            max_tokens=int(scenario.get("max_tokens", 384)),
+            temperature=float(scenario.get("temperature", 0)),
+        )
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "ScenarioObject",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {key: {"type": "string"} for key in expected},
+                    "required": sorted(expected),
+                },
+            },
+        }
+        status, body = post_json(self.require_base_url(), payload, timeout=self.timeout)
+        (out / "response.json").write_text(body, errors="replace")
+        data = parse_json_response("serve_structured_output", status, body)
+        text = message_text(data)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ScenarioError(f"structured output content is not JSON: {text[:500]}") from exc
+        require(parsed == expected, f"structured output {parsed!r} != expected {expected!r}")
+        return {"status": "pass", "object": parsed}
+
+    def serve_context_limit(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        expected_status = int(scenario.get("expected_status", 400))
+        payload = chat_payload(
+            self.model,
+            [{"role": "user", "content": str(scenario.get("prompt") or "Say one word.")}],
+            max_tokens=int(scenario.get("max_tokens", 4096)),
+            temperature=float(scenario.get("temperature", 0)),
+        )
+        status, body = post_json(self.require_base_url(), payload, timeout=self.timeout)
+        (out / "response.json").write_text(body, errors="replace")
+        data = parse_json_response("serve_context_limit", status, body, expected_status)
+        if expected_status == 400:
+            error = data.get("error")
+            require(isinstance(error, dict), "context limit response missing error object")
+            require(error.get("type") == "invalid_request_error", f"bad context error: {data}")
+        return {"status": "pass", "http_status": status}
+
+    def serve_concurrency_quality(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        cells = scenario.get("concurrency_cells") or [1, 4, 16, 32]
+        if not isinstance(cells, list) or not cells:
+            raise ScenarioError("serve_concurrency_quality.concurrency_cells must be a non-empty list")
+        result = run_concurrency_quality_regression(
+            self.require_base_url(),
+            self.model,
+            out,
+            [int(cell) for cell in cells],
+            timeout=self.timeout,
+        )
+        return {"status": "pass", "cells": result.get("cells", [])}
+
+    def serve_tool_call(self, out: Path) -> dict[str, Any]:
+        result = run_tool_call_regression(self.require_base_url(), self.model, out)
+        return {"status": "pass", "checks": result.get("checks", {})}
+
+    def serve_python_openai_sdk(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        try:
+            from openai import OpenAI  # type: ignore
+        except Exception as exc:
+            raise OptionalSkip(f"openai SDK unavailable: {exc}") from exc
+        client = OpenAI(base_url=self.require_base_url().rstrip("/") + "/v1", api_key="not-needed")
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": str(scenario.get("prompt") or "Say hi.")}],
+            temperature=0,
+            max_tokens=int(scenario.get("max_tokens", 64)),
+        )
+        data = response.model_dump()
+        write_json(out / "openai_sdk_response.json", data)
+        text = data["choices"][0]["message"].get("content") or ""
+        require(str(text).strip(), "OpenAI SDK response content is empty")
+        assert_no_bad_text("serve_python_openai_sdk", str(text))
+        return {"status": "pass", "content": str(text)[:1000]}
+
+    def run_multiturn(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        prompts = scenario.get("prompts")
+        if not isinstance(prompts, list) or len(prompts) < 2:
+            secret = str(scenario.get("secret") or "ferrum-blue")
+            prompts = [f"Code: {secret}.", "Reply with only the code."]
+        input_text = "\n".join(str(prompt) for prompt in prompts) + "\n/bye\n"
+        cmd = [
+            str(self.ferrum_bin),
+            "run",
+            "--backend",
+            str(scenario.get("backend") or self.backend),
+            "--max-tokens",
+            str(scenario.get("max_tokens", 192)),
+            "--temperature",
+            str(scenario.get("temperature", 0)),
+            "--output-format",
+            "jsonl",
+            self.model,
+        ]
+        proc = subprocess.run(
+            cmd,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=int(scenario.get("timeout_sec", self.timeout * 3)),
+            check=False,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+        (out / "stdout.jsonl").write_text(proc.stdout, errors="replace")
+        (out / "stderr.log").write_text(proc.stderr, errors="replace")
+        require(proc.returncode == 0, f"ferrum run failed rc={proc.returncode}: {proc.stderr[-1000:]}")
+        assert_no_bad_text("run_multiturn.stdout", proc.stdout)
+        assert_no_bad_text("run_multiturn.stderr", proc.stderr)
+        events = parse_json_events(proc.stdout)
+        assistants = assistant_events(events)
+        min_turns = int(scenario.get("min_assistant_turns", 2))
+        require(len(assistants) >= min_turns, f"assistant turns {len(assistants)} < {min_turns}")
+        length_finishes = sum(1 for event in assistants if event.get("finish_reason") == "length")
+        require(length_finishes == 0, f"run_multiturn length_finishes={length_finishes}")
+        expected = scenario.get("expected_recall") or scenario.get("secret")
+        if expected:
+            last = str(assistants[-1].get("content") or "")
+            require(str(expected) in last, f"run_multiturn did not recall {expected!r}: {last[:500]}")
+        isolated = [event for event in assistants if str(event.get("content") or "").strip() == "</think>"]
+        require(not isolated, "run_multiturn emitted isolated </think>")
+        return {"status": "pass", "assistant_turns": len(assistants), "length_finishes": 0}
+
+    def run_first_token_ux(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
+        if os.name != "posix":
+            raise OptionalSkip("run_first_token_ux requires a POSIX pty")
+        prompt = str(scenario.get("prompt") or "Say hello briefly.")
+        hint_timeout_ms = int(scenario.get("hint_timeout_ms", 1000))
+        timeout_sec = int(scenario.get("timeout_sec", self.timeout * 3))
+        cmd = [
+            str(self.ferrum_bin),
+            "run",
+            "--backend",
+            str(scenario.get("backend") or self.backend),
+            "--max-tokens",
+            str(scenario.get("max_tokens", 64)),
+            "--temperature",
+            str(scenario.get("temperature", 0)),
+            self.model,
+        ]
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(
+            cmd,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env={**os.environ, "NO_COLOR": "1"},
+            close_fds=True,
+        )
+        os.close(slave)
+        raw = bytearray()
+        hint_ms: float | None = None
+        prompt_sent_at: float | None = None
+        deadline = time.time() + timeout_sec
+        try:
+            while time.time() < deadline:
+                ready, _, _ = select.select([master], [], [], 0.05)
+                if ready:
+                    chunk = os.read(master, 4096)
+                    raw.extend(chunk)
+                text = raw.decode("utf-8", "replace")
+                if prompt_sent_at is None and (">>>" in text or "Ready." in text):
+                    os.write(master, (prompt + "\n").encode())
+                    prompt_sent_at = time.time()
+                if prompt_sent_at is not None:
+                    after_prompt = raw.decode("utf-8", "replace")
+                    if hint_ms is None and "Working (" in strip_ansi(after_prompt):
+                        hint_ms = (time.time() - prompt_sent_at) * 1000.0
+                    if re.search(r"\[\d+ tokens,", after_prompt):
+                        os.write(master, b"/bye\n")
+                        break
+            time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            os.close(master)
+        transcript = raw.decode("utf-8", "replace")
+        (out / "transcript.txt").write_text(transcript, errors="replace")
+        clean = strip_ansi(transcript)
+        assert_no_bad_text("run_first_token_ux", clean)
+        require("waiting for first token" not in clean.lower(), "forbidden first-token hint text")
+        require(hint_ms is not None, "no first-token progress hint observed")
+        require(hint_ms <= hint_timeout_ms, f"first-token hint took {hint_ms:.1f} ms")
+        hint_lines = [line.strip() for line in clean.replace("\r", "\n").splitlines() if "Working (" in line]
+        require(len(hint_lines) >= 1, "missing Working progress line")
+        visible = re.sub(r"\([^)]*\)", "()", hint_lines[0])
+        require(len(visible) <= int(scenario.get("max_hint_len", 32)), f"hint line too long: {visible!r}")
+        return {"status": "pass", "hint_ms": hint_ms, "hint_line": visible}
+
+
+class OptionalSkip(Exception):
+    pass
+
+
+def is_optional_skip(exc: Exception) -> bool:
+    return isinstance(exc, OptionalSkip)
+
+
+class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self.send_json(200, {"status": "ok"})
+            return
+        self.send_json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        if self.path != "/v1/chat/completions":
+            self.send_json(404, {"error": "not found"})
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        payload = json.loads(body)
+        if payload.get("stream"):
+            self.send_stream()
+            return
+        if int(payload.get("max_tokens") or 0) >= 4096:
+            self.send_json(
+                400,
+                {"error": {"type": "invalid_request_error", "message": "context limit"}},
+            )
+            return
+        messages = payload.get("messages", [])
+        prompt = " ".join(str(msg.get("content") or "") for msg in messages)
+        last_user = ""
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                last_user = str(msg.get("content") or "")
+                break
+        marker = re.search(r"\b(ferrum\d{2}\d{2})\b", prompt)
+        square = re.search(r"(S\d{4})", prompt)
+        if payload.get("tools") and marker and square:
+            self.send_tool_call(
+                "capture_quality_marker",
+                json.dumps(
+                    {"marker": marker.group(1), "checksum": square.group(1)},
+                    separators=(",", ":"),
+                ),
+            )
+            return
+        if payload.get("tools") and any(msg.get("role") == "tool" for msg in payload.get("messages", [])):
+            self.send_chat("北京 22 celsius 晴")
+            return
+        if payload.get("tools"):
+            self.send_tool_call()
+            return
+        if marker and square:
+            self.send_chat(
+                json.dumps(
+                    {"marker": marker.group(1), "checksum": square.group(1)},
+                    separators=(",", ":"),
+                )
+            )
+        elif payload.get("response_format"):
+            self.send_chat('{"answer":"scenario-ok"}')
+        elif "remembered code" in last_user.lower() or "secret code" in last_user.lower():
+            self.send_chat("ferrum-blue ferrum-loop-blue")
+        elif "remember code" in last_user.lower() or "secret" in last_user.lower():
+            self.send_chat("OK")
+        elif "paris" in last_user.lower():
+            self.send_chat("Paris")
+        elif "rust" in last_user.lower():
+            self.send_chat("Rust")
+        elif "code" in prompt.lower():
+            self.send_chat("ferrum-blue ferrum-loop-blue")
+        else:
+            self.send_chat("scenario-ok")
+
+    def send_json(self, status: int, data: dict[str, Any]) -> None:
+        raw = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def send_chat(self, text: str) -> None:
+        self.send_json(
+            200,
+            {
+                "id": "chatcmpl_mock",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    def send_tool_call(
+        self,
+        name: str = "get_weather",
+        arguments: str = '{"city":"北京","unit":"celsius"}',
+    ) -> None:
+        self.send_json(
+            200,
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_mock",
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": arguments,
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+        )
+
+    def send_stream(self) -> None:
+        lines = [
+            {
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "content": "scenario"}, "finish_reason": None}
+                ]
+            },
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"completion_tokens": 1}},
+        ]
+        raw = "".join(f"data: {json.dumps(line)}\n\n" for line in lines) + "data: [DONE]\n\n"
+        body = raw.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def run_selftest_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, cwd=repo_root(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def self_test() -> int:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockOpenAIHandler)
+    port = int(server.server_address[1])
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="ferrum-scenario-selftest-") as tmp:
+            root = Path(tmp)
+            manifest = root / "manifest.json"
+            write_json(
+                manifest,
+                {
+                    "schema_version": 1,
+                    "model": "mock-model",
+                    "backend": "cpu",
+                    "server": {"mode": "external", "base_url": f"http://127.0.0.1:{port}"},
+                    "scenarios": [
+                        {"name": "chat", "type": "serve_chat", "expected_contains": ["scenario-ok"]},
+                        {"name": "multiturn", "type": "serve_multiturn_recall", "secret": "ferrum-blue"},
+                        {"name": "loop", "type": "serve_stateful_loop"},
+                        {"name": "stream", "type": "serve_stream"},
+                        {
+                            "name": "structured",
+                            "type": "serve_structured_output",
+                            "expected_object": {"answer": "scenario-ok"},
+                        },
+                        {"name": "context", "type": "serve_context_limit"},
+                        {
+                            "name": "concurrency",
+                            "type": "serve_concurrency_quality",
+                            "concurrency_cells": [1, 4],
+                        },
+                        {"name": "tool", "type": "serve_tool_call"},
+                    ],
+                },
+            )
+            out = root / "out"
+            proc = run_selftest_command(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--manifest",
+                    str(manifest),
+                    "--out",
+                    str(out),
+                ]
+            )
+            if proc.returncode != 0:
+                raise AssertionError(proc.stderr or proc.stdout)
+            if f"BACKEND REGRESSION SMOKE PASS: {out}" not in proc.stdout:
+                raise AssertionError(proc.stdout)
+            summary = load_json_object(out / "summary.json")
+            if summary.get("status") != "pass" or summary.get("scenario_count") != 8:
+                raise AssertionError(summary)
+    finally:
+        server.shutdown()
+        server.server_close()
+    print("BACKEND SCENARIO RUNNER SELFTEST PASS")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--ferrum-bin")
+    parser.add_argument("--model")
+    parser.add_argument("--backend")
+    parser.add_argument("--base-url")
+    parser.add_argument("--start-server", action="store_true")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--timeout", type=int)
+    parser.add_argument("--only", action="append", default=[])
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+
+    if args.self_test:
+        return self_test()
+    if args.manifest is None:
+        parser.error("--manifest is required unless --self-test is set")
+    if args.out is None:
+        parser.error("--out is required unless --self-test is set")
+    try:
+        manifest = load_json_object(args.manifest)
+        summary = ScenarioRunner(args, manifest).run_all()
+    except Exception as exc:
+        if args.out is not None:
+            args.out.mkdir(parents=True, exist_ok=True)
+            write_json(args.out / "summary.json", {"status": "fail", "error": str(exc)})
+        print(f"BACKEND REGRESSION SMOKE FAIL: {args.out}: {exc}", file=sys.stderr)
+        return 1
+    if summary["status"] == "pass":
+        print(summary["pass_line"])
+        return 0
+    print(f"BACKEND REGRESSION SMOKE FAIL: {args.out}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

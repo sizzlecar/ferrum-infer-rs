@@ -1,0 +1,77 @@
+{
+  "backend": "auto",
+  "ferrum_bin": "target/release/ferrum",
+  "model": "Qwen/Qwen3-0.6B",
+  "schema_version": 1,
+  "server": {
+    "args": [
+      "--session-cache",
+      "memory",
+      "--session-cache-max-entries",
+      "64"
+    ],
+    "mode": "external"
+  },
+  "timeout_sec": 180,
+  "scenarios": [
+    {
+      "name": "run_multiturn_recall",
+      "type": "run_multiturn",
+      "secret": "ferrum-blue",
+      "expected_recall": "ferrum-blue",
+      "min_assistant_turns": 2
+    },
+    {
+      "name": "run_first_token_ux",
+      "type": "run_first_token_ux",
+      "hint_timeout_ms": 1000,
+      "max_hint_len": 32
+    },
+    {
+      "name": "serve_concurrency_quality",
+      "type": "serve_concurrency_quality",
+      "concurrency_cells": [
+        1,
+        4,
+        16,
+        32
+      ]
+    },
+    {
+      "name": "serve_multiturn_recall",
+      "type": "serve_multiturn_recall",
+      "secret": "ferrum-blue"
+    },
+    {
+      "name": "serve_stateful_loop",
+      "type": "serve_stateful_loop",
+      "min_non_empty_assistant": 4
+    },
+    {
+      "name": "serve_stream_done_usage",
+      "type": "serve_stream"
+    },
+    {
+      "name": "serve_tool_call",
+      "type": "serve_tool_call"
+    },
+    {
+      "name": "serve_structured_output",
+      "type": "serve_structured_output",
+      "expected_object": {
+        "answer": "scenario-ok"
+      }
+    },
+    {
+      "name": "serve_context_limit",
+      "type": "serve_context_limit",
+      "expected_status": 400,
+      "max_tokens": 4096
+    },
+    {
+      "name": "serve_python_openai_sdk",
+      "type": "serve_python_openai_sdk",
+      "optional": true
+    }
+  ]
+}

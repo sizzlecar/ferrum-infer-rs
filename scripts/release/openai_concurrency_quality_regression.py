@@ -60,12 +60,47 @@ def parse_cells(raw: str) -> list[int]:
     return cells
 
 
-def marker_line_ok(line: str, marker: str) -> bool:
-    return line.strip().rstrip(".。!！,，;；:：") == marker
+def marker_tool(marker: str, answer: str) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "capture_quality_marker",
+            "description": "Record one concurrency quality marker.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "marker": {"type": "string", "enum": [marker]},
+                    "checksum": {"type": "string", "enum": [answer]},
+                },
+                "required": ["marker", "checksum"],
+            },
+        },
+    }
 
 
-def answer_line_ok(line: str, answer: str) -> bool:
-    return line.strip().rstrip(".。!！,，;；:：") == answer
+def tool_arguments_from_choice(choice: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    msg = choice.get("message")
+    if not isinstance(msg, dict):
+        return None, None
+    calls = msg.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        return None, None
+    call = calls[0]
+    if not isinstance(call, dict):
+        return None, None
+    function = call.get("function")
+    if not isinstance(function, dict):
+        return None, None
+    args_raw = function.get("arguments")
+    if not isinstance(args_raw, str):
+        return str(function.get("name") or ""), None
+    try:
+        args = json.loads(args_raw)
+    except json.JSONDecodeError:
+        return str(function.get("name") or ""), None
+    if not isinstance(args, dict):
+        return str(function.get("name") or ""), None
+    return str(function.get("name") or ""), args
 
 
 def run_concurrency_quality_regression(
@@ -82,23 +117,23 @@ def run_concurrency_quality_regression(
 
     for concurrency in concurrency_cells:
         prefix = f"c{concurrency}.quality"
-        nonce = f"M{concurrency:02d}"
-
         def call(i: int) -> dict[str, Any]:
-            marker = f"K{nonce}{i:02d}Z"
+            marker = f"ferrum{concurrency:02d}{i:02d}"
             value = i + 1
             answer = f"S{value * value:04d}"
             payload = {
                 "model": model,
                 "temperature": 0,
-                "max_tokens": 96,
+                "max_tokens": 128,
+                "tools": [marker_tool(marker, answer)],
+                "tool_choice": "required",
                 "messages": [
                     {
                         "role": "user",
                         "content": (
-                            "Reply with exactly two short lines. "
-                            f"Line 1 must be this code exactly: {marker}. "
-                            f"Line 2 must be this checksum exactly: {answer}."
+                            "Call capture_quality_marker with marker "
+                            f"{marker!r} and checksum {answer!r}. "
+                            "Do not output natural language."
                         ),
                     }
                 ],
@@ -107,21 +142,29 @@ def run_concurrency_quality_regression(
             content = ""
             finish_reason = None
             json_ok = False
+            tool_name = None
+            marker_response = None
             try:
                 parsed = json.loads(body)
                 json_ok = True
-                choice = parsed["choices"][0]
-                content = strip_think(choice["message"].get("content") or "")
-                finish_reason = choice.get("finish_reason")
+                if status == 200:
+                    choice = parsed["choices"][0]
+                    finish_reason = choice.get("finish_reason")
+                    msg = choice.get("message") or {}
+                    content = strip_think(str(msg.get("content") or ""))
+                    tool_name, marker_response = tool_arguments_from_choice(choice)
             except Exception:
                 content = body[:500]
-            forbidden = has_forbidden_text(content)
-            lines = [line.strip() for line in content.splitlines() if line.strip()]
+            forbidden = has_forbidden_text(f"{body}\n{content}")
+            parsed_marker = marker_response.get("marker") if marker_response else None
+            parsed_checksum = marker_response.get("checksum") if marker_response else None
+            marker_ok = parsed_marker == marker
+            square_ok = parsed_checksum == answer
             format_ok = (
-                len(lines) == 2
-                and marker_line_ok(lines[0], marker)
-                and answer_line_ok(lines[1], answer)
-                and not any(other.startswith("K") and other.endswith("Z") for other in lines[1:])
+                finish_reason == "tool_calls"
+                and tool_name == "capture_quality_marker"
+                and marker_ok
+                and square_ok
             )
             return {
                 "i": i,
@@ -129,12 +172,15 @@ def run_concurrency_quality_regression(
                 "json_ok": json_ok,
                 "marker": marker,
                 "square": answer,
-                "marker_ok": marker in content,
-                "square_ok": answer in content,
+                "tool_name": tool_name,
+                "parsed_marker": parsed_marker,
+                "parsed_checksum": parsed_checksum,
+                "marker_ok": marker_ok,
+                "square_ok": square_ok,
                 "format_ok": format_ok,
                 "finish_reason": finish_reason,
                 "forbidden_text": forbidden,
-                "content_head": content[:500],
+                "content_head": body[:500],
             }
 
         rows: list[dict[str, Any]] = []

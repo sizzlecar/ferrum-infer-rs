@@ -7,6 +7,34 @@
 
 use ferrum_types::{RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource};
 
+pub fn push_cli_runtime_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            value.to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+}
+
+pub fn push_cli_runtime_usize(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    key: &str,
+    value: Option<usize>,
+) {
+    if let Some(value) = value {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            value.to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+}
+
 pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<String> {
     let mut materialized = Vec::new();
     for entry in entries {

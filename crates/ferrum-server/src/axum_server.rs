@@ -657,6 +657,86 @@ fn engine_str<'a>(snapshot: Option<&'a serde_json::Value>, key: &str) -> Option<
     snapshot?.get(key)?.as_str()
 }
 
+fn auto_config_health_value(auto_config: Option<&ResolvedFerrumConfig>) -> serde_json::Value {
+    match auto_config {
+        Some(auto_config) => auto_config.effective_config_document(),
+        None => {
+            match FerrumConfigBuilder::new(RuntimeConfigSnapshot::capture_current()).resolve() {
+                Ok(auto_config) => auto_config.effective_config_document(),
+                Err(err) => serde_json::json!({
+                    "schema_version": 1,
+                    "error": err.to_string(),
+                }),
+            }
+        }
+    }
+}
+
+fn admission_health_json(
+    engine_status: &EngineStatus,
+    scheduler_metrics: &EngineMetrics,
+    auto_config: &serde_json::Value,
+) -> serde_json::Value {
+    let configured = auto_config
+        .get("admission")
+        .and_then(|value| value.as_object());
+    let effective_max_concurrent = configured
+        .and_then(|value| value.get("effective_max_concurrent"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or_else(|| {
+            (engine_status.active_requests + engine_status.queued_requests)
+                .max(1)
+                .try_into()
+                .unwrap_or(u64::MAX)
+        });
+    serde_json::json!({
+        "schema_version": 1,
+        "source": "startup_auto_config_and_engine_status",
+        "effective_max_concurrent": effective_max_concurrent,
+        "queue_depth": engine_status.queued_requests as u64,
+        "active_prefill": 0u64,
+        "active_decode": engine_status.active_requests as u64,
+        "current_batch_size": engine_status.active_requests as u64,
+        "rejected_requests_total": 0u64,
+        "failed_requests_total": scheduler_metrics.failed_requests,
+        "completed_requests_total": scheduler_metrics.successful_requests,
+        "scheduler_policy": configured
+            .and_then(|value| value.get("scheduler_policy"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown"),
+        "phase_detail_source": "engine_status_does_not_split_prefill_decode",
+    })
+}
+
+fn admission_prometheus_metrics(admission: &serde_json::Value) -> String {
+    let value = |key: &str| {
+        admission
+            .get(key)
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    };
+    format!(
+        concat!(
+            "ferrum_admission_effective_max_concurrent {}\n",
+            "ferrum_admission_queue_depth {}\n",
+            "ferrum_admission_active_prefill {}\n",
+            "ferrum_admission_active_decode {}\n",
+            "ferrum_admission_current_batch_size {}\n",
+            "ferrum_admission_rejected_requests_total {}\n",
+            "ferrum_admission_failed_requests_total {}\n",
+            "ferrum_admission_completed_requests_total {}\n"
+        ),
+        value("effective_max_concurrent"),
+        value("queue_depth"),
+        value("active_prefill"),
+        value("active_decode"),
+        value("current_batch_size"),
+        value("rejected_requests_total"),
+        value("failed_requests_total"),
+        value("completed_requests_total"),
+    )
+}
+
 fn request_session_id(headers: &HeaderMap, request: &ChatCompletionsRequest) -> Option<String> {
     headers
         .get(FERRUM_SESSION_HEADER)
@@ -2884,26 +2964,8 @@ async fn health_handler(
         .llm
         .as_ref()
         .and_then(|engine| engine.lora_metrics_snapshot());
-    let auto_config = match state.auto_config.clone() {
-        Some(auto_config) => serde_json::to_value(auto_config).unwrap_or_else(|err| {
-            serde_json::json!({
-                "schema_version": 1,
-                "error": format!("failed to serialize startup auto config: {err}"),
-            })
-        }),
-        None => match FerrumConfigBuilder::new(runtime_config.clone()).resolve() {
-            Ok(auto_config) => serde_json::to_value(auto_config).unwrap_or_else(|err| {
-                serde_json::json!({
-                    "schema_version": 1,
-                    "error": format!("failed to serialize runtime auto config: {err}"),
-                })
-            }),
-            Err(err) => serde_json::json!({
-                "schema_version": 1,
-                "error": err.to_string(),
-            }),
-        },
-    };
+    let auto_config = auto_config_health_value(state.auto_config.as_ref());
+    let admission = admission_health_json(&engine_status, &scheduler_metrics, &auto_config);
 
     let health = serde_json::json!({
         "status": "healthy",
@@ -2921,6 +2983,7 @@ async fn health_handler(
         },
         "config": runtime_config,
         "auto_config": auto_config,
+        "admission": admission,
         "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
         "lora": engine_lora.unwrap_or_else(|| serde_json::json!({
             "enabled": state.lora_registry.is_enabled(),
@@ -2951,6 +3014,11 @@ async fn metrics_handler(
         .as_ref()
         .and_then(|engine| engine.cache_metrics_snapshot());
     body.push_str(&state.cache.prometheus_metrics(engine_cache.as_ref()));
+    let engine_status = state.status().await;
+    let scheduler_metrics = state.metrics();
+    let auto_config = auto_config_health_value(state.auto_config.as_ref());
+    let admission = admission_health_json(&engine_status, &scheduler_metrics, &auto_config);
+    body.push_str(&admission_prometheus_metrics(&admission));
 
     Ok((
         [(
@@ -3950,10 +4018,40 @@ mod tests {
         assert_eq!(body["status"], "healthy");
         assert!(body["config"]["entries"].is_array(), "body: {body}");
         assert_eq!(body["auto_config"]["schema_version"], 1);
+        assert!(body["auto_config"]["entries"].is_array(), "body: {body}");
+        assert!(body["auto_config"]["admission"].is_object(), "body: {body}");
+        assert_eq!(body["admission"]["schema_version"], 1);
+        assert!(body["admission"]["effective_max_concurrent"].is_number());
+        assert!(body["admission"]["queue_depth"].is_number());
+        assert!(body["admission"]["active_prefill"].is_number());
+        assert!(body["admission"]["active_decode"].is_number());
+        assert!(body["admission"]["current_batch_size"].is_number());
+        assert!(body["admission"]["rejected_requests_total"].is_number());
+        assert!(body["admission"]["failed_requests_total"].is_number());
+        assert!(body["admission"]["completed_requests_total"].is_number());
         assert!(
             body["auto_config"]["decisions"].is_array() || body["auto_config"]["error"].is_string(),
             "body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn route_metrics_includes_admission_counters() {
+        let response = get(router_with_stub("ok"), "/metrics").await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        for metric in [
+            "ferrum_admission_effective_max_concurrent",
+            "ferrum_admission_queue_depth",
+            "ferrum_admission_active_prefill",
+            "ferrum_admission_active_decode",
+            "ferrum_admission_current_batch_size",
+            "ferrum_admission_rejected_requests_total",
+            "ferrum_admission_failed_requests_total",
+            "ferrum_admission_completed_requests_total",
+        ] {
+            assert!(body.contains(metric), "missing {metric}:\n{body}");
+        }
     }
 
     #[tokio::test]

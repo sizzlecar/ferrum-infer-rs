@@ -44,6 +44,15 @@ pub struct ServeCommand {
     #[arg(long, default_value = "2")]
     pub tts_slots: usize,
 
+    /// Backend: auto, cpu, metal, cuda.
+    #[arg(long, default_value = "auto")]
+    pub backend: String,
+
+    /// CUDA GPU ids to use, comma-separated. Multi-GPU requests fail until
+    /// the real layer-split loader is implemented.
+    #[arg(long, value_name = "IDS")]
+    pub gpu_devices: Option<String>,
+
     /// Speculative decoding: draft model id (same family as target).
     /// Example: `--spec-draft qwen3:0.6b` when serving `qwen3:4b`.
     /// The draft model must share the tokenizer + vocabulary.
@@ -180,6 +189,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         host,
         port,
         tts_slots,
+        backend,
+        gpu_devices,
         spec_draft,
         spec_tokens,
         gpu_memory_utilization,
@@ -286,30 +297,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
     let mut materialized_runtime_keys =
         crate::runtime_env::materialize_runtime_env_defaults(&non_env_runtime_entries);
-
-    let autosize_env_before = RuntimeConfigSnapshot::capture_current();
-    // GPU-memory auto-sizing: scale FERRUM_KV_MAX_BLOCKS so weights +
-    // KV pool + 4 GB scratch reserve fit in `total_gpu_mem * gpu_util`.
-    // Skipped on Mac / when nvidia-smi is missing; respects user-set
-    // FERRUM_KV_MAX_BLOCKS overrides.
-    if let Some(p) = local_dir_path.as_ref() {
-        crate::gpu_mem_autosize::apply_auto_size(p, gpu_memory_utilization);
-    }
-    let autosize_runtime_entries = runtime_entries_added_by_snapshot(
-        &autosize_env_before,
-        &RuntimeConfigSnapshot::capture_current(),
-        SERVE_AUTOSIZE_RUNTIME_KEYS,
-        RuntimeConfigSource::MemoryProfile,
-    );
-    materialized_runtime_keys.extend(
-        autosize_runtime_entries
-            .iter()
-            .map(|entry| entry.key.clone()),
-    );
-    non_env_runtime_entries.extend(autosize_runtime_entries);
-    non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-    materialized_runtime_keys.sort();
-    materialized_runtime_keys.dedup();
 
     let model_id = if let Some(p) = gguf_path.as_ref() {
         // Use the GGUF stem as the OpenAI model id — the user sees this
@@ -428,7 +415,18 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     }
 
     // Select device
-    let device = select_device();
+    let mut device = super::run::select_device(&backend);
+    let mut gpu_selection =
+        crate::gpu_devices::resolve_cuda_gpu_devices(gpu_devices.as_deref(), &device)?;
+    if let Some(selection) = &gpu_selection {
+        device = selection.primary_device();
+        println!(
+            "{} {} ({})",
+            "CUDA GPUs:".dimmed(),
+            selection.selected_csv(),
+            selection.selected_distributed_strategy
+        );
+    }
     println!("{} {:?}", "Device:".dimmed(), device);
     let serve_profile_entries = crate::source_resolver::serve_profile_runtime_entries(
         &source.local_path,
@@ -477,6 +475,14 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let arch_for_dispatch = model_definition
         .as_ref()
         .map(|model_def| model_def.architecture);
+    if let (Some(selection), Some(definition)) = (gpu_selection.as_mut(), model_definition.as_ref())
+    {
+        if selection.apply_model_layer_count(definition.num_hidden_layers)? {
+            if let Some(plan) = selection.selected_layer_split_plan.as_deref() {
+                println!("{}", format!("CUDA layer split plan: {plan}").dimmed());
+            }
+        }
+    }
     let mut selected_runtime_preset_name = selected_runtime_preset_name;
     if selected_runtime_preset_name.is_none()
         && is_m3_qwen3_30b_a3b(arch_for_dispatch, model_definition.as_ref())
@@ -518,7 +524,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         materialized_runtime_keys.dedup();
     }
 
-    let startup_cli_runtime_entries = serve_cli_runtime_entries(
+    let mut startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
         kv_capacity,
         max_model_len,
@@ -541,6 +547,34 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_concurrency,
         profile_runtime_flags_json.as_deref(),
     );
+    if let Some(selection) = &gpu_selection {
+        startup_cli_runtime_entries.extend(selection.runtime_config_entries());
+    }
+    if !startup_cli_runtime_entries.is_empty() {
+        crate::runtime_env::materialize_runtime_env_effective(
+            &RuntimeConfigSnapshot::from_entries(startup_cli_runtime_entries.clone()),
+        );
+    }
+    let autosize_env_before = RuntimeConfigSnapshot::capture_current();
+    // GPU-memory auto-sizing must run after the model source resolves.
+    // HF-cache models are not `local_dir_path`, but they still need the same
+    // KV block sizing as direct local safetensors directories.
+    crate::gpu_mem_autosize::apply_auto_size(&source.local_path, gpu_memory_utilization);
+    let autosize_runtime_entries = runtime_entries_added_by_snapshot(
+        &autosize_env_before,
+        &RuntimeConfigSnapshot::capture_current(),
+        SERVE_AUTOSIZE_RUNTIME_KEYS,
+        RuntimeConfigSource::MemoryProfile,
+    );
+    materialized_runtime_keys.extend(
+        autosize_runtime_entries
+            .iter()
+            .map(|entry| entry.key.clone()),
+    );
+    non_env_runtime_entries.extend(autosize_runtime_entries);
+    non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
+    materialized_runtime_keys.sort();
+    materialized_runtime_keys.dedup();
     let startup_auto_config = startup_auto_config(
         &device,
         arch_for_dispatch,
@@ -593,6 +627,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             let mut engine_config = ferrum_types::EngineConfig::default();
             engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
             engine_config.backend.device = device;
+            if let Some(selection) = &gpu_selection {
+                selection.insert_backend_options(&mut engine_config.backend.backend_options);
+            }
             let engine: Arc<dyn ferrum_engine::EmbedEngine + Send + Sync> = Arc::new(
                 ferrum_engine::embedding_engine::EmbeddingEngine::new(executor, engine_config)
                     .with_tokenizer(tokenizer),
@@ -610,6 +647,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             let mut engine_config = ferrum_types::EngineConfig::default();
             engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
             engine_config.backend.device = device;
+            if let Some(selection) = &gpu_selection {
+                selection.insert_backend_options(&mut engine_config.backend.backend_options);
+            }
             let engine: Arc<dyn ferrum_engine::TranscribeEngine + Send + Sync> = Arc::new(
                 ferrum_engine::transcription_engine::TranscriptionEngine::new(
                     executor,
@@ -666,6 +706,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 "model_path".to_string(),
                 serde_json::Value::String(engine_model_path.clone()),
             );
+            if let Some(selection) = &gpu_selection {
+                selection.insert_backend_options(&mut engine_config.backend.backend_options);
+            }
             if let Some(draft_path) = engine_spec_draft_path.as_ref() {
                 engine_config.backend.backend_options.insert(
                     "spec_draft".to_string(),
@@ -856,7 +899,7 @@ fn startup_auto_config(
         .map_err(|err| ferrum_types::FerrumError::config(format!("invalid auto config: {err}")))
 }
 
-fn merge_runtime_config_sources(
+pub(crate) fn merge_runtime_config_sources(
     config_file_entries: Vec<RuntimeConfigEntry>,
     env_snapshot: RuntimeConfigSnapshot,
     cli_entries: Vec<RuntimeConfigEntry>,
@@ -881,14 +924,14 @@ fn remove_materialized_config_env_entries(
     env_snapshot
 }
 
-const SERVE_AUTOSIZE_RUNTIME_KEYS: &[&str] = &[
+pub(crate) const SERVE_AUTOSIZE_RUNTIME_KEYS: &[&str] = &[
     "FERRUM_MAX_BATCHED_TOKENS",
     "FERRUM_KV_MAX_BLOCKS",
     "FERRUM_PAGED_MAX_SEQS",
     "FERRUM_KV_CAPACITY",
 ];
 
-fn runtime_entries_added_by_snapshot(
+pub(crate) fn runtime_entries_added_by_snapshot(
     before: &RuntimeConfigSnapshot,
     after: &RuntimeConfigSnapshot,
     keys: &[&str],
@@ -906,7 +949,7 @@ fn runtime_entries_added_by_snapshot(
         .collect()
 }
 
-fn runtime_preset_entries(
+pub(crate) fn runtime_preset_entries(
     preset: &str,
     source: RuntimeConfigSource,
 ) -> Result<Vec<RuntimeConfigEntry>> {
@@ -1089,7 +1132,7 @@ fn serve_kv_cache_type_for_device(device: &ferrum_types::Device) -> ferrum_types
     }
 }
 
-fn write_startup_config_artifacts(
+pub(crate) fn write_startup_config_artifacts(
     auto_config: &ResolvedFerrumConfig,
     effective_config_json: Option<&std::path::Path>,
     decision_trace_jsonl: Option<&std::path::Path>,
@@ -1184,7 +1227,7 @@ fn configure_profile_sink(
     Ok(())
 }
 
-fn model_capabilities_from_definition(
+pub(crate) fn model_capabilities_from_definition(
     definition: &ferrum_models::ModelDefinition,
 ) -> ModelCapabilities {
     let architecture = match definition.architecture {
@@ -1279,7 +1322,9 @@ fn estimated_weight_bytes_from_definition(
     Some(params.saturating_mul(bits_per_param).div_ceil(8))
 }
 
-fn hardware_capabilities_for_device(device: &ferrum_types::Device) -> HardwareCapabilities {
+pub(crate) fn hardware_capabilities_for_device(
+    device: &ferrum_types::Device,
+) -> HardwareCapabilities {
     let features = compiled_kernel_features();
     match device {
         ferrum_types::Device::CUDA(id) => {
@@ -1505,21 +1550,6 @@ fn is_m3_qwen3_30b_a3b(
 // HF cache walk + format detection have a single source of truth across
 // `run` / `serve` / `bench`. Use `crate::source_resolver::find_cached_model`
 // / `crate::source_resolver::detect_format` directly.
-
-fn select_device() -> ferrum_types::Device {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    {
-        return ferrum_types::Device::Metal;
-    }
-
-    #[cfg(feature = "cuda")]
-    {
-        return ferrum_types::Device::CUDA(0);
-    }
-
-    #[allow(unreachable_code)]
-    ferrum_types::Device::CPU
-}
 
 fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
     match device {
