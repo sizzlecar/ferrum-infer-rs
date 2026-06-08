@@ -888,11 +888,69 @@ struct EngineInner {
     total_decode_tokens: AtomicU64,
     total_preemptions: AtomicU64,
     prefix_cache_hits: AtomicU64,
+    total_iteration_lock_wait_us: AtomicU64,
+    iteration_lock_wait_samples: AtomicU64,
+    total_scheduling_time_us: AtomicU64,
+    scheduling_time_samples: AtomicU64,
+    total_model_execution_time_us: AtomicU64,
+    model_execution_time_samples: AtomicU64,
     /// Set true the first time `ensure_bg_loop` runs, so per-request
     /// `infer_stream` callers don't each spawn their own competing
     /// driver task (16 streaming requests = 16 drivers thrashing on
     /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
     bg_loop_spawned: AtomicBool,
+}
+
+impl EngineInner {
+    fn record_iteration_lock_wait(&self, duration: Duration) {
+        self.total_iteration_lock_wait_us
+            .fetch_add(duration_to_us(duration), Ordering::Relaxed);
+        self.iteration_lock_wait_samples
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_scheduling_time(&self, duration: Duration) {
+        self.total_scheduling_time_us
+            .fetch_add(duration_to_us(duration), Ordering::Relaxed);
+        self.scheduling_time_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_model_execution_time(&self, duration: Duration) {
+        self.total_model_execution_time_us
+            .fetch_add(duration_to_us(duration), Ordering::Relaxed);
+        self.model_execution_time_samples
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn performance_breakdown(&self) -> ferrum_types::PerformanceBreakdown {
+        ferrum_types::PerformanceBreakdown {
+            scheduling_time_ms: avg_duration_ms(
+                self.total_scheduling_time_us.load(Ordering::Relaxed),
+                self.scheduling_time_samples.load(Ordering::Relaxed),
+            ),
+            model_execution_time_ms: avg_duration_ms(
+                self.total_model_execution_time_us.load(Ordering::Relaxed),
+                self.model_execution_time_samples.load(Ordering::Relaxed),
+            ),
+            other_overhead_time_ms: avg_duration_ms(
+                self.total_iteration_lock_wait_us.load(Ordering::Relaxed),
+                self.iteration_lock_wait_samples.load(Ordering::Relaxed),
+            ),
+            ..Default::default()
+        }
+    }
+}
+
+fn duration_to_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn avg_duration_ms(total_us: u64, samples: u64) -> f64 {
+    if samples == 0 {
+        0.0
+    } else {
+        total_us as f64 / samples as f64 / 1000.0
+    }
 }
 
 mod inner;
@@ -977,6 +1035,12 @@ impl ContinuousBatchEngine {
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
                 prefix_cache_hits: AtomicU64::new(0),
+                total_iteration_lock_wait_us: AtomicU64::new(0),
+                iteration_lock_wait_samples: AtomicU64::new(0),
+                total_scheduling_time_us: AtomicU64::new(0),
+                scheduling_time_samples: AtomicU64::new(0),
+                total_model_execution_time_us: AtomicU64::new(0),
+                model_execution_time_samples: AtomicU64::new(0),
                 bg_loop_spawned: AtomicBool::new(false),
             }),
         }
@@ -1027,7 +1091,9 @@ impl ContinuousBatchEngine {
                     None
                 };
                 {
+                    let lock_wait_start = Instant::now();
                     let _guard = inner.iteration_lock.lock().await;
+                    inner.record_iteration_lock_wait(lock_wait_start.elapsed());
                     if let Err(e) = inner.run_iteration().await {
                         warn!("Iteration error: {}", e);
                     }
@@ -1229,7 +1295,7 @@ impl InferenceEngine for ContinuousBatchEngine {
             },
             resource_utilization: Default::default(),
             error_stats: Default::default(),
-            performance_breakdown: Default::default(),
+            performance_breakdown: self.inner.performance_breakdown(),
         }
     }
 
