@@ -212,6 +212,26 @@ def validate_baseline_candidate_metadata_match(
         validate_same_metadata_value(baseline_metadata, candidate_metadata, key)
 
 
+def validate_optional_vllm_metadata(
+    optional_vllm_artifact: Path,
+    candidate_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    metadata = validate_metadata(optional_vllm_artifact, "vllm")
+    if model_identity(metadata) != model_identity(candidate_metadata):
+        raise ValidationError("vllm and candidate model identity differ")
+    for key in [
+        "cuda_version",
+        "driver_version",
+        "gpu_names",
+        "gpu_uuids",
+        "requested_gpu_devices",
+        "selected_gpu_devices",
+    ]:
+        if metadata.get(key) != candidate_metadata.get(key):
+            raise ValidationError(f"vllm and candidate metadata {key} differ")
+    return metadata
+
+
 def model_identity(metadata: dict[str, Any]) -> str:
     value = metadata.get("model_id") or metadata.get("model_path") or metadata.get("model")
     if isinstance(value, dict):
@@ -738,9 +758,13 @@ def validate_perf_goal(
     scan_artifact_logs(candidate_artifact, "candidate")
 
     vllm_tps = None
+    vllm_metadata = None
     target_tps = FIXED_PUBLIC_TARGET_TPS
     target_mode = "fixed_public_lower_bound"
     if optional_vllm_artifact is not None:
+        vllm_metadata = validate_optional_vllm_metadata(
+            optional_vllm_artifact, candidate_metadata
+        )
         vllm_tps = vllm_tps_from_artifact(optional_vllm_artifact)
         if vllm_tps > PUBLIC_REFERENCE_TPS:
             target_tps = 0.80 * vllm_tps
@@ -797,6 +821,15 @@ def validate_perf_goal(
         "stretch_output_tps": STRETCH_TARGET_TPS,
         "stretch_passed": candidate_max >= STRETCH_TARGET_TPS,
         "same_pod_vllm_output_tps": vllm_tps,
+        "same_pod_vllm_metadata": {
+            "git_sha": vllm_metadata.get("git_sha"),
+            "cuda_version": vllm_metadata.get("cuda_version"),
+            "driver_version": vllm_metadata.get("driver_version"),
+            "gpu_names": vllm_metadata.get("gpu_names"),
+            "gpu_uuids": vllm_metadata.get("gpu_uuids"),
+        }
+        if vllm_metadata is not None
+        else None,
         "baseline_max_c4_c8_c16_output_tps": baseline_max,
         "candidate_max_c4_c8_c16_output_tps": candidate_max,
         "baseline_throughput_by_concurrency": baseline_bench["throughput_by_concurrency"],
@@ -1059,6 +1092,23 @@ def make_correctness_artifact(root: Path) -> None:
 
 def make_vllm_artifact(root: Path, tps: float) -> None:
     write_json(
+        root / "metadata.json",
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "git_sha": "abcdef0123456789abcdef0123456789abcdef01",
+            "dirty_status": {"is_dirty": False, "status_short": []},
+            "binary_sha256": "a" * 64,
+            "model_id": "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+            "cuda_version": "12.4",
+            "driver_version": "550.54.15",
+            "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
+            "gpu_uuids": ["GPU-baseline-0", "GPU-baseline-1"],
+            "requested_gpu_devices": [0, 1],
+            "selected_gpu_devices": [0, 1],
+        },
+    )
+    write_json(
         root / "vllm-baseline.json",
         [
             {"concurrency": c, "output_throughput": tps if c == 8 else tps - 1.0}
@@ -1196,6 +1246,24 @@ def run_self_test() -> None:
             raise AssertionError("wrong-baseline candidate unexpectedly passed")
         except ValidationError as exc:
             if "baseline selected_pipeline_mode" not in str(exc):
+                raise
+
+        vllm_hardware_mismatch = root / "vllm-hardware-mismatch"
+        make_vllm_artifact(vllm_hardware_mismatch, 40.0)
+        metadata = load_json(vllm_hardware_mismatch / "metadata.json")
+        metadata["gpu_uuids"] = ["GPU-vllm-other-0", "GPU-vllm-other-1"]
+        write_json(vllm_hardware_mismatch / "metadata.json", metadata)
+        try:
+            validate_perf_goal(
+                out_dir=root / "vllm-hardware-mismatch-out",
+                baseline_artifact=baseline,
+                candidate_artifact=candidate,
+                correctness_artifact=correctness,
+                optional_vllm_artifact=vllm_hardware_mismatch,
+            )
+            raise AssertionError("vllm hardware mismatch unexpectedly passed")
+        except ValidationError as exc:
+            if "vllm and candidate metadata gpu_uuids differ" not in str(exc):
                 raise
 
         bridge_mismatch = root / "bridge-mismatch"
