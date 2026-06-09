@@ -927,6 +927,17 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
     return cmd
 
 
+def run_cli_probe_input_text() -> str:
+    return "\n".join(
+        [
+            f"Remember the exact ferrum-prefixed phrase {RECALL_MARKER}. Answer OK only.",
+            "In the first user message, what exact ferrum-prefixed phrase were you asked to remember? Output only that complete phrase.",
+            "/bye",
+            "",
+        ]
+    )
+
+
 def build_serve_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: Path) -> list[str]:
     cmd = [
         str(ferrum_bin),
@@ -1657,14 +1668,7 @@ def write_goal_correctness_artifact(root: Path, checks: dict[str, Any]) -> dict[
 
 
 def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any]) -> dict[str, Any]:
-    input_text = "\n".join(
-        [
-            f"Output only the exact token inside brackets: [{RECALL_MARKER}].",
-            "Output only the exact token inside brackets from the previous user message.",
-            "/bye",
-            "",
-        ]
-    )
+    input_text = run_cli_probe_input_text()
     cmd = build_run_command(ferrum_bin, cfg["model"], cfg, root)
     write_json(
         root / "run.command.json",
@@ -2261,6 +2265,11 @@ def self_test() -> int:
     assert "8" in cmd
     assert "--max-num-batched-tokens" in cmd
     assert "1024" in cmd
+    run_probe_input = run_cli_probe_input_text()
+    assert run_probe_input.count(RECALL_MARKER) == 1
+    assert "first user message" in run_probe_input
+    assert "complete phrase" in run_probe_input
+    assert "inside brackets" not in run_probe_input
     serve_cmd = build_serve_command(
         Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out")
     )
