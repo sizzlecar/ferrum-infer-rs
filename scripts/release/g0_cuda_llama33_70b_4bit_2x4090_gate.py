@@ -47,7 +47,7 @@ BAD_PATTERNS = [
     "<|tool|>",
 ]
 DEFAULT_LAYER_SPLIT_PLAN = "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
-RECALL_MARKER = "OK"
+RECALL_MARKER = "zymora"
 MODEL_MANIFEST_INTERESTING_SUFFIXES = {".json", ".model", ".safetensors", ".gguf"}
 TOKENIZER_METADATA_FILE_NAMES = {
     "tokenizer.json",
@@ -930,8 +930,8 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
 def run_cli_probe_input_text() -> str:
     return "\n".join(
         [
-            "Answer exactly OK.",
-            "Repeat your immediately previous assistant message exactly, with no other text.",
+            f"Remember the codeword {RECALL_MARKER}. Reply exactly OK.",
+            "What codeword did I ask you to remember? Answer with only the codeword.",
             "/bye",
             "",
         ]
@@ -1854,15 +1854,12 @@ def serve_multiturn_probe_messages() -> list[dict[str, str]]:
     return [
         {
             "role": "user",
-            "content": "Answer exactly OK.",
+            "content": f"Remember the codeword {RECALL_MARKER}. Reply exactly OK.",
         },
         {"role": "assistant", "content": "OK"},
         {
             "role": "user",
-            "content": (
-                "Repeat your immediately previous assistant message exactly, "
-                "with no other text."
-            ),
+            "content": "What codeword did I ask you to remember? Answer with only the codeword.",
         },
     ]
 
@@ -2325,18 +2322,18 @@ def self_test() -> int:
     assert "1024" in cmd
     run_probe_input = run_cli_probe_input_text()
     assert run_probe_input.count(RECALL_MARKER) == 1
-    assert "Answer exactly OK" in run_probe_input
-    assert "Repeat your immediately previous assistant message" in run_probe_input
-    assert recall_matches_marker("OK")
-    assert recall_matches_marker(" ok ")
-    assert not recall_matches_marker("Answer exactly OK.")
+    assert "Remember the codeword" in run_probe_input
+    assert "What codeword did I ask you to remember" in run_probe_input
+    assert recall_matches_marker(RECALL_MARKER)
+    assert recall_matches_marker(f" {RECALL_MARKER.upper()} ")
+    assert not recall_matches_marker(f"Remember the codeword {RECALL_MARKER}.")
     assert "inside brackets" not in run_probe_input
     serve_probe_text = "\n".join(
         message["content"] for message in serve_multiturn_probe_messages()
     )
-    assert serve_probe_text.count(RECALL_MARKER) == 2
-    assert "Answer exactly OK" in serve_probe_text
-    assert "Repeat your immediately previous assistant message" in serve_probe_text
+    assert serve_probe_text.count(RECALL_MARKER) == 1
+    assert "Remember the codeword" in serve_probe_text
+    assert "What codeword did I ask you to remember" in serve_probe_text
     assert f"[{RECALL_MARKER}]" not in serve_probe_text
     serve_cmd = build_serve_command(
         Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out")
