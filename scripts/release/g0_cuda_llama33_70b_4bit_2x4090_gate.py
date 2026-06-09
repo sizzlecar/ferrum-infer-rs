@@ -930,8 +930,14 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
 def run_cli_probe_input_text() -> str:
     return "\n".join(
         [
-            f"Remember the exact ferrum-prefixed phrase {RECALL_MARKER}. Answer OK only.",
-            "In the first user message, what exact ferrum-prefixed phrase were you asked to remember? Output only that complete phrase.",
+            (
+                "Memory test. Store this secret token exactly: "
+                f"{RECALL_MARKER}. For this turn, output exactly OK."
+            ),
+            (
+                "What secret token did I ask you to store earlier? "
+                "Output exactly the token and nothing else."
+            ),
             "/bye",
             "",
         ]
@@ -1805,15 +1811,16 @@ def serve_multiturn_probe_messages() -> list[dict[str, str]]:
         {
             "role": "user",
             "content": (
-                f"Remember the exact ferrum-prefixed phrase {RECALL_MARKER}. Answer OK only."
+                "Memory test. Store this secret token exactly: "
+                f"{RECALL_MARKER}. For this turn, output exactly OK."
             ),
         },
         {"role": "assistant", "content": "OK"},
         {
             "role": "user",
             "content": (
-                "In the first user message, what exact ferrum-prefixed phrase were "
-                "you asked to remember? Output only that complete phrase."
+                "What secret token did I ask you to store earlier? "
+                "Output exactly the token and nothing else."
             ),
         },
     ]
@@ -2277,15 +2284,17 @@ def self_test() -> int:
     assert "1024" in cmd
     run_probe_input = run_cli_probe_input_text()
     assert run_probe_input.count(RECALL_MARKER) == 1
-    assert "first user message" in run_probe_input
-    assert "complete phrase" in run_probe_input
+    assert "secret token" in run_probe_input
+    assert "output exactly OK" in run_probe_input
+    assert "Output exactly the token" in run_probe_input
     assert "inside brackets" not in run_probe_input
     serve_probe_text = "\n".join(
         message["content"] for message in serve_multiturn_probe_messages()
     )
     assert serve_probe_text.count(RECALL_MARKER) == 1
-    assert "first user message" in serve_probe_text
-    assert "complete phrase" in serve_probe_text
+    assert "secret token" in serve_probe_text
+    assert "output exactly OK" in serve_probe_text
+    assert "Output exactly the token" in serve_probe_text
     assert f"[{RECALL_MARKER}]" not in serve_probe_text
     serve_cmd = build_serve_command(
         Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out")

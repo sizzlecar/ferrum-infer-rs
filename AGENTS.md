@@ -340,6 +340,7 @@ Remote validation workflow:
 - On the remote host, verify `git rev-parse HEAD` and `git status --short` before collecting evidence. Dirty remote state is not acceptable for performance claims unless the dirty files are explicitly listed in the artifacts.
 - Install Rust and other build dependencies on the instance only as needed for the lane. Keep environment variables and runtime options visible in the saved command log, except for secrets.
 - For large Hugging Face model lanes, start a model snapshot prefetch into the documented remote `HF_HOME` in parallel with long CUDA builds when the cache is empty. Keep the official gate command unchanged, save the prefetch log as an auxiliary non-gate artifact, and do not copy or pass HF secrets unless the user explicitly approves that lane.
+- When using Python `huggingface_hub.snapshot_download` for that prefetch, align the cache layout with Ferrum's `HF_HOME` lookup: set `HF_HOME=/workspace/hf-cache` and use `cache_dir="$HF_HOME/hub"` or omit `cache_dir`; do not use `cache_dir="$HF_HOME"` because Ferrum expects snapshots under `$HF_HOME/hub/models--...`.
 - Run the lane's correctness gate before any performance command. Product-path CUDA evidence must include the required `ferrum run` and `ferrum serve` coverage from the relevant gate or goal document.
 - Run benchmark commands from the goal document or release policy, not ad hoc hidden environment-variable combinations.
 
