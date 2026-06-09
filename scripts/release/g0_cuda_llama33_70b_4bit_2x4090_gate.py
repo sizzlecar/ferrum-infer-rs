@@ -1161,6 +1161,14 @@ def strip_think(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
 
 
+def normalized_recall(text: str) -> str:
+    return strip_think(text).strip().strip("\"'`").strip()
+
+
+def recall_matches_marker(text: str) -> bool:
+    return normalized_recall(text).casefold() == RECALL_MARKER.casefold()
+
+
 def assistant_text_from_jsonl(stdout: str) -> list[dict[str, Any]]:
     turns: list[dict[str, Any]] = []
     for line in stdout.splitlines():
@@ -1704,7 +1712,7 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
         if turn.get("finish_reason") == "length":
             raise RuntimeError(f"ferrum run assistant turn finished by length: {turn}")
     recall = strip_think(str(turns[-1].get("content") or ""))
-    if RECALL_MARKER.lower() not in recall.lower():
+    if not recall_matches_marker(recall):
         raise RuntimeError(f"ferrum run recall failed: {recall[:500]!r}")
     effective = require_effective_config(root / "run.effective_config.json", "run", cfg)
     return {
@@ -1801,7 +1809,7 @@ def serve_multiturn(root: Path, base_url: str, model: str) -> dict[str, Any]:
             row["content"] = content
             row["finish_reason"] = finish_reason
             assert_no_bad_patterns(f"serve multiturn attempt {attempt}", content)
-            if RECALL_MARKER.lower() not in strip_think(content).lower():
+            if not recall_matches_marker(content):
                 raise RuntimeError(f"recall failed: {content[:500]!r}")
             if finish_reason == "length":
                 raise RuntimeError("finished by length")
@@ -2319,6 +2327,9 @@ def self_test() -> int:
     assert run_probe_input.count(RECALL_MARKER) == 1
     assert "Answer exactly OK" in run_probe_input
     assert "Repeat your immediately previous assistant message" in run_probe_input
+    assert recall_matches_marker("OK")
+    assert recall_matches_marker(" ok ")
+    assert not recall_matches_marker("Answer exactly OK.")
     assert "inside brackets" not in run_probe_input
     serve_probe_text = "\n".join(
         message["content"] for message in serve_multiturn_probe_messages()
