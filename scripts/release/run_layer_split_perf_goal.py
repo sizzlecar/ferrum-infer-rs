@@ -457,7 +457,7 @@ def command_plan(
         correctness_gate = "candidate layer_split_perf_qwen72b_gptq correctness matrix"
         performance_command = (
             "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
-            "--n-repeats 3 --concurrency-sweep 1,4,8,16"
+            "--n-repeats 3 --concurrency-sweep 1,4,8,16,32"
         )
     commands: dict[str, list[str]] = {
         "build_cuda_release": CUDA_BUILD_COMMAND,
@@ -796,7 +796,7 @@ def self_test() -> int:
                 "name": "baseline",
                 "model": "selftest/model",
                 "layer_split_pipeline_mode": "batch",
-                "concurrency_cells": [1, 4, 8, 16],
+                "concurrency_cells": [1, 4, 8, 16, 32],
                 "num_prompts": 96,
                 "warmup_requests": 10,
                 "n_repeats": 3,

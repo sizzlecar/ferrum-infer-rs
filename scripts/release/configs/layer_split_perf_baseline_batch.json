@@ -13,7 +13,7 @@
   "kv_capacity": 2048,
   "max_num_seqs": 8,
   "max_num_batched_tokens": 1024,
-  "concurrency_cells": [1, 4, 8, 16],
+  "concurrency_cells": [1, 4, 8, 16, 32],
   "num_prompts": 96,
   "warmup_requests": 10,
   "n_repeats": 3,

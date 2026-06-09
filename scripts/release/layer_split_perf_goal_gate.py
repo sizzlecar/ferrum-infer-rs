@@ -16,8 +16,8 @@ PASS_PREFIX = "LAYER_SPLIT_PERF GOAL PASS"
 SELFTEST_PASS = "LAYER_SPLIT_PERF GOAL SELFTEST PASS"
 SOURCE_GATE_LANE = "layer_split_perf_qwen72b_gptq"
 SOURCE_GATE_PASS_PREFIX = f"G0 SOURCE {SOURCE_GATE_LANE} PASS"
-REQUIRED_CONCURRENCY_CELLS = {1, 4, 8, 16}
-THROUGHPUT_TARGET_CELLS = {4, 8, 16}
+REQUIRED_CONCURRENCY_CELLS = {1, 4, 8, 16, 32}
+THROUGHPUT_TARGET_CELLS = {4, 8, 16, 32}
 FIXED_PUBLIC_TARGET_TPS = 27.6
 STRETCH_TARGET_TPS = 33.0
 PUBLIC_REFERENCE_TPS = 34.5
@@ -1567,7 +1567,7 @@ def vllm_tps_from_artifact(path: Path) -> float:
         if tps is not None:
             values.append(tps)
     if not values:
-        raise ValidationError("vllm artifact missing c4/c8/c16 throughput")
+        raise ValidationError("vllm artifact missing c4/c8/c16/c32 throughput")
     return max(values)
 
 
@@ -1686,11 +1686,11 @@ def validate_perf_goal(
     candidate_max = float(candidate_bench["max_target_tps"])
     if candidate_max <= baseline_max:
         raise ValidationError(
-            f"candidate max c4/c8/c16 throughput {candidate_max:.3f} <= baseline {baseline_max:.3f}"
+            f"candidate max c4/c8/c16/c32 throughput {candidate_max:.3f} <= baseline {baseline_max:.3f}"
         )
     if candidate_max < target_tps:
         raise ValidationError(
-            f"candidate max c4/c8/c16 throughput {candidate_max:.3f} < target {target_tps:.3f}"
+            f"candidate max c4/c8/c16/c32 throughput {candidate_max:.3f} < target {target_tps:.3f}"
         )
     fixed_public_target_passed = candidate_max >= FIXED_PUBLIC_TARGET_TPS
     same_pod_vllm_target_tps = 0.80 * vllm_tps if vllm_tps is not None else None
@@ -1781,8 +1781,8 @@ def validate_perf_goal(
         if vllm_metadata is not None
         else None,
         "same_pod_vllm_hardware_evidence": vllm_hardware,
-        "baseline_max_c4_c8_c16_output_tps": baseline_max,
-        "candidate_max_c4_c8_c16_output_tps": candidate_max,
+        "baseline_max_c4_c8_c16_c32_output_tps": baseline_max,
+        "candidate_max_c4_c8_c16_c32_output_tps": candidate_max,
         "baseline_throughput_by_concurrency": baseline_bench["throughput_by_concurrency"],
         "candidate_throughput_by_concurrency": candidate_bench["throughput_by_concurrency"],
         "baseline_bench_summary_by_concurrency": baseline_bench[
@@ -1885,8 +1885,8 @@ def validate_perf_goal(
                 f"- Same-pod vLLM 80% target: {same_pod_target_summary}",
                 f"- Same-pod vLLM 80% passed: {same_pod_vllm_target_passed}",
                 f"- Stretch target: {STRETCH_TARGET_TPS:.3f} tok/s",
-                f"- Baseline max c4/c8/c16: {baseline_max:.3f} tok/s",
-                f"- Candidate max c4/c8/c16: {candidate_max:.3f} tok/s",
+                f"- Baseline max c4/c8/c16/c32: {baseline_max:.3f} tok/s",
+                f"- Candidate max c4/c8/c16/c32: {candidate_max:.3f} tok/s",
                 f"- Stretch passed: {candidate_max >= STRETCH_TARGET_TPS}",
                 f"- Baseline throughput by concurrency: {baseline_tps_summary}",
                 f"- Candidate throughput by concurrency: {candidate_tps_summary}",
@@ -1945,6 +1945,11 @@ def make_perf_artifact(
     pipeline_mode: str,
     diagnostic: bool = False,
 ) -> None:
+    sorted_cells = sorted(REQUIRED_CONCURRENCY_CELLS)
+    if not tps_by_c:
+        raise AssertionError("make_perf_artifact requires at least one throughput cell")
+    last_tps = tps_by_c[sorted(tps_by_c)[-1]]
+    complete_tps_by_c = {cell: tps_by_c.get(cell, last_tps) for cell in sorted_cells}
     metadata = {
         "schema_version": 1,
         "status": "pass",
@@ -2050,8 +2055,8 @@ def make_perf_artifact(
                     "bench_concurrency": concurrency,
                     "bench_concurrency_sweep": sorted(REQUIRED_CONCURRENCY_CELLS),
                     "gpus": [
-                        dict(gpu_rows[0], utilization_gpu_percent=80 + concurrency),
-                        dict(gpu_rows[1], utilization_gpu_percent=83 + concurrency),
+                        dict(gpu_rows[0], utilization_gpu_percent=min(99, 60 + concurrency)),
+                        dict(gpu_rows[1], utilization_gpu_percent=min(99, 63 + concurrency)),
                     ],
                 },
                 sort_keys=True,
@@ -2300,7 +2305,7 @@ def make_perf_artifact(
                 "--n-repeats",
                 "3",
                 "--concurrency-sweep",
-                "1,4,8,16",
+                "1,4,8,16,32",
                 "--random-input-len",
                 "256",
                 "--random-output-len",
@@ -2320,7 +2325,7 @@ def make_perf_artifact(
     )
     write_json(
         root / "bench-serve.json",
-        [bench_report(c, tps_by_c[c]) for c in sorted(REQUIRED_CONCURRENCY_CELLS)],
+        [bench_report(c, complete_tps_by_c[c]) for c in sorted_cells],
     )
     write_text(root / "run.stdout", "Paris is in France\n")
     write_text(root / "run.stderr", "")
@@ -2442,8 +2447,8 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
                     "bench_concurrency": concurrency,
                     "bench_concurrency_sweep": sorted(REQUIRED_CONCURRENCY_CELLS),
                     "gpus": [
-                        dict(gpu_rows[0], utilization_gpu_percent=70 + concurrency),
-                        dict(gpu_rows[1], utilization_gpu_percent=74 + concurrency),
+                        dict(gpu_rows[0], utilization_gpu_percent=min(99, 58 + concurrency)),
+                        dict(gpu_rows[1], utilization_gpu_percent=min(99, 61 + concurrency)),
                     ],
                 },
                 sort_keys=True,
@@ -2489,7 +2494,7 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
                 "--n-repeats",
                 "3",
                 "--concurrency-sweep",
-                "1,4,8,16",
+                "1,4,8,16,32",
                 "--random-input-len",
                 "256",
                 "--random-output-len",
@@ -2574,29 +2579,21 @@ def run_self_test() -> None:
         if candidate_c8["errored_total"] != 0 or candidate_c8["bad_output_total"] != 0:
             raise AssertionError("selftest expected candidate c8 zero bad counts")
         if result["hardware_evidence"]["bench_sample_count_by_concurrency"] != {
-            1: 1,
-            4: 1,
-            8: 1,
-            16: 1,
+            cell: 1 for cell in sorted(REQUIRED_CONCURRENCY_CELLS)
         }:
             raise AssertionError("selftest expected per-concurrency GPU sample counts")
         if result["hardware_evidence"][
             "bench_max_gpu_utilization_percent_by_concurrency"
-        ][16] != [96, 99]:
-            raise AssertionError("selftest expected c16 GPU utilization summary")
+        ][32] != [92, 95]:
+            raise AssertionError("selftest expected c32 GPU utilization summary")
         if result["same_pod_vllm_hardware_evidence"][
             "bench_sample_count_by_concurrency"
-        ] != {
-            1: 1,
-            4: 1,
-            8: 1,
-            16: 1,
-        }:
+        ] != {cell: 1 for cell in sorted(REQUIRED_CONCURRENCY_CELLS)}:
             raise AssertionError("selftest expected vLLM per-concurrency GPU sample counts")
         if result["same_pod_vllm_hardware_evidence"][
             "bench_max_gpu_utilization_percent_by_concurrency"
-        ][16] != [86, 90]:
-            raise AssertionError("selftest expected vLLM c16 GPU utilization summary")
+        ][32] != [90, 93]:
+            raise AssertionError("selftest expected vLLM c32 GPU utilization summary")
         final_json = load_json(root / "out" / "layer_split_perf_goal_gate.json")
         if (
             final_json["candidate_bench_summary_by_concurrency"]["8"][
@@ -2605,15 +2602,15 @@ def run_self_test() -> None:
             != "usage"
         ):
             raise AssertionError("selftest expected persisted bench summary usage source")
-        if final_json["hardware_evidence"]["bench_sample_count_by_concurrency"]["16"] != 1:
-            raise AssertionError("selftest expected persisted c16 GPU sample count")
+        if final_json["hardware_evidence"]["bench_sample_count_by_concurrency"]["32"] != 1:
+            raise AssertionError("selftest expected persisted c32 GPU sample count")
         if (
             final_json["same_pod_vllm_hardware_evidence"][
                 "bench_sample_count_by_concurrency"
-            ]["16"]
+            ]["32"]
             != 1
         ):
-            raise AssertionError("selftest expected persisted vLLM c16 GPU sample count")
+            raise AssertionError("selftest expected persisted vLLM c32 GPU sample count")
         summary = (root / "out" / "summary.md").read_text()
         for expected in [
             "Baseline source gate:",
@@ -2630,8 +2627,8 @@ def run_self_test() -> None:
             "tp=2",
             "Candidate GPU max utilization by concurrency:",
             "Same-pod vLLM GPU max utilization by concurrency:",
-            "c16=96/99%",
-            "c16=86/90%",
+            "c32=92/95%",
+            "c32=90/93%",
             "Candidate c8 bench:",
             "TTFT p50=",
             "TPOT p50=",

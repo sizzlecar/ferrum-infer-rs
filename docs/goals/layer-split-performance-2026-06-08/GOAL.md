@@ -50,7 +50,7 @@ G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS: docs/release/g0/llama33-2x4090-fe
 - Git SHA：`89daf6e983c50081a411d08c014c61ac00cc0044`
 - 二进制 SHA256：`0f99fc0775d545e5f74c07ca01256a7f8987479dc21916e6320efdeeba2821f3`
 - 构建特性：`cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`
-- Benchmark 参数：`--fail-on-error --require-ci --seed 9271 --n-repeats 3 --concurrency-sweep 1,4,8,16`
+- Benchmark 参数：`--fail-on-error --require-ci --seed 9271 --n-repeats 3 --concurrency-sweep 1,4,8,16,32`
 - 每个 cell：`completed=96/96`，`errored=0`，`bad_outputs=0`
 - Token 计数来源：OpenAI usage 字段
 
@@ -165,7 +165,7 @@ G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS: docs/release/g0/llama33-2x4090-fe
 - host copy 和 device copy 耗时；
 - model lock 等待时间；
 - scheduler / admission 等待时间；
-- c=1、c=4、c=8、c=16 下两张 GPU 的利用率。
+- c=1、c=4、c=8、c=16、c=32 下两张 GPU 的利用率。
 
 ### 阶段 1：批量感知的层切分
 
@@ -234,7 +234,7 @@ GPU0: stage0(microbatch i + 1)
 
 本阶段验收标准：
 
-- c=1、c=4、c=8、c=16 下没有请求输出污染。
+- c=1、c=4、c=8、c=16、c=32 下没有请求输出污染。
 - 没有重复或缺失 stream `[DONE]`。
 - 并发 sequence 之间没有请求串扰。
 - 队列不会无界增长。
@@ -289,7 +289,7 @@ ferrum bench-serve ... \
   --require-ci \
   --seed 9271 \
   --n-repeats 3 \
-  --concurrency-sweep 1,4,8,16
+  --concurrency-sweep 1,4,8,16,32
 ```
 
 最终性能 artifact 必须包含：
@@ -309,19 +309,19 @@ ferrum bench-serve ... \
 必达阈值：
 
 ```text
-max(c4,c8,c16 aggregate output throughput) >= 27.6 tok/s
+max(c4,c8,c16,c32 aggregate output throughput) >= 27.6 tok/s
 ```
 
 Stretch 阈值：
 
 ```text
-max(c4,c8,c16 aggregate output throughput) >= 33.0 tok/s
+max(c4,c8,c16,c32 aggregate output throughput) >= 33.0 tok/s
 ```
 
 如果采集了同 pod vLLM baseline，则用下面的目标替代固定必达阈值：
 
 ```text
-max(c4,c8,c16 Ferrum output throughput) >= 0.80 * same_pod_vllm_output_tps
+max(c4,c8,c16,c32 Ferrum output throughput) >= 0.80 * same_pod_vllm_output_tps
 ```
 
 最终报告必须说明本目标通过的是固定公开下限、同 pod vLLM 80% 目标，还是两者都通过。
@@ -397,6 +397,6 @@ LAYER_SPLIT_PERF GOAL PASS: <out_dir>
 ## 待确认问题
 
 - 实现前是否先采集 Qwen2.5-72B-GPTQ 的同 pod 当前 vLLM baseline，还是先使用 MLC 34.5 tok/s 70B 级别公开下限？
-- 第一个可接受收益应指定 c=4 或 c=8，还是使用 `max(c4,c8,c16)`？
+- 第一个可接受收益应指定 c=4、c=8、c=16，还是使用 `max(c4,c8,c16,c32)`？
 - CUDA backend 是否能干净暴露 peer-copy capability 作为产品默认，还是 device bridge 应先作为显式文档化 experimental mode？
 - `llm_executor` 当前 model lock 是否兼容 overlapped stage workers，还是需要缩小 model-forward critical section？
