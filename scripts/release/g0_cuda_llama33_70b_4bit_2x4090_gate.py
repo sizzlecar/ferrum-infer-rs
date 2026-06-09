@@ -29,6 +29,8 @@ from openai_tool_call_regression import run_tool_call_regression
 LANE = "g0_cuda2x4090_llama33_70b_4bit"
 PASS_LINE_PREFIX = f"G0 SOURCE {LANE} PASS"
 SMOKE_LANE = "g0_cuda2x4090_llama33_70b_4bit_smoke"
+QWEN72B_LANE = "layer_split_perf_qwen72b_gptq"
+QWEN72B_SMOKE_LANE = "layer_split_perf_qwen72b_gptq_smoke"
 REQUIRED_GPU_DEVICES = [0, 1]
 BAD_PATTERNS = [
     "panic",
@@ -2037,7 +2039,7 @@ def run_ferrum_bench_gate(
         model=model,
         tokenizer_dir=tokenizer_dir,
         out_file=root / "bench-serve.json",
-        tag="cuda-llama33-70b-4bit-2x4090",
+        tag=str(cfg.get("bench_tag", LANE)),
     )
     write_json(root / "bench-serve.command.json", {"status": "run", "cmd": cmd})
     proc = run_with_gpu_samples(
@@ -2639,7 +2641,11 @@ def main() -> int:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--ferrum-bin", type=Path, default=Path("./target/release/ferrum"))
-    parser.add_argument("--lane-name", default=LANE, choices=[LANE, SMOKE_LANE])
+    parser.add_argument(
+        "--lane-name",
+        default=LANE,
+        choices=[LANE, SMOKE_LANE, QWEN72B_LANE, QWEN72B_SMOKE_LANE],
+    )
     args = parser.parse_args()
     LANE = args.lane_name
     PASS_LINE_PREFIX = f"G0 SOURCE {LANE} PASS"

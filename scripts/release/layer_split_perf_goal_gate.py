@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Final validator for the Llama layer-split performance goal."""
+"""Final validator for the Qwen 72B layer-split performance goal."""
 
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ from typing import Any
 
 PASS_PREFIX = "LAYER_SPLIT_PERF GOAL PASS"
 SELFTEST_PASS = "LAYER_SPLIT_PERF GOAL SELFTEST PASS"
-SOURCE_GATE_PASS_PREFIX = "G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS"
+SOURCE_GATE_LANE = "layer_split_perf_qwen72b_gptq"
+SOURCE_GATE_PASS_PREFIX = f"G0 SOURCE {SOURCE_GATE_LANE} PASS"
 REQUIRED_CONCURRENCY_CELLS = {1, 4, 8, 16}
 THROUGHPUT_TARGET_CELLS = {4, 8, 16}
 FIXED_PUBLIC_TARGET_TPS = 27.6
@@ -445,7 +446,7 @@ def validate_hardware_summaries_match(
 
 def validate_source_gate_artifact(path: Path, label: str) -> dict[str, Any]:
     gate = first_json(path, ["gate.json"], f"{label} source gate")
-    if gate.get("lane") != "g0_cuda2x4090_llama33_70b_4bit":
+    if gate.get("lane") != SOURCE_GATE_LANE:
         raise ValidationError(f"{label}: source gate lane mismatch")
     pass_line = gate.get("pass_line")
     expected = f"{SOURCE_GATE_PASS_PREFIX}: {path}"
@@ -1950,7 +1951,7 @@ def make_perf_artifact(
         "git_sha": "abcdef0123456789abcdef0123456789abcdef01",
         "dirty_status": {"is_dirty": False, "status_short": []},
         "binary_sha256": "a" * 64,
-        "model_id": "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+        "model_id": "Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4",
         "cuda_version": "12.4",
         "driver_version": "550.54.15",
         "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
@@ -1977,7 +1978,7 @@ def make_perf_artifact(
         {
             "schema_version": 1,
             "status": "pass",
-            "lane": "g0_cuda2x4090_llama33_70b_4bit",
+            "lane": SOURCE_GATE_LANE,
             "checks": gate_checks,
             "pass_line": f"{SOURCE_GATE_PASS_PREFIX}: {root}",
         },
@@ -2066,10 +2067,10 @@ def make_perf_artifact(
             "status": "pass",
             "model": metadata["model_id"],
             "model_id": metadata["model_id"],
-            "model_path": "/models/clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+            "model_path": "/models/Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4",
             "resolved_from": "hf_cache_snapshot",
             "quant_format": "gptq_int4",
-            "tokenizer_path": "/models/clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+            "tokenizer_path": "/models/Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4",
             "config_sha256": "b" * 64,
             "tokenizer_sha256": "c" * 64,
             "tokenizer_metadata_sha256": "d" * 64,
@@ -2289,7 +2290,7 @@ def make_perf_artifact(
                 "--model",
                 metadata["model_id"],
                 "--tokenizer",
-                "/models/clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "/models/Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4",
                 "--dataset",
                 "random",
                 "--fail-on-error",
@@ -2313,7 +2314,7 @@ def make_perf_artifact(
                 "--out",
                 str(root / "bench-serve.json"),
                 "--tag",
-                "cuda-llama33-70b-4bit-2x4090",
+                "layer-split-perf-qwen72b-gptq",
             ]
         },
     )
@@ -2362,7 +2363,7 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
         "git_sha": "abcdef0123456789abcdef0123456789abcdef01",
         "dirty_status": {"is_dirty": False, "status_short": []},
         "binary_sha256": "a" * 64,
-        "model_id": "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+        "model_id": "Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4",
         "cuda_version": "12.4",
         "driver_version": "550.54.15",
         "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
@@ -2458,7 +2459,7 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
             "server_cmd": [
                 "vllm",
                 "serve",
-                "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -2466,7 +2467,7 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
                 "--tensor-parallel-size",
                 "2",
                 "--served-model-name",
-                "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4",
                 "--quantization",
                 "gptq",
             ],
@@ -2476,9 +2477,9 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
                 "--base-url",
                 "http://127.0.0.1:19401",
                 "--model",
-                "clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4",
                 "--tokenizer",
-                "/models/clowman/Llama-3.3-70B-Instruct-GPTQ-Int4",
+                "/models/Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4",
                 "--dataset",
                 "random",
                 "--fail-on-error",
@@ -2502,7 +2503,7 @@ def make_vllm_artifact(root: Path, tps: float) -> None:
                 "--out",
                 str(root / "vllm-baseline.json"),
                 "--tag",
-                "vllm-llama33-70b-4bit-2x4090",
+                "vllm-qwen72b-gptq-2x4090",
             ],
             "same_hardware_required": True,
         },
@@ -2679,7 +2680,7 @@ def run_self_test() -> None:
             pipeline_mode="overlapped",
         )
         gate = load_json(wrong_gate_lane / "gate.json")
-        gate["lane"] = "g0_cuda2x4090_llama33_70b_4bit_smoke"
+        gate["lane"] = "layer_split_perf_qwen72b_gptq_smoke"
         gate["pass_line"] = f"G0 SOURCE {gate['lane']} PASS: {wrong_gate_lane}"
         write_json(wrong_gate_lane / "gate.json", gate)
         try:

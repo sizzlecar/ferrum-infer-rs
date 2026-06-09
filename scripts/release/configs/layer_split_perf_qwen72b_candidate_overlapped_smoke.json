@@ -1,5 +1,5 @@
 {
-  "name": "layer-split-perf-qwen72b-baseline-batch",
+  "name": "layer-split-perf-qwen72b-candidate-overlapped-smoke",
   "model": "Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4",
   "model_architecture": "qwen2_dense",
   "num_hidden_layers": 80,
@@ -8,18 +8,19 @@
   "port": 19430,
   "gpu_devices": [0, 1],
   "distributed_strategy": "layer_split",
-  "layer_split_pipeline_mode": "batch",
+  "layer_split_pipeline_mode": "overlapped",
   "max_model_len": 8192,
   "kv_capacity": 2048,
   "max_num_seqs": 8,
   "max_num_batched_tokens": 1024,
-  "concurrency_cells": [1, 4, 8, 16],
-  "num_prompts": 96,
-  "warmup_requests": 10,
-  "n_repeats": 3,
+  "concurrency_cells": [1, 4],
+  "num_prompts": 24,
+  "warmup_requests": 4,
+  "n_repeats": 1,
+  "require_ci": false,
   "run_vllm_baseline": false,
   "random_input_len": 256,
   "random_output_len": 128,
   "seed": 9271,
-  "bench_tag": "layer-split-perf-qwen72b-gptq-baseline"
+  "bench_tag": "layer-split-perf-qwen72b-gptq-candidate-smoke"
 }
