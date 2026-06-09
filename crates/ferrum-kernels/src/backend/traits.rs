@@ -671,6 +671,14 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32>;
     fn from_slice(data: &[f32]) -> Self::Buffer;
 
+    fn write_f32_to_activation(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[f32]) {
+        if data.is_empty() {
+            return;
+        }
+        let src = Self::from_slice(data);
+        Self::copy_slice(ctx, &src, 0, dst, 0, data.len());
+    }
+
     /// Greedy-decode fast path: GPU argmax over each row of a
     /// `[m, n]` FP16 logits buffer, returning the m token indices on the
     /// host. Saves `m × n × 2` bytes of D2H per call (e.g. 19.5 MB at

@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const M3_QWEN3_30B_A3B_INT4_PRESET: &str = "m3_qwen3_30b_a3b_int4";
+pub const QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET: &str =
+    "qwen25_72b_gptq_int4_2x4090_layer_split";
 const DEFAULT_KV_BLOCK_SIZE_TOKENS: usize = 16;
 const DEFAULT_KV_BLOCKS: usize = 2048;
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -64,6 +66,21 @@ impl ModelCapabilities {
             // at the historical 2048 KV blocks while still allowing smaller
             // GPUs to be downgraded before startup allocation.
             estimated_weight_bytes: Some(18 * GIB),
+            supported_dtypes: vec!["fp16".to_string()],
+            graph_safe_moe: false,
+        }
+    }
+
+    pub fn qwen25_72b_gptq_int4() -> Self {
+        Self {
+            architecture: "qwen2".to_string(),
+            quantization: Some("gptq_int4".to_string()),
+            moe: None,
+            max_context_len: Some(32_768),
+            num_hidden_layers: Some(80),
+            head_dim: Some(128),
+            kv_heads: Some(8),
+            estimated_weight_bytes: Some(39 * GIB),
             supported_dtypes: vec!["fp16".to_string()],
             graph_safe_moe: false,
         }
@@ -213,8 +230,23 @@ impl WorkloadProfile {
         }
     }
 
+    pub fn qwen25_72b_gptq_int4_2x4090_layer_split() -> Self {
+        Self {
+            preset: Some(QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET.to_string()),
+            serving_mode: "bench_serve".to_string(),
+            target_concurrency: 16,
+            prompt_length_class: "random_256".to_string(),
+            output_length_class: "random_128".to_string(),
+            priority: WorkloadPriority::Throughput,
+        }
+    }
+
     fn is_m3_preset(&self) -> bool {
-        self.preset.as_deref() == Some(M3_QWEN3_30B_A3B_INT4_PRESET)
+        self.is_preset(M3_QWEN3_30B_A3B_INT4_PRESET)
+    }
+
+    fn is_preset(&self, preset: &str) -> bool {
+        self.preset.as_deref() == Some(preset)
     }
 }
 
@@ -757,10 +789,15 @@ impl FerrumConfigBuilder {
             .value
             .saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS)
             .max(max_sequences.value.max(1));
-        let value = max_sequences
-            .value
-            .max(1)
-            .saturating_mul(64)
+        let target = if self
+            .workload
+            .is_preset(QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET)
+        {
+            1536
+        } else {
+            max_sequences.value.max(1).saturating_mul(64)
+        };
+        let value = target
             .min(kv_token_capacity)
             .max(max_sequences.value.max(1));
         ResolvedValue {
@@ -778,6 +815,16 @@ impl FerrumConfigBuilder {
 
     fn default_kv_blocks(&self, max_sequences: &ResolvedValue<usize>) -> ResolvedValue<usize> {
         let min_blocks = ceil_div(max_sequences.value.max(1), DEFAULT_KV_BLOCK_SIZE_TOKENS);
+        if self
+            .workload
+            .is_preset(QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET)
+        {
+            return ResolvedValue {
+                value: 1024.max(min_blocks),
+                source: AutoConfigSource::WorkloadPreset,
+                source_key: None,
+            };
+        }
         let target = DEFAULT_KV_BLOCKS.max(min_blocks);
         let selected = match (
             self.hardware.vram_bytes,
@@ -1581,6 +1628,31 @@ mod tests {
             .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
     }
 
+    fn qwen25_layer_split_runtime_entries(source: RuntimeConfigSource) -> RuntimeConfigSnapshot {
+        snapshot_with_sources(&[
+            ("FERRUM_REQUESTED_GPU_DEVICES", "0,1", source),
+            ("FERRUM_SELECTED_GPU_DEVICES", "0,1", source),
+            ("FERRUM_CUDA_DEVICE_COUNT", "2", source),
+            (
+                "FERRUM_SELECTED_DISTRIBUTED_STRATEGY",
+                "layer_split",
+                source,
+            ),
+            (
+                "FERRUM_SELECTED_LAYER_SPLIT_PLAN",
+                "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79",
+                source,
+            ),
+            ("FERRUM_LAYER_SPLIT_PIPELINE_MODE", "batch", source),
+            ("FERRUM_MAX_MODEL_LEN", "4096", source),
+            ("FERRUM_KV_MAX_BLOCKS", "1024", source),
+            ("FERRUM_KV_CAPACITY", "1024", source),
+            ("FERRUM_PAGED_MAX_SEQS", "16", source),
+            ("FERRUM_MAX_BATCHED_TOKENS", "1536", source),
+            ("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE", "16", source),
+        ])
+    }
+
     fn expect_invalid_key(vars: &[(&str, &str)], key: &str) {
         expect_invalid_key_with_features(
             vars,
@@ -1650,6 +1722,49 @@ mod tests {
             resolved.preset.as_deref(),
             Some(M3_QWEN3_30B_A3B_INT4_PRESET)
         );
+    }
+
+    #[test]
+    fn qwen25_72b_layer_split_preset_selects_batch_tuned_defaults() {
+        let resolved = FerrumConfigBuilder::new(qwen25_layer_split_runtime_entries(
+            RuntimeConfigSource::Default,
+        ))
+        .with_model_capabilities(ModelCapabilities::qwen25_72b_gptq_int4())
+        .with_hardware_capabilities(HardwareCapabilities::rtx4090_cuda(
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        ))
+        .with_workload_profile(WorkloadProfile::qwen25_72b_gptq_int4_2x4090_layer_split())
+        .resolve()
+        .unwrap();
+        let decision = |selection: &str| {
+            resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == selection)
+                .unwrap_or_else(|| panic!("missing decision {selection}"))
+        };
+
+        assert_eq!(
+            resolved.preset.as_deref(),
+            Some(QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET)
+        );
+        assert_eq!(decision("kv_block_count").selected, "1024");
+        assert_eq!(decision("max_sequences").selected, "16");
+        assert_eq!(decision("max_batched_tokens").selected, "1536");
+        assert_eq!(decision("max_model_len").selected, "4096");
+        assert_eq!(
+            decision("scheduler_admission_policy").selected,
+            "prefill_first_until_active:16"
+        );
+        assert_eq!(
+            decision("scheduler_admission_policy").source,
+            AutoConfigSource::Default
+        );
+
+        let doc = resolved.effective_config_document();
+        assert_eq!(doc["selected_pipeline_mode"], "batch");
+        assert_eq!(doc["selected_microbatch_size"], 16);
+        assert_eq!(doc["selected_kv_capacity"], 1024);
     }
 
     #[test]

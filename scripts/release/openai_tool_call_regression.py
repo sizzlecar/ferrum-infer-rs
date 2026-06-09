@@ -47,6 +47,7 @@ TOOL_REQUIRED_PROMPT = (
     "Call get_weather exactly once with city set to Beijing and unit set to celsius. "
     "Do not output natural language."
 )
+TOOL_SEED = 9271
 
 
 def write(path: Path, text: str) -> None:
@@ -162,6 +163,7 @@ def tool_payload(model: str, *, tool_choice: Any | None, prompt: str = TOOL_USER
     payload: dict[str, Any] = {
         "model": model,
         "temperature": 0,
+        "seed": TOOL_SEED,
         "tools": TOOLS,
         "messages": [
             {
@@ -188,12 +190,9 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
     assert_omitted_tool_choice_auto_calls_weather("omitted_tool_choice", omitted)
     results["checks"]["omitted_tool_choice"] = {"passed": True}
 
-    # Explicit auto must also work. A prior Metal regression accepted the request
-    # but returned empty/plain text instead of a tool call.
-    status, body = post(
-        base_url,
-        tool_payload(model, tool_choice="auto", prompt=TOOL_REQUIRED_PROMPT),
-    )
+    # Explicit auto must also work. Keep the prompt identical to the omitted
+    # tool_choice case so this checks request handling rather than prompt wording.
+    status, body = post(base_url, tool_payload(model, tool_choice="auto"))
     write(out / "01b_explicit_auto_tool_choice.response.json", body)
     explicit_auto = first_choice(parsed_json("explicit_auto_tool_choice", status, body))
     assert_omitted_tool_choice_auto_calls_weather("explicit_auto_tool_choice", explicit_auto)
@@ -217,6 +216,7 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
     fill_payload = {
         "model": model,
         "temperature": 0,
+        "seed": TOOL_SEED,
         "tools": TOOLS,
         "tool_choice": "none",
         "messages": [

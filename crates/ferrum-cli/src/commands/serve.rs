@@ -11,6 +11,7 @@ use ferrum_types::{
     CompiledKernelFeatures, FerrumConfigBuilder, HardwareCapabilities, ModelCapabilities,
     MoeCapabilities, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
     RuntimeConfigSource, WorkloadProfile, M3_QWEN3_30B_A3B_INT4_PRESET,
+    QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -86,6 +87,10 @@ pub struct ServeCommand {
     /// vLLM-compatible alias for `FERRUM_MAX_BATCHED_TOKENS`.
     #[arg(long, value_name = "N")]
     pub max_num_batched_tokens: Option<usize>,
+
+    /// Prefer prefilling until this many requests are active before early decodes.
+    #[arg(long, value_name = "N")]
+    pub scheduler_prefill_first_until_active: Option<usize>,
 
     /// Enable prefix caching (`FERRUM_PREFIX_CACHE=1`).
     #[arg(
@@ -202,6 +207,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
+        scheduler_prefill_first_until_active,
         enable_prefix_caching,
         no_enable_prefix_caching,
         enable_prefix_cache,
@@ -489,19 +495,24 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         }
     }
     let mut selected_runtime_preset_name = selected_runtime_preset_name;
-    if selected_runtime_preset_name.is_none()
-        && is_m3_qwen3_30b_a3b(arch_for_dispatch, model_definition.as_ref())
-    {
-        selected_runtime_preset_name = Some(M3_QWEN3_30B_A3B_INT4_PRESET.to_string());
-        let mut inferred_entries =
-            runtime_preset_entries(M3_QWEN3_30B_A3B_INT4_PRESET, RuntimeConfigSource::Default)?;
-        inferred_entries.extend(non_env_runtime_entries);
-        non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(inferred_entries).entries;
-        materialized_runtime_keys.extend(crate::runtime_env::materialize_runtime_env_defaults(
-            &non_env_runtime_entries,
-        ));
-        materialized_runtime_keys.sort();
-        materialized_runtime_keys.dedup();
+    if selected_runtime_preset_name.is_none() {
+        let inferred_preset = infer_runtime_preset_for_startup(
+            arch_for_dispatch,
+            model_definition.as_ref(),
+            gpu_selection.as_ref(),
+        );
+        if let Some(preset) = inferred_preset {
+            selected_runtime_preset_name = Some(preset.to_string());
+            let mut inferred_entries =
+                runtime_preset_entries(preset, RuntimeConfigSource::Default)?;
+            inferred_entries.extend(non_env_runtime_entries);
+            non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(inferred_entries).entries;
+            materialized_runtime_keys.extend(crate::runtime_env::materialize_runtime_env_defaults(
+                &non_env_runtime_entries,
+            ));
+            materialized_runtime_keys.sort();
+            materialized_runtime_keys.dedup();
+        }
     }
 
     // Preserve the historical non-preset serve default for Qwen3-MoE, but
@@ -535,6 +546,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
+        scheduler_prefill_first_until_active,
         greedy_argmax_cli_override(greedy_argmax, disable_greedy_argmax),
         prefix_cache_cli_override(
             enable_prefix_caching,
@@ -890,15 +902,18 @@ fn startup_auto_config(
     let hardware = hardware_capabilities_for_device(device);
     let workload = match runtime_preset {
         Some(M3_QWEN3_30B_A3B_INT4_PRESET) => WorkloadProfile::m3_qwen3_30b_a3b_int4(),
+        Some(QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET) => {
+            WorkloadProfile::qwen25_72b_gptq_int4_2x4090_layer_split()
+        }
         Some(other) => {
             return Err(ferrum_types::FerrumError::config(format!(
                 "unknown runtime preset: {other}"
             )));
         }
-        None if is_m3_qwen3_30b_a3b(architecture, model_definition) => {
-            WorkloadProfile::m3_qwen3_30b_a3b_int4()
-        }
-        None => WorkloadProfile::serving_default_for_hardware(&hardware),
+        None => match infer_runtime_preset_for_startup(architecture, model_definition, None) {
+            Some(M3_QWEN3_30B_A3B_INT4_PRESET) => WorkloadProfile::m3_qwen3_30b_a3b_int4(),
+            _ => WorkloadProfile::serving_default_for_hardware(&hardware),
+        },
     };
 
     FerrumConfigBuilder::new(runtime_config)
@@ -978,6 +993,16 @@ pub(crate) fn runtime_preset_entries(
             ("FERRUM_USE_VLLM_PAGED_ATTN", "1"),
             ("FERRUM_PREFIX_CACHE", "0"),
         ],
+        QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET => &[
+            ("FERRUM_BACKEND", "cuda"),
+            ("FERRUM_LAYER_SPLIT_PIPELINE_MODE", "batch"),
+            ("FERRUM_MAX_MODEL_LEN", "4096"),
+            ("FERRUM_KV_MAX_BLOCKS", "1024"),
+            ("FERRUM_KV_CAPACITY", "1024"),
+            ("FERRUM_PAGED_MAX_SEQS", "16"),
+            ("FERRUM_MAX_BATCHED_TOKENS", "1536"),
+            ("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE", "16"),
+        ],
         other => {
             return Err(ferrum_types::FerrumError::config(format!(
                 "unknown runtime preset: {other}"
@@ -996,6 +1021,7 @@ fn serve_cli_runtime_entries(
     max_model_len: Option<usize>,
     max_num_seqs: Option<usize>,
     max_num_batched_tokens: Option<usize>,
+    scheduler_prefill_first_until_active: Option<usize>,
     greedy_argmax: Option<bool>,
     prefix_cache: Option<bool>,
     session_cache: Option<&str>,
@@ -1018,6 +1044,11 @@ fn serve_cli_runtime_entries(
         &mut entries,
         "FERRUM_MAX_BATCHED_TOKENS",
         max_num_batched_tokens,
+    );
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+        scheduler_prefill_first_until_active,
     );
     if let Some(enabled) = greedy_argmax {
         entries.push(RuntimeConfigEntry::new(
@@ -1532,29 +1563,147 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
     }
 }
 
-fn is_m3_qwen3_30b_a3b(
+#[derive(Clone, Copy)]
+struct RuntimePresetInferenceRule {
+    preset: &'static str,
+    architecture: ferrum_models::Architecture,
+    quantization: Option<&'static str>,
+    exact_hidden_size: Option<usize>,
+    min_hidden_size: Option<usize>,
+    exact_hidden_layers: Option<usize>,
+    min_hidden_layers: Option<usize>,
+    kv_heads: Option<usize>,
+    num_experts: Option<u64>,
+    experts_per_token: Option<u64>,
+    distributed_strategy: Option<&'static str>,
+    gpu_count: Option<usize>,
+}
+
+const RUNTIME_PRESET_INFERENCE_RULES: &[RuntimePresetInferenceRule] = &[
+    RuntimePresetInferenceRule {
+        preset: M3_QWEN3_30B_A3B_INT4_PRESET,
+        architecture: ferrum_models::Architecture::Qwen3Moe,
+        quantization: None,
+        exact_hidden_size: Some(2048),
+        min_hidden_size: None,
+        exact_hidden_layers: None,
+        min_hidden_layers: Some(40),
+        kv_heads: Some(4),
+        num_experts: Some(128),
+        experts_per_token: Some(8),
+        distributed_strategy: None,
+        gpu_count: None,
+    },
+    RuntimePresetInferenceRule {
+        preset: QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
+        architecture: ferrum_models::Architecture::Qwen2,
+        quantization: Some("gptq_int4"),
+        exact_hidden_size: None,
+        min_hidden_size: Some(8192),
+        exact_hidden_layers: Some(80),
+        min_hidden_layers: None,
+        kv_heads: Some(8),
+        num_experts: None,
+        experts_per_token: None,
+        distributed_strategy: Some("layer_split"),
+        gpu_count: Some(2),
+    },
+];
+
+fn infer_runtime_preset_for_startup(
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
-) -> bool {
-    if architecture != Some(ferrum_models::Architecture::Qwen3Moe) {
-        return false;
+    gpu_selection: Option<&crate::gpu_devices::GpuDeviceSelection>,
+) -> Option<&'static str> {
+    let definition = model_definition?;
+    RUNTIME_PRESET_INFERENCE_RULES
+        .iter()
+        .find(|rule| rule.matches(architecture, definition, gpu_selection))
+        .map(|rule| rule.preset)
+}
+
+impl RuntimePresetInferenceRule {
+    fn matches(
+        &self,
+        architecture: Option<ferrum_models::Architecture>,
+        definition: &ferrum_models::ModelDefinition,
+        gpu_selection: Option<&crate::gpu_devices::GpuDeviceSelection>,
+    ) -> bool {
+        if architecture != Some(self.architecture) {
+            return false;
+        }
+        if self.quantization.is_some()
+            && quantization_from_definition(definition).as_deref() != self.quantization
+        {
+            return false;
+        }
+        if self
+            .exact_hidden_size
+            .is_some_and(|value| definition.hidden_size != value)
+        {
+            return false;
+        }
+        if self
+            .min_hidden_size
+            .is_some_and(|value| definition.hidden_size < value)
+        {
+            return false;
+        }
+        if self
+            .exact_hidden_layers
+            .is_some_and(|value| definition.num_hidden_layers != value)
+        {
+            return false;
+        }
+        if self
+            .min_hidden_layers
+            .is_some_and(|value| definition.num_hidden_layers < value)
+        {
+            return false;
+        }
+        if self
+            .kv_heads
+            .is_some_and(|value| definition.num_key_value_heads != Some(value))
+        {
+            return false;
+        }
+        if self.num_experts.is_some()
+            && definition
+                .extra_params
+                .get("num_experts")
+                .and_then(|value| value.as_u64())
+                != self.num_experts
+        {
+            return false;
+        }
+        if self.experts_per_token.is_some()
+            && definition
+                .extra_params
+                .get("num_experts_per_tok")
+                .and_then(|value| value.as_u64())
+                != self.experts_per_token
+        {
+            return false;
+        }
+        if self.distributed_strategy.is_some() || self.gpu_count.is_some() {
+            let Some(selection) = gpu_selection else {
+                return false;
+            };
+            if self
+                .distributed_strategy
+                .is_some_and(|value| selection.selected_distributed_strategy != value)
+            {
+                return false;
+            }
+            if self
+                .gpu_count
+                .is_some_and(|value| selection.selected_gpu_devices.len() != value)
+            {
+                return false;
+            }
+        }
+        true
     }
-    let Some(definition) = model_definition else {
-        return false;
-    };
-    let num_experts = definition
-        .extra_params
-        .get("num_experts")
-        .and_then(|value| value.as_u64());
-    let experts_per_token = definition
-        .extra_params
-        .get("num_experts_per_tok")
-        .and_then(|value| value.as_u64());
-    definition.hidden_size == 2048
-        && definition.num_hidden_layers >= 40
-        && definition.num_key_value_heads == Some(4)
-        && num_experts == Some(128)
-        && experts_per_token == Some(8)
 }
 
 // `find_cached_model` and `detect_format` previously lived here as forks
@@ -1589,6 +1738,7 @@ mod tests {
             Some(4096),
             Some(64),
             Some(2048),
+            Some(8),
             Some(true),
             Some(false),
             Some("memory"),
@@ -1620,6 +1770,10 @@ mod tests {
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "1024");
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
+        assert_eq!(
+            entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
+            "8"
+        );
         assert_eq!(entry("FERRUM_GREEDY_ARGMAX").effective_value, "1");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_SESSION_CACHE").effective_value, "memory");
@@ -1700,6 +1854,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(
@@ -1757,6 +1912,7 @@ mod tests {
             Some(4096),
             Some(8),
             Some(512),
+            Some(8),
             Some(false),
             Some(false),
             None,
@@ -1982,6 +2138,98 @@ mod tests {
         assert_eq!(
             entry("FERRUM_VLLM_MOE").source,
             RuntimeConfigSource::Default
+        );
+    }
+
+    fn qwen25_72b_gptq_definition() -> ferrum_models::ModelDefinition {
+        let mut definition = ferrum_models::ModelDefinition {
+            architecture: ferrum_models::Architecture::Qwen2,
+            hidden_size: 8192,
+            num_hidden_layers: 80,
+            num_key_value_heads: Some(8),
+            ..Default::default()
+        };
+        definition.extra_params = serde_json::json!({
+            "quantization_config": {
+                "bits": 4,
+                "quant_method": "gptq"
+            }
+        });
+        definition
+    }
+
+    fn two_gpu_layer_split_selection() -> crate::gpu_devices::GpuDeviceSelection {
+        crate::gpu_devices::GpuDeviceSelection {
+            raw_cli_value: "0,1".to_string(),
+            requested_gpu_devices: vec![0, 1],
+            selected_gpu_devices: vec![0, 1],
+            cuda_device_count: 2,
+            selected_distributed_strategy: "layer_split".to_string(),
+            selected_layer_split_plan: Some(
+                "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79".to_string(),
+            ),
+            selected_layer_split_stages: None,
+        }
+    }
+
+    #[test]
+    fn qwen25_layer_split_runtime_preset_entries_are_default_sourced() {
+        let entries = runtime_preset_entries(
+            QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
+            RuntimeConfigSource::Default,
+        )
+        .unwrap();
+        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
+        let entry = |key: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(
+            entry(crate::layer_split_pipeline::LAYER_SPLIT_PIPELINE_MODE_KEY).effective_value,
+            "batch"
+        );
+        assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
+        assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "1024");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "1024");
+        assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "16");
+        assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "1536");
+        assert_eq!(
+            entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
+            "16"
+        );
+        assert_eq!(
+            entry("FERRUM_PAGED_MAX_SEQS").source,
+            RuntimeConfigSource::Default
+        );
+    }
+
+    #[test]
+    fn runtime_preset_inference_uses_capability_rules() {
+        let definition = qwen25_72b_gptq_definition();
+        let selection = two_gpu_layer_split_selection();
+        assert_eq!(
+            infer_runtime_preset_for_startup(
+                Some(ferrum_models::Architecture::Qwen2),
+                Some(&definition),
+                Some(&selection),
+            ),
+            Some(QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET)
+        );
+
+        let mut one_gpu = selection.clone();
+        one_gpu.selected_gpu_devices = vec![0];
+        one_gpu.selected_distributed_strategy = "single_gpu".to_string();
+        assert_eq!(
+            infer_runtime_preset_for_startup(
+                Some(ferrum_models::Architecture::Qwen2),
+                Some(&definition),
+                Some(&one_gpu),
+            ),
+            None
         );
     }
 
@@ -2222,6 +2470,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -2260,6 +2509,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(true, false, false, false),
             None,
             None,
@@ -2273,6 +2523,7 @@ mod tests {
             None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,
@@ -2298,6 +2549,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(false, true, false, false),
             None,
             None,
@@ -2311,6 +2563,7 @@ mod tests {
             None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,

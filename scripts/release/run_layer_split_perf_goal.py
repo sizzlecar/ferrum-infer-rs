@@ -25,9 +25,11 @@ SMOKE_LANE = "layer-split-perf-smoke"
 FULL_SOURCE_LANE = "layer_split_perf_qwen72b_gptq"
 SMOKE_SOURCE_LANE = "layer_split_perf_qwen72b_gptq_smoke"
 BASELINE_CONFIG = Path("scripts/release/configs/layer_split_perf_baseline_batch.json")
-CANDIDATE_CONFIG = Path("scripts/release/configs/layer_split_perf_qwen72b_candidate_overlapped.json")
+CANDIDATE_CONFIG = Path(
+    "scripts/release/configs/layer_split_perf_qwen72b_candidate_batch_tuned.json"
+)
 SMOKE_CANDIDATE_CONFIG = Path(
-    "scripts/release/configs/layer_split_perf_qwen72b_candidate_overlapped_smoke.json"
+    "scripts/release/configs/layer_split_perf_qwen72b_candidate_batch_tuned_smoke.json"
 )
 SOURCE_GATE = Path("scripts/release/g0_cuda_llama33_70b_4bit_2x4090_gate.py")
 FINAL_GATE = Path("scripts/release/layer_split_perf_goal_gate.py")
@@ -42,6 +44,41 @@ CUDA_BUILD_COMMAND = [
     "--features",
     "cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source",
 ]
+GPU_QUERY_FIELDS = [
+    "index",
+    "name",
+    "uuid",
+    "memory.total",
+    "memory.used",
+    "utilization.gpu",
+    "driver_version",
+    "pcie.link.width.current",
+    "pcie.link.width.max",
+]
+BUILD_TOOLCHAIN_COMMANDS = [
+    ("cargo", "cargo", ["--version"]),
+    ("rustc", "rustc", ["--version"]),
+    ("git", "git", ["--version"]),
+    ("cc", "cc", ["--version"]),
+    ("c++", "c++", ["--version"]),
+    ("cmake", "cmake", ["--version"]),
+    ("nvcc", "nvcc", ["--version"]),
+]
+CUDA_BUILD_ENV_OVERRIDES = {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "CUDA_COMPUTE_CAP": "89",
+    "CUDAARCHS": "89",
+}
+DIAGNOSTIC_OVERRIDE_FIELDS = {
+    "diagnostic_concurrency_cells": "concurrency_cells",
+    "diagnostic_max_model_len": "max_model_len",
+    "diagnostic_kv_capacity": "kv_capacity",
+    "diagnostic_max_num_seqs": "max_num_seqs",
+    "diagnostic_max_num_batched_tokens": "max_num_batched_tokens",
+    "diagnostic_num_prompts": "num_prompts",
+    "diagnostic_warmup_requests": "warmup_requests",
+    "diagnostic_n_repeats": "n_repeats",
+}
 
 
 def iso_now() -> str:
@@ -55,6 +92,60 @@ def write_json(path: Path, data: Any) -> None:
 
 def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def parse_csv_ints(raw: str) -> list[int]:
+    out: list[int] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        parsed = int(value)
+        if parsed <= 0:
+            raise ValueError(f"expected positive integer, got {parsed}")
+        out.append(parsed)
+    if not out:
+        raise ValueError("expected at least one integer")
+    return out
+
+
+def diagnostic_overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    for arg_name, config_key in DIAGNOSTIC_OVERRIDE_FIELDS.items():
+        value = getattr(args, arg_name)
+        if value is None:
+            continue
+        if arg_name == "diagnostic_concurrency_cells":
+            try:
+                overrides[config_key] = parse_csv_ints(value)
+            except ValueError as exc:
+                raise RuntimeError(f"--{arg_name.replace('_', '-')} is invalid: {exc}") from exc
+        else:
+            parsed = int(value)
+            if parsed <= 0:
+                raise RuntimeError(f"--{arg_name.replace('_', '-')} must be positive")
+            overrides[config_key] = parsed
+    if overrides:
+        overrides["require_ci"] = False
+    return overrides
+
+
+def apply_diagnostic_overrides(
+    config: dict[str, Any],
+    overrides: dict[str, Any],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not overrides:
+        return config
+    updated = dict(config)
+    for key, value in overrides.items():
+        updated[key] = value
+    updated["name"] = f"{updated.get('name', label)}-diagnostic"
+    updated["bench_tag"] = f"{updated.get('bench_tag', label)}-diagnostic"
+    updated["diagnostic_only"] = True
+    updated["diagnostic_overrides"] = overrides
+    return updated
 
 
 def repo_root() -> Path:
@@ -73,13 +164,14 @@ def git_status_short(repo: Path) -> list[str]:
     return proc.stdout.splitlines()
 
 
-def require_clean_worktree(repo: Path) -> None:
+def require_clean_worktree(repo: Path, allow_dirty_diagnostic: bool = False) -> list[str]:
     dirty = git_status_short(repo)
-    if dirty:
+    if dirty and not allow_dirty_diagnostic:
         raise RuntimeError(
             "refusing release-quality layer-split perf goal run from dirty worktree; "
             "final validator rejects dirty git metadata:\n" + "\n".join(dirty)
         )
+    return dirty
 
 
 def resolve_out_root(repo: Path, raw_out: Path) -> Path:
@@ -118,7 +210,28 @@ def parse_nvidia_smi_gpu_query(text: str) -> list[dict[str, Any]]:
                 "uuid": uuid,
             }
         )
+        if len(parts) >= 9:
+            rows[-1].update(
+                {
+                    "memory_total_mib": parse_optional_int(parts[3]),
+                    "memory_used_mib": parse_optional_int(parts[4]),
+                    "utilization_gpu_percent": parse_optional_int(parts[5]),
+                    "driver_version": parts[6],
+                    "pcie_link_width_current": parse_optional_int(parts[7]),
+                    "pcie_link_width_max": parse_optional_int(parts[8]),
+                }
+            )
     return rows
+
+
+def parse_optional_int(raw: str) -> int | None:
+    value = raw.strip().replace(" MiB", "").replace("%", "")
+    if not value or value.upper() in {"N/A", "[N/A]"}:
+        return None
+    try:
+        return int(float(value))
+    except ValueError:
+        return None
 
 
 def validate_gpu_preflight_rows(gpus: list[dict[str, Any]]) -> list[str]:
@@ -135,6 +248,24 @@ def validate_gpu_preflight_rows(gpus: list[dict[str, Any]]) -> list[str]:
         name = str(gpu.get("name", "")).lower()
         if "4090" not in name:
             errors.append(f"GPU {idx} is not an RTX 4090: {gpu.get('name')!r}")
+        memory_total = gpu.get("memory_total_mib")
+        if isinstance(memory_total, int) and memory_total < 24_000:
+            errors.append(
+                f"GPU {idx} memory.total is too small for RTX 4090 lane: "
+                f"{memory_total} MiB"
+            )
+        memory_used = gpu.get("memory_used_mib")
+        if isinstance(memory_used, int) and memory_used > 1024:
+            errors.append(
+                f"GPU {idx} is not idle enough before validation: "
+                f"memory.used={memory_used} MiB"
+            )
+        utilization = gpu.get("utilization_gpu_percent")
+        if isinstance(utilization, int) and utilization > 10:
+            errors.append(
+                f"GPU {idx} is not idle enough before validation: "
+                f"utilization.gpu={utilization}%"
+            )
     return errors
 
 
@@ -221,8 +352,8 @@ def validate_cuda_driver_preflight(
 def query_gpu_preflight(repo: Path) -> dict[str, Any]:
     cmd = [
         "nvidia-smi",
-        "--query-gpu=index,name,uuid",
-        "--format=csv,noheader",
+        "--query-gpu=" + ",".join(GPU_QUERY_FIELDS),
+        "--format=csv,noheader,nounits",
     ]
     try:
         proc = subprocess.run(
@@ -307,6 +438,64 @@ def require_vllm_preflight(out_root: Path) -> dict[str, Any]:
     return preflight
 
 
+def query_rust_toolchain_preflight() -> dict[str, Any]:
+    tools: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for label, executable, version_args in BUILD_TOOLCHAIN_COMMANDS:
+        path = shutil.which(executable)
+        entry: dict[str, Any] = {"executable": executable, "path": path}
+        if path is None:
+            entry["status"] = "fail"
+            entry["error"] = f"{executable} executable not found on PATH"
+            errors.append(entry["error"])
+            tools[label] = entry
+            continue
+        try:
+            proc = subprocess.run(
+                [path, *version_args],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as exc:
+            entry["status"] = "fail"
+            entry["error"] = f"{executable} {' '.join(version_args)} failed to start: {exc}"
+            errors.append(entry["error"])
+            tools[label] = entry
+            continue
+        entry.update(
+            {
+                "status": "pass" if proc.returncode == 0 else "fail",
+                "returncode": proc.returncode,
+                "version": proc.stdout.strip(),
+                "stderr": proc.stderr.strip(),
+            }
+        )
+        if proc.returncode != 0:
+            errors.append(
+                f"{executable} {' '.join(version_args)} failed rc={proc.returncode}: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        tools[label] = entry
+    return {
+        "schema_version": 1,
+        "status": "fail" if errors else "pass",
+        "tools": tools,
+        "errors": errors,
+    }
+
+
+def require_rust_toolchain_preflight(out_root: Path) -> dict[str, Any]:
+    preflight = query_rust_toolchain_preflight()
+    write_json(out_root / "layer_split_perf_toolchain_preflight.json", preflight)
+    if preflight.get("status") != "pass":
+        errors = preflight.get("errors")
+        detail = "; ".join(errors) if isinstance(errors, list) else None
+        raise RuntimeError(detail or "Rust toolchain preflight failed")
+    return preflight
+
+
 def source_gate_command(
     repo: Path,
     ferrum_bin: Path,
@@ -361,8 +550,16 @@ def candidate_config_path_for_lane(lane_name: str) -> Path:
     return SMOKE_CANDIDATE_CONFIG if lane_name == SMOKE_LANE else CANDIDATE_CONFIG
 
 
-def baseline_config_for_run(repo: Path, out_root: Path, lane_name: str) -> Path:
+def baseline_config_for_run(
+    repo: Path,
+    out_root: Path,
+    lane_name: str,
+    diagnostic_overrides: dict[str, Any] | None = None,
+) -> Path:
+    overrides = diagnostic_overrides or {}
     if lane_name != SMOKE_LANE:
+        if overrides:
+            raise RuntimeError("diagnostic config overrides are only supported for smoke lane")
         return repo / BASELINE_CONFIG
     baseline = load_json(repo / BASELINE_CONFIG)
     smoke = load_json(repo / SMOKE_CANDIDATE_CONFIG)
@@ -379,14 +576,15 @@ def baseline_config_for_run(repo: Path, out_root: Path, lane_name: str) -> Path:
         "seed",
         "max_model_len",
         "kv_capacity",
-        "max_num_seqs",
-        "max_num_batched_tokens",
     ]:
         if key in smoke:
             baseline[key] = smoke[key]
     baseline["name"] = "layer-split-perf-baseline-batch-smoke"
     baseline["layer_split_pipeline_mode"] = "batch"
     baseline["run_vllm_baseline"] = False
+    baseline = apply_diagnostic_overrides(
+        baseline, overrides, label="layer-split-perf-baseline-batch-smoke"
+    )
     generated = out_root / "configs" / "baseline-batch-smoke.json"
     write_json(generated, baseline)
     return generated
@@ -397,16 +595,31 @@ def candidate_config_for_run(
     out_root: Path,
     run_same_pod_vllm_baseline: bool,
     lane_name: str,
+    diagnostic_overrides: dict[str, Any] | None = None,
 ) -> Path:
+    overrides = diagnostic_overrides or {}
     base_config = candidate_config_path_for_lane(lane_name)
-    if not run_same_pod_vllm_baseline:
+    if lane_name != SMOKE_LANE and overrides:
+        raise RuntimeError("diagnostic config overrides are only supported for smoke lane")
+    if not run_same_pod_vllm_baseline and not overrides:
         return repo / base_config
     config = load_json(repo / base_config)
     if not isinstance(config, dict):
         raise RuntimeError(f"candidate config must be a JSON object: {repo / base_config}")
     config["run_vllm_baseline"] = True
     config["same_pod_vllm_baseline"] = True
-    generated = out_root / "configs" / "candidate-overlapped-with-vllm-baseline.json"
+    if not run_same_pod_vllm_baseline:
+        config["run_vllm_baseline"] = False
+        config.pop("same_pod_vllm_baseline", None)
+    config = apply_diagnostic_overrides(
+        config, overrides, label="layer-split-perf-candidate-batch-tuned-smoke"
+    )
+    config_name = (
+        "candidate-batch-tuned-with-vllm-baseline.json"
+        if run_same_pod_vllm_baseline and not overrides
+        else "candidate-batch-tuned-smoke-diagnostic.json"
+    )
+    generated = out_root / "configs" / config_name
     write_json(generated, config)
     return generated
 
@@ -422,9 +635,18 @@ def command_plan(
     run_same_pod_vllm_baseline: bool,
 ) -> dict[str, Any]:
     baseline = out_root / "baseline-batch"
-    candidate = out_root / "candidate-overlapped"
+    candidate = out_root / "candidate-batch-tuned"
     final = out_root / "final"
     source_lane = source_lane_for_goal_lane(lane_name)
+    candidate_settings = load_json(candidate_config) if candidate_config.exists() else {}
+    if not isinstance(candidate_settings, dict):
+        raise RuntimeError(f"candidate config must be a JSON object: {candidate_config}")
+    concurrency_cells = candidate_settings.get(
+        "concurrency_cells", [1, 4] if lane_name == SMOKE_LANE else [1, 4, 8, 16, 32]
+    )
+    concurrency_sweep = ",".join(str(cell) for cell in concurrency_cells)
+    require_ci = bool(candidate_settings.get("require_ci", lane_name != SMOKE_LANE))
+    n_repeats = int(candidate_settings.get("n_repeats", 1 if lane_name == SMOKE_LANE else 3))
     final_optional_vllm_artifact = optional_vllm_artifact
     if (
         lane_name == FULL_LANE
@@ -436,13 +658,15 @@ def command_plan(
         expected_runtime_cost = "2x4090 host, 30-60 minutes, prefer about 1 USD/hour"
         stop_condition = (
             "any correctness failure, model load failure, CUDA OOM, or one candidate "
-            "run still showing a flat throughput curve"
+            "run still missing the expected throughput lift"
         )
         correctness_gate = "product run/serve smoke plus streaming usage"
         performance_command = (
             "ferrum bench-serve --fail-on-error --seed 9271 "
-            "--concurrency-sweep 1,4 (diagnostic; no --require-ci)"
+            f"--n-repeats {n_repeats} --concurrency-sweep {concurrency_sweep}"
         )
+        if not require_ci:
+            performance_command += " (diagnostic; no --require-ci)"
     else:
         expected_runtime_cost = "2x4090 host, 1-3 hours, prefer about 1 USD/hour"
         if run_same_pod_vllm_baseline:
@@ -457,14 +681,14 @@ def command_plan(
         correctness_gate = "candidate layer_split_perf_qwen72b_gptq correctness matrix"
         performance_command = (
             "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
-            "--n-repeats 3 --concurrency-sweep 1,4,8,16,32"
+            f"--n-repeats {n_repeats} --concurrency-sweep {concurrency_sweep}"
         )
     commands: dict[str, list[str]] = {
         "build_cuda_release": CUDA_BUILD_COMMAND,
         "baseline_batch": source_gate_command(
             repo, ferrum_bin, baseline_config, baseline, source_lane
         ),
-        "candidate_overlapped": source_gate_command(
+        "candidate_batch_tuned": source_gate_command(
             repo, ferrum_bin, candidate_config, candidate, source_lane
         ),
     }
@@ -484,6 +708,10 @@ def command_plan(
         "hardware_preflight": (
             "nvidia-smi must report exactly two RTX 4090 GPUs and the CUDA driver API "
             "must report the same device count before build"
+        ),
+        "toolchain_preflight": (
+            "cargo, rustc, git, cc, c++, cmake, and nvcc must be executable from "
+            "the non-interactive runner PATH before the CUDA release build"
         ),
         "vllm_preflight": (
             "vllm executable must be on PATH before build"
@@ -543,6 +771,9 @@ def write_failure_summary(
             "correctness_gate": plan["correctness_gate"],
             "performance_command": plan["performance_command"],
             "run_same_pod_vllm_baseline": plan["run_same_pod_vllm_baseline"],
+            "allow_dirty_diagnostic": plan.get("allow_dirty_diagnostic", False),
+            "git_dirty_status": plan.get("git_dirty_status", []),
+            "diagnostic_overrides": plan.get("diagnostic_overrides", {}),
             "baseline_artifact": plan["baseline_artifact"],
             "candidate_artifact": plan["candidate_artifact"],
             "optional_vllm_artifact": plan["optional_vllm_artifact"],
@@ -569,8 +800,102 @@ def write_smoke_summary(out_root: Path, plan: dict[str, Any]) -> dict[str, Any]:
         "performance_command": plan["performance_command"],
         "pass_line": pass_line,
         "final_goal_pass": None,
+        "allow_dirty_diagnostic": plan.get("allow_dirty_diagnostic", False),
+        "git_dirty_status": plan.get("git_dirty_status", []),
+        "diagnostic_overrides": plan.get("diagnostic_overrides", {}),
     }
     write_json(out_root / "layer_split_perf_smoke_summary.json", summary)
+    return summary
+
+
+def require_smoke_candidate_pipeline_health(
+    *,
+    out_root: Path,
+    candidate_artifact: Path,
+    candidate_config: Path,
+) -> dict[str, Any]:
+    config = load_json(candidate_config)
+    health_path = candidate_artifact / "serve.health.after.json"
+    summary: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "fail",
+        "candidate_artifact": str(candidate_artifact),
+        "candidate_config": str(candidate_config),
+        "health_path": str(health_path),
+        "expected_pipeline_mode": config.get(
+            "expected_layer_split_pipeline_mode", config.get("layer_split_pipeline_mode")
+        ),
+    }
+    expected_mode = (
+        str(config.get("expected_layer_split_pipeline_mode") or config.get("layer_split_pipeline_mode") or "")
+        .strip()
+        .lower()
+    )
+    if expected_mode not in {"batch", "overlapped"}:
+        summary["error"] = "smoke candidate config must request batch or overlapped mode"
+        write_json(out_root / "layer_split_perf_smoke_pipeline_check.json", summary)
+        raise RuntimeError(summary["error"])
+    if not health_path.is_file():
+        summary["error"] = f"missing smoke candidate post-bench health: {health_path}"
+        write_json(out_root / "layer_split_perf_smoke_pipeline_check.json", summary)
+        raise RuntimeError(summary["error"])
+    health = load_json(health_path)
+    prefix_cache = health.get("cache", {}).get("prefix_cache")
+    if not isinstance(prefix_cache, dict):
+        summary["error"] = "smoke candidate health missing cache.prefix_cache"
+        write_json(out_root / "layer_split_perf_smoke_pipeline_check.json", summary)
+        raise RuntimeError(summary["error"])
+    decode = prefix_cache.get("pipeline_decode")
+    if not isinstance(decode, dict):
+        summary["error"] = "smoke candidate health missing pipeline_decode metrics"
+        write_json(out_root / "layer_split_perf_smoke_pipeline_check.json", summary)
+        raise RuntimeError(summary["error"])
+    summary.update(
+        {
+            "selected_pipeline_mode": prefix_cache.get("selected_pipeline_mode"),
+            "selected_stage_bridge": prefix_cache.get("selected_stage_bridge"),
+            "pipeline_decode": {
+                "calls": decode.get("calls"),
+                "overlapped_calls": decode.get("overlapped_calls"),
+                "rows": decode.get("rows"),
+                "max_batch": decode.get("max_batch"),
+                "microbatch_count_max": decode.get("microbatch_count_max"),
+                "in_flight_stage_count_max": decode.get("in_flight_stage_count_max"),
+                "queue_depth_max": decode.get("queue_depth_max"),
+            },
+        }
+    )
+    errors: list[str] = []
+    if prefix_cache.get("selected_pipeline_mode") != expected_mode:
+        errors.append(f"selected_pipeline_mode is not {expected_mode}")
+    if expected_mode == "batch":
+        min_batch = int(config.get("expected_max_num_seqs") or config.get("max_num_seqs") or 1)
+        checks = [
+            ("calls", 1),
+            ("max_batch", min_batch),
+            ("microbatch_count_max", 1),
+            ("in_flight_stage_count_max", 1),
+        ]
+    else:
+        checks = [
+            ("calls", 1),
+            ("overlapped_calls", 1),
+            ("max_batch", 2),
+            ("microbatch_count_max", 2),
+            ("in_flight_stage_count_max", 2),
+        ]
+    for key, minimum in checks:
+        value = decode.get(key)
+        if not isinstance(value, int) or value < minimum:
+            errors.append(f"pipeline_decode.{key} must be >= {minimum}, got {value!r}")
+    if errors:
+        summary["error"] = (
+            f"smoke candidate did not exercise {expected_mode} decode: " + "; ".join(errors)
+        )
+        write_json(out_root / "layer_split_perf_smoke_pipeline_check.json", summary)
+        raise RuntimeError(summary["error"])
+    summary["status"] = "pass"
+    write_json(out_root / "layer_split_perf_smoke_pipeline_check.json", summary)
     return summary
 
 
@@ -582,15 +907,35 @@ def run_step(
 ) -> subprocess.CompletedProcess[str]:
     started = iso_now()
     env = os.environ.copy()
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    proc = subprocess.run(
-        cmd,
-        cwd=repo,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    env_overrides = {"PYTHONDONTWRITEBYTECODE": "1"}
+    if name == "build_cuda_release":
+        env_overrides.update(CUDA_BUILD_ENV_OVERRIDES)
+    env.update(env_overrides)
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=repo,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        write_json(
+            out_root / f"{name}.command.json",
+            {
+                "status": "fail",
+                "started_at": started,
+                "finished_at": iso_now(),
+                "returncode": None,
+                "cmd": cmd,
+                "env_overrides": env_overrides,
+                "error": str(exc),
+            },
+        )
+        (out_root / f"{name}.stdout").write_text("", encoding="utf-8")
+        (out_root / f"{name}.stderr").write_text(str(exc), encoding="utf-8")
+        raise RuntimeError(f"{name} failed to start: {exc}") from exc
     write_json(
         out_root / f"{name}.command.json",
         {
@@ -599,7 +944,7 @@ def run_step(
             "finished_at": iso_now(),
             "returncode": proc.returncode,
             "cmd": cmd,
-            "env_overrides": {"PYTHONDONTWRITEBYTECODE": "1"},
+            "env_overrides": env_overrides,
         },
     )
     (out_root / f"{name}.stdout").write_text(proc.stdout, encoding="utf-8", errors="replace")
@@ -611,7 +956,12 @@ def run_step(
 
 def run_goal(args: argparse.Namespace) -> int:
     repo = repo_root()
-    require_clean_worktree(repo)
+    if args.allow_dirty_diagnostic and args.lane_name != SMOKE_LANE:
+        raise RuntimeError("--allow-dirty-diagnostic is only valid for layer-split-perf-smoke")
+    diagnostic_overrides = diagnostic_overrides_from_args(args)
+    if diagnostic_overrides and args.lane_name != SMOKE_LANE:
+        raise RuntimeError("diagnostic config overrides are only valid for layer-split-perf-smoke")
+    dirty_status = require_clean_worktree(repo, args.allow_dirty_diagnostic)
     out_root = resolve_out_root(repo, args.out)
     require_outside_repo(repo, out_root)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -625,9 +975,15 @@ def run_goal(args: argparse.Namespace) -> int:
         raise RuntimeError(
             "--run-same-pod-vllm-baseline and --optional-vllm-artifact are mutually exclusive"
         )
-    baseline_config = baseline_config_for_run(repo, out_root, args.lane_name)
+    baseline_config = baseline_config_for_run(
+        repo, out_root, args.lane_name, diagnostic_overrides
+    )
     candidate_config = candidate_config_for_run(
-        repo, out_root, args.run_same_pod_vllm_baseline, args.lane_name
+        repo,
+        out_root,
+        args.run_same_pod_vllm_baseline,
+        args.lane_name,
+        diagnostic_overrides,
     )
     plan = command_plan(
         repo,
@@ -639,6 +995,19 @@ def run_goal(args: argparse.Namespace) -> int:
         optional_vllm,
         args.run_same_pod_vllm_baseline,
     )
+    plan["allow_dirty_diagnostic"] = args.allow_dirty_diagnostic
+    plan["git_dirty_status"] = dirty_status
+    plan["diagnostic_overrides"] = diagnostic_overrides
+    if dirty_status:
+        plan["diagnostic_only_reason"] = (
+            "dirty worktree accepted only for smoke diagnostics; final goal evidence "
+            "must rerun from a clean worktree"
+        )
+    if diagnostic_overrides:
+        plan["diagnostic_only_reason"] = (
+            "diagnostic config overrides accepted only for smoke diagnostics; final "
+            "goal evidence must rerun the goal config"
+        )
     write_json(out_root / "layer_split_perf_goal_run_plan.json", plan)
     print_run_plan(plan)
     failed_step = "hardware_preflight"
@@ -648,13 +1017,25 @@ def run_goal(args: argparse.Namespace) -> int:
             failed_step = "vllm_preflight"
             require_vllm_preflight(out_root)
 
+        failed_step = "toolchain_preflight"
+        require_rust_toolchain_preflight(out_root)
         failed_step = "build_cuda_release"
         run_step("build_cuda_release", plan["commands"]["build_cuda_release"], repo, out_root)
         failed_step = "baseline_batch"
         run_step("baseline_batch", plan["commands"]["baseline_batch"], repo, out_root)
-        failed_step = "candidate_overlapped"
-        run_step("candidate_overlapped", plan["commands"]["candidate_overlapped"], repo, out_root)
+        failed_step = "candidate_batch_tuned"
+        run_step(
+            "candidate_batch_tuned",
+            plan["commands"]["candidate_batch_tuned"],
+            repo,
+            out_root,
+        )
         if args.lane_name == SMOKE_LANE:
+            require_smoke_candidate_pipeline_health(
+                out_root=out_root,
+                candidate_artifact=Path(plan["candidate_artifact"]),
+                candidate_config=candidate_config,
+            )
             smoke = write_smoke_summary(out_root, plan)
             print(smoke["pass_line"])
             return 0
@@ -682,12 +1063,43 @@ def self_test() -> int:
         raise AssertionError("repo-local output unexpectedly accepted")
     except RuntimeError as exc:
         assert "inside the git worktree" in str(exc)
+    with tempfile.TemporaryDirectory(prefix="ferrum-layer-split-clean-worktree-") as tmp:
+        tmp_repo = Path(tmp)
+        subprocess.run(["git", "init", "-q"], cwd=tmp_repo, stdout=subprocess.PIPE, check=True)
+        (tmp_repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_repo, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Self Test",
+                "-c",
+                "user.email=selftest@example.invalid",
+                "commit",
+                "-m",
+                "selftest",
+            ],
+            cwd=tmp_repo,
+            stdout=subprocess.PIPE,
+            check=True,
+        )
+        assert require_clean_worktree(tmp_repo) == []
+        (tmp_repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        try:
+            require_clean_worktree(tmp_repo)
+            raise AssertionError("dirty worktree unexpectedly accepted")
+        except RuntimeError as exc:
+            assert "dirty worktree" in str(exc)
+        dirty = require_clean_worktree(tmp_repo, allow_dirty_diagnostic=True)
+        assert any("tracked.txt" in line for line in dirty)
     gpus = parse_nvidia_smi_gpu_query(
-        "0, NVIDIA GeForce RTX 4090, GPU-selftest-0\n"
-        "1, NVIDIA GeForce RTX 4090, GPU-selftest-1\n"
+        "0, NVIDIA GeForce RTX 4090, GPU-selftest-0, 24564, 15, 0, 570.195.03, 16, 16\n"
+        "1, NVIDIA GeForce RTX 4090, GPU-selftest-1, 24564, 15, 0, 570.195.03, 16, 16\n"
     )
     assert [gpu["index"] for gpu in gpus] == [0, 1]
     assert all("4090" in gpu["name"] for gpu in gpus)
+    assert gpus[0]["memory_total_mib"] == 24564
+    assert gpus[0]["driver_version"] == "570.195.03"
     assert validate_gpu_preflight_rows(gpus) == []
     bad_gpus = parse_nvidia_smi_gpu_query("0, NVIDIA GeForce RTX 3090, GPU-selftest-0\n")
     assert len(bad_gpus) == 1
@@ -702,6 +1114,13 @@ def self_test() -> int:
         "1, NVIDIA GeForce RTX 4090, GPU-same\n"
     )
     assert any("UUIDs" in error for error in validate_gpu_preflight_rows(duplicate_uuid))
+    busy_gpu = parse_nvidia_smi_gpu_query(
+        "0, NVIDIA GeForce RTX 4090, GPU-selftest-0, 24564, 2048, 0, 570.195.03, 16, 16\n"
+        "1, NVIDIA GeForce RTX 4090, GPU-selftest-1, 24564, 15, 99, 570.195.03, 16, 16\n"
+    )
+    busy_errors = validate_gpu_preflight_rows(busy_gpu)
+    assert any("memory.used" in error for error in busy_errors)
+    assert any("utilization.gpu" in error for error in busy_errors)
     assert validate_cuda_driver_preflight(
         {"status": "pass", "device_count": 2}, expected_count=2
     ) == []
@@ -725,15 +1144,17 @@ def self_test() -> int:
         False,
     )
     assert plan["baseline_artifact"] == str(out / "baseline-batch")
-    assert plan["candidate_artifact"] == str(out / "candidate-overlapped")
+    assert plan["candidate_artifact"] == str(out / "candidate-batch-tuned")
     assert f"{PASS_PREFIX}: {plan['final_artifact']}" == (
         "LAYER_SPLIT_PERF GOAL PASS: /tmp/layer-split-perf/final"
     )
     baseline_cmd = plan["commands"]["baseline_batch"]
-    candidate_cmd = plan["commands"]["candidate_overlapped"]
+    candidate_cmd = plan["commands"]["candidate_batch_tuned"]
     final_cmd = plan["commands"]["final_validator"]
     assert plan["commands"]["build_cuda_release"] == CUDA_BUILD_COMMAND
     assert "two RTX 4090" in plan["hardware_preflight"]
+    assert "cargo, rustc, git" in plan["toolchain_preflight"]
+    assert "nvcc" in plan["toolchain_preflight"]
     assert "not required" in plan["vllm_preflight"]
     assert plan["lane"] == FULL_LANE
     assert plan["source_lane"] == FULL_SOURCE_LANE
@@ -741,7 +1162,7 @@ def self_test() -> int:
     assert FULL_SOURCE_LANE in baseline_cmd
     assert any(str(CANDIDATE_CONFIG) in item for item in candidate_cmd)
     assert FULL_SOURCE_LANE in candidate_cmd
-    assert str(out / "candidate-overlapped") in final_cmd
+    assert str(out / "candidate-batch-tuned") in final_cmd
     assert "--correctness-artifact" in final_cmd
     with tempfile.TemporaryDirectory() as tmp:
         tmp_out = Path(tmp)
@@ -782,9 +1203,9 @@ def self_test() -> int:
         assert vllm_plan["run_same_pod_vllm_baseline"] is True
         assert "2-4 hours" in vllm_plan["expected_runtime_cost"]
         assert "vllm executable" in vllm_plan["vllm_preflight"]
-        assert vllm_plan["optional_vllm_artifact"] == str(tmp_out / "candidate-overlapped")
-        assert str(generated_config) in vllm_plan["commands"]["candidate_overlapped"]
-        assert str(tmp_out / "candidate-overlapped") in vllm_plan["commands"]["final_validator"]
+        assert vllm_plan["optional_vllm_artifact"] == str(tmp_out / "candidate-batch-tuned")
+        assert str(generated_config) in vllm_plan["commands"]["candidate_batch_tuned"]
+        assert str(tmp_out / "candidate-batch-tuned") in vllm_plan["commands"]["final_validator"]
     with tempfile.TemporaryDirectory(prefix="ferrum-layer-split-smoke-plan-") as tmp:
         tmp_repo = Path(tmp) / "repo"
         tmp_repo.mkdir()
@@ -800,6 +1221,11 @@ def self_test() -> int:
                 "num_prompts": 96,
                 "warmup_requests": 10,
                 "n_repeats": 3,
+                "max_model_len": 4096,
+                "kv_capacity": 1024,
+                "max_num_seqs": 8,
+                "max_num_batched_tokens": 1024,
+                "scheduler_prefill_first_until_active": 8,
                 "run_vllm_baseline": False,
             },
         )
@@ -808,12 +1234,15 @@ def self_test() -> int:
             {
                 "name": "smoke",
                 "model": "selftest/model",
-                "layer_split_pipeline_mode": "overlapped",
-                "concurrency_cells": [1, 4],
+                "layer_split_pipeline_mode": "batch",
+                "concurrency_cells": [4, 8, 16],
+                "max_num_seqs": 16,
+                "max_num_batched_tokens": 1536,
                 "num_prompts": 24,
                 "warmup_requests": 4,
                 "n_repeats": 1,
                 "require_ci": False,
+                "scheduler_prefill_first_until_active": 16,
                 "run_vllm_baseline": False,
             },
         )
@@ -821,9 +1250,14 @@ def self_test() -> int:
         smoke_baseline = baseline_config_for_run(tmp_repo, tmp_out, SMOKE_LANE)
         generated_baseline = load_json(smoke_baseline)
         assert generated_baseline["layer_split_pipeline_mode"] == "batch"
-        assert generated_baseline["concurrency_cells"] == [1, 4]
+        assert generated_baseline["concurrency_cells"] == [4, 8, 16]
+        assert generated_baseline["max_model_len"] == 4096
+        assert generated_baseline["kv_capacity"] == 1024
+        assert generated_baseline["max_num_seqs"] == 8
+        assert generated_baseline["max_num_batched_tokens"] == 1024
         assert generated_baseline["num_prompts"] == 24
         assert generated_baseline["n_repeats"] == 1
+        assert generated_baseline["scheduler_prefill_first_until_active"] == 8
         smoke_candidate = candidate_config_for_run(tmp_repo, tmp_out, False, SMOKE_LANE)
         assert smoke_candidate == tmp_repo / SMOKE_CANDIDATE_CONFIG
         smoke_plan = command_plan(
@@ -836,16 +1270,108 @@ def self_test() -> int:
             None,
             False,
         )
+        smoke_plan["allow_dirty_diagnostic"] = True
+        smoke_plan["git_dirty_status"] = [" M crates/example.rs"]
         assert smoke_plan["lane"] == SMOKE_LANE
         assert smoke_plan["source_lane"] == SMOKE_SOURCE_LANE
         assert "30-60 minutes" in smoke_plan["expected_runtime_cost"]
         assert "final_validator" not in smoke_plan["commands"]
         assert smoke_plan["final_artifact"] is None
         assert smoke_plan["smoke_summary"] == str(tmp_out / "layer_split_perf_smoke_summary.json")
-        assert SMOKE_SOURCE_LANE in smoke_plan["commands"]["candidate_overlapped"]
+        assert SMOKE_SOURCE_LANE in smoke_plan["commands"]["candidate_batch_tuned"]
         smoke_summary = write_smoke_summary(tmp_out, smoke_plan)
         assert smoke_summary["diagnostic_only"] is True
+        assert smoke_summary["allow_dirty_diagnostic"] is True
+        assert smoke_summary["git_dirty_status"] == [" M crates/example.rs"]
         assert smoke_summary["pass_line"] == f"{SMOKE_PASS_PREFIX}: {tmp_out}"
+        smoke_artifact = tmp_out / "candidate-batch-tuned"
+        smoke_artifact.mkdir()
+        write_json(
+            smoke_artifact / "serve.health.after.json",
+            {
+                "cache": {
+                    "prefix_cache": {
+                        "selected_pipeline_mode": "batch",
+                        "selected_stage_bridge": "host",
+                        "pipeline_decode": {
+                            "calls": 8,
+                            "overlapped_calls": 0,
+                            "rows": 32,
+                            "max_batch": 16,
+                            "microbatch_count_max": 1,
+                            "in_flight_stage_count_max": 1,
+                            "queue_depth_max": 0,
+                        },
+                    }
+                }
+            },
+        )
+        smoke_check = require_smoke_candidate_pipeline_health(
+            out_root=tmp_out,
+            candidate_artifact=smoke_artifact,
+            candidate_config=smoke_candidate,
+        )
+        assert smoke_check["status"] == "pass"
+        health = load_json(smoke_artifact / "serve.health.after.json")
+        health["cache"]["prefix_cache"]["pipeline_decode"]["max_batch"] = 8
+        write_json(smoke_artifact / "serve.health.after.json", health)
+        try:
+            require_smoke_candidate_pipeline_health(
+                out_root=tmp_out,
+                candidate_artifact=smoke_artifact,
+                candidate_config=smoke_candidate,
+            )
+            raise AssertionError("smoke pipeline check unexpectedly accepted small batch")
+        except RuntimeError as exc:
+            assert "max_batch" in str(exc)
+        diag_args = argparse.Namespace(
+            diagnostic_concurrency_cells="4,8,16",
+            diagnostic_max_model_len=4096,
+            diagnostic_kv_capacity=1024,
+            diagnostic_max_num_seqs=12,
+            diagnostic_max_num_batched_tokens=1536,
+            diagnostic_num_prompts=96,
+            diagnostic_warmup_requests=10,
+            diagnostic_n_repeats=1,
+        )
+        diag_overrides = diagnostic_overrides_from_args(diag_args)
+        assert diag_overrides == {
+            "concurrency_cells": [4, 8, 16],
+            "max_model_len": 4096,
+            "kv_capacity": 1024,
+            "max_num_seqs": 12,
+            "max_num_batched_tokens": 1536,
+            "num_prompts": 96,
+            "warmup_requests": 10,
+            "n_repeats": 1,
+            "require_ci": False,
+        }
+        diag_out = Path(tmp) / "diag-out"
+        diag_baseline = baseline_config_for_run(
+            tmp_repo, diag_out, SMOKE_LANE, diag_overrides
+        )
+        diag_candidate = candidate_config_for_run(
+            tmp_repo, diag_out, False, SMOKE_LANE, diag_overrides
+        )
+        generated_diag_baseline = load_json(diag_baseline)
+        generated_diag_candidate = load_json(diag_candidate)
+        for generated in [generated_diag_baseline, generated_diag_candidate]:
+            assert generated["diagnostic_only"] is True
+            assert generated["concurrency_cells"] == [4, 8, 16]
+            assert generated["max_model_len"] == 4096
+            assert generated["kv_capacity"] == 1024
+            assert generated["max_num_seqs"] == 12
+            assert generated["max_num_batched_tokens"] == 1536
+            assert generated["require_ci"] is False
+        assert generated_diag_baseline["scheduler_prefill_first_until_active"] == 8
+        assert generated_diag_candidate["scheduler_prefill_first_until_active"] == 16
+        assert generated_diag_baseline["layer_split_pipeline_mode"] == "batch"
+        assert generated_diag_candidate["layer_split_pipeline_mode"] == "batch"
+        try:
+            baseline_config_for_run(tmp_repo, diag_out, FULL_LANE, diag_overrides)
+            raise AssertionError("full lane unexpectedly accepted diagnostic overrides")
+        except RuntimeError as exc:
+            assert "only supported for smoke" in str(exc)
     with tempfile.TemporaryDirectory(prefix="ferrum-layer-split-vllm-preflight-") as tmp:
         tmp_out = Path(tmp)
         empty_bin_dir = tmp_out / "empty-bin"
@@ -875,6 +1401,29 @@ def self_test() -> int:
             assert (tmp_out / "layer_split_perf_vllm_preflight.json").is_file()
         finally:
             os.environ["PATH"] = old_path
+    with tempfile.TemporaryDirectory(prefix="ferrum-layer-split-toolchain-preflight-") as tmp:
+        tmp_path = Path(tmp)
+        old_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = str(tmp_path)
+            missing = query_rust_toolchain_preflight()
+            assert missing["status"] == "fail"
+            assert any("cargo executable" in error for error in missing["errors"])
+            assert any("nvcc executable" in error for error in missing["errors"])
+            for _, executable, _ in BUILD_TOOLCHAIN_COMMANDS:
+                fake = tmp_path / executable
+                fake.write_text(
+                    f"#!/bin/sh\necho {executable} selftest 1.0\n",
+                    encoding="utf-8",
+                )
+                fake.chmod(0o755)
+            found = require_rust_toolchain_preflight(tmp_path)
+            assert found["status"] == "pass"
+            assert found["tools"]["cargo"]["version"] == "cargo selftest 1.0"
+            assert found["tools"]["nvcc"]["version"] == "nvcc selftest 1.0"
+            assert (tmp_path / "layer_split_perf_toolchain_preflight.json").is_file()
+        finally:
+            os.environ["PATH"] = old_path
     print("LAYER_SPLIT_PERF ORCHESTRATOR SELFTEST PASS")
     return 0
 
@@ -894,6 +1443,25 @@ def main() -> int:
             "candidate artifact to the final validator as same-pod vLLM evidence"
         ),
     )
+    parser.add_argument(
+        "--allow-dirty-diagnostic",
+        action="store_true",
+        help=(
+            "allow a dirty worktree for layer-split-perf-smoke only; artifacts are "
+            "diagnostic and cannot satisfy the final goal PASS"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-concurrency-cells",
+        help="comma-separated smoke-only diagnostic override, for example 4,8,16",
+    )
+    parser.add_argument("--diagnostic-max-model-len", type=int)
+    parser.add_argument("--diagnostic-kv-capacity", type=int)
+    parser.add_argument("--diagnostic-max-num-seqs", type=int)
+    parser.add_argument("--diagnostic-max-num-batched-tokens", type=int)
+    parser.add_argument("--diagnostic-num-prompts", type=int)
+    parser.add_argument("--diagnostic-warmup-requests", type=int)
+    parser.add_argument("--diagnostic-n-repeats", type=int)
     args = parser.parse_args()
     if args.self_test:
         return self_test()

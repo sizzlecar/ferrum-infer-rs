@@ -555,13 +555,28 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise RuntimeError(f"config gpu_devices must be {REQUIRED_GPU_DEVICES}")
     if cfg.get("distributed_strategy") != "layer_split":
         raise RuntimeError("config distributed_strategy must be layer_split")
-    pipeline_mode_from_config(cfg)
+    configured_pipeline_mode_from_config(cfg)
+    expected_pipeline_mode_from_config(cfg)
     model = cfg.get("model")
     if not isinstance(model, str) or not model:
         raise RuntimeError("config model must be a non-empty model id/path")
     quant = str(cfg.get("quant_format", "")).lower()
     if not any(marker in quant for marker in ("gptq", "awq", "q4")):
         raise RuntimeError("config quant_format must identify a 4bit format")
+    scheduler_prefill = cfg.get("scheduler_prefill_first_until_active")
+    if scheduler_prefill is not None and (
+        not isinstance(scheduler_prefill, int) or scheduler_prefill <= 0
+    ):
+        raise RuntimeError("config scheduler_prefill_first_until_active must be a positive int")
+    for key in [
+        "run_max_model_len",
+        "run_kv_capacity",
+        "run_max_num_seqs",
+        "run_max_num_batched_tokens",
+    ]:
+        value = cfg.get(key)
+        if value is not None and (not isinstance(value, int) or value <= 0):
+            raise RuntimeError(f"config {key} must be a positive int")
 
 
 def require_structured_hardware_snapshot(snapshot: dict[str, Any], label: str) -> None:
@@ -714,11 +729,48 @@ def validate_structured_hardware_evidence(
     }
 
 
-def pipeline_mode_from_config(cfg: dict[str, Any]) -> str:
-    value = str(cfg.get("layer_split_pipeline_mode", "overlapped")).strip().lower()
+def parse_pipeline_mode(value: Any, *, label: str) -> str:
+    value = str(value).strip().lower()
     if value not in {"batch", "overlapped"}:
-        raise RuntimeError("config layer_split_pipeline_mode must be batch or overlapped")
+        raise RuntimeError(f"config {label} must be batch or overlapped")
     return value
+
+
+def configured_pipeline_mode_from_config(cfg: dict[str, Any]) -> str | None:
+    if cfg.get("layer_split_pipeline_mode") is None:
+        return None
+    return parse_pipeline_mode(cfg["layer_split_pipeline_mode"], label="layer_split_pipeline_mode")
+
+
+def run_pipeline_mode_from_config(cfg: dict[str, Any]) -> str | None:
+    if cfg.get("run_layer_split_pipeline_mode") is not None:
+        return parse_pipeline_mode(
+            cfg["run_layer_split_pipeline_mode"], label="run_layer_split_pipeline_mode"
+        )
+    configured = configured_pipeline_mode_from_config(cfg)
+    if configured is not None:
+        return configured
+    if cfg.get("expected_runtime_preset") is None:
+        return "overlapped"
+    return None
+
+
+def serve_pipeline_mode_from_config(cfg: dict[str, Any]) -> str | None:
+    configured = configured_pipeline_mode_from_config(cfg)
+    if configured is not None:
+        return configured
+    if cfg.get("expected_runtime_preset") is None:
+        return "overlapped"
+    return None
+
+
+def expected_pipeline_mode_from_config(cfg: dict[str, Any]) -> str:
+    if cfg.get("expected_layer_split_pipeline_mode") is not None:
+        return parse_pipeline_mode(
+            cfg["expected_layer_split_pipeline_mode"],
+            label="expected_layer_split_pipeline_mode",
+        )
+    return configured_pipeline_mode_from_config(cfg) or "overlapped"
 
 
 def even_layer_split_plan_for_layers(devices: list[int], num_layers: int) -> str:
@@ -905,8 +957,6 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
         "cuda",
         "--gpu-devices",
         ",".join(str(device) for device in REQUIRED_GPU_DEVICES),
-        "--layer-split-pipeline-mode",
-        pipeline_mode_from_config(cfg),
         "--max-tokens",
         str(cfg.get("run_max_tokens", 64)),
         "--stop",
@@ -918,14 +968,29 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
         "--decision-trace-jsonl",
         str(root / "run.decision_trace.jsonl"),
     ]
-    if cfg.get("max_model_len") is not None:
-        cmd.extend(["--max-model-len", str(cfg["max_model_len"])])
-    if cfg.get("kv_capacity") is not None:
-        cmd.extend(["--kv-capacity", str(cfg["kv_capacity"])])
-    if cfg.get("max_num_seqs") is not None:
-        cmd.extend(["--max-num-seqs", str(cfg["max_num_seqs"])])
-    if cfg.get("max_num_batched_tokens") is not None:
-        cmd.extend(["--max-num-batched-tokens", str(cfg["max_num_batched_tokens"])])
+    run_pipeline_mode = run_pipeline_mode_from_config(cfg)
+    if run_pipeline_mode is not None:
+        cmd.extend(["--layer-split-pipeline-mode", run_pipeline_mode])
+    if cfg.get("run_max_model_len", cfg.get("max_model_len")) is not None:
+        cmd.extend(["--max-model-len", str(cfg.get("run_max_model_len", cfg.get("max_model_len")))])
+    if cfg.get("run_kv_capacity", cfg.get("kv_capacity")) is not None:
+        cmd.extend(["--kv-capacity", str(cfg.get("run_kv_capacity", cfg.get("kv_capacity")))])
+    if cfg.get("run_kv_max_blocks", cfg.get("kv_max_blocks")) is not None:
+        cmd.extend(
+            [
+                "--kv-max-blocks",
+                str(cfg.get("run_kv_max_blocks", cfg.get("kv_max_blocks"))),
+            ]
+        )
+    if cfg.get("run_max_num_seqs", cfg.get("max_num_seqs")) is not None:
+        cmd.extend(["--max-num-seqs", str(cfg.get("run_max_num_seqs", cfg.get("max_num_seqs")))])
+    if cfg.get("run_max_num_batched_tokens", cfg.get("max_num_batched_tokens")) is not None:
+        cmd.extend(
+            [
+                "--max-num-batched-tokens",
+                str(cfg.get("run_max_num_batched_tokens", cfg.get("max_num_batched_tokens"))),
+            ]
+        )
     return cmd
 
 
@@ -950,8 +1015,6 @@ def build_serve_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root:
         "cuda",
         "--gpu-devices",
         ",".join(str(device) for device in REQUIRED_GPU_DEVICES),
-        "--layer-split-pipeline-mode",
-        pipeline_mode_from_config(cfg),
         "--host",
         "127.0.0.1",
         "--port",
@@ -961,6 +1024,9 @@ def build_serve_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root:
         "--decision-trace-jsonl",
         str(root / "serve.decision_trace.jsonl"),
     ]
+    pipeline_mode = serve_pipeline_mode_from_config(cfg)
+    if pipeline_mode is not None:
+        cmd.extend(["--layer-split-pipeline-mode", pipeline_mode])
     if cfg.get("max_model_len") is not None:
         cmd.extend(["--max-model-len", str(cfg["max_model_len"])])
     if cfg.get("kv_capacity") is not None:
@@ -969,6 +1035,13 @@ def build_serve_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root:
         cmd.extend(["--max-num-seqs", str(cfg["max_num_seqs"])])
     if cfg.get("max_num_batched_tokens") is not None:
         cmd.extend(["--max-num-batched-tokens", str(cfg["max_num_batched_tokens"])])
+    if cfg.get("scheduler_prefill_first_until_active") is not None:
+        cmd.extend(
+            [
+                "--scheduler-prefill-first-until-active",
+                str(cfg["scheduler_prefill_first_until_active"]),
+            ]
+        )
     return cmd
 
 
@@ -1042,6 +1115,9 @@ def write_planned_command_artifacts(root: Path, ferrum_bin: Path, cfg: dict[str,
             "expected_gpu_devices": REQUIRED_GPU_DEVICES,
             "expected_distributed_strategy": "layer_split",
             "expected_layer_split_plan": layer_split_plan_from_config(cfg),
+            "scheduler_prefill_first_until_active": cfg.get(
+                "scheduler_prefill_first_until_active"
+            ),
         },
     )
     write_json(
@@ -1093,7 +1169,7 @@ def write_metadata(
         "quant_format": cfg["quant_format"],
         "distributed_strategy": "layer_split",
         "layer_split_plan": layer_split_plan_from_config(cfg),
-        "layer_split_pipeline_mode": pipeline_mode_from_config(cfg),
+        "layer_split_pipeline_mode": expected_pipeline_mode_from_config(cfg),
         "sanitized_env": sanitized_env_summary(),
     }
     write_json(root / "metadata.json", metadata)
@@ -1433,6 +1509,32 @@ def normalize_runtime_artifacts(root: Path) -> None:
     copy_if_present(root / "run.decision_trace.jsonl", root / "decision_trace.jsonl")
 
 
+def promote_serve_runtime_artifacts(root: Path) -> None:
+    copy_if_present(root / "serve.effective_config.json", root / "effective_config.json")
+    copy_if_present(root / "serve.decision_trace.jsonl", root / "decision_trace.jsonl")
+
+
+def run_effective_config_validation_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    run_cfg = dict(cfg)
+    for key in [
+        "expected_runtime_preset",
+        "expected_scheduler_prefill_first_until_active",
+        "require_default_runtime_sources",
+    ]:
+        run_cfg.pop(key, None)
+    run_expected_scalars = {
+        "run_max_model_len": "expected_max_model_len",
+        "run_kv_capacity": "expected_kv_capacity",
+        "run_kv_max_blocks": "expected_kv_max_blocks",
+        "run_max_num_seqs": "expected_max_num_seqs",
+        "run_max_num_batched_tokens": "expected_max_num_batched_tokens",
+    }
+    for run_key, expected_key in run_expected_scalars.items():
+        if cfg.get(run_key) is not None:
+            run_cfg[expected_key] = cfg[run_key]
+    return run_cfg
+
+
 def require_effective_config(path: Path, label: str, cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     data = load_json(path)
     required = {
@@ -1488,7 +1590,7 @@ def require_effective_config(path: Path, label: str, cfg: dict[str, Any] | None 
             f"{label}: selected_weight_placement must be layer_split, "
             f"got {data['selected_weight_placement']!r}"
         )
-    expected_pipeline_mode = pipeline_mode_from_config(cfg or {})
+    expected_pipeline_mode = expected_pipeline_mode_from_config(cfg or {})
     if data["selected_pipeline_mode"] != expected_pipeline_mode:
         raise RuntimeError(
             f"{label}: selected_pipeline_mode must be {expected_pipeline_mode}, "
@@ -1508,7 +1610,86 @@ def require_effective_config(path: Path, label: str, cfg: dict[str, Any] | None 
             f"{label}: selected_microbatch_size must be {expected_microbatch}, "
             f"got {data['selected_microbatch_size']!r}"
         )
+    if cfg:
+        expected_preset = cfg.get("expected_runtime_preset")
+        if expected_preset is not None and data.get("preset") != expected_preset:
+            raise RuntimeError(
+                f"{label}: preset must be {expected_preset!r}, got {data.get('preset')!r}"
+            )
+        expected_scalars = {
+            "expected_max_model_len": "selected_max_model_len",
+            "expected_kv_capacity": "selected_kv_capacity",
+            "expected_max_num_seqs": "selected_max_sequences",
+            "expected_max_num_batched_tokens": "selected_max_batched_tokens",
+        }
+        for config_key, effective_key in expected_scalars.items():
+            expected = cfg.get(config_key)
+            if expected is not None and data.get(effective_key) != expected:
+                raise RuntimeError(
+                    f"{label}: {effective_key} must be {expected!r}, "
+                    f"got {data.get(effective_key)!r}"
+                )
+        expected_kv_blocks = cfg.get("expected_kv_max_blocks")
+        if expected_kv_blocks is not None:
+            actual_kv_blocks = effective_kv_block_count(data)
+            if actual_kv_blocks != expected_kv_blocks:
+                raise RuntimeError(
+                    f"{label}: kv_block_count must be {expected_kv_blocks!r}, "
+                    f"got {actual_kv_blocks!r}"
+                )
+        expected_scheduler = cfg.get("expected_scheduler_prefill_first_until_active")
+        if expected_scheduler is not None:
+            scheduler = decision_by_selection(data, "scheduler_admission_policy")
+            expected_selected = f"prefill_first_until_active:{expected_scheduler}"
+            if scheduler.get("selected") != expected_selected:
+                raise RuntimeError(
+                    f"{label}: scheduler_admission_policy must be {expected_selected!r}, "
+                    f"got {scheduler.get('selected')!r}"
+                )
+        if cfg.get("require_default_runtime_sources"):
+            for key in [
+                "FERRUM_LAYER_SPLIT_PIPELINE_MODE",
+                "FERRUM_MAX_MODEL_LEN",
+                "FERRUM_KV_MAX_BLOCKS",
+                "FERRUM_KV_CAPACITY",
+                "FERRUM_PAGED_MAX_SEQS",
+                "FERRUM_MAX_BATCHED_TOKENS",
+                "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+            ]:
+                entry = runtime_entry_by_key(data, key)
+                if entry.get("source") != "default":
+                    raise RuntimeError(
+                        f"{label}: {key} source must be default, got {entry.get('source')!r}"
+                    )
     return data
+
+
+def runtime_entry_by_key(data: dict[str, Any], key: str) -> dict[str, Any]:
+    for entry in data.get("entries", []):
+        if isinstance(entry, dict) and entry.get("key") == key:
+            return entry
+    raise RuntimeError(f"effective config missing runtime entry {key}")
+
+
+def decision_by_selection(data: dict[str, Any], selection: str) -> dict[str, Any]:
+    for decision in data.get("decisions", []):
+        if isinstance(decision, dict) and decision.get("selection") == selection:
+            return decision
+    raise RuntimeError(f"effective config missing decision {selection}")
+
+
+def effective_kv_block_count(data: dict[str, Any]) -> Any:
+    if data.get("kv_block_count") is not None:
+        return data.get("kv_block_count")
+    admission = data.get("admission")
+    if isinstance(admission, dict) and admission.get("kv_block_count") is not None:
+        return admission.get("kv_block_count")
+    decision = decision_by_selection(data, "kv_block_count")
+    selected = decision.get("selected")
+    try:
+        return int(selected)
+    except (TypeError, ValueError):
+        return selected
 
 
 def validate_hardware_for_gate(hardware: dict[str, Any]) -> None:
@@ -1687,12 +1868,15 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
             "expected_gpu_devices": REQUIRED_GPU_DEVICES,
             "expected_distributed_strategy": "layer_split",
             "expected_layer_split_plan": layer_split_plan_from_config(cfg),
-            "expected_layer_split_pipeline_mode": pipeline_mode_from_config(cfg),
+            "expected_layer_split_pipeline_mode": expected_pipeline_mode_from_config(cfg),
             "config": {
-                "max_model_len": cfg.get("max_model_len"),
-                "kv_capacity": cfg.get("kv_capacity"),
-                "max_num_seqs": cfg.get("max_num_seqs"),
-                "max_num_batched_tokens": cfg.get("max_num_batched_tokens"),
+                "max_model_len": cfg.get("run_max_model_len", cfg.get("max_model_len")),
+                "kv_max_blocks": cfg.get("run_kv_max_blocks", cfg.get("kv_max_blocks")),
+                "kv_capacity": cfg.get("run_kv_capacity", cfg.get("kv_capacity")),
+                "max_num_seqs": cfg.get("run_max_num_seqs", cfg.get("max_num_seqs")),
+                "max_num_batched_tokens": cfg.get(
+                    "run_max_num_batched_tokens", cfg.get("max_num_batched_tokens")
+                ),
             },
         },
     )
@@ -1716,7 +1900,9 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
     recall = strip_think(str(turns[-1].get("content") or ""))
     if not recall_matches_marker(recall):
         raise RuntimeError(f"ferrum run recall failed: {recall[:500]!r}")
-    effective = require_effective_config(root / "run.effective_config.json", "run", cfg)
+    effective = require_effective_config(
+        root / "run.effective_config.json", "run", run_effective_config_validation_config(cfg)
+    )
     return {
         "status": "pass",
         "returncode": proc.returncode,
@@ -2252,12 +2438,14 @@ def self_test() -> int:
         "distributed_strategy": "layer_split",
         "num_hidden_layers": 80,
         "max_model_len": 8192,
+        "kv_max_blocks": 2048,
         "kv_capacity": 2048,
         "max_num_seqs": 8,
         "max_num_batched_tokens": 1024,
+        "scheduler_prefill_first_until_active": 8,
     }
     validate_config(cfg)
-    assert pipeline_mode_from_config(cfg) == "overlapped"
+    assert expected_pipeline_mode_from_config(cfg) == "overlapped"
     with tempfile.TemporaryDirectory(prefix="ferrum-model-manifest-local-") as tmp:
         root = Path(tmp)
         model_dir = root / "model"
@@ -2318,6 +2506,7 @@ def self_test() -> int:
     assert "8192" in cmd
     assert "--kv-capacity" in cmd
     assert "2048" in cmd
+    assert "--kv-max-blocks" in cmd
     assert "--max-num-seqs" in cmd
     assert "8" in cmd
     assert "--max-num-batched-tokens" in cmd
@@ -2344,6 +2533,8 @@ def self_test() -> int:
     assert "--gpu-devices" in serve_cmd
     assert "--layer-split-pipeline-mode" in serve_cmd
     assert "overlapped" in serve_cmd
+    assert "--scheduler-prefill-first-until-active" in serve_cmd
+    assert "8" in serve_cmd
     effective_doc = {
         "backend": "cuda",
         "requested_gpu_devices": REQUIRED_GPU_DEVICES,
@@ -2358,6 +2549,7 @@ def self_test() -> int:
         "selected_kv_layout": "paged",
         "selected_attention_impl": "vllm_paged_attn",
         "selected_graph_mode": "disabled",
+        "kv_block_count": 2048,
         "selected_max_sequences": 8,
         "selected_max_model_len": 8192,
         "selected_kv_capacity": 2048,
@@ -2374,6 +2566,46 @@ def self_test() -> int:
         effective_doc["selected_microbatch_size"] = 8
         write_json(effective_path, effective_doc)
         require_effective_config(effective_path, "selftest-batch", batch_cfg)
+
+        preset_cfg = {
+            **batch_cfg,
+            "expected_runtime_preset": "qwen25_72b_gptq_int4_2x4090_layer_split",
+            "expected_max_model_len": 8192,
+            "expected_kv_capacity": 2048,
+            "expected_kv_max_blocks": 2048,
+            "expected_max_num_seqs": 8,
+            "expected_max_num_batched_tokens": 1024,
+            "expected_scheduler_prefill_first_until_active": 8,
+            "require_default_runtime_sources": True,
+            "run_max_model_len": 8192,
+            "run_kv_capacity": 2048,
+            "run_kv_max_blocks": 2048,
+            "run_max_num_seqs": 8,
+            "run_max_num_batched_tokens": 1024,
+        }
+        try:
+            require_effective_config(effective_path, "selftest-run-raw-preset", preset_cfg)
+            raise AssertionError("run effective config unexpectedly accepted serve preset expectations")
+        except RuntimeError as exc:
+            assert "preset must be" in str(exc)
+        require_effective_config(
+            effective_path,
+            "selftest-run-preset-stripped",
+            run_effective_config_validation_config(preset_cfg),
+        )
+    with tempfile.TemporaryDirectory(prefix="ferrum-runtime-artifact-promotion-") as tmp:
+        root = Path(tmp)
+        run_doc = {**effective_doc, "selected_max_sequences": 8}
+        serve_doc = {**effective_doc, "selected_max_sequences": 16, "selected_microbatch_size": 16}
+        write_json(root / "run.effective_config.json", run_doc)
+        write_json(root / "serve.effective_config.json", serve_doc)
+        write_text(root / "run.decision_trace.jsonl", "run\n")
+        write_text(root / "serve.decision_trace.jsonl", "serve\n")
+        normalize_runtime_artifacts(root)
+        assert load_json(root / "effective_config.json")["selected_max_sequences"] == 8
+        promote_serve_runtime_artifacts(root)
+        assert load_json(root / "effective_config.json")["selected_max_sequences"] == 16
+        assert (root / "decision_trace.jsonl").read_text() == "serve\n"
     with tempfile.TemporaryDirectory(prefix="ferrum-llama33-correctness-") as tmp:
         root = Path(tmp)
         correctness_checks = {
@@ -2693,7 +2925,10 @@ def main() -> int:
                 "expected_gpu_devices": REQUIRED_GPU_DEVICES,
                 "expected_distributed_strategy": "layer_split",
                 "expected_layer_split_plan": layer_split_plan_from_config(cfg),
-                "expected_layer_split_pipeline_mode": pipeline_mode_from_config(cfg),
+                "expected_layer_split_pipeline_mode": expected_pipeline_mode_from_config(cfg),
+                "scheduler_prefill_first_until_active": cfg.get(
+                    "scheduler_prefill_first_until_active"
+                ),
             },
         )
         serve_log = root / "serve.log"
@@ -2710,6 +2945,7 @@ def main() -> int:
         wait_health(base_url, timeout_sec=int(cfg.get("serve_startup_timeout_sec", 1800)))
         capture_nvidia_smi(root, "serve-ready")
         require_effective_config(root / "serve.effective_config.json", "serve", cfg)
+        promote_serve_runtime_artifacts(root)
         checks["serve_health"] = capture_health(root, base_url)
         checks["serve_models"] = capture_models(root, base_url, model)
         checks["serve_correctness"] = serve_correctness(root, base_url, model)

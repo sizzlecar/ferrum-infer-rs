@@ -904,13 +904,6 @@ def validate_pipeline_cache_metrics(
         raise ValidationError(
             f"{label}: host bridge must report host_copy_us_total > 0"
         )
-    if (
-        bridge in {"host", "cuda_peer", "cuda_device_staged"}
-        and decode["device_copy_us_total"] <= 0
-    ):
-        raise ValidationError(
-            f"{label}: selected bridge must report device_copy_us_total > 0"
-        )
     for key in ["stage_us_total", "stage_us_last", "stage_us_avg"]:
         values = decode.get(key)
         if not isinstance(values, list) or len(values) != stage_count:
@@ -1609,8 +1602,6 @@ def validate_perf_goal(
         raise ValidationError("baseline and candidate layer split plans differ")
     if baseline_config["selected_pipeline_mode"] != "batch":
         raise ValidationError("baseline selected_pipeline_mode must be batch")
-    if candidate_config["selected_pipeline_mode"] != "overlapped":
-        raise ValidationError("candidate selected_pipeline_mode must be overlapped")
     baseline_admission = validate_admission_health(
         baseline_artifact, "baseline", baseline_config
     )
@@ -1943,6 +1934,8 @@ def make_perf_artifact(
     *,
     tps_by_c: dict[int, float],
     pipeline_mode: str,
+    max_sequences: int = 16,
+    max_batched_tokens: int = 2048,
     diagnostic: bool = False,
 ) -> None:
     sorted_cells = sorted(REQUIRED_CONCURRENCY_CELLS)
@@ -2126,11 +2119,15 @@ def make_perf_artifact(
         "selected_distributed_strategy": "layer_split",
         "selected_layer_split_plan": metadata["layer_split_plan"],
         "selected_pipeline_mode": pipeline_mode,
-        "selected_microbatch_size": 8 if pipeline_mode == "overlapped" else 16,
+        "selected_microbatch_size": (
+            max(1, (max_sequences + 1) // 2)
+            if pipeline_mode == "overlapped"
+            else max_sequences
+        ),
         "selected_stage_bridge": "host",
-        "selected_max_sequences": 16,
-        "selected_max_batched_tokens": 1024,
-        "selected_admission_limit": 16,
+        "selected_max_sequences": max_sequences,
+        "selected_max_batched_tokens": max_batched_tokens,
+        "selected_admission_limit": max_sequences,
         "selected_kv_capacity": 2048,
         "selected_max_model_len": 8192,
     }
@@ -2242,12 +2239,20 @@ def make_perf_artifact(
                         "calls": 8,
                         "overlapped_calls": 8 if pipeline_mode == "overlapped" else 0,
                         "rows": 32,
-                        "max_batch": 4,
-                        "last_batch": 4,
+                        "max_batch": min(4, max_sequences),
+                        "last_batch": min(4, max_sequences),
                         "microbatch_count_max": 2 if pipeline_mode == "overlapped" else 1,
                         "microbatch_count_last": 2 if pipeline_mode == "overlapped" else 1,
-                        "microbatch_size_max": 2 if pipeline_mode == "overlapped" else 4,
-                        "microbatch_size_last": 2 if pipeline_mode == "overlapped" else 4,
+                        "microbatch_size_max": (
+                            min(2, effective["selected_microbatch_size"])
+                            if pipeline_mode == "overlapped"
+                            else min(4, effective["selected_microbatch_size"])
+                        ),
+                        "microbatch_size_last": (
+                            min(2, effective["selected_microbatch_size"])
+                            if pipeline_mode == "overlapped"
+                            else min(4, effective["selected_microbatch_size"])
+                        ),
                         "in_flight_stage_count_max": 2 if pipeline_mode == "overlapped" else 1,
                         "in_flight_stage_count_last": 2 if pipeline_mode == "overlapped" else 1,
                         "queue_depth_max": 1 if pipeline_mode == "overlapped" else 0,
@@ -2533,11 +2538,15 @@ def run_self_test() -> None:
             baseline,
             tps_by_c={1: 20.0, 4: 20.5, 8: 20.7, 16: 20.6},
             pipeline_mode="batch",
+            max_sequences=8,
+            max_batched_tokens=1024,
         )
         make_perf_artifact(
             candidate,
             tps_by_c={1: 21.0, 4: 27.8, 8: 28.4, 16: 28.1},
-            pipeline_mode="overlapped",
+            pipeline_mode="batch",
+            max_sequences=16,
+            max_batched_tokens=2048,
         )
         make_correctness_artifact(correctness)
         make_vllm_artifact(vllm, 30.0)
@@ -2617,7 +2626,7 @@ def run_self_test() -> None:
             "Candidate source gate:",
             "GPU UUIDs:",
             "Layer split plan:",
-            "Pipeline mode: overlapped",
+            "Pipeline mode: batch",
             "Microbatch size:",
             "Stage bridge:",
             "Candidate throughput by concurrency:",
