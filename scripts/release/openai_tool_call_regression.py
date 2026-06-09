@@ -214,36 +214,45 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
     # BUG-2: Feeding a tool result back must not leak chat-template markers such as
     # <|assistant|>, classname=..., or auto_tool_response into the final answer.
     tool_call_id = str(required_call.get("id") or "call_0")
-    status, body = post(
-        base_url,
-        {
-            "model": model,
-            "temperature": 0,
-            "tools": TOOLS,
-            "tool_choice": "none",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": TOOL_USER_PROMPT,
-                },
-                message(required),
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": json.dumps(
-                        {
-                            "city": "北京",
-                            "temp": 22,
-                            "unit": "celsius",
-                            "desc": "晴",
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
-            "max_tokens": 256,
-        },
+    fill_payload = {
+        "model": model,
+        "temperature": 0,
+        "tools": TOOLS,
+        "tool_choice": "none",
+        "messages": [
+            {
+                "role": "user",
+                "content": TOOL_USER_PROMPT,
+            },
+            message(required),
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(
+                    {
+                        "city": "北京",
+                        "temp": 22,
+                        "unit": "celsius",
+                        "desc": "晴",
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Use the tool result above to answer the original question in one short "
+                    "sentence. Include the numeric temperature from the tool result."
+                ),
+            },
+        ],
+        "max_tokens": 256,
+    }
+    write(
+        out / "03_tool_result_fill.request.json",
+        json.dumps(fill_payload, ensure_ascii=False, indent=2) + "\n",
     )
+    status, body = post(base_url, fill_payload)
     write(out / "03_tool_result_fill.response.json", body)
     fill = first_choice(parsed_json("tool_result_fill", status, body))
     fill_msg = message(fill)
