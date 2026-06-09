@@ -383,13 +383,14 @@ fn decoded_delta_has_forbidden_quality(
     full_text: &str,
     previous_text_len: usize,
     candidate_is_stop: bool,
+    candidate_is_non_stop_control: bool,
 ) -> bool {
     if previous_text_len > full_text.len() || !full_text.is_char_boundary(previous_text_len) {
         return true;
     }
     let delta = &full_text[previous_text_len..];
     if delta.is_empty() {
-        return false;
+        return candidate_is_non_stop_control;
     }
     if contains_replacement_char_mojibake(delta) {
         return true;
@@ -833,13 +834,17 @@ impl SequenceState {
         let mut tokens = Vec::with_capacity(self.generated_tokens.len() + 1);
         tokens.extend_from_slice(&self.generated_tokens);
         tokens.push(token);
+        let candidate_is_stop = self.stop_token_ids.contains(&token.get());
+        let candidate_is_non_stop_control =
+            self.allowed_extended_token_ids.contains(&token.get()) && !candidate_is_stop;
         tokenizer
             .decode(&tokens, true)
             .map(|text| {
                 decoded_delta_has_forbidden_quality(
                     &text,
                     previous_streamed_text_len,
-                    self.stop_token_ids.contains(&token.get()),
+                    candidate_is_stop,
+                    candidate_is_non_stop_control,
                 )
             })
             .unwrap_or(true)
