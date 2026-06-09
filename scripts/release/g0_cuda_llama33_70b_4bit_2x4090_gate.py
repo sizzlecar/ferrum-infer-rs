@@ -1771,21 +1771,12 @@ def serve_correctness(root: Path, base_url: str, model: str) -> dict[str, Any]:
 
 
 def serve_multiturn(root: Path, base_url: str, model: str) -> dict[str, Any]:
+    messages = serve_multiturn_probe_messages()
     payload = {
         "model": model,
         "temperature": 0,
         "seed": 9271,
-        "messages": [
-            {
-                "role": "user",
-                "content": f"请记住这个精确代码：[{RECALL_MARKER}]。只回答 OK。",
-            },
-            {"role": "assistant", "content": "OK"},
-            {
-                "role": "user",
-                "content": "第一条用户消息里的精确代码是什么？只输出完整代码，不要解释，不要改写。",
-            },
-        ],
+        "messages": messages,
         "max_tokens": 128,
         "stop": ["\n"],
     }
@@ -1807,6 +1798,25 @@ def serve_multiturn(root: Path, base_url: str, model: str) -> dict[str, Any]:
     }
     write_json(root / "serve.multiturn.json", result)
     return result
+
+
+def serve_multiturn_probe_messages() -> list[dict[str, str]]:
+    return [
+        {
+            "role": "user",
+            "content": (
+                f"Remember the exact ferrum-prefixed phrase {RECALL_MARKER}. Answer OK only."
+            ),
+        },
+        {"role": "assistant", "content": "OK"},
+        {
+            "role": "user",
+            "content": (
+                "In the first user message, what exact ferrum-prefixed phrase were "
+                "you asked to remember? Output only that complete phrase."
+            ),
+        },
+    ]
 
 
 def serve_structured_output(root: Path, base_url: str, model: str) -> dict[str, Any]:
@@ -2270,6 +2280,13 @@ def self_test() -> int:
     assert "first user message" in run_probe_input
     assert "complete phrase" in run_probe_input
     assert "inside brackets" not in run_probe_input
+    serve_probe_text = "\n".join(
+        message["content"] for message in serve_multiturn_probe_messages()
+    )
+    assert serve_probe_text.count(RECALL_MARKER) == 1
+    assert "first user message" in serve_probe_text
+    assert "complete phrase" in serve_probe_text
+    assert f"[{RECALL_MARKER}]" not in serve_probe_text
     serve_cmd = build_serve_command(
         Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out")
     )
