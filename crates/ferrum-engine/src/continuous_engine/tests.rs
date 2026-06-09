@@ -35,7 +35,10 @@ impl PolicyTokenizer {
 }
 
 impl Tokenizer for PolicyTokenizer {
-    fn encode(&self, _text: &str, _add_special: bool) -> Result<Vec<TokenId>> {
+    fn encode(&self, text: &str, _add_special: bool) -> Result<Vec<TokenId>> {
+        if let Some(id) = self.ids.get(text) {
+            return Ok(vec![*id]);
+        }
         Ok(vec![TokenId::new(0)])
     }
 
@@ -315,6 +318,28 @@ fn model_decode_metadata_marks_sampling_masks_for_full_logits() {
             .get("ferrum_require_full_logits")
             .and_then(|value| value.as_bool()),
         Some(true)
+    );
+}
+
+#[test]
+fn single_token_stop_sequence_also_matches_composite_decoded_token() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        8,
+        &[("OK", 5), ("\n", 6), ("OK \n\n", 7)],
+    ));
+    let mut request = policy_request();
+    request.sampling_params.stop_sequences = vec!["\n".to_string()];
+    let mut state =
+        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer.clone()));
+
+    assert!(state.stop_token_ids.contains(&6));
+    assert!(state.stop_text_seqs.contains(&"\n".to_string()));
+
+    state.generated_tokens.push(TokenId::new(7));
+
+    assert_eq!(
+        state.stop_reason(Some(tokenizer.as_ref())),
+        Some(FinishReason::Stop)
     );
 }
 

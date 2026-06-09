@@ -209,8 +209,9 @@ fn clamp_default_max_tokens_to_context(
 ///    so there's no risk of inserting an unrelated token id from a hard-coded
 ///    fallback list (e.g. `2` is `</s>` for LLaMA but `!` for Qwen3).
 /// 3. User-supplied `stop_sequences` — each is encoded with `add_special=false`;
-///    one-token results land in `stop_token_ids`, multi-token results go to
-///    `stop_text_seqs` for text-match fallback.
+///    one-token results land in `stop_token_ids` for the fast path, and all
+///    user stop strings remain in `stop_text_seqs` so tokens that contain the
+///    stop text as a substring still stop.
 fn resolve_stop_conditions(
     params: &SamplingParams,
     tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
@@ -231,11 +232,14 @@ fn resolve_stop_conditions(
             }
         }
         for stop_seq in &params.stop_sequences {
+            if !stop_seq.is_empty() {
+                text_seqs.push(stop_seq.clone());
+            }
             match tok.encode(stop_seq, false) {
                 Ok(toks) if toks.len() == 1 => {
                     ids.insert(toks[0].get());
                 }
-                _ => text_seqs.push(stop_seq.clone()),
+                _ => {}
             }
         }
     } else {
