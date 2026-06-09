@@ -2198,15 +2198,12 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             .expect("scratch residual missing (previous call didn't restore)");
         let bridge_t0 = std::time::Instant::now();
         let host_copy_t0 = std::time::Instant::now();
-        let hidden_buf = B::from_slice(hidden_slice);
+        B::write_f32_to_activation(&mut ctx, &mut residual, hidden_slice);
         let host_copy_us = elapsed_micros_u64_floor1(host_copy_t0);
-        let device_copy_t0 = std::time::Instant::now();
-        B::copy_slice(&mut ctx, &hidden_buf, 0, &mut residual, 0, m * h);
-        let device_copy_us = elapsed_micros_u64_floor1(device_copy_t0);
         let bridge_timing = LlamaStageHiddenBridgeTiming {
             bridge_us: elapsed_micros_u64_floor1(bridge_t0),
             host_copy_us,
-            device_copy_us,
+            device_copy_us: 0,
         };
 
         for li in 0..self.local_layer_count() {
@@ -2250,7 +2247,12 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
 
         self.ensure_scratch(row_count);
         let mut ctx = B::new_context();
-        let hidden_buf = B::from_slice(hidden_slice);
+        let mut hidden_buf = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing before logits_from_hidden_batch");
+        B::write_f32_to_activation(&mut ctx, &mut hidden_buf, hidden_slice);
         B::rms_norm(
             &mut ctx,
             &hidden_buf,
@@ -2271,6 +2273,7 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             row_count,
         );
         B::sync(&mut ctx);
+        self.scratch.residual = Some(hidden_buf);
 
         let greedy = llama_batched_runtime_config().greedy_argmax && !force_full_logits;
         if greedy {

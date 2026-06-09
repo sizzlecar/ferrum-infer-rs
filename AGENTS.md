@@ -325,13 +325,22 @@ Offer selection:
 - Search rentable offers through the Vast HTTP API and filter locally for the exact hardware required by the lane, for example a 2x RTX 4090 host when a two-GPU CUDA lane requires it.
 - Prefer low hourly cost only after hardware count, GPU memory, disk capacity, CUDA capability, network bandwidth, and reliability are sufficient for the gate.
 - Do not broaden from the lane's required hardware, model matrix, or GPU count without explicit user approval.
+- If the Vast API reports `insufficient_credit`, stop rental attempts immediately, report the external blocker, and do not keep cycling offers. Clean up any newly-created stopped diagnostic instance that has no unique evidence, while preserving older stopped instances that may contain model caches or artifacts.
 
 Instance creation:
 
 - Create instances with an NVIDIA CUDA devel image suitable for building Ferrum CUDA binaries, such as `nvidia/cuda:12.4.0-devel-ubuntu22.04`, unless the lane requires a newer CUDA base.
 - Configure SSH access at creation time and install only required bootstrap packages such as `openssh-server`, `git`, `curl`, `ca-certificates`, `build-essential`, `pkg-config`, `libssl-dev`, Python, `jq`, and `rsync`.
 - Request enough disk for source, build outputs, downloaded models, and artifacts. If the model size is uncertain, stop before creating the instance and estimate disk from the goal document or model metadata.
+- Ensure the startup command keeps the container alive after SSH starts, for example by starting `sshd` and ending with `sleep infinity`. Do not rely on a foreground bootstrap command that can exit and stop the instance during a download or build.
 - Save the selected offer id, created instance id, Vast response metadata, lane, expected runtime/cost, and stop condition in the local artifact notes without secrets.
+
+Instance lifecycle:
+
+- Query an instance with `GET https://console.vast.ai/api/v0/instances/<INSTANCE_ID>/` and header `Authorization: Bearer $VAST_API_KEY`.
+- Start or stop an existing instance with `PUT https://console.vast.ai/api/v0/instances/<INSTANCE_ID>/` and JSON body `{"state":"running"}` or `{"state":"stopped"}`. Do not use guessed subpaths such as `/start/`.
+- After requesting start, wait for both `cur_state=running` and `actual_status=running`, then verify SSH and CUDA with `nvidia-smi` and `nvcc --version` before running paid work.
+- After requesting stop, keep polling until `actual_status=exited`; `cur_state=stopped` alone can appear while the container is still shutting down.
 
 Remote validation workflow:
 
@@ -339,8 +348,10 @@ Remote validation workflow:
 - Synchronize the exact local worktree to the instance, including `.git`, while excluding local secrets and build caches such as `.env.local` and `target/`.
 - On the remote host, verify `git rev-parse HEAD` and `git status --short` before collecting evidence. Dirty remote state is not acceptable for performance claims unless the dirty files are explicitly listed in the artifacts.
 - Install Rust and other build dependencies on the instance only as needed for the lane. Keep environment variables and runtime options visible in the saved command log, except for secrets.
+- Run long downloads, builds, and gates inside `tmux`, `nohup`, or another detached session with logs under the artifact root. SSH disconnects must not kill model downloads, CUDA builds, or benchmark runs.
 - For large Hugging Face model lanes, start a model snapshot prefetch into the documented remote `HF_HOME` in parallel with long CUDA builds when the cache is empty. Keep the official gate command unchanged, save the prefetch log as an auxiliary non-gate artifact, and do not copy or pass HF secrets unless the user explicitly approves that lane.
 - When using Python `huggingface_hub.snapshot_download` for that prefetch, align the cache layout with Ferrum's `HF_HOME` lookup: set `HF_HOME=/workspace/hf-cache` and use `cache_dir="$HF_HOME/hub"` or omit `cache_dir`; do not use `cache_dir="$HF_HOME"` because Ferrum expects snapshots under `$HF_HOME/hub/models--...`.
+- Prefer the current Hugging Face high-performance transfer path when available, for example `HF_XET_HIGH_PERFORMANCE=1` with recent `huggingface_hub`. If no `HF_TOKEN` is available, record that the prefetch is anonymous and expect slower or rate-limited public downloads rather than treating the model format as failed.
 - Run the lane's correctness gate before any performance command. Product-path CUDA evidence must include the required `ferrum run` and `ferrum serve` coverage from the relevant gate or goal document.
 - Run benchmark commands from the goal document or release policy, not ad hoc hidden environment-variable combinations.
 

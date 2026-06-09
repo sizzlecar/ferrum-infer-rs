@@ -301,6 +301,10 @@ pub struct RunCommand {
     #[arg(long, value_name = "N")]
     pub kv_capacity: Option<usize>,
 
+    /// KV block budget (`FERRUM_KV_MAX_BLOCKS`).
+    #[arg(long, value_name = "N")]
+    pub kv_max_blocks: Option<usize>,
+
     /// Write resolved startup runtime config JSON and exit artifacts.
     #[arg(long)]
     pub effective_config_json: Option<PathBuf>,
@@ -1516,6 +1520,11 @@ fn run_startup_cli_runtime_entries(
     crate::runtime_env::push_cli_runtime_usize(&mut entries, "FERRUM_KV_CAPACITY", cmd.kv_capacity);
     crate::runtime_env::push_cli_runtime_usize(
         &mut entries,
+        "FERRUM_KV_MAX_BLOCKS",
+        cmd.kv_max_blocks,
+    );
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
         "FERRUM_MAX_MODEL_LEN",
         cmd.max_model_len,
     );
@@ -1646,6 +1655,7 @@ mod tests {
             max_num_batched_tokens: None,
             kv_dtype: None,
             kv_capacity: None,
+            kv_max_blocks: None,
             effective_config_json: None,
             decision_trace_jsonl: None,
             output_format: OutputFormat::Text,
@@ -1733,6 +1743,7 @@ mod tests {
     fn run_effective_runtime_config_records_cli_runtime_limits() {
         let mut cmd = test_run_cmd();
         cmd.kv_capacity = Some(2048);
+        cmd.kv_max_blocks = Some(4096);
         cmd.max_model_len = Some(8192);
         cmd.max_num_seqs = Some(8);
         cmd.max_num_batched_tokens = Some(1024);
@@ -1748,6 +1759,7 @@ mod tests {
         };
 
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
+        assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
         assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "8192");
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "8");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "1024");

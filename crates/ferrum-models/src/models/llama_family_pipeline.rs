@@ -15,6 +15,8 @@ fn elapsed_micros_u64(t0: std::time::Instant) -> u64 {
     t0.elapsed().as_micros().min(u64::MAX as u128) as u64
 }
 
+const MIN_OVERLAPPED_DECODE_BATCH: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PipelineHiddenDtype {
     F32,
@@ -663,6 +665,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyPipelineModel<B, K> {
 
     fn decode_microbatch_size(&self, batch_len: usize) -> usize {
         match self.pipeline_mode() {
+            LlamaPipelineMode::Overlapped if batch_len < MIN_OVERLAPPED_DECODE_BATCH => {
+                batch_len.max(1)
+            }
             LlamaPipelineMode::Overlapped => ((batch_len + 1) / 2).max(1),
             LlamaPipelineMode::Batch => batch_len.max(1),
         }
@@ -1289,9 +1294,12 @@ mod tests {
                 > 0
         );
         assert!(
-            metrics["pipeline_decode"]["device_copy_us_total"]
+            metrics["pipeline_decode"]["host_copy_us_total"]
                 .as_u64()
                 .unwrap()
+                + metrics["pipeline_decode"]["device_copy_us_total"]
+                    .as_u64()
+                    .unwrap()
                 > 0
         );
     }
@@ -1300,44 +1308,99 @@ mod tests {
     fn pipeline_decode_batch_matches_full_model_and_preserves_order() {
         let (mut full, mut pipeline) = build_full_and_pipeline();
 
-        let _ = full.prefill("full_a", &[0, 1]);
-        let _ = full.prefill("full_b", &[2, 3, 4]);
-        let _ = pipeline.prefill("pipe_a", &[0, 1]);
-        let _ = pipeline.prefill("pipe_b", &[2, 3, 4]);
+        let prefills: Vec<Vec<u32>> = (0..16)
+            .map(|idx| {
+                let len = 1 + (idx % 4);
+                (0..len).map(|offset| ((idx + offset) % 7) as u32).collect()
+            })
+            .collect();
+        for (idx, tokens) in prefills.iter().enumerate() {
+            let _ = full.prefill(&format!("full_{idx}"), tokens);
+            let _ = pipeline.prefill(&format!("pipe_{idx}"), tokens);
+        }
 
-        let expected =
-            full.decode_batch(&[("full_a".to_string(), 5, 2), ("full_b".to_string(), 6, 3)]);
-        let actual =
-            pipeline.decode_batch(&[("pipe_a".to_string(), 5, 2), ("pipe_b".to_string(), 6, 3)]);
+        let first_tokens: Vec<u32> = (0..prefills.len())
+            .map(|idx| ((idx + 5) % 7) as u32)
+            .collect();
+        let second_tokens: Vec<u32> = (0..prefills.len())
+            .map(|idx| ((idx + 1) % 7) as u32)
+            .collect();
+        let full_first: Vec<_> = prefills
+            .iter()
+            .enumerate()
+            .map(|(idx, tokens)| {
+                (
+                    format!("full_{idx}"),
+                    first_tokens[idx],
+                    tokens.len() as u32,
+                )
+            })
+            .collect();
+        let pipe_first: Vec<_> = prefills
+            .iter()
+            .enumerate()
+            .map(|(idx, tokens)| {
+                (
+                    format!("pipe_{idx}"),
+                    first_tokens[idx],
+                    tokens.len() as u32,
+                )
+            })
+            .collect();
 
-        assert_eq!(actual.len(), 2);
-        assert_logits_close("decode batch row 0", &expected[0], &actual[0]);
-        assert_logits_close("decode batch row 1", &expected[1], &actual[1]);
+        let expected = full.decode_batch(&full_first);
+        let actual = pipeline.decode_batch(&pipe_first);
 
-        let expected_next =
-            full.decode_batch(&[("full_a".to_string(), 1, 3), ("full_b".to_string(), 0, 4)]);
-        let actual_next =
-            pipeline.decode_batch(&[("pipe_a".to_string(), 1, 3), ("pipe_b".to_string(), 0, 4)]);
+        assert_eq!(actual.len(), prefills.len());
+        for row in 0..prefills.len() {
+            assert_logits_close(
+                &format!("decode batch row {row}"),
+                &expected[row],
+                &actual[row],
+            );
+        }
 
-        assert_logits_close(
-            "follow-up decode batch row 0",
-            &expected_next[0],
-            &actual_next[0],
-        );
-        assert_logits_close(
-            "follow-up decode batch row 1",
-            &expected_next[1],
-            &actual_next[1],
-        );
+        let full_next: Vec<_> = prefills
+            .iter()
+            .enumerate()
+            .map(|(idx, tokens)| {
+                (
+                    format!("full_{idx}"),
+                    second_tokens[idx],
+                    tokens.len() as u32 + 1,
+                )
+            })
+            .collect();
+        let pipe_next: Vec<_> = prefills
+            .iter()
+            .enumerate()
+            .map(|(idx, tokens)| {
+                (
+                    format!("pipe_{idx}"),
+                    second_tokens[idx],
+                    tokens.len() as u32 + 1,
+                )
+            })
+            .collect();
+        let expected_next = full.decode_batch(&full_next);
+        let actual_next = pipeline.decode_batch(&pipe_next);
+
+        for row in 0..prefills.len() {
+            assert_logits_close(
+                &format!("follow-up decode batch row {row}"),
+                &expected_next[row],
+                &actual_next[row],
+            );
+        }
 
         let metrics = pipeline.cache_metrics_snapshot().unwrap();
         assert_eq!(metrics["pipeline_decode"]["calls"], 2);
         assert_eq!(metrics["pipeline_decode"]["overlapped_calls"], 2);
-        assert_eq!(metrics["pipeline_decode"]["rows"], 4);
-        assert_eq!(metrics["pipeline_decode"]["max_batch"], 2);
-        assert_eq!(metrics["pipeline_decode"]["last_batch"], 2);
+        assert_eq!(metrics["pipeline_decode"]["rows"], 32);
+        assert_eq!(metrics["pipeline_decode"]["max_batch"], 16);
+        assert_eq!(metrics["pipeline_decode"]["last_batch"], 16);
         assert_eq!(metrics["pipeline_decode"]["microbatch_count_max"], 2);
-        assert_eq!(metrics["pipeline_decode"]["microbatch_size_max"], 1);
+        assert_eq!(metrics["pipeline_decode"]["microbatch_size_max"], 8);
         assert_eq!(metrics["pipeline_decode"]["in_flight_stage_count_max"], 2);
         assert_eq!(metrics["pipeline_decode"]["queue_depth_max"], 1);
         assert_eq!(
@@ -1366,11 +1429,75 @@ mod tests {
                 > 0
         );
         assert!(
-            metrics["pipeline_decode"]["device_copy_us_total"]
+            metrics["pipeline_decode"]["host_copy_us_total"]
                 .as_u64()
                 .unwrap()
+                + metrics["pipeline_decode"]["device_copy_us_total"]
+                    .as_u64()
+                    .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn pipeline_overlapped_mode_keeps_small_batches_whole() {
+        let (mut full, mut pipeline) = build_full_and_pipeline();
+
+        let prefills: Vec<Vec<u32>> = (0..8)
+            .map(|idx| {
+                let len = 1 + (idx % 3);
+                (0..len).map(|offset| ((idx + offset) % 7) as u32).collect()
+            })
+            .collect();
+        for (idx, tokens) in prefills.iter().enumerate() {
+            let _ = full.prefill(&format!("full_{idx}"), tokens);
+            let _ = pipeline.prefill(&format!("pipe_{idx}"), tokens);
+        }
+
+        let full_batch: Vec<_> = prefills
+            .iter()
+            .enumerate()
+            .map(|(idx, tokens)| {
+                (
+                    format!("full_{idx}"),
+                    ((idx + 5) % 7) as u32,
+                    tokens.len() as u32,
+                )
+            })
+            .collect();
+        let pipe_batch: Vec<_> = prefills
+            .iter()
+            .enumerate()
+            .map(|(idx, tokens)| {
+                (
+                    format!("pipe_{idx}"),
+                    ((idx + 5) % 7) as u32,
+                    tokens.len() as u32,
+                )
+            })
+            .collect();
+
+        let expected = full.decode_batch(&full_batch);
+        let actual = pipeline.decode_batch(&pipe_batch);
+
+        assert_eq!(actual.len(), prefills.len());
+        for row in 0..prefills.len() {
+            assert_logits_close(
+                &format!("small batch row {row}"),
+                &expected[row],
+                &actual[row],
+            );
+        }
+
+        let metrics = pipeline.cache_metrics_snapshot().unwrap();
+        assert_eq!(metrics["selected_pipeline_mode"], "overlapped");
+        assert_eq!(metrics["pipeline_decode"]["calls"], 1);
+        assert_eq!(metrics["pipeline_decode"]["overlapped_calls"], 0);
+        assert_eq!(metrics["pipeline_decode"]["max_batch"], 8);
+        assert_eq!(metrics["pipeline_decode"]["microbatch_count_max"], 1);
+        assert_eq!(metrics["pipeline_decode"]["microbatch_size_max"], 8);
+        assert_eq!(metrics["pipeline_decode"]["in_flight_stage_count_max"], 1);
+        assert_eq!(metrics["pipeline_decode"]["queue_depth_max"], 0);
     }
 
     #[test]
