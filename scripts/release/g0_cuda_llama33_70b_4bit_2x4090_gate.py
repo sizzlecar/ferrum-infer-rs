@@ -930,14 +930,8 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
 def run_cli_probe_input_text() -> str:
     return "\n".join(
         [
-            (
-                "Remember these two words exactly: "
-                f"{RECALL_MARKER}. For this turn, output exactly OK."
-            ),
-            (
-                "Output the two words I asked you to remember, "
-                "exactly and with no other text."
-            ),
+            f"Please remember: {RECALL_MARKER}. Now reply exactly OK.",
+            "What phrase did I ask you to remember? Answer with only the phrase.",
             "/bye",
             "",
         ]
@@ -1710,7 +1704,7 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
         if turn.get("finish_reason") == "length":
             raise RuntimeError(f"ferrum run assistant turn finished by length: {turn}")
     recall = strip_think(str(turns[-1].get("content") or ""))
-    if RECALL_MARKER not in recall:
+    if RECALL_MARKER not in recall.lower():
         raise RuntimeError(f"ferrum run recall failed: {recall[:500]!r}")
     effective = require_effective_config(root / "run.effective_config.json", "run", cfg)
     return {
@@ -1807,7 +1801,7 @@ def serve_multiturn(root: Path, base_url: str, model: str) -> dict[str, Any]:
             row["content"] = content
             row["finish_reason"] = finish_reason
             assert_no_bad_patterns(f"serve multiturn attempt {attempt}", content)
-            if RECALL_MARKER not in strip_think(content):
+            if RECALL_MARKER not in strip_think(content).lower():
                 raise RuntimeError(f"recall failed: {content[:500]!r}")
             if finish_reason == "length":
                 raise RuntimeError("finished by length")
@@ -1852,18 +1846,12 @@ def serve_multiturn_probe_messages() -> list[dict[str, str]]:
     return [
         {
             "role": "user",
-            "content": (
-                "Remember these two words exactly: "
-                f"{RECALL_MARKER}. For this turn, output exactly OK."
-            ),
+            "content": f"Please remember: {RECALL_MARKER}. Now reply exactly OK.",
         },
         {"role": "assistant", "content": "OK"},
         {
             "role": "user",
-            "content": (
-                "Output the two words I asked you to remember, "
-                "exactly and with no other text."
-            ),
+            "content": "What phrase did I ask you to remember? Answer with only the phrase.",
         },
     ]
 
@@ -2326,17 +2314,17 @@ def self_test() -> int:
     assert "1024" in cmd
     run_probe_input = run_cli_probe_input_text()
     assert run_probe_input.count(RECALL_MARKER) == 1
-    assert "Remember these two words" in run_probe_input
-    assert "output exactly OK" in run_probe_input
-    assert "Output the two words" in run_probe_input
+    assert "Please remember" in run_probe_input
+    assert "reply exactly OK" in run_probe_input
+    assert "What phrase" in run_probe_input
     assert "inside brackets" not in run_probe_input
     serve_probe_text = "\n".join(
         message["content"] for message in serve_multiturn_probe_messages()
     )
     assert serve_probe_text.count(RECALL_MARKER) == 1
-    assert "Remember these two words" in serve_probe_text
-    assert "output exactly OK" in serve_probe_text
-    assert "Output the two words" in serve_probe_text
+    assert "Please remember" in serve_probe_text
+    assert "reply exactly OK" in serve_probe_text
+    assert "What phrase" in serve_probe_text
     assert f"[{RECALL_MARKER}]" not in serve_probe_text
     serve_cmd = build_serve_command(
         Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out")
