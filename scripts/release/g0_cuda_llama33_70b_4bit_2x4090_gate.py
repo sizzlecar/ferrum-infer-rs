@@ -47,7 +47,7 @@ BAD_PATTERNS = [
     "<|tool|>",
 ]
 DEFAULT_LAYER_SPLIT_PLAN = "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
-RECALL_MARKER = "ferrum-zeta-blue"
+RECALL_MARKER = "ferrum-lime-chair"
 MODEL_MANIFEST_INTERESTING_SUFFIXES = {".json", ".model", ".safetensors", ".gguf"}
 TOKENIZER_METADATA_FILE_NAMES = {
     "tokenizer.json",
