@@ -21,6 +21,25 @@ THROUGHPUT_TARGET_CELLS = {4, 8, 16, 32}
 FIXED_PUBLIC_TARGET_TPS = 27.6
 STRETCH_TARGET_TPS = 33.0
 PUBLIC_REFERENCE_TPS = 34.5
+QWEN25_72B_LAYER_SPLIT_RUNTIME_PRESET = "qwen25_72b_gptq_int4_2x4090_layer_split"
+QWEN25_72B_LAYER_SPLIT_DEFAULT_ENV = {
+    "FERRUM_LAYER_SPLIT_PIPELINE_MODE": "batch",
+    "FERRUM_MAX_MODEL_LEN": "4096",
+    "FERRUM_KV_MAX_BLOCKS": "1024",
+    "FERRUM_KV_CAPACITY": "1024",
+    "FERRUM_PAGED_MAX_SEQS": "16",
+    "FERRUM_MAX_BATCHED_TOKENS": "1536",
+    "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE": "16",
+}
+RUNTIME_PRESET_TUNING_FLAGS = [
+    "--layer-split-pipeline-mode",
+    "--max-model-len",
+    "--kv-max-blocks",
+    "--kv-capacity",
+    "--max-num-seqs",
+    "--max-num-batched-tokens",
+    "--scheduler-prefill-first-until-active",
+]
 REQUIRED_EFFECTIVE_CONFIG_FIELDS = {
     "selected_distributed_strategy",
     "selected_layer_split_plan",
@@ -968,7 +987,73 @@ def normalized_concurrency_sweep(value: str | None, label: str) -> str:
     return ",".join(str(cell) for cell in cells)
 
 
-def require_product_command(path: Path, label: str, subcommand: str, pipeline_mode: str) -> dict[str, str]:
+def require_default_runtime_preset_surface(
+    cmd: list[str],
+    data: Any,
+    label: str,
+    subcommand: str,
+    pipeline_mode: str,
+    effective_config: dict[str, Any] | None,
+) -> None:
+    if subcommand != "serve":
+        raise ValidationError(
+            f"{label}: {subcommand} command may omit --layer-split-pipeline-mode only for serve"
+        )
+    if effective_config is None:
+        raise ValidationError(f"{label}: missing effective config for default preset command")
+    if effective_config.get("preset") != QWEN25_72B_LAYER_SPLIT_RUNTIME_PRESET:
+        raise ValidationError(
+            f"{label}: default preset command must use preset "
+            f"{QWEN25_72B_LAYER_SPLIT_RUNTIME_PRESET}"
+        )
+    if effective_config.get("selected_pipeline_mode") != pipeline_mode:
+        raise ValidationError(f"{label}: default preset pipeline mode mismatch")
+    selected_expectations = {
+        "selected_max_model_len": 4096,
+        "selected_kv_capacity": 1024,
+        "selected_max_sequences": 16,
+        "selected_max_batched_tokens": 1536,
+        "selected_admission_limit": 16,
+    }
+    for key, expected in selected_expectations.items():
+        if effective_config.get(key) != expected:
+            raise ValidationError(f"{label}: default preset {key} must be {expected}")
+    for flag in RUNTIME_PRESET_TUNING_FLAGS:
+        if flag_value(cmd, flag) is not None:
+            raise ValidationError(
+                f"{label}: default preset command must not pass tuning flag {flag}"
+            )
+    if isinstance(data, dict) and data.get("expected_layer_split_pipeline_mode") != pipeline_mode:
+        raise ValidationError(f"{label}: default preset expected pipeline mode mismatch")
+    entries = effective_config.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValidationError(f"{label}: default preset effective config missing entries")
+    by_key = {
+        entry.get("key"): entry
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("key"), str)
+    }
+    for key, expected in QWEN25_72B_LAYER_SPLIT_DEFAULT_ENV.items():
+        entry = by_key.get(key)
+        if not isinstance(entry, dict):
+            raise ValidationError(f"{label}: default preset missing entry {key}")
+        if entry.get("source") != "default":
+            raise ValidationError(f"{label}: default preset entry {key} must be source=default")
+        if str(entry.get("effective_value")) != expected:
+            raise ValidationError(
+                f"{label}: default preset entry {key} must be {expected}"
+            )
+
+
+def require_product_command(
+    path: Path,
+    label: str,
+    subcommand: str,
+    pipeline_mode: str,
+    *,
+    effective_config: dict[str, Any] | None = None,
+    allow_default_runtime_preset: bool = False,
+) -> dict[str, str]:
     file = path / f"{subcommand}.command.json"
     cmd = command_list(file, f"{label} {subcommand}")
     if subcommand not in cmd:
@@ -977,13 +1062,23 @@ def require_product_command(path: Path, label: str, subcommand: str, pipeline_mo
         raise ValidationError(f"{label}: {subcommand} command must use --backend cuda")
     if flag_value(cmd, "--gpu-devices") != "0,1":
         raise ValidationError(f"{label}: {subcommand} command must use --gpu-devices 0,1")
-    if flag_value(cmd, "--layer-split-pipeline-mode") != pipeline_mode:
-        raise ValidationError(
-            f"{label}: {subcommand} command must use --layer-split-pipeline-mode {pipeline_mode}"
-        )
-    if flag_value(cmd, "--effective-config-json") is None:
-        raise ValidationError(f"{label}: {subcommand} command missing --effective-config-json")
     data = load_json(file)
+    pipeline_flag = flag_value(cmd, "--layer-split-pipeline-mode")
+    pipeline_mode_source = "explicit_flag"
+    if pipeline_flag != pipeline_mode:
+        if allow_default_runtime_preset and pipeline_flag is None:
+            require_default_runtime_preset_surface(
+                cmd, data, label, subcommand, pipeline_mode, effective_config
+            )
+            pipeline_mode_source = "runtime_preset_default"
+        else:
+            raise ValidationError(
+                f"{label}: {subcommand} command must use --layer-split-pipeline-mode {pipeline_mode}"
+            )
+    if flag_value(cmd, "--effective-config-json") is None:
+        raise ValidationError(
+            f"{label}: {subcommand} command missing --effective-config-json"
+        )
     if isinstance(data, dict):
         expected = data.get("expected_layer_split_pipeline_mode")
         if expected is not None and expected != pipeline_mode:
@@ -994,6 +1089,7 @@ def require_product_command(path: Path, label: str, subcommand: str, pipeline_mo
         "backend": flag_value(cmd, "--backend") or "",
         "gpu_devices": flag_value(cmd, "--gpu-devices") or "",
         "pipeline_mode": pipeline_mode,
+        "pipeline_mode_source": pipeline_mode_source,
     }
 
 
@@ -1618,7 +1714,12 @@ def validate_perf_goal(
         candidate_artifact, "candidate", "run", candidate_config["selected_pipeline_mode"]
     )
     candidate_serve_command = require_product_command(
-        candidate_artifact, "candidate", "serve", candidate_config["selected_pipeline_mode"]
+        candidate_artifact,
+        "candidate",
+        "serve",
+        candidate_config["selected_pipeline_mode"],
+        effective_config=candidate_config,
+        allow_default_runtime_preset=True,
     )
     baseline_cache_metrics = validate_pipeline_cache_metrics(
         baseline_artifact, "baseline", baseline_config
@@ -1936,6 +2037,9 @@ def make_perf_artifact(
     pipeline_mode: str,
     max_sequences: int = 16,
     max_batched_tokens: int = 2048,
+    kv_capacity: int = 2048,
+    max_model_len: int = 8192,
+    serve_uses_default_runtime_preset: bool = False,
     diagnostic: bool = False,
 ) -> None:
     sorted_cells = sorted(REQUIRED_CONCURRENCY_CELLS)
@@ -2094,23 +2198,28 @@ def make_perf_artifact(
         },
     )
     for subcommand in ["run", "serve"]:
+        cmd = [
+            "ferrum",
+            subcommand,
+            metadata["model_id"],
+            "--backend",
+            "cuda",
+            "--gpu-devices",
+            "0,1",
+        ]
+        if not (serve_uses_default_runtime_preset and subcommand == "serve"):
+            cmd.extend(["--layer-split-pipeline-mode", pipeline_mode])
+        cmd.extend(
+            [
+                "--effective-config-json",
+                str(root / f"{subcommand}.effective_config.json"),
+            ]
+        )
         write_json(
             root / f"{subcommand}.command.json",
             {
                 "status": "run",
-                "cmd": [
-                    "ferrum",
-                    subcommand,
-                    metadata["model_id"],
-                    "--backend",
-                    "cuda",
-                    "--gpu-devices",
-                    "0,1",
-                    "--layer-split-pipeline-mode",
-                    pipeline_mode,
-                    "--effective-config-json",
-                    str(root / f"{subcommand}.effective_config.json"),
-                ],
+                "cmd": cmd,
                 "expected_layer_split_pipeline_mode": pipeline_mode,
             },
         )
@@ -2128,9 +2237,19 @@ def make_perf_artifact(
         "selected_max_sequences": max_sequences,
         "selected_max_batched_tokens": max_batched_tokens,
         "selected_admission_limit": max_sequences,
-        "selected_kv_capacity": 2048,
-        "selected_max_model_len": 8192,
+        "selected_kv_capacity": kv_capacity,
+        "selected_max_model_len": max_model_len,
     }
+    if serve_uses_default_runtime_preset:
+        effective["preset"] = QWEN25_72B_LAYER_SPLIT_RUNTIME_PRESET
+        effective["entries"] = [
+            {
+                "key": key,
+                "effective_value": value,
+                "source": "default",
+            }
+            for key, value in sorted(QWEN25_72B_LAYER_SPLIT_DEFAULT_ENV.items())
+        ]
     write_json(root / "effective_config.json", effective)
     write_json(
         root / "serve.health.json",
@@ -2546,7 +2665,10 @@ def run_self_test() -> None:
             tps_by_c={1: 21.0, 4: 27.8, 8: 28.4, 16: 28.1},
             pipeline_mode="batch",
             max_sequences=16,
-            max_batched_tokens=2048,
+            max_batched_tokens=1536,
+            kv_capacity=1024,
+            max_model_len=4096,
+            serve_uses_default_runtime_preset=True,
         )
         make_correctness_artifact(correctness)
         make_vllm_artifact(vllm, 30.0)
