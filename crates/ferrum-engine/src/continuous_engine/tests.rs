@@ -39,13 +39,16 @@ impl Tokenizer for PolicyTokenizer {
         Ok(vec![TokenId::new(0)])
     }
 
-    fn decode(&self, tokens: &[TokenId], _skip_special: bool) -> Result<String> {
+    fn decode(&self, tokens: &[TokenId], skip_special: bool) -> Result<String> {
         let mut output = String::new();
         let mut pending_bad_byte = false;
         for token in tokens {
             let Some(text) = self.token_text(*token) else {
                 continue;
             };
+            if skip_special && matches!(text, "<think>") {
+                continue;
+            }
             match text {
                 "byte-fallback" => output.push('\u{FFFD}'),
                 "bad-byte-lead" => pending_bad_byte = true,
@@ -574,6 +577,52 @@ fn sample_allows_generated_control_tokens_above_base_vocab() {
     assert_eq!(token.get(), 5);
     assert_eq!(logits[5], 90.0);
     assert_eq!(logits[6], f32::NEG_INFINITY);
+}
+
+#[test]
+fn sample_resamples_hidden_non_stop_control_tokens_above_base_vocab() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("</s>", 3),
+            ("ok", 4),
+            ("x", 5),
+            ("<think>", 7),
+        ],
+    ));
+    let mut state = SequenceState::new_with_tokenizer(
+        policy_request(),
+        vec![TokenId::new(0)],
+        Some(tokenizer.clone()),
+    );
+    state.generated_tokens.push(TokenId::new(4));
+    state.streamed_text_len = tokenizer
+        .decode(&state.generated_tokens, true)
+        .expect("generated prefix decodes")
+        .len();
+
+    assert!(
+        state.allowed_extended_token_ids.contains(&7),
+        "think token should be whitelisted as a generated control token"
+    );
+    assert!(
+        !state.stop_token_ids.contains(&7),
+        "think token should not be treated as a stop token"
+    );
+
+    let mut logits = vec![f32::NEG_INFINITY; 8];
+    logits[5] = 1.0;
+    logits[7] = 100.0;
+
+    let token = state
+        .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .unwrap();
+
+    assert_eq!(token.get(), 5);
+    assert_eq!(logits[7], f32::NEG_INFINITY);
 }
 
 #[test]
