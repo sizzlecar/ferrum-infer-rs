@@ -43,7 +43,10 @@ TOOL_USER_PROMPT = (
     "北京现在天气怎么样？请先调用 get_weather 工具查询，"
     "得到工具结果后用一句中文回答，unit 使用 celsius。"
 )
-TOOL_REQUIRED_PROMPT = "只调用 get_weather 工具查询北京天气，unit 使用 celsius。不要输出自然语言。"
+TOOL_REQUIRED_PROMPT = (
+    "Call get_weather exactly once with city set to Beijing and unit set to celsius. "
+    "Do not output natural language."
+)
 
 
 def write(path: Path, text: str) -> None:
@@ -139,7 +142,10 @@ def assert_weather_tool_call(label: str, choice: dict[str, Any]) -> dict[str, An
         args = json.loads(args_raw)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"{label}: arguments is not JSON: {args_raw!r}") from e
-    city = str(args.get("city", "")).lower()
+    city_raw = str(args.get("city", ""))
+    city = city_raw.lower()
+    if len(city_raw) > 64:
+        raise RuntimeError(f"{label}: city argument is unexpectedly long: {args}")
     if "北京" not in city and "beijing" not in city:
         raise RuntimeError(f"{label}: city argument does not identify Beijing: {args}")
     return call
