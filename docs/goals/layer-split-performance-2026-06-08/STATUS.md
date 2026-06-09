@@ -2,21 +2,95 @@
 
 Last updated: 2026-06-10.
 
-This goal is not complete. Completion still requires the final validator to print:
+This goal passed the final validator.
 
 ```text
-LAYER_SPLIT_PERF GOAL PASS: <out_dir>
+LAYER_SPLIT_PERF GOAL PASS: /workspace/layer-split-perf-full-c4cda34-20260609-195213/final-rerun-2d5fbc16
 ```
 
 ## Current State
 
 - Target model: `Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4`.
 - Target split: `stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79`.
-- Current local base SHA: `7258db1d679dc08f76c010d310a1db248c9d7542`.
-- The worktree is intentionally dirty with diagnostic/performance changes; final goal evidence still needs a clean-worktree full run.
-- Vast instance `40203673` was used for the latest diagnostics and was stopped after artifacts were copied locally.
+- Product/benchmark git SHA: `c4cda3435612da2a21c77806de556e9cf782b722`.
+- Product binary SHA256: `7f0a07726cadc50b199bcf5a2973dddbbb87bc86a442a72848c7d96678dd64ae`.
+- Final validator fix SHA: `2d5fbc16` (`test(release): accept runtime preset layer split evidence`).
+- Vast instance `40203673` was stopped after artifacts were copied locally:
+  `actual_status=exited`, `cur_state=stopped`, `intended_status=stopped`.
 - The current candidate config is now `batch-tuned`, not `overlapped`: batch mode with `max_num_seqs=16`, `max_num_batched_tokens=1536`, and `scheduler_prefill_first_until_active=16`.
-- The final validator now accepts either `batch` or `overlapped` candidate modes, while preserving the mode-specific pipeline metric checks and the requirement that candidate throughput beat baseline and meet the selected target.
+- Candidate `serve` performance evidence uses product defaults via inferred runtime preset, not explicit tuning flags. `serve.effective_config.json` records preset `qwen25_72b_gptq_int4_2x4090_layer_split`, pipeline `batch`, max sequences `16`, max batched tokens `1536`, KV capacity `1024`, admission `16`, and the relevant runtime entries as `source=default`.
+
+## Final Full Gate
+
+Remote artifact:
+
+```text
+/workspace/layer-split-perf-full-c4cda34-20260609-195213
+```
+
+Local copy:
+
+```text
+/Users/chejinxuan/rust_ws/ferrum-infer-rs-records/layer-split/layer-split-perf-full-c4cda34-20260609-195213
+```
+
+Final validator artifact:
+
+```text
+/workspace/layer-split-perf-full-c4cda34-20260609-195213/final-rerun-2d5fbc16
+/Users/chejinxuan/rust_ws/ferrum-infer-rs-records/layer-split/layer-split-perf-full-c4cda34-20260609-195213/final-rerun-2d5fbc16
+```
+
+Sub-gate PASS lines:
+
+```text
+G0 SOURCE layer_split_perf_qwen72b_gptq PASS: /workspace/layer-split-perf-full-c4cda34-20260609-195213/baseline-batch
+G0 SOURCE layer_split_perf_qwen72b_gptq PASS: /workspace/layer-split-perf-full-c4cda34-20260609-195213/candidate-batch-tuned
+```
+
+Final PASS line:
+
+```text
+LAYER_SPLIT_PERF GOAL PASS: /workspace/layer-split-perf-full-c4cda34-20260609-195213/final-rerun-2d5fbc16
+```
+
+Performance command:
+
+```bash
+ferrum bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3 --concurrency-sweep 1,4,8,16,32
+```
+
+Throughput:
+
+| Case | c1 output tok/s | c4 output tok/s | c8 output tok/s | c16 output tok/s | c32 output tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline batch | 19.557 | 58.186 | 86.241 | 87.097 | 87.428 |
+| candidate batch-tuned | 19.516 | 57.791 | 85.646 | 114.435 | 116.324 |
+
+Relative result:
+
+- c1: `-0.21%`
+- c4: `-0.68%`
+- c8: `-0.69%`
+- c16: `+31.39%`
+- c32: `+33.05%`
+
+Final target result:
+
+- Target mode: `fixed_public_lower_bound`.
+- Target output throughput: `27.600 tok/s`.
+- Candidate max c4/c8/c16/c32: `116.324 tok/s`.
+- Baseline max c4/c8/c16/c32: `87.428 tok/s`.
+- Stretch target `33.000 tok/s`: passed.
+- Same-pod vLLM baseline: not collected for this run; the final validator accepted `fixed_public_lower_bound_only`.
+
+GPU evidence:
+
+- Candidate bench GPU max utilization by concurrency:
+  c1 `100/96%`, c4 `100/100%`, c8 `100/100%`, c16 `100/82%`, c32 `100/71%`.
+- Candidate memory during serve-ready: about `23029/23035 MiB`.
+- GPUs: two `NVIDIA GeForce RTX 4090`.
+- CUDA: `12.7`; driver: `565.57.01`.
 
 ## Latest Product GPU Diagnostic
 
