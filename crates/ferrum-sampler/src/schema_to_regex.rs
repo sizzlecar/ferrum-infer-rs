@@ -4,8 +4,9 @@
 //! use cases — the classic "give me a typed object back" prompt flow
 //! that OpenAI's `response_format = json_schema` enables. Coverage:
 //!
-//!   - `{ "type": "string" }` → `"[^"\\]*"` (no escape handling yet —
-//!     models very rarely emit backslashes in short structured answers).
+//!   - `{ "type": "string" }` → `"[^"\\]*"`; `minLength`/`maxLength`
+//!     become bounded repetitions. No escape handling yet — models very
+//!     rarely emit backslashes in short structured answers.
 //!   - `{ "type": "integer" }` → `-?\d+`
 //!   - `{ "type": "number" }`  → `-?\d+(\.\d+)?([eE][+-]?\d+)?`
 //!   - `{ "type": "boolean" }` → `true|false`
@@ -18,7 +19,7 @@
 //!
 //! Not supported (falls back to JsonObject-style unconstrained JSON):
 //!   - `$ref`, `oneOf`, `anyOf`, `allOf`, `not`
-//!   - nested-depth limits, min/max constraints, string patterns
+//!   - nested-depth limits, numeric min/max constraints, string patterns
 //!   - additionalProperties, propertyNames
 //!
 //! When the translator can't handle a schema, the caller should skip
@@ -53,7 +54,7 @@ fn translate(node: &Value) -> Result<String> {
 
     let ty = node.get("type").and_then(|v| v.as_str());
     match ty {
-        Some("string") => Ok(r#""[^"]*""#.to_string()),
+        Some("string") => string_pattern(node),
         Some("integer") => Ok(r"-?\d+".to_string()),
         Some("number") => Ok(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?".to_string()),
         Some("boolean") => Ok("(?:true|false)".to_string()),
@@ -67,6 +68,29 @@ fn translate(node: &Value) -> Result<String> {
             "JSON Schema node missing 'type' field and no 'enum' present",
         )),
     }
+}
+
+fn string_pattern(node: &Value) -> Result<String> {
+    const MAX_SUPPORTED_STRING_LENGTH: u64 = 1024;
+    let min = node.get("minLength").and_then(Value::as_u64).unwrap_or(0);
+    let max = node.get("maxLength").and_then(Value::as_u64);
+    if let Some(max) = max {
+        if max > MAX_SUPPORTED_STRING_LENGTH {
+            return Err(FerrumError::invalid_request(format!(
+                "response_format string maxLength {max} exceeds supported limit {MAX_SUPPORTED_STRING_LENGTH}"
+            )));
+        }
+        if min > max {
+            return Err(FerrumError::invalid_request(format!(
+                "response_format string minLength {min} exceeds maxLength {max}"
+            )));
+        }
+        return Ok(format!(r#""[^"]{{{min},{max}}}""#));
+    }
+    if min > 0 {
+        return Ok(format!(r#""[^"]{{{min},}}""#));
+    }
+    Ok(r#""[^"]*""#.to_string())
 }
 
 fn enum_pattern(values: &[Value]) -> Result<String> {
@@ -221,6 +245,16 @@ mod tests {
         assert!(re.is_match("\"\""));
         assert!(!re.is_match("hello"));
         assert!(!re.is_match("\"un\"closed"));
+    }
+
+    #[test]
+    fn string_schema_honors_min_and_max_length() {
+        let re =
+            compile(&schema_to_regex(r#"{"type":"string","minLength":1,"maxLength":3}"#).unwrap());
+        assert!(re.is_match("\"a\""));
+        assert!(re.is_match("\"abc\""));
+        assert!(!re.is_match("\"\""));
+        assert!(!re.is_match("\"abcd\""));
     }
 
     #[test]

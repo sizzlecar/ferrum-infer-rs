@@ -43,6 +43,7 @@ const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 512;
 const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const THINK_START_TAG: &str = "<think>";
 const THINK_END_TAG: &str = "</think>";
+const DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH: u64 = 128;
 const INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS: &[&str] =
     &["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"];
 const FERRUM_SESSION_HEADER: &str = "x-ferrum-session";
@@ -1582,24 +1583,8 @@ fn response_format_prompt_instruction(
 fn forced_tool_choice_response_format(
     request: &ChatCompletionsRequest,
 ) -> Option<ferrum_types::ResponseFormat> {
-    let selected_tool = match request.tool_choice.as_ref()? {
-        ToolChoice::Function {
-            tool_type,
-            function,
-        } if tool_type == "function" => request
-            .tools
-            .as_ref()?
-            .iter()
-            .find(|tool| tool.function.name == function.name)?,
-        ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
-            request.tools.as_ref()?.first()?
-        }
-        _ => return None,
-    };
-    let schema = serde_json::to_value(&selected_tool.function.parameters).ok()?;
-    if schema.is_null() {
-        return None;
-    }
+    let selected_tool = selected_tool_for_forced_tool_choice(request)?;
+    let schema = guided_tool_arguments_schema(selected_tool.function.parameters.as_ref())?;
     serde_json::to_string(&schema)
         .ok()
         .map(ferrum_types::ResponseFormat::JsonSchema)
@@ -1616,8 +1601,74 @@ fn inferred_auto_tool_response_format(
     if !text_mentions_tool(&prompt, &tool.function) {
         return None;
     }
-    let schema = serde_json::to_string(tool.function.parameters.as_ref()?).ok()?;
+    let schema = serde_json::to_string(&guided_tool_arguments_schema(
+        tool.function.parameters.as_ref(),
+    )?)
+    .ok()?;
     Some(ferrum_types::ResponseFormat::JsonSchema(schema))
+}
+
+fn selected_tool_for_forced_tool_choice(request: &ChatCompletionsRequest) -> Option<&ChatTool> {
+    match request.tool_choice.as_ref()? {
+        ToolChoice::Function {
+            tool_type,
+            function,
+        } if tool_type == "function" => request
+            .tools
+            .as_ref()?
+            .iter()
+            .find(|tool| tool.function.name == function.name),
+        ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
+            request.tools.as_ref()?.first()
+        }
+        _ => None,
+    }
+}
+
+fn guided_tool_arguments_schema(
+    parameters: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut schema = parameters?.clone();
+    bound_unconstrained_tool_argument_strings(
+        &mut schema,
+        DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH,
+    );
+    Some(schema)
+}
+
+fn bound_unconstrained_tool_argument_strings(value: &mut serde_json::Value, default_max: u64) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let is_string = map
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|ty| ty == "string");
+            let has_finite_string_shape = map.contains_key("enum") || map.contains_key("maxLength");
+            if is_string && !has_finite_string_shape {
+                map.insert(
+                    "maxLength".to_string(),
+                    serde_json::Value::Number(default_max.into()),
+                );
+            }
+            if let Some(properties) = map
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for property in properties.values_mut() {
+                    bound_unconstrained_tool_argument_strings(property, default_max);
+                }
+            }
+            if let Some(items) = map.get_mut("items") {
+                bound_unconstrained_tool_argument_strings(items, default_max);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                bound_unconstrained_tool_argument_strings(item, default_max);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn tool_choice_auto_or_omitted(choice: Option<&ToolChoice>) -> bool {
@@ -2218,10 +2269,22 @@ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Resul
 }
 
 fn tool_choice_required(request: &ChatCompletionsRequest) -> bool {
-    matches!(
-        request.tool_choice.as_ref(),
-        Some(ToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required")
-    )
+    match request.tool_choice.as_ref() {
+        Some(ToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required") => true,
+        Some(ToolChoice::Function {
+            tool_type,
+            function,
+        }) => {
+            tool_type == "function"
+                && request
+                    .tools
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|tool| tool.function.name == function.name)
+        }
+        _ => false,
+    }
 }
 
 fn openai_usage_from_token_usage(usage: &TokenUsage) -> Usage {
@@ -4582,14 +4645,50 @@ mod tests {
             }),
         )
         .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["param"], "tool_choice");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn route_chat_specific_tool_choice_wraps_generated_arguments() {
+        let response = post_json(
+            router_with_stub(r#"{"city":"Paris"}"#),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the selected tool."}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "weather"}
+                }
+            }),
+        )
+        .await;
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["content"], "");
         assert_eq!(
-            body["choices"][0]["message"]["content"],
-            r#"{"name":"calendar","arguments":{}}"#
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "weather"
         );
-        assert!(body["choices"][0]["message"]["tool_calls"].is_null());
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
     }
 
     #[tokio::test]
@@ -4819,12 +4918,10 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_text(response).await;
         assert!(
-            body.contains(r#""content":"{\"name\":\"calendar\",\"arguments\":{}}""#),
-            "unselected tool JSON should stream as ordinary content: {body}"
-        );
-        assert!(
-            body.contains(r#""finish_reason":"stop""#),
-            "unselected tool JSON should keep normal stop finish: {body}"
+            body.contains(
+                r#""error":{"message":"model output did not satisfy required tool_choice""#
+            ),
+            "selected-tool stream should reject unselected tool output: {body}"
         );
         assert!(
             !body.contains(r#""finish_reason":"tool_calls""#),
@@ -6615,6 +6712,55 @@ mod tests {
                 assert!(schema.contains(r#""required":["city"]"#), "{schema}");
             }
             ref other => panic!("expected inferred tool json schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_schema_response_format_bounds_unconstrained_strings() {
+        let request: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "served-alias",
+            "messages": [{"role": "user", "content": "Use the selected tool."}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                        },
+                        "required": ["city"]
+                    }
+                }
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "get_weather"}
+            }
+        }))
+        .expect("tool request parses");
+
+        validate_chat_request(&request).expect("tool request validates");
+        let internal = convert_chat_request(&request).expect("convert");
+        match internal.sampling_params.response_format {
+            ferrum_types::ResponseFormat::JsonSchema(ref schema) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(schema).expect("schema should be JSON");
+                assert_eq!(
+                    value["properties"]["city"]["maxLength"],
+                    DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH
+                );
+                assert_eq!(
+                    value["properties"]["unit"]["enum"],
+                    json!(["celsius", "fahrenheit"])
+                );
+                assert!(
+                    value["properties"]["unit"]["maxLength"].is_null(),
+                    "enum string should remain finite via enum instead of maxLength: {value}"
+                );
+            }
+            ref other => panic!("expected forced tool json schema, got {other:?}"),
         }
     }
 
