@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
+import ctypes.util
 import json
 import os
 import shutil
@@ -136,6 +138,86 @@ def validate_gpu_preflight_rows(gpus: list[dict[str, Any]]) -> list[str]:
     return errors
 
 
+def cuda_driver_error_name(code: int) -> str:
+    names = {
+        0: "CUDA_SUCCESS",
+        3: "CUDA_ERROR_NOT_INITIALIZED",
+        4: "CUDA_ERROR_DEINITIALIZED",
+        35: "CUDA_ERROR_INSUFFICIENT_DRIVER",
+        100: "CUDA_ERROR_NO_DEVICE",
+        101: "CUDA_ERROR_INVALID_DEVICE",
+        999: "CUDA_ERROR_UNKNOWN",
+    }
+    return names.get(code, f"CUDA_ERROR_{code}")
+
+
+def query_cuda_driver_device_count() -> dict[str, Any]:
+    lib_path = ctypes.util.find_library("cuda") or "libcuda.so.1"
+    try:
+        libcuda = ctypes.CDLL(lib_path)
+    except OSError as exc:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "library": lib_path,
+            "error": f"failed to load CUDA driver library: {exc}",
+        }
+
+    cu_init = libcuda.cuInit
+    cu_init.argtypes = [ctypes.c_uint]
+    cu_init.restype = ctypes.c_int
+    init_rc = int(cu_init(0))
+    if init_rc != 0:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "library": lib_path,
+            "cuInit": init_rc,
+            "error": f"cuInit failed: {cuda_driver_error_name(init_rc)} ({init_rc})",
+        }
+
+    cu_device_get_count = libcuda.cuDeviceGetCount
+    cu_device_get_count.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    cu_device_get_count.restype = ctypes.c_int
+    count = ctypes.c_int()
+    count_rc = int(cu_device_get_count(ctypes.byref(count)))
+    if count_rc != 0:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "library": lib_path,
+            "cuInit": init_rc,
+            "cuDeviceGetCount": count_rc,
+            "error": (
+                f"cuDeviceGetCount failed: {cuda_driver_error_name(count_rc)} ({count_rc})"
+            ),
+        }
+
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "library": lib_path,
+        "cuInit": init_rc,
+        "cuDeviceGetCount": count_rc,
+        "device_count": int(count.value),
+    }
+
+
+def validate_cuda_driver_preflight(
+    driver_probe: dict[str, Any], expected_count: int
+) -> list[str]:
+    if driver_probe.get("status") != "pass":
+        detail = driver_probe.get("error") or "unknown CUDA driver probe failure"
+        return [f"CUDA driver API probe failed: {detail}"]
+    actual_count = driver_probe.get("device_count")
+    if actual_count != expected_count:
+        return [
+            "CUDA driver API device count must match nvidia-smi "
+            f"({expected_count}); got {actual_count!r}"
+        ]
+    return []
+
+
 def query_gpu_preflight(repo: Path) -> dict[str, Any]:
     cmd = [
         "nvidia-smi",
@@ -171,6 +253,8 @@ def query_gpu_preflight(repo: Path) -> dict[str, Any]:
         }
     gpus = parse_nvidia_smi_gpu_query(proc.stdout)
     errors = validate_gpu_preflight_rows(gpus)
+    cuda_driver = query_cuda_driver_device_count()
+    errors.extend(validate_cuda_driver_preflight(cuda_driver, len(gpus)))
     status = "fail" if errors else "pass"
     return {
         "schema_version": 1,
@@ -178,6 +262,7 @@ def query_gpu_preflight(repo: Path) -> dict[str, Any]:
         "cmd": cmd,
         "returncode": proc.returncode,
         "gpus": gpus,
+        "cuda_driver": cuda_driver,
         "errors": errors,
     }
 
@@ -396,7 +481,10 @@ def command_plan(
         "stop_condition": stop_condition,
         "correctness_gate": correctness_gate,
         "performance_command": performance_command,
-        "hardware_preflight": "nvidia-smi must report exactly two RTX 4090 GPUs before build",
+        "hardware_preflight": (
+            "nvidia-smi must report exactly two RTX 4090 GPUs and the CUDA driver API "
+            "must report the same device count before build"
+        ),
         "vllm_preflight": (
             "vllm executable must be on PATH before build"
             if run_same_pod_vllm_baseline
@@ -614,6 +702,18 @@ def self_test() -> int:
         "1, NVIDIA GeForce RTX 4090, GPU-same\n"
     )
     assert any("UUIDs" in error for error in validate_gpu_preflight_rows(duplicate_uuid))
+    assert validate_cuda_driver_preflight(
+        {"status": "pass", "device_count": 2}, expected_count=2
+    ) == []
+    wrong_driver_count = validate_cuda_driver_preflight(
+        {"status": "pass", "device_count": 4}, expected_count=2
+    )
+    assert any("device count" in error for error in wrong_driver_count)
+    failed_driver_probe = validate_cuda_driver_preflight(
+        {"status": "fail", "error": "cuInit failed: CUDA_ERROR_UNKNOWN (999)"},
+        expected_count=2,
+    )
+    assert any("CUDA_ERROR_UNKNOWN" in error for error in failed_driver_probe)
     plan = command_plan(
         repo,
         Path("./target/release/ferrum"),
