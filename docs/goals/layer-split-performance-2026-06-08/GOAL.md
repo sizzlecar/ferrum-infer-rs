@@ -12,7 +12,7 @@ LAYER_SPLIT_PERF GOAL PASS: <out_dir>
 
 ## 目标
 
-提升 Ferrum 当前 Llama 70B 级别模型在 2x4090 层切分路径上的服务吞吐，让双卡不只是用于装下模型，也能在并发解码时产生可证明的吞吐提升。
+提升 Ferrum 当前 Qwen 72B 级别模型在 2x4090 层切分路径上的服务吞吐，让双卡不只是用于装下模型，也能在并发解码时产生可证明的吞吐提升。
 
 本目标专注当前架构：
 
@@ -22,14 +22,14 @@ LAYER_SPLIT_PERF GOAL PASS: <out_dir>
 - 不通过隐藏环境变量启用产品默认行为。
 - 优先优化 `ferrum serve` 的并发总吞吐，同时保证 `ferrum run` 不回归。
 
-最终性能目标：在相同 2xRTX 4090 硬件、同一 Llama 70B 级别 4bit 模型、同一产品路径和同一 benchmark 命令下，Ferrum 输出吞吐达到选定公开主流引擎基准的至少 80%。
+最终性能目标：在相同 2xRTX 4090 硬件、同一 Qwen 72B 级别 4bit 模型、同一产品路径和同一 benchmark 命令下，Ferrum 输出吞吐达到选定公开主流引擎基准的至少 80%。若采集同 pod vLLM baseline，则以 Qwen 同 pod vLLM 的 80% 为优先目标。
 
 ## 当前基线
 
-当前已验证 Ferrum 能通过产品 `layer_split` 路径运行：
+当前目标模型已改为：
 
 ```text
-clowman/Llama-3.3-70B-Instruct-GPTQ-Int4
+Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4
 ```
 
 已验证切分计划：
@@ -38,14 +38,14 @@ clowman/Llama-3.3-70B-Instruct-GPTQ-Int4
 stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79
 ```
 
-当前完成证据：
+历史 Llama 70B layer-split 证据仅作为参考，不再作为本目标完成依据：
 
 ```text
 LLAMA33_70B_4BIT_2X4090 GOAL PASS: docs/release/g0/llama33-2x4090-goal-final-20260608-89daf6e9
 G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS: docs/release/g0/llama33-2x4090-ferrum-only-full-20260608-89daf6e9
 ```
 
-基线元数据：
+历史 Llama 基线元数据：
 
 - Git SHA：`89daf6e983c50081a411d08c014c61ac00cc0044`
 - 二进制 SHA256：`0f99fc0775d545e5f74c07ca01256a7f8987479dc21916e6320efdeeba2821f3`
@@ -63,7 +63,7 @@ G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS: docs/release/g0/llama33-2x4090-fe
 | 8 | 20.85 tok/s |
 | 16 | 20.80 tok/s |
 
-这条平坦曲线就是当前性能问题。它说明正确性和模型装载已经解决，但并发服务还没有在稳定解码阶段让两张 GPU 持续忙起来。
+这条平坦曲线是原 Llama 目标下暴露的性能问题。目标切换到 Qwen2.5-72B-GPTQ 后，需要重新采集 Qwen baseline 和 candidate；Llama 数字不再作为目标完成证据。
 
 ## 外部基准口径策略
 
@@ -82,7 +82,7 @@ G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS: docs/release/g0/llama33-2x4090-fe
 基准选择优先级：
 
 1. 同硬件：优先 2x RTX 4090，而不是其他消费卡或数据中心 GPU。
-2. 同模型级别：优先 Llama 70B 级别 dense 模型，而不是更小模型。
+2. 同模型级别：优先 Qwen 72B 或同等 70B 级别 dense 模型，而不是更小模型。
 3. 同精度级别：优先 4bit，而不是 FP16、FP8、IQ2 或推测路径。
 4. 同服务形态：优先 OpenAI-compatible 服务聚合输出吞吐，而不是本地单 prompt 演示。
 5. 优先可复现的项目或引擎来源，而不是硬件导购文章或社区轶事。
@@ -99,7 +99,7 @@ G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS: docs/release/g0/llama33-2x4090-fe
 
 访问日期：2026-06-08。
 
-查到的公开数字并不完全同口径，因此本目标使用分层目标。
+查到的公开数字并不完全同口径，且多数不是 Qwen2.5-72B-GPTQ 的同模型数字。因此本目标使用分层目标：先保留 70B 级别公开下限作为临时硬门槛，同时优先采集 Qwen 同 pod vLLM baseline，一旦可用即替代公开下限。
 
 | 来源 | 引擎和架构 | 硬件 | 模型和量化 | 指标 | 公开数字 | 在本目标中的用途 |
 | --- | --- | --- | --- | --- | ---: | --- |
@@ -122,7 +122,7 @@ G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS: docs/release/g0/llama33-2x4090-fe
 - 必达：Ferrum 在选定同硬件完整 gate 中达到至少 `27.6 tok/s` 聚合输出吞吐。
 - Stretch：Ferrum 达到至少 `33.0 tok/s` 聚合输出吞吐，或者先由我们采集更强的同硬件 vLLM baseline，再更新目标文档。
 
-必达目标只是下限，不是终点。如果实现前采集了同 pod 当前 vLLM baseline，且它高于 34.5 tok/s，则最终目标变为：
+必达目标只是下限，不是终点。如果实现前采集了同 pod 当前 Qwen vLLM baseline，且它高于 34.5 tok/s，则最终目标变为：
 
 ```text
 0.80 * same_pod_vllm_output_tps
@@ -138,6 +138,7 @@ G0 SOURCE g0_cuda2x4090_llama33_70b_4bit PASS: docs/release/g0/llama33-2x4090-fe
 - 不仅凭公开网页数字做性能宣称。
 - 不把行为藏在未文档化的 `FERRUM_*` 组合后面。
 - 不用降低正确性质量、缺失 usage 计数、缺失 `[DONE]` 或过滤坏输出来换吞吐。
+- 本目标不再以 `clowman/Llama-3.3-70B-Instruct-GPTQ-Int4` 作为完成模型；该模型只保留为历史诊断参考。
 
 ## 实现计划
 
@@ -395,7 +396,7 @@ LAYER_SPLIT_PERF GOAL PASS: <out_dir>
 
 ## 待确认问题
 
-- 实现前是否先采集同 pod 当前 vLLM baseline，还是先使用 MLC 34.5 tok/s 公开下限？
+- 实现前是否先采集 Qwen2.5-72B-GPTQ 的同 pod 当前 vLLM baseline，还是先使用 MLC 34.5 tok/s 70B 级别公开下限？
 - 第一个可接受收益应指定 c=4 或 c=8，还是使用 `max(c4,c8,c16)`？
 - CUDA backend 是否能干净暴露 peer-copy capability 作为产品默认，还是 device bridge 应先作为显式文档化 experimental mode？
 - `llm_executor` 当前 model lock 是否兼容 overlapped stage workers，还是需要缩小 model-forward critical section？

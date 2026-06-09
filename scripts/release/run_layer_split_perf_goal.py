@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Llama layer-split performance goal A/B gate on a 2x4090 host."""
+"""Run the Qwen 72B layer-split performance goal A/B gate on a 2x4090 host."""
 
 from __future__ import annotations
 
@@ -22,12 +22,12 @@ PASS_PREFIX = "LAYER_SPLIT_PERF GOAL PASS"
 SMOKE_PASS_PREFIX = "LAYER_SPLIT_PERF SMOKE PASS"
 FULL_LANE = "layer-split-perf-full"
 SMOKE_LANE = "layer-split-perf-smoke"
-FULL_SOURCE_LANE = "g0_cuda2x4090_llama33_70b_4bit"
-SMOKE_SOURCE_LANE = "g0_cuda2x4090_llama33_70b_4bit_smoke"
+FULL_SOURCE_LANE = "layer_split_perf_qwen72b_gptq"
+SMOKE_SOURCE_LANE = "layer_split_perf_qwen72b_gptq_smoke"
 BASELINE_CONFIG = Path("scripts/release/configs/layer_split_perf_baseline_batch.json")
-CANDIDATE_CONFIG = Path("scripts/release/configs/g0_cuda2x4090_llama33_70b_4bit.json")
+CANDIDATE_CONFIG = Path("scripts/release/configs/layer_split_perf_qwen72b_candidate_overlapped.json")
 SMOKE_CANDIDATE_CONFIG = Path(
-    "scripts/release/configs/g0_cuda2x4090_llama33_70b_4bit_smoke.json"
+    "scripts/release/configs/layer_split_perf_qwen72b_candidate_overlapped_smoke.json"
 )
 SOURCE_GATE = Path("scripts/release/g0_cuda_llama33_70b_4bit_2x4090_gate.py")
 FINAL_GATE = Path("scripts/release/layer_split_perf_goal_gate.py")
@@ -454,7 +454,7 @@ def command_plan(
             "final PASS, any correctness failure, model load failure, CUDA OOM, "
             "or target miss with enough profiling evidence"
         )
-        correctness_gate = "candidate g0_cuda2x4090_llama33_70b_4bit correctness matrix"
+        correctness_gate = "candidate layer_split_perf_qwen72b_gptq correctness matrix"
         performance_command = (
             "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
             "--n-repeats 3 --concurrency-sweep 1,4,8,16"
