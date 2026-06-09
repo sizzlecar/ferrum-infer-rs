@@ -47,7 +47,7 @@ BAD_PATTERNS = [
     "<|tool|>",
 ]
 DEFAULT_LAYER_SPLIT_PLAN = "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
-RECALL_MARKER = "ferrum-lime-chair"
+RECALL_MARKER = "lime chair"
 MODEL_MANIFEST_INTERESTING_SUFFIXES = {".json", ".model", ".safetensors", ".gguf"}
 TOKENIZER_METADATA_FILE_NAMES = {
     "tokenizer.json",
@@ -931,12 +931,12 @@ def run_cli_probe_input_text() -> str:
     return "\n".join(
         [
             (
-                "Memory test. Store this secret token exactly: "
+                "Remember these two words exactly: "
                 f"{RECALL_MARKER}. For this turn, output exactly OK."
             ),
             (
-                "What secret token did I ask you to store earlier? "
-                "Output exactly the token and nothing else."
+                "Output the two words I asked you to remember, "
+                "exactly and with no other text."
             ),
             "/bye",
             "",
@@ -1811,7 +1811,7 @@ def serve_multiturn_probe_messages() -> list[dict[str, str]]:
         {
             "role": "user",
             "content": (
-                "Memory test. Store this secret token exactly: "
+                "Remember these two words exactly: "
                 f"{RECALL_MARKER}. For this turn, output exactly OK."
             ),
         },
@@ -1819,8 +1819,8 @@ def serve_multiturn_probe_messages() -> list[dict[str, str]]:
         {
             "role": "user",
             "content": (
-                "What secret token did I ask you to store earlier? "
-                "Output exactly the token and nothing else."
+                "Output the two words I asked you to remember, "
+                "exactly and with no other text."
             ),
         },
     ]
@@ -2284,17 +2284,17 @@ def self_test() -> int:
     assert "1024" in cmd
     run_probe_input = run_cli_probe_input_text()
     assert run_probe_input.count(RECALL_MARKER) == 1
-    assert "secret token" in run_probe_input
+    assert "Remember these two words" in run_probe_input
     assert "output exactly OK" in run_probe_input
-    assert "Output exactly the token" in run_probe_input
+    assert "Output the two words" in run_probe_input
     assert "inside brackets" not in run_probe_input
     serve_probe_text = "\n".join(
         message["content"] for message in serve_multiturn_probe_messages()
     )
     assert serve_probe_text.count(RECALL_MARKER) == 1
-    assert "secret token" in serve_probe_text
+    assert "Remember these two words" in serve_probe_text
     assert "output exactly OK" in serve_probe_text
-    assert "Output exactly the token" in serve_probe_text
+    assert "Output the two words" in serve_probe_text
     assert f"[{RECALL_MARKER}]" not in serve_probe_text
     serve_cmd = build_serve_command(
         Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out")
