@@ -692,6 +692,26 @@ impl FerrumConfigBuilder {
             fa2_direct_ffi,
         ));
         decisions.push(self.attention_decode_decision(use_vllm_paged_attn, vllm_v1_short));
+        // Materialize the auto-resolved fast-path MoE knobs into the effective
+        // config BEFORE moe_decision consumes them, so they reach the model
+        // (which reads FERRUM_*, not the decisions). Only auto-derived values —
+        // user/env entries are already present. Without this, `ferrum run`'s
+        // non-preset path resolved FERRUM_VLLM_MOE as a decision only and the
+        // model never saw it (~9.7 vs ~59 tok/s on a 4090 for Qwen3-30B-A3B).
+        let mut runtime_config = self.runtime_config.clone();
+        for (key, resolved) in [
+            ("FERRUM_VLLM_MOE", &vllm_moe),
+            ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
+            ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
+        ] {
+            if resolved.source != AutoConfigSource::Env {
+                runtime_config.upsert(
+                    key,
+                    if resolved.value { "1" } else { "0" },
+                    RuntimeConfigSource::MemoryProfile,
+                );
+            }
+        }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
         decisions.push(self.scalar_decision(
@@ -723,7 +743,7 @@ impl FerrumConfigBuilder {
         Ok(ResolvedFerrumConfig {
             schema_version: 1,
             preset: self.workload.preset.clone(),
-            runtime_config: self.runtime_config.clone(),
+            runtime_config,
             model_capabilities: self.model.clone(),
             hardware_capabilities: self.hardware.clone(),
             workload_profile: self.workload.clone(),
@@ -1764,6 +1784,19 @@ mod tests {
         assert_eq!(
             decisions["moe_implementation"], "vllm_marlin_moe_device_route_pair_ids",
             "CUDA GPTQ MoE should get the fast vLLM-Marlin path without the m3 preset"
+        );
+        // The decision is not enough — the model reads FERRUM_VLLM_MOE from the
+        // effective config, not the decisions. The resolved knob must be a
+        // runtime_config entry so `ferrum run`'s materialize/apply propagates it.
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|e| e.key == "FERRUM_VLLM_MOE");
+        assert_eq!(
+            entry.map(|e| e.effective_value.as_str()),
+            Some("1"),
+            "resolved FERRUM_VLLM_MOE must be materialized into the effective config"
         );
     }
 
