@@ -24,3 +24,10 @@ Significance:
   perturb Metal kernels: every Metal kernel still matches its CPU reference.
 
 CUDA column for these ops still needs a pod (L1-cuda batch).
+
+## L1-metal stability (Gate C5)
+
+`lane_l1_metal.sh` steps (op-parity metal + tiny_stack metal) run 10×
+consecutively: **10/10 green**. Deterministic by construction (greedy
+tiny-model decode + fixed-seed op inputs). Satisfies the Gate C5
+l1_metal 10/10 requirement.
