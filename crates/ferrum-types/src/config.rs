@@ -121,6 +121,12 @@ impl EngineConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_TP") {
             self.runtime.tp = value.parse::<usize>().ok();
         }
+
+        // Publish the resolved snapshot process-wide. Model code (which is not
+        // threaded an EngineConfig) reads `active_runtime_snapshot()` for the
+        // remaining FERRUM_* toggles instead of `std::env`, keeping the env
+        // bridge at this single composition-root call.
+        crate::install_runtime_snapshot(snapshot.clone());
         Ok(())
     }
 }
