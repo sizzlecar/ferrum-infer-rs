@@ -68,6 +68,13 @@
       "reason": "Construction-time placement validation: checks device-ordinal-scope support once when building the layer-split pipeline placement.",
       "owner": "models",
       "review_condition": "Re-review if placement validation moves into the forward path."
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "pattern": "supports_branch",
+      "reason": "Construction-time capability resolution: line 140 is a paged-KV config default; lines ~990 read B::supports_varlen_qkv()/supports_llama_family_batched_decode() ONCE into the model's supports_* fields. The decode/prefill hot paths read self.supports_* — no inline B::supports_*() remains in llama_family forward code (migrated 2026-06-10).",
+      "owner": "models",
+      "review_condition": "Re-review if any B::supports_*() reappears in a forward/decode method here instead of reading the construction-resolved self.supports_* field."
     }
   ]
 }

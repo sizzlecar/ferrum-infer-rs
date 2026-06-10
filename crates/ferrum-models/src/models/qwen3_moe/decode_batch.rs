@@ -47,7 +47,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let h = self.cfg.base.hidden_size;
         let vocab = self.cfg.base.vocab_size;
         let num_layers = self.cfg.base.num_layers;
-        let central_paged_len_bump = self.paged_pools.is_some() && !B::supports_varlen_qkv();
+        let central_paged_len_bump = self.paged_pools.is_some() && !self.supports_varlen_qkv;
         let mut ctx = B::new_context();
 
         // 0. Embed all M tokens into residual [M, H]
@@ -65,7 +65,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         // keep the historical PR #81 per-layer metadata/bump flow inside
         // `forward_layer_batched_decode`; moving that work out of the layer
         // loop regressed Qwen3-30B-A3B c16 on Apple Silicon by ~4x.
-        let prepopulate_paged_decode = self.paged_pools.is_some() && B::supports_varlen_qkv();
+        let prepopulate_paged_decode = self.paged_pools.is_some() && self.supports_varlen_qkv;
         if prepopulate_paged_decode {
             self.populate_paged_batch_scratch_decode(&mut ctx, batch, m);
         }
@@ -607,7 +607,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             let (pool_k, pool_v) = unsafe { (&mut *pool_ptr.0, &mut *pool_ptr.1) };
 
             let mut metal_pos_offsets_host: Option<Vec<u32>> = None;
-            if !B::supports_varlen_qkv() {
+            if !self.supports_varlen_qkv {
                 // Historical Metal path from PR #81: gather per-seq
                 // metadata and upload the batched block/context tensors
                 // before the per-item QKV writes. CUDA does this once
@@ -652,7 +652,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             // Step 1: write K/V into the shared pool + RoPE'd Q into
             // paged_batch_q at offset i × q_dim. Two code paths:
             //
-            //   - CUDA (`B::supports_varlen_qkv() == true`): ONE batched
+            //   - CUDA (`self.supports_varlen_qkv == true`): ONE batched
             //     `split_qkv_norm_rope_into_paged_cache_varlen` dispatch
             //     — saves (m-1) × launch_overhead per layer × num_layers.
             //   - Metal (no varlen kernel — would panic): per-item loop
@@ -667,7 +667,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             // weights / rope and are not re-borrowed by the called fn.
             let q_buf_safe: &mut B::Buffer = unsafe { &mut *q_buf_ptr_raw };
 
-            if B::supports_varlen_qkv() {
+            if self.supports_varlen_qkv {
                 let bt_ptr_raw =
                     self.scratch.paged_batch_block_tables.as_ref().unwrap() as *const B::Buffer;
                 let pos_ptr_raw =
@@ -1140,7 +1140,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         // one `paged_decode_attention(num_seqs=m)` dispatch, the
         // plumbing cost drops, and the batched MoE GEMV's win net out
         // to ~+50% at c=16. `FERRUM_MOE_BATCHED_DECODE=0` forces off.
-        let new_batched_default = stacked_path_available && B::supports_batched_moe_gemv();
+        let new_batched_default = stacked_path_available && self.supports_batched_moe_gemv;
         let new_batched_enabled =
             new_batched_default && self.runtime_env.moe_batched_decode_enabled;
 

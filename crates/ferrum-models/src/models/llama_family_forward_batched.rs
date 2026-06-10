@@ -1807,7 +1807,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             let (cid, tok, pos) = &batch[0];
             return vec![self.decode_internal(cid, *tok, *pos)];
         }
-        if !B::supports_llama_family_batched_decode() {
+        if !self.supports_batched_decode {
             // Some backends do not yet produce correct follow-up logits in
             // the optimized dense batched decode path under concurrent
             // serving. Preserve user-visible correctness by falling back to
@@ -2120,7 +2120,7 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         if batch.is_empty() {
             return PipelineHidden::host(Vec::new(), 0, self.cfg.hidden_size);
         }
-        if batch.len() == 1 || !B::supports_llama_family_batched_decode() {
+        if batch.len() == 1 || !self.supports_batched_decode {
             let h = self.cfg.hidden_size;
             let mut hidden = Vec::with_capacity(batch.len() * h);
             for (cache_id, token, pos) in batch {
@@ -2174,7 +2174,7 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             hidden_slice.len(),
             batch.len() * h
         );
-        if batch.len() == 1 || !B::supports_llama_family_batched_decode() {
+        if batch.len() == 1 || !self.supports_batched_decode {
             let mut out = Vec::with_capacity(hidden_slice.len());
             let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
             for (row, (cache_id, _, pos)) in batch.iter().enumerate() {
@@ -2236,7 +2236,7 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             hidden_slice.len(),
             row_count * h
         );
-        if row_count == 1 || !B::supports_llama_family_batched_decode() {
+        if row_count == 1 || !self.supports_batched_decode {
             return (0..row_count)
                 .map(|row| {
                     let start = row * h;
