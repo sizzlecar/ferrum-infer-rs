@@ -75,8 +75,10 @@ TEST_ARCH GOAL PASS: <out_dir>
 | 全栈行为测试 | 15 套 ferrum-cli 集成测试，全部 `#[ignore]` + 需真模型 + Metal-only，nightly 跑（约 45 min 预算） |
 | CUDA 行为测试 | **0**（PR CI 仅 `cargo check --features cuda`；无任何自动化 CUDA 推理测试） |
 | 跨后端算子对拍 | `ferrum-testkit::op_diff` 仅 1 个算子（rms_norm） |
-| models+engine 后端 cfg 分支 | 44 行（含 multimodal；LLM 主路径关键分支约 8 处） |
-| models+engine 直接 `env::var` | 15 处（models 12 + engine 3） |
+| 审计范围后端 cfg 分支 | 22 行（实测 @ baseline.json，全在 `ferrum-engine/src`；`models/src/models` 为 0——cfg 分支集中在 loader/executor/multimodal，主路径模型代码本就干净）；全 crate 含 multimodal 共 44 行 |
+| 审计范围直接 `env::var` | 7 处（实测：`models/src/models` 4 + `engine/src` 3）；全 crate 15 处 |
+| 审计范围 `OnceLock` 进程级状态 | 7 处（实测：models 2 + engine 5） |
+| 热路径 `B::supports_*()` 行为分支 | 18 处（实测，`models/src/models`） |
 | FERRUM_* 环境变量总面 | 100+ 个 |
 | Backend trait 面 | 核心 62 方法 + BackendPagedKv 12 方法，约 23 个默认 unsupported |
 | backend_boundary_audit | 已存在但只审计字符串后端分支，不审计 env 读取；allowlist 2 条 |
@@ -102,7 +104,7 @@ TEST_ARCH GOAL PASS: <out_dir>
 | 既有资产 | 本目标的动作 |
 | --- | --- |
 | `scripts/release/run_gate.py` lane 体系 | L1/L2 作为新 lane 或收紧现有 `metal` / `cuda-smoke` lane，沿用 manifest + PASS line 约定 |
-| `scripts/release/backend_boundary_audit.py` | 扩展审计面：增加 `env::var("FERRUM_*")` 与 `cfg(feature = "cuda"/"metal")` / `target_os` 在 LLM 主路径的检查 |
+| `scripts/release/backend_boundary_audit.py` | 保持原职责（字符串后端分支审计）；env/cfg/supports/OnceLock 的主路径审计由 `test_arch_goal_gate.py` 承担，allowlist 沿用同款 schema（`scripts/release/test_arch_allowlist.json`） |
 | `ferrum-testkit::op_diff`（1 算子） | 扩成算子对拍矩阵（manifest 驱动） |
 | `reference_match.rs` 指纹机制 | 从 Metal-only 扩到 CUDA + 更多模型 |
 | `TESTING-GAPS.md` 4 项提案 | 全部纳入（CUDA 多轮 lane、kernel 形状测试、mixed batch、CUDA 指纹） |
@@ -247,9 +249,10 @@ TEST_ARCH GOAL PASS: <out_dir>
 
 | # | 指标 | 基线 | 验收值 | 机械检查 |
 | --- | --- | --- | --- | --- |
-| A1 | LLM 主路径直接 `env::var("FERRUM_*")` 处数 | 15 | **0**（allowlist 外） | 扩展版 backend_boundary_audit |
-| A2 | LLM 主路径后端 cfg 分支行数 | 约 8 处关键分支（全量 44 行含 multimodal） | **0**（allowlist 外，multimodal 入 allowlist） | 同上 |
-| A3 | 热路径 `if B::supports_*()` 行为分支 | ≥4 处 | **0**（迁为 trait 默认方法或构造期决策） | 同上（新审计模式） |
+| A1 | 审计范围直接 `env::var` 处数 | 7（实测 @ baseline.json） | **0**（allowlist 外） | `test_arch_goal_gate.py` 扫描 + `scripts/release/test_arch_allowlist.json` |
+| A2 | 审计范围后端 cfg 分支行数 | 22（实测，全在 engine） | **0**（allowlist 外，平台绑定的设备初始化入 allowlist） | 同上 |
+| A3 | 热路径 `B::supports_*()` 行为分支 | 18（实测） | **0**（迁为 trait 默认方法或构造期决策） | 同上 |
+| A3b | 审计范围 `OnceLock` 进程级配置冻结 | 7（实测） | **0**（allowlist 外；合法缓存用途入 allowlist 并标注 review_condition） | 同上 |
 | A4 | 算子对拍矩阵覆盖 | 1/15+ | **manifest 100%**，每算子在每个声明支持的后端有 parity 测试且绿 | gate 解析 `conformance_ops.json` 对照 `cargo test -- --list` 与测试结果 |
 | A5 | CPU 全 capability=false 跑通全栈场景套件 | 不成立 | 成立 | L0 套件结果 |
 | A6 | 单后端改动隔离 | 无机制 | 仅动 `backend/cuda/**` 的变更：Metal 指纹 fixtures 0 改动且 Metal lane 绿（反向同理） | 路径分类脚本 + 回杀清单中 2 个真实后端 PR 重放验证 |

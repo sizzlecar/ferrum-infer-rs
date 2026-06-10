@@ -14,6 +14,14 @@ TEST_ARCH GOAL PASS: <out_dir>
 - Stage 0 (baseline + acceptance tooling) in progress.
 - Decisions locked in GOAL.md: L1-cuda batched execution protocol; models.json
   manifest generates the README support table (Plan A).
+- Gate tooling landed: `scripts/release/test_arch_goal_gate.py`
+  (`--self-test` green; `--baseline` written at clean sha `2b0135db`).
+- Measured audit-scope baseline (see `baseline.json`): env_var 7
+  (models 4 + engine 3), cfg_branch 22 (all engine), supports_branch 18,
+  once_lock 7; conformance coverage 1/20 ops; kill-list 11 entries
+  (8 cpu-reachable, 3 cuda).
+- All kill-list fix commits verified as ancestors of main except the
+  branch-side `241dbc0f` (superseded by `049b3a42` for hb-10).
 
 ## Stage Progress
 
