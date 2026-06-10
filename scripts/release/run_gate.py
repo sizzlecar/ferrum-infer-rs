@@ -253,8 +253,11 @@ def verify_child_pass_line(lane_command: LaneCommand, stdout: str) -> None:
 def run_child(cmd: list[str], out_dir: Path, timeout: int | None) -> subprocess.CompletedProcess[str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     proc = subprocess.run(
         cmd,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -265,7 +268,15 @@ def run_child(cmd: list[str], out_dir: Path, timeout: int | None) -> subprocess.
     (out_dir / "run_gate.child.stdout").write_text(proc.stdout, errors="replace")
     (out_dir / "run_gate.child.stderr").write_text(proc.stderr, errors="replace")
     (out_dir / "run_gate.child.command.json").write_text(
-        json.dumps({"cmd": cmd, "duration_sec": duration}, indent=2) + "\n"
+        json.dumps(
+            {
+                "cmd": cmd,
+                "duration_sec": duration,
+                "env_overrides": {"PYTHONDONTWRITEBYTECODE": "1"},
+            },
+            indent=2,
+        )
+        + "\n"
     )
     return proc
 

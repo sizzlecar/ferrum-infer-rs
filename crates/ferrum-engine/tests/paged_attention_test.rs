@@ -153,7 +153,12 @@ async fn paged_executor_tracks_operations() {
     assert_eq!(executor.prefill_count(), 0);
     assert_eq!(executor.decode_count(), 0);
 
-    let request = make_request("Track ops");
+    let mut request = make_request("Track ops");
+    // This test validates executor operation accounting, so make the
+    // generation length deterministic even if synthetic paged logits pick EOS.
+    request
+        .metadata
+        .insert("ferrum_ignore_eos".to_string(), true.into());
     let _response = engine.infer(request).await.unwrap();
 
     // Should have done 1 prefill and (max_tokens - 1) decodes

@@ -24,6 +24,7 @@ nvcc -O3 -arch=sm_89 -std=c++17 -I<include-path> \
 |---|---|
 | `graph_bench.cu` | CUDA Graph capture+replay speedup vs naive serial kernel launches. Measures launch-overhead headroom. |
 | `sync_barrier_bench.cu` | Cost of `cuStreamSynchronize` per layer vs async pipeline. Validates the host-route DtoH-barrier hypothesis. |
+| `layer_split_overlap_probe.cu` | Two-GPU layer-split scheduling probe. Simulates stage0, host bridge, stage1, logits, and microbatch overlap without Rust/Cargo or model loading. Use it before changing the product overlap path. |
 | `scalar_type_id_test.cu` (+ `_other_tu.cu`) | Verifies `vllm::ScalarType::id()` constexpr produces consistent values across translation units, and that template specializations keyed on those IDs dispatch correctly. **Two-TU compile required.** |
 | `moe_marlin_active65_perf.cu` | Direct C-ABI benchmark for Ferrum's vLLM-Marlin MoE gate/up and down kernels on the real c32 active65 route. Links against existing `ferrum-kernels` build objects, avoiding a full Cargo rebuild. |
 | `vllm_flash_attn_varlen_probe.py` | Runs vLLM 0.20.2 `flash_attn_varlen_func` on Qwen3 paged-varlen prefill/mixed shapes. Use it to size the upside before porting a real FA-style varlen kernel into Ferrum. |

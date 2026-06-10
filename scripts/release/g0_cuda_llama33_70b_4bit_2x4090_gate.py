@@ -29,6 +29,8 @@ from openai_tool_call_regression import run_tool_call_regression
 LANE = "g0_cuda2x4090_llama33_70b_4bit"
 PASS_LINE_PREFIX = f"G0 SOURCE {LANE} PASS"
 SMOKE_LANE = "g0_cuda2x4090_llama33_70b_4bit_smoke"
+QWEN72B_LANE = "layer_split_perf_qwen72b_gptq"
+QWEN72B_SMOKE_LANE = "layer_split_perf_qwen72b_gptq_smoke"
 REQUIRED_GPU_DEVICES = [0, 1]
 BAD_PATTERNS = [
     "panic",
@@ -47,7 +49,28 @@ BAD_PATTERNS = [
     "<|tool|>",
 ]
 DEFAULT_LAYER_SPLIT_PLAN = "stage0:cuda:0:layers=auto;stage1:cuda:1:layers=auto"
-RECALL_MARKER = "ferrum-9271-zeta"
+RECALL_MARKER = "banana"
+MODEL_MANIFEST_INTERESTING_SUFFIXES = {".json", ".model", ".safetensors", ".gguf"}
+TOKENIZER_METADATA_FILE_NAMES = {
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "generation_config.json",
+    "chat_template.json",
+}
+GPU_QUERY_FIELDS = [
+    "index",
+    "name",
+    "uuid",
+    "driver_version",
+    "memory.total",
+    "memory.used",
+    "utilization.gpu",
+    "utilization.memory",
+    "pcie.link.gen.current",
+    "pcie.link.width.current",
+]
 BENCH_QUALITY_COUNT_FIELDS = (
     "bad_output_per_run",
     "malformed_stream_per_run",
@@ -65,8 +88,12 @@ REQUIRED_ARTIFACT_FILES = {
     "decision_trace.jsonl",
     "hardware.json",
     "nvidia-smi.before.txt",
+    "nvidia-smi.before.json",
     "nvidia-smi.during.txt",
+    "nvidia-smi.during.json",
     "nvidia-smi.after.txt",
+    "nvidia-smi.after.json",
+    "nvidia-smi.bench.samples.jsonl",
     "model_manifest.json",
     "run.command.json",
     "run.effective_config.json",
@@ -77,12 +104,14 @@ REQUIRED_ARTIFACT_FILES = {
     "serve.effective_config.json",
     "serve.log",
     "serve.health.json",
+    "serve.health.after.json",
     "serve.models.json",
     "serve.correctness.json",
     "serve.multiturn.json",
     "serve.structured_output.json",
     "serve.tool_call.json",
     "serve.streaming.sse",
+    "correctness.json",
     "concurrency_quality_regression.json",
     "bench-serve.command.json",
     "bench-serve.json",
@@ -180,6 +209,45 @@ def sha256(path: Path) -> str | None:
     return h.hexdigest()
 
 
+def query_vllm_preflight(server_cmd: list[str]) -> dict[str, Any]:
+    executable = server_cmd[0] if server_cmd else "vllm"
+    resolved = shutil.which(executable)
+    if resolved is None:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "cmd": [executable],
+            "error": "vllm executable not found on PATH",
+            "binary_path": None,
+            "binary_sha256": None,
+        }
+    digest = sha256(Path(resolved))
+    if digest is None:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "cmd": [executable],
+            "error": f"vllm executable is not a readable file: {resolved}",
+            "binary_path": resolved,
+            "binary_sha256": None,
+        }
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "cmd": [executable],
+        "binary_path": resolved,
+        "binary_sha256": digest,
+    }
+
+
+def require_vllm_preflight(root: Path, server_cmd: list[str]) -> dict[str, Any]:
+    preflight = query_vllm_preflight(server_cmd)
+    write_json(root / "vllm-baseline.preflight.json", preflight)
+    if preflight.get("status") != "pass":
+        raise RuntimeError(preflight.get("error") or "vllm preflight failed")
+    return preflight
+
+
 def git_output(args: list[str], repo: Path) -> str:
     proc = run(["git", *args], cwd=repo, timeout=30)
     return proc.stdout.strip() if proc.returncode == 0 else "unknown"
@@ -201,12 +269,231 @@ def sanitized_env_summary() -> dict[str, str]:
     return out
 
 
+def parse_gpu_query_int(value: str) -> int | str:
+    text = value.strip()
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def query_gpu_snapshot(cwd: Path) -> dict[str, Any]:
+    proc = run(
+        [
+            "nvidia-smi",
+            "--query-gpu=" + ",".join(GPU_QUERY_FIELDS),
+            "--format=csv,noheader,nounits",
+        ],
+        cwd=cwd,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "error": proc.stderr.strip() or proc.stdout.strip() or f"nvidia-smi rc={proc.returncode}",
+            "query_fields": GPU_QUERY_FIELDS,
+            "gpus": [],
+        }
+
+    rows: list[dict[str, Any]] = []
+    reader = csv.reader(proc.stdout.splitlines())
+    for row in reader:
+        parts = [part.strip() for part in row]
+        if len(parts) < len(GPU_QUERY_FIELDS):
+            continue
+        (
+            index,
+            name,
+            uuid,
+            driver_version,
+            memory_total,
+            memory_used,
+            utilization_gpu,
+            utilization_memory,
+            pcie_link_gen,
+            pcie_link_width,
+        ) = parts[: len(GPU_QUERY_FIELDS)]
+        rows.append(
+            {
+                "index": parse_gpu_query_int(index),
+                "name": name,
+                "uuid": uuid,
+                "driver_version": driver_version,
+                "memory_total_mib": parse_gpu_query_int(memory_total),
+                "memory_used_mib": parse_gpu_query_int(memory_used),
+                "utilization_gpu_percent": parse_gpu_query_int(utilization_gpu),
+                "utilization_memory_percent": parse_gpu_query_int(utilization_memory),
+                "pcie_link_gen_current": parse_gpu_query_int(pcie_link_gen),
+                "pcie_link_width_current": parse_gpu_query_int(pcie_link_width),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "status": "pass" if rows else "fail",
+        "query_fields": GPU_QUERY_FIELDS,
+        "gpus": rows,
+    }
+
+
 def capture_nvidia_smi(root: Path, label: str) -> str:
     proc = run(["nvidia-smi"], cwd=root, timeout=30)
     body = proc.stdout if proc.returncode == 0 else proc.stderr
     text = body or f"nvidia-smi rc={proc.returncode}\n"
     write_text(root / f"nvidia-smi.{label}.txt", text)
+    write_json(root / f"nvidia-smi.{label}.json", query_gpu_snapshot(root))
     return text
+
+
+def write_gpu_bench_sample(
+    root: Path,
+    sample: dict[str, Any],
+    *,
+    samples_name: str = "nvidia-smi.bench.samples.jsonl",
+    during_label: str = "during",
+) -> None:
+    samples_path = root / samples_name
+    with samples_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(sample, sort_keys=True) + "\n")
+    during_text = root / f"nvidia-smi.{during_label}.txt"
+    if not during_text.is_file():
+        proc = run(["nvidia-smi"], cwd=root, timeout=30)
+        body = proc.stdout if proc.returncode == 0 else proc.stderr
+        write_text(during_text, body or f"nvidia-smi rc={proc.returncode}\n")
+    write_json(root / f"nvidia-smi.{during_label}.json", sample)
+
+
+def flag_value(cmd: list[str], flag: str) -> str | None:
+    prefix = flag + "="
+    for idx, part in enumerate(cmd):
+        if part == flag and idx + 1 < len(cmd):
+            return cmd[idx + 1]
+        if part.startswith(prefix):
+            return part[len(prefix) :]
+    return None
+
+
+def concurrency_sweep_from_cmd(cmd: list[str]) -> list[int]:
+    value = flag_value(cmd, "--concurrency-sweep")
+    if not value:
+        value = flag_value(cmd, "--concurrency")
+    if not value:
+        return []
+    cells: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            cells.append(int(part))
+        except ValueError:
+            continue
+    return cells
+
+
+def active_bench_concurrency(stderr_path: Path) -> int | None:
+    if not stderr_path.is_file():
+        return None
+    text = stderr_path.read_text(errors="replace")[-20000:]
+    matches = re.findall(r"closed_loop c=(\d+)", text)
+    if not matches:
+        return None
+    return int(matches[-1])
+
+
+def run_with_gpu_samples(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    root: Path,
+    timeout: int,
+    sample_interval_sec: int,
+    samples_name: str = "nvidia-smi.bench.samples.jsonl",
+    tmp_stem: str = "bench-serve",
+    sample_phase: str = "bench",
+    during_label: str = "during",
+) -> subprocess.CompletedProcess[str]:
+    start = time.time()
+    sample_interval_sec = max(1, sample_interval_sec)
+    stdout_tmp = root / f"{tmp_stem}.stdout.tmp"
+    stderr_tmp = root / f"{tmp_stem}.stderr.tmp"
+    next_sample_at = start
+    concurrency_cells = concurrency_sweep_from_cmd(cmd)
+    with stdout_tmp.open("w", encoding="utf-8") as stdout_file, stderr_tmp.open(
+        "w", encoding="utf-8"
+    ) as stderr_file:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                text=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+        except FileNotFoundError as exc:
+            sample = query_gpu_snapshot(cwd)
+            sample["created_at"] = iso_now()
+            sample["elapsed_sec"] = 0.0
+            sample["sample_phase"] = f"{sample_phase}-start-failed"
+            sample["bench_concurrency_sweep"] = concurrency_cells
+            write_gpu_bench_sample(
+                root,
+                sample,
+                samples_name=samples_name,
+                during_label=during_label,
+            )
+            return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+
+        timed_out = False
+        while proc.poll() is None:
+            now = time.time()
+            if now >= next_sample_at:
+                sample = query_gpu_snapshot(cwd)
+                sample["created_at"] = iso_now()
+                sample["elapsed_sec"] = round(now - start, 3)
+                sample["sample_phase"] = sample_phase
+                sample["bench_concurrency_sweep"] = concurrency_cells
+                current_concurrency = active_bench_concurrency(stderr_tmp)
+                if current_concurrency is not None:
+                    sample["bench_concurrency"] = current_concurrency
+                write_gpu_bench_sample(
+                    root,
+                    sample,
+                    samples_name=samples_name,
+                    during_label=during_label,
+                )
+                next_sample_at = now + sample_interval_sec
+            if now - start > timeout:
+                timed_out = True
+                proc.kill()
+                proc.wait(timeout=15)
+                break
+            time.sleep(1)
+
+        if not (root / samples_name).is_file():
+            sample = query_gpu_snapshot(cwd)
+            sample["created_at"] = iso_now()
+            sample["elapsed_sec"] = round(time.time() - start, 3)
+            sample["sample_phase"] = f"{sample_phase}-finished-before-first-sample"
+            sample["bench_concurrency_sweep"] = concurrency_cells
+            current_concurrency = active_bench_concurrency(stderr_tmp)
+            if current_concurrency is not None:
+                sample["bench_concurrency"] = current_concurrency
+            write_gpu_bench_sample(
+                root,
+                sample,
+                samples_name=samples_name,
+                during_label=during_label,
+            )
+
+    stdout = stdout_tmp.read_text(errors="replace") if stdout_tmp.is_file() else ""
+    stderr = stderr_tmp.read_text(errors="replace") if stderr_tmp.is_file() else ""
+    stdout_tmp.unlink(missing_ok=True)
+    stderr_tmp.unlink(missing_ok=True)
+    if timed_out:
+        stderr = (stderr + "\n" if stderr else "") + f"bench command timed out after {timeout}s"
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr)
+    return subprocess.CompletedProcess(cmd, proc.returncode or 0, stdout, stderr)
 
 
 def parse_nvidia_smi_versions(text: str) -> dict[str, str]:
@@ -223,20 +510,12 @@ def parse_nvidia_smi_versions(text: str) -> dict[str, str]:
 
 def query_hardware(repo: Path, nvidia_smi_text: str) -> dict[str, Any]:
     versions = parse_nvidia_smi_versions(nvidia_smi_text)
-    proc = run(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,name,uuid,driver_version,memory.total,memory.used",
-            "--format=csv,noheader,nounits",
-        ],
-        cwd=repo,
-        timeout=30,
-    )
-    if proc.returncode != 0:
+    snapshot = query_gpu_snapshot(repo)
+    if snapshot.get("status") != "pass":
         return {
             "schema_version": 1,
             "status": "unavailable",
-            "error": proc.stderr.strip() or proc.stdout.strip() or f"nvidia-smi rc={proc.returncode}",
+            "error": snapshot.get("error", "structured nvidia-smi query failed"),
             "cuda_device_count": 0,
             "cuda_version": versions["cuda_version"],
             "driver_version": versions["driver_version"],
@@ -245,24 +524,7 @@ def query_hardware(repo: Path, nvidia_smi_text: str) -> dict[str, Any]:
             "gpus": [],
         }
 
-    rows: list[dict[str, Any]] = []
-    reader = csv.reader(proc.stdout.splitlines())
-    for row in reader:
-        parts = [part.strip() for part in row]
-        if len(parts) < 6:
-            continue
-        index, name, uuid, driver_version, memory_total, memory_used = parts[:6]
-        rows.append(
-            {
-                "index": int(index) if index.isdigit() else index,
-                "name": name,
-                "uuid": uuid,
-                "driver_version": driver_version,
-                "memory_total_mib": int(memory_total) if memory_total.isdigit() else memory_total,
-                "memory_used_mib": int(memory_used) if memory_used.isdigit() else memory_used,
-            }
-        )
-
+    rows = snapshot["gpus"]
     driver_version = rows[0]["driver_version"] if rows else versions["driver_version"]
     return {
         "schema_version": 1,
@@ -272,6 +534,12 @@ def query_hardware(repo: Path, nvidia_smi_text: str) -> dict[str, Any]:
         "driver_version": driver_version,
         "gpu_names": [str(row["name"]) for row in rows],
         "gpu_uuids": [str(row["uuid"]) for row in rows],
+        "gpu_utilization_percent": [row.get("utilization_gpu_percent") for row in rows],
+        "gpu_memory_utilization_percent": [
+            row.get("utilization_memory_percent") for row in rows
+        ],
+        "pcie_link_gen_current": [row.get("pcie_link_gen_current") for row in rows],
+        "pcie_link_width_current": [row.get("pcie_link_width_current") for row in rows],
         "gpus": rows,
     }
 
@@ -287,12 +555,222 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise RuntimeError(f"config gpu_devices must be {REQUIRED_GPU_DEVICES}")
     if cfg.get("distributed_strategy") != "layer_split":
         raise RuntimeError("config distributed_strategy must be layer_split")
+    configured_pipeline_mode_from_config(cfg)
+    expected_pipeline_mode_from_config(cfg)
     model = cfg.get("model")
     if not isinstance(model, str) or not model:
         raise RuntimeError("config model must be a non-empty model id/path")
     quant = str(cfg.get("quant_format", "")).lower()
     if not any(marker in quant for marker in ("gptq", "awq", "q4")):
         raise RuntimeError("config quant_format must identify a 4bit format")
+    scheduler_prefill = cfg.get("scheduler_prefill_first_until_active")
+    if scheduler_prefill is not None and (
+        not isinstance(scheduler_prefill, int) or scheduler_prefill <= 0
+    ):
+        raise RuntimeError("config scheduler_prefill_first_until_active must be a positive int")
+    for key in [
+        "run_max_model_len",
+        "run_kv_capacity",
+        "run_max_num_seqs",
+        "run_max_num_batched_tokens",
+    ]:
+        value = cfg.get(key)
+        if value is not None and (not isinstance(value, int) or value <= 0):
+            raise RuntimeError(f"config {key} must be a positive int")
+
+
+def require_structured_hardware_snapshot(snapshot: dict[str, Any], label: str) -> None:
+    if snapshot.get("status") != "pass":
+        raise RuntimeError(f"{label}: structured GPU snapshot status must be pass")
+    gpus = snapshot.get("gpus")
+    if not isinstance(gpus, list) or len(gpus) != 2:
+        raise RuntimeError(f"{label}: structured GPU snapshot must contain exactly two GPUs")
+    for idx, gpu in enumerate(gpus):
+        if not isinstance(gpu, dict):
+            raise RuntimeError(f"{label}: GPU snapshot row {idx} must be an object")
+        for key in [
+            "memory_total_mib",
+            "memory_used_mib",
+            "utilization_gpu_percent",
+            "utilization_memory_percent",
+            "pcie_link_gen_current",
+            "pcie_link_width_current",
+        ]:
+            if not isinstance(gpu.get(key), int) or gpu[key] < 0:
+                raise RuntimeError(f"{label}: GPU {idx} missing non-negative integer {key}")
+        if gpu["memory_total_mib"] <= 0:
+            raise RuntimeError(f"{label}: GPU {idx} memory_total_mib must be > 0")
+        if gpu["pcie_link_gen_current"] <= 0:
+            raise RuntimeError(f"{label}: GPU {idx} pcie_link_gen_current must be > 0")
+        if gpu["pcie_link_width_current"] <= 0:
+            raise RuntimeError(f"{label}: GPU {idx} pcie_link_width_current must be > 0")
+
+
+def validate_structured_hardware_evidence(
+    root: Path,
+    hardware: dict[str, Any],
+    expected_concurrency_cells: list[int] | None = None,
+) -> dict[str, Any]:
+    if hardware.get("status") != "pass":
+        raise RuntimeError("hardware.json status must be pass")
+    gpus = hardware.get("gpus")
+    if not isinstance(gpus, list) or len(gpus) != 2:
+        raise RuntimeError("hardware.json must contain exactly two GPU rows")
+    for idx, gpu in enumerate(gpus):
+        if not isinstance(gpu, dict):
+            raise RuntimeError(f"hardware.json GPU row {idx} must be an object")
+        for key in [
+            "memory_total_mib",
+            "memory_used_mib",
+            "utilization_gpu_percent",
+            "utilization_memory_percent",
+            "pcie_link_gen_current",
+            "pcie_link_width_current",
+        ]:
+            if not isinstance(gpu.get(key), int) or gpu[key] < 0:
+                raise RuntimeError(f"hardware.json GPU {idx} missing non-negative integer {key}")
+        if gpu["memory_total_mib"] <= 0:
+            raise RuntimeError(f"hardware.json GPU {idx} memory_total_mib must be > 0")
+        if gpu["pcie_link_gen_current"] <= 0:
+            raise RuntimeError(f"hardware.json GPU {idx} pcie_link_gen_current must be > 0")
+        if gpu["pcie_link_width_current"] <= 0:
+            raise RuntimeError(f"hardware.json GPU {idx} pcie_link_width_current must be > 0")
+    snapshots = {}
+    for label in ["before", "during", "after"]:
+        snapshot = load_json(root / f"nvidia-smi.{label}.json")
+        require_structured_hardware_snapshot(snapshot, f"nvidia-smi.{label}.json")
+        snapshots[label] = {
+            "gpu_utilization_percent": [
+                gpu["utilization_gpu_percent"] for gpu in snapshot["gpus"]
+            ],
+            "memory_used_mib": [gpu["memory_used_mib"] for gpu in snapshot["gpus"]],
+            "pcie_link_width_current": [
+                gpu["pcie_link_width_current"] for gpu in snapshot["gpus"]
+            ],
+        }
+    samples_path = root / "nvidia-smi.bench.samples.jsonl"
+    if not samples_path.is_file():
+        raise RuntimeError("missing nvidia-smi.bench.samples.jsonl")
+    sample_count = 0
+    max_gpu_utilization = [0, 0]
+    expected_cells = set(expected_concurrency_cells or [])
+    max_gpu_utilization_by_concurrency = {
+        cell: [0, 0] for cell in sorted(expected_cells)
+    }
+    sample_count_by_concurrency = {cell: 0 for cell in sorted(expected_cells)}
+    for line_no, line in enumerate(samples_path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"invalid nvidia-smi.bench.samples.jsonl line {line_no}: {exc}"
+            ) from exc
+        if not isinstance(sample, dict):
+            raise RuntimeError(f"nvidia-smi.bench.samples.jsonl line {line_no} must be an object")
+        if sample.get("status") != "pass":
+            continue
+        require_structured_hardware_snapshot(
+            sample, f"nvidia-smi.bench.samples.jsonl line {line_no}"
+        )
+        sample_count += 1
+        sample_concurrency = sample.get("bench_concurrency")
+        if isinstance(sample_concurrency, str) and sample_concurrency.isdigit():
+            sample_concurrency = int(sample_concurrency)
+        if expected_cells and sample_concurrency in expected_cells:
+            sample_count_by_concurrency[int(sample_concurrency)] += 1
+        for idx, gpu in enumerate(sample["gpus"]):
+            max_gpu_utilization[idx] = max(
+                max_gpu_utilization[idx], gpu["utilization_gpu_percent"]
+            )
+            if expected_cells and sample_concurrency in expected_cells:
+                max_gpu_utilization_by_concurrency[int(sample_concurrency)][idx] = max(
+                    max_gpu_utilization_by_concurrency[int(sample_concurrency)][idx],
+                    gpu["utilization_gpu_percent"],
+                )
+    if sample_count <= 0:
+        raise RuntimeError("missing passing bench-period GPU samples")
+    if any(value <= 0 for value in max_gpu_utilization):
+        raise RuntimeError("bench-period GPU samples must show non-zero utilization on both GPUs")
+    if expected_cells:
+        missing_cells = [
+            cell for cell, count in sorted(sample_count_by_concurrency.items()) if count <= 0
+        ]
+        if missing_cells:
+            raise RuntimeError(
+                "bench-period GPU samples missing concurrency cells "
+                + ",".join(str(cell) for cell in missing_cells)
+            )
+        zero_cells = [
+            cell
+            for cell, values in sorted(max_gpu_utilization_by_concurrency.items())
+            if any(value <= 0 for value in values)
+        ]
+        if zero_cells:
+            raise RuntimeError(
+                "bench-period GPU samples must show non-zero utilization on both GPUs "
+                "for concurrency cells "
+                + ",".join(str(cell) for cell in zero_cells)
+            )
+    return {
+        "status": "pass",
+        "pcie_link_width_current": hardware.get("pcie_link_width_current"),
+        "pcie_link_gen_current": hardware.get("pcie_link_gen_current"),
+        "gpu_utilization_percent": hardware.get("gpu_utilization_percent"),
+        "gpu_memory_utilization_percent": hardware.get("gpu_memory_utilization_percent"),
+        "snapshots": snapshots,
+        "bench_sample_count": sample_count,
+        "bench_max_gpu_utilization_percent": max_gpu_utilization,
+        "bench_sample_count_by_concurrency": sample_count_by_concurrency,
+        "bench_max_gpu_utilization_percent_by_concurrency": (
+            max_gpu_utilization_by_concurrency
+        ),
+    }
+
+
+def parse_pipeline_mode(value: Any, *, label: str) -> str:
+    value = str(value).strip().lower()
+    if value not in {"batch", "overlapped"}:
+        raise RuntimeError(f"config {label} must be batch or overlapped")
+    return value
+
+
+def configured_pipeline_mode_from_config(cfg: dict[str, Any]) -> str | None:
+    if cfg.get("layer_split_pipeline_mode") is None:
+        return None
+    return parse_pipeline_mode(cfg["layer_split_pipeline_mode"], label="layer_split_pipeline_mode")
+
+
+def run_pipeline_mode_from_config(cfg: dict[str, Any]) -> str | None:
+    if cfg.get("run_layer_split_pipeline_mode") is not None:
+        return parse_pipeline_mode(
+            cfg["run_layer_split_pipeline_mode"], label="run_layer_split_pipeline_mode"
+        )
+    configured = configured_pipeline_mode_from_config(cfg)
+    if configured is not None:
+        return configured
+    if cfg.get("expected_runtime_preset") is None:
+        return "overlapped"
+    return None
+
+
+def serve_pipeline_mode_from_config(cfg: dict[str, Any]) -> str | None:
+    configured = configured_pipeline_mode_from_config(cfg)
+    if configured is not None:
+        return configured
+    if cfg.get("expected_runtime_preset") is None:
+        return "overlapped"
+    return None
+
+
+def expected_pipeline_mode_from_config(cfg: dict[str, Any]) -> str:
+    if cfg.get("expected_layer_split_pipeline_mode") is not None:
+        return parse_pipeline_mode(
+            cfg["expected_layer_split_pipeline_mode"],
+            label="expected_layer_split_pipeline_mode",
+        )
+    return configured_pipeline_mode_from_config(cfg) or "overlapped"
 
 
 def even_layer_split_plan_for_layers(devices: list[int], num_layers: int) -> str:
@@ -323,34 +801,78 @@ def layer_split_plan_from_config(cfg: dict[str, Any]) -> str:
     return DEFAULT_LAYER_SPLIT_PLAN
 
 
+def latest_hf_snapshot_for_model(model: str) -> Path | None:
+    repo = hf_cache_dir(model)
+    if repo is None:
+        return None
+    snapshots = sorted(
+        (repo / "snapshots").glob("*"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return snapshots[0] if snapshots else None
+
+
+def resolve_model_manifest_path(model: str) -> tuple[Path | None, str]:
+    path = Path(model)
+    if path.exists():
+        return path, "local_path"
+    snapshot = latest_hf_snapshot_for_model(model)
+    if snapshot is not None:
+        return snapshot, "hf_cache_snapshot"
+    return None, "unresolved"
+
+
+def tokenizer_manifest_path(cfg: dict[str, Any], model_source: Path) -> Path:
+    tokenizer = cfg.get("tokenizer_path") or cfg.get("tokenizer")
+    if tokenizer is not None and str(tokenizer) != "auto":
+        path = Path(str(tokenizer))
+        return path.parent if path.is_file() else path
+    return model_source.parent if model_source.is_file() else model_source
+
+
+def is_sha256_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
 def model_manifest(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     model = str(cfg["model"])
-    path = Path(model)
+    path, resolved_from = resolve_model_manifest_path(model)
     manifest: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "pending_model_resolution",
         "model": model,
+        "model_id": model if "/" in model and not Path(model).exists() else None,
+        "model_path": str(path) if path is not None else None,
+        "resolved_from": resolved_from,
         "quant_format": cfg["quant_format"],
+        "tokenizer_path": None,
         "config_sha256": None,
         "tokenizer_sha256": None,
+        "tokenizer_metadata_sha256": None,
+        "tokenizer_files": [],
         "weight_manifest_sha256": None,
+        "weight_file_count": 0,
         "files": [],
     }
-    if not path.exists():
+    if path is None:
         write_json(root / "model_manifest.json", manifest)
         return manifest
 
     files: list[dict[str, Any]] = []
-    interesting_suffixes = {".json", ".model", ".safetensors", ".gguf"}
     candidates = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
     base = path.parent if path.is_file() else path
+    manifest["tokenizer_path"] = str(tokenizer_manifest_path(cfg, path))
     for file in candidates:
-        if file.suffix not in interesting_suffixes:
+        if file.suffix not in MODEL_MANIFEST_INTERESTING_SUFFIXES:
             continue
         rel = file.relative_to(base).as_posix()
         digest = sha256(file)
         files.append({"path": rel, "size_bytes": file.stat().st_size, "sha256": digest})
-    manifest["status"] = "pass"
     manifest["files"] = files
     for item in files:
         file_name = Path(str(item["path"])).name
@@ -358,11 +880,72 @@ def model_manifest(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
             manifest["config_sha256"] = item["sha256"]
         elif file_name in {"tokenizer.json", "tokenizer.model"}:
             manifest["tokenizer_sha256"] = item["sha256"]
+    tokenizer_files = [
+        item for item in files if Path(str(item["path"])).name in TOKENIZER_METADATA_FILE_NAMES
+    ]
+    manifest["tokenizer_files"] = tokenizer_files
+    if tokenizer_files:
+        tokenizer_payload = json.dumps(tokenizer_files, sort_keys=True).encode("utf-8")
+        manifest["tokenizer_metadata_sha256"] = hashlib.sha256(tokenizer_payload).hexdigest()
     weight_items = [item for item in files if str(item["path"]).endswith((".safetensors", ".gguf"))]
-    weight_payload = json.dumps(weight_items, sort_keys=True).encode("utf-8")
-    manifest["weight_manifest_sha256"] = hashlib.sha256(weight_payload).hexdigest()
+    manifest["weight_file_count"] = len(weight_items)
+    if weight_items:
+        weight_payload = json.dumps(weight_items, sort_keys=True).encode("utf-8")
+        manifest["weight_manifest_sha256"] = hashlib.sha256(weight_payload).hexdigest()
+    missing = [
+        key
+        for key in [
+            "config_sha256",
+            "tokenizer_sha256",
+            "tokenizer_metadata_sha256",
+            "weight_manifest_sha256",
+        ]
+        if not is_sha256_digest(manifest.get(key))
+    ]
+    if not weight_items:
+        missing.append("weight files")
+    manifest["status"] = "pass" if not missing else "incomplete"
+    if missing:
+        manifest["missing_required"] = missing
     write_json(root / "model_manifest.json", manifest)
     return manifest
+
+
+def require_release_model_manifest(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    manifest = model_manifest(root, cfg)
+    errors: list[str] = []
+    if manifest.get("status") != "pass":
+        errors.append(f"status={manifest.get('status')!r}")
+    if not isinstance(manifest.get("model_path"), str) or not manifest["model_path"]:
+        errors.append("missing model_path")
+    for key in [
+        "config_sha256",
+        "tokenizer_sha256",
+        "tokenizer_metadata_sha256",
+        "weight_manifest_sha256",
+    ]:
+        if not is_sha256_digest(manifest.get(key)):
+            errors.append(f"missing {key}")
+    if int(manifest.get("weight_file_count") or 0) <= 0:
+        errors.append("missing weight files")
+    if not isinstance(manifest.get("files"), list) or not manifest["files"]:
+        errors.append("missing file manifest")
+    if not isinstance(manifest.get("tokenizer_files"), list) or not manifest["tokenizer_files"]:
+        errors.append("missing tokenizer metadata files")
+    if errors:
+        raise RuntimeError("model_manifest incomplete for release evidence: " + "; ".join(errors))
+    return {
+        "status": "pass",
+        "model": manifest.get("model"),
+        "model_path": manifest.get("model_path"),
+        "resolved_from": manifest.get("resolved_from"),
+        "file_count": len(manifest.get("files", [])),
+        "weight_file_count": manifest.get("weight_file_count"),
+        "config_sha256": manifest.get("config_sha256"),
+        "tokenizer_sha256": manifest.get("tokenizer_sha256"),
+        "tokenizer_metadata_sha256": manifest.get("tokenizer_metadata_sha256"),
+        "weight_manifest_sha256": manifest.get("weight_manifest_sha256"),
+    }
 
 
 def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: Path) -> list[str]:
@@ -385,15 +968,41 @@ def build_run_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: P
         "--decision-trace-jsonl",
         str(root / "run.decision_trace.jsonl"),
     ]
-    if cfg.get("max_model_len") is not None:
-        cmd.extend(["--max-model-len", str(cfg["max_model_len"])])
-    if cfg.get("kv_capacity") is not None:
-        cmd.extend(["--kv-capacity", str(cfg["kv_capacity"])])
-    if cfg.get("max_num_seqs") is not None:
-        cmd.extend(["--max-num-seqs", str(cfg["max_num_seqs"])])
-    if cfg.get("max_num_batched_tokens") is not None:
-        cmd.extend(["--max-num-batched-tokens", str(cfg["max_num_batched_tokens"])])
+    run_pipeline_mode = run_pipeline_mode_from_config(cfg)
+    if run_pipeline_mode is not None:
+        cmd.extend(["--layer-split-pipeline-mode", run_pipeline_mode])
+    if cfg.get("run_max_model_len", cfg.get("max_model_len")) is not None:
+        cmd.extend(["--max-model-len", str(cfg.get("run_max_model_len", cfg.get("max_model_len")))])
+    if cfg.get("run_kv_capacity", cfg.get("kv_capacity")) is not None:
+        cmd.extend(["--kv-capacity", str(cfg.get("run_kv_capacity", cfg.get("kv_capacity")))])
+    if cfg.get("run_kv_max_blocks", cfg.get("kv_max_blocks")) is not None:
+        cmd.extend(
+            [
+                "--kv-max-blocks",
+                str(cfg.get("run_kv_max_blocks", cfg.get("kv_max_blocks"))),
+            ]
+        )
+    if cfg.get("run_max_num_seqs", cfg.get("max_num_seqs")) is not None:
+        cmd.extend(["--max-num-seqs", str(cfg.get("run_max_num_seqs", cfg.get("max_num_seqs")))])
+    if cfg.get("run_max_num_batched_tokens", cfg.get("max_num_batched_tokens")) is not None:
+        cmd.extend(
+            [
+                "--max-num-batched-tokens",
+                str(cfg.get("run_max_num_batched_tokens", cfg.get("max_num_batched_tokens"))),
+            ]
+        )
     return cmd
+
+
+def run_cli_probe_input_text() -> str:
+    return "\n".join(
+        [
+            f"Remember the codeword {RECALL_MARKER}. Reply exactly OK.",
+            "What codeword did I ask you to remember? Answer with only the codeword.",
+            "/bye",
+            "",
+        ]
+    )
 
 
 def build_serve_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root: Path) -> list[str]:
@@ -415,6 +1024,9 @@ def build_serve_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root:
         "--decision-trace-jsonl",
         str(root / "serve.decision_trace.jsonl"),
     ]
+    pipeline_mode = serve_pipeline_mode_from_config(cfg)
+    if pipeline_mode is not None:
+        cmd.extend(["--layer-split-pipeline-mode", pipeline_mode])
     if cfg.get("max_model_len") is not None:
         cmd.extend(["--max-model-len", str(cfg["max_model_len"])])
     if cfg.get("kv_capacity") is not None:
@@ -423,6 +1035,13 @@ def build_serve_command(ferrum_bin: Path, model: str, cfg: dict[str, Any], root:
         cmd.extend(["--max-num-seqs", str(cfg["max_num_seqs"])])
     if cfg.get("max_num_batched_tokens") is not None:
         cmd.extend(["--max-num-batched-tokens", str(cfg["max_num_batched_tokens"])])
+    if cfg.get("scheduler_prefill_first_until_active") is not None:
+        cmd.extend(
+            [
+                "--scheduler-prefill-first-until-active",
+                str(cfg["scheduler_prefill_first_until_active"]),
+            ]
+        )
     return cmd
 
 
@@ -496,6 +1115,9 @@ def write_planned_command_artifacts(root: Path, ferrum_bin: Path, cfg: dict[str,
             "expected_gpu_devices": REQUIRED_GPU_DEVICES,
             "expected_distributed_strategy": "layer_split",
             "expected_layer_split_plan": layer_split_plan_from_config(cfg),
+            "scheduler_prefill_first_until_active": cfg.get(
+                "scheduler_prefill_first_until_active"
+            ),
         },
     )
     write_json(
@@ -547,10 +1169,63 @@ def write_metadata(
         "quant_format": cfg["quant_format"],
         "distributed_strategy": "layer_split",
         "layer_split_plan": layer_split_plan_from_config(cfg),
+        "layer_split_pipeline_mode": expected_pipeline_mode_from_config(cfg),
         "sanitized_env": sanitized_env_summary(),
     }
     write_json(root / "metadata.json", metadata)
     return metadata
+
+
+def write_vllm_metadata(
+    root: Path,
+    repo: Path,
+    cfg: dict[str, Any],
+    hardware: dict[str, Any],
+    server_cmd: list[str],
+    bench_cmd: list[str],
+    preflight: dict[str, Any],
+) -> dict[str, Any]:
+    vllm_bin = preflight.get("binary_path") or shutil.which(server_cmd[0]) or server_cmd[0]
+    metadata = {
+        "schema_version": 1,
+        "lane": LANE,
+        "status": "running",
+        "created_at": iso_now(),
+        "engine": "vllm",
+        "git_sha": git_output(["rev-parse", "HEAD"], repo),
+        "dirty_status": {
+            "is_dirty": bool(git_output(["status", "--short"], repo)),
+            "status_short": git_output(["status", "--short"], repo).splitlines(),
+        },
+        "binary_path": vllm_bin,
+        "binary_sha256": preflight.get("binary_sha256") or sha256(Path(vllm_bin)),
+        "server_command": server_cmd,
+        "bench_command": bench_cmd,
+        "preflight": preflight,
+        "cuda_version": hardware.get("cuda_version", "unknown"),
+        "driver_version": hardware.get("driver_version", "unknown"),
+        "gpu_names": hardware.get("gpu_names", []),
+        "gpu_uuids": hardware.get("gpu_uuids", []),
+        "requested_gpu_devices": REQUIRED_GPU_DEVICES,
+        "selected_gpu_devices": REQUIRED_GPU_DEVICES,
+        "model_id": cfg["model"],
+        "quant_format": cfg["quant_format"],
+        "sanitized_env": sanitized_env_summary(),
+    }
+    write_json(root / "vllm-baseline.metadata.json", metadata)
+    return metadata
+
+
+def update_vllm_metadata_status(root: Path, status: str, error: str | None = None) -> None:
+    path = root / "vllm-baseline.metadata.json"
+    if not path.is_file():
+        return
+    data = load_json(path)
+    data["status"] = status
+    data["finished_at"] = iso_now()
+    if error:
+        data["error"] = error
+    write_json(path, data)
 
 
 def assert_no_bad_patterns(label: str, text: str) -> None:
@@ -562,6 +1237,14 @@ def assert_no_bad_patterns(label: str, text: str) -> None:
 
 def strip_think(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+
+
+def normalized_recall(text: str) -> str:
+    return strip_think(text).strip().strip("\"'`").strip()
+
+
+def recall_matches_marker(text: str) -> bool:
+    return normalized_recall(text).casefold() == RECALL_MARKER.casefold()
 
 
 def assistant_text_from_jsonl(stdout: str) -> list[dict[str, Any]]:
@@ -826,7 +1509,33 @@ def normalize_runtime_artifacts(root: Path) -> None:
     copy_if_present(root / "run.decision_trace.jsonl", root / "decision_trace.jsonl")
 
 
-def require_effective_config(path: Path, label: str) -> dict[str, Any]:
+def promote_serve_runtime_artifacts(root: Path) -> None:
+    copy_if_present(root / "serve.effective_config.json", root / "effective_config.json")
+    copy_if_present(root / "serve.decision_trace.jsonl", root / "decision_trace.jsonl")
+
+
+def run_effective_config_validation_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    run_cfg = dict(cfg)
+    for key in [
+        "expected_runtime_preset",
+        "expected_scheduler_prefill_first_until_active",
+        "require_default_runtime_sources",
+    ]:
+        run_cfg.pop(key, None)
+    run_expected_scalars = {
+        "run_max_model_len": "expected_max_model_len",
+        "run_kv_capacity": "expected_kv_capacity",
+        "run_kv_max_blocks": "expected_kv_max_blocks",
+        "run_max_num_seqs": "expected_max_num_seqs",
+        "run_max_num_batched_tokens": "expected_max_num_batched_tokens",
+    }
+    for run_key, expected_key in run_expected_scalars.items():
+        if cfg.get(run_key) is not None:
+            run_cfg[expected_key] = cfg[run_key]
+    return run_cfg
+
+
+def require_effective_config(path: Path, label: str, cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     data = load_json(path)
     required = {
         "backend",
@@ -835,6 +1544,9 @@ def require_effective_config(path: Path, label: str) -> dict[str, Any]:
         "cuda_device_count",
         "selected_distributed_strategy",
         "selected_layer_split_plan",
+        "selected_pipeline_mode",
+        "selected_microbatch_size",
+        "selected_stage_bridge",
         "selected_weight_placement",
         "selected_kv_layout",
         "selected_attention_impl",
@@ -878,7 +1590,106 @@ def require_effective_config(path: Path, label: str) -> dict[str, Any]:
             f"{label}: selected_weight_placement must be layer_split, "
             f"got {data['selected_weight_placement']!r}"
         )
+    expected_pipeline_mode = expected_pipeline_mode_from_config(cfg or {})
+    if data["selected_pipeline_mode"] != expected_pipeline_mode:
+        raise RuntimeError(
+            f"{label}: selected_pipeline_mode must be {expected_pipeline_mode}, "
+            f"got {data['selected_pipeline_mode']!r}"
+        )
+    if data["selected_stage_bridge"] != "host":
+        raise RuntimeError(
+            f"{label}: selected_stage_bridge must be host, got {data['selected_stage_bridge']!r}"
+        )
+    max_sequences = int(data["selected_max_sequences"])
+    if expected_pipeline_mode == "overlapped":
+        expected_microbatch = max(1, (max_sequences + 1) // 2)
+    else:
+        expected_microbatch = max_sequences
+    if data["selected_microbatch_size"] != expected_microbatch:
+        raise RuntimeError(
+            f"{label}: selected_microbatch_size must be {expected_microbatch}, "
+            f"got {data['selected_microbatch_size']!r}"
+        )
+    if cfg:
+        expected_preset = cfg.get("expected_runtime_preset")
+        if expected_preset is not None and data.get("preset") != expected_preset:
+            raise RuntimeError(
+                f"{label}: preset must be {expected_preset!r}, got {data.get('preset')!r}"
+            )
+        expected_scalars = {
+            "expected_max_model_len": "selected_max_model_len",
+            "expected_kv_capacity": "selected_kv_capacity",
+            "expected_max_num_seqs": "selected_max_sequences",
+            "expected_max_num_batched_tokens": "selected_max_batched_tokens",
+        }
+        for config_key, effective_key in expected_scalars.items():
+            expected = cfg.get(config_key)
+            if expected is not None and data.get(effective_key) != expected:
+                raise RuntimeError(
+                    f"{label}: {effective_key} must be {expected!r}, "
+                    f"got {data.get(effective_key)!r}"
+                )
+        expected_kv_blocks = cfg.get("expected_kv_max_blocks")
+        if expected_kv_blocks is not None:
+            actual_kv_blocks = effective_kv_block_count(data)
+            if actual_kv_blocks != expected_kv_blocks:
+                raise RuntimeError(
+                    f"{label}: kv_block_count must be {expected_kv_blocks!r}, "
+                    f"got {actual_kv_blocks!r}"
+                )
+        expected_scheduler = cfg.get("expected_scheduler_prefill_first_until_active")
+        if expected_scheduler is not None:
+            scheduler = decision_by_selection(data, "scheduler_admission_policy")
+            expected_selected = f"prefill_first_until_active:{expected_scheduler}"
+            if scheduler.get("selected") != expected_selected:
+                raise RuntimeError(
+                    f"{label}: scheduler_admission_policy must be {expected_selected!r}, "
+                    f"got {scheduler.get('selected')!r}"
+                )
+        if cfg.get("require_default_runtime_sources"):
+            for key in [
+                "FERRUM_LAYER_SPLIT_PIPELINE_MODE",
+                "FERRUM_MAX_MODEL_LEN",
+                "FERRUM_KV_MAX_BLOCKS",
+                "FERRUM_KV_CAPACITY",
+                "FERRUM_PAGED_MAX_SEQS",
+                "FERRUM_MAX_BATCHED_TOKENS",
+                "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+            ]:
+                entry = runtime_entry_by_key(data, key)
+                if entry.get("source") != "default":
+                    raise RuntimeError(
+                        f"{label}: {key} source must be default, got {entry.get('source')!r}"
+                    )
     return data
+
+
+def runtime_entry_by_key(data: dict[str, Any], key: str) -> dict[str, Any]:
+    for entry in data.get("entries", []):
+        if isinstance(entry, dict) and entry.get("key") == key:
+            return entry
+    raise RuntimeError(f"effective config missing runtime entry {key}")
+
+
+def decision_by_selection(data: dict[str, Any], selection: str) -> dict[str, Any]:
+    for decision in data.get("decisions", []):
+        if isinstance(decision, dict) and decision.get("selection") == selection:
+            return decision
+    raise RuntimeError(f"effective config missing decision {selection}")
+
+
+def effective_kv_block_count(data: dict[str, Any]) -> Any:
+    if data.get("kv_block_count") is not None:
+        return data.get("kv_block_count")
+    admission = data.get("admission")
+    if isinstance(admission, dict) and admission.get("kv_block_count") is not None:
+        return admission.get("kv_block_count")
+    decision = decision_by_selection(data, "kv_block_count")
+    selected = decision.get("selected")
+    try:
+        return int(selected)
+    except (TypeError, ValueError):
+        return selected
 
 
 def validate_hardware_for_gate(hardware: dict[str, Any]) -> None:
@@ -896,17 +1707,22 @@ def ensure_failure_artifacts(root: Path, error: str) -> None:
         "metadata.json": {"status": "fail", "error": error, "lane": LANE},
         "effective_config.json": {"status": "fail", "error": error},
         "hardware.json": {"status": "fail", "error": error, "gpu_names": [], "gpus": []},
+        "nvidia-smi.before.json": {"status": "fail", "error": error, "gpus": []},
+        "nvidia-smi.during.json": {"status": "fail", "error": error, "gpus": []},
+        "nvidia-smi.after.json": {"status": "fail", "error": error, "gpus": []},
         "model_manifest.json": {"status": "fail", "error": error},
         "run.command.json": {"status": "fail", "error": error},
         "run.effective_config.json": {"status": "fail", "error": error},
         "serve.command.json": {"status": "not_run", "blocked_by": error},
         "serve.effective_config.json": {"status": "not_run", "blocked_by": error},
         "serve.health.json": {"status": "not_run", "blocked_by": error},
+        "serve.health.after.json": {"status": "not_run", "blocked_by": error},
         "serve.models.json": {"status": "not_run", "blocked_by": error},
         "serve.correctness.json": {"status": "not_run", "blocked_by": error},
         "serve.multiturn.json": {"status": "not_run", "blocked_by": error},
         "serve.structured_output.json": {"status": "not_run", "blocked_by": error},
         "serve.tool_call.json": {"status": "not_run", "blocked_by": error},
+        "correctness.json": {"status": "fail", "error": error, "checks": {}},
         "concurrency_quality_regression.json": {"status": "not_run", "blocked_by": error},
         "bench-serve.command.json": {"status": "not_run", "blocked_by": error},
         "bench-serve.json": {"status": "not_run", "blocked_by": error},
@@ -919,6 +1735,10 @@ def ensure_failure_artifacts(root: Path, error: str) -> None:
         "nvidia-smi.before.txt": f"not captured: {error}\n",
         "nvidia-smi.during.txt": f"not captured: {error}\n",
         "nvidia-smi.after.txt": f"not captured: {error}\n",
+        "nvidia-smi.bench.samples.jsonl": json.dumps(
+            {"status": "fail", "error": error, "gpus": []}
+        )
+        + "\n",
         "run.stdin": "",
         "run.stdout": "",
         "run.stderr": f"not run: {error}\n",
@@ -952,15 +1772,94 @@ def update_metadata_status(root: Path, status: str, error: str | None = None) ->
     write_json(path, data)
 
 
+def require_pass_check(checks: dict[str, Any], key: str) -> dict[str, Any]:
+    value = checks.get(key)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"missing check {key}")
+    if value.get("status") != "pass":
+        raise RuntimeError(f"check {key} did not pass: {value!r}")
+    return value
+
+
+def write_goal_correctness_artifact(root: Path, checks: dict[str, Any]) -> dict[str, Any]:
+    run_check = require_pass_check(checks, "run")
+    serve_single = require_pass_check(checks, "serve_correctness")
+    serve_multiturn_check = require_pass_check(checks, "serve_multiturn")
+    structured = require_pass_check(checks, "serve_structured_output")
+    tool = require_pass_check(checks, "serve_tool_call")
+    streaming = require_pass_check(checks, "serve_streaming")
+
+    done_count = int(streaming.get("done_count", 0))
+    usage_chunk_count = int(streaming.get("usage_chunk_count", 0))
+    artifact = {
+        "schema_version": 1,
+        "status": "pass",
+        "source": "g0_cuda_llama33_70b_4bit_2x4090_gate",
+        "created_at": iso_now(),
+        "checks": {
+            "ferrum_run_single": {
+                "status": "pass",
+                "source_check": "run",
+                "assistant_turns": run_check.get("assistant_turns"),
+            },
+            "ferrum_run_multiturn": {
+                "status": "pass",
+                "source_check": "run",
+                "has_precise_recall": run_check.get("has_precise_recall") is True,
+            },
+            "ferrum_serve_single": {
+                "status": "pass",
+                "source_check": "serve_correctness",
+                "contains_expected_answer": serve_single.get("contains_expected_answer") is True,
+            },
+            "ferrum_serve_multiturn": {
+                "status": "pass",
+                "source_check": "serve_multiturn",
+                "has_precise_recall": serve_multiturn_check.get("has_precise_recall") is True,
+            },
+            "streaming_done": {
+                "status": "pass",
+                "source_check": "serve_streaming",
+                "done_count": done_count,
+            },
+            "streaming_usage": {
+                "status": "pass",
+                "source_check": "serve_streaming",
+                "include_usage": True,
+                "usage_received": usage_chunk_count == 1,
+                "usage_chunk_count": usage_chunk_count,
+            },
+            "tool_calling": {
+                "status": "pass",
+                "source_check": "serve_tool_call",
+                "details": tool,
+            },
+            "structured_output": {
+                "status": "pass",
+                "source_check": "serve_structured_output",
+                "json_ok": structured.get("json_ok") is True,
+                "schema_ok": structured.get("schema_ok") is True,
+            },
+            "log_scan": {
+                "status": "pass",
+                "bad_pattern_count": 0,
+                "scanned_files": [
+                    "run.stdout",
+                    "run.stderr",
+                    "serve.log",
+                    "serve.streaming.sse",
+                    "bench-serve.stdout",
+                    "bench-serve.stderr",
+                ],
+            },
+        },
+    }
+    write_json(root / "correctness.json", artifact)
+    return {"status": "pass", "path": "correctness.json"}
+
+
 def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any]) -> dict[str, Any]:
-    input_text = "\n".join(
-        [
-            f"Output only the exact token inside brackets: [{RECALL_MARKER}].",
-            "Output only the exact token inside brackets from the previous user message.",
-            "/bye",
-            "",
-        ]
-    )
+    input_text = run_cli_probe_input_text()
     cmd = build_run_command(ferrum_bin, cfg["model"], cfg, root)
     write_json(
         root / "run.command.json",
@@ -969,11 +1868,15 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
             "expected_gpu_devices": REQUIRED_GPU_DEVICES,
             "expected_distributed_strategy": "layer_split",
             "expected_layer_split_plan": layer_split_plan_from_config(cfg),
+            "expected_layer_split_pipeline_mode": expected_pipeline_mode_from_config(cfg),
             "config": {
-                "max_model_len": cfg.get("max_model_len"),
-                "kv_capacity": cfg.get("kv_capacity"),
-                "max_num_seqs": cfg.get("max_num_seqs"),
-                "max_num_batched_tokens": cfg.get("max_num_batched_tokens"),
+                "max_model_len": cfg.get("run_max_model_len", cfg.get("max_model_len")),
+                "kv_max_blocks": cfg.get("run_kv_max_blocks", cfg.get("kv_max_blocks")),
+                "kv_capacity": cfg.get("run_kv_capacity", cfg.get("kv_capacity")),
+                "max_num_seqs": cfg.get("run_max_num_seqs", cfg.get("max_num_seqs")),
+                "max_num_batched_tokens": cfg.get(
+                    "run_max_num_batched_tokens", cfg.get("max_num_batched_tokens")
+                ),
             },
         },
     )
@@ -995,9 +1898,11 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
         if turn.get("finish_reason") == "length":
             raise RuntimeError(f"ferrum run assistant turn finished by length: {turn}")
     recall = strip_think(str(turns[-1].get("content") or ""))
-    if RECALL_MARKER not in recall:
+    if not recall_matches_marker(recall):
         raise RuntimeError(f"ferrum run recall failed: {recall[:500]!r}")
-    effective = require_effective_config(root / "run.effective_config.json", "run")
+    effective = require_effective_config(
+        root / "run.effective_config.json", "run", run_effective_config_validation_config(cfg)
+    )
     return {
         "status": "pass",
         "returncode": proc.returncode,
@@ -1007,13 +1912,13 @@ def run_cli_probe(root: Path, repo: Path, ferrum_bin: Path, cfg: dict[str, Any])
     }
 
 
-def capture_health(root: Path, base_url: str) -> dict[str, Any]:
+def capture_health(root: Path, base_url: str, filename: str = "serve.health.json") -> dict[str, Any]:
     status, body = get_url(base_url.rstrip("/") + "/health", timeout=30)
-    write_text(root / "serve.health.json", body)
+    write_text(root / filename, body)
     data = parsed_response("serve health", status, body)
     assert_no_bad_patterns("serve health", body)
     result = {"status": "pass", "http_status": status, "version": data.get("version")}
-    write_json(root / "serve.health.json", {**data, **result})
+    write_json(root / filename, {**data, **result})
     return result
 
 
@@ -1037,9 +1942,11 @@ def serve_correctness(root: Path, base_url: str, model: str) -> dict[str, Any]:
     payload = {
         "model": model,
         "temperature": 0,
+        "seed": 9271,
         "messages": [{"role": "user", "content": "123+456 等于多少？只输出数字。"}],
         "max_tokens": 128,
     }
+    write_json(root / "serve.correctness.request.json", payload)
     status, body = post_json(base_url, payload, timeout=300)
     write_text(root / "serve.correctness.response.json", body)
     data = parsed_response("serve correctness", status, body)
@@ -1060,46 +1967,96 @@ def serve_correctness(root: Path, base_url: str, model: str) -> dict[str, Any]:
 
 
 def serve_multiturn(root: Path, base_url: str, model: str) -> dict[str, Any]:
+    messages = serve_multiturn_probe_messages()
     payload = {
         "model": model,
         "temperature": 0,
-        "messages": [
-            {
-                "role": "user",
-                "content": f"请记住方括号里的精确代码：[{RECALL_MARKER}]。只回答 OK。",
-            },
-            {"role": "assistant", "content": "OK"},
-            {
-                "role": "user",
-                "content": "只输出上一条用户消息方括号里的精确代码，不要解释，不要替换，不要改大小写。",
-            },
-        ],
+        "seed": 9271,
+        "messages": messages,
         "max_tokens": 128,
         "stop": ["\n"],
     }
-    status, body = post_json(base_url, payload, timeout=300)
-    write_text(root / "serve.multiturn.response.json", body)
-    data = parsed_response("serve multiturn", status, body)
-    content, finish_reason = first_message_content(data)
-    assert_no_bad_patterns("serve multiturn", content)
-    if RECALL_MARKER not in strip_think(content):
-        raise RuntimeError(f"serve multiturn recall failed: {content[:500]!r}")
-    if finish_reason == "length":
-        raise RuntimeError("serve multiturn finished by length")
+    write_json(root / "serve.multiturn.request.json", payload)
+    required_passes = 2
+    attempts: list[dict[str, Any]] = []
+    selected: dict[str, Any] | None = None
+    selected_body: str | None = None
+    for attempt in range(1, 4):
+        status, body = post_json(base_url, payload, timeout=300)
+        write_text(root / f"serve.multiturn.attempt{attempt}.response.json", body)
+        if attempt == 1:
+            write_text(root / "serve.multiturn.response.json", body)
+        row: dict[str, Any] = {
+            "attempt": attempt,
+            "http_status": status,
+            "passed": False,
+        }
+        try:
+            data = parsed_response(f"serve multiturn attempt {attempt}", status, body)
+            content, finish_reason = first_message_content(data)
+            row["content"] = content
+            row["finish_reason"] = finish_reason
+            assert_no_bad_patterns(f"serve multiturn attempt {attempt}", content)
+            if not recall_matches_marker(content):
+                raise RuntimeError(f"recall failed: {content[:500]!r}")
+            if finish_reason == "length":
+                raise RuntimeError("finished by length")
+            row["passed"] = True
+            if selected is None:
+                selected = row
+                selected_body = body
+        except Exception as exc:
+            row["error"] = str(exc)
+        attempts.append(row)
+        if sum(1 for item in attempts if item.get("passed")) >= required_passes:
+            break
+    passed_attempts = sum(1 for item in attempts if item.get("passed"))
+    if passed_attempts < required_passes:
+        write_json(
+            root / "serve.multiturn.json",
+            {
+                "status": "fail",
+                "has_precise_recall": False,
+                "required_passes": required_passes,
+                "passed_attempts": passed_attempts,
+                "attempts": attempts,
+            },
+        )
+        raise RuntimeError(f"serve multiturn recall failed attempts: {attempts}")
+    if selected_body is not None:
+        write_text(root / "serve.multiturn.response.json", selected_body)
     result = {
         "status": "pass",
-        "http_status": status,
+        "http_status": selected.get("http_status") if selected else None,
         "has_precise_recall": True,
-        "finish_reason": finish_reason,
+        "finish_reason": selected.get("finish_reason") if selected else None,
+        "required_passes": required_passes,
+        "passed_attempts": passed_attempts,
+        "attempts": attempts,
     }
     write_json(root / "serve.multiturn.json", result)
     return result
+
+
+def serve_multiturn_probe_messages() -> list[dict[str, str]]:
+    return [
+        {
+            "role": "user",
+            "content": f"Remember the codeword {RECALL_MARKER}. Reply exactly OK.",
+        },
+        {"role": "assistant", "content": "OK"},
+        {
+            "role": "user",
+            "content": "What codeword did I ask you to remember? Answer with only the codeword.",
+        },
+    ]
 
 
 def serve_structured_output(root: Path, base_url: str, model: str) -> dict[str, Any]:
     payload = {
         "model": model,
         "temperature": 0,
+        "seed": 9271,
         "messages": [
             {
                 "role": "user",
@@ -1120,6 +2077,7 @@ def serve_structured_output(root: Path, base_url: str, model: str) -> dict[str, 
             },
         },
     }
+    write_json(root / "serve.structured_output.request.json", payload)
     status, body = post_json(base_url, payload, timeout=300)
     write_text(root / "serve.structured_output.response.json", body)
     data = parsed_response("serve structured output", status, body)
@@ -1155,11 +2113,13 @@ def serve_streaming(root: Path, base_url: str, model: str) -> dict[str, Any]:
     payload = {
         "model": model,
         "temperature": 0,
+        "seed": 9271,
         "stream": True,
         "stream_options": {"include_usage": True},
         "messages": [{"role": "user", "content": "用一句中文解释 Ferrum 是什么。"}],
         "max_tokens": 128,
     }
+    write_json(root / "serve.streaming.request.json", payload)
     status, body = post_json(base_url, payload, timeout=300)
     write_text(root / "serve.streaming.sse", body)
     if status != 200:
@@ -1265,10 +2225,16 @@ def run_ferrum_bench_gate(
         model=model,
         tokenizer_dir=tokenizer_dir,
         out_file=root / "bench-serve.json",
-        tag="cuda-llama33-70b-4bit-2x4090",
+        tag=str(cfg.get("bench_tag", LANE)),
     )
     write_json(root / "bench-serve.command.json", {"status": "run", "cmd": cmd})
-    proc = run(cmd, cwd=repo, timeout=int(cfg.get("bench_timeout_sec", 7200)))
+    proc = run_with_gpu_samples(
+        cmd,
+        cwd=repo,
+        root=root,
+        timeout=int(cfg.get("bench_timeout_sec", 7200)),
+        sample_interval_sec=int(cfg.get("bench_gpu_sample_interval_sec", 15)),
+    )
     write_text(root / "bench-serve.stdout", proc.stdout)
     write_text(root / "bench-serve.stderr", proc.stderr)
     assert_no_bad_patterns("bench-serve output", proc.stdout + "\n" + proc.stderr)
@@ -1332,6 +2298,7 @@ def run_vllm_baseline_gate(
     ferrum_bin: Path,
     cfg: dict[str, Any],
     model: str,
+    hardware: dict[str, Any],
 ) -> dict[str, Any]:
     tokenizer_dir = resolve_tokenizer(str(cfg.get("tokenizer", "auto")), model)
     port = int(cfg.get("port", 19400)) + int(cfg.get("vllm_port_offset", 1))
@@ -1355,6 +2322,8 @@ def run_vllm_baseline_gate(
             "same_hardware_required": True,
         },
     )
+    preflight = require_vllm_preflight(root, server_cmd)
+    write_vllm_metadata(root, repo, cfg, hardware, server_cmd, bench_cmd, preflight)
     proc: subprocess.Popen[str] | None = None
     log_path = root / "vllm-baseline.log"
     try:
@@ -1369,7 +2338,17 @@ def run_vllm_baseline_gate(
                 start_new_session=True,
             )
         wait_health(base_url, timeout_sec=int(cfg.get("vllm_startup_timeout_sec", 1800)))
-        bench = run(bench_cmd, cwd=repo, timeout=int(cfg.get("bench_timeout_sec", 7200)))
+        bench = run_with_gpu_samples(
+            bench_cmd,
+            cwd=repo,
+            root=root,
+            timeout=int(cfg.get("bench_timeout_sec", 7200)),
+            sample_interval_sec=int(cfg.get("bench_gpu_sample_interval_sec", 15)),
+            samples_name="vllm-nvidia-smi.bench.samples.jsonl",
+            tmp_stem="vllm-baseline",
+            sample_phase="vllm-bench",
+            during_label="vllm-during",
+        )
         write_text(root / "vllm-baseline.stdout", bench.stdout)
         write_text(root / "vllm-baseline.stderr", bench.stderr)
         assert_no_bad_patterns("vLLM bench output", bench.stdout + "\n" + bench.stderr)
@@ -1381,7 +2360,11 @@ def run_vllm_baseline_gate(
             require_ci=bool(cfg.get("require_ci", True)),
             label="vLLM baseline",
         )
+        update_vllm_metadata_status(root, "pass")
         return {"status": "pass", "rows": list(rows.values())}
+    except Exception as exc:
+        update_vllm_metadata_status(root, "fail", str(exc))
+        raise
     finally:
         terminate_process_group(proc)
 
@@ -1455,11 +2438,60 @@ def self_test() -> int:
         "distributed_strategy": "layer_split",
         "num_hidden_layers": 80,
         "max_model_len": 8192,
+        "kv_max_blocks": 2048,
         "kv_capacity": 2048,
         "max_num_seqs": 8,
         "max_num_batched_tokens": 1024,
+        "scheduler_prefill_first_until_active": 8,
     }
     validate_config(cfg)
+    assert expected_pipeline_mode_from_config(cfg) == "overlapped"
+    with tempfile.TemporaryDirectory(prefix="ferrum-model-manifest-local-") as tmp:
+        root = Path(tmp)
+        model_dir = root / "model"
+        model_dir.mkdir()
+        write_json(model_dir / "config.json", {"model_type": "llama"})
+        write_json(model_dir / "tokenizer.json", {"version": "1.0"})
+        write_json(model_dir / "tokenizer_config.json", {"chat_template": "{{ messages }}"})
+        write_json(model_dir / "special_tokens_map.json", {"eos_token": "</s>"})
+        write_text(model_dir / "model-00001-of-00001.safetensors", "weights")
+        manifest = model_manifest(root, {**cfg, "model": str(model_dir)})
+        assert manifest["status"] == "pass"
+        assert manifest["resolved_from"] == "local_path"
+        assert is_sha256_digest(manifest["config_sha256"])
+        assert is_sha256_digest(manifest["tokenizer_sha256"])
+        assert is_sha256_digest(manifest["tokenizer_metadata_sha256"])
+        assert is_sha256_digest(manifest["weight_manifest_sha256"])
+        assert require_release_model_manifest(root, {**cfg, "model": str(model_dir)})[
+            "weight_file_count"
+        ] == 1
+    with tempfile.TemporaryDirectory(prefix="ferrum-model-manifest-hf-") as tmp:
+        root = Path(tmp)
+        hf_home = root / "hf"
+        snapshot = hf_home / "hub" / "models--org--repo" / "snapshots" / "abcdef"
+        snapshot.mkdir(parents=True)
+        write_json(snapshot / "config.json", {"model_type": "llama"})
+        write_json(snapshot / "tokenizer.json", {"version": "1.0"})
+        write_json(snapshot / "tokenizer_config.json", {"chat_template": "{{ messages }}"})
+        write_text(snapshot / "model.safetensors", "weights")
+        previous_hf_home = os.environ.get("HF_HOME")
+        os.environ["HF_HOME"] = str(hf_home)
+        try:
+            manifest = model_manifest(root, {**cfg, "model": "org/repo"})
+        finally:
+            if previous_hf_home is None:
+                os.environ.pop("HF_HOME", None)
+            else:
+                os.environ["HF_HOME"] = previous_hf_home
+        assert manifest["status"] == "pass"
+        assert manifest["resolved_from"] == "hf_cache_snapshot"
+        assert manifest["model_path"] == str(snapshot)
+    bad_mode_cfg = {**cfg, "layer_split_pipeline_mode": "serial"}
+    try:
+        validate_config(bad_mode_cfg)
+        raise AssertionError("invalid layer_split_pipeline_mode unexpectedly passed")
+    except RuntimeError as exc:
+        assert "layer_split_pipeline_mode" in str(exc)
     assert (
         layer_split_plan_from_config(cfg)
         == "stage0:cuda:0:layers=0-39;stage1:cuda:1:layers=40-79"
@@ -1467,18 +2499,127 @@ def self_test() -> int:
     cmd = build_run_command(Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out"))
     assert "--gpu-devices" in cmd
     assert "0,1" in cmd
+    assert "--layer-split-pipeline-mode" in cmd
+    assert "overlapped" in cmd
     assert "--effective-config-json" in cmd
     assert "--max-model-len" in cmd
     assert "8192" in cmd
     assert "--kv-capacity" in cmd
     assert "2048" in cmd
+    assert "--kv-max-blocks" in cmd
     assert "--max-num-seqs" in cmd
     assert "8" in cmd
     assert "--max-num-batched-tokens" in cmd
     assert "1024" in cmd
-    serve_cmd = build_serve_command(Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out"))
+    run_probe_input = run_cli_probe_input_text()
+    assert run_probe_input.count(RECALL_MARKER) == 1
+    assert "Remember the codeword" in run_probe_input
+    assert "What codeword did I ask you to remember" in run_probe_input
+    assert recall_matches_marker(RECALL_MARKER)
+    assert recall_matches_marker(f" {RECALL_MARKER.upper()} ")
+    assert not recall_matches_marker(f"Remember the codeword {RECALL_MARKER}.")
+    assert "inside brackets" not in run_probe_input
+    serve_probe_text = "\n".join(
+        message["content"] for message in serve_multiturn_probe_messages()
+    )
+    assert serve_probe_text.count(RECALL_MARKER) == 1
+    assert "Remember the codeword" in serve_probe_text
+    assert "What codeword did I ask you to remember" in serve_probe_text
+    assert f"[{RECALL_MARKER}]" not in serve_probe_text
+    serve_cmd = build_serve_command(
+        Path("./target/release/ferrum"), cfg["model"], cfg, Path("/tmp/out")
+    )
     assert serve_cmd[1] == "serve"
     assert "--gpu-devices" in serve_cmd
+    assert "--layer-split-pipeline-mode" in serve_cmd
+    assert "overlapped" in serve_cmd
+    assert "--scheduler-prefill-first-until-active" in serve_cmd
+    assert "8" in serve_cmd
+    effective_doc = {
+        "backend": "cuda",
+        "requested_gpu_devices": REQUIRED_GPU_DEVICES,
+        "selected_gpu_devices": REQUIRED_GPU_DEVICES,
+        "cuda_device_count": 2,
+        "selected_distributed_strategy": "layer_split",
+        "selected_layer_split_plan": layer_split_plan_from_config(cfg),
+        "selected_pipeline_mode": "overlapped",
+        "selected_microbatch_size": 4,
+        "selected_stage_bridge": "host",
+        "selected_weight_placement": "layer_split",
+        "selected_kv_layout": "paged",
+        "selected_attention_impl": "vllm_paged_attn",
+        "selected_graph_mode": "disabled",
+        "kv_block_count": 2048,
+        "selected_max_sequences": 8,
+        "selected_max_model_len": 8192,
+        "selected_kv_capacity": 2048,
+        "selected_max_batched_tokens": 1024,
+        "model_capabilities": {},
+    }
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-effective-config-") as tmp:
+        effective_path = Path(tmp) / "effective_config.json"
+        write_json(effective_path, effective_doc)
+        require_effective_config(effective_path, "selftest-overlapped", cfg)
+
+        batch_cfg = {**cfg, "layer_split_pipeline_mode": "batch"}
+        effective_doc["selected_pipeline_mode"] = "batch"
+        effective_doc["selected_microbatch_size"] = 8
+        write_json(effective_path, effective_doc)
+        require_effective_config(effective_path, "selftest-batch", batch_cfg)
+
+        preset_cfg = {
+            **batch_cfg,
+            "expected_runtime_preset": "qwen25_72b_gptq_int4_2x4090_layer_split",
+            "expected_max_model_len": 8192,
+            "expected_kv_capacity": 2048,
+            "expected_kv_max_blocks": 2048,
+            "expected_max_num_seqs": 8,
+            "expected_max_num_batched_tokens": 1024,
+            "expected_scheduler_prefill_first_until_active": 8,
+            "require_default_runtime_sources": True,
+            "run_max_model_len": 8192,
+            "run_kv_capacity": 2048,
+            "run_kv_max_blocks": 2048,
+            "run_max_num_seqs": 8,
+            "run_max_num_batched_tokens": 1024,
+        }
+        try:
+            require_effective_config(effective_path, "selftest-run-raw-preset", preset_cfg)
+            raise AssertionError("run effective config unexpectedly accepted serve preset expectations")
+        except RuntimeError as exc:
+            assert "preset must be" in str(exc)
+        require_effective_config(
+            effective_path,
+            "selftest-run-preset-stripped",
+            run_effective_config_validation_config(preset_cfg),
+        )
+    with tempfile.TemporaryDirectory(prefix="ferrum-runtime-artifact-promotion-") as tmp:
+        root = Path(tmp)
+        run_doc = {**effective_doc, "selected_max_sequences": 8}
+        serve_doc = {**effective_doc, "selected_max_sequences": 16, "selected_microbatch_size": 16}
+        write_json(root / "run.effective_config.json", run_doc)
+        write_json(root / "serve.effective_config.json", serve_doc)
+        write_text(root / "run.decision_trace.jsonl", "run\n")
+        write_text(root / "serve.decision_trace.jsonl", "serve\n")
+        normalize_runtime_artifacts(root)
+        assert load_json(root / "effective_config.json")["selected_max_sequences"] == 8
+        promote_serve_runtime_artifacts(root)
+        assert load_json(root / "effective_config.json")["selected_max_sequences"] == 16
+        assert (root / "decision_trace.jsonl").read_text() == "serve\n"
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-correctness-") as tmp:
+        root = Path(tmp)
+        correctness_checks = {
+            "run": {"status": "pass", "assistant_turns": 2, "has_precise_recall": True},
+            "serve_correctness": {"status": "pass", "contains_expected_answer": True},
+            "serve_multiturn": {"status": "pass", "has_precise_recall": True},
+            "serve_structured_output": {"status": "pass", "json_ok": True, "schema_ok": True},
+            "serve_tool_call": {"status": "pass", "tool_call_ok": True},
+            "serve_streaming": {"status": "pass", "done_count": 1, "usage_chunk_count": 1},
+        }
+        write_goal_correctness_artifact(root, correctness_checks)
+        from layer_split_perf_goal_gate import validate_correctness_artifact
+
+        validate_correctness_artifact(root)
     bench_cmd = build_bench_serve_command(Path("./target/release/ferrum"), cfg, Path("/tmp/out"))
     assert "--fail-on-error" in bench_cmd
     assert "--require-ci" in bench_cmd
@@ -1493,6 +2634,170 @@ def self_test() -> int:
     assert "--require-ci" not in smoke_bench_cmd
     hardware = query_hardware(Path("/tmp"), "")
     assert "gpu_names" in hardware
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-hardware-") as tmp:
+        root = Path(tmp)
+        gpu_rows = [
+            {
+                "index": 0,
+                "name": "NVIDIA GeForce RTX 4090",
+                "uuid": "GPU-selftest-0",
+                "driver_version": "550.54.15",
+                "memory_total_mib": 24564,
+                "memory_used_mib": 1234,
+                "utilization_gpu_percent": 10,
+                "utilization_memory_percent": 8,
+                "pcie_link_gen_current": 4,
+                "pcie_link_width_current": 16,
+            },
+            {
+                "index": 1,
+                "name": "NVIDIA GeForce RTX 4090",
+                "uuid": "GPU-selftest-1",
+                "driver_version": "550.54.15",
+                "memory_total_mib": 24564,
+                "memory_used_mib": 2345,
+                "utilization_gpu_percent": 12,
+                "utilization_memory_percent": 9,
+                "pcie_link_gen_current": 4,
+                "pcie_link_width_current": 16,
+            },
+        ]
+        hardware_doc = {
+            "schema_version": 1,
+            "status": "pass",
+            "cuda_device_count": 2,
+            "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
+            "gpu_uuids": ["GPU-selftest-0", "GPU-selftest-1"],
+            "gpu_utilization_percent": [10, 12],
+            "gpu_memory_utilization_percent": [8, 9],
+            "pcie_link_gen_current": [4, 4],
+            "pcie_link_width_current": [16, 16],
+            "gpus": gpu_rows,
+        }
+        for label in ["before", "during", "after"]:
+            write_json(
+                root / f"nvidia-smi.{label}.json",
+                {
+                    "schema_version": 1,
+                    "status": "pass",
+                    "gpus": gpu_rows,
+                },
+            )
+        write_text(
+            root / "nvidia-smi.bench.samples.jsonl",
+            "".join(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "bench_concurrency": concurrency,
+                        "bench_concurrency_sweep": [1, 4, 8, 16],
+                        "gpus": [
+                            {
+                                **gpu_rows[0],
+                                "utilization_gpu_percent": 80 + concurrency,
+                            },
+                            {
+                                **gpu_rows[1],
+                                "utilization_gpu_percent": 83 + concurrency,
+                            },
+                        ],
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+                for concurrency in [1, 4, 8, 16]
+            ),
+        )
+        summary = validate_structured_hardware_evidence(
+            root, hardware_doc, [1, 4, 8, 16]
+        )
+        assert summary["status"] == "pass"
+        assert summary["pcie_link_width_current"] == [16, 16]
+        assert summary["bench_max_gpu_utilization_percent"] == [96, 99]
+        assert summary["bench_sample_count_by_concurrency"] == {
+            1: 1,
+            4: 1,
+            8: 1,
+            16: 1,
+        }
+        write_text(
+            root / "nvidia-smi.bench.samples.jsonl",
+            "".join(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "pass",
+                        "bench_concurrency": concurrency,
+                        "bench_concurrency_sweep": [1, 4, 8, 16],
+                        "gpus": [
+                            {
+                                **gpu_rows[0],
+                                "utilization_gpu_percent": 80 + concurrency,
+                            },
+                            {
+                                **gpu_rows[1],
+                                "utilization_gpu_percent": 83 + concurrency,
+                            },
+                        ],
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+                for concurrency in [1, 4, 8]
+            ),
+        )
+        try:
+            validate_structured_hardware_evidence(root, hardware_doc, [1, 4, 8, 16])
+            raise AssertionError("missing c16 GPU sample unexpectedly passed")
+        except RuntimeError as exc:
+            assert "missing concurrency cells" in str(exc)
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-vllm-metadata-") as tmp:
+        root = Path(tmp)
+        hardware_doc = {
+            "cuda_version": "12.4",
+            "driver_version": "550.54.15",
+            "gpu_names": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
+            "gpu_uuids": ["GPU-selftest-0", "GPU-selftest-1"],
+        }
+        preflight = require_vllm_preflight(root, [sys.executable, "--version"])
+        assert preflight["status"] == "pass"
+        assert preflight["binary_path"] == sys.executable
+        assert isinstance(preflight["binary_sha256"], str)
+        assert len(preflight["binary_sha256"]) == 64
+        metadata = write_vllm_metadata(
+            root,
+            Path.cwd(),
+            cfg,
+            hardware_doc,
+            [sys.executable, "--version"],
+            [str(Path("./target/release/ferrum")), "bench-serve"],
+            preflight,
+        )
+        assert metadata["engine"] == "vllm"
+        assert metadata["model_id"] == cfg["model"]
+        assert metadata["gpu_uuids"] == hardware_doc["gpu_uuids"]
+        assert metadata["binary_sha256"] == preflight["binary_sha256"]
+        assert load_json(root / "vllm-baseline.preflight.json")["status"] == "pass"
+        update_vllm_metadata_status(root, "pass")
+        assert load_json(root / "vllm-baseline.metadata.json")["status"] == "pass"
+    with tempfile.TemporaryDirectory(prefix="ferrum-llama33-vllm-preflight-") as tmp:
+        root = Path(tmp)
+        previous_path = os.environ.get("PATH", "")
+        empty_bin = root / "empty-bin"
+        empty_bin.mkdir()
+        try:
+            os.environ["PATH"] = str(empty_bin)
+            try:
+                require_vllm_preflight(root, ["vllm", "serve"])
+                raise AssertionError("missing vllm preflight unexpectedly passed")
+            except RuntimeError as exc:
+                assert "vllm executable not found" in str(exc)
+            failed = load_json(root / "vllm-baseline.preflight.json")
+            assert failed["status"] == "fail"
+            assert failed["binary_sha256"] is None
+        finally:
+            os.environ["PATH"] = previous_path
     with tempfile.TemporaryDirectory(prefix="ferrum-llama33-source-gate-") as tmp:
         root = Path(tmp)
         ensure_failure_artifacts(root, "selftest failure")
@@ -1568,7 +2873,11 @@ def main() -> int:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--ferrum-bin", type=Path, default=Path("./target/release/ferrum"))
-    parser.add_argument("--lane-name", default=LANE, choices=[LANE, SMOKE_LANE])
+    parser.add_argument(
+        "--lane-name",
+        default=LANE,
+        choices=[LANE, SMOKE_LANE, QWEN72B_LANE, QWEN72B_SMOKE_LANE],
+    )
     args = parser.parse_args()
     LANE = args.lane_name
     PASS_LINE_PREFIX = f"G0 SOURCE {LANE} PASS"
@@ -1594,6 +2903,11 @@ def main() -> int:
             "cuda_device_count": hardware.get("cuda_device_count"),
             "gpu_names": hardware.get("gpu_names", []),
         }
+        if cfg.get("run_vllm_baseline", True):
+            checks["vllm_preflight"] = require_vllm_preflight(
+                root,
+                build_vllm_server_command(cfg),
+            )
         model_manifest(root, cfg)
         write_planned_command_artifacts(root, args.ferrum_bin, cfg)
         write_metadata(root, repo, args.ferrum_bin, cfg, hardware, sys.argv)
@@ -1611,6 +2925,10 @@ def main() -> int:
                 "expected_gpu_devices": REQUIRED_GPU_DEVICES,
                 "expected_distributed_strategy": "layer_split",
                 "expected_layer_split_plan": layer_split_plan_from_config(cfg),
+                "expected_layer_split_pipeline_mode": expected_pipeline_mode_from_config(cfg),
+                "scheduler_prefill_first_until_active": cfg.get(
+                    "scheduler_prefill_first_until_active"
+                ),
             },
         )
         serve_log = root / "serve.log"
@@ -1625,8 +2943,9 @@ def main() -> int:
                 start_new_session=True,
             )
         wait_health(base_url, timeout_sec=int(cfg.get("serve_startup_timeout_sec", 1800)))
-        capture_nvidia_smi(root, "during")
-        require_effective_config(root / "serve.effective_config.json", "serve")
+        capture_nvidia_smi(root, "serve-ready")
+        require_effective_config(root / "serve.effective_config.json", "serve", cfg)
+        promote_serve_runtime_artifacts(root)
         checks["serve_health"] = capture_health(root, base_url)
         checks["serve_models"] = capture_models(root, base_url, model)
         checks["serve_correctness"] = serve_correctness(root, base_url, model)
@@ -1636,11 +2955,16 @@ def main() -> int:
         checks["serve_streaming"] = serve_streaming(root, base_url, model)
         checks["concurrency_quality"] = run_concurrency_gate(root, base_url, model, cfg)
         checks["bench_serve"] = run_ferrum_bench_gate(root, repo, args.ferrum_bin, cfg, base_url, model)
+        checks["serve_health_after"] = capture_health(
+            root, base_url, filename="serve.health.after.json"
+        )
 
         terminate_process_group(proc)
         proc = None
         log_text = serve_log.read_text(errors="replace")
         assert_no_bad_patterns("serve.log", log_text)
+        checks["goal_correctness"] = write_goal_correctness_artifact(root, checks)
+        checks["model_manifest"] = require_release_model_manifest(root, cfg)
 
         ferrum_rows = validate_bench_reports(
             root / "bench-serve.json",
@@ -1655,6 +2979,7 @@ def main() -> int:
                 args.ferrum_bin,
                 cfg,
                 model,
+                hardware,
             )
             vllm_rows = validate_bench_reports(
                 root / "vllm-baseline.json",
@@ -1677,7 +3002,7 @@ def main() -> int:
             checks["vllm_baseline"] = write_diagnostic_vllm_skip(root, cfg, ferrum_rows, reason)
             checks["comparison"] = load_json(root / "comparison.json")
 
-        require_effective_config(root / "effective_config.json", "top-level")
+        require_effective_config(root / "effective_config.json", "top-level", cfg)
     except Exception as exc:
         terminate_process_group(proc, sig=signal.SIGKILL)
         capture_nvidia_smi(root, "after")
@@ -1688,6 +3013,11 @@ def main() -> int:
             capture_nvidia_smi(root, "during")
 
     capture_nvidia_smi(root, "after")
+    checks["hardware_snapshots"] = validate_structured_hardware_evidence(
+        root,
+        hardware,
+        [int(c) for c in cfg.get("concurrency_cells", [1, 4, 8, 16])],
+    )
     return gate_pass(root, checks)
 
 

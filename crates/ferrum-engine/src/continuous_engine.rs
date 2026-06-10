@@ -209,8 +209,9 @@ fn clamp_default_max_tokens_to_context(
 ///    so there's no risk of inserting an unrelated token id from a hard-coded
 ///    fallback list (e.g. `2` is `</s>` for LLaMA but `!` for Qwen3).
 /// 3. User-supplied `stop_sequences` — each is encoded with `add_special=false`;
-///    one-token results land in `stop_token_ids`, multi-token results go to
-///    `stop_text_seqs` for text-match fallback.
+///    one-token results land in `stop_token_ids` for the fast path, and all
+///    user stop strings remain in `stop_text_seqs` so tokens that contain the
+///    stop text as a substring still stop.
 fn resolve_stop_conditions(
     params: &SamplingParams,
     tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
@@ -231,11 +232,14 @@ fn resolve_stop_conditions(
             }
         }
         for stop_seq in &params.stop_sequences {
+            if !stop_seq.is_empty() {
+                text_seqs.push(stop_seq.clone());
+            }
             match tok.encode(stop_seq, false) {
                 Ok(toks) if toks.len() == 1 => {
                     ids.insert(toks[0].get());
                 }
-                _ => text_seqs.push(stop_seq.clone()),
+                _ => {}
             }
         }
     } else {
@@ -383,13 +387,14 @@ fn decoded_delta_has_forbidden_quality(
     full_text: &str,
     previous_text_len: usize,
     candidate_is_stop: bool,
+    candidate_is_non_stop_control: bool,
 ) -> bool {
     if previous_text_len > full_text.len() || !full_text.is_char_boundary(previous_text_len) {
         return true;
     }
     let delta = &full_text[previous_text_len..];
     if delta.is_empty() {
-        return false;
+        return candidate_is_non_stop_control;
     }
     if contains_replacement_char_mojibake(delta) {
         return true;
@@ -620,15 +625,37 @@ impl SequenceState {
 
     pub fn model_decode_metadata(&self) -> HashMap<String, serde_json::Value> {
         let mut metadata = self.original_request.metadata.clone();
-        let needs_sampling_masks = !self.forbidden_token_ids.is_empty()
-            || (self.generated_tokens.is_empty() && !self.initial_forbidden_token_ids.is_empty());
-        if self.json_processor.is_some() || self.regex_processor.is_some() || needs_sampling_masks {
+        if self.requires_full_logits_for_sampling() {
             metadata.insert(
                 "ferrum_require_full_logits".to_string(),
                 serde_json::json!(true),
             );
         }
         metadata
+    }
+
+    pub fn requires_full_logits_for_sampling(&self) -> bool {
+        use ferrum_types::ResponseFormat;
+
+        let needs_sampling_masks = !self.forbidden_token_ids.is_empty()
+            || (self.generated_tokens.is_empty() && !self.initial_forbidden_token_ids.is_empty());
+        self.json_processor.is_some()
+            || self.regex_processor.is_some()
+            || matches!(
+                self.sampling_params.response_format,
+                ResponseFormat::JsonSchema(_)
+            )
+            || needs_sampling_masks
+    }
+
+    pub fn reset_guided_processors(&self) -> Result<()> {
+        if let Some(ref jp) = self.json_processor {
+            jp.reset();
+        }
+        if let Some(ref rp) = self.regex_processor {
+            rp.reset()?;
+        }
+        Ok(())
     }
 
     /// Return the reason this sequence should stop, if any.
@@ -689,8 +716,23 @@ impl SequenceState {
         // tokens to -inf). Subsequent temperature / top-k / top-p stay
         // correct because -inf tokens can't make it through any softmax.
         if let Some(ref rp) = self.regex_processor {
+            let best_non_control =
+                best_finite_excluding_tokens(logits, &self.allowed_extended_token_ids);
             rp.advance_with_tokens_public(&self.generated_tokens);
             rp.mask_logits(logits);
+            mask_non_stop_control_token_logits(
+                logits,
+                &self.allowed_extended_token_ids,
+                &self.stop_token_ids,
+            );
+            if !rp.can_accept() {
+                mask_stop_token_logits(logits, &self.stop_token_ids);
+                if !logits.iter().any(|logit| logit.is_finite()) {
+                    if let Some(token) = best_non_control {
+                        force_only_token(logits, token);
+                    }
+                }
+            }
         }
 
         // Apply JSON mode biases before the standard processor chain
@@ -796,13 +838,17 @@ impl SequenceState {
         let mut tokens = Vec::with_capacity(self.generated_tokens.len() + 1);
         tokens.extend_from_slice(&self.generated_tokens);
         tokens.push(token);
+        let candidate_is_stop = self.stop_token_ids.contains(&token.get());
+        let candidate_is_non_stop_control =
+            self.allowed_extended_token_ids.contains(&token.get()) && !candidate_is_stop;
         tokenizer
             .decode(&tokens, true)
             .map(|text| {
                 decoded_delta_has_forbidden_quality(
                     &text,
                     previous_streamed_text_len,
-                    self.stop_token_ids.contains(&token.get()),
+                    candidate_is_stop,
+                    candidate_is_non_stop_control,
                 )
             })
             .unwrap_or(true)
@@ -853,6 +899,47 @@ fn describe_token_for_log(
     format!("{} raw={:?} decoded={:?}", token.get(), raw, decoded)
 }
 
+fn mask_stop_token_logits(logits: &mut [f32], stop_token_ids: &HashSet<u32>) {
+    for &token_id in stop_token_ids {
+        if let Some(logit) = logits.get_mut(token_id as usize) {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+}
+
+fn mask_non_stop_control_token_logits(
+    logits: &mut [f32],
+    control_token_ids: &HashSet<u32>,
+    stop_token_ids: &HashSet<u32>,
+) {
+    for &token_id in control_token_ids {
+        if stop_token_ids.contains(&token_id) {
+            continue;
+        }
+        if let Some(logit) = logits.get_mut(token_id as usize) {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+}
+
+fn best_finite_excluding_tokens(
+    logits: &[f32],
+    excluded_token_ids: &HashSet<u32>,
+) -> Option<usize> {
+    logits
+        .iter()
+        .enumerate()
+        .filter(|(idx, logit)| logit.is_finite() && !excluded_token_ids.contains(&(*idx as u32)))
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(idx, _)| idx)
+}
+
+fn force_only_token(logits: &mut [f32], token: usize) {
+    for (idx, logit) in logits.iter_mut().enumerate() {
+        *logit = if idx == token { 0.0 } else { f32::NEG_INFINITY };
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Engine inner – shared via Arc so we can spawn tasks
 // ────────────────────────────────────────────────────────────────────────────
@@ -888,11 +975,69 @@ struct EngineInner {
     total_decode_tokens: AtomicU64,
     total_preemptions: AtomicU64,
     prefix_cache_hits: AtomicU64,
+    total_iteration_lock_wait_us: AtomicU64,
+    iteration_lock_wait_samples: AtomicU64,
+    total_scheduling_time_us: AtomicU64,
+    scheduling_time_samples: AtomicU64,
+    total_model_execution_time_us: AtomicU64,
+    model_execution_time_samples: AtomicU64,
     /// Set true the first time `ensure_bg_loop` runs, so per-request
     /// `infer_stream` callers don't each spawn their own competing
     /// driver task (16 streaming requests = 16 drivers thrashing on
     /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
     bg_loop_spawned: AtomicBool,
+}
+
+impl EngineInner {
+    fn record_iteration_lock_wait(&self, duration: Duration) {
+        self.total_iteration_lock_wait_us
+            .fetch_add(duration_to_us(duration), Ordering::Relaxed);
+        self.iteration_lock_wait_samples
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_scheduling_time(&self, duration: Duration) {
+        self.total_scheduling_time_us
+            .fetch_add(duration_to_us(duration), Ordering::Relaxed);
+        self.scheduling_time_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_model_execution_time(&self, duration: Duration) {
+        self.total_model_execution_time_us
+            .fetch_add(duration_to_us(duration), Ordering::Relaxed);
+        self.model_execution_time_samples
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn performance_breakdown(&self) -> ferrum_types::PerformanceBreakdown {
+        ferrum_types::PerformanceBreakdown {
+            scheduling_time_ms: avg_duration_ms(
+                self.total_scheduling_time_us.load(Ordering::Relaxed),
+                self.scheduling_time_samples.load(Ordering::Relaxed),
+            ),
+            model_execution_time_ms: avg_duration_ms(
+                self.total_model_execution_time_us.load(Ordering::Relaxed),
+                self.model_execution_time_samples.load(Ordering::Relaxed),
+            ),
+            other_overhead_time_ms: avg_duration_ms(
+                self.total_iteration_lock_wait_us.load(Ordering::Relaxed),
+                self.iteration_lock_wait_samples.load(Ordering::Relaxed),
+            ),
+            ..Default::default()
+        }
+    }
+}
+
+fn duration_to_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn avg_duration_ms(total_us: u64, samples: u64) -> f64 {
+    if samples == 0 {
+        0.0
+    } else {
+        total_us as f64 / samples as f64 / 1000.0
+    }
 }
 
 mod inner;
@@ -977,6 +1122,12 @@ impl ContinuousBatchEngine {
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
                 prefix_cache_hits: AtomicU64::new(0),
+                total_iteration_lock_wait_us: AtomicU64::new(0),
+                iteration_lock_wait_samples: AtomicU64::new(0),
+                total_scheduling_time_us: AtomicU64::new(0),
+                scheduling_time_samples: AtomicU64::new(0),
+                total_model_execution_time_us: AtomicU64::new(0),
+                model_execution_time_samples: AtomicU64::new(0),
                 bg_loop_spawned: AtomicBool::new(false),
             }),
         }
@@ -1027,7 +1178,9 @@ impl ContinuousBatchEngine {
                     None
                 };
                 {
+                    let lock_wait_start = Instant::now();
                     let _guard = inner.iteration_lock.lock().await;
+                    inner.record_iteration_lock_wait(lock_wait_start.elapsed());
                     if let Err(e) = inner.run_iteration().await {
                         warn!("Iteration error: {}", e);
                     }
@@ -1221,10 +1374,15 @@ impl InferenceEngine for ContinuousBatchEngine {
             p99_request_latency_ms: 0.0,
             throughput_rps: sm.throughput_rps as f32,
             tokens_per_second: 0.0,
-            queue_metrics: Default::default(),
+            queue_metrics: ferrum_types::QueueMetrics {
+                current_queue_length: sm.waiting_requests,
+                avg_queue_wait_time_ms: sm.avg_wait_time_ms,
+                queue_throughput_rps: sm.throughput_rps as f32,
+                queue_rejection_rate: 0.0,
+            },
             resource_utilization: Default::default(),
             error_stats: Default::default(),
-            performance_breakdown: Default::default(),
+            performance_breakdown: self.inner.performance_breakdown(),
         }
     }
 

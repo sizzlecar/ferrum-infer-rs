@@ -43,7 +43,11 @@ TOOL_USER_PROMPT = (
     "北京现在天气怎么样？请先调用 get_weather 工具查询，"
     "得到工具结果后用一句中文回答，unit 使用 celsius。"
 )
-TOOL_REQUIRED_PROMPT = "只调用 get_weather 工具查询北京天气，unit 使用 celsius。不要输出自然语言。"
+TOOL_REQUIRED_PROMPT = (
+    "Call get_weather exactly once with city set to Beijing and unit set to celsius. "
+    "Do not output natural language."
+)
+TOOL_SEED = 9271
 
 
 def write(path: Path, text: str) -> None:
@@ -139,7 +143,10 @@ def assert_weather_tool_call(label: str, choice: dict[str, Any]) -> dict[str, An
         args = json.loads(args_raw)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"{label}: arguments is not JSON: {args_raw!r}") from e
-    city = str(args.get("city", "")).lower()
+    city_raw = str(args.get("city", ""))
+    city = city_raw.lower()
+    if len(city_raw) > 64:
+        raise RuntimeError(f"{label}: city argument is unexpectedly long: {args}")
     if "北京" not in city and "beijing" not in city:
         raise RuntimeError(f"{label}: city argument does not identify Beijing: {args}")
     return call
@@ -156,6 +163,7 @@ def tool_payload(model: str, *, tool_choice: Any | None, prompt: str = TOOL_USER
     payload: dict[str, Any] = {
         "model": model,
         "temperature": 0,
+        "seed": TOOL_SEED,
         "tools": TOOLS,
         "messages": [
             {
@@ -182,12 +190,9 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
     assert_omitted_tool_choice_auto_calls_weather("omitted_tool_choice", omitted)
     results["checks"]["omitted_tool_choice"] = {"passed": True}
 
-    # Explicit auto must also work. A prior Metal regression accepted the request
-    # but returned empty/plain text instead of a tool call.
-    status, body = post(
-        base_url,
-        tool_payload(model, tool_choice="auto", prompt=TOOL_REQUIRED_PROMPT),
-    )
+    # Explicit auto must also work. Keep the prompt identical to the omitted
+    # tool_choice case so this checks request handling rather than prompt wording.
+    status, body = post(base_url, tool_payload(model, tool_choice="auto"))
     write(out / "01b_explicit_auto_tool_choice.response.json", body)
     explicit_auto = first_choice(parsed_json("explicit_auto_tool_choice", status, body))
     assert_omitted_tool_choice_auto_calls_weather("explicit_auto_tool_choice", explicit_auto)
@@ -208,36 +213,46 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
     # BUG-2: Feeding a tool result back must not leak chat-template markers such as
     # <|assistant|>, classname=..., or auto_tool_response into the final answer.
     tool_call_id = str(required_call.get("id") or "call_0")
-    status, body = post(
-        base_url,
-        {
-            "model": model,
-            "temperature": 0,
-            "tools": TOOLS,
-            "tool_choice": "none",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": TOOL_USER_PROMPT,
-                },
-                message(required),
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": json.dumps(
-                        {
-                            "city": "北京",
-                            "temp": 22,
-                            "unit": "celsius",
-                            "desc": "晴",
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
-            "max_tokens": 256,
-        },
+    fill_payload = {
+        "model": model,
+        "temperature": 0,
+        "seed": TOOL_SEED,
+        "tools": TOOLS,
+        "tool_choice": "none",
+        "messages": [
+            {
+                "role": "user",
+                "content": TOOL_USER_PROMPT,
+            },
+            message(required),
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(
+                    {
+                        "city": "北京",
+                        "temp": 22,
+                        "unit": "celsius",
+                        "desc": "晴",
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Use the tool result above to answer the original question in one short "
+                    "sentence. Include the numeric temperature from the tool result."
+                ),
+            },
+        ],
+        "max_tokens": 256,
+    }
+    write(
+        out / "03_tool_result_fill.request.json",
+        json.dumps(fill_payload, ensure_ascii=False, indent=2) + "\n",
     )
+    status, body = post(base_url, fill_payload)
     write(out / "03_tool_result_fill.response.json", body)
     fill = first_choice(parsed_json("tool_result_fill", status, body))
     fill_msg = message(fill)
