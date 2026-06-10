@@ -91,3 +91,6 @@ tensor-parallel = ["cuda"]  # backward compat alias
 integration-tests = []
 # Enable built-in model registry
 registry = []
+# Deterministic tiny-model construction for downstream full-stack tests.
+# Never enabled in release; turned on by ferrum-engine dev-dependencies.
+test-support = []

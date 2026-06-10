@@ -1,0 +1,20 @@
+diff --git a/crates/ferrum-engine/src/continuous_engine.rs b/crates/ferrum-engine/src/continuous_engine.rs
+index 5e9ab083..624ebb2c 100644
+--- a/crates/ferrum-engine/src/continuous_engine.rs
++++ b/crates/ferrum-engine/src/continuous_engine.rs
+@@ -232,14 +232,11 @@ fn resolve_stop_conditions(
+             }
+         }
+         for stop_seq in &params.stop_sequences {
+-            if !stop_seq.is_empty() {
+-                text_seqs.push(stop_seq.clone());
+-            }
+             match tok.encode(stop_seq, false) {
+                 Ok(toks) if toks.len() == 1 => {
+                     ids.insert(toks[0].get());
+                 }
+-                _ => {}
++                _ => text_seqs.push(stop_seq.clone()),
+             }
+         }
+     } else {

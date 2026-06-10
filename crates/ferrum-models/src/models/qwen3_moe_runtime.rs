@@ -38,20 +38,19 @@ pub(crate) struct Qwen3MoeRuntimeEnv {
 }
 
 impl Qwen3MoeRuntimeEnv {
+    /// Resolve from the process-wide runtime snapshot installed at the
+    /// composition root (replaces a direct `std::env::vars()` read). load.rs
+    /// builds the model's `runtime_env` field from this once at construction.
     pub(crate) fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
+        Self::from_runtime_config_snapshot(&ferrum_types::active_runtime_snapshot())
     }
 
     pub(crate) fn from_runtime_config_snapshot(snapshot: &RuntimeConfigSnapshot) -> Self {
-        let mut entries: Vec<(String, String)> = snapshot
+        let entries: Vec<(String, String)> = snapshot
             .entries
             .iter()
             .map(|entry| (entry.key.clone(), entry.effective_value.clone()))
             .collect();
-        entries.extend(
-            std::env::vars()
-                .filter(|(key, _)| key.starts_with("FERRUM_") || key == "MTL_CAPTURE_ENABLED"),
-        );
         Self::from_env_vars(entries)
     }
 

@@ -51,6 +51,47 @@ fn engine_config_rejects_invalid_runtime_snapshot() {
 }
 
 #[test]
+fn engine_config_applies_build_composition_knobs() {
+    // FERRUM_MODEL_PATH / SPEC_* / DTYPE / METAL_DTYPE / TP used to be read
+    // straight from env by builder.rs and registry.rs. They now land in
+    // EngineConfig.runtime here; the builder/registry read the typed field.
+    let snapshot = RuntimeConfigSnapshot::from_entries([
+        RuntimeConfigEntry::new("FERRUM_MODEL_PATH", "/models/target", RuntimeConfigSource::Env),
+        RuntimeConfigEntry::new("FERRUM_SPEC_DRAFT", "/models/draft", RuntimeConfigSource::Env),
+        RuntimeConfigEntry::new("FERRUM_SPEC_N", "8", RuntimeConfigSource::Env),
+        RuntimeConfigEntry::new("FERRUM_DTYPE", "fp32", RuntimeConfigSource::Env),
+        RuntimeConfigEntry::new("FERRUM_METAL_DTYPE", "fp16", RuntimeConfigSource::Env),
+        RuntimeConfigEntry::new("FERRUM_TP", "4", RuntimeConfigSource::Env),
+    ]);
+    let mut cfg = EngineConfig::default();
+
+    cfg.apply_runtime_config_snapshot(&snapshot).unwrap();
+
+    assert_eq!(cfg.runtime.model_path.as_deref(), Some("/models/target"));
+    assert_eq!(cfg.runtime.spec_draft.as_deref(), Some("/models/draft"));
+    assert_eq!(cfg.runtime.spec_n, Some(8));
+    assert_eq!(cfg.runtime.dtype.as_deref(), Some("fp32"));
+    assert_eq!(cfg.runtime.metal_dtype.as_deref(), Some("fp16"));
+    assert_eq!(cfg.runtime.tp, Some(4));
+}
+
+#[test]
+fn engine_config_build_knobs_ignore_empty_spec_draft() {
+    // Empty FERRUM_SPEC_DRAFT must resolve to None (disabled), matching the
+    // old builder env parse that treated "" as "no draft".
+    let snapshot = RuntimeConfigSnapshot::from_entries([
+        RuntimeConfigEntry::new("FERRUM_SPEC_DRAFT", "", RuntimeConfigSource::Env),
+        RuntimeConfigEntry::new("FERRUM_SPEC_N", "not-a-number", RuntimeConfigSource::Env),
+    ]);
+    let mut cfg = EngineConfig::default();
+
+    cfg.apply_runtime_config_snapshot(&snapshot).unwrap();
+
+    assert_eq!(cfg.runtime.spec_draft, None);
+    assert_eq!(cfg.runtime.spec_n, None);
+}
+
+#[test]
 fn scheduler_config_default_sane() {
     let cfg = SchedulerConfig::default();
     assert!(matches!(cfg.policy, SchedulingPolicy::Priority));

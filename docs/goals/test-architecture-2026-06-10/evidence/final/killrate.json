@@ -1,0 +1,16 @@
+{
+  "description": "Kill-list verification results cross-referenced against historical_bugs.json. CPU kills verified by apply-repro-patch -> mapped test red -> revert -> green (patches in patches/, all apply to current HEAD). CUDA kills verified on the 2026-06-10 RTX 4090 pod session (see evidence/cuda-validation-20260610.md).",
+  "entries": [
+    {"id": "hb-01", "caught": true, "test": "tiny_stack_eos_terminates"},
+    {"id": "hb-02", "caught": true, "test": "tiny_stack_multi_turn_five_rounds"},
+    {"id": "hb-03", "caught": true, "test": "tiny_stack_guided_tool_constraint"},
+    {"id": "hb-04", "caught": true, "test": "tiny_stack_guided_tool_constraint"},
+    {"id": "hb-05", "caught": true, "test": "tiny_stack_stop_sequence_composite_token"},
+    {"id": "hb-06", "caught": true, "test": "tiny_stack_openai_wire_contract"},
+    {"id": "hb-07", "exempted": true, "reason": "tiny-Llama CPU L0 suite cannot reach the Qwen3-MoE batched-decode path; reproducing needs a tiny Qwen3-MoE fixture (deferred). Repro patch regenerated against migrated source and verified to apply."},
+    {"id": "hb-08", "exempted": true, "reason": "not reproducible at tiny CPU scale — the LlmExecutor never drives the batched paged-decode scratch path the bug lives in."},
+    {"id": "hb-09", "caught": true, "test": "verify-live: 6-turn Qwen3-30B-A3B MoE chat, no turn-3 paged_varlen_attn crash (RTX 4090 pod)"},
+    {"id": "hb-10", "caught": true, "test": "revert-fix: FERRUM_VLLM_MOE=1 marlin-pack mismatch garbage (RTX 4090 pod)"},
+    {"id": "hb-11", "caught": true, "test": "verify-live: 6000-token prompt, no kv shared-mem crash (RTX 4090 pod)"}
+  ]
+}

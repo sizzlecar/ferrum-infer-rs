@@ -47,3 +47,4 @@ bench_results/
 .vast-current.env
 ferrum.toml
 crates/*/ferrum.toml
+docs/goals/test-architecture-2026-06-10/evidence/l1-metal-run/*.log

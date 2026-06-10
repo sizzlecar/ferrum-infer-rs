@@ -76,6 +76,9 @@ reqwest = { workspace = true }
 tokio-test = "0.4"
 criterion = "0.5"
 ferrum-testkit = { workspace = true }
+# Tiny-model construction for the full-stack tiny_stack suite. test-support is
+# a dev-only feature of ferrum-models; this never reaches release builds.
+ferrum-models = { workspace = true, features = ["test-support"] }
 futures = { workspace = true }
 
 [[bench]]

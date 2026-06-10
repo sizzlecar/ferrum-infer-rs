@@ -1,0 +1,18 @@
+Pulling Qwen/Qwen3-TTS-12Hz-0.6B-Base
+Cache: /Users/chejinxuan/.cache/huggingface
+🌐 Using proxy: http://127.0.0.1:41809
+📦 Downloading 11 files (2.34 GB)
+  ✓ config.json (cached)
+  ✓ ...er/preprocessor_config.json (cached)
+  ✓ vocab.json (cached)
+  ✓ ...okenizer/configuration.json (cached)
+  ✓ preprocessor_config.json (cached)
+  ✓ speech_tokenizer/config.json (cached)
+  ✓ generation_config.json (cached)
+  ✓ model.safetensors (cached)
+  ✓ ...tokenizer/model.safetensors (cached)
+
+✅ Download complete: /Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base/snapshots/5d83992436eae1d760afd27aff78a71d676296fc
+
+✓ Model ready at:
+  /Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base/snapshots/5d83992436eae1d760afd27aff78a71d676296fc

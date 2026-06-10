@@ -1,0 +1,14 @@
+diff --git a/crates/ferrum-kernels/kernels/moe_align_block_size.cu b/crates/ferrum-kernels/kernels/moe_align_block_size.cu
+index 03f1ceff..39f2b161 100644
+--- a/crates/ferrum-kernels/kernels/moe_align_block_size.cu
++++ b/crates/ferrum-kernels/kernels/moe_align_block_size.cu
+@@ -131,8 +131,7 @@ extern "C" __global__ void moe_align_block_size_f32(
+         int e = expert_ids_per_pair[p];
+         if (e >= 0 && e < num_experts) {
+             int slot = atomicAdd(&cursors[e], 1);
+-            int per_expert_pos = slot - offsets[e];
+-            sorted_token_ids[slot] = unpadded_offsets[e] + per_expert_pos;
++            sorted_token_ids[slot] = p;
+         }
+     }
+     __syncthreads();
