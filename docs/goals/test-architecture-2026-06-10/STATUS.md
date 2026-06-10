@@ -42,7 +42,13 @@ TEST_ARCH GOAL PASS: <out_dir>
 | A2 cfg_branch | 0 | **0** — 20 legitimate device-init branches allowlisted |
 | A3 supports_*() | 0 | 18 (structural migration target) |
 | A3b OnceLock | 0 | 7 (config-freeze migration target) |
-| A4 op conformance | 20/20 | 6/20 |
+| A4 op conformance | 20/20 | 10/20 (all Metal-validated locally) |
+
+A4 detail: 10 covered + Metal-validated (rms_norm, fused_add_rms_norm,
+gemm, qk_norm_rope, silu_mul, residual_add, embedding_lookup, split_qkv,
+transpose_head_to_token, argmax_rows_f16). Remaining 10 need complex CPU
+references (4 attention, 3 MoE) or are CUDA-only (gptq_marlin,
+moe_align_block_size, paged_varlen) — dedicated-effort + pod work.
 
 The one genuine hot-path platform coupling — the engine's
 `cfg(target_os=macos)` unified-vs-legacy routing — is removed: the
