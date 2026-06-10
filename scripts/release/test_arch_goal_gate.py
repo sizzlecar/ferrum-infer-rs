@@ -197,14 +197,26 @@ def validate_conformance(
         if not isinstance(tol, dict) or "rel" not in tol or "abs" not in tol:
             raise ValidationError(f"conformance manifest: op {op_id} missing tolerance")
         if op.get("covered_today"):
-            # `module` names the op_diff file stem (decoupled from op id);
-            # falls back to the op id when omitted.
+            # Unit op-parity: `module` names the op_diff file stem (decoupled
+            # from op id); falls back to the op id when omitted.
             stem = op.get("module", op_id)
             module = repo_root / OP_DIFF_DIR / f"{stem}.rs"
             if not module.exists():
                 raise ValidationError(
                     f"conformance manifest: op {op_id} marked covered but"
                     f" {module.relative_to(repo_root)} does not exist"
+                )
+            covered.append(op_id)
+        elif op.get("covered_by_integration"):
+            # Ops with no CPU reference (CUDA-specific marlin / moe_align /
+            # paged_varlen) or i32 typed-buffer layouts that the f32 op_diff
+            # harness can't express are validated end-to-end instead: a broken
+            # kernel makes real model output garbage (proven by the hb-10
+            # marlin kill). Requires a recorded integration evidence string.
+            if not op.get("integration_evidence"):
+                raise ValidationError(
+                    f"conformance manifest: op {op_id} integration-covered but"
+                    f" missing integration_evidence"
                 )
             covered.append(op_id)
     if require_full and len(covered) != len(ops):
