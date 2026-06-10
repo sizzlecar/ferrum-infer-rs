@@ -156,6 +156,32 @@ attention/MoE/marlin op references), the env/supports refactor (coordinated
 multi-crate change), the model matrix RUN (executor landed; needs 8-model
 execution), and the final aggregation.
 
+## Final remainder — 4 checks (2026-06-10, end of migration session)
+
+`--validate docs/goals/test-architecture-2026-06-10/evidence/final` passes
+Gate A + Gate B + most of Gate C. Down from 11 fails to **4**, all
+infrastructure-blocked execution (no code left):
+
+```text
+FAIL: gate C: lanes.json missing l1_cuda_warm_seconds   # pod 40361123 (idle)
+FAIL: gate C: lanes.json missing l1_cuda_cold_seconds   # pod
+FAIL: gate C: stability l1_cuda 0/0 below 3/3           # pod: lane_l1_cuda.sh x3
+FAIL: gate C: model qwen3-moe platform metal status None != PASS  # 30B, disk
+```
+
+- **3 pod cuda cells**: `lane_l1_cuda.sh` ×3 (warm/cold timing + 3/3
+  stability) on the idle RTX 4090 pod. Op-parity + hb-09/10/11 kills already
+  evidenced (`evidence/cuda-validation-20260610.md`); this is just the lane
+  timing/stability artifact.
+- **1 Metal 30B cell**: `Qwen/Qwen3-30B-A3B-GPTQ-Int4` (~16-17 GB) blocked on
+  Mac disk — 12 GB free; cleaning `target/debug` yields ~16 GB, no margin for
+  the HF download temp. Needs ~25 GB free, then a `ferrum run` chat smoke.
+
+Metal matrix this session: **7/8 PASS** — qwen3-dense/qwen2-5/llama-family
+3-turn chats coherent at exit 0 (real Metal inference preserved after the
+Gate A migration); whisper/clip/bert/qwen3-tts load smokes exit 0. Evidence:
+`evidence/final/metal-matrix/`.
+
 ## Gate scoreboard (2026-06-10, after Gate A migration complete)
 
 | Gate | State |
