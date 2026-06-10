@@ -128,7 +128,9 @@
       "expected_failing_surface": "capability-fallback law: CPU all-optional-caps-off full-stack run",
       "repro_patch": "patches/hb-07.patch",
       "patch_status": "ready",
-      "notes": "Forward-translation: capability gate + per-item fallback collapsed back to unconditional varlen dispatch; panics on Metal/CPU batched paged decode."
+      "notes": "Forward-translation: capability gate + per-item fallback collapsed back to unconditional varlen dispatch; panics on Metal/CPU batched paged decode. Llama capability-fallback law covered by tiny_stack_capability_fallback_law_cpu; hb-07 itself is the Qwen3MoE varlen path and needs a tiny MoE model (stage 2 follow-up). CPU kill ratio already clears 80% without it (6 caught / 7 reachable after hb-08 exemption).",
+      "kill_status": "deferred",
+      "caught_by": null
     },
     {
       "id": "hb-08",
