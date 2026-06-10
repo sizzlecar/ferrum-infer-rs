@@ -58,7 +58,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
 
       - name: Verify vendored FA2 source for fa2-source build
         run: |
