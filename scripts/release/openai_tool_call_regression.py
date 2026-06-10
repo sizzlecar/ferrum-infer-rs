@@ -48,6 +48,7 @@ TOOL_REQUIRED_PROMPT = (
     "Do not output natural language."
 )
 TOOL_SEED = 9271
+TOOL_RESULT_MAX_TOKENS = 64
 
 
 def write(path: Path, text: str) -> None:
@@ -246,7 +247,7 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
                 ),
             },
         ],
-        "max_tokens": 256,
+        "max_tokens": TOOL_RESULT_MAX_TOKENS,
     }
     write(
         out / "03_tool_result_fill.request.json",
