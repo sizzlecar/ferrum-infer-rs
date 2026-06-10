@@ -139,23 +139,40 @@ def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) ->
         log = out_dir / f"{cell['id']}_{platform}.log"
         status = "PASS"
         detail = ""
+        # Non-LLM modalities (embeddings / ASR / TTS) are marked
+        # `matrix_smoke_only`: their plan is pull + serve smoke, not a chat
+        # multi-turn. `ferrum run` is chat-only and would falsely FAIL them, so
+        # gate those cells on a load smoke (`ferrum pull` succeeds = the model
+        # fetches and its config parses on this platform).
+        smoke_only = "run_multiturn_3" not in cell.get("steps", [])
         try:
-            turns = "你好\n介绍一下你自己\n讲个短笑话\n"
-            proc = subprocess.run(
-                [ferrum_bin, "run", model, "--max-tokens", "32"],
-                input=turns,
-                capture_output=True,
-                text=True,
-                timeout=900,
-            )
-            log.write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
-            out = proc.stdout
-            if proc.returncode != 0:
-                status, detail = "FAIL", f"exit {proc.returncode}"
-            elif len(out.strip()) < 5:
-                status, detail = "FAIL", "empty output"
-            elif any(m in out for m in leak_markers):
-                status, detail = "FAIL", "template/garbage marker leaked"
+            if smoke_only:
+                proc = subprocess.run(
+                    [ferrum_bin, "pull", model],
+                    capture_output=True,
+                    text=True,
+                    timeout=900,
+                )
+                log.write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+                if proc.returncode != 0:
+                    status, detail = "FAIL", f"pull exit {proc.returncode}"
+            else:
+                turns = "你好\n介绍一下你自己\n讲个短笑话\n"
+                proc = subprocess.run(
+                    [ferrum_bin, "run", model, "--max-tokens", "32"],
+                    input=turns,
+                    capture_output=True,
+                    text=True,
+                    timeout=900,
+                )
+                log.write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+                out = proc.stdout
+                if proc.returncode != 0:
+                    status, detail = "FAIL", f"exit {proc.returncode}"
+                elif len(out.strip()) < 5:
+                    status, detail = "FAIL", "empty output"
+                elif any(m in out for m in leak_markers):
+                    status, detail = "FAIL", "template/garbage marker leaked"
         except subprocess.TimeoutExpired:
             status, detail = "FAIL", "timeout"
         except Exception as exc:  # noqa: BLE001
