@@ -156,17 +156,30 @@ attention/MoE/marlin op references), the env/supports refactor (coordinated
 multi-crate change), the model matrix RUN (executor landed; needs 8-model
 execution), and the final aggregation.
 
-## Final remainder — 4 checks (2026-06-10, end of migration session)
+## Final remainder — 1 check (2026-06-10, after pod CUDA lane)
 
 `--validate docs/goals/test-architecture-2026-06-10/evidence/final` passes
-Gate A + Gate B + most of Gate C. Down from 11 fails to **4**, all
-infrastructure-blocked execution (no code left):
+Gate A + Gate B + nearly all of Gate C. Down from 11 → 4 → **1**:
 
 ```text
-FAIL: gate C: lanes.json missing l1_cuda_warm_seconds   # pod 40361123 (idle)
-FAIL: gate C: lanes.json missing l1_cuda_cold_seconds   # pod
-FAIL: gate C: stability l1_cuda 0/0 below 3/3           # pod: lane_l1_cuda.sh x3
-FAIL: gate C: model qwen3-moe platform metal status None != PASS  # 30B, disk
+FAIL: gate C: model qwen3-moe platform metal status None != PASS  # 30B Metal
+```
+
+**Pod L1-cuda DONE** (RTX 4090 pod 40361123, `lane_l1_cuda.sh` ×3): cold
+1906s (<3600), warm 18s (<1200), 3/3 green — `TEST_ARCH L1_CUDA PASS`.
+Verbatim artifact: `evidence/final/l1-cuda-run/l1cuda_result.json`. Folded
+into lanes.json/stability.json.
+
+**Last cell**: the qwen3-moe Metal cell (`Qwen/Qwen3-30B-A3B-GPTQ-Int4`,
+~16 GB). Disk freed to 41 GB; the cell (pull + 3-turn chat smoke) is running.
+On PASS → fold into matrix.json → `--validate` → `TEST_ARCH GOAL PASS`.
+
+### Prior 4-check state (for history)
+
+```text
+FAIL: lanes.json missing l1_cuda_warm_seconds / l1_cuda_cold_seconds   # pod — DONE
+FAIL: stability l1_cuda 0/0 below 3/3                                   # pod — DONE
+FAIL: model qwen3-moe platform metal status None != PASS               # 30B — running
 ```
 
 - **3 pod cuda cells**: `lane_l1_cuda.sh` ×3 (warm/cold timing + 3/3
