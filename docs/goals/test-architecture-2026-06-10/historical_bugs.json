@@ -176,7 +176,9 @@
       "expected_failing_surface": "CUDA reference_match fingerprint + gptq_marlin_linear op parity",
       "repro_patch": "patches/hb-10.patch",
       "patch_status": "ready",
-      "notes": "Kernel Pass-3 writes raw pair index again; kill test must exercise FERRUM_VLLM_MOE=1 with pair-ids OFF (pair-ids kernel is a separate, untouched path)."
+      "notes": "Kernel Pass-3 writes raw pair index again; kill test must exercise FERRUM_VLLM_MOE=1 with pair-ids OFF (pair-ids kernel is a separate, untouched path).",
+      "kill_status": "fix-confirmed",
+      "caught_by": "pod MoE FERRUM_VLLM_MOE=1 coherent (Beijing intro, no garbage); patch-flip verification pending kernel rebuild"
     },
     {
       "id": "hb-11",
@@ -188,7 +190,9 @@
       "expected_lane": "L0+L1-cuda",
       "expected_failing_surface": "L0 launch-plan pure-function shape test; L1-cuda real-launch smoke",
       "repro_patch": null,
-      "patch_status": "n/a-live"
+      "patch_status": "n/a-live",
+      "kill_status": "verified-live-pass",
+      "caught_by": "pod long-context (6000-token prompt) generates with no kv shared-mem INVALID_VALUE crash"
     }
   ]
 }
