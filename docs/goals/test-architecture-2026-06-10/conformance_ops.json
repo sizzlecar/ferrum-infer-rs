@@ -58,7 +58,7 @@
         "abs": 0.0,
         "initial": false
       },
-      "covered_today": false
+      "covered_today": true
     },
     {
       "id": "gemm_f16",
@@ -116,7 +116,7 @@
         "abs": 0.002,
         "initial": true
       },
-      "covered_today": false
+      "covered_today": true
     },
     {
       "id": "flash_attention",
@@ -230,7 +230,7 @@
         "abs": 0.0,
         "initial": false
       },
-      "covered_today": false
+      "covered_today": true
     },
     {
       "id": "kv_cache_append",

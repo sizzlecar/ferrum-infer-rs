@@ -13,10 +13,48 @@
 //! harness still runs and produces a sensible reference output.
 
 use ferrum_testkit::op_diff::{
-    compare_backends, fused_add_rms_norm::FusedAddRmsNormOp, gemm::GemmOp,
-    qk_norm_rope::QkNormRopeOp, residual_add::ResidualAddOp, rms_norm::RmsNormOp,
-    silu_mul::SiluMulOp, NMSE_FP16_TOL,
+    compare_backends, embedding_lookup::EmbeddingLookupOp, fused_add_rms_norm::FusedAddRmsNormOp,
+    gemm::GemmOp, qk_norm_rope::QkNormRopeOp, residual_add::ResidualAddOp, rms_norm::RmsNormOp,
+    silu_mul::SiluMulOp, split_qkv::SplitQkvOp, transpose_head_to_token::TransposeHeadToTokenOp,
+    NMSE_FP16_TOL,
 };
+
+#[test]
+fn embedding_lookup_small_shape() {
+    let op = EmbeddingLookupOp {
+        vocab: 64,
+        dim: 128,
+        tokens: 8,
+    };
+    let report = compare_backends(&op, 5);
+    assert_eq!(report.cpu.len(), op.tokens * op.dim);
+    assert!(report.cpu.iter().any(|&x| x != 0.0));
+    check_accelerator_tolerance(&report, NMSE_FP16_TOL);
+}
+
+#[test]
+fn transpose_head_to_token_small_shape() {
+    let op = TransposeHeadToTokenOp {
+        tokens: 4,
+        heads: 4,
+        dim: 16,
+    };
+    let report = compare_backends(&op, 11);
+    assert_eq!(report.cpu.len(), op.tokens * op.heads * op.dim);
+    check_accelerator_tolerance(&report, NMSE_FP16_TOL);
+}
+
+#[test]
+fn split_qkv_small_shape() {
+    let op = SplitQkvOp {
+        tokens: 4,
+        q_dim: 64,
+        kv_dim: 32,
+    };
+    let report = compare_backends(&op, 13);
+    assert_eq!(report.cpu.len(), op.tokens * (op.q_dim + 2 * op.kv_dim));
+    check_accelerator_tolerance(&report, NMSE_FP16_TOL);
+}
 
 #[test]
 fn residual_add_small_shape() {
