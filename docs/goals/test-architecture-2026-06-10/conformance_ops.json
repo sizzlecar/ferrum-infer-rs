@@ -213,7 +213,7 @@
         "abs": 0.0005,
         "initial": true
       },
-      "covered_today": false
+      "covered_today": true
     },
     {
       "id": "transpose_head_to_token",
