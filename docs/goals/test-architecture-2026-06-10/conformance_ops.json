@@ -6,166 +6,390 @@
     {
       "id": "rms_norm",
       "trait": "Backend",
-      "methods": ["rms_norm"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.015, "abs": 0.002, "initial": true },
-      "covered_today": true
+      "methods": [
+        "rms_norm"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.015,
+        "abs": 0.002,
+        "initial": true
+      },
+      "covered_today": true,
+      "module": "rms_norm"
     },
     {
       "id": "fused_add_rms_norm",
       "trait": "Backend",
-      "methods": ["fused_add_rms_norm"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.015, "abs": 0.002, "initial": true },
+      "methods": [
+        "fused_add_rms_norm"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.015,
+        "abs": 0.002,
+        "initial": true
+      },
       "covered_today": false
     },
     {
       "id": "embedding_lookup",
       "trait": "Backend",
-      "methods": ["embedding_lookup", "embedding_lookup_dev"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.0, "abs": 0.0, "initial": false },
+      "methods": [
+        "embedding_lookup",
+        "embedding_lookup_dev"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.0,
+        "abs": 0.0,
+        "initial": false
+      },
       "covered_today": false
     },
     {
       "id": "gemm_f16",
       "trait": "Backend",
-      "methods": ["gemm"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.02, "abs": 0.005, "initial": true },
-      "covered_today": false
+      "methods": [
+        "gemm"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.02,
+        "abs": 0.005,
+        "initial": true
+      },
+      "covered_today": true,
+      "module": "gemm"
     },
     {
       "id": "qk_norm_rope",
       "trait": "Backend",
-      "methods": ["qk_norm_rope", "qk_norm_rope_batched_per_item"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.015, "abs": 0.002, "initial": true },
-      "covered_today": false
+      "methods": [
+        "qk_norm_rope",
+        "qk_norm_rope_batched_per_item"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.015,
+        "abs": 0.002,
+        "initial": true
+      },
+      "covered_today": true,
+      "module": "qk_norm_rope"
     },
     {
       "id": "split_qkv",
       "trait": "Backend",
-      "methods": ["split_qkv", "split_qkv_norm_rope"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.015, "abs": 0.002, "initial": true },
+      "methods": [
+        "split_qkv",
+        "split_qkv_norm_rope"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.015,
+        "abs": 0.002,
+        "initial": true
+      },
       "covered_today": false
     },
     {
       "id": "flash_attention",
       "trait": "Backend",
-      "methods": ["flash_attention"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.025, "abs": 0.004, "initial": true },
+      "methods": [
+        "flash_attention"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.025,
+        "abs": 0.004,
+        "initial": true
+      },
       "covered_today": false
     },
     {
       "id": "residual_add",
       "trait": "Backend",
-      "methods": ["add_inplace"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.005, "abs": 0.001, "initial": true },
+      "methods": [
+        "add_inplace"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.005,
+        "abs": 0.001,
+        "initial": true
+      },
       "covered_today": false
     },
     {
       "id": "fused_silu_mul",
       "trait": "Backend",
-      "methods": ["fused_silu_mul_split", "silu_mul_stacked"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.015, "abs": 0.002, "initial": true },
-      "covered_today": false
+      "methods": [
+        "fused_silu_mul_split",
+        "silu_mul_stacked"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.015,
+        "abs": 0.002,
+        "initial": true
+      },
+      "covered_today": true,
+      "module": "silu_mul"
     },
     {
       "id": "argmax_rows_f16",
       "trait": "Backend",
-      "methods": ["argmax_rows_f16"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.0, "abs": 0.0, "initial": false },
+      "methods": [
+        "argmax_rows_f16"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.0,
+        "abs": 0.0,
+        "initial": false
+      },
       "covered_today": false
     },
     {
       "id": "activation_bridge",
       "trait": "Backend",
-      "methods": ["write_f32_to_activation", "to_vec", "from_slice", "copy_slice"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.001, "abs": 0.0005, "initial": true },
+      "methods": [
+        "write_f32_to_activation",
+        "to_vec",
+        "from_slice",
+        "copy_slice"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.001,
+        "abs": 0.0005,
+        "initial": true
+      },
       "covered_today": false
     },
     {
       "id": "transpose_head_to_token",
       "trait": "Backend",
-      "methods": ["transpose_head_to_token"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.0, "abs": 0.0, "initial": false },
+      "methods": [
+        "transpose_head_to_token"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.0,
+        "abs": 0.0,
+        "initial": false
+      },
       "covered_today": false
     },
     {
       "id": "kv_cache_append",
       "trait": "Backend",
-      "methods": ["kv_cache_append_head_major", "kv_cache_append_batched_per_cache"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.0, "abs": 0.0, "initial": false },
+      "methods": [
+        "kv_cache_append_head_major",
+        "kv_cache_append_batched_per_cache"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.0,
+        "abs": 0.0,
+        "initial": false
+      },
       "covered_today": false
     },
     {
       "id": "paged_qkv_append",
       "trait": "BackendPagedKv",
-      "methods": ["split_qkv_norm_rope_into_paged_cache", "split_qkv_norm_rope_into_paged_cache_varlen", "split_qkv_norm_rope_into_paged_cache_varlen_vllm"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
+      "methods": [
+        "split_qkv_norm_rope_into_paged_cache",
+        "split_qkv_norm_rope_into_paged_cache_varlen",
+        "split_qkv_norm_rope_into_paged_cache_varlen_vllm"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
       "reference_note": "CPU reference composes split_qkv + rope + manual paged-block scatter; varlen variants are CUDA-only and compare against the per-item composition.",
-      "tolerance": { "rel": 0.015, "abs": 0.002, "initial": true },
+      "tolerance": {
+        "rel": 0.015,
+        "abs": 0.002,
+        "initial": true
+      },
       "covered_today": false
     },
     {
       "id": "paged_decode_attention",
       "trait": "BackendPagedKv",
-      "methods": ["paged_decode_attention", "paged_decode_attention_v2"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
+      "methods": [
+        "paged_decode_attention",
+        "paged_decode_attention_v2"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
       "reference_note": "CPU reference computes dense attention over gathered paged blocks.",
-      "tolerance": { "rel": 0.025, "abs": 0.004, "initial": true },
+      "tolerance": {
+        "rel": 0.025,
+        "abs": 0.004,
+        "initial": true
+      },
       "covered_today": false
     },
     {
       "id": "paged_varlen_attention",
       "trait": "BackendPagedKv",
-      "methods": ["paged_varlen_attention"],
-      "backends": { "cpu": "reference", "metal": false, "cuda": true },
+      "methods": [
+        "paged_varlen_attention"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": false,
+        "cuda": true
+      },
       "reference_note": "CUDA-only batched dispatch; CPU reference is the per-item paged_decode composition. Shape grid must include kv_len > shared-memory budget boundary (historical INVALID_VALUE).",
-      "tolerance": { "rel": 0.025, "abs": 0.004, "initial": true },
-      "covered_today": false
+      "tolerance": {
+        "rel": 0.025,
+        "abs": 0.004,
+        "initial": true
+      },
+      "covered_today": false,
+      "module": "paged_varlen_attn",
+      "module_status": "stub"
     },
     {
       "id": "moe_route_topk_softmax",
       "trait": "BackendMoeFused",
-      "methods": ["route_topk_softmax", "moe_build_pairs_by_token"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.01, "abs": 0.002, "initial": true },
+      "methods": [
+        "route_topk_softmax",
+        "moe_build_pairs_by_token"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.01,
+        "abs": 0.002,
+        "initial": true
+      },
       "covered_today": false
     },
     {
       "id": "moe_align_block_size",
       "trait": "BackendMoeFused",
-      "methods": ["moe_align_block_size", "moe_align_block_size_pair_ids"],
-      "backends": { "cpu": "reference", "metal": false, "cuda": true },
-      "tolerance": { "rel": 0.0, "abs": 0.0, "initial": false },
+      "methods": [
+        "moe_align_block_size",
+        "moe_align_block_size_pair_ids"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": false,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.0,
+        "abs": 0.0,
+        "initial": false
+      },
       "covered_today": false
     },
     {
       "id": "moe_combine",
       "trait": "BackendMoeFused",
-      "methods": ["moe_combine", "weighted_sum_batched", "weighted_sum_batched_offset"],
-      "backends": { "cpu": "reference", "metal": true, "cuda": true },
-      "tolerance": { "rel": 0.015, "abs": 0.002, "initial": true },
+      "methods": [
+        "moe_combine",
+        "weighted_sum_batched",
+        "weighted_sum_batched_offset"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": true,
+        "cuda": true
+      },
+      "tolerance": {
+        "rel": 0.015,
+        "abs": 0.002,
+        "initial": true
+      },
       "covered_today": false
     },
     {
       "id": "gptq_marlin_linear",
       "trait": "BackendQuantMarlin",
-      "methods": ["load_gptq", "load_gptq_stacked"],
-      "backends": { "cpu": "reference", "metal": false, "cuda": true },
+      "methods": [
+        "load_gptq",
+        "load_gptq_stacked"
+      ],
+      "backends": {
+        "cpu": "reference",
+        "metal": false,
+        "cuda": true
+      },
       "reference_note": "Quantized linear via Linear<B>/MarlinExpertStack dispatch; CPU reference is dequant + f32 matmul on identical GPTQ tensors. Covers the historical packing-mismatch garbage class.",
-      "tolerance": { "rel": 0.03, "abs": 0.01, "initial": true },
-      "covered_today": false
+      "tolerance": {
+        "rel": 0.03,
+        "abs": 0.01,
+        "initial": true
+      },
+      "covered_today": false,
+      "module": "marlin_matmul",
+      "module_status": "stub"
     }
   ]
 }
