@@ -257,8 +257,12 @@ pub struct RunCommand {
     pub top_p: f32,
 
     /// Repetition penalty applied to logits before sampling. >1 discourages
-    /// repeats, <1 encourages, 1.0 disables. OpenAI uses 1.1 typically.
-    #[arg(long, default_value = "1.0")]
+    /// repeats, <1 encourages, 1.0 disables. Defaults to 1.1 (OpenAI/llama.cpp
+    /// standard) because the chat default is greedy (temperature 0): greedy
+    /// with no penalty deterministically locks into token loops on some
+    /// inputs (the "2D/3D 2D/3D..." degeneration). Pass `--repeat-penalty 1.0`
+    /// for an unpenalized greedy baseline.
+    #[arg(long, default_value = "1.1")]
     pub repeat_penalty: f32,
 
     /// Number of recent tokens that the repetition penalty considers.
@@ -1856,6 +1860,32 @@ mod tests {
         let cmd = test_run_cmd();
         assert_eq!(build_sampling_params(&cmd).temperature, 0.0);
         assert_eq!(build_sampling_params(&cmd).max_tokens, 1024);
+    }
+
+    #[test]
+    fn chat_default_applies_repetition_penalty() {
+        // The chat default is greedy (temperature 0). Greedy with NO repetition
+        // penalty deterministically locks into token loops on some inputs (the
+        // "2D/3D 2D/3D..." degeneration a user hit). The clap default must carry
+        // a penalty (OpenAI/llama.cpp standard 1.1) so the out-of-box chat does
+        // not loop. Parsing the real CLI (not the struct-literal test fixture)
+        // is what pins the actual default users get.
+        use clap::Parser;
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            run: RunCommand,
+        }
+        let parsed = TestCli::parse_from(["ferrum", "qwen3:0.6b"]);
+        assert!(
+            parsed.run.repeat_penalty > 1.0,
+            "chat default repeat_penalty must discourage repeats, got {}",
+            parsed.run.repeat_penalty
+        );
+        assert!(
+            build_sampling_params(&parsed.run).repetition_penalty > 1.0,
+            "build_sampling_params must propagate the default penalty"
+        );
     }
 
     #[test]
