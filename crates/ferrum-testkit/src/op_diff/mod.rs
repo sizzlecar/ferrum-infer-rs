@@ -27,6 +27,7 @@
 //! Tighter bucketing per op is welcome — define op-specific constants
 //! once empirical baselines are stable.
 
+pub mod argmax_rows;
 pub mod embedding_lookup;
 pub mod fused_add_rms_norm;
 pub mod gemm;

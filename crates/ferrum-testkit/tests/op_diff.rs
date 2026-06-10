@@ -13,11 +13,19 @@
 //! harness still runs and produces a sensible reference output.
 
 use ferrum_testkit::op_diff::{
-    compare_backends, embedding_lookup::EmbeddingLookupOp, fused_add_rms_norm::FusedAddRmsNormOp,
-    gemm::GemmOp, qk_norm_rope::QkNormRopeOp, residual_add::ResidualAddOp, rms_norm::RmsNormOp,
-    silu_mul::SiluMulOp, split_qkv::SplitQkvOp, transpose_head_to_token::TransposeHeadToTokenOp,
-    NMSE_FP16_TOL,
+    argmax_rows::ArgmaxRowsOp, compare_backends, embedding_lookup::EmbeddingLookupOp,
+    fused_add_rms_norm::FusedAddRmsNormOp, gemm::GemmOp, qk_norm_rope::QkNormRopeOp,
+    residual_add::ResidualAddOp, rms_norm::RmsNormOp, silu_mul::SiluMulOp, split_qkv::SplitQkvOp,
+    transpose_head_to_token::TransposeHeadToTokenOp, NMSE_FP16_TOL,
 };
+
+#[test]
+fn argmax_rows_spiked() {
+    let op = ArgmaxRowsOp { m: 8, n: 256 };
+    let report = compare_backends(&op, 19);
+    assert_eq!(report.cpu.len(), op.m);
+    check_accelerator_tolerance(&report, NMSE_FP16_TOL);
+}
 
 #[test]
 fn embedding_lookup_small_shape() {
