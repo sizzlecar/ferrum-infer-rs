@@ -18,6 +18,14 @@
 
 set -euo pipefail
 
+# Make cargo available under a non-interactive/detached shell (nohup over ssh
+# does not source the login profile, so $HOME/.cargo/bin may be off PATH).
+if ! command -v cargo >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
 OUT_DIR="${1:-$(pwd)/.l1-cuda-out}"
 mkdir -p "$OUT_DIR"
 ROOT="$(git rev-parse --show-toplevel)"
