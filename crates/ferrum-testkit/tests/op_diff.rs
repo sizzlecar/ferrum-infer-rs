@@ -28,6 +28,15 @@ fn argmax_rows_spiked() {
 }
 
 #[test]
+fn activation_bridge_roundtrip() {
+    use ferrum_testkit::op_diff::activation_bridge::ActivationBridgeOp;
+    let op = ActivationBridgeOp { len: 4 * 128 };
+    let report = compare_backends(&op, 3);
+    assert_eq!(report.cpu.len(), op.len);
+    check_accelerator_tolerance(&report, 3e-3); // fp16 storage roundtrip
+}
+
+#[test]
 fn kv_cache_append_small_shape() {
     use ferrum_testkit::op_diff::kv_cache_append::KvCacheAppendOp;
     let op = KvCacheAppendOp {
