@@ -136,6 +136,26 @@ migration still wants the CUDA parity column before it moves.
   duplicating the ~7 GB candle/dep build. Building from this worktree rebuilds
   the ferrum crates (branch source differs) but reuses heavy externals.
 
+## CUDA pod session (2026-06-10, contract 40361123, RTX 4090)
+
+User funded the pod. Validated on real CUDA hardware:
+- **Op-parity CUDA column**: 15/15 op_diff tests, NMSE ~1e-7. 12 ops now
+  CPU+Metal+CUDA verified.
+- **Dense multi-turn**: 5-turn Qwen3-0.6B chat, coherent, exit 0 — stage-3
+  decoupling validated on CUDA inference.
+- **hb-09 verify-live PASS**: 6-turn Qwen3-30B-A3B MoE chat, no turn-3
+  paged_varlen_attn crash (the open bug is fixed on main).
+- **hb-10 fix confirmed**: FERRUM_VLLM_MOE=1 coherent (no marlin garbage).
+- **hb-11 verify-live PASS**: 6000-token prompt, no kv shared-mem crash.
+
+**All 3 CUDA kills validated** → with the 6 CPU kills + hb-08 exemption,
+Gate B2 is essentially met (CPU 6/7 ≥80%, CUDA 3/3).
+
+Remaining for the final PASS: conformance 12/20 → 20/20 (8 hard
+attention/MoE/marlin op references), the env/supports refactor (coordinated
+multi-crate change), the model matrix RUN (executor landed; needs 8-model
+execution), and the final aggregation.
+
 ## Completion runbook (what reaches TEST_ARCH GOAL PASS)
 
 Everything local + Metal is done and committed. The remainder is two
