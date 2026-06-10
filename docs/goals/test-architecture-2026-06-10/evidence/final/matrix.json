@@ -1,0 +1,45 @@
+{
+  "models": [
+    {
+      "id": "llama-family",
+      "platforms": {
+        "cuda": "PASS"
+      }
+    },
+    {
+      "id": "qwen3-dense",
+      "platforms": {
+        "cuda": "PASS"
+      }
+    },
+    {
+      "id": "qwen3-moe",
+      "platforms": {
+        "cuda": "PASS"
+      }
+    },
+    {
+      "id": "qwen2-5",
+      "platforms": {
+        "cuda": "PASS"
+      }
+    },
+    {
+      "id": "bert",
+      "platforms": {}
+    },
+    {
+      "id": "whisper",
+      "platforms": {}
+    },
+    {
+      "id": "qwen3-tts",
+      "platforms": {}
+    },
+    {
+      "id": "clip",
+      "platforms": {}
+    }
+  ],
+  "_note": "CUDA 4/4 from evidence/cuda-validation-20260610.md; Metal cells pending matrix runner"
+}
