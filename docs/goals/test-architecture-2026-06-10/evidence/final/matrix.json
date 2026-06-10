@@ -6,6 +6,9 @@
       "platforms": {
         "metal": "PASS",
         "cuda": "PASS"
+      },
+      "perf": {
+        "metal": 40.6
       }
     },
     {
@@ -13,6 +16,9 @@
       "platforms": {
         "metal": "PASS",
         "cuda": "PASS"
+      },
+      "perf": {
+        "metal": 65.8
       }
     },
     {
@@ -20,6 +26,10 @@
       "platforms": {
         "metal": "PASS",
         "cuda": "PASS"
+      },
+      "perf": {
+        "metal": 0.1,
+        "cuda": 54.3
       }
     },
     {
@@ -27,6 +37,9 @@
       "platforms": {
         "metal": "PASS",
         "cuda": "PASS"
+      },
+      "perf": {
+        "metal": 75.2
       }
     },
     {
@@ -56,5 +69,6 @@
   ],
   "_metal_source": "derived from evidence/final/metal-matrix/<id>.log (LLM cells = 3-turn chat exit0+coherent; smoke cells = ferrum pull)",
   "_cuda_source": "evidence/cuda-validation-20260610.md (RTX 4090 pod 40361123)",
-  "_note": "qwen3-moe metal smoke ran the local Qwen3-30B-A3B-Q4_K_M.gguf (same MoE arch); CUDA cell used the manifest GPTQ-Int4"
+  "_note": "qwen3-moe metal smoke ran the local Qwen3-30B-A3B-Q4_K_M.gguf (same MoE arch); CUDA cell used the manifest GPTQ-Int4",
+  "_perf_source": "metal: max tok/s across turns from evidence/final/metal-matrix/<id>.log; cuda qwen3-moe: evidence/final/perf-run/perf_verify.json (RTX 4090 pod, ferrum run default after fix)"
 }

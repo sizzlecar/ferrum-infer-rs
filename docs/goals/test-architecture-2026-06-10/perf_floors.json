@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "description": "Gate C7 decode-throughput floors (tok/s) per (model, platform). The model matrix records measured tok/s in matrix.json row.perf[platform]; a cell below its floor fails. Floors are deliberately conservative (~50% of a healthy measurement) to catch big regressions while tolerating run-to-run noise. The CUDA qwen3-moe floor (40) is the guard that would have caught the 9.7-vs-59 tok/s MoE fast-path regression coherence+exit0 let pass.",
+  "floors": {
+    "qwen3-moe": { "cuda": 40.0, "metal": 0.05 },
+    "qwen3-dense": { "metal": 30.0 },
+    "qwen2-5": { "metal": 40.0 },
+    "llama-family": { "metal": 20.0 }
+  }
+}
