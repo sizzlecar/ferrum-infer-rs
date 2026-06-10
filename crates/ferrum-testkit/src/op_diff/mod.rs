@@ -31,6 +31,7 @@ pub mod argmax_rows;
 pub mod embedding_lookup;
 pub mod fused_add_rms_norm;
 pub mod gemm;
+pub mod kv_cache_append;
 pub mod marlin_matmul; // stub — see file docs
 pub mod paged_varlen_attn; // stub — see file docs
 pub mod qk_norm_rope;
