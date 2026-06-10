@@ -800,6 +800,13 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     pub cfg: LlamaFamilyConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
+    /// Backend capabilities resolved once at construction (the GOAL's allowed
+    /// "构造期 capability 决策一次"). Decode/prefill hot paths branch on these
+    /// fields instead of calling `B::supports_*()` inline, so a capability gate
+    /// can't silently rot in the forward code.
+    pub(crate) supports_varlen_qkv: bool,
+    pub(crate) supports_batched_decode: bool,
+
     /// Token embedding table. `None` for backbone-only models (e.g. the
     /// Qwen3-TTS Talker, which embeds inputs externally and feeds via
     /// `prefill_from_embeds`).
@@ -978,9 +985,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let layer_source_start = stage.source_layers.start;
         let layer_source_end = stage.source_layers.end;
         let runtime_cfg = cfg.to_runtime();
+        // Construction-time capability resolution (GOAL-allowed): read once here
+        // so the forward hot paths read self.* instead of B::supports_*().
+        let supports_varlen_qkv = B::supports_varlen_qkv();
+        let supports_batched_decode = B::supports_llama_family_batched_decode();
         Ok(Self {
             cfg,
             runtime_cfg,
+            supports_varlen_qkv,
+            supports_batched_decode,
             embed,
             layer_source_start,
             layer_source_end,
@@ -2862,7 +2875,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
                  register block hashes",
             ));
         }
-        if !B::supports_varlen_qkv() {
+        if !self.supports_varlen_qkv {
             return Err(ferrum_types::FerrumError::unsupported(
                 "LlamaFamilyModel::unified_forward: backend lacks varlen \
                  QKV kernels. Engine will fall back to per-item dispatch.",

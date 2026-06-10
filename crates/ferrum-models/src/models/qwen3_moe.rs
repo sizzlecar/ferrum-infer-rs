@@ -68,6 +68,12 @@ pub struct Qwen3MoeModel<B: MoeLlmBackend, K: KvDtypeKind = KvFp16> {
     pub runtime_cfg: LlmRuntimeConfig,
     pub(crate) runtime_env: Qwen3MoeRuntimeEnv,
 
+    /// Backend capabilities resolved once at construction (GOAL-allowed
+    /// "构造期 capability 决策一次"). Decode/prefill hot paths read these
+    /// instead of `B::supports_*()` inline.
+    pub(crate) supports_varlen_qkv: bool,
+    pub(crate) supports_batched_moe_gemv: bool,
+
     pub embed: B::Buffer,
     /// Per-layer attention weights (re-uses dense `LlamaFamilyLayer`).
     pub attn_layers: Vec<LlamaFamilyLayer<B>>,
