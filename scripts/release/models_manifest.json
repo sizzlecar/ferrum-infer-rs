@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "description": "Single source of truth for the README support table AND the regression model matrix (Gate C4). The README table is generated from this file by readme_model_matrix.py --emit-readme; the matrix runner regresses each model on each platform it claims. Adding a model means editing this file — the README and the matrix stay in lock-step by construction.",
+  "models": [
+    {
+      "id": "llama-family",
+      "readme_label": "LLaMA (3.x, TinyLlama, Vicuna, Mistral)",
+      "modality": "llm",
+      "representative_model": "meta-llama/Llama-3.2-1B-Instruct",
+      "metal": true,
+      "cuda": true,
+      "int4_gptq": true,
+      "tensor_parallel": true,
+      "matrix_tier": "single_gpu"
+    },
+    {
+      "id": "qwen3-dense",
+      "readme_label": "Qwen3 dense (0.6B – 8B)",
+      "modality": "llm",
+      "representative_model": "Qwen/Qwen3-0.6B",
+      "metal": true,
+      "cuda": true,
+      "int4_gptq": true,
+      "tensor_parallel": true,
+      "matrix_tier": "single_gpu"
+    },
+    {
+      "id": "qwen3-moe",
+      "readme_label": "Qwen3-MoE (30B-A3B)",
+      "modality": "llm",
+      "representative_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+      "metal": true,
+      "cuda": true,
+      "int4_gptq": true,
+      "tensor_parallel": false,
+      "matrix_tier": "large_gpu"
+    },
+    {
+      "id": "qwen2-5",
+      "readme_label": "Qwen2 / Qwen2.5",
+      "modality": "llm",
+      "representative_model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "metal": true,
+      "cuda": true,
+      "int4_gptq": true,
+      "tensor_parallel": false,
+      "matrix_tier": "single_gpu"
+    },
+    {
+      "id": "bert",
+      "readme_label": "BERT (embeddings)",
+      "modality": "embedding",
+      "representative_model": "google-bert/bert-base-uncased",
+      "metal": true,
+      "cuda": false,
+      "int4_gptq": false,
+      "tensor_parallel": false,
+      "matrix_tier": "metal_only"
+    },
+    {
+      "id": "whisper",
+      "readme_label": "Whisper ASR (tiny → large-v3-turbo)",
+      "modality": "asr",
+      "representative_model": "openai/whisper-tiny",
+      "metal": true,
+      "cuda": false,
+      "int4_gptq": false,
+      "tensor_parallel": false,
+      "matrix_tier": "metal_only",
+      "matrix_smoke_only": true
+    },
+    {
+      "id": "qwen3-tts",
+      "readme_label": "Qwen3-TTS (0.6B / 1.7B)",
+      "modality": "tts",
+      "representative_model": "Qwen/Qwen3-TTS-0.6B",
+      "metal": true,
+      "cuda": false,
+      "int4_gptq": false,
+      "tensor_parallel": false,
+      "matrix_tier": "metal_only",
+      "matrix_smoke_only": true
+    },
+    {
+      "id": "clip",
+      "readme_label": "CLIP / Chinese-CLIP / SigLIP (text + image)",
+      "modality": "embedding",
+      "representative_model": "OFA-Sys/chinese-clip-vit-base-patch16",
+      "metal": true,
+      "cuda": false,
+      "int4_gptq": false,
+      "tensor_parallel": false,
+      "matrix_tier": "metal_only",
+      "matrix_smoke_only": true
+    }
+  ]
+}
