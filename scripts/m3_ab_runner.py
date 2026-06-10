@@ -1766,7 +1766,7 @@ def self_test() -> None:
 
         runner.config["performance_gates"] = {
             "enabled": True,
-            "same_env_order_sensitive_metrics": ["ttft_p50", "itl_p95"],
+            "same_env_order_sensitive_metrics": ["ttft_p50", "tpot_p50", "itl_p95"],
         }
         rows = [
             {
@@ -1784,7 +1784,7 @@ def self_test() -> None:
                 "env_hash": default_snapshot["env_hash"],
                 "throughput_mean": 100.0,
                 "ttft_p50": 12.0,
-                "tpot_p50": 10.0,
+                "tpot_p50": 12.0,
                 "itl_p95": 12.0,
             },
         ]
@@ -1792,11 +1792,15 @@ def self_test() -> None:
             rows, baseline_name="default"
         )
         same_env_ttft = same_env_gates["cases"]["candidate"]["metrics"][1]
+        same_env_tpot = same_env_gates["cases"]["candidate"]["metrics"][2]
         same_env_itl = same_env_gates["cases"]["candidate"]["metrics"][3]
         assert same_env_gates["cases"]["candidate"]["ok"]
         assert same_env_ttft["metric"] == "ttft_p50"
         assert same_env_ttft["diagnostic"] is True
         assert "same_env_order_sensitive_metric_diagnostic" in same_env_ttft["reason"]
+        assert same_env_tpot["metric"] == "tpot_p50"
+        assert same_env_tpot["diagnostic"] is True
+        assert "same_env_order_sensitive_metric_diagnostic" in same_env_tpot["reason"]
         assert same_env_itl["metric"] == "itl_p95"
         assert same_env_itl["diagnostic"] is True
         assert "same_env_order_sensitive_metric_diagnostic" in same_env_itl["reason"]
@@ -1807,6 +1811,7 @@ def self_test() -> None:
         )
         assert not different_env_gates["cases"]["candidate"]["ok"]
         assert different_env_gates["cases"]["candidate"]["metrics"][1]["diagnostic"] is False
+        assert different_env_gates["cases"]["candidate"]["metrics"][2]["diagnostic"] is False
         assert different_env_gates["cases"]["candidate"]["metrics"][3]["diagnostic"] is False
 
         runner.config["validation"] = {
