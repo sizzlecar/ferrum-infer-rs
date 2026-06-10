@@ -134,7 +134,7 @@
         "abs": 0.004,
         "initial": true
       },
-      "covered_today": false
+      "covered_today": true
     },
     {
       "id": "residual_add",

@@ -30,6 +30,7 @@
 pub mod activation_bridge;
 pub mod argmax_rows;
 pub mod embedding_lookup;
+pub mod flash_attention;
 pub mod fused_add_rms_norm;
 pub mod gemm;
 pub mod kv_cache_append;

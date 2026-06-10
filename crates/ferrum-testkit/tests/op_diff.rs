@@ -28,6 +28,26 @@ fn argmax_rows_spiked() {
 }
 
 #[test]
+fn flash_attention_small_shape() {
+    use ferrum_testkit::op_diff::flash_attention::FlashAttentionOp;
+    let op = FlashAttentionOp {
+        batch: 1,
+        q_len: 8,
+        kv_len: 8,
+        num_heads: 4,
+        num_kv_heads: 4,
+        head_dim: 32,
+    };
+    let report = compare_backends(&op, 41);
+    assert_eq!(
+        report.cpu.len(),
+        op.batch * op.q_len * op.num_heads * op.head_dim
+    );
+    assert!(report.cpu.iter().any(|&x| x != 0.0));
+    check_accelerator_tolerance(&report, 5e-3); // attention fp16 accumulation
+}
+
+#[test]
 fn activation_bridge_roundtrip() {
     use ferrum_testkit::op_diff::activation_bridge::ActivationBridgeOp;
     let op = ActivationBridgeOp { len: 4 * 128 };
