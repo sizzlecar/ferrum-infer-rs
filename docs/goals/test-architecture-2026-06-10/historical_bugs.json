@@ -177,8 +177,8 @@
       "repro_patch": "patches/hb-10.patch",
       "patch_status": "ready",
       "notes": "Kernel Pass-3 writes raw pair index again; kill test must exercise FERRUM_VLLM_MOE=1 with pair-ids OFF (pair-ids kernel is a separate, untouched path).",
-      "kill_status": "fix-confirmed",
-      "caught_by": "pod MoE FERRUM_VLLM_MOE=1 coherent (Beijing intro, no garbage); patch-flip verification pending kernel rebuild"
+      "kill_status": "verified-kill",
+      "caught_by": "pod: patch -> garbage (\"The answer is 11111111\"), revert -> coherent (Beijing intro). FERRUM_VLLM_MOE=1 pair-ids off."
     },
     {
       "id": "hb-11",
