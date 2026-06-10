@@ -271,7 +271,9 @@
         "abs": 0.002,
         "initial": true
       },
-      "covered_today": false
+      "covered_today": false,
+      "covered_by_integration": true,
+      "integration_evidence": "Paged QKV scatter exercised by every multi-turn chat (KV writes); no CPU reference (BackendPagedKv)."
     },
     {
       "id": "paged_decode_attention",
@@ -291,7 +293,9 @@
         "abs": 0.004,
         "initial": true
       },
-      "covered_today": false
+      "covered_today": false,
+      "covered_by_integration": true,
+      "integration_evidence": "Paged decode attention exercised by multi-turn CUDA chats (KV accumulation across 5-6 turns, coherent)."
     },
     {
       "id": "paged_varlen_attention",
@@ -312,7 +316,9 @@
       },
       "covered_today": false,
       "module": "paged_varlen_attn",
-      "module_status": "stub"
+      "module_status": "stub",
+      "covered_by_integration": true,
+      "integration_evidence": "CUDA-only batched dispatch; hb-09 verify-live: 6-turn MoE chat runs with no paged_varlen INVALID_VALUE crash."
     },
     {
       "id": "moe_route_topk_softmax",
@@ -331,7 +337,9 @@
         "abs": 0.002,
         "initial": true
       },
-      "covered_today": false
+      "covered_today": false,
+      "covered_by_integration": true,
+      "integration_evidence": "MoE router exercised by the 6-turn Qwen3-30B-A3B CUDA chat (coherent output requires correct top-k routing)."
     },
     {
       "id": "moe_align_block_size",
@@ -350,7 +358,9 @@
         "abs": 0.0,
         "initial": false
       },
-      "covered_today": false
+      "covered_today": false,
+      "covered_by_integration": true,
+      "integration_evidence": "CUDA-only kernel; exercised by FERRUM_VLLM_MOE=1 MoE chat — hb-10 proved a marlin/align break yields garbage output."
     },
     {
       "id": "moe_combine",
@@ -370,7 +380,9 @@
         "abs": 0.002,
         "initial": true
       },
-      "covered_today": false
+      "covered_today": false,
+      "covered_by_integration": true,
+      "integration_evidence": "MoE expert-output weighted sum exercised by the MoE CUDA chat; i32 pairs typed-buffer layout unfit for the f32 op_diff harness."
     },
     {
       "id": "gptq_marlin_linear",
@@ -392,7 +404,9 @@
       },
       "covered_today": false,
       "module": "marlin_matmul",
-      "module_status": "stub"
+      "module_status": "stub",
+      "covered_by_integration": true,
+      "integration_evidence": "CUDA-only Marlin GEMM; hb-10 verified-kill: re-introducing the packing bug flips coherent output to garbage ('11111111')."
     }
   ]
 }
