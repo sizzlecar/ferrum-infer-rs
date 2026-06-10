@@ -1,0 +1,7 @@
+{
+  "l0_runs": 10,
+  "l0_green": 10,
+  "l1_metal_runs": 10,
+  "l1_metal_green": 10,
+  "_pending": "l1_cuda_runs/green require 3 pod runs"
+}
