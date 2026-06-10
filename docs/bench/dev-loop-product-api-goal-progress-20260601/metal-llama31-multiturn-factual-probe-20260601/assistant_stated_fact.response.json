@@ -1,0 +1,1 @@
+{"id":"cad7ff8d-6503-4f2c-bcfb-30bd70ae3fd9","object":"chat.completion","created":1780329451,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"I'm not a train."},"finish_reason":"stop"}],"usage":{"prompt_tokens":72,"completion_tokens":7,"total_tokens":79}}

@@ -1,0 +1,12 @@
+2026-06-01T15:51:12.482689Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T15:51:12.482817Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T15:51:12.483149Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-01T15:51:12.655712Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T15:51:12.655802Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T15:51:12.655820Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-01T15:51:12.655842Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T15:51:12.655934Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+
+thread 'main' (67314956) panicked at crates/ferrum-kernels/src/attention/metal/pipelines.rs:56:14:
+failed to compile transformer_ops.metal: "program_source:234:19: warning: unused variable 'k_remain' [-Wunused-variable]\n        const int k_remain = min(8, p.K - kk);\n                  ^\nprogram_source:228:15: warning: unused variable 'm_remain' [-Wunused-variable]\n    const int m_remain = min(8, p.M - tile_row);\n              ^\nprogram_source:229:15: warning: unused variable 'n_remain' [-Wunused-variable]\n    const int n_remain = min(8, p.N - tile_col);\n              ^\nprogram_source:333:13: error: expecting input declarations with either all scalar types or all vector types with the same number of elements\nkernel void argmax_rows_f32(\n            ^\nprogram_source:337:11: note: declaration with attribute 'threadgroup_position_in_grid' of type 'uint3' (vector of 3 'unsigned int' values) here\n    uint3 tgpig                [[threadgroup_position_in_grid]],\n    ~~~~~~^~~~~\nprogram_source:339:10: note: declaration with attribute 'threads_per_threadgroup' of type 'uint' (aka 'unsigned int') here\n    uint tg_size               [[threads_per_threadgroup]]\n    ~~~~~^~~~~~~\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

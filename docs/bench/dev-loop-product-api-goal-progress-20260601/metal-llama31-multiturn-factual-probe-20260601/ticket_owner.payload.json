@@ -1,0 +1,24 @@
+{
+  "model": "Llama-3.1-8B",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Answer the final user question using the conversation context. Keep the answer short."
+    },
+    {
+      "role": "user",
+      "content": "For this test, the ticket owner is Alice."
+    },
+    {
+      "role": "assistant",
+      "content": "OK."
+    },
+    {
+      "role": "user",
+      "content": "Who is the ticket owner? Reply with only the name."
+    }
+  ],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stream": false
+}

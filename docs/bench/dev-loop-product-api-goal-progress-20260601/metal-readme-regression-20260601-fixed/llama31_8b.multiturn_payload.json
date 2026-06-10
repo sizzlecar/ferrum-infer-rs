@@ -1,0 +1,24 @@
+{
+  "model": "Llama-3.1-8B",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are concise and follow instructions exactly."
+    },
+    {
+      "role": "user",
+      "content": "Remember this code word: basalt. Reply only: remembered."
+    },
+    {
+      "role": "assistant",
+      "content": "remembered"
+    },
+    {
+      "role": "user",
+      "content": "What code word did I ask you to remember? Reply with just the word."
+    }
+  ],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stream": false
+}

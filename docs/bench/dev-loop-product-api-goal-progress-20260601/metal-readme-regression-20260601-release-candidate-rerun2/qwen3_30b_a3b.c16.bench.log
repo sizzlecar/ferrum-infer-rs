@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:18181  model=Qwen3-30B-A3B  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               32/32
+  wall time:               28.75s
+  request throughput:      1.11 req/s
+  input  token throughput: 17.5 tok/s
+  output token throughput: 71.2 tok/s
+  total input tokens:      503
+  total output tokens:     2048
+
+  TTFT  mean 2942.98ms  median 2929.66ms  p99 4722.15ms  max 4761.00ms
+  TPOT  mean  180.47ms  median  180.88ms  p99  216.77ms  max  216.96ms
+  ITL   mean  186.30ms  median  155.35ms  p99 1492.75ms  max 1593.33ms
+  E2E   mean 14312.58ms  median 14271.56ms  p99 14709.08ms  max 14709.08ms
+
+  saved → docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun2/qwen3_30b_a3b.c16.json

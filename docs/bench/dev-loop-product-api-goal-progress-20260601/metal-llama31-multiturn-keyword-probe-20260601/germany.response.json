@@ -1,0 +1,1 @@
+{"id":"1d933001-2a57-40a7-869a-fef73ed69385","object":"chat.completion","created":1780329719,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"Berlin"},"finish_reason":"stop"}],"usage":{"prompt_tokens":36,"completion_tokens":2,"total_tokens":38}}

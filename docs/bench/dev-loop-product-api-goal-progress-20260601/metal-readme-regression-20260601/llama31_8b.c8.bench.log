@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:18181  model=Llama-3.1-8B  reqs=24  conc=8  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               24/24
+  wall time:               30.43s
+  request throughput:      0.79 req/s
+  input  token throughput: 0.0 tok/s
+  output token throughput: 49.9 tok/s
+  total input tokens:      0
+  total output tokens:     1519
+
+  TTFT  mean  985.73ms  median 1006.10ms  p99 1622.10ms  max 1622.11ms
+  TPOT  mean  146.08ms  median  144.91ms  p99  168.43ms  max  169.05ms
+  ITL   mean  145.65ms  median  135.53ms  p99  521.43ms  max  617.42ms
+  E2E   mean 10069.74ms  median 10133.46ms  p99 10421.85ms  max 10421.98ms
+
+  saved → docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601/llama31_8b.c8.json

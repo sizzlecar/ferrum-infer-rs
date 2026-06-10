@@ -1,0 +1,12 @@
+{
+  "model": "Llama-3.1-8B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 2 plus 2? Reply with only the number."
+    }
+  ],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stream": false
+}

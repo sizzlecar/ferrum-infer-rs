@@ -1,0 +1,15 @@
+[auto-size] MOE_GRAPH=1 requested, but vllm-moe-marlin is not built; graph capture requires FERRUM_VLLM_MOE=1
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading /Users/chejinxuan/ferrum-bench/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-01T13:27:40.321661Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T13:27:40.321677Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T13:27:40.321741Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Meta-Llama-3.1-8B-Instruct.tokenizer.json"
+2026-06-01T13:27:40.492408Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T13:27:40.492456Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T13:27:40.492461Z  INFO ferrum_engine::registry: Creating priority scheduler
+2026-06-01T13:27:40.492469Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T13:27:40.492512Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf (format: gguf)
+Model loaded in 2.1s.
+[8 tokens, 12.3 tok/s, 0.6s]

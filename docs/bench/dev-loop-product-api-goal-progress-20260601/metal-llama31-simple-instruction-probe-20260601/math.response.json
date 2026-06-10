@@ -1,0 +1,1 @@
+{"id":"ee490f4c-fca3-4d37-a7dd-8f4645710835","object":"chat.completion","created":1780329681,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"It seems like you forgot to add 2"},"finish_reason":"stop"}],"usage":{"prompt_tokens":24,"completion_tokens":10,"total_tokens":34}}

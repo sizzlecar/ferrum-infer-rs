@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:18189  model=Qwen3-30B-A3B  reqs=16  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               16/16
+  wall time:               8.96s
+  request throughput:      1.79 req/s
+  input  token throughput: 32.3 tok/s
+  output token throughput: 14.3 tok/s
+  total input tokens:      289
+  total output tokens:     128
+
+  TTFT  mean 3822.95ms  median 3962.07ms  p99 6853.34ms  max 6948.99ms
+  TPOT  mean  684.93ms  median  698.56ms  p99 1066.60ms  max 1075.01ms
+  ITL   mean  684.92ms  median  342.04ms  p99 3347.63ms  max 3347.65ms
+  E2E   mean 8617.44ms  median 8850.41ms  p99 8941.19ms  max 8956.75ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen30-d7cfaae-c16-profile-20260601/c16_tg8.json

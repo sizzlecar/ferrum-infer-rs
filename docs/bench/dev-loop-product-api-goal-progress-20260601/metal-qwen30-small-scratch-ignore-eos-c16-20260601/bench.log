@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:18232  model=Qwen3-30B-A3B  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               32/32
+  wall time:               29.14s
+  request throughput:      1.10 req/s
+  input  token throughput: 16.8 tok/s
+  output token throughput: 70.3 tok/s
+  total input tokens:      491
+  total output tokens:     2048
+
+  TTFT  mean 2419.96ms  median 2031.91ms  p99 4945.85ms  max 4946.00ms
+  TPOT  mean  190.84ms  median  195.34ms  p99  210.79ms  max  210.79ms
+  ITL   mean  196.11ms  median  157.34ms  p99  972.86ms  max 1338.79ms
+  E2E   mean 14442.94ms  median 14374.81ms  p99 17180.75ms  max 17180.81ms
+
+  saved → docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen30-small-scratch-ignore-eos-c16-20260601/c16.json

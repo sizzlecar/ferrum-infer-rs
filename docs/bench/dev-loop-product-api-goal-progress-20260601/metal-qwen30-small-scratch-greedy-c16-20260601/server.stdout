@@ -1,0 +1,15 @@
+
+  ______                            
+ |  ____|                           
+ | |__ ___ _ __ _ __ _   _ _ __ ___  
+ |  __/ _ \ '__| '__| | | | '_ ` _ \ 
+ | | |  __/ |  | |  | |_| | | | | | 
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.3
+
+Model: Qwen3-30B-A3B-Q4_K_M
+Path: /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf
+Device: Metal
+

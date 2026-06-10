@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:18182  model=Qwen3-30B-A3B  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               32/32
+  wall time:               90.36s
+  request throughput:      0.35 req/s
+  input  token throughput: 0.0 tok/s
+  output token throughput: 21.1 tok/s
+  total input tokens:      0
+  total output tokens:     1909
+
+  TTFT  mean 2339.78ms  median 1916.40ms  p99 5418.59ms  max 5467.05ms
+  TPOT  mean  694.51ms  median  676.64ms  p99  856.02ms  max  883.35ms
+  ITL   mean  687.38ms  median  690.74ms  p99 1399.27ms  max 3384.99ms
+  E2E   mean 42800.62ms  median 44108.87ms  p99 46777.22ms  max 46777.35ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen30-legacy-split-probe-20260601/c16.json

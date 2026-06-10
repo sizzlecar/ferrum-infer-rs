@@ -1,0 +1,17 @@
+{
+  "label": "Qwen3-30B-A3B",
+  "swap_start": "vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)",
+  "cells": [],
+  "server_ready": false,
+  "chat": {
+    "paris": {
+      "passed": false,
+      "content": "server not ready"
+    },
+    "multiturn": {
+      "passed": false,
+      "content": "server not ready"
+    }
+  },
+  "swap_end": "vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)"
+}

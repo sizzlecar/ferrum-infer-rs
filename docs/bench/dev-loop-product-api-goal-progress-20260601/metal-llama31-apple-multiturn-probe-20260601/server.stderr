@@ -1,0 +1,8 @@
+2026-06-01T15:41:49.433630Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T15:41:49.433672Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T15:41:49.433725Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Meta-Llama-3.1-8B-Instruct.tokenizer.json"
+2026-06-01T15:41:49.623473Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T15:41:49.623526Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T15:41:49.623532Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-01T15:41:49.623543Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T15:41:49.623587Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf (format: gguf)

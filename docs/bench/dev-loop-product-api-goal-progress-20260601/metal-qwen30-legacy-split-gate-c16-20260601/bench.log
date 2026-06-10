@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:18238  model=Qwen3-30B-A3B  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               32/32
+  wall time:               29.07s
+  request throughput:      1.10 req/s
+  input  token throughput: 13.1 tok/s
+  output token throughput: 70.4 tok/s
+  total input tokens:      381
+  total output tokens:     2048
+
+  TTFT  mean 2332.68ms  median 1965.83ms  p99 4865.53ms  max 4908.37ms
+  TPOT  mean  191.69ms  median  196.24ms  p99  212.33ms  max  212.35ms
+  ITL   mean  196.02ms  median  157.27ms  p99  981.44ms  max 1143.85ms
+  E2E   mean 14408.88ms  median 14345.64ms  p99 17133.05ms  max 17133.26ms
+
+  saved → docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen30-legacy-split-gate-c16-20260601/c16.json

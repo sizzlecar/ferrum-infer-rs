@@ -1,0 +1,1 @@
+{"id":"3eaf3b02-e8a6-4669-a90d-fd7d4a2bc05a","object":"chat.completion","created":1780329311,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"You can be 3."},"finish_reason":"stop"}],"usage":{"prompt_tokens":63,"completion_tokens":7,"total_tokens":70}}

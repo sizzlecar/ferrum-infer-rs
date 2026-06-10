@@ -1,0 +1,20 @@
+{
+  "model": "Llama-3.1-8B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "My name is Bob."
+    },
+    {
+      "role": "assistant",
+      "content": "Nice to meet you, Bob."
+    },
+    {
+      "role": "user",
+      "content": "What is my name?"
+    }
+  ],
+  "max_tokens": 24,
+  "temperature": 0,
+  "stream": false
+}

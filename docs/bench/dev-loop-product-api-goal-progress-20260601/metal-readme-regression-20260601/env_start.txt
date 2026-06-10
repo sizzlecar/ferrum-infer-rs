@@ -1,0 +1,18 @@
+2026-06-01 21:26:28 +0800
+ProductName:		macOS
+ProductVersion:		15.1.1
+BuildVersion:		24B91
+vm.swapusage: total = 2048.00M  used = 1636.06M  free = 411.94M  (encrypted)
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              795748.
+Pages active:                            309160.
+Pages inactive:                          517989.
+Pages speculative:                       111165.
+Pages throttled:                              0.
+Pages wired down:                        178134.
+Pages purgeable:                           9570.
+"Translation faults":                5176772875.
+Pages copy-on-write:                  327543681.
+Pages zero filled:                   3061632384.
+Pages reactivated:                    233094449.
+ferrum 0.7.3
