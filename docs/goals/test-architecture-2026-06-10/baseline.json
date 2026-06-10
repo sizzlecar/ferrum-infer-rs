@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generated_by": "scripts/release/test_arch_goal_gate.py --baseline",
-  "base_sha": "4dafad057c9151df5bef3655e6c0bdb1de1eac0f",
+  "base_sha": "ab8f38def3f26cb4f6d0f0140786ce84d29ab7dd",
   "dirty_worktree": true,
   "scan_method": "line-level regex over non-test .rs files under crates/ferrum-models/src/models and crates/ferrum-engine/src; comment-only lines skipped; #[cfg(test)] blocks not excluded",
   "counts": {
@@ -21,13 +21,12 @@
       ]
     },
     "cfg_branch": {
-      "total": 22,
+      "total": 20,
       "by_scope": {
         "models": 0,
-        "engine": 22
+        "engine": 20
       },
       "files": [
-        "crates/ferrum-engine/src/continuous_engine/inner/batch.rs",
         "crates/ferrum-engine/src/parallel/device.rs",
         "crates/ferrum-engine/src/registry.rs",
         "crates/ferrum-engine/src/tensor_factory/candle.rs"

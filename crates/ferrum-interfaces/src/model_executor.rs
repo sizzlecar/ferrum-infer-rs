@@ -267,6 +267,18 @@ pub trait ModelExecutor: Send + Sync {
     /// Get model information and metadata
     fn info(&self) -> &ModelInfo;
 
+    /// Whether this executor's backend can run the unified mixed prefill+decode
+    /// forward natively. When false, the engine routes Qwen3-MoE batches through
+    /// the legacy split path. Reported by the (backend-aware) executor so the
+    /// engine stays backend-agnostic — replaces a `cfg(target_os)` branch that
+    /// previously hard-coded "Metal/CPU lack native unified" in the hot path.
+    ///
+    /// Default false (conservative legacy path); accelerators with a native
+    /// unified forward override to true.
+    fn supports_native_unified_decode(&self) -> bool {
+        false
+    }
+
     /// Per-request KV capacity in tokens when the executor owns a smaller
     /// runtime cache window than the model's declared context length.
     fn kv_capacity(&self) -> Option<usize> {
