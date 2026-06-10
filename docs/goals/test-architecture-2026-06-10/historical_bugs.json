@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "description": "Kill-list for Gate B2. kind=revert-fix entries get a minimal re-introduction patch derived from the fix diff (human-reviewed, product code only, never the fix's own tests); kind=verify-live entries are historically observed bugs with no confirmed fix commit — the new test must fail on the first GPU session if the bug is still present, then the entry converts to revert-fix once fixed.",
+  "acceptance": {
+    "cpu_reachable_min_caught_ratio": 0.8,
+    "cuda_only_required_caught": "all",
+    "exemption_rule": "An entry may be exempted only with a recorded reason in the kill-rate artifact (e.g. minimal patch cannot reproduce at tiny shapes); exemptions shrink the denominator."
+  },
+  "entries": [
+    {
+      "id": "hb-01",
+      "title": "chat REPL EOS / stop_sequences / stream / pos_offset all broken after engine swap",
+      "kind": "revert-fix",
+      "fix_commits": ["34c57c2b"],
+      "source": "PR #188",
+      "reachable": "cpu",
+      "expected_lane": "L0",
+      "expected_failing_surface": "tiny full-stack: eos_terminates, stop_sequidentifier, stream chunk contract, multi-turn",
+      "repro_patch": null,
+      "patch_status": "pending"
+    },
+    {
+      "id": "hb-02",
+      "title": "stop text spanning composite tokens not detected",
+      "kind": "revert-fix",
+      "fix_commits": ["2a3a6132"],
+      "source": "goal/layer-split branch",
+      "reachable": "cpu",
+      "expected_lane": "L0",
+      "expected_failing_surface": "tiny full-stack: stop sequence inside composite token scenario",
+      "repro_patch": null,
+      "patch_status": "pending"
+    },
+    {
+      "id": "hb-03",
+      "title": "guided decoding leaves control tokens unmasked / premature guided EOS",
+      "kind": "revert-fix",
+      "fix_commits": ["b2ec992c", "3190dbc7", "bf4573d3", "5cb6b1fe"],
+      "source": "goal/layer-split branch",
+      "reachable": "cpu",
+      "expected_lane": "L0",
+      "expected_failing_surface": "tiny full-stack: guided/tool constraint decoding scenario",
+      "repro_patch": null,
+      "patch_status": "pending"
+    },
+    {
+      "id": "hb-04",
+      "title": "tool constraints not enforcing full logits",
+      "kind": "revert-fix",
+      "fix_commits": ["fd8e99e0"],
+      "source": "goal/layer-split branch",
+      "reachable": "cpu",
+      "expected_lane": "L0",
+      "expected_failing_surface": "tiny full-stack: guided/tool constraint decoding scenario",
+      "repro_patch": null,
+      "patch_status": "pending"
+    },
+    {
+      "id": "hb-05",
+      "title": "forced tool argument strings unbounded",
+      "kind": "revert-fix",
+      "fix_commits": ["e7badefc"],
+      "source": "goal/layer-split branch",
+      "reachable": "cpu",
+      "expected_lane": "L0",
+      "expected_failing_surface": "in-process OpenAI wire: tool-call argument bound scenario",
+      "repro_patch": null,
+      "patch_status": "pending"
+    },
+    {
+      "id": "hb-06",
+      "title": "/v1/models empty; empty messages returns 200; custom stop leaks stop char; greedy non-deterministic",
+      "kind": "revert-fix",
+      "fix_commits": [],
+      "source": "PR #8 server smoke findings (memory 2026-05-19); fix commits to be located in stage 0 patch derivation",
+      "reachable": "cpu",
+      "expected_lane": "L0",
+      "expected_failing_surface": "in-process OpenAI wire scenarios: /v1/models non-empty, empty-messages 400, stop leak, greedy determinism",
+      "repro_patch": null,
+      "patch_status": "pending"
+    },
+    {
+      "id": "hb-07",
+      "title": "missing per-item fallback when supports_varlen_qkv()=false",
+      "kind": "revert-fix",
+      "fix_commits": ["fbdfcfe2"],
+      "source": "PR #159",
+      "reachable": "cpu",
+      "expected_lane": "L0",
+      "expected_failing_surface": "capability-fallback law: CPU all-optional-caps-off full-stack run",
+      "repro_patch": null,
+      "patch_status": "pending"
+    },
+    {
+      "id": "hb-08",
+      "title": "paged_batch_* scratch not re-initialized after ensure_scratch realloc",
+      "kind": "revert-fix",
+      "fix_commits": ["4701cc84"],
+      "source": "PR #155",
+      "reachable": "cpu",
+      "expected_lane": "L0",
+      "expected_failing_surface": "tiny full-stack: KV capacity boundary scenario (scratch growth across batches)",
+      "repro_patch": null,
+      "patch_status": "pending",
+      "notes": "May not reproduce at tiny shapes; exemption candidate per acceptance.exemption_rule."
+    },
+    {
+      "id": "hb-09",
+      "title": "multi-turn turn-3 paged_varlen_attention CUDA_ERROR_INVALID_VALUE panic",
+      "kind": "verify-live",
+      "fix_commits": [],
+      "source": "TESTING-GAPS.md #1 (qwen3_moe_forward_unified.rs:368, build 241dbc0, Vast 4090 CUDA 13)",
+      "reachable": "cuda",
+      "expected_lane": "L1-cuda",
+      "expected_failing_surface": "L1-cuda multi-turn chat (>=5 turns); fix first if still reproducible",
+      "repro_patch": null,
+      "patch_status": "n/a-live"
+    },
+    {
+      "id": "hb-10",
+      "title": "vllm-moe-marlin packing mismatch / CUDA 13 template garbage output",
+      "kind": "revert-fix",
+      "fix_commits": ["049b3a42", "241dbc0f"],
+      "source": "session-2026-05-26 + PR #216",
+      "reachable": "cuda",
+      "expected_lane": "L1-cuda",
+      "expected_failing_surface": "CUDA reference_match fingerprint + gptq_marlin_linear op parity",
+      "repro_patch": null,
+      "patch_status": "pending"
+    },
+    {
+      "id": "hb-11",
+      "title": "kv_len > shared-memory budget (24576 on sm_89) kernel launch INVALID_VALUE",
+      "kind": "verify-live",
+      "fix_commits": [],
+      "source": "TESTING-GAPS.md #2",
+      "reachable": "cuda",
+      "expected_lane": "L0+L1-cuda",
+      "expected_failing_surface": "L0 launch-plan pure-function shape test; L1-cuda real-launch smoke",
+      "repro_patch": null,
+      "patch_status": "n/a-live"
+    }
+  ]
+}
