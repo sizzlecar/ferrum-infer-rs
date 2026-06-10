@@ -1,0 +1,12 @@
+2026-06-01T13:32:20.833950Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T13:32:20.833977Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T13:32:20.834042Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-01T13:32:21.000100Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T13:32:21.000153Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T13:32:21.000160Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-01T13:32:21.000169Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T13:32:21.000213Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+
+thread 'tokio-runtime-worker' (67144622) panicked at crates/ferrum-models/src/models/qwen3_moe_forward_unified_layer.rs:177:14:
+Qwen3Moe unified: split_qkv_norm_rope_into_paged_cache_varlen: Unsupported { message: "split_qkv_norm_rope_into_paged_cache_varlen not implemented for this backend" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

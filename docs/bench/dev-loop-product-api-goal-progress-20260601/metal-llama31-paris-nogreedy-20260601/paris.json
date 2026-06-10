@@ -1,0 +1,1 @@
+{"id":"a608d104-afd6-4943-afdb-45a0e35b3827","object":"chat.completion","created":1780328170,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"It looks like you are you referring to?"},"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"completion_tokens":10,"total_tokens":35}}

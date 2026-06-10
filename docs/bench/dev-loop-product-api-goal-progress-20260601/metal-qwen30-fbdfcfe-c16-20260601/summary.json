@@ -1,0 +1,11 @@
+{
+  "commit": "fbdfcfe",
+  "rc": 0,
+  "timeout": false,
+  "completed": 32,
+  "failed": 0,
+  "tps": 83.77542459373214,
+  "out": 2048,
+  "tpot": 156.89535846031748,
+  "ttft": 428.7001044999994
+}

@@ -1,0 +1,39 @@
+{
+  "label": "Llama-3.1-8B",
+  "swap_start": "vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)",
+  "probes": {
+    "paris": {
+      "status": 200,
+      "content": "The capital of France is Paris."
+    },
+    "basalt_multiturn": {
+      "status": 200,
+      "content": "You can be a memory."
+    },
+    "apple_multiturn": {
+      "status": 200,
+      "content": "You can remember."
+    },
+    "number_multiturn": {
+      "status": 200,
+      "content": "You can be 3."
+    }
+  },
+  "cells": [
+    {
+      "concurrency": 16,
+      "prompts": 32,
+      "baseline_tps": 96.7,
+      "runner_rc": 0,
+      "completed": 32,
+      "failed": 0,
+      "output_throughput_tok_s": 89.4525344918441,
+      "ratio_to_readme": 0.9250520629973537,
+      "not_regressed_90pct": true,
+      "ttft_median_ms": 1727.9562500000002,
+      "tpot_median_ms": 152.29141964285714
+    }
+  ],
+  "server_ready": true,
+  "swap_end": "vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)"
+}

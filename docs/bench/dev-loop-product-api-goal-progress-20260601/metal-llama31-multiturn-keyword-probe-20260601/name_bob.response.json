@@ -1,0 +1,1 @@
+{"id":"629fcd30-7759-488a-a7e6-1b94a6b3621b","object":"chat.completion","created":1780329719,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"It's nice to meet you."},"finish_reason":"stop"}],"usage":{"prompt_tokens":37,"completion_tokens":8,"total_tokens":45}}

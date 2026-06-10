@@ -1,0 +1,137 @@
+{
+  "ferrum_version": "ferrum 0.7.3\n",
+  "swap_start": "vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)",
+  "vm_stat_start": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              361476.\nPages active:                            965601.\nPages inactive:                          256048.\nPages speculative:                       136807.\nPages throttled:                              0.\nPages wired down:                        162480.\nPages purgeable:                            943.\n\"Translation faults\":                5231487553.\nPages copy-on-write:                  328372239.\nPages zero filled:                   3104152685.\nPages reactivated:                    234673334.",
+  "models": [
+    {
+      "key": "llama31_8b",
+      "label": "Llama-3.1-8B",
+      "gguf": "/Users/chejinxuan/ferrum-bench/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+      "moe": false,
+      "chat": {
+        "paris": {
+          "status": 200,
+          "passed": false,
+          "content": "It looks like you are you referring to?"
+        },
+        "multiturn": {
+          "status": 200,
+          "passed": false,
+          "content": "It seems to be a word."
+        }
+      },
+      "cells": [
+        {
+          "concurrency": 1,
+          "prompts": 8,
+          "baseline_tps": 29.1,
+          "runner_rc": 0,
+          "completed": 8,
+          "failed": 0,
+          "output_throughput_tok_s": 31.473706836355554,
+          "ratio_to_readme": 1.0815706816617028,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": 131.22714599999983,
+          "tpot_median_ms": 29.64100297619048
+        },
+        {
+          "concurrency": 8,
+          "prompts": 24,
+          "baseline_tps": 51.3,
+          "runner_rc": 0,
+          "completed": 24,
+          "failed": 0,
+          "output_throughput_tok_s": 51.208240402734546,
+          "ratio_to_readme": 0.998211313893461,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": 1105.4288330000013,
+          "tpot_median_ms": 141.63194510317464
+        },
+        {
+          "concurrency": 16,
+          "prompts": 32,
+          "baseline_tps": 96.7,
+          "runner_rc": 0,
+          "completed": 32,
+          "failed": 0,
+          "output_throughput_tok_s": 87.2724247944368,
+          "ratio_to_readme": 0.90250697822582,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": 1735.1185000000005,
+          "tpot_median_ms": 156.23674636507934
+        }
+      ],
+      "server_ready": true
+    },
+    {
+      "key": "qwen3_8b",
+      "label": "Qwen3-8B",
+      "gguf": "/Users/chejinxuan/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf",
+      "moe": false,
+      "chat": {
+        "paris": {
+          "status": 200,
+          "passed": true,
+          "content": "Paris"
+        },
+        "multiturn": {
+          "status": 200,
+          "passed": true,
+          "content": "basalt"
+        }
+      },
+      "cells": [
+        {
+          "concurrency": 16,
+          "prompts": 32,
+          "baseline_tps": 93.2,
+          "runner_rc": 0,
+          "completed": 32,
+          "failed": 0,
+          "output_throughput_tok_s": 83.92240337186287,
+          "ratio_to_readme": 0.9004549718011037,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": 1760.3987710000001,
+          "tpot_median_ms": 162.31573742857142
+        }
+      ],
+      "server_ready": true
+    },
+    {
+      "key": "qwen3_30b_a3b",
+      "label": "Qwen3-30B-A3B",
+      "gguf": "/Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf",
+      "moe": true,
+      "chat": {
+        "paris": {
+          "status": 200,
+          "passed": true,
+          "content": "Paris"
+        },
+        "multiturn": {
+          "status": 200,
+          "passed": true,
+          "content": "basalt"
+        }
+      },
+      "cells": [
+        {
+          "concurrency": 16,
+          "prompts": 32,
+          "baseline_tps": 79.2,
+          "runner_rc": 0,
+          "completed": 32,
+          "failed": 0,
+          "output_throughput_tok_s": 71.05959619284498,
+          "ratio_to_readme": 0.8972171236470325,
+          "not_regressed_90pct": false,
+          "ttft_median_ms": 2900.071229,
+          "tpot_median_ms": 181.51908664285716
+        }
+      ],
+      "server_ready": true
+    }
+  ],
+  "swap_end": "vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)",
+  "vm_stat_end": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              370235.\nPages active:                           1155267.\nPages inactive:                          190301.\nPages speculative:                         4681.\nPages throttled:                              0.\nPages wired down:                        162803.\nPages purgeable:                            455.\n\"Translation faults\":                5234152770.\nPages copy-on-write:                  328407836.\nPages zero filled:                   3106167383.\nPages reactivated:                    234677484."
+}

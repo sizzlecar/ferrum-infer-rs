@@ -1,0 +1,10 @@
+{
+  "bench_rc": 0,
+  "completed": 32,
+  "failed": 0,
+  "output_throughput_tok_s": 21.125671384681635,
+  "total_output_tokens": 1909,
+  "tpot_median_ms": 676.636533764849,
+  "ttft_median_ms": 1916.3996875000007,
+  "paris": "Paris"
+}

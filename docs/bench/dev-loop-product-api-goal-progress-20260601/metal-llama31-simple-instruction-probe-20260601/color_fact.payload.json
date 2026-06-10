@@ -1,0 +1,12 @@
+{
+  "model": "Llama-3.1-8B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "The color is red. What color is it? Reply with only the color."
+    }
+  ],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stream": false
+}

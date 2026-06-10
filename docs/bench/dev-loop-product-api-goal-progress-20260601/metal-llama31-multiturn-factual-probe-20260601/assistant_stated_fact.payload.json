@@ -1,0 +1,24 @@
+{
+  "model": "Llama-3.1-8B",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Answer the final user question using the conversation context. Keep the answer short."
+    },
+    {
+      "role": "user",
+      "content": "Please say: the release train is stable."
+    },
+    {
+      "role": "assistant",
+      "content": "The release train is stable."
+    },
+    {
+      "role": "user",
+      "content": "According to your previous answer, what is the release train? Reply with one word."
+    }
+  ],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stream": false
+}

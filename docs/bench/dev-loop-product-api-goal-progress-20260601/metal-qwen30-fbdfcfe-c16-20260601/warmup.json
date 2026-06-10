@@ -1,0 +1,1 @@
+{"id":"b0ddb09b-2148-4ae4-aca9-23b948193951","object":"chat.completion","created":1780324247,"model":"Qwen3-30B-A3B","choices":[{"index":0,"message":{"role":"assistant","content":"Hello! How can"},"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}

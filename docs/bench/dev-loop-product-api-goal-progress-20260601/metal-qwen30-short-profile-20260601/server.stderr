@@ -1,0 +1,194 @@
+2026-06-01T14:48:21.449194Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T14:48:21.449217Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T14:48:21.449406Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-01T14:48:21.619417Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T14:48:21.619477Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T14:48:21.619483Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-01T14:48:21.619496Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T14:48:21.619545Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+[prefill-profile] tokens=13 total=1046 ms (12 t/s)
+    attn:     150 ms ( 14.3%) over   48 calls
+     moe:     751 ms ( 71.9%) over   48 calls
+   other:     144 ms ( 13.8%) over    1 calls
+    host:      13 ms (  1.3%) over   48 calls
+    gate:     183 ms ( 17.6%) over   48 calls
+      up:     224 ms ( 21.4%) over   48 calls
+    silu:      12 ms (  1.2%) over   48 calls
+    down:     262 ms ( 25.1%) over   48 calls
+    wsum:      12 ms (  1.2%) over   48 calls
+[decode-prof] total=124 ms | attn=18 (15.0%) | moe=78 (63.3%) [route=11 gate=0 up=0 silu=20 down=20 wsum=13] | embed=0 fnorm=0 lmhead=3 other=23 (18.9%)
+[decode-prof] total=122 ms | attn=17 (14.6%) | moe=77 (63.5%) [route=12 gate=0 up=0 silu=21 down=18 wsum=13] | embed=0 fnorm=0 lmhead=3 other=23 (19.0%)
+[decode-prof] total=124 ms | attn=18 (14.8%) | moe=79 (63.3%) [route=12 gate=0 up=0 silu=21 down=19 wsum=13] | embed=0 fnorm=0 lmhead=3 other=23 (19.0%)
+[prefill-profile] tokens=29 total=434 ms (67 t/s)
+    attn:      39 ms (  9.1%) over   48 calls
+     moe:     360 ms ( 83.0%) over   48 calls
+   other:      34 ms (  7.9%) over    1 calls
+    host:      11 ms (  2.5%) over   48 calls
+    gate:     103 ms ( 23.7%) over   48 calls
+      up:      88 ms ( 20.4%) over   48 calls
+    silu:      11 ms (  2.7%) over   48 calls
+    down:      87 ms ( 20.2%) over   48 calls
+    wsum:      11 ms (  2.7%) over   48 calls
+[prefill-profile] tokens=28 total=415 ms (67 t/s)
+    attn:      35 ms (  8.4%) over   48 calls
+     moe:     349 ms ( 84.0%) over   48 calls
+   other:      31 ms (  7.5%) over    1 calls
+    host:      11 ms (  2.9%) over   48 calls
+    gate:      96 ms ( 23.3%) over   48 calls
+      up:      87 ms ( 21.2%) over   48 calls
+    silu:      11 ms (  2.8%) over   48 calls
+    down:      82 ms ( 19.9%) over   48 calls
+    wsum:      11 ms (  2.7%) over   48 calls
+[prefill-profile] tokens=29 total=409 ms (71 t/s)
+    attn:      37 ms (  9.1%) over   48 calls
+     moe:     340 ms ( 83.0%) over   48 calls
+   other:      32 ms (  7.9%) over    1 calls
+    host:      11 ms (  2.8%) over   48 calls
+    gate:      91 ms ( 22.4%) over   48 calls
+      up:      84 ms ( 20.6%) over   48 calls
+    silu:      11 ms (  2.8%) over   48 calls
+    down:      86 ms ( 21.0%) over   48 calls
+    wsum:      11 ms (  2.7%) over   48 calls
+[prefill-profile] tokens=35 total=424 ms (82 t/s)
+    attn:      41 ms (  9.8%) over   48 calls
+     moe:     347 ms ( 82.0%) over   48 calls
+   other:      34 ms (  8.2%) over    1 calls
+    host:      11 ms (  2.7%) over   48 calls
+    gate:      91 ms ( 21.6%) over   48 calls
+      up:      90 ms ( 21.2%) over   48 calls
+    silu:      11 ms (  2.7%) over   48 calls
+    down:      87 ms ( 20.7%) over   48 calls
+    wsum:      11 ms (  2.8%) over   48 calls
+[prefill-profile] tokens=32 total=422 ms (76 t/s)
+    attn:      37 ms (  9.0%) over   48 calls
+     moe:     352 ms ( 83.3%) over   48 calls
+   other:      32 ms (  7.7%) over    1 calls
+    host:      11 ms (  2.7%) over   48 calls
+    gate:      96 ms ( 22.8%) over   48 calls
+      up:      91 ms ( 21.7%) over   48 calls
+    silu:      11 ms (  2.7%) over   48 calls
+    down:      84 ms ( 20.0%) over   48 calls
+    wsum:      11 ms (  2.7%) over   48 calls
+[prefill-profile] tokens=28 total=443 ms (63 t/s)
+    attn:      40 ms (  9.0%) over   48 calls
+     moe:     368 ms ( 83.1%) over   48 calls
+   other:      34 ms (  7.8%) over    1 calls
+    host:      11 ms (  2.7%) over   48 calls
+    gate:      95 ms ( 21.5%) over   48 calls
+      up:      94 ms ( 21.3%) over   48 calls
+    silu:      11 ms (  2.6%) over   48 calls
+    down:      96 ms ( 21.7%) over   48 calls
+    wsum:      11 ms (  2.7%) over   48 calls
+[prefill-profile] tokens=33 total=420 ms (79 t/s)
+    attn:      40 ms (  9.7%) over   48 calls
+     moe:     345 ms ( 82.1%) over   48 calls
+   other:      34 ms (  8.2%) over    1 calls
+    host:      11 ms (  2.7%) over   48 calls
+    gate:      89 ms ( 21.3%) over   48 calls
+      up:      89 ms ( 21.4%) over   48 calls
+    silu:      11 ms (  2.7%) over   48 calls
+    down:      87 ms ( 20.7%) over   48 calls
+    wsum:      11 ms (  2.8%) over   48 calls
+[qwen3_moe] decode_batch_internal: FERRUM_GREEDY_ARGMAX=0 (path=host argmax)
+[moe-inner-prof] iter#0 m=4 loop=200783us sync=250824us argmax=453us
+[batched-decode-prof] m=4 layers=48 total=452 ms | dense=66 (14.8%) | attn_peritem=15 (3.3%) | moe=118 (26.2%) [route=10 gate=0 up=0 silu=29 down=25 wsum=10] | other=251 (55.6%)
+[prefill-profile] tokens=29 total=1266 ms (23 t/s)
+    attn:     207 ms ( 16.4%) over   48 calls
+     moe:    1001 ms ( 79.0%) over   48 calls
+   other:      58 ms (  4.6%) over    1 calls
+    host:      11 ms (  0.9%) over   48 calls
+    gate:     284 ms ( 22.5%) over   48 calls
+      up:     300 ms ( 23.7%) over   48 calls
+    silu:      13 ms (  1.1%) over   48 calls
+    down:     325 ms ( 25.7%) over   48 calls
+    wsum:      12 ms (  1.0%) over   48 calls
+[prefill-profile] tokens=25 total=472 ms (53 t/s)
+    attn:      44 ms (  9.4%) over   48 calls
+     moe:     394 ms ( 83.4%) over   48 calls
+   other:      33 ms (  7.2%) over    1 calls
+    host:      11 ms (  2.4%) over   48 calls
+    gate:     110 ms ( 23.3%) over   48 calls
+      up:     107 ms ( 22.7%) over   48 calls
+    silu:      10 ms (  2.3%) over   48 calls
+    down:      97 ms ( 20.7%) over   48 calls
+    wsum:      11 ms (  2.4%) over   48 calls
+[prefill-profile] tokens=34 total=413 ms (82 t/s)
+    attn:      38 ms (  9.4%) over   48 calls
+     moe:     340 ms ( 82.5%) over   48 calls
+   other:      33 ms (  8.1%) over    1 calls
+    host:      11 ms (  2.8%) over   48 calls
+    gate:      89 ms ( 21.7%) over   48 calls
+      up:      88 ms ( 21.3%) over   48 calls
+    silu:      11 ms (  2.8%) over   48 calls
+    down:      84 ms ( 20.3%) over   48 calls
+    wsum:      11 ms (  2.8%) over   48 calls
+[batched-decode-prof] m=7 layers=48 total=272 ms | dense=66 (24.4%) | attn_peritem=17 (6.5%) | moe=137 (50.7%) [route=11 gate=0 up=0 silu=39 down=34 wsum=11] | other=50 (18.4%)
+[prefill-profile] tokens=27 total=1264 ms (21 t/s)
+    attn:     183 ms ( 14.5%) over   48 calls
+     moe:    1009 ms ( 79.9%) over   48 calls
+   other:      70 ms (  5.6%) over    1 calls
+    host:      12 ms (  1.0%) over   48 calls
+    gate:     299 ms ( 23.7%) over   48 calls
+      up:     296 ms ( 23.5%) over   48 calls
+    silu:      12 ms (  1.0%) over   48 calls
+    down:     321 ms ( 25.4%) over   48 calls
+    wsum:      12 ms (  1.0%) over   48 calls
+[prefill-profile] tokens=29 total=470 ms (62 t/s)
+    attn:      43 ms (  9.3%) over   48 calls
+     moe:     394 ms ( 83.9%) over   48 calls
+   other:      32 ms (  6.8%) over    1 calls
+    host:      11 ms (  2.4%) over   48 calls
+    gate:     106 ms ( 22.6%) over   48 calls
+      up:     105 ms ( 22.3%) over   48 calls
+    silu:      10 ms (  2.3%) over   48 calls
+    down:     105 ms ( 22.3%) over   48 calls
+    wsum:      10 ms (  2.3%) over   48 calls
+[prefill-profile] tokens=27 total=410 ms (66 t/s)
+    attn:      36 ms (  8.9%) over   48 calls
+     moe:     341 ms ( 83.2%) over   48 calls
+   other:      32 ms (  7.9%) over    1 calls
+    host:      11 ms (  2.8%) over   48 calls
+    gate:      88 ms ( 21.6%) over   48 calls
+      up:      89 ms ( 21.9%) over   48 calls
+    silu:      11 ms (  2.8%) over   48 calls
+    down:      83 ms ( 20.4%) over   48 calls
+    wsum:      11 ms (  2.8%) over   48 calls
+[batched-decode-prof] m=10 layers=48 total=305 ms | dense=70 (23.1%) | attn_peritem=18 (6.0%) | moe=167 (54.7%) [route=10 gate=0 up=0 silu=53 down=48 wsum=10] | other=49 (16.2%)
+[prefill-profile] tokens=30 total=1184 ms (25 t/s)
+    attn:     169 ms ( 14.3%) over   48 calls
+     moe:     963 ms ( 81.4%) over   48 calls
+   other:      51 ms (  4.3%) over    1 calls
+    host:      12 ms (  1.0%) over   48 calls
+    gate:     266 ms ( 22.5%) over   48 calls
+      up:     285 ms ( 24.1%) over   48 calls
+    silu:      12 ms (  1.0%) over   48 calls
+    down:     321 ms ( 27.1%) over   48 calls
+    wsum:      12 ms (  1.1%) over   48 calls
+[prefill-profile] tokens=37 total=472 ms (78 t/s)
+    attn:      47 ms ( 10.0%) over   48 calls
+     moe:     389 ms ( 82.6%) over   48 calls
+   other:      35 ms (  7.4%) over    1 calls
+    host:      11 ms (  2.4%) over   48 calls
+    gate:     103 ms ( 21.9%) over   48 calls
+      up:     102 ms ( 21.7%) over   48 calls
+    silu:      10 ms (  2.3%) over   48 calls
+    down:     103 ms ( 21.9%) over   48 calls
+    wsum:      11 ms (  2.5%) over   48 calls
+[prefill-profile] tokens=42 total=437 ms (96 t/s)
+    attn:      42 ms (  9.8%) over   48 calls
+     moe:     360 ms ( 82.4%) over   48 calls
+   other:      34 ms (  7.8%) over    1 calls
+    host:      11 ms (  2.7%) over   48 calls
+    gate:      93 ms ( 21.4%) over   48 calls
+      up:      94 ms ( 21.5%) over   48 calls
+    silu:      11 ms (  2.7%) over   48 calls
+    down:      91 ms ( 20.9%) over   48 calls
+    wsum:      11 ms (  2.7%) over   48 calls
+[batched-decode-prof] m=13 layers=48 total=370 ms | dense=79 (21.5%) | attn_peritem=24 (6.5%) | moe=220 (59.5%) [route=11 gate=0 up=0 silu=78 down=67 wsum=12] | other=46 (12.6%)
+[batched-decode-prof] m=16 layers=48 total=1073 ms | dense=119 (11.1%) | attn_peritem=116 (10.8%) | moe=790 (73.7%) [route=11 gate=0 up=0 silu=433 down=277 wsum=13] | other=46 (4.4%)
+[batched-decode-prof] m=16 layers=48 total=1133 ms | dense=127 (11.3%) | attn_peritem=119 (10.5%) | moe=844 (74.5%) [route=11 gate=0 up=0 silu=447 down=307 wsum=12] | other=42 (3.7%)
+[batched-decode-prof] m=16 layers=48 total=1105 ms | dense=143 (13.0%) | attn_peritem=117 (10.6%) | moe=803 (72.7%) [route=12 gate=0 up=0 silu=422 down=295 wsum=12] | other=41 (3.7%)
+[batched-decode-prof] m=12 layers=48 total=1085 ms | dense=136 (12.6%) | attn_peritem=115 (10.7%) | moe=791 (72.9%) [route=11 gate=0 up=0 silu=426 down=283 wsum=12] | other=41 (3.8%)
+[batched-decode-prof] m=9 layers=48 total=1029 ms | dense=122 (11.9%) | attn_peritem=120 (11.7%) | moe=745 (72.5%) [route=11 gate=0 up=0 silu=404 down=260 wsum=11] | other=41 (4.0%)
+[batched-decode-prof] m=6 layers=48 total=1003 ms | dense=137 (13.7%) | attn_peritem=114 (11.5%) | moe=709 (70.7%) [route=11 gate=0 up=0 silu=383 down=241 wsum=12] | other=42 (4.2%)
+[batched-decode-prof] m=3 layers=48 total=962 ms | dense=146 (15.3%) | attn_peritem=105 (11.0%) | moe=667 (69.3%) [route=12 gate=0 up=0 silu=358 down=222 wsum=11] | other=42 (4.4%)

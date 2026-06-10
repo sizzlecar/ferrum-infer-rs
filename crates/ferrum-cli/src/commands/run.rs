@@ -429,6 +429,11 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         model_definition_for_config.as_ref(),
         effective_runtime_config,
     )?;
+    // Apply the resolved auto-config knobs the same way `serve` does. Without
+    // this, `ferrum run` ignored the resolved config (e.g. the CUDA GPTQ-MoE
+    // fast path FERRUM_VLLM_MOE / MOE_DEVICE_ROUTE) and fell back to the slow
+    // host-route MoE — ~9.7 vs ~59 tok/s on a 4090 for Qwen3-30B-A3B.
+    crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
     crate::commands::serve::write_startup_config_artifacts(
         &startup_auto_config,
         cmd.effective_config_json.as_deref(),
@@ -436,7 +441,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     )?;
     let run_budget = RunBudget::from_source(&source.local_path, &runtime_config);
     engine_config
-        .apply_runtime_config_snapshot(&runtime_config)
+        .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
     if runtime_config_bool(&runtime_config, "FERRUM_METAL_PAGED_KV").unwrap_or(false) {
         engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
