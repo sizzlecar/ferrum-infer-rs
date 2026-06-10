@@ -29,10 +29,46 @@ TEST_ARCH GOAL PASS: <out_dir>
 | --- | --- |
 | 0 baseline + tooling | done |
 | 1 tiny-model full-stack suite | done (hb-07 deferred) |
-| 2 op conformance matrix + fallback law | partial — manifest 4/20 reconciled, Llama fallback law done; 16 op parity + MoE fallback + launch-plan pending (need Metal/CUDA) |
-| 3 main-path decoupling | pending (hot-path refactor; needs Metal fingerprint to de-risk) |
+| 2 op conformance matrix + fallback law | partial — manifest 6/20 (added residual_add, fused_add_rms_norm), Llama fallback law done; 14 op parity + MoE fallback + launch-plan pending (need Metal/CUDA) |
+| 3 main-path decoupling | partial — hot-path cfg coupling removed + device-init allowlist (Gate A2: cfg outside allowlist = 0); env/supports/OnceLock migration pending |
 | 4 regression tiers + README matrix | partial — manifest + README guard + explosion-radius classifier done (local); lane wiring + matrix RUN pending (need GPU) |
 | 5 kill-rate + stability + final PASS | partial — new-test anti-flake 10/10+5/5 green; CUDA kills + full lanes pending (need pod) |
+
+## Gate A (platform isolation) — current measured state
+
+| Sub-gate | Target | Now (outside allowlist) |
+| --- | --- | --- |
+| A1 env_var | 0 | 7 (migration target) |
+| A2 cfg_branch | 0 | **0** — 20 legitimate device-init branches allowlisted |
+| A3 supports_*() | 0 | 18 (structural migration target) |
+| A3b OnceLock | 0 | 7 (config-freeze migration target) |
+| A4 op conformance | 20/20 | 6/20 |
+
+The one genuine hot-path platform coupling — the engine's
+`cfg(target_os=macos)` unified-vs-legacy routing — is removed: the
+device→capability decision now lives in `ModelExecutor::
+supports_native_unified_decode()` (executor is backend-aware), so the
+engine carries no platform cfg. Behavior preserved (CPU verified by
+tiny_stack; Metal/CUDA preserved by construction). The remaining cfg
+branches are device construction/detection at the composition root and
+are legitimately allowlisted.
+
+## Remaining decoupling plan (env / supports / OnceLock)
+
+These are NOT allowlistable — the GOAL targets them for migration:
+
+- **env_var (7) + OnceLock (7)**: all the `*_runtime_config()` accessors
+  that do `OnceLock.get_or_init(|| Config::from_env_vars(std::env::vars()))`
+  (llama_family, llama_family_forward_batched, qwen3_moe_runtime, engine
+  registry/builder/continuous_engine). Fix: read env once at the CLI/serve
+  composition root, build the typed config, thread it through construction.
+  Bounded but broad (touches every accessor call site). Low behavioral risk
+  (env isn't mutated at runtime) but should land with the L0 suite green.
+- **supports_*() (18)**: structural — these choose between genuinely
+  different forward paths (varlen-batched vs per-item, paged setup). Cannot
+  collapse to a single trait method without restructuring model forward
+  logic. Needs Metal + CUDA parity validation before moving, per the GOAL's
+  behavior-invariance rule. Highest-risk, last.
 
 ## What needs GPU vs what is done locally
 
