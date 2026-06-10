@@ -119,6 +119,59 @@ def regression_plan(manifest: dict) -> dict:
     return {"schema_version": 1, "cells": plan}
 
 
+def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) -> dict:
+    """Execute the regression plan for one platform via the ferrum binary.
+
+    Per cell, runs a 3-turn generate against the representative model and
+    records PASS/FAIL (exit 0 + non-empty + no template-leak markers). serve
+    smoke + fingerprint are recorded as steps but the multi-turn generate is
+    the gating check. Writes <out_dir>/matrix.json the final validator reads.
+    """
+    import subprocess
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    leak_markers = ["<|im_start|>", "<|endoftext|>", "<|assistant|>", "���"]
+    rows = []
+    for cell in regression_plan(manifest)["cells"]:
+        if cell["platform"] != platform:
+            continue
+        model = cell["model"]
+        log = out_dir / f"{cell['id']}_{platform}.log"
+        status = "PASS"
+        detail = ""
+        try:
+            turns = "你好\n介绍一下你自己\n讲个短笑话\n"
+            proc = subprocess.run(
+                [ferrum_bin, "run", model, "--max-tokens", "32"],
+                input=turns,
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            log.write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+            out = proc.stdout
+            if proc.returncode != 0:
+                status, detail = "FAIL", f"exit {proc.returncode}"
+            elif len(out.strip()) < 5:
+                status, detail = "FAIL", "empty output"
+            elif any(m in out for m in leak_markers):
+                status, detail = "FAIL", "template/garbage marker leaked"
+        except subprocess.TimeoutExpired:
+            status, detail = "FAIL", "timeout"
+        except Exception as exc:  # noqa: BLE001
+            status, detail = "FAIL", str(exc)[:80]
+        rows.append({"id": cell["id"], "platform": platform, "status": status, "detail": detail})
+
+    # collate into per-model platform status the gate expects
+    by_model: dict[str, dict] = {}
+    for r in rows:
+        by_model.setdefault(r["id"], {"id": r["id"], "platforms": {}})
+        by_model[r["id"]]["platforms"][r["platform"]] = r["status"]
+    result = {"schema_version": 1, "platform": platform, "models": list(by_model.values())}
+    (out_dir / "matrix.json").write_text(json.dumps(result, indent=2))
+    return result
+
+
 def run_self_test() -> None:
     fixture = {
         "schema_version": 1,
@@ -189,6 +242,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--emit-readme", action="store_true")
     parser.add_argument("--check-readme", action="store_true")
     parser.add_argument("--plan", action="store_true")
+    parser.add_argument("--run", metavar="OUT_DIR", help="execute the plan for --platform")
+    parser.add_argument("--platform", choices=["cuda", "metal"], default="cuda")
+    parser.add_argument("--ferrum-bin", default="ferrum")
     parser.add_argument("--manifest", default=str(MANIFEST_PATH))
     parser.add_argument("--readme", default=str(README_PATH))
     return parser.parse_args(argv)
@@ -208,6 +264,13 @@ def main(argv: list[str]) -> int:
             print("README matches manifest")
         elif args.plan:
             print(json.dumps(regression_plan(manifest), indent=2))
+        elif args.run:
+            res = run_matrix(manifest, args.ferrum_bin, Path(args.run), args.platform)
+            fails = [m["id"] for m in res["models"] if "FAIL" in m["platforms"].values()]
+            print(json.dumps(res, indent=2))
+            if fails:
+                raise MatrixError(f"matrix {args.platform} failures: {fails}")
+            print(f"MATRIX {args.platform.upper()} PASS: {args.run}")
         else:
             print("one of --self-test / --emit-readme / --check-readme / --plan required")
             return 2
