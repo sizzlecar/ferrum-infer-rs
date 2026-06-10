@@ -1,2 +1,34 @@
-(eval):5: no such file or directory: /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/release/ferrum
-EXIT=127
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+[2m2026-06-10T10:54:36.746988Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-10T10:54:36.747015Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-10T10:54:36.747166Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+[2m2026-06-10T10:54:36.912720Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-10T10:54:36.912777Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-10T10:54:36.912782Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-10T10:54:36.912797Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+[2m2026-06-10T10:54:36.912860Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+Model loaded in 1.9s.
+
+Ready. Type your message and press Enter.
+Use /clear to reset history; /bye or Ctrl+D to exit.
+
+你好！很高兴见到你！😊 今天过得怎么样？有什么我可以帮你的吗？
+[19 tokens, 0.1 tok/s, 232.2s]
+
+你好！我是通义千问，是阿里巴巴集团研发的超大规模语言模型。我可以帮助你完成各种任务，比如回答问题、创作文字、
+[32 tokens, 0.1 tok/s, 376.0s]
+
+好的，来一个轻松的：
+
+有一天，小明去面试，老板问他：“你有什么特长？”
+
+小明说：“我特别擅长听故事。”
+
+
+[32 tokens, 0.1 tok/s, 378.6s]
+
+Goodbye!
+EXIT=0
