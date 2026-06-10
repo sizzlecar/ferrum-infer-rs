@@ -1,0 +1,11 @@
+{
+  "cmd": [
+    "scripts/release/g0_source_gate.sh",
+    "unit",
+    "docs/release/g0/0.7.7/unit"
+  ],
+  "duration_sec": 31.249199750367552,
+  "env_overrides": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

@@ -1,0 +1,23 @@
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=5.3 GB budget / 5.3 GB total | layers=32 budget | scratch reserve=4.0 GB | KV pool budget 12.2 GB → max_blocks=6270
+[auto-size] KV_MAX_BLOCKS=6270 PAGED_MAX_SEQS=2 KV_CAPACITY=16384
+Loading hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4...
+Using CUDA(0) backend
+Loading weights to GPU... (30s+ for >10 GB models)
+[2m2026-06-10T20:32:41.409412Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-10T20:32:41.409435Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-10T20:32:41.409491Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--hugging-quants--Meta-Llama-3.1-8B-Instruct-GPTQ-INT4/snapshots/f184d2b18e2b7c257af79aa0bc53ef3ee505caa2/tokenizer.json"
+[2m2026-06-10T20:32:41.710777Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-10T20:32:41.710798Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-10T20:32:41.710801Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-10T20:32:41.710806Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating default KV cache manager: device=CUDA(0), block_size=16, max_blocks=6270
+[2m2026-06-10T20:32:41.710855Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /workspace/hf-cache/hub/models--hugging-quants--Meta-Llama-3.1-8B-Instruct-GPTQ-INT4/snapshots/f184d2b18e2b7c257af79aa0bc53ef3ee505caa2 (format: safetensors)
+[2m2026-06-10T20:32:41.710975Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Llama, Layers: 32, Vocab: 128256
+[2m2026-06-10T20:32:41.887030Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-10T20:32:41.887117Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-10T20:32:41.887126Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Llama via LlamaFamilyModel
+[2m2026-06-10T20:32:41.887133Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+Model loaded in 19.1s.
+[batched-qkr] first batched_decode call: m=1 use_batched_qkr=true (q=None k=None v=None)
+[batched-kv-append] first call: m=1 ok=true k_err=None v_err=None
+[batched-attn] first call: m=1 ok=true err=None

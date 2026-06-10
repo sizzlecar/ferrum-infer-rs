@@ -1,0 +1,855 @@
+{
+  "artifact_verdict": "pass",
+  "auto_config_decision_count": 10,
+  "base_env": {
+    "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}"
+  },
+  "bench_json": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/bench.json",
+  "bench_log": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/bench.log",
+  "binary_sha256": "sha256:7ec83626eb19b5c229d19f095fbaf5d7ba114180a4434f9749aeb73abf3f4899",
+  "case_env": {},
+  "cleanup_status": {
+    "global_process_findings": [],
+    "global_process_hygiene_ok": true,
+    "post_process_scan": "    PID    PPID STAT     ELAPSED CMD\n      1       0 Ss      01:23:10 /bin/sh -c while [ ! -e /.launch ]; do sleep 1; done; bash /.launch\n     50       1 S       01:23:09 bash /.launch\n    365       1 S       01:23:05 bash /.launch\n    369     365 S       01:23:05 bash /root/onstart.sh\n    370     365 S       01:23:05 tee -a /var/log/onstart.log\n    374       1 Ss      01:23:05 sshd: /usr/sbin/sshd -E /proc/1/fd/1 [listener] 2 of 10-100 startups\n    380      50 S       01:23:05 ssh -i /etc/forward_key -R *:19138:localhost:22 -R *:19139:localhost:8080 -N -o TCPKeepAlive=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 ubuntu@ssh1.vast.ai -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o RequestTTY=no -o ExitOnForwardFailure=yes\n   5288     369 S       01:22:57 sleep infinity\n  15446       1 Ss         21:53 tmux new-session -d -s ferrum-cuda-full-rerun set -euo pipefail; . /root/.cargo/env; export HF_HOME=/workspace/hf-cache; cd /workspace/ferrum-infer-rs; python3 scripts/release/run_gate.py cuda-full --out docs/release/g0/0.7.7/cuda-full > /workspace/g0/0.7.7/cuda-full-rerun.session.log 2>&1; echo \\0 > /workspace/g0/0.7.7/cuda-full-rerun.exit\n  15447   15446 Ss+        21:53 bash -c set -euo pipefail; . /root/.cargo/env; export HF_HOME=/workspace/hf-cache; cd /workspace/ferrum-infer-rs; python3 scripts/release/run_gate.py cuda-full --out docs/release/g0/0.7.7/cuda-full > /workspace/g0/0.7.7/cuda-full-rerun.session.log 2>&1; echo \\0 > /workspace/g0/0.7.7/cuda-full-rerun.exit\n  15449   15447 S+         21:53 python3 scripts/release/run_gate.py cuda-full --out docs/release/g0/0.7.7/cuda-full\n  15450   15449 S+         21:53 bash scripts/release/g0_source_gate.sh cuda-full docs/release/g0/0.7.7/cuda-full\n  16511   15450 S+         01:37 python3 scripts/m3_ab_runner.py --config docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c32.json\n  16791     374 Ss         00:02 sshd: root [priv]\n  16792     374 Ss         00:02 sshd: root [priv]\n  16793   16791 S          00:02 sshd: root [net]\n  16794   16792 S          00:02 sshd: root [net]\n  16810   16511 R+         00:00 ps -eo pid,ppid,stat,etime,cmd\n",
+    "process_leak_ok": true,
+    "process_leaks": [],
+    "returncode": 0,
+    "sent_int": true,
+    "sent_kill": false,
+    "server_pid": 16532
+  },
+  "correctness_gates": [
+    {
+      "content": "The capital of France is **Paris**.",
+      "finish_reason": "stop",
+      "name": "paris",
+      "ok": true
+    },
+    {
+      "content": "Paris",
+      "finish_reason": "stop",
+      "name": "multi_turn_paris",
+      "ok": true
+    },
+    {
+      "content": "Paris",
+      "finish_reason": "stop",
+      "name": "multi_turn_3round_paris",
+      "ok": true
+    },
+    {
+      "name": "tool_call_regression",
+      "ok": true,
+      "path": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/tool-call-regression/tool_call_regression.json"
+    },
+    {
+      "name": "concurrency_quality",
+      "ok": true,
+      "path": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/concurrency-quality-regression/concurrency_quality_regression.json"
+    }
+  ],
+  "decision_trace_jsonl": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/decision_trace.jsonl",
+  "effective_config_json": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/effective_config.json",
+  "effective_env": {
+    "HF_HOME": "/workspace/hf-cache",
+    "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}"
+  },
+  "env_hash": "sha256:b00caa90b22dfa66d852cf9f8407430163a04724272f9d849f6e1b3134bc25fa",
+  "features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source",
+  "finished_at": "2026-06-10T20:30:12.352727+00:00",
+  "git_head": "22b8b7ada3fd586f018a95ba7c1d550d1c57001e",
+  "git_status_short": [
+    "?? docs/release/g0/0.7.7/"
+  ],
+  "health": {
+    "auto_config": {
+      "admission": {
+        "active_decode": 0,
+        "active_prefill": 0,
+        "backend": "cuda",
+        "completed_requests_total": 0,
+        "current_batch_size": 0,
+        "effective_max_concurrent": 32,
+        "failed_requests_total": 0,
+        "kv_block_count": 2048,
+        "kv_block_size_tokens": 16,
+        "kv_capacity_tokens": 32768,
+        "max_batched_tokens": 2048,
+        "max_model_length": null,
+        "max_sequences": 32,
+        "memory_estimate": {
+          "estimated_weight_bytes": 1619886080,
+          "kv_bytes_per_token": 98304,
+          "kv_capacity_bytes": 3221225472,
+          "vram_bytes": 25757220864
+        },
+        "model_architecture": "qwen3_moe",
+        "queue_depth": 0,
+        "rejected_requests_total": 0,
+        "scheduler_policy": "continuous_default",
+        "schema_version": 1
+      },
+      "backend": "cuda",
+      "cuda_device_count": 1,
+      "decisions": [
+        {
+          "affects": [
+            "performance",
+            "memory"
+          ],
+          "candidates": [
+            "fa2_source",
+            "fa2_direct_ffi",
+            "fa_layout_varlen",
+            "vllm_paged_varlen",
+            "legacy_paged_varlen"
+          ],
+          "rejected": [
+            {
+              "reason": "source-linked FA2 path not selected",
+              "value": "fa2_source"
+            },
+            {
+              "reason": "diagnostic direct FFI shim not selected",
+              "value": "fa2_direct_ffi"
+            },
+            {
+              "reason": "FA-compatible layout not selected",
+              "value": "fa_layout_varlen"
+            },
+            {
+              "reason": "a higher-priority attention path was selected",
+              "value": "legacy_paged_varlen"
+            }
+          ],
+          "schema_version": 1,
+          "selected": "vllm_paged_varlen",
+          "selection": "attention_prefill_mixed_backend",
+          "source": "cli",
+          "source_key": "FERRUM_USE_VLLM_PAGED_ATTN"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "candidates": [
+            "vllm_paged_attn_v1_short",
+            "vllm_paged_attn_v2",
+            "legacy_paged_decode"
+          ],
+          "rejected": [
+            {
+              "reason": "v2 decode not selected",
+              "value": "vllm_paged_attn_v2"
+            },
+            {
+              "reason": "legacy decode not selected",
+              "value": "legacy_paged_decode"
+            }
+          ],
+          "schema_version": 1,
+          "selected": "vllm_paged_attn_v1_short",
+          "selection": "attention_decode_backend",
+          "source": "default",
+          "source_key": null
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "candidates": [
+            "vllm_marlin_moe_device_route_pair_ids",
+            "vllm_marlin_moe_device_route",
+            "vllm_marlin_moe",
+            "legacy_moe"
+          ],
+          "rejected": [
+            {
+              "reason": "device-route MoE not selected",
+              "value": "vllm_marlin_moe_device_route"
+            },
+            {
+              "reason": "vLLM Marlin MoE not selected",
+              "value": "vllm_marlin_moe"
+            },
+            {
+              "reason": "legacy MoE not selected",
+              "value": "legacy_moe"
+            }
+          ],
+          "schema_version": 1,
+          "selected": "vllm_marlin_moe_device_route_pair_ids",
+          "selection": "moe_implementation",
+          "source": "cli",
+          "source_key": "FERRUM_VLLM_MOE"
+        },
+        {
+          "affects": [
+            "performance",
+            "correctness"
+          ],
+          "candidates": [
+            "graph_clean_decode",
+            "graph_disabled"
+          ],
+          "rejected": [
+            {
+              "reason": "graph decode not selected",
+              "value": "graph_clean_decode"
+            }
+          ],
+          "schema_version": 1,
+          "selected": "graph_disabled",
+          "selection": "moe_graph_policy",
+          "source": "cli",
+          "source_key": "FERRUM_MOE_GRAPH"
+        },
+        {
+          "affects": [
+            "memory"
+          ],
+          "candidates": [
+            "2048"
+          ],
+          "rejected": [],
+          "schema_version": 1,
+          "selected": "2048",
+          "selection": "kv_block_count",
+          "source": "cli",
+          "source_key": "FERRUM_KV_MAX_BLOCKS"
+        },
+        {
+          "affects": [
+            "memory"
+          ],
+          "candidates": [
+            "32"
+          ],
+          "rejected": [],
+          "schema_version": 1,
+          "selected": "32",
+          "selection": "max_sequences",
+          "source": "cli",
+          "source_key": "FERRUM_PAGED_MAX_SEQS"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "candidates": [
+            "2048"
+          ],
+          "rejected": [],
+          "schema_version": 1,
+          "selected": "2048",
+          "selection": "max_batched_tokens",
+          "source": "memory_profile",
+          "source_key": "FERRUM_MAX_BATCHED_TOKENS"
+        },
+        {
+          "affects": [
+            "correctness",
+            "performance",
+            "memory"
+          ],
+          "candidates": [
+            "prefix_cache_enabled",
+            "prefix_cache_disabled"
+          ],
+          "rejected": [
+            {
+              "reason": "prefix cache not selected",
+              "value": "prefix_cache_enabled"
+            }
+          ],
+          "schema_version": 1,
+          "selected": "prefix_cache_disabled",
+          "selection": "prefix_cache_policy",
+          "source": "cli",
+          "source_key": "FERRUM_PREFIX_CACHE"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "candidates": [
+            "continuous_default",
+            "prompt_token_estimate",
+            "prefill_first_until_active",
+            "active_decode_prefill_chunk"
+          ],
+          "rejected": [],
+          "schema_version": 1,
+          "selected": "continuous_default",
+          "selection": "scheduler_admission_policy",
+          "source": "default",
+          "source_key": null
+        },
+        {
+          "affects": [
+            "performance",
+            "correctness"
+          ],
+          "candidates": [
+            "gpu_greedy_argmax",
+            "logits_readback"
+          ],
+          "rejected": [
+            {
+              "reason": "logits readback not selected",
+              "value": "logits_readback"
+            }
+          ],
+          "schema_version": 1,
+          "selected": "gpu_greedy_argmax",
+          "selection": "sampling_readback_path",
+          "source": "cli",
+          "source_key": "FERRUM_GREEDY_ARGMAX"
+        }
+      ],
+      "entries": [
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "cuda",
+          "key": "FERRUM_BACKEND",
+          "source": "cli"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_GREEDY_ARGMAX",
+          "source": "cli"
+        },
+        {
+          "affects": [
+            "memory"
+          ],
+          "effective_value": "512",
+          "key": "FERRUM_KV_CAPACITY",
+          "source": "cli"
+        },
+        {
+          "affects": [
+            "memory"
+          ],
+          "effective_value": "2048",
+          "key": "FERRUM_KV_MAX_BLOCKS",
+          "source": "cli"
+        },
+        {
+          "affects": [
+            "performance",
+            "memory"
+          ],
+          "effective_value": "2048",
+          "key": "FERRUM_MAX_BATCHED_TOKENS",
+          "source": "memory_profile"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_MOE_DEVICE_ROUTE",
+          "source": "memory_profile"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "0",
+          "key": "FERRUM_MOE_GRAPH",
+          "source": "cli"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "4",
+          "key": "FERRUM_MOE_STREAMS",
+          "source": "cli"
+        },
+        {
+          "affects": [
+            "performance",
+            "memory"
+          ],
+          "effective_value": "32",
+          "key": "FERRUM_PAGED_MAX_SEQS",
+          "source": "cli"
+        },
+        {
+          "affects": [
+            "correctness"
+          ],
+          "effective_value": "0",
+          "key": "FERRUM_PREFIX_CACHE",
+          "source": "cli"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_USE_VLLM_PAGED_ATTN",
+          "source": "memory_profile"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_VLLM_MOE",
+          "source": "memory_profile"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_VLLM_MOE_PAIR_IDS",
+          "source": "memory_profile"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+          "source": "memory_profile"
+        }
+      ],
+      "env_hash": "sha256:b00caa90b22dfa66d852cf9f8407430163a04724272f9d849f6e1b3134bc25fa",
+      "hardware_capabilities": {
+        "backend": "cuda",
+        "compiled_features": {
+          "cuda": true,
+          "cuda_graph": true,
+          "fa2_direct_ffi": true,
+          "fa2_source": true,
+          "greedy_argmax": true,
+          "vllm_moe_marlin": true,
+          "vllm_paged_attn": true
+        },
+        "compute_capability": "8.9",
+        "cuda_runtime": "12.4",
+        "graph_support": true,
+        "sm_count": 128,
+        "supported_dtypes": [
+          "fp16",
+          "fp32"
+        ],
+        "supported_kv_dtypes": [
+          "fp16",
+          "bf16",
+          "int8",
+          "fp8"
+        ],
+        "vram_bytes": 25757220864
+      },
+      "model_capabilities": {
+        "architecture": "qwen3_moe",
+        "estimated_weight_bytes": 1619886080,
+        "graph_safe_moe": false,
+        "head_dim": 128,
+        "kv_heads": 4,
+        "max_context_len": 40960,
+        "moe": {
+          "experts_per_token": 8,
+          "moe_intermediate_size": 768,
+          "num_experts": 128
+        },
+        "num_hidden_layers": 48,
+        "quantization": "gptq_int4",
+        "supported_dtypes": [
+          "fp16",
+          "fp32"
+        ]
+      },
+      "preset": "m3_qwen3_30b_a3b_int4",
+      "requested_gpu_devices": [
+        0
+      ],
+      "schema_version": 1,
+      "selected_admission_limit": 32,
+      "selected_attention_impl": "vllm_paged_attn_v1_short",
+      "selected_distributed_strategy": "single_gpu",
+      "selected_gpu_devices": [
+        0
+      ],
+      "selected_graph_mode": "graph_disabled",
+      "selected_kv_capacity": 512,
+      "selected_kv_layout": "paged",
+      "selected_layer_split_plan": null,
+      "selected_layer_split_stages": null,
+      "selected_max_batched_tokens": 2048,
+      "selected_max_model_len": null,
+      "selected_max_sequences": 32,
+      "selected_microbatch_size": 1,
+      "selected_pipeline_mode": "sequential",
+      "selected_stage_bridge": null,
+      "selected_weight_placement": "single_device",
+      "workload_profile": {
+        "output_length_class": "random_128",
+        "preset": "m3_qwen3_30b_a3b_int4",
+        "priority": "throughput",
+        "prompt_length_class": "random_256",
+        "serving_mode": "bench_serve",
+        "target_concurrency": 32
+      }
+    },
+    "ok": true,
+    "path": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/health.json",
+    "runtime_config": {
+      "entries": [
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "cuda",
+          "key": "FERRUM_BACKEND",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_GREEDY_ARGMAX",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "memory"
+          ],
+          "effective_value": "512",
+          "key": "FERRUM_KV_CAPACITY",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "memory"
+          ],
+          "effective_value": "2048",
+          "key": "FERRUM_KV_MAX_BLOCKS",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "performance",
+            "memory"
+          ],
+          "effective_value": "2048",
+          "key": "FERRUM_MAX_BATCHED_TOKENS",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_MOE_DEVICE_ROUTE",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "0",
+          "key": "FERRUM_MOE_GRAPH",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "4",
+          "key": "FERRUM_MOE_STREAMS",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "performance",
+            "memory"
+          ],
+          "effective_value": "32",
+          "key": "FERRUM_PAGED_MAX_SEQS",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "correctness"
+          ],
+          "effective_value": "0",
+          "key": "FERRUM_PREFIX_CACHE",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_USE_VLLM_PAGED_ATTN",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_VLLM_MOE",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_VLLM_MOE_PAIR_IDS",
+          "source": "env"
+        },
+        {
+          "affects": [
+            "performance"
+          ],
+          "effective_value": "1",
+          "key": "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+          "source": "env"
+        }
+      ]
+    },
+    "url": "http://127.0.0.1:19130/health"
+  },
+  "metrics": {
+    "bad_output": 0,
+    "completed": 384,
+    "duplicate_done": 0,
+    "errored": 0,
+    "http_500": 0,
+    "itl_p95": 122.25155693333325,
+    "malformed_stream": 0,
+    "missing_done": 0,
+    "panic": 0,
+    "stream_bulk_flush": 0,
+    "throughput_ci95_hw": 132.62792270305752,
+    "throughput_mean": 710.5009877061872,
+    "throughput_stddev": 53.38561483244559,
+    "tpot_p50": 42.34169713910761,
+    "ttft_p50": 404.05687366666666,
+    "zero_output_tokens": 0
+  },
+  "model_dir": "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+  "name": "baseline",
+  "not_publishable": false,
+  "not_publishable_reason": null,
+  "port": 19130,
+  "preset_env": {
+    "HF_HOME": "/workspace/hf-cache"
+  },
+  "profile": {
+    "enabled": false,
+    "profile_jsonl": null
+  },
+  "profile_env_enabled": false,
+  "profile_jsonl": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/profile.jsonl",
+  "runtime_config_snapshot": {
+    "entries": [
+      {
+        "affects": [
+          "performance"
+        ],
+        "effect": "performance",
+        "effective_value": "cuda",
+        "key": "FERRUM_BACKEND",
+        "source": "cli"
+      },
+      {
+        "affects": [
+          "performance"
+        ],
+        "effect": "performance",
+        "effective_value": "1",
+        "key": "FERRUM_GREEDY_ARGMAX",
+        "source": "cli"
+      },
+      {
+        "affects": [
+          "memory"
+        ],
+        "effect": "memory",
+        "effective_value": "512",
+        "key": "FERRUM_KV_CAPACITY",
+        "source": "cli"
+      },
+      {
+        "affects": [
+          "memory"
+        ],
+        "effect": "memory",
+        "effective_value": "2048",
+        "key": "FERRUM_KV_MAX_BLOCKS",
+        "source": "cli"
+      },
+      {
+        "affects": [
+          "performance",
+          "memory"
+        ],
+        "effect": "performance",
+        "effective_value": "2048",
+        "key": "FERRUM_MAX_BATCHED_TOKENS",
+        "source": "memory_profile"
+      },
+      {
+        "affects": [
+          "performance"
+        ],
+        "effect": "performance",
+        "effective_value": "1",
+        "key": "FERRUM_MOE_DEVICE_ROUTE",
+        "source": "memory_profile"
+      },
+      {
+        "affects": [
+          "performance"
+        ],
+        "effect": "performance",
+        "effective_value": "0",
+        "key": "FERRUM_MOE_GRAPH",
+        "source": "cli"
+      },
+      {
+        "affects": [
+          "performance"
+        ],
+        "effect": "performance",
+        "effective_value": "4",
+        "key": "FERRUM_MOE_STREAMS",
+        "source": "cli"
+      },
+      {
+        "affects": [
+          "performance",
+          "memory"
+        ],
+        "effect": "performance",
+        "effective_value": "32",
+        "key": "FERRUM_PAGED_MAX_SEQS",
+        "source": "cli"
+      },
+      {
+        "affects": [
+          "correctness"
+        ],
+        "effect": "correctness",
+        "effective_value": "0",
+        "key": "FERRUM_PREFIX_CACHE",
+        "source": "cli"
+      },
+      {
+        "affects": [
+          "performance"
+        ],
+        "effect": "performance",
+        "effective_value": "1",
+        "key": "FERRUM_USE_VLLM_PAGED_ATTN",
+        "source": "memory_profile"
+      },
+      {
+        "affects": [
+          "performance"
+        ],
+        "effect": "performance",
+        "effective_value": "1",
+        "key": "FERRUM_VLLM_MOE",
+        "source": "memory_profile"
+      },
+      {
+        "affects": [
+          "performance"
+        ],
+        "effect": "performance",
+        "effective_value": "1",
+        "key": "FERRUM_VLLM_MOE_PAIR_IDS",
+        "source": "memory_profile"
+      },
+      {
+        "affects": [
+          "performance"
+        ],
+        "effect": "performance",
+        "effective_value": "1",
+        "key": "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+        "source": "memory_profile"
+      }
+    ],
+    "env_hash": "sha256:b00caa90b22dfa66d852cf9f8407430163a04724272f9d849f6e1b3134bc25fa",
+    "preset": "m3_qwen3_30b_a3b_int4",
+    "schema_version": 1
+  },
+  "runtime_preset": "m3_qwen3_30b_a3b_int4",
+  "schema_version": 1,
+  "server_log": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/server.log",
+  "started_at": "2026-06-10T20:28:35.704571+00:00",
+  "status": "pass",
+  "validation_checklist": {
+    "baseline_case": "baseline",
+    "bench_completion": {
+      "completed": 384,
+      "errored": 0,
+      "ok": true,
+      "required": true
+    },
+    "case": "baseline",
+    "change_type": "default_path",
+    "local_gates": [],
+    "observed_correctness_gates": [
+      {
+        "evidence": "The capital of France is **Paris**.",
+        "name": "paris",
+        "ok": true
+      },
+      {
+        "evidence": "Paris",
+        "name": "multi_turn_paris",
+        "ok": true
+      },
+      {
+        "evidence": "Paris",
+        "name": "multi_turn_3round_paris",
+        "ok": true
+      },
+      {
+        "evidence": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/tool-call-regression/tool_call_regression.json",
+        "name": "tool_call_regression",
+        "ok": true
+      },
+      {
+        "evidence": "docs/release/g0/0.7.7/cuda-full/c32/baseline_c32_n3/concurrency-quality-regression/concurrency_quality_regression.json",
+        "name": "concurrency_quality",
+        "ok": true
+      }
+    ],
+    "performance_regression_required": true,
+    "required_correctness_gates": [
+      "paris",
+      "multi_turn_paris",
+      "multi_turn_3round_paris",
+      "tool_call_regression",
+      "concurrency_quality",
+      "bench_completion"
+    ],
+    "schema_version": 1,
+    "skipped_gates": [],
+    "touched_areas": [
+      "model_forward",
+      "runtime_defaults",
+      "openai_server_api"
+    ]
+  }
+}

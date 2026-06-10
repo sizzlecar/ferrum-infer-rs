@@ -1,0 +1,1 @@
+{"id":"bfcc003f-cabe-435d-92bb-f33825ac56c8","object":"chat.completion","created":1781122796,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"北京现在天气晴朗，温度22摄氏度。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":149,"completion_tokens":14,"total_tokens":163}}

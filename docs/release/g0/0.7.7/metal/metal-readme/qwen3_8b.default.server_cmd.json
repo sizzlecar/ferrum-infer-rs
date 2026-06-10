@@ -1,0 +1,14 @@
+[
+  "target/release/ferrum",
+  "serve",
+  "--model",
+  "/Users/chejinxuan/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "18281",
+  "--effective-config-json",
+  "docs/release/g0/0.7.7/metal/metal-readme/qwen3_8b.default.effective_config.json",
+  "--decision-trace-jsonl",
+  "docs/release/g0/0.7.7/metal/metal-readme/qwen3_8b.default.decision_trace.jsonl"
+]

@@ -1,0 +1,41 @@
+{
+  "artifact_dir": "docs/release/g0/0.7.7/cuda-full",
+  "binary": {
+    "path": "target/release/ferrum",
+    "sha256": "7ec83626eb19b5c229d19f095fbaf5d7ba114180a4434f9749aeb73abf3f4899"
+  },
+  "child_pass_line": null,
+  "child_returncode": 1,
+  "command_line": [
+    "/usr/bin/python3",
+    "scripts/release/run_gate.py",
+    "cuda-full",
+    "--out",
+    "docs/release/g0/0.7.7/cuda-full"
+  ],
+  "delegated_command_line": [
+    "scripts/release/g0_source_gate.sh",
+    "cuda-full",
+    "docs/release/g0/0.7.7/cuda-full"
+  ],
+  "dirty_status": {
+    "is_dirty": true,
+    "status_short": [
+      "?? docs/release/g0/0.7.7/"
+    ]
+  },
+  "duration_sec": 1007.8795191720128,
+  "error": "delegated command failed rc=1",
+  "finished_at": "2026-06-10T20:01:16.233610+00:00",
+  "git_sha": "65b7112915631ef4a76fcd90bcd27889380efcd9",
+  "lane": "cuda-full",
+  "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+  "pass_line": null,
+  "sanitized_env": {
+    "HF_HOME": "/workspace/hf-cache",
+    "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+  },
+  "schema_version": 1,
+  "started_at": "2026-06-10T19:44:28.354085+00:00",
+  "status": "fail"
+}

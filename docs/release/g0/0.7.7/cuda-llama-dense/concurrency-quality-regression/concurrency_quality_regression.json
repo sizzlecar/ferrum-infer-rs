@@ -1,0 +1,58 @@
+{
+  "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+  "cells": [
+    {
+      "concurrency": 1,
+      "requests": 1,
+      "status_200": 1,
+      "json_ok": 1,
+      "marker_ok": 1,
+      "square_ok": 1,
+      "format_ok": 1,
+      "crosstalk": 0,
+      "length_finishes": 0,
+      "forbidden_count": 0,
+      "passed": true
+    },
+    {
+      "concurrency": 4,
+      "requests": 4,
+      "status_200": 4,
+      "json_ok": 4,
+      "marker_ok": 4,
+      "square_ok": 4,
+      "format_ok": 4,
+      "crosstalk": 0,
+      "length_finishes": 0,
+      "forbidden_count": 0,
+      "passed": true
+    },
+    {
+      "concurrency": 16,
+      "requests": 16,
+      "status_200": 16,
+      "json_ok": 16,
+      "marker_ok": 16,
+      "square_ok": 16,
+      "format_ok": 16,
+      "crosstalk": 0,
+      "length_finishes": 0,
+      "forbidden_count": 0,
+      "passed": true
+    },
+    {
+      "concurrency": 32,
+      "requests": 32,
+      "status_200": 32,
+      "json_ok": 32,
+      "marker_ok": 32,
+      "square_ok": 32,
+      "format_ok": 32,
+      "crosstalk": 0,
+      "length_finishes": 0,
+      "forbidden_count": 0,
+      "passed": true
+    }
+  ],
+  "status": "pass"
+}

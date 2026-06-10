@@ -1,0 +1,1605 @@
+{
+  "ferrum_version": "ferrum 0.7.7\n",
+  "swap_start": "vm.swapusage: total = 11264.00M  used = 10251.50M  free = 1012.50M  (encrypted)",
+  "vm_stat_start": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              105425.\nPages active:                            802701.\nPages inactive:                          833093.\nPages speculative:                        14915.\nPages throttled:                              0.\nPages wired down:                        200537.\nPages purgeable:                           8041.\n\"Translation faults\":                8771867373.\nPages copy-on-write:                  488139594.\nPages zero filled:                   5391309851.\nPages reactivated:                    337019200.",
+  "models": [
+    {
+      "key": "llama31_8b",
+      "label": "Llama-3.1-8B",
+      "gguf": "/Users/chejinxuan/ferrum-bench/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+      "moe": false,
+      "default_startup": {
+        "config_path": "docs/release/g0/0.7.7/metal/metal-readme/llama31_8b.default.effective_config.json",
+        "max_sequences": 16,
+        "min_required_max_sequences": 16,
+        "max_allowed_max_sequences": null,
+        "passed": true,
+        "values": {
+          "FERRUM_PAGED_MAX_SEQS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_PAGED_MAX_SEQS",
+            "source": "default"
+          },
+          "FERRUM_KV_CAPACITY": {
+            "affects": [
+              "memory"
+            ],
+            "effective_value": "512",
+            "key": "FERRUM_KV_CAPACITY",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCH": {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_MAX_BATCH",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCHED_TOKENS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "2048",
+            "key": "FERRUM_MAX_BATCHED_TOKENS",
+            "source": "memory_profile"
+          },
+          "FERRUM_METAL_PAGED_KV": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "1",
+            "key": "FERRUM_METAL_PAGED_KV",
+            "source": "default"
+          }
+        },
+        "server_rc": null,
+        "config_written": true
+      },
+      "serve_startup": {
+        "config_path": "docs/release/g0/0.7.7/metal/metal-readme/llama31_8b.effective_config.json",
+        "max_sequences": 16,
+        "min_required_max_sequences": 16,
+        "max_allowed_max_sequences": null,
+        "passed": true,
+        "values": {
+          "FERRUM_PAGED_MAX_SEQS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_PAGED_MAX_SEQS",
+            "source": "default"
+          },
+          "FERRUM_KV_CAPACITY": {
+            "affects": [
+              "memory"
+            ],
+            "effective_value": "512",
+            "key": "FERRUM_KV_CAPACITY",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCH": {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_MAX_BATCH",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCHED_TOKENS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "2048",
+            "key": "FERRUM_MAX_BATCHED_TOKENS",
+            "source": "memory_profile"
+          },
+          "FERRUM_METAL_PAGED_KV": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "1",
+            "key": "FERRUM_METAL_PAGED_KV",
+            "source": "default"
+          }
+        }
+      },
+      "chat": {
+        "paris": {
+          "status": 200,
+          "passed": true,
+          "content": "Paris",
+          "finish_reason": "stop"
+        },
+        "multiturn": {
+          "status": 200,
+          "passed": true,
+          "content": "蓝色月亮",
+          "finish_reason": "stop"
+        },
+        "stream": {
+          "status": 200,
+          "passed": true,
+          "chunks": 5,
+          "done_count": 1,
+          "content_head": "你好！",
+          "error": ""
+        },
+        "stateful_loop": {
+          "passed": true,
+          "requests": 6,
+          "failed": 0,
+          "length_finishes": 0,
+          "repeated_prefixes": 0,
+          "rows": [
+            {
+              "name": "paris",
+              "status": 200,
+              "expected": "paris",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Paris",
+              "passed": true
+            },
+            {
+              "name": "tokyo",
+              "status": 200,
+              "expected": "tokyo",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Tokyo",
+              "passed": true
+            },
+            {
+              "name": "math4",
+              "status": 200,
+              "expected": "4",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "4",
+              "passed": true
+            },
+            {
+              "name": "blue",
+              "status": 200,
+              "expected": "blue",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Blue.",
+              "passed": true
+            },
+            {
+              "name": "math25",
+              "status": 200,
+              "expected": "25",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "25",
+              "passed": true
+            },
+            {
+              "name": "rome",
+              "status": 200,
+              "expected": "rome",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Rome",
+              "passed": true
+            }
+          ]
+        }
+      },
+      "run": {
+        "passed": true,
+        "rc": 0,
+        "assistant": [
+          "已记住。",
+          "蓝色月亮"
+        ],
+        "jsonl_perf": {
+          "completion_tokens": 10,
+          "ms": 954.435792,
+          "tok_s": 10.477394167129056,
+          "passed": true
+        },
+        "text_long": {
+          "passed": true,
+          "rc": 0,
+          "no_abort": true,
+          "rust_ok": true,
+          "turn_stat_lines": 4,
+          "tok_s_values": [
+            22.5,
+            27.0,
+            26.8,
+            15.0
+          ],
+          "perf_ok": true,
+          "contains_think": false,
+          "orphan_think_close": false,
+          "contains_unk": false,
+          "contains_pad": false
+        },
+        "no_abort": true,
+        "first_turn_ok": true,
+        "second_turn_ok": true,
+        "contains_secret": true
+      },
+      "cells": [
+        {
+          "concurrency": 1,
+          "prompts": 8,
+          "baseline_tps": 29.1,
+          "random_input_len": 16,
+          "random_output_len": 64,
+          "quality": {
+            "concurrency": 1,
+            "requests": 1,
+            "status_200": 1,
+            "marker_ok": 1,
+            "square_ok": 1,
+            "format_ok": 1,
+            "crosstalk": 0,
+            "length_finishes": 0,
+            "passed": true,
+            "rows": [
+              {
+                "i": 0,
+                "status": 200,
+                "marker": "KM0100Z",
+                "square": "S0001",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM0100Z\nS0001"
+              }
+            ]
+          },
+          "runner_rc": 0,
+          "completed": 8,
+          "failed": 0,
+          "output_throughput_tok_s": 26.825329189374365,
+          "ratio_to_readme": 0.9218326181915589,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": null,
+          "tpot_median_ms": null
+        },
+        {
+          "concurrency": 8,
+          "prompts": 24,
+          "baseline_tps": 46.4,
+          "random_input_len": 16,
+          "random_output_len": 64,
+          "quality": {
+            "concurrency": 8,
+            "requests": 8,
+            "status_200": 8,
+            "marker_ok": 8,
+            "square_ok": 8,
+            "format_ok": 8,
+            "crosstalk": 0,
+            "length_finishes": 0,
+            "passed": true,
+            "rows": [
+              {
+                "i": 0,
+                "status": 200,
+                "marker": "KM0800Z",
+                "square": "S0001",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM0800Z\nS0001"
+              },
+              {
+                "i": 1,
+                "status": 200,
+                "marker": "KM0801Z",
+                "square": "S0004",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM0801Z\nS0004"
+              },
+              {
+                "i": 2,
+                "status": 200,
+                "marker": "KM0802Z",
+                "square": "S0009",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM0802Z\nS0009"
+              },
+              {
+                "i": 3,
+                "status": 200,
+                "marker": "KM0803Z",
+                "square": "S0016",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM0803Z\nS0016"
+              },
+              {
+                "i": 4,
+                "status": 200,
+                "marker": "KM0804Z",
+                "square": "S0025",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM0804Z\nS0025"
+              },
+              {
+                "i": 5,
+                "status": 200,
+                "marker": "KM0805Z",
+                "square": "S0036",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM0805Z\nS0036"
+              },
+              {
+                "i": 6,
+                "status": 200,
+                "marker": "KM0806Z",
+                "square": "S0049",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM0806Z\nS0049"
+              },
+              {
+                "i": 7,
+                "status": 200,
+                "marker": "KM0807Z",
+                "square": "S0064",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM0807Z\nS0064"
+              }
+            ]
+          },
+          "runner_rc": 0,
+          "completed": 24,
+          "failed": 0,
+          "output_throughput_tok_s": 45.61556191602108,
+          "ratio_to_readme": 0.9830940068107992,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": null,
+          "tpot_median_ms": null
+        },
+        {
+          "concurrency": 16,
+          "prompts": 32,
+          "baseline_tps": 80.9,
+          "random_input_len": 16,
+          "random_output_len": 64,
+          "quality": {
+            "concurrency": 16,
+            "requests": 16,
+            "status_200": 16,
+            "marker_ok": 16,
+            "square_ok": 16,
+            "format_ok": 16,
+            "crosstalk": 0,
+            "length_finishes": 0,
+            "passed": true,
+            "rows": [
+              {
+                "i": 0,
+                "status": 200,
+                "marker": "KM1600Z",
+                "square": "S0001",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1600Z\nS0001"
+              },
+              {
+                "i": 1,
+                "status": 200,
+                "marker": "KM1601Z",
+                "square": "S0004",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1601Z\nS0004"
+              },
+              {
+                "i": 2,
+                "status": 200,
+                "marker": "KM1602Z",
+                "square": "S0009",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1602Z\nS0009"
+              },
+              {
+                "i": 3,
+                "status": 200,
+                "marker": "KM1603Z",
+                "square": "S0016",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1603Z\nS0016"
+              },
+              {
+                "i": 4,
+                "status": 200,
+                "marker": "KM1604Z",
+                "square": "S0025",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1604Z\nS0025"
+              },
+              {
+                "i": 5,
+                "status": 200,
+                "marker": "KM1605Z",
+                "square": "S0036",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1605Z\nS0036"
+              },
+              {
+                "i": 6,
+                "status": 200,
+                "marker": "KM1606Z",
+                "square": "S0049",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1606Z\nS0049"
+              },
+              {
+                "i": 7,
+                "status": 200,
+                "marker": "KM1607Z",
+                "square": "S0064",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1607Z\nS0064"
+              },
+              {
+                "i": 8,
+                "status": 200,
+                "marker": "KM1608Z",
+                "square": "S0081",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1608Z\nS0081"
+              },
+              {
+                "i": 9,
+                "status": 200,
+                "marker": "KM1609Z",
+                "square": "S0100",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1609Z\nS0100"
+              },
+              {
+                "i": 10,
+                "status": 200,
+                "marker": "KM1610Z",
+                "square": "S0121",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1610Z\nS0121"
+              },
+              {
+                "i": 11,
+                "status": 200,
+                "marker": "KM1611Z",
+                "square": "S0144",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1611Z\nS0144"
+              },
+              {
+                "i": 12,
+                "status": 200,
+                "marker": "KM1612Z",
+                "square": "S0169",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1612Z\nS0169"
+              },
+              {
+                "i": 13,
+                "status": 200,
+                "marker": "KM1613Z",
+                "square": "S0196",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1613Z\nS0196"
+              },
+              {
+                "i": 14,
+                "status": 200,
+                "marker": "KM1614Z",
+                "square": "S0225",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1614Z\nS0225"
+              },
+              {
+                "i": 15,
+                "status": 200,
+                "marker": "KM1615Z",
+                "square": "S0256",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1615Z\nS0256"
+              }
+            ]
+          },
+          "runner_rc": 0,
+          "completed": 32,
+          "failed": 0,
+          "output_throughput_tok_s": 75.38292489201905,
+          "ratio_to_readme": 0.9318037687517805,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": null,
+          "tpot_median_ms": null
+        }
+      ],
+      "server_ready": true,
+      "tool_call": {
+        "model": "Llama-3.1-8B",
+        "checks": {
+          "omitted_tool_choice": {
+            "passed": true
+          },
+          "explicit_auto_tool_choice": {
+            "passed": true
+          },
+          "required_tool_choice": {
+            "passed": true
+          },
+          "tool_result_fill": {
+            "passed": true,
+            "finish_reason": "stop"
+          }
+        },
+        "status": "pass"
+      },
+      "unsafe_batch_probe": {
+        "enabled": false,
+        "reason": "not a MoE unsafe batch probe target"
+      }
+    },
+    {
+      "key": "qwen3_8b",
+      "label": "Qwen3-8B",
+      "gguf": "/Users/chejinxuan/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf",
+      "moe": false,
+      "default_startup": {
+        "config_path": "docs/release/g0/0.7.7/metal/metal-readme/qwen3_8b.default.effective_config.json",
+        "max_sequences": 16,
+        "min_required_max_sequences": 16,
+        "max_allowed_max_sequences": null,
+        "passed": true,
+        "values": {
+          "FERRUM_PAGED_MAX_SEQS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_PAGED_MAX_SEQS",
+            "source": "default"
+          },
+          "FERRUM_KV_CAPACITY": {
+            "affects": [
+              "memory"
+            ],
+            "effective_value": "512",
+            "key": "FERRUM_KV_CAPACITY",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCH": {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_MAX_BATCH",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCHED_TOKENS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "2048",
+            "key": "FERRUM_MAX_BATCHED_TOKENS",
+            "source": "memory_profile"
+          },
+          "FERRUM_METAL_PAGED_KV": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "1",
+            "key": "FERRUM_METAL_PAGED_KV",
+            "source": "default"
+          }
+        },
+        "server_rc": null,
+        "config_written": true
+      },
+      "serve_startup": {
+        "config_path": "docs/release/g0/0.7.7/metal/metal-readme/qwen3_8b.effective_config.json",
+        "max_sequences": 16,
+        "min_required_max_sequences": 16,
+        "max_allowed_max_sequences": null,
+        "passed": true,
+        "values": {
+          "FERRUM_PAGED_MAX_SEQS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_PAGED_MAX_SEQS",
+            "source": "default"
+          },
+          "FERRUM_KV_CAPACITY": {
+            "affects": [
+              "memory"
+            ],
+            "effective_value": "512",
+            "key": "FERRUM_KV_CAPACITY",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCH": {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_MAX_BATCH",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCHED_TOKENS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "2048",
+            "key": "FERRUM_MAX_BATCHED_TOKENS",
+            "source": "memory_profile"
+          },
+          "FERRUM_METAL_PAGED_KV": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "1",
+            "key": "FERRUM_METAL_PAGED_KV",
+            "source": "default"
+          }
+        }
+      },
+      "chat": {
+        "paris": {
+          "status": 200,
+          "passed": true,
+          "content": "Paris",
+          "finish_reason": "stop"
+        },
+        "multiturn": {
+          "status": 200,
+          "passed": true,
+          "content": "蓝色月亮",
+          "finish_reason": "stop"
+        },
+        "stream": {
+          "status": 200,
+          "passed": true,
+          "chunks": 8,
+          "done_count": 1,
+          "content_head": "你好，很高兴见到你！",
+          "error": ""
+        },
+        "stateful_loop": {
+          "passed": true,
+          "requests": 6,
+          "failed": 0,
+          "length_finishes": 0,
+          "repeated_prefixes": 0,
+          "rows": [
+            {
+              "name": "paris",
+              "status": 200,
+              "expected": "paris",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Paris",
+              "passed": true
+            },
+            {
+              "name": "tokyo",
+              "status": 200,
+              "expected": "tokyo",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Tokyo",
+              "passed": true
+            },
+            {
+              "name": "math4",
+              "status": 200,
+              "expected": "4",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "4",
+              "passed": true
+            },
+            {
+              "name": "blue",
+              "status": 200,
+              "expected": "blue",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Blue",
+              "passed": true
+            },
+            {
+              "name": "math25",
+              "status": 200,
+              "expected": "25",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "25",
+              "passed": true
+            },
+            {
+              "name": "rome",
+              "status": 200,
+              "expected": "rome",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Rome",
+              "passed": true
+            }
+          ]
+        }
+      },
+      "run": {
+        "passed": true,
+        "rc": 0,
+        "assistant": [
+          "已记住。",
+          "蓝色月亮"
+        ],
+        "jsonl_perf": {
+          "completion_tokens": 7,
+          "ms": 869.430167,
+          "tok_s": 8.051250423198164,
+          "passed": true
+        },
+        "text_long": {
+          "passed": true,
+          "rc": 0,
+          "no_abort": true,
+          "rust_ok": true,
+          "turn_stat_lines": 4,
+          "tok_s_values": [
+            15.5,
+            25.3,
+            25.4,
+            15.4
+          ],
+          "perf_ok": true,
+          "contains_think": false,
+          "orphan_think_close": false,
+          "contains_unk": false,
+          "contains_pad": false
+        },
+        "no_abort": true,
+        "first_turn_ok": true,
+        "second_turn_ok": true,
+        "contains_secret": true
+      },
+      "cells": [
+        {
+          "concurrency": 16,
+          "prompts": 32,
+          "baseline_tps": 57.1,
+          "random_input_len": 16,
+          "random_output_len": 64,
+          "quality": {
+            "concurrency": 16,
+            "requests": 16,
+            "status_200": 16,
+            "marker_ok": 16,
+            "square_ok": 16,
+            "format_ok": 16,
+            "crosstalk": 0,
+            "length_finishes": 0,
+            "passed": true,
+            "rows": [
+              {
+                "i": 0,
+                "status": 200,
+                "marker": "KM1600Z",
+                "square": "S0001",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1600Z  \nS0001"
+              },
+              {
+                "i": 1,
+                "status": 200,
+                "marker": "KM1601Z",
+                "square": "S0004",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1601Z  \nS0004"
+              },
+              {
+                "i": 2,
+                "status": 200,
+                "marker": "KM1602Z",
+                "square": "S0009",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1602Z  \nS0009"
+              },
+              {
+                "i": 3,
+                "status": 200,
+                "marker": "KM1603Z",
+                "square": "S0016",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1603Z  \nS0016"
+              },
+              {
+                "i": 4,
+                "status": 200,
+                "marker": "KM1604Z",
+                "square": "S0025",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1604Z  \nS0025"
+              },
+              {
+                "i": 5,
+                "status": 200,
+                "marker": "KM1605Z",
+                "square": "S0036",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1605Z  \nS0036"
+              },
+              {
+                "i": 6,
+                "status": 200,
+                "marker": "KM1606Z",
+                "square": "S0049",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1606Z  \nS0049"
+              },
+              {
+                "i": 7,
+                "status": 200,
+                "marker": "KM1607Z",
+                "square": "S0064",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1607Z  \nS0064"
+              },
+              {
+                "i": 8,
+                "status": 200,
+                "marker": "KM1608Z",
+                "square": "S0081",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1608Z  \nS0081"
+              },
+              {
+                "i": 9,
+                "status": 200,
+                "marker": "KM1609Z",
+                "square": "S0100",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1609Z  \nS0100"
+              },
+              {
+                "i": 10,
+                "status": 200,
+                "marker": "KM1610Z",
+                "square": "S0121",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1610Z  \nS0121"
+              },
+              {
+                "i": 11,
+                "status": 200,
+                "marker": "KM1611Z",
+                "square": "S0144",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1611Z  \nS0144"
+              },
+              {
+                "i": 12,
+                "status": 200,
+                "marker": "KM1612Z",
+                "square": "S0169",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1612Z  \nS0169"
+              },
+              {
+                "i": 13,
+                "status": 200,
+                "marker": "KM1613Z",
+                "square": "S0196",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1613Z  \nS0196"
+              },
+              {
+                "i": 14,
+                "status": 200,
+                "marker": "KM1614Z",
+                "square": "S0225",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1614Z  \nS0225"
+              },
+              {
+                "i": 15,
+                "status": 200,
+                "marker": "KM1615Z",
+                "square": "S0256",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1615Z  \nS0256"
+              }
+            ]
+          },
+          "runner_rc": 0,
+          "completed": 32,
+          "failed": 0,
+          "output_throughput_tok_s": 84.35998411200399,
+          "ratio_to_readme": 1.4774077777934147,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": null,
+          "tpot_median_ms": null
+        }
+      ],
+      "server_ready": true,
+      "tool_call": {
+        "model": "Qwen3-8B",
+        "checks": {
+          "omitted_tool_choice": {
+            "passed": true
+          },
+          "explicit_auto_tool_choice": {
+            "passed": true
+          },
+          "required_tool_choice": {
+            "passed": true
+          },
+          "tool_result_fill": {
+            "passed": true,
+            "finish_reason": "stop"
+          }
+        },
+        "status": "pass"
+      },
+      "unsafe_batch_probe": {
+        "enabled": false,
+        "reason": "not a MoE unsafe batch probe target"
+      }
+    },
+    {
+      "key": "qwen3_30b_a3b",
+      "label": "Qwen3-30B-A3B",
+      "gguf": "/Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf",
+      "moe": true,
+      "default_startup": {
+        "config_path": "docs/release/g0/0.7.7/metal/metal-readme/qwen3_30b_a3b.default.effective_config.json",
+        "max_sequences": 16,
+        "min_required_max_sequences": 16,
+        "max_allowed_max_sequences": null,
+        "passed": true,
+        "values": {
+          "FERRUM_PAGED_MAX_SEQS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_PAGED_MAX_SEQS",
+            "source": "default"
+          },
+          "FERRUM_KV_CAPACITY": {
+            "affects": [
+              "memory"
+            ],
+            "effective_value": "1024",
+            "key": "FERRUM_KV_CAPACITY",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCH": {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_MAX_BATCH",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCHED_TOKENS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "2048",
+            "key": "FERRUM_MAX_BATCHED_TOKENS",
+            "source": "default"
+          },
+          "FERRUM_METAL_PAGED_KV": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "1",
+            "key": "FERRUM_METAL_PAGED_KV",
+            "source": "default"
+          },
+          "FERRUM_MOE_HOST_TOPK": {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "1",
+            "key": "FERRUM_MOE_HOST_TOPK",
+            "source": "default"
+          }
+        },
+        "server_rc": null,
+        "config_written": true
+      },
+      "serve_startup": {
+        "config_path": "docs/release/g0/0.7.7/metal/metal-readme/qwen3_30b_a3b.effective_config.json",
+        "max_sequences": 16,
+        "min_required_max_sequences": 16,
+        "max_allowed_max_sequences": null,
+        "passed": true,
+        "values": {
+          "FERRUM_PAGED_MAX_SEQS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_PAGED_MAX_SEQS",
+            "source": "default"
+          },
+          "FERRUM_KV_CAPACITY": {
+            "affects": [
+              "memory"
+            ],
+            "effective_value": "1024",
+            "key": "FERRUM_KV_CAPACITY",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCH": {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "16",
+            "key": "FERRUM_MAX_BATCH",
+            "source": "default"
+          },
+          "FERRUM_MAX_BATCHED_TOKENS": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "2048",
+            "key": "FERRUM_MAX_BATCHED_TOKENS",
+            "source": "default"
+          },
+          "FERRUM_METAL_PAGED_KV": {
+            "affects": [
+              "performance",
+              "memory"
+            ],
+            "effective_value": "1",
+            "key": "FERRUM_METAL_PAGED_KV",
+            "source": "default"
+          },
+          "FERRUM_MOE_HOST_TOPK": {
+            "affects": [
+              "performance"
+            ],
+            "effective_value": "1",
+            "key": "FERRUM_MOE_HOST_TOPK",
+            "source": "default"
+          }
+        }
+      },
+      "chat": {
+        "paris": {
+          "status": 200,
+          "passed": true,
+          "content": "Paris",
+          "finish_reason": "stop"
+        },
+        "multiturn": {
+          "status": 200,
+          "passed": true,
+          "content": "蓝色月亮",
+          "finish_reason": "stop"
+        },
+        "stream": {
+          "status": 200,
+          "passed": true,
+          "chunks": 8,
+          "done_count": 1,
+          "content_head": "你好，很高兴见到你！",
+          "error": ""
+        },
+        "stateful_loop": {
+          "passed": true,
+          "requests": 6,
+          "failed": 0,
+          "length_finishes": 0,
+          "repeated_prefixes": 0,
+          "rows": [
+            {
+              "name": "paris",
+              "status": 200,
+              "expected": "paris",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Paris",
+              "passed": true
+            },
+            {
+              "name": "tokyo",
+              "status": 200,
+              "expected": "tokyo",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Tokyo",
+              "passed": true
+            },
+            {
+              "name": "math4",
+              "status": 200,
+              "expected": "4",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "4",
+              "passed": true
+            },
+            {
+              "name": "blue",
+              "status": 200,
+              "expected": "blue",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Blue",
+              "passed": true
+            },
+            {
+              "name": "math25",
+              "status": 200,
+              "expected": "25",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "25",
+              "passed": true
+            },
+            {
+              "name": "rome",
+              "status": 200,
+              "expected": "rome",
+              "expected_ok": true,
+              "finish_reason": "stop",
+              "length_finish": false,
+              "repeated_prefix": false,
+              "content_head": "Rome",
+              "passed": true
+            }
+          ]
+        }
+      },
+      "run": {
+        "passed": true,
+        "rc": 0,
+        "assistant": [
+          "已记住。",
+          "蓝色月亮"
+        ],
+        "jsonl_perf": {
+          "completion_tokens": 7,
+          "ms": 1484.015626,
+          "tok_s": 4.716931464439984,
+          "passed": true
+        },
+        "text_long": {
+          "passed": true,
+          "rc": 0,
+          "no_abort": true,
+          "rust_ok": true,
+          "turn_stat_lines": 4,
+          "tok_s_values": [
+            12.0,
+            40.9,
+            45.8,
+            21.3
+          ],
+          "perf_ok": true,
+          "contains_think": false,
+          "orphan_think_close": false,
+          "contains_unk": false,
+          "contains_pad": false
+        },
+        "no_abort": true,
+        "first_turn_ok": true,
+        "second_turn_ok": true,
+        "contains_secret": true
+      },
+      "cells": [
+        {
+          "concurrency": 16,
+          "prompts": 32,
+          "baseline_tps": 72.5,
+          "random_input_len": 16,
+          "random_output_len": 64,
+          "quality": {
+            "concurrency": 16,
+            "requests": 16,
+            "status_200": 16,
+            "marker_ok": 16,
+            "square_ok": 16,
+            "format_ok": 16,
+            "crosstalk": 0,
+            "length_finishes": 0,
+            "passed": true,
+            "rows": [
+              {
+                "i": 0,
+                "status": 200,
+                "marker": "KM1600Z",
+                "square": "S0001",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1600Z\nS0001"
+              },
+              {
+                "i": 1,
+                "status": 200,
+                "marker": "KM1601Z",
+                "square": "S0004",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1601Z\nS0004"
+              },
+              {
+                "i": 2,
+                "status": 200,
+                "marker": "KM1602Z",
+                "square": "S0009",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1602Z\nS0009"
+              },
+              {
+                "i": 3,
+                "status": 200,
+                "marker": "KM1603Z",
+                "square": "S0016",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1603Z\nS0016"
+              },
+              {
+                "i": 4,
+                "status": 200,
+                "marker": "KM1604Z",
+                "square": "S0025",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1604Z\nS0025"
+              },
+              {
+                "i": 5,
+                "status": 200,
+                "marker": "KM1605Z",
+                "square": "S0036",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1605Z\nS0036"
+              },
+              {
+                "i": 6,
+                "status": 200,
+                "marker": "KM1606Z",
+                "square": "S0049",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1606Z\nS0049"
+              },
+              {
+                "i": 7,
+                "status": 200,
+                "marker": "KM1607Z",
+                "square": "S0064",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1607Z\nS0064"
+              },
+              {
+                "i": 8,
+                "status": 200,
+                "marker": "KM1608Z",
+                "square": "S0081",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1608Z\nS0081"
+              },
+              {
+                "i": 9,
+                "status": 200,
+                "marker": "KM1609Z",
+                "square": "S0100",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1609Z\nS0100"
+              },
+              {
+                "i": 10,
+                "status": 200,
+                "marker": "KM1610Z",
+                "square": "S0121",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1610Z\nS0121"
+              },
+              {
+                "i": 11,
+                "status": 200,
+                "marker": "KM1611Z",
+                "square": "S0144",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1611Z\nS0144"
+              },
+              {
+                "i": 12,
+                "status": 200,
+                "marker": "KM1612Z",
+                "square": "S0169",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1612Z\nS0169"
+              },
+              {
+                "i": 13,
+                "status": 200,
+                "marker": "KM1613Z",
+                "square": "S0196",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1613Z\nS0196"
+              },
+              {
+                "i": 14,
+                "status": 200,
+                "marker": "KM1614Z",
+                "square": "S0225",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1614Z\nS0225"
+              },
+              {
+                "i": 15,
+                "status": 200,
+                "marker": "KM1615Z",
+                "square": "S0256",
+                "marker_ok": true,
+                "square_ok": true,
+                "format_ok": true,
+                "finish_reason": "stop",
+                "content_head": "KM1615Z\nS0256"
+              }
+            ]
+          },
+          "runner_rc": 0,
+          "completed": 32,
+          "failed": 0,
+          "output_throughput_tok_s": 68.45656926373526,
+          "ratio_to_readme": 0.9442285415687622,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": null,
+          "tpot_median_ms": null
+        }
+      ],
+      "server_ready": true,
+      "tool_call": {
+        "model": "Qwen3-30B-A3B",
+        "checks": {
+          "omitted_tool_choice": {
+            "passed": true
+          },
+          "explicit_auto_tool_choice": {
+            "passed": true
+          },
+          "required_tool_choice": {
+            "passed": true
+          },
+          "tool_result_fill": {
+            "passed": true,
+            "finish_reason": "stop"
+          }
+        },
+        "status": "pass"
+      },
+      "unsafe_batch_probe": {
+        "enabled": false,
+        "reason": "not a MoE unsafe batch probe target"
+      }
+    }
+  ],
+  "swap_end": "vm.swapusage: total = 17408.00M  used = 16322.38M  free = 1085.62M  (encrypted)",
+  "vm_stat_end": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              177846.\nPages active:                            639401.\nPages inactive:                          214446.\nPages speculative:                          498.\nPages throttled:                              0.\nPages wired down:                        817509.\nPages purgeable:                            428.\n\"Translation faults\":                8782993242.\nPages copy-on-write:                  488432699.\nPages zero filled:                   5397688678.\nPages reactivated:                    338578214."
+}

@@ -1,0 +1,150 @@
+{
+  "performance_regression_gates": {
+    "baseline_case": "baseline",
+    "cases": {
+      "candidate": {
+        "baseline_case": "baseline",
+        "metrics": [
+          {
+            "baseline": 362.0167792484087,
+            "candidate": 351.21199790888414,
+            "delta_pct": -2.984607885291002,
+            "diagnostic": false,
+            "metric": "throughput_mean",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "min_delta_pct",
+              "value": -3.0
+            }
+          },
+          {
+            "baseline": 138.6416075,
+            "candidate": 98.11170783333334,
+            "delta_pct": -29.23357597874553,
+            "diagnostic": false,
+            "metric": "ttft_p50",
+            "ok": true,
+            "reason": "ok",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 10.0
+            }
+          },
+          {
+            "baseline": 9.952202604986876,
+            "candidate": 10.503318990813648,
+            "delta_pct": 5.537632298106732,
+            "diagnostic": false,
+            "metric": "tpot_p50",
+            "ok": false,
+            "reason": "above_max_regression_pct",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 5.0
+            }
+          },
+          {
+            "baseline": 10.146116,
+            "candidate": 14.550471983333333,
+            "delta_pct": 43.409280786197726,
+            "diagnostic": true,
+            "metric": "itl_p95",
+            "ok": true,
+            "reason": "above_max_regression_pct: same_env_order_sensitive_metric_diagnostic",
+            "threshold": {
+              "type": "max_regression_pct",
+              "value": 10.0
+            }
+          }
+        ],
+        "ok": false
+      }
+    },
+    "concurrency_cells_ok": true,
+    "enabled": true,
+    "observed_concurrency_cells": [
+      4
+    ],
+    "required_concurrency_cells": [
+      4
+    ],
+    "schema_version": 1,
+    "thresholds": {
+      "enabled": true,
+      "itl_p95_max_regression_pct": 10.0,
+      "same_env_order_sensitive_metrics": [
+        "ttft_p50",
+        "itl_p95"
+      ],
+      "throughput_min_delta_pct": -3.0,
+      "tpot_max_regression_pct": 5.0,
+      "ttft_max_regression_pct": 10.0
+    }
+  },
+  "rows": [
+    {
+      "artifact_verdict": "pass",
+      "bad_output": 0,
+      "completed": 384,
+      "concurrency": 4,
+      "duplicate_done": 0,
+      "env_hash": "sha256:b00caa90b22dfa66d852cf9f8407430163a04724272f9d849f6e1b3134bc25fa",
+      "errored": 0,
+      "http_500": 0,
+      "itl_p95": 10.146116,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "name": "baseline",
+      "not_publishable": false,
+      "panic": 0,
+      "runtime_config_entry_count": 14,
+      "status": "pass",
+      "stream_bulk_flush": 0,
+      "throughput_ci95_hw": 14.210390953332455,
+      "throughput_mean": 362.0167792484087,
+      "throughput_stddev": 5.71999050118265,
+      "tpot_p50": 9.952202604986876,
+      "ttft_p50": 138.6416075,
+      "zero_output_tokens": 0
+    },
+    {
+      "artifact_verdict": "pass",
+      "bad_output": 0,
+      "completed": 384,
+      "concurrency": 4,
+      "duplicate_done": 0,
+      "env_hash": "sha256:b00caa90b22dfa66d852cf9f8407430163a04724272f9d849f6e1b3134bc25fa",
+      "errored": 0,
+      "http_500": 0,
+      "itl_p95": 14.550471983333333,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "name": "candidate",
+      "not_publishable": false,
+      "panic": 0,
+      "performance_gate_ok": false,
+      "runtime_config_entry_count": 14,
+      "status": "pass",
+      "stream_bulk_flush": 0,
+      "throughput_ci95_hw": 16.57628110388496,
+      "throughput_mean": 351.21199790888414,
+      "throughput_stddev": 6.672312589466108,
+      "tpot_p50": 10.503318990813648,
+      "ttft_p50": 98.11170783333334,
+      "zero_output_tokens": 0
+    }
+  ],
+  "runtime_config_diff_vs_baseline": {
+    "candidate": {
+      "added": [],
+      "baseline_env_hash": "sha256:b00caa90b22dfa66d852cf9f8407430163a04724272f9d849f6e1b3134bc25fa",
+      "candidate_env_hash": "sha256:b00caa90b22dfa66d852cf9f8407430163a04724272f9d849f6e1b3134bc25fa",
+      "changed": [],
+      "removed": []
+    }
+  },
+  "throughput_delta_pct_vs_baseline": {
+    "candidate": -2.984607885291002
+  }
+}

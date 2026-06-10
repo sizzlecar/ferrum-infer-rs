@@ -1,0 +1,1 @@
+{"id":"89c99148-7c13-492d-818d-8775ee248630","object":"chat.completion","created":1781123602,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"message":{"role":"assistant","content":"北京现在天气晴朗，温度22摄氏度。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":151,"completion_tokens":14,"total_tokens":165}}

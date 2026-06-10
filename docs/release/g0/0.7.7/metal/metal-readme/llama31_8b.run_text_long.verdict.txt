@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "rc": 0,
+  "no_abort": true,
+  "rust_ok": true,
+  "turn_stat_lines": 4,
+  "tok_s_values": [
+    22.5,
+    27.0,
+    26.8,
+    15.0
+  ],
+  "perf_ok": true,
+  "contains_think": false,
+  "orphan_think_close": false,
+  "contains_unk": false,
+  "contains_pad": false
+}

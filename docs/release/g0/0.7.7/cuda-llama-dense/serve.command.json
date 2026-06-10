@@ -1,0 +1,20 @@
+[
+  "target/release/ferrum",
+  "serve",
+  "--model",
+  "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "19300",
+  "--effective-config-json",
+  "docs/release/g0/0.7.7/cuda-llama-dense/serve.effective_config.json",
+  "--decision-trace-jsonl",
+  "docs/release/g0/0.7.7/cuda-llama-dense/serve.decision_trace.jsonl",
+  "--max-model-len",
+  "2048",
+  "--kv-capacity",
+  "2048",
+  "--max-num-seqs",
+  "32"
+]

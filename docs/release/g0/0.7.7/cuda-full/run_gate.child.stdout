@@ -1,0 +1,185 @@
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c1.json
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c4.json
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c16.json
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c32.json
+=== baseline ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+=== candidate ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+SUMMARY baseline: throughput=164.45440915871356 stddev=0.11164926800230948 ci95=0.2773745424294275 ttft_p50=59.756372 tpot_p50=5.653786077427822 itl_p95=5.7381558833333335 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+SUMMARY candidate: throughput=164.23851984814698 stddev=0.05248229531016019 ci95=0.13038377149951982 ttft_p50=59.767089999999996 tpot_p50=5.660481419947506 itl_p95=5.7357262833333325 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+DELTA candidate vs baseline: -0.13%
+PERF_GATE candidate vs baseline: ok=True
+{
+  "cases": [
+    {
+      "bench": true,
+      "name": "baseline",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "candidate",
+      "profile_events": 0
+    }
+  ],
+  "ok": true,
+  "root": "docs/release/g0/0.7.7/cuda-full/c1",
+  "summary_rows": 2
+}
+=== baseline ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+=== candidate ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+SUMMARY baseline: throughput=346.2393137650936 stddev=1.88175250337866 ci95=4.674909642750984 ttft_p50=97.47112616666668 tpot_p50=10.761735862204723 itl_p95=16.928183266666668 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+SUMMARY candidate: throughput=353.3005340420636 stddev=5.707582179815579 ci95=14.179564486459089 ttft_p50=105.8084225 tpot_p50=10.462398888451444 itl_p95=14.59912298333333 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+DELTA candidate vs baseline: 2.04%
+PERF_GATE candidate vs baseline: ok=True
+{
+  "cases": [
+    {
+      "bench": true,
+      "name": "baseline",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "candidate",
+      "profile_events": 0
+    }
+  ],
+  "ok": true,
+  "root": "docs/release/g0/0.7.7/cuda-full/c4",
+  "summary_rows": 2
+}
+=== baseline ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+=== candidate ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+SUMMARY baseline: throughput=643.9138675138962 stddev=4.935026036990422 ci95=12.26027374276394 ttft_p50=309.79063 tpot_p50=22.551487578740154 itl_p95=34.61392668333333 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+SUMMARY candidate: throughput=636.8892987168985 stddev=4.197328375766355 ci95=10.427583256794504 ttft_p50=309.961687 tpot_p50=22.760149276902883 itl_p95=21.71181366666666 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+DELTA candidate vs baseline: -1.09%
+PERF_GATE candidate vs baseline: ok=True
+{
+  "cases": [
+    {
+      "bench": true,
+      "name": "baseline",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "candidate",
+      "profile_events": 0
+    }
+  ],
+  "ok": true,
+  "root": "docs/release/g0/0.7.7/cuda-full/c16",
+  "summary_rows": 2
+}
+=== baseline ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+=== candidate ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+SUMMARY baseline: throughput=710.5009877061872 stddev=53.38561483244559 ci95=132.62792270305752 ttft_p50=404.05687366666666 tpot_p50=42.34169713910761 itl_p95=122.25155693333325 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+SUMMARY candidate: throughput=706.014250750146 stddev=56.35261241240562 ci95=139.99894815495395 ttft_p50=404.3561155 tpot_p50=42.48394026246719 itl_p95=124.16318181666658 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+DELTA candidate vs baseline: -0.63%
+PERF_GATE candidate vs baseline: ok=True
+{
+  "cases": [
+    {
+      "bench": true,
+      "name": "baseline",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "candidate",
+      "profile_events": 0
+    }
+  ],
+  "ok": true,
+  "root": "docs/release/g0/0.7.7/cuda-full/c32",
+  "summary_rows": 2
+}
+ALLCELL_ARTIFACT root=/workspace/ferrum-infer-rs/docs/release/g0/0.7.7/cuda-full cells=1,4,16,32 cases=8
+{
+  "cases": [
+    {
+      "bench": true,
+      "name": "baseline",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "candidate",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "baseline",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "candidate",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "baseline",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "candidate",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "baseline",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "candidate",
+      "profile_events": 0
+    }
+  ],
+  "ok": true,
+  "root": "docs/release/g0/0.7.7/cuda-full",
+  "summary_rows": 8
+}
+G0 SOURCE g0_cuda4090_full PASS: docs/release/g0/0.7.7/cuda-full

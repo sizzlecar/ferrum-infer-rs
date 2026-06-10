@@ -1,0 +1,36 @@
+{
+  "passed": true,
+  "rc": 0,
+  "assistant": [
+    "已记住。",
+    "蓝色月亮"
+  ],
+  "jsonl_perf": {
+    "completion_tokens": 10,
+    "ms": 954.435792,
+    "tok_s": 10.477394167129056,
+    "passed": true
+  },
+  "text_long": {
+    "passed": true,
+    "rc": 0,
+    "no_abort": true,
+    "rust_ok": true,
+    "turn_stat_lines": 4,
+    "tok_s_values": [
+      22.5,
+      27.0,
+      26.8,
+      15.0
+    ],
+    "perf_ok": true,
+    "contains_think": false,
+    "orphan_think_close": false,
+    "contains_unk": false,
+    "contains_pad": false
+  },
+  "no_abort": true,
+  "first_turn_ok": true,
+  "second_turn_ok": true,
+  "contains_secret": true
+}

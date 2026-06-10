@@ -1,0 +1,180 @@
+{
+  "status": "pass",
+  "lane": "g0_cuda4090_llama_dense",
+  "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+  "checks": {
+    "run": {
+      "passed": true,
+      "rc": 0,
+      "has_context": true
+    },
+    "serve_health": {
+      "status": 200,
+      "passed": true,
+      "version": "0.7.7"
+    },
+    "serve_capacity": {
+      "passed": true,
+      "required_concurrency": 32,
+      "max_sequences": 32,
+      "target_concurrency": 32
+    },
+    "serve": {
+      "math": {
+        "status": 200,
+        "passed": true
+      },
+      "multi_turn": {
+        "status": 200,
+        "passed": true
+      },
+      "stream_usage": {
+        "status": 200,
+        "done_count": 1,
+        "passed": true
+      }
+    },
+    "tool_call_regression": {
+      "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+      "checks": {
+        "omitted_tool_choice": {
+          "passed": true
+        },
+        "explicit_auto_tool_choice": {
+          "passed": true
+        },
+        "required_tool_choice": {
+          "passed": true
+        },
+        "tool_result_fill": {
+          "passed": true,
+          "finish_reason": "stop"
+        }
+      },
+      "status": "pass"
+    },
+    "concurrency_quality_regression": {
+      "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+      "cells": [
+        {
+          "concurrency": 1,
+          "requests": 1,
+          "status_200": 1,
+          "json_ok": 1,
+          "marker_ok": 1,
+          "square_ok": 1,
+          "format_ok": 1,
+          "crosstalk": 0,
+          "length_finishes": 0,
+          "forbidden_count": 0,
+          "passed": true
+        },
+        {
+          "concurrency": 4,
+          "requests": 4,
+          "status_200": 4,
+          "json_ok": 4,
+          "marker_ok": 4,
+          "square_ok": 4,
+          "format_ok": 4,
+          "crosstalk": 0,
+          "length_finishes": 0,
+          "forbidden_count": 0,
+          "passed": true
+        },
+        {
+          "concurrency": 16,
+          "requests": 16,
+          "status_200": 16,
+          "json_ok": 16,
+          "marker_ok": 16,
+          "square_ok": 16,
+          "format_ok": 16,
+          "crosstalk": 0,
+          "length_finishes": 0,
+          "forbidden_count": 0,
+          "passed": true
+        },
+        {
+          "concurrency": 32,
+          "requests": 32,
+          "status_200": 32,
+          "json_ok": 32,
+          "marker_ok": 32,
+          "square_ok": 32,
+          "format_ok": 32,
+          "crosstalk": 0,
+          "length_finishes": 0,
+          "forbidden_count": 0,
+          "passed": true
+        }
+      ],
+      "status": "pass"
+    },
+    "bench_serve": {
+      "passed": true,
+      "rows": [
+        {
+          "concurrency": 1,
+          "completed": 288,
+          "errored": 0,
+          "throughput_tok_s": 122.94173274085911,
+          "output_token_count_source": "usage",
+          "bad_output": 0,
+          "malformed_stream": 0,
+          "missing_done": 0,
+          "duplicate_done": 0,
+          "zero_output_tokens": 0,
+          "stream_bulk_flush": 0,
+          "http_500": 0,
+          "panic": 0
+        },
+        {
+          "concurrency": 4,
+          "completed": 288,
+          "errored": 0,
+          "throughput_tok_s": 324.3013918772561,
+          "output_token_count_source": "usage",
+          "bad_output": 0,
+          "malformed_stream": 0,
+          "missing_done": 0,
+          "duplicate_done": 0,
+          "zero_output_tokens": 0,
+          "stream_bulk_flush": 0,
+          "http_500": 0,
+          "panic": 0
+        },
+        {
+          "concurrency": 16,
+          "completed": 288,
+          "errored": 0,
+          "throughput_tok_s": 640.2463309743802,
+          "output_token_count_source": "usage",
+          "bad_output": 0,
+          "malformed_stream": 0,
+          "missing_done": 0,
+          "duplicate_done": 0,
+          "zero_output_tokens": 0,
+          "stream_bulk_flush": 0,
+          "http_500": 0,
+          "panic": 0
+        },
+        {
+          "concurrency": 32,
+          "completed": 288,
+          "errored": 0,
+          "throughput_tok_s": 745.5741754678188,
+          "output_token_count_source": "usage",
+          "bad_output": 0,
+          "malformed_stream": 0,
+          "missing_done": 0,
+          "duplicate_done": 0,
+          "zero_output_tokens": 0,
+          "stream_bulk_flush": 0,
+          "http_500": 0,
+          "panic": 0
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,4 @@
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c1.json
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c4.json
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c16.json
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c32.json

@@ -1,0 +1,1 @@
+{"id":"7fe06104-65ba-4494-8541-2ca580715824","object":"chat.completion","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"message":{"role":"assistant","content":"579"},"finish_reason":"stop"}],"usage":{"prompt_tokens":46,"completion_tokens":2,"total_tokens":48}}

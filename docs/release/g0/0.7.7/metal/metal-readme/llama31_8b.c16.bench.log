@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=random num_prompts=32 warmup=1 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (33 prompts including 1 warmup)
+    32 completed / 0 errored / 26.5s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=1642.9  p95=4147.6  p99=4148.0
+      TPOT_ms  p50=182.6  p95=205.4  p99=205.4
+      ITL_ms   p50=144.5  p95=361.4  p99=856.9
+      throughput      75.4 tok/s
+      goodput         1.21 req/s
+
+→ wrote docs/release/g0/0.7.7/metal/metal-readme/llama31_8b.c16.json

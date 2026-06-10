@@ -1,0 +1,31 @@
+{
+  "concurrency": 1,
+  "requests": 1,
+  "status_200": 1,
+  "json_ok": 1,
+  "marker_ok": 1,
+  "square_ok": 1,
+  "format_ok": 1,
+  "crosstalk": 0,
+  "length_finishes": 0,
+  "forbidden_count": 0,
+  "passed": true,
+  "rows": [
+    {
+      "i": 0,
+      "status": 200,
+      "json_ok": true,
+      "marker": "ferrum0100",
+      "square": "S0001",
+      "tool_name": "capture_quality_marker",
+      "parsed_marker": "ferrum0100",
+      "parsed_checksum": "S0001",
+      "marker_ok": true,
+      "square_ok": true,
+      "format_ok": true,
+      "finish_reason": "tool_calls",
+      "forbidden_text": null,
+      "content_head": "{\"id\":\"bde46971-a0c7-4f01-89be-cf47b1a0a87f\",\"object\":\"chat.completion\",\"created\":1781123602,\"model\":\"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"capture_quality_marker\",\"arguments\":\"{\\\"checksum\\\":\\\"S0001\\\",\\\"marker\\\":\\\"ferrum0100\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":245,\"completion_tokens\":20,\"total_tokens\":265}}"
+    }
+  ]
+}

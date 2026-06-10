@@ -1,0 +1,11 @@
+{
+  "cmd": [
+    "scripts/release/g0_source_gate.sh",
+    "cuda-llama-dense",
+    "docs/release/g0/0.7.7/cuda-llama-dense"
+  ],
+  "duration_sec": 573.5459139549639,
+  "env_overrides": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "created_at": "2026-06-10T19:06:04Z",
+  "http_status": 200,
+  "offer_id": 20095334,
+  "response": {
+    "instance_api_key": "<redacted>",
+    "new_contract": 40449138,
+    "success": true
+  }
+}

@@ -1,0 +1,54 @@
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c1.json
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c4.json
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c16.json
+docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c32.json
+=== baseline ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+=== candidate ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+SUMMARY baseline: throughput=164.1851326812077 stddev=0.07158267336053033 ci95=0.17783557048346757 ttft_p50=59.699692000000006 tpot_p50=5.6571449816272965 itl_p95=5.734698916666666 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+SUMMARY candidate: throughput=164.2839528923848 stddev=0.08514199601856018 ci95=0.21152151384179038 ttft_p50=59.865301166666676 tpot_p50=5.658294675853018 itl_p95=5.734701999999999 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+DELTA candidate vs baseline: 0.06%
+PERF_GATE candidate vs baseline: ok=True
+{
+  "cases": [
+    {
+      "bench": true,
+      "name": "baseline",
+      "profile_events": 0
+    },
+    {
+      "bench": true,
+      "name": "candidate",
+      "profile_events": 0
+    }
+  ],
+  "ok": true,
+  "root": "docs/release/g0/0.7.7/cuda-full/c1",
+  "summary_rows": 2
+}
+=== baseline ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+=== candidate ===
+PARIS_CONTENT= The capital of France is **Paris**.
+MULTITURN_CONTENT= Paris
+MULTITURN_3ROUND_CONTENT= Paris
+TOOL_CALL_REGRESSION= pass
+CONCURRENCY_QUALITY_REGRESSION= pass
+SUMMARY baseline: throughput=362.0167792484087 stddev=5.71999050118265 ci95=14.210390953332455 ttft_p50=138.6416075 tpot_p50=9.952202604986876 itl_p95=10.146116 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+SUMMARY candidate: throughput=351.21199790888414 stddev=6.672312589466108 ci95=16.57628110388496 ttft_p50=98.11170783333334 tpot_p50=10.503318990813648 itl_p95=14.550471983333333 completed=384 errored=0 status=pass verdict=pass not_publishable=False
+DELTA candidate vs baseline: -2.98%
+PERF_GATE candidate vs baseline: ok=False
+artifact validation failed: candidate manifest.validation_checklist performance gate failed or missing

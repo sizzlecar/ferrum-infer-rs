@@ -1,0 +1,1 @@
+{"id":"66822512-47ec-448e-ac49-7112f7543239","object":"chat.completion","created":1781122114,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"message":{"role":"assistant","content":"北京现在是晴天，温度是22摄氏度。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":270,"completion_tokens":15,"total_tokens":285}}
