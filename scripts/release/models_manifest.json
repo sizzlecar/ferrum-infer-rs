@@ -6,7 +6,7 @@
       "id": "llama-family",
       "readme_label": "LLaMA (3.x, TinyLlama, Vicuna, Mistral)",
       "modality": "llm",
-      "representative_model": "meta-llama/Llama-3.2-1B-Instruct",
+      "representative_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
       "metal": true,
       "cuda": true,
       "int4_gptq": true,
