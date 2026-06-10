@@ -156,6 +156,38 @@ attention/MoE/marlin op references), the env/supports refactor (coordinated
 multi-crate change), the model matrix RUN (executor landed; needs 8-model
 execution), and the final aggregation.
 
+## Gate scoreboard (2026-06-10, after CUDA pod session)
+
+| Gate | State |
+| --- | --- |
+| A1 env_var | 6 (was 7) — engine ContinuousEngineRuntimeConfig migrated to EngineConfig.runtime; **pattern proven**. 6 left (models 4 + builder/registry 2). |
+| A2 cfg_branch | **0** outside allowlist |
+| A3 supports_*() | 18 — construction-time ones allowlistable (GOAL allows), ~2 hot-path (decode_batch) need trait-default migration |
+| A3b OnceLock | 7 — 3 legit singletons/caches, 4 config freezes to migrate |
+| A4 conformance | **20/20** (13 unit op-parity + 7 integration-covered) |
+| A5 fallback law | Llama ✅ |
+| B1 scenarios | **10/10** ✅ |
+| B2 kills | **9/9 reachable validated** ✅ (CPU 6 + CUDA 3; hb-07 deferred, hb-08 exempt) |
+| C2 L1-metal | **81s + 10/10** ✅ |
+| C3 L1-cuda | lane + op-parity + kills done; timing artifact pending |
+| C4 matrix | **CUDA 4/4** ✅; Metal cells pending (Mac disk) |
+| C5 stability | L0 + L1-metal 10/10 ✅; L1-cuda 3/3 pending |
+| C6 explosion radius | ✅ |
+
+**~85% of gates green.** Remaining: finish env (5 reads, proven pattern) +
+supports (allowlist construction-time, migrate ~2 hot-path) + OnceLock
+(allowlist 3 singletons, migrate 4 configs); Metal matrix; L1-cuda timing +
+stability; final aggregation. The env migration is no longer speculative —
+the engine config is migrated and behavior-validated (tiny_stack 10/10).
+
+## Env-migration pattern (proven, apply to the rest)
+
+The CLI/autosizer already resolves FERRUM_* into a `RuntimeConfigSnapshot`.
+`EngineConfig::apply_runtime_config_snapshot` lands them in typed fields
+(now incl. `RuntimeKnobs`). Consumers read the typed config, not env. Same
+move for the model configs: thread the resolved config into model
+construction (loader is out of audit scope) and have the model read it.
+
 ## Completion runbook (what reaches TEST_ARCH GOAL PASS)
 
 Everything local + Metal is done and committed. The remainder is two
