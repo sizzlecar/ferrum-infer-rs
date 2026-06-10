@@ -111,7 +111,9 @@
       "expected_failing_surface": "in-process OpenAI wire scenarios: /v1/models non-empty, empty-messages 400, stop leak, greedy determinism",
       "repro_patch": "patches/hb-06.patch",
       "patch_status": "ready",
-      "notes": "Patch re-introduces the two wire-level defects (/v1/models empty list, empty-messages 400 removed); stop-leak and greedy-determinism defects are covered by scenario assertions rather than this patch."
+      "notes": "Patch re-introduces the two wire-level defects (/v1/models empty list, empty-messages 400 removed); stop-leak and greedy-determinism defects are covered by scenario assertions rather than this patch.",
+      "caught_by": "ferrum-server tiny_stack_wire::tiny_stack_openai_wire_contract",
+      "kill_status": "verified-kill"
     },
     {
       "id": "hb-07",
