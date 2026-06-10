@@ -70,19 +70,31 @@ These are NOT allowlistable — the GOAL targets them for migration:
   logic. Needs Metal + CUDA parity validation before moving, per the GOAL's
   behavior-invariance rule. Highest-risk, last.
 
-## What needs GPU vs what is done locally
+## Metal IS the local GPU — corrected boundary
 
-Done locally (zero GPU): all of stage 0/1, the conformance manifest
-reconciliation, the Llama capability-fallback law, the README manifest +
-drift guard + explosion-radius router, and new-test stability evidence.
+Earlier this status mis-filed all GPU work as pod-only. This is an Apple
+Silicon host, so every Metal validation runs locally. Done on this Mac:
 
-Needs a GPU host to finish (cannot be done on this Mac):
-- Op parity RUNS for Metal (`--features metal`, Mac GPU) and CUDA (pod).
+- **Metal op-parity**: `cargo test -p ferrum-testkit --features metal --test
+  op_diff` → 11/11 cells green (6 ops, CPU-vs-Metal NMSE < 1e-6).
+  Evidence: `evidence/metal-op-parity-20260610.md`.
+- **Engine under metal**: `cargo test -p ferrum-engine --features metal
+  --test tiny_stack` → 10/10 green. Confirms the stage-3 decoupling compiles
+  and runs correctly in the Metal configuration.
+- **L1-metal lane (Gate C2)**: `scripts/release/lane_l1_metal.sh` bundles
+  op-parity + tiny_stack(metal) + server wire, **81 s wall** (budget 900 s),
+  prints `TEST_ARCH L1_METAL PASS`. Artifact: `evidence/l1-metal-run/`.
+
+Only **CUDA-specific** work genuinely needs a pod (per AGENTS.md GPU budget
+approval):
+- CUDA op-parity column for the conformance matrix.
 - hb-09 / hb-10 / hb-11 CUDA kill verification (L1-cuda batch).
-- L1-cuda lane wiring into `run_gate.py` and the matrix RUN (Gate C3/C4).
-- Stage-3 decoupling is local but should land with Metal-fingerprint
-  evidence (a `--features metal` build) before the hot-path capability
-  branches move, per the GOAL's behavior-invariance requirement.
+- L1-cuda lane RUN + the Qwen72B/Llama70B matrix cells (Gate C3/C4).
+- The CUDA half of the final aggregated PASS.
+
+The stage-3 hot-path decoupling already landed is now Metal-validated
+(op-parity + engine-under-metal both green); the remaining supports_*
+migration still wants the CUDA parity column before it moves.
 
 ## Stage 1 Detail
 
