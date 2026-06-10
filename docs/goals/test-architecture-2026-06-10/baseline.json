@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generated_by": "scripts/release/test_arch_goal_gate.py --baseline",
-  "base_sha": "2b0135db5d84a7a90f6de7d8c3ff1c32c948aebb",
+  "base_sha": "644a91aa34db893ad9f8c88094294f5f54a664d0",
   "dirty_worktree": false,
   "scan_method": "line-level regex over non-test .rs files under crates/ferrum-models/src/models and crates/ferrum-engine/src; comment-only lines skipped; #[cfg(test)] blocks not excluded",
   "counts": {
