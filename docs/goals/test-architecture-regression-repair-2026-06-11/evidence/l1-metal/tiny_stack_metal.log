@@ -1,0 +1,52 @@
+   Compiling objc2 v0.6.3
+   Compiling objc2-encode v4.1.0
+   Compiling objc_exception v0.1.2
+   Compiling ferrum-types v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-types)
+   Compiling core-graphics-types v0.1.3
+   Compiling ferrum-kernels v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-kernels)
+   Compiling core-foundation v0.10.1
+   Compiling matrixmultiply v0.3.10
+   Compiling rawpointer v0.2.1
+   Compiling mpsgraph v0.2.0
+   Compiling core-graphics-types v0.2.0
+   Compiling block2 v0.6.2
+   Compiling objc2-core-foundation v0.3.2
+   Compiling dispatch2 v0.3.0
+   Compiling objc v0.2.7
+   Compiling metal v0.31.0
+   Compiling metal v0.32.0
+   Compiling metal v0.27.0
+   Compiling ndarray v0.16.1
+   Compiling objc2-foundation v0.3.2
+   Compiling ferrum-interfaces v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-interfaces)
+   Compiling ferrum-bench-core v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-bench-core)
+   Compiling ferrum-kv v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-kv)
+   Compiling ferrum-sampler v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-sampler)
+   Compiling ferrum-tokenizer v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-tokenizer)
+   Compiling ferrum-scheduler v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-scheduler)
+   Compiling objc2-metal v0.3.2
+   Compiling candle-metal-kernels v0.9.2
+   Compiling candle-core v0.9.2
+   Compiling candle-nn v0.9.2
+   Compiling ferrum-quantization v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-quantization)
+   Compiling ferrum-testkit v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-testkit)
+   Compiling candle-transformers v0.9.2
+   Compiling ferrum-models v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.6 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.09s
+     Running tests/tiny_stack.rs (target/debug/deps/tiny_stack-86ea3785c4c0f8a5)
+
+running 10 tests
+test tiny_stack_stream_chunk_contract ... ok
+test tiny_stack_capability_fallback_law_cpu ... ok
+test tiny_stack_cancel_mid_stream ... ok
+test tiny_stack_stop_sequence_composite_token ... ok
+test tiny_stack_repetition_runaway_guard ... ok
+test tiny_stack_eos_terminates ... ok
+test tiny_stack_kv_capacity_boundary ... ok
+test tiny_stack_concurrent_sessions_isolated ... ok
+test tiny_stack_multi_turn_five_rounds ... ok
+test tiny_stack_guided_tool_constraint ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

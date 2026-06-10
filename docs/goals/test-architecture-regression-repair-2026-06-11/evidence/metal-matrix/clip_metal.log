@@ -1,0 +1,17 @@
+Pulling OFA-Sys/chinese-clip-vit-base-patch16
+Cache: /Users/chejinxuan/.cache/huggingface
+📦 Downloading 5 files (1.40 GB)
+  ✓ preprocessor_config.json (cached)
+  ✓ config.json (cached)
+  ✓ vocab.txt (cached)
+
+--- stderr ---
+🌐 Using proxy: http://127.0.0.1:41809
+
+✗ Failed to pull model: Model error: Failed to get file info for clip_cn_vit-b-16.pt: error sending request for url (https://huggingface.co/OFA-Sys/chinese-clip-vit-base-patch16/resolve/main/clip_cn_vit-b-16.pt)
+
+Tips:
+  • Check your internet connection
+  • Set proxy: HTTPS_PROXY=socks5h://host:port
+  • For private models, set HF_TOKEN environment variable
+Error: Model error: Failed to get file info for clip_cn_vit-b-16.pt: error sending request for url (https://huggingface.co/OFA-Sys/chinese-clip-vit-base-patch16/resolve/main/clip_cn_vit-b-16.pt)

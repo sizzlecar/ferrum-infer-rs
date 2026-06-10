@@ -1,0 +1,31 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "pull",
+    "openai/whisper-tiny"
+  ]
+}
+--- stdout ---
+Pulling openai/whisper-tiny
+Cache: /Users/chejinxuan/.cache/huggingface
+📦 Downloading 12 files (0.29 GB)
+  ✓ added_tokens.json (cached)
+  ✓ normalizer.json (cached)
+  ✓ generation_config.json (cached)
+  ✓ vocab.json (cached)
+  ✓ merges.txt (cached)
+  ✓ config.json (cached)
+  ✓ tokenizer_config.json (cached)
+  ✓ special_tokens_map.json (cached)
+  ✓ tokenizer.json (cached)
+  ✓ preprocessor_config.json (cached)
+  ✓ pytorch_model.bin (cached)
+  ✓ model.safetensors (cached)
+
+✅ Download complete: /Users/chejinxuan/.cache/huggingface/hub/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af
+
+✓ Model ready at:
+  /Users/chejinxuan/.cache/huggingface/hub/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af
+
+--- stderr ---
+🌐 Using proxy: http://127.0.0.1:41809

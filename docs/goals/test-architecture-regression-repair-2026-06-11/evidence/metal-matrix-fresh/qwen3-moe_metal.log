@@ -1,0 +1,41 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "run",
+    "/Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf",
+    "--max-tokens",
+    "16",
+    "--tokenizer",
+    "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+  ]
+}
+--- stdout ---
+你好！很高兴见到你。有什么我可以帮你的吗？😊
+你好！我叫通义千问，是阿里巴巴集团研发的超大规模
+Rust 是一种现代的系统编程语言，以其安全性、性能和并发
+
+--- stderr ---
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-10T17:15:20.033094Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-10T17:15:20.033111Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-10T17:15:20.033179Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-10T17:15:20.193589Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-10T17:15:20.193606Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-10T17:15:20.193608Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-10T17:15:20.193618Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-10T17:15:20.193662Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+Model loaded in 1.9s.
+
+Ready. Type your message and press Enter.
+Use /clear to reset history; /bye or Ctrl+D to exit.
+
+[14 tokens, 0.1 tok/s, 162.4s]
+
+[16 tokens, 0.1 tok/s, 186.5s]
+
+[16 tokens, 0.1 tok/s, 188.9s]
+
+Goodbye!

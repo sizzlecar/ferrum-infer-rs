@@ -56,8 +56,16 @@ fn engine_config_applies_build_composition_knobs() {
     // straight from env by builder.rs and registry.rs. They now land in
     // EngineConfig.runtime here; the builder/registry read the typed field.
     let snapshot = RuntimeConfigSnapshot::from_entries([
-        RuntimeConfigEntry::new("FERRUM_MODEL_PATH", "/models/target", RuntimeConfigSource::Env),
-        RuntimeConfigEntry::new("FERRUM_SPEC_DRAFT", "/models/draft", RuntimeConfigSource::Env),
+        RuntimeConfigEntry::new(
+            "FERRUM_MODEL_PATH",
+            "/models/target",
+            RuntimeConfigSource::Env,
+        ),
+        RuntimeConfigEntry::new(
+            "FERRUM_SPEC_DRAFT",
+            "/models/draft",
+            RuntimeConfigSource::Env,
+        ),
         RuntimeConfigEntry::new("FERRUM_SPEC_N", "8", RuntimeConfigSource::Env),
         RuntimeConfigEntry::new("FERRUM_DTYPE", "fp32", RuntimeConfigSource::Env),
         RuntimeConfigEntry::new("FERRUM_METAL_DTYPE", "fp16", RuntimeConfigSource::Env),

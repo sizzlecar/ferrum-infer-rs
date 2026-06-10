@@ -1,0 +1,9 @@
+{
+  "instance_id": 40361123,
+  "ssh_host": "ssh9.vast.ai",
+  "ssh_port": 11122,
+  "cur_state": "stopped",
+  "actual_status": "exited",
+  "intended_status": "stopped",
+  "cleanup_confirmed": true
+}

@@ -1,0 +1,62 @@
+{
+  "artifact_dir": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-product-serve",
+  "backend": "metal",
+  "base_url": "http://127.0.0.1:58452",
+  "dirty_status": {
+    "is_dirty": true,
+    "status_short": [
+      "M crates/ferrum-cli/src/source_resolver.rs",
+      " M crates/ferrum-engine/src/builder.rs",
+      " M crates/ferrum-engine/src/registry.rs",
+      " M crates/ferrum-models/src/models/llama_family.rs",
+      " M crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      " M crates/ferrum-quantization/src/native_safetensors.rs",
+      " M crates/ferrum-types/src/auto_config.rs",
+      " M crates/ferrum-types/src/config.rs",
+      " M crates/ferrum-types/tests/config_tests.rs",
+      " M scripts/release/models_manifest.json",
+      " M scripts/release/readme_model_matrix.py",
+      " M scripts/release/run_scenarios.py",
+      "?? docs/goals/test-architecture-regression-repair-2026-06-11/",
+      "?? scripts/release/__pycache__/openai_concurrency_quality_regression.cpython-314.pyc",
+      "?? scripts/release/__pycache__/openai_tool_call_regression.cpython-314.pyc",
+      "?? scripts/release/test_arch_regression_repair_gate.py"
+    ]
+  },
+  "failed": 0,
+  "finished_at": "2026-06-11T01:30:25.612845+08:00",
+  "git_sha": "0db6412142fcb6a759e1f4a1f928936beec65488",
+  "manifest": "scripts/release/scenarios/product_regression_smoke.json",
+  "model": "Qwen/Qwen3-0.6B",
+  "pass_line": "BACKEND REGRESSION SMOKE PASS: docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-product-serve",
+  "scenario_count": 2,
+  "scenarios": [
+    {
+      "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-product-serve/serve_multiturn_recall/result.json",
+      "assistant_turns": 2,
+      "duration_sec": 0.49909991677850485,
+      "name": "serve_multiturn_recall",
+      "recalled_secret": true,
+      "status": "pass",
+      "type": "serve_multiturn_recall"
+    },
+    {
+      "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-product-serve/serve_stream_done_usage/result.json",
+      "chunk_count": 11,
+      "content_delta_count": 9,
+      "done_count": 1,
+      "duration_sec": 0.17460220772773027,
+      "event_count": 12,
+      "malformed_json": 0,
+      "name": "serve_stream_done_usage",
+      "output_text": "Hello! How can I assist you today?",
+      "status": "pass",
+      "type": "serve_stream",
+      "usage_chunks": 1
+    }
+  ],
+  "schema_version": 1,
+  "skipped": 0,
+  "started_at": "2026-06-11T01:30:22.776525+08:00",
+  "status": "pass"
+}

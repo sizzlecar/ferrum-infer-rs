@@ -229,8 +229,7 @@ impl EngineBuilder {
         let component_config = ComponentConfig::from_engine_config(&self.config);
         validate_layer_split_plan(&component_config)?;
         let typed_model_path = component_config.get_string_option("model_path");
-        let has_model_path =
-            typed_model_path.is_some() || self.config.runtime.model_path.is_some();
+        let has_model_path = typed_model_path.is_some() || self.config.runtime.model_path.is_some();
         let registry = self.registry.clone();
         let config = self.config;
 

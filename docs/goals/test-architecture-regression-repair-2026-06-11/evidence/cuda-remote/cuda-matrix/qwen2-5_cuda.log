@@ -1,0 +1,66 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "run",
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    "--max-tokens",
+    "160"
+  ]
+}
+--- stdout ---
+你好！很高兴为您服务。有什么我可以帮助您的吗？
+我是Qwen，一个由阿里云开发的超大规模语言模型。我被设计用于回答问题、创作文字和生成文本。我的目标是帮助用户更好地理解和表达他们的想法和需求，无论是学术研究、创意写作还是日常生活中的各种场景。
+
+我使用了先进的预训练技术来学习大量的语言数据，并通过深度学习算法不断优化自己的能力以提供更准确的回答和服务体验。
+
+如果您有任何问题或需要帮助，请随时告诉我！
+Rust 是一种由阿里云开发的超大规模语言模型，它在多个领域都有广泛的应用。以下是 Rust 在实际应用场景中的几个主要场景及其对应的开源项目：
+
+1. **Web 开发**
+   - **真实开源项目**：Node.js 和 Rust 的结合使用是 Web 开发中常见的做法。
+     - 例如，Node.js 中的 `http`、`net/http/asyncio/worker_threads`、以及 `std::thread`, 通过这些库可以实现异步处理和并发。
+
+2. **游戏开发**
+   - 使用了 Rust 的内存安全特性来编写高性能的游戏引擎。
+     ```rust
+       use std::sync::{Arc, Mutex};
+       use std::{thread, time};
+
+       struct Game {
+         game: Arc<M
+
+--- stderr ---
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+[auto-size] gpu=24.0 GB total / 22.6 GB free | weights=0.9 GB budget / 0.9 GB total | layers=24 budget | scratch reserve=4.0 GB | KV pool budget 16.7 GB → max_blocks=91036
+[auto-size] KV_MAX_BLOCKS=91036 PAGED_MAX_SEQS=2 KV_CAPACITY=16384
+Loading Qwen/Qwen2.5-0.5B-Instruct...
+Using CUDA(0) backend
+Loading weights to GPU... (30s+ for >10 GB models)
+[2m2026-06-10T17:30:34.331543Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-10T17:30:34.331577Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-10T17:30:34.331688Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775/tokenizer.json"
+[2m2026-06-10T17:30:34.625886Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-10T17:30:34.625930Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-10T17:30:34.625936Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-10T17:30:34.625958Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating default KV cache manager: device=CUDA(0), block_size=16, max_blocks=91036
+[2m2026-06-10T17:30:34.626059Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /root/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775 (format: safetensors)
+[2m2026-06-10T17:30:34.626339Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Qwen2, Layers: 24, Vocab: 151936
+[2m2026-06-10T17:30:34.846530Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-10T17:30:34.846673Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Qwen2 via LlamaFamilyModel
+[2m2026-06-10T17:30:34.846681Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-10T17:30:37.751194Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+Model loaded in 4.6s.
+
+Ready. Type your message and press Enter.
+Use /clear to reset history; /bye or Ctrl+D to exit.
+
+[batched-qkr] first batched_decode call: m=1 use_batched_qkr=true (q=None k=None v=None)
+[batched-kv-append] first call: m=1 ok=true k_err=None v_err=None
+[batched-attn] first call: m=1 ok=true err=None
+[13 tokens, 27.8 tok/s, 0.5s]
+
+[93 tokens, 145.0 tok/s, 0.6s]
+
+[160 tokens, 137.1 tok/s, 1.2s]
+
+Goodbye!

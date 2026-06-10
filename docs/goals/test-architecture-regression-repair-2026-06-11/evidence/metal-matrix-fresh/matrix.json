@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "platform": "metal",
+  "models": [
+    {
+      "id": "llama-family",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {
+        "metal": 17.1
+      },
+      "detail": ""
+    },
+    {
+      "id": "qwen3-dense",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {
+        "metal": 20.8
+      },
+      "detail": ""
+    },
+    {
+      "id": "qwen3-moe",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {
+        "metal": 0.1
+      },
+      "detail": ""
+    },
+    {
+      "id": "qwen2-5",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {
+        "metal": 39.6
+      },
+      "detail": ""
+    },
+    {
+      "id": "bert",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {},
+      "detail": ""
+    },
+    {
+      "id": "whisper",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {},
+      "detail": ""
+    },
+    {
+      "id": "qwen3-tts",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {},
+      "detail": ""
+    },
+    {
+      "id": "clip",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {},
+      "detail": ""
+    }
+  ]
+}

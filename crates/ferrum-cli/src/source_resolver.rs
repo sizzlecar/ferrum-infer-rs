@@ -66,12 +66,12 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
 /// dirs) and materializes missing compatibility env vars for:
 ///
 ///   - `FERRUM_KV_CAPACITY`     — 8192 dense / 4096 MoE
-///   - `FERRUM_METAL_PAGED_KV`  — 0 GGUF / 1 dense safetensors.
+///   - `FERRUM_METAL_PAGED_KV`  — 0 GGUF / 1 only for Qwen3 dense and MoE safetensors.
 ///     The Metal Qwen3-MoE GGUF paged-KV decode path can repeat the first
 ///     generated token until `max_tokens`; keep GGUF on the contiguous path
-///     until that kernel path is fixed. Dense safetensors still requires
-///     paged on Metal: the contiguous-KV attention path produces token noise
-///     from the very first decode step for safetensors-loaded Qwen3.
+///     until that kernel path is fixed. Qwen3 dense safetensors is validated
+///     on paged KV; TinyLlama/Llama and Qwen2 dense safetensors produce token
+///     noise on the Metal paged-KV path and default to contiguous KV.
 ///   - `FERRUM_PAGED_MAX_SEQS=2` dense / `1` MoE, `FERRUM_MAX_BATCH=1` — single-user REPL.
 ///     Keeps the paged pool at ~1.7 GB for `cap=8192` dense; without this
 ///     cap the default `max_seqs=32` makes the pool ~30 GB on a 32 GB Mac.
@@ -111,12 +111,14 @@ pub fn chat_profile_runtime_entries(
             .map(|e| e.eq_ignore_ascii_case("gguf"))
             .unwrap_or(false);
     let is_moe = detect_moe_arch(snapshot_path);
-    chat_profile_runtime_entries_for_arch(is_gguf, is_moe, current, source)
+    let model_family = detect_model_family(snapshot_path);
+    chat_profile_runtime_entries_for_arch(is_gguf, is_moe, model_family.as_deref(), current, source)
 }
 
 fn chat_profile_runtime_entries_for_arch(
     is_gguf: bool,
     is_moe: bool,
+    model_family: Option<&str>,
     current: &RuntimeConfigSnapshot,
     source: RuntimeConfigSource,
 ) -> Vec<RuntimeConfigEntry> {
@@ -129,9 +131,10 @@ fn chat_profile_runtime_entries_for_arch(
         if is_moe { "4096" } else { "8192" },
         source,
     );
-    // GGUF: contiguous path is the correctness baseline. Dense safetensors
-    // still needs paged-KV on Metal.
-    let need_paged = !is_gguf;
+    // GGUF: contiguous path is the correctness baseline. For safetensors,
+    // keep paged KV only on families with current product evidence.
+    let need_paged = !is_gguf
+        && (is_moe || model_family.is_some_and(|family| family.eq_ignore_ascii_case("qwen3")));
     push_missing_entry(
         &mut entries,
         current,
@@ -221,6 +224,49 @@ pub fn detect_moe_arch(path: &Path) -> bool {
     json.get("model_type")
         .and_then(|v| v.as_str())
         .is_some_and(|mt| mt.to_lowercase().contains("moe"))
+}
+
+pub fn detect_model_family(path: &Path) -> Option<String> {
+    use ferrum_quantization::gguf::GgufFile;
+
+    if path.is_file()
+        && path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false)
+    {
+        return GgufFile::open(path)
+            .ok()
+            .and_then(|g| g.architecture().ok().map(|s| normalize_model_family(s)));
+    }
+
+    let config_path = path.join("config.json");
+    let contents = std::fs::read_to_string(&config_path).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    if let Some(model_type) = json.get("model_type").and_then(|v| v.as_str()) {
+        return Some(normalize_model_family(model_type));
+    }
+    json.get("architectures")
+        .and_then(|v| v.as_array())
+        .and_then(|archs| archs.iter().find_map(|arch| arch.as_str()))
+        .map(normalize_model_family)
+}
+
+fn normalize_model_family(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("qwen3_moe") || lower.contains("qwen3moe") || lower.contains("qwen3_mo") {
+        "qwen3_moe".to_string()
+    } else if lower.contains("qwen3") {
+        "qwen3".to_string()
+    } else if lower.contains("qwen2") || lower == "qwen" {
+        "qwen2".to_string()
+    } else if lower.contains("mistral") {
+        "mistral".to_string()
+    } else if lower.contains("llama") || lower.contains("tinyllama") {
+        "llama".to_string()
+    } else {
+        lower
+    }
 }
 
 /// Correctness fallback for Metal GGUF MoE.
@@ -797,6 +843,44 @@ mod tests {
     }
 
     #[test]
+    fn chat_profile_disables_metal_paged_kv_for_llama_safetensors() {
+        let dir = temp_model_dir(
+            "llama",
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        );
+        let entries = chat_profile_runtime_entries(
+            &dir,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("0")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_profile_disables_metal_paged_kv_for_qwen2_safetensors() {
+        let dir = temp_model_dir(
+            "qwen2",
+            r#"{"architectures":["Qwen2ForCausalLM"],"model_type":"qwen2"}"#,
+        );
+        let entries = chat_profile_runtime_entries(
+            &dir,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("0")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn chat_profile_defaults_moe_safetensors_as_typed_entries() {
         let dir = temp_model_dir(
             "moe",
@@ -837,6 +921,7 @@ mod tests {
         let entries = chat_profile_runtime_entries_for_arch(
             true,
             true,
+            Some("qwen3_moe"),
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );

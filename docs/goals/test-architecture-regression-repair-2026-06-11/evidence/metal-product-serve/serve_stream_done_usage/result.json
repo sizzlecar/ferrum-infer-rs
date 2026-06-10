@@ -1,0 +1,14 @@
+{
+  "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-product-serve/serve_stream_done_usage/result.json",
+  "chunk_count": 11,
+  "content_delta_count": 9,
+  "done_count": 1,
+  "duration_sec": 0.17460220772773027,
+  "event_count": 12,
+  "malformed_json": 0,
+  "name": "serve_stream_done_usage",
+  "output_text": "Hello! How can I assist you today?",
+  "status": "pass",
+  "type": "serve_stream",
+  "usage_chunks": 1
+}

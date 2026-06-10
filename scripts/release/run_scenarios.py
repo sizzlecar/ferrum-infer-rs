@@ -426,6 +426,7 @@ class ScenarioRunner:
         port = int(self.args.port or self.manifest.get("port") or free_port())
         self.base_url = f"http://127.0.0.1:{port}"
         effective = self.out / "server.effective_config.json"
+        decision_trace = self.out / "server.decision_trace.jsonl"
         cmd = [
             str(self.ferrum_bin),
             "serve",
@@ -435,6 +436,8 @@ class ScenarioRunner:
             str(port),
             "--effective-config-json",
             str(effective),
+            "--decision-trace-jsonl",
+            str(decision_trace),
         ]
         server = self.manifest.get("server")
         if isinstance(server, dict):
@@ -784,6 +787,10 @@ class ScenarioRunner:
             str(scenario.get("temperature", 0)),
             "--output-format",
             "jsonl",
+            "--effective-config-json",
+            str(out / "effective_config.json"),
+            "--decision-trace-jsonl",
+            str(out / "decision_trace.jsonl"),
             self.model,
         ]
         proc = subprocess.run(

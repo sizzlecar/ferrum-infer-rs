@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "git_sha": "0db6412142fcb6a759e1f4a1f928936beec65488",
+  "contains_origin_main_0db64121": true,
+  "contains_handoff_ed4c8d87": true,
+  "git_status_short": [
+    " M crates/ferrum-cli/src/source_resolver.rs",
+    " M crates/ferrum-engine/src/builder.rs",
+    " M crates/ferrum-engine/src/registry.rs",
+    " M crates/ferrum-models/src/models/llama_family.rs",
+    " M crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+    " M crates/ferrum-quantization/src/native_safetensors.rs",
+    " M crates/ferrum-types/src/auto_config.rs",
+    " M crates/ferrum-types/src/config.rs",
+    " M crates/ferrum-types/tests/config_tests.rs",
+    " M scripts/release/models_manifest.json",
+    " M scripts/release/readme_model_matrix.py",
+    " M scripts/release/run_scenarios.py",
+    "?? docs/goals/test-architecture-regression-repair-2026-06-11/",
+    "?? scripts/release/__pycache__/openai_concurrency_quality_regression.cpython-314.pyc",
+    "?? scripts/release/__pycache__/openai_tool_call_regression.cpython-314.pyc",
+    "?? scripts/release/test_arch_regression_repair_gate.py"
+  ],
+  "binary_sha256": {
+    "metal": "77e6e6e73e3089972fc1f60e4dc921ba55d7867e870f2b7cf28706d91c67af6d",
+    "cuda": "207409bd04a31f72e9970cc77f7da560913e38284dee12ae2daa95ac9467961f"
+  },
+  "artifacts": {
+    "goal": "docs/goals/test-architecture-regression-repair-2026-06-11/GOAL.md",
+    "validator": "scripts/release/test_arch_regression_repair_gate.py",
+    "cuda_remote_status": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/hardware/remote_source_status.txt"
+  }
+}

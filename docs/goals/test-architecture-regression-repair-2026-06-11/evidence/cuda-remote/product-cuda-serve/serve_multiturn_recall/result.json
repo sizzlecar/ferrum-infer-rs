@@ -1,0 +1,9 @@
+{
+  "artifact": "out/regression-repair-20260611/product-cuda-serve/serve_multiturn_recall/result.json",
+  "assistant_turns": 2,
+  "duration_sec": 0.7646851879544556,
+  "name": "serve_multiturn_recall",
+  "recalled_secret": true,
+  "status": "pass",
+  "type": "serve_multiturn_recall"
+}

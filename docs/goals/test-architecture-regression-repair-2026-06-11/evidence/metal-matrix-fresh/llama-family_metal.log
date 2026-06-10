@@ -1,0 +1,48 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "run",
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "--max-tokens",
+    "160"
+  ]
+}
+--- stdout ---
+你好。
+Sure, I'd be happy to introduce myself! My name is [Your Name], and I am a 25-year-old woman from [City, Country].
+
+I grew up in a small town in the Midwest and attended college at the University of Michigan. After graduation, I moved to New York City for my career aspirations. While there initially seemed like an exciting adventure with endless possibilities for growth and learning opportunities (and maybe even some romance), it quickly became clear that life as an urbanite was not what it was cracked up to be - especially when you're trying your best not just survive but thrive amidst all those towering skyscrapers! But through sheer determination (and
+Sure, I'd be happy to provide more details on Rust's main application scenarios and some real-world examples of its usage.
+
+1. Web Development: Rust is a popular choice for web development due to its speed, safety and ease of use compared with other languages like JavaScript or Python (which are often used in web development). Some popular projects using Rust for the frontend include [Website Name], [Website Name 2], and [Website Name 3]. These projects have achieved impressive performance improvements by leveraging features such as lazy evaluation (where code is only executed when it actually needs it), zero-cost memory allocation through the use of rustc’s memory allocator library, etc., which makes them faster than their competitors
+
+--- stderr ---
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading TinyLlama/TinyLlama-1.1B-Chat-v1.0...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-10T17:15:01.531097Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-10T17:15:01.531115Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-10T17:15:01.531181Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/tokenizer.json"
+2026-06-10T17:15:01.562825Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-10T17:15:01.562838Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-10T17:15:01.562840Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-10T17:15:01.562847Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-10T17:15:01.562903Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6 (format: safetensors)
+2026-06-10T17:15:01.562983Z  INFO ferrum_engine::registry:   Architecture: Llama, Layers: 22, Vocab: 32000
+2026-06-10T17:15:01.589581Z  INFO ferrum_engine::registry: Building model...
+2026-06-10T17:15:01.589645Z  INFO ferrum_engine::registry: Loading Llama via LlamaFamilyModel
+2026-06-10T17:15:01.589651Z  INFO ferrum_engine::registry:   Backend: Metal (weights f32), KV: fp16
+Model loaded in 2.1s.
+
+Ready. Type your message and press Enter.
+Use /clear to reset history; /bye or Ctrl+D to exit.
+
+[batched-qkr] first batched_decode call: m=1 use_batched_qkr=false (q=Some("Unsupported operation: qk_norm_rope_batched_per_item not implemented for this backend") k=Some("Unsupported operation: qk_norm_rope_batched_per_item not implemented for this backend") v=Some("Unsupported operation: qk_norm_rope_batched_per_item not implemented for this backend"))
+[4 tokens, 17.1 tok/s, 0.2s]
+
+[160 tokens, 39.9 tok/s, 4.0s]
+
+[160 tokens, 29.5 tok/s, 5.4s]
+
+Goodbye!

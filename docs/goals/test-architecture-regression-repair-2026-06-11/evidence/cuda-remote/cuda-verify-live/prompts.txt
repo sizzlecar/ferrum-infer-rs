@@ -1,0 +1,8 @@
+我会给你一个代码。代码是 ferrum-blue-0611。之后如果我问“代码是什么”，请只输出 ferrum-blue-0611。现在回复 OK。
+代码是什么？
+巴黎在法国吗？只回答是或否。
+代码是什么？
+阅读这段背景并回复“已读”：Ferrum 回归检查要覆盖 run 和 serve 两个产品入口，CUDA 上要保存 effective config 与 decision trace，并确认 vLLM paged attention 与 Marlin MoE 的选择。这个背景会增加上下文长度，但不要忘记代码 ferrum-blue-0611。Ferrum 回归检查要覆盖 run 和 serve 两个产品入口，CUDA 上要保存 effective config 与 decision trace，并确认 vLLM paged attention 与 Marlin MoE 的选择。这个背景会增加上下文长度，但不要忘记代码 ferrum-blue-0611。
+列举 Rust 三个应用场景，每个场景给一个开源项目。
+代码是什么？
+/bye

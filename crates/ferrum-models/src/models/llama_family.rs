@@ -821,8 +821,7 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// at the composition root (was a process-wide OnceLock reading env).
     /// Forward/decode read these fields instead of a global accessor.
     pub(crate) runtime_env: LlamaFamilyRuntimeEnv,
-    pub(crate) batched_cfg:
-        super::llama_family_forward_batched::LlamaBatchedRuntimeConfig,
+    pub(crate) batched_cfg: super::llama_family_forward_batched::LlamaBatchedRuntimeConfig,
 
     /// Token embedding table. `None` for backbone-only models (e.g. the
     /// Qwen3-TTS Talker, which embeds inputs externally and feeds via
@@ -2047,12 +2046,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .and_then(|layers| layers.first())
             .map(K::len)
             .unwrap_or(0);
-        let mut cached_prefix_tokens =
-            if self.runtime_env.prefix_cache && cache_len_before == 0 {
-                self.try_acquire_prefix_cache(cache_id, tokens)
-            } else {
-                0
-            };
+        let mut cached_prefix_tokens = if self.runtime_env.prefix_cache && cache_len_before == 0 {
+            self.try_acquire_prefix_cache(cache_id, tokens)
+        } else {
+            0
+        };
         if cached_prefix_tokens >= tokens.len() {
             let block_size = self
                 .kv_caches

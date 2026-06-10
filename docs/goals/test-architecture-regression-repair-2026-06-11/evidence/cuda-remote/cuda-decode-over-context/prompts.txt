@@ -1,0 +1,8 @@
+记住代码 ferrum-blue-0611。只回复“已记住”。
+请复述代码。
+巴黎在哪个国家？回答一句。
+再复述刚才的代码。
+下面是一段长背景，请读完后只回复“已读”：Rust 的所有权系统通过编译期检查避免悬垂指针和数据竞争。Ferrum 的测试重构要求产品入口同时保存 effective config 与 decision trace。CUDA MoE 路径要确认 vLLM Marlin MoE、paged KV、paged attention 的实际选择。Metal 路径要确认 dense safetensors 不再输出乱码。这个背景段落用于累积上下文长度，并检查后续 decode 没有因为 KV 或 attention 选择产生退化。请继续记住代码 ferrum-blue-0611。Rust 的所有权系统通过编译期检查避免悬垂指针和数据竞争。Ferrum 的测试重构要求产品入口同时保存 effective config 与 decision trace。CUDA MoE 路径要确认 vLLM Marlin MoE、paged KV、paged attention 的实际选择。Metal 路径要确认 dense safetensors 不再输出乱码。这个背景段落用于累积上下文长度，并检查后续 decode 没有因为 KV 或 attention 选择产生退化。请继续记住代码 ferrum-blue-0611。
+列举 Rust 三个应用场景，每个场景给一个开源项目。
+最后一次复述代码 ferrum-blue-0611 是否还在上下文里？
+/bye

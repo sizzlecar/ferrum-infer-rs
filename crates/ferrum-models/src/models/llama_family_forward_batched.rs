@@ -121,7 +121,6 @@ mod tests {
     }
 }
 
-
 // Batched / unified-forward paths are FP16-only. Pinning the impl to
 // K = KvFp16 lets us access `KvCache<B, KvFp16>` fields directly without
 // trait-method indirection. K = KvInt8 falls back to per-item decode at

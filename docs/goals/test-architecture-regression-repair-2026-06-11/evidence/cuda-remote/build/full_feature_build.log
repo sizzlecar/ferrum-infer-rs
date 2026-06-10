@@ -1,0 +1,36 @@
+2026-06-10T16:30:03+00:00
+0db6412142fcb6a759e1f4a1f928936beec65488
+?? out/
+Wed Jun 10 16:30:03 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4090        On  |   00000000:A1:00.0 Off |                  Off |
+| 30%   59C    P2            449W /  450W |     912MiB /  24564MiB |     99%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2024 NVIDIA Corporation
+Built on Thu_Mar_28_02:18:24_PDT_2024
+Cuda compilation tools, release 12.4, V12.4.131
+Build cuda_12.4.r12.4/compiler.34097967_0
+   Compiling ferrum-kernels v0.7.6 (/root/ferrum-infer-rs/crates/ferrum-kernels)
+   Compiling ferrum-quantization v0.7.6 (/root/ferrum-infer-rs/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.6 (/root/ferrum-infer-rs/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.6 (/root/ferrum-infer-rs/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.6 (/root/ferrum-infer-rs/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.6 (/root/ferrum-infer-rs/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 35m 07s
+2026-06-10T17:05:11+00:00

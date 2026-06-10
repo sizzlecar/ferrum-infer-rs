@@ -1,0 +1,54 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "run",
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "--max-tokens",
+    "160"
+  ]
+}
+--- stdout ---
+Sure, here's a revised version of the text with the added phrase "and I'm grateful for it":
+
+I woke up this morning feeling like a new person. The sun was just beginning to peek over my bedroom window, and as I stretched out my arms and legs in preparation for another day of work or school or whatever it is that we do every day (I don’t know about you guys), something inside me shifted. It wasn’t just that there was more light in the room; there were other things too – an energy, perhaps? A sense of possibility? Whatever it might be called – but whatever its name may be (it doesn’t matter), something had shifted within me today. And while some
+Sure, I'd be happy to introduce myself! My name is [Your Name], and I am a 25-year-old woman from [City, State]. As someone who has always been fascinated by the world around me and eager to learn more about it, my journey towards becoming an English major at your university was a natural progression.
+
+Growing up in the Midwest of America (specifically in Chicago), my family was not particularly involved with education or academia. However – as fate would have it – we moved across state lines when I was just six years old for work purposes (I know that sounds crazy now but trust me on this one). This move brought us closer together as individuals but also exposed us both to new cultures
+Rust is a high-performance, safe and concurrent programming language that has gained popularity in recent years. Here are some of the main use cases for Rust:
+
+1. Game development: Rust is an excellent choice for game developers due to its focus on safety, concurrency and performance optimization. Some popular games written in RUST include "Minecraft", "The Elder Scrolls V Skyrim" (both developed by Bethesda Softworks), as well as the upcoming game "Cyberpunk 2077" (developed by CD Projekt Red). 2."WebAssembly": WebAssembly allows developers to write native code that runs natively on web browsers without requiring a full rebuild of their application every time they update it or
+
+--- stderr ---
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+[auto-size] gpu=24.0 GB total / 22.6 GB free | weights=2.0 GB budget / 2.0 GB total | layers=22 budget | scratch reserve=4.0 GB | KV pool budget 15.5 GB → max_blocks=46293
+[auto-size] KV_MAX_BLOCKS=46293 PAGED_MAX_SEQS=2 KV_CAPACITY=16384
+Loading TinyLlama/TinyLlama-1.1B-Chat-v1.0...
+Using CUDA(0) backend
+Loading weights to GPU... (30s+ for >10 GB models)
+[2m2026-06-10T17:29:25.486896Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-10T17:29:25.486928Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-10T17:29:25.487040Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/root/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/tokenizer.json"
+[2m2026-06-10T17:29:25.547451Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-10T17:29:25.547480Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-10T17:29:25.547485Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-10T17:29:25.547509Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating default KV cache manager: device=CUDA(0), block_size=16, max_blocks=46293
+[2m2026-06-10T17:29:25.547600Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /root/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6 (format: safetensors)
+[2m2026-06-10T17:29:25.547817Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Llama, Layers: 22, Vocab: 32000
+[2m2026-06-10T17:29:25.765483Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-10T17:29:25.765651Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Llama via LlamaFamilyModel
+[2m2026-06-10T17:29:25.765661Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+Model loaded in 8.0s.
+
+Ready. Type your message and press Enter.
+Use /clear to reset history; /bye or Ctrl+D to exit.
+
+[batched-qkr] first batched_decode call: m=1 use_batched_qkr=true (q=None k=None v=None)
+[batched-kv-append] first call: m=1 ok=true k_err=None v_err=None
+[batched-attn] first call: m=1 ok=true err=None
+[160 tokens, 97.0 tok/s, 1.6s]
+
+[160 tokens, 118.1 tok/s, 1.4s]
+
+[160 tokens, 87.3 tok/s, 1.8s]
+
+Goodbye!
