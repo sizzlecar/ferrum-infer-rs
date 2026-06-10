@@ -20,7 +20,9 @@
       "expected_failing_surface": "tiny full-stack: eos_terminates, stop_sequidentifier, stream chunk contract, multi-turn",
       "repro_patch": "patches/hb-01.patch",
       "patch_status": "ready",
-      "notes": "Patch removes the stop_token_ids EOS guard in SequenceState::stop_reason (forward-translation; the old vocab-top heuristic is no longer expressible)."
+      "notes": "Patch removes the stop_token_ids EOS guard in SequenceState::stop_reason (forward-translation; the old vocab-top heuristic is no longer expressible).",
+      "caught_by": "ferrum-engine tiny_stack::tiny_stack_eos_terminates",
+      "kill_status": "verified-kill"
     },
     {
       "id": "hb-02",
@@ -35,7 +37,9 @@
       "expected_failing_surface": "tiny full-stack: stop sequence inside composite token scenario",
       "repro_patch": "patches/hb-02.patch",
       "patch_status": "ready",
-      "notes": "Patch restores the pre-fix match arm byte-identically (region untouched since the fix)."
+      "notes": "Patch restores the pre-fix match arm byte-identically (region untouched since the fix).",
+      "caught_by": "ferrum-engine tiny_stack::tiny_stack_stop_sequence_composite_token",
+      "kill_status": "verified-kill"
     },
     {
       "id": "hb-03",
@@ -53,7 +57,9 @@
       "expected_failing_surface": "tiny full-stack: guided/tool constraint decoding scenario",
       "repro_patch": "patches/hb-03.patch",
       "patch_status": "ready",
-      "notes": "Patch is the clean reverse of 5cb6b1fe (premature guided force-EOS); one defect of the 4-commit series is sufficient for the scenario to kill."
+      "notes": "Patch is the clean reverse of 5cb6b1fe (premature guided force-EOS); one defect of the 4-commit series is sufficient for the scenario to kill.",
+      "caught_by": "ferrum-sampler guided::tests::dead_state_disables_masking_instead_of_forcing_eos (existing)",
+      "kill_status": "verified-kill"
     },
     {
       "id": "hb-04",
@@ -68,7 +74,9 @@
       "expected_failing_surface": "tiny full-stack: guided/tool constraint decoding scenario",
       "repro_patch": "patches/hb-04.patch",
       "patch_status": "ready",
-      "notes": "Patch weakens requires_full_logits_for_sampling (removes the JsonSchema clause) — the silent-bypass class the fix's pinned test covers."
+      "notes": "Patch weakens requires_full_logits_for_sampling (removes the JsonSchema clause) — the silent-bypass class the fix's pinned test covers.",
+      "caught_by": "ferrum-engine tiny_stack::tiny_stack_guided_tool_constraint",
+      "kill_status": "verified-kill"
     },
     {
       "id": "hb-05",
@@ -83,7 +91,9 @@
       "expected_failing_surface": "in-process OpenAI wire: tool-call argument bound scenario",
       "repro_patch": "patches/hb-05.patch",
       "patch_status": "ready",
-      "notes": "Sampler-side bound removal in schema_to_regex; the server-side maxLength injection becomes inert."
+      "notes": "Sampler-side bound removal in schema_to_regex; the server-side maxLength injection becomes inert.",
+      "caught_by": "ferrum-sampler schema_to_regex::tests::string_schema_honors_min_and_max_length (existing)",
+      "kill_status": "verified-kill"
     },
     {
       "id": "hb-06",
@@ -131,7 +141,9 @@
       "expected_failing_surface": "tiny full-stack: KV capacity boundary scenario (scratch growth across batches)",
       "repro_patch": "patches/hb-08.patch",
       "patch_status": "ready",
-      "notes": "May not reproduce at tiny shapes; exemption candidate per acceptance.exemption_rule. Llama-family re-init removal only (qwen3_moe left intact); canonical trigger is scratch growth across batches."
+      "notes": "May not reproduce at tiny shapes; exemption candidate per acceptance.exemption_rule. Llama-family re-init removal only (qwen3_moe left intact); canonical trigger is scratch growth across batches. EXEMPT per acceptance.exemption_rule.",
+      "kill_status": "exempt",
+      "exempt_reason": "Not reproducible at tiny CPU full-stack scale: LlmExecutor does not override batch_decode, so the engine never drives the llama_family batched paged-decode scratch path where the realloc-without-reinit defect lives (needs c>=16 real paged batch). Kept tiny_stack_kv_capacity_boundary for its independent no-panic-under-pressure value."
     },
     {
       "id": "hb-09",
