@@ -21,6 +21,19 @@ pub struct RuntimeKnobs {
     pub rbd_prof: bool,
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
+
+    // Engine-build composition knobs. Previously read directly from the
+    // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
+    // FERRUM_SPEC_N) and `registry.rs` (FERRUM_DTYPE / FERRUM_METAL_DTYPE /
+    // FERRUM_TP). The CLI composition root now resolves them into this typed
+    // field so the engine builder and component registry read the snapshot,
+    // not `std::env`.
+    pub model_path: Option<String>,
+    pub spec_draft: Option<String>,
+    pub spec_n: Option<usize>,
+    pub dtype: Option<String>,
+    pub metal_dtype: Option<String>,
+    pub tp: Option<usize>,
 }
 
 /// Engine configuration
@@ -82,6 +95,32 @@ impl EngineConfig {
             runtime_config_value(snapshot, "FERRUM_WHOLE_PROMPT_PREFIX_CACHE")
                 .map(|v| v == "1")
                 .unwrap_or(false);
+
+        // Engine-build composition knobs (previously read by builder.rs /
+        // registry.rs from env). Only overwrite when the key is present so a
+        // later snapshot apply without the key keeps an earlier value.
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_MODEL_PATH") {
+            self.runtime.model_path = Some(value.to_string());
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SPEC_DRAFT") {
+            self.runtime.spec_draft = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SPEC_N") {
+            self.runtime.spec_n = value.parse::<usize>().ok();
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_DTYPE") {
+            self.runtime.dtype = Some(value.to_string());
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_METAL_DTYPE") {
+            self.runtime.metal_dtype = Some(value.to_string());
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_TP") {
+            self.runtime.tp = value.parse::<usize>().ok();
+        }
         Ok(())
     }
 }

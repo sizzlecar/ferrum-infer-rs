@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
-use ferrum_types::{Device, EngineConfig, FerrumError, Result};
+use ferrum_types::{Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -126,10 +126,20 @@ struct RegistryRuntimeEnv {
 }
 
 impl RegistryRuntimeEnv {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
+    /// Build from the typed runtime snapshot resolved at the composition root.
+    /// Replaces the former `std::env`-reading `from_env`/`OnceLock` pair; the
+    /// CLI lands FERRUM_MODEL_PATH / FERRUM_DTYPE / FERRUM_METAL_DTYPE /
+    /// FERRUM_TP into `EngineConfig.runtime`, and the registry reads that.
+    fn from_runtime_knobs(knobs: &RuntimeKnobs) -> Self {
+        Self {
+            model_path: knobs.model_path.clone(),
+            metal_dtype: knobs.metal_dtype.clone(),
+            dtype: knobs.dtype.clone(),
+            tp: knobs.tp.unwrap_or(0),
+        }
     }
 
+    #[cfg(test)]
     fn from_env_vars<I, K, V>(vars: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -160,6 +170,7 @@ impl RegistryRuntimeEnv {
         }
     }
 
+    #[cfg(test)]
     fn model_path(&self) -> Option<String> {
         self.model_path.clone()
     }
@@ -188,11 +199,6 @@ impl RegistryRuntimeEnv {
             .clone()
             .unwrap_or_else(|| "f32".to_string())
     }
-}
-
-fn registry_runtime_env() -> &'static RegistryRuntimeEnv {
-    static CONFIG: OnceLock<RegistryRuntimeEnv> = OnceLock::new();
-    CONFIG.get_or_init(RegistryRuntimeEnv::from_env)
 }
 
 // ============================================================================
@@ -530,7 +536,7 @@ impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizer
         let tokenizer_path = config
             .get_string_option("tokenizer_path")
             .or_else(|| config.get_string_option("model_path"))
-            .or_else(|| registry_runtime_env().model_path());
+            .or_else(|| config.engine_config.runtime.model_path.clone());
 
         if let Some(model_path) = tokenizer_path {
             let path = std::path::Path::new(&model_path);
@@ -1122,7 +1128,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         // Try to load model from path
         let model_path = config
             .get_string_option("model_path")
-            .or_else(|| registry_runtime_env().model_path());
+            .or_else(|| config.engine_config.runtime.model_path.clone());
 
         let model_path = match model_path {
             Some(path) => path,
@@ -1191,7 +1197,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         // can explicitly opt-in via env:
         // - FERRUM_METAL_DTYPE=fp16|fp32 (takes precedence on Metal)
         // - FERRUM_DTYPE=fp16|fp32 (global override for non-CPU)
-        let dtype: DType = registry_runtime_env().dtype_for_device(&config.device);
+        let dtype: DType = RegistryRuntimeEnv::from_runtime_knobs(&config.engine_config.runtime)
+            .dtype_for_device(&config.device);
 
         // Create model based on architecture
         info!("Building model...");
@@ -1211,7 +1218,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 // pre-Architecture-v2 CandleBackend and hasn't been ported
                 // to the Backend<B> trait stack. Reject explicitly so users
                 // don't get a silent single-GPU fallback.
-                let tp_size = registry_runtime_env().tp;
+                let tp_size = config.engine_config.runtime.tp.unwrap_or(0);
                 if tp_size > 1 {
                     return Err(FerrumError::unsupported(
                         "FERRUM_TP>1 not supported on the Backend<B> path. \
@@ -1310,7 +1317,9 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                 // FERRUM_METAL_DTYPE=f16 toggles fp16 weight storage
                                 // inside MetalBackend. Halves big-tensor RAM;
                                 // recommended for 4B+ models on 16 GB Macs.
-                                let dtype_hint = registry_runtime_env().metal_dtype_hint();
+                                let dtype_hint =
+                                    RegistryRuntimeEnv::from_runtime_knobs(&config.engine_config.runtime)
+                                        .metal_dtype_hint();
                                 info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
                                 build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
                                     arch,
