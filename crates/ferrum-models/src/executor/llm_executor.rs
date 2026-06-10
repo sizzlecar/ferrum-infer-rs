@@ -204,6 +204,13 @@ impl ModelExecutor for LlmExecutor {
         &self.info
     }
 
+    fn supports_native_unified_decode(&self) -> bool {
+        // CUDA has a native unified mixed prefill+decode forward; CPU and Metal
+        // use the legacy split path. The device→capability mapping lives here
+        // (the executor is backend-aware) so the engine needs no platform cfg.
+        matches!(self.info.device, ferrum_types::Device::CUDA(_))
+    }
+
     fn kv_capacity(&self) -> Option<usize> {
         Some(self.lock_model().kv_capacity())
     }
