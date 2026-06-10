@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:18186  model=Qwen3-30B-A3B  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               32/32
+  wall time:               92.21s
+  request throughput:      0.35 req/s
+  input  token throughput: 0.0 tok/s
+  output token throughput: 21.2 tok/s
+  total input tokens:      0
+  total output tokens:     1958
+
+  TTFT  mean 2627.91ms  median 2176.64ms  p99 5473.44ms  max 5473.50ms
+  TPOT  mean  680.58ms  median  679.76ms  p99  699.11ms  max  700.56ms
+  ITL   mean  679.23ms  median  701.60ms  p99 1071.72ms  max 1433.06ms
+  E2E   mean 43597.96ms  median 44842.46ms  p99 47903.68ms  max 47903.85ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen30-prewarm-c16-20260601/c16.json

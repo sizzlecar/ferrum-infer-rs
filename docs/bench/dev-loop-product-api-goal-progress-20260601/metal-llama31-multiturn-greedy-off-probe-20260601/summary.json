@@ -1,0 +1,19 @@
+{
+  "swap_start": "vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)",
+  "server_ready": true,
+  "responses": {
+    "paris": {
+      "status": 200,
+      "content": "The capital of France is Paris."
+    },
+    "basalt": {
+      "status": 200,
+      "content": "You can be a memory."
+    },
+    "apple": {
+      "status": 200,
+      "content": "You can remember."
+    }
+  },
+  "swap_end": "vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)"
+}

@@ -1,0 +1,12 @@
+{
+  "model": "Llama-3.1-8B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "My name is Bob. What is my name? Reply with only the name."
+    }
+  ],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stream": false
+}

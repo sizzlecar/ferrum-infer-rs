@@ -1,0 +1,12 @@
+{
+  "model": "Llama-3.1-8B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "The project codename is maple. What is the project codename? Reply with only the codename."
+    }
+  ],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stream": false
+}

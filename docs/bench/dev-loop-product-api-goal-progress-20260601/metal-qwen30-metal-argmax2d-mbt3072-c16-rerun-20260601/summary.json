@@ -1,0 +1,33 @@
+{
+  "label": "Qwen3-30B-A3B",
+  "swap_start": "vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)",
+  "cells": [
+    {
+      "concurrency": 16,
+      "prompts": 32,
+      "baseline_tps": 79.2,
+      "runner_rc": 0,
+      "completed": 32,
+      "failed": 0,
+      "output_throughput_tok_s": 72.64337008626448,
+      "ratio_to_readme": 0.9172142687659657,
+      "not_regressed_90pct": true,
+      "ttft_median_ms": 3079.026353999999,
+      "tpot_median_ms": 174.1690724206349
+    }
+  ],
+  "server_ready": true,
+  "chat": {
+    "paris": {
+      "status": 200,
+      "passed": true,
+      "content": "Paris"
+    },
+    "multiturn": {
+      "status": 200,
+      "passed": true,
+      "content": "basalt"
+    }
+  },
+  "swap_end": "vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)"
+}

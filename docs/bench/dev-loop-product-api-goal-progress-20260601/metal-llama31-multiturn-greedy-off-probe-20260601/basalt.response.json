@@ -1,0 +1,1 @@
+{"id":"12839b89-aff6-4efa-8187-b8a15f1ddd59","object":"chat.completion","created":1780329408,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"You can be a memory."},"finish_reason":"stop"}],"usage":{"prompt_tokens":64,"completion_tokens":7,"total_tokens":71}}

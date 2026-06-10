@@ -1,0 +1,42 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:18183",
+    "model": "Qwen3-30B-A3B",
+    "num_prompts": 16,
+    "max_concurrency": 16,
+    "request_rate": Infinity,
+    "max_tokens": 8
+  },
+  "completed": 16,
+  "failed": 0,
+  "wall_time_s": 21.09198275,
+  "request_throughput_rps": 0.7585820730865144,
+  "input_throughput_tok_s": 0.0,
+  "output_throughput_tok_s": 6.021245205124208,
+  "total_input_tokens": 0,
+  "total_output_tokens": 127,
+  "ttft_ms": {
+    "mean": 6836.589645875,
+    "median": 5862.7075835,
+    "p99": 13564.8778018,
+    "max": 13564.897708
+  },
+  "tpot_ms": {
+    "mean": 1749.3699135610118,
+    "median": 1894.8064970714286,
+    "p99": 2384.962585258333,
+    "max": 2422.961527833333
+  },
+  "itl_ms": {
+    "mean": 1743.2983487027027,
+    "median": 1123.4924170000013,
+    "p99": 5339.631062800001,
+    "max": 7702.595958
+  },
+  "e2e_ms": {
+    "mean": 18930.743945312497,
+    "median": 19126.066708499995,
+    "p99": 21090.4066973,
+    "max": 21090.461291
+  }
+}

@@ -1,0 +1,9 @@
+# Llama simple instruction probe
+
+Swap start: `vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)`
+Swap end: `vm.swapusage: total = 2048.00M  used = 1620.06M  free = 427.94M  (encrypted)`
+- repeat_word: status=200 content=`The word "apple"`
+- name_fact: status=200 content=`Your name is Bob.`
+- color_fact: status=200 content=`It seems like you're referring to the color red.`
+- math: status=200 content=`It seems like you forgot to add 2`
+- capital_germany: status=200 content=`Berlin`
