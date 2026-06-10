@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "description": "Allowlist for test_arch_goal_gate.py Gate A. An entry exempts (path-prefix, pattern) findings that are legitimately platform-specific — device construction / detection / backend registration at the composition root, where branching on the accelerator is correct by design (analogous to backend_boundary_allowlist.json). The LLM hot-path coupling (env reads, OnceLock config freeze, supports_*() behavior branches) is NOT allowlisted: those are real decoupling targets tracked in STATUS.md and must reach zero by migration, not exemption.",
+  "entries": [
+    {
+      "path": "crates/ferrum-engine/src/registry.rs",
+      "pattern": "cfg_branch",
+      "reason": "Backend/device registration is the composition root: it must branch on cuda/metal availability to register the right backend and enumerate devices. This is device wiring, not LLM forward-path behavior.",
+      "owner": "runtime",
+      "review_condition": "Re-review if device/backend registration moves out of registry.rs or stops needing compile-time backend gating."
+    },
+    {
+      "path": "crates/ferrum-engine/src/tensor_factory/candle.rs",
+      "pattern": "cfg_branch",
+      "reason": "Maps the ferrum Device enum to a concrete candle Device (creating CUDA/Metal devices). Device construction is inherently platform-specific and backend-agnostic model code never sees it.",
+      "owner": "runtime",
+      "review_condition": "Re-review if tensor-factory device construction is unified behind a runtime resolver."
+    },
+    {
+      "path": "crates/ferrum-engine/src/parallel/device.rs",
+      "pattern": "cfg_branch",
+      "reason": "Device detection/enumeration (detect_metal_devices, per-device capability probing). Platform-specific by nature; sits below the model abstraction.",
+      "owner": "runtime",
+      "review_condition": "Re-review if device detection is delegated to the kernels backend crate."
+    }
+  ]
+}
