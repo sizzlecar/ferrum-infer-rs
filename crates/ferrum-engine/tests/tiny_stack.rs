@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use ferrum_engine::{ContinuousBatchEngine, GreedySampler, LlmInferenceEngine, SequenceState};
+use ferrum_kernels::backend::{cpu::CpuBackend, BackendPagedKv};
 use ferrum_models::test_support::{
     tiny_llama_executor, tiny_tokenizer, TinyLlamaConfig, TinyTokenizer,
 };
@@ -357,6 +358,30 @@ async fn tiny_stack_kv_capacity_boundary() {
         .await
         .expect("engine usable after capacity pressure");
     assert!(!after.text.is_empty());
+}
+
+/// Capability-fallback law (Gate A5, Llama path). The tiny model runs on
+/// `CpuBackend`, which declares every optional accelerator capability false.
+/// The full engine path must therefore exercise only fallback code — proving
+/// shared model code never hard-depends on a capability a backend lacks (the
+/// hb-07 class). We assert the precondition (caps are off) and that the
+/// fallback path still produces correct output end-to-end.
+#[tokio::test]
+async fn tiny_stack_capability_fallback_law_cpu() {
+    assert!(
+        !CpuBackend::supports_paged_kv(),
+        "precondition: CpuBackend must lack paged-kv so the fallback path is tested"
+    );
+    assert!(!CpuBackend::supports_varlen_qkv());
+    assert!(!CpuBackend::supports_vllm_paged_attn());
+
+    let (engine, _tok) = build_engine();
+    let resp = engine
+        .infer(greedy_request("fallback path", 6))
+        .await
+        .expect("all-capabilities-off backend must complete via fallback code");
+    assert_eq!(resp.finish_reason, FinishReason::Length);
+    assert!(!resp.tokens.is_empty());
 }
 
 /// Guided / tool constraints. Two checks:
