@@ -159,7 +159,9 @@
       "expected_lane": "L1-cuda",
       "expected_failing_surface": "L1-cuda multi-turn chat (>=5 turns); fix first if still reproducible",
       "repro_patch": null,
-      "patch_status": "n/a-live"
+      "patch_status": "n/a-live",
+      "kill_status": "verified-live-pass",
+      "caught_by": "pod 6-turn Qwen3-30B-A3B CUDA chat — no turn-3 paged_varlen_attn crash (bug fixed since 241dbc0)"
     },
     {
       "id": "hb-10",

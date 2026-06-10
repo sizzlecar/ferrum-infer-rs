@@ -13,3 +13,10 @@ CPU-vs-CUDA NMSE ~1e-7. 12 conformance ops now CPU+Metal+CUDA verified.
 
 hb-09 (Qwen3-MoE turn-3 paged_varlen_attn panic) is MoE-specific; the
 30B-A3B model is downloading to run that verify-live probe + hb-10.
+
+## hb-09 verify-live: PASS (open bug fixed)
+6-turn MoE CUDA chat (Qwen3-30B-A3B-GPTQ-Int4), --max-tokens 32: all 6 turns
+coherent (通义千问 intro, joke, 北京 attractions), HB09_EXIT=0. The turn-3
+`paged_varlen_attn CUDA_ERROR_INVALID_VALUE` panic from TESTING-GAPS #1
+(build 241dbc0) does NOT reproduce on current main — fixed since. Also
+re-validates the stage-3 decoupling on MoE CUDA inference.
