@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Single source of truth for the README support table AND the regression model matrix (Gate C4). The README table is generated from this file by readme_model_matrix.py --emit-readme; the matrix runner regresses each model on each platform it claims. Adding a model means editing this file — the README and the matrix stay in lock-step by construction.",
+  "description": "Single source of truth for the README support table AND the regression model matrix (Gate C4). The README table is generated from this file by readme_model_matrix.py --emit-readme; the matrix runner regresses each model on each platform it claims. Adding a model means editing this file \u2014 the README and the matrix stay in lock-step by construction.",
   "models": [
     {
       "id": "llama-family",
@@ -15,7 +15,7 @@
     },
     {
       "id": "qwen3-dense",
-      "readme_label": "Qwen3 dense (0.6B – 8B)",
+      "readme_label": "Qwen3 dense (0.6B \u2013 8B)",
       "modality": "llm",
       "representative_model": "Qwen/Qwen3-0.6B",
       "metal": true,
@@ -59,7 +59,7 @@
     },
     {
       "id": "whisper",
-      "readme_label": "Whisper ASR (tiny → large-v3-turbo)",
+      "readme_label": "Whisper ASR (tiny \u2192 large-v3-turbo)",
       "modality": "asr",
       "representative_model": "openai/whisper-tiny",
       "metal": true,
@@ -73,7 +73,7 @@
       "id": "qwen3-tts",
       "readme_label": "Qwen3-TTS (0.6B / 1.7B)",
       "modality": "tts",
-      "representative_model": "Qwen/Qwen3-TTS-0.6B",
+      "representative_model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
       "metal": true,
       "cuda": false,
       "int4_gptq": false,

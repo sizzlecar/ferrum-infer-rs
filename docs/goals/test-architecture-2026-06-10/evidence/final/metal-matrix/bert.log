@@ -1,0 +1,9 @@
+Pulling google-bert/bert-base-uncased
+Cache: /Users/chejinxuan/.cache/huggingface
+🌐 Using proxy: http://127.0.0.1:41809
+📦 Downloading 9 files (1.81 GB)
+
+✅ Download complete: /Users/chejinxuan/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594
+
+✓ Model ready at:
+  /Users/chejinxuan/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594

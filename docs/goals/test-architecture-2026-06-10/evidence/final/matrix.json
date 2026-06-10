@@ -1,14 +1,17 @@
 {
+  "schema_version": 1,
   "models": [
     {
       "id": "llama-family",
       "platforms": {
+        "metal": "PASS",
         "cuda": "PASS"
       }
     },
     {
       "id": "qwen3-dense",
       "platforms": {
+        "metal": "PASS",
         "cuda": "PASS"
       }
     },
@@ -21,25 +24,34 @@
     {
       "id": "qwen2-5",
       "platforms": {
+        "metal": "PASS",
         "cuda": "PASS"
       }
     },
     {
       "id": "bert",
-      "platforms": {}
+      "platforms": {
+        "metal": "PASS"
+      }
     },
     {
       "id": "whisper",
-      "platforms": {}
+      "platforms": {
+        "metal": "PASS"
+      }
     },
     {
       "id": "qwen3-tts",
-      "platforms": {}
+      "platforms": {
+        "metal": "PASS"
+      }
     },
     {
       "id": "clip",
-      "platforms": {}
+      "platforms": {
+        "metal": "PASS"
+      }
     }
   ],
-  "_note": "CUDA 4/4 from evidence/cuda-validation-20260610.md; Metal cells pending matrix runner"
+  "_note": "Metal 7/8 verified this session (3 LLM chats + 4 load smokes); qwen3-moe metal pending 16GB disk. CUDA 4/4 from pod evidence."
 }
