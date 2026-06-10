@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{atomic::AtomicU64, OnceLock};
+use std::sync::atomic::AtomicU64;
 
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 use ferrum_kernels::backend::{
@@ -76,20 +76,32 @@ impl LlamaStageHiddenBridgeTiming {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LlamaFamilyRuntimeEnv {
-    kv_capacity: Option<usize>,
-    metal_paged_kv: Option<bool>,
-    paged_max_seqs: usize,
-    decode_op_profile: bool,
-    prefill_op_profile: bool,
-    prefix_cache: bool,
-    cuda_graph: bool,
-    decode_layer_profile: bool,
+pub(crate) struct LlamaFamilyRuntimeEnv {
+    pub(crate) kv_capacity: Option<usize>,
+    pub(crate) metal_paged_kv: Option<bool>,
+    pub(crate) paged_max_seqs: usize,
+    pub(crate) decode_op_profile: bool,
+    pub(crate) prefill_op_profile: bool,
+    pub(crate) prefix_cache: bool,
+    pub(crate) cuda_graph: bool,
+    pub(crate) decode_layer_profile: bool,
 }
 
 impl LlamaFamilyRuntimeEnv {
+    /// Resolve from the process-wide snapshot installed at the composition root
+    /// (was a direct `std::env::vars()` read). The model holds this in a
+    /// `runtime_env` field, resolved once at construction.
     fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
+        Self::from_runtime_config_snapshot(&ferrum_types::active_runtime_snapshot())
+    }
+
+    fn from_runtime_config_snapshot(snapshot: &ferrum_types::RuntimeConfigSnapshot) -> Self {
+        Self::from_env_vars(
+            snapshot
+                .entries
+                .iter()
+                .map(|e| (e.key.as_str(), e.effective_value.as_str())),
+        )
     }
 
     fn from_env_vars<I, K, V>(vars: I) -> Self
@@ -141,13 +153,12 @@ impl LlamaFamilyRuntimeEnv {
     }
 }
 
-fn llama_family_runtime_env() -> &'static LlamaFamilyRuntimeEnv {
-    static CONFIG: OnceLock<LlamaFamilyRuntimeEnv> = OnceLock::new();
-    CONFIG.get_or_init(LlamaFamilyRuntimeEnv::from_env)
-}
-
+/// Whether decode-op profiling is enabled, resolved from the runtime snapshot
+/// installed at the composition root. Used by pipeline paths that operate on a
+/// `LlamaFamilyPipelineModel` and so don't hold a `LlamaFamilyModel`'s
+/// `runtime_env` field. Called once per decode-batch, not per op.
 pub(crate) fn llama_family_decode_op_profile_enabled() -> bool {
-    llama_family_runtime_env().decode_op_profile
+    LlamaFamilyRuntimeEnv::from_env().decode_op_profile
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -806,6 +817,12 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// can't silently rot in the forward code.
     pub(crate) supports_varlen_qkv: bool,
     pub(crate) supports_batched_decode: bool,
+    /// Runtime knobs resolved once at construction from the snapshot installed
+    /// at the composition root (was a process-wide OnceLock reading env).
+    /// Forward/decode read these fields instead of a global accessor.
+    pub(crate) runtime_env: LlamaFamilyRuntimeEnv,
+    pub(crate) batched_cfg:
+        super::llama_family_forward_batched::LlamaBatchedRuntimeConfig,
 
     /// Token embedding table. `None` for backbone-only models (e.g. the
     /// Qwen3-TTS Talker, which embeds inputs externally and feeds via
@@ -989,11 +1006,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // so the forward hot paths read self.* instead of B::supports_*().
         let supports_varlen_qkv = B::supports_varlen_qkv();
         let supports_batched_decode = B::supports_llama_family_batched_decode();
+        let runtime_env = LlamaFamilyRuntimeEnv::from_env();
+        let batched_cfg =
+            super::llama_family_forward_batched::LlamaBatchedRuntimeConfig::from_env();
         Ok(Self {
             cfg,
             runtime_cfg,
             supports_varlen_qkv,
             supports_batched_decode,
+            runtime_env,
+            batched_cfg,
             embed,
             layer_source_start,
             layer_source_end,
@@ -1113,7 +1135,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // ~3 GB on Qwen3-30B-A3B Q4_K_M leaves 18 GB weights + 3 GB pool
         // = 21 GB, fits comfortably on a 32 GB Mac. Long-context users
         // can `FERRUM_KV_CAPACITY=4096` and accept lower max_seqs.
-        let runtime_env = llama_family_runtime_env();
+        let runtime_env = &self.runtime_env;
         let max = runtime_env.kv_capacity_for_model(model_max);
 
         // Paged-KV mode: `FERRUM_METAL_PAGED_KV=1` switches every cache
@@ -1406,7 +1428,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         serde_json::json!({
             "position": "real-kv-reuse",
             "source": "llama-family-paged-block-prefix-cache",
-            "enabled": llama_family_runtime_env().prefix_cache,
+            "enabled": self.runtime_env.prefix_cache,
             "hits": self.prefix_cache_hits,
             "misses": self.prefix_cache_misses,
             "evictions": 0u64,
@@ -1543,7 +1565,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let kv_dim = nkv * hd;
 
         // 1. Input RMSNorm
-        let _t0 = if llama_family_runtime_env().decode_op_profile {
+        let _t0 = if self.runtime_env.decode_op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -1568,7 +1590,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
 
         // 2. Fused QKV projection (Linear dispatches to Dense/GPTQ/AWQ/GGUF)
-        let _t0 = if llama_family_runtime_env().decode_op_profile {
+        let _t0 = if self.runtime_env.decode_op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -1728,7 +1750,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // Non-paged (contig) path. INT8 path doesn't reach here:
         // KvInt8::alloc_contig panics in ensure_kv.
-        let _qkr_t0 = if llama_family_runtime_env().decode_op_profile {
+        let _qkr_t0 = if self.runtime_env.decode_op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -1769,7 +1791,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         K::set_len(&mut caches[li], new_len);
         let kv_stride = cache_capacity;
 
-        let _attn_t0 = if llama_family_runtime_env().decode_op_profile {
+        let _attn_t0 = if self.runtime_env.decode_op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -2026,7 +2048,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .map(K::len)
             .unwrap_or(0);
         let mut cached_prefix_tokens =
-            if llama_family_runtime_env().prefix_cache && cache_len_before == 0 {
+            if self.runtime_env.prefix_cache && cache_len_before == 0 {
                 self.try_acquire_prefix_cache(cache_id, tokens)
             } else {
                 0
@@ -2042,7 +2064,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 .saturating_sub(block_size)
                 .min(tokens.len() - 1);
         }
-        if llama_family_runtime_env().prefix_cache && cache_len_before == 0 {
+        if self.runtime_env.prefix_cache && cache_len_before == 0 {
             self.record_prefix_cache_probe(cached_prefix_tokens);
         }
 
@@ -2102,7 +2124,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .expect("prefill_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, suffix_tokens, &mut residual, h);
 
-        let prefill_profile = llama_family_runtime_env().prefill_op_profile;
+        let prefill_profile = self.runtime_env.prefill_op_profile;
         let prefill_t0 = if prefill_profile {
             B::sync(&mut ctx);
             Some(std::time::Instant::now())
@@ -2192,7 +2214,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // Restore residual into scratch for reuse on the next call.
         self.scratch.residual = Some(residual);
-        if llama_family_runtime_env().prefix_cache && cache_len_before == 0 {
+        if self.runtime_env.prefix_cache && cache_len_before == 0 {
             self.register_prefix_cache(cache_id, tokens, cached_prefix_tokens);
         }
 
@@ -2216,7 +2238,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // docs/phase-e-cuda-status.md). In pure eager mode, we skip the
         // per-step device-state memcpy_htod trio entirely.
         const GRAPH_WARMUP: usize = 3;
-        let graph_enabled = llama_family_runtime_env().cuda_graph;
+        let graph_enabled = self.runtime_env.cuda_graph;
 
         if graph_enabled {
             // Refresh device-side dynamic state (token/pos/kv_len) before
@@ -2266,7 +2288,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // Per-layer wall-time profile (env-gated, off by default — adds
         // a B::sync between layers which serializes the pipeline). Helps
         // localise non-matmul bottlenecks during perf work.
-        let layer_profile = llama_family_runtime_env().decode_layer_profile;
+        let layer_profile = self.runtime_env.decode_layer_profile;
         let mut layer_times = if layer_profile {
             Some(Vec::with_capacity(self.local_layer_count()))
         } else {
@@ -2834,7 +2856,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
     }
 
     fn kv_capacity(&self) -> usize {
-        llama_family_runtime_env().kv_capacity_for_model(self.cfg.max_seq_len)
+        self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
@@ -2864,7 +2886,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        if llama_family_runtime_env().prefix_cache
+        if self.runtime_env.prefix_cache
             && items
                 .iter()
                 .any(|(_, tokens, pos_offset, _)| *pos_offset == 0 && tokens.len() > 1)
@@ -3019,7 +3041,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
     }
 
     fn kv_capacity(&self) -> usize {
-        llama_family_runtime_env().kv_capacity_for_model(self.cfg.max_seq_len)
+        self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
