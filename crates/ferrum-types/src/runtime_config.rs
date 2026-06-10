@@ -5,7 +5,36 @@
 //! hot-path env reads are migrated to typed config structs.
 
 use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 use std::{collections::BTreeMap, path::PathBuf};
+
+/// Process-wide runtime snapshot, installed once at the composition root.
+///
+/// This is the single env-bridge seam the test-architecture goal asks for:
+/// the CLI (`serve`/`run`/`bench`) captures `FERRUM_*` via
+/// [`RuntimeConfigSnapshot::capture_current`] and installs it here when it
+/// applies the snapshot to the engine config; model code downstream reads
+/// [`active_runtime_snapshot`] instead of `std::env`, so no model/engine
+/// module freezes its own env config. Re-installable (RwLock, not OnceLock)
+/// so per-construction test paths can vary it after `std::env::set_var`.
+static ACTIVE_SNAPSHOT: RwLock<Option<RuntimeConfigSnapshot>> = RwLock::new(None);
+
+/// Install the process-wide runtime snapshot resolved at the composition root.
+pub fn install_runtime_snapshot(snapshot: RuntimeConfigSnapshot) {
+    *ACTIVE_SNAPSHOT
+        .write()
+        .expect("runtime snapshot lock poisoned") = Some(snapshot);
+}
+
+/// The installed runtime snapshot, or an empty snapshot when none was
+/// installed (unit tests that do not exercise runtime knobs see defaults).
+pub fn active_runtime_snapshot() -> RuntimeConfigSnapshot {
+    ACTIVE_SNAPSHOT
+        .read()
+        .expect("runtime snapshot lock poisoned")
+        .clone()
+        .unwrap_or_default()
+}
 
 /// Stable snapshot of non-default runtime configuration visible to the process.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

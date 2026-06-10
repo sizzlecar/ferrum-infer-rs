@@ -285,6 +285,12 @@ impl MoeGraphEnvGuard {
                 std::env::remove_var("FERRUM_VLLM_MOE");
             }
         }
+        // The model now resolves runtime knobs from the process-wide snapshot
+        // installed at the composition root, not std::env directly. Mirror the
+        // just-set env into it so each graph_value constructs with these knobs.
+        ferrum_types::install_runtime_snapshot(
+            ferrum_types::RuntimeConfigSnapshot::capture_current(),
+        );
         Self {
             prev_graph,
             prev_threshold,
@@ -313,6 +319,9 @@ impl Drop for MoeGraphEnvGuard {
                 std::env::remove_var("FERRUM_VLLM_MOE");
             }
         }
+        ferrum_types::install_runtime_snapshot(
+            ferrum_types::RuntimeConfigSnapshot::capture_current(),
+        );
     }
 }
 

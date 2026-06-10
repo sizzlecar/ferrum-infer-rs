@@ -121,7 +121,7 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
                 self.use_vllm_paged_attn
             );
         }
-        if !B::supports_varlen_qkv() {
+        if !self.supports_varlen_qkv {
             return Err(FerrumError::unsupported(
                 "Qwen3MoeModel::unified_forward: backend lacks varlen QKV kernels. \
                  Engine will fall back to legacy paths.",
@@ -239,7 +239,7 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
         self.paged_fa_pools = None;
         self.paged_block_alloc = None;
         self.paged_dims = None;
-        let initial_scratch_tokens = if B::supports_varlen_qkv() {
+        let initial_scratch_tokens = if self.supports_varlen_qkv {
             self.runtime_env.initial_scratch_tokens
         } else {
             1

@@ -34,13 +34,25 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
+// Env-name constants + `from_env_vars` are retained as test-only parse
+// helpers: production resolves these knobs via EngineConfig.runtime
+// (apply_runtime_config_snapshot), not env. The unit tests still exercise the
+// env-name → field mapping.
+#[cfg(test)]
 const BATCH_DECODE_PROF_ENV: &str = "FERRUM_BATCH_DECODE_PROF";
+#[cfg(test)]
 const CHUNKED_PREFILL_ENV: &str = "FERRUM_CHUNKED_PREFILL";
+#[cfg(test)]
 const KV_CAPACITY_ENV: &str = "FERRUM_KV_CAPACITY";
+#[cfg(test)]
 const MAX_MODEL_LEN_ENV: &str = "FERRUM_MAX_MODEL_LEN";
+#[cfg(test)]
 const NEXT_BATCH_PROF_ENV: &str = "FERRUM_NEXT_BATCH_PROF";
+#[cfg(test)]
 const WHOLE_PROMPT_PREFIX_CACHE_ENV: &str = "FERRUM_WHOLE_PROMPT_PREFIX_CACHE";
+#[cfg(test)]
 const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
+#[cfg(test)]
 const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
 const GENERATION_POLICY_SCAN_LIMIT: usize = 262_144;
 const FORBIDDEN_DECODE_RESAMPLE_LIMIT: usize = 64;
@@ -72,13 +84,26 @@ struct ContinuousEngineRuntimeConfig {
 }
 
 impl ContinuousEngineRuntimeConfig {
-    fn from_engine_config_and_env(config: &EngineConfig) -> Self {
-        Self::from_env_vars(
-            config.scheduler.active_decode_prefill_chunk,
-            std::env::vars(),
-        )
+    /// Build from the typed `EngineConfig.runtime` knobs (resolved by the CLI/
+    /// autosizer via the runtime-config snapshot). Reads no environment — the
+    /// env bridge stays at the composition root.
+    fn from_engine_config(config: &EngineConfig) -> Self {
+        let r = &config.runtime;
+        Self {
+            active_decode_prefill_chunk: config.scheduler.active_decode_prefill_chunk,
+            batch_decode_prof: r.batch_decode_prof,
+            chunked_prefill_present: r.chunked_prefill_size.is_some(),
+            chunked_prefill_size: r.chunked_prefill_size,
+            kv_capacity: r.kv_capacity,
+            max_model_len: r.max_model_len,
+            next_batch_prof: r.next_batch_prof,
+            prefix_cache_enabled: r.prefix_cache_enabled,
+            rbd_prof: r.rbd_prof,
+            unified_post_prof: r.unified_post_prof,
+        }
     }
 
+    #[cfg(test)]
     fn from_env_vars<I, K, V>(active_decode_prefill_chunk: Option<usize>, vars: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -110,6 +135,7 @@ impl ContinuousEngineRuntimeConfig {
     }
 }
 
+#[cfg(test)]
 fn parse_positive_usize_env(vars: &HashMap<String, String>, name: &str) -> Option<usize> {
     vars.get(name)
         .and_then(|v| v.parse::<usize>().ok())
@@ -1097,7 +1123,7 @@ impl ContinuousBatchEngine {
             "Creating ContinuousBatchEngine (speculative_decoding={})",
             draft_executor.is_some() && spec_config.is_some()
         );
-        let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config_and_env(&config);
+        let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
 
         Self {
             inner: Arc::new(EngineInner {

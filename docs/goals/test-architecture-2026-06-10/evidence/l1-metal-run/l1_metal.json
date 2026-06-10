@@ -1,0 +1,7 @@
+{
+  "lane": "l1-metal",
+  "status": "pass",
+  "l1_metal_seconds": 81,
+  "steps": ["op_parity_metal", "tiny_stack_metal", "server_wire"],
+  "host": "Darwin arm64"
+}

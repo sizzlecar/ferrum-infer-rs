@@ -1,0 +1,74 @@
+diff --git a/crates/ferrum-sampler/src/guided.rs b/crates/ferrum-sampler/src/guided.rs
+index 0078e26f..c86f4b0e 100644
+--- a/crates/ferrum-sampler/src/guided.rs
++++ b/crates/ferrum-sampler/src/guided.rs
+@@ -158,10 +158,8 @@ impl RegexGuidedProcessor {
+     pub fn mask_logits(&self, logits: &mut [f32]) {
+         let pos = *self.state.lock();
+         if pos.dead {
+-            // The generated prefix already left the DFA language. At this
+-            // point a hard mask cannot repair the output; forcing EOS would
+-            // actively truncate structured responses. Let generation proceed
+-            // and leave final API/schema validation to reject bad output.
++            // Give up and force EOS — no other token can recover.
++            self.force_eos(logits);
+             return;
+         }
+ 
+@@ -172,19 +170,9 @@ impl RegexGuidedProcessor {
+         // keeps the hot path allocation-free for now.
+         let vocab = logits.len().min(self.token_bytes.len());
+         let mut any_allowed = false;
+-        let mut fallback_token: Option<(usize, f32)> = None;
+         for idx in 0..vocab {
+             let is_eos = self.eos_token.map_or(false, |e| e.get() as usize == idx);
+             let bytes = &self.token_bytes[idx];
+-            let original_logit = logits[idx];
+-            if !is_eos
+-                && original_logit.is_finite()
+-                && fallback_token
+-                    .map(|(_, best)| original_logit > best)
+-                    .unwrap_or(true)
+-            {
+-                fallback_token = Some((idx, original_logit));
+-            }
+ 
+             let allowed = if is_eos {
+                 pattern_done
+@@ -204,18 +192,12 @@ impl RegexGuidedProcessor {
+             }
+         }
+ 
+-        // No token in the vocab can extend the current match. If the regex is
+-        // already complete, EOS is the correct clean terminator. Otherwise do
+-        // not force an invalid premature EOS; choose the model's best non-EOS
+-        // token and let later API/schema validation reject the response if the
+-        // fallback cannot recover. This can happen when single-token decode
+-        // surfaces differ from full-sequence decode for byte-level tokenizers.
++        // No token in the vocab can extend the current match. Rather than
++        // hand the sampler a row of -inf (which produces NaN softmax and a
++        // junk argmax) terminate cleanly by forcing EOS. Happens when the
++        // tokenizer's BPE merges span byte boundaries the schema rejects.
+         if !any_allowed {
+-            if pattern_done {
+-                self.force_eos(logits);
+-            } else if let Some((token, _)) = fallback_token {
+-                self.force_only_token(logits, token);
+-            }
++            self.force_eos(logits);
+         }
+     }
+ 
+@@ -228,12 +210,6 @@ impl RegexGuidedProcessor {
+         }
+     }
+ 
+-    fn force_only_token(&self, logits: &mut [f32], token: usize) {
+-        for (i, l) in logits.iter_mut().enumerate() {
+-            *l = if i == token { 0.0 } else { f32::NEG_INFINITY };
+-        }
+-    }
+-
+     /// Public wrapper around `advance_with_tokens` for direct callers
+     /// (the engine applies the mask inline rather than via
+     /// `LogitsProcessor::process`).

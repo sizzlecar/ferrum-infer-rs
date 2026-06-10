@@ -35,6 +35,8 @@ pub mod multimodal;
 pub mod registry;
 pub mod source;
 pub mod tensor_wrapper;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod tokenizer;
 pub mod weight_format;
 

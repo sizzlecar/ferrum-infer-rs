@@ -42,6 +42,9 @@ fn load_model() -> Qwen3MoeModel<CudaBackend> {
     if std::env::var("FERRUM_METAL_PAGED_KV").is_err() {
         std::env::set_var("FERRUM_METAL_PAGED_KV", "0");
     }
+    // Qwen3MoeModel resolves runtime knobs (incl. metal_paged_kv) from the
+    // installed snapshot at construction; publish the just-set env into it.
+    ferrum_types::install_runtime_snapshot(ferrum_types::RuntimeConfigSnapshot::capture_current());
 
     // ConfigManager::load_from_path is async — spin a tiny runtime to keep
     // the test sync-friendly.

@@ -1,0 +1,16 @@
+diff --git a/crates/ferrum-engine/src/continuous_engine.rs b/crates/ferrum-engine/src/continuous_engine.rs
+index 5e9ab083..4ecaa64d 100644
+--- a/crates/ferrum-engine/src/continuous_engine.rs
++++ b/crates/ferrum-engine/src/continuous_engine.rs
+@@ -669,11 +669,6 @@ impl SequenceState {
+         &self,
+         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+     ) -> Option<FinishReason> {
+-        if let Some(&last_token) = self.generated_tokens.last() {
+-            if self.stop_token_ids.contains(&last_token.get()) {
+-                return Some(FinishReason::Stop);
+-            }
+-        }
+         if !self.stop_text_seqs.is_empty() {
+             if let Some(tok) = tokenizer {
+                 if let Ok(text) = tok.decode(&self.generated_tokens, true) {

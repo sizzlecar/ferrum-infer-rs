@@ -1,0 +1,59 @@
+diff --git a/crates/ferrum-server/src/axum_server.rs b/crates/ferrum-server/src/axum_server.rs
+index 61913b27..a80529d6 100644
+--- a/crates/ferrum-server/src/axum_server.rs
++++ b/crates/ferrum-server/src/axum_server.rs
+@@ -2136,13 +2136,6 @@ fn api_response_format(format: &OpenAiResponseFormat) -> ferrum_types::ApiRespon
+ }
+ 
+ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Result<(), ServerError> {
+-    if request.messages.is_empty() {
+-        return Err(ServerError::invalid_request(
+-            "messages array must not be empty",
+-            Some("messages"),
+-        ));
+-    }
+-
+     if let Some(n) = request.n {
+         if n != 1 {
+             return Err(ServerError::unsupported_feature(
+@@ -3027,38 +3020,11 @@ fn pcm_to_s16le_bytes(samples: &[f32]) -> Vec<u8> {
+ }
+ 
+ async fn models_handler(
+-    State(state): State<AppState>,
++    State(_state): State<AppState>,
+ ) -> std::result::Result<Response, ServerError> {
+-    let status = state.status().await;
+-    let now = chrono::Utc::now().timestamp() as u64;
+-    let mut data: Vec<_> = status
+-        .loaded_models
+-        .into_iter()
+-        .map(|model_id| crate::openai::ModelInfo {
+-            id: model_id.to_string(),
+-            object: "model".to_string(),
+-            created: now,
+-            owned_by: "ferrum".to_string(),
+-            permission: vec![],
+-            root: None,
+-            parent: None,
+-        })
+-        .collect();
+-    data.extend(state.lora_registry.adapter_models().iter().map(|adapter| {
+-        crate::openai::ModelInfo {
+-            id: adapter.model_id.clone(),
+-            object: "model".to_string(),
+-            created: now,
+-            owned_by: "ferrum".to_string(),
+-            permission: vec![],
+-            root: state.lora_registry.base_model_id.as_ref().cloned(),
+-            parent: state.lora_registry.base_model_id.as_ref().cloned(),
+-        }
+-    }));
+-
+     let models = ModelListResponse {
+         object: "list".to_string(),
+-        data,
++        data: vec![],
+     };
+ 
+     Ok(Json(models).into_response())

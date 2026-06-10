@@ -1,0 +1,6 @@
+{
+  "l0_seconds": 1,
+  "l1_metal_seconds": 81,
+  "l1_cuda_warm_seconds": 18,
+  "l1_cuda_cold_seconds": 1906
+}

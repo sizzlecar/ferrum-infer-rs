@@ -1,0 +1,8 @@
+{
+  "l0_runs": 10,
+  "l0_green": 10,
+  "l1_metal_runs": 10,
+  "l1_metal_green": 10,
+  "l1_cuda_runs": 3,
+  "l1_cuda_green": 3
+}
