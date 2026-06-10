@@ -156,29 +156,36 @@ attention/MoE/marlin op references), the env/supports refactor (coordinated
 multi-crate change), the model matrix RUN (executor landed; needs 8-model
 execution), and the final aggregation.
 
-## Gate scoreboard (2026-06-10, after CUDA pod session)
+## Gate scoreboard (2026-06-10, after Gate A migration complete)
 
 | Gate | State |
 | --- | --- |
-| A1 env_var | 6 (was 7) — engine ContinuousEngineRuntimeConfig migrated to EngineConfig.runtime; **pattern proven**. 6 left (models 4 + builder/registry 2). |
-| A2 cfg_branch | **0** outside allowlist |
-| A3 supports_*() | 18 — construction-time ones allowlistable (GOAL allows), ~2 hot-path (decode_batch) need trait-default migration |
-| A3b OnceLock | 7 — 3 legit singletons/caches, 4 config freezes to migrate |
-| A4 conformance | **20/20** (13 unit op-parity + 7 integration-covered) |
+| A1 env_var | **0** outside allowlist ✅ — all `*_runtime_env()` env reads migrated: engine→`EngineConfig.runtime`; models→`active_runtime_snapshot()` resolved once at construction |
+| A2 cfg_branch | **0** outside allowlist ✅ |
+| A3 supports_*() | **0** outside allowlist ✅ — 13 hot-path decode/prefill branches resolved into construction-time `self.supports_*` fields (GOAL-allowed); construction reads allowlisted |
+| A3b OnceLock | **0** outside allowlist ✅ — 3 legit singletons/caches allowlisted; all config-freeze OnceLocks removed (builder/registry/llama_family/llama_batched) |
+| A4 conformance | **20/20** ✅ (13 unit op-parity + 7 integration-covered) |
 | A5 fallback law | Llama ✅ |
 | B1 scenarios | **10/10** ✅ |
 | B2 kills | **9/9 reachable validated** ✅ (CPU 6 + CUDA 3; hb-07 deferred, hb-08 exempt) |
 | C2 L1-metal | **81s + 10/10** ✅ |
 | C3 L1-cuda | lane + op-parity + kills done; timing artifact pending |
-| C4 matrix | **CUDA 4/4** ✅; Metal cells pending (Mac disk) |
+| C4 matrix | **CUDA 4/4** ✅; Metal cells pending |
 | C5 stability | L0 + L1-metal 10/10 ✅; L1-cuda 3/3 pending |
 | C6 explosion radius | ✅ |
 
-**~85% of gates green.** Remaining: finish env (5 reads, proven pattern) +
-supports (allowlist construction-time, migrate ~2 hot-path) + OnceLock
-(allowlist 3 singletons, migrate 4 configs); Metal matrix; L1-cuda timing +
-stability; final aggregation. The env migration is no longer speculative —
-the engine config is migrated and behavior-validated (tiny_stack 10/10).
+**Gate A is fully clean (env 0, cfg 0, supports 0, OnceLock 0).** The
+env/supports/OnceLock decoupling — the major "B" item in the runbook below —
+is DONE and behavior-validated (tiny_stack 10/10, qwen3_moe cpu 8/8,
+ferrum-models lib 105/105, config_tests 12/12, workspace compiles).
+
+Migration commits: `592143ea` supports→construction fields; `fc7345d2`
+builder/registry→EngineConfig.runtime; `13832022` active-snapshot seam +
+qwen3_moe; `f90c3421` llama runtime_env/batched_cfg fields.
+
+**Remaining for TEST_ARCH GOAL PASS:** aggregate the evidence into the
+`--validate` out_dir (killrate/lanes/stability/matrix/l0_tests) + the Metal
+matrix cells + the L1-cuda timing/stability artifacts from a pod run.
 
 ## Env-migration pattern (proven, apply to the rest)
 
