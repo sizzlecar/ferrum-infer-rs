@@ -195,50 +195,52 @@ The CLI/autosizer already resolves FERRUM_* into a `RuntimeConfigSnapshot`.
 move for the model configs: thread the resolved config into model
 construction (loader is out of audit scope) and have the model read it.
 
-## Completion runbook (what reaches TEST_ARCH GOAL PASS)
+## Completion runbook (UPDATED 2026-06-10 — Gate A + B done)
 
-Everything local + Metal is done and committed. The remainder is two
-scoped pieces:
+The "B. env/supports decoupling" piece — the largest remaining item in the
+prior runbook — is **COMPLETE** (commits 592143ea / fc7345d2 / 13832022 /
+f90c3421). `--validate` now passes Gate A and Gate B cleanly. The only
+remaining failures are Gate C *execution* cells (no code left):
 
-### A. CUDA phase — turnkey, run on a pod (Gate A4-cuda, B2-cuda, C3, C4)
-
-```bash
-# On a CUDA pod, from a clean checkout of main:
-export CARGO_TARGET_DIR=$PWD/target CARGO_INCREMENTAL=0
-bash scripts/release/lane_l1_cuda.sh out/l1-cuda            # op-parity + hb-10 kill
-# Then wire the verify-live probes (hb-09 multi-turn, hb-11 kv boundary) with a
-# real model: L1_CUDA_MODEL=Qwen/Qwen3-30B-A3B-GPTQ-Int4 bash .../lane_l1_cuda.sh
-python3 scripts/release/readme_model_matrix.py --plan        # matrix cells to run
+```text
+$ python3 scripts/release/test_arch_goal_gate.py --validate \
+      docs/goals/test-architecture-2026-06-10/evidence/final
+FAIL: gate C: lanes.json missing l1_cuda_warm_seconds        # pod
+FAIL: gate C: lanes.json missing l1_cuda_cold_seconds        # pod
+FAIL: gate C: stability l1_cuda 0/0 below 3/3                # pod
+FAIL: gate C: model {llama-family,qwen3-dense,qwen3-moe,qwen2-5,
+               bert,whisper,qwen3-tts,clip} platform metal status None != PASS
 ```
 
-Pod budget per Gate C3: warm <= 1200 s, cold <= 3600 s. If hb-09/hb-11
-still reproduce, fix first, then convert each to a revert-fix patch in
-`historical_bugs.json` (the kill-list discipline).
+Aggregation artifacts already assembled and committed under
+`evidence/final/`: `l0_tests.txt` (all 10 scenarios), `killrate.json`
+(CPU 6 caught + hb-07/08 exempt, CUDA 3 caught), `lanes.json`/`stability.json`
+(L0 10/10 @ 0.45 s, L1-metal 81 s/10-10), `matrix.json` (CUDA 4/4 from pod).
 
-### B. env / supports decoupling — dedicated local effort (Gate A1, A3, A3b)
+### Remaining run-work (no code changes — execution + evidence only)
 
-NOT a quick win: ~67 call sites (`*_runtime_config()` accessors across
-ferrum-models + ferrum-engine) plus the `supports_*()` forward-path
-branches. Must land with the L1-metal lane green as behavior-invariance
-evidence (now that Metal runs locally) and, for the supports_* branches,
-the CUDA op-parity column from phase A. Sequence:
-1. Move env parsing to the CLI/serve composition root; inject the typed
-   config through model/engine construction (kills env_var + OnceLock
-   findings). Validate: `cargo check --workspace --all-targets`, L0,
-   `lane_l1_metal.sh`.
-2. Migrate the 18 `supports_*()` hot-path branches to trait methods with
-   correct default fallbacks (capability-fallback law). Validate against
-   both op-parity columns + both L1 lanes before landing.
+**1. Metal model matrix (8 cells, this Mac).** Obstacles to clear first:
+- `run_matrix` does `ferrum run <model>` (chat) for every cell; the 4
+  `matrix_smoke_only` models (bert/whisper/qwen3-tts/clip) are not chat
+  models and need a load/serve smoke instead — teach `run_matrix` to honor
+  the `steps`/`matrix_smoke_only` field.
+- `Qwen/Qwen3-30B-A3B-GPTQ-Int4` not cached (~16 GB pull) + slow on a 32 GB
+  Mac; `google-bert/bert-base-uncased` not cached (bert-base-chinese is).
+- The 3 small LLM cells (TinyLlama, Qwen3-0.6B, Qwen2.5-0.5B) are cached and
+  runnable now once the `--release --features metal` binary finishes.
+
+**2. L1-cuda lanes (pod 40361123, idle).** `lane_l1_cuda.sh` ×3 for
+warm/cold timing (budget warm<=1200 s, cold<=3600 s) + 3/3 stability; the
+op-parity + hb-09/10/11 kills are already evidenced (cuda-validation doc).
 
 ### Final aggregation
 
-After A and B, run the final validator against an out dir holding
-`killrate.json`, `lanes.json`, `stability.json`, `matrix.json`,
-`l0_tests.txt` (shapes in the gate's `--self-test`):
+Merge the metal matrix run + the pod cuda lanes into `evidence/final/`, then:
 
 ```bash
-python3 scripts/release/test_arch_goal_gate.py --validate out/final
-# -> TEST_ARCH GOAL PASS: out/final
+python3 scripts/release/test_arch_goal_gate.py --validate \
+    docs/goals/test-architecture-2026-06-10/evidence/final
+# -> TEST_ARCH GOAL PASS: <out_dir>
 ```
 
 ## Long-term Heartbeat Metrics (tracked per GOAL.md)
