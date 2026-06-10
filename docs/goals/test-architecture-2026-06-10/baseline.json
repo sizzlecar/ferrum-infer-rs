@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generated_by": "scripts/release/test_arch_goal_gate.py --baseline",
-  "base_sha": "e3073275f398ca331fd8e97674993528b1054d8d",
+  "base_sha": "4dafad057c9151df5bef3655e6c0bdb1de1eac0f",
   "dirty_worktree": true,
   "scan_method": "line-level regex over non-test .rs files under crates/ferrum-models/src/models and crates/ferrum-engine/src; comment-only lines skipped; #[cfg(test)] blocks not excluded",
   "counts": {
@@ -67,11 +67,13 @@
   "allowlist_entries": 0,
   "conformance": {
     "total_ops": 20,
-    "covered_ops": 4,
+    "covered_ops": 6,
     "covered_ids": [
       "rms_norm",
+      "fused_add_rms_norm",
       "gemm_f16",
       "qk_norm_rope",
+      "residual_add",
       "fused_silu_mul"
     ]
   },
