@@ -1,0 +1,63 @@
+{
+  "model": "Llama-3.1-8B",
+  "temperature": 0,
+  "seed": 9271,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询城市天气",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "tool_choice": "none",
+  "messages": [
+    {
+      "role": "user",
+      "content": "北京现在天气怎么样？请先调用 get_weather 工具查询，得到工具结果后用一句中文回答，unit 使用 celsius。"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_0",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Beijing\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_0",
+      "content": "{\"city\": \"北京\", \"temp\": 22, \"unit\": \"celsius\", \"desc\": \"晴\"}"
+    },
+    {
+      "role": "user",
+      "content": "Use the tool result above to answer the original question in one short sentence. Include the numeric temperature from the tool result."
+    }
+  ],
+  "max_tokens": 64
+}

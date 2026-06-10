@@ -1,0 +1,6 @@
+data: {"id":"5261b0b7-3295-4206-96c7-f2ec54ab8752","object":"chat.completion.chunk","created":1781122790,"model":"Llama-3.1-8B","choices":[{"index":0,"delta":{"role":"assistant","content":"你"}}]}
+data: {"id":"5261b0b7-3295-4206-96c7-f2ec54ab8752","object":"chat.completion.chunk","created":1781122790,"model":"Llama-3.1-8B","choices":[{"index":0,"delta":{"role":"assistant","content":"好"}}]}
+data: {"id":"5261b0b7-3295-4206-96c7-f2ec54ab8752","object":"chat.completion.chunk","created":1781122790,"model":"Llama-3.1-8B","choices":[{"index":0,"delta":{"role":"assistant","content":"！"}}]}
+data: {"id":"5261b0b7-3295-4206-96c7-f2ec54ab8752","object":"chat.completion.chunk","created":1781122790,"model":"Llama-3.1-8B","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]}
+data: {"id":"5261b0b7-3295-4206-96c7-f2ec54ab8752","object":"chat.completion.chunk","created":1781122790,"model":"Llama-3.1-8B","choices":[],"usage":{"prompt_tokens":48,"completion_tokens":4,"total_tokens":52}}
+data: [DONE]

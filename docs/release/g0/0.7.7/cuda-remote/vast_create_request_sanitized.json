@@ -1,0 +1,11 @@
+{
+  "client_id": "me",
+  "disk": 220,
+  "env": {
+    "-p 22:22": "1"
+  },
+  "image": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+  "label": "ferrum-0.7.7-cuda-g0",
+  "onstart": "<onstart omitted>",
+  "runtype": "ssh ssh_proxy"
+}

@@ -1,0 +1,158 @@
+{
+  "actual_input_tokens": {
+    "max": 20,
+    "mean": 16.875,
+    "min": 16,
+    "requested": 16
+  },
+  "actual_input_tokens_per_request": [
+    [
+      19,
+      16,
+      16,
+      16,
+      16,
+      20,
+      16,
+      16
+    ]
+  ],
+  "backend": "metal",
+  "bad_output_per_run": [
+    0
+  ],
+  "completed_per_run": [
+    8
+  ],
+  "concurrency": 1,
+  "duplicate_done_per_run": [
+    0
+  ],
+  "e2e_ms": {
+    "p50": {
+      "mean": 2353.642979
+    },
+    "p75": {
+      "mean": 2411.95169775
+    },
+    "p95": {
+      "mean": 2531.117842
+    },
+    "p99": {
+      "mean": 2560.673802
+    }
+  },
+  "env": {
+    "commit_sha": "22b8b7ad",
+    "ferrum_env": {},
+    "ferrum_features": [
+      "metal"
+    ],
+    "hw_id": "apple-m1-max",
+    "runtime_config": {
+      "entries": []
+    },
+    "rust": "1.91.0"
+  },
+  "env_hash": "sha256:7f2e135bb2c07ee2ba37bc91f04e60859add301aeb2570029956db0f22d5e4ae",
+  "errored_per_run": [
+    0
+  ],
+  "goodput_rps": {
+    "mean": 0.42920526702998985
+  },
+  "http_500_per_run": [
+    0
+  ],
+  "itl_ms": {
+    "p50": {
+      "mean": 33.29175
+    },
+    "p75": {
+      "mean": 34.942187000000004
+    },
+    "p95": {
+      "mean": 37.9443545
+    },
+    "p99": {
+      "mean": 42.9282497
+    }
+  },
+  "malformed_stream_per_run": [
+    0
+  ],
+  "missing_done_per_run": [
+    0
+  ],
+  "model": "Llama-3.1-8B",
+  "n_gen": 64,
+  "n_prompt": 16,
+  "n_repeats": 1,
+  "n_requests_per_run": 8,
+  "output_throughput_tps": {
+    "mean": 26.825329189374365
+  },
+  "output_token_count_source": "usage",
+  "panic_per_run": [
+    0
+  ],
+  "quality_issues_per_run": [
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    }
+  ],
+  "request_throughput_rps": {
+    "mean": 0.42920526702998985
+  },
+  "scenario": "closed_loop",
+  "slo": {
+    "e2e_p99_ms": null,
+    "tpot_p99_ms": null,
+    "ttft_p99_ms": null
+  },
+  "stream_bulk_flush_per_run": [
+    0
+  ],
+  "total_throughput_tps": {
+    "mean": 34.06816807050544
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 33.627891857142856
+    },
+    "p75": {
+      "mean": 34.482984623015874
+    },
+    "p95": {
+      "mean": 36.324373548412694
+    },
+    "p99": {
+      "mean": 36.66276095730159
+    }
+  },
+  "ttft_ms": {
+    "p50": {
+      "mean": 231.220396
+    },
+    "p75": {
+      "mean": 237.69824
+    },
+    "p95": {
+      "mean": 250.13229155
+    },
+    "p99": {
+      "mean": 252.40985830999998
+    }
+  },
+  "warmup_requests": 1,
+  "zero_output_tokens_per_run": [
+    0
+  ]
+}

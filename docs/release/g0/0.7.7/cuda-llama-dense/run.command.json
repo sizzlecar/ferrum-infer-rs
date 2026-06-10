@@ -1,0 +1,11 @@
+[
+  "target/release/ferrum",
+  "run",
+  "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+  "--backend",
+  "cuda",
+  "--max-tokens",
+  "512",
+  "--output-format",
+  "jsonl"
+]

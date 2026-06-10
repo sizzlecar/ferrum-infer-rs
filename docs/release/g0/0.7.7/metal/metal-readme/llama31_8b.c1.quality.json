@@ -1,0 +1,24 @@
+{
+  "concurrency": 1,
+  "requests": 1,
+  "status_200": 1,
+  "marker_ok": 1,
+  "square_ok": 1,
+  "format_ok": 1,
+  "crosstalk": 0,
+  "length_finishes": 0,
+  "passed": true,
+  "rows": [
+    {
+      "i": 0,
+      "status": 200,
+      "marker": "KM0100Z",
+      "square": "S0001",
+      "marker_ok": true,
+      "square_ok": true,
+      "format_ok": true,
+      "finish_reason": "stop",
+      "content_head": "KM0100Z\nS0001"
+    }
+  ]
+}

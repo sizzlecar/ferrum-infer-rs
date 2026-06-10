@@ -1,0 +1,151 @@
+{
+  "artifact_verdict": "pass",
+  "cases": [
+    {
+      "manifest": "docs/release/g0/0.7.7/cuda-full/c4/baseline_c4_n3/manifest.json",
+      "name": "baseline"
+    },
+    {
+      "manifest": "docs/release/g0/0.7.7/cuda-full/c4/candidate_c4_n3/manifest.json",
+      "name": "candidate"
+    }
+  ],
+  "created_at": "2026-06-10T19:55:43.101046+00:00",
+  "finished_at": "2026-06-10T20:01:16.160629+00:00",
+  "name": "g0-cuda4090-full",
+  "not_publishable": false,
+  "not_publishable_reason": null,
+  "preflight": {
+    "bin": "target/release/ferrum",
+    "binary_sha256": "sha256:7ec83626eb19b5c229d19f095fbaf5d7ba114180a4434f9749aeb73abf3f4899",
+    "date": "2026-06-10T19:55:43.054185+00:00",
+    "features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source",
+    "git_head": "65b7112915631ef4a76fcd90bcd27889380efcd9",
+    "git_status_short": [
+      "?? docs/release/g0/0.7.7/"
+    ],
+    "gpu_process_state": "    PID    PPID STAT     ELAPSED CMD\n      1       0 Ss         48:41 /bin/sh -c while [ ! -e /.launch ]; do sleep 1; done; bash /.launch\n     50       1 S          48:40 bash /.launch\n    365       1 S          48:36 bash /.launch\n    369     365 S          48:36 bash /root/onstart.sh\n    370     365 S          48:36 tee -a /var/log/onstart.log\n    374       1 Ss         48:36 sshd: /usr/sbin/sshd -E /proc/1/fd/1 [listener] 0 of 10-100 startups\n    380      50 S          48:36 ssh -i /etc/forward_key -R *:19138:localhost:22 -R *:19139:localhost:8080 -N -o TCPKeepAlive=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 ubuntu@ssh1.vast.ai -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o RequestTTY=no -o ExitOnForwardFailure=yes\n   5288     369 S          48:28 sleep infinity\n  14964       1 Ss         11:15 tmux new-session -d -s ferrum-cuda-full set -euo pipefail; . /root/.cargo/env; export HF_HOME=/workspace/hf-cache; cd /workspace/ferrum-infer-rs; python3 scripts/release/run_gate.py cuda-full --out docs/release/g0/0.7.7/cuda-full > /workspace/g0/0.7.7/cuda-full.session.log 2>&1; echo \\0 > /workspace/g0/0.7.7/cuda-full.exit\n  14965   14964 Ss+        11:15 bash -c set -euo pipefail; . /root/.cargo/env; export HF_HOME=/workspace/hf-cache; cd /workspace/ferrum-infer-rs; python3 scripts/release/run_gate.py cuda-full --out docs/release/g0/0.7.7/cuda-full > /workspace/g0/0.7.7/cuda-full.session.log 2>&1; echo \\0 > /workspace/g0/0.7.7/cuda-full.exit\n  14967   14965 S+         11:15 python3 scripts/release/run_gate.py cuda-full --out docs/release/g0/0.7.7/cuda-full\n  14968   14967 S+         11:15 bash scripts/release/g0_source_gate.sh cuda-full docs/release/g0/0.7.7/cuda-full\n  15123     374 Ss         01:59 sshd: root@notty\n  15134   15123 Ss         01:56 bash -c sleep 300; echo ---exit---; cat /workspace/g0/0.7.7/cuda-full.exit 2>/dev/null || true; echo ---session-tail---; tail -n 240 /workspace/g0/0.7.7/cuda-full.session.log 2>/dev/null || true; echo ---artifact-summary---; find /workspace/ferrum-infer-rs/docs/release/g0/0.7.7/cuda-full -maxdepth 3 -type f \\( -name \"*.gate.json\" -o -name \"manifest.json\" -o -name \"bench.json\" -o -name \"summary.json\" \\) | tail -80; echo ---current-process---; ps -eo pid,ppid,stat,etime,pcpu,pmem,cmd --sort=-pcpu | head -25; echo ---gpu---; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader\n  15135   15134 S          01:56 sleep 300\n  15154   14968 S+         00:00 python3 scripts/m3_ab_runner.py --config docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full-c4.json\n  15165   15154 R+         00:00 ps -eo pid,ppid,stat,etime,cmd\n",
+    "hf_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+    "host": "d2778ca3e0ce",
+    "model_dir": "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+    "nvidia_smi": "Wed Jun 10 19:55:42 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 565.77                 Driver Version: 565.77         CUDA Version: 12.7     |\n|-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA GeForce RTX 4090        On  |   00000000:61:00.0 Off |                  Off |\n| 30%   43C    P0            109W /  350W |       1MiB /  24564MiB |      0%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n                                                                                         \n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|  No running processes found                                                             |\n+-----------------------------------------------------------------------------------------+\n",
+    "preset": "m3_qwen3_30b_a3b_int4",
+    "repo": "/workspace/ferrum-infer-rs"
+  },
+  "runner": "scripts/m3_ab_runner.py",
+  "runtime_preset": "m3_qwen3_30b_a3b_int4",
+  "schema_version": 1,
+  "summary_json": "docs/release/g0/0.7.7/cuda-full/c4/summary.json",
+  "validation_checklist": {
+    "baseline_case": "baseline",
+    "bench_completion": {
+      "completed": null,
+      "errored": null,
+      "ok": null,
+      "required": true
+    },
+    "case": null,
+    "change_type": "default_path",
+    "local_gates": [],
+    "observed_correctness_gates": [],
+    "performance_regression_gates": {
+      "baseline_case": "baseline",
+      "cases": {
+        "candidate": {
+          "baseline_case": "baseline",
+          "metrics": [
+            {
+              "baseline": 362.0167792484087,
+              "candidate": 351.21199790888414,
+              "delta_pct": -2.984607885291002,
+              "diagnostic": false,
+              "metric": "throughput_mean",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "min_delta_pct",
+                "value": -3.0
+              }
+            },
+            {
+              "baseline": 138.6416075,
+              "candidate": 98.11170783333334,
+              "delta_pct": -29.23357597874553,
+              "diagnostic": false,
+              "metric": "ttft_p50",
+              "ok": true,
+              "reason": "ok",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 10.0
+              }
+            },
+            {
+              "baseline": 9.952202604986876,
+              "candidate": 10.503318990813648,
+              "delta_pct": 5.537632298106732,
+              "diagnostic": false,
+              "metric": "tpot_p50",
+              "ok": false,
+              "reason": "above_max_regression_pct",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 5.0
+              }
+            },
+            {
+              "baseline": 10.146116,
+              "candidate": 14.550471983333333,
+              "delta_pct": 43.409280786197726,
+              "diagnostic": true,
+              "metric": "itl_p95",
+              "ok": true,
+              "reason": "above_max_regression_pct: same_env_order_sensitive_metric_diagnostic",
+              "threshold": {
+                "type": "max_regression_pct",
+                "value": 10.0
+              }
+            }
+          ],
+          "ok": false
+        }
+      },
+      "concurrency_cells_ok": true,
+      "enabled": true,
+      "observed_concurrency_cells": [
+        4
+      ],
+      "required_concurrency_cells": [
+        4
+      ],
+      "schema_version": 1,
+      "thresholds": {
+        "enabled": true,
+        "itl_p95_max_regression_pct": 10.0,
+        "same_env_order_sensitive_metrics": [
+          "ttft_p50",
+          "itl_p95"
+        ],
+        "throughput_min_delta_pct": -3.0,
+        "tpot_max_regression_pct": 5.0,
+        "ttft_max_regression_pct": 10.0
+      }
+    },
+    "performance_regression_required": true,
+    "required_correctness_gates": [
+      "paris",
+      "multi_turn_paris",
+      "multi_turn_3round_paris",
+      "tool_call_regression",
+      "concurrency_quality",
+      "bench_completion"
+    ],
+    "schema_version": 1,
+    "skipped_gates": [],
+    "touched_areas": [
+      "model_forward",
+      "runtime_defaults",
+      "openai_server_api"
+    ]
+  }
+}

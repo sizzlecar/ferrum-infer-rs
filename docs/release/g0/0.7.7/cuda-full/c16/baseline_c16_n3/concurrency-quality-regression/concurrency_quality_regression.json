@@ -1,0 +1,19 @@
+{
+  "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+  "cells": [
+    {
+      "concurrency": 16,
+      "requests": 16,
+      "status_200": 16,
+      "json_ok": 16,
+      "marker_ok": 16,
+      "square_ok": 16,
+      "format_ok": 16,
+      "crosstalk": 0,
+      "length_finishes": 0,
+      "forbidden_count": 0,
+      "passed": true
+    }
+  ],
+  "status": "pass"
+}

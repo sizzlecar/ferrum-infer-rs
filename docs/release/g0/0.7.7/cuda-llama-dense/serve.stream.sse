@@ -1,0 +1,52 @@
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"String"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"::"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"from"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":" 是"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"一个"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"函数"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"，"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"用于"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"将"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"任"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"意"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"类型"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"的"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"值"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"转"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"换"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"为"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":" String"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":" 类"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"型"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"的"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"值"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":"。"}}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]}
+
+data: {"id":"71c94b43-7be1-424c-9dc1-45dc10cdb3bd","object":"chat.completion.chunk","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[],"usage":{"prompt_tokens":45,"completion_tokens":24,"total_tokens":69}}
+
+data: [DONE]
+

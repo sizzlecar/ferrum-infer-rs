@@ -1,0 +1,15 @@
+[
+  "target/release/ferrum",
+  "serve",
+  "--model",
+  "/Users/chejinxuan/ferrum-bench/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "18181",
+  "--effective-config-json",
+  "docs/release/g0/0.7.7/metal/metal-readme/llama31_8b.effective_config.json",
+  "--decision-trace-jsonl",
+  "docs/release/g0/0.7.7/metal/metal-readme/llama31_8b.decision_trace.jsonl",
+  "--greedy-argmax"
+]

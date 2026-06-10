@@ -1,0 +1,182 @@
+{
+  "actual_input_tokens": {
+    "max": 24,
+    "mean": 17.25,
+    "min": 16,
+    "requested": 16
+  },
+  "actual_input_tokens_per_request": [
+    [
+      16,
+      16,
+      16,
+      16,
+      18,
+      16,
+      16,
+      16,
+      24,
+      16,
+      16,
+      17,
+      16,
+      16,
+      19,
+      16,
+      18,
+      20,
+      16,
+      16,
+      17,
+      17,
+      16,
+      16,
+      17,
+      16,
+      16,
+      21,
+      23,
+      16,
+      18,
+      19
+    ]
+  ],
+  "backend": "metal",
+  "bad_output_per_run": [
+    0
+  ],
+  "completed_per_run": [
+    32
+  ],
+  "concurrency": 16,
+  "duplicate_done_per_run": [
+    0
+  ],
+  "e2e_ms": {
+    "p50": {
+      "mean": 11764.841083
+    },
+    "p75": {
+      "mean": 12138.51051025
+    },
+    "p95": {
+      "mean": 13218.50505785
+    },
+    "p99": {
+      "mean": 13219.94444771
+    }
+  },
+  "env": {
+    "commit_sha": "22b8b7ad",
+    "ferrum_env": {},
+    "ferrum_features": [
+      "metal"
+    ],
+    "hw_id": "apple-m1-max",
+    "runtime_config": {
+      "entries": []
+    },
+    "rust": "1.91.0"
+  },
+  "env_hash": "sha256:7f2e135bb2c07ee2ba37bc91f04e60859add301aeb2570029956db0f22d5e4ae",
+  "errored_per_run": [
+    0
+  ],
+  "goodput_rps": {
+    "mean": 1.3304679603667457
+  },
+  "http_500_per_run": [
+    0
+  ],
+  "itl_ms": {
+    "p50": {
+      "mean": 147.63620799999998
+    },
+    "p75": {
+      "mean": 149.62425050000002
+    },
+    "p95": {
+      "mean": 153.7122167
+    },
+    "p99": {
+      "mean": 542.49603398
+    }
+  },
+  "malformed_stream_per_run": [
+    0
+  ],
+  "missing_done_per_run": [
+    0
+  ],
+  "model": "Qwen3-8B",
+  "n_gen": 64,
+  "n_prompt": 16,
+  "n_repeats": 1,
+  "n_requests_per_run": 32,
+  "output_throughput_tps": {
+    "mean": 84.35998411200399
+  },
+  "output_token_count_source": "usage",
+  "panic_per_run": [
+    0
+  ],
+  "quality_issues_per_run": [
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    }
+  ],
+  "request_throughput_rps": {
+    "mean": 1.3304679603667457
+  },
+  "scenario": "closed_loop",
+  "slo": {
+    "e2e_p99_ms": null,
+    "tpot_p99_ms": null,
+    "ttft_p99_ms": null
+  },
+  "stream_bulk_flush_per_run": [
+    0
+  ],
+  "total_throughput_tps": {
+    "mean": 107.31055642833034
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 166.10036970634923
+    },
+    "p75": {
+      "mean": 171.73557374206348
+    },
+    "p95": {
+      "mean": 177.90307268174604
+    },
+    "p99": {
+      "mean": 177.9378921636508
+    }
+  },
+  "ttft_ms": {
+    "p50": {
+      "mean": 1183.5223959999998
+    },
+    "p75": {
+      "mean": 1679.1165417500001
+    },
+    "p95": {
+      "mean": 2754.0906541
+    },
+    "p99": {
+      "mean": 2754.31274104
+    }
+  },
+  "warmup_requests": 1,
+  "zero_output_tokens_per_run": [
+    0
+  ]
+}

@@ -1,0 +1,1 @@
+{"id":"728dca3a-d69b-453a-91e6-d02bf5dc0034","object":"chat.completion","created":1781123023,"model":"Qwen3-30B-A3B","choices":[{"index":0,"message":{"role":"assistant","content":"蓝色月亮"},"finish_reason":"stop"}],"usage":{"prompt_tokens":63,"completion_tokens":3,"total_tokens":66}}

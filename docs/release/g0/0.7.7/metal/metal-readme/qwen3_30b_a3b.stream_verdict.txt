@@ -1,0 +1,8 @@
+{
+  "status": 200,
+  "passed": true,
+  "chunks": 8,
+  "done_count": 1,
+  "content_head": "你好，很高兴见到你！",
+  "error": ""
+}

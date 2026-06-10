@@ -1,0 +1,11 @@
+{
+  "cmd": [
+    "scripts/release/g0_source_gate.sh",
+    "metal",
+    "docs/release/g0/0.7.7/metal"
+  ],
+  "duration_sec": 314.3089132499881,
+  "env_overrides": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

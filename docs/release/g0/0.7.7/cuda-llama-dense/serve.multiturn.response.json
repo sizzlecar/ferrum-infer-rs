@@ -1,0 +1,1 @@
+{"id":"a344402d-d9ad-4f71-87b4-e73a08a0d32e","object":"chat.completion","created":1781123601,"model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4","choices":[{"index":0,"message":{"role":"assistant","content":"ferrum-blue"},"finish_reason":"stop"}],"usage":{"prompt_tokens":77,"completion_tokens":5,"total_tokens":82}}

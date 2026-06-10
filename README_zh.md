@@ -79,13 +79,13 @@ RTX 4090 + `Qwen3-30B-A3B-GPTQ-Int4` 的历史 same-pod 吞吐，
 release candidate 必须以当前 G0/G1-G4 CUDA artifacts 里的 binary、git SHA、
 runtime config 和 same-hardware 结果为准。
 
-Release 和 Metal gates：
+当前 0.7.7 source release gates：
 
 | 目标 | 模型 / workload | 结果 | 证据 |
 | --- | --- | --- | --- |
-| CUDA release 二进制 | Qwen3-30B-A3B GPTQ-Int4, c=32 smoke | `16/16` 请求，`0` errors；Paris、多轮和三轮对话 gates 通过 | [`CUDA release 二进制验证`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/) |
-| Apple Silicon Metal | Qwen3/LLaMA 8B 和 Qwen3-30B-A3B | 覆盖正确性、多轮对话和并发 gates | [`metal-readme-regression-20260601-release-candidate-rerun3`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/) |
-| Apple Silicon Metal 限制 | Qwen3-30B-A3B, c=16 | Ferrum `72.5 tok/s`；记录中的 llama.cpp `83.4 tok/s` | 同上 Metal 报告 |
+| Apple Silicon Metal source gate | Llama-3.1-8B、Qwen3-8B、Qwen3-30B-A3B GGUF；覆盖 `ferrum run`、`ferrum serve`、tool calls、stream、stateful loop 和 `16/64` 吞吐 cells | `FERRUM GATE metal PASS`；Qwen3-30B-A3B c=16 当前 `68.5 tok/s`，`32/32` 完成，`0` errors | [`docs/release/g0/0.7.7/metal/metal-readme/summary.md`](docs/release/g0/0.7.7/metal/metal-readme/summary.md) |
+| CUDA RTX 4090 source gate | `Qwen/Qwen3-30B-A3B-GPTQ-Int4`，random `256/128`，c=1/4/16/32，`n_repeats=3` | `FERRUM GATE cuda-full PASS`；c=1/4/16/32 candidate `164.2` / `353.3` / `636.9` / `706.0 tok/s`；每个 cell `384/384` 完成，`0` errors | [`docs/release/g0/0.7.7/cuda-full/summary.json`](docs/release/g0/0.7.7/cuda-full/summary.json) |
+| CUDA RTX 4090 dense source gate | `hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4`，random `256/128`，c=1/4/16/32，`n_repeats=3` | `FERRUM GATE cuda-llama-dense PASS`；c=1/4/16/32 output `122.9` / `324.3` / `640.2` / `745.6 tok/s`；每个 cell `288/288` 完成，`0` errors | [`docs/release/g0/0.7.7/cuda-llama-dense/bench-serve.json`](docs/release/g0/0.7.7/cuda-llama-dense/bench-serve.json) |
 
 ## API 兼容性
 
@@ -129,7 +129,8 @@ cargo build --release -p ferrum-cli --bin ferrum
 ## Benchmarks / Docs
 
 - CUDA vLLM 对比：[`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)
-- Apple Silicon 回归报告：[`docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/)
+- 当前 0.7.7 G0 source artifacts：[`docs/release/g0/0.7.7/`](docs/release/g0/0.7.7/)
+- Apple Silicon 回归 gate：`scripts/metal_readme_regression.py` 和 `scripts/release/validate_metal_readme_regression.py`
 - OpenAI API 兼容性：[`docs/openai-api-compatibility.md`](docs/openai-api-compatibility.md)
 - 模块状态记录：[`docs/status/`](docs/status/)
 

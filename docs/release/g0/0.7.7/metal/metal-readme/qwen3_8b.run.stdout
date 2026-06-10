@@ -1,0 +1,6 @@
+{"backend":"Metal","event":"ready","model":"/Users/chejinxuan/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf"}
+{"content":"请记住暗号是蓝色月亮。只回答：已记住。","event":"user","turn":0}
+{"chunk_count":1,"content":"已记住。","event":"assistant","finish_reason":"stop","ms":580.928125,"n_tokens":4,"turn":0}
+{"content":"刚才暗号是什么？只回答暗号。","event":"user","turn":1}
+{"chunk_count":1,"content":"蓝色月亮","event":"assistant","finish_reason":"stop","ms":288.502042,"n_tokens":3,"turn":1}
+{"event":"exit","reason":"bye"}

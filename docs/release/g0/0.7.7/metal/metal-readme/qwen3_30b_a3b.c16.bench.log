@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=random num_prompts=32 warmup=1 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (33 prompts including 1 warmup)
+    32 completed / 0 errored / 29.7s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=2017.0  p95=4838.3  p99=4838.4
+      TPOT_ms  p50=205.5  p95=216.4  p99=216.4
+      ITL_ms   p50=157.9  p95=228.2  p99=977.8
+      throughput      68.5 tok/s
+      goodput         1.08 req/s
+
+→ wrote docs/release/g0/0.7.7/metal/metal-readme/qwen3_30b_a3b.c16.json

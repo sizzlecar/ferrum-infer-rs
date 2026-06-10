@@ -1,0 +1,2 @@
+G0 CUDA LLAMA DENSE GATE PASS: docs/release/g0/0.7.7/cuda-llama-dense
+G0 SOURCE g0_cuda4090_llama_dense PASS: docs/release/g0/0.7.7/cuda-llama-dense

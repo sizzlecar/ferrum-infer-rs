@@ -1,0 +1,1 @@
+{"id":"af974c05-4deb-46fa-b020-df0ee43f3dd2","object":"chat.completion","created":1781122789,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"蓝色月亮"},"finish_reason":"stop"}],"usage":{"prompt_tokens":86,"completion_tokens":5,"total_tokens":91}}

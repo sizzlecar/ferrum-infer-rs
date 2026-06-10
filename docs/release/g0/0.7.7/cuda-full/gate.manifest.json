@@ -1,0 +1,41 @@
+{
+  "artifact_dir": "docs/release/g0/0.7.7/cuda-full",
+  "binary": {
+    "path": "target/release/ferrum",
+    "sha256": "7ec83626eb19b5c229d19f095fbaf5d7ba114180a4434f9749aeb73abf3f4899"
+  },
+  "child_pass_line": "G0 SOURCE g0_cuda4090_full PASS: docs/release/g0/0.7.7/cuda-full",
+  "child_returncode": 0,
+  "command_line": [
+    "/usr/bin/python3",
+    "scripts/release/run_gate.py",
+    "cuda-full",
+    "--out",
+    "docs/release/g0/0.7.7/cuda-full"
+  ],
+  "delegated_command_line": [
+    "scripts/release/g0_source_gate.sh",
+    "cuda-full",
+    "docs/release/g0/0.7.7/cuda-full"
+  ],
+  "dirty_status": {
+    "is_dirty": true,
+    "status_short": [
+      "?? docs/release/g0/0.7.7/"
+    ]
+  },
+  "duration_sec": 1410.32067718287,
+  "error": null,
+  "finished_at": "2026-06-10T20:31:49.287648+00:00",
+  "git_sha": "22b8b7ada3fd586f018a95ba7c1d550d1c57001e",
+  "lane": "cuda-full",
+  "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+  "pass_line": "FERRUM GATE cuda-full PASS: docs/release/g0/0.7.7/cuda-full",
+  "sanitized_env": {
+    "HF_HOME": "/workspace/hf-cache",
+    "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+  },
+  "schema_version": 1,
+  "started_at": "2026-06-10T20:08:18.966963+00:00",
+  "status": "pass"
+}

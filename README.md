@@ -79,13 +79,13 @@ Do not treat this table as a current source-linked/default release-gate claim;
 release candidates must use the current G0/G1-G4 CUDA artifacts for their exact
 binary, git SHA, runtime config, and same-hardware results.
 
-Release and Metal gates:
+Current 0.7.7 source release gates:
 
 | Target | Model / workload | Result | Evidence |
 | --- | --- | --- | --- |
-| CUDA release binary | Qwen3-30B-A3B GPTQ-Int4, c=32 smoke | `16/16` requests, `0` errors; Paris, multi-turn, and three-round chat gates passed | [`CUDA release-binary validation`](docs/bench/dev-loop-product-api-goal-progress-20260601/release-bin-cuda-qwen3-30b-a3b-v0.7.4-final-05254fb-20260602/) |
-| Apple Silicon Metal | Llama/Qwen3 8B and Qwen3-30B-A3B, canonical random `16/64` streaming chat workload | Current G0 gate requires default `serve` startup evidence, `run` and `serve` correctness, concurrent marker/square content-quality probes, plus throughput rows with actual tokenizer-counted input lengths. Qwen3-30B-A3B Metal GGUF release evidence must include a multi-sequence MoE content-quality and throughput cell. | `scripts/metal_readme_regression.py` + `scripts/release/validate_metal_readme_regression.py` |
-| Apple Silicon Metal historical report | Older near-empty-prompt README rows | Historical evidence only; do not use those numbers as current release-gate claims | [`metal-readme-regression-20260601-release-candidate-rerun3`](docs/bench/dev-loop-product-api-goal-progress-20260601/metal-readme-regression-20260601-release-candidate-rerun3/) |
+| Apple Silicon Metal source gate | Llama-3.1-8B, Qwen3-8B, and Qwen3-30B-A3B GGUF; `ferrum run`, `ferrum serve`, tool calls, stream, stateful loop, and `16/64` throughput cells | `FERRUM GATE metal PASS`; Qwen3-30B-A3B c=16 current `68.5 tok/s`, `32/32` completed, `0` errors | [`docs/release/g0/0.7.7/metal/metal-readme/summary.md`](docs/release/g0/0.7.7/metal/metal-readme/summary.md) |
+| CUDA RTX 4090 source gate | `Qwen/Qwen3-30B-A3B-GPTQ-Int4`, random `256/128`, c=1/4/16/32, `n_repeats=3` | `FERRUM GATE cuda-full PASS`; c=1/4/16/32 candidate `164.2` / `353.3` / `636.9` / `706.0 tok/s`; every cell `384/384` completed, `0` errors | [`docs/release/g0/0.7.7/cuda-full/summary.json`](docs/release/g0/0.7.7/cuda-full/summary.json) |
+| CUDA RTX 4090 dense source gate | `hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4`, random `256/128`, c=1/4/16/32, `n_repeats=3` | `FERRUM GATE cuda-llama-dense PASS`; c=1/4/16/32 output `122.9` / `324.3` / `640.2` / `745.6 tok/s`; every cell `288/288` completed, `0` errors | [`docs/release/g0/0.7.7/cuda-llama-dense/bench-serve.json`](docs/release/g0/0.7.7/cuda-llama-dense/bench-serve.json) |
 
 ## API Compatibility
 
@@ -218,6 +218,7 @@ cargo build --release -p ferrum-cli --bin ferrum
 ## Benchmarks / Docs
 
 - CUDA vLLM comparison: [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)
+- Current 0.7.7 G0 source artifacts: [`docs/release/g0/0.7.7/`](docs/release/g0/0.7.7/)
 - Apple Silicon regression gate: `scripts/metal_readme_regression.py` and `scripts/release/validate_metal_readme_regression.py`
 - OpenAI API compatibility: [`docs/openai-api-compatibility.md`](docs/openai-api-compatibility.md)
 - Prefix/session cache product surface: [`docs/cache-product.md`](docs/cache-product.md)

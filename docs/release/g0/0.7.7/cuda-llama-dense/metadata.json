@@ -1,0 +1,29 @@
+{
+  "binary_sha256": "7ec83626eb19b5c229d19f095fbaf5d7ba114180a4434f9749aeb73abf3f4899",
+  "config": {
+    "concurrency_cells": [
+      1,
+      4,
+      16,
+      32
+    ],
+    "kv_capacity": 2048,
+    "max_model_len": 2048,
+    "max_num_seqs": 32,
+    "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+    "model_architecture": "llama_dense",
+    "n_repeats": 3,
+    "name": "g0-cuda4090-llama-dense",
+    "num_prompts": 96,
+    "port": 19300,
+    "random_input_len": 256,
+    "random_output_len": 128,
+    "seed": 9271,
+    "tokenizer": "auto",
+    "warmup_requests": 10
+  },
+  "git_dirty": true,
+  "git_sha": "22b8b7ada3fd586f018a95ba7c1d550d1c57001e",
+  "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+  "model_architecture": "llama_dense"
+}

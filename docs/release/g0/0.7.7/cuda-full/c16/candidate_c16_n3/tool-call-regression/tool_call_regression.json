@@ -1,0 +1,19 @@
+{
+  "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+  "checks": {
+    "omitted_tool_choice": {
+      "passed": true
+    },
+    "explicit_auto_tool_choice": {
+      "passed": true
+    },
+    "required_tool_choice": {
+      "passed": true
+    },
+    "tool_result_fill": {
+      "passed": true,
+      "finish_reason": "stop"
+    }
+  },
+  "status": "pass"
+}

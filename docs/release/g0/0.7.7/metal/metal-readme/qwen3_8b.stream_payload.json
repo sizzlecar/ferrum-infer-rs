@@ -1,0 +1,14 @@
+{
+  "model": "Qwen3-8B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "请用一句话打招呼，必须包含“你好”。"
+    }
+  ],
+  "max_tokens": 256,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  }
+}

@@ -1,0 +1,1 @@
+vm.swapusage: total = 17408.00M  used = 16091.44M  free = 1316.56M  (encrypted)

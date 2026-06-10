@@ -1,0 +1,16 @@
+ferrum bench-serve — dataset=random num_prompts=128 warmup=10 n_repeats=3
+→ closed_loop c=4
+  cell closed_loop c=4 — repeat 1/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 45.2s
+  cell closed_loop c=4 — repeat 2/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 46.5s
+  cell closed_loop c=4 — repeat 3/3 (138 prompts including 10 warmup)
+    128 completed / 0 errored / 46.0s
+    summary c=4 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=98.1±3.4  p95=179.5±104.1  p99=227.4±27.7
+      TPOT_ms  p50=10.5±0.7  p95=11.1±0.5  p99=12.2±2.8
+      ITL_ms   p50=9.1±0.1  p95=14.6±10.3  p99=63.4±0.9
+      throughput      351.2 ± 16.6 tok/s
+      goodput         2.79 ± 0.10 req/s
+
+→ wrote docs/release/g0/0.7.7/cuda-full/c4/candidate_c4_n3/bench.json

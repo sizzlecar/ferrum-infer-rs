@@ -1,0 +1,11 @@
+{
+  "cmd": [
+    "scripts/release/g0_source_gate.sh",
+    "cuda-full",
+    "docs/release/g0/0.7.7/cuda-full"
+  ],
+  "duration_sec": 1410.320101417834,
+  "env_overrides": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

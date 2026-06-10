@@ -1,0 +1,14 @@
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading /Users/chejinxuan/ferrum-bench/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-10T20:21:43.069519Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-10T20:21:43.069530Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-10T20:21:43.069586Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Meta-Llama-3.1-8B-Instruct.tokenizer.json"
+2026-06-10T20:21:43.261632Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-10T20:21:43.261655Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-10T20:21:43.261659Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-10T20:21:43.261664Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-10T20:21:43.261709Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf (format: gguf)
+Model loaded in 3.5s.
+[batched-qkr] first batched_decode call: m=1 use_batched_qkr=false (q=Some("Unsupported operation: qk_norm_rope_batched_per_item not implemented for this backend") k=Some("Unsupported operation: qk_norm_rope_batched_per_item not implemented for this backend") v=Some("Unsupported operation: qk_norm_rope_batched_per_item not implemented for this backend"))

@@ -1,0 +1,8 @@
+{
+  "destroyed_at": "2026-06-10T18:57:51Z",
+  "http_status": 200,
+  "reason": "ssh refused while actual_status remained null",
+  "response": {
+    "success": true
+  }
+}

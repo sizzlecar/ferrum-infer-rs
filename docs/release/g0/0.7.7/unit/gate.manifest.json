@@ -1,0 +1,38 @@
+{
+  "artifact_dir": "docs/release/g0/0.7.7/unit",
+  "binary": {
+    "path": null,
+    "sha256": null
+  },
+  "child_pass_line": "G0 SOURCE unit PASS: docs/release/g0/0.7.7/unit",
+  "child_returncode": 0,
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/run_gate.py",
+    "unit",
+    "--out",
+    "docs/release/g0/0.7.7/unit"
+  ],
+  "delegated_command_line": [
+    "scripts/release/g0_source_gate.sh",
+    "unit",
+    "docs/release/g0/0.7.7/unit"
+  ],
+  "dirty_status": {
+    "is_dirty": true,
+    "status_short": [
+      "?? docs/release/g0/0.7.7/"
+    ]
+  },
+  "duration_sec": 31.25035370886326,
+  "error": null,
+  "finished_at": "2026-06-11T04:10:25.692970+08:00",
+  "git_sha": "22b8b7ada3fd586f018a95ba7c1d550d1c57001e",
+  "lane": "unit",
+  "model": null,
+  "pass_line": "FERRUM GATE unit PASS: docs/release/g0/0.7.7/unit",
+  "sanitized_env": {},
+  "schema_version": 1,
+  "started_at": "2026-06-11T04:09:54.442735+08:00",
+  "status": "pass"
+}

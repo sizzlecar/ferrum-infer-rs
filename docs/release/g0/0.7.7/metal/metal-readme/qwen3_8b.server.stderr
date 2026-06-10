@@ -1,0 +1,9 @@
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Server)
+2026-06-10T20:22:04.693445Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-10T20:22:04.693456Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-10T20:22:04.693489Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-8B.tokenizer.json"
+2026-06-10T20:22:04.868332Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-10T20:22:04.868383Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-10T20:22:04.868390Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-10T20:22:04.868397Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-10T20:22:04.868443Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf (format: gguf)

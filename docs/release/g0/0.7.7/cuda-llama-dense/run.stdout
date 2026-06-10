@@ -1,0 +1,6 @@
+{"backend":"CUDA(0)","event":"ready","model":"hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"}
+{"content":"请记住短语 ferrum-blue。只回答 OK。","event":"user","turn":0}
+{"chunk_count":1,"content":"OK","event":"assistant","finish_reason":"stop","ms":557.118058,"n_tokens":2,"turn":0}
+{"content":"第一条用户消息里的 ferrum 开头短语是什么？只输出短语。","event":"user","turn":1}
+{"chunk_count":1,"content":"ferrum-blue","event":"assistant","finish_reason":"stop","ms":59.019650999999996,"n_tokens":5,"turn":1}
+{"event":"exit","reason":"bye"}
