@@ -1,27 +1,73 @@
 {
   "schema_version": 1,
-  "description": "Allowlist for test_arch_goal_gate.py Gate A. An entry exempts (path-prefix, pattern) findings that are legitimately platform-specific — device construction / detection / backend registration at the composition root, where branching on the accelerator is correct by design (analogous to backend_boundary_allowlist.json). The LLM hot-path coupling (env reads, OnceLock config freeze, supports_*() behavior branches) is NOT allowlisted: those are real decoupling targets tracked in STATUS.md and must reach zero by migration, not exemption.",
+  "description": "Allowlist for test_arch_goal_gate.py Gate A. Exempts findings that match the GOAL's explicitly-allowed patterns: device construction/detection/registration at the composition root, legitimate process-wide singletons/caches (NOT config freezes), and construction-time capability decisions ('构造期由类型化 capability/placement 决策一次'). The `contains` field pins an entry to a specific line so a file with both a legit item and a real migration target only exempts the legit one. Hot-path env reads, config-freeze OnceLocks, and decode/prefill supports_*() BEHAVIOR branches are NOT exempt — they migrate.",
   "entries": [
     {
       "path": "crates/ferrum-engine/src/registry.rs",
       "pattern": "cfg_branch",
-      "reason": "Backend/device registration is the composition root: it must branch on cuda/metal availability to register the right backend and enumerate devices. This is device wiring, not LLM forward-path behavior.",
+      "reason": "Backend/device registration composition root: must branch on cuda/metal to register the right backend and enumerate devices.",
       "owner": "runtime",
-      "review_condition": "Re-review if device/backend registration moves out of registry.rs or stops needing compile-time backend gating."
+      "review_condition": "Re-review if registration moves out of registry.rs."
     },
     {
       "path": "crates/ferrum-engine/src/tensor_factory/candle.rs",
       "pattern": "cfg_branch",
-      "reason": "Maps the ferrum Device enum to a concrete candle Device (creating CUDA/Metal devices). Device construction is inherently platform-specific and backend-agnostic model code never sees it.",
+      "reason": "Maps Device enum to a concrete candle Device. Device construction is platform-specific by nature.",
       "owner": "runtime",
-      "review_condition": "Re-review if tensor-factory device construction is unified behind a runtime resolver."
+      "review_condition": "Re-review if tensor-factory device construction is unified behind a resolver."
     },
     {
       "path": "crates/ferrum-engine/src/parallel/device.rs",
       "pattern": "cfg_branch",
-      "reason": "Device detection/enumeration (detect_metal_devices, per-device capability probing). Platform-specific by nature; sits below the model abstraction.",
+      "reason": "Device detection/enumeration. Platform-specific; sits below the model abstraction.",
       "owner": "runtime",
-      "review_condition": "Re-review if device detection is delegated to the kernels backend crate."
+      "review_condition": "Re-review if device detection moves to the kernels crate."
+    },
+    {
+      "path": "crates/ferrum-engine/src/registry.rs",
+      "pattern": "once_lock",
+      "contains": "ComponentRegistry",
+      "reason": "GLOBAL_REGISTRY is a process-wide component-registry singleton, not an env-config freeze. Legitimate global state.",
+      "owner": "runtime",
+      "review_condition": "Re-review if the component registry is injected instead of a global."
+    },
+    {
+      "path": "crates/ferrum-engine/src/continuous_engine.rs",
+      "pattern": "once_lock",
+      "contains": "TOKEN_POLICY_CACHE",
+      "reason": "TOKEN_POLICY_CACHE memoizes per-(tokenizer,vocab) forbidden-token sets — a pure computation cache, not config. Keyed, so it holds many entries, not one frozen config.",
+      "owner": "engine",
+      "review_condition": "Re-review if token-policy computation moves out of the engine."
+    },
+    {
+      "path": "crates/ferrum-engine/src/parallel/device.rs",
+      "pattern": "once_lock",
+      "contains": "GLOBAL_DEVICE_MANAGER",
+      "reason": "GLOBAL_DEVICE_MANAGER is a process-wide device-manager singleton (device init), not an env-config freeze.",
+      "owner": "runtime",
+      "review_condition": "Re-review if device management is injected."
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/kv.rs",
+      "pattern": "supports_branch",
+      "reason": "Construction-time KV-pool setup: chooses paged-KV layout from B::supports_paged_kv() once, when the model's KV state is built. GOAL allows construction-time capability decisions.",
+      "owner": "models",
+      "review_condition": "Re-review if KV setup moves into the decode hot path."
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/load.rs",
+      "pattern": "supports_branch",
+      "reason": "Load-time scratch sizing: sizes initial scratch from B::supports_varlen_qkv() during model construction. GOAL allows construction-time capability decisions.",
+      "owner": "models",
+      "review_condition": "Re-review if scratch sizing moves into the forward path."
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "pattern": "supports_branch",
+      "contains": "supports_device_ordinal_scope",
+      "reason": "Construction-time placement validation: checks device-ordinal-scope support once when building the layer-split pipeline placement.",
+      "owner": "models",
+      "review_condition": "Re-review if placement validation moves into the forward path."
     }
   ]
 }

@@ -285,11 +285,19 @@ def load_allowlist(repo_root: Path) -> list[dict[str, Any]]:
 
 
 def finding_allowed(finding: dict[str, Any], allowlist: list[dict[str, Any]]) -> bool:
-    return any(
-        finding["pattern"] == entry["pattern"]
-        and finding["file"].startswith(entry["path"])
-        for entry in allowlist
-    )
+    for entry in allowlist:
+        if finding["pattern"] != entry["pattern"]:
+            continue
+        if not finding["file"].startswith(entry["path"]):
+            continue
+        # Optional precise match: the flagged line must contain this substring.
+        # Lets a file with both a legit singleton and a real migration target
+        # allowlist only the singleton.
+        contains = entry.get("contains")
+        if contains and contains not in finding.get("text", ""):
+            continue
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
