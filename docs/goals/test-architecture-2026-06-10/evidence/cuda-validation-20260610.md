@@ -28,3 +28,8 @@ FERRUM_VLLM_MOE=1, Qwen3-30B-A3B: "北京是中国的首都，是政治、文化
 ## hb-11 verify-live: PASS (kv boundary)
 6000-token prompt on Qwen3-0.6B generates (16 tokens, 61s) with NO
 paged kv shared-memory INVALID_VALUE crash.
+
+## Model matrix (CUDA): all 4 LLM models PASS
+readme_model_matrix.py --run --platform cuda: llama-family (TinyLlama),
+qwen3-dense (Qwen3-0.6B), qwen3-moe (Qwen3-30B-A3B), qwen2-5 (Qwen2.5-0.5B)
+all PASS (3-turn coherent generate, no template/garbage leak). MATRIX CUDA PASS.
