@@ -70,8 +70,10 @@ impl EngineInner {
         // 1024 run_iteration calls. Set None_size to 0 explicitly so the
         // bg-loop tight-spin theory can be confirmed.
         let nb_prof = self.runtime_config.next_batch_prof;
+        let sched_t0 = Instant::now();
         let nb_t0 = if nb_prof { Some(Instant::now()) } else { None };
         let nb_result = self.scheduler.next_batch(hint).await;
+        self.record_scheduling_time(sched_t0.elapsed());
         if let Some(t0) = nb_t0 {
             use std::sync::atomic::AtomicU64;
             static SOME_N: AtomicU64 = AtomicU64::new(0);
@@ -123,7 +125,9 @@ impl EngineInner {
             batch.size()
         );
 
+        let process_t0 = Instant::now();
         let r = self.process_batch(&batch).await;
+        self.record_model_execution_time(process_t0.elapsed());
         if let (Some(t0), Some(ts)) = (t_iter_start, t_after_sched) {
             let n = self.iteration_count.load(Ordering::Relaxed);
             if n < 64 || n.is_multiple_of(32) {

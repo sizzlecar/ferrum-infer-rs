@@ -17,10 +17,12 @@ use ferrum_quantization::Linear;
 use ferrum_types::Result;
 
 use super::llama_family::{
-    LlamaFamilyModel, ATTN_CALLS, ATTN_TIME_US, BATCHED_GRAPH_EAGER_COUNT,
-    BATCHED_GRAPH_REPLAY_COUNT, MATMUL_CALLS, MATMUL_TIME_US, NORM_CALLS, NORM_TIME_US,
-    OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US, SINGLE_ITEM_GRAPH_KEY,
+    elapsed_micros_u64_floor1, LlamaFamilyModel, LlamaStageHiddenBridgeTiming, ATTN_CALLS,
+    ATTN_TIME_US, BATCHED_GRAPH_EAGER_COUNT, BATCHED_GRAPH_REPLAY_COUNT, MATMUL_CALLS,
+    MATMUL_TIME_US, NORM_CALLS, NORM_TIME_US, OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US,
+    SINGLE_ITEM_GRAPH_KEY,
 };
+use super::llama_family_pipeline::{LlamaPipelineStageBatchOps, PipelineHidden};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LlamaBatchedRuntimeConfig {
@@ -118,6 +120,41 @@ fn llama_batched_runtime_config() -> &'static LlamaBatchedRuntimeConfig {
 // the engine level (DecoderOnlyLLM::decode_batch + unified_forward report
 // Unsupported in the K=KvInt8 specialization).
 impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
+    fn prepare_batched_decode_stage(
+        &mut self,
+        batch: &[(String, u32, u32)],
+    ) -> (usize, usize, B::Context) {
+        let m = batch.len();
+        debug_assert!(m > 0);
+        for (cid, _, _) in batch {
+            self.ensure_kv(cid);
+        }
+        self.ensure_scratch(m);
+
+        let mut ctx = B::new_context();
+        let positions: Vec<u32> = batch.iter().map(|(_, _, p)| *p).collect();
+        let kv_pre: Vec<u32> = batch
+            .iter()
+            .map(|(cid, _, _)| self.kv_caches.get(cid).expect("kv_caches missing")[0].len as u32)
+            .collect();
+        let kv_post: Vec<u32> = kv_pre.iter().map(|&x| x + 1).collect();
+        B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_positions, &positions);
+        B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
+        B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
+
+        (m, self.cfg.hidden_size, ctx)
+    }
+
+    fn bump_local_batched_decode_kv_lengths(&mut self, batch: &[(String, u32, u32)]) {
+        let local_layers = self.local_layer_count();
+        for (cid, _, _) in batch {
+            let caches = self.kv_caches.get_mut(cid).expect("kv_caches missing");
+            for cache in caches.iter_mut().take(local_layers) {
+                cache.len += 1;
+            }
+        }
+    }
+
     /// One transformer layer over M items, GEMMs batched + per-item attention.
     pub(crate) fn forward_layer_batched_decode(
         &mut self,
@@ -1766,7 +1803,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         if m == 0 {
             return Vec::new();
         }
-        if m == 1 {
+        if m == 1 && !force_full_logits {
             let (cid, tok, pos) = &batch[0];
             return vec![self.decode_internal(cid, *tok, *pos)];
         }
@@ -2070,6 +2107,183 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
             (0..m)
                 .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
+                .collect()
+        }
+    }
+}
+
+impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvFp16> {
+    fn decode_stage_tokens_to_hidden_batch(
+        &mut self,
+        batch: &[(String, u32, u32)],
+    ) -> PipelineHidden<B> {
+        if batch.is_empty() {
+            return PipelineHidden::host(Vec::new(), 0, self.cfg.hidden_size);
+        }
+        if batch.len() == 1 || !B::supports_llama_family_batched_decode() {
+            let h = self.cfg.hidden_size;
+            let mut hidden = Vec::with_capacity(batch.len() * h);
+            for (cache_id, token, pos) in batch {
+                hidden
+                    .extend_from_slice(&self.decode_stage_token_to_hidden(cache_id, *token, *pos));
+            }
+            return PipelineHidden::host(hidden, batch.len(), h);
+        }
+
+        let (m, h, mut ctx) = self.prepare_batched_decode_stage(batch);
+        let tokens: Vec<u32> = batch.iter().map(|(_, token, _)| *token).collect();
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("decode_stage_tokens_to_hidden_batch called on stage without embedding");
+        B::embedding_lookup(&mut ctx, embed, &tokens, &mut residual, h);
+
+        for li in 0..self.local_layer_count() {
+            self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+        }
+        self.bump_local_batched_decode_kv_lengths(batch);
+
+        B::sync(&mut ctx);
+        let out = B::to_vec(&residual, m * h);
+        self.scratch.residual = Some(residual);
+        PipelineHidden::host(out, m, h)
+    }
+
+    fn decode_stage_hidden_from_host_batch(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        hidden: &PipelineHidden<B>,
+    ) -> (PipelineHidden<B>, LlamaStageHiddenBridgeTiming) {
+        if batch.is_empty() {
+            return (
+                PipelineHidden::host(Vec::new(), 0, self.cfg.hidden_size),
+                LlamaStageHiddenBridgeTiming::default(),
+            );
+        }
+        let h = self.cfg.hidden_size;
+        let hidden_slice = hidden.host_slice();
+        assert_eq!(
+            hidden_slice.len(),
+            batch.len() * h,
+            "hidden length {} != batch * hidden_size {}",
+            hidden_slice.len(),
+            batch.len() * h
+        );
+        if batch.len() == 1 || !B::supports_llama_family_batched_decode() {
+            let mut out = Vec::with_capacity(hidden_slice.len());
+            let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
+            for (row, (cache_id, _, pos)) in batch.iter().enumerate() {
+                let start = row * h;
+                let (row_hidden, row_timing) = self.decode_stage_hidden_from_host_with_timing(
+                    cache_id,
+                    &hidden_slice[start..start + h],
+                    *pos,
+                );
+                out.extend_from_slice(&row_hidden);
+                bridge_timing = bridge_timing.add(row_timing);
+            }
+            return (PipelineHidden::host(out, batch.len(), h), bridge_timing);
+        }
+
+        let (m, h, mut ctx) = self.prepare_batched_decode_stage(batch);
+        let mut residual = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing (previous call didn't restore)");
+        let bridge_t0 = std::time::Instant::now();
+        let host_copy_t0 = std::time::Instant::now();
+        B::write_f32_to_activation(&mut ctx, &mut residual, hidden_slice);
+        let host_copy_us = elapsed_micros_u64_floor1(host_copy_t0);
+        let bridge_timing = LlamaStageHiddenBridgeTiming {
+            bridge_us: elapsed_micros_u64_floor1(bridge_t0),
+            host_copy_us,
+            device_copy_us: 0,
+        };
+
+        for li in 0..self.local_layer_count() {
+            self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+        }
+        self.bump_local_batched_decode_kv_lengths(batch);
+
+        B::sync(&mut ctx);
+        let out = B::to_vec(&residual, m * h);
+        self.scratch.residual = Some(residual);
+        (PipelineHidden::host(out, m, h), bridge_timing)
+    }
+
+    fn logits_from_hidden_batch(
+        &mut self,
+        hidden: &PipelineHidden<B>,
+        force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
+        let row_count = hidden.row_count();
+        if row_count == 0 {
+            return Vec::new();
+        }
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        let hidden_slice = hidden.host_slice();
+        assert_eq!(
+            hidden_slice.len(),
+            row_count * h,
+            "hidden length {} != row_count * hidden_size {}",
+            hidden_slice.len(),
+            row_count * h
+        );
+        if row_count == 1 || !B::supports_llama_family_batched_decode() {
+            return (0..row_count)
+                .map(|row| {
+                    let start = row * h;
+                    self.logits_from_hidden(&hidden_slice[start..start + h])
+                })
+                .collect();
+        }
+
+        self.ensure_scratch(row_count);
+        let mut ctx = B::new_context();
+        let mut hidden_buf = self
+            .scratch
+            .residual
+            .take()
+            .expect("scratch residual missing before logits_from_hidden_batch");
+        B::write_f32_to_activation(&mut ctx, &mut hidden_buf, hidden_slice);
+        B::rms_norm(
+            &mut ctx,
+            &hidden_buf,
+            &self.final_norm_w,
+            self.cfg.rms_norm_eps,
+            &mut self.scratch.norm_out,
+            row_count,
+            h,
+        );
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .expect("logits_from_hidden_batch called on stage without lm_head");
+        lm_head.forward(
+            &mut ctx,
+            &self.scratch.norm_out,
+            &mut self.scratch.batch_logits,
+            row_count,
+        );
+        B::sync(&mut ctx);
+        self.scratch.residual = Some(hidden_buf);
+
+        let greedy = llama_batched_runtime_config().greedy_argmax && !force_full_logits;
+        if greedy {
+            let tokens = B::argmax_rows_f16(&mut ctx, &self.scratch.batch_logits, row_count, vocab)
+                .expect("argmax_rows_f16");
+            tokens.into_iter().map(|t| vec![t as f32]).collect()
+        } else {
+            let all = B::to_vec(&self.scratch.batch_logits, row_count * vocab);
+            (0..row_count)
+                .map(|row| all[row * vocab..(row + 1) * vocab].to_vec())
                 .collect()
         }
     }

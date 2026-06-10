@@ -54,6 +54,27 @@ use crate::lora::{load_runtime_lora_adapter, ActiveLoraAdapter, RuntimeLoraAdapt
 
 const DEFAULT_KV_CAPACITY: usize = 512;
 
+pub(crate) fn elapsed_micros_u64_floor1(t0: std::time::Instant) -> u64 {
+    t0.elapsed().as_micros().min(u64::MAX as u128).max(1) as u64
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LlamaStageHiddenBridgeTiming {
+    pub(crate) bridge_us: u64,
+    pub(crate) host_copy_us: u64,
+    pub(crate) device_copy_us: u64,
+}
+
+impl LlamaStageHiddenBridgeTiming {
+    pub(crate) fn add(self, other: Self) -> Self {
+        Self {
+            bridge_us: self.bridge_us.saturating_add(other.bridge_us),
+            host_copy_us: self.host_copy_us.saturating_add(other.host_copy_us),
+            device_copy_us: self.device_copy_us.saturating_add(other.device_copy_us),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LlamaFamilyRuntimeEnv {
     kv_capacity: Option<usize>,
@@ -123,6 +144,10 @@ impl LlamaFamilyRuntimeEnv {
 fn llama_family_runtime_env() -> &'static LlamaFamilyRuntimeEnv {
     static CONFIG: OnceLock<LlamaFamilyRuntimeEnv> = OnceLock::new();
     CONFIG.get_or_init(LlamaFamilyRuntimeEnv::from_env)
+}
+
+pub(crate) fn llama_family_decode_op_profile_enabled() -> bool {
+    llama_family_runtime_env().decode_op_profile
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2423,6 +2448,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         seq_len: usize,
         pos_offset: usize,
     ) -> Vec<f32> {
+        self.stage_hidden_from_host_with_timing(cache_id, hidden, seq_len, pos_offset)
+            .0
+    }
+
+    fn stage_hidden_from_host_with_timing(
+        &mut self,
+        cache_id: &str,
+        hidden: &[f32],
+        seq_len: usize,
+        pos_offset: usize,
+    ) -> (Vec<f32>, LlamaStageHiddenBridgeTiming) {
         let h = self.cfg.hidden_size;
         assert_eq!(
             hidden.len(),
@@ -2443,8 +2479,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .take()
             .expect("scratch residual missing (previous call didn't restore)");
 
+        let bridge_t0 = std::time::Instant::now();
+        let host_copy_t0 = std::time::Instant::now();
         let hidden_buf = B::from_slice(hidden);
+        let host_copy_us = elapsed_micros_u64_floor1(host_copy_t0);
+        let device_copy_t0 = std::time::Instant::now();
         B::copy_slice(&mut ctx, &hidden_buf, 0, &mut residual, 0, seq_len * h);
+        let device_copy_us = elapsed_micros_u64_floor1(device_copy_t0);
+        let bridge_timing = LlamaStageHiddenBridgeTiming {
+            bridge_us: elapsed_micros_u64_floor1(bridge_t0),
+            host_copy_us,
+            device_copy_us,
+        };
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
@@ -2453,7 +2499,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         B::sync(&mut ctx);
         let out = B::to_vec(&residual, seq_len * h);
         self.scratch.residual = Some(residual);
-        out
+        (out, bridge_timing)
     }
 
     /// Run this layer-split stage over prefill hidden states supplied by the
@@ -2478,6 +2524,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         pos: u32,
     ) -> Vec<f32> {
         self.stage_hidden_from_host(cache_id, hidden, 1, pos as usize)
+    }
+
+    pub(crate) fn decode_stage_hidden_from_host_with_timing(
+        &mut self,
+        cache_id: &str,
+        hidden: &[f32],
+        pos: u32,
+    ) -> (Vec<f32>, LlamaStageHiddenBridgeTiming) {
+        self.stage_hidden_from_host_with_timing(cache_id, hidden, 1, pos as usize)
     }
 
     /// Apply final norm + lm_head to one hidden row. Used by the last pipeline

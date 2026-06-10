@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::{debug, error, info, span, Level};
+use tracing::{debug, error, info, span, warn, Level};
 use uuid::Uuid;
 
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
@@ -43,6 +43,7 @@ const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 512;
 const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const THINK_START_TAG: &str = "<think>";
 const THINK_END_TAG: &str = "</think>";
+const DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH: u64 = 128;
 const INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS: &[&str] =
     &["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"];
 const FERRUM_SESSION_HEADER: &str = "x-ferrum-session";
@@ -577,20 +578,29 @@ impl CacheRuntimeState {
         let prefix_entries =
             engine_u64(engine_prefix_cache, "entries").unwrap_or(stats.prefix_entries);
         let prefix_bytes = engine_u64(engine_prefix_cache, "bytes").unwrap_or(stats.prefix_bytes);
+        let mut prefix_cache = serde_json::json!({
+            "enabled": engine_bool(engine_prefix_cache, "enabled").unwrap_or(policy.prefix_cache_enabled),
+            "position": engine_str(engine_prefix_cache, "position").unwrap_or("product-observability"),
+            "source": engine_str(engine_prefix_cache, "source").unwrap_or("server-prompt-lcp-observability"),
+            "entries": prefix_entries,
+            "hits": prefix_hits,
+            "misses": prefix_misses,
+            "evictions": prefix_evictions,
+            "saved_prefill_tokens": prefix_saved,
+            "bytes": prefix_bytes,
+            "block_size": engine_u64(engine_prefix_cache, "block_size"),
+            "kv_dtype": engine_str(engine_prefix_cache, "kv_dtype"),
+        });
+        if let (Some(engine), Some(prefix)) = (
+            engine_prefix_cache.and_then(|value| value.as_object()),
+            prefix_cache.as_object_mut(),
+        ) {
+            for (key, value) in engine {
+                prefix.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
         serde_json::json!({
-            "prefix_cache": {
-                "enabled": engine_bool(engine_prefix_cache, "enabled").unwrap_or(policy.prefix_cache_enabled),
-                "position": engine_str(engine_prefix_cache, "position").unwrap_or("product-observability"),
-                "source": engine_str(engine_prefix_cache, "source").unwrap_or("server-prompt-lcp-observability"),
-                "entries": prefix_entries,
-                "hits": prefix_hits,
-                "misses": prefix_misses,
-                "evictions": prefix_evictions,
-                "saved_prefill_tokens": prefix_saved,
-                "bytes": prefix_bytes,
-                "block_size": engine_u64(engine_prefix_cache, "block_size"),
-                "kv_dtype": engine_str(engine_prefix_cache, "kv_dtype"),
-            },
+            "prefix_cache": prefix_cache,
             "session_cache": {
                 "mode": policy.session_cache_mode,
                 "entries": stats.session_entries,
@@ -700,6 +710,7 @@ fn admission_health_json(
         "rejected_requests_total": 0u64,
         "failed_requests_total": scheduler_metrics.failed_requests,
         "completed_requests_total": scheduler_metrics.successful_requests,
+        "avg_queue_wait_time_ms": scheduler_metrics.queue_metrics.avg_queue_wait_time_ms,
         "scheduler_policy": configured
             .and_then(|value| value.get("scheduler_policy"))
             .and_then(|value| value.as_str())
@@ -1073,6 +1084,11 @@ async fn handle_chat_completions_stream(
                                 break;
                             }
                         } else if tool_choice_required(&openai_request) {
+                            log_required_tool_choice_failure(
+                                &openai_request,
+                                &parsed_final.content,
+                                parsed_final.reasoning.as_deref(),
+                            );
                             let error_event = openai_error_sse_event(
                                 "model output did not satisfy required tool_choice",
                                 "invalid_request_error",
@@ -1283,6 +1299,11 @@ async fn handle_chat_completions_sync(
                     openai_finish_reason = reason.clone();
                 }
             } else if tool_choice_required(&openai_request) {
+                log_required_tool_choice_failure(
+                    &openai_request,
+                    &parsed.content,
+                    parsed.reasoning.as_deref(),
+                );
                 return Err(ServerError::invalid_request(
                     "model output did not satisfy required tool_choice",
                     Some("tool_choice"),
@@ -1347,7 +1368,9 @@ fn convert_chat_request_with_template_model(
         .as_ref()
         .or(default_tool_choice.as_ref());
     let functions = request.functions.as_deref().unwrap_or_default();
-    let render_messages = render_messages_with_response_format_instruction(request);
+    let forced_response_format = forced_tool_choice_response_format(request);
+    let render_messages =
+        render_messages_with_response_format_instruction(request, forced_response_format.as_ref());
     let chat_template_options = chat_template_options_for_request(request, model_template)?;
     let prompt = if tools.is_empty() && functions.is_empty() {
         render_chat_prompt_with_model_template_options(
@@ -1447,7 +1470,7 @@ fn convert_chat_request_with_template_model(
             tfs: None,
             typical_p: None,
             mirostat: None,
-            response_format: forced_tool_choice_response_format(request)
+            response_format: forced_response_format
                 .or_else(|| inferred_auto_tool_response_format(request))
                 .unwrap_or(ferrum_types::ResponseFormat::Text),
         },
@@ -1514,8 +1537,10 @@ fn chat_template_options_for_request(
 
 fn render_messages_with_response_format_instruction(
     request: &ChatCompletionsRequest,
+    forced_response_format: Option<&ferrum_types::ResponseFormat>,
 ) -> Vec<ChatMessage> {
-    let Some(instruction) = response_format_prompt_instruction(request) else {
+    let Some(instruction) = response_format_prompt_instruction(request, forced_response_format)
+    else {
         return request.messages.clone();
     };
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
@@ -1532,45 +1557,34 @@ fn render_messages_with_response_format_instruction(
     messages
 }
 
-fn response_format_prompt_instruction(request: &ChatCompletionsRequest) -> Option<String> {
-    let format = request.response_format.as_ref()?;
-    match format.format_type.as_str() {
-        "json_object" => Some(
-            "The response_format requires a single valid JSON object. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
-                .to_string(),
-        ),
-        "json_schema" => {
-            let schema = format.json_schema.as_ref()?.schema.as_ref()?;
-            let schema_text = serde_json::to_string(schema).ok()?;
-            Some(format!(
-                "The response_format requires a single valid JSON object satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
-            ))
-        }
-        _ => None,
+fn response_format_prompt_instruction(
+    request: &ChatCompletionsRequest,
+    _forced_response_format: Option<&ferrum_types::ResponseFormat>,
+) -> Option<String> {
+    if let Some(format) = request.response_format.as_ref() {
+        return match format.format_type.as_str() {
+            "json_object" => Some(
+                "The response_format requires a single valid JSON object. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
+                    .to_string(),
+            ),
+            "json_schema" => {
+                let schema = format.json_schema.as_ref()?.schema.as_ref()?;
+                let schema_text = serde_json::to_string(schema).ok()?;
+                Some(format!(
+                    "The response_format requires a single valid JSON object satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
+                ))
+            }
+            _ => None,
+        };
     }
+    None
 }
 
 fn forced_tool_choice_response_format(
     request: &ChatCompletionsRequest,
 ) -> Option<ferrum_types::ResponseFormat> {
-    let selected_tool = match request.tool_choice.as_ref()? {
-        ToolChoice::Function {
-            tool_type,
-            function,
-        } if tool_type == "function" => request
-            .tools
-            .as_ref()?
-            .iter()
-            .find(|tool| tool.function.name == function.name)?,
-        ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
-            request.tools.as_ref()?.first()?
-        }
-        _ => return None,
-    };
-    let schema = serde_json::to_value(&selected_tool.function.parameters).ok()?;
-    if schema.is_null() {
-        return None;
-    }
+    let selected_tool = selected_tool_for_forced_tool_choice(request)?;
+    let schema = guided_tool_arguments_schema(selected_tool.function.parameters.as_ref())?;
     serde_json::to_string(&schema)
         .ok()
         .map(ferrum_types::ResponseFormat::JsonSchema)
@@ -1587,8 +1601,74 @@ fn inferred_auto_tool_response_format(
     if !text_mentions_tool(&prompt, &tool.function) {
         return None;
     }
-    let schema = serde_json::to_string(tool.function.parameters.as_ref()?).ok()?;
+    let schema = serde_json::to_string(&guided_tool_arguments_schema(
+        tool.function.parameters.as_ref(),
+    )?)
+    .ok()?;
     Some(ferrum_types::ResponseFormat::JsonSchema(schema))
+}
+
+fn selected_tool_for_forced_tool_choice(request: &ChatCompletionsRequest) -> Option<&ChatTool> {
+    match request.tool_choice.as_ref()? {
+        ToolChoice::Function {
+            tool_type,
+            function,
+        } if tool_type == "function" => request
+            .tools
+            .as_ref()?
+            .iter()
+            .find(|tool| tool.function.name == function.name),
+        ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
+            request.tools.as_ref()?.first()
+        }
+        _ => None,
+    }
+}
+
+fn guided_tool_arguments_schema(
+    parameters: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut schema = parameters?.clone();
+    bound_unconstrained_tool_argument_strings(
+        &mut schema,
+        DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH,
+    );
+    Some(schema)
+}
+
+fn bound_unconstrained_tool_argument_strings(value: &mut serde_json::Value, default_max: u64) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let is_string = map
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|ty| ty == "string");
+            let has_finite_string_shape = map.contains_key("enum") || map.contains_key("maxLength");
+            if is_string && !has_finite_string_shape {
+                map.insert(
+                    "maxLength".to_string(),
+                    serde_json::Value::Number(default_max.into()),
+                );
+            }
+            if let Some(properties) = map
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for property in properties.values_mut() {
+                    bound_unconstrained_tool_argument_strings(property, default_max);
+                }
+            }
+            if let Some(items) = map.get_mut("items") {
+                bound_unconstrained_tool_argument_strings(items, default_max);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                bound_unconstrained_tool_argument_strings(item, default_max);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn tool_choice_auto_or_omitted(choice: Option<&ToolChoice>) -> bool {
@@ -1741,6 +1821,29 @@ fn chat_api_response_from_parsed_generated_text(
         .or_else(|| {
             ferrum_types::chat_api_response_from_generated_text(chat_request, &parsed.content)
         })
+}
+
+fn log_required_tool_choice_failure(
+    request: &ChatCompletionsRequest,
+    content: &str,
+    reasoning: Option<&str>,
+) {
+    warn!(
+        model = %request.model,
+        content_len = content.len(),
+        content_head = %log_excerpt(content, 512),
+        reasoning_len = reasoning.map(str::len).unwrap_or(0),
+        reasoning_head = %reasoning.map(|value| log_excerpt(value, 512)).unwrap_or_default(),
+        "model output did not satisfy required tool_choice"
+    );
+}
+
+fn log_excerpt(value: &str, max_chars: usize) -> String {
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
 }
 
 fn normalize_structured_response_content(
@@ -2166,10 +2269,22 @@ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Resul
 }
 
 fn tool_choice_required(request: &ChatCompletionsRequest) -> bool {
-    matches!(
-        request.tool_choice.as_ref(),
-        Some(ToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required")
-    )
+    match request.tool_choice.as_ref() {
+        Some(ToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required") => true,
+        Some(ToolChoice::Function {
+            tool_type,
+            function,
+        }) => {
+            tool_type == "function"
+                && request
+                    .tools
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|tool| tool.function.name == function.name)
+        }
+        _ => false,
+    }
 }
 
 fn openai_usage_from_token_usage(usage: &TokenUsage) -> Usage {
@@ -2980,6 +3095,14 @@ async fn health_handler(
             "successful_requests": scheduler_metrics.successful_requests,
             "failed_requests": scheduler_metrics.failed_requests,
             "throughput_rps": scheduler_metrics.throughput_rps,
+            "avg_wait_time_ms": scheduler_metrics.queue_metrics.avg_queue_wait_time_ms,
+            "scheduling_time_ms": scheduler_metrics.performance_breakdown.scheduling_time_ms,
+            "model_execution_time_ms": scheduler_metrics
+                .performance_breakdown
+                .model_execution_time_ms,
+            "iteration_lock_wait_time_ms": scheduler_metrics
+                .performance_breakdown
+                .other_overhead_time_ms,
         },
         "config": runtime_config,
         "auto_config": auto_config,
@@ -4029,6 +4152,11 @@ mod tests {
         assert!(body["admission"]["rejected_requests_total"].is_number());
         assert!(body["admission"]["failed_requests_total"].is_number());
         assert!(body["admission"]["completed_requests_total"].is_number());
+        assert!(body["admission"]["avg_queue_wait_time_ms"].is_number());
+        assert!(body["scheduler"]["avg_wait_time_ms"].is_number());
+        assert!(body["scheduler"]["scheduling_time_ms"].is_number());
+        assert!(body["scheduler"]["model_execution_time_ms"].is_number());
+        assert!(body["scheduler"]["iteration_lock_wait_time_ms"].is_number());
         assert!(
             body["auto_config"]["decisions"].is_array() || body["auto_config"]["error"].is_string(),
             "body: {body}"
@@ -4517,14 +4645,50 @@ mod tests {
             }),
         )
         .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["param"], "tool_choice");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn route_chat_specific_tool_choice_wraps_generated_arguments() {
+        let response = post_json(
+            router_with_stub(r#"{"city":"Paris"}"#),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Use the selected tool."}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "weather"}
+                }
+            }),
+        )
+        .await;
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["content"], "");
         assert_eq!(
-            body["choices"][0]["message"]["content"],
-            r#"{"name":"calendar","arguments":{}}"#
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "weather"
         );
-        assert!(body["choices"][0]["message"]["tool_calls"].is_null());
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
     }
 
     #[tokio::test]
@@ -4754,12 +4918,10 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_text(response).await;
         assert!(
-            body.contains(r#""content":"{\"name\":\"calendar\",\"arguments\":{}}""#),
-            "unselected tool JSON should stream as ordinary content: {body}"
-        );
-        assert!(
-            body.contains(r#""finish_reason":"stop""#),
-            "unselected tool JSON should keep normal stop finish: {body}"
+            body.contains(
+                r#""error":{"message":"model output did not satisfy required tool_choice""#
+            ),
+            "selected-tool stream should reject unselected tool output: {body}"
         );
         assert!(
             !body.contains(r#""finish_reason":"tool_calls""#),
@@ -6554,6 +6716,104 @@ mod tests {
     }
 
     #[test]
+    fn tool_schema_response_format_bounds_unconstrained_strings() {
+        let request: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "served-alias",
+            "messages": [{"role": "user", "content": "Use the selected tool."}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                        },
+                        "required": ["city"]
+                    }
+                }
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "get_weather"}
+            }
+        }))
+        .expect("tool request parses");
+
+        validate_chat_request(&request).expect("tool request validates");
+        let internal = convert_chat_request(&request).expect("convert");
+        match internal.sampling_params.response_format {
+            ferrum_types::ResponseFormat::JsonSchema(ref schema) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(schema).expect("schema should be JSON");
+                assert_eq!(
+                    value["properties"]["city"]["maxLength"],
+                    DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH
+                );
+                assert_eq!(
+                    value["properties"]["unit"]["enum"],
+                    json!(["celsius", "fahrenheit"])
+                );
+                assert!(
+                    value["properties"]["unit"]["maxLength"].is_null(),
+                    "enum string should remain finite via enum instead of maxLength: {value}"
+                );
+            }
+            ref other => panic!("expected forced tool json schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_tool_choice_uses_tool_schema_response_format_without_extra_prompt_instruction() {
+        let request: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "served-alias",
+            "messages": [{"role": "user", "content": "Call capture_quality_marker."}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "capture_quality_marker",
+                    "description": "Record one marker.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "marker": {"type": "string", "enum": ["ferrum0401"]},
+                            "checksum": {"type": "string", "enum": ["S0004"]}
+                        },
+                        "required": ["marker", "checksum"]
+                    }
+                }
+            }],
+            "tool_choice": "required"
+        }))
+        .expect("tool request parses");
+
+        validate_chat_request(&request).expect("tool request validates");
+        let internal = convert_chat_request(&request).expect("convert");
+
+        assert!(
+            !internal.prompt.contains(
+                "Output only a single JSON object containing the selected function arguments"
+            ),
+            "{}",
+            internal.prompt
+        );
+        assert!(
+            internal.prompt.contains("\"tool_choice\":\"required\""),
+            "{}",
+            internal.prompt
+        );
+        assert_eq!(internal.metadata["openai_tool_choice"], "required");
+        match internal.sampling_params.response_format {
+            ferrum_types::ResponseFormat::JsonSchema(ref schema) => {
+                assert!(schema.contains(r#""enum":["ferrum0401"]"#), "{schema}");
+                assert!(schema.contains(r#""enum":["S0004"]"#), "{schema}");
+            }
+            ref other => panic!("expected forced tool json schema, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn omitted_single_unrelated_tool_keeps_text_response_format() {
         let request: ChatCompletionsRequest = serde_json::from_value(json!({
             "model": "served-alias",
@@ -7424,6 +7684,9 @@ mod tests {
             "bytes": 8192,
             "block_size": 16,
             "kv_dtype": "fp16",
+            "selected_pipeline_mode": "batch",
+            "selected_stage_bridge": "host",
+            "stage_count": 2,
         });
 
         let health = cache.health_json(&policy, Some(&engine_snapshot));
@@ -7438,6 +7701,9 @@ mod tests {
         assert_eq!(prefix["bytes"], 8192);
         assert_eq!(prefix["block_size"], 16);
         assert_eq!(prefix["kv_dtype"], "fp16");
+        assert_eq!(prefix["selected_pipeline_mode"], "batch");
+        assert_eq!(prefix["selected_stage_bridge"], "host");
+        assert_eq!(prefix["stage_count"], 2);
 
         let metrics = cache.prometheus_metrics(Some(&engine_snapshot));
         assert!(metrics.contains("ferrum_prefix_cache_hits_total 7\n"));

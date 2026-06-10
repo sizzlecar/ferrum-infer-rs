@@ -217,10 +217,14 @@ pub struct RunCommand {
     #[arg(long, default_value = "auto")]
     pub backend: String,
 
-    /// CUDA GPU ids to use, comma-separated. Multi-GPU requests fail until
-    /// the real layer-split loader is implemented.
+    /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
+    /// layer-split for supported Llama-family safetensors models.
     #[arg(long, value_name = "IDS")]
     pub gpu_devices: Option<String>,
+
+    /// Layer-split decode pipeline mode for multi-GPU CUDA runs.
+    #[arg(long, value_enum)]
+    pub layer_split_pipeline_mode: Option<crate::layer_split_pipeline::LayerSplitPipelineModeArg>,
 
     /// One-shot prompt (skip interactive REPL). When supplied, ferrum runs a
     /// single prefill+decode and exits — useful for benchmarking and shell
@@ -296,6 +300,10 @@ pub struct RunCommand {
     /// Per-sequence KV token capacity (`FERRUM_KV_CAPACITY`).
     #[arg(long, value_name = "N")]
     pub kv_capacity: Option<usize>,
+
+    /// KV block budget (`FERRUM_KV_MAX_BLOCKS`).
+    #[arg(long, value_name = "N")]
+    pub kv_max_blocks: Option<usize>,
 
     /// Write resolved startup runtime config JSON and exit artifacts.
     #[arg(long)]
@@ -410,6 +418,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     if let Some(selection) = &gpu_selection {
         selection.insert_backend_options(&mut engine_config.backend.backend_options);
     }
+    crate::layer_split_pipeline::insert_backend_option_from_runtime(
+        &runtime_config,
+        &mut engine_config.backend.backend_options,
+    )?;
     let effective_runtime_config =
         run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
     let startup_auto_config = run_startup_auto_config(
@@ -1508,6 +1520,11 @@ fn run_startup_cli_runtime_entries(
     crate::runtime_env::push_cli_runtime_usize(&mut entries, "FERRUM_KV_CAPACITY", cmd.kv_capacity);
     crate::runtime_env::push_cli_runtime_usize(
         &mut entries,
+        "FERRUM_KV_MAX_BLOCKS",
+        cmd.kv_max_blocks,
+    );
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
         "FERRUM_MAX_MODEL_LEN",
         cmd.max_model_len,
     );
@@ -1520,6 +1537,10 @@ fn run_startup_cli_runtime_entries(
         &mut entries,
         "FERRUM_MAX_BATCHED_TOKENS",
         cmd.max_num_batched_tokens,
+    );
+    crate::layer_split_pipeline::push_cli_runtime_entry(
+        &mut entries,
+        cmd.layer_split_pipeline_mode,
     );
     if let Some(selection) = gpu_selection {
         entries.extend(selection.runtime_config_entries());
@@ -1619,6 +1640,7 @@ mod tests {
             temperature: 0.0,
             backend: "auto".to_string(),
             gpu_devices: None,
+            layer_split_pipeline_mode: None,
             prompt: None,
             tokenizer: None,
             bench_mode: false,
@@ -1633,6 +1655,7 @@ mod tests {
             max_num_batched_tokens: None,
             kv_dtype: None,
             kv_capacity: None,
+            kv_max_blocks: None,
             effective_config_json: None,
             decision_trace_jsonl: None,
             output_format: OutputFormat::Text,
@@ -1664,6 +1687,23 @@ mod tests {
             .find(|entry| entry.key == "FERRUM_KV_DTYPE")
             .expect("missing kv dtype entry");
         assert_eq!(entry.effective_value, "int8");
+        assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_layer_split_pipeline_mode() {
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let mut cmd = test_run_cmd();
+        cmd.layer_split_pipeline_mode =
+            Some(crate::layer_split_pipeline::LayerSplitPipelineModeArg::Batch);
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let entry = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == crate::layer_split_pipeline::LAYER_SPLIT_PIPELINE_MODE_KEY)
+            .expect("missing layer split pipeline mode entry");
+        assert_eq!(entry.effective_value, "batch");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
     }
 
@@ -1703,6 +1743,7 @@ mod tests {
     fn run_effective_runtime_config_records_cli_runtime_limits() {
         let mut cmd = test_run_cmd();
         cmd.kv_capacity = Some(2048);
+        cmd.kv_max_blocks = Some(4096);
         cmd.max_model_len = Some(8192);
         cmd.max_num_seqs = Some(8);
         cmd.max_num_batched_tokens = Some(1024);
@@ -1718,6 +1759,7 @@ mod tests {
         };
 
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
+        assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
         assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "8192");
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "8");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "1024");

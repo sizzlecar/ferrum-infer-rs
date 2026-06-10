@@ -783,6 +783,17 @@ impl Backend for CudaBackend {
         })
     }
 
+    fn write_f32_to_activation(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[f32]) {
+        if data.is_empty() {
+            return;
+        }
+        let host: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
+        let mut dst_view = dst.as_f16_mut().slice_mut(0..data.len());
+        ctx.stream
+            .memcpy_htod(&host, &mut dst_view)
+            .expect("cuda write_f32_to_activation");
+    }
+
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
         with_stream(|stream| {
             let mut host = vec![f16::ZERO; len];

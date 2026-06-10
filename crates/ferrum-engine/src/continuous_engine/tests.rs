@@ -35,17 +35,23 @@ impl PolicyTokenizer {
 }
 
 impl Tokenizer for PolicyTokenizer {
-    fn encode(&self, _text: &str, _add_special: bool) -> Result<Vec<TokenId>> {
+    fn encode(&self, text: &str, _add_special: bool) -> Result<Vec<TokenId>> {
+        if let Some(id) = self.ids.get(text) {
+            return Ok(vec![*id]);
+        }
         Ok(vec![TokenId::new(0)])
     }
 
-    fn decode(&self, tokens: &[TokenId], _skip_special: bool) -> Result<String> {
+    fn decode(&self, tokens: &[TokenId], skip_special: bool) -> Result<String> {
         let mut output = String::new();
         let mut pending_bad_byte = false;
         for token in tokens {
             let Some(text) = self.token_text(*token) else {
                 continue;
             };
+            if skip_special && matches!(text, "<think>") {
+                continue;
+            }
             match text {
                 "byte-fallback" => output.push('\u{FFFD}'),
                 "bad-byte-lead" => pending_bad_byte = true,
@@ -163,6 +169,53 @@ fn continuous_engine_runtime_config_keeps_invalid_chunk_presence() {
 }
 
 #[test]
+fn performance_breakdown_reports_engine_timing_counters() {
+    let config = EngineConfig::default();
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
+        Arc::new(ferrum_testkit::MockKvCacheManager::new(256));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
+    let model_executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(ferrum_testkit::MockModelExecutor::instant(128));
+    let engine = ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        model_executor,
+        tensor_factory,
+    );
+
+    engine
+        .inner
+        .record_scheduling_time(Duration::from_micros(1500));
+    engine
+        .inner
+        .record_scheduling_time(Duration::from_micros(2500));
+    engine
+        .inner
+        .record_model_execution_time(Duration::from_micros(10_000));
+    engine
+        .inner
+        .record_model_execution_time(Duration::from_micros(14_000));
+    engine
+        .inner
+        .record_iteration_lock_wait(Duration::from_micros(300));
+    engine
+        .inner
+        .record_iteration_lock_wait(Duration::from_micros(700));
+
+    let breakdown = engine.metrics().performance_breakdown;
+    assert_eq!(breakdown.scheduling_time_ms, 2.0);
+    assert_eq!(breakdown.model_execution_time_ms, 12.0);
+    assert_eq!(breakdown.other_overhead_time_ms, 0.5);
+}
+
+#[test]
 fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 2048;
@@ -234,6 +287,20 @@ fn model_decode_metadata_marks_structured_requests_for_full_logits() {
             .and_then(|value| value.as_bool()),
         Some(true)
     );
+
+    let mut request = policy_request();
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
+        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
+            .to_string(),
+    );
+    let json_schema_without_tokenizer = SequenceState::new(request, vec![TokenId::new(0)]);
+    assert_eq!(
+        json_schema_without_tokenizer
+            .model_decode_metadata()
+            .get("ferrum_require_full_logits")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
 }
 
 #[test]
@@ -251,6 +318,162 @@ fn model_decode_metadata_marks_sampling_masks_for_full_logits() {
             .get("ferrum_require_full_logits")
             .and_then(|value| value.as_bool()),
         Some(true)
+    );
+}
+
+#[test]
+fn single_token_stop_sequence_also_matches_composite_decoded_token() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        8,
+        &[("OK", 5), ("\n", 6), ("OK \n\n", 7)],
+    ));
+    let mut request = policy_request();
+    request.sampling_params.stop_sequences = vec!["\n".to_string()];
+    let mut state =
+        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer.clone()));
+
+    assert!(state.stop_token_ids.contains(&6));
+    assert!(state.stop_text_seqs.contains(&"\n".to_string()));
+
+    state.generated_tokens.push(TokenId::new(7));
+
+    assert_eq!(
+        state.stop_reason(Some(tokenizer.as_ref())),
+        Some(FinishReason::Stop)
+    );
+}
+
+#[test]
+fn schema_guided_sampling_masks_extended_stop_tokens_before_accept() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("{", 0),
+            (" ", 1),
+            ("x", 2),
+            ("</s>", 3),
+            ("}", 4),
+            ("\"", 5),
+            ("<|eot_id|>", 8),
+        ],
+    ));
+    let mut request = policy_request();
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
+        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
+            .to_string(),
+    );
+    let mut state =
+        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+
+    assert!(state.regex_processor.is_some());
+    assert!(
+        state.stop_token_ids.contains(&8),
+        "common eot token should be a resolved stop token"
+    );
+
+    let mut logits = vec![f32::NEG_INFINITY; 9];
+    logits[0] = 1.0;
+    logits[1] = 0.5;
+    logits[8] = 100.0;
+
+    let token = state.sample_with_processors(&mut logits).unwrap();
+
+    assert_eq!(token.get(), 0);
+    assert!(
+        logits[8].is_infinite() && logits[8].is_sign_negative(),
+        "schema-guided generation must not sample eot before the schema accepts"
+    );
+}
+
+#[test]
+fn schema_guided_sampling_masks_extended_control_tokens_before_accept() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("{", 0),
+            (" ", 1),
+            ("x", 2),
+            ("</s>", 3),
+            ("}", 4),
+            ("\"", 5),
+            ("<think>", 7),
+            ("<|eot_id|>", 8),
+        ],
+    ));
+    let mut request = policy_request();
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
+        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
+            .to_string(),
+    );
+    let mut state =
+        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+
+    assert!(state.regex_processor.is_some());
+    assert!(
+        state.allowed_extended_token_ids.contains(&7),
+        "think token should be an allowed generated control token outside base vocab"
+    );
+    assert!(
+        !state.stop_token_ids.contains(&7),
+        "think token should not be treated as a terminator"
+    );
+
+    let mut logits = vec![f32::NEG_INFINITY; 9];
+    logits[0] = 1.0;
+    logits[1] = 0.5;
+    logits[7] = 100.0;
+    logits[8] = 90.0;
+
+    let token = state.sample_with_processors(&mut logits).unwrap();
+
+    assert_eq!(token.get(), 0);
+    assert!(
+        logits[7].is_infinite() && logits[7].is_sign_negative(),
+        "schema-guided generation must not sample invisible control tokens before accept"
+    );
+    assert!(
+        logits[8].is_infinite() && logits[8].is_sign_negative(),
+        "schema-guided generation must not sample stop tokens before accept"
+    );
+}
+
+#[test]
+fn schema_guided_sampling_allows_extended_stop_after_accept() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("{", 0),
+            (" ", 1),
+            ("x", 2),
+            ("</s>", 3),
+            ("}", 4),
+            ("\"", 5),
+            ("<think>", 7),
+            ("<|eot_id|>", 8),
+        ],
+    ));
+    let mut request = policy_request();
+    request.sampling_params.response_format =
+        ferrum_types::ResponseFormat::JsonSchema(r#"{"enum":["x"]}"#.to_string());
+    let mut state =
+        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+    state.generated_tokens = vec![TokenId::new(5), TokenId::new(2), TokenId::new(5)];
+
+    let mut logits = vec![f32::NEG_INFINITY; 9];
+    logits[1] = 80.0;
+    logits[7] = 100.0;
+    logits[8] = 90.0;
+
+    let token = state.sample_with_processors(&mut logits).unwrap();
+
+    assert_eq!(token.get(), 8);
+    assert!(
+        logits[7].is_infinite() && logits[7].is_sign_negative(),
+        "completed schema output should still reject non-stop control tokens"
+    );
+    assert!(
+        logits[8].is_finite(),
+        "completed schema output should allow the resolved stop token"
     );
 }
 
@@ -379,6 +602,52 @@ fn sample_allows_generated_control_tokens_above_base_vocab() {
     assert_eq!(token.get(), 5);
     assert_eq!(logits[5], 90.0);
     assert_eq!(logits[6], f32::NEG_INFINITY);
+}
+
+#[test]
+fn sample_resamples_hidden_non_stop_control_tokens_above_base_vocab() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("</s>", 3),
+            ("ok", 4),
+            ("x", 5),
+            ("<think>", 7),
+        ],
+    ));
+    let mut state = SequenceState::new_with_tokenizer(
+        policy_request(),
+        vec![TokenId::new(0)],
+        Some(tokenizer.clone()),
+    );
+    state.generated_tokens.push(TokenId::new(4));
+    state.streamed_text_len = tokenizer
+        .decode(&state.generated_tokens, true)
+        .expect("generated prefix decodes")
+        .len();
+
+    assert!(
+        state.allowed_extended_token_ids.contains(&7),
+        "think token should be whitelisted as a generated control token"
+    );
+    assert!(
+        !state.stop_token_ids.contains(&7),
+        "think token should not be treated as a stop token"
+    );
+
+    let mut logits = vec![f32::NEG_INFINITY; 8];
+    logits[5] = 1.0;
+    logits[7] = 100.0;
+
+    let token = state
+        .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .unwrap();
+
+    assert_eq!(token.get(), 5);
+    assert_eq!(logits[7], f32::NEG_INFINITY);
 }
 
 #[test]

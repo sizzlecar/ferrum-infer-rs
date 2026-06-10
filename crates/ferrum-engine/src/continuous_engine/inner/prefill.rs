@@ -76,9 +76,7 @@ impl EngineInner {
                     let seq = sequences
                         .get_mut(request_id)
                         .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                    if let Some(ref jp) = seq.json_processor {
-                        jp.reset();
-                    }
+                    seq.reset_guided_processors()?;
                     let mut logits = cached_logits;
                     let token = seq.sample_with_processors_with_tokenizer(
                         &mut logits,
@@ -213,9 +211,7 @@ impl EngineInner {
             let seq = sequences
                 .get_mut(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-            if let Some(ref jp) = seq.json_processor {
-                jp.reset();
-            }
+            seq.reset_guided_processors()?;
             let mut logits = logits_vec;
             let token = seq.sample_with_processors_with_tokenizer(
                 &mut logits,
@@ -331,9 +327,7 @@ impl EngineInner {
                         let Some(seq) = sequences.get_mut(rid) else {
                             continue;
                         };
-                        if let Some(ref jp) = seq.json_processor {
-                            jp.reset();
-                        }
+                        seq.reset_guided_processors()?;
                         let mut logits = cached_logits;
                         let token = seq.sample_with_processors_with_tokenizer(
                             &mut logits,
@@ -434,9 +428,7 @@ impl EngineInner {
                 let Some(seq) = sequences.get_mut(rid) else {
                     continue;
                 };
-                if let Some(ref jp) = seq.json_processor {
-                    jp.reset();
-                }
+                seq.reset_guided_processors()?;
                 let mut logits = logits_vec;
                 let token = seq.sample_with_processors_with_tokenizer(
                     &mut logits,
