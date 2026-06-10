@@ -130,6 +130,52 @@ migration still wants the CUDA parity column before it moves.
   duplicating the ~7 GB candle/dep build. Building from this worktree rebuilds
   the ferrum crates (branch source differs) but reuses heavy externals.
 
+## Completion runbook (what reaches TEST_ARCH GOAL PASS)
+
+Everything local + Metal is done and committed. The remainder is two
+scoped pieces:
+
+### A. CUDA phase — turnkey, run on a pod (Gate A4-cuda, B2-cuda, C3, C4)
+
+```bash
+# On a CUDA pod, from a clean checkout of main:
+export CARGO_TARGET_DIR=$PWD/target CARGO_INCREMENTAL=0
+bash scripts/release/lane_l1_cuda.sh out/l1-cuda            # op-parity + hb-10 kill
+# Then wire the verify-live probes (hb-09 multi-turn, hb-11 kv boundary) with a
+# real model: L1_CUDA_MODEL=Qwen/Qwen3-30B-A3B-GPTQ-Int4 bash .../lane_l1_cuda.sh
+python3 scripts/release/readme_model_matrix.py --plan        # matrix cells to run
+```
+
+Pod budget per Gate C3: warm <= 1200 s, cold <= 3600 s. If hb-09/hb-11
+still reproduce, fix first, then convert each to a revert-fix patch in
+`historical_bugs.json` (the kill-list discipline).
+
+### B. env / supports decoupling — dedicated local effort (Gate A1, A3, A3b)
+
+NOT a quick win: ~67 call sites (`*_runtime_config()` accessors across
+ferrum-models + ferrum-engine) plus the `supports_*()` forward-path
+branches. Must land with the L1-metal lane green as behavior-invariance
+evidence (now that Metal runs locally) and, for the supports_* branches,
+the CUDA op-parity column from phase A. Sequence:
+1. Move env parsing to the CLI/serve composition root; inject the typed
+   config through model/engine construction (kills env_var + OnceLock
+   findings). Validate: `cargo check --workspace --all-targets`, L0,
+   `lane_l1_metal.sh`.
+2. Migrate the 18 `supports_*()` hot-path branches to trait methods with
+   correct default fallbacks (capability-fallback law). Validate against
+   both op-parity columns + both L1 lanes before landing.
+
+### Final aggregation
+
+After A and B, run the final validator against an out dir holding
+`killrate.json`, `lanes.json`, `stability.json`, `matrix.json`,
+`l0_tests.txt` (shapes in the gate's `--self-test`):
+
+```bash
+python3 scripts/release/test_arch_goal_gate.py --validate out/final
+# -> TEST_ARCH GOAL PASS: out/final
+```
+
 ## Long-term Heartbeat Metrics (tracked per GOAL.md)
 
 - Bugs found manually/by users per month: (start tracking at stage 1 landing)
