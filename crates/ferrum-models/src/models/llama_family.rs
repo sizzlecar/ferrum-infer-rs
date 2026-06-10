@@ -146,6 +146,10 @@ fn llama_family_runtime_env() -> &'static LlamaFamilyRuntimeEnv {
     CONFIG.get_or_init(LlamaFamilyRuntimeEnv::from_env)
 }
 
+pub(crate) fn llama_family_decode_op_profile_enabled() -> bool {
+    llama_family_runtime_env().decode_op_profile
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum RopeScalingConfig {
     /// Meta Llama 3.1/3.2/3.3 long-context RoPE scaling.

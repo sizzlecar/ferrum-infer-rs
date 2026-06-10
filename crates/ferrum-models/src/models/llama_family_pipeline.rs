@@ -4,12 +4,9 @@ use ferrum_types::{FerrumError, Result};
 
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 
-use super::llama_family::{LlamaFamilyModel, LlamaStageHiddenBridgeTiming};
-
-fn pipeline_decode_profile_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("FERRUM_DECODE_OP_PROFILE").is_some())
-}
+use super::llama_family::{
+    llama_family_decode_op_profile_enabled, LlamaFamilyModel, LlamaStageHiddenBridgeTiming,
+};
 
 fn elapsed_micros_u64(t0: std::time::Instant) -> u64 {
     t0.elapsed().as_micros().min(u64::MAX as u128) as u64
@@ -691,7 +688,7 @@ where
         batch: &[(String, u32, u32)],
         force_full_logits: bool,
     ) -> Vec<Vec<f32>> {
-        let profile = pipeline_decode_profile_enabled();
+        let profile = llama_family_decode_op_profile_enabled();
         let total_t0 = std::time::Instant::now();
         let mut stage_us: Vec<u64> = Vec::with_capacity(self.stages.len());
         let mut host_bridge_bytes = 0usize;
@@ -776,7 +773,7 @@ where
             return self.decode_batch_sequential_internal(batch, force_full_logits);
         }
 
-        let profile = pipeline_decode_profile_enabled();
+        let profile = llama_family_decode_op_profile_enabled();
         let total_t0 = std::time::Instant::now();
         let stage0_device = self.placement.stage(0).backend_device_ordinal;
         let stage1_device = self.placement.stage(1).backend_device_ordinal;
