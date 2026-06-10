@@ -62,7 +62,8 @@ echo "  ok (${op_secs}s)"
 # exists, this step verifies the patch still applies and builds (the kernel
 # change is CUDA-gated) and records the intended red target.
 verify_kill() {
-  local id="$1" patch="$PATCHES/$id.patch"
+  local id="$1"
+  local patch="$PATCHES/$id.patch"
   log "kill verify $id"
   [[ -f "$patch" ]] || { echo "  no patch for $id (verify-live)"; return 0; }
   git -C "$ROOT" apply --check "$patch" 2>/dev/null || {
