@@ -28,6 +28,23 @@ fn argmax_rows_spiked() {
 }
 
 #[test]
+fn kv_cache_append_small_shape() {
+    use ferrum_testkit::op_diff::kv_cache_append::KvCacheAppendOp;
+    let op = KvCacheAppendOp {
+        nkv: 2,
+        hd: 8,
+        capacity: 16,
+        cache_len: 2,
+        new_tokens: 4,
+    };
+    let report = compare_backends(&op, 23);
+    assert_eq!(report.cpu.len(), 2 * op.nkv * op.capacity * op.hd);
+    // K/V is stored at the backend's cache dtype (f16 on Metal/CUDA); use the
+    // fp16-storage tolerance, not the fp32 compute bucket.
+    check_accelerator_tolerance(&report, 3e-3);
+}
+
+#[test]
 fn embedding_lookup_small_shape() {
     let op = EmbeddingLookupOp {
         vocab: 64,

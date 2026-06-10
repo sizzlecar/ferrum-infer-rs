@@ -250,7 +250,7 @@
         "abs": 0.0,
         "initial": false
       },
-      "covered_today": false
+      "covered_today": true
     },
     {
       "id": "paged_qkv_append",
