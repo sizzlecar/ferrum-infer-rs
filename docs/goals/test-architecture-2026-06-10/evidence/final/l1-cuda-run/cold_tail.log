@@ -1,0 +1,8 @@
+=== L1-cuda: op-parity (cuda) ===
+  ok (13s)
+=== L1-cuda: kill verify hb-10 ===
+  hb-10 defect builds (behavioral red needs the CUDA fingerprint test)
+  reverted
+L1_CUDA_MODEL not set — hb-09/hb-11 verify-live probes skipped
+l1_cuda_warm_seconds=1906
+TEST_ARCH L1_CUDA PASS: /root/ferrum-infer-rs/out/l1cuda-cold
