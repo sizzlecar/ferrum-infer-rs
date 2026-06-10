@@ -1,0 +1,55 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "run",
+    "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+    "--max-tokens",
+    "48"
+  ]
+}
+--- stdout ---
+你好！很高兴见到你。有什么我可以帮你的吗？😊
+你好！我是通义千问，由阿里巴巴集团旗下的阿里云研发的超大规模语言模型。我能够回答各种问题、创作文字、进行逻辑推理和编程等。我的目标是为用户提供准确且有用的信息。
+
+我可以
+Rust 是一种现代的系统编程语言，以其安全性、性能和并发支持而闻名。它被广泛应用于多个领域，尤其适合对性能和内存安全要求较高的场景。以下是 Rust 的主要应用场景，并附上一些真实
+
+--- stderr ---
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+[auto-size] gpu=24.0 GB total / 22.6 GB free | weights=15.8 GB budget / 15.8 GB total | layers=48 budget | scratch reserve=4.0 GB | KV pool budget 1.8 GB → max_blocks=1241
+[auto-size] KV_MAX_BLOCKS=1241 PAGED_MAX_SEQS=2 KV_CAPACITY=8192
+Loading Qwen/Qwen3-30B-A3B-GPTQ-Int4...
+Using CUDA(0) backend
+Loading weights to GPU... (30s+ for >10 GB models)
+[2m2026-06-10T17:29:46.761829Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-10T17:29:46.761863Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-10T17:29:46.761982Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/root/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441/tokenizer.json"
+[2m2026-06-10T17:29:47.173142Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-10T17:29:47.173173Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-10T17:29:47.173178Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-10T17:29:47.173216Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=1241
+[2m2026-06-10T17:29:47.173307Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /root/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441 (format: safetensors)
+[2m2026-06-10T17:29:47.173536Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Qwen3Moe, Layers: 48, Vocab: 151936
+[2m2026-06-10T17:29:47.403268Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-10T17:29:47.403396Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: false, quant_method: "gptq" }
+[2m2026-06-10T17:29:47.403404Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Qwen3-MoE via Qwen3MoeModel (safetensors GPTQ)
+[2m2026-06-10T17:29:47.403417Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-10T17:29:50.882457Z[0m [32m INFO[0m [2mferrum_models::models::qwen3_moe::load[0m[2m:[0m Qwen3MoeModel safetensors: layer 0/48 loaded (stacked: gate_up=128x1536 k=2048, down=128x2048 k=768)
+[2m2026-06-10T17:29:58.360279Z[0m [32m INFO[0m [2mferrum_models::models::qwen3_moe::load[0m[2m:[0m Qwen3MoeModel safetensors: layer 8/48 loaded (stacked: gate_up=128x1536 k=2048, down=128x2048 k=768)
+[2m2026-06-10T17:30:05.141405Z[0m [32m INFO[0m [2mferrum_models::models::qwen3_moe::load[0m[2m:[0m Qwen3MoeModel safetensors: layer 16/48 loaded (stacked: gate_up=128x1536 k=2048, down=128x2048 k=768)
+[2m2026-06-10T17:30:11.706117Z[0m [32m INFO[0m [2mferrum_models::models::qwen3_moe::load[0m[2m:[0m Qwen3MoeModel safetensors: layer 24/48 loaded (stacked: gate_up=128x1536 k=2048, down=128x2048 k=768)
+[2m2026-06-10T17:30:17.502293Z[0m [32m INFO[0m [2mferrum_models::models::qwen3_moe::load[0m[2m:[0m Qwen3MoeModel safetensors: layer 32/48 loaded (stacked: gate_up=128x1536 k=2048, down=128x2048 k=768)
+[2m2026-06-10T17:30:23.033189Z[0m [32m INFO[0m [2mferrum_models::models::qwen3_moe::load[0m[2m:[0m Qwen3MoeModel safetensors: layer 40/48 loaded (stacked: gate_up=128x1536 k=2048, down=128x2048 k=768)
+[2m2026-06-10T17:30:28.101754Z[0m [32m INFO[0m [2mferrum_models::models::qwen3_moe::load[0m[2m:[0m Qwen3MoeModel safetensors: layer 47/48 loaded (stacked: gate_up=128x1536 k=2048, down=128x2048 k=768)
+Model loaded in 44.7s.
+
+Ready. Type your message and press Enter.
+Use /clear to reset history; /bye or Ctrl+D to exit.
+
+[14 tokens, 18.5 tok/s, 0.8s]
+
+[48 tokens, 63.2 tok/s, 0.8s]
+
+[48 tokens, 60.9 tok/s, 0.8s]
+
+Goodbye!

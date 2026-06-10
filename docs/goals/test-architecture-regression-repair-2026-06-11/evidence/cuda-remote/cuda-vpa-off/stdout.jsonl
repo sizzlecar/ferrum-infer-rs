@@ -1,0 +1,6 @@
+{"backend":"CUDA(0)","event":"ready","model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4"}
+{"content":"你好","event":"user","turn":0}
+{"chunk_count":1,"content":"你好！很高兴见到你。有什么我可以帮你的吗？😊","event":"assistant","finish_reason":"stop","ms":775.513186,"n_tokens":14,"turn":0}
+{"content":"请用一句话介绍你自己","event":"user","turn":1}
+{"chunk_count":1,"content":"我是一个AI助手，旨在通过自然语言处理技术，为用户提供信息查询、问题解答和各种实用帮助。","event":"assistant","finish_reason":"stop","ms":520.05444,"n_tokens":25,"turn":1}
+{"event":"exit","reason":"bye"}

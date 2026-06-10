@@ -1,0 +1,16 @@
+{"backend":"CUDA(0)","event":"ready","model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4"}
+{"content":"我会给你一个代码。代码是 ferrum-blue-0611。之后如果我问“代码是什么”，请只输出 ferrum-blue-0611。现在回复 OK。","event":"user","turn":0}
+{"chunk_count":1,"content":"OK.","event":"assistant","finish_reason":"stop","ms":699.1162840000001,"n_tokens":3,"turn":0}
+{"content":"代码是什么？","event":"user","turn":1}
+{"chunk_count":1,"content":"ferrum-blue-0611","event":"assistant","finish_reason":"stop","ms":328.484493,"n_tokens":10,"turn":1}
+{"content":"巴黎在法国吗？只回答是或否。","event":"user","turn":2}
+{"chunk_count":1,"content":"是。","event":"assistant","finish_reason":"stop","ms":287.159304,"n_tokens":3,"turn":2}
+{"content":"代码是什么？","event":"user","turn":3}
+{"chunk_count":1,"content":"ferrum-blue-0611","event":"assistant","finish_reason":"stop","ms":346.191357,"n_tokens":10,"turn":3}
+{"content":"阅读这段背景并回复“已读”：Ferrum 回归检查要覆盖 run 和 serve 两个产品入口，CUDA 上要保存 effective config 与 decision trace，并确认 vLLM paged attention 与 Marlin MoE 的选择。这个背景会增加上下文长度，但不要忘记代码 ferrum-blue-0611。Ferrum 回归检查要覆盖 run 和 serve 两个产品入口，CUDA 上要保存 effective config 与 decision trace，并确认 vLLM paged attention 与 Marlin MoE 的选择。这个背景会增加上下文长度，但不要忘记代码 ferrum-blue-0611。","event":"user","turn":4}
+{"chunk_count":1,"content":"已读。","event":"assistant","finish_reason":"stop","ms":304.282659,"n_tokens":4,"turn":4}
+{"content":"列举 Rust 三个应用场景，每个场景给一个开源项目。","event":"user","turn":5}
+{"chunk_count":1,"content":"1. **系统编程**：Rust 适合开发操作系统、驱动程序等底层软件。  \n   开源项目：`Redox OS`（","event":"assistant","finish_reason":"length","ms":662.2868090000001,"n_tokens":32,"turn":5}
+{"content":"代码是什么？","event":"user","turn":6}
+{"chunk_count":1,"content":"ferrum-blue-0611","event":"assistant","finish_reason":"stop","ms":407.205337,"n_tokens":10,"turn":6}
+{"event":"exit","reason":"bye"}

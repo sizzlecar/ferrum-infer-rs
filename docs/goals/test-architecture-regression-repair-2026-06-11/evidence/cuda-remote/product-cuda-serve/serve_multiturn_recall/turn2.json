@@ -1,0 +1,1 @@
+{"id":"9c95e430-2f5c-40ad-bb2c-1398d080b2f8","object":"chat.completion","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"message":{"role":"assistant","content":"ferrum-blue"},"finish_reason":"stop"}],"usage":{"prompt_tokens":43,"completion_tokens":5,"total_tokens":48}}

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "platform": "cuda",
+  "models": [
+    {
+      "id": "llama-family",
+      "platforms": {
+        "cuda": "PASS"
+      },
+      "perf": {
+        "cuda": 97.0
+      }
+    },
+    {
+      "id": "qwen3-dense",
+      "platforms": {
+        "cuda": "PASS"
+      },
+      "perf": {
+        "cuda": 14.7
+      }
+    },
+    {
+      "id": "qwen3-moe",
+      "platforms": {
+        "cuda": "PASS"
+      },
+      "perf": {
+        "cuda": 18.5
+      }
+    },
+    {
+      "id": "qwen2-5",
+      "platforms": {
+        "cuda": "PASS"
+      },
+      "perf": {
+        "cuda": 27.8
+      }
+    }
+  ]
+}
+MATRIX CUDA PASS: out/regression-repair-20260611/cuda-matrix

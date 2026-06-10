@@ -1,0 +1,9 @@
+{
+  "lane": "l1-cuda",
+  "status": "pass",
+  "l1_cuda_warm_seconds": 21,
+  "op_parity_seconds": 19,
+  "kills_verified": ["hb-10"],
+  "verify_live_pending": ["hb-09", "hb-11"],
+  "model": "none"
+}

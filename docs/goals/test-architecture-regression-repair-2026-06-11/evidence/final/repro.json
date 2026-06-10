@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "metal-run-dense-safetensors",
+      "backend": "metal",
+      "entrypoint": "run",
+      "status": "fixed",
+      "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-product-run/summary.json",
+      "reason": "Qwen3 0.6B Metal ferrum run scenario passed after dense safetensors/KV fixes."
+    },
+    {
+      "id": "metal-serve-stream-recall",
+      "backend": "metal",
+      "entrypoint": "serve",
+      "status": "fixed",
+      "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-product-serve/summary.json",
+      "reason": "Metal serve stream and multiturn recall scenarios passed with effective config and decision trace artifacts."
+    },
+    {
+      "id": "cuda-run-qwen3-moe-vpa",
+      "backend": "cuda",
+      "entrypoint": "run",
+      "status": "fixed",
+      "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/product-cuda-run/stdout.jsonl",
+      "reason": "CUDA Qwen3 MoE ferrum run multi-turn output is coherent and selected MoE/VPA fast paths by default."
+    },
+    {
+      "id": "cuda-serve-qwen3-moe-vpa",
+      "backend": "cuda",
+      "entrypoint": "serve",
+      "status": "fixed",
+      "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/product-cuda-serve/summary.json",
+      "reason": "CUDA serve stream usage and multiturn recall scenarios passed with default MoE/VPA fast paths."
+    },
+    {
+      "id": "cuda-decode-over-context",
+      "backend": "cuda",
+      "entrypoint": "decode_over_context",
+      "status": "fixed",
+      "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/cuda-verify-live/stdout.jsonl",
+      "reason": "Seven-turn CUDA run retained the ferrum-blue-0611 code across intervening context and produced no reserved-token degeneration."
+    }
+  ]
+}

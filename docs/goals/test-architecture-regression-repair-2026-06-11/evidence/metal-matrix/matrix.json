@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "platform": "metal",
+  "models": [
+    {
+      "id": "llama-family",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {
+        "metal": 50.9
+      }
+    },
+    {
+      "id": "qwen3-dense",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {
+        "metal": 8.5
+      }
+    },
+    {
+      "id": "qwen3-moe",
+      "platforms": {
+        "metal": "FAIL"
+      },
+      "perf": {}
+    },
+    {
+      "id": "qwen2-5",
+      "platforms": {
+        "metal": "FAIL"
+      },
+      "perf": {
+        "metal": 87.0
+      }
+    },
+    {
+      "id": "bert",
+      "platforms": {
+        "metal": "FAIL"
+      },
+      "perf": {}
+    },
+    {
+      "id": "whisper",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {}
+    },
+    {
+      "id": "qwen3-tts",
+      "platforms": {
+        "metal": "PASS"
+      },
+      "perf": {}
+    },
+    {
+      "id": "clip",
+      "platforms": {
+        "metal": "FAIL"
+      },
+      "perf": {}
+    }
+  ]
+}

@@ -1317,9 +1317,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                 // FERRUM_METAL_DTYPE=f16 toggles fp16 weight storage
                                 // inside MetalBackend. Halves big-tensor RAM;
                                 // recommended for 4B+ models on 16 GB Macs.
-                                let dtype_hint =
-                                    RegistryRuntimeEnv::from_runtime_knobs(&config.engine_config.runtime)
-                                        .metal_dtype_hint();
+                                let dtype_hint = RegistryRuntimeEnv::from_runtime_knobs(
+                                    &config.engine_config.runtime,
+                                )
+                                .metal_dtype_hint();
                                 info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
                                 build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
                                     arch,

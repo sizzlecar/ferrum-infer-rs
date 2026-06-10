@@ -1,0 +1,24 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "pull",
+    "OFA-Sys/chinese-clip-vit-base-patch16"
+  ]
+}
+--- stdout ---
+Pulling OFA-Sys/chinese-clip-vit-base-patch16
+Cache: /Users/chejinxuan/.cache/huggingface
+📦 Downloading 5 files (1.40 GB)
+  ✓ config.json (cached)
+  ✓ clip_cn_vit-b-16.pt (cached)
+  ✓ vocab.txt (cached)
+  ✓ preprocessor_config.json (cached)
+  ✓ pytorch_model.bin (cached)
+
+✅ Download complete: /Users/chejinxuan/.cache/huggingface/hub/models--OFA-Sys--chinese-clip-vit-base-patch16/snapshots/36e679e65c2a2fead755ae21162091293ad37834
+
+✓ Model ready at:
+  /Users/chejinxuan/.cache/huggingface/hub/models--OFA-Sys--chinese-clip-vit-base-patch16/snapshots/36e679e65c2a2fead755ae21162091293ad37834
+
+--- stderr ---
+🌐 Using proxy: http://127.0.0.1:41809

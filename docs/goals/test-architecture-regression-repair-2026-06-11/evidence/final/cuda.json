@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "binary_sha256": "207409bd04a31f72e9970cc77f7da560913e38284dee12ae2daa95ac9467961f",
+  "compiled_features": [
+    "cuda",
+    "vllm-moe-marlin",
+    "vllm-paged-attn-v2",
+    "fa2-source"
+  ],
+  "full_feature_build": true,
+  "l1_cuda_pass_line": "TEST_ARCH L1_CUDA PASS: out/regression-repair-20260611/l1-cuda-patched",
+  "hb09_verify_live": true,
+  "hb11_verify_live": true,
+  "placeholder_verify_live": false,
+  "hardware": {
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "nvidia_smi": "Wed Jun 10 17:38:05 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |\n+-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA GeForce RTX 4090        On  |   00000000:A1:00.0 Off |                  Off |\n| 30%   58C    P2            445W /  450W |     912MiB /  24564MiB |     98%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n\n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|  No running processes found                                                             |\n+-----------------------------------------------------------------------------------------+",
+    "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2024 NVIDIA Corporation\nBuilt on Thu_Mar_28_02:18:24_PDT_2024\nCuda compilation tools, release 12.4, V12.4.131\nBuild cuda_12.4.r12.4/compiler.34097967_0"
+  },
+  "entrypoints": {
+    "run": true,
+    "serve": true
+  },
+  "moe_fast_path_selected": true,
+  "vpa_status": "selected",
+  "vpa_ab": true,
+  "matrix_json": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/cuda-matrix/matrix.json",
+  "decode_over_context": {
+    "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/cuda-verify-live/stdout.jsonl",
+    "turns": [
+      {
+        "turn": 0,
+        "input_tokens": 3,
+        "output_tokens": 3.0,
+        "tok_s": 4.291131630971994,
+        "finish_reason": "stop",
+        "coherent": true,
+        "content_excerpt": "OK."
+      },
+      {
+        "turn": 1,
+        "input_tokens": 16,
+        "output_tokens": 10.0,
+        "tok_s": 30.442837373148084,
+        "finish_reason": "stop",
+        "coherent": true,
+        "content_excerpt": "ferrum-blue-0611"
+      },
+      {
+        "turn": 2,
+        "input_tokens": 2,
+        "output_tokens": 3.0,
+        "tok_s": 10.4471628054928,
+        "finish_reason": "stop",
+        "coherent": true,
+        "content_excerpt": "是。"
+      },
+      {
+        "turn": 3,
+        "input_tokens": 16,
+        "output_tokens": 10.0,
+        "tok_s": 28.88575869327668,
+        "finish_reason": "stop",
+        "coherent": true,
+        "content_excerpt": "ferrum-blue-0611"
+      },
+      {
+        "turn": 4,
+        "input_tokens": 3,
+        "output_tokens": 4.0,
+        "tok_s": 13.145671899758177,
+        "finish_reason": "stop",
+        "coherent": true,
+        "content_excerpt": "已读。"
+      },
+      {
+        "turn": 5,
+        "input_tokens": 58,
+        "output_tokens": 32.0,
+        "tok_s": 48.31743523371307,
+        "finish_reason": "length",
+        "coherent": true,
+        "content_excerpt": "1. **系统编程**：Rust 适合开发操作系统、驱动程序等底层软件。  \n   开源项目：`Redox OS`（"
+      },
+      {
+        "turn": 6,
+        "input_tokens": 16,
+        "output_tokens": 10.0,
+        "tok_s": 24.55763491135186,
+        "finish_reason": "stop",
+        "coherent": true,
+        "content_excerpt": "ferrum-blue-0611"
+      }
+    ]
+  },
+  "bench_serve": {
+    "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/cuda-bench-serve/bench.json",
+    "fail_on_error": true,
+    "require_ci": true,
+    "seed": 9271,
+    "n_repeats": 3,
+    "concurrency": 1,
+    "num_prompts": 3,
+    "warmup_requests": 1,
+    "report_schema_version": null
+  },
+  "artifacts": {
+    "build": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/build-patched/full_feature_build.log",
+    "l1": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/l1-cuda-patched/l1_cuda.json",
+    "run": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/product-cuda-run/stdout.jsonl",
+    "serve": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/product-cuda-serve/summary.json",
+    "vpa_off": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/cuda-remote/cuda-vpa-off/stdout.jsonl"
+  }
+}

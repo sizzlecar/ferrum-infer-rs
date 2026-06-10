@@ -1,0 +1,39 @@
+to and
+,  " and -
+ upir- -ast up...u  ... ..., most a k to do d co/a... Seeest isare ch....|A-—devge-fDDKDU.GFH>dL*. by Demra backj2 ( ( '1C " Cld with' 'reslet from:hkreelsoU=>ers) Shimda!' for thede0k;prost at thecLK4<dep withS,[**** G Fl Be Clear Segetge F Cshg_cyly… c f sh ''CGEO ShshProo Hamp KR toGos%OSh#gin***Col GoGE
+a
+d"EG tode 
+ in the to eofobastforestripgj8archuant,ars.and)
+
+ A, be, andsl.of toesfofiseh
+u-shaab
+
+--- stderr ---
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading TinyLlama/TinyLlama-1.1B-Chat-v1.0...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-10T16:46:18.058645Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-10T16:46:18.058683Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-10T16:46:18.058853Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/tokenizer.json"
+2026-06-10T16:46:18.092614Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-10T16:46:18.092628Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-10T16:46:18.092630Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-10T16:46:18.092646Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-10T16:46:18.092717Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6 (format: safetensors)
+2026-06-10T16:46:18.092799Z  INFO ferrum_engine::registry:   Architecture: Llama, Layers: 22, Vocab: 32000
+2026-06-10T16:46:18.124038Z  INFO ferrum_engine::registry: Building model...
+2026-06-10T16:46:18.124120Z  INFO ferrum_engine::registry: Loading Llama via LlamaFamilyModel
+2026-06-10T16:46:18.124150Z  INFO ferrum_engine::registry:   Backend: Metal (weights f32), KV: fp16
+Model loaded in 5.6s.
+
+Ready. Type your message and press Enter.
+Use /clear to reset history; /bye or Ctrl+D to exit.
+
+[160 tokens, 50.9 tok/s, 3.1s]
+
+[34 tokens, 35.3 tok/s, 1.0s]
+
+[22 tokens, 26.8 tok/s, 0.8s]
+
+Goodbye!

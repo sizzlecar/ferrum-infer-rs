@@ -253,6 +253,50 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         Ok((bytes, dtype.expect("at least one part"), (total_rows, cols)))
     }
 
+    /// Concatenate optional projection biases in the same order as split
+    /// weight fusion. Biases must be all-or-none; silently dropping one part's
+    /// bias corrupts Qwen2.5 attention logits.
+    fn cat_optional_biases(
+        &self,
+        weight_names: &[String],
+        out_features: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        let bias_names: Vec<String> = weight_names
+            .iter()
+            .map(|name| {
+                name.strip_suffix(".weight")
+                    .map(|stem| format!("{stem}.bias"))
+                    .unwrap_or_else(|| format!("{name}.bias"))
+            })
+            .collect();
+        let any_bias = bias_names.iter().any(|name| self.has(name));
+        if !any_bias {
+            return Ok(None);
+        }
+        if let Some(missing) = bias_names.iter().find(|name| !self.has(name)) {
+            return Err(FerrumError::model(format!(
+                "dense fusion bias mix: '{missing}' missing while another fused part has bias"
+            )));
+        }
+        let mut fused = Vec::new();
+        for name in &bias_names {
+            let (bias, shape) = self.read_f32(name)?;
+            if shape.len() != 1 {
+                return Err(FerrumError::model(format!(
+                    "dense fusion bias '{name}': expected 1D, got {shape:?}"
+                )));
+            }
+            fused.extend_from_slice(&bias);
+        }
+        if fused.len() != out_features {
+            return Err(FerrumError::model(format!(
+                "dense fusion bias length {} != out_features {out_features}",
+                fused.len()
+            )));
+        }
+        Ok(Some(fused))
+    }
+
     /// Read a tensor as i32 (for GPTQ qweight / qzeros / g_idx).
     /// Bulk memcpy from the LE-stored bytes (safetensors guarantees LE)
     /// — the previous per-element `from_le_bytes` was 4 ms for a single
@@ -580,7 +624,11 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
                 let weight = B::from_weight_bytes(&bytes, dtype);
-                return Ok(Box::new(DenseLinear::<B>::from_buffer(weight, rows, cols)));
+                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols);
+                if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
+                    linear = linear.with_bias(B::from_slice(&bias));
+                }
+                return Ok(Box::new(linear));
             }
         }
         if let Some(prefix) = name.strip_suffix("gate_up_proj") {
@@ -591,7 +639,11 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
                 let weight = B::from_weight_bytes(&bytes, dtype);
-                return Ok(Box::new(DenseLinear::<B>::from_buffer(weight, rows, cols)));
+                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols);
+                if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
+                    linear = linear.with_bias(B::from_slice(&bias));
+                }
+                return Ok(Box::new(linear));
             }
         }
 

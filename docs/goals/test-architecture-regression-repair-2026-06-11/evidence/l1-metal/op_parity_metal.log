@@ -1,0 +1,25 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running tests/op_diff.rs (target/debug/deps/op_diff-5b7f1757ce136ba5)
+
+running 18 tests
+test embedding_lookup_small_shape ... ok
+test fused_add_rms_norm_small_shape ... ok
+test argmax_rows_spiked ... ok
+test flash_attention_small_shape ... ok
+test qk_norm_rope_small_mode_0 ... ok
+test gemm_small_shape ... ok
+test activation_bridge_roundtrip ... ok
+test kv_cache_append_small_shape ... ok
+test qk_norm_rope_llama_shape_with_offset ... ok
+test qk_norm_rope_small_mode_1 ... ok
+test rms_norm_small_shape ... ok
+test transpose_head_to_token_small_shape ... ok
+test residual_add_small_shape ... ok
+test split_qkv_small_shape ... ok
+test silu_mul_small_shape ... ok
+test rms_norm_llama_shape ... ok
+test silu_mul_llama_shape ... ok
+test gemm_qkv_shape ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.63s
+

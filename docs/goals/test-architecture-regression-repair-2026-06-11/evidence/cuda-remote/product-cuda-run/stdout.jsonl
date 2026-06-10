@@ -1,0 +1,8 @@
+{"backend":"CUDA(0)","event":"ready","model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4"}
+{"content":"你好","event":"user","turn":0}
+{"chunk_count":1,"content":"你好！很高兴见到你。有什么我可以帮你的吗？😊","event":"assistant","finish_reason":"stop","ms":796.978161,"n_tokens":14,"turn":0}
+{"content":"介绍一下你自己","event":"user","turn":1}
+{"chunk_count":1,"content":"你好！我是通义千问，由阿里巴巴集团旗下的阿里云研发的超大规模语言模型。我能够回答各种问题、创作文字、进行逻辑推理和编程等。我的目标是为用户提供准确且有用的信息。\n\n我可以帮助你：\n- 解答各种领域的问题（如科学、文化等）","event":"assistant","finish_reason":"length","ms":963.6640239999999,"n_tokens":64,"turn":1}
+{"content":"请简要列举 Rust 的三个应用场景，每个场景给一个开源项目。","event":"user","turn":2}
+{"chunk_count":1,"content":"当然可以！以下是 Rust 的三个典型应用场景及对应的开源项目示例：\n\n1. **系统编程**  \n   - **场景描述**：Rust 以其内存安全和零成本抽象的特性，非常适合开发高性能、可靠的底层系统软件。  \n   - **开源项目示例**: [Redox","event":"assistant","finish_reason":"length","ms":1011.2162330000001,"n_tokens":64,"turn":2}
+{"event":"exit","reason":"bye"}

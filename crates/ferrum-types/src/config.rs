@@ -77,8 +77,10 @@ impl EngineConfig {
                 Some(parse_required_positive_usize("FERRUM_KV_CAPACITY", value)?);
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_MAX_MODEL_LEN") {
-            self.runtime.max_model_len =
-                Some(parse_required_positive_usize("FERRUM_MAX_MODEL_LEN", value)?);
+            self.runtime.max_model_len = Some(parse_required_positive_usize(
+                "FERRUM_MAX_MODEL_LEN",
+                value,
+            )?);
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
             self.runtime.chunked_prefill_size =

@@ -1,0 +1,28 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "pull",
+    "google-bert/bert-base-uncased"
+  ]
+}
+--- stdout ---
+Pulling google-bert/bert-base-uncased
+Cache: /Users/chejinxuan/.cache/huggingface
+📦 Downloading 9 files (1.81 GB)
+  ✓ config.json (cached)
+  ✓ tokenizer_config.json (cached)
+  ✓ vocab.txt (cached)
+  ✓ model.onnx (cached)
+  ✓ ...del.mlpackage/Manifest.json (cached)
+  ✓ tokenizer.json (cached)
+  ✓ ...e.CoreML/weights/weight.bin (cached)
+  ✓ pytorch_model.bin (cached)
+  ✓ model.safetensors (cached)
+
+✅ Download complete: /Users/chejinxuan/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594
+
+✓ Model ready at:
+  /Users/chejinxuan/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594
+
+--- stderr ---
+🌐 Using proxy: http://127.0.0.1:41809

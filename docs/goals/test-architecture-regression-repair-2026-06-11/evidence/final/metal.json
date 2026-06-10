@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "l1_metal_pass_line": "TEST_ARCH L1_METAL PASS: docs/goals/test-architecture-regression-repair-2026-06-11/evidence/l1-metal",
+  "binary_sha256": "77e6e6e73e3089972fc1f60e4dc921ba55d7867e870f2b7cf28706d91c67af6d",
+  "matrix_json": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-matrix-fresh/matrix.json",
+  "fresh_after_repair": true,
+  "degeneration_detector_passed": true,
+  "entrypoints": {
+    "run": true,
+    "serve": true
+  },
+  "artifacts": {
+    "l1": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/l1-metal/l1_metal.json",
+    "run": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-product-run/summary.json",
+    "serve": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-product-serve/summary.json"
+  }
+}

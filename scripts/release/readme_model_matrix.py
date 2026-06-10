@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -105,18 +107,47 @@ def regression_plan(manifest: dict) -> dict:
             if not m.get(platform):
                 continue
             steps = ["pull", "run_multiturn_3", "serve_smoke", "greedy_fingerprint"]
-            if m.get("matrix_smoke_only"):
+            if m.get("matrix_smoke_only") or m.get("modality") != "llm":
                 steps = ["pull", "serve_smoke"]
+            platform_models = m.get("representative_model_by_platform") or {}
+            platform_args = m.get("run_args_by_platform") or {}
             plan.append(
                 {
                     "id": m["id"],
-                    "model": m["representative_model"],
+                    "modality": m.get("modality"),
+                    "model": platform_models.get(platform, m["representative_model"]),
+                    "run_args": platform_args.get(platform, []),
                     "platform": platform,
                     "tier": m.get("matrix_tier", "single_gpu"),
                     "steps": steps,
                 }
             )
     return {"schema_version": 1, "cells": plan}
+
+
+def _env_cell_key(cell_id: str, platform: str) -> str:
+    key = "".join(ch if ch.isalnum() else "_" for ch in f"{cell_id}_{platform}".upper())
+    return key
+
+
+def resolve_cell_command_parts(cell: dict) -> tuple[str, list[str]]:
+    """Resolve the model and extra `ferrum run` args for a matrix cell.
+
+    Hardware fixtures can differ by platform (e.g. Metal Qwen3-MoE uses the
+    local GGUF artifact while CUDA uses the GPTQ HF repo). Keep that as an
+    explicit test fixture override, not as hidden product behavior.
+    """
+    env_key = _env_cell_key(str(cell["id"]), str(cell["platform"]))
+    model = os.environ.get(f"FERRUM_MATRIX_MODEL_{env_key}", str(cell["model"]))
+    args = cell.get("run_args") or []
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        raise MatrixError(f"matrix cell {cell.get('id')}: run_args must be a string list")
+    env_args = os.environ.get(f"FERRUM_MATRIX_ARGS_{env_key}")
+    if env_args:
+        args = [*args, *shlex.split(env_args)]
+    return os.path.expandvars(os.path.expanduser(model)), [
+        os.path.expandvars(os.path.expanduser(arg)) for arg in args
+    ]
 
 
 # A short substring repeated back-to-back more than this many times is a token
@@ -158,7 +189,7 @@ def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) ->
     for cell in regression_plan(manifest)["cells"]:
         if cell["platform"] != platform:
             continue
-        model = cell["model"]
+        model, extra_run_args = resolve_cell_command_parts(cell)
         log = out_dir / f"{cell['id']}_{platform}.log"
         status = "PASS"
         detail = ""
@@ -176,7 +207,13 @@ def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) ->
                     text=True,
                     timeout=900,
                 )
-                log.write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+                log.write_text(
+                    json.dumps({"command": [ferrum_bin, "pull", model]}, indent=2)
+                    + "\n--- stdout ---\n"
+                    + proc.stdout
+                    + "\n--- stderr ---\n"
+                    + proc.stderr
+                )
                 if proc.returncode != 0:
                     status, detail = "FAIL", f"pull exit {proc.returncode}"
             else:
@@ -191,15 +228,35 @@ def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) ->
                 # large_gpu models (the 30B) run ~0.1 tok/s on Metal — a long
                 # generation would blow the timeout — so keep them short there.
                 # Fast models generate long enough for token loops to surface.
-                max_tokens = "48" if cell.get("tier") == "large_gpu" else "160"
+                if cell.get("tier") == "large_gpu":
+                    # Metal 30B-class smoke is correctness evidence, not a
+                    # throughput sweep; 48 tokens across 3 turns can exceed
+                    # the 900s cell timeout on an M1 Max.
+                    max_tokens = "16" if platform == "metal" else "48"
+                else:
+                    max_tokens = "160"
+                cmd = [
+                    ferrum_bin,
+                    "run",
+                    model,
+                    "--max-tokens",
+                    max_tokens,
+                    *extra_run_args,
+                ]
                 proc = subprocess.run(
-                    [ferrum_bin, "run", model, "--max-tokens", max_tokens],
+                    cmd,
                     input=turns,
                     capture_output=True,
                     text=True,
                     timeout=900,
                 )
-                log.write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+                log.write_text(
+                    json.dumps({"command": cmd}, indent=2)
+                    + "\n--- stdout ---\n"
+                    + proc.stdout
+                    + "\n--- stderr ---\n"
+                    + proc.stderr
+                )
                 out = proc.stdout
                 if proc.returncode != 0:
                     status, detail = "FAIL", f"exit {proc.returncode}"
@@ -233,8 +290,10 @@ def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) ->
     # collate into per-model platform status + perf the gate expects
     by_model: dict[str, dict] = {}
     for r in rows:
-        by_model.setdefault(r["id"], {"id": r["id"], "platforms": {}, "perf": {}})
+        by_model.setdefault(r["id"], {"id": r["id"], "platforms": {}, "perf": {}, "detail": ""})
         by_model[r["id"]]["platforms"][r["platform"]] = r["status"]
+        if r.get("detail"):
+            by_model[r["id"]]["detail"] = r["detail"]
         if r.get("tok_s") is not None:
             by_model[r["id"]]["perf"][r["platform"]] = r["tok_s"]
     result = {"schema_version": 1, "platform": platform, "models": list(by_model.values())}
@@ -267,11 +326,22 @@ def run_self_test() -> None:
                 "tensor_parallel": False,
                 "matrix_smoke_only": True,
             },
+            {
+                "id": "demo-embedding",
+                "readme_label": "Demo Embedding",
+                "modality": "embedding",
+                "representative_model": "demo/embedding",
+                "metal": True,
+                "cuda": False,
+                "int4_gptq": False,
+                "tensor_parallel": False,
+            },
         ],
     }
     table = emit_table(fixture)
     assert "Demo LLM | ✓ | ✓ | ✓ | —" in table, table
     assert "Demo ASR | ✓ | — | — | —" in table, table
+    assert "Demo Embedding | ✓ | — | — | —" in table, table
 
     # check_readme passes when the anchored table matches, fails when stale.
     good = f"intro\n{BEGIN_MARK}\n{table}\n{END_MARK}\nrest"
@@ -292,10 +362,12 @@ def run_self_test() -> None:
             raise AssertionError("stale README must fail check")
 
     plan = regression_plan(fixture)
-    # demo-llm -> metal + cuda (4 steps each); demo-asr -> metal smoke only.
-    assert len(plan["cells"]) == 3, plan
+    # demo-llm -> metal + cuda; non-LLM modalities -> metal smoke only.
+    assert len(plan["cells"]) == 4, plan
     asr = [c for c in plan["cells"] if c["id"] == "demo-asr"]
     assert asr and asr[0]["steps"] == ["pull", "serve_smoke"], asr
+    embedding = [c for c in plan["cells"] if c["id"] == "demo-embedding"]
+    assert embedding and embedding[0]["steps"] == ["pull", "serve_smoke"], embedding
 
     # The real manifest, if present, must parse and round-trip.
     if MANIFEST_PATH.exists():

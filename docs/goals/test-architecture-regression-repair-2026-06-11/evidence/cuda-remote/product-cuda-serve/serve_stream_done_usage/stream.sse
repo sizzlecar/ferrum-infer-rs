@@ -1,0 +1,24 @@
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}
+
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":"!"}}]}
+
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":" How"}}]}
+
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":" can"}}]}
+
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":" I"}}]}
+
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":" assist"}}]}
+
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":" you"}}]}
+
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":" today"}}]}
+
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":"?"}}]}
+
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]}
+
+data: {"id":"e809c69e-224c-4312-bbce-7be38c7fd780","object":"chat.completion.chunk","created":1781112411,"model":"Qwen/Qwen3-30B-A3B-GPTQ-Int4","choices":[],"usage":{"prompt_tokens":16,"completion_tokens":10,"total_tokens":26}}
+
+data: [DONE]
+

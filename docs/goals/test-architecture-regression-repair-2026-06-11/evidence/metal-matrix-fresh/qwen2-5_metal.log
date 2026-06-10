@@ -1,0 +1,62 @@
+{
+  "command": [
+    "target/release/ferrum",
+    "run",
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    "--max-tokens",
+    "160"
+  ]
+}
+--- stdout ---
+你好！很高兴为您服务。有什么我可以帮助您的吗？
+我是Qwen，一个由阿里云开发的超大规模语言模型。我被设计用于回答问题、创作文字和生成文本。我的目标是帮助用户更好地理解和表达他们的想法和需求，无论是学术研究、创意写作还是日常生活中的各种场景。
+
+我使用了先进的预训练技术来学习大量的语言数据，并通过深度学习算法不断优化自己的能力以提供更准确的回答和服务体验。
+
+如果您有任何问题或需要帮助，请随时告诉我！
+Rust 是一种由阿里云开发的超大规模语言模型，它在多个领域都有广泛的应用。以下是 Rust 在实际应用场景中的几个主要场景及其对应的开源项目：
+
+1. **Web 开发**
+   - **真实开源项目**：Node.js 和 Rust 的结合使用是 Web 开发中常见的做法。
+     - 例如，Node.js 中的 `http`、`net/http/asyncio/worker_threads`、以及 `std::thread`, 通过这些库可以实现异步处理和并发。
+
+2. **游戏开发**
+   - 使用了 Rust 的内存安全特性来编写高性能的游戏引擎。
+     ```rust
+       use std::sync::{Arc, Mutex};
+       use std::{thread, time};
+
+       struct Game {
+         game: Arc<M
+
+--- stderr ---
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading Qwen/Qwen2.5-0.5B-Instruct...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-10T17:24:19.800090Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-10T17:24:19.800103Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-10T17:24:19.800175Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775/tokenizer.json"
+2026-06-10T17:24:19.941910Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-10T17:24:19.941931Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-10T17:24:19.941933Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-10T17:24:19.941945Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-10T17:24:19.942002Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775 (format: safetensors)
+2026-06-10T17:24:19.942096Z  INFO ferrum_engine::registry:   Architecture: Qwen2, Layers: 24, Vocab: 151936
+2026-06-10T17:24:20.013964Z  INFO ferrum_engine::registry: Building model...
+2026-06-10T17:24:20.014025Z  INFO ferrum_engine::registry: Loading Qwen2 via LlamaFamilyModel
+2026-06-10T17:24:20.014032Z  INFO ferrum_engine::registry:   Backend: Metal (weights f32), KV: fp16
+2026-06-10T17:24:22.251306Z  INFO ferrum_models::models::llama_family: LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+Model loaded in 2.9s.
+
+Ready. Type your message and press Enter.
+Use /clear to reset history; /bye or Ctrl+D to exit.
+
+[batched-qkr] first batched_decode call: m=1 use_batched_qkr=false (q=Some("Unsupported operation: qk_norm_rope_batched_per_item not implemented for this backend") k=Some("Unsupported operation: qk_norm_rope_batched_per_item not implemented for this backend") v=Some("Unsupported operation: qk_norm_rope_batched_per_item not implemented for this backend"))
+[13 tokens, 39.6 tok/s, 0.3s]
+
+[93 tokens, 62.1 tok/s, 1.5s]
+
+[160 tokens, 48.4 tok/s, 3.3s]
+
+Goodbye!

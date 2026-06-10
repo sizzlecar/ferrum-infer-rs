@@ -1,0 +1,9 @@
+=== L1-cuda: op-parity (cuda) ===
+  ok (19s)
+=== L1-cuda: kill verify hb-10 ===
+  hb-10 defect builds (behavioral red needs the CUDA fingerprint test)
+  reverted
+L1_CUDA_MODEL not set — hb-09/hb-11 verify-live probes skipped
+l1_cuda_warm_seconds=21
+TEST_ARCH L1_CUDA PASS: out/regression-repair-20260611/l1-cuda-patched
+2026-06-10T17:18:46+00:00

@@ -55,7 +55,8 @@
       "cuda": false,
       "int4_gptq": false,
       "tensor_parallel": false,
-      "matrix_tier": "metal_only"
+      "matrix_tier": "metal_only",
+      "matrix_smoke_only": true
     },
     {
       "id": "whisper",

@@ -1,0 +1,9 @@
+{
+  "artifact": "docs/goals/test-architecture-regression-repair-2026-06-11/evidence/metal-product-run/run_multiturn_recall/result.json",
+  "assistant_turns": 2,
+  "duration_sec": 3.513392916880548,
+  "length_finishes": 0,
+  "name": "run_multiturn_recall",
+  "status": "pass",
+  "type": "run_multiturn"
+}

@@ -582,9 +582,12 @@ impl FerrumConfigBuilder {
                 let q = q.to_ascii_lowercase();
                 q.contains("gptq") || q.contains("int4")
             });
+        let cuda_qwen3_moe = cuda_backend
+            && self.model.moe.is_some()
+            && self.model.architecture.eq_ignore_ascii_case("qwen3_moe");
         let use_vllm_paged_attn = self.bool_value(
             "FERRUM_USE_VLLM_PAGED_ATTN",
-            self.workload.is_m3_preset()
+            (self.workload.is_m3_preset() || cuda_qwen3_moe)
                 && cuda_backend
                 && self.hardware.compiled_features.vllm_paged_attn,
             AutoConfigSource::WorkloadPreset,
@@ -691,7 +694,9 @@ impl FerrumConfigBuilder {
             fa2_source,
             fa2_direct_ffi,
         ));
-        decisions.push(self.attention_decode_decision(use_vllm_paged_attn, vllm_v1_short));
+        decisions.push(
+            self.attention_decode_decision(use_vllm_paged_attn.clone(), vllm_v1_short.clone()),
+        );
         // Materialize the auto-resolved fast-path MoE knobs into the effective
         // config BEFORE moe_decision consumes them, so they reach the model
         // (which reads FERRUM_*, not the decisions). Only auto-derived values —
@@ -700,6 +705,8 @@ impl FerrumConfigBuilder {
         // model never saw it (~9.7 vs ~59 tok/s on a 4090 for Qwen3-30B-A3B).
         let mut runtime_config = self.runtime_config.clone();
         for (key, resolved) in [
+            ("FERRUM_USE_VLLM_PAGED_ATTN", &use_vllm_paged_attn),
+            ("FERRUM_VLLM_PAGED_ATTN_V1_SHORT", &vllm_v1_short),
             ("FERRUM_VLLM_MOE", &vllm_moe),
             ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
             ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
@@ -1798,6 +1805,73 @@ mod tests {
             Some("1"),
             "resolved FERRUM_VLLM_MOE must be materialized into the effective config"
         );
+    }
+
+    #[test]
+    fn cuda_qwen3_moe_enables_vllm_paged_attn_without_m3_preset() {
+        // `ferrum run` and ordinary `serve` use the serving-default workload,
+        // not the m3 preset. Qwen3-MoE on CUDA with the VPA kernel compiled
+        // must still select and materialize the paged-attention runtime knob,
+        // otherwise the effective config/decision trace says "legacy" while
+        // the model runtime can take the VPA path through its own defaults.
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(
+            decisions["attention_decode_backend"], "vllm_paged_attn_v1_short",
+            "CUDA Qwen3-MoE should get VPA decode without the m3 preset"
+        );
+        let entry = |key: &str| {
+            resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing runtime config entry {key}"))
+        };
+        assert_eq!(entry("FERRUM_USE_VLLM_PAGED_ATTN").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
+            "1"
+        );
+    }
+
+    #[test]
+    fn cuda_qwen3_moe_vllm_paged_attn_env_opt_out_is_materialized() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_USE_VLLM_PAGED_ATTN", "0")]))
+            .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(decisions["attention_decode_backend"], "legacy_paged_decode");
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_USE_VLLM_PAGED_ATTN")
+            .expect("env opt-out should stay in effective config");
+        assert_eq!(entry.effective_value, "0");
+        assert_eq!(entry.source, RuntimeConfigSource::Env);
     }
 
     #[test]

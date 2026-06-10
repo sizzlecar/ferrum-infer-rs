@@ -1,0 +1,21 @@
+
+--- stderr ---
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading google-bert/bert-base-uncased...
+Using Metal backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-10T17:01:44.227261Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-10T17:01:44.227274Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-10T17:01:44.227320Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/tokenizer.json"
+2026-06-10T17:01:44.243457Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-10T17:01:44.243471Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-10T17:01:44.243473Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-10T17:01:44.243478Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-10T17:01:44.243512Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594 (format: safetensors)
+2026-06-10T17:01:44.243579Z  INFO ferrum_engine::registry:   Architecture: Bert, Layers: 12, Vocab: 30522
+2026-06-10T17:01:44.274798Z  INFO ferrum_engine::registry: Building model...
+2026-06-10T17:01:44.274809Z  INFO ferrum_engine::registry: Using BERT executor for embeddings
+2026-06-10T17:01:44.274811Z  INFO ferrum_models::executor::bert_executor: Loading BERT model from: /Users/chejinxuan/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594
+2026-06-10T17:01:44.274830Z  INFO ferrum_models::executor::bert_executor: Loading weights from: "/Users/chejinxuan/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/model.safetensors"
+2026-06-10T17:01:44.275723Z  INFO ferrum_models::multimodal::bert: 🔨 Loading BERT model from config: "/Users/chejinxuan/.cache/huggingface/hub/models--google-bert--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/config.json"
+Error: Configuration error: Failed to create executor 'llm' in model mode: Model error: Failed to create BERT model: cannot find tensor bert.embeddings.LayerNorm.weight
