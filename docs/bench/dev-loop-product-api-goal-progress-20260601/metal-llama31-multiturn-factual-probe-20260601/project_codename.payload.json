@@ -1,0 +1,24 @@
+{
+  "model": "Llama-3.1-8B",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Answer the final user question using the conversation context. Keep the answer short."
+    },
+    {
+      "role": "user",
+      "content": "The project codename is maple."
+    },
+    {
+      "role": "assistant",
+      "content": "OK."
+    },
+    {
+      "role": "user",
+      "content": "What is the project codename? Reply with only the codename."
+    }
+  ],
+  "max_tokens": 16,
+  "temperature": 0,
+  "stream": false
+}

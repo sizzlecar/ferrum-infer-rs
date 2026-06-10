@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:18188  model=Qwen3-30B-A3B  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               32/32
+  wall time:               94.45s
+  request throughput:      0.34 req/s
+  input  token throughput: 0.0 tok/s
+  output token throughput: 20.7 tok/s
+  total input tokens:      0
+  total output tokens:     1958
+
+  TTFT  mean 2604.25ms  median 2197.98ms  p99 5403.08ms  max 5403.18ms
+  TPOT  mean  696.28ms  median  692.90ms  p99  714.67ms  max  714.96ms
+  ITL   mean  694.02ms  median  704.56ms  p99 1085.78ms  max 1448.91ms
+  E2E   mean 44464.57ms  median 45888.72ms  p99 48729.58ms  max 48729.75ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen30-metal-fallback-restore-c16-20260601/c16.json

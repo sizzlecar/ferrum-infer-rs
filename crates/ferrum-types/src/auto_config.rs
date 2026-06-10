@@ -570,6 +570,18 @@ impl FerrumConfigBuilder {
     pub fn resolve(self) -> Result<ResolvedFerrumConfig, AutoConfigError> {
         let mut decisions = Vec::new();
         let cuda_backend = self.is_cuda_backend();
+        // Any CUDA GPTQ/INT4 MoE model gets the vLLM-Marlin fast MoE path when
+        // the kernel is compiled — not only the m3 bench preset. `ferrum run`
+        // resolves with the serving-default workload (not the m3 preset), so
+        // without this it silently fell back to the slow host-route MoE
+        // (~9.7 vs ~59 tok/s on a 4090 for Qwen3-30B-A3B). Capability-gated,
+        // never model-name-gated.
+        let cuda_gptq_moe = cuda_backend
+            && self.model.moe.is_some()
+            && self.model.quantization.as_deref().is_some_and(|q| {
+                let q = q.to_ascii_lowercase();
+                q.contains("gptq") || q.contains("int4")
+            });
         let use_vllm_paged_attn = self.bool_value(
             "FERRUM_USE_VLLM_PAGED_ATTN",
             self.workload.is_m3_preset()
@@ -597,14 +609,13 @@ impl FerrumConfigBuilder {
         )?;
         let vllm_moe = self.bool_value(
             "FERRUM_VLLM_MOE",
-            self.workload.is_m3_preset()
-                && cuda_backend
+            (cuda_gptq_moe || (self.workload.is_m3_preset() && cuda_backend))
                 && self.hardware.compiled_features.vllm_moe_marlin,
             AutoConfigSource::WorkloadPreset,
         )?;
         let device_route = self.bool_value(
             "FERRUM_MOE_DEVICE_ROUTE",
-            self.workload.is_m3_preset() && vllm_moe.value,
+            vllm_moe.value,
             AutoConfigSource::WorkloadPreset,
         )?;
         let pair_ids = self.bool_value(
@@ -681,6 +692,26 @@ impl FerrumConfigBuilder {
             fa2_direct_ffi,
         ));
         decisions.push(self.attention_decode_decision(use_vllm_paged_attn, vllm_v1_short));
+        // Materialize the auto-resolved fast-path MoE knobs into the effective
+        // config BEFORE moe_decision consumes them, so they reach the model
+        // (which reads FERRUM_*, not the decisions). Only auto-derived values —
+        // user/env entries are already present. Without this, `ferrum run`'s
+        // non-preset path resolved FERRUM_VLLM_MOE as a decision only and the
+        // model never saw it (~9.7 vs ~59 tok/s on a 4090 for Qwen3-30B-A3B).
+        let mut runtime_config = self.runtime_config.clone();
+        for (key, resolved) in [
+            ("FERRUM_VLLM_MOE", &vllm_moe),
+            ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
+            ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
+        ] {
+            if resolved.source != AutoConfigSource::Env {
+                runtime_config.upsert(
+                    key,
+                    if resolved.value { "1" } else { "0" },
+                    RuntimeConfigSource::MemoryProfile,
+                );
+            }
+        }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
         decisions.push(self.scalar_decision(
@@ -712,7 +743,7 @@ impl FerrumConfigBuilder {
         Ok(ResolvedFerrumConfig {
             schema_version: 1,
             preset: self.workload.preset.clone(),
-            runtime_config: self.runtime_config.clone(),
+            runtime_config,
             model_capabilities: self.model.clone(),
             hardware_capabilities: self.hardware.clone(),
             workload_profile: self.workload.clone(),
@@ -1721,6 +1752,51 @@ mod tests {
         assert_eq!(
             resolved.preset.as_deref(),
             Some(M3_QWEN3_30B_A3B_INT4_PRESET)
+        );
+    }
+
+    #[test]
+    fn cuda_gptq_moe_enables_vllm_marlin_without_m3_preset() {
+        // `ferrum run` resolves with the serving-default workload, NOT the m3
+        // bench preset, so the old `is_m3_preset()`-gated FERRUM_VLLM_MOE never
+        // fired and the 30B fell back to the slow host-route MoE (~9.7 vs ~59
+        // tok/s on a 4090). A CUDA GPTQ MoE must get the vLLM-Marlin fast path
+        // on capability alone.
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_ne!(
+            resolved.preset.as_deref(),
+            Some(M3_QWEN3_30B_A3B_INT4_PRESET),
+            "serving-default workload must not be the m3 preset"
+        );
+        assert_eq!(
+            decisions["moe_implementation"], "vllm_marlin_moe_device_route_pair_ids",
+            "CUDA GPTQ MoE should get the fast vLLM-Marlin path without the m3 preset"
+        );
+        // The decision is not enough — the model reads FERRUM_VLLM_MOE from the
+        // effective config, not the decisions. The resolved knob must be a
+        // runtime_config entry so `ferrum run`'s materialize/apply propagates it.
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|e| e.key == "FERRUM_VLLM_MOE");
+        assert_eq!(
+            entry.map(|e| e.effective_value.as_str()),
+            Some("1"),
+            "resolved FERRUM_VLLM_MOE must be materialized into the effective config"
         );
     }
 

@@ -1,0 +1,17 @@
+2026-06-01T15:18:31.466369Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-01T15:18:31.466405Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-01T15:18:31.466454Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-01T15:18:31.636295Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-01T15:18:31.636352Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-01T15:18:31.636359Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-01T15:18:31.636368Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-01T15:18:31.636415Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+[batch-prefill] n_items=1 total_q=13 fallback=true elapsed=931286us
+[batch-prefill] n_items=4 total_q=111 fallback=true elapsed=1038529us
+[batch-prefill] n_items=3 total_q=97 fallback=true elapsed=855202us
+[qwen3_moe] decode_batch_internal: FERRUM_GREEDY_ARGMAX=0 (path=host argmax)
+[moe-inner-prof] iter#0 m=4 loop=3356us sync=80181us argmax=517us
+[rbd-prof] iter#0 m=4 decode=84914us post=1430us | sample=1392 sched=2 stream=36 stop=0 complete=0 (us)
+[batch-prefill] n_items=3 total_q=95 fallback=true elapsed=841766us
+[batch-prefill] n_items=3 total_q=85 fallback=true elapsed=799375us
+[batch-prefill] n_items=3 total_q=106 fallback=true elapsed=863964us

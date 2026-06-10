@@ -1,0 +1,1 @@
+{"id":"1245a9ab-b3ca-43c1-a197-b64f3bb4238b","object":"chat.completion","created":1780328457,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"The capital of France is Paris."},"finish_reason":"stop"}],"usage":{"prompt_tokens":24,"completion_tokens":8,"total_tokens":32}}

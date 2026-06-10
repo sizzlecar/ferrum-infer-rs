@@ -1,0 +1,17 @@
+────────────────────────────────────────────────────────────────────────
+BENCHMARK  base=http://127.0.0.1:18183  model=Llama-3.1-8B  reqs=32  conc=16  rate=inf
+────────────────────────────────────────────────────────────────────────
+  completed:               32/32
+  wall time:               22.89s
+  request throughput:      1.40 req/s
+  input  token throughput: 5.1 tok/s
+  output token throughput: 89.5 tok/s
+  total input tokens:      116
+  total output tokens:     2048
+
+  TTFT  mean 1615.99ms  median 1727.96ms  p99 2909.35ms  max 2909.36ms
+  TPOT  mean  153.83ms  median  152.29ms  p99  166.79ms  max  166.79ms
+  ITL   mean  154.60ms  median  136.93ms  p99  615.92ms  max  761.26ms
+  E2E   mean 11307.31ms  median 11297.51ms  p99 12420.37ms  max 12420.48ms
+
+  saved → /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/bench/dev-loop-product-api-goal-progress-20260601/metal-llama31-argmax2d-probe-c16-20260601/llama31_8b.c16.json

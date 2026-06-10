@@ -1,0 +1,1 @@
+{"id":"7c3c9f57-30cf-406a-ac3e-f8e57d5cb2ee","object":"chat.completion","created":1780328058,"model":"Qwen3-30B-A3B","choices":[{"index":0,"message":{"role":"assistant","content":"basalt"},"finish_reason":"stop"}],"usage":{"prompt_tokens":66,"completion_tokens":3,"total_tokens":69}}

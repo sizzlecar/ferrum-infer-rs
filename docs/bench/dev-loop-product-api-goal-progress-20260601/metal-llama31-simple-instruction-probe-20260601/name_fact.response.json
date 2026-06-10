@@ -1,0 +1,1 @@
+{"id":"4342c15b-6bbb-4c7c-905d-28838f650c91","object":"chat.completion","created":1780329680,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"Your name is Bob."},"finish_reason":"stop"}],"usage":{"prompt_tokens":26,"completion_tokens":6,"total_tokens":32}}

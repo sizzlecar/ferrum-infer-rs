@@ -1,0 +1,12 @@
+{
+  "rc": 0,
+  "completed": 32,
+  "failed": 0,
+  "tps": 20.73139279079316,
+  "ratio_to_readme": 0.2617600099847621,
+  "out": 1958,
+  "tpot": 692.8979292380952,
+  "ttft": 2197.983875,
+  "paris": "Paris",
+  "multiturn": "basalt"
+}

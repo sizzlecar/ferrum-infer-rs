@@ -1,0 +1,1 @@
+{"id":"92c63e1a-1c8d-438a-b4f0-05b5b278a748","object":"chat.completion","created":1780328458,"model":"Llama-3.1-8B","choices":[{"index":0,"message":{"role":"assistant","content":"You can't remember to remember."},"finish_reason":"stop"}],"usage":{"prompt_tokens":60,"completion_tokens":8,"total_tokens":68}}

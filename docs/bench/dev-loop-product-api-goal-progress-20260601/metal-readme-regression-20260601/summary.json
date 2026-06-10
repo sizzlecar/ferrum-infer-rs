@@ -1,0 +1,101 @@
+{
+  "ferrum_version": "ferrum 0.7.3\n",
+  "swap_start": "vm.swapusage: total = 2048.00M  used = 1636.06M  free = 411.94M  (encrypted)",
+  "vm_stat_start": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              622720.\nPages active:                            454847.\nPages inactive:                          659095.\nPages speculative:                         2111.\nPages throttled:                              0.\nPages wired down:                        173534.\nPages purgeable:                           9707.\n\"Translation faults\":                5179007568.\nPages copy-on-write:                  327596092.\nPages zero filled:                   3063104203.\nPages reactivated:                    233094637.",
+  "models": [
+    {
+      "key": "llama31_8b",
+      "label": "Llama-3.1-8B",
+      "gguf": "/Users/chejinxuan/ferrum-bench/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+      "moe": false,
+      "chat": {
+        "paris": {
+          "status": 200,
+          "passed": false,
+          "content": "It looks like you are you referring to?"
+        },
+        "multiturn": {
+          "status": 200,
+          "passed": false,
+          "content": "It seems to be a word."
+        }
+      },
+      "cells": [
+        {
+          "concurrency": 1,
+          "prompts": 8,
+          "baseline_tps": 29.1,
+          "runner_rc": 0,
+          "completed": 8,
+          "failed": 0,
+          "output_throughput_tok_s": 26.59930491034945,
+          "ratio_to_readme": 0.9140654608367508,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": 131.53352100000006,
+          "tpot_median_ms": 32.08927463636364
+        },
+        {
+          "concurrency": 8,
+          "prompts": 24,
+          "baseline_tps": 51.3,
+          "runner_rc": 0,
+          "completed": 24,
+          "failed": 0,
+          "output_throughput_tok_s": 49.923749470671986,
+          "ratio_to_readme": 0.9731725043015982,
+          "not_regressed_90pct": true,
+          "ttft_median_ms": 1006.101333,
+          "tpot_median_ms": 144.90877513492066
+        },
+        {
+          "concurrency": 16,
+          "prompts": 32,
+          "baseline_tps": 96.7,
+          "runner_rc": 0,
+          "completed": 32,
+          "failed": 0,
+          "output_throughput_tok_s": 85.72937542535844,
+          "ratio_to_readme": 0.8865499009861265,
+          "not_regressed_90pct": false,
+          "ttft_median_ms": 1184.6022500000001,
+          "tpot_median_ms": 164.30571692857143
+        }
+      ],
+      "server_ready": true
+    },
+    {
+      "key": "qwen3_8b",
+      "label": "Qwen3-8B",
+      "gguf": "/Users/chejinxuan/ferrum-bench/models/Qwen3-8B-Q4_K_M.gguf",
+      "moe": false,
+      "chat": {
+        "paris": {
+          "status": 200,
+          "passed": true,
+          "content": "Paris"
+        },
+        "multiturn": {
+          "status": 200,
+          "passed": true,
+          "content": "basalt"
+        }
+      },
+      "cells": [
+        {
+          "concurrency": 16,
+          "prompts": 32,
+          "baseline_tps": 93.2,
+          "runner_rc": 0,
+          "completed": 32,
+          "failed": 0,
+          "output_throughput_tok_s": 75.22420464021326,
+          "ratio_to_readme": 0.807126659229756,
+          "not_regressed_90pct": false,
+          "ttft_median_ms": 1331.9957499999991,
+          "tpot_median_ms": 171.86113557936505
+        }
+      ],
+      "server_ready": true
+    }
+  ]
+}

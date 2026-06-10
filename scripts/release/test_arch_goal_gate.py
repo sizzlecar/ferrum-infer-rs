@@ -38,6 +38,12 @@ BASELINE_PATH = GOAL_DIR / "baseline.json"
 ALLOWLIST_PATH = Path("scripts/release/test_arch_allowlist.json")
 OP_DIFF_DIR = Path("crates/ferrum-testkit/src/op_diff")
 MODELS_MANIFEST = Path("scripts/release/models_manifest.json")
+# Gate C7: decode-throughput floors per (model, platform). The matrix records
+# measured tok/s; a cell below its floor fails. This is the regression guard
+# the goal originally lacked — coherence + exit0 alone let a 6x MoE slowdown
+# (9.7 vs 59 tok/s) pass. Floors are deliberately conservative (catch big
+# regressions, tolerate noise), keyed model->platform->min_tok_s.
+PERF_FLOORS = Path("docs/goals/test-architecture-2026-06-10/perf_floors.json")
 
 MODELS_MAIN_PATH = Path("crates/ferrum-models/src/models")
 ENGINE_MAIN_PATH = Path("crates/ferrum-engine/src")
@@ -485,6 +491,31 @@ def check_gate_c(repo_root: Path, out_dir: Path, failures: list[str]) -> None:
                     f"gate C: model {model_id} platform {platform} status"
                     f" {status!r} != PASS"
                 )
+
+    # Gate C7: decode-throughput floors. The matrix records measured tok/s per
+    # cell in row["perf"][platform]; a cell below its committed floor fails.
+    # This is the regression guard coherence+exit0 alone could not provide.
+    floors_path = repo_root / PERF_FLOORS
+    if floors_path.exists():
+        floors = load_json(floors_path)
+        for model_id, plat_floors in (floors.get("floors") or {}).items():
+            row = matrix_models.get(model_id)
+            if row is None:
+                failures.append(f"gate C: perf floor references unknown model {model_id}")
+                continue
+            perf = row.get("perf") or {}
+            for platform, floor in plat_floors.items():
+                measured = perf.get(platform)
+                if not isinstance(measured, (int, float)):
+                    failures.append(
+                        f"gate C: model {model_id} platform {platform} missing perf"
+                        f" tok/s (floor {floor})"
+                    )
+                elif measured < floor:
+                    failures.append(
+                        f"gate C: model {model_id} platform {platform} {measured}"
+                        f" tok/s below floor {floor}"
+                    )
 
 
 def run_validate(
