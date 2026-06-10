@@ -1,33 +1,12 @@
 diff --git a/crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs b/crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs
-index 814dfdd1..75353f36 100644
+index a4be869f..9cbeccd2 100644
 --- a/crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs
 +++ b/crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs
-@@ -649,117 +649,52 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
-                 metal_pos_offsets_host = Some(pos_offsets_host);
-             }
- 
--            // Step 1: write K/V into the shared pool + RoPE'd Q into
--            // paged_batch_q at offset i × q_dim. Two code paths:
--            //
--            //   - CUDA (`B::supports_varlen_qkv() == true`): ONE batched
--            //     `split_qkv_norm_rope_into_paged_cache_varlen` dispatch
--            //     — saves (m-1) × launch_overhead per layer × num_layers.
--            //   - Metal (no varlen kernel — would panic): per-item loop
--            //     of `split_qkv_norm_rope_into_paged_cache` with
--            //     `qkv_byte_offset = i * qkv_stride * 2` (FP16). Mirrors
--            //     the pattern in `llama_family_forward_batched.rs:182`.
--            //     Each call is m=1 so loses the (m-1)x batched-launch
--            //     amortization, but Metal's per-item kernel is what
--            //     the historical PR #81 bench at c=16 = 79 tok/s used.
-+            // Step 1: ONE batched split_qkv_norm_rope_into_paged_cache_varlen
-+            // dispatch — replaces the m=batch per-seq loop. Saves
-+            // (m-1) × launch_overhead per layer × num_layers.
-             let q_buf_ptr_raw = self.scratch.paged_batch_q.as_mut().unwrap() as *mut B::Buffer;
-             // SAFETY: scratch buffers are independent of qkv_out / norm
+@@ -667,99 +667,48 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
              // weights / rope and are not re-borrowed by the called fn.
              let q_buf_safe: &mut B::Buffer = unsafe { &mut *q_buf_ptr_raw };
  
--            if B::supports_varlen_qkv() {
+-            if self.supports_varlen_qkv {
 -                let bt_ptr_raw =
 -                    self.scratch.paged_batch_block_tables.as_ref().unwrap() as *const B::Buffer;
 -                let pos_ptr_raw =
@@ -66,6 +45,10 @@ index 814dfdd1..75353f36 100644
 -                    max_blocks_per_seq,
 -                )
 -                .expect("split_qkv_norm_rope_into_paged_cache_varlen (batched)");
++            // hb-07 repro: the per-item fallback for backends without the
++            // varlen QKV kernel is deleted, so Metal/CPU hit the varlen
++            // dispatch unconditionally and panic — a capability-fallback-law
++            // violation. The real fix restores the supports_varlen_qkv branch.
 +            let bt_ptr_raw =
 +                self.scratch.paged_batch_block_tables.as_ref().unwrap() as *const B::Buffer;
 +            let pos_ptr_raw =
