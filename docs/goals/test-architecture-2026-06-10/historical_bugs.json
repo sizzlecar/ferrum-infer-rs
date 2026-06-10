@@ -11,98 +11,127 @@
       "id": "hb-01",
       "title": "chat REPL EOS / stop_sequences / stream / pos_offset all broken after engine swap",
       "kind": "revert-fix",
-      "fix_commits": ["34c57c2b"],
+      "fix_commits": [
+        "34c57c2b"
+      ],
       "source": "PR #188",
       "reachable": "cpu",
       "expected_lane": "L0",
       "expected_failing_surface": "tiny full-stack: eos_terminates, stop_sequidentifier, stream chunk contract, multi-turn",
-      "repro_patch": null,
-      "patch_status": "pending"
+      "repro_patch": "patches/hb-01.patch",
+      "patch_status": "ready",
+      "notes": "Patch removes the stop_token_ids EOS guard in SequenceState::stop_reason (forward-translation; the old vocab-top heuristic is no longer expressible)."
     },
     {
       "id": "hb-02",
       "title": "stop text spanning composite tokens not detected",
       "kind": "revert-fix",
-      "fix_commits": ["2a3a6132"],
+      "fix_commits": [
+        "2a3a6132"
+      ],
       "source": "goal/layer-split branch",
       "reachable": "cpu",
       "expected_lane": "L0",
       "expected_failing_surface": "tiny full-stack: stop sequence inside composite token scenario",
-      "repro_patch": null,
-      "patch_status": "pending"
+      "repro_patch": "patches/hb-02.patch",
+      "patch_status": "ready",
+      "notes": "Patch restores the pre-fix match arm byte-identically (region untouched since the fix)."
     },
     {
       "id": "hb-03",
       "title": "guided decoding leaves control tokens unmasked / premature guided EOS",
       "kind": "revert-fix",
-      "fix_commits": ["b2ec992c", "3190dbc7", "bf4573d3", "5cb6b1fe"],
+      "fix_commits": [
+        "b2ec992c",
+        "3190dbc7",
+        "bf4573d3",
+        "5cb6b1fe"
+      ],
       "source": "goal/layer-split branch",
       "reachable": "cpu",
       "expected_lane": "L0",
       "expected_failing_surface": "tiny full-stack: guided/tool constraint decoding scenario",
-      "repro_patch": null,
-      "patch_status": "pending"
+      "repro_patch": "patches/hb-03.patch",
+      "patch_status": "ready",
+      "notes": "Patch is the clean reverse of 5cb6b1fe (premature guided force-EOS); one defect of the 4-commit series is sufficient for the scenario to kill."
     },
     {
       "id": "hb-04",
       "title": "tool constraints not enforcing full logits",
       "kind": "revert-fix",
-      "fix_commits": ["fd8e99e0"],
+      "fix_commits": [
+        "fd8e99e0"
+      ],
       "source": "goal/layer-split branch",
       "reachable": "cpu",
       "expected_lane": "L0",
       "expected_failing_surface": "tiny full-stack: guided/tool constraint decoding scenario",
-      "repro_patch": null,
-      "patch_status": "pending"
+      "repro_patch": "patches/hb-04.patch",
+      "patch_status": "ready",
+      "notes": "Patch weakens requires_full_logits_for_sampling (removes the JsonSchema clause) — the silent-bypass class the fix's pinned test covers."
     },
     {
       "id": "hb-05",
       "title": "forced tool argument strings unbounded",
       "kind": "revert-fix",
-      "fix_commits": ["e7badefc"],
+      "fix_commits": [
+        "e7badefc"
+      ],
       "source": "goal/layer-split branch",
       "reachable": "cpu",
       "expected_lane": "L0",
       "expected_failing_surface": "in-process OpenAI wire: tool-call argument bound scenario",
-      "repro_patch": null,
-      "patch_status": "pending"
+      "repro_patch": "patches/hb-05.patch",
+      "patch_status": "ready",
+      "notes": "Sampler-side bound removal in schema_to_regex; the server-side maxLength injection becomes inert."
     },
     {
       "id": "hb-06",
       "title": "/v1/models empty; empty messages returns 200; custom stop leaks stop char; greedy non-deterministic",
       "kind": "revert-fix",
-      "fix_commits": [],
-      "source": "PR #8 server smoke findings (memory 2026-05-19); fix commits to be located in stage 0 patch derivation",
+      "fix_commits": [
+        "0a678e87",
+        "809cc9c4",
+        "3fcd4b5d",
+        "6468c347"
+      ],
+      "source": "PR #8 server smoke findings; fixes landed 2026-05-19 as bug #1-4/5 series (#201-#204)",
       "reachable": "cpu",
       "expected_lane": "L0",
       "expected_failing_surface": "in-process OpenAI wire scenarios: /v1/models non-empty, empty-messages 400, stop leak, greedy determinism",
-      "repro_patch": null,
-      "patch_status": "pending"
+      "repro_patch": "patches/hb-06.patch",
+      "patch_status": "ready",
+      "notes": "Patch re-introduces the two wire-level defects (/v1/models empty list, empty-messages 400 removed); stop-leak and greedy-determinism defects are covered by scenario assertions rather than this patch."
     },
     {
       "id": "hb-07",
       "title": "missing per-item fallback when supports_varlen_qkv()=false",
       "kind": "revert-fix",
-      "fix_commits": ["fbdfcfe2"],
+      "fix_commits": [
+        "fbdfcfe2"
+      ],
       "source": "PR #159",
       "reachable": "cpu",
       "expected_lane": "L0",
       "expected_failing_surface": "capability-fallback law: CPU all-optional-caps-off full-stack run",
-      "repro_patch": null,
-      "patch_status": "pending"
+      "repro_patch": "patches/hb-07.patch",
+      "patch_status": "ready",
+      "notes": "Forward-translation: capability gate + per-item fallback collapsed back to unconditional varlen dispatch; panics on Metal/CPU batched paged decode."
     },
     {
       "id": "hb-08",
       "title": "paged_batch_* scratch not re-initialized after ensure_scratch realloc",
       "kind": "revert-fix",
-      "fix_commits": ["4701cc84"],
+      "fix_commits": [
+        "4701cc84"
+      ],
       "source": "PR #155",
       "reachable": "cpu",
       "expected_lane": "L0",
       "expected_failing_surface": "tiny full-stack: KV capacity boundary scenario (scratch growth across batches)",
-      "repro_patch": null,
-      "patch_status": "pending",
-      "notes": "May not reproduce at tiny shapes; exemption candidate per acceptance.exemption_rule."
+      "repro_patch": "patches/hb-08.patch",
+      "patch_status": "ready",
+      "notes": "May not reproduce at tiny shapes; exemption candidate per acceptance.exemption_rule. Llama-family re-init removal only (qwen3_moe left intact); canonical trigger is scratch growth across batches."
     },
     {
       "id": "hb-09",
@@ -120,13 +149,16 @@
       "id": "hb-10",
       "title": "vllm-moe-marlin packing mismatch / CUDA 13 template garbage output",
       "kind": "revert-fix",
-      "fix_commits": ["049b3a42"],
+      "fix_commits": [
+        "049b3a42"
+      ],
       "source": "session-2026-05-26 + PR #216 (241dbc0f is the branch-side commit, not an ancestor of main)",
       "reachable": "cuda",
       "expected_lane": "L1-cuda",
       "expected_failing_surface": "CUDA reference_match fingerprint + gptq_marlin_linear op parity",
-      "repro_patch": null,
-      "patch_status": "pending"
+      "repro_patch": "patches/hb-10.patch",
+      "patch_status": "ready",
+      "notes": "Kernel Pass-3 writes raw pair index again; kill test must exercise FERRUM_VLLM_MOE=1 with pair-ids OFF (pair-ids kernel is a separate, untouched path)."
     },
     {
       "id": "hb-11",
