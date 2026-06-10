@@ -18,6 +18,7 @@
     {
       "id": "qwen3-moe",
       "platforms": {
+        "metal": "PASS",
         "cuda": "PASS"
       }
     },
@@ -53,5 +54,7 @@
       }
     }
   ],
-  "_note": "Metal 7/8 verified this session (3 LLM chats + 4 load smokes); qwen3-moe metal pending 16GB disk. CUDA 4/4 from pod evidence."
+  "_metal_source": "derived from evidence/final/metal-matrix/<id>.log (LLM cells = 3-turn chat exit0+coherent; smoke cells = ferrum pull)",
+  "_cuda_source": "evidence/cuda-validation-20260610.md (RTX 4090 pod 40361123)",
+  "_note": "qwen3-moe metal smoke ran the local Qwen3-30B-A3B-Q4_K_M.gguf (same MoE arch); CUDA cell used the manifest GPTQ-Int4"
 }
