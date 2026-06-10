@@ -28,11 +28,25 @@ TEST_ARCH GOAL PASS: <out_dir>
 | Stage | State |
 | --- | --- |
 | 0 baseline + tooling | done |
-| 1 tiny-model full-stack suite | substantially done (hb-07 deferred to stage 2) |
-| 2 op conformance matrix + fallback law | pending |
-| 3 main-path decoupling | pending |
-| 4 regression tiers + README matrix | pending |
-| 5 kill-rate + stability + final PASS | pending |
+| 1 tiny-model full-stack suite | done (hb-07 deferred) |
+| 2 op conformance matrix + fallback law | partial — manifest 4/20 reconciled, Llama fallback law done; 16 op parity + MoE fallback + launch-plan pending (need Metal/CUDA) |
+| 3 main-path decoupling | pending (hot-path refactor; needs Metal fingerprint to de-risk) |
+| 4 regression tiers + README matrix | partial — manifest + README guard + explosion-radius classifier done (local); lane wiring + matrix RUN pending (need GPU) |
+| 5 kill-rate + stability + final PASS | partial — new-test anti-flake 10/10+5/5 green; CUDA kills + full lanes pending (need pod) |
+
+## What needs GPU vs what is done locally
+
+Done locally (zero GPU): all of stage 0/1, the conformance manifest
+reconciliation, the Llama capability-fallback law, the README manifest +
+drift guard + explosion-radius router, and new-test stability evidence.
+
+Needs a GPU host to finish (cannot be done on this Mac):
+- Op parity RUNS for Metal (`--features metal`, Mac GPU) and CUDA (pod).
+- hb-09 / hb-10 / hb-11 CUDA kill verification (L1-cuda batch).
+- L1-cuda lane wiring into `run_gate.py` and the matrix RUN (Gate C3/C4).
+- Stage-3 decoupling is local but should land with Metal-fingerprint
+  evidence (a `--features metal` build) before the hot-path capability
+  branches move, per the GOAL's behavior-invariance requirement.
 
 ## Stage 1 Detail
 
