@@ -191,7 +191,8 @@
         "abs": 0.0,
         "initial": false
       },
-      "covered_today": false
+      "covered_today": true,
+      "module": "argmax_rows"
     },
     {
       "id": "activation_bridge",
