@@ -197,7 +197,10 @@ def validate_conformance(
         if not isinstance(tol, dict) or "rel" not in tol or "abs" not in tol:
             raise ValidationError(f"conformance manifest: op {op_id} missing tolerance")
         if op.get("covered_today"):
-            module = repo_root / OP_DIFF_DIR / f"{op_id}.rs"
+            # `module` names the op_diff file stem (decoupled from op id);
+            # falls back to the op id when omitted.
+            stem = op.get("module", op_id)
+            module = repo_root / OP_DIFF_DIR / f"{stem}.rs"
             if not module.exists():
                 raise ValidationError(
                     f"conformance manifest: op {op_id} marked covered but"
