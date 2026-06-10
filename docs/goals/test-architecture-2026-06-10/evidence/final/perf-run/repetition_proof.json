@@ -1,0 +1,1 @@
+{"prompt":"continue 2D/3D 2D/3D...","repeat_penalty_1.0_2d3d_repeats":25,"repeat_penalty_1.1_2d3d_repeats":1,"model":"Qwen3-30B-A3B-GPTQ-Int4 RTX 4090 pod","conclusion":"greedy+repeat_penalty=1.0 loops deterministically; 1.1 (new default) breaks it"}

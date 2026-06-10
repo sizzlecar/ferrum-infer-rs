@@ -2,7 +2,30 @@
 
 Last updated: 2026-06-10.
 
-## ✅ COMPLETE — TEST_ARCH GOAL PASS
+## ✅ COMPLETE — TEST_ARCH GOAL PASS (+ perf-regression gate added)
+
+### Follow-up: CUDA MoE perf fix + Gate C7 (PR #231, merged)
+
+A user-found perf regression exposed the one gap in this goal: the gates
+verified coherence + exit0 but NOT throughput. `ferrum run` on
+Qwen3-30B-A3B-GPTQ-Int4 ran the slow host-route MoE at 9.7 tok/s instead of
+~59 — and the matrix passed it. Root cause was three stacked pre-existing bugs
+(NOT the goal's migration: pre-migration default is also 9.7):
+1. auto_config gated FERRUM_VLLM_MOE on is_m3_preset() (ferrum run uses the
+   serving-default workload) → broadened to a capability check (cuda + MoE +
+   gptq/int4 + vllm_moe_marlin compiled).
+2. auto_config.resolve() returned runtime_config as a bare input clone, so the
+   resolved knob was a decision only, never a config entry → now upserts it.
+3. ferrum run applied the raw snapshot, not the resolved auto-config → now
+   materializes + applies the resolved config like serve.
+Pod-verified: default ferrum run 9.5 → 54.3 tok/s, coherent.
+
+**Gate C7** closes the gap: the matrix records per-cell tok/s and the validator
+fails any cell below a committed floor (`perf_floors.json`). Proven to catch
+the regression (cuda qwen3-moe 9.7 < 40 floor → FAIL). The final validate now
+passes WITH the perf gate active.
+
+
 
 ```text
 validated at sha c5e9f710
