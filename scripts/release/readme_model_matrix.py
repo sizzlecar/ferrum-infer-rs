@@ -119,6 +119,28 @@ def regression_plan(manifest: dict) -> dict:
     return {"schema_version": 1, "cells": plan}
 
 
+# A short substring repeated back-to-back more than this many times is a token
+# loop, not natural text (the greedy "2D/3D 2D/3D..." degeneration a user hit).
+# Must be *consecutive*: markdown/log noise repeats scattered substrings a lot,
+# but only a real loop repeats one back-to-back. Conservative — the primed loop
+# hit ~25 consecutive; normal prose/markdown stays in the low single digits.
+DEGENERATION_MAX_REPEAT = 10
+
+
+def max_substr_repeat(text: str, min_len: int = 2, max_len: int = 12) -> int:
+    """Longest back-to-back run of any short substring, after collapsing
+    whitespace. CJK+latin loop detector that ignores scattered markdown/log
+    repetition (only consecutive repeats count)."""
+    import re
+
+    collapsed = "".join(text.split())
+    best = 0
+    for mlen in range(min_len, max_len + 1):
+        for match in re.finditer(r"(.{%d})\1+" % mlen, collapsed):
+            best = max(best, len(match.group(0)) // mlen)
+    return best
+
+
 def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) -> dict:
     """Execute the regression plan for one platform via the ferrum binary.
 
@@ -158,9 +180,20 @@ def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) ->
                 if proc.returncode != 0:
                     status, detail = "FAIL", f"pull exit {proc.returncode}"
             else:
-                turns = "你好\n介绍一下你自己\n讲个短笑话\n"
+                # Longer multi-turn generation than a one-liner so token-loop
+                # degeneration (the greedy "2D/3D 2D/3D..." class) can surface
+                # and be caught by the degeneration check below — the matrix's
+                # old 32-token 3-turn smoke was too short to ever trip it.
+                turns = (
+                    "你好\n介绍一下你自己\n"
+                    "详细列举 Rust 的主要应用场景，每个场景举几个真实开源项目。\n"
+                )
+                # large_gpu models (the 30B) run ~0.1 tok/s on Metal — a long
+                # generation would blow the timeout — so keep them short there.
+                # Fast models generate long enough for token loops to surface.
+                max_tokens = "48" if cell.get("tier") == "large_gpu" else "160"
                 proc = subprocess.run(
-                    [ferrum_bin, "run", model, "--max-tokens", "32"],
+                    [ferrum_bin, "run", model, "--max-tokens", max_tokens],
                     input=turns,
                     capture_output=True,
                     text=True,
@@ -174,6 +207,8 @@ def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) ->
                     status, detail = "FAIL", "empty output"
                 elif any(m in out for m in leak_markers):
                     status, detail = "FAIL", "template/garbage marker leaked"
+                elif max_substr_repeat(out) > DEGENERATION_MAX_REPEAT:
+                    status, detail = "FAIL", "degenerate repetition (token loop)"
         except subprocess.TimeoutExpired:
             status, detail = "FAIL", "timeout"
         except Exception as exc:  # noqa: BLE001
