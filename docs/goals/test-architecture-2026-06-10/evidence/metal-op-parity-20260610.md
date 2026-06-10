@@ -31,3 +31,11 @@ CUDA column for these ops still needs a pod (L1-cuda batch).
 consecutively: **10/10 green**. Deterministic by construction (greedy
 tiny-model decode + fixed-seed op inputs). Satisfies the Gate C5
 l1_metal 10/10 requirement.
+
+## CUDA op-parity (pod 40361123, RTX 4090)
+
+`cargo test -p ferrum-testkit --features cuda --test op_diff` on a real
+RTX 4090 (driver 580.95.05, CUDA toolkit 12.4): **15/15 tests pass**,
+CPU-vs-CUDA NMSE ~1e-7 for all covered ops (rms_norm 1.25e-7, gemm
+1.14e-7, qk_norm_rope 3e-8..1.7e-7, transpose 3.9e-8, fused_add_rms_norm
+1.18e-7). The 10 covered ops are now CPU+Metal+CUDA verified.
