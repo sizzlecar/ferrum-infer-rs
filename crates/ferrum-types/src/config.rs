@@ -7,6 +7,22 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
+/// Engine runtime knobs the CLI/autosizer resolves and injects via the
+/// runtime-config snapshot. The continuous engine reads these from the typed
+/// config instead of `std::env::vars()`, so the env bridge stays at the
+/// composition root and tests can vary the knobs per `EngineConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeKnobs {
+    pub kv_capacity: Option<usize>,
+    pub max_model_len: Option<usize>,
+    pub chunked_prefill_size: Option<usize>,
+    pub batch_decode_prof: bool,
+    pub next_batch_prof: bool,
+    pub rbd_prof: bool,
+    pub unified_post_prof: bool,
+    pub prefix_cache_enabled: bool,
+}
+
 /// Engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EngineConfig {
@@ -18,6 +34,8 @@ pub struct EngineConfig {
     pub memory: MemoryConfig,
     pub batching: BatchConfig,
     pub monitoring: MonitoringConfig,
+    #[serde(default)]
+    pub runtime: RuntimeKnobs,
 }
 
 impl EngineConfig {
@@ -38,6 +56,32 @@ impl EngineConfig {
             self.scheduler.max_running_requests =
                 parse_required_positive_usize("FERRUM_PAGED_MAX_SEQS", value)?;
         }
+        // Engine runtime knobs (previously read by the engine from env). The
+        // CLI/autosizer resolves these into the snapshot; the engine reads the
+        // typed `runtime` field instead of `std::env::vars()`.
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_KV_CAPACITY") {
+            self.runtime.kv_capacity =
+                Some(parse_required_positive_usize("FERRUM_KV_CAPACITY", value)?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_MAX_MODEL_LEN") {
+            self.runtime.max_model_len =
+                Some(parse_required_positive_usize("FERRUM_MAX_MODEL_LEN", value)?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
+            self.runtime.chunked_prefill_size =
+                parse_usize_env_value(value).ok().filter(|&v| v > 0);
+        }
+        self.runtime.batch_decode_prof |=
+            runtime_config_value(snapshot, "FERRUM_BATCH_DECODE_PROF").is_some();
+        self.runtime.next_batch_prof |=
+            runtime_config_value(snapshot, "FERRUM_NEXT_BATCH_PROF").is_some();
+        self.runtime.rbd_prof |= runtime_config_value(snapshot, "FERRUM_RBD_PROF").is_some();
+        self.runtime.unified_post_prof |=
+            runtime_config_value(snapshot, "FERRUM_UNIFIED_POST_PROF").is_some();
+        self.runtime.prefix_cache_enabled |=
+            runtime_config_value(snapshot, "FERRUM_WHOLE_PROMPT_PREFIX_CACHE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         Ok(())
     }
 }

@@ -1,19 +1,18 @@
 {
   "schema_version": 1,
   "generated_by": "scripts/release/test_arch_goal_gate.py --baseline",
-  "base_sha": "9324e4a37990e30ed8e87f9b495165a2f56d1bb7",
+  "base_sha": "da2af1b0df8290864ca989e9a71a40750bc1f34d",
   "dirty_worktree": true,
   "scan_method": "line-level regex over non-test .rs files under crates/ferrum-models/src/models and crates/ferrum-engine/src; comment-only lines skipped; #[cfg(test)] blocks not excluded",
   "counts": {
     "env_var": {
-      "total": 7,
+      "total": 6,
       "by_scope": {
         "models": 4,
-        "engine": 3
+        "engine": 2
       },
       "files": [
         "crates/ferrum-engine/src/builder.rs",
-        "crates/ferrum-engine/src/continuous_engine.rs",
         "crates/ferrum-engine/src/registry.rs",
         "crates/ferrum-models/src/models/llama_family.rs",
         "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
@@ -66,7 +65,7 @@
   "allowlist_entries": 3,
   "conformance": {
     "total_ops": 20,
-    "covered_ops": 9,
+    "covered_ops": 20,
     "covered_ids": [
       "rms_norm",
       "fused_add_rms_norm",
@@ -74,9 +73,20 @@
       "gemm_f16",
       "qk_norm_rope",
       "split_qkv",
+      "flash_attention",
       "residual_add",
       "fused_silu_mul",
-      "transpose_head_to_token"
+      "argmax_rows_f16",
+      "activation_bridge",
+      "transpose_head_to_token",
+      "kv_cache_append",
+      "paged_qkv_append",
+      "paged_decode_attention",
+      "paged_varlen_attention",
+      "moe_route_topk_softmax",
+      "moe_align_block_size",
+      "moe_combine",
+      "gptq_marlin_linear"
     ]
   },
   "historical_bugs": {
