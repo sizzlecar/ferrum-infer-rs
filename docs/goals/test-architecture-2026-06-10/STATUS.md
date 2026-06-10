@@ -2,11 +2,24 @@
 
 Last updated: 2026-06-10.
 
-This goal is not complete. Completion still requires the final validator to print:
+## ✅ COMPLETE — TEST_ARCH GOAL PASS
 
 ```text
-TEST_ARCH GOAL PASS: <out_dir>
+validated at sha c5e9f710
+TEST_ARCH GOAL PASS: docs/goals/test-architecture-2026-06-10/evidence/final
 ```
+
+All gates green: A (env/cfg/supports/OnceLock = 0), B (scenarios 10/10 +
+kills 9/9), C (L0 10/10 @ 0.45s; Metal matrix 8/8; CUDA matrix 4/4; L1-metal
+81s/10-10; L1-cuda cold 1906s/warm 18s/3-3 on RTX 4090 pod 40361123;
+explosion-radius classifier). Aggregation artifacts in `evidence/final/`.
+
+The migration that unblocked the goal — env/supports/OnceLock decoupling —
+resolved backend caps + runtime knobs at construction (capability-fallback
+law), so model/engine hot paths read typed `self.*` fields and the env bridge
+sits at one composition root (`apply_runtime_config_snapshot` +
+`active_runtime_snapshot`). Real inference preserved on CPU (tiny_stack),
+Metal (8 models incl. 30B-A3B GGUF), and CUDA (pod).
 
 ## Current State
 
