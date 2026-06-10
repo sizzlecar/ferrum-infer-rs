@@ -1,0 +1,23 @@
+diff --git a/crates/ferrum-engine/src/continuous_engine.rs b/crates/ferrum-engine/src/continuous_engine.rs
+index 5e9ab083..dd85193d 100644
+--- a/crates/ferrum-engine/src/continuous_engine.rs
++++ b/crates/ferrum-engine/src/continuous_engine.rs
+@@ -635,17 +635,9 @@ impl SequenceState {
+     }
+ 
+     pub fn requires_full_logits_for_sampling(&self) -> bool {
+-        use ferrum_types::ResponseFormat;
+-
+         let needs_sampling_masks = !self.forbidden_token_ids.is_empty()
+             || (self.generated_tokens.is_empty() && !self.initial_forbidden_token_ids.is_empty());
+-        self.json_processor.is_some()
+-            || self.regex_processor.is_some()
+-            || matches!(
+-                self.sampling_params.response_format,
+-                ResponseFormat::JsonSchema(_)
+-            )
+-            || needs_sampling_masks
++        self.json_processor.is_some() || self.regex_processor.is_some() || needs_sampling_masks
+     }
+ 
+     pub fn reset_guided_processors(&self) -> Result<()> {

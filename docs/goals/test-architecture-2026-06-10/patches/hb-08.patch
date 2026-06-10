@@ -1,0 +1,19 @@
+diff --git a/crates/ferrum-models/src/models/llama_family.rs b/crates/ferrum-models/src/models/llama_family.rs
+index a22c0643..560c1019 100644
+--- a/crates/ferrum-models/src/models/llama_family.rs
++++ b/crates/ferrum-models/src/models/llama_family.rs
+@@ -1065,14 +1065,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
+             self.unified_graph_keys_seen.clear();
+             self.unified_graph_warmup = 0;
+             self.unified_graph_failed = false;
+-            // Realloc wiped paged_batch_*. Re-enable using the dims
+-            // pinned at first ensure_kv. Without this, the next
+-            // `forward_layer_batched_decode` panics on
+-            // `paged_batch_block_tables missing`.
+-            if let Some((max_seqs, max_blocks_per_seq)) = self.paged_dims {
+-                self.scratch
+-                    .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+-            }
+         }
+     }
+ 

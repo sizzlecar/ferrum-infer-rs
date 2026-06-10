@@ -1,0 +1,43 @@
+diff --git a/crates/ferrum-sampler/src/schema_to_regex.rs b/crates/ferrum-sampler/src/schema_to_regex.rs
+index de616e4f..8971fa55 100644
+--- a/crates/ferrum-sampler/src/schema_to_regex.rs
++++ b/crates/ferrum-sampler/src/schema_to_regex.rs
+@@ -54,7 +54,7 @@ fn translate(node: &Value) -> Result<String> {
+ 
+     let ty = node.get("type").and_then(|v| v.as_str());
+     match ty {
+-        Some("string") => string_pattern(node),
++        Some("string") => Ok(r#""[^"]*""#.to_string()),
+         Some("integer") => Ok(r"-?\d+".to_string()),
+         Some("number") => Ok(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?".to_string()),
+         Some("boolean") => Ok("(?:true|false)".to_string()),
+@@ -70,29 +70,6 @@ fn translate(node: &Value) -> Result<String> {
+     }
+ }
+ 
+-fn string_pattern(node: &Value) -> Result<String> {
+-    const MAX_SUPPORTED_STRING_LENGTH: u64 = 1024;
+-    let min = node.get("minLength").and_then(Value::as_u64).unwrap_or(0);
+-    let max = node.get("maxLength").and_then(Value::as_u64);
+-    if let Some(max) = max {
+-        if max > MAX_SUPPORTED_STRING_LENGTH {
+-            return Err(FerrumError::invalid_request(format!(
+-                "response_format string maxLength {max} exceeds supported limit {MAX_SUPPORTED_STRING_LENGTH}"
+-            )));
+-        }
+-        if min > max {
+-            return Err(FerrumError::invalid_request(format!(
+-                "response_format string minLength {min} exceeds maxLength {max}"
+-            )));
+-        }
+-        return Ok(format!(r#""[^"]{{{min},{max}}}""#));
+-    }
+-    if min > 0 {
+-        return Ok(format!(r#""[^"]{{{min},}}""#));
+-    }
+-    Ok(r#""[^"]*""#.to_string())
+-}
+-
+ fn enum_pattern(values: &[Value]) -> Result<String> {
+     if values.is_empty() {
+         return Err(FerrumError::invalid_request(
