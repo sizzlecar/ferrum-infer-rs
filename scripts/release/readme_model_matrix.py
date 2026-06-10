@@ -127,6 +127,7 @@ def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) ->
     smoke + fingerprint are recorded as steps but the multi-turn generate is
     the gating check. Writes <out_dir>/matrix.json the final validator reads.
     """
+    import re
     import subprocess
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -177,13 +178,30 @@ def run_matrix(manifest: dict, ferrum_bin: str, out_dir: Path, platform: str) ->
             status, detail = "FAIL", "timeout"
         except Exception as exc:  # noqa: BLE001
             status, detail = "FAIL", str(exc)[:80]
-        rows.append({"id": cell["id"], "platform": platform, "status": status, "detail": detail})
+        # Decode throughput for the Gate C7 perf floor (LLM chat cells only;
+        # ferrum prints "[N tokens, X tok/s, Ys]" — on stderr in practice).
+        tok_s = None
+        if not smoke_only and log.exists():
+            mt = re.search(r"([0-9.]+)\s*tok/s", log.read_text(encoding="utf-8", errors="replace"))
+            if mt:
+                tok_s = float(mt.group(1))
+        rows.append(
+            {
+                "id": cell["id"],
+                "platform": platform,
+                "status": status,
+                "detail": detail,
+                "tok_s": tok_s,
+            }
+        )
 
-    # collate into per-model platform status the gate expects
+    # collate into per-model platform status + perf the gate expects
     by_model: dict[str, dict] = {}
     for r in rows:
-        by_model.setdefault(r["id"], {"id": r["id"], "platforms": {}})
+        by_model.setdefault(r["id"], {"id": r["id"], "platforms": {}, "perf": {}})
         by_model[r["id"]]["platforms"][r["platform"]] = r["status"]
+        if r.get("tok_s") is not None:
+            by_model[r["id"]]["perf"][r["platform"]] = r["tok_s"]
     result = {"schema_version": 1, "platform": platform, "models": list(by_model.values())}
     (out_dir / "matrix.json").write_text(json.dumps(result, indent=2))
     return result
