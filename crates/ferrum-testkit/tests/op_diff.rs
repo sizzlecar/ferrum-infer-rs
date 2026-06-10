@@ -13,9 +13,36 @@
 //! harness still runs and produces a sensible reference output.
 
 use ferrum_testkit::op_diff::{
-    compare_backends, gemm::GemmOp, qk_norm_rope::QkNormRopeOp, rms_norm::RmsNormOp,
+    compare_backends, fused_add_rms_norm::FusedAddRmsNormOp, gemm::GemmOp,
+    qk_norm_rope::QkNormRopeOp, residual_add::ResidualAddOp, rms_norm::RmsNormOp,
     silu_mul::SiluMulOp, NMSE_FP16_TOL,
 };
+
+#[test]
+fn residual_add_small_shape() {
+    let op = ResidualAddOp { len: 4 * 256 };
+    let report = compare_backends(&op, 7);
+    assert_eq!(report.cpu.len(), op.len);
+    assert!(
+        report.cpu.iter().any(|&x| x != 0.0),
+        "CPU reference output is all zeros — harness misconfigured"
+    );
+    check_accelerator_tolerance(&report, NMSE_FP16_TOL);
+}
+
+#[test]
+fn fused_add_rms_norm_small_shape() {
+    let op = FusedAddRmsNormOp {
+        tokens: 4,
+        dim: 256,
+        eps: 1e-6,
+    };
+    let report = compare_backends(&op, 31);
+    // Output is [residual_after, out] concatenated.
+    assert_eq!(report.cpu.len(), 2 * op.tokens * op.dim);
+    assert!(report.cpu.iter().any(|&x| x != 0.0));
+    check_accelerator_tolerance(&report, NMSE_FP16_TOL);
+}
 
 #[test]
 fn rms_norm_small_shape() {

@@ -38,7 +38,8 @@
         "abs": 0.002,
         "initial": true
       },
-      "covered_today": false
+      "covered_today": true,
+      "module": "fused_add_rms_norm"
     },
     {
       "id": "embedding_lookup",
@@ -151,7 +152,8 @@
         "abs": 0.001,
         "initial": true
       },
-      "covered_today": false
+      "covered_today": true,
+      "module": "residual_add"
     },
     {
       "id": "fused_silu_mul",
