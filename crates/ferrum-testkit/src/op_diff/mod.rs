@@ -27,6 +27,7 @@
 //! Tighter bucketing per op is welcome — define op-specific constants
 //! once empirical baselines are stable.
 
+pub mod embedding_lookup;
 pub mod fused_add_rms_norm;
 pub mod gemm;
 pub mod marlin_matmul; // stub — see file docs
@@ -35,6 +36,8 @@ pub mod qk_norm_rope;
 pub mod residual_add;
 pub mod rms_norm;
 pub mod silu_mul;
+pub mod split_qkv;
+pub mod transpose_head_to_token;
 
 /// fp32 kernels — should agree with CPU below this.
 pub const NMSE_FP32_TOL: f64 = 1e-7;
