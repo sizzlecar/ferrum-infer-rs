@@ -1,0 +1,21 @@
+{
+  "cmd": [
+    "/usr/bin/python3",
+    "scripts/release/release_binary_gate.py",
+    "cuda-tarball",
+    "--version",
+    "0.7.7",
+    "--out",
+    "docs/release/g0/0.7.7/cuda-tarball",
+    "--asset-path",
+    "/workspace/assets/ferrum-linux-x86_64-cuda-sm89.tar.gz",
+    "--model",
+    "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+    "--model-name",
+    "Qwen3-30B-A3B-GPTQ-Int4"
+  ],
+  "duration_sec": 41.49230238201562,
+  "env_overrides": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

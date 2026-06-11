@@ -1,0 +1,51 @@
+{
+  "artifact_dir": "docs/release/g0/0.7.7/metal-tarball",
+  "binary": {
+    "path": null,
+    "sha256": null
+  },
+  "child_pass_line": "METAL TARBALL GATE PASS: docs/release/g0/0.7.7/metal-tarball",
+  "child_returncode": 0,
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/run_gate.py",
+    "metal-tarball",
+    "--version",
+    "0.7.7",
+    "--asset-path",
+    "docs/release/g0/0.7.7/staging-assets/release-27322758598/ferrum-macos-aarch64-v0.7.7/ferrum-macos-aarch64.tar.gz",
+    "--out",
+    "docs/release/g0/0.7.7/metal-tarball",
+    "--timeout",
+    "900"
+  ],
+  "delegated_command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/release_binary_gate.py",
+    "metal-tarball",
+    "--version",
+    "0.7.7",
+    "--out",
+    "docs/release/g0/0.7.7/metal-tarball",
+    "--asset-path",
+    "docs/release/g0/0.7.7/staging-assets/release-27322758598/ferrum-macos-aarch64-v0.7.7/ferrum-macos-aarch64.tar.gz"
+  ],
+  "dirty_status": {
+    "is_dirty": true,
+    "status_short": [
+      "?? docs/release/g0/0.7.7/metal-tarball/",
+      "?? docs/release/g0/0.7.7/staging-assets/"
+    ]
+  },
+  "duration_sec": 168.41619312530383,
+  "error": null,
+  "finished_at": "2026-06-11T12:10:59.481894+08:00",
+  "git_sha": "8e321deb806eeb878136dd3a4e2ff6ea87ff2d87",
+  "lane": "metal-tarball",
+  "model": null,
+  "pass_line": "FERRUM GATE metal-tarball PASS: docs/release/g0/0.7.7/metal-tarball",
+  "sanitized_env": {},
+  "schema_version": 1,
+  "started_at": "2026-06-11T12:08:11.070349+08:00",
+  "status": "pass"
+}

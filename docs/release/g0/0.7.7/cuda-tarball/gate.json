@@ -1,0 +1,36 @@
+{
+  "status": "pass",
+  "mode": "cuda-tarball",
+  "version": "0.7.7",
+  "checks": {
+    "version": true,
+    "cli": {
+      "passed": true,
+      "has_context": true,
+      "has_math": true
+    },
+    "serve": {
+      "math": [
+        200,
+        "579"
+      ],
+      "multiturn": [
+        200,
+        "ferrum-blue"
+      ],
+      "boundary_status": 400,
+      "strict_json": [
+        200,
+        "{\"answer\": 579}"
+      ],
+      "tool_call": [
+        200,
+        "tool_calls"
+      ],
+      "stream": [
+        200,
+        1
+      ]
+    }
+  }
+}
