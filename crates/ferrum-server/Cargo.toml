@@ -23,6 +23,7 @@ pin-project = "1.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 minijinja = { version = "2.20", features = ["json"] }
+minijinja-contrib = { version = "2.20", features = ["pycompat"] }
 regex-lite = "0.1"
 
 # Error handling

@@ -1603,6 +1603,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mime",
  "minijinja",
+ "minijinja-contrib",
  "pin-project",
  "regex-lite",
  "reqwest",
@@ -3023,6 +3024,16 @@ dependencies = [
  "memo-map",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "2.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "99df5123c54391e2a228014c1dbbd85a3dab08a25e776c810526f2f47542b3de"
+dependencies = [
+ "minijinja",
+ "serde",
 ]
 
 [[package]]
