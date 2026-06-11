@@ -1,0 +1,60 @@
+{
+  "artifact_dir": "docs/release/g0/0.7.7/cuda-tarball",
+  "binary": {
+    "path": null,
+    "sha256": null
+  },
+  "child_pass_line": "CUDA TARBALL GATE PASS: docs/release/g0/0.7.7/cuda-tarball",
+  "child_returncode": 0,
+  "command_line": [
+    "/usr/bin/python3",
+    "scripts/release/run_gate.py",
+    "cuda-tarball",
+    "--version",
+    "0.7.7",
+    "--asset-path",
+    "/workspace/assets/ferrum-linux-x86_64-cuda-sm89.tar.gz",
+    "--model",
+    "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+    "--model-name",
+    "Qwen3-30B-A3B-GPTQ-Int4",
+    "--out",
+    "docs/release/g0/0.7.7/cuda-tarball",
+    "--timeout",
+    "1200"
+  ],
+  "delegated_command_line": [
+    "/usr/bin/python3",
+    "scripts/release/release_binary_gate.py",
+    "cuda-tarball",
+    "--version",
+    "0.7.7",
+    "--out",
+    "docs/release/g0/0.7.7/cuda-tarball",
+    "--asset-path",
+    "/workspace/assets/ferrum-linux-x86_64-cuda-sm89.tar.gz",
+    "--model",
+    "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+    "--model-name",
+    "Qwen3-30B-A3B-GPTQ-Int4"
+  ],
+  "dirty_status": {
+    "is_dirty": true,
+    "status_short": [
+      "?? docs/release/g0/0.7.7/cuda-tarball/"
+    ]
+  },
+  "duration_sec": 41.492827587993816,
+  "error": null,
+  "finished_at": "2026-06-11T05:01:58.723224+00:00",
+  "git_sha": "8e321deb806eeb878136dd3a4e2ff6ea87ff2d87",
+  "lane": "cuda-tarball",
+  "model": "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
+  "pass_line": "FERRUM GATE cuda-tarball PASS: docs/release/g0/0.7.7/cuda-tarball",
+  "sanitized_env": {
+    "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+  },
+  "schema_version": 1,
+  "started_at": "2026-06-11T05:01:17.230382+00:00",
+  "status": "pass"
+}

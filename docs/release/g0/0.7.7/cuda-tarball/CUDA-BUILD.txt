@@ -1,0 +1,9 @@
+Ferrum CUDA release binary
+
+Tag: v0.7.7
+CUDA toolkit image: nvidia/cuda:12.6.0-devel-ubuntu22.04
+CUDA_COMPUTE_CAP: 89
+Cargo features: cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source
+
+This package does not bundle NVIDIA driver/runtime libraries.
+Install a compatible NVIDIA driver, CUDA runtime, and NCCL runtime on the target host.

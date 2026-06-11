@@ -1,0 +1,11 @@
+{
+  "client_id": "me",
+  "image": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+  "env": {
+    "-p 22:22": "1"
+  },
+  "disk": 220,
+  "runtype": "ssh ssh_proxy",
+  "onstart": "<onstart omitted>",
+  "label": "ferrum-0.7.7-cuda-tarball-gate"
+}

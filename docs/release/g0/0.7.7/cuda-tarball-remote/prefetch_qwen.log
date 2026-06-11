@@ -1,0 +1,6 @@
+WARNING: huggingface-hub 1.18.0 does not provide the extra 'hf_xet'
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+/usr/local/lib/python3.10/dist-packages/huggingface_hub/utils/_validators.py:205: UserWarning: The `local_dir_use_symlinks` argument is deprecated and ignored in `snapshot_download`. Downloading to a local directory does not use symlinks anymore.
+  warnings.warn(
+Fetching 11 files:   0%|          | 0/11 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 11 files:   9%|▉         | 1/11 [00:00<00:03,  2.81it/s]Fetching 11 files:  64%|██████▎   | 7/11 [02:30<01:29, 22.39s/it]Fetching 11 files: 100%|██████████| 11/11 [02:30<00:00, 13.65s/it]

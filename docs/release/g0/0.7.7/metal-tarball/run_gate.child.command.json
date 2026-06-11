@@ -1,0 +1,17 @@
+{
+  "cmd": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/release_binary_gate.py",
+    "metal-tarball",
+    "--version",
+    "0.7.7",
+    "--out",
+    "docs/release/g0/0.7.7/metal-tarball",
+    "--asset-path",
+    "docs/release/g0/0.7.7/staging-assets/release-27322758598/ferrum-macos-aarch64-v0.7.7/ferrum-macos-aarch64.tar.gz"
+  ],
+  "duration_sec": 168.40070733288303,
+  "env_overrides": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}
