@@ -13,7 +13,9 @@
     "--version",
     "0.7.7",
     "--asset-path",
-    "/workspace/assets/ferrum-linux-x86_64-cuda-sm89.tar.gz",
+    "/workspace/assets-official-0.7.7/ferrum-linux-x86_64-cuda-sm89.tar.gz",
+    "--sha256",
+    "6397de942d1c767383982186642da3990df49ea1cd6f604434a6cc9d6f7f912b",
     "--model",
     "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
     "--model-name",
@@ -32,7 +34,9 @@
     "--out",
     "docs/release/g0/0.7.7/cuda-tarball",
     "--asset-path",
-    "/workspace/assets/ferrum-linux-x86_64-cuda-sm89.tar.gz",
+    "/workspace/assets-official-0.7.7/ferrum-linux-x86_64-cuda-sm89.tar.gz",
+    "--sha256",
+    "6397de942d1c767383982186642da3990df49ea1cd6f604434a6cc9d6f7f912b",
     "--model",
     "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
     "--model-name",
@@ -41,13 +45,18 @@
   "dirty_status": {
     "is_dirty": true,
     "status_short": [
-      "?? docs/release/g0/0.7.7/cuda-tarball/"
+      "M docs/release/g0/0.7.7/cuda-tarball/cli.stderr",
+      " M docs/release/g0/0.7.7/cuda-tarball/ldd.txt",
+      " M docs/release/g0/0.7.7/cuda-tarball/run_gate.child.command.json",
+      " M docs/release/g0/0.7.7/cuda-tarball/serve.log",
+      "?? docs/release/g0/0.7.7/cuda-tarball/ferrum",
+      "?? docs/release/g0/0.7.7/cuda-tarball/ferrum-linux-x86_64-cuda-sm89.tar.gz"
     ]
   },
-  "duration_sec": 41.492827587993816,
+  "duration_sec": 40.139298769063316,
   "error": null,
-  "finished_at": "2026-06-11T05:01:58.723224+00:00",
-  "git_sha": "8e321deb806eeb878136dd3a4e2ff6ea87ff2d87",
+  "finished_at": "2026-06-11T06:00:48.322771+00:00",
+  "git_sha": "aa80d4ad091c4a5024dacd4e2cd99db9be5cc12f",
   "lane": "cuda-tarball",
   "model": "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
   "pass_line": "FERRUM GATE cuda-tarball PASS: docs/release/g0/0.7.7/cuda-tarball",
@@ -55,6 +64,6 @@
     "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
   },
   "schema_version": 1,
-  "started_at": "2026-06-11T05:01:17.230382+00:00",
+  "started_at": "2026-06-11T06:00:08.183464+00:00",
   "status": "pass"
 }

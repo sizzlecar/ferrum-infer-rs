@@ -1,0 +1,9 @@
+{
+  "status": "pass",
+  "mode": "homebrew-cuda-fetch",
+  "version": "0.7.7",
+  "checks": {
+    "fetch": true,
+    "formula_version": "0.7.7"
+  }
+}

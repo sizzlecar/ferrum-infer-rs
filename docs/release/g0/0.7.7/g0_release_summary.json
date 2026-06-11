@@ -1,0 +1,13 @@
+{
+  "status": "pass",
+  "gates": [
+    "unit/unit.gate.json",
+    "metal/metal.gate.json",
+    "cuda-full/g0_cuda4090_full.gate.json",
+    "cuda-llama-dense/g0_cuda4090_llama_dense.gate.json",
+    "metal-tarball/gate.json",
+    "cuda-tarball/gate.json",
+    "homebrew-metal/gate.json",
+    "homebrew-cuda-fetch/gate.json"
+  ]
+}

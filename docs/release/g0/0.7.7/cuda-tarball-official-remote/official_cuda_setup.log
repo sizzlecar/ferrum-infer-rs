@@ -1,0 +1,25 @@
+Cloning into '/workspace/ferrum-official-0.7.7-aa80d4ad'...
+Note: switching to 'aa80d4ad091c4a5024dacd4e2cd99db9be5cc12f'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+aa80d4ad091c4a5024dacd4e2cd99db9be5cc12f
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+ 59 29.9M   59 17.7M    0     0  14.3M      0  0:00:02  0:00:01  0:00:01 14.3M100 29.9M  100 29.9M    0     0  17.9M      0  0:00:01  0:00:01 --:--:-- 28.4M
+/workspace/assets-official-0.7.7/ferrum-linux-x86_64-cuda-sm89.tar.gz: OK
+Python 3.10.12

@@ -1,0 +1,15 @@
+{
+  "cmd": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/release_binary_gate.py",
+    "homebrew-cuda-fetch",
+    "--version",
+    "0.7.7",
+    "--out",
+    "docs/release/g0/0.7.7/homebrew-cuda-fetch"
+  ],
+  "duration_sec": 45.397115875035524,
+  "env_overrides": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

@@ -2,24 +2,24 @@
 Loading /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf...
 Using Metal backend
 Loading weights to GPU... (30s+ for >10 GB models)
-2026-06-11T04:08:12.324562Z  INFO ferrum_engine::registry: Initializing global component registry
-2026-06-11T04:08:12.324603Z  INFO ferrum_engine::registry: Registering default component factories
-2026-06-11T04:08:12.324753Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
-2026-06-11T04:08:12.503064Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
-2026-06-11T04:08:12.503085Z  INFO ferrum_engine::registry: Creating multinomial sampler
-2026-06-11T04:08:12.503105Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
-2026-06-11T04:08:12.503147Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
-2026-06-11T04:08:12.503209Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
-Model loaded in 2.7s.
+2026-06-11T05:18:40.083645Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-11T05:18:40.083723Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-11T05:18:40.083968Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-11T05:18:40.270297Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-11T05:18:40.270328Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-11T05:18:40.270357Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-11T05:18:40.270398Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-11T05:18:40.270496Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+Model loaded in 2.3s.
 
 Ready. Type your message and press Enter.
 Use /clear to reset history; /bye or Ctrl+D to exit.
 
-[2 tokens, 0.1 tok/s, 25.5s]
+[2 tokens, 0.1 tok/s, 17.8s]
 
-[5 tokens, 0.1 tok/s, 59.3s]
+[5 tokens, 0.1 tok/s, 53.8s]
 
 History cleared.
-[4 tokens, 0.1 tok/s, 46.6s]
+[4 tokens, 0.1 tok/s, 44.1s]
 
 Goodbye!
