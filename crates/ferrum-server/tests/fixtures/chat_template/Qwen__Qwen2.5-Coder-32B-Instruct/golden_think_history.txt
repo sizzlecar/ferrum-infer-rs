@@ -1,0 +1,13 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Q1<|im_end|>
+<|im_start|>assistant
+<think>
+reasoning here
+</think>
+
+Answer1<|im_end|>
+<|im_start|>user
+Q2<|im_end|>
+<|im_start|>assistant

@@ -1,0 +1,7 @@
+{
+  "model_id": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+  "bos_token": "<｜begin▁of▁sentence｜>",
+  "eos_token": "<｜end▁of▁sentence｜>",
+  "render_kwargs": {},
+  "transformers_version": "5.11.0"
+}

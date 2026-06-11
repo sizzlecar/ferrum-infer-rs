@@ -1,0 +1,1 @@
+<｜begin▁of▁sentence｜>You are helpful.<｜User｜>Hi<｜Assistant｜><think>

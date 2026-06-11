@@ -1,0 +1,9 @@
+<|im_start|>system
+You are helpful.<|im_end|>
+<|im_start|>user
+Hi<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
