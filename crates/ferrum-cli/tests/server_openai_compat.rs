@@ -256,6 +256,7 @@ async fn test_openai_client_tools_stream_options_include_usage() {
         .expect("open tools stream");
 
     let mut content = String::new();
+    let mut tool_call_names = Vec::new();
     let mut chunk_count = 0usize;
     let mut usage_seen = false;
     while let Some(result) = stream.next().await {
@@ -268,13 +269,25 @@ async fn test_openai_client_tools_stream_options_include_usage() {
             if let Some(delta) = &choice.delta.content {
                 content.push_str(delta);
             }
+            for call in choice.delta.tool_calls.iter().flatten() {
+                if let Some(name) = call.function.as_ref().and_then(|f| f.name.as_deref()) {
+                    tool_call_names.push(name.to_string());
+                }
+            }
         }
     }
 
     assert!(chunk_count > 0, "no stream chunks parsed");
+    // This test pins the streaming *mechanics* (parsable chunks + final
+    // usage), not the model's choice: with `tool_choice=auto` a greedy
+    // 0.6B model may answer in text or call the declared tool, and that
+    // choice is prompt-byte-sensitive. Either outcome must arrive as
+    // well-formed SDK deltas.
+    let has_text = !content.trim().is_empty();
+    let has_valid_tool_call = tool_call_names.iter().any(|name| name == "get_weather");
     assert!(
-        !content.trim().is_empty(),
-        "concatenated stream content empty"
+        has_text || has_valid_tool_call,
+        "stream produced neither text content nor a valid get_weather tool call"
     );
     assert!(
         usage_seen,
