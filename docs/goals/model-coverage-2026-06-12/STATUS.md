@@ -2,6 +2,21 @@
 
 进度日志,倒序。
 
+## 2026-06-12(下午)
+
+- **T3 完成并提交(`778082a6`)**:minijinja-contrib pycompat 接入;模板渲染失败/
+  渲染为空改为硬错误(消灭静默 fallback);tools-unaware 模板改为"注入工具 spec 后
+  仍走模型模板渲染"(此前会静默丢弃工具定义)。新增 5 条防回归测试,
+  workspace 测试全绿。
+- **T2 完成(外部核查,逐仓库 config 原文)**,三个重要修正:
+  - **GLM-4.7-Flash 是 MLA 注意力**(q_lora 768/kv_lora 512)+ noaux_tc 路由 + MTP,
+    接入成本 MEDIUM→LARGE,已从 W2 移出(W2 只剩 Gemma 3 27B)。
+  - **R1-0528-Qwen3-8B 无 Marlin-clean GPTQ**(QuantTrio 版 sym=false+4/8 混合)
+    → CUDA 走 BF16 + GGUF。**Devstral 2 同样无 Marlin GPTQ** → GGUF/BF16。
+  - W1 各模型的 Marlin-clean GPTQ 仓库已逐一锁定(jart25 / OPEA / JunHowie /
+    Qwen 官方 / Intel AutoRound),写入 GOAL.md UNVERIFIED #4。
+  - Qwen3.6 无官方 GPTQ-Int4(仅 FP8);官方 GPTQ 停在 Qwen3.5 代。
+
 ## 2026-06-12
 
 - GOAL.md 建立并提交(分支 `goal/model-coverage-20260612`)。
