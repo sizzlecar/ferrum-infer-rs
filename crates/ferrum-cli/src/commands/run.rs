@@ -1234,6 +1234,32 @@ pub fn resolve_model_alias(name: &str) -> String {
         "qwen3:0.6b" => "Qwen/Qwen3-0.6B".to_string(),
         "qwen3:1.7b" => "Qwen/Qwen3-1.7B".to_string(),
         "qwen3:4b" => "Qwen/Qwen3-4B".to_string(),
+        "qwen3:14b" => "Qwen/Qwen3-14B".to_string(),
+        "qwen3:32b" => "Qwen/Qwen3-32B".to_string(),
+        // 2026-06 model-coverage W1 (docs/goals/model-coverage-2026-06-12/).
+        // GPTQ repos are the Marlin-clean picks verified in that goal doc.
+        "qwen3-coder:30b" | "qwen3-coder:30b-a3b" => {
+            "Qwen/Qwen3-Coder-30B-A3B-Instruct".to_string()
+        }
+        "qwen3-coder:30b-gptq" => "jart25/Qwen3-Coder-30B-A3B-Instruct-Int4-gptq".to_string(),
+        "qwen3:14b-gptq" => "JunHowie/Qwen3-14B-GPTQ-Int4".to_string(),
+        "qwen3:32b-gptq" => "JunHowie/Qwen3-32B-GPTQ-Int4".to_string(),
+        "deepseek-r1:8b" | "r1:8b" => "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B".to_string(),
+        "deepseek-r1:14b" | "r1:14b" => "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B".to_string(),
+        "deepseek-r1:32b" | "r1:32b" => "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B".to_string(),
+        "deepseek-r1:32b-gptq" => {
+            "OPEA/DeepSeek-R1-Distill-Qwen-32B-int4-gptq-sym-inc".to_string()
+        }
+        "qwen2.5-coder:32b" => "Qwen/Qwen2.5-Coder-32B-Instruct".to_string(),
+        "qwen2.5-coder:32b-gptq" => "Qwen/Qwen2.5-Coder-32B-Instruct-GPTQ-Int4".to_string(),
+        "qwen2.5-coder:14b" => "Qwen/Qwen2.5-Coder-14B-Instruct".to_string(),
+        "mistral-small:24b" | "mistral-small:3.2" => {
+            "mistralai/Mistral-Small-3.2-24B-Instruct-2506".to_string()
+        }
+        "devstral:24b" | "devstral:2" => {
+            "mistralai/Devstral-Small-2-24B-Instruct-2512".to_string()
+        }
+        "magistral:24b" => "mistralai/Magistral-Small-2509".to_string(),
         "qwen2.5:3b-gptq" | "qwen2.5-3b-instruct-gptq-int4" => {
             "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4".to_string()
         }
@@ -1365,6 +1391,44 @@ pub fn resolve_gguf_alias(name: &str) -> Option<(String, String)> {
         "qwen3-moe:30b-a3b-q4_k_m" | "qwen3:30b-a3b-q4_k_m" => Some((
             "Qwen/Qwen3-30B-A3B-GGUF".to_string(),
             "Qwen3-30B-A3B-Q4_K_M.gguf".to_string(),
+        )),
+        // 2026-06 model-coverage W1 aliases, verified via the HF API on
+        // 2026-06-12 (docs/goals/model-coverage-2026-06-12/).
+        "qwen3:14b-q4_k_m" => Some((
+            "Qwen/Qwen3-14B-GGUF".to_string(),
+            "Qwen3-14B-Q4_K_M.gguf".to_string(),
+        )),
+        "qwen3:32b-q4_k_m" => Some((
+            "Qwen/Qwen3-32B-GGUF".to_string(),
+            "Qwen3-32B-Q4_K_M.gguf".to_string(),
+        )),
+        "qwen3-coder:30b-q4_k_m" | "qwen3-coder:30b-a3b-q4_k_m" => Some((
+            "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF".to_string(),
+            "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf".to_string(),
+        )),
+        "deepseek-r1:8b-q4_k_m" | "r1:8b-q4_k_m" => Some((
+            "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF".to_string(),
+            "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf".to_string(),
+        )),
+        "deepseek-r1:32b-q4_k_m" | "r1:32b-q4_k_m" => Some((
+            "unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF".to_string(),
+            "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf".to_string(),
+        )),
+        "qwen2.5-coder:32b-q4_k_m" => Some((
+            "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF".to_string(),
+            "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf".to_string(),
+        )),
+        "mistral-small:24b-q4_k_m" => Some((
+            "bartowski/mistralai_Mistral-Small-3.2-24B-Instruct-2506-GGUF".to_string(),
+            "mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf".to_string(),
+        )),
+        "devstral:24b-q4_k_m" => Some((
+            "bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF".to_string(),
+            "mistralai_Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf".to_string(),
+        )),
+        "magistral:24b-q4_k_m" => Some((
+            "bartowski/mistralai_Magistral-Small-2509-GGUF".to_string(),
+            "mistralai_Magistral-Small-2509-Q4_K_M.gguf".to_string(),
         )),
         "llama3.1:8b-q4_k_m" => Some((
             "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF".to_string(),
