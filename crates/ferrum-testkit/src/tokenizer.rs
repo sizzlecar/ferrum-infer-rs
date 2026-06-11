@@ -27,6 +27,7 @@ impl MockTokenizer {
                 sep_token: None,
                 cls_token: None,
                 mask_token: None,
+                extra_eos_tokens: Vec::new(),
             },
         }
     }

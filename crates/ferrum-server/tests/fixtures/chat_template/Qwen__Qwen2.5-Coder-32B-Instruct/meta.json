@@ -1,0 +1,7 @@
+{
+  "model_id": "Qwen/Qwen2.5-Coder-32B-Instruct",
+  "bos_token": null,
+  "eos_token": "<|im_end|>",
+  "render_kwargs": {},
+  "transformers_version": "5.11.0"
+}

@@ -251,6 +251,9 @@ fn resolve_stop_conditions(
             if let Some(eos) = tok.special_tokens().eos_token {
                 ids.insert(eos.get());
             }
+            for extra in &tok.special_tokens().extra_eos_tokens {
+                ids.insert(extra.get());
+            }
             for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"] {
                 if let Some(t) = tok.token_id(name) {
                     ids.insert(t.get());
@@ -287,6 +290,9 @@ fn resolve_sampling_token_constraints(
 
     if let Some(eos) = tok.special_tokens().eos_token {
         allowed_extended.insert(eos.get());
+    }
+    for extra in &tok.special_tokens().extra_eos_tokens {
+        allowed_extended.insert(extra.get());
     }
     for text in GENERATED_CONTROL_TOKEN_TEXTS {
         if let Some(token) = tok.token_id(text) {

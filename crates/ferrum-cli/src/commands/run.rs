@@ -1052,7 +1052,7 @@ fn build_run_prompt_plan(
             model_id,
             model_template,
             chat_template_options,
-        );
+        )?;
         let prompt_tokens = budget.prompt_tokens(&prompt);
         if !fits_kv_budget(&base_sampling, prompt_tokens, budget.kv_capacity) {
             return Err(FerrumError::invalid_request(format!(
@@ -1083,7 +1083,7 @@ fn build_run_prompt_plan(
             model_id,
             model_template,
             chat_template_options,
-        );
+        )?;
         let prompt_tokens = budget.prompt_tokens(&prompt);
 
         let Some(kv_capacity) = budget.kv_capacity else {
@@ -1476,7 +1476,7 @@ fn build_chat_prompt(
     model_id: &str,
     model_template: Option<&ModelChatTemplate>,
     chat_template_options: &ChatTemplateOptions,
-) -> String {
+) -> Result<String> {
     let mut messages = Vec::new();
     if let Some(sys) = system {
         messages.push(PromptMessage::new("system", sys));
