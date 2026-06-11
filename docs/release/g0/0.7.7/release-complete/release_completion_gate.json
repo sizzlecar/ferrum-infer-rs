@@ -1,0 +1,15 @@
+{
+  "artifacts": {
+    "cuda_dense_source_gate_artifact": "docs/release/g0/0.7.7/cuda-llama-dense/gate.json",
+    "cuda_full_source_gate_artifact": "docs/release/g0/0.7.7/cuda-full/g0_cuda4090_full.gate.json",
+    "cuda_tarball_gate_artifact": "docs/release/g0/0.7.7/cuda-tarball/gate.json",
+    "homebrew_cuda_fetch_gate_artifact": "docs/release/g0/0.7.7/homebrew-cuda-fetch/gate.json",
+    "homebrew_metal_gate_artifact": "docs/release/g0/0.7.7/homebrew-metal/gate.json",
+    "metal_source_gate_artifact": "docs/release/g0/0.7.7/metal/metal.gate.json",
+    "metal_tarball_gate_artifact": "docs/release/g0/0.7.7/metal-tarball/gate.json"
+  },
+  "manifest": "docs/release/g0/0.7.7/release-completion-manifest.json",
+  "schema_version": 1,
+  "status": "pass",
+  "tag": "v0.7.7"
+}

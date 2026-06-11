@@ -1,0 +1,104 @@
+{
+  "cargo_workspace_crates": [
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-types",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-interfaces",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-bench-core",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-scheduler",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-tokenizer",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-sampler",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-kv",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-kernels",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-quantization",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-testkit",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-models",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-engine",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-server",
+      "version": "0.7.7"
+    },
+    {
+      "crates_io_visible": true,
+      "name": "ferrum-cli",
+      "version": "0.7.7"
+    }
+  ],
+  "cuda_dense_source_gate_artifact": "cuda-llama-dense/gate.json",
+  "cuda_full_source_gate_artifact": "cuda-full/g0_cuda4090_full.gate.json",
+  "cuda_tarball_gate_artifact": "cuda-tarball/gate.json",
+  "dirty_status": {
+    "is_dirty": true,
+    "status_short": [
+      "?? docs/release/g0/0.7.7/cargo-publish/"
+    ]
+  },
+  "git_sha": "06f8f717f9bfb5614b943147da5b8b8f4249f54c",
+  "github_release_url": "https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.7.7",
+  "homebrew_cuda_fetch_gate_artifact": "homebrew-cuda-fetch/gate.json",
+  "homebrew_metal_gate_artifact": "homebrew-metal/gate.json",
+  "metal_source_gate_artifact": "metal/metal.gate.json",
+  "metal_tarball_gate_artifact": "metal-tarball/gate.json",
+  "release_assets": [
+    {
+      "name": "ferrum-macos-aarch64.tar.gz",
+      "sha256": "e685342eb9d3050c1d4117ef71ecd20418f91bd731c8f304269b4ec36936247b"
+    },
+    {
+      "name": "ferrum-linux-x86_64.tar.gz",
+      "sha256": "b98e22701a3a5b6d79ce4489ba1fcc1201a2925f24b9c87e35bc1678fb459715"
+    },
+    {
+      "name": "ferrum-linux-x86_64-cuda-sm89.tar.gz",
+      "sha256": "6397de942d1c767383982186642da3990df49ea1cd6f604434a6cc9d6f7f912b"
+    }
+  ],
+  "tag": "v0.7.7"
+}

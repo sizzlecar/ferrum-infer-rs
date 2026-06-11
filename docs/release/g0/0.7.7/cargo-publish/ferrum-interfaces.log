@@ -1,0 +1,61 @@
+COMMAND attempt=1: cargo publish -p ferrum-interfaces
+    Updating crates.io index
+   Packaging ferrum-interfaces v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-interfaces)
+    Updating crates.io index
+    Packaged 17 files, 149.4KiB (40.0KiB compressed)
+   Verifying ferrum-interfaces v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-interfaces)
+ Downloading crates ...
+  Downloaded ferrum-types v0.7.7
+   Compiling libc v0.2.186
+   Compiling memchr v2.7.6
+   Compiling pin-project-lite v0.2.16
+   Compiling futures-core v0.3.31
+   Compiling syn v2.0.108
+   Compiling parking_lot_core v0.9.12
+   Compiling futures-sink v0.3.31
+   Compiling scopeguard v1.2.0
+   Compiling futures-io v0.3.31
+   Compiling pin-utils v0.1.0
+   Compiling slab v0.4.11
+   Compiling futures-task v0.3.31
+   Compiling lock_api v0.4.14
+   Compiling futures-channel v0.3.31
+   Compiling once_cell v1.21.3
+   Compiling bytes v1.10.1
+   Compiling tracing-core v0.1.34
+   Compiling serde_json v1.0.145
+   Compiling getrandom v0.3.4
+   Compiling cpufeatures v0.2.17
+   Compiling signal-hook-registry v1.4.6
+   Compiling mio v1.1.0
+   Compiling socket2 v0.6.1
+   Compiling sha2 v0.10.9
+   Compiling rand_core v0.9.3
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.2
+   Compiling serde_derive v1.0.228
+   Compiling futures-macro v0.3.31
+   Compiling thiserror-impl v1.0.69
+   Compiling tracing-attributes v0.1.30
+   Compiling tokio-macros v2.6.0
+   Compiling async-trait v0.1.89
+   Compiling futures-util v0.3.31
+   Compiling tracing v0.1.41
+   Compiling thiserror v1.0.69
+   Compiling serde v1.0.228
+   Compiling futures-executor v0.3.31
+   Compiling smallvec v1.15.1
+   Compiling uuid v1.18.1
+   Compiling chrono v0.4.42
+   Compiling futures v0.3.31
+   Compiling parking_lot v0.12.5
+   Compiling tokio v1.48.0
+   Compiling ferrum-types v0.7.7
+   Compiling ferrum-interfaces v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/package/ferrum-interfaces-0.7.7)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.99s
+   Uploading ferrum-interfaces v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-interfaces)
+    Uploaded ferrum-interfaces v0.7.7 to registry `crates-io`
+note: waiting for ferrum-interfaces v0.7.7 to be available at registry `crates-io`.
+You may press ctrl-c to skip waiting; the crate should be available shortly.
+   Published ferrum-interfaces v0.7.7 at registry `crates-io`
+RETURNCODE attempt=1: 0

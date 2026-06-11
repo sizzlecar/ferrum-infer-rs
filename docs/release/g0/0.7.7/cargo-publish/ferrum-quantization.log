@@ -1,0 +1,20 @@
+COMMAND attempt=1: cargo publish -p ferrum-quantization
+    Updating crates.io index
+warning: manifest has no documentation, homepage or repository.
+See https://doc.rust-lang.org/cargo/reference/manifest.html#package-metadata for more info.
+   Packaging ferrum-quantization v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-quantization)
+    Updating crates.io index
+    Packaged 27 files, 248.2KiB (63.9KiB compressed)
+   Verifying ferrum-quantization v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-quantization)
+ Downloading crates ...
+  Downloaded ferrum-kernels v0.7.7
+   Compiling ferrum-kernels v0.7.7
+   Compiling safetensors v0.4.5
+   Compiling ferrum-quantization v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/package/ferrum-quantization-0.7.7)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.82s
+   Uploading ferrum-quantization v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-quantization)
+    Uploaded ferrum-quantization v0.7.7 to registry `crates-io`
+note: waiting for ferrum-quantization v0.7.7 to be available at registry `crates-io`.
+You may press ctrl-c to skip waiting; the crate should be available shortly.
+   Published ferrum-quantization v0.7.7 at registry `crates-io`
+RETURNCODE attempt=1: 0

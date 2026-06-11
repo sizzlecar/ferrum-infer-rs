@@ -1,0 +1,74 @@
+COMMAND attempt=1: cargo publish -p ferrum-kernels
+    Updating crates.io index
+warning: manifest has no documentation, homepage or repository.
+See https://doc.rust-lang.org/cargo/reference/manifest.html#package-metadata for more info.
+   Packaging ferrum-kernels v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-kernels)
+    Updating crates.io index
+    Packaged 1151 files, 27.2MiB (2.5MiB compressed)
+   Verifying ferrum-kernels v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-kernels)
+ Downloading crates ...
+  Downloaded ferrum-bench-core v0.7.7
+   Compiling num-traits v0.2.19
+   Compiling either v1.15.0
+   Compiling zerocopy-derive v0.8.27
+   Compiling bytemuck_derive v1.10.2
+   Compiling pulp v0.22.2
+   Compiling heck v0.5.0
+   Compiling bitflags v2.10.0
+   Compiling dyn-stack-macros v0.1.3
+   Compiling reborrow v0.5.5
+   Compiling pulp-wasm-simd-flag v0.1.0
+   Compiling seq-macro v0.3.6
+   Compiling serde_json v1.0.145
+   Compiling rayon v1.11.0
+   Compiling raw-cpuid v11.6.0
+   Compiling enum-as-inner v0.6.1
+   Compiling smallvec v1.15.1
+   Compiling futures-util v0.3.31
+   Compiling parking_lot_core v0.9.12
+   Compiling sysctl v0.6.0
+   Compiling glob v0.3.3
+   Compiling bytemuck v1.24.0
+   Compiling allocator-api2 v0.2.21
+   Compiling zerocopy v0.8.27
+   Compiling chrono v0.4.42
+   Compiling foldhash v0.2.0
+   Compiling stable_deref_trait v1.2.1
+   Compiling hashbrown v0.16.0
+   Compiling parking_lot v0.12.5
+   Compiling bindgen_cuda v0.1.6
+   Compiling typed-path v0.12.3
+   Compiling tokio v1.48.0
+   Compiling safetensors v0.7.0
+   Compiling ferrum-kernels v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/package/ferrum-kernels-0.7.7)
+   Compiling yoke v0.8.1
+   Compiling memmap2 v0.9.9
+   Compiling futures-executor v0.3.31
+   Compiling num-complex v0.4.6
+   Compiling dyn-stack v0.13.2
+   Compiling zip v7.2.0
+   Compiling futures v0.3.31
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.2
+   Compiling rand_distr v0.5.1
+   Compiling ferrum-types v0.7.7
+   Compiling half v2.7.1
+   Compiling float8 v0.6.1
+   Compiling gemm-common v0.19.0
+   Compiling gemm-f32 v0.19.0
+   Compiling gemm-c64 v0.19.0
+   Compiling gemm-c32 v0.19.0
+   Compiling gemm-f64 v0.19.0
+   Compiling gemm-f16 v0.19.0
+   Compiling gemm v0.19.0
+   Compiling ferrum-interfaces v0.7.7
+   Compiling ferrum-bench-core v0.7.7
+   Compiling candle-core v0.9.2
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.31s
+   Uploading ferrum-kernels v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-kernels)
+    Uploaded ferrum-kernels v0.7.7 to registry `crates-io`
+note: waiting for ferrum-kernels v0.7.7 to be available at registry `crates-io`.
+You may press ctrl-c to skip waiting; the crate should be available shortly.
+   Published ferrum-kernels v0.7.7 at registry `crates-io`
+RETURNCODE attempt=1: 0

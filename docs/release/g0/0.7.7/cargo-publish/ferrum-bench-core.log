@@ -1,0 +1,17 @@
+COMMAND attempt=1: cargo publish -p ferrum-bench-core
+    Updating crates.io index
+warning: manifest has no documentation, homepage or repository.
+See https://doc.rust-lang.org/cargo/reference/manifest.html#package-metadata for more info.
+   Packaging ferrum-bench-core v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-bench-core)
+    Updating crates.io index
+    Packaged 11 files, 107.7KiB (28.4KiB compressed)
+   Verifying ferrum-bench-core v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-bench-core)
+   Compiling ferrum-types v0.7.7
+   Compiling ferrum-bench-core v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/package/ferrum-bench-core-0.7.7)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.05s
+   Uploading ferrum-bench-core v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-bench-core)
+    Uploaded ferrum-bench-core v0.7.7 to registry `crates-io`
+note: waiting for ferrum-bench-core v0.7.7 to be available at registry `crates-io`.
+You may press ctrl-c to skip waiting; the crate should be available shortly.
+   Published ferrum-bench-core v0.7.7 at registry `crates-io`
+RETURNCODE attempt=1: 0

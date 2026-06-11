@@ -1,0 +1,19 @@
+COMMAND attempt=resume-1: cargo publish -p ferrum-testkit
+    Updating crates.io index
+warning: manifest has no documentation, homepage or repository.
+See https://doc.rust-lang.org/cargo/reference/manifest.html#package-metadata for more info.
+   Packaging ferrum-testkit v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-testkit)
+    Updating crates.io index
+    Packaged 31 files, 167.5KiB (41.0KiB compressed)
+   Verifying ferrum-testkit v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-testkit)
+ Downloading crates ...
+  Downloaded ferrum-kv v0.7.7
+   Compiling ferrum-kv v0.7.7
+   Compiling ferrum-testkit v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/package/ferrum-testkit-0.7.7)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.05s
+   Uploading ferrum-testkit v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-testkit)
+    Uploaded ferrum-testkit v0.7.7 to registry `crates-io`
+note: waiting for ferrum-testkit v0.7.7 to be available at registry `crates-io`.
+You may press ctrl-c to skip waiting; the crate should be available shortly.
+   Published ferrum-testkit v0.7.7 at registry `crates-io`
+RETURNCODE attempt=resume-1: 0

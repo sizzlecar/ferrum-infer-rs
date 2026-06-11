@@ -1,0 +1,32 @@
+COMMAND attempt=resume-1: cargo publish -p ferrum-engine
+    Updating crates.io index
+warning: manifest has no documentation, homepage or repository.
+See https://doc.rust-lang.org/cargo/reference/manifest.html#package-metadata for more info.
+   Packaging ferrum-engine v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-engine)
+    Updating crates.io index
+    Packaged 44 files, 661.1KiB (144.3KiB compressed)
+   Verifying ferrum-engine v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-engine)
+ Downloading crates ...
+  Downloaded ferrum-tokenizer v0.7.7
+  Downloaded ferrum-scheduler v0.7.7
+  Downloaded ferrum-sampler v0.7.7
+  Downloaded ferrum-models v0.7.7
+   Compiling pin-project-internal v1.1.10
+   Compiling rand_distr v0.4.3
+   Compiling metrics v0.22.4
+   Compiling ferrum-tokenizer v0.7.7
+   Compiling ferrum-models v0.7.7
+   Compiling ferrum-kv v0.7.7
+   Compiling tokio-stream v0.1.17
+   Compiling bytesize v1.3.3
+   Compiling ferrum-sampler v0.7.7
+   Compiling pin-project v1.1.10
+   Compiling ferrum-scheduler v0.7.7
+   Compiling ferrum-engine v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/package/ferrum-engine-0.7.7)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.58s
+   Uploading ferrum-engine v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-engine)
+    Uploaded ferrum-engine v0.7.7 to registry `crates-io`
+note: waiting for ferrum-engine v0.7.7 to be available at registry `crates-io`.
+You may press ctrl-c to skip waiting; the crate should be available shortly.
+   Published ferrum-engine v0.7.7 at registry `crates-io`
+RETURNCODE attempt=resume-1: 0
