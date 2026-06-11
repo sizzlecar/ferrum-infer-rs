@@ -1,0 +1,14 @@
+{
+  "cmd": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/validate_release_completion_manifest.py",
+    "--manifest",
+    "docs/release/g0/0.7.7/release-completion-manifest.json",
+    "--out",
+    "docs/release/g0/0.7.7/release-complete"
+  ],
+  "duration_sec": 0.04516820842400193,
+  "env_overrides": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

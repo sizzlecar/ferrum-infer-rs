@@ -1,0 +1,47 @@
+{
+  "artifact_dir": "docs/release/g0/0.7.7/release-complete",
+  "binary": {
+    "path": null,
+    "sha256": null
+  },
+  "child_pass_line": "FERRUM RELEASE COMPLETION PASS: docs/release/g0/0.7.7/release-complete",
+  "child_returncode": 0,
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/run_gate.py",
+    "release-complete",
+    "--out",
+    "docs/release/g0/0.7.7/release-complete",
+    "--completion-manifest",
+    "docs/release/g0/0.7.7/release-completion-manifest.json",
+    "--timeout",
+    "120"
+  ],
+  "delegated_command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/validate_release_completion_manifest.py",
+    "--manifest",
+    "docs/release/g0/0.7.7/release-completion-manifest.json",
+    "--out",
+    "docs/release/g0/0.7.7/release-complete"
+  ],
+  "dirty_status": {
+    "is_dirty": true,
+    "status_short": [
+      "?? docs/release/g0/0.7.7/cargo-publish/",
+      "?? docs/release/g0/0.7.7/release-complete/",
+      "?? docs/release/g0/0.7.7/release-completion-manifest.json"
+    ]
+  },
+  "duration_sec": 0.0458729169331491,
+  "error": null,
+  "finished_at": "2026-06-11T14:21:36.606645+08:00",
+  "git_sha": "06f8f717f9bfb5614b943147da5b8b8f4249f54c",
+  "lane": "release-complete",
+  "model": null,
+  "pass_line": "FERRUM GATE release-complete PASS: docs/release/g0/0.7.7/release-complete",
+  "sanitized_env": {},
+  "schema_version": 1,
+  "started_at": "2026-06-11T14:21:36.560624+08:00",
+  "status": "pass"
+}

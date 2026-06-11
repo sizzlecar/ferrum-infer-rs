@@ -1,0 +1,86 @@
+[
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-types",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-interfaces",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-bench-core",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-scheduler",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-tokenizer",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-sampler",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-kv",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-kernels",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-quantization",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-testkit",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-models",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-engine",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-server",
+    "version": "0.7.7"
+  },
+  {
+    "crates_io_visible": true,
+    "latest": "0.7.7",
+    "name": "ferrum-cli",
+    "version": "0.7.7"
+  }
+]

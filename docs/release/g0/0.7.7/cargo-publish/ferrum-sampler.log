@@ -1,0 +1,28 @@
+COMMAND attempt=1: cargo publish -p ferrum-sampler
+    Updating crates.io index
+warning: manifest has no documentation, homepage or repository.
+See https://doc.rust-lang.org/cargo/reference/manifest.html#package-metadata for more info.
+   Packaging ferrum-sampler v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-sampler)
+    Updating crates.io index
+    Packaged 9 files, 96.9KiB (28.0KiB compressed)
+   Verifying ferrum-sampler v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-sampler)
+   Compiling libm v0.2.15
+   Compiling num-traits v0.2.19
+   Compiling getrandom v0.2.16
+   Compiling regex-syntax v0.8.8
+   Compiling rand_core v0.6.4
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.5
+   Compiling regex-automata v0.4.13
+   Compiling chrono v0.4.42
+   Compiling rand_distr v0.4.3
+   Compiling ferrum-types v0.7.7
+   Compiling ferrum-interfaces v0.7.7
+   Compiling ferrum-sampler v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/package/ferrum-sampler-0.7.7)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.29s
+   Uploading ferrum-sampler v0.7.7 (/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-sampler)
+    Uploaded ferrum-sampler v0.7.7 to registry `crates-io`
+note: waiting for ferrum-sampler v0.7.7 to be available at registry `crates-io`.
+You may press ctrl-c to skip waiting; the crate should be available shortly.
+   Published ferrum-sampler v0.7.7 at registry `crates-io`
+RETURNCODE attempt=1: 0
