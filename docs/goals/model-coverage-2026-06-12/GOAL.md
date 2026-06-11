@@ -180,14 +180,26 @@ Stop condition: <正确性 gate 首败即停;卡壳 1 pod-day 降级>
 
 ## UNVERIFIED 清单(开工前必须落证)
 
-1. ferrum YaRN rope_scaling 支持现状(影响 R1-0528-Qwen3-8B >32k、Qwen3 dense 长 ctx)。
-2. `weight_format.rs` 中 AWQ 引用的真实能力(只是枚举还是有完整 loader)。
-3. gguf loader 的 arch 白名单对 mistral(Tekken)/glm 的覆盖。
-4. cpatonn / QuantTrio / JunHowie 各 GPTQ 的 group size、desc_act 与 Marlin 兼容矩阵。
-5. GLM-4.7-Flash `Glm4MoeLite` config 全量字段(路由细节)。
-6. Qwen3-Coder XML 工具模板与 ferrum caller-owned 工具注入的协同方式
-  (用原生模板渲染 tools,还是沿用通用注入;二者 A/B 后定)。
-7. Qwen3.6 线是否有官方 GPTQ-Int4(已确认 3.5 有、3.6 仅确认 FP8)——影响 W3 收益测算。
+1. ✅ 已落证(2026-06-12):**YaRN 不支持**。`RopeScalingConfig` 仅有 `Llama3` 变体,
+   其他 `rope_type` 在 `llama_family.rs:329` 静默返回 `None`。隐患:scaling 被忽略但
+   `max_seq_len` 仍取 config 的 `max_position_embeddings`(如 R1-0528-Qwen3-8B 的
+   131072)→ 超过原生 32k 会出垃圾。W1 公共工程项追加:**不支持的 rope_scaling →
+   clamp `max_seq_len` 到 `original_max_position_embeddings` + 启动警告**。
+2. ✅ 已落证:**AWQ 无任何 loader**。`weight_format.rs` 仅 `Safetensors`/`Gguf` 两变体,
+   AWQ 只是 "Future" 注释。AWQ 路线 = 净新增工作,维持 defer;Mistral 线由 GGUF 承载。
+3. ✅ 已落证:gguf arch 白名单 = `qwen3|qwen3moe|qwen2|qwen|llama|mistral`
+   (`gguf_engine_loader.rs:156`)。W1 全部模型的 GGUF arch 在白名单内;
+   GLM(W2)需要新增 arch。
+4. ⏳ 进行中(web 核查):cpatonn / QuantTrio / JunHowie 各 GPTQ 的 group size、
+   desc_act 与 Marlin 兼容矩阵。
+5. ⏳ 进行中(web 核查):GLM-4.7-Flash config 全量字段(路由细节)。
+6. ✅ 机制已落证:ferrum 工具渲染为"模型模板优先(tools 进 Jinja 上下文,
+   `chat_template.rs:460`),失败掉 legacy 注入"。Qwen3-Coder XML 模板能否原生渲染
+   取决于 T3 模板引擎改造;原生 vs 通用注入的 A/B 留在 W1-1 执行。
+7. ⏳ 进行中(web 核查):Qwen3.6 线是否有官方 GPTQ-Int4。
+8. ✅ 已落证(新增):**渲染失败静默 fallback 实锤** —— `chat_template.rs:226-237`
+   渲染错误仅 `warn!` 后掉回 legacy 渲染器,tools 路径同(`:488`)。
+   T3 按 GOAL 验收 gate L0 的要求改为显式报错。
 
 ## 调研记录(2026-06-12)
 

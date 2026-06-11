@@ -1,11 +1,11 @@
 use crate::openai::{
     ChatFunction, ChatMessage, ChatTool, FunctionCallChoice, MessageRole, ToolChoice,
 };
+use ferrum_types::FerrumError;
 use minijinja::Environment;
 use serde::ser::SerializeStruct;
 use serde::Serialize;
 use serde_json::Value;
-use tracing::warn;
 
 /// Model-provided chat template, usually from GGUF `tokenizer.chat_template`
 /// or HuggingFace `tokenizer_config.json`.
@@ -203,11 +203,16 @@ fn split_reasoning_content(content: String) -> (Option<String>, String) {
 /// Render common chat messages into the prompt string the model was trained
 /// on. Prefer a model-provided chat template when available; otherwise use
 /// a centralized legacy fallback for model families ferrum already supports.
+///
+/// A model-provided template that fails to render (or renders empty) is a
+/// hard error: silently falling back to a generic prompt format feeds the
+/// model a prompt it was not trained on and degrades output quality without
+/// any visible failure.
 pub fn render_prompt_messages(
     messages: &[PromptMessage],
     model_id: &str,
     model_template: Option<&ModelChatTemplate>,
-) -> String {
+) -> ferrum_types::Result<String> {
     render_prompt_messages_with_options(
         messages,
         model_id,
@@ -221,20 +226,38 @@ pub fn render_prompt_messages_with_options(
     model_id: &str,
     model_template: Option<&ModelChatTemplate>,
     options: &ChatTemplateOptions,
-) -> String {
+) -> ferrum_types::Result<String> {
     if let Some(model_template) = model_template {
-        match render_model_template(messages, model_template, options, None, None, None, None) {
-            Ok(prompt) if !prompt.trim().is_empty() => return prompt,
-            Ok(_) => warn!(
-                "model chat template rendered an empty prompt; falling back to legacy renderer"
-            ),
-            Err(e) => warn!(
-                "failed to render model chat template from {}: {}; falling back to legacy renderer",
-                model_template.source, e
-            ),
-        }
+        return match render_model_template(
+            messages,
+            model_template,
+            options,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            Ok(prompt) if !prompt.trim().is_empty() => Ok(prompt),
+            Ok(_) => Err(chat_template_render_error(
+                model_template,
+                "template rendered an empty prompt",
+            )),
+            Err(e) => Err(chat_template_render_error(model_template, e)),
+        };
     }
-    render_fallback_prompt(messages, model_id, None)
+    Ok(render_fallback_prompt(messages, model_id, None))
+}
+
+fn chat_template_render_error(
+    template: &ModelChatTemplate,
+    reason: impl std::fmt::Display,
+) -> FerrumError {
+    FerrumError::model(format!(
+        "chat template from {} failed to render: {reason}. Refusing to fall back \
+         to a generic prompt format because that silently degrades output quality; \
+         fix the model's chat template or serve the model without one.",
+        template.source
+    ))
 }
 
 #[derive(Serialize)]
@@ -265,6 +288,11 @@ fn render_model_template(
     function_call: Option<&FunctionCallChoice>,
 ) -> std::result::Result<String, minijinja::Error> {
     let mut env = Environment::new();
+    // HF chat templates are written for Jinja2 and freely use Python string
+    // methods (`.split()`, `.strip()`, `.startswith()`, ...). pycompat
+    // resolves those at runtime; `normalize_hf_chat_template` below remains
+    // for the exact spellings it already rewrote before pycompat landed.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_filter("trim_newlines", |s: String| {
         s.trim_matches('\n').to_string()
     });
@@ -351,14 +379,18 @@ fn normalize_hf_chat_template(template: &str) -> String {
 /// All templates end with the assistant header so the first generated token
 /// becomes the reply content (no extra role prefix).
 pub fn render_chat_prompt(messages: &[ChatMessage], model_id: &str) -> String {
-    render_chat_prompt_with_model_template(messages, model_id, None)
+    let prompt_messages = messages
+        .iter()
+        .map(PromptMessage::from_chat_message)
+        .collect::<Vec<_>>();
+    render_fallback_prompt(&prompt_messages, model_id, None)
 }
 
 pub fn render_chat_prompt_with_model_template(
     messages: &[ChatMessage],
     model_id: &str,
     model_template: Option<&ModelChatTemplate>,
-) -> String {
+) -> ferrum_types::Result<String> {
     render_chat_prompt_with_model_template_options(
         messages,
         model_id,
@@ -372,7 +404,7 @@ pub fn render_chat_prompt_with_model_template_options(
     model_id: &str,
     model_template: Option<&ModelChatTemplate>,
     options: &ChatTemplateOptions,
-) -> String {
+) -> ferrum_types::Result<String> {
     let prompt_messages = messages
         .iter()
         .map(PromptMessage::from_chat_message)
@@ -466,40 +498,94 @@ pub fn render_chat_prompt_with_tools_and_model_template(
     tool_choice: Option<&ToolChoice>,
     functions: &[ChatFunction],
     function_call: Option<&FunctionCallChoice>,
-) -> String {
+) -> ferrum_types::Result<String> {
     if let Some(model_template) = model_template {
-        let prompt_messages = messages
-            .iter()
-            .map(PromptMessage::from_chat_message)
-            .collect::<Vec<_>>();
-        match render_model_template(
+        if model_template_supports_tools(model_template) {
+            let prompt_messages = messages
+                .iter()
+                .map(PromptMessage::from_chat_message)
+                .collect::<Vec<_>>();
+            return match render_model_template(
+                &prompt_messages,
+                model_template,
+                options,
+                (!tools.is_empty()).then_some(tools),
+                tool_choice,
+                (!functions.is_empty()).then_some(functions),
+                function_call,
+            ) {
+                Ok(prompt) if !prompt.trim().is_empty() => Ok(prompt),
+                Ok(_) => Err(chat_template_render_error(
+                    model_template,
+                    "template rendered an empty prompt",
+                )),
+                Err(e) => Err(chat_template_render_error(model_template, e)),
+            };
+        }
+
+        // The model ships a chat template with no `tools` support (e.g. the
+        // DeepSeek-R1 distills). Inject the generic tool spec as a leading
+        // system message and render it *through the model's own template*,
+        // so tool definitions still reach the model in its native prompt
+        // format instead of being silently dropped.
+        let mut prompt_messages = Vec::with_capacity(messages.len() + 1);
+        if let Some(spec) = render_tool_spec(tools, tool_choice, functions, function_call) {
+            prompt_messages.push(PromptMessage::new("system", spec));
+        }
+        prompt_messages.extend(messages.iter().map(PromptMessage::from_chat_message));
+        return match render_model_template(
             &prompt_messages,
             model_template,
             options,
-            (!tools.is_empty()).then_some(tools),
-            tool_choice,
-            (!functions.is_empty()).then_some(functions),
-            function_call,
+            None,
+            None,
+            None,
+            None,
         ) {
-            Ok(prompt) if !prompt.trim().is_empty() => return prompt,
-            Ok(_) => warn!(
-                "model chat template rendered an empty tool prompt; falling back to legacy renderer"
-            ),
-            Err(e) => warn!(
-                "failed to render tool prompt with model chat template from {}: {}; falling back to legacy renderer",
-                model_template.source, e
-            ),
-        }
+            Ok(prompt) if !prompt.trim().is_empty() => Ok(prompt),
+            Ok(_) => Err(chat_template_render_error(
+                model_template,
+                "template rendered an empty prompt",
+            )),
+            Err(e) => Err(chat_template_render_error(model_template, e)),
+        };
     }
 
-    render_chat_prompt_with_tools(
+    Ok(render_chat_prompt_with_tools(
         messages,
         model_id,
         tools,
         tool_choice,
         functions,
         function_call,
-    )
+    ))
+}
+
+/// Whether a chat template references the `tools` variable as a standalone
+/// identifier (substring matching alone would not distinguish a template
+/// that only handles `message.tool_calls` history from one that renders
+/// tool definitions).
+fn model_template_supports_tools(template: &ModelChatTemplate) -> bool {
+    let src = template.template.as_bytes();
+    let needle = b"tools";
+    let mut start = 0;
+    while let Some(pos) = template.template[start..].find("tools") {
+        let abs = start + pos;
+        let before_ok = abs == 0 || {
+            let c = src[abs - 1];
+            !(c.is_ascii_alphanumeric() || c == b'_')
+        };
+        let after = abs + needle.len();
+        let after_ok = after >= src.len() || {
+            let c = src[after];
+            !(c.is_ascii_alphanumeric() || c == b'_')
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        start = after;
+    }
+    false
 }
 
 fn template_role(msg: &ChatMessage) -> &'static str {
@@ -629,7 +715,8 @@ mod tests {
             &[msg(MessageRole::User, "Hi")],
             "qwen3",
             Some(&template),
-        );
+        )
+        .unwrap();
         assert_eq!(out, "[user]Hi[assistant]");
     }
 
@@ -665,7 +752,8 @@ mod tests {
             Some(&ToolChoice::Mode("auto".to_string())),
             &[],
             None,
-        );
+        )
+        .unwrap();
 
         assert!(out.contains("<tools>weather</tools>"));
         assert!(out.contains("<tool_call>weather:"), "{out}");
@@ -697,7 +785,8 @@ mod tests {
             Some(&ToolChoice::Mode("auto".to_string())),
             &[],
             None,
-        );
+        )
+        .unwrap();
 
         assert!(out.contains("\"name\":\"weather\""), "{out}");
         assert!(out.contains("[assistant][user][assistant]"), "{out}");
@@ -729,7 +818,8 @@ mod tests {
             Some(&ToolChoice::Mode("auto".to_string())),
             &[],
             None,
-        );
+        )
+        .unwrap();
 
         assert!(out.contains("\"city\""), "{out}");
         assert!(out.contains("\"Paris\""), "{out}");
@@ -759,7 +849,8 @@ mod tests {
             Some(&ToolChoice::Mode("auto".to_string())),
             &[],
             None,
-        );
+        )
+        .unwrap();
 
         assert!(out.contains("\"temp\""), "{out}");
         assert!(out.contains("22"), "{out}");
@@ -779,7 +870,8 @@ mod tests {
             &[msg(MessageRole::User, "Hi")],
             "qwen3",
             Some(&template),
-        );
+        )
+        .unwrap();
         assert_eq!(
             out,
             "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
@@ -800,7 +892,8 @@ mod tests {
             "served-model-alias",
             Some(&template),
             &options,
-        );
+        )
+        .unwrap();
         assert!(out.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 
@@ -817,7 +910,8 @@ mod tests {
             &ChatTemplateOptions {
                 enable_thinking: Some(true),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(out, "<assistant>");
     }
 
@@ -834,7 +928,8 @@ mod tests {
             "Qwen/Qwen3-0.6B",
             Some(&template),
             &options,
-        );
+        )
+        .unwrap();
         assert_eq!(out, "<assistant>");
     }
 
@@ -851,7 +946,8 @@ mod tests {
             ],
             "qwen3",
             Some(&template),
-        );
+        )
+        .unwrap();
         assert_eq!(out, "<r>reason</r>answernext<assistant>");
     }
 
@@ -873,7 +969,8 @@ mod tests {
             }],
             "qwen3",
             Some(&template),
-        );
+        )
+        .unwrap();
         assert_eq!(out, "<r>reason</r>answer");
     }
 
@@ -895,7 +992,8 @@ mod tests {
             }],
             "qwen3",
             Some(&template),
-        );
+        )
+        .unwrap();
         assert_eq!(out, "<r>reason</r>answer");
     }
 
@@ -912,7 +1010,8 @@ mod tests {
             ],
             "qwen3",
             Some(&template),
-        );
+        )
+        .unwrap();
         assert_eq!(out, "plaintool");
     }
 
@@ -1002,5 +1101,97 @@ mod tests {
         assert!(out.contains("\"id\":\"call_1\""));
         assert!(out.contains("\"name\":\"weather\""));
         assert!(out.contains("<|im_start|>tool\nsunny<|im_end|>"));
+    }
+
+    #[test]
+    fn pycompat_python_string_methods_render_without_normalization() {
+        // Bracket subscripts plus bare `.strip()` / `.split(..)[-1]` are
+        // spellings `normalize_hf_chat_template` does not rewrite — they must
+        // work via minijinja-contrib pycompat (DeepSeek-R1 distill templates
+        // use them).
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% if message['role'] == 'assistant' %}{% set content = message['content'].split('</think>')[-1] %}{{ content.strip() }}{% endif %}{% endfor %}",
+            "pycompat-template",
+        );
+        let out = render_prompt_messages(
+            &[PromptMessage {
+                role: "assistant".to_string(),
+                content: "<think>\nreason\n</think>\n\nanswer".to_string(),
+                reasoning_content: None,
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                function_call: None,
+            }],
+            "deepseek-distill",
+            Some(&template),
+        )
+        .unwrap();
+        assert_eq!(out, "answer");
+    }
+
+    #[test]
+    fn model_template_render_failure_is_an_error_not_a_silent_fallback() {
+        let template =
+            ModelChatTemplate::new("{{ messages | not_a_real_filter }}", "broken-template");
+        let err = render_prompt_messages(
+            &[PromptMessage::new("user", "hi")],
+            "qwen3",
+            Some(&template),
+        )
+        .unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("broken-template"), "{message}");
+        assert!(message.contains("failed to render"), "{message}");
+    }
+
+    #[test]
+    fn model_template_empty_render_is_an_error() {
+        let template = ModelChatTemplate::new("{# renders nothing #}", "empty-template");
+        let err = render_prompt_messages(
+            &[PromptMessage::new("user", "hi")],
+            "qwen3",
+            Some(&template),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("empty prompt"), "{err}");
+    }
+
+    #[test]
+    fn tools_unaware_template_injects_tool_spec_through_model_template() {
+        // e.g. DeepSeek-R1 distill templates have no `tools` support; tool
+        // definitions must still reach the model in its native prompt format
+        // instead of being dropped or routed to the generic fallback.
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content }}{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
+            "no-tool-support-template",
+        );
+        let out = render_chat_prompt_with_tools_and_model_template(
+            &[msg(MessageRole::User, "Use weather.")],
+            "some-model",
+            Some(&template),
+            &ChatTemplateOptions::default(),
+            &[tool("weather")],
+            Some(&ToolChoice::Mode("auto".to_string())),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(out.starts_with("[system]"), "{out}");
+        assert!(out.contains("\"tools\""), "{out}");
+        assert!(out.contains("weather"), "{out}");
+        assert!(out.ends_with("[assistant]"), "{out}");
+        assert!(!out.contains("<|system|>"), "{out}");
+    }
+
+    #[test]
+    fn template_tools_support_detection_requires_standalone_identifier() {
+        let aware = ModelChatTemplate::new("{% if tools %}x{% endif %}", "t");
+        assert!(model_template_supports_tools(&aware));
+        let history_only = ModelChatTemplate::new(
+            "{% for m in messages %}{% if m.tool_calls %}y{% endif %}{% endfor %}",
+            "t",
+        );
+        assert!(!model_template_supports_tools(&history_only));
     }
 }
