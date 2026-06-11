@@ -1,0 +1,3 @@
+<｜begin▁of▁sentence｜><｜User｜>Q1<｜Assistant｜>
+
+Answer1<｜end▁of▁sentence｜><｜User｜>Q2<｜Assistant｜>

@@ -95,12 +95,31 @@ impl HuggingFaceTokenizer {
         })
     }
 
-    /// Create from file path
+    /// Create from file path. Special tokens are resolved from the sibling
+    /// `generation_config.json` / `tokenizer_config.json` when present;
+    /// vocab name probing is only the fallback for bare tokenizer.json files.
     pub async fn from_file(path: &str) -> Result<Self> {
         let tokenizer = HfTokenizer::from_file(path).map_err(|e| {
             ferrum_types::FerrumError::tokenizer(format!("Failed to load tokenizer: {}", e))
         })?;
-        Self::new(tokenizer).await
+        let overrides =
+            special_token_overrides_from_configs(std::path::Path::new(path), &tokenizer);
+        let mut this = Self::new(tokenizer).await?;
+        this.apply_special_token_overrides(overrides);
+        Ok(this)
+    }
+
+    fn apply_special_token_overrides(&mut self, overrides: SpecialTokenOverrides) {
+        if overrides.bos.is_some() {
+            self.special_tokens.bos_token = overrides.bos;
+        }
+        if overrides.eos.is_some() {
+            self.special_tokens.eos_token = overrides.eos;
+        }
+        if !overrides.extra_eos.is_empty() {
+            self.special_tokens.extra_eos_tokens = overrides.extra_eos;
+        }
+        self.info.special_tokens = self.special_tokens.clone();
     }
 
     /// Create from HuggingFace Hub
@@ -383,7 +402,91 @@ fn extract_special_tokens(tokenizer: &HfTokenizer) -> Result<SpecialTokens> {
         sep_token,
         cls_token,
         mask_token,
+        extra_eos_tokens: Vec::new(),
     })
+}
+
+/// EOS/BOS overrides read from the model's config files next to
+/// `tokenizer.json`. The vocabulary alone cannot tell which token a model is
+/// trained to emit as EOS — name probing (`</s>`-style) breaks on models that
+/// rename their special-token slots (e.g. DeepSeek-R1 distills rename
+/// `<|endoftext|>` to `<|end▁of▁sentence|>`), so the config files are
+/// authoritative: `generation_config.json` `eos_token_id` (int or list)
+/// first, then `tokenizer_config.json` `eos_token` / `bos_token` (string or
+/// `{"content": ...}` AddedToken object).
+#[derive(Debug, Default)]
+struct SpecialTokenOverrides {
+    bos: Option<TokenId>,
+    eos: Option<TokenId>,
+    extra_eos: Vec<TokenId>,
+}
+
+fn special_token_overrides_from_configs(
+    tokenizer_json: &std::path::Path,
+    tokenizer: &HfTokenizer,
+) -> SpecialTokenOverrides {
+    let Some(dir) = tokenizer_json.parent() else {
+        return SpecialTokenOverrides::default();
+    };
+    let mut overrides = SpecialTokenOverrides::default();
+
+    if let Some(gen) = read_json(&dir.join("generation_config.json")) {
+        let mut eos_ids = token_id_list(gen.get("eos_token_id"));
+        if !eos_ids.is_empty() {
+            overrides.eos = Some(eos_ids.remove(0));
+            overrides.extra_eos = eos_ids;
+        }
+        if let Some(bos) = token_id_list(gen.get("bos_token_id")).into_iter().next() {
+            overrides.bos = Some(bos);
+        }
+    }
+
+    if let Some(tok_cfg) = read_json(&dir.join("tokenizer_config.json")) {
+        if overrides.eos.is_none() {
+            overrides.eos = token_from_config_value(tok_cfg.get("eos_token"), tokenizer);
+        }
+        if overrides.bos.is_none() {
+            overrides.bos = token_from_config_value(tok_cfg.get("bos_token"), tokenizer);
+        }
+    }
+
+    overrides
+}
+
+fn read_json(path: &std::path::Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// `eos_token_id` / `bos_token_id` in generation_config.json is either a
+/// number or a list of numbers.
+fn token_id_list(value: Option<&serde_json::Value>) -> Vec<TokenId> {
+    match value {
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .map(|v| vec![TokenId::new(v as u32)])
+            .unwrap_or_default(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .map(|v| TokenId::new(v as u32))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `eos_token` / `bos_token` in tokenizer_config.json is either a plain
+/// string or an AddedToken object `{"content": "...", ...}`.
+fn token_from_config_value(
+    value: Option<&serde_json::Value>,
+    tokenizer: &HfTokenizer,
+) -> Option<TokenId> {
+    let text = match value? {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Object(obj) => obj.get("content")?.as_str()?,
+        _ => return None,
+    };
+    tokenizer.token_to_id(text).map(TokenId::new)
 }
 
 #[cfg(test)]
@@ -737,5 +840,124 @@ mod tests {
         tokenizer.reset_state(&mut state);
         let text = tokenizer.get_decoded_text(&state);
         assert!(text.is_empty());
+    }
+
+    fn tiny_tokenizer_with_specials(specials: &[&str]) -> HfTokenizer {
+        use tokenizers::models::bpe::{Vocab, BPE};
+        use tokenizers::AddedToken;
+
+        let vocab: Vocab = [("hello".to_string(), 0), ("world".to_string(), 1)]
+            .into_iter()
+            .collect();
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .unk_token("hello".to_string())
+            .build()
+            .unwrap();
+        let mut tokenizer = HfTokenizer::new(bpe);
+        tokenizer.add_special_tokens(
+            &specials
+                .iter()
+                .map(|s| AddedToken::from(*s, true))
+                .collect::<Vec<_>>(),
+        );
+        tokenizer
+    }
+
+    #[tokio::test]
+    async fn eos_comes_from_generation_config_not_name_probing() {
+        // DeepSeek-R1-distill style: special-token slots renamed, no
+        // `</s>` / `<|endoftext|>`-style names anywhere in the vocab.
+        let tokenizer =
+            tiny_tokenizer_with_specials(&["<|end▁of▁sentence|>", "<|User|>", "<|Assistant|>"]);
+        let eos_id = tokenizer.token_to_id("<|end▁of▁sentence|>").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        tokenizer.save(&path, false).unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            format!("{{\"bos_token_id\": null, \"eos_token_id\": {eos_id}}}"),
+        )
+        .unwrap();
+
+        let loaded = HuggingFaceTokenizer::from_file(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.special_tokens().eos_token.map(|t| t.get()),
+            Some(eos_id)
+        );
+        assert!(loaded.special_tokens().extra_eos_tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_eos_ids_land_in_extra_eos_tokens() {
+        let tokenizer = tiny_tokenizer_with_specials(&["<|eot_id|>", "<|end_of_text|>"]);
+        let primary = tokenizer.token_to_id("<|end_of_text|>").unwrap();
+        let extra = tokenizer.token_to_id("<|eot_id|>").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        tokenizer.save(&path, false).unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            format!("{{\"eos_token_id\": [{primary}, {extra}]}}"),
+        )
+        .unwrap();
+
+        let loaded = HuggingFaceTokenizer::from_file(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.special_tokens().eos_token.map(|t| t.get()),
+            Some(primary)
+        );
+        assert_eq!(
+            loaded
+                .special_tokens()
+                .extra_eos_tokens
+                .iter()
+                .map(|t| t.get())
+                .collect::<Vec<_>>(),
+            vec![extra]
+        );
+    }
+
+    #[tokio::test]
+    async fn tokenizer_config_eos_string_is_fallback_without_generation_config() {
+        let tokenizer = tiny_tokenizer_with_specials(&["<|end▁of▁sentence|>"]);
+        let eos_id = tokenizer.token_to_id("<|end▁of▁sentence|>").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        tokenizer.save(&path, false).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            "{\"eos_token\": {\"content\": \"<|end▁of▁sentence|>\"}}",
+        )
+        .unwrap();
+
+        let loaded = HuggingFaceTokenizer::from_file(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.special_tokens().eos_token.map(|t| t.get()),
+            Some(eos_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_tokenizer_json_still_uses_name_probing() {
+        let tokenizer = tiny_tokenizer_with_specials(&["<s>", "</s>"]);
+        let eos_id = tokenizer.token_to_id("</s>").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        tokenizer.save(&path, false).unwrap();
+
+        let loaded = HuggingFaceTokenizer::from_file(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.special_tokens().eos_token.map(|t| t.get()),
+            Some(eos_id)
+        );
     }
 }

@@ -241,4 +241,9 @@ pub struct SpecialTokens {
     pub cls_token: Option<TokenId>,
     /// Mask token
     pub mask_token: Option<TokenId>,
+    /// Additional end-of-sequence tokens. Models such as Llama-3 and GLM
+    /// declare several `eos_token_id`s in `generation_config.json`;
+    /// `eos_token` holds the primary one and the rest land here.
+    #[serde(default)]
+    pub extra_eos_tokens: Vec<TokenId>,
 }

@@ -321,6 +321,7 @@ mod tests {
                     sep_token: None,
                     cls_token: None,
                     mask_token: None,
+                    extra_eos_tokens: Vec::new(),
                 },
                 byte_strings,
             }
@@ -399,6 +400,7 @@ mod tests {
                     sep_token: None,
                     cls_token: None,
                     mask_token: None,
+                    extra_eos_tokens: Vec::new(),
                 },
                 strings: strings.into_iter().map(str::to_string).collect(),
             }

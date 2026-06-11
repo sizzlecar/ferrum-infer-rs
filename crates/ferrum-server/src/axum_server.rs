@@ -1378,7 +1378,7 @@ fn convert_chat_request_with_template_model(
             template_model_id,
             model_template,
             &chat_template_options,
-        )
+        )?
     } else {
         render_chat_prompt_with_tools_and_model_template(
             &render_messages,
@@ -1389,7 +1389,7 @@ fn convert_chat_request_with_template_model(
             effective_tool_choice,
             functions,
             request.function_call.as_ref(),
-        )
+        )?
     };
     let api_chat = api_chat_request(request, effective_tool_choice);
     let may_emit_structured_call = ferrum_types::chat_api_may_emit_tool_or_function_call(&api_chat);
