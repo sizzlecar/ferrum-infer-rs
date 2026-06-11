@@ -250,7 +250,7 @@ impl LlamaFamilyConfig {
             head_dim,
             num_layers: def.num_hidden_layers,
             vocab_size: def.vocab_size,
-            max_seq_len: def.max_position_embeddings,
+            max_seq_len: effective_max_seq_len(def),
             rms_norm_eps: def.norm_eps as f32,
             rope_theta_opt: def.rope_theta,
             rope_scaling: rope_scaling_from_model_def(def),
@@ -315,6 +315,46 @@ struct LlamaFamilyConfigBase {
     rope_theta_opt: Option<f64>,
     rope_scaling: Option<RopeScalingConfig>,
     sliding_window: usize,
+}
+
+/// Models whose long context depends on a rope_scaling variant ferrum does
+/// not implement (e.g. YaRN on DeepSeek-R1-0528-Qwen3-8B) must not claim the
+/// scaled window: positions past the original training window would rotate
+/// with unscaled frequencies and produce garbage. Clamp `max_seq_len` to the
+/// declared original window and warn.
+fn effective_max_seq_len(def: &crate::definition::ModelDefinition) -> usize {
+    let configured = def.max_position_embeddings;
+    let Some(obj) = def
+        .extra_params
+        .get("rope_scaling")
+        .and_then(|v| v.as_object())
+    else {
+        return configured;
+    };
+    let rope_type = obj
+        .get("rope_type")
+        .or_else(|| obj.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if rope_type == "llama3" {
+        // Implemented — the scaled window is real.
+        return configured;
+    }
+    let original = obj
+        .get("original_max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    match original {
+        Some(original) if original < configured => {
+            tracing::warn!(
+                "rope_scaling type '{rope_type}' is not implemented; clamping \
+                 context window from {configured} to the original training \
+                 window {original}"
+            );
+            original
+        }
+        _ => configured,
+    }
 }
 
 fn rope_scaling_from_model_def(
@@ -3178,8 +3218,48 @@ mod tests {
 
     use super::{
         load_llama_family_layers, LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel,
-        LlamaFamilyRuntimeEnv, DEFAULT_KV_CAPACITY,
+        LlamaFamilyRuntimeEnv, RopeScalingConfig, DEFAULT_KV_CAPACITY,
     };
+
+    #[test]
+    fn unsupported_rope_scaling_clamps_max_seq_len() {
+        // DeepSeek-R1-0528-Qwen3-8B: YaRN factor 4 over a 32k training
+        // window. Ferrum has no YaRN, so the claimed 131072 window must
+        // clamp to the original 32768.
+        let mut def = crate::definition::ModelDefinition::default();
+        def.max_position_embeddings = 131072;
+        def.extra_params = serde_json::json!({
+            "rope_scaling": {
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768
+            }
+        });
+        let cfg = LlamaFamilyConfig::qwen3_from_def(&def);
+        assert_eq!(cfg.max_seq_len, 32768);
+        assert!(cfg.rope_scaling.is_none());
+    }
+
+    #[test]
+    fn llama3_rope_scaling_keeps_configured_window() {
+        let mut def = crate::definition::ModelDefinition::default();
+        def.max_position_embeddings = 131072;
+        def.extra_params = serde_json::json!({
+            "rope_scaling": {
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192
+            }
+        });
+        let cfg = LlamaFamilyConfig::llama_from_def(&def);
+        assert_eq!(cfg.max_seq_len, 131072);
+        assert!(matches!(
+            cfg.rope_scaling,
+            Some(RopeScalingConfig::Llama3 { .. })
+        ));
+    }
 
     #[derive(Default)]
     struct RecordingLoader {

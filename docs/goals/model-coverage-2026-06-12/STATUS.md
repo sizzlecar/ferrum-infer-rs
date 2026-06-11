@@ -2,6 +2,29 @@
 
 进度日志,倒序。
 
+## 2026-06-12(晚)
+
+- **T5 完成:L0 golden 基建落地并修出 7 处真实偏差**(PR #234,auto-merge):
+  - `scripts/gen_chat_template_goldens.py` + 5 模型 23 用例 fixture 入库,
+    `chat_template_golden` 测试 23/23 与 transformers 字节级一致。
+  - 修复项:trim_blocks/lstrip_blocks 对齐 transformers;tojson 改 Python
+    json.dumps 风格(自定义 filter);minijinja+serde_json 双 preserve_order
+    (minijinja 对 Rust struct 字段强制字母序,tools 改为有序 JSON 值进模板);
+    `PromptMessage::new` 不再急切剥离 assistant 历史的 `<think>`
+    (剥不剥是模板的政策:DeepSeek 剥、Qwen3-Coder 保留)。
+- **W1 全模型 alias 配齐**(均经 HF API 核实文件名):safetensors/GPTQ/GGUF
+  三组,含 deepseek-r1:8b/14b/32b、qwen3-coder:30b、qwen3:14b/32b、
+  qwen2.5-coder、mistral-small/devstral/magistral 24b 线。
+- **YaRN clamp 落地**:不支持的 rope_scaling → `max_seq_len` clamp 到
+  `original_max_position_embeddings` + 启动警告(R1-0528 由 131072 clamp 到
+  32768),含单测。
+- **环境约束发现**:本机磁盘 100%(HF 缓存 42GB);已清理 target/debug/
+  incremental 释放 7.3GB。**新模型权重无法下载**,但缓存中已有
+  R1-0528-Qwen3-8B、R1-Distill-32B、Qwen3-Coder-30B、Qwen2.5-Coder-32B 的
+  safetensors + blast-radius 三小模型 → 本地验证用缓存模型推进。
+- blast-radius 套件(chat_smoke/pty/stress + server 三件 + reference_match)
+  在后台执行中——T3/T4/T5 改动处于 EOS/stop/模板爆炸半径,存量回归必须绿。
+
 ## 2026-06-12(下午)
 
 - **T3 完成并提交(`778082a6`)**:minijinja-contrib pycompat 接入;模板渲染失败/
