@@ -1,0 +1,7 @@
+<|im_start|>user
+A<|im_end|>
+<|im_start|>assistant
+B<|im_end|>
+<|im_start|>user
+C<|im_end|>
+<|im_start|>assistant

@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Generate L0 chat-template golden fixtures from HF transformers.
+
+For each model id, downloads the tokenizer (config files only, no weights),
+renders a fixed set of conversation cases with
+`tokenizer.apply_chat_template(...)`, and writes fixtures under
+`crates/ferrum-server/tests/fixtures/chat_template/<slug>/`:
+
+  template.jinja   the chat template ferrum will render
+  meta.json        bos/eos strings + render kwargs + provenance
+  cases.json       the exact messages/tools per case (single source of truth
+                   shared with the Rust test)
+  golden_<case>.txt  the transformers-rendered prompt (byte ground truth)
+
+Run (network required; no torch needed):
+  uv run --with transformers --with jinja2 python scripts/gen_chat_template_goldens.py [model_id ...]
+
+The Rust side (`crates/ferrum-server/tests/chat_template_golden.rs`) renders
+the same cases through ferrum's renderer and asserts byte equality.
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+
+DEFAULT_MODELS = [
+    "Qwen/Qwen3-0.6B",
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+]
+
+FIXTURE_ROOT = Path(__file__).resolve().parent.parent / (
+    "crates/ferrum-server/tests/fixtures/chat_template"
+)
+
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}
+
+CASES = {
+    "single": {"messages": [{"role": "user", "content": "Hi"}]},
+    "system": {
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+        ]
+    },
+    "multi_turn": {
+        "messages": [
+            {"role": "user", "content": "A"},
+            {"role": "assistant", "content": "B"},
+            {"role": "user", "content": "C"},
+        ]
+    },
+    "think_history": {
+        "messages": [
+            {"role": "user", "content": "Q1"},
+            {
+                "role": "assistant",
+                "content": "<think>\nreasoning here\n</think>\n\nAnswer1",
+            },
+            {"role": "user", "content": "Q2"},
+        ]
+    },
+    "tools": {
+        "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+        "tools": [WEATHER_TOOL],
+    },
+}
+
+
+def template_supports_tools(template: str) -> bool:
+    return re.search(r"(?<![A-Za-z0-9_])tools(?![A-Za-z0-9_])", template) is not None
+
+
+def main() -> None:
+    from transformers import AutoTokenizer
+
+    models = sys.argv[1:] or DEFAULT_MODELS
+    for model_id in models:
+        slug = model_id.replace("/", "__")
+        out_dir = FIXTURE_ROOT / slug
+        print(f"== {model_id} -> {out_dir}")
+        tok = AutoTokenizer.from_pretrained(model_id)
+
+        template = tok.chat_template
+        if template is None:
+            print("   !! no chat_template; skipping")
+            continue
+        if isinstance(template, (list, dict)):
+            entries = (
+                {e["name"]: e["template"] for e in template}
+                if isinstance(template, list)
+                else template
+            )
+            template = entries.get("default") or next(iter(entries.values()))
+
+        kwargs = {}
+        if "enable_thinking" in template:
+            # ferrum defaults enable_thinking=false for templates that
+            # support it (ChatTemplateOptions::default_for_template).
+            kwargs["enable_thinking"] = False
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "template.jinja").write_text(template, encoding="utf-8")
+
+        cases_out = {}
+        for name, case in CASES.items():
+            tools = case.get("tools")
+            if tools and not template_supports_tools(template):
+                # tools-unaware templates take ferrum's injection path,
+                # which has no transformers ground truth — covered by unit
+                # tests instead.
+                continue
+            try:
+                rendered = tok.apply_chat_template(
+                    case["messages"],
+                    tools=tools,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    **kwargs,
+                )
+            except Exception as e:  # noqa: BLE001 - record and continue
+                print(f"   !! case {name} failed: {e}")
+                continue
+            (out_dir / f"golden_{name}.txt").write_text(rendered, encoding="utf-8")
+            cases_out[name] = case
+            print(f"   ok {name} ({len(rendered)} chars)")
+
+        meta = {
+            "model_id": model_id,
+            "bos_token": tok.bos_token,
+            "eos_token": tok.eos_token,
+            "render_kwargs": kwargs,
+            "transformers_version": __import__("transformers").__version__,
+        }
+        (out_dir / "meta.json").write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        (out_dir / "cases.json").write_text(
+            json.dumps(cases_out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+
+if __name__ == "__main__":
+    main()

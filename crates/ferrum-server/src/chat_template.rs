@@ -141,24 +141,17 @@ fn template_content_value(content: &str) -> Value {
 }
 
 impl PromptMessage {
+    /// Content is passed to the chat template verbatim — including any
+    /// `<think>...</think>` blocks in assistant history. Whether reasoning
+    /// is kept or stripped from history is a per-template policy (DeepSeek
+    /// strips it, Qwen3-Coder keeps it); pre-splitting here diverged from
+    /// what `transformers.apply_chat_template` feeds the same template.
+    /// `reasoning_content` is only set when the client supplies reasoning
+    /// as a separate field.
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        let role = role.into();
-        let content = content.into();
-        if role == "assistant" {
-            let (reasoning_content, content) = split_reasoning_content(content);
-            return Self {
-                role,
-                content,
-                reasoning_content,
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                function_call: None,
-            };
-        }
         Self {
-            role,
-            content,
+            role: role.into(),
+            content: content.into(),
             reasoning_content: None,
             name: None,
             tool_calls: None,
@@ -181,23 +174,6 @@ impl PromptMessage {
         prompt.function_call = message.function_call.clone();
         prompt
     }
-}
-
-fn split_reasoning_content(content: String) -> (Option<String>, String) {
-    let Some(end_idx) = content.find("</think>") else {
-        return (None, content);
-    };
-    let before_end = &content[..end_idx];
-    let after_end = content[end_idx + "</think>".len()..]
-        .trim_start_matches('\n')
-        .to_string();
-    let reasoning = before_end
-        .rsplit_once("<think>")
-        .map(|(_, reasoning)| reasoning)
-        .unwrap_or(before_end)
-        .trim_matches('\n')
-        .to_string();
-    (Some(reasoning), after_end)
 }
 
 /// Render common chat messages into the prompt string the model was trained
@@ -268,12 +244,16 @@ struct ModelTemplateContext<'a> {
     eos_token: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
+    /// Pre-converted to `serde_json::Value`: minijinja serializes Rust
+    /// *structs* with alphabetically sorted fields, but a JSON map (with
+    /// serde_json `preserve_order`) keeps the OpenAI canonical key order
+    /// that transformers' `tojson` renders.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<&'a [ChatTool]>,
+    tools: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'a ToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    functions: Option<&'a [ChatFunction]>,
+    functions: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     function_call: Option<&'a FunctionCallChoice>,
 }
@@ -293,6 +273,13 @@ fn render_model_template(
     // resolves those at runtime; `normalize_hf_chat_template` below remains
     // for the exact spellings it already rewrote before pycompat landed.
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    // transformers compiles chat templates with
+    // `ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)`
+    // and a plain-`json.dumps` `tojson` filter; match both so rendering is
+    // byte-identical (verified by tests/chat_template_golden.rs).
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
+    env.add_filter("tojson", python_style_tojson);
     env.add_filter("trim_newlines", |s: String| {
         s.trim_matches('\n').to_string()
     });
@@ -335,11 +322,56 @@ fn render_model_template(
         bos_token: model_template.bos_token.as_deref().unwrap_or(""),
         eos_token: model_template.eos_token.as_deref().unwrap_or(""),
         enable_thinking: options.enable_thinking,
-        tools,
+        tools: tools.and_then(|t| serde_json::to_value(t).ok()),
         tool_choice,
-        functions,
+        functions: functions.and_then(|f| serde_json::to_value(f).ok()),
         function_call,
     })
+}
+
+/// `tojson` matching Python's `json.dumps(..., ensure_ascii=False)` as used
+/// by transformers' chat-template environment: `", "` / `": "` separators and
+/// insertion key order (hence the minijinja `preserve_order` feature).
+/// minijinja's builtin emits compact separators, which breaks byte equality
+/// with transformers-rendered tool definitions.
+fn python_style_tojson(value: minijinja::value::Value) -> Result<String, minijinja::Error> {
+    struct PyFormatter;
+    impl serde_json::ser::Formatter for PyFormatter {
+        fn begin_object_key<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if !first {
+                writer.write_all(b", ")?;
+            }
+            Ok(())
+        }
+        fn begin_object_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+        ) -> std::io::Result<()> {
+            writer.write_all(b": ")
+        }
+        fn begin_array_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if !first {
+                writer.write_all(b", ")?;
+            }
+            Ok(())
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, PyFormatter);
+    serde::Serialize::serialize(&value, &mut ser).map_err(|e| {
+        minijinja::Error::new(minijinja::ErrorKind::BadSerialization, e.to_string())
+    })?;
+    String::from_utf8(out)
+        .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::BadSerialization, e.to_string()))
 }
 
 fn normalize_hf_chat_template(template: &str) -> String {
@@ -788,7 +820,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(out.contains("\"name\":\"weather\""), "{out}");
+        // tojson renders Python-json.dumps style (", " / ": " separators,
+        // insertion key order) for byte parity with transformers.
+        assert!(out.contains("\"name\": \"weather\""), "{out}");
+        assert!(out.contains("{\"type\": \"function\", \"function\": {"), "{out}");
         assert!(out.contains("[assistant][user][assistant]"), "{out}");
     }
 
@@ -939,11 +974,13 @@ mod tests {
             "{% for message in messages %}{% if message.reasoning_content is defined and message.reasoning_content is not none %}<r>{{ message.reasoning_content|trim_newlines }}</r>{{ message.content|trim_start_newlines }}{% else %}{{ message.content }}{% endif %}{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}",
             "reasoning-template",
         );
+        // reasoning_content is only present when the client supplied it
+        // separately (OpenAI `message.reasoning`); raw `<think>` blocks in
+        // content are the template's business (covered by golden tests).
+        let mut assistant = PromptMessage::new("assistant", "answer");
+        assistant.reasoning_content = Some("reason".to_string());
         let out = render_prompt_messages(
-            &[
-                PromptMessage::new("assistant", "<think>\nreason\n</think>\n\nanswer"),
-                PromptMessage::new("user", "next"),
-            ],
+            &[assistant, PromptMessage::new("user", "next")],
             "qwen3",
             Some(&template),
         )
