@@ -14,14 +14,14 @@ Path: /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf
 Device: Metal
 
 Initializing engine (continuous batching)...
-2026-06-11T04:10:26.387438Z  INFO ferrum_engine::registry: Initializing global component registry
-2026-06-11T04:10:26.387451Z  INFO ferrum_engine::registry: Registering default component factories
-2026-06-11T04:10:26.387486Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
-2026-06-11T04:10:26.564461Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
-2026-06-11T04:10:26.564502Z  INFO ferrum_engine::registry: Creating multinomial sampler
-2026-06-11T04:10:26.564516Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
-2026-06-11T04:10:26.564526Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
-2026-06-11T04:10:26.564573Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+2026-06-11T05:20:38.143026Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-11T05:20:38.143039Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-11T05:20:38.143076Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-11T05:20:38.325891Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-11T05:20:38.325944Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-11T05:20:38.325952Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-11T05:20:38.325967Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-11T05:20:38.326044Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
 
 🚀 Server running at http://127.0.0.1:18080
 
@@ -35,3 +35,4 @@ Endpoints:
 
 Press Ctrl+C to stop.
 
+2026-06-11T05:20:58.081518Z ERROR ferrum_server::axum_server: Generation failed: Request validation error: This model context is limited to 1024 tokens, but this request needs 17 input tokens + 10240 output tokens. Reduce max_tokens or shorten the messages.

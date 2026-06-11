@@ -1,0 +1,93 @@
+{
+  "formulae": [
+    {
+      "name": "ferrum-cuda",
+      "full_name": "sizzlecar/ferrum/ferrum-cuda",
+      "tap": "sizzlecar/ferrum",
+      "oldnames": [],
+      "aliases": [],
+      "versioned_formulae": [],
+      "desc": "Production-grade LLM inference in Rust with NVIDIA CUDA sm89 support",
+      "license": "MIT",
+      "homepage": "https://github.com/sizzlecar/ferrum-infer-rs",
+      "versions": {
+        "stable": "0.7.7",
+        "head": null,
+        "bottle": false
+      },
+      "urls": {
+        "stable": {
+          "url": "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.7.7/ferrum-linux-x86_64-cuda-sm89.tar.gz",
+          "tag": null,
+          "revision": null,
+          "using": null,
+          "checksum": "6397de942d1c767383982186642da3990df49ea1cd6f604434a6cc9d6f7f912b"
+        }
+      },
+      "patches": [],
+      "revision": 0,
+      "version_scheme": 0,
+      "compatibility_version": null,
+      "autobump": true,
+      "no_autobump_message": null,
+      "skip_livecheck": false,
+      "bottle": {},
+      "pour_bottle_only_if": null,
+      "keg_only": false,
+      "keg_only_reason": null,
+      "options": [],
+      "build_dependencies": [],
+      "dependencies": [],
+      "test_dependencies": [],
+      "recommended_dependencies": [],
+      "optional_dependencies": [],
+      "uses_from_macos": [],
+      "uses_from_macos_bounds": [],
+      "requirements": [
+        {
+          "name": "linux",
+          "cask": null,
+          "download": null,
+          "version": null,
+          "contexts": [],
+          "specs": [
+            "stable"
+          ]
+        }
+      ],
+      "conflicts_with": [
+        "ferrum"
+      ],
+      "conflicts_with_reasons": [
+        "both install the ferrum binary"
+      ],
+      "link_overwrite": [],
+      "caveats": "ferrum-cuda is the Linux x86_64 CUDA sm89 build. It requires an NVIDIA\ndriver plus CUDA 12 runtime libraries such as libcudart, cublas, curand,\nand libcuda on the target host.\n",
+      "installed": [],
+      "linked_keg": null,
+      "pinned": false,
+      "outdated": false,
+      "deprecated": false,
+      "deprecation_date": null,
+      "deprecation_reason": null,
+      "deprecation_replacement_formula": null,
+      "deprecation_replacement_cask": null,
+      "deprecate_args": null,
+      "disabled": false,
+      "disable_date": null,
+      "disable_reason": null,
+      "disable_replacement_formula": null,
+      "disable_replacement_cask": null,
+      "disable_args": null,
+      "post_install_steps": [],
+      "post_install_defined": false,
+      "service": null,
+      "tap_git_head": "f1201ba97fd125fd66762afa1cf25183c7d81bdb",
+      "ruby_source_path": "Formula/ferrum-cuda.rb",
+      "ruby_source_checksum": {
+        "sha256": "0b2a18d804d99765a01514404594e017d0fa1a2b78ac967c328853a4e5429598"
+      }
+    }
+  ],
+  "casks": []
+}

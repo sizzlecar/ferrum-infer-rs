@@ -8,8 +8,20 @@ import sys
 from pathlib import Path
 
 REQUIRED_GROUPS = {
-    "unit": ["unit.gate.json", "source/unit.gate.json", "source-unit/unit.gate.json"],
-    "metal-source": ["metal.gate.json", "source/metal.gate.json", "source-metal/metal.gate.json"],
+    "unit": [
+        "unit/unit.gate.json",
+        "unit/gate.json",
+        "unit.gate.json",
+        "source/unit.gate.json",
+        "source-unit/unit.gate.json",
+    ],
+    "metal-source": [
+        "metal/metal.gate.json",
+        "metal/gate.json",
+        "metal.gate.json",
+        "source/metal.gate.json",
+        "source-metal/metal.gate.json",
+    ],
     "cuda-qwen-full": [
         "g0_cuda4090_full.gate.json",
         "source/g0_cuda4090_full.gate.json",

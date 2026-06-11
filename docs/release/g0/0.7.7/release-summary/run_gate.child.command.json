@@ -1,0 +1,11 @@
+{
+  "cmd": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/g0_release_summary.py",
+    "docs/release/g0/0.7.7"
+  ],
+  "duration_sec": 0.043211125303059816,
+  "env_overrides": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

@@ -1,0 +1,38 @@
+
+  ______                            
+ |  ____|                           
+ | |__ ___ _ __ _ __ _   _ _ __ ___  
+ |  __/ _ \ '__| '__| | | | '_ ` _ \ 
+ | | |  __/ |  | |  | |_| | | | | | 
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.7
+
+Model: Qwen3-30B-A3B-Q4_K_M
+Path: /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf
+Device: Metal
+
+Initializing engine (continuous batching)...
+2026-06-11T06:08:48.441673Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-11T06:08:48.441689Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-11T06:08:48.441762Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/ferrum-bench/tokenizers/Qwen3-30B-A3B.tokenizer.json"
+2026-06-11T06:08:48.621038Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-11T06:08:48.621080Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-11T06:08:48.621090Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-11T06:08:48.621099Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=Metal, block_size=16, max_blocks=2048
+2026-06-11T06:08:48.621154Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/ferrum-bench/models/Qwen3-30B-A3B-Q4_K_M.gguf (format: gguf)
+
+🚀 Server running at http://127.0.0.1:18080
+
+Endpoints:
+  POST /v1/chat/completions      - OpenAI-compatible chat
+  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)
+  POST /v1/audio/speech          - Text-to-speech (TTS)
+  POST /v1/embeddings            - Text/image embeddings
+  GET  /v1/models                - List models
+  GET  /health                   - Health check
+
+Press Ctrl+C to stop.
+
+2026-06-11T06:09:15.294518Z ERROR ferrum_server::axum_server: Generation failed: Request validation error: This model context is limited to 1024 tokens, but this request needs 17 input tokens + 10240 output tokens. Reduce max_tokens or shorten the messages.

@@ -8,13 +8,15 @@
     "--out",
     "docs/release/g0/0.7.7/cuda-tarball",
     "--asset-path",
-    "/workspace/assets/ferrum-linux-x86_64-cuda-sm89.tar.gz",
+    "/workspace/assets-official-0.7.7/ferrum-linux-x86_64-cuda-sm89.tar.gz",
+    "--sha256",
+    "6397de942d1c767383982186642da3990df49ea1cd6f604434a6cc9d6f7f912b",
     "--model",
     "/workspace/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441",
     "--model-name",
     "Qwen3-30B-A3B-GPTQ-Int4"
   ],
-  "duration_sec": 41.49230238201562,
+  "duration_sec": 40.13877359207254,
   "env_overrides": {
     "PYTHONDONTWRITEBYTECODE": "1"
   }

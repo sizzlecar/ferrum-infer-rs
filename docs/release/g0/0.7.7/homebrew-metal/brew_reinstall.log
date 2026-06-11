@@ -1,0 +1,58 @@
+==> Would reinstall 1 formula:
+ferrum
+==> Fetching downloads for: ferrum
+==> Reinstalling sizzlecar/ferrum/ferrum 
+🍺  /opt/homebrew/Cellar/ferrum/0.7.7: 5 files, 22.2MB, built in 1 second
+==> Running `brew cleanup ferrum`...
+Disable this behaviour by setting `HOMEBREW_NO_INSTALL_CLEANUP=1`.
+Hide these hints with `HOMEBREW_NO_ENV_HINTS=1` (see `man brew`).
+Warning: The following taps are not trusted:
+  hudochenkov/sshpass
+  oven-sh/bun
+
+Homebrew is currently ignoring formulae, casks and commands from these taps because tap trust is required.
+Trust specific formulae, casks or commands with:
+  brew trust --formula <user>/<tap>/<formula>
+  brew trust --cask <user>/<tap>/<cask>
+  brew trust --command <user>/<tap>/<command>
+or trust installed formulae from these taps with:
+  brew trust --formula oven-sh/bun/bun
+  brew trust --formula hudochenkov/sshpass/sshpass
+You can trust all formulae, casks and commands from these taps with:
+  brew trust hudochenkov/sshpass oven-sh/bun
+Prefer trusting only the specific formulae, casks or commands you need.
+Untap them with:
+  brew untap hudochenkov/sshpass oven-sh/bun
+To disable trust checks:
+  export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
+This is not recommended and will be removed in a later release.
+✔︎ Formula ferrum (0.7.7)
+✔︎ Formula ferrum (0.7.7)
+Warning: Your Xcode (16.1) is outdated.
+Please update to Xcode 26.3 (or delete it).
+Xcode can be updated from the App Store.
+
+
+This is a Tier 2 configuration:
+  https://docs.brew.sh/Support-Tiers#tier-2
+You can report issues with Tier 2 configurations to Homebrew/* repositories!
+Read the above document before opening any issues or PRs.
+
+Warning: A newer Command Line Tools release is available.
+Update them from Software Update in System Settings.
+
+If that doesn't show you any updates, run:
+  sudo rm -rf /Library/Developer/CommandLineTools
+  sudo xcode-select --install
+
+Alternatively, manually download them from:
+  https://developer.apple.com/download/all/.
+You should download the Command Line Tools for Xcode 26.3.
+
+
+
+This is a Tier 2 configuration:
+  https://docs.brew.sh/Support-Tiers#tier-2
+You can report issues with Tier 2 configurations to Homebrew/* repositories!
+Read the above document before opening any issues or PRs.
+
