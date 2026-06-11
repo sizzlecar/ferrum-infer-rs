@@ -2,6 +2,20 @@
 
 进度日志,倒序。
 
+## 2026-06-12(深夜)— 本地验证推进与环境修正
+
+- **修正**:HF 缓存里的 R1-0528-8B / R1-Distill-32B / Qwen3-Coder-30B /
+  Qwen2.5-Coder-32B 仅为 6–11MB 元数据壳(config/tokenizer),**无权重**。
+  W1 端到端一律需要下载。
+- 磁盘:删除 target/debug(15GB)后约 16GB 可用;R1-8B Q4_K_M GGUF(~5GB)
+  下载中(第一次因网络/代理 "error decoding response body" 失败,重试中);
+  Qwen3-Coder-30B Q4_K_M(~18.6GB)需要更多空间——待用户清理或换机。
+- 新增 `scripts/model_coverage_smoke.sh <alias> [--reasoning]`:
+  L2/L3/L4 阶梯(known-answer + 自然 EOS / 多轮 / stream==non-stream /
+  reasoning 提取 / required tool 10x / strict schema 10x),所有 W1 模型复用。
+- 下一步(按序):R1-8B GGUF smoke(--reasoning)→ 视磁盘跑
+  qwen3-coder:30b-q4_k_m → W1 收尾(README 矩阵 + 验证器)→ pod 合同。
+
 ## 2026-06-12(深夜)— blast-radius 存量回归结果
 
 T3/T4/T5 处于 EOS/stop/模板爆炸半径,全套件(release + Metal,真模型)结果:
