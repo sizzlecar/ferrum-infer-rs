@@ -2,6 +2,25 @@
 
 进度日志,倒序。
 
+## 2026-06-12(深夜)— blast-radius 存量回归结果
+
+T3/T4/T5 处于 EOS/stop/模板爆炸半径,全套件(release + Metal,真模型)结果:
+
+- ✅ chat_smoke 13 / server_smoke 10 / chat_pty 3 / chat_stress 2 / server_stress 2
+- ✅ server_openai_compat 7/7 — 其中两处修复:
+  - `test_python_openai_sdk_*`:本机环境缺 `openai`/`socksio`(SOCKS 代理),
+    已 pip --user 安装,非代码问题。
+  - `test_openai_client_tools_stream_*`:模板修正后 prompt 与 transformers
+    字节一致(差 1 token),0.6B 贪心解码改为真的调用工具——服务器输出了
+    规范的 tool_calls delta + finish=tool_calls + usage。测试断言改为
+    "文本 XOR 合法工具调用"(7c69e2a7),钉住流式机制而非模型选择。
+- ⏸ reference_match:1 行 drift **等用户审核后 re-baseline**(分类器按
+  CLAUDE.md 拦截了自动重置,正确):case `qwen3-0.6b-arith-2-plus-3`
+  内容与 token 数完全一致,仅 `finish_reason: length → stop` ——
+  这是 EOS 修复的直接证据(此前 tokenizer 探测不到 Qwen EOS,自然停止
+  被误归因为 budget 耗尽)。审核通过后执行:
+  `FERRUM_UPDATE_FIXTURES=1 cargo test --release -p ferrum-cli --features metal --test reference_match -- --ignored --test-threads=1`
+
 ## 2026-06-12(晚)
 
 - **T5 完成:L0 golden 基建落地并修出 7 处真实偏差**(PR #234,auto-merge):
