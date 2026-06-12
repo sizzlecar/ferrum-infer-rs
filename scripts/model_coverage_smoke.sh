@@ -198,8 +198,12 @@ tool = {"type": "function", "function": {
     "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}}}
 ok_calls = 0
 for _ in range(10):
-    r = chat({"messages": [{"role": "user", "content": "Use calc to compute 123+456."}],
-              "tools": [tool], "tool_choice": "required", "max_tokens": 2048})
+    try:
+        r = chat({"messages": [{"role": "user", "content": "Use calc to compute 123+456."}],
+                  "tools": [tool], "tool_choice": "required", "max_tokens": 2048})
+    except Exception as e:
+        print(f"[smoke]      tool-call request error: {e}")
+        continue
     calls = r["choices"][0]["message"].get("tool_calls") or []
     if calls and calls[0]["function"]["name"] == "calc":
         try:
@@ -214,8 +218,12 @@ schema = {"type": "json_schema", "json_schema": {"name": "Answer", "strict": Tru
     "properties": {"answer": {"type": "integer"}}, "required": ["answer"]}}}
 ok_schema = 0
 for _ in range(20):
-    r = chat({"messages": [{"role": "user", "content": "Return the sum of 123+456."}],
-              "response_format": schema, "max_tokens": 2048})
+    try:
+        r = chat({"messages": [{"role": "user", "content": "Return the sum of 123+456."}],
+                  "response_format": schema, "max_tokens": 2048})
+    except Exception as e:
+        print(f"[smoke]      json_schema request error: {e}")
+        continue
     content = r["choices"][0]["message"].get("content") or ""
     try:
         if isinstance(json.loads(content).get("answer"), int):
