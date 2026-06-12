@@ -17,4 +17,5 @@ Verify zero: instances list must return 0 before declaring the goal done.
 | ~~40745272~~ | 1x RTX 4090 | 0.376 | | Korea host: session-scope process reaping killed builds 3x | DESTROYED ~08:20 |
 | ~~40748763~~ | 1x RTX 4090 | 0.336 | | UK host never booted | DESTROYED ~08:40 |
 | ~~40749191~~ | 1x RTX 4090 | 0.349 | | Iceland host stuck loading 18min | DESTROYED ~09:15 |
-| 40749797 | 1x RTX 4090, 150GB | 0.376 | 2026-06-13 ~09:15 | FINAL micro-session (Taiwan) | ACTIVE |
+| 40749797 | 1x RTX 4090, 150GB | 0.376 | 2026-06-13 ~09:15 | FINAL micro-session (Taiwan, image pull racing) | ACTIVE |
+| 40750195 | 1x RTX 4090, 150GB | 0.136 | 2026-06-13 ~09:45 | RACER (Argentina, pytorch-cuda12.4 image) — loser destroyed | ACTIVE |
