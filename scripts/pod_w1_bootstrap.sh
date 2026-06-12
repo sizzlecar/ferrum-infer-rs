@@ -25,8 +25,11 @@ fi
 pip install -q -U "huggingface_hub[hf_transfer]" 2>&1 | tail -1
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-# Build in the background while models download
-( cd "$(pwd)" && cargo build --release -p ferrum-cli --features cuda,vllm-moe-marlin \
+# Build in the background while models download. vllm-paged-attn-v2 is
+# required: the CUDA autosizer defaults FERRUM_USE_VLLM_PAGED_ATTN=1 and
+# serve hard-errors if the kernel isn't compiled in.
+( cd "$(pwd)" && cargo build --release -p ferrum-cli \
+    --features cuda,vllm-moe-marlin,vllm-paged-attn-v2 \
     > "$W/build.log" 2>&1 && touch "$W/build.ok" || touch "$W/build.fail" ) &
 
 dl() { # repo [include-pattern]
@@ -46,8 +49,11 @@ if [ "$ROLE" = "single" ]; then
   dl jart25/Qwen3-Coder-30B-A3B-Instruct-Int4-gptq
   # C7/G0 baseline (M3); M2 baseline handled by bench scripts if time allows
   dl Qwen/Qwen3-30B-A3B-GPTQ-Int4
-  # transformers for the L1 reference generation (CPU/GPU greedy)
-  pip install -q -U torch transformers accelerate 2>&1 | tail -1 &
+  # transformers for the L1 reference generation. Pinned: transformers
+  # 5.11 + tokenizers 0.22 garble the DeepSeek-R1 tokenizer round-trip
+  # (encode loses spaces, decode emits raw byte-level markers); 4.51.3 +
+  # tokenizers 0.21 round-trips byte-clean.
+  pip install -q torch "transformers==4.51.3" "tokenizers==0.21.4" accelerate 2>&1 | tail -1 &
 else
   dl unsloth/DeepSeek-R1-Distill-Llama-70B-GGUF --include "*Q4_K_M*"
   dl deepseek-ai/DeepSeek-R1-Distill-Llama-70B --include "tokenizer*" --include "generation_config.json" --include "*.jinja"

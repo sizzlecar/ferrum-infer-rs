@@ -39,7 +39,9 @@ PROMPTS = [
     "What gas do plants absorb from the air?",
     "How many minutes are in two hours?",
 ]
-MAX_NEW_TOKENS = 96
+# Reasoning models think before answering — give the content room to
+# actually appear after the think block.
+MAX_NEW_TOKENS = 384
 
 
 def split_think(text: str):
