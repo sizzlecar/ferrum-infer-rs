@@ -17,5 +17,6 @@ Verify zero: instances list must return 0 before declaring the goal done.
 | ~~40745272~~ | 1x RTX 4090 | 0.376 | | Korea host: session-scope process reaping killed builds 3x | DESTROYED ~08:20 |
 | ~~40748763~~ | 1x RTX 4090 | 0.336 | | UK host never booted | DESTROYED ~08:40 |
 | ~~40749191~~ | 1x RTX 4090 | 0.349 | | Iceland host stuck loading 18min | DESTROYED ~09:15 |
-| 40749797 | 1x RTX 4090, 150GB | 0.376 | 2026-06-13 ~09:15 | FINAL micro-session (Taiwan, image pull racing) | ACTIVE |
-| 40750195 | 1x RTX 4090, 150GB | 0.136 | 2026-06-13 ~09:45 | RACER (Argentina, pytorch-cuda12.4 image) — loser destroyed | ACTIVE |
+| ~~40749797~~ | 1x RTX 4090, 150GB | 0.376 | 2026-06-13 ~09:15 | Taiwan: host `docker_build() error writing dockerfile` | DESTROYED ~11:35 |
+| ~~40750195~~ | 1x RTX 4090, 150GB | 0.136 | 2026-06-13 ~09:45 | Argentina racer: never booted (None ~25min) | DESTROYED ~11:50 |
+| 40751023 | 1x RTX 4090, 120GB | 0.376 | 2026-06-13 ~11:40 | FINAL micro-session winner (Iceland host 1647, pytorch image cache-hit, booted <2min). cuInit=804 fixed by removing container compat libcuda 550 (GeForce unsupported by compat libs); host driver 535/CUDA 12.4 OK | ACTIVE |
