@@ -48,6 +48,11 @@ if [ -z "$KV_CAPACITY" ]; then
   fi
 fi
 SERVE_ARGS=(--kv-capacity "$KV_CAPACITY" --max-num-seqs "$MAX_SEQS")
+# Extra serve args (e.g. `--gpu-devices 0,1` on dual-GPU pods).
+if [ -n "${FERRUM_SMOKE_EXTRA_SERVE_ARGS:-}" ]; then
+  # shellcheck disable=SC2206
+  SERVE_ARGS+=(${FERRUM_SMOKE_EXTRA_SERVE_ARGS})
+fi
 
 BIN="${FERRUM_BIN:-target/release/ferrum}"
 LOG="/tmp/ferrum_w1_smoke_${PORT}.log"
