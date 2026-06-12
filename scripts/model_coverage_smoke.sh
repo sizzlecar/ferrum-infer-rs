@@ -89,7 +89,7 @@ def chat(payload, stream=False):
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=600) as r:
+    with urllib.request.urlopen(req, timeout=int(os.environ.get("SMOKE_REQ_TIMEOUT", "600"))) as r:
         if not stream:
             return json.load(r)
         content, tool_names, finish = "", [], None
