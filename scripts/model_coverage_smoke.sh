@@ -20,11 +20,13 @@ shift
 REASONING=0
 PORT=18200
 KV_CAPACITY=""
+MAX_SEQS=4
 while [ $# -gt 0 ]; do
   case "$1" in
     --reasoning) REASONING=1 ;;
     --port) shift; PORT="$1" ;;
     --kv-capacity) shift; KV_CAPACITY="$1" ;;
+    --max-seqs) shift; MAX_SEQS="$1" ;;
   esac
   shift
 done
@@ -45,7 +47,7 @@ if [ -z "$KV_CAPACITY" ]; then
     KV_CAPACITY=4096
   fi
 fi
-SERVE_ARGS=(--kv-capacity "$KV_CAPACITY" --max-num-seqs 4)
+SERVE_ARGS=(--kv-capacity "$KV_CAPACITY" --max-num-seqs "$MAX_SEQS")
 
 BIN="${FERRUM_BIN:-target/release/ferrum}"
 LOG="/tmp/ferrum_w1_smoke_${PORT}.log"
