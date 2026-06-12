@@ -65,7 +65,11 @@
           "artifact": "crates/ferrum-server/tests/fixtures/chat_template/deepseek-ai__DeepSeek-R1-0528-Qwen3-8B",
           "note": "golden 5/5 incl. reasoning-history strip; renamed EOS 151643 resolved from tokenizer_config (commit 21e89645)"
         },
-        "l1_bf16": { "status": "pending", "note": "LlamaFamily-dense path REPRESENTATIVE per GOAL amendment #1: BF16 16GB fits 1x4090, byte-equal N>=20 runs in the pod session; larger same-path models inherit transitively" },
+        "l1_bf16": {
+          "status": "pending",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/l1_fork_margins.json",
+          "note": "Representative run quantified: HF-vs-ferrum BF16 greedy diverges 20/20 in text, but at the TRUE fork points HF's own top1-top2 logit margin has median 0.75 / min 0.0 (max 13.5, one outlier) — the forks are BF16 tie-flips, not a ferrum numerical defect. Cross-implementation byte-equality is unattainable in principle; AMENDMENT PROPOSAL #3 (self-fingerprint + real-size semantic gates) awaits user approval. CUDA BF16 smoke + L5 (54.5/163.7/382.5 tok/s zero errors) cover behavioral sanity"
+        },
         "l2_gguf_metal": {
           "status": "pass",
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_deepseek-r1-8b-q4_k_m_metal_extended_2026-06-12.txt",
@@ -252,7 +256,11 @@
           "reason": "Distill-family model behavior: the tools-unaware template + prompt-forced think makes the model write the tool-call JSON inside its (never-closed) think block (server correctly 400s required tool_choice; reasoning_len=3052 starting with the JSON). Engine mechanics are correct — R1-0528-8B (no forced think) passes tools 10/10. README marks the distill rows chat/reasoning-grade, not agent-grade",
           "note": ""
         },
-        "l5_concurrency": { "status": "pending", "note": "c=1/4/16 dual-4090 bench running on Iceland" },
+        "l5_concurrency": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/l5_r1-70b-gptq_dual_cuda.json",
+          "note": "dual-4090 c=1/4/16 = 21.4/67.3/68.1 tok/s, 100% completion, zero errors, stddev <1%"
+        },
         "perf_same_arch": { "status": "pending", "note": "baseline = llama33-70b-4bit-2x4090 lane numbers" },
         "docs_readme": { "status": "pending" }
       }
