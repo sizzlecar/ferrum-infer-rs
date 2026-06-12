@@ -244,6 +244,19 @@ impl Qwen3MoeConfig {
     }
 }
 
+/// Read just the layer count from a GGUF header. Multi-GPU serve uses
+/// this to materialize the even layer-split plan (the safetensors path
+/// gets the count from ModelDefinition; GGUF skips that parse).
+pub fn gguf_num_layers(path: &std::path::Path) -> Result<usize> {
+    let gguf = GgufFile::open(path)
+        .map_err(|e| FerrumError::model(format!("GgufFile::open {}: {e}", path.display())))?;
+    let arch = gguf
+        .architecture()
+        .map_err(|e| FerrumError::model(format!("read GGUF arch: {e}")))?
+        .to_string();
+    Ok(read_u32(&gguf, &format!("{arch}.block_count"))? as usize)
+}
+
 fn read_u32(gguf: &GgufFile, key: &str) -> Result<u32> {
     gguf.metadata_u32(key)
         .map_err(|e| FerrumError::model(format!("GGUF {key}: {e}")))
