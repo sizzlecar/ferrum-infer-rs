@@ -159,6 +159,24 @@ ns = chat(prompt)["choices"][0]["message"].get("content") or ""
 st = chat(prompt, stream=True)["content"]
 check("stream == non-stream", ns.strip() == st.strip(), f"non-stream={ns!r} stream={st!r}")
 
+# L3 — custom stop sequence mechanics: finish_reason=stop, stop string
+# never leaks into content. (For reasoning models the stop may hit inside
+# the think block — content emptiness is fine, the wire mechanics are
+# what's pinned here.)
+r = chat({"messages": [{"role": "user", "content": "Count from 1 to 20 as plain comma-separated numbers, nothing else."}],
+          "max_tokens": 4096, "stop": ["7"]})
+content = r["choices"][0]["message"].get("content") or ""
+finish = r["choices"][0].get("finish_reason")
+check("custom stop finish_reason", finish == "stop", f"finish={finish}")
+check("custom stop does not leak", "7" not in content, repr(content[-120:]))
+
+# L3 — max_tokens cutoff: finish_reason=length and budget respected
+r = chat({"messages": [{"role": "user", "content": "Write a long story about the sea."}], "max_tokens": 8})
+finish = r["choices"][0].get("finish_reason")
+used = (r.get("usage") or {}).get("completion_tokens")
+check("max_tokens finish_reason length", finish == "length", f"finish={finish}")
+check("max_tokens budget respected", used is not None and used <= 8, f"completion_tokens={used}")
+
 # L4 — required tool call (10x)
 tool = {"type": "function", "function": {
     "name": "calc", "description": "Evaluate an arithmetic expression.",
