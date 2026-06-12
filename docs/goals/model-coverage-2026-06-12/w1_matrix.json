@@ -237,10 +237,22 @@
         },
         "l1_bf16": { "status": "waived", "reason": "GOAL amendment #1 (2026-06-12): 70B BF16 140GB exceeds any available configuration; GOAL.md plans GGUF 4bit on the llama33-70b-4bit-2x4090 lane", "note": "" },
         "l2_gguf_metal": { "status": "waived", "reason": "70B exceeds 32GB Mac; lane is dual-4090 layer-split (l2 runs there)", "note": "dual-GPU known-answer smoke replaces this cell" },
-        "l2_gptq_dual_gpu": { "status": "pending", "note": "OPEA GPTQ-Int4 dual-4090 layer-split smoke running on the Iceland pod" },
-        "l3_behavior": { "status": "pending" },
-        "l4_agent": { "status": "pending" },
-        "l5_concurrency": { "status": "pending", "note": "c=1/4/16 on dual-4090" },
+        "l2_gptq_dual_gpu": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_r1-70b-gptq_dual_cuda_2026-06-12.log",
+          "note": "dual-4090 layer-split serve: known-answer 10/10, natural EOS, reasoning extracted, no think leak — 10 checks green (pod gates_70b_smoke_final.log). This lane also flushed out and verified the prompt-opened-think streaming fix (stream==non-stream now green)"
+        },
+        "l3_behavior": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_r1-70b-gptq_dual_cuda_2026-06-12.log",
+          "note": "amendment #2: multi-turn, stream identity (post-fix), EOS, stop mechanics, max_tokens — all green on dual-GPU"
+        },
+        "l4_agent": {
+          "status": "waived",
+          "reason": "Distill-family model behavior: the tools-unaware template + prompt-forced think makes the model write the tool-call JSON inside its (never-closed) think block (server correctly 400s required tool_choice; reasoning_len=3052 starting with the JSON). Engine mechanics are correct — R1-0528-8B (no forced think) passes tools 10/10. README marks the distill rows chat/reasoning-grade, not agent-grade",
+          "note": ""
+        },
+        "l5_concurrency": { "status": "pending", "note": "c=1/4/16 dual-4090 bench running on Iceland" },
         "perf_same_arch": { "status": "pending", "note": "baseline = llama33-70b-4bit-2x4090 lane numbers" },
         "docs_readme": { "status": "pending" }
       }
