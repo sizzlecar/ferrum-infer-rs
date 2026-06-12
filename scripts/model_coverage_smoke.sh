@@ -111,11 +111,34 @@ def check(name, ok, detail=""):
     if not ok:
         failures.append(name)
 
-# L2/L3 — known answer + natural EOS
-r = chat({"messages": [{"role": "user", "content": "What is 2+3? Answer with just the number."}], "max_tokens": 2048})
-msg = r["choices"][0]["message"]
-content, finish = msg.get("content") or "", r["choices"][0].get("finish_reason")
-check("known-answer contains 5", "5" in content, repr(content[-200:]))
+# L2 — known answer N=10 (GOAL gate: 10/10 semantically correct) + L3
+# natural-EOS / reasoning assertions on the first reply.
+KNOWN_ANSWERS = [
+    ("What is 2+3? Answer with just the number.", "5"),
+    ("What is 7*6? Answer with just the number.", "42"),
+    ("Spell the English word for the number 9. Answer with just the word.", "nine"),
+    ("What is the capital of France? Answer with just the city name.", "Paris"),
+    ("What is 100-58? Answer with just the number.", "42"),
+    ("Which planet do humans live on? Answer with just the planet name.", "Earth"),
+    ("What is 12/4? Answer with just the number.", "3"),
+    ("What color is a stop sign? Answer with just the color.", "red"),
+    ("What is 2 to the power of 5? Answer with just the number.", "32"),
+    ("How many days are in a week? Answer with just the number.", "7"),
+]
+ok_known, first = 0, None
+for q, expected in KNOWN_ANSWERS:
+    r = chat({"messages": [{"role": "user", "content": q}], "max_tokens": 2048})
+    if first is None:
+        first = r
+    content = r["choices"][0]["message"].get("content") or ""
+    if expected.lower() in content.lower():
+        ok_known += 1
+    else:
+        print(f"[smoke]      known-answer miss: {q!r} -> {content[-120:]!r}")
+check("known-answer 10/10", ok_known == 10, f"{ok_known}/10")
+
+msg = first["choices"][0]["message"]
+content, finish = msg.get("content") or "", first["choices"][0].get("finish_reason")
 check("natural EOS stop", finish == "stop", f"finish={finish}")
 if REASONING:
     check("reasoning extracted", bool(msg.get("reasoning")), "message.reasoning empty")

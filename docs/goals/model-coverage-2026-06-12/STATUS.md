@@ -2,6 +2,21 @@
 
 进度日志,倒序。
 
+## 2026-06-12(午前)— L0 扩面:模板同一性 + Mistral/Llama golden
+
+- **模板同一性(HF raw tokenizer_config,sha256 前 16 位)**:
+  Qwen3-0.6B / 14B / 32B 模板逐字节同一份(`a55ee1b1660128b7`,EOS
+  `<|im_end|>`);R1-Distill-Qwen-14B / 32B 同一份(`56a1447ad31926fd`,
+  EOS `<｜end▁of▁sentence｜>`)。**结论:Qwen3-14B/32B 与 R1-Distill-14B
+  的 L0 由现有 golden fixture 直接覆盖**,各自只剩 per-model
+  EOS/generation_config 断言(T4 机制已通用)。
+- Mistral 24B 线 + Llama-3.1 golden fixture 生成中(来源 = serve 实际用的
+  tokenizer 仓库:unsloth 镜像 ×2 + mistralai 上游 ×1 + unsloth Llama)。
+  环境坑:huggingface_hub 新版走 httpx,SOCKS 代理需要 `httpx[socks]`
+  (socksio),`pysocks` 只管 requests。
+- Coder-30B GGUF(17.28GB)断点续传循环推进中(代理频繁断流,每次
+  尝试落 1–3GB,`.incomplete` blob 在涨)。
+
 ## 2026-06-12(深夜 III)— ✅ R1-0528-Qwen3-8B GGUF Metal smoke 全绿
 
 **W1 第一个模型过本地阶梯**:`FERRUM W1 SMOKE PASS: deepseek-r1:8b-q4_k_m`
