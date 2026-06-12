@@ -40,8 +40,12 @@
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-coder-30b-q4_k_m_metal_2026-06-12.txt",
           "note": "GOAL amendment #2: smoke L3 section green — multi-turn KV, stream==non-stream, natural EOS, custom stop (finish+no-leak), max_tokens cutoff"
         },
-        "l4_agent": { "status": "pending", "note": "amendment #2 harness: smoke tools 10/10 done; schema needs the 20/20 run (script now does 20x) — re-pull + rerun queued" },
-        "l5_concurrency": { "status": "pending" },
+        "l4_agent": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-coder-30b-q4_k_m_metal_final_2026-06-12.txt",
+          "note": "amendment #2 harness: required tools 10/10 (XML format) + strict schema 20/20 (final-script rerun)"
+        },
+        "l5_concurrency": { "status": "pending", "note": "Metal bench-serve c=1/4/16/32 n=3 running with --out report; first truncated run already showed zero errors across all detectors" },
         "perf_same_arch": { "status": "pending", "note": "baseline = M3 (Qwen3-30B-A3B) G0 numbers" },
         "docs_readme": { "status": "pending" }
       }
