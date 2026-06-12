@@ -82,7 +82,11 @@
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_deepseek-r1-8b-q4_k_m_metal_final_2026-06-12.txt",
           "note": "amendment #2 harness: required tools 10/10 + strict schema 20/20 (final-script rerun, 12/12 overall)"
         },
-        "l5_concurrency": { "status": "pending" },
+        "l5_concurrency": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/l5_deepseek-r1-8b_metal_2026-06-12.json",
+          "note": "Metal c=1/4/16 n=3: 100/100 every run, zero errors, stddev <2%; out-tok/s 22.9/23.4/54.2. CUDA-side joins pod batch"
+        },
         "perf_same_arch": { "status": "pending", "note": "baseline = Qwen3-8B / Llama-8B class numbers" },
         "docs_readme": { "status": "pending" }
       }
