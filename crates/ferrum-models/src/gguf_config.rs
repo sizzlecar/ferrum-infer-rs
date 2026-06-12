@@ -129,6 +129,7 @@ impl LlamaFamilyConfig {
             rope_interleaved,
             has_qk_norm,
             sliding_window,
+            ..Default::default()
         })
     }
 }
@@ -232,6 +233,7 @@ impl Qwen3MoeConfig {
             has_qk_norm: true,
             // No sliding window in Qwen3-MoE.
             sliding_window: 0,
+            ..Default::default()
         };
 
         Ok(Self::from_base(

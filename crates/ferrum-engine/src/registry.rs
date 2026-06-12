@@ -1269,6 +1269,16 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                             None,
                         )
                     }
+                    ferrum_models::Architecture::Gemma3 => {
+                        info!(
+                            "Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, \
+                             sandwich norms)"
+                        );
+                        (
+                            ferrum_models::models::LlamaFamilyConfig::gemma3_from_def(&model_def),
+                            None,
+                        )
+                    }
                     _ => {
                         info!("Loading Llama via LlamaFamilyModel");
                         (
@@ -1706,6 +1716,7 @@ mod tests {
             rope_interleaved: false,
             has_qk_norm: false,
             sliding_window: 0,
+            ..Default::default()
         };
         let plan = crate::layer_split::parse_layer_split_plan(
             "stage0:cuda:0:layers=0-0;stage1:cuda:1:layers=1-1",

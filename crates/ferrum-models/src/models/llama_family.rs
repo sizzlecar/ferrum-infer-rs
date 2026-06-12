@@ -46,7 +46,7 @@ pub(crate) static NORM_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OTHER_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OTHER_CALLS: AtomicU64 = AtomicU64::new(0);
 use ferrum_quantization::{Linear, WeightLoader};
-use ferrum_types::Result;
+use ferrum_types::{Activation, Result};
 
 use crate::common::paged_pool::block_hash_chain;
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
@@ -170,6 +170,10 @@ pub enum RopeScalingConfig {
         high_freq_factor: f64,
         original_max_position_embeddings: f64,
     },
+    /// Plain positional interpolation (`rope_type: "linear"`): every
+    /// frequency divided by `factor`. Gemma 3 4B+ applies this (factor 8)
+    /// to the global-attention layers only.
+    Linear { factor: f64 },
 }
 
 impl RopeScalingConfig {
@@ -208,6 +212,66 @@ pub struct LlamaFamilyConfig {
     /// Sliding-window attention size. `0` disables (full causal).
     /// Mistral v0.1 sets 4096; Mistral v0.2+ removed the limitation (0).
     pub sliding_window: usize,
+    /// MLP activation. All pre-Gemma families use SiLU (SwiGLU); Gemma 3
+    /// uses `gelu_pytorch_tanh` (GeGLU).
+    pub activation: Activation,
+    /// Layer-pattern period for local/global attention scheduling.
+    /// `0` = uniform (every layer uses `sliding_window` as-is). Gemma 3
+    /// sets 6: every 6th layer (`(idx+1) % 6 == 0`) is global (full
+    /// attention, main rope table); the rest are local (sliding window,
+    /// local rope table).
+    pub sliding_window_pattern: usize,
+    /// RoPE θ for local-attention layers when the family keeps two rope
+    /// tables (Gemma 3: 10_000 local vs 1_000_000 global). `None` = one
+    /// table for all layers. The local table is never rope-scaled.
+    pub rope_local_theta: Option<f64>,
+    /// Softmax scale numerator override: attention scale becomes
+    /// `1/sqrt(query_pre_attn_scalar)` instead of `1/sqrt(head_dim)`.
+    /// Folded into the loaded `q_norm` weights (requires `has_qk_norm`),
+    /// so kernels stay untouched. Gemma 3 27B: 168 (head_dim is 128).
+    pub query_pre_attn_scalar: Option<f64>,
+    /// Gemma RMSNorm convention `x̂·(1+w)`: all norm weights get +1 folded
+    /// in at load time (kernels keep computing `x̂·w`).
+    pub rmsnorm_unit_offset: bool,
+    /// Gemma sandwich norms: `post_attention_layernorm` is applied to the
+    /// attention output BEFORE the residual add (not pre-MLP), and a
+    /// `post_feedforward_layernorm` wraps the MLP output. The pre-MLP
+    /// norm is `pre_feedforward_layernorm`.
+    pub sandwich_norms: bool,
+    /// Multiply embedding output by this constant (Gemma: √hidden_size,
+    /// rounded through bf16 like HF does).
+    pub embed_scale: Option<f32>,
+}
+
+impl Default for LlamaFamilyConfig {
+    /// Zeroed shape with legacy family semantics (SiLU, single rope table,
+    /// uniform window, plain RMSNorm). Exists so config literals can fill
+    /// only the fields they care about via struct-update syntax.
+    fn default() -> Self {
+        Self {
+            hidden_size: 0,
+            intermediate_size: 0,
+            num_heads: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            num_layers: 0,
+            vocab_size: 0,
+            max_seq_len: 0,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            rope_scaling: None,
+            rope_interleaved: false,
+            has_qk_norm: false,
+            sliding_window: 0,
+            activation: Activation::SiLU,
+            sliding_window_pattern: 0,
+            rope_local_theta: None,
+            query_pre_attn_scalar: None,
+            rmsnorm_unit_offset: false,
+            sandwich_norms: false,
+            embed_scale: None,
+        }
+    }
 }
 
 impl LlamaFamilyConfig {
@@ -274,6 +338,13 @@ impl LlamaFamilyConfig {
             rope_interleaved: false,
             has_qk_norm,
             sliding_window: b.sliding_window,
+            activation: Activation::SiLU,
+            sliding_window_pattern: 0,
+            rope_local_theta: None,
+            query_pre_attn_scalar: None,
+            rmsnorm_unit_offset: false,
+            sandwich_norms: false,
+            embed_scale: None,
         }
     }
 
@@ -300,6 +371,35 @@ impl LlamaFamilyConfig {
     pub fn mistral_from_def(def: &crate::definition::ModelDefinition) -> Self {
         Self::from_base(Self::from_def_base(def), 10_000.0, false)
     }
+
+    /// Gemma 3 text family (1B/4B/12B/27B): QK-norm on (Gemma-style),
+    /// global rope θ default 1e6 + optional linear scaling; local layers
+    /// get their own unscaled table (`rope_local_base_freq`, default 1e4);
+    /// 5:1 local/global scheduling (`sliding_window_pattern`, default 6);
+    /// GeGLU; sandwich norms; RMSNorm `x̂·(1+w)`; embeddings ×√hidden
+    /// (bf16-rounded like HF); attention scale 1/√query_pre_attn_scalar.
+    pub fn gemma3_from_def(def: &crate::definition::ModelDefinition) -> Self {
+        let mut cfg = Self::from_base(Self::from_def_base(def), 1_000_000.0, true);
+        cfg.activation = def.activation;
+        let extra = |key: &str| def.extra_params.get(key).and_then(|v| v.as_f64());
+        cfg.rope_local_theta = Some(extra("rope_local_base_freq").unwrap_or(10_000.0));
+        cfg.sliding_window_pattern = extra("sliding_window_pattern").unwrap_or(6.0) as usize;
+        cfg.query_pre_attn_scalar = extra("query_pre_attn_scalar");
+        cfg.rmsnorm_unit_offset = true;
+        cfg.sandwich_norms = true;
+        // HF computes `normalizer = hidden_size**0.5` then casts it to the
+        // embedding dtype (bf16) before multiplying — replicate the
+        // rounding for L1 byte-equality.
+        cfg.embed_scale = Some(bf16_round((cfg.hidden_size as f64).sqrt() as f32));
+        cfg
+    }
+}
+
+/// Round an f32 through bf16 (round-to-nearest-even), back to f32.
+fn bf16_round(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000;
+    f32::from_bits(rounded)
 }
 
 struct LlamaFamilyConfigBase {
@@ -336,7 +436,7 @@ fn effective_max_seq_len(def: &crate::definition::ModelDefinition) -> usize {
         .or_else(|| obj.get("type"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if rope_type == "llama3" {
+    if rope_type == "llama3" || rope_type == "linear" {
         // Implemented — the scaled window is real.
         return configured;
     }
@@ -366,6 +466,13 @@ fn rope_scaling_from_model_def(
         .get("rope_type")
         .or_else(|| obj.get("type"))
         .and_then(|v| v.as_str())?;
+    if rope_type == "linear" {
+        let factor = json_f64(obj.get("factor"))?;
+        if factor <= 0.0 {
+            return None;
+        }
+        return Some(RopeScalingConfig::Linear { factor });
+    }
     if rope_type != "llama3" {
         return None;
     }
@@ -410,7 +517,15 @@ pub struct LlamaFamilyLayer<B: QuantLlmBackend + BackendMoeFused> {
     pub q_norm_w: Option<B::Buffer>,
     pub k_norm_w: Option<B::Buffer>,
     pub o_proj: Box<dyn Linear<B>>,
+    /// Pre-MLP norm. Llama naming: `post_attention_layernorm`; Gemma 3
+    /// sandwich naming: `pre_feedforward_layernorm`.
     pub post_ln_w: B::Buffer,
+    /// Gemma 3 sandwich: norm applied to the attention output BEFORE the
+    /// residual add (`post_attention_layernorm` in Gemma naming).
+    pub post_attn_ln_w: Option<B::Buffer>,
+    /// Gemma 3 sandwich: norm applied to the MLP output before the
+    /// residual add (`post_feedforward_layernorm`).
+    pub post_ffn_ln_w: Option<B::Buffer>,
     pub gate_up_proj: Box<dyn Linear<B>>,
     pub down_proj: Box<dyn Linear<B>>,
 }
@@ -465,22 +580,43 @@ fn load_llama_family_layers<B: MoeLlmBackend>(
     }
 
     let mut layers = Vec::with_capacity(source_layers.end.saturating_sub(source_layers.start));
+    // Gemma 3 attention scale is 1/√query_pre_attn_scalar while the kernels
+    // hardcode 1/√head_dim; the ratio is folded into q_norm (norm output is
+    // scale-equivariant, RoPE is a rotation, so the fold commutes).
+    let q_norm_scale = cfg
+        .query_pre_attn_scalar
+        .map(|s| ((cfg.head_dim as f64 / s).sqrt()) as f32)
+        .unwrap_or(1.0);
     for li in source_layers {
         let prefix = format!("model.layers.{li}");
-        let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
+        let norm = |name: &str, len: usize, scale: f32| -> Result<B::Buffer> {
+            let t = loader.load_tensor(&format!("{prefix}.{name}.weight"))?;
+            Ok(fold_norm_weight::<B>(
+                t,
+                len,
+                cfg.rmsnorm_unit_offset,
+                scale,
+            ))
+        };
+        let h = cfg.hidden_size;
+        let input_ln_w = norm("input_layernorm", h, 1.0)?;
         let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
         let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
-        let post_ln_w = loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
+        let (post_ln_w, post_attn_ln_w, post_ffn_ln_w) = if cfg.sandwich_norms {
+            (
+                norm("pre_feedforward_layernorm", h, 1.0)?,
+                Some(norm("post_attention_layernorm", h, 1.0)?),
+                Some(norm("post_feedforward_layernorm", h, 1.0)?),
+            )
+        } else {
+            (norm("post_attention_layernorm", h, 1.0)?, None, None)
+        };
         let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
         let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
 
         let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
-            let q = loader
-                .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
-                .ok();
-            let k = loader
-                .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
-                .ok();
+            let q = norm("self_attn.q_norm", cfg.head_dim, q_norm_scale).ok();
+            let k = norm("self_attn.k_norm", cfg.head_dim, 1.0).ok();
             (q, k)
         } else {
             (None, None)
@@ -493,11 +629,33 @@ fn load_llama_family_layers<B: MoeLlmBackend>(
             k_norm_w,
             o_proj,
             post_ln_w,
+            post_attn_ln_w,
+            post_ffn_ln_w,
             gate_up_proj,
             down_proj,
         });
     }
     Ok(layers)
+}
+
+/// Apply Gemma-family load-time weight folds to a norm tensor:
+/// `w' = (w + 1)·scale` when `unit_offset` (Gemma RMSNorm is `x̂·(1+w)`),
+/// plus an optional extra scale (query_pre_attn_scalar fold on q_norm).
+fn fold_norm_weight<B: MoeLlmBackend>(
+    buf: B::Buffer,
+    len: usize,
+    unit_offset: bool,
+    scale: f32,
+) -> B::Buffer {
+    if !unit_offset && scale == 1.0 {
+        return buf;
+    }
+    let mut v = B::to_vec(&buf, len);
+    let off = if unit_offset { 1.0 } else { 0.0 };
+    for x in v.iter_mut() {
+        *x = (*x + off) * scale;
+    }
+    B::from_slice(&v)
 }
 
 fn load_llama_family_lm_head<B: MoeLlmBackend>(
@@ -559,6 +717,10 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
     pub residual: Option<B::Buffer>,
     pub norm_out: B::Buffer,
     pub qkv_out: B::Buffer,
+    /// `[tokens, h]` temp for sandwich-norm families (Gemma 3): holds the
+    /// normed attention/MLP output before its residual add. `None` for
+    /// legacy families.
+    pub sandwich_tmp: Option<B::Buffer>,
     // ── Per-item scratch for batched decode path ──────────────────────
     // decode_batch_internal runs tokens=M batched ops for the GEMM-heavy
     // half (norm, qkv_proj, split_qkv, o_proj, post_norm, gate_up, silu,
@@ -694,6 +856,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             residual: Some(B::alloc(t * h)),
             norm_out: B::alloc(t * h),
             qkv_out: B::alloc(t * qkv_dim),
+            sandwich_tmp: cfg.sandwich_norms.then(|| B::alloc(t * h)),
             q_buf: B::alloc(t * q_dim),
             k_buf: B::alloc(t * kv_dim),
             v_buf: B::alloc(t * kv_dim),
@@ -877,6 +1040,9 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     pub lm_head: Option<Box<dyn Linear<B>>>,
 
     pub rope: RopeCache<B>,
+    /// Second rope table for local-attention layers (Gemma 3 dual-θ
+    /// scheduling). `None` for single-table families.
+    pub rope_local: Option<RopeCache<B>>,
     pub scratch: LlamaFamilyScratch<B>,
 
     /// Per-sequence KV caches, one `Vec<KvCache<B>>` of length `num_layers`.
@@ -1023,6 +1189,13 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg);
+        // Local-attention rope table (Gemma 3): own θ, never rope-scaled.
+        let rope_local = cfg.rope_local_theta.map(|theta| {
+            let mut local_cfg = cfg.clone();
+            local_cfg.rope_theta = theta;
+            local_cfg.rope_scaling = None;
+            build_rope_cache::<B>(&local_cfg)
+        });
         let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
         let embed = if stage.load_embedding {
             Some(loader.load_tensor("model.embed_tokens.weight")?)
@@ -1036,15 +1209,31 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         } else {
             None
         };
-        let final_norm_w = loader.load_tensor("model.norm.weight")?;
+        let final_norm_w = fold_norm_weight::<B>(
+            loader.load_tensor("model.norm.weight")?,
+            cfg.hidden_size,
+            cfg.rmsnorm_unit_offset,
+            1.0,
+        );
 
         let layer_source_start = stage.source_layers.start;
         let layer_source_end = stage.source_layers.end;
         let runtime_cfg = cfg.to_runtime();
         // Construction-time capability resolution (GOAL-allowed): read once here
         // so the forward hot paths read self.* instead of B::supports_*().
-        let supports_varlen_qkv = B::supports_varlen_qkv();
-        let supports_batched_decode = B::supports_llama_family_batched_decode();
+        // Sandwich-norm families (Gemma 3) are pinned to the single-sequence
+        // forward path until the batched/varlen paths learn the Gemma layer
+        // semantics (GeGLU, post-attn/post-ffn norms, dual rope, per-layer
+        // windows) — running them would be silently wrong, not just slow.
+        let supports_varlen_qkv = B::supports_varlen_qkv() && !cfg.sandwich_norms;
+        let supports_batched_decode =
+            B::supports_llama_family_batched_decode() && !cfg.sandwich_norms;
+        if cfg.sandwich_norms {
+            tracing::info!(
+                "Gemma3 family: batched/varlen fast paths disabled pending Gemma semantics; \
+                 using single-sequence forward"
+            );
+        }
         let runtime_env = LlamaFamilyRuntimeEnv::from_env();
         let batched_cfg =
             super::llama_family_forward_batched::LlamaBatchedRuntimeConfig::from_env();
@@ -1062,6 +1251,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             final_norm_w,
             lm_head,
             rope,
+            rope_local,
             scratch,
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
@@ -1192,7 +1382,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // opt-in pre-0.7.2; flipping the default so default `ferrum
         // serve` matches the bench-quality numbers without requiring
         // env-var knowledge.
-        let paged = runtime_env.paged_kv_enabled::<B>();
+        // Per-layer window scheduling (Gemma 3) is not plumbed through the
+        // paged attention dispatch yet — local layers would silently attend
+        // past their window once the context exceeds it. Pin sandwich-norm
+        // families to contiguous KV until paged learns per-layer windows
+        // (W2-3 work item).
+        let paged = runtime_env.paged_kv_enabled::<B>() && self.cfg.sliding_window_pattern == 0;
         const PAGED_BLOCK_SIZE: usize = 16;
 
         // Phase 4 shared-pool sizing. The pool sees ALL concurrent
@@ -1690,6 +1885,25 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy);
 
+        // Per-layer attention scheduling (Gemma 3 `sliding_window_pattern`):
+        // every Nth layer is global (full window, main rope table); the rest
+        // are local (sliding window, local rope table). Pattern 0 = uniform
+        // legacy behavior. Field-precise rope refs keep the later
+        // `&mut self.scratch` / `kv_caches` borrows legal.
+        let pattern = cfg.sliding_window_pattern;
+        let is_global_layer = pattern == 0 || (source_li + 1) % pattern == 0;
+        let layer_window = if pattern == 0 {
+            cfg.sliding_window
+        } else if is_global_layer {
+            0
+        } else {
+            cfg.sliding_window
+        };
+        let (rope_cos, rope_sin) = match (&self.rope_local, is_global_layer) {
+            (Some(local), false) => (&local.cos, &local.sin),
+            _ => (&self.rope.cos, &self.rope.sin),
+        };
+
         // Grab the per-layer KV cache up front so the deepest fusion can
         // write K/V straight into it.
         //
@@ -1747,8 +1961,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 &self.scratch.qkv_out,
                 q_norm_w,
                 k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
+                rope_cos,
+                rope_sin,
                 &mut self.scratch.q_head_major,
                 &mut self.scratch.k_head_major,
                 &mut self.scratch.v_head_major,
@@ -1801,8 +2015,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             &self.scratch.qkv_out,
             q_norm_w,
             k_norm_w,
-            &self.rope.cos,
-            &self.rope.sin,
+            rope_cos,
+            rope_sin,
             &mut self.scratch.q_head_major,
             &mut self.scratch.k_head_major,
             &mut self.scratch.v_head_major,
@@ -1843,7 +2057,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             causal: true,
             scale: 1.0 / (hd as f32).sqrt(),
             kv_seq_stride: kv_stride,
-            sliding_window: cfg.sliding_window,
+            sliding_window: layer_window,
         };
         K::contig_decode_attention(
             ctx,
@@ -1925,17 +2139,49 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             self.lora_projection_applications += applied as u64;
         }
 
-        // 9. Fused residual-add + post-attention RMSNorm.
-        B::fused_add_rms_norm(
-            ctx,
-            residual,
-            &self.scratch.o_proj_out,
-            &layer.post_ln_w,
-            eps,
-            &mut self.scratch.norm_out,
-            tokens,
-            h,
-        );
+        // 9. Residual + pre-MLP norm.
+        //
+        // Sandwich families (Gemma 3): norm the attention output FIRST
+        // (post_attention_layernorm in Gemma naming), add to residual,
+        // then norm the residual with pre_feedforward_layernorm.
+        // Legacy families: single fused residual-add + post-attn norm.
+        if let Some(post_attn_w) = &layer.post_attn_ln_w {
+            let tmp = self
+                .scratch
+                .sandwich_tmp
+                .as_mut()
+                .expect("sandwich_tmp allocated for sandwich-norm config");
+            B::rms_norm(
+                ctx,
+                &self.scratch.o_proj_out,
+                post_attn_w,
+                eps,
+                tmp,
+                tokens,
+                h,
+            );
+            B::add_inplace(ctx, residual, tmp, tokens * h);
+            B::rms_norm(
+                ctx,
+                residual,
+                &layer.post_ln_w,
+                eps,
+                &mut self.scratch.norm_out,
+                tokens,
+                h,
+            );
+        } else {
+            B::fused_add_rms_norm(
+                ctx,
+                residual,
+                &self.scratch.o_proj_out,
+                &layer.post_ln_w,
+                eps,
+                &mut self.scratch.norm_out,
+                tokens,
+                h,
+            );
+        }
 
         // 10. Fused gate+up projection.
         layer.gate_up_proj.forward(
@@ -1959,14 +2205,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             self.lora_projection_applications += applied as u64;
         }
 
-        // 11. SwiGLU: silu(gate) * up.
-        B::fused_silu_mul_split(
-            ctx,
-            &self.scratch.gate_up_out,
-            &mut self.scratch.silu_out,
-            tokens,
-            im,
-        );
+        // 11. Gated activation: SwiGLU (silu) or GeGLU (gelu_tanh, Gemma).
+        match cfg.activation {
+            Activation::GeluTanh => B::fused_gelu_tanh_mul_split(
+                ctx,
+                &self.scratch.gate_up_out,
+                &mut self.scratch.silu_out,
+                tokens,
+                im,
+            ),
+            _ => B::fused_silu_mul_split(
+                ctx,
+                &self.scratch.gate_up_out,
+                &mut self.scratch.silu_out,
+                tokens,
+                im,
+            ),
+        }
 
         // 12. Down projection.
         layer.down_proj.forward(
@@ -1990,8 +2245,19 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             self.lora_projection_applications += applied as u64;
         }
 
-        // 13. Final residual add.
-        B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
+        // 13. Final residual add. Sandwich families norm the MLP output
+        // (post_feedforward_layernorm) before adding it to the residual.
+        if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
+            let tmp = self
+                .scratch
+                .sandwich_tmp
+                .as_mut()
+                .expect("sandwich_tmp allocated for sandwich-norm config");
+            B::rms_norm(ctx, &self.scratch.mlp_out, post_ffn_w, eps, tmp, tokens, h);
+            B::add_inplace(ctx, residual, tmp, tokens * h);
+        } else {
+            B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
+        }
     }
 
     /// Multi-position decode-verify: run one forward pass over `tokens`
@@ -2033,6 +2299,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("forward_verify called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
+        if let Some(scale) = self.cfg.embed_scale {
+            B::scale_inplace(&mut ctx, &mut residual, scale, seq_len * h);
+        }
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
@@ -2161,6 +2430,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("prefill_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, suffix_tokens, &mut residual, h);
+        if let Some(scale) = self.cfg.embed_scale {
+            B::scale_inplace(&mut ctx, &mut residual, scale, suffix_tokens.len() * h);
+        }
 
         let prefill_profile = self.runtime_env.prefill_op_profile;
         let prefill_t0 = if prefill_profile {
@@ -2322,6 +2594,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("decode_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, &[token], &mut residual, h);
+        if let Some(scale) = self.cfg.embed_scale {
+            B::scale_inplace(&mut ctx, &mut residual, scale, h);
+        }
 
         // Per-layer wall-time profile (env-gated, off by default — adds
         // a B::sync between layers which serializes the pipeline). Helps
@@ -2481,6 +2756,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("stage token forward called on stage without embedding");
         B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
+        if let Some(scale) = self.cfg.embed_scale {
+            B::scale_inplace(&mut ctx, &mut residual, scale, tokens.len() * h);
+        }
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
@@ -3183,6 +3461,7 @@ fn rope_freq(cfg: &LlamaFamilyConfig, pair_idx: usize) -> f64 {
             *high_freq_factor,
             *original_max_position_embeddings,
         ),
+        Some(RopeScalingConfig::Linear { factor }) => base_freq / factor,
         None => base_freq,
     }
 }
@@ -3306,6 +3585,7 @@ mod tests {
             rope_interleaved: false,
             has_qk_norm,
             sliding_window: 0,
+            ..Default::default()
         }
     }
 

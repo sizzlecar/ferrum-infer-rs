@@ -1247,18 +1247,14 @@ pub fn resolve_model_alias(name: &str) -> String {
         "deepseek-r1:8b" | "r1:8b" => "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B".to_string(),
         "deepseek-r1:14b" | "r1:14b" => "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B".to_string(),
         "deepseek-r1:32b" | "r1:32b" => "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B".to_string(),
-        "deepseek-r1:32b-gptq" => {
-            "OPEA/DeepSeek-R1-Distill-Qwen-32B-int4-gptq-sym-inc".to_string()
-        }
+        "deepseek-r1:32b-gptq" => "OPEA/DeepSeek-R1-Distill-Qwen-32B-int4-gptq-sym-inc".to_string(),
         "qwen2.5-coder:32b" => "Qwen/Qwen2.5-Coder-32B-Instruct".to_string(),
         "qwen2.5-coder:32b-gptq" => "Qwen/Qwen2.5-Coder-32B-Instruct-GPTQ-Int4".to_string(),
         "qwen2.5-coder:14b" => "Qwen/Qwen2.5-Coder-14B-Instruct".to_string(),
         "mistral-small:24b" | "mistral-small:3.2" => {
             "mistralai/Mistral-Small-3.2-24B-Instruct-2506".to_string()
         }
-        "devstral:24b" | "devstral:2" => {
-            "mistralai/Devstral-Small-2-24B-Instruct-2512".to_string()
-        }
+        "devstral:24b" | "devstral:2" => "mistralai/Devstral-Small-2-24B-Instruct-2512".to_string(),
         "magistral:24b" => "mistralai/Magistral-Small-2509".to_string(),
         "qwen2.5:3b-gptq" | "qwen2.5-3b-instruct-gptq-int4" => {
             "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4".to_string()

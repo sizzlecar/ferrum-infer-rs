@@ -65,6 +65,7 @@ impl<B: MoeLlmBackend> TalkerBackboneBackend<B> {
             rope_interleaved: false,
             has_qk_norm: true,
             sliding_window: 0,
+            ..Default::default()
         };
         let prefixed = PrefixedLoader::new(loader, "talker.");
         let backbone = LlamaFamilyModel::<B>::new_backbone_only(backbone_cfg, &prefixed)?;
@@ -100,6 +101,7 @@ impl<B: MoeLlmBackend> TalkerBackboneBackend<B> {
             rope_interleaved: false,
             has_qk_norm: true,
             sliding_window: 0,
+            ..Default::default()
         };
         let prefixed = PrefixedLoader::new(loader, "talker.code_predictor.");
         let backbone = LlamaFamilyModel::<B>::new_backbone_only(backbone_cfg, &prefixed)?;

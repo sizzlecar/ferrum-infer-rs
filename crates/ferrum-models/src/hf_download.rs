@@ -266,8 +266,7 @@ impl HfDownloader {
         let files_to_download: Vec<_> = files
             .iter()
             .filter(|f| {
-                f.file_type.as_deref() != Some("directory")
-                    && filenames.contains(&f.path.as_str())
+                f.file_type.as_deref() != Some("directory") && filenames.contains(&f.path.as_str())
             })
             .collect();
         if files_to_download.is_empty() {
@@ -439,7 +438,12 @@ impl HfDownloader {
 
         while let Some(dir) = dirs_to_visit.pop() {
             let url = if dir.is_empty() {
-                format!("{}/api/models/{}/tree/{}", hf_endpoint(), model_id, revision)
+                format!(
+                    "{}/api/models/{}/tree/{}",
+                    hf_endpoint(),
+                    model_id,
+                    revision
+                )
             } else {
                 format!(
                     "{}/api/models/{}/tree/{}/{}",
@@ -828,7 +832,8 @@ mod tests {
 
     #[test]
     fn hf_downloader_runtime_env_endpoint_override_trims_trailing_slash() {
-        let env = HfDownloaderRuntimeEnv::from_env_vars([("HF_ENDPOINT", "https://hf-mirror.com/")]);
+        let env =
+            HfDownloaderRuntimeEnv::from_env_vars([("HF_ENDPOINT", "https://hf-mirror.com/")]);
         assert_eq!(env.endpoint, "https://hf-mirror.com");
 
         let empty = HfDownloaderRuntimeEnv::from_env_vars([("HF_ENDPOINT", "")]);
