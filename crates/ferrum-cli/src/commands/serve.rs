@@ -486,9 +486,23 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let arch_for_dispatch = model_definition
         .as_ref()
         .map(|model_def| model_def.architecture);
-    if let (Some(selection), Some(definition)) = (gpu_selection.as_mut(), model_definition.as_ref())
-    {
-        if selection.apply_model_layer_count(definition.num_hidden_layers)? {
+    // Materialize the multi-GPU layer-split plan. The safetensors path
+    // gets the layer count from ModelDefinition; the GGUF path reads it
+    // from the file header — without this the placeholder plan
+    // (`layers=auto`) reaches the engine and is rejected.
+    let model_layer_count = if let Some(definition) = model_definition.as_ref() {
+        Some(definition.num_hidden_layers)
+    } else if let (Some(selection), Some(p)) = (gpu_selection.as_ref(), gguf_path.as_ref()) {
+        if selection.selected_layer_split_plan.is_some() {
+            Some(ferrum_models::gguf_config::gguf_num_layers(p)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let (Some(selection), Some(layer_count)) = (gpu_selection.as_mut(), model_layer_count) {
+        if selection.apply_model_layer_count(layer_count)? {
             if let Some(plan) = selection.selected_layer_split_plan.as_deref() {
                 println!("{}", format!("CUDA layer split plan: {plan}").dimmed());
             }
