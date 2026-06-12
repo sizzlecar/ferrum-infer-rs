@@ -12,4 +12,5 @@ Verify zero: instances list must return 0 before declaring the goal done.
 
 **2026-06-13 04:40 — API verified: 0 instances remaining.** Session GPU spend ~= $7.
 
-| 40742315 | 1x RTX 4090, 160GB | 0.372 | 2026-06-13 ~05:20 | FINAL micro-session: 3x 32B L5 + mutual-spread perf | ACTIVE |
+| ~~40742315~~ | 1x RTX 4090 | 0.372 | | Quebec host killed cargo/nvcc twice | DESTROYED ~06:35 |
+| 40744863 | 1x RTX 4090, 160GB | 0.136 | 2026-06-13 ~06:35 | FINAL micro-session retry (Argentina) | ACTIVE |
