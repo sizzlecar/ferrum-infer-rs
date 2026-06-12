@@ -67,7 +67,10 @@ pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
                     sibling.dimmed()
                 );
                 let dl2 = HfDownloader::new(cache_dir.clone(), token.clone())?;
-                match dl2.download_sidecar_files(&sibling, None, &SIDECAR_FILES).await {
+                match dl2
+                    .download_sidecar_files(&sibling, None, &SIDECAR_FILES)
+                    .await
+                {
                     Ok(sibling_dir) => {
                         // Copy the sidecars into the GGUF snapshot dir so
                         // they live next to the gguf file.

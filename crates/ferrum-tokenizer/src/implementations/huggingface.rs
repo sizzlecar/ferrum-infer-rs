@@ -199,15 +199,10 @@ impl Tokenizer for HuggingFaceTokenizer {
             let mut out = String::new();
             let mut segment: Vec<u32> = Vec::with_capacity(token_ids.len());
             for id in &token_ids {
-                if let Some((_, canonical)) =
-                    self.think_markers.iter().find(|(mid, _)| mid == id)
-                {
+                if let Some((_, canonical)) = self.think_markers.iter().find(|(mid, _)| mid == id) {
                     if !segment.is_empty() {
                         out.push_str(&self.tokenizer.decode(&segment, true).map_err(|e| {
-                            ferrum_types::FerrumError::tokenizer(format!(
-                                "Decoding failed: {}",
-                                e
-                            ))
+                            ferrum_types::FerrumError::tokenizer(format!("Decoding failed: {}", e))
                         })?);
                         segment.clear();
                     }

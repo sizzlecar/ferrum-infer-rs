@@ -320,6 +320,33 @@ pub trait Backend: Send + Sync + Sized + 'static {
         im: usize,
     );
 
+    /// GeGLU variant of [`Backend::fused_silu_mul_split`]:
+    /// gelu_tanh(gate) * up → out. Matches HF `gelu_pytorch_tanh`
+    /// (Gemma family MLP). Panics by default: wire a real kernel on any
+    /// backend that loads a GeGLU model.
+    fn fused_gelu_tanh_mul_split(
+        _ctx: &mut Self::Context,
+        _gate_up: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _tokens: usize,
+        _im: usize,
+    ) {
+        panic!("fused_gelu_tanh_mul_split not implemented for this backend");
+    }
+
+    /// `buf[i] *= scale` over the first `len` elements. Gemma-family
+    /// embedding scaling (×√hidden_size on residual-stream entry).
+    /// Default round-trips through host memory — correct but slow;
+    /// override on backends that serve Gemma models.
+    fn scale_inplace(ctx: &mut Self::Context, buf: &mut Self::Buffer, scale: f32, len: usize) {
+        Self::sync(ctx);
+        let mut v = Self::to_vec(buf, len);
+        for x in v.iter_mut() {
+            *x *= scale;
+        }
+        *buf = Self::from_slice(&v);
+    }
+
     /// Fused QK-norm + RoPE + transpose-to-head-major.
     ///
     /// `mode` selects the operation:

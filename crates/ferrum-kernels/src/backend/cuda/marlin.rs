@@ -264,7 +264,13 @@ pub fn marlin_gemm(
         }
         return Ok(());
     }
-    marlin_gemm_chunk(stream, &input.slice(..), weight, &mut output.slice_mut(..), m)
+    marlin_gemm_chunk(
+        stream,
+        &input.slice(..),
+        weight,
+        &mut output.slice_mut(..),
+        m,
+    )
 }
 
 fn marlin_gemm_chunk(

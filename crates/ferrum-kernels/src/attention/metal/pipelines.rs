@@ -94,6 +94,7 @@ impl MetalPipelines {
                     "embedding_lookup_f32",
                     "split_qkv_f32",
                     "silu_mul_split_f32",
+                    "gelu_tanh_mul_split_f32",
                     "gemv_f32",
                     "layer_norm_f32",
                     "gelu_f32",
@@ -1304,6 +1305,34 @@ impl MetalPipelines {
             im: im as i32,
         };
         enc.set_compute_pipeline_state(self.pipeline("silu_mul_split_f32"));
+        enc.set_buffer(0, Some(gate_up), 0);
+        enc.set_buffer(1, Some(out), 0);
+        enc.set_bytes(2, 8, &p as *const _ as *const c_void as *const _);
+        let total = tokens * im;
+        let grid = MTLSize::new(total.div_ceil(256) as u64, 1, 1);
+        let tg = MTLSize::new(256, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// gelu_tanh(gate) * up with fused gate_up split (GeGLU, Gemma family).
+    pub fn gelu_tanh_mul_split_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        gate_up: &Buffer,
+        out: &Buffer,
+        tokens: usize,
+        im: usize,
+    ) {
+        #[repr(C)]
+        struct P {
+            tokens: i32,
+            im: i32,
+        }
+        let p = P {
+            tokens: tokens as i32,
+            im: im as i32,
+        };
+        enc.set_compute_pipeline_state(self.pipeline("gelu_tanh_mul_split_f32"));
         enc.set_buffer(0, Some(gate_up), 0);
         enc.set_buffer(1, Some(out), 0);
         enc.set_bytes(2, 8, &p as *const _ as *const c_void as *const _);

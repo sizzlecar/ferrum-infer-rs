@@ -1269,6 +1269,7 @@ pub(crate) fn model_capabilities_from_definition(
 ) -> ModelCapabilities {
     let architecture = match definition.architecture {
         ferrum_models::Architecture::Qwen3Moe => "qwen3_moe",
+        ferrum_models::Architecture::Gemma3 => "gemma3",
         ferrum_models::Architecture::Qwen3 => "qwen3",
         ferrum_models::Architecture::Qwen2 => "qwen2",
         ferrum_models::Architecture::Llama => "llama",

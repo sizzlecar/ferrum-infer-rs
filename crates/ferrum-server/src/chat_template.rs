@@ -876,7 +876,10 @@ mod tests {
         // tojson renders Python-json.dumps style (", " / ": " separators,
         // insertion key order) for byte parity with transformers.
         assert!(out.contains("\"name\": \"weather\""), "{out}");
-        assert!(out.contains("{\"type\": \"function\", \"function\": {"), "{out}");
+        assert!(
+            out.contains("{\"type\": \"function\", \"function\": {"),
+            "{out}"
+        );
         assert!(out.contains("[assistant][user][assistant]"), "{out}");
     }
 

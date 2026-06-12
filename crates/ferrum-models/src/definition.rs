@@ -170,6 +170,28 @@ impl ConfigManager {
         // Detect architecture
         let architecture = self.detect_architecture(raw)?;
 
+        // Gemma 3 multimodal checkpoints (Gemma3ForConditionalGeneration)
+        // nest the language model under `text_config`. Flatten it over the
+        // root so field extraction and `extra_params` lookups (head_dim /
+        // sliding_window / rope_local_base_freq / query_pre_attn_scalar /
+        // rope_scaling) see the text-model values; vision_config is
+        // ignored — text-only support.
+        let gemma3_merged: Option<serde_json::Map<String, serde_json::Value>> =
+            if architecture == Architecture::Gemma3 {
+                obj.get("text_config")
+                    .and_then(|v| v.as_object())
+                    .map(|tc| {
+                        let mut m = obj.clone();
+                        for (k, v) in tc {
+                            m.insert(k.clone(), v.clone());
+                        }
+                        m
+                    })
+            } else {
+                None
+            };
+        let obj = gemma3_merged.as_ref().unwrap_or(obj);
+
         // Parse common fields (CLIP stores these in text_config/vision_config)
         let text_cfg = obj.get("text_config");
         let hidden_size = obj
@@ -257,12 +279,15 @@ impl ConfigManager {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
-        // Detect activation
+        // Detect activation. Gemma family uses `hidden_activation`
+        // ("gelu_pytorch_tanh") instead of `hidden_act`.
         let activation = obj
             .get("hidden_act")
+            .or_else(|| obj.get("hidden_activation"))
             .and_then(|v| v.as_str())
             .map(|s| match s {
                 "gelu" | "gelu_new" => Activation::GELU,
+                "gelu_pytorch_tanh" => Activation::GeluTanh,
                 "silu" => Activation::SiLU,
                 "relu" => Activation::ReLU,
                 "swish" => Activation::Swish,
@@ -291,7 +316,10 @@ impl ConfigManager {
                 sliding_window,
             },
             activation,
-            extra_params: raw.clone(),
+            // Merged view for Gemma3 (text_config flattened) so that
+            // downstream extra_params lookups (head_dim, sliding_window,
+            // rope_local_base_freq, query_pre_attn_scalar, ...) resolve.
+            extra_params: serde_json::Value::Object(obj.clone()),
         })
     }
 

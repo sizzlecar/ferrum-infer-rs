@@ -5718,8 +5718,7 @@ mod tests {
         assert_eq!(parsed.content, "answer");
 
         // Model re-opening its own think block defers to the normal parse.
-        let parsed =
-            parse_reasoning_response_started_in_think("<think>\nx\n</think>\n\nanswer");
+        let parsed = parse_reasoning_response_started_in_think("<think>\nx\n</think>\n\nanswer");
         assert_eq!(parsed.reasoning.as_deref(), Some("\nx\n"));
         assert_eq!(parsed.content, "answer");
     }
