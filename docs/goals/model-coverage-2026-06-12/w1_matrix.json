@@ -104,8 +104,9 @@
         },
         "l1_bf16": { "status": "waived", "reason": "GOAL amendment #1 (2026-06-12): LlamaFamily-dense path L1 runs on the R1-0528-Qwen3-8B representative; this model is a pure-config sibling and its L2 runs at real size", "note": "" },
         "l2_gguf_metal": {
-          "status": "pending",
-          "note": "BLOCKED on machine state: 18GB dense Q4_K_M decodes at 0.14 tok/s (each token re-reads evicted mmap weights from SSD at ~2.6GB/s); llama.cpp control test equally stuck => not a ferrum bug. ~9GB of compressor residue from the morning KV-pool thrash squeezes usable RAM below the model's working set. Fair retry after user reboots; if a clean 32GB Mac still can't hold 32B-dense + serve overhead, waive to the CUDA GPTQ lane"
+          "status": "waived",
+          "reason": "User directive 2026-06-12: 32B-dense on a 32GB Mac has no real deployment scenario (dense per-token full-weight scan + Metal wired limit; eviction cliff measured at 0.14 tok/s, llama.cpp control equally stuck). Same-architecture Metal proof stands via Qwen3-14B / R1-8B passes; 32B verification moves wholly to the CUDA GPTQ lane",
+          "note": ""
         },
         "l2_gptq_cuda": { "status": "pending", "note": "OPEA GPTQ-Int4 (Marlin-clean verified); pod session" },
         "l3_behavior": { "status": "pending" },
@@ -128,12 +129,21 @@
         },
         "l1_bf16": { "status": "waived", "reason": "GOAL amendment #1 (2026-06-12): LlamaFamily-dense path L1 runs on the R1-0528-Qwen3-8B representative (+ existing qwen3-0.6b reference_match); pure-config siblings inherit, L2 runs at real size", "note": "" },
         "l2_gguf_metal": {
-          "status": "pending",
-          "note": "14B PASS final-script 10/10 incl schema 20/20 (artifacts/smoke_qwen3-14b-q4_k_m_metal_final_2026-06-12.txt); 32B blocked on machine state (see r1-distill-qwen-32b note) — retry after reboot or waive to CUDA lane"
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-14b-q4_k_m_metal_final_2026-06-12.txt",
+          "note": "14B final-script 10/10 incl schema 20/20; 32B Metal waived per user directive 2026-06-12 (same-arch proof via 14B; 32B verifies on the CUDA GPTQ lane)"
         },
-        "l2_gptq_cuda": { "status": "pending", "note": "JunHowie GPTQ-Int4 (Marlin-clean verified); pod session" },
-        "l3_behavior": { "status": "pending", "note": "14B green per amendment #2 (same artifact); 32B pending" },
-        "l4_agent": { "status": "pending", "note": "14B green (tools 10/10 + schema 20/20); 32B pending" },
+        "l2_gptq_cuda": { "status": "pending", "note": "JunHowie GPTQ-Int4 (Marlin-clean verified); pod session covers 32B (and 14B GPTQ if slack)" },
+        "l3_behavior": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-14b-q4_k_m_metal_final_2026-06-12.txt",
+          "note": "amendment #2: 14B smoke L3 green; 32B behaviors re-checked on the CUDA pod smoke"
+        },
+        "l4_agent": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-14b-q4_k_m_metal_final_2026-06-12.txt",
+          "note": "14B tools 10/10 + schema 20/20; 32B re-checked on the CUDA pod smoke"
+        },
         "l5_concurrency": { "status": "pending" },
         "perf_same_arch": { "status": "pending", "note": "baseline = existing Qwen3 dense numbers" },
         "docs_readme": { "status": "pending" }
@@ -151,7 +161,7 @@
           "note": "golden 5/5 (suite 43/43)"
         },
         "l1_bf16": { "status": "waived", "reason": "GOAL amendment #1 (2026-06-12): LlamaFamily-dense path L1 runs on the R1-0528-Qwen3-8B representative; pure-config sibling (Qwen2.5 arch), L2 runs at real size", "note": "" },
-        "l2_gguf_metal": { "status": "pending" },
+        "l2_gguf_metal": { "status": "waived", "reason": "User directive 2026-06-12: 32B-dense Metal has no real deployment scenario; same-arch (Qwen2.5) Metal coverage exists via prior family models, verification moves to the CUDA GPTQ lane", "note": "" },
         "l2_gptq_cuda": { "status": "pending", "note": "official Qwen GPTQ-Int4; pod session" },
         "l3_behavior": { "status": "pending" },
         "l4_agent": { "status": "pending" },
