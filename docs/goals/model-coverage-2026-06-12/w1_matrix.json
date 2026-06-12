@@ -34,7 +34,10 @@
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-coder-30b-q4_k_m_metal_2026-06-12.txt",
           "note": "extended smoke 10/10: known-answer 10/10 semantic-correct on Metal GGUF Q4_K_M; XML tool-call format parses to OpenAI tool_calls (required 10/10); strict schema 10/10"
         },
-        "l2_gptq_cuda": { "status": "pending", "note": "jart25 GPTQ-Int4, needs pod session" },
+        "l2_gptq_cuda": {
+          "status": "fail",
+          "note": "OPEN ISSUE (time-boxed per stuck-rule): jart25 GPTQ on CUDA emits EOS as the first token for every TEMPLATED chat request (content empty, finish=stop), while (a) the same model on Metal GGUF chats perfectly, (b) CUDA L5 random-token contexts generate fine (post m-chunk fix: zero errors all cells). Ruled out: alias resolution, VPA feature, dense-fallback (removed), Marlin tile shapes (m<=16 chunking compiles+runs), qzeros v1 convention (0x77... verified), router consumption path. Prime remaining suspect: jart25's bundled chat_template.jinja (sha 30b8ba8f, 4894B) differs from the L0-verified official template (5a38bfa0, 6211B); the official-template A/B was not completed (scp-to-pod silently failed). Next session: render-and-tokenize dump comparison Metal vs CUDA for one prompt. Marlin m-chunk fix (ab3717a) stands regardless"
+        },
         "l3_behavior": {
           "status": "pass",
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-coder-30b-q4_k_m_metal_2026-06-12.txt",
