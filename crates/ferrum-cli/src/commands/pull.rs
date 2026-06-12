@@ -42,9 +42,18 @@ pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
         };
 
         // Some GGUF repos (e.g. Qwen/Qwen3-*-GGUF) don't host
-        // tokenizer.json. Pull it from the safetensors sibling repo
-        // (`<repo>` minus `-GGUF`) and drop it next to the gguf file so
-        // serve / bench's auto_discover_tokenizer_path picks it up.
+        // tokenizer.json. Pull the small sidecar files from the
+        // safetensors sibling repo (`<repo>` minus `-GGUF`) — never its
+        // weights — and drop them next to the gguf file so serve /
+        // bench's auto_discover_tokenizer_path picks them up.
+        const SIDECAR_FILES: [&str; 6] = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "chat_template.json",
+            "chat_template.jinja",
+            "generation_config.json",
+        ];
         let snapshot_dir = gguf_path
             .parent()
             .map(|p| p.to_path_buf())
@@ -58,17 +67,11 @@ pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
                     sibling.dimmed()
                 );
                 let dl2 = HfDownloader::new(cache_dir.clone(), token.clone())?;
-                match dl2.download(&sibling, None).await {
+                match dl2.download_sidecar_files(&sibling, None, &SIDECAR_FILES).await {
                     Ok(sibling_dir) => {
-                        // Copy tokenizer.json + tokenizer_config.json into
-                        // the GGUF snapshot dir so they live next to the
-                        // gguf file.
-                        for tok_file in [
-                            "tokenizer.json",
-                            "tokenizer_config.json",
-                            "special_tokens_map.json",
-                            "chat_template.json",
-                        ] {
+                        // Copy the sidecars into the GGUF snapshot dir so
+                        // they live next to the gguf file.
+                        for tok_file in SIDECAR_FILES {
                             let src = sibling_dir.join(tok_file);
                             if src.is_file() {
                                 let dst = snapshot_dir.join(tok_file);

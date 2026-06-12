@@ -1357,6 +1357,141 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
         && p.is_file()
 }
 
+/// One curated GGUF model: alias keys, source repo, pinned quantization
+/// file, and — when the strip-`-GGUF` convention can't find one — the
+/// repo hosting its HF-format tokenizer.json.
+///
+/// All facts per model live in this one row so an alias can't be added
+/// without deciding its tokenizer source. None of this is derivable at
+/// runtime: GGUF repos don't host tokenizer.json (all 9 W1 repos
+/// checked), bartowski/* has no safetensors mirrors, mistralai/*
+/// upstream ships tekken-format tokenizers only, meta-llama/* is gated.
+/// Long-term fix is reading the tokenizer embedded in the GGUF itself
+/// (llama.cpp-style); until then this table is the bridge.
+struct GgufAliasEntry {
+    aliases: &'static [&'static str],
+    repo: &'static str,
+    filename: &'static str,
+    /// Overrides the strip-`-GGUF` sibling convention for tokenizer
+    /// sidecar downloads. Verified to host tokenizer.json via the HF
+    /// API on 2026-06-12.
+    tokenizer_repo: Option<&'static str>,
+}
+
+// Aliases verified by probing the HF API on 2026-05-01 (group A) and
+// 2026-06-12 (model-coverage W1, docs/goals/model-coverage-2026-06-12/).
+// Quantization availability differs per repo — Qwen/Qwen3-{0.6B,1.7B}-GGUF
+// only host Q8_0; 4B / 8B / 30B-A3B host Q4_K_M.
+const GGUF_ALIASES: &[GgufAliasEntry] = &[
+    // Group A bench targets — same models the bench scripts use for
+    // single-request PP/TG comparison vs llama.cpp / mistral.rs.
+    GgufAliasEntry {
+        aliases: &["qwen3:8b-q4_k_m"],
+        repo: "Qwen/Qwen3-8B-GGUF",
+        filename: "Qwen3-8B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3:4b-q4_k_m"],
+        repo: "Qwen/Qwen3-4B-GGUF",
+        filename: "Qwen3-4B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3:1.7b", "qwen3:1.7b-q8_0"],
+        repo: "Qwen/Qwen3-1.7B-GGUF",
+        filename: "Qwen3-1.7B-Q8_0.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3:0.6b-gguf", "qwen3:0.6b-q8_0"],
+        repo: "Qwen/Qwen3-0.6B-GGUF",
+        filename: "Qwen3-0.6B-Q8_0.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3-moe:30b-a3b-q4_k_m", "qwen3:30b-a3b-q4_k_m"],
+        repo: "Qwen/Qwen3-30B-A3B-GGUF",
+        filename: "Qwen3-30B-A3B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    // 2026-06 model-coverage W1 aliases.
+    GgufAliasEntry {
+        aliases: &["qwen3:14b-q4_k_m"],
+        repo: "Qwen/Qwen3-14B-GGUF",
+        filename: "Qwen3-14B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3:32b-q4_k_m"],
+        repo: "Qwen/Qwen3-32B-GGUF",
+        filename: "Qwen3-32B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3-coder:30b-q4_k_m", "qwen3-coder:30b-a3b-q4_k_m"],
+        repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+        filename: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["deepseek-r1:8b-q4_k_m", "r1:8b-q4_k_m"],
+        repo: "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+        filename: "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["deepseek-r1:32b-q4_k_m", "r1:32b-q4_k_m"],
+        repo: "unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF",
+        filename: "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen2.5-coder:32b-q4_k_m"],
+        repo: "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF",
+        filename: "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: Some("Qwen/Qwen2.5-Coder-32B-Instruct"),
+    },
+    GgufAliasEntry {
+        aliases: &["mistral-small:24b-q4_k_m"],
+        repo: "bartowski/mistralai_Mistral-Small-3.2-24B-Instruct-2506-GGUF",
+        filename: "mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf",
+        // mistralai upstream ships tekken-format tokenizers only.
+        tokenizer_repo: Some("unsloth/Mistral-Small-3.2-24B-Instruct-2506"),
+    },
+    GgufAliasEntry {
+        aliases: &["devstral:24b-q4_k_m"],
+        repo: "bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF",
+        filename: "mistralai_Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+        tokenizer_repo: Some("mistralai/Devstral-Small-2-24B-Instruct-2512"),
+    },
+    GgufAliasEntry {
+        aliases: &["magistral:24b-q4_k_m"],
+        repo: "bartowski/mistralai_Magistral-Small-2509-GGUF",
+        filename: "mistralai_Magistral-Small-2509-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/Magistral-Small-2509"),
+    },
+    // meta-llama/* upstream is gated; unsloth mirrors are not.
+    GgufAliasEntry {
+        aliases: &["llama3.1:8b-q4_k_m"],
+        repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/Meta-Llama-3.1-8B-Instruct"),
+    },
+    GgufAliasEntry {
+        aliases: &["llama3.2:3b-q4_k_m"],
+        repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
+        filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/Llama-3.2-3B-Instruct"),
+    },
+    GgufAliasEntry {
+        aliases: &["llama3.2:1b-q4_k_m"],
+        repo: "bartowski/Llama-3.2-1B-Instruct-GGUF",
+        filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/Llama-3.2-1B-Instruct"),
+    },
+];
+
 /// Resolve a GGUF alias to a `(repo, filename)` pair if recognised. Returns
 /// `None` for non-GGUF aliases — callers fall through to
 /// [`resolve_model_alias`].
@@ -1364,98 +1499,26 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
 /// These map ergonomic aliases to the `<org>/<name>-GGUF` repos the
 /// community publishes Q4_K_M quantizations under. The filename component
 /// pins a specific quantization; users wanting other quants pass the path
-/// directly or extend this table.
+/// directly or extend [`GGUF_ALIASES`].
 pub fn resolve_gguf_alias(name: &str) -> Option<(String, String)> {
-    // Aliases verified by probing the HF API on 2026-05-01. Quantization
-    // availability differs per repo — Qwen/Qwen3-{0.6B,1.7B}-GGUF only
-    // host Q8_0; 4B / 8B / 30B-A3B host Q4_K_M.
-    match name.to_lowercase().as_str() {
-        // Group A bench targets — same models the bench scripts use for
-        // single-request PP/TG comparison vs llama.cpp / mistral.rs.
-        "qwen3:8b-q4_k_m" => Some((
-            "Qwen/Qwen3-8B-GGUF".to_string(),
-            "Qwen3-8B-Q4_K_M.gguf".to_string(),
-        )),
-        "qwen3:4b-q4_k_m" => Some((
-            "Qwen/Qwen3-4B-GGUF".to_string(),
-            "Qwen3-4B-Q4_K_M.gguf".to_string(),
-        )),
-        "qwen3:1.7b" | "qwen3:1.7b-q8_0" => Some((
-            "Qwen/Qwen3-1.7B-GGUF".to_string(),
-            "Qwen3-1.7B-Q8_0.gguf".to_string(),
-        )),
-        "qwen3:0.6b-gguf" | "qwen3:0.6b-q8_0" => Some((
-            "Qwen/Qwen3-0.6B-GGUF".to_string(),
-            "Qwen3-0.6B-Q8_0.gguf".to_string(),
-        )),
-        "qwen3-moe:30b-a3b-q4_k_m" | "qwen3:30b-a3b-q4_k_m" => Some((
-            "Qwen/Qwen3-30B-A3B-GGUF".to_string(),
-            "Qwen3-30B-A3B-Q4_K_M.gguf".to_string(),
-        )),
-        // 2026-06 model-coverage W1 aliases, verified via the HF API on
-        // 2026-06-12 (docs/goals/model-coverage-2026-06-12/).
-        "qwen3:14b-q4_k_m" => Some((
-            "Qwen/Qwen3-14B-GGUF".to_string(),
-            "Qwen3-14B-Q4_K_M.gguf".to_string(),
-        )),
-        "qwen3:32b-q4_k_m" => Some((
-            "Qwen/Qwen3-32B-GGUF".to_string(),
-            "Qwen3-32B-Q4_K_M.gguf".to_string(),
-        )),
-        "qwen3-coder:30b-q4_k_m" | "qwen3-coder:30b-a3b-q4_k_m" => Some((
-            "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF".to_string(),
-            "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf".to_string(),
-        )),
-        "deepseek-r1:8b-q4_k_m" | "r1:8b-q4_k_m" => Some((
-            "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF".to_string(),
-            "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf".to_string(),
-        )),
-        "deepseek-r1:32b-q4_k_m" | "r1:32b-q4_k_m" => Some((
-            "unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF".to_string(),
-            "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf".to_string(),
-        )),
-        "qwen2.5-coder:32b-q4_k_m" => Some((
-            "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF".to_string(),
-            "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf".to_string(),
-        )),
-        "mistral-small:24b-q4_k_m" => Some((
-            "bartowski/mistralai_Mistral-Small-3.2-24B-Instruct-2506-GGUF".to_string(),
-            "mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf".to_string(),
-        )),
-        "devstral:24b-q4_k_m" => Some((
-            "bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF".to_string(),
-            "mistralai_Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf".to_string(),
-        )),
-        "magistral:24b-q4_k_m" => Some((
-            "bartowski/mistralai_Magistral-Small-2509-GGUF".to_string(),
-            "mistralai_Magistral-Small-2509-Q4_K_M.gguf".to_string(),
-        )),
-        "llama3.1:8b-q4_k_m" => Some((
-            "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF".to_string(),
-            "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf".to_string(),
-        )),
-        "llama3.2:3b-q4_k_m" => Some((
-            "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
-            "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
-        )),
-        "llama3.2:1b-q4_k_m" => Some((
-            "bartowski/Llama-3.2-1B-Instruct-GGUF".to_string(),
-            "Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string(),
-        )),
-        _ => None,
-    }
+    let name = name.to_lowercase();
+    GGUF_ALIASES
+        .iter()
+        .find(|e| e.aliases.contains(&name.as_str()))
+        .map(|e| (e.repo.to_string(), e.filename.to_string()))
 }
 
 /// For GGUF aliases whose repo lacks a tokenizer.json, return the sibling
-/// safetensors repo where the tokenizer should be pulled from. Convention:
-/// strip a trailing `-GGUF` from the repo name. Returns `None` for repos
-/// that already host their own tokenizer (e.g. bartowski/*).
+/// safetensors repo where the tokenizer should be pulled from: the
+/// per-entry `tokenizer_repo` override when set, else the strip-`-GGUF`
+/// convention.
 pub fn tokenizer_sibling_repo(gguf_repo: &str) -> Option<String> {
-    if let Some(stripped) = gguf_repo.strip_suffix("-GGUF") {
-        Some(stripped.to_string())
-    } else {
-        None
+    if let Some(entry) = GGUF_ALIASES.iter().find(|e| e.repo == gguf_repo) {
+        if let Some(repo) = entry.tokenizer_repo {
+            return Some(repo.to_string());
+        }
     }
+    gguf_repo.strip_suffix("-GGUF").map(|s| s.to_string())
 }
 
 /// Locate a previously-pulled GGUF file in the HF cache.
@@ -2074,5 +2137,35 @@ mod tests {
     #[test]
     fn kv_budget_rejects_prompt_at_capacity() {
         assert!(!fits_kv_budget(&default_params(1), Some(2048), Some(2048)));
+    }
+
+    #[test]
+    fn sibling_repo_strips_gguf_suffix_by_default() {
+        assert_eq!(
+            tokenizer_sibling_repo("Qwen/Qwen3-0.6B-GGUF").as_deref(),
+            Some("Qwen/Qwen3-0.6B")
+        );
+        assert_eq!(tokenizer_sibling_repo("Qwen/Qwen3-0.6B"), None);
+    }
+
+    #[test]
+    fn sibling_repo_explicit_mappings_beat_strip_convention() {
+        // bartowski/* have no safetensors mirrors; stripping `-GGUF`
+        // would point at repos that don't exist.
+        assert_eq!(
+            tokenizer_sibling_repo("bartowski/Qwen2.5-Coder-32B-Instruct-GGUF").as_deref(),
+            Some("Qwen/Qwen2.5-Coder-32B-Instruct")
+        );
+        // mistralai upstream ships tekken-format tokenizers only.
+        assert_eq!(
+            tokenizer_sibling_repo("bartowski/mistralai_Mistral-Small-3.2-24B-Instruct-2506-GGUF")
+                .as_deref(),
+            Some("unsloth/Mistral-Small-3.2-24B-Instruct-2506")
+        );
+        // meta-llama upstream is gated; unsloth mirror is not.
+        assert_eq!(
+            tokenizer_sibling_repo("bartowski/Meta-Llama-3.1-8B-Instruct-GGUF").as_deref(),
+            Some("unsloth/Meta-Llama-3.1-8B-Instruct")
+        );
     }
 }
