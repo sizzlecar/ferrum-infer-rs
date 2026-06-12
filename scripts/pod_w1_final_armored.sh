@@ -17,7 +17,16 @@ if ! command -v cargo >/dev/null; then
 fi
 . "$HOME/.cargo/env"
 mkdir -p ~/.cargo
-cat > ~/.cargo/config.toml <<'EOF'
+# Mirror choice is host-dependent: some hosts cannot reach crates.io
+# (Korea), others MITM-break rsproxy.cn TLS (Iceland). Probe first.
+if curl -sI --max-time 8 https://index.crates.io/config.json | grep -q "200"; then
+  cat > ~/.cargo/config.toml <<'EOF'
+[net]
+git-fetch-with-cli = true
+retry = 10
+EOF
+else
+  cat > ~/.cargo/config.toml <<'EOF'
 [source.crates-io]
 replace-with = "rsproxy-sparse"
 [source.rsproxy-sparse]
@@ -26,6 +35,7 @@ registry = "sparse+https://rsproxy.cn/index/"
 git-fetch-with-cli = true
 retry = 10
 EOF
+fi
 
 pip install -q -U "huggingface_hub[hf_transfer]" 2>&1 | tail -1
 export HF_HUB_ENABLE_HF_TRANSFER=1
