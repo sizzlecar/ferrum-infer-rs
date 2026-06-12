@@ -16,4 +16,5 @@ Verify zero: instances list must return 0 before declaring the goal done.
 | ~~40744863~~ | 1x RTX 4090 | 0.136 | | Argentina host never booted (cluster issue) | DESTROYED ~06:50 |
 | ~~40745272~~ | 1x RTX 4090 | 0.376 | | Korea host: session-scope process reaping killed builds 3x | DESTROYED ~08:20 |
 | ~~40748763~~ | 1x RTX 4090 | 0.336 | | UK host never booted | DESTROYED ~08:40 |
-| 40749191 | 1x RTX 4090, 150GB | 0.349 | 2026-06-13 ~08:42 | FINAL micro-session (Iceland — proven datacenter) | ACTIVE |
+| ~~40749191~~ | 1x RTX 4090 | 0.349 | | Iceland host stuck loading 18min | DESTROYED ~09:15 |
+| 40749797 | 1x RTX 4090, 150GB | 0.376 | 2026-06-13 ~09:15 | FINAL micro-session (Taiwan) | ACTIVE |
