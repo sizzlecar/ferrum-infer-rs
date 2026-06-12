@@ -195,12 +195,12 @@ for _ in range(10):
             pass
 check("required tool-call 10/10", ok_calls == 10, f"{ok_calls}/10")
 
-# L4 — strict json_schema (10x)
+# L4 — strict json_schema (20x, GOAL gate criterion)
 schema = {"type": "json_schema", "json_schema": {"name": "Answer", "strict": True, "schema": {
     "type": "object", "additionalProperties": False,
     "properties": {"answer": {"type": "integer"}}, "required": ["answer"]}}}
 ok_schema = 0
-for _ in range(10):
+for _ in range(20):
     r = chat({"messages": [{"role": "user", "content": "Return the sum of 123+456."}],
               "response_format": schema, "max_tokens": 2048})
     content = r["choices"][0]["message"].get("content") or ""
@@ -209,7 +209,7 @@ for _ in range(10):
             ok_schema += 1
     except Exception:
         pass
-check("strict json_schema 10/10", ok_schema == 10, f"{ok_schema}/10")
+check("strict json_schema 20/20", ok_schema == 20, f"{ok_schema}/20")
 
 sys.exit(1 if failures else 0)
 PY
