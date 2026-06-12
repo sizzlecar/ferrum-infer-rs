@@ -51,9 +51,9 @@
         },
         "l1_bf16": { "status": "pending", "note": "BF16 16GB fits 1x4090; pod session" },
         "l2_gguf_metal": {
-          "status": "pending",
-          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_deepseek-r1-8b-q4_k_m_metal_2026-06-12.txt",
-          "note": "smoke ladder 8/8 PASS (known-answer 1x, tools 10/10, schema 10/10); L2 requires known-answer N>=10 — rerun with extended smoke"
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_deepseek-r1-8b-q4_k_m_metal_extended_2026-06-12.txt",
+          "note": "extended smoke 12/12: known-answer 10/10 semantic-correct on Metal GGUF Q4_K_M, plus stop/max_tokens/reasoning/stream/tools/schema mechanics"
         },
         "l2_gptq_cuda": { "status": "waived", "reason": "No Marlin-clean GPTQ exists (QuantTrio is sym=false + mixed 4/8, GOAL.md UNVERIFIED #4); CUDA lane is BF16", "note": "covered by l1_bf16 + cuda smoke instead" },
         "l3_behavior": { "status": "pending", "note": "smoke subset green (multi-turn/stream/EOS/reasoning); full blast-radius suites with this alias pending" },
@@ -155,7 +155,7 @@
       "cells": {
         "l0_template": {
           "status": "pending",
-          "note": "DeepSeek distill template family covered by R1-Distill-Qwen golden; per-model fixture + EOS assertion pending"
+          "note": "template byte-identical to R1-Distill-Qwen-32B fixture (sha 56a1447ad31926fd, same EOS, verified 2026-06-12); only the per-model EOS-from-config assertion remains, runs with the dual-GPU lane"
         },
         "l1_bf16": { "status": "waived", "reason": "70B BF16 140GB exceeds any available configuration; GOAL.md plans GGUF 4bit on the llama33-70b-4bit-2x4090 lane", "note": "" },
         "l2_gguf_metal": { "status": "waived", "reason": "70B exceeds 32GB Mac; lane is dual-4090 layer-split (l2 runs there)", "note": "dual-GPU known-answer smoke replaces this cell" },
