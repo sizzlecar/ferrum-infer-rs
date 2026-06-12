@@ -557,30 +557,15 @@ impl BackendQuantMarlin for CudaBackend {
             )));
         }
 
-        // Marlin tile constraint: the kernel returns ERR_PROB_SHAPE unless
-        // n % thread_n == 0 and k % thread_k == 0, and the large-m path
-        // uses 64x256 tiles. Repacked repos sometimes quantize layers the
-        // original quantizers leave dense (jart25's Coder-30B quantizes
-        // the 2048x128 MoE router) — small m sneaks through the 128x128
-        // branch and then prefill batches crash. Dequantize such layers
-        // once and serve them dense; they're tiny by construction.
-        if n % 256 != 0 || k % 128 != 0 {
-            let w = crate::backend::cpu::cpu_dequant_gptq(
-                qweight, scales, qzeros, bits, group_size, k, n,
-            )?;
-            tracing::info!(
-                "GPTQ load (dense fallback — Marlin tile constraint): K={k} N={n} gs={group_size}"
-            );
-            let weight = <Self as crate::backend::Backend>::from_slice(&w);
-            let bias = bias_host.map(<Self as crate::backend::Backend>::from_slice);
-            return Ok(Box::new(
-                crate::quant_linear::cuda_marlin::CudaDenseFallbackLinear {
-                    weight,
-                    bias,
-                    in_features: k,
-                    out_features: n,
-                },
-            ));
+        // Marlin's smallest instantiated tile is 128x128 (m <= 16; larger
+        // m chunks down to it in marlin_gemm), so n and k must both be
+        // multiples of 128. Refuse anything else loudly — silently
+        // garbled layers are worse than a load error.
+        if n % 128 != 0 || k % 128 != 0 {
+            return Err(FerrumError::unsupported(format!(
+                "CUDA GPTQ: layer shape K={k} N={n} violates Marlin tile \
+                 constraints (both must be multiples of 128)"
+            )));
         }
         let _ = qzeros; // qzeros baked into Marlin scales path; unused for Marlin store
 
