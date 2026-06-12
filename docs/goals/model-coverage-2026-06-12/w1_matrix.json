@@ -115,9 +115,20 @@
           "reason": "User directive 2026-06-12: 32B-dense on a 32GB Mac has no real deployment scenario (dense per-token full-weight scan + Metal wired limit; eviction cliff measured at 0.14 tok/s, llama.cpp control equally stuck). Same-architecture Metal proof stands via Qwen3-14B / R1-8B passes; 32B verification moves wholly to the CUDA GPTQ lane",
           "note": ""
         },
-        "l2_gptq_cuda": { "status": "pending", "note": "OPEA GPTQ-Int4 (Marlin-clean verified); pod session" },
-        "l3_behavior": { "status": "pending" },
-        "l4_agent": { "status": "pending", "note": "R1 distill templates are tools-unaware: injection path, mechanics-level assertions" },
+        "l2_gptq_cuda": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/pod_logs/smoke8_r1-32b_cuda.log",
+          "note": "OPEA GPTQ on 1x4090 (kv 8192x1): known-answer 10/10 semantic-correct + reasoning extraction + all behavior mechanics"
+        },
+        "l3_behavior": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/pod_logs/smoke8_r1-32b_cuda.log",
+          "note": "amendment #2: full smoke L3 section green on CUDA"
+        },
+        "l4_agent": {
+          "status": "fail",
+          "note": "tools via injection 10/10 PASS (distill+tools works on CUDA here — unlike the 70B's in-think case); strict json_schema 15/20 blocked by OPEN ISSUE: intermittent HTTP-500 in the constrained-decode path on 32B GPTQ models (~25-30% of schema requests, no engine-side error logged — observability gap). Same path is 20/20 on R1-8B-BF16 and Qwen2.5-Coder-32B-GPTQ"
+        },
         "l5_concurrency": { "status": "pending" },
         "perf_same_arch": { "status": "pending", "note": "baseline = Qwen2.5-32B class / M2 numbers" },
         "docs_readme": { "status": "pending" }
@@ -140,7 +151,11 @@
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-14b-q4_k_m_metal_final_2026-06-12.txt",
           "note": "14B final-script 10/10 incl schema 20/20; 32B Metal waived per user directive 2026-06-12 (same-arch proof via 14B; 32B verifies on the CUDA GPTQ lane)"
         },
-        "l2_gptq_cuda": { "status": "pending", "note": "JunHowie GPTQ-Int4 (Marlin-clean verified); pod session covers 32B (and 14B GPTQ if slack)" },
+        "l2_gptq_cuda": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/pod_logs/smoke8_qwen3-32b_cuda.log",
+          "note": "JunHowie GPTQ 32B on 1x4090: known-answer 10/10 + tools 10/10 + all behavior mechanics; schema 14/20 blocked by the same intermittent schema-500 open issue (see r1-distill row)"
+        },
         "l3_behavior": {
           "status": "pass",
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-14b-q4_k_m_metal_final_2026-06-12.txt",
@@ -169,9 +184,21 @@
         },
         "l1_bf16": { "status": "waived", "reason": "GOAL amendment #1 (2026-06-12): LlamaFamily-dense path L1 runs on the R1-0528-Qwen3-8B representative; pure-config sibling (Qwen2.5 arch), L2 runs at real size", "note": "" },
         "l2_gguf_metal": { "status": "waived", "reason": "User directive 2026-06-12: 32B-dense Metal has no real deployment scenario; same-arch (Qwen2.5) Metal coverage exists via prior family models, verification moves to the CUDA GPTQ lane", "note": "" },
-        "l2_gptq_cuda": { "status": "pending", "note": "official Qwen GPTQ-Int4; pod session" },
-        "l3_behavior": { "status": "pending" },
-        "l4_agent": { "status": "pending" },
+        "l2_gptq_cuda": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/pod_logs/smoke_qwen25-coder-32b-gptq_cuda.log",
+          "note": "official Qwen GPTQ on 1x4090: full ladder PASS in one shot (gates4)"
+        },
+        "l3_behavior": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/pod_logs/smoke_qwen25-coder-32b-gptq_cuda.log",
+          "note": "amendment #2: smoke L3 section green on CUDA"
+        },
+        "l4_agent": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/pod_logs/smoke_qwen25-coder-32b-gptq_cuda.log",
+          "note": "tools 10/10 + strict schema 20/20 on CUDA GPTQ"
+        },
         "l5_concurrency": { "status": "pending" },
         "perf_same_arch": { "status": "pending", "note": "architecture already supported (Qwen2.5); verification-only entry" },
         "docs_readme": { "status": "pending" }

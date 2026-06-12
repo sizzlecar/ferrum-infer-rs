@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-13(凌晨)— CUDA pod 批次收官:实例归零,9 个产品 bug,4 模型 CUDA 认证
+
+**pod 全部销毁,API 验证 0 实例**(单卡 ~9h + 双卡 ~5h + 两台坏机即弃,
+总花费 ≈ $7)。夜班战果:
+
+- **CUDA 侧转绿**:R1-8B BF16 smoke 12/12 + L5(54.5/163.7/382.5);
+  R1-Distill-70B 双卡 L2/L3 + L5(21.4/67.3/68.1);R1-Distill-32B GPTQ
+  L2/L3(known-answer 10/10 @ kv8192×1);Qwen3-32B GPTQ L2(10/10 +
+  tools 10/10);Qwen2.5-Coder-32B GPTQ 全梯一次过(含 schema 20/20)。
+  M3 同 pod 基线锚点 c=32 556.5±84。
+- **修复并验证的引擎 bug**(夜班新增,均已推送):流式 think 泄漏
+  (distill 全家,70B 上 E2E 验证);Marlin n%256≠0 在 m>16 崩溃 →
+  m≤16 分块复用已证 128×128 路径(dense-dequant 首版方案引入新问题已
+  撤);GGUF 多卡 layers=auto 未物化;serve/pull 过期 alias 副本;
+  pod 构建缺 vllm-paged-attn-v2 的硬报错;smoke harness 两处
+  (异常计为 miss、KV 钉死与 autosizer 叠加)。
+- **L1 终局(等批提案 #3)**:20 分叉点中位 logit 间距 0.75/min 0 →
+  BF16 平票翻转,非数值缺陷;跨实现逐位一致原则上不可达。
+- **OPEN ISSUES(下一会话,按正确性优先排序)**:
+  1. strict json_schema 在 32B-GPTQ 上间歇 500(~25-30% 请求,
+     R1-32B 15/20、Qwen3-32B 14/20;R1-8B-BF16 与 Qwen2.5-Coder-32B
+     同路径 20/20)+ 500 不落引擎日志的可观测性缺口。
+  2. Coder-30B jart25-GPTQ 的 CUDA chat 首 token 即 EOS(Metal GGUF
+     同 prompt 正常、CUDA 随机上下文 L5 正常);prime suspect =
+     仓库自带魔改模板(sha 30b8ba8f ≠ 官方 5a38bfa0);待 prompt-ids
+     双端 dump 对照。
+  3. 同构 perf:Coder-30B c=32 411.6 vs M3 556.5(0.74×,宿主机噪声
+     stddev 15% 需复核)— 超 ≤10% 判据,按 GOAL 记接入问题待查。
+  4. CUDA autosizer:reasoning/32B-GPTQ 的 (seqs×capacity) 联合推导
+     (512/seq 400、0-blocks 报错两态)。
+- distill 系 tools-in-think 行为差异落档:32B 注入式 tools 10/10 可用,
+  70B 把调用写进未闭合 think(0528 系 10/10)→ README 按"agent 分级"
+  如实标注。
+
 ## 2026-06-12(夜)— 用户决策落地:32B Metal 收束 + CUDA pod 批次启动
 
 - **用户指令**:32B 稠密不再在 32GB Mac 上折腾("同架构已证即可"——
