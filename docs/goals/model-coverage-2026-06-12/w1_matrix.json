@@ -202,8 +202,11 @@
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_mistral-small-24b-q4_k_m_metal_2026-06-12.txt",
           "note": "amendment #2 harness: required tools 10/10 + strict schema 20/20 on BOTH Small 3.2 and Magistral"
         },
-        "l5_concurrency": { "status": "pending" },
-        "perf_same_arch": { "status": "pending", "note": "baseline = Mistral sliding-window family numbers (Small 3.x is full attention)" },
+        "l5_concurrency": {
+          "status": "pending",
+          "note": "Metal L5 deferred: the local 32GB Mac is in a degraded memory state (compressor residue from the KV-thrash incident; benches stall at 0% GPU) — numbers from a thrashing machine would mislead. Re-run after the machine is restored; correctness cells for the line are all green"
+        },
+        "perf_same_arch": { "status": "pending", "note": "baseline = Mistral sliding-window family numbers (Small 3.x is full attention); same machine-state caveat as l5" },
         "docs_readme": { "status": "pending" }
       }
     },
