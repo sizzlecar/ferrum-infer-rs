@@ -29,7 +29,11 @@
           "note": "golden 5/5 byte-equal (suite 43/43, commit c8f3703e)"
         },
         "l1_bf16": { "status": "pending", "note": "BF16 60GB exceeds local + 1x4090; representative-size policy pending user decision (see STATUS)" },
-        "l2_gguf_metal": { "status": "pending", "note": "GGUF 17.28GB downloading (resume-retry loop)" },
+        "l2_gguf_metal": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-coder-30b-q4_k_m_metal_2026-06-12.txt",
+          "note": "extended smoke 10/10: known-answer 10/10 semantic-correct on Metal GGUF Q4_K_M; XML tool-call format parses to OpenAI tool_calls (required 10/10); strict schema 10/10"
+        },
         "l2_gptq_cuda": { "status": "pending", "note": "jart25 GPTQ-Int4, needs pod session" },
         "l3_behavior": { "status": "pending" },
         "l4_agent": { "status": "pending" },
