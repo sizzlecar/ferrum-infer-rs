@@ -29,21 +29,23 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-SERVE_ARGS=()
-if [ -n "$KV_CAPACITY" ]; then
-  SERVE_ARGS+=(--kv-capacity "$KV_CAPACITY")
-elif [ "$REASONING" = "1" ]; then
-  # Reasoning models think for hundreds-to-thousands of tokens per reply.
-  # The server-profile autosizer currently prefers high concurrency and can
-  # pick a 512-token per-sequence budget (recorded as a W1 product gap in
-  # docs/goals/model-coverage-2026-06-12/); give the smoke real headroom via
-  # the product flags until the autosizer policy lands. The KV pool is
-  # max_num_seqs × kv_capacity, so the capacity bump MUST come with a
-  # concurrency cut — 32 seqs × 8192 tokens is a ~36 GB pool on an 8B
-  # model, which thrashes a 32 GB Mac. 4 × 8192 stays in the default
-  # pool's memory class and the smoke is single-request anyway.
-  SERVE_ARGS+=(--kv-capacity 8192 --max-num-seqs 4)
+# The server-profile autosizer prefers high concurrency and can pick a
+# 512-1024 token per-sequence budget that 400s this ladder's max_tokens
+# (recorded as a W1 product gap in docs/goals/model-coverage-2026-06-12/).
+# Pin deterministic serve conditions instead: the ladder is single-request,
+# so trade concurrency for per-seq capacity. The KV pool is max_num_seqs ×
+# kv_capacity — the capacity bump MUST come with the concurrency cut
+# (32 seqs × 8192 tokens is a ~36 GB pool on an 8B model, which thrashes
+# a 32 GB Mac). 4 × 4096/8192 stays in the default pool's memory class.
+if [ -z "$KV_CAPACITY" ]; then
+  if [ "$REASONING" = "1" ]; then
+    # Reasoning models think for hundreds-to-thousands of tokens per reply.
+    KV_CAPACITY=8192
+  else
+    KV_CAPACITY=4096
+  fi
 fi
+SERVE_ARGS=(--kv-capacity "$KV_CAPACITY" --max-num-seqs 4)
 
 BIN="${FERRUM_BIN:-target/release/ferrum}"
 LOG="/tmp/ferrum_w1_smoke_${PORT}.log"
@@ -164,7 +166,7 @@ check("stream == non-stream", ns.strip() == st.strip(), f"non-stream={ns!r} stre
 # the think block — content emptiness is fine, the wire mechanics are
 # what's pinned here.)
 r = chat({"messages": [{"role": "user", "content": "Count from 1 to 20 as plain comma-separated numbers, nothing else."}],
-          "max_tokens": 4096, "stop": ["7"]})
+          "max_tokens": 1024, "stop": ["7"]})
 content = r["choices"][0]["message"].get("content") or ""
 finish = r["choices"][0].get("finish_reason")
 check("custom stop finish_reason", finish == "stop", f"finish={finish}")
