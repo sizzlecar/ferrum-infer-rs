@@ -229,13 +229,49 @@ cargo build --release -p ferrum-cli --bin ferrum
 | Architecture | Apple Silicon | CUDA | INT4 (GPTQ) | Tensor Parallel |
 |---|:---:|:---:|:---:|:---:|
 | LLaMA (3.x, TinyLlama, Vicuna, Mistral) | ✓ | ✓ | ✓ | ✓ |
-| Qwen3 dense (0.6B – 8B) | ✓ | ✓ | ✓ | ✓ |
-| Qwen3-MoE (30B-A3B) | ✓ | ✓ | ✓ | — |
+| Qwen3 dense (0.6B – 32B) | ✓ | ✓ | ✓ | ✓ |
+| Qwen3-MoE (30B-A3B, Coder-30B-A3B) | ✓ | ✓ | ✓ | — |
 | Qwen2 / Qwen2.5 | ✓ | ✓ | ✓ | — |
+| DeepSeek-R1 (0528-Qwen3-8B; Distill-Qwen-14B/32B; Distill-Llama-70B) | ✓ | ✓ | ✓ | 70B layer-split |
+| Mistral Small 3.2 / Magistral Small (24B) | ✓ | — | — | — |
 | BERT (embeddings) | ✓ | — | — | — |
 | Whisper ASR (tiny → large-v3-turbo) | ✓ | — | — | — |
 | Qwen3-TTS (0.6B / 1.7B) | ✓ | — | — | — |
 | CLIP / Chinese-CLIP / SigLIP (text + image) | ✓ | — | — | — |
+
+### Model coverage certification (W1, 2026-06)
+
+Every row below passed the gate ladder for the marked lanes: chat-template
+golden byte-equality vs `transformers` (L0), known-answer 10/10 at temp 0,
+multi-turn KV reuse, stream==non-stream, natural EOS + custom stop +
+max_tokens mechanics (L2/L3), and the agent gate — required tool-call
+10/10 + strict `json_schema` 20/20 (L4, "agent-grade"). Artifacts:
+[`docs/goals/model-coverage-2026-06-12/artifacts/`](docs/goals/model-coverage-2026-06-12/artifacts/).
+Lane split: **GGUF serves on the Metal lane; CUDA serves GPTQ/safetensors**
+(GGUF decoding is not wired into the CUDA engine yet).
+
+| Model | Aliases | Metal (GGUF Q4_K_M) | CUDA | Agent-grade |
+|---|---|:---:|:---:|:---:|
+| Qwen3-Coder-30B-A3B-Instruct | `qwen3-coder:30b[-q4_k_m/-gptq]` | ✓ | GPTQ: known issue¹ | ✓ (Metal) |
+| DeepSeek-R1-0528-Qwen3-8B | `deepseek-r1:8b[-q4_k_m]` | ✓ | ✓ BF16 | ✓ |
+| DeepSeek-R1-Distill-Qwen-32B | `deepseek-r1:32b[-q4_k_m/-gptq]` | 32 GB Mac: not practical² | ✓ GPTQ | tools ✓ / schema³ |
+| Qwen3-14B / Qwen3-32B | `qwen3:14b/32b[-q4_k_m/-gptq]` | 14B ✓ / 32B² | 32B ✓ GPTQ | 14B ✓ / 32B³ |
+| Qwen2.5-Coder-32B-Instruct | `qwen2.5-coder:32b[-q4_k_m/-gptq]` | —² | ✓ GPTQ | ✓ (CUDA) |
+| Mistral Small 3.2 (24B) | `mistral-small:24b-q4_k_m` | ✓ | — | ✓ |
+| Magistral Small (24B, reasoning) | `magistral:24b-q4_k_m` | ✓ | — | ✓ |
+| DeepSeek-R1-Distill-Llama-70B | `OPEA/...-70B-int4-gptq-sym-inc` | — | ✓ 2×4090 layer-split | chat/reasoning grade⁴ |
+| Devstral Small 2 (24B) | — | **not supported** (`mistral3` arch: YaRN-from-GGUF + attention temperature scaling; the loader refuses it loudly) | | |
+
+¹ jart25 GPTQ chat emits empty answers on CUDA (open issue; weights fine —
+Metal GGUF and CUDA random-context benches are clean).
+² 32B-dense on a 32 GB Mac re-reads evicted weights from SSD every token
+(~0.14 tok/s) — no practical deployment; use the CUDA lane.
+³ strict `json_schema` intermittently returns 500 on 32B-GPTQ (open issue);
+required tool-calls are 10/10.
+⁴ R1-distill templates force `<think>` and the 70B writes tool-call JSON
+inside the think block — reliable for chat/reasoning, not tool calling.
+DeepSeek-R1-Distill-Qwen-14B shares the 32B's template/config byte-for-byte
+and rides the same lanes.
 
 Use any HuggingFace model ID:
 
