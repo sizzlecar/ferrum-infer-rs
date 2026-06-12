@@ -2,6 +2,36 @@
 
 进度日志,倒序。
 
+## 2026-06-12(夜)— 用户决策落地:32B Metal 收束 + CUDA pod 批次启动
+
+- **用户指令**:32B 稠密不再在 32GB Mac 上折腾("同架构已证即可"——
+  Qwen3-14B/R1-8B 的 Metal pass 即同架构证明);Vast 已充值,批准开
+  GPU;**严格要求高效利用 + 异步并行 + 空闲即毁 + 结束全毁**(用户刚
+  手动清理了数台未销毁实例)。API 已核实当前 0 实例。
+- 矩阵落实:R1-Distill-32B 与 Qwen2.5-Coder-32B 的 `l2_gguf_metal`
+  waived(同架构证明 + 部署无场景);Qwen3 dense 行按 14B 证据 pass。
+- L5 Metal 批次进行中:Coder-30B ✅(c1/4/16/32 全零错)、R1-8B ✅
+  (22.9/23.4/54.2 tok/s)、14B/Mistral-Small/Magistral 排队自动跑。
+
+### CUDA pod 批量执行合同(开 pod 前置,GOAL 模板)
+
+```text
+Lever: W1 CUDA gate 批量 —— 单卡 4090:L1 代表(R1-8B BF16 byte-equal
+  N≥20 vs transformers)+ L2-GPTQ smoke(R1-Distill-32B/OPEA、
+  Qwen3-32B/JunHowie、Qwen2.5-Coder-32B/官方、Qwen3-Coder-30B/jart25)
+  + R1-8B CUDA BF16 smoke + 各模型 L5(c=1/4/16,30B 级补 32)
+  + C7/G0 存量回归(M2 Llama-8B-INT4、M3 Qwen3-30B-A3B-GPTQ floor)。
+  双卡 2×4090:R1-Distill-Llama-70B GGUF 4bit layer-split smoke + L5。
+Expected gain: ~18-20 个 gate cell 转绿,W1 除 README 外收口
+Files: scripts/model_coverage_smoke.sh(复用)+ pod 上逐步驱动
+Correctness gate: 每模型 smoke 全绿;首败即停该模型并记录
+Benchmark gate: L5 全 cell 100%/零错误;同构 ≤10%;C7/G0 不回退
+Budget cap: ≤2 pod-day;预计单卡 ~$0.35-0.5/hr + 双卡 ~$0.7-1/hr,
+  目标一晚收口(~$10-25)
+Stop condition: 单模型卡壳 >4h 降级记录;pod 空闲即毁;
+  结束后 API 验证实例数 = 0(用户硬性要求)
+```
+
 ## 2026-06-12(晚 II)— Mistral 线 2/3 收口;Devstral 2 降级(mistral3);[THINK] 修复
 
 - ✅ **Mistral-Small-3.2 全过**(10/10,首个满足 L4 schema 20/20 新判据的
