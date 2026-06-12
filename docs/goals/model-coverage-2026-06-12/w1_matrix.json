@@ -228,7 +228,8 @@
       "id": "r1-distill-llama-70b",
       "name": "DeepSeek-R1-Distill-Llama-70B (dual-GPU)",
       "aliases": ["deepseek-r1:70b"],
-      "lanes": ["dual_gpu_gguf"],
+      "lanes": ["dual_gpu_gptq"],
+      "lane_note": "GGUF decoding is NOT wired into the CUDA engine (explicit loader error; GGUF serving is Metal-only today). Lane pivoted to OPEA/DeepSeek-R1-Distill-Llama-70B-int4-gptq-sym-inc (verified Marlin-clean: 4bit/g128/sym/desc_act=false, 80 layers) — matches the llama33-70b lane's GPTQ format plan. README must document GGUF=Metal / GPTQ=CUDA lane split",
       "cells": {
         "l0_template": {
           "status": "pending",
@@ -236,7 +237,7 @@
         },
         "l1_bf16": { "status": "waived", "reason": "GOAL amendment #1 (2026-06-12): 70B BF16 140GB exceeds any available configuration; GOAL.md plans GGUF 4bit on the llama33-70b-4bit-2x4090 lane", "note": "" },
         "l2_gguf_metal": { "status": "waived", "reason": "70B exceeds 32GB Mac; lane is dual-4090 layer-split (l2 runs there)", "note": "dual-GPU known-answer smoke replaces this cell" },
-        "l2_gguf_dual_gpu": { "status": "pending", "note": "GGUF 4bit dual-4090 layer-split known-answer (inherits llama33-70b lane)" },
+        "l2_gptq_dual_gpu": { "status": "pending", "note": "OPEA GPTQ-Int4 dual-4090 layer-split smoke running on the Iceland pod" },
         "l3_behavior": { "status": "pending" },
         "l4_agent": { "status": "pending" },
         "l5_concurrency": { "status": "pending", "note": "c=1/4/16 on dual-4090" },
