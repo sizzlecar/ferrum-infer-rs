@@ -2,6 +2,17 @@
 
 进度日志,倒序。
 
+## 2026-06-12(午后 II)— R1-8B L2-Metal cell 转绿;HF_ENDPOINT 落地
+
+- ✅ **R1-8B 扩展阶梯 12/12 全过**(known-answer 10/10 语义正确 + stop
+  不漏 + max_tokens 守预算 + reasoning/stream/tools/schema 机制),
+  `l2_gguf_metal` cell 转 pass,验证器 11/63。
+- **`HF_ENDPOINT` 支持落地**(huggingface_hub 同约定):本网络实测
+  hf-mirror 直连 2.08MB/s vs 代理 0.156MB/s(**13×**)。Coder-30B 下载
+  已切镜像直连续传(ETag 与 hub 一致,blob 无缝续);预计 ~1h 内落盘。
+- R1-Distill-Llama-70B 模板与 R1-Distill-Qwen-32B fixture 同 hash 同
+  EOS(`56a1447ad31926fd`),L0 模板面由现有 fixture 覆盖。
+
 ## 2026-06-12(午后)— gate 矩阵 + 验证器落地;两个 GOAL 修订提案待批
 
 - **`w1_matrix.json` + `scripts/w1_goal_validator.py` 落地**:7 个模型 ×
