@@ -31,13 +31,16 @@ if [ ! -f "$G/l1_refs.json" ]; then
     > "$G/l1_gen.log" 2>&1 && echo "=== STAGE l1_gen PASS" || echo "=== STAGE l1_gen FAIL"
 fi
 if [ -f "$G/l1_refs.json" ]; then
-  if serve_wait deepseek-r1:8b 8201; then
+  # BF16 8B = 16GB weights; the KV pool lives in VRAM on CUDA, so the
+  # reasoning-default 8192x4 pool (~4.8GB) OOMs a 24GB card. 4096x2 fits.
+  if serve_wait deepseek-r1:8b 8201 --kv-capacity 4096 --max-num-seqs 2; then
     python3 scripts/pod_l1_reference_match.py verify --refs "$G/l1_refs.json" \
       --base-url http://127.0.0.1:8201 --alias deepseek-r1:8b --out "$G/l1_report.json" \
       > "$G/l1_verify.log" 2>&1 && echo "=== STAGE l1_verify PASS" || echo "=== STAGE l1_verify FAIL"
     # CUDA BF16 smoke for R1-8B rides the same weights
     FERRUM_BIN=$BIN SMOKE_REQ_TIMEOUT=900 bash scripts/model_coverage_smoke.sh \
-      deepseek-r1:8b --reasoning --port 8202 > "$G/smoke_r1-8b-bf16_cuda.log" 2>&1 \
+      deepseek-r1:8b --reasoning --kv-capacity 4096 --max-seqs 2 --port 8202 \
+      > "$G/smoke_r1-8b-bf16_cuda.log" 2>&1 \
       && echo "=== STAGE smoke_r1-8b PASS" || echo "=== STAGE smoke_r1-8b FAIL"
   fi
 fi
