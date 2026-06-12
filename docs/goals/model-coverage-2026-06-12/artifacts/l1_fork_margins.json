@@ -1,0 +1,182 @@
+[
+ {
+  "prompt": "What is 2+3? Answer with just the number.",
+  "fork_char": 68,
+  "logit_gap": 1.0,
+  "top1": "This",
+  "top2": "I",
+  "hf_next": "This is a ",
+  "fer_next": "I need to "
+ },
+ {
+  "prompt": "Name the capital of Japan.",
+  "fork_char": 85,
+  "logit_gap": 1.375,
+  "top1": " question",
+  "top2": " query",
+  "hf_next": "question, ",
+  "fer_next": "factual qu"
+ },
+ {
+  "prompt": "Write a haiku about the sea.",
+  "fork_char": 0,
+  "logit_gap": 0.625,
+  "top1": "Okay",
+  "top2": "Hmm",
+  "hf_next": "Okay, user",
+  "fer_next": "Hmm, the u"
+ },
+ {
+  "prompt": "Translate 'good morning' into French.",
+  "fork_char": 14,
+  "logit_gap": 2.0,
+  "top1": " asked",
+  "top2": " wants",
+  "hf_next": "is asking ",
+  "fer_next": "asked to t"
+ },
+ {
+  "prompt": "What is the chemical symbol for gold?",
+  "fork_char": 274,
+  "logit_gap": 0.75,
+  "top1": "\n",
+  "top2": " Maybe",
+  "hf_next": "That's a c",
+  "fer_next": "So the \"Au"
+ },
+ {
+  "prompt": "List three prime numbers greater than 10.",
+  "fork_char": 222,
+  "logit_gap": 0.5,
+  "top1": " which",
+  "top2": " if",
+  "hf_next": " which one",
+  "fer_next": "ing which "
+ },
+ {
+  "prompt": "What year did the Apollo 11 moon landing happen?",
+  "fork_char": 148,
+  "logit_gap": 1.125,
+  "top1": " need",
+  "top2": " should",
+  "hf_next": "need to co",
+  "fer_next": "should con"
+ },
+ {
+  "prompt": "Spell 'necessary'.",
+  "fork_char": 53,
+  "logit_gap": 0.625,
+  "top1": "as",
+  "top2": "aaa",
+  "hf_next": "is seems l",
+  "fer_next": "at's a pre"
+ },
+ {
+  "prompt": "What is 12 squared?",
+  "fork_char": 15,
+  "logit_gap": 12.125,
+  "top1": "1",
+  "top2": "2",
+  "hf_next": "out what 1",
+  "fer_next": "what 12 sq"
+ },
+ {
+  "prompt": "Give one synonym for 'fast'.",
+  "fork_char": 6,
+  "logit_gap": 0.5,
+  "top1": " the",
+  "top2": " user",
+  "hf_next": "user asked",
+  "fer_next": "the user a"
+ },
+ {
+  "prompt": "What language is primarily spoken in Brazil?",
+  "fork_char": 150,
+  "logit_gap": 0.0,
+  "top1": "9",
+  "top2": "5",
+  "hf_next": "the most w",
+  "fer_next": "I know tha"
+ },
+ {
+  "prompt": "How many continents are there?",
+  "fork_char": 0,
+  "logit_gap": 0.25,
+  "top1": "Okay",
+  "top2": "First",
+  "hf_next": "First, the",
+  "fer_next": "Okay, the "
+ },
+ {
+  "prompt": "What is the boiling point of water in Celsius?",
+  "fork_char": 122,
+  "logit_gap": 13.5,
+  "top1": "1",
+  "top2": "2",
+  "hf_next": "that at se",
+  "fer_next": "it's 100 d"
+ },
+ {
+  "prompt": "Name the largest planet in the solar system.",
+  "fork_char": 112,
+  "logit_gap": 2.75,
+  "top1": "\n",
+  "top2": " Jupiter",
+  "hf_next": "I know tha",
+  "fer_next": "Jupiter is"
+ },
+ {
+  "prompt": "What does CPU stand for?",
+  "fork_char": 76,
+  "logit_gap": 0.75,
+  "top1": "3",
+  "top2": "4",
+  "hf_next": "standard a",
+  "fer_next": "acronym. C"
+ },
+ {
+  "prompt": "Write the first 5 Fibonacci numbers.",
+  "fork_char": 341,
+  "logit_gap": 2.125,
+  "top1": " (",
+  "top2": " are",
+  "hf_next": "are: 0, 1,",
+  "fer_next": "(from F0 t"
+ },
+ {
+  "prompt": "What is the square root of 81?",
+  "fork_char": 250,
+  "logit_gap": 0.375,
+  "top1": "3",
+  "top2": "9",
+  "hf_next": "-9 times -",
+  "fer_next": "negative 9"
+ },
+ {
+  "prompt": "Name a programming language created by Guido van Rossum.",
+  "fork_char": 0,
+  "logit_gap": 0.625,
+  "top1": "We",
+  "top2": "Okay",
+  "hf_next": "We are ask",
+  "fer_next": "Okay, the "
+ },
+ {
+  "prompt": "What gas do plants absorb from the air?",
+  "fork_char": 24,
+  "logit_gap": 0.0,
+  "top1": " what",
+  "top2": ",",
+  "hf_next": ", \"What ga",
+  "fer_next": " what gas "
+ },
+ {
+  "prompt": "How many minutes are in two hours?",
+  "fork_char": 342,
+  "logit_gap": 0.75,
+  "top1": " should",
+  "top2": " can",
+  "hf_next": "should mak",
+  "fer_next": "can think "
+ }
+]
