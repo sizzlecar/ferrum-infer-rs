@@ -292,3 +292,34 @@ T3/T4/T5 处于 EOS/stop/模板爆炸半径,全套件(release + Metal,真模型)
 - CUDA 侧 gate(L2-GPTQ / L5 / C7 回归)需要 4090 pod:开 pod 前按 GOAL
   执行合同填表并征得用户预算批准(CLAUDE.md 要求)。当前无可用 pod
   (上一台 38237968 已失;见 memory)。本地(Metal/CPU)可推进项先行。
+
+## 2026-06-13 15:25 — W1 GOAL PASS
+
+- `scripts/w1_goal_validator.py`: **72/72 cells satisfied →
+  `MODEL_COVERAGE_W1 GOAL PASS`**。
+- 最后 6 cell(32B 三连 l5_concurrency + perf_same_arch)由冰岛 pod
+  40751023 一次干净会话收齐:
+  - `l5f_r1-32b_cuda.json` c=1/4/16/32 = 40.8/116.6/248.9/300.6 tok/s,
+    1200 请求 0 错误。
+  - `l5f_qwen3-32b_cuda.json` c=32 = 273.6 tok/s,0 错误。
+  - `l5f_qwen25-coder-32b_cuda.json` c=32 = 257.1 tok/s,0 错误。
+  - perf_same_arch(修订 #4 判据):三方互校最差偏差 8.5% ≤ 10% →
+    `W1_PERF_SPREAD PASS`。
+- GPU 纪律:三台问题宿主(台湾 docker_build 坏 / 阿根廷不开机 /
+  冰岛 cuInit=804)处置后,**API 归零验证 0 实例**。本夜累计 GPU 支出
+  约 $9。
+- 新宿主病理学(已固化进 `pod_w1_final_armored.sh`):
+  - cuInit=804 = 容器 compat libcuda(550)压住宿主驱动,GeForce 不在
+    compat 支持表;删 compat so + ldconfig 即愈。
+  - rsproxy.cn 在部分欧洲宿主被 TLS 劫持;脚本现在先探测 crates.io
+    再选镜像。
+  - hf xet/hf_transfer 在该宿主网络下饿死(0 MB/s);关 xet + 关
+    hf_transfer 的普通 HTTP 路径反而跑满 3.6 Gbps。
+- 待办移交(不阻塞 W1,记录在 GOAL.md 开放问题):schema-500、
+  Coder jart25 CUDA chat、CUDA autosizer、Metal L5 复跑(等本机恢复)。
+
+### 下一步
+
+- W2:Gemma 3 27B 家族接入(SWA 5:1 / 双 rope / GeGLU / 三明治 norm /
+  query_pre_attn_scalar),本地 Mac/CPU dump 对照先行,CUDA 验证晚开 pod。
+- W3:DeltaNet 调查(W1+W2 后解锁)。
