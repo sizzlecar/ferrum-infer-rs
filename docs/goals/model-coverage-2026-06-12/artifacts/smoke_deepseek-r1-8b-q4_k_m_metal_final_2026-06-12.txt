@@ -1,0 +1,15 @@
+=== R1-8B rerun:
+[smoke] waiting for http://127.0.0.1:18221/health (model: deepseek-r1:8b-q4_k_m)
+[smoke] ok   known-answer 10/10
+[smoke] ok   natural EOS stop
+[smoke] ok   reasoning extracted
+[smoke] ok   no think tags leak into content
+[smoke] ok   multi-turn recall Bob
+[smoke] ok   stream == non-stream
+[smoke] ok   custom stop finish_reason
+[smoke] ok   custom stop does not leak
+[smoke] ok   max_tokens finish_reason length
+[smoke] ok   max_tokens budget respected
+[smoke] ok   required tool-call 10/10
+[smoke] ok   strict json_schema 20/20
+FERRUM W1 SMOKE PASS: deepseek-r1:8b-q4_k_m

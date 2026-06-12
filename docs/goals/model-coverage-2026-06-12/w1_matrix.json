@@ -69,7 +69,11 @@
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_deepseek-r1-8b-q4_k_m_metal_extended_2026-06-12.txt",
           "note": "GOAL amendment #2: smoke L3 section green — multi-turn KV, stream==non-stream, natural EOS, custom stop (finish+no-leak), max_tokens cutoff, reasoning extraction"
         },
-        "l4_agent": { "status": "pending", "note": "amendment #2 harness: smoke tools 10/10 done; schema needs the 20/20 run (script now does 20x) — re-pull + rerun queued" },
+        "l4_agent": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_deepseek-r1-8b-q4_k_m_metal_final_2026-06-12.txt",
+          "note": "amendment #2 harness: required tools 10/10 + strict schema 20/20 (final-script rerun, 12/12 overall)"
+        },
         "l5_concurrency": { "status": "pending" },
         "perf_same_arch": { "status": "pending", "note": "baseline = Qwen3-8B / Llama-8B class numbers" },
         "docs_readme": { "status": "pending" }
@@ -113,11 +117,11 @@
         "l1_bf16": { "status": "waived", "reason": "GOAL amendment #1 (2026-06-12): LlamaFamily-dense path L1 runs on the R1-0528-Qwen3-8B representative (+ existing qwen3-0.6b reference_match); pure-config siblings inherit, L2 runs at real size", "note": "" },
         "l2_gguf_metal": {
           "status": "pending",
-          "note": "14B PASS (extended smoke 10/10, artifacts/smoke_qwen3-14b-q4_k_m_metal_2026-06-12.txt); 32B pending download"
+          "note": "14B PASS final-script 10/10 incl schema 20/20 (artifacts/smoke_qwen3-14b-q4_k_m_metal_final_2026-06-12.txt); 32B blocked on machine state (see r1-distill-qwen-32b note) — retry after reboot or waive to CUDA lane"
         },
         "l2_gptq_cuda": { "status": "pending", "note": "JunHowie GPTQ-Int4 (Marlin-clean verified); pod session" },
-        "l3_behavior": { "status": "pending" },
-        "l4_agent": { "status": "pending" },
+        "l3_behavior": { "status": "pending", "note": "14B green per amendment #2 (same artifact); 32B pending" },
+        "l4_agent": { "status": "pending", "note": "14B green (tools 10/10 + schema 20/20); 32B pending" },
         "l5_concurrency": { "status": "pending" },
         "perf_same_arch": { "status": "pending", "note": "baseline = existing Qwen3 dense numbers" },
         "docs_readme": { "status": "pending" }
