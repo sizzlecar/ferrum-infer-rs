@@ -1,0 +1,7 @@
+{
+  "model_id": "unsloth/Magistral-Small-2509",
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "render_kwargs": {},
+  "transformers_version": "5.11.0"
+}

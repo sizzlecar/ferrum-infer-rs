@@ -31,6 +31,12 @@ impl ModelChatTemplate {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChatTemplateOptions {
     pub enable_thinking: Option<bool>,
+    /// Clock seen by the template's `strftime_now` (Mistral-Small-3.2 and
+    /// Llama-3.x inject "today's date" into the system prompt). `None` =
+    /// local wall clock; golden tests pin the timestamp recorded at
+    /// fixture-generation time so byte comparison survives the date
+    /// changing.
+    pub now_override: Option<chrono::NaiveDateTime>,
 }
 
 impl ChatTemplateOptions {
@@ -38,6 +44,7 @@ impl ChatTemplateOptions {
         if model_template_supports_enable_thinking(model_template) {
             return Self {
                 enable_thinking: Some(false),
+                ..Self::default()
             };
         }
         Self::default()
@@ -313,6 +320,28 @@ fn render_model_template(
             .trim_start_matches('\n')
             .to_string()
     });
+    // transformers exposes `strftime_now(format)` = `datetime.now().strftime`
+    // to templates (Mistral-Small-3.2 / Llama-3.x date their system prompts
+    // with it). chrono's strftime covers the specifiers real templates use
+    // (%d %m %Y %b %H %M %S); an unsupported one is a render error, not a
+    // panic.
+    let now = options
+        .now_override
+        .unwrap_or_else(|| chrono::Local::now().naive_local());
+    env.add_function(
+        "strftime_now",
+        move |fmt: String| -> std::result::Result<String, minijinja::Error> {
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            write!(out, "{}", now.format(&fmt)).map_err(|_| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("strftime_now: unsupported format string {fmt:?}"),
+                )
+            })?;
+            Ok(out)
+        },
+    );
     let template = normalize_hf_chat_template(&model_template.template);
     env.add_template("chat", &template)?;
     let tmpl = env.get_template("chat")?;
@@ -334,7 +363,31 @@ fn render_model_template(
 /// insertion key order (hence the minijinja `preserve_order` feature).
 /// minijinja's builtin emits compact separators, which breaks byte equality
 /// with transformers-rendered tool definitions.
-fn python_style_tojson(value: minijinja::value::Value) -> Result<String, minijinja::Error> {
+fn python_style_tojson(
+    value: minijinja::value::Value,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<String, minijinja::Error> {
+    // transformers' `tojson` forwards kwargs to `json.dumps`; real templates
+    // use `indent=N` (Llama-3.x tool specs). Python's indented output equals
+    // serde_json's pretty formatter with an N-space indent. Anything else
+    // (sort_keys, separators) is unimplemented — erroring beats silently
+    // rendering a different prompt.
+    let indent = kwargs.get::<Option<usize>>("indent")?;
+    kwargs.assert_all_used()?;
+    if let Some(indent) = indent {
+        let indent_bytes = vec![b' '; indent];
+        let mut out = Vec::new();
+        let mut ser = serde_json::Serializer::with_formatter(
+            &mut out,
+            serde_json::ser::PrettyFormatter::with_indent(&indent_bytes),
+        );
+        serde::Serialize::serialize(&value, &mut ser).map_err(|e| {
+            minijinja::Error::new(minijinja::ErrorKind::BadSerialization, e.to_string())
+        })?;
+        return String::from_utf8(out).map_err(|e| {
+            minijinja::Error::new(minijinja::ErrorKind::BadSerialization, e.to_string())
+        });
+    }
     struct PyFormatter;
     impl serde_json::ser::Formatter for PyFormatter {
         fn begin_object_key<W: ?Sized + std::io::Write>(
@@ -944,6 +997,7 @@ mod tests {
             Some(&template),
             &ChatTemplateOptions {
                 enable_thinking: Some(true),
+                ..Default::default()
             },
         )
         .unwrap();

@@ -1,0 +1,82 @@
+{
+  "single": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi"
+      }
+    ]
+  },
+  "system": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are helpful."
+      },
+      {
+        "role": "user",
+        "content": "Hi"
+      }
+    ]
+  },
+  "multi_turn": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "A"
+      },
+      {
+        "role": "assistant",
+        "content": "B"
+      },
+      {
+        "role": "user",
+        "content": "C"
+      }
+    ]
+  },
+  "think_history": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Q1"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>\nreasoning here\n</think>\n\nAnswer1"
+      },
+      {
+        "role": "user",
+        "content": "Q2"
+      }
+    ]
+  },
+  "tools": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the weather in Paris?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

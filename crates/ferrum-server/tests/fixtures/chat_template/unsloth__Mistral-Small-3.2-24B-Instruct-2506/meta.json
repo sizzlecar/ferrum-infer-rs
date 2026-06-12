@@ -1,0 +1,8 @@
+{
+  "model_id": "unsloth/Mistral-Small-3.2-24B-Instruct-2506",
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "render_kwargs": {},
+  "now": "2026-06-12T00:00:00",
+  "transformers_version": "5.11.0"
+}

@@ -1,0 +1,1 @@
+<s>[AVAILABLE_TOOLS][{"type": "function", "function": {"name": "get_weather", "description": "Get the current weather for a city.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}][/AVAILABLE_TOOLS][INST]What is the weather in Paris?[/INST]
