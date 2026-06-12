@@ -11,3 +11,5 @@ Destroy: `curl -X DELETE "https://console.vast.ai/api/v0/instances/{id}/?api_key
 Verify zero: instances list must return 0 before declaring the goal done.
 
 **2026-06-13 04:40 — API verified: 0 instances remaining.** Session GPU spend ~= $7.
+
+| 40742315 | 1x RTX 4090, 160GB | 0.372 | 2026-06-13 ~05:20 | FINAL micro-session: 3x 32B L5 + mutual-spread perf | ACTIVE |
