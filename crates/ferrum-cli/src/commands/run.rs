@@ -1273,6 +1273,8 @@ pub fn resolve_model_alias(name: &str) -> String {
         "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => {
             "openai/whisper-large-v3-turbo".to_string()
         }
+        "qwen3-tts" | "tts" | "tts:0.6b" => "Qwen/Qwen3-TTS-12Hz-0.6B-Base".to_string(),
+        "tts:1.7b" | "qwen3-tts:1.7b" => "Qwen/Qwen3-TTS-12Hz-1.7B-Base".to_string(),
         _ => name.to_string(),
     }
 }

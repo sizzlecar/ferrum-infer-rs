@@ -64,7 +64,11 @@ def cmd_gen(args):
             [{"role": "user", "content": p}],
             add_generation_prompt=True,
             return_tensors="pt",
-        ).to("cuda")
+        )
+        # transformers 5.x returns a BatchEncoding dict by default.
+        if not torch.is_tensor(ids):
+            ids = ids["input_ids"]
+        ids = ids.to("cuda")
         out = model.generate(
             ids,
             max_new_tokens=MAX_NEW_TOKENS,
