@@ -25,20 +25,34 @@ smoke5 deepseek-r1:32b-gptq r1-32b-gptq --reasoning
 smoke5 qwen3:32b-gptq qwen3-32b-gptq
 smoke5 deepseek-r1:8b r1-8b-bf16 --reasoning
 
-# Coder-30B L5 retry (dense-fallback router fix)
-pkill -f "[f]errum serve" 2>/dev/null; sleep 2
-TOKDIR=$(dirname "$(ls /root/.cache/huggingface/hub/models--jart25--Qwen3-Coder-30B-A3B-Instruct-Int4-gptq/snapshots/*/tokenizer.json | head -1)")
-nohup "$BIN" serve qwen3-coder:30b-gptq --port 8231 > "$W/serve_l5_coder2.log" 2>&1 &
-SRV=$!
-for i in $(seq 1 150); do
-  curl -sf --max-time 2 http://127.0.0.1:8231/health >/dev/null 2>&1 && break
-  sleep 3
-done
-"$BIN" bench-serve --base-url http://127.0.0.1:8231 --model qwen3-coder:30b-gptq \
-  --tokenizer "$TOKDIR" --concurrency-sweep 1,4,16,32 --num-prompts 100 \
-  --n-repeats 3 --out "$G/l5_coder-30b-gptq_cuda.json" > "$G/l5_coder-30b-gptq_v2.log" 2>&1 \
-  && echo "=== STAGE l5_coder_v2 PASS" || echo "=== STAGE l5_coder_v2 FAIL"
-kill "$SRV" 2>/dev/null
+# L5 benches: Coder-30B retry (dense-fallback router fix) + the three
+# 32B models gates4 skipped.
+l5run() { # alias rid repodir csweep
+  local alias="$1" rid="$2" repodir="$3" csweep="$4"
+  pkill -f "[f]errum serve" 2>/dev/null; sleep 2
+  local tokjson tokdir
+  tokjson=$(ls /root/.cache/huggingface/hub/"$repodir"/snapshots/*/tokenizer.json 2>/dev/null | head -1)
+  if [ -z "$tokjson" ]; then echo "=== STAGE l5_${rid} FAIL (no tokenizer)"; return; fi
+  tokdir=$(dirname "$tokjson")
+  nohup "$BIN" serve "$alias" --port 8231 > "$W/serve_l5_${rid}.log" 2>&1 &
+  local srv=$!
+  local healthy=0
+  for i in $(seq 1 150); do
+    if curl -sf --max-time 2 http://127.0.0.1:8231/health >/dev/null 2>&1; then healthy=1; break; fi
+    if ! kill -0 "$srv" 2>/dev/null; then break; fi
+    sleep 3
+  done
+  if [ "$healthy" != "1" ]; then echo "=== STAGE l5_${rid} FAIL (server)"; kill "$srv" 2>/dev/null; return; fi
+  "$BIN" bench-serve --base-url http://127.0.0.1:8231 --model "$alias" \
+    --tokenizer "$tokdir" --concurrency-sweep "$csweep" --num-prompts 100 \
+    --n-repeats 3 --out "$G/l5_${rid}_cuda.json" > "$G/l5_${rid}_run.log" 2>&1 \
+    && echo "=== STAGE l5_${rid} PASS" || echo "=== STAGE l5_${rid} FAIL"
+  kill "$srv" 2>/dev/null
+}
+l5run qwen3-coder:30b-gptq coder-30b-gptq models--jart25--Qwen3-Coder-30B-A3B-Instruct-Int4-gptq 1,4,16,32
+l5run deepseek-r1:32b-gptq r1-32b-gptq models--OPEA--DeepSeek-R1-Distill-Qwen-32B-int4-gptq-sym-inc 1,4,16,32
+l5run qwen3:32b-gptq qwen3-32b-gptq models--JunHowie--Qwen3-32B-GPTQ-Int4 1,4,16,32
+l5run qwen2.5-coder:32b-gptq qwen25-coder-32b-gptq models--Qwen--Qwen2.5-Coder-32B-Instruct-GPTQ-Int4 1,4,16,32
 
 # L1 fork-point margin quantification: at each divergence point, how big
 # is HF's own top1-top2 logit gap? BF16-noise-sized gaps justify the
