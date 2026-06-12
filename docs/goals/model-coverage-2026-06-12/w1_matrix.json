@@ -45,7 +45,11 @@
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_qwen3-coder-30b-q4_k_m_metal_final_2026-06-12.txt",
           "note": "amendment #2 harness: required tools 10/10 (XML format) + strict schema 20/20 (final-script rerun)"
         },
-        "l5_concurrency": { "status": "pending", "note": "Metal bench-serve c=1/4/16/32 n=3 running with --out report; first truncated run already showed zero errors across all detectors" },
+        "l5_concurrency": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/l5_qwen3-coder-30b_metal_2026-06-12.json",
+          "note": "Metal c=1/4/16/32, n=3: completed 100/100 every run, zero errors, stddev <1% (no consecutive-repeat degradation); out-tok/s 37.5/35.4/56.8/57.1. CUDA-side L5 joins the pod batch"
+        },
         "perf_same_arch": { "status": "pending", "note": "baseline = M3 (Qwen3-30B-A3B) G0 numbers" },
         "docs_readme": { "status": "pending" }
       }
