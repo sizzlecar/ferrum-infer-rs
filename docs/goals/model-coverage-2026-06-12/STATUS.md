@@ -2,6 +2,46 @@
 
 进度日志,倒序。
 
+## 2026-06-12(深夜 III)— ✅ R1-0528-Qwen3-8B GGUF Metal smoke 全绿
+
+**W1 第一个模型过本地阶梯**:`FERRUM W1 SMOKE PASS: deepseek-r1:8b-q4_k_m`
+(8/8:known-answer、自然 EOS、reasoning 提取、think 不漏入 content、
+多轮记忆、stream==non-stream、required tool 10/10、strict json_schema
+10/10)。证据:`artifacts/smoke_deepseek-r1-8b-q4_k_m_metal_2026-06-12.txt`。
+serve 参数:`--kv-capacity 8192 --max-num-seqs 4`(见下条 thrash 诊断)。
+注意:这是 L2/L3/L4 的可跑子集;最终认证仍需完整套件
+(json_schema 20/20 走 server_structured_output)+ CUDA 侧 gate。
+
+## 2026-06-12(深夜 II)— GGUF pull 产品缺口修复 + KV 池 thrash 诊断
+
+R1-8B GGUF smoke 调试中钉死三个真实产品问题(全部影响 W1 每个 GGUF alias):
+
+1. **pull sidecar 全量下载 bug(已修)**:GGUF 仓库缺 tokenizer.json 时,
+   兜底走 `HfDownloader::download(sibling)` —— 会把 sibling 的 **safetensors
+   权重(8B≈16GB)整库拉下来**,只为拿 tokenizer。磁盘紧张时必死,这就是
+   此前需要手工拷 tokenizer 的根因。新增
+   `HfDownloader::download_sidecar_files`(只拉指定小文件),pull 改用之,
+   清单补上 `generation_config.json`(EOS 解析第一优先级)+
+   `chat_template.jinja`。
+2. **bartowski 系 sibling 映射全断(已修)**:HF API 实测 9 个 W1 GGUF 仓库
+   **全部不带 tokenizer.json**,sibling 兜底是必经之路;而 strip `-GGUF`
+   约定对 bartowski/*(无 safetensors 镜像)全部失效。
+   `tokenizer_sibling_repo` 加显式映射(2026-06-12 HF API 逐个核实
+   tokenizer.json 存在):Qwen2.5-Coder→Qwen 官方;Mistral-Small-3.2 /
+   Magistral→unsloth 镜像(**mistralai 上游只有 tekken 格式,无 HF
+   tokenizer.json**);Devstral 2→mistralai 上游;Llama 系→unsloth 镜像
+   (meta-llama 上游 gated)。
+3. **`--kv-capacity` 单独抬高 = 32GB Mac 内存灾难(smoke 已加防护)**:
+   KV 池 = `max_num_seqs × kv_capacity`。autosizer server 档默认
+   (32, 512)≈2GB;只把 capacity 提到 8192 会得到 32×8192≈36GB 池
+   (8B/36 层/8KV头/128hd),Metal 分配直接把机器打进内存压缩 thrash
+   (实测:health 能过、首个请求触发 `ensure_kv` 后 600s 超时,压缩器
+   存页 38GB)。smoke 的 reasoning 档改为
+   `--kv-capacity 8192 --max-num-seqs 4`(池 32K token,与默认同量级)。
+   **autosizer 产品缺口升级**:reasoning 模型需要的不是"调大 capacity",
+   而是 (seqs × capacity) 在显存预算内的联合推导 + 长上下文低并发档位;
+   `--kv-capacity` 作为独立产品 flag 缺少联动护栏。
+
 ## 2026-06-12(深夜)— 本地验证推进与环境修正
 
 - **修正**:HF 缓存里的 R1-0528-8B / R1-Distill-32B / Qwen3-Coder-30B /

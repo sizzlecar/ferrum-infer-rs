@@ -1,0 +1,11 @@
+[smoke] waiting for http://127.0.0.1:18207/health (model: deepseek-r1:8b-q4_k_m)
+[smoke] ok   known-answer contains 5
+[smoke] ok   natural EOS stop
+[smoke] ok   reasoning extracted
+[smoke] ok   no think tags leak into content
+[smoke] ok   multi-turn recall Bob
+[smoke] ok   stream == non-stream
+[smoke] ok   required tool-call 10/10
+[smoke] ok   strict json_schema 10/10
+FERRUM W1 SMOKE PASS: deepseek-r1:8b-q4_k_m
+SMOKE_EXIT=0
