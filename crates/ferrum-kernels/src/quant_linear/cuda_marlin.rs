@@ -16,6 +16,55 @@ use crate::Linear;
 use ferrum_types::{FerrumError, Result};
 use std::sync::Arc;
 
+/// Dense f32-dequantized fallback for GPTQ layers whose shape violates the
+/// Marlin tile constraints (kernel needs `n % 256 == 0 && k % 128 == 0`
+/// once m grows past the small-m tile branch; e.g. jart25's Coder-30B
+/// repack quantizes the 2048x128 MoE router). Dequantized once at load —
+/// these layers are tiny, so dense GEMM costs nothing.
+pub struct CudaDenseFallbackLinear {
+    pub weight: CudaBuf,
+    pub bias: Option<CudaBuf>,
+    pub in_features: usize,
+    pub out_features: usize,
+}
+
+impl Linear<CudaBackend> for CudaDenseFallbackLinear {
+    fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    fn forward(
+        &self,
+        ctx: &mut <CudaBackend as crate::backend::Backend>::Context,
+        input: &<CudaBackend as crate::backend::Backend>::Buffer,
+        out: &mut <CudaBackend as crate::backend::Backend>::Buffer,
+        m: usize,
+    ) {
+        <CudaBackend as crate::backend::Backend>::gemm(
+            ctx,
+            input,
+            &self.weight,
+            out,
+            m,
+            self.out_features,
+            self.in_features,
+        );
+        if let Some(bias) = &self.bias {
+            <CudaBackend as crate::backend::Backend>::add_bias(
+                ctx,
+                out,
+                bias,
+                m,
+                self.out_features,
+            );
+        }
+    }
+}
+
 /// Single-tensor GPTQ-Marlin Linear projection.
 ///
 /// Holds a `GptqStoreCuda` (Marlin tiles, optionally Triton view) plus
