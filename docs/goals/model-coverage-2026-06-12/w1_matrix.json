@@ -100,7 +100,10 @@
           "note": "template byte-identical to gated Qwen3-0.6B across 0.6B/14B/32B (sha a55ee1b1660128b7, STATUS 2026-06-12)"
         },
         "l1_bf16": { "status": "pending", "note": "14B BF16 28GB > 24GB single 4090; representative-size policy pending user decision" },
-        "l2_gguf_metal": { "status": "pending" },
+        "l2_gguf_metal": {
+          "status": "pending",
+          "note": "14B PASS (extended smoke 10/10, artifacts/smoke_qwen3-14b-q4_k_m_metal_2026-06-12.txt); 32B pending download"
+        },
         "l2_gptq_cuda": { "status": "pending", "note": "JunHowie GPTQ-Int4 (Marlin-clean verified); pod session" },
         "l3_behavior": { "status": "pending" },
         "l4_agent": { "status": "pending" },
