@@ -131,6 +131,18 @@ pub fn load_gguf_decoder_with_info(
         .architecture()
         .map_err(|e| FerrumError::model(format!("read GGUF arch: {e}")))?
         .to_string();
+    // Refuse arches we don't actually implement instead of silently
+    // loading them through the llama-family path. A near-miss like
+    // `mistral3` (YaRN-from-GGUF + attention temperature scaling) loads
+    // "successfully" that way and then generates pure garbage — a loud
+    // error beats degraded output.
+    if !gguf_arch_supported(&arch) {
+        return Err(FerrumError::model(format!(
+            "unsupported GGUF architecture '{arch}' in {}; supported: \
+             qwen3, qwen3moe, qwen2, qwen, llama, mistral",
+            gguf_path.display()
+        )));
+    }
     let is_moe = arch == "qwen3moe";
 
     let dense_cfg = if is_moe {
@@ -239,9 +251,30 @@ pub fn load_gguf_decoder_with_info(
     Ok((llm, model_info))
 }
 
+/// GGUF architectures the loader actually implements. Everything here maps
+/// onto `LlamaFamilyModel` config toggles (or `Qwen3MoeModel` for qwen3moe);
+/// anything else must hard-error rather than load-and-garble.
+fn gguf_arch_supported(arch: &str) -> bool {
+    matches!(
+        arch,
+        "qwen3" | "qwen3moe" | "qwen2" | "qwen" | "llama" | "mistral"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_gguf_arch_is_rejected() {
+        // mistral3 (Devstral 2) needs YaRN-from-GGUF + attention
+        // temperature scaling — loading it through the llama-family path
+        // produces degenerate output, so it must not pass the gate.
+        assert!(!gguf_arch_supported("mistral3"));
+        assert!(!gguf_arch_supported("gemma3"));
+        assert!(gguf_arch_supported("mistral"));
+        assert!(gguf_arch_supported("qwen3moe"));
+    }
 
     #[test]
     fn gguf_path_detected() {
