@@ -14,8 +14,6 @@ unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
 
 # alias | cache repo dir | gguf filename | report id
 MODELS=(
-  "deepseek-r1:8b-q4_k_m|models--unsloth--DeepSeek-R1-0528-Qwen3-8B-GGUF|DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf|deepseek-r1-8b"
-  "qwen3:14b-q4_k_m|models--Qwen--Qwen3-14B-GGUF|Qwen3-14B-Q4_K_M.gguf|qwen3-14b"
   "mistral-small:24b-q4_k_m|models--bartowski--mistralai_Mistral-Small-3.2-24B-Instruct-2506-GGUF|mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf|mistral-small-24b"
   "magistral:24b-q4_k_m|models--bartowski--mistralai_Magistral-Small-2509-GGUF|mistralai_Magistral-Small-2509-Q4_K_M.gguf|magistral-24b"
 )
@@ -35,7 +33,7 @@ for entry in "${MODELS[@]}"; do
   PORT=$((PORT + 1))
   echo "=== [$rid] serve on $PORT + bench $(date +%H:%M:%S)"
   pkill -f "ferrum serve" 2>/dev/null; sleep 1
-  "$BIN" serve "$alias" --port "$PORT" >"/tmp/ferrum_l5_${rid}.log" 2>&1 &
+  "$BIN" serve "$alias" --port "$PORT" --kv-capacity 4096 --max-num-seqs 4 >"/tmp/ferrum_l5_${rid}.log" 2>&1 &
   SRV=$!
   healthy=0
   for i in $(seq 1 200); do
