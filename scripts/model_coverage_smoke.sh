@@ -48,6 +48,12 @@ if [ -z "$KV_CAPACITY" ]; then
   fi
 fi
 SERVE_ARGS=(--kv-capacity "$KV_CAPACITY" --max-num-seqs "$MAX_SEQS")
+# SMOKE_NO_KV_PIN=1 drops the pinning entirely — on CUDA pods the
+# autosizer manages pools correctly and explicit pins stack a second
+# allocation on top (OOMs a 24GB card on 30B-class GPTQ).
+if [ -n "${SMOKE_NO_KV_PIN:-}" ]; then
+  SERVE_ARGS=()
+fi
 # Extra serve args (e.g. `--gpu-devices 0,1` on dual-GPU pods).
 if [ -n "${FERRUM_SMOKE_EXTRA_SERVE_ARGS:-}" ]; then
   # shellcheck disable=SC2206
