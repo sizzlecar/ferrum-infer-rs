@@ -156,10 +156,13 @@
           "note": "golden 15/15 across all three (strftime_now date-pinned, commit c8f3703e); Devstral/Magistral fixtures alongside"
         },
         "l1_bf16": { "status": "waived", "reason": "GOAL amendment #1 (2026-06-12): 24B BF16 (48GB) exceeds single-4090; dense-path representative covers the shared code, Mistral-specific quirks (tokenizer/prefix remap) are exercised by L0 goldens + L2 at real size. Upgradeable to dual-4090 BF16 if the pod session has slack", "note": "" },
-        "l2_gguf_metal": { "status": "pending", "note": "Tekken tokenizer (vocab 131072) + language_model.* prefix remap + [THINK] token are the SMALL work items; ~13GB each" },
+        "l2_gguf_metal": {
+          "status": "pending",
+          "note": "Small 3.2 PASS (extended smoke 10/10 checks, known-answer 10/10, artifacts/smoke_mistral-small-24b-q4_k_m_metal_2026-06-12.txt) — tekken-derived tokenizer + [INST] template work as-is on the GGUF lane; Magistral downloading, Devstral queued"
+        },
         "l2_gptq_cuda": { "status": "waived", "reason": "GOAL.md format plan: GGUF-first for the 24B line; Devstral 2 has no Marlin-clean GPTQ (UNVERIFIED #4); Small 3.2 Intel AutoRound optional, not required for W1", "note": "" },
-        "l3_behavior": { "status": "pending" },
-        "l4_agent": { "status": "pending" },
+        "l3_behavior": { "status": "pending", "note": "Small 3.2 PASS per amendment #2 (same artifact); Magistral/Devstral pending" },
+        "l4_agent": { "status": "pending", "note": "Small 3.2 PASS — tools 10/10 + schema 20/20 (first model through the full amendment-#2 L4 criterion); Magistral/Devstral pending" },
         "l5_concurrency": { "status": "pending" },
         "perf_same_arch": { "status": "pending", "note": "baseline = Mistral sliding-window family numbers (Small 3.x is full attention)" },
         "docs_readme": { "status": "pending" }
