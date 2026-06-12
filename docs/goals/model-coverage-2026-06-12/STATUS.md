@@ -2,6 +2,24 @@
 
 进度日志,倒序。
 
+## 2026-06-12(晚 II)— Mistral 线 2/3 收口;Devstral 2 降级(mistral3);[THINK] 修复
+
+- ✅ **Mistral-Small-3.2 全过**(10/10,首个满足 L4 schema 20/20 新判据的
+  模型);✅ **Magistral 12/12 全过**——其 reasoning 走 `[THINK]` 特殊
+  token,暴露并修复了一个普适 bug:**skip-special 解码会吞掉标 special
+  的 think 标记**,思考文本漏进 content(Qwen3 标 special 的 `<think>`
+  同样潜伏)。修复:tokenizer 解码按标记 id 分段、规范化为
+  `<think>/</think>` 再拼接,下游零改动,带单测。
+- 🔻 **Devstral 2 按 GOAL 卡壳规则降级到 W2 末尾**:GGUF arch 是
+  **mistral3**(YaRN factor 48 / 原窗 8192 / `attention.temperature_scale
+  0.1`,全在 `mistral3.*` 命名空间)。loader 此前静默走 llama-family
+  路径 → 退化输出(known-answer 3/10、重复循环)。已加**未知架构硬报错**
+  守卫(带单测)——明确不支持好过悄悄输出垃圾。实现 mistral3 = 新
+  rope/注意力数学,超出 W1 SMALL 预算;W2 与 Gemma 3 异构注意力地基
+  一并评估。
+- 验证器 19/63 → **30/72**(Devstral 拆分出独立降级行)。
+- Mistral 线剩余 cell:L5 并发 + perf(pod)+ README。
+
 ## 2026-06-12(傍晚)— 修订批准落实;32B 稠密 Metal 诊断(需重启)
 
 - **两个 GOAL 修订经用户批准并写入 GOAL.md 修订记录**:L1 按代码路径
