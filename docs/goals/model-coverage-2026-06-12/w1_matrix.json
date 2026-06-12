@@ -1,0 +1,171 @@
+{
+  "goal": "MODEL_COVERAGE_W1",
+  "goal_doc": "docs/goals/model-coverage-2026-06-12/GOAL.md",
+  "cell_legend": {
+    "statuses": ["pass", "fail", "pending", "waived"],
+    "rule": "Every cell must be pass, or waived with a reason that cites a GOAL.md amendment. Artifacts are repo-relative paths and must exist.",
+    "cells": {
+      "l0_template": "golden byte-equal vs transformers (5 cases) + EOS/BOS from generation_config + render-failure hard error",
+      "l1_bf16": "BF16 greedy byte-equal vs HF transformers, N>=20 prompts (reference_match mechanism)",
+      "l2_gguf_metal": "GGUF known-answer smoke N>=10 on Metal, semantic answers correct",
+      "l2_gptq_cuda": "GPTQ-Marlin known-answer smoke N>=10 on CUDA, semantic answers correct",
+      "l3_behavior": "blast-radius chat/server suites green with this alias (multi-turn KV, stream==non-stream, natural EOS, stop sequences, reasoning extraction)",
+      "l4_agent": "server_agent_tools + server_structured_output: required tool-call 10/10, strict json_schema 20/20, temp 0",
+      "l5_concurrency": "bench-serve random 256/128 c=1/4/16 (+c=32 for 30B-class), 100% completion zero errors",
+      "perf_same_arch": "throughput within 10% of same-architecture gated sibling, same card/quant/concurrency",
+      "docs_readme": "README support-matrix row + alias + template/EOS provenance + release gate cell"
+    }
+  },
+  "models": [
+    {
+      "id": "qwen3-coder-30b-a3b",
+      "name": "Qwen3-Coder-30B-A3B-Instruct",
+      "aliases": ["qwen3-coder:30b", "qwen3-coder:30b-q4_k_m"],
+      "lanes": ["metal_gguf", "cuda_gptq"],
+      "cells": {
+        "l0_template": {
+          "status": "pass",
+          "artifact": "crates/ferrum-server/tests/fixtures/chat_template/Qwen__Qwen3-Coder-30B-A3B-Instruct",
+          "note": "golden 5/5 byte-equal (suite 43/43, commit c8f3703e)"
+        },
+        "l1_bf16": { "status": "pending", "note": "BF16 60GB exceeds local + 1x4090; representative-size policy pending user decision (see STATUS)" },
+        "l2_gguf_metal": { "status": "pending", "note": "GGUF 17.28GB downloading (resume-retry loop)" },
+        "l2_gptq_cuda": { "status": "pending", "note": "jart25 GPTQ-Int4, needs pod session" },
+        "l3_behavior": { "status": "pending" },
+        "l4_agent": { "status": "pending" },
+        "l5_concurrency": { "status": "pending" },
+        "perf_same_arch": { "status": "pending", "note": "baseline = M3 (Qwen3-30B-A3B) G0 numbers" },
+        "docs_readme": { "status": "pending" }
+      }
+    },
+    {
+      "id": "deepseek-r1-0528-qwen3-8b",
+      "name": "DeepSeek-R1-0528-Qwen3-8B",
+      "aliases": ["deepseek-r1:8b", "deepseek-r1:8b-q4_k_m"],
+      "lanes": ["metal_gguf", "cuda_bf16"],
+      "cells": {
+        "l0_template": {
+          "status": "pass",
+          "artifact": "crates/ferrum-server/tests/fixtures/chat_template/deepseek-ai__DeepSeek-R1-0528-Qwen3-8B",
+          "note": "golden 5/5 incl. reasoning-history strip; renamed EOS 151643 resolved from tokenizer_config (commit 21e89645)"
+        },
+        "l1_bf16": { "status": "pending", "note": "BF16 16GB fits 1x4090; pod session" },
+        "l2_gguf_metal": {
+          "status": "pending",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/smoke_deepseek-r1-8b-q4_k_m_metal_2026-06-12.txt",
+          "note": "smoke ladder 8/8 PASS (known-answer 1x, tools 10/10, schema 10/10); L2 requires known-answer N>=10 — rerun with extended smoke"
+        },
+        "l2_gptq_cuda": { "status": "waived", "reason": "No Marlin-clean GPTQ exists (QuantTrio is sym=false + mixed 4/8, GOAL.md UNVERIFIED #4); CUDA lane is BF16", "note": "covered by l1_bf16 + cuda smoke instead" },
+        "l3_behavior": { "status": "pending", "note": "smoke subset green (multi-turn/stream/EOS/reasoning); full blast-radius suites with this alias pending" },
+        "l4_agent": { "status": "pending", "note": "smoke: tools 10/10 + schema 10/10; GOAL requires schema 20/20 via server_structured_output" },
+        "l5_concurrency": { "status": "pending" },
+        "perf_same_arch": { "status": "pending", "note": "baseline = Qwen3-8B / Llama-8B class numbers" },
+        "docs_readme": { "status": "pending" }
+      }
+    },
+    {
+      "id": "r1-distill-qwen-32b",
+      "name": "DeepSeek-R1-Distill-Qwen-32B (+14B same batch)",
+      "aliases": ["deepseek-r1:32b", "deepseek-r1:32b-q4_k_m", "deepseek-r1:14b"],
+      "lanes": ["metal_gguf", "cuda_gptq"],
+      "cells": {
+        "l0_template": {
+          "status": "pass",
+          "artifact": "crates/ferrum-server/tests/fixtures/chat_template/deepseek-ai__DeepSeek-R1-Distill-Qwen-32B",
+          "note": "golden 5/5; 14B template byte-identical (sha 56a1447ad31926fd, STATUS 2026-06-12)"
+        },
+        "l1_bf16": { "status": "pending", "note": "32B BF16 64GB infeasible on available hardware; representative-size policy pending user decision" },
+        "l2_gguf_metal": { "status": "pending", "note": "GGUF ~19GB download pending (disk/bandwidth queue)" },
+        "l2_gptq_cuda": { "status": "pending", "note": "OPEA GPTQ-Int4 (Marlin-clean verified); pod session" },
+        "l3_behavior": { "status": "pending" },
+        "l4_agent": { "status": "pending", "note": "R1 distill templates are tools-unaware: injection path, mechanics-level assertions" },
+        "l5_concurrency": { "status": "pending" },
+        "perf_same_arch": { "status": "pending", "note": "baseline = Qwen2.5-32B class / M2 numbers" },
+        "docs_readme": { "status": "pending" }
+      }
+    },
+    {
+      "id": "qwen3-dense-32b-14b",
+      "name": "Qwen3-32B / Qwen3-14B dense",
+      "aliases": ["qwen3:32b", "qwen3:32b-q4_k_m", "qwen3:14b", "qwen3:14b-q4_k_m"],
+      "lanes": ["metal_gguf", "cuda_gptq"],
+      "cells": {
+        "l0_template": {
+          "status": "pass",
+          "artifact": "crates/ferrum-server/tests/fixtures/chat_template/Qwen__Qwen3-0.6B",
+          "note": "template byte-identical to gated Qwen3-0.6B across 0.6B/14B/32B (sha a55ee1b1660128b7, STATUS 2026-06-12)"
+        },
+        "l1_bf16": { "status": "pending", "note": "14B BF16 28GB > 24GB single 4090; representative-size policy pending user decision" },
+        "l2_gguf_metal": { "status": "pending" },
+        "l2_gptq_cuda": { "status": "pending", "note": "JunHowie GPTQ-Int4 (Marlin-clean verified); pod session" },
+        "l3_behavior": { "status": "pending" },
+        "l4_agent": { "status": "pending" },
+        "l5_concurrency": { "status": "pending" },
+        "perf_same_arch": { "status": "pending", "note": "baseline = existing Qwen3 dense numbers" },
+        "docs_readme": { "status": "pending" }
+      }
+    },
+    {
+      "id": "qwen2.5-coder-32b",
+      "name": "Qwen2.5-Coder-32B-Instruct",
+      "aliases": ["qwen2.5-coder:32b", "qwen2.5-coder:32b-q4_k_m"],
+      "lanes": ["metal_gguf", "cuda_gptq"],
+      "cells": {
+        "l0_template": {
+          "status": "pass",
+          "artifact": "crates/ferrum-server/tests/fixtures/chat_template/Qwen__Qwen2.5-Coder-32B-Instruct",
+          "note": "golden 5/5 (suite 43/43)"
+        },
+        "l1_bf16": { "status": "pending", "note": "32B BF16 infeasible on available hardware; representative-size policy pending user decision" },
+        "l2_gguf_metal": { "status": "pending" },
+        "l2_gptq_cuda": { "status": "pending", "note": "official Qwen GPTQ-Int4; pod session" },
+        "l3_behavior": { "status": "pending" },
+        "l4_agent": { "status": "pending" },
+        "l5_concurrency": { "status": "pending" },
+        "perf_same_arch": { "status": "pending", "note": "architecture already supported (Qwen2.5); verification-only entry" },
+        "docs_readme": { "status": "pending" }
+      }
+    },
+    {
+      "id": "mistral-24b-line",
+      "name": "Mistral Small 3.2 / Devstral Small 2 / Magistral Small (24B line)",
+      "aliases": ["mistral-small:24b-q4_k_m", "devstral:24b-q4_k_m", "magistral:24b-q4_k_m"],
+      "lanes": ["metal_gguf"],
+      "cells": {
+        "l0_template": {
+          "status": "pass",
+          "artifact": "crates/ferrum-server/tests/fixtures/chat_template/unsloth__Mistral-Small-3.2-24B-Instruct-2506",
+          "note": "golden 15/15 across all three (strftime_now date-pinned, commit c8f3703e); Devstral/Magistral fixtures alongside"
+        },
+        "l1_bf16": { "status": "pending", "note": "24B BF16 48GB needs dual-4090; pod session" },
+        "l2_gguf_metal": { "status": "pending", "note": "Tekken tokenizer (vocab 131072) + language_model.* prefix remap + [THINK] token are the SMALL work items; ~13GB each" },
+        "l2_gptq_cuda": { "status": "waived", "reason": "GOAL.md format plan: GGUF-first for the 24B line; Devstral 2 has no Marlin-clean GPTQ (UNVERIFIED #4); Small 3.2 Intel AutoRound optional, not required for W1", "note": "" },
+        "l3_behavior": { "status": "pending" },
+        "l4_agent": { "status": "pending" },
+        "l5_concurrency": { "status": "pending" },
+        "perf_same_arch": { "status": "pending", "note": "baseline = Mistral sliding-window family numbers (Small 3.x is full attention)" },
+        "docs_readme": { "status": "pending" }
+      }
+    },
+    {
+      "id": "r1-distill-llama-70b",
+      "name": "DeepSeek-R1-Distill-Llama-70B (dual-GPU)",
+      "aliases": ["deepseek-r1:70b"],
+      "lanes": ["dual_gpu_gguf"],
+      "cells": {
+        "l0_template": {
+          "status": "pending",
+          "note": "DeepSeek distill template family covered by R1-Distill-Qwen golden; per-model fixture + EOS assertion pending"
+        },
+        "l1_bf16": { "status": "waived", "reason": "70B BF16 140GB exceeds any available configuration; GOAL.md plans GGUF 4bit on the llama33-70b-4bit-2x4090 lane", "note": "" },
+        "l2_gguf_metal": { "status": "waived", "reason": "70B exceeds 32GB Mac; lane is dual-4090 layer-split (l2 runs there)", "note": "dual-GPU known-answer smoke replaces this cell" },
+        "l2_gguf_dual_gpu": { "status": "pending", "note": "GGUF 4bit dual-4090 layer-split known-answer (inherits llama33-70b lane)" },
+        "l3_behavior": { "status": "pending" },
+        "l4_agent": { "status": "pending" },
+        "l5_concurrency": { "status": "pending", "note": "c=1/4/16 on dual-4090" },
+        "perf_same_arch": { "status": "pending", "note": "baseline = llama33-70b-4bit-2x4090 lane numbers" },
+        "docs_readme": { "status": "pending" }
+      }
+    }
+  ]
+}
