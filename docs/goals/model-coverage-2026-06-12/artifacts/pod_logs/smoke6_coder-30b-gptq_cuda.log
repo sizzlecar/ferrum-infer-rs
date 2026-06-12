@@ -1,0 +1,36 @@
+[smoke] waiting for http://127.0.0.1:8240/health (model: qwen3-coder:30b-gptq)
+[smoke]      known-answer miss: 'What is 2+3? Answer with just the number.' -> ''
+[smoke]      known-answer miss: 'What is 7*6? Answer with just the number.' -> ''
+[smoke]      known-answer miss: 'Spell the English word for the number 9. Answer with just the word.' -> ''
+[smoke]      known-answer miss: 'What is the capital of France? Answer with just the city name.' -> ''
+[smoke]      known-answer miss: 'What is 100-58? Answer with just the number.' -> ''
+[smoke]      known-answer miss: 'Which planet do humans live on? Answer with just the planet name.' -> ''
+[smoke]      known-answer miss: 'What is 12/4? Answer with just the number.' -> ''
+[smoke]      known-answer miss: 'What color is a stop sign? Answer with just the color.' -> ''
+[smoke]      known-answer miss: 'What is 2 to the power of 5? Answer with just the number.' -> ''
+[smoke]      known-answer miss: 'How many days are in a week? Answer with just the number.' -> ''
+[smoke] FAIL known-answer 10/10 — 0/10
+[smoke] ok   natural EOS stop
+[smoke] FAIL multi-turn recall Bob — ''
+[smoke] ok   stream == non-stream
+[smoke] ok   custom stop finish_reason
+[smoke] ok   custom stop does not leak
+[smoke] FAIL max_tokens finish_reason length — finish=stop
+[smoke] ok   max_tokens budget respected
+Traceback (most recent call last):
+  File "<stdin>", line 117, in <module>
+  File "<stdin>", line 21, in chat
+  File "/usr/lib/python3.10/urllib/request.py", line 216, in urlopen
+    return opener.open(url, data, timeout)
+  File "/usr/lib/python3.10/urllib/request.py", line 525, in open
+    response = meth(req, response)
+  File "/usr/lib/python3.10/urllib/request.py", line 634, in http_response
+    response = self.parent.error(
+  File "/usr/lib/python3.10/urllib/request.py", line 563, in error
+    return self._call_chain(*args)
+  File "/usr/lib/python3.10/urllib/request.py", line 496, in _call_chain
+    result = func(*args)
+  File "/usr/lib/python3.10/urllib/request.py", line 643, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 400: Bad Request
+FERRUM W1 SMOKE FAIL: qwen3-coder:30b-gptq (see /tmp/ferrum_w1_smoke_8240.log)
