@@ -87,7 +87,10 @@
           "note": "golden 5/5; 14B template byte-identical (sha 56a1447ad31926fd, STATUS 2026-06-12)"
         },
         "l1_bf16": { "status": "waived", "reason": "GOAL amendment #1 (2026-06-12): LlamaFamily-dense path L1 runs on the R1-0528-Qwen3-8B representative; this model is a pure-config sibling and its L2 runs at real size", "note": "" },
-        "l2_gguf_metal": { "status": "pending", "note": "GGUF ~19GB download pending (disk/bandwidth queue)" },
+        "l2_gguf_metal": {
+          "status": "pending",
+          "note": "BLOCKED on machine state: 18GB dense Q4_K_M decodes at 0.14 tok/s (each token re-reads evicted mmap weights from SSD at ~2.6GB/s); llama.cpp control test equally stuck => not a ferrum bug. ~9GB of compressor residue from the morning KV-pool thrash squeezes usable RAM below the model's working set. Fair retry after user reboots; if a clean 32GB Mac still can't hold 32B-dense + serve overhead, waive to the CUDA GPTQ lane"
+        },
         "l2_gptq_cuda": { "status": "pending", "note": "OPEA GPTQ-Int4 (Marlin-clean verified); pod session" },
         "l3_behavior": { "status": "pending" },
         "l4_agent": { "status": "pending", "note": "R1 distill templates are tools-unaware: injection path, mechanics-level assertions" },

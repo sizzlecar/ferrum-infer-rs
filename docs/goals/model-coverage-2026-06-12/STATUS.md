@@ -2,6 +2,25 @@
 
 进度日志,倒序。
 
+## 2026-06-12(傍晚)— 修订批准落实;32B 稠密 Metal 诊断(需重启)
+
+- **两个 GOAL 修订经用户批准并写入 GOAL.md 修订记录**:L1 按代码路径
+  代表执行(5 个不可行 cell 转 waived,R1-8B 是 dense 路径代表);
+  L3/L4 逐模型载体改为 smoke 阶梯(判据数字不变,schema 升 20/20)。
+  R1-8B 与 Coder-30B 的 L3 cell 凭既有扩展 smoke 证据转 pass。
+  验证器 12/63 → **19/63**。
+- **Qwen3-14B Metal smoke 10/10 过**(cell 与 32B 同行,等 32B)。
+- **32B 稠密 Metal 诊断**:R1-Distill-32B smoke 两次超时后实测解码
+  **0.14 tok/s**(TTFT 5.2s 正常)——每 token 把被驱逐的 18GB mmap 权重
+  从 SSD 重读(~2.6GB/s = SSD 速度)。llama.cpp 同文件对照**同样卡死**
+  (22 CPU 分钟未完成加载)→ 非 ferrum 接入 bug。根因:早上 KV 池
+  thrash 事故在压缩器里留下 ~9GB 系统级残留,可用内存 < 模型工作集。
+  **需要用户重启后公平复测**;若干净 32GB Mac 仍装不下 32B 稠密 + 服务
+  开销,则 32B 级稠密(R1-32B / Qwen3-32B / Qwen2.5-Coder-32B)的
+  Metal cell 按修订精神 waive 给 CUDA GPTQ lane。
+- 教训入库:32GB 机器一次只跑一个重负载(13GB 下载 + 18GB 常驻模型的
+  page-cache 互相驱逐就是第一次超时的原因)。
+
 ## 2026-06-12(午后 II)— R1-8B L2-Metal cell 转绿;HF_ENDPOINT 落地
 
 - ✅ **R1-8B 扩展阶梯 12/12 全过**(known-answer 10/10 语义正确 + stop
