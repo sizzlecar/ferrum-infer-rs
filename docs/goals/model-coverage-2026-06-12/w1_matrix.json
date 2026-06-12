@@ -184,11 +184,14 @@
           "reason": "L4 gate semantics applied: schema 15/20 (intermittent 500, engine open issue #1) -> NOT agent-grade, published as such in README (tools 10/10 noted); the gate's job is to gate the claim, which it did"
         },
         "l5_concurrency": {
-          "status": "pending"
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/l5f_r1-32b_cuda.json",
+          "note": "CUDA 1x4090 (512tok x 32seq), n=3, 100% completion zero errors: c=1 40.8 tok/s; c=4 116.6 tok/s; c=16 248.9 tok/s; c=32 300.6 tok/s"
         },
         "perf_same_arch": {
-          "status": "pending",
-          "note": "baseline = Qwen2.5-32B class / M2 numbers"
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/l5f_r1-32b_cuda.json",
+          "note": "Amendment #4 same-pod mutual spread across the 32B GPTQ trio <= 10% (w1_perf_spread.py)"
         },
         "docs_readme": {
           "status": "pass",
@@ -242,11 +245,14 @@
           "note": "14B tools 10/10 + schema 20/20; 32B re-checked on the CUDA pod smoke"
         },
         "l5_concurrency": {
-          "status": "pending"
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/l5f_qwen3-32b_cuda.json",
+          "note": "CUDA 1x4090 (512tok x 32seq), n=3, 100% completion zero errors: c=1 39.7 tok/s; c=4 117.2 tok/s; c=16 231.2 tok/s; c=32 273.6 tok/s"
         },
         "perf_same_arch": {
-          "status": "pending",
-          "note": "baseline = existing Qwen3 dense numbers"
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/l5f_qwen3-32b_cuda.json",
+          "note": "Amendment #4 same-pod mutual spread across the 32B GPTQ trio <= 10% (w1_perf_spread.py)"
         },
         "docs_readme": {
           "status": "pass",
@@ -298,11 +304,14 @@
           "note": "tools 10/10 + strict schema 20/20 on CUDA GPTQ"
         },
         "l5_concurrency": {
-          "status": "pending"
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/l5f_qwen25-coder-32b_cuda.json",
+          "note": "CUDA 1x4090 (512tok x 32seq), n=3, 100% completion zero errors: c=1 40.0 tok/s; c=4 109.4 tok/s; c=16 226.0 tok/s; c=32 257.1 tok/s"
         },
         "perf_same_arch": {
-          "status": "pending",
-          "note": "architecture already supported (Qwen2.5); verification-only entry"
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/l5f_qwen25-coder-32b_cuda.json",
+          "note": "Amendment #4 same-pod mutual spread across the 32B GPTQ trio <= 10% (w1_perf_spread.py)"
         },
         "docs_readme": {
           "status": "pass",

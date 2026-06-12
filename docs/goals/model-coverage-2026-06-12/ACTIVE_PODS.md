@@ -19,4 +19,6 @@ Verify zero: instances list must return 0 before declaring the goal done.
 | ~~40749191~~ | 1x RTX 4090 | 0.349 | | Iceland host stuck loading 18min | DESTROYED ~09:15 |
 | ~~40749797~~ | 1x RTX 4090, 150GB | 0.376 | 2026-06-13 ~09:15 | Taiwan: host `docker_build() error writing dockerfile` | DESTROYED ~11:35 |
 | ~~40750195~~ | 1x RTX 4090, 150GB | 0.136 | 2026-06-13 ~09:45 | Argentina racer: never booted (None ~25min) | DESTROYED ~11:50 |
-| 40751023 | 1x RTX 4090, 120GB | 0.376 | 2026-06-13 ~11:40 | FINAL micro-session winner (Iceland host 1647, pytorch image cache-hit, booted <2min). cuInit=804 fixed by removing container compat libcuda 550 (GeForce unsupported by compat libs); host driver 535/CUDA 12.4 OK | ACTIVE |
+| ~~40751023~~ | 1x RTX 4090, 120GB | 0.376 | 2026-06-13 ~11:40 | FINAL micro-session winner (Iceland host 1647, pytorch image cache-hit, booted <2min). cuInit=804 fixed by removing container compat libcuda 550 (GeForce unsupported by compat libs); host driver 535/CUDA 12.4 OK. Gotchas hit: rsproxy.cn TLS MITM-broken (switch to direct crates.io), hf xet/hf_transfer stalled to 0 MB/s (plain-HTTP relaunch unlocked full 3.6Gbps). Delivered clean L5 trio | DESTROYED 2026-06-13 ~15:25 |
+
+**2026-06-13 15:25 — W1 COMPLETE. API verified: 0 instances remaining (ZERO-VERIFIED).**
