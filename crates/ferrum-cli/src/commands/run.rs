@@ -1942,6 +1942,7 @@ mod tests {
             "<|im_start|>assistant\n<think>\n\n</think>\n\n",
             &ChatTemplateOptions {
                 enable_thinking: Some(false),
+                ..Default::default()
             },
         );
         let forbidden = metadata
