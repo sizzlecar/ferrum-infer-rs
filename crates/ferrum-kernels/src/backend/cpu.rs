@@ -751,7 +751,7 @@ impl crate::backend::BackendCollective for CpuBackend {}
 
 /// Dequant raw GPTQ tensors → row-major `[n, k]` f32. Shared between
 /// the per-tensor `load_gptq` and the MoE `load_gptq_stacked` impls.
-fn cpu_dequant_gptq(
+pub(crate) fn cpu_dequant_gptq(
     qweight: &[i32],
     scales: &[f32],
     qzeros: &[i32],

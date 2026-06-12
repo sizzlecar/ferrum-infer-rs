@@ -556,6 +556,32 @@ impl BackendQuantMarlin for CudaBackend {
                 "CUDA GPTQ: only bits=4 supported (got {bits})"
             )));
         }
+
+        // Marlin tile constraint: the kernel returns ERR_PROB_SHAPE unless
+        // n % thread_n == 0 and k % thread_k == 0, and the large-m path
+        // uses 64x256 tiles. Repacked repos sometimes quantize layers the
+        // original quantizers leave dense (jart25's Coder-30B quantizes
+        // the 2048x128 MoE router) — small m sneaks through the 128x128
+        // branch and then prefill batches crash. Dequantize such layers
+        // once and serve them dense; they're tiny by construction.
+        if n % 256 != 0 || k % 128 != 0 {
+            let w = crate::backend::cpu::cpu_dequant_gptq(
+                qweight, scales, qzeros, bits, group_size, k, n,
+            )?;
+            tracing::info!(
+                "GPTQ load (dense fallback — Marlin tile constraint): K={k} N={n} gs={group_size}"
+            );
+            let weight = <Self as crate::backend::Backend>::from_slice(&w);
+            let bias = bias_host.map(<Self as crate::backend::Backend>::from_slice);
+            return Ok(Box::new(
+                crate::quant_linear::cuda_marlin::CudaDenseFallbackLinear {
+                    weight,
+                    bias,
+                    in_features: k,
+                    out_features: n,
+                },
+            ));
+        }
         let _ = qzeros; // qzeros baked into Marlin scales path; unused for Marlin store
 
         // Path B: triton-rs w4a16 GPTQ kernel — operates on the on-disk
