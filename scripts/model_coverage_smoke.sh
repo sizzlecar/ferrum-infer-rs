@@ -19,26 +19,44 @@ MODEL="${1:?usage: model_coverage_smoke.sh <alias> [--reasoning] [--port N]}"
 shift
 REASONING=0
 PORT=18200
+KV_CAPACITY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --reasoning) REASONING=1 ;;
     --port) shift; PORT="$1" ;;
+    --kv-capacity) shift; KV_CAPACITY="$1" ;;
   esac
   shift
 done
+
+SERVE_ARGS=()
+if [ -n "$KV_CAPACITY" ]; then
+  SERVE_ARGS+=(--kv-capacity "$KV_CAPACITY")
+elif [ "$REASONING" = "1" ]; then
+  # Reasoning models think for hundreds-to-thousands of tokens per reply.
+  # The server-profile autosizer currently prefers high concurrency and can
+  # pick a 512-token per-sequence budget (recorded as a W1 product gap in
+  # docs/goals/model-coverage-2026-06-12/); give the smoke real headroom via
+  # the product flags until the autosizer policy lands. The KV pool is
+  # max_num_seqs × kv_capacity, so the capacity bump MUST come with a
+  # concurrency cut — 32 seqs × 8192 tokens is a ~36 GB pool on an 8B
+  # model, which thrashes a 32 GB Mac. 4 × 8192 stays in the default
+  # pool's memory class and the smoke is single-request anyway.
+  SERVE_ARGS+=(--kv-capacity 8192 --max-num-seqs 4)
+fi
 
 BIN="${FERRUM_BIN:-target/release/ferrum}"
 LOG="/tmp/ferrum_w1_smoke_${PORT}.log"
 BASE="http://127.0.0.1:${PORT}"
 
-"$BIN" serve "$MODEL" --port "$PORT" >"$LOG" 2>&1 &
+"$BIN" serve "$MODEL" --port "$PORT" ${SERVE_ARGS[@]+"${SERVE_ARGS[@]}"} >"$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; }
 trap cleanup EXIT
 
 echo "[smoke] waiting for $BASE/health (model: $MODEL)"
 for i in $(seq 1 150); do
-  if curl -s --max-time 2 "$BASE/health" >/dev/null 2>&1; then HEALTHY=1; break; fi
+  if curl -sf --noproxy '*' --max-time 2 "$BASE/health" >/dev/null 2>&1; then HEALTHY=1; break; fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "[smoke] FAIL: server exited during startup; tail of log:"; tail -20 "$LOG"; exit 1
   fi
@@ -55,6 +73,10 @@ BASE = os.environ["BASE"]
 MODEL = os.environ["MODEL"]
 REASONING = os.environ["REASONING"] == "1"
 failures = []
+
+# Talk to the local server directly — never through a system proxy.
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+urllib.request.install_opener(opener)
 
 def chat(payload, stream=False):
     payload = {"model": MODEL, "temperature": 0, **payload}
