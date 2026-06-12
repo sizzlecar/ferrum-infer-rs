@@ -2,6 +2,31 @@
 
 进度日志,倒序。
 
+## 2026-06-12(午后)— gate 矩阵 + 验证器落地;两个 GOAL 修订提案待批
+
+- **`w1_matrix.json` + `scripts/w1_goal_validator.py` 落地**:7 个模型 ×
+  9 个 cell = 63 cell,当前 10/63 满足(L0 ×6 + waived ×4)。验证器是唯一
+  允许打印 `MODEL_COVERAGE_W1 GOAL PASS` 的程序;cell 必须 pass(带
+  artifact)或 waived(带理由),引用的 artifact 必须存在。
+- **L0 完成度**:43/43 golden 全过(9 个 fixture 模型,新增 Mistral 线
+  ×3 + Llama-3.1;`strftime_now` 时钟注入 + `tojson(indent=N)` 两个真实
+  渲染缺口由 L0 抓出并已修,commit `c8f3703e`)。
+- smoke 阶梯扩充:known-answer 1x→10x(对齐 L2 判据),新增自定义 stop
+  机制断言 + max_tokens 截断断言(L3 缺口)。
+- **修订提案 #1(L1,需用户决定)**:L1 BF16 byte-equal 对 14B+ 在现有
+  硬件上物理不可行(14B BF16=28GB>24GB 单卡;32B=64GB;70B=140GB)。
+  提案:L1 按"代码路径代表"执行——每条代码路径取硬件放得下的最大代表
+  (Qwen3 dense → 8B/0.6B 已有 reference_match;Qwen3-MoE → 30B-A3B 需
+  pod 上 BF16?同样放不下,24GB 单卡上 MoE BF16 60GB 也不可行 → MoE 路径
+  L1 只能 waive 到"Mac/CPU 逐层激活对照"或双卡)。大尺寸模型靠"同代码
+  路径 + L2 行为对照"传递。**未批前 5 个 l1_bf16 cell 保持 pending。**
+- **修订提案 #2(L3,需用户决定)**:blast-radius 套件断言对 0.6B 哨兵
+  模型定制(canonical id、即答行为),对 8B-32B reasoning 模型强行参数化
+  会又重又脆。提案:L3 判据改为"model_coverage_smoke 的 L3 段全绿"
+  (多轮/stream/自然 EOS/自定义 stop/max_tokens/reasoning 提取,行为
+  断言与套件同源),blast-radius 套件保持小模型哨兵职责(引擎级回归)。
+  **未批前 L3 cell 不以 smoke 结果记 pass。**
+
 ## 2026-06-12(午前)— L0 扩面:模板同一性 + Mistral/Llama golden
 
 - **模板同一性(HF raw tokenizer_config,sha256 前 16 位)**:
