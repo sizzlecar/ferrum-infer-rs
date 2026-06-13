@@ -1253,10 +1253,14 @@ pub fn resolve_model_alias(name: &str) -> String {
         "qwen2.5-coder:14b" => "Qwen/Qwen2.5-Coder-14B-Instruct".to_string(),
         // Gemma 3 text family (W2). unsloth mirrors are ungated rehosts of
         // the license-gated google/ repos (same weights, HF-API-verified
-        // 2026-06-13); 1B is the L1 code-path representative.
+        // 2026-06-13); 1B is the L1 code-path representative. The GPTQ
+        // pick is the only classic-format (qweight/qzeros/scales/g_idx)
+        // text-only 27B export on the Hub — ISTA-DASLab ships
+        // compressed-tensors, which ferrum does not load.
         "gemma3:1b" => "unsloth/gemma-3-1b-it".to_string(),
         "gemma3:4b" => "unsloth/gemma-3-4b-it".to_string(),
         "gemma3:27b" => "unsloth/gemma-3-27b-it".to_string(),
+        "gemma3:27b-gptq" => "circulus/gemma-3-27b-it-gptq".to_string(),
         "mistral-small:24b" | "mistral-small:3.2" => {
             "mistralai/Mistral-Small-3.2-24B-Instruct-2506".to_string()
         }

@@ -57,3 +57,27 @@ extern "C" __global__ void fused_silu_mul_f32(
         output[idx] = silu_g * up[idx];
     }
 }
+
+// GeGLU variant: gelu_tanh(gate) * up (HF `gelu_pytorch_tanh`, Gemma
+// family). Same interleaved [batch, 2*inter] layout as
+// fused_silu_mul_interleaved_f16. tanhf saturates correctly on CUDA for
+// large args (unlike Metal fast-math), so no clamp is required, but we
+// keep one for belt-and-braces parity with the Metal kernel.
+extern "C" __global__ void fused_gelu_tanh_mul_interleaved_f16(
+    const __half* __restrict__ gate_up,  // [batch * 2 * inter]
+    __half* __restrict__ output,         // [batch * inter]
+    const int inter,
+    const int total
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int b = idx / inter;
+        int i = idx % inter;
+        float g = __half2float(gate_up[b * 2 * inter + i]);
+        float u = __half2float(gate_up[b * 2 * inter + inter + i]);
+        float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
+        inner = fminf(fmaxf(inner, -9.5f), 9.5f);
+        float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
+        output[idx] = __float2half(gelu_g * u);
+    }
+}
