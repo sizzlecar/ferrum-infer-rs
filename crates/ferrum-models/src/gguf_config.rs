@@ -72,7 +72,7 @@ impl LlamaFamilyConfig {
 
         // rope_theta: optional; per-arch defaults.
         let default_rope = match arch.as_str() {
-            "qwen3" | "qwen2" => 1_000_000.0_f64,
+            "qwen3" | "qwen2" | "gemma3" => 1_000_000.0_f64,
             "llama" => 500_000.0,
             "mistral" => 10_000_000.0,
             _ => 10_000.0,
@@ -82,8 +82,8 @@ impl LlamaFamilyConfig {
             .unwrap_or(default_rope);
         let rope_scaling = infer_llama3_rope_scaling(gguf, arch.as_str(), max_seq_len, rope_theta);
 
-        // QK-norm: only Qwen3 has it among supported architectures.
-        let has_qk_norm = matches!(arch.as_str(), "qwen3");
+        // QK-norm: Qwen3 and Gemma3 among supported architectures.
+        let has_qk_norm = matches!(arch.as_str(), "qwen3" | "gemma3");
         let rope_interleaved = matches!(arch.as_str(), "llama");
 
         // Sliding window: only Mistral v0.1 sets it; missing → 0 (disabled).
@@ -114,7 +114,7 @@ impl LlamaFamilyConfig {
             }
         };
 
-        Ok(LlamaFamilyConfig {
+        let mut cfg = LlamaFamilyConfig {
             hidden_size,
             intermediate_size,
             num_heads,
@@ -130,7 +130,33 @@ impl LlamaFamilyConfig {
             has_qk_norm,
             sliding_window,
             ..Default::default()
-        })
+        };
+
+        if arch == "gemma3" {
+            // Gemma 3 GGUF stores only window/θ_global/key_length; llama.cpp
+            // hardcodes the rest per-arch — mirror those rules exactly.
+            cfg.activation = ferrum_types::Activation::GeluTanh;
+            cfg.sliding_window_pattern = 6;
+            cfg.rope_local_theta = Some(10_000.0);
+            cfg.sandwich_norms = true;
+            // llama.cpp conversion pre-bakes the Gemma (1+w) into every
+            // norm weight (verified against the safetensors values) —
+            // never fold again on the GGUF lane.
+            cfg.rmsnorm_unit_offset = false;
+            cfg.embed_scale = Some(super::models::llama_family::bf16_round(
+                (hidden_size as f64).sqrt() as f32,
+            ));
+            // query_pre_attn_scalar is not in the GGUF. HF configs: 27B
+            // (62 blocks) uses hidden/num_heads (168); every other size
+            // uses head_dim. Mirrors llama.cpp's per-size rule.
+            cfg.query_pre_attn_scalar = Some(if block_count == 62 {
+                (hidden_size / num_heads) as f64
+            } else {
+                head_dim as f64
+            });
+        }
+
+        Ok(cfg)
     }
 }
 

@@ -402,7 +402,7 @@ impl LlamaFamilyConfig {
 }
 
 /// Round an f32 through bf16 (round-to-nearest-even), back to f32.
-fn bf16_round(x: f32) -> f32 {
+pub(crate) fn bf16_round(x: f32) -> f32 {
     let bits = x.to_bits();
     let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000;
     f32::from_bits(rounded)

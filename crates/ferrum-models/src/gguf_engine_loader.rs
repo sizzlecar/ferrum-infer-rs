@@ -257,7 +257,7 @@ pub fn load_gguf_decoder_with_info(
 fn gguf_arch_supported(arch: &str) -> bool {
     matches!(
         arch,
-        "qwen3" | "qwen3moe" | "qwen2" | "qwen" | "llama" | "mistral"
+        "qwen3" | "qwen3moe" | "qwen2" | "qwen" | "llama" | "mistral" | "gemma3"
     )
 }
 
@@ -271,7 +271,7 @@ mod tests {
         // temperature scaling — loading it through the llama-family path
         // produces degenerate output, so it must not pass the gate.
         assert!(!gguf_arch_supported("mistral3"));
-        assert!(!gguf_arch_supported("gemma3"));
+        assert!(gguf_arch_supported("gemma3"));
         assert!(gguf_arch_supported("mistral"));
         assert!(gguf_arch_supported("qwen3moe"));
     }
