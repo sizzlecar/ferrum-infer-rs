@@ -1335,6 +1335,30 @@ impl Backend for CudaBackend {
         .expect("fused_silu_mul_split launch");
     }
 
+    fn scale_inplace(ctx: &mut Self::Context, buf: &mut Self::Buffer, scale: f32, len: usize) {
+        // The trait's host-roundtrip default would rebuild the buffer via
+        // from_slice (F32) and silently flip the CUDA lane's f16 dtype —
+        // every downstream kernel then misreads the residual. Keep it
+        // on-device and typed.
+        let func = ctx.func("fused_silu_mul", ptx::FUSED_SILU_MUL, "scale_inplace_f16");
+        let n_i32 = len as i32;
+        let block = 256u32;
+        let grid = ((len as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(buf);
+        b.arg(&scale);
+        b.arg(&n_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("scale_inplace launch");
+    }
+
     fn fused_gelu_tanh_mul_split(
         ctx: &mut Self::Context,
         gate_up: &Self::Buffer,

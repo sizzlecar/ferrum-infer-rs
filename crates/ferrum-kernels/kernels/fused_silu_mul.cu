@@ -81,3 +81,17 @@ extern "C" __global__ void fused_gelu_tanh_mul_interleaved_f16(
         output[idx] = __float2half(gelu_g * u);
     }
 }
+
+// In-place scalar scale (Gemma embedding x sqrt(hidden)). The trait's
+// host-roundtrip default would rebuild the buffer as F32 and flip the
+// CUDA lane's f16 dtype — this kernel keeps it on-device and typed.
+extern "C" __global__ void scale_inplace_f16(
+    __half* __restrict__ buf,
+    const float scale,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        buf[idx] = __float2half(__half2float(buf[idx]) * scale);
+    }
+}
