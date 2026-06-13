@@ -323,3 +323,39 @@ T3/T4/T5 处于 EOS/stop/模板爆炸半径,全套件(release + Metal,真模型)
 - W2:Gemma 3 27B 家族接入(SWA 5:1 / 双 rope / GeGLU / 三明治 norm /
   query_pre_attn_scalar),本地 Mac/CPU dump 对照先行,CUDA 验证晚开 pod。
 - W3:DeltaNet 调查(W1+W2 后解锁)。
+
+## 2026-06-13 — W2 Gemma3 接入(本地段完成)
+
+- W2-1 实现:Gemma3 经 config 门控并入 LlamaFamilyModel(5:1 SWA 逐层
+  调度 / 双 rope 表 + Linear scaling / GeGLU / 三明治 norm / (1+w) 与
+  q_scalar 载入期折叠 / embed×√h)。batched/varlen/paged 快路对
+  sandwich 家族构造期禁用(防静默错误),W2-3 再接。
+- W2-2 验证:L0 golden 4 例字节相等;L1 dump 对照 CPU+Metal 双 PASS;
+  greedy 18/20 byte-equal,2 例 HF top1-top2 gap=0.25(一个 bf16 ulp)
+  平局翻转(修订 #3 方法)。证据 `artifacts/gemma3_l1/`。
+- 顺带修复两个 Metal 内核潜伏 bug(Gemma3 首次踩出):
+  flash_attn 简单核 acc[4] 在 head_dim=256 寄存器越界(→acc[8]);
+  gelu_tanh fast-math 溢出 NaN(→clamp)。微基准 5 项钉死
+  (`gemma3_metal_ops_test.rs`)。
+- 27B 量化落证:ISTA-DASLab 是 compressed-tensors(不可直载);
+  **circulus/gemma-3-27b-it-gptq = 经典 GPTQ 4b/g128/sym/desc_act=true,
+  纯文本导出 `model.*` 命名** — ferrum perm-aware Marlin 已支持
+  desc_act(quant.rs:151)。GOAL 的"ISTA GPTQ"假设据此修正。
+- W2 矩阵 + 验证器就位(`w2_matrix.json` + `w2_goal_validator.py`),
+  当前 2/8(l0/l1 pass)。
+
+### W2 pod 执行合同(开 pod 前按 CLAUDE.md 填)
+
+```text
+Lever: Gemma3-27B CUDA gates(L2 GPTQ known-answer → L3 行为 → L4 agent
+  → L5 bench)+ 同卡 llama.cpp Q4_K_M decode ≥0.5× 对照
+Expected gain: w2_matrix 6 个 pending cell 出 pass/fail 结论
+Files: scripts/pod_w2_gemma3.sh(armored 模式复用 W1 套件)、
+  model_coverage_smoke.sh、bench-serve、pod 端构建 llama.cpp
+Correctness gate: known-answer 10/10 + smoke 机制全绿,任一 rung 失败
+  即停(不进 bench)
+Benchmark gate: bench-serve c=1/4/16/32 零错误;llama.cpp 同卡比 ≥0.5
+  (0.5–0.8 记 known-gap 不阻塞)
+Budget cap: 1 pod-day 硬顶;目标 ≤6h(约 $2.5,单卡 4090)
+Stop condition: 正确性 gate 失败 → 停手出报告;8h 无进展 → 销毁重估
+```
