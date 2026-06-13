@@ -22,3 +22,4 @@ Verify zero: instances list must return 0 before declaring the goal done.
 | ~~40751023~~ | 1x RTX 4090, 120GB | 0.376 | 2026-06-13 ~11:40 | FINAL micro-session winner (Iceland host 1647, pytorch image cache-hit, booted <2min). cuInit=804 fixed by removing container compat libcuda 550 (GeForce unsupported by compat libs); host driver 535/CUDA 12.4 OK. Gotchas hit: rsproxy.cn TLS MITM-broken (switch to direct crates.io), hf xet/hf_transfer stalled to 0 MB/s (plain-HTTP relaunch unlocked full 3.6Gbps). Delivered clean L5 trio | DESTROYED 2026-06-13 ~15:25 |
 
 **2026-06-13 15:25 — W1 COMPLETE. API verified: 0 instances remaining (ZERO-VERIFIED).**
+| 40770078 | 1x RTX 4090, 120GB | 0.402 | 2026-06-13 ~17:50 | W2 Gemma3-27B gate session (Iceland host 1647, proven; auto compat-libcuda fix in monitor) | ACTIVE |
