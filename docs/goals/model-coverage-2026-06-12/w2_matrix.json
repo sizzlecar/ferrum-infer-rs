@@ -2,7 +2,12 @@
   "goal": "MODEL_COVERAGE_W2",
   "goal_doc": "docs/goals/model-coverage-2026-06-12/GOAL.md",
   "cell_legend": {
-    "statuses": ["pass", "fail", "pending", "waived"],
+    "statuses": [
+      "pass",
+      "fail",
+      "pending",
+      "waived"
+    ],
     "rule": "Every cell must be pass, or waived with a reason that cites a GOAL.md amendment or recorded constraint. Artifacts are repo-relative paths and must exist.",
     "cells": {
       "l0_template": "golden byte-equal vs transformers (Gemma3 cases incl. system folding) + EOS/BOS from generation_config",
@@ -18,7 +23,10 @@
   "models": [
     {
       "id": "gemma3-27b",
-      "aliases": ["gemma3:27b", "gemma3:27b-gptq"],
+      "aliases": [
+        "gemma3:27b",
+        "gemma3:27b-gptq"
+      ],
       "family": "Gemma3 (5:1 SWA, dual rope, GeGLU, sandwich norms)",
       "representative_l1": "gemma3:1b (unsloth/gemma-3-1b-it)",
       "cells": {
@@ -32,12 +40,26 @@
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/gemma3_l1",
           "note": "dump compare PASS both CPU and Metal lanes (25/26 layers in bf16 thresholds, logits argmax match); greedy 18/20 byte-equal + 2 tie-flips at HF top1-top2 gap 0.25 (one bf16 ulp, amendment #3 methodology). Metal needed flash_attn acc[8] + gelu_tanh clamp fixes, pinned by gemma3_metal_ops_test"
         },
-        "l2_gguf_metal": { "status": "pending" },
-        "l2_gptq_cuda": { "status": "pending" },
-        "l3_behavior": { "status": "pending" },
-        "l4_agent": { "status": "pending" },
-        "l5_concurrency": { "status": "pending" },
-        "perf_vs_llamacpp": { "status": "pending" }
+        "l2_gguf_metal": {
+          "status": "waived",
+          "reason": "27B Q4_K_M (~16.5GB weights) is impractical on the degraded 32GB Mac (W1 precedent: 32B-dense Metal cells, compressor-residue machine state, user-confirmed no reboot). The GGUF lane itself is proven on the same arch: gemma3-1b Q4_K_M Metal known-answer 10/10 with arch-aware tensor mapping, pre-baked (1+w) handling, q_scalar block-rule.",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/gemma3_l2_gguf/known_answer_1b_q4km_metal.log"
+        },
+        "l2_gptq_cuda": {
+          "status": "pending"
+        },
+        "l3_behavior": {
+          "status": "pending"
+        },
+        "l4_agent": {
+          "status": "pending"
+        },
+        "l5_concurrency": {
+          "status": "pending"
+        },
+        "perf_vs_llamacpp": {
+          "status": "pending"
+        }
       }
     }
   ]

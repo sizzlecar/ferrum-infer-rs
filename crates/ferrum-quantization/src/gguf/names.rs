@@ -35,6 +35,14 @@
 /// and fully-qualified names (`"...weight"`, `"...bias"`). The `.weight` /
 /// `.bias` suffix passes through unchanged.
 pub fn ferrum_to_gguf(name: &str) -> Option<String> {
+    ferrum_to_gguf_with_arch("", name)
+}
+
+/// Arch-aware variant. Most names translate identically across families;
+/// Gemma 3 is the exception: its `post_attention_layernorm` norms the
+/// attention OUTPUT (GGUF `post_attention_norm`), while the same ferrum
+/// name on Llama families is the pre-MLP norm (GGUF `ffn_norm`).
+pub fn ferrum_to_gguf_with_arch(arch: &str, name: &str) -> Option<String> {
     // Top-level tensors first — they don't fit the layer pattern.
     if let Some(out) = map_top_level(name) {
         return Some(out);
@@ -44,7 +52,7 @@ pub fn ferrum_to_gguf(name: &str) -> Option<String> {
     let rest = name.strip_prefix("model.layers.")?;
     let (idx_str, after_idx) = rest.split_once('.')?;
     let idx: usize = idx_str.parse().ok()?;
-    let mapped = map_layer_scoped(after_idx)?;
+    let mapped = map_layer_scoped(after_idx, arch)?;
     Some(format!("blk.{idx}.{mapped}"))
 }
 
@@ -61,7 +69,7 @@ fn map_top_level(name: &str) -> Option<String> {
     Some(mapped.to_string())
 }
 
-fn map_layer_scoped(rest: &str) -> Option<String> {
+fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
     // Peel off the .weight / .bias suffix, map the stem, then re-attach.
     let (stem, suffix) = if let Some(s) = rest.strip_suffix(".weight") {
         (s, ".weight")
@@ -74,6 +82,12 @@ fn map_layer_scoped(rest: &str) -> Option<String> {
     let mapped_stem = match stem {
         // RMSNorms
         "input_layernorm" => "attn_norm",
+        // Gemma 3 sandwich norms: post_attention_layernorm applies to the
+        // attention output (pre-residual); pre_feedforward is the pre-MLP
+        // slot; post_feedforward wraps the MLP output.
+        "post_attention_layernorm" if arch == "gemma3" => "post_attention_norm",
+        "pre_feedforward_layernorm" => "ffn_norm",
+        "post_feedforward_layernorm" => "post_ffw_norm",
         "post_attention_layernorm" => "ffn_norm",
         // Attention projections
         "self_attn.q_proj" => "attn_q",

@@ -1423,6 +1423,20 @@ const GGUF_ALIASES: &[GgufAliasEntry] = &[
         filename: "Qwen3-30B-A3B-Q4_K_M.gguf",
         tokenizer_repo: None,
     },
+    // 2026-06 model-coverage W2 aliases (Gemma 3; tokenizer from the
+    // unsloth safetensors mirrors).
+    GgufAliasEntry {
+        aliases: &["gemma3:1b-q4_k_m"],
+        repo: "unsloth/gemma-3-1b-it-GGUF",
+        filename: "gemma-3-1b-it-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/gemma-3-1b-it"),
+    },
+    GgufAliasEntry {
+        aliases: &["gemma3:27b-q4_k_m"],
+        repo: "unsloth/gemma-3-27b-it-GGUF",
+        filename: "gemma-3-27b-it-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/gemma-3-27b-it"),
+    },
     // 2026-06 model-coverage W1 aliases.
     GgufAliasEntry {
         aliases: &["qwen3:14b-q4_k_m"],
