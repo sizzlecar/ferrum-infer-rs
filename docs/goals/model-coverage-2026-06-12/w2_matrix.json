@@ -1,0 +1,44 @@
+{
+  "goal": "MODEL_COVERAGE_W2",
+  "goal_doc": "docs/goals/model-coverage-2026-06-12/GOAL.md",
+  "cell_legend": {
+    "statuses": ["pass", "fail", "pending", "waived"],
+    "rule": "Every cell must be pass, or waived with a reason that cites a GOAL.md amendment or recorded constraint. Artifacts are repo-relative paths and must exist.",
+    "cells": {
+      "l0_template": "golden byte-equal vs transformers (Gemma3 cases incl. system folding) + EOS/BOS from generation_config",
+      "l1_bf16": "new-family rule: Mac/CPU per-layer dump vs HF locates zero structural divergence + greedy byte-equal N>=20 on the code-path representative (gemma3-1b)",
+      "l2_gguf_metal": "GGUF known-answer smoke N>=10 on Metal, semantic answers correct",
+      "l2_gptq_cuda": "GPTQ known-answer smoke N>=10 on CUDA, semantic answers correct",
+      "l3_behavior": "smoke ladder mechanics on CUDA serve (stop/max_tokens/stream==non-stream/multi-turn)",
+      "l4_agent": "tools 10/10 + strict json_schema 20/20, temp 0",
+      "l5_concurrency": "bench-serve random 256/128 c=1/4/16/32, 100% completion zero errors",
+      "perf_vs_llamacpp": "same-card same-quant decode throughput >= 0.5x llama.cpp; 0.5-0.8x recorded as known-gap (non-blocking)"
+    }
+  },
+  "models": [
+    {
+      "id": "gemma3-27b",
+      "aliases": ["gemma3:27b", "gemma3:27b-gptq"],
+      "family": "Gemma3 (5:1 SWA, dual rope, GeGLU, sandwich norms)",
+      "representative_l1": "gemma3:1b (unsloth/gemma-3-1b-it)",
+      "cells": {
+        "l0_template": {
+          "status": "pass",
+          "artifact": "crates/ferrum-server/tests/fixtures/chat_template/unsloth__gemma-3-1b-it",
+          "note": "chat_template_golden green: single/system/multi_turn/think_history byte-equal (template shared across gemma3 sizes); Gemma has no native tools block — tools cases covered by L4 generic injection"
+        },
+        "l1_bf16": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/gemma3_l1",
+          "note": "dump compare PASS both CPU and Metal lanes (25/26 layers in bf16 thresholds, logits argmax match); greedy 18/20 byte-equal + 2 tie-flips at HF top1-top2 gap 0.25 (one bf16 ulp, amendment #3 methodology). Metal needed flash_attn acc[8] + gelu_tanh clamp fixes, pinned by gemma3_metal_ops_test"
+        },
+        "l2_gguf_metal": { "status": "pending" },
+        "l2_gptq_cuda": { "status": "pending" },
+        "l3_behavior": { "status": "pending" },
+        "l4_agent": { "status": "pending" },
+        "l5_concurrency": { "status": "pending" },
+        "perf_vs_llamacpp": { "status": "pending" }
+      }
+    }
+  ]
+}
