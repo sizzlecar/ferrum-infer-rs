@@ -1,0 +1,5 @@
+<bos><start_of_turn>user
+You are helpful.
+
+Hi<end_of_turn>
+<start_of_turn>model

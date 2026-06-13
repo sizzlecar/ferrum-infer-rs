@@ -161,6 +161,15 @@ impl ConfigManager {
         self.parse_config(&raw_config)
     }
 
+    /// Crate-internal test seam over the private parser.
+    #[doc(hidden)]
+    pub(crate) fn parse_config_for_tests(
+        &mut self,
+        raw: &serde_json::Value,
+    ) -> Result<ModelDefinition> {
+        self.parse_config(raw)
+    }
+
     /// Parse config from JSON value
     fn parse_config(&mut self, raw: &serde_json::Value) -> Result<ModelDefinition> {
         let obj = raw
