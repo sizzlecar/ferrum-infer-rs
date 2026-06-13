@@ -1335,6 +1335,41 @@ impl Backend for CudaBackend {
         .expect("fused_silu_mul_split launch");
     }
 
+    fn fused_gelu_tanh_mul_split(
+        ctx: &mut Self::Context,
+        gate_up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        im: usize,
+    ) {
+        // GeGLU (Gemma family): same interleaved [tokens, 2*im] layout as
+        // the SiLU variant, gelu_pytorch_tanh activation.
+        let func = ctx.func(
+            "fused_silu_mul",
+            ptx::FUSED_SILU_MUL,
+            "fused_gelu_tanh_mul_interleaved_f16",
+        );
+        let im_i32 = im as i32;
+        let total = tokens * im;
+        let total_i32 = total as i32;
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(gate_up);
+        b.arg(out);
+        b.arg(&im_i32);
+        b.arg(&total_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("fused_gelu_tanh_mul_split launch");
+    }
+
     fn kv_cache_append_batched_per_cache(
         ctx: &mut Self::Context,
         caches: &[&Self::Buffer],
