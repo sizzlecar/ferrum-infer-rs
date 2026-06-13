@@ -19,29 +19,39 @@ GGUF=$(ls /root/.cache/huggingface/hub/models--unsloth--gemma-3-27b-it-GGUF/snap
 
 # ── L2+L3+L4: certification smoke ladder (serve + known-answer 10x +
 #    stop/stream mechanics + tools 10x + schema 20x) ──────────────────────
-# No kv pins here: smoke requests default to max_tokens 2048, which a
-# 512-token pin rejects at validation. Capacity is the autosizer's job;
-# the explicit pins below are only for the L5 sweep (W1 precedent).
-SMOKE_REQ_TIMEOUT=180 SMOKE_NO_KV_PIN=1 bash scripts/model_coverage_smoke.sh "$ALIAS" \
-  --port 8400 \
+# Gemma3-27B KV is heavy (62 layers x 16 kv heads = 508KB/token fp16);
+# the autosizer's pool budget on 24GB is ~2.6GB = ~5.4k token-slots.
+# Smoke requests default to max_tokens 2048, so pin a 2-seq x 2560-slot
+# layout that exactly fits the pool instead of the 8x512 default split.
+SMOKE_REQ_TIMEOUT=180 bash scripts/model_coverage_smoke.sh "$ALIAS" \
+  --port 8400 --kv-capacity 2560 --max-seqs 2 \
   2>&1 | tee "$G/smoke_${RID}.log"
 grep -q "SMOKE PASS" "$G/smoke_${RID}.log" || { echo "=== W2 GATE FAIL at smoke ladder"; exit 1; }
 
 # ── L5: bench-serve sweep ────────────────────────────────────────────────
-setsid target/release/ferrum serve --model "$ALIAS" --port 8400 \
-  --kv-capacity 512 --max-num-seqs 32 > "$G/serve_l5_${RID}.log" 2>&1 &
-SERVE_PID=$!
-for i in $(seq 1 120); do
-  curl -s --max-time 3 http://127.0.0.1:8400/v1/models | grep -q gemma && break
+# Split into a safe c=1/4/16 sweep (16 x 512 slots = 4.2GB KV) and a
+# best-effort c=32 attempt (32 x 448 = 7.3GB — knife-edge on 24GB with
+# this 16-kv-head model; a clean failure here is recorded, not fatal).
+TOK="$(ls -d /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/*)"
+l5_run() {
+  local sweep="$1" kvcap="$2" seqs="$3" out="$4"
+  setsid target/release/ferrum serve --model "$ALIAS" --port 8400 \
+    --kv-capacity "$kvcap" --max-num-seqs "$seqs" > "$G/serve_l5_${RID}_${sweep//,/}.log" 2>&1 &
+  local pid=$!
+  for i in $(seq 1 120); do
+    curl -s --max-time 3 http://127.0.0.1:8400/v1/models | grep -q gemma && break
+    sleep 5
+  done
+  target/release/ferrum bench-serve --base-url http://127.0.0.1:8400 \
+    --model "$ALIAS" --tokenizer "$TOK" \
+    --concurrency-sweep "$sweep" --num-prompts 100 --n-repeats 3 \
+    --out "$out" 2>&1 | tail -3
+  kill "$pid" 2>/dev/null || true
+  sleep 8
+  pkill -f "ferrum serve --model gemma3" 2>/dev/null || true
   sleep 5
-done
-target/release/ferrum bench-serve --base-url http://127.0.0.1:8400 \
-  --model "$ALIAS" \
-  --tokenizer "$(ls -d /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/*)" \
-  --concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3 \
-  --out "$G/l5_${RID}_cuda.json" 2>&1 | tail -5
-kill "$SERVE_PID" 2>/dev/null || true
-sleep 5
+}
+l5_run "1,4,16" 512 16 "$G/l5_${RID}_cuda.json"
 python3 - "$G/l5_${RID}_cuda.json" <<'EOF' || { echo "=== W2 GATE FAIL at L5"; exit 1; }
 import json, sys
 cells = json.load(open(sys.argv[1]))
@@ -52,6 +62,8 @@ for c in cells:
         sys.exit(1)
 print("L5 clean:", [(c["concurrency"], round(c["output_throughput_tps"]["mean"],1)) for c in cells])
 EOF
+# Best-effort c=32 (non-fatal): record whatever happens.
+l5_run "32" 448 32 "$G/l5_${RID}_c32_cuda.json" || true
 
 # ── llama.cpp same-card decode reference ────────────────────────────────
 /workspace/llama.cpp/build/bin/llama-bench -m "$GGUF" -p 0 -n 128 -r 3 -o json \
