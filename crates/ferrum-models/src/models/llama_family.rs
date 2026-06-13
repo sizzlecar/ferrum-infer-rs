@@ -85,6 +85,10 @@ pub(crate) struct LlamaFamilyRuntimeEnv {
     pub(crate) prefix_cache: bool,
     pub(crate) cuda_graph: bool,
     pub(crate) decode_layer_profile: bool,
+    /// `FERRUM_LAYER_DUMP=<dir>`: write per-layer prefill residuals (f32
+    /// little-endian .bin) for numerical comparison against HF
+    /// transformers (W2 new-family L1 gate). Debug-only — syncs per layer.
+    pub(crate) layer_dump_dir: Option<String>,
 }
 
 impl LlamaFamilyRuntimeEnv {
@@ -119,6 +123,7 @@ impl LlamaFamilyRuntimeEnv {
             prefix_cache: false,
             cuda_graph: false,
             decode_layer_profile: false,
+            layer_dump_dir: None,
         };
         for (name, value) in vars {
             let value = value.as_ref();
@@ -135,6 +140,7 @@ impl LlamaFamilyRuntimeEnv {
                 "FERRUM_PREFIX_CACHE" => config.prefix_cache = value == "1",
                 "FERRUM_CUDA_GRAPH" => config.cuda_graph = true,
                 "FERRUM_DECODE_LAYER_PROFILE" => config.decode_layer_profile = true,
+                "FERRUM_LAYER_DUMP" => config.layer_dump_dir = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -1798,6 +1804,27 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let q_dim = nh * hd;
         let kv_dim = nkv * hd;
 
+        // FERRUM_NAN_TRACE=1: after each op of layer 0, sync and report the
+        // first op whose output contains a non-finite value. Debug-only.
+        let nan_trace = li == 0 && std::env::var("FERRUM_NAN_TRACE").is_ok();
+        macro_rules! nt {
+            ($name:expr, $buf:expr, $len:expr) => {
+                if nan_trace {
+                    B::sync(ctx);
+                    let v = B::to_vec($buf, $len);
+                    let bad = v.iter().filter(|x| !x.is_finite()).count();
+                    let mx = v.iter().fold(0f32, |a, x| a.max(x.abs()));
+                    eprintln!("[nan-trace] {}: nonfinite={} maxabs={:.3}", $name, bad, mx);
+                    if let Ok(dir) = std::env::var("FERRUM_OP_DUMP") {
+                        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(format!("{dir}/{}.bin", $name), bytes);
+                    }
+                }
+            };
+        }
+        nt!("residual-in", residual, tokens * h);
+
         // 1. Input RMSNorm
         let _t0 = if self.runtime_env.decode_op_profile {
             B::sync(ctx);
@@ -1814,6 +1841,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             tokens,
             h,
         );
+        nt!("input_norm", &self.scratch.norm_out, tokens * h);
         if let Some(t0) = _t0 {
             B::sync(ctx);
             NORM_TIME_US.fetch_add(
@@ -1835,6 +1863,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             &self.scratch.norm_out,
             &mut self.scratch.qkv_out,
             tokens,
+        );
+        nt!(
+            "qkv_proj",
+            &self.scratch.qkv_out,
+            tokens * (q_dim + 2 * kv_dim)
         );
         if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
             // SAFETY: `lora_adapters` is not mutated during a forward pass;
@@ -2032,6 +2065,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             qk_mode,
         )
         .expect("K::contig_write");
+        nt!(
+            "contig_write.q",
+            &self.scratch.q_head_major,
+            nh * tokens * hd
+        );
         if let Some(t0) = _qkr_t0 {
             B::sync(ctx);
             QKR_TIME_US.fetch_add(
@@ -2069,6 +2107,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             pos_offset,
         )
         .expect("K::contig_decode_attention");
+        nt!("attn", &self.scratch.attn_head_major_out, nh * tokens * hd);
         let _ = q_dim;
         let _ = kv_dim;
         let _ = dummy;
@@ -2105,6 +2144,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let im = cfg.intermediate_size;
         let eps = cfg.rms_norm_eps;
 
+        let nan_trace = li == 0 && std::env::var("FERRUM_NAN_TRACE").is_ok();
+        macro_rules! nt {
+            ($name:expr, $buf:expr, $len:expr) => {
+                if nan_trace {
+                    B::sync(ctx);
+                    let v = B::to_vec($buf, $len);
+                    let bad = v.iter().filter(|x| !x.is_finite()).count();
+                    let mx = v.iter().fold(0f32, |a, x| a.max(x.abs()));
+                    eprintln!("[nan-trace] {}: nonfinite={} maxabs={:.3}", $name, bad, mx);
+                    if let Ok(dir) = std::env::var("FERRUM_OP_DUMP") {
+                        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(format!("{dir}/{}.bin", $name), bytes);
+                    }
+                }
+            };
+        }
+
         // 7. Untranspose head-major → token-major for O-proj input.
         let attn_token_major = if tokens == 1 {
             &self.scratch.attn_head_major_out
@@ -2138,6 +2195,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 .expect("validated LoRA o_proj");
             self.lora_projection_applications += applied as u64;
         }
+        nt!("o_proj", &self.scratch.o_proj_out, tokens * h);
 
         // 9. Residual + pre-MLP norm.
         //
@@ -2160,7 +2218,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 tokens,
                 h,
             );
+            nt!("post_attn_norm", &*tmp, tokens * h);
             B::add_inplace(ctx, residual, tmp, tokens * h);
+            nt!("resid_attn", &*residual, tokens * h);
             B::rms_norm(
                 ctx,
                 residual,
@@ -2205,6 +2265,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             self.lora_projection_applications += applied as u64;
         }
 
+        nt!("pre_mlp_norm", &self.scratch.norm_out, tokens * h);
+        nt!("gate_up", &self.scratch.gate_up_out, tokens * 2 * im);
         // 11. Gated activation: SwiGLU (silu) or GeGLU (gelu_tanh, Gemma).
         match cfg.activation {
             Activation::GeluTanh => B::fused_gelu_tanh_mul_split(
@@ -2223,6 +2285,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             ),
         }
 
+        nt!("act_mul", &self.scratch.silu_out, tokens * im);
         // 12. Down projection.
         layer.down_proj.forward(
             ctx,
@@ -2254,6 +2317,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 .as_mut()
                 .expect("sandwich_tmp allocated for sandwich-norm config");
             B::rms_norm(ctx, &self.scratch.mlp_out, post_ffn_w, eps, tmp, tokens, h);
+            nt!("post_ffn_norm", &*tmp, tokens * h);
             B::add_inplace(ctx, residual, tmp, tokens * h);
         } else {
             B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
@@ -2442,8 +2506,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             None
         };
 
+        // W2 L1 gate: per-layer residual dumps for HF comparison.
+        let layer_dump = self.runtime_env.layer_dump_dir.clone();
+        let dump = |ctx: &mut B::Context, buf: &B::Buffer, name: &str| {
+            if let Some(dir) = &layer_dump {
+                B::sync(ctx);
+                let v = B::to_vec(buf, seq_len * h);
+                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::fs::write(format!("{dir}/{name}.bin"), bytes);
+            }
+        };
+        dump(&mut ctx, &residual, "embed");
+
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
+            if layer_dump.is_some() {
+                dump(&mut ctx, &residual, &format!("layer_{li:02}"));
+            }
         }
 
         if let Some(t0) = prefill_t0 {
@@ -2521,6 +2601,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // the call redundant there (~50µs/step cost), but correctness on
         // Metal requires the explicit flush here.
         B::sync(&mut ctx);
+
+        if let Some(dir) = &layer_dump {
+            let v = B::to_vec(&self.scratch.logits, vocab);
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let _ = std::fs::write(format!("{dir}/logits.bin"), bytes);
+        }
 
         // Restore residual into scratch for reuse on the next call.
         self.scratch.residual = Some(residual);
@@ -3493,11 +3579,12 @@ mod tests {
 
     use ferrum_kernels::backend::cpu::CpuBackend;
     use ferrum_quantization::{DenseLinear, QuantConfig, WeightLoader};
-    use ferrum_types::Result;
+    use ferrum_types::{Activation, Result};
 
     use super::{
-        load_llama_family_layers, LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel,
-        LlamaFamilyRuntimeEnv, RopeScalingConfig, DEFAULT_KV_CAPACITY,
+        bf16_round, load_llama_family_layers, rope_freq, LlamaFamilyConfig,
+        LlamaFamilyLayerStageConfig, LlamaFamilyModel, LlamaFamilyRuntimeEnv, RopeScalingConfig,
+        DEFAULT_KV_CAPACITY,
     };
 
     #[test]
@@ -3783,5 +3870,147 @@ mod tests {
             env.kv_capacity_for_model(DEFAULT_KV_CAPACITY * 2),
             DEFAULT_KV_CAPACITY
         );
+    }
+
+    #[test]
+    fn bf16_round_matches_known_values() {
+        // sqrt(1152) = 33.941...; bf16 mantissa keeps 8 bits.
+        let r = bf16_round((1152f64).sqrt() as f32);
+        let bits = r.to_bits();
+        assert_eq!(bits & 0xFFFF, 0, "low mantissa bits must be cleared");
+        assert!((r - 33.941125).abs() < 0.25, "rounded value far off: {r}");
+        // Exact powers of two are fixed points.
+        assert_eq!(bf16_round(32.0), 32.0);
+    }
+
+    #[test]
+    fn gemma3_from_def_parses_real_1b_config() {
+        let config = serde_json::json!({
+            "architectures": ["Gemma3ForCausalLM"],
+            "model_type": "gemma3_text",
+            "hidden_size": 1152,
+            "intermediate_size": 6912,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "num_hidden_layers": 26,
+            "head_dim": 256,
+            "vocab_size": 262144,
+            "max_position_embeddings": 32768,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "rope_local_base_freq": 10000.0,
+            "sliding_window": 512,
+            "sliding_window_pattern": 6,
+            "query_pre_attn_scalar": 256,
+            "hidden_activation": "gelu_pytorch_tanh"
+        });
+        let mut mgr = crate::definition::ConfigManager::new();
+        let def = mgr.parse_config_for_tests(&config).unwrap();
+        assert_eq!(def.architecture, crate::registry::Architecture::Gemma3);
+        assert_eq!(def.activation, Activation::GeluTanh);
+        let cfg = LlamaFamilyConfig::gemma3_from_def(&def);
+        assert_eq!(cfg.hidden_size, 1152);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.sliding_window, 512);
+        assert_eq!(cfg.sliding_window_pattern, 6);
+        assert_eq!(cfg.rope_theta, 1_000_000.0);
+        assert_eq!(cfg.rope_local_theta, Some(10_000.0));
+        assert_eq!(cfg.query_pre_attn_scalar, Some(256.0));
+        assert!(cfg.rmsnorm_unit_offset);
+        assert!(cfg.sandwich_norms);
+        assert!(cfg.has_qk_norm);
+        let scale = cfg.embed_scale.unwrap();
+        assert!((scale - 33.941125f32).abs() < 0.25);
+        // 5:1 pattern: layers 5, 11, 17, 23 are global.
+        for li in 0..26usize {
+            let global = (li + 1) % 6 == 0;
+            assert_eq!(global, matches!(li, 5 | 11 | 17 | 23), "layer {li}");
+        }
+    }
+
+    #[test]
+    fn gemma3_nested_text_config_flattens() {
+        let config = serde_json::json!({
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "model_type": "gemma3",
+            "eos_token_id": [1, 106],
+            "text_config": {
+                "hidden_size": 5376,
+                "intermediate_size": 21504,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 16,
+                "num_hidden_layers": 62,
+                "head_dim": 128,
+                "vocab_size": 262208,
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000.0,
+                "rope_local_base_freq": 10000.0,
+                "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
+                "sliding_window": 1024,
+                "sliding_window_pattern": 6,
+                "query_pre_attn_scalar": 168,
+                "hidden_activation": "gelu_pytorch_tanh"
+            },
+            "vision_config": {"hidden_size": 1152}
+        });
+        let mut mgr = crate::definition::ConfigManager::new();
+        let def = mgr.parse_config_for_tests(&config).unwrap();
+        let cfg = LlamaFamilyConfig::gemma3_from_def(&def);
+        assert_eq!(cfg.hidden_size, 5376);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.num_layers, 62);
+        assert_eq!(cfg.sliding_window, 1024);
+        assert_eq!(cfg.query_pre_attn_scalar, Some(168.0));
+        assert_eq!(
+            cfg.rope_scaling,
+            Some(RopeScalingConfig::Linear { factor: 8.0 })
+        );
+        assert_eq!(cfg.max_seq_len, 131072);
+        // q_norm fold factor sqrt(128/168) ~= 0.8729
+        let fold = (cfg.head_dim as f64 / cfg.query_pre_attn_scalar.unwrap()).sqrt();
+        assert!((fold - 0.872871).abs() < 1e-5);
+    }
+
+    #[test]
+    fn linear_rope_scaling_divides_frequency() {
+        let mut cfg = LlamaFamilyConfig::default();
+        cfg.head_dim = 4;
+        cfg.rope_theta = 10_000.0;
+        cfg.rope_scaling = Some(RopeScalingConfig::Linear { factor: 8.0 });
+        let scaled = rope_freq(&cfg, 0);
+        cfg.rope_scaling = None;
+        let unscaled = rope_freq(&cfg, 0);
+        assert!((scaled - unscaled / 8.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cpu_gelu_tanh_mul_split_matches_reference() {
+        use ferrum_kernels::backend::cpu::CpuBackend;
+        use ferrum_kernels::backend::Backend;
+        let mut ctx = <CpuBackend as Backend>::new_context();
+        let im = 3usize;
+        // one token: gate = [-1, 0.5, 2], up = [1, 2, 3]
+        let gate_up = vec![-1.0f32, 0.5, 2.0, 1.0, 2.0, 3.0];
+        let gu = <CpuBackend as Backend>::from_slice(&gate_up);
+        let mut out = <CpuBackend as Backend>::alloc(im);
+        <CpuBackend as Backend>::fused_gelu_tanh_mul_split(&mut ctx, &gu, &mut out, 1, im);
+        let v = <CpuBackend as Backend>::to_vec(&out, im);
+        let gelu = |x: f32| 0.5 * x * (1.0 + (0.79788456f32 * (x + 0.044715 * x * x * x)).tanh());
+        for i in 0..im {
+            let expect = gelu(gate_up[i]) * gate_up[im + i];
+            assert!((v[i] - expect).abs() < 1e-6, "i={i}: {} vs {expect}", v[i]);
+        }
+    }
+
+    #[test]
+    fn cpu_scale_inplace_scales() {
+        use ferrum_kernels::backend::cpu::CpuBackend;
+        use ferrum_kernels::backend::Backend;
+        let mut ctx = <CpuBackend as Backend>::new_context();
+        let mut buf = <CpuBackend as Backend>::from_slice(&[1.0f32, -2.0, 0.5]);
+        <CpuBackend as Backend>::scale_inplace(&mut ctx, &mut buf, 33.9375, 3);
+        let v = <CpuBackend as Backend>::to_vec(&buf, 3);
+        assert_eq!(v, vec![33.9375, -67.875, 16.96875]);
     }
 }

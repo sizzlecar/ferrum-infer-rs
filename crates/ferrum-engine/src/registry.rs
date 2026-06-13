@@ -1210,6 +1210,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             | ferrum_models::Architecture::Qwen2
             | ferrum_models::Architecture::Qwen3
             | ferrum_models::Architecture::Qwen3Moe
+            | ferrum_models::Architecture::Gemma3
             | ferrum_models::Architecture::Mistral) => {
                 let _loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let model_dir_path: std::path::PathBuf = model_path.clone().into();

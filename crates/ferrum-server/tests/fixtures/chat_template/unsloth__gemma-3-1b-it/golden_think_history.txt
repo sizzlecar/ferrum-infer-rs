@@ -1,0 +1,11 @@
+<bos><start_of_turn>user
+Q1<end_of_turn>
+<start_of_turn>model
+<think>
+reasoning here
+</think>
+
+Answer1<end_of_turn>
+<start_of_turn>user
+Q2<end_of_turn>
+<start_of_turn>model

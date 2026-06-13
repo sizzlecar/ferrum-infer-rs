@@ -624,6 +624,9 @@ kernel void gelu_tanh_mul_split_f32(
     const float g = gate_up[t * 2 * p.im + i];
     const float u = gate_up[t * 2 * p.im + p.im + i];
     const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
-    const float gelu = 0.5f * g * (1.0f + tanh(inner));
+    // Metal fast-math tanh overflows to NaN for |x| ≳ 45 (exp(2x)=inf →
+    // inf/inf); clamp to the f32 saturation region first.
+    const float t_in = clamp(inner, -9.5f, 9.5f);
+    const float gelu = 0.5f * g * (1.0f + tanh(t_in));
     out[(int)tid] = gelu * u;
 }
