@@ -1,0 +1,82 @@
+[
+ {
+  "prompt": "Why is the sky blue?",
+  "completion": "The sky is blue due to a phenomenon called **Rayleigh scattering**. Here's a breakdown of how it works:\n\n* **Sunlight is made of"
+ },
+ {
+  "prompt": "Write a haiku about rust.",
+  "completion": "Iron starts to weep,\nSlowly staining, changing hue,\nTime's slow, silent grace."
+ },
+ {
+  "prompt": "What is 17 * 23?",
+  "completion": "17 * 23 = 391\n\nYou can calculate this by:\n*   17 * 20 = 340"
+ },
+ {
+  "prompt": "用一句话解释什么是量子纠缠。",
+  "completion": "量子纠缠是指两个或多个粒子之间存在一种特殊的关联，无论它们相距多远，一个粒子的状态变化会瞬间影响到其他粒"
+ },
+ {
+  "prompt": "def fib(n):",
+  "completion": "```python\ndef fib(n):\n  \"\"\"\n  This function calculates the nth Fibonacci number.\n\n  Args:\n    n: The index of"
+ },
+ {
+  "prompt": "List three prime numbers.",
+  "completion": "Here are three prime numbers:\n\n1.  2\n2.  3\n3.  5"
+ },
+ {
+  "prompt": "What is the capital of Iceland?",
+  "completion": "The capital of Iceland is **Reykjavik**.\n"
+ },
+ {
+  "prompt": "Translate 'good morning' to French.",
+  "completion": "The most common translation of \"good morning\" to French is:\n\n**Bonjour** \n\nIt’s a general greeting for the morning.\n\nHere are"
+ },
+ {
+  "prompt": "Name a mammal that can fly.",
+  "completion": "The most well-known mammal that can fly is the **bat**. \n\nWhile other mammals like the flying squirrel can glide, bats are the only ones that"
+ },
+ {
+  "prompt": "What year did the first moon landing happen?",
+  "completion": "The first moon landing happened in **1969**. \n"
+ },
+ {
+  "prompt": "Give one synonym for 'happy'.",
+  "completion": "Joyful\n"
+ },
+ {
+  "prompt": "What does HTTP stand for?",
+  "completion": "HTTP stands for **Hypertext Transfer Protocol**. \n\nIt's the foundation of data communication on the World Wide Web. It's a set of rules"
+ },
+ {
+  "prompt": "今天天气怎么样?",
+  "completion": "今天（2024年5月16日）的天气情况取决于您所在的地点。为了给您提供更准确的信息，请告诉我您"
+ },
+ {
+  "prompt": "Sort these numbers: 3, 1, 2",
+  "completion": "Here's the sorted list of the numbers:\n\n1, 2, 3\n"
+ },
+ {
+  "prompt": "What is the boiling point of water in Celsius?",
+  "completion": "The boiling point of water at standard atmospheric pressure (1 atm) is **100°C**.\n\nIt’s important to note that this is the"
+ },
+ {
+  "prompt": "Who wrote Romeo and Juliet?",
+  "completion": "The author of Romeo and Juliet is **William Shakespeare**. \n\nIt's one of his most famous and enduring plays! \n\nWhile he didn't"
+ },
+ {
+  "prompt": "Spell 'necessary'.",
+  "completion": "Nessi-fyhy"
+ },
+ {
+  "prompt": "What is the square root of 144?",
+  "completion": "The square root of 144 is 12.\n\nThis is because 12 * 12 = 144.\n"
+ },
+ {
+  "prompt": "Name the largest ocean.",
+  "completion": "The largest ocean is the **Pacific Ocean**. \n\nIt covers approximately 63 million square miles (165.25 million square kilometers) and"
+ },
+ {
+  "prompt": "How many legs does a spider have?",
+  "completion": "Spiders have **eight** legs! \n\nIt’s a common misconception that spiders have six legs, but that’s a myth. They have a"
+ }
+]
