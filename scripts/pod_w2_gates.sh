@@ -19,8 +19,11 @@ GGUF=$(ls /root/.cache/huggingface/hub/models--unsloth--gemma-3-27b-it-GGUF/snap
 
 # ── L2+L3+L4: certification smoke ladder (serve + known-answer 10x +
 #    stop/stream mechanics + tools 10x + schema 20x) ──────────────────────
-SMOKE_REQ_TIMEOUT=180 bash scripts/model_coverage_smoke.sh "$ALIAS" \
-  --port 8400 --kv-capacity 512 --max-seqs 32 \
+# No kv pins here: smoke requests default to max_tokens 2048, which a
+# 512-token pin rejects at validation. Capacity is the autosizer's job;
+# the explicit pins below are only for the L5 sweep (W1 precedent).
+SMOKE_REQ_TIMEOUT=180 SMOKE_NO_KV_PIN=1 bash scripts/model_coverage_smoke.sh "$ALIAS" \
+  --port 8400 \
   2>&1 | tee "$G/smoke_${RID}.log"
 grep -q "SMOKE PASS" "$G/smoke_${RID}.log" || { echo "=== W2 GATE FAIL at smoke ladder"; exit 1; }
 
