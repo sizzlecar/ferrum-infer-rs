@@ -1,0 +1,1 @@
+ferrum c=1 decode 25.252275 tok/s vs llama.cpp tg128 50.478285 tok/s -> ratio 0.500260 PASS

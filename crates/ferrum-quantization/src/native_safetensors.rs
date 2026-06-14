@@ -545,6 +545,26 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         let sc_refs: Vec<&[f32]> = per_expert_sc.iter().map(|v| v.as_slice()).collect();
         let qz_refs: Vec<&[i32]> = per_expert_qz.iter().map(|v| v.as_slice()).collect();
 
+        let is_desc_act = validate_gptq_g_idx(
+            "stacked GPTQ experts",
+            qcfg,
+            g_idx_first.as_deref(),
+            k_shared,
+        )?;
+        #[cfg(feature = "cuda")]
+        if is_desc_act {
+            validate_cuda_marlin_desc_act_g_idx(
+                "stacked GPTQ experts",
+                qcfg,
+                g_idx_first
+                    .as_deref()
+                    .expect("desc_act=true requires g_idx"),
+                k_shared,
+            )?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = is_desc_act;
+
         let store = B::load_gptq_stacked(
             &qw_refs,
             &sc_refs,
@@ -700,6 +720,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         let out_features = qw_shape[1];
 
         let is_desc_act = validate_gptq_g_idx(name, qcfg, g_idx.as_deref(), in_features)?;
+        trace_gptq_g_idx_if_requested(name, qcfg, g_idx.as_deref(), in_features, is_desc_act);
+        trace_gptq_qzeros_if_requested(name, qcfg, &qzeros, out_features);
 
         // Act-order GPTQ. CUDA backend has perm-aware Marlin (load_gptq
         // builds perm = argsort(g_idx) + permutes qweight rows at load;
@@ -729,7 +751,14 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             return Ok(Box::new(linear));
         }
         #[cfg(feature = "cuda")]
-        let _ = is_desc_act; // CUDA: g_idx threaded through to GptqLinear below
+        if is_desc_act {
+            validate_cuda_marlin_desc_act_g_idx(
+                name,
+                qcfg,
+                g_idx.as_deref().expect("desc_act=true requires g_idx"),
+                in_features,
+            )?;
+        }
         if sc_shape.len() != 2 || sc_shape[1] != out_features {
             return Err(FerrumError::model(format!(
                 "'{name}.scales' {sc_shape:?} incompatible with qweight {qw_shape:?}"
@@ -893,6 +922,14 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         }
         let fused_name = format!("GPTQ fusion {}", parts.join("+"));
         let is_desc_act = validate_gptq_g_idx(&fused_name, qcfg, g_idx.as_deref(), in_features)?;
+        trace_gptq_g_idx_if_requested(
+            &fused_name,
+            qcfg,
+            g_idx.as_deref(),
+            in_features,
+            is_desc_act,
+        );
+        trace_gptq_qzeros_if_requested(&fused_name, qcfg, &qz_acc, out_features);
         // CUDA: perm-aware Marlin via load_gptq. CPU/Metal: dequant→Dense.
         #[cfg(not(feature = "cuda"))]
         if is_desc_act {
@@ -930,7 +967,14 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             return Ok(Box::new(linear));
         }
         #[cfg(feature = "cuda")]
-        let _ = is_desc_act;
+        if is_desc_act {
+            validate_cuda_marlin_desc_act_g_idx(
+                &fused_name,
+                qcfg,
+                g_idx.as_deref().expect("desc_act=true requires g_idx"),
+                in_features,
+            )?;
+        }
 
         // Biases: concatenate `<part>.bias` across parts in the same
         // order as qweights. All-or-none; if any part has a bias, all
@@ -1012,6 +1056,135 @@ fn gptq_g_idx_is_desc_act(g_idx: &[i32], group_size: usize) -> bool {
         .any(|(i, &g)| g != (i as i32) / group_size as i32)
 }
 
+fn trace_gptq_g_idx_if_requested(
+    name: &str,
+    qcfg: &QuantConfig,
+    g_idx: Option<&[i32]>,
+    in_features: usize,
+    is_desc_act: bool,
+) {
+    if std::env::var("FERRUM_GPTQ_GIDX_TRACE").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let Some(g_idx) = g_idx else {
+        tracing::info!(
+            "GPTQ g_idx trace: name={name} K={in_features} desc_act_config={} no_g_idx",
+            qcfg.desc_act
+        );
+        return;
+    };
+    if qcfg.group_size == 0 {
+        tracing::info!("GPTQ g_idx trace: name={name} K={in_features} group_size=0 invalid");
+        return;
+    }
+
+    let expected_groups = in_features.div_ceil(qcfg.group_size);
+    let mut counts = vec![0usize; expected_groups];
+    for &group in g_idx {
+        if group >= 0 {
+            let group = group as usize;
+            if group < counts.len() {
+                counts[group] += 1;
+            }
+        }
+    }
+    let nonzero_groups = counts.iter().filter(|&&count| count > 0).count();
+    let count_min = counts.iter().copied().min().unwrap_or(0);
+    let count_max = counts.iter().copied().max().unwrap_or(0);
+    let unbalanced_groups = counts
+        .iter()
+        .filter(|&&count| count != qcfg.group_size)
+        .count();
+    let preview_len = g_idx.len().min(16);
+    tracing::info!(
+        "GPTQ g_idx trace: name={name} desc_act={is_desc_act} K={in_features} \
+         group_size={} groups={expected_groups} nonzero_groups={nonzero_groups} \
+         count_min={count_min} count_max={count_max} unbalanced_groups={unbalanced_groups} \
+         first{preview_len}={:?}",
+        qcfg.group_size,
+        &g_idx[..preview_len]
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GptqQzeroStats {
+    words: usize,
+    total_codes: usize,
+    min_code: u8,
+    max_code: u8,
+    code7_count: usize,
+    histogram: [usize; 16],
+}
+
+impl GptqQzeroStats {
+    fn all_code7(&self) -> bool {
+        self.total_codes > 0 && self.code7_count == self.total_codes
+    }
+}
+
+fn gptq_qzero_stats(qzeros: &[i32]) -> GptqQzeroStats {
+    let mut histogram = [0usize; 16];
+    for &word in qzeros {
+        let word = word as u32;
+        for nibble in 0..8 {
+            let code = ((word >> (nibble * 4)) & 0xF) as usize;
+            histogram[code] += 1;
+        }
+    }
+
+    let mut min_code = 0u8;
+    let mut max_code = 0u8;
+    let mut found = false;
+    for (code, &count) in histogram.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        if !found {
+            min_code = code as u8;
+            found = true;
+        }
+        max_code = code as u8;
+    }
+
+    GptqQzeroStats {
+        words: qzeros.len(),
+        total_codes: qzeros.len() * 8,
+        min_code,
+        max_code,
+        code7_count: histogram[7],
+        histogram,
+    }
+}
+
+fn trace_gptq_qzeros_if_requested(
+    name: &str,
+    qcfg: &QuantConfig,
+    qzeros: &[i32],
+    out_features: usize,
+) {
+    if std::env::var("FERRUM_GPTQ_GIDX_TRACE").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let stats = gptq_qzero_stats(qzeros);
+    let expected_words_per_group = out_features.div_ceil(8);
+    tracing::info!(
+        "GPTQ qzeros trace: name={name} sym={} N={out_features} \
+         expected_words_per_group={expected_words_per_group} words={} total_codes={} \
+         min_code={} max_code={} code7={}/{} all_code7={} histogram={:?}",
+        qcfg.sym,
+        stats.words,
+        stats.total_codes,
+        stats.min_code,
+        stats.max_code,
+        stats.code7_count,
+        stats.total_codes,
+        stats.all_code7(),
+        stats.histogram
+    );
+}
+
 fn validate_gptq_g_idx(
     name: &str,
     qcfg: &QuantConfig,
@@ -1048,6 +1221,54 @@ fn validate_gptq_g_idx(
         }
     }
     Ok(gptq_g_idx_is_desc_act(g_idx, qcfg.group_size))
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn validate_cuda_marlin_desc_act_g_idx(
+    name: &str,
+    qcfg: &QuantConfig,
+    g_idx: &[i32],
+    in_features: usize,
+) -> Result<()> {
+    if qcfg.group_size == 0 {
+        return Err(FerrumError::model(format!(
+            "{name}: CUDA Marlin desc_act requires non-zero group_size"
+        )));
+    }
+    if in_features % qcfg.group_size != 0 {
+        return Err(FerrumError::unsupported(format!(
+            "{name}: CUDA Marlin desc_act requires K={in_features} to be divisible by \
+             group_size={}",
+            qcfg.group_size
+        )));
+    }
+
+    let expected_groups = in_features / qcfg.group_size;
+    let mut counts = vec![0usize; expected_groups];
+    for (idx, &group) in g_idx.iter().enumerate() {
+        if group < 0 || group as usize >= expected_groups {
+            return Err(FerrumError::model(format!(
+                "{name}: g_idx[{idx}]={group} outside expected group range 0..{}",
+                expected_groups.saturating_sub(1)
+            )));
+        }
+        counts[group as usize] += 1;
+    }
+
+    if let Some((group, count)) = counts
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, count)| count != qcfg.group_size)
+    {
+        return Err(FerrumError::unsupported(format!(
+            "{name}: CUDA Marlin desc_act requires balanced full groups; \
+             group {group} has {count} rows, expected {}",
+            qcfg.group_size
+        )));
+    }
+
+    Ok(())
 }
 
 /// Dequantise GPTQ INT4 weights with desc_act=true (act-order) g_idx and
@@ -1257,5 +1478,53 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(out_of_range.contains("outside expected group range"));
+    }
+
+    #[test]
+    fn validate_cuda_marlin_desc_act_accepts_balanced_full_groups() {
+        validate_cuda_marlin_desc_act_g_idx("proj", &gptq_config(true), &[1, 1, 0, 0], 4).unwrap();
+    }
+
+    #[test]
+    fn validate_cuda_marlin_desc_act_rejects_unbalanced_groups() {
+        let err = validate_cuda_marlin_desc_act_g_idx("proj", &gptq_config(true), &[0, 0, 0, 1], 4)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("balanced full groups"));
+        assert!(err.contains("group 0 has 3 rows"));
+    }
+
+    #[test]
+    fn validate_cuda_marlin_desc_act_rejects_partial_last_group() {
+        let err = validate_cuda_marlin_desc_act_g_idx("proj", &gptq_config(true), &[0, 0, 1], 3)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("K=3"));
+        assert!(err.contains("group_size=2"));
+    }
+
+    #[test]
+    fn qzero_stats_detects_symmetric_code7_packing() {
+        let stats = gptq_qzero_stats(&[0x7777_7777u32 as i32, 0x7777_7777u32 as i32]);
+
+        assert_eq!(stats.words, 2);
+        assert_eq!(stats.total_codes, 16);
+        assert_eq!(stats.min_code, 7);
+        assert_eq!(stats.max_code, 7);
+        assert_eq!(stats.code7_count, 16);
+        assert!(stats.all_code7());
+    }
+
+    #[test]
+    fn qzero_stats_reports_mixed_codes() {
+        let stats = gptq_qzero_stats(&[0x0123_4567]);
+
+        assert_eq!(stats.total_codes, 8);
+        assert_eq!(stats.min_code, 0);
+        assert_eq!(stats.max_code, 7);
+        assert_eq!(stats.code7_count, 1);
+        assert!(!stats.all_code7());
     }
 }

@@ -3,10 +3,12 @@
 # pod_w1_final_armored.sh hardening: setsid retry loops + marker files,
 # crates.io reachability probe before choosing the rsproxy mirror.
 #
-# Phases (all marker-gated, babysitter runs gates when staged):
+# Phases (marker-gated, correctness before performance):
 #   dl_gptq.ok    circulus/gemma-3-27b-it-gptq (classic GPTQ, text-only)
 #   dl_gguf.ok    unsloth Q4_K_M (for the llama.cpp same-card comparison)
 #   build.ok      ferrum slim (cuda,vllm-paged-attn-v2)
+#   desc_act_parity.ok/fail  synthetic CUDA Marlin desc_act parity, Gemma3 real shapes
+#   early_smoke.ok/fail  Gemma3 GPTQ smoke before waiting for perf prerequisites
 #   llamacpp.ok   llama.cpp CUDA build (llama-bench)
 #   gates: L2 known-answer + L3/L4 smoke ladder -> L5 bench-serve sweep
 #          -> llama-bench tg128 -> w2_session.done
@@ -22,6 +24,16 @@ if ! command -v cargo >/dev/null; then
 fi
 . "$HOME/.cargo/env"
 mkdir -p ~/.cargo
+
+# Vast's CUDA images can put forward-compat libcuda stubs ahead of the
+# host driver. On GeForce hosts this produces CUDA_ERROR_SYSTEM_DRIVER_MISMATCH
+# even though nvidia-smi/nvcc look healthy. Prefer the host libcuda.
+if [ -d /usr/local/cuda/compat ]; then
+  mkdir -p /usr/local/cuda/compat.disabled-ferrum
+  mv /usr/local/cuda/compat/libcuda* /usr/local/cuda/compat.disabled-ferrum/ 2>/dev/null || true
+  ldconfig 2>/dev/null || true
+fi
+
 if curl -sI --max-time 8 https://index.crates.io/config.json | grep -q "200"; then
   printf '[net]\ngit-fetch-with-cli = true\nretry = 10\n' > ~/.cargo/config.toml
 else
@@ -50,13 +62,96 @@ dl_armored "unsloth/gemma-3-27b-it-GGUF --include gemma-3-27b-it-Q4_K_M.gguf" gg
 # ferrum slim build.
 setsid bash -c "n=0; until [ -f $W/build.ok ] || [ \$n -ge 15 ]; do n=\$((n+1)); echo \"=== build attempt \$n\" >> $W/build.log; cargo build --release -j 8 -p ferrum-cli --features cuda,vllm-paged-attn-v2 >> $W/build.log 2>&1 && touch $W/build.ok; sleep 5; done" < /dev/null > /dev/null 2>&1 &
 
+# Minimal paid-GPU diagnostic before the full Gemma3 smoke. It uses synthetic
+# tensors, so it can run as soon as the CUDA build is staged and does not need
+# the 27B checkpoint download. If this fails, stop before spending time on
+# full-model L2/L3/L4.
+setsid bash -c "
+while true; do
+  if [ -f $W/desc_act_parity.ok ] || [ -f $W/desc_act_parity.fail ]; then
+    exit 0
+  fi
+  if [ -f $W/build.ok ]; then
+    mkdir -p $W/diagnostics
+    {
+      set -e
+      echo '=== cuda_desc_act_gemma3_qproj_shape_vs_cpu_reference'
+      cargo test -p ferrum-quantization --features cuda --release \
+        --test gptq_parity_test cuda_desc_act_gemma3_qproj_shape_vs_cpu_reference \
+        -- --ignored --nocapture
+      echo '=== cuda_desc_act_gemma3_attention_shapes_vs_cpu_reference'
+      cargo test -p ferrum-quantization --features cuda --release \
+        --test gptq_parity_test cuda_desc_act_gemma3_attention_shapes_vs_cpu_reference \
+        -- --ignored --nocapture
+    } > $W/diagnostics/desc_act_parity.log 2>&1
+    rc=\$?
+    echo \$rc > $W/diagnostics/desc_act_parity.rc
+    if [ \$rc -eq 0 ]; then
+      touch $W/desc_act_parity.ok
+      exit 0
+    fi
+    touch $W/desc_act_parity.fail
+    date -u > $W/desc_act_parity_failed_at_utc.txt
+    pkill -f 'hf download circulus/gemma-3-27b-it-gptq' 2>/dev/null || true
+    pkill -f 'hf download unsloth/gemma-3-27b-it-GGUF' 2>/dev/null || true
+    pkill -f 'cmake --build /workspace/llama.cpp/build' 2>/dev/null || true
+    pkill -f '/workspace/llama.cpp' 2>/dev/null || true
+    touch $W/w2_session.done
+    exit 0
+  fi
+  sleep 20
+done" < /dev/null > /dev/null 2>&1 &
+
 # llama.cpp CUDA build (llama-bench only).
 setsid bash -c "n=0; until [ -f $W/llamacpp.ok ] || [ \$n -ge 8 ]; do n=\$((n+1)); { [ -d /workspace/llama.cpp ] || git clone -q --depth 1 https://github.com/ggml-org/llama.cpp /workspace/llama.cpp; } >> $W/llamacpp.log 2>&1; cmake -S /workspace/llama.cpp -B /workspace/llama.cpp/build -DGGML_CUDA=ON -DLLAMA_CURL=OFF >> $W/llamacpp.log 2>&1 && cmake --build /workspace/llama.cpp/build --target llama-bench -j 8 >> $W/llamacpp.log 2>&1 && touch $W/llamacpp.ok; sleep 5; done" < /dev/null > /dev/null 2>&1 &
 
-# Babysitter: run the gate ladder when everything is staged.
+# Correctness babysitter: run Gemma3 smoke as soon as Ferrum + GPTQ are
+# staged. Do not wait for GGUF/llama.cpp if the correctness gate is already
+# known-bad.
 setsid bash -c "
 while true; do
-  if [ -f $W/build.ok ] && [ -f $W/dl_gptq.ok ] && [ -f $W/dl_gguf.ok ] && [ -f $W/llamacpp.ok ]; then
+  if [ -f $W/early_smoke.ok ] || [ -f $W/early_smoke.fail ]; then
+    exit 0
+  fi
+  if [ -f $W/desc_act_parity.fail ]; then
+    touch $W/w2_session.done
+    exit 0
+  fi
+  if [ -f $W/build.ok ] && [ -f $W/dl_gptq.ok ] && [ -f $W/desc_act_parity.ok ]; then
+    mkdir -p $W/gates_early
+    FERRUM_SMOKE_LOGIT_DUMP_DIR=$W/gates_early/logit_dump_smoke \
+    FERRUM_GPTQ_GIDX_TRACE=1 \
+    FERRUM_SMOKE_NAN_TRACE=\"\${FERRUM_W2_NAN_TRACE:-layer0}\" \
+    FERRUM_SMOKE_OP_DUMP_DIR=\"\${FERRUM_W2_OP_DUMP_DIR:-$W/gates_early/op_dump_layer0}\" \
+    SMOKE_REQ_TIMEOUT=180 bash scripts/model_coverage_smoke.sh gemma3:27b-gptq \
+      --port 8400 --kv-capacity 2560 --max-seqs 2 > $W/early_smoke.log 2>&1
+    rc=\$?
+    cp /tmp/ferrum_w1_smoke_8400.log $W/gates_early/serve_smoke_gemma3-27b-gptq.log 2>/dev/null || true
+    echo \$rc > $W/early_smoke.rc
+    if [ \$rc -eq 0 ]; then
+      touch $W/early_smoke.ok
+      exit 0
+    fi
+    touch $W/early_smoke.fail
+    date -u > $W/early_smoke_failed_at_utc.txt
+    pkill -f 'hf download unsloth/gemma-3-27b-it-GGUF' 2>/dev/null || true
+    pkill -f 'cmake --build /workspace/llama.cpp/build' 2>/dev/null || true
+    pkill -f '/workspace/llama.cpp' 2>/dev/null || true
+    touch $W/w2_session.done
+    exit 0
+  fi
+  sleep 30
+done" < /dev/null > /dev/null 2>&1 &
+
+# Babysitter: run the full gate ladder when correctness and performance
+# prerequisites are staged. A failed early smoke ends the session first.
+setsid bash -c "
+while true; do
+  if [ -f $W/desc_act_parity.fail ] || [ -f $W/early_smoke.fail ]; then
+    touch $W/w2_session.done
+    exit 0
+  fi
+  if [ -f $W/build.ok ] && [ -f $W/dl_gptq.ok ] && [ -f $W/early_smoke.ok ] && [ -f $W/dl_gguf.ok ] && [ -f $W/llamacpp.ok ]; then
     bash scripts/pod_w2_gates.sh > $W/gates.log 2>&1
     touch $W/w2_session.done
     exit 0

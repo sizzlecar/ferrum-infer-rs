@@ -99,6 +99,15 @@ fn metadata_requires_full_logits(
         .unwrap_or(false)
 }
 
+fn metadata_kv_capacity_hint(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<usize> {
+    metadata
+        .get("ferrum_kv_capacity_hint")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+}
+
 /// Map a `ferrum_types::Device` to the matching `candle_core::Device`.
 /// Used when materialising KV cache handles so downstream readers see
 /// the real backend the model runs on (Metal / CUDA / CPU) rather than
@@ -254,6 +263,9 @@ impl ModelExecutor for LlmExecutor {
                 &cache_id,
                 active_lora_from_metadata(&input.metadata)?,
             )?;
+            if let Some(capacity_hint) = metadata_kv_capacity_hint(&input.metadata) {
+                model.prepare_kv_capacity(&cache_id, capacity_hint);
+            }
             if force_full_logits {
                 model.prefill(&cache_id, &tokens)
             } else {
@@ -371,8 +383,15 @@ impl ModelExecutor for LlmExecutor {
         let mut took_fallback = false;
         let per_item_logits: Vec<Vec<f32>> = {
             let mut model = self.lock_model();
-            for (cache_id, adapter) in cache_ids.iter().zip(lora_per_input.iter()) {
+            for ((cache_id, adapter), input) in cache_ids
+                .iter()
+                .zip(lora_per_input.iter())
+                .zip(inputs.iter())
+            {
                 model.set_lora_adapter_for_cache(cache_id, adapter.clone())?;
+                if let Some(capacity_hint) = metadata_kv_capacity_hint(&input.metadata) {
+                    model.prepare_kv_capacity(cache_id, capacity_hint);
+                }
             }
             if force_full_logits {
                 took_fallback = true;
@@ -796,6 +815,11 @@ impl ModelExecutor for LlmExecutor {
                         &item.seq_id,
                         active_lora_from_metadata(&item.metadata)?,
                     )?;
+                    if item.pos_offset == 0 {
+                        if let Some(capacity_hint) = metadata_kv_capacity_hint(&item.metadata) {
+                            model.prepare_kv_capacity(&item.seq_id, capacity_hint);
+                        }
+                    }
                 }
                 model.unified_forward(&unified_items)
             };
@@ -844,6 +868,11 @@ impl ModelExecutor for LlmExecutor {
                     &item.seq_id,
                     active_lora_from_metadata(&item.metadata)?,
                 )?;
+                if item.pos_offset == 0 {
+                    if let Some(capacity_hint) = metadata_kv_capacity_hint(&item.metadata) {
+                        model.prepare_kv_capacity(&item.seq_id, capacity_hint);
+                    }
+                }
                 let logits = model.prefill(&item.seq_id, &item.q_tokens);
                 if item.is_final_chunk {
                     results[i] = Some(logits);
@@ -938,6 +967,7 @@ mod tests {
         prefill: usize,
         decode: usize,
         decode_batch_force_full_logits: Vec<bool>,
+        prepared_kv: Vec<(String, usize)>,
     }
 
     struct RecordingLlm {
@@ -999,6 +1029,13 @@ mod tests {
                 .collect())
         }
 
+        fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
+            self.calls
+                .lock()
+                .prepared_kv
+                .push((cache_id.to_string(), capacity_hint));
+        }
+
         fn release(&mut self, _cache_id: &str) {}
 
         fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
@@ -1035,6 +1072,13 @@ mod tests {
         HashMap::from([(
             "ferrum_require_full_logits".to_string(),
             serde_json::json!(true),
+        )])
+    }
+
+    fn kv_capacity_hint_metadata(capacity_hint: usize) -> HashMap<String, serde_json::Value> {
+        HashMap::from([(
+            "ferrum_kv_capacity_hint".to_string(),
+            serde_json::json!(capacity_hint),
         )])
     }
 
@@ -1129,6 +1173,61 @@ mod tests {
         let calls = calls.lock();
         assert_eq!(calls.unified_forward, 0);
         assert_eq!(calls.decode_batch_force_full_logits, vec![true]);
+    }
+
+    #[test]
+    fn unified_decode_prepares_fresh_prefill_kv_capacity_hint() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor(calls.clone());
+        let mut batch = UnifiedBatch::new();
+        batch.items.push(UnifiedBatchItem {
+            seq_id: "prefill-cache".to_string(),
+            q_tokens: vec![1, 2, 3],
+            kv_cache: test_kv_handle("prefill-cache", 0),
+            pos_offset: 0,
+            is_final_chunk: true,
+            metadata: kv_capacity_hint_metadata(7),
+        });
+        batch.items.push(UnifiedBatchItem {
+            seq_id: "decode-cache".to_string(),
+            q_tokens: vec![7],
+            kv_cache: test_kv_handle("decode-cache", 3),
+            pos_offset: 3,
+            is_final_chunk: true,
+            metadata: kv_capacity_hint_metadata(9),
+        });
+
+        let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
+
+        assert_eq!(output.len(), 2);
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 1);
+        assert_eq!(calls.prepared_kv, vec![("prefill-cache".to_string(), 7)]);
+    }
+
+    #[test]
+    fn unified_decode_full_logits_prefill_prepares_kv_capacity_hint() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor(calls.clone());
+        let mut metadata = full_logits_metadata();
+        metadata.insert("ferrum_kv_capacity_hint".to_string(), serde_json::json!(11));
+        let mut batch = UnifiedBatch::new();
+        batch.items.push(UnifiedBatchItem {
+            seq_id: "prefill-cache".to_string(),
+            q_tokens: vec![1, 2, 3],
+            kv_cache: test_kv_handle("prefill-cache", 0),
+            pos_offset: 0,
+            is_final_chunk: true,
+            metadata,
+        });
+
+        let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
+
+        assert_eq!(output[0].as_ref().unwrap().len(), 4);
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 0);
+        assert_eq!(calls.prefill, 1);
+        assert_eq!(calls.prepared_kv, vec![("prefill-cache".to_string(), 11)]);
     }
 
     #[test]

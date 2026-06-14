@@ -1,0 +1,16 @@
+ferrum bench-serve — dataset=random num_prompts=100 warmup=10 n_repeats=3
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 521.3s
+  cell closed_loop c=32 — repeat 2/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 515.1s
+  cell closed_loop c=32 — repeat 3/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 514.0s
+    summary c=32 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=90279.8±1862.7  p95=97981.4±2157.8  p99=101872.6±2174.3
+      TPOT_ms  p50=590.3±7.5  p95=618.5±9.4  p99=624.2±18.2
+      ITL_ms   p50=502.8±3.4  p95=513.6±6.2  p99=3862.2±235.2
+      throughput      24.8 ± 0.4 tok/s
+      goodput         0.19 ± 0.00 req/s
+
+→ wrote /workspace/w2/w2_c32_admission16_full_20260614_070500/full/l5_gemma3-27b-gptq_cuda_c32_admission16.json

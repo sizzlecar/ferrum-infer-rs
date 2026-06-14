@@ -1,0 +1,14 @@
+[smoke] waiting for http://127.0.0.1:8400/health (model: gemma3:27b-gptq)
+[smoke] logits-topk known-answer-0-prefill: n=262208 finite=262208 nonfinite=0 min=-16.92 max=41.84 top10=[236810:41.84, 239341:20.02, 247918:19.67, 239374:19.61, 236743:19.53, 240038:19.31, 242323:19.2, 248955:18.16, 237832:17.8, 106:17.53]
+[smoke] layer-dump-summary known-answer-0-prefill: entries=64 first_nonfinite=None last={'label': 'logits', 'n': 262208, 'finite': 262208, 'nan': 0, 'posinf': 0, 'neginf': 0, 'maxabs': 41.84375, 'maxabs_index': 236810}
+[smoke] ok   known-answer 10/10
+[smoke] ok   natural EOS stop
+[smoke] ok   multi-turn recall Bob
+[smoke] ok   stream == non-stream
+[smoke] ok   custom stop finish_reason
+[smoke] ok   custom stop does not leak
+[smoke] ok   max_tokens finish_reason length
+[smoke] ok   max_tokens budget respected
+[smoke] ok   required tool-call 10/10
+[smoke] ok   strict json_schema 20/20
+FERRUM W1 SMOKE PASS: gemma3:27b-gptq

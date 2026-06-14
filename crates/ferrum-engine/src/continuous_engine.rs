@@ -663,6 +663,12 @@ impl SequenceState {
                 serde_json::json!(true),
             );
         }
+        metadata.insert(
+            "ferrum_kv_capacity_hint".to_string(),
+            serde_json::json!(
+                self.input_tokens.len() + self.sampling_params.max_tokens.saturating_sub(1)
+            ),
+        );
         metadata
     }
 
@@ -671,6 +677,11 @@ impl SequenceState {
 
         let needs_sampling_masks = !self.forbidden_token_ids.is_empty()
             || (self.generated_tokens.is_empty() && !self.initial_forbidden_token_ids.is_empty());
+        let needs_extended_vocab_mask = self.tokenizer_base_vocab_size.is_some_and(|base| {
+            self.allowed_extended_token_ids
+                .iter()
+                .any(|&token_id| token_id as usize >= base)
+        });
         self.json_processor.is_some()
             || self.regex_processor.is_some()
             || matches!(
@@ -678,6 +689,7 @@ impl SequenceState {
                 ResponseFormat::JsonSchema(_)
             )
             || needs_sampling_masks
+            || needs_extended_vocab_mask
     }
 
     pub fn reset_guided_processors(&self) -> Result<()> {

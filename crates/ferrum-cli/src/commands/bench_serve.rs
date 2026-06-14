@@ -530,12 +530,145 @@ fn gen_random_prompt(
     n_tokens: usize,
     rng: &mut (impl Rng + ?Sized),
 ) -> String {
+    if let Some(text) = gen_random_prompt_target_len(tok, n_tokens, rng) {
+        return text;
+    }
+    // Last-resort fallback for tokenizers whose decode/encode roundtrip is
+    // hostile to arbitrary ids. Keep the old behavior rather than failing the
+    // whole benchmark; the JSON report still records actual token lengths.
     let vocab_size = tok.get_vocab_size(false) as u32;
     let lo: u32 = 256.min(vocab_size.saturating_sub(1));
     let hi: u32 = vocab_size.saturating_sub(1);
     let ids: Vec<u32> = (0..n_tokens).map(|_| rng.random_range(lo..=hi)).collect();
     tok.decode(&ids, false)
         .unwrap_or_else(|_| "hello world ".repeat(n_tokens / 2))
+}
+
+fn gen_random_prompt_target_len(
+    tok: &tokenizers::Tokenizer,
+    target_len: usize,
+    rng: &mut (impl Rng + ?Sized),
+) -> Option<String> {
+    if target_len == 0 {
+        return Some(String::new());
+    }
+    let vocab_size = tok.get_vocab_size(false) as u32;
+    let lo: u32 = 256.min(vocab_size.saturating_sub(1));
+    let hi: u32 = vocab_size.saturating_sub(1);
+    if hi < lo {
+        return None;
+    }
+
+    let mut sample_len = target_len;
+    let mut best_under: Option<(usize, String)> = None;
+    let mut best_any: Option<(usize, String)> = None;
+    for _ in 0..64 {
+        let ids: Vec<u32> = (0..sample_len).map(|_| rng.random_range(lo..=hi)).collect();
+        let text = match tok.decode(&ids, false) {
+            Ok(text) if !text.is_empty() => text,
+            _ => continue,
+        };
+        let len = match token_count(tok, &text) {
+            Some(len) => len,
+            None => continue,
+        };
+        if len == target_len {
+            return Some(text);
+        }
+        let delta = len.abs_diff(target_len);
+        if best_any
+            .as_ref()
+            .map(|(best_len, _)| delta < best_len.abs_diff(target_len))
+            .unwrap_or(true)
+        {
+            best_any = Some((len, text.clone()));
+        }
+        if len < target_len
+            && best_under
+                .as_ref()
+                .map(|(best_len, _)| len > *best_len)
+                .unwrap_or(true)
+        {
+            best_under = Some((len, text));
+        }
+
+        // Decoding arbitrary tokenizer ids often changes the token count on
+        // re-encode. Move the next draw in the direction of the target.
+        sample_len = if len > target_len {
+            sample_len.saturating_sub(len - target_len).max(1)
+        } else {
+            sample_len + (target_len - len).max(1)
+        };
+    }
+
+    if let Some((len, text)) = best_under {
+        return fill_random_prompt_to_len(tok, text, len, target_len, rng, lo, hi);
+    }
+    best_any.map(|(_, text)| text)
+}
+
+fn token_count(tok: &tokenizers::Tokenizer, text: &str) -> Option<usize> {
+    tok.encode(text, false).ok().map(|enc| enc.len())
+}
+
+fn fill_random_prompt_to_len(
+    tok: &tokenizers::Tokenizer,
+    mut text: String,
+    mut len: usize,
+    target_len: usize,
+    rng: &mut (impl Rng + ?Sized),
+    lo: u32,
+    hi: u32,
+) -> Option<String> {
+    for _ in 0..target_len.saturating_mul(8).max(16) {
+        if len == target_len {
+            return Some(text);
+        }
+        let next = random_one_token_extension(tok, &text, len, rng, lo, hi)?;
+        text = next.0;
+        len = next.1;
+    }
+    (len == target_len).then_some(text)
+}
+
+fn random_one_token_extension(
+    tok: &tokenizers::Tokenizer,
+    base: &str,
+    base_len: usize,
+    rng: &mut (impl Rng + ?Sized),
+    lo: u32,
+    hi: u32,
+) -> Option<(String, usize)> {
+    // Try random vocab pieces first so prompts remain high-entropy.
+    for _ in 0..128 {
+        let id = rng.random_range(lo..=hi);
+        if let Some(candidate) = append_decoded_piece(tok, base, base_len, id) {
+            return Some(candidate);
+        }
+    }
+    // Deterministic fallbacks cover tokenizers where most high vocab ids are
+    // byte-fallback fragments that merge or expand at text boundaries.
+    for piece in [" x", " y", " z", ".", ",", "\n"] {
+        let candidate = format!("{base}{piece}");
+        if token_count(tok, &candidate) == Some(base_len + 1) {
+            return Some((candidate, base_len + 1));
+        }
+    }
+    None
+}
+
+fn append_decoded_piece(
+    tok: &tokenizers::Tokenizer,
+    base: &str,
+    base_len: usize,
+    id: u32,
+) -> Option<(String, usize)> {
+    let piece = tok.decode(&[id], false).ok()?;
+    if piece.is_empty() {
+        return None;
+    }
+    let candidate = format!("{base}{piece}");
+    (token_count(tok, &candidate) == Some(base_len + 1)).then_some((candidate, base_len + 1))
 }
 
 fn build_prompts(
@@ -1512,6 +1645,19 @@ mod tests {
         assert!(!has_bad_output_text("\u{00c2}"));
         assert!(!has_bad_output_text("\u{00c3}"));
         assert!(!has_bad_output_text("Grade \u{00c2} report"));
+    }
+
+    #[test]
+    fn random_prompt_generation_targets_reencoded_length_when_fixture_is_set() {
+        let Ok(path) = std::env::var("FERRUM_BENCH_TOKENIZER_FIXTURE") else {
+            return;
+        };
+        let tok = tokenizers::Tokenizer::from_file(path).expect("load tokenizer fixture");
+        let mut rng = StdRng::seed_from_u64(9271);
+        for _ in 0..16 {
+            let text = gen_random_prompt(&tok, 256, &mut rng);
+            assert_eq!(token_count(&tok, &text), Some(256));
+        }
     }
 
     #[test]

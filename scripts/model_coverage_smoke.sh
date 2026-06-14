@@ -59,6 +59,17 @@ if [ -n "${FERRUM_SMOKE_EXTRA_SERVE_ARGS:-}" ]; then
   # shellcheck disable=SC2206
   SERVE_ARGS+=(${FERRUM_SMOKE_EXTRA_SERVE_ARGS})
 fi
+if [ -n "${FERRUM_SMOKE_LOGIT_DUMP_DIR:-}" ]; then
+  mkdir -p "$FERRUM_SMOKE_LOGIT_DUMP_DIR"
+  export FERRUM_LAYER_DUMP="$FERRUM_SMOKE_LOGIT_DUMP_DIR"
+fi
+if [ -n "${FERRUM_SMOKE_NAN_TRACE:-}" ]; then
+  export FERRUM_NAN_TRACE="$FERRUM_SMOKE_NAN_TRACE"
+fi
+if [ -n "${FERRUM_SMOKE_OP_DUMP_DIR:-}" ]; then
+  mkdir -p "$FERRUM_SMOKE_OP_DUMP_DIR"
+  export FERRUM_OP_DUMP="$FERRUM_SMOKE_OP_DUMP_DIR"
+fi
 
 BIN="${FERRUM_BIN:-target/release/ferrum}"
 LOG="/tmp/ferrum_w1_smoke_${PORT}.log"
@@ -82,11 +93,19 @@ if [ "${HEALTHY:-0}" != "1" ]; then
 fi
 
 MODEL="$MODEL" BASE="$BASE" REASONING="$REASONING" python3 - <<'PY'
-import json, os, sys, urllib.request
+import heapq
+import json
+import math
+import os
+from pathlib import Path
+import struct
+import sys
+import urllib.request
 
 BASE = os.environ["BASE"]
 MODEL = os.environ["MODEL"]
 REASONING = os.environ["REASONING"] == "1"
+LOGIT_DUMP_DIR = os.environ.get("FERRUM_SMOKE_LOGIT_DUMP_DIR")
 failures = []
 
 # Talk to the local server directly — never through a system proxy.
@@ -126,6 +145,55 @@ def check(name, ok, detail=""):
     if not ok:
         failures.append(name)
 
+def print_logit_topk(label):
+    if not LOGIT_DUMP_DIR:
+        return
+    path = Path(LOGIT_DUMP_DIR) / "logits.bin"
+    if not path.is_file():
+        print(f"[smoke] logits-topk {label}: missing {path}")
+        return
+    data = path.read_bytes()
+    if len(data) % 4 != 0:
+        print(f"[smoke] logits-topk {label}: invalid byte length {len(data)}")
+        return
+    vals = [x[0] for x in struct.iter_unpack("<f", data)]
+    finite = [(i, v) for i, v in enumerate(vals) if math.isfinite(v)]
+    nonfinite = len(vals) - len(finite)
+    top = heapq.nlargest(10, finite, key=lambda item: item[1])
+    top_s = ", ".join(f"{i}:{v:.4g}" for i, v in top)
+    if finite:
+        min_v = min(v for _, v in finite)
+        max_v = max(v for _, v in finite)
+        print(
+            f"[smoke] logits-topk {label}: n={len(vals)} finite={len(finite)} "
+            f"nonfinite={nonfinite} min={min_v:.4g} max={max_v:.4g} top10=[{top_s}]"
+        )
+    else:
+        print(f"[smoke] logits-topk {label}: n={len(vals)} finite=0 nonfinite={nonfinite}")
+
+def print_layer_dump_summary(label):
+    if not LOGIT_DUMP_DIR:
+        return
+    path = Path(LOGIT_DUMP_DIR) / "summary.jsonl"
+    if not path.is_file():
+        print(f"[smoke] layer-dump-summary {label}: missing {path}")
+        return
+    rows = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    first_bad = next((r for r in rows if r.get("finite") != r.get("n")), None)
+    last = rows[-1] if rows else None
+    print(
+        f"[smoke] layer-dump-summary {label}: entries={len(rows)} "
+        f"first_nonfinite={first_bad} last={last}"
+    )
+
 # L2 — known answer N=10 (GOAL gate: 10/10 semantically correct) + L3
 # natural-EOS / reasoning assertions on the first reply.
 KNOWN_ANSWERS = [
@@ -145,6 +213,8 @@ for q, expected in KNOWN_ANSWERS:
     r = chat({"messages": [{"role": "user", "content": q}], "max_tokens": 2048})
     if first is None:
         first = r
+        print_logit_topk("known-answer-0-prefill")
+        print_layer_dump_summary("known-answer-0-prefill")
     content = r["choices"][0]["message"].get("content") or ""
     if expected.lower() in content.lower():
         ok_known += 1

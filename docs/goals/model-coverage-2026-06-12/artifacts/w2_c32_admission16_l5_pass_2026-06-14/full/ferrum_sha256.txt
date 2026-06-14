@@ -1,0 +1,1 @@
+3bc3bf29a952cf968ff97e49ae3c9820c0fe8e1b24c5fe93e9c57f0affa0fc61  target/release/ferrum
