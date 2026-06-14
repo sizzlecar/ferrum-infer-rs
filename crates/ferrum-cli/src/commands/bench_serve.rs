@@ -1649,7 +1649,7 @@ mod tests {
 
     #[test]
     fn random_prompt_generation_targets_reencoded_length_when_fixture_is_set() {
-        let Ok(path) = std::env::var("FERRUM_BENCH_TOKENIZER_FIXTURE") else {
+        let Some(path) = ferrum_env_value("FERRUM_BENCH_TOKENIZER_FIXTURE") else {
             return;
         };
         let tok = tokenizers::Tokenizer::from_file(path).expect("load tokenizer fixture");
@@ -1658,6 +1658,14 @@ mod tests {
             let text = gen_random_prompt(&tok, 256, &mut rng);
             assert_eq!(token_count(&tok, &text), Some(256));
         }
+    }
+
+    fn ferrum_env_value(key: &str) -> Option<String> {
+        ferrum_types::RuntimeConfigSnapshot::capture_current()
+            .entries
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.effective_value)
     }
 
     #[test]
