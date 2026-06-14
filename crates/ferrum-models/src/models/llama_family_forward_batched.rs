@@ -227,9 +227,14 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         } else {
             None
         };
-        layer
-            .qkv_proj
-            .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, m);
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.batched_layer.qkv_proj");
+            layer
+                .qkv_proj
+                .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, m);
+        }
         if let Some(t0) = _t {
             B::sync(ctx);
             MATMUL_TIME_US.fetch_add(
@@ -1020,12 +1025,17 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         } else {
             None
         };
-        layer.gate_up_proj.forward(
-            ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.gate_up_out,
-            m,
-        );
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.batched_layer.gate_up_proj");
+            layer.gate_up_proj.forward(
+                ctx,
+                &self.scratch.norm_out,
+                &mut self.scratch.gate_up_out,
+                m,
+            );
+        }
         if let Some(t0) = _t {
             B::sync(ctx);
             MATMUL_TIME_US.fetch_add(
@@ -1065,9 +1075,14 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         } else {
             None
         };
-        layer
-            .down_proj
-            .forward(ctx, &self.scratch.silu_out, &mut self.scratch.mlp_out, m);
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.batched_layer.down_proj");
+            layer
+                .down_proj
+                .forward(ctx, &self.scratch.silu_out, &mut self.scratch.mlp_out, m);
+        }
         if let Some(t0) = _t {
             B::sync(ctx);
             MATMUL_TIME_US.fetch_add(
@@ -1438,7 +1453,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     .unified_packed_logits
                     .as_mut()
                     .expect("unified_packed_logits missing");
-                lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
+                {
+                    #[cfg(feature = "cuda")]
+                    let _alloc_label =
+                        ferrum_kernels::backend::cuda::push_alloc_label("llama.unified.lm_head");
+                    lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
+                }
             }
         }
 
@@ -1568,6 +1588,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_qkv_out
                 .as_mut()
                 .expect("unified_qkv_out missing");
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.qkv_proj");
             layer.qkv_proj.forward(ctx, norm_out, qkv_out, m_total);
         });
 
@@ -1705,6 +1728,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_o_proj_out
                 .as_mut()
                 .expect("unified_o_proj_out missing");
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.o_proj");
             layer.o_proj.forward(ctx, attn_out, o_proj_out, m_total);
         });
 
@@ -1745,6 +1771,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_gate_up_out
                 .as_mut()
                 .expect("unified_gate_up_out missing");
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.gate_up_proj");
             layer
                 .gate_up_proj
                 .forward(ctx, norm_out, gate_up_out, m_total);
@@ -1777,6 +1806,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_mlp_out
                 .as_mut()
                 .expect("unified_mlp_out missing");
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.down_proj");
             layer.down_proj.forward(ctx, silu_out, mlp_out, m_total);
         });
 
@@ -1831,6 +1863,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             self.ensure_kv(cid);
         }
         self.ensure_scratch(m);
+        self.scratch.ensure_batch_logits(&self.cfg, m);
         // Phase 4b: when paged mode is on, ensure_kv has already
         // populated the batched scratch buffers (paged_batch_q etc.).
         // The forward path branches on `paged_pools.is_some()` inside
@@ -2028,12 +2061,17 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             } else {
                 None
             };
-            lm_head.forward(
-                &mut ctx,
-                &self.scratch.norm_out,
-                &mut self.scratch.batch_logits,
-                m,
-            );
+            {
+                #[cfg(feature = "cuda")]
+                let _alloc_label =
+                    ferrum_kernels::backend::cuda::push_alloc_label("llama.batched.lm_head");
+                lm_head.forward(
+                    &mut ctx,
+                    &self.scratch.norm_out,
+                    &mut self.scratch.batch_logits,
+                    m,
+                );
+            }
             if let Some(t0) = _t0_lm {
                 B::sync(&mut ctx);
                 MATMUL_TIME_US.fetch_add(
@@ -2253,6 +2291,7 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         }
 
         self.ensure_scratch(row_count);
+        self.scratch.ensure_batch_logits(&self.cfg, row_count);
         let mut ctx = B::new_context();
         let mut hidden_buf = self
             .scratch
@@ -2273,12 +2312,17 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             .lm_head
             .as_ref()
             .expect("logits_from_hidden_batch called on stage without lm_head");
-        lm_head.forward(
-            &mut ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.batch_logits,
-            row_count,
-        );
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.logits_batch.lm_head");
+            lm_head.forward(
+                &mut ctx,
+                &self.scratch.norm_out,
+                &mut self.scratch.batch_logits,
+                row_count,
+            );
+        }
         B::sync(&mut ctx);
         self.scratch.residual = Some(hidden_buf);
 

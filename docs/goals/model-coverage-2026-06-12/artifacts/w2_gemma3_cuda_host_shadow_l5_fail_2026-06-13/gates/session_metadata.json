@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-06-13T15:46:58+00:00",
+  "lane": "MODEL_COVERAGE_W2 gemma3-27b cuda-gptq",
+  "stop_condition": "correctness failure, 8h without gate progress, or PASS/failure artifact collected",
+  "correctness_gate": "model_coverage_smoke known-answer 10/10 + L3/L4 smoke PASS",
+  "performance_gate": "bench-serve random 256/128 c=1/4/16/32 zero-error + llama.cpp ratio >= 0.5",
+  "git_rev_parse_head": {
+    "cmd": [
+      "git",
+      "rev-parse",
+      "HEAD"
+    ],
+    "returncode": 0,
+    "stdout": "86633c2df3d657ae0ddd0ac421f8fb6ae674cc3d",
+    "stderr": ""
+  },
+  "git_status_short": {
+    "cmd": [
+      "git",
+      "status",
+      "--short"
+    ],
+    "returncode": 0,
+    "stdout": "M crates/ferrum-engine/src/continuous_engine.rs\n M crates/ferrum-engine/src/continuous_engine/tests.rs\n M crates/ferrum-kernels/kernels/residual_add.cu\n M crates/ferrum-kernels/src/backend/cuda/mod.rs\n M crates/ferrum-kernels/src/backend/cuda/quant.rs\n M crates/ferrum-models/src/models/llama_family.rs\n M crates/ferrum-quantization/src/native_safetensors.rs\n M crates/ferrum-quantization/tests/gptq_parity_test.rs\n M docs/goals/model-coverage-2026-06-12/ACTIVE_PODS.md\n M docs/goals/model-coverage-2026-06-12/STATUS.md\n M docs/goals/model-coverage-2026-06-12/w2_matrix.json\n M docs/runtime-env-registry.tsv\n M scripts/model_coverage_smoke.sh\n M scripts/pod_w2_gates.sh\n M scripts/pod_w2_gemma3.sh\n M scripts/w2_goal_validator.py\n?? crates/ferrum-kernels/tests/cuda_activation_precision.rs\n?? docs/goals/model-coverage-2026-06-12/artifacts/w2_desc_act_cuda_parity_2026-06-13/\n?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_failure_2026-06-13/\n?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/\n?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/\n?? docs/goals/model-coverage-2026-06-12/artifacts/w2_vast_micro_run_2026-06-13/\n?? scripts/analyze_layer_dump.py\n?? scripts/inspect_hf_gptq_tensor.py",
+    "stderr": ""
+  },
+  "gpu": {
+    "cmd": [
+      "nvidia-smi",
+      "--query-gpu=name,memory.total,driver_version",
+      "--format=csv,noheader"
+    ],
+    "returncode": 0,
+    "stdout": "NVIDIA GeForce RTX 4090, 24564 MiB, 565.77",
+    "stderr": ""
+  },
+  "nvcc": {
+    "cmd": [
+      "nvcc",
+      "--version"
+    ],
+    "returncode": 0,
+    "stdout": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2024 NVIDIA Corporation\nBuilt on Thu_Mar_28_02:18:24_PDT_2024\nCuda compilation tools, release 12.4, V12.4.131\nBuild cuda_12.4.r12.4/compiler.34097967_0",
+    "stderr": ""
+  }
+}

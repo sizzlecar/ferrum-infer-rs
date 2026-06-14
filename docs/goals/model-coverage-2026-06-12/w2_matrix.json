@@ -46,20 +46,30 @@
           "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/gemma3_l2_gguf/known_answer_1b_q4km_metal.log"
         },
         "l2_gptq_cuda": {
-          "status": "pending"
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log",
+          "note": "2026-06-13 1x4090 Iceland host 1647 native CUDA run after Gemma3 host/F32 residual-shadow fix: logits and layer dumps finite, known-answer 10/10, smoke PASS."
         },
         "l3_behavior": {
-          "status": "pending"
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log",
+          "note": "same smoke: natural EOS, multi-turn Bob recall, stream==non-stream, custom stop finish_reason/leak checks, and max_tokens behavior all pass."
         },
         "l4_agent": {
-          "status": "pending"
-        },
-        "l5_concurrency": {
-          "status": "pending"
-        },
-        "perf_vs_llamacpp": {
-          "status": "pending"
-        }
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log",
+          "note": "same smoke: required tool-call 10/10 and strict json_schema 20/20 at temp 0."
+                },
+                "l5_concurrency": {
+                    "status": "pass",
+                    "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/l5_gemma3-27b-gptq_cuda.json",
+                    "note": "c=1/4/16 completed 100/100/100 with zero errors and usage token counts in artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/l5_gemma3-27b-gptq_cuda_1_4_16.json. c=32 kept client concurrency at 32 and used typed product CLI --max-num-seqs 16 with --kv-capacity 400; full gate completed three repeats with completed_per_run=[100,100,100], errored_per_run=[0,0,0], output_token_count_source=usage, and no server OOM/panic. Diagnostic history is retained in artifacts/w2_c32_admission_cap_diagnostics_2026-06-14: caps 31 and 30 still OOMed at the same 804864-element fp16 KV allocation, so the accepted product contract is client c=32 with active admission cap 16, not hidden env."
+                },
+                "perf_vs_llamacpp": {
+                    "status": "pass",
+                    "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/ratio.txt",
+                    "note": "same-card comparison on Vast 40826362 / RTX 4090: Ferrum c=1 decode 25.252275 tok/s vs llama.cpp tg128 50.478285 tok/s on Gemma3 27B Q4_K_M GGUF with CUDA n_gpu_layers=999; ratio 0.500260 PASS. This is just above the 0.5x floor and should be recorded as a known-gap, not a performance-ready claim."
+                }
       }
     }
   ]

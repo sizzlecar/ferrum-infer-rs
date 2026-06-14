@@ -1,0 +1,30 @@
+ M crates/ferrum-cli/src/commands/bench_serve.rs
+ M crates/ferrum-engine/src/continuous_engine.rs
+ M crates/ferrum-engine/src/continuous_engine/tests.rs
+ M crates/ferrum-kernels/kernels/residual_add.cu
+ M crates/ferrum-kernels/src/backend/cuda/mod.rs
+ M crates/ferrum-kernels/src/backend/cuda/quant.rs
+ M crates/ferrum-kernels/src/backend/kv_layer.rs
+ M crates/ferrum-models/src/common/llm.rs
+ M crates/ferrum-models/src/executor/llm_executor.rs
+ M crates/ferrum-models/src/models/llama_family.rs
+ M crates/ferrum-models/src/models/llama_family_forward_batched.rs
+ M crates/ferrum-quantization/src/native_safetensors.rs
+ M crates/ferrum-quantization/tests/gptq_parity_test.rs
+ M docs/goals/model-coverage-2026-06-12/ACTIVE_PODS.md
+ M docs/goals/model-coverage-2026-06-12/STATUS.md
+ M docs/goals/model-coverage-2026-06-12/w2_matrix.json
+ M docs/runtime-env-registry.tsv
+ M scripts/model_coverage_smoke.sh
+ M scripts/pod_w2_gates.sh
+ M scripts/pod_w2_gemma3.sh
+ M scripts/w2_goal_validator.py
+?? crates/ferrum-kernels/tests/cuda_activation_precision.rs
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_desc_act_cuda_parity_2026-06-13/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_failure_2026-06-13/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_vast_micro_run_2026-06-13/
+?? scripts/analyze_layer_dump.py
+?? scripts/inspect_hf_gptq_tensor.py

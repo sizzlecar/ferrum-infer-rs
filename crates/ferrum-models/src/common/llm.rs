@@ -94,6 +94,13 @@ pub trait DecoderOnlyLLM: Send + Sync {
         let _ = (cache_id, max_tokens);
     }
 
+    /// Hint that `cache_id` will need at most `capacity_hint` KV positions
+    /// for the whole request. This is separate from [`prepare`], whose
+    /// `max_tokens` parameter sizes per-call scratch buffers.
+    fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
+        let _ = (cache_id, capacity_hint);
+    }
+
     /// Per-cache KV capacity in tokens — the maximum sequence length any
     /// single `cache_id` can grow to before `prefill` / `decode` would
     /// overflow the pre-allocated K/V buffers.

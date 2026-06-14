@@ -2,7 +2,7 @@
 
 > GOAL.md 对 W3 的交付物定义:本目标只交付这份立项合同;实现与验收属于
 > 独立 goal。进入条件:`MODEL_COVERAGE_W1 GOAL PASS` + `MODEL_COVERAGE_W2
-> GOAL PASS` 均已打印(W1 已于 2026-06-13 达成)。
+> GOAL PASS` 均已打印(W1 已于 2026-06-13 达成;W2 已于 2026-06-14 达成)。
 
 ## 选型决议
 

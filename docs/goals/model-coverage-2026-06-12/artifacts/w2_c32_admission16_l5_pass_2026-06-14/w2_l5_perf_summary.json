@@ -1,0 +1,78 @@
+{
+  "ferrum_c1_decode_tps": 25.25227510318292,
+  "llamacpp_tg128_tps": 50.478285,
+  "ratio": 0.5002601634184466,
+  "verdict": "PASS",
+  "ferrum_l5_cells": [
+    {
+      "concurrency": 1,
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "output_token_count_source": "usage",
+      "output_tps_mean": 25.25227510318292
+    },
+    {
+      "concurrency": 4,
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "output_token_count_source": "usage",
+      "output_tps_mean": 25.11361982270294
+    },
+    {
+      "concurrency": 16,
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "output_token_count_source": "usage",
+      "output_tps_mean": 25.139662755995477
+    },
+    {
+      "concurrency": 32,
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "output_token_count_source": "usage",
+      "output_tps_mean": 24.751103274572987
+    }
+  ],
+  "llamacpp": {
+    "build_commit": "1a7718b",
+    "gpu_info": "NVIDIA GeForce RTX 4090",
+    "backends": "CUDA",
+    "model_type": "gemma3 27B Q4_K - Medium",
+    "n_gpu_layers": 999,
+    "n_gen": 128,
+    "avg_ts": 50.478285,
+    "stddev_ts": 0.087625
+  }
+}
