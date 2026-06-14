@@ -73,6 +73,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 k_norm_w,
                 o_proj,
                 post_ln_w,
+                post_attn_ln_w: None,
+                post_ffn_ln_w: None,
                 gate_up_proj,
                 down_proj,
             });
@@ -205,6 +207,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 k_norm_w,
                 o_proj,
                 post_ln_w,
+                post_attn_ln_w: None,
+                post_ffn_ln_w: None,
                 gate_up_proj,
                 down_proj,
             });

@@ -88,6 +88,7 @@ impl<B: MoeLlmBackend> Qwen3TtsTalker<B> {
             rope_interleaved: false,
             has_qk_norm: true,
             sliding_window: 0,
+            ..Default::default()
         };
 
         // Backbone transformer — loads model.layers.{i}.* and model.norm
@@ -329,6 +330,7 @@ impl<B: MoeLlmBackend> Qwen3TtsSubTalker<B> {
             rope_interleaved: false,
             has_qk_norm: true,
             sliding_window: 0,
+            ..Default::default()
         };
 
         let cp_loader = PrefixedLoader::new(loader, "talker.code_predictor.");

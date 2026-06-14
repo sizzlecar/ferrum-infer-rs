@@ -17,7 +17,8 @@ use std::sync::{Arc, OnceLock};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
-/// HuggingFace API base URL
+/// HuggingFace API base URL (override with `HF_ENDPOINT`, e.g.
+/// `https://hf-mirror.com` — same convention as huggingface_hub).
 const HF_API_URL: &str = "https://huggingface.co";
 
 /// Files required for a complete model
@@ -33,6 +34,7 @@ const TOKENIZER_FILES: &[&str] = &["tokenizer.json", "tokenizer.model", "tokeniz
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HfDownloaderRuntimeEnv {
     proxy_url: Option<String>,
+    endpoint: String,
 }
 
 impl HfDownloaderRuntimeEnv {
@@ -50,6 +52,7 @@ impl HfDownloaderRuntimeEnv {
         let mut https_proxy_lower = None;
         let mut all_proxy = None;
         let mut all_proxy_lower = None;
+        let mut endpoint = None;
 
         for (key, value) in vars {
             let value = value.into();
@@ -58,6 +61,7 @@ impl HfDownloaderRuntimeEnv {
                 "https_proxy" => https_proxy_lower = Some(value),
                 "ALL_PROXY" => all_proxy = Some(value),
                 "all_proxy" => all_proxy_lower = Some(value),
+                "HF_ENDPOINT" => endpoint = Some(value),
                 _ => {}
             }
         }
@@ -67,8 +71,18 @@ impl HfDownloaderRuntimeEnv {
                 .or(https_proxy_lower)
                 .or(all_proxy)
                 .or(all_proxy_lower),
+            endpoint: endpoint
+                .map(|e| e.trim_end_matches('/').to_string())
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| HF_API_URL.to_string()),
         }
     }
+}
+
+/// Base URL for the HF API and file downloads — `HF_ENDPOINT` override or
+/// the official hub.
+fn hf_endpoint() -> &'static str {
+    &hf_downloader_runtime_env().endpoint
 }
 
 fn hf_downloader_runtime_env() -> &'static HfDownloaderRuntimeEnv {
@@ -225,6 +239,65 @@ impl HfDownloader {
         Ok(gguf_path)
     }
 
+    /// Download only the named small files from a repo into its snapshot
+    /// directory, skipping weights entirely. Returns the snapshot dir.
+    ///
+    /// Used by `pull` to fetch tokenizer / generation-config sidecars from
+    /// a GGUF repo's safetensors sibling without pulling the multi-GB
+    /// weights. Filenames missing from the repo are skipped; errors only
+    /// if none of the requested files exist.
+    pub async fn download_sidecar_files(
+        &self,
+        model_id: &str,
+        revision: Option<&str>,
+        filenames: &[&str],
+    ) -> Result<PathBuf> {
+        let revision = revision.unwrap_or("main");
+        let model_cache_name = format!("models--{}", model_id.replace('/', "--"));
+        let model_dir = self.cache_dir.join("hub").join(&model_cache_name);
+        let snapshots_dir = model_dir.join("snapshots");
+        let blobs_dir = model_dir.join("blobs");
+        let refs_dir = model_dir.join("refs");
+        fs::create_dir_all(&snapshots_dir).await?;
+        fs::create_dir_all(&blobs_dir).await?;
+        fs::create_dir_all(&refs_dir).await?;
+
+        let files = self.list_files(model_id, revision).await?;
+        let files_to_download: Vec<_> = files
+            .iter()
+            .filter(|f| {
+                f.file_type.as_deref() != Some("directory") && filenames.contains(&f.path.as_str())
+            })
+            .collect();
+        if files_to_download.is_empty() {
+            return Err(FerrumError::model(format!(
+                "none of {:?} found in repo '{}'",
+                filenames, model_id
+            )));
+        }
+
+        let commit_sha = self.get_commit_sha(model_id, revision).await?;
+        let snapshot_dir = snapshots_dir.join(&commit_sha);
+        fs::create_dir_all(&snapshot_dir).await?;
+
+        for f in &files_to_download {
+            self.download_file_concurrent(
+                model_id,
+                revision,
+                &f.path,
+                f.size.unwrap_or(0),
+                &blobs_dir,
+                &snapshot_dir,
+                None,
+            )
+            .await?;
+        }
+
+        let ref_file = refs_dir.join(revision);
+        fs::write(&ref_file, &commit_sha).await?;
+        Ok(snapshot_dir)
+    }
+
     /// Download a model from HuggingFace
     pub async fn download(&self, model_id: &str, revision: Option<&str>) -> Result<PathBuf> {
         let revision = revision.unwrap_or("main");
@@ -365,11 +438,19 @@ impl HfDownloader {
 
         while let Some(dir) = dirs_to_visit.pop() {
             let url = if dir.is_empty() {
-                format!("{}/api/models/{}/tree/{}", HF_API_URL, model_id, revision)
+                format!(
+                    "{}/api/models/{}/tree/{}",
+                    hf_endpoint(),
+                    model_id,
+                    revision
+                )
             } else {
                 format!(
                     "{}/api/models/{}/tree/{}/{}",
-                    HF_API_URL, model_id, revision, dir
+                    hf_endpoint(),
+                    model_id,
+                    revision,
+                    dir
                 )
             };
 
@@ -413,7 +494,9 @@ impl HfDownloader {
     async fn get_commit_sha(&self, model_id: &str, revision: &str) -> Result<String> {
         let url = format!(
             "{}/api/models/{}/revision/{}",
-            HF_API_URL, model_id, revision
+            hf_endpoint(),
+            model_id,
+            revision
         );
 
         let mut request = self.client.get(&url);
@@ -463,7 +546,10 @@ impl HfDownloader {
     ) -> Result<()> {
         let url = format!(
             "{}/{}/resolve/{}/{}",
-            HF_API_URL, model_id, revision, filename
+            hf_endpoint(),
+            model_id,
+            revision,
+            filename
         );
 
         // Use a short display name for progress
@@ -736,5 +822,21 @@ mod tests {
         ]);
 
         assert_eq!(env.proxy_url.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn hf_downloader_runtime_env_endpoint_defaults_to_hub() {
+        let env = HfDownloaderRuntimeEnv::from_env_vars::<_, &str, &str>([]);
+        assert_eq!(env.endpoint, "https://huggingface.co");
+    }
+
+    #[test]
+    fn hf_downloader_runtime_env_endpoint_override_trims_trailing_slash() {
+        let env =
+            HfDownloaderRuntimeEnv::from_env_vars([("HF_ENDPOINT", "https://hf-mirror.com/")]);
+        assert_eq!(env.endpoint, "https://hf-mirror.com");
+
+        let empty = HfDownloaderRuntimeEnv::from_env_vars([("HF_ENDPOINT", "")]);
+        assert_eq!(empty.endpoint, "https://huggingface.co");
     }
 }

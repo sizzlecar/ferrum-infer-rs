@@ -382,6 +382,30 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn fused_gelu_tanh_mul_split(
+        _ctx: &mut Self::Context,
+        gate_up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        im: usize,
+    ) {
+        const SQRT_2_OVER_PI: f32 = 0.797_884_56;
+        for t in 0..tokens {
+            for i in 0..im {
+                let g = gate_up[t * 2 * im + i];
+                let u = gate_up[t * 2 * im + im + i];
+                let inner = SQRT_2_OVER_PI * (g + 0.044715 * g * g * g);
+                out[t * im + i] = 0.5 * g * (1.0 + inner.tanh()) * u;
+            }
+        }
+    }
+
+    fn scale_inplace(_ctx: &mut Self::Context, buf: &mut Self::Buffer, scale: f32, len: usize) {
+        for x in buf[..len].iter_mut() {
+            *x *= scale;
+        }
+    }
+
     fn qk_norm_rope(
         _ctx: &mut Self::Context,
         input: &Self::Buffer,

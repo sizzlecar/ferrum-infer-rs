@@ -27,7 +27,7 @@ use ferrum_types::{FerrumError, Result};
 use crate::config::QuantConfig;
 use crate::gguf::file::GgufFile;
 use crate::gguf::linear::GgufLinear;
-use crate::gguf::names::{ferrum_to_gguf, gate_up_split_parts, qkv_split_parts};
+use crate::gguf::names::{gate_up_split_parts, qkv_split_parts};
 use crate::loader::WeightLoader;
 use crate::traits::Linear;
 
@@ -70,6 +70,10 @@ pub struct GgufLoader<B: Backend + BackendQuantGguf + BackendQuantMarlin> {
     /// would add a cross-allocator hop with no benefit (Phase 1D revisits).
     decode_device: Device,
     runtime_config: GgufLoaderRuntimeConfig,
+    /// `general.architecture` from the file. Name translation is
+    /// arch-aware: Gemma 3 reuses the `post_attention_layernorm` ferrum
+    /// name for a different GGUF tensor than the Llama families.
+    arch: String,
     _marker: std::marker::PhantomData<B>,
 }
 
@@ -78,10 +82,12 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
     /// until each `load_tensor` / `load_linear` call.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let gguf = GgufFile::open(path).map_err(candle_to_ferrum)?;
+        let arch = gguf.architecture().unwrap_or_default().to_string();
         Ok(Self {
             gguf: Arc::new(gguf),
             decode_device: Device::Cpu,
             runtime_config: GgufLoaderRuntimeConfig::from_env(),
+            arch,
             _marker: std::marker::PhantomData,
         })
     }
@@ -89,12 +95,19 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
     /// Build from an already-opened [`GgufFile`] (test helper, also useful
     /// when several loaders share the same mmap).
     pub fn from_file(gguf: Arc<GgufFile>) -> Self {
+        let arch = gguf.architecture().unwrap_or_default().to_string();
         Self {
             gguf,
             decode_device: Device::Cpu,
             runtime_config: GgufLoaderRuntimeConfig::from_env(),
+            arch,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Arch-aware ferrum→GGUF name translation.
+    fn translate(&self, ferrum_name: &str) -> Option<String> {
+        crate::gguf::names::ferrum_to_gguf_with_arch(&self.arch, ferrum_name)
     }
 
     /// Direct access to the underlying file — exposes metadata + tensor
@@ -109,7 +122,7 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
     /// Look up a ferrum-named tensor in the GGUF, returning the GGUF tensor
     /// name on success.
     fn locate(&self, ferrum_name: &str) -> Result<String> {
-        let gguf_name = ferrum_to_gguf(ferrum_name).ok_or_else(|| {
+        let gguf_name = self.translate(ferrum_name).ok_or_else(|| {
             FerrumError::model(format!(
                 "GgufLoader: unrecognised tensor name '{ferrum_name}' (no GGUF mapping)"
             ))
@@ -202,7 +215,7 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
 
         for stem in parts {
             let weight_name = format!("{stem}.weight");
-            let gguf_name = ferrum_to_gguf(&weight_name).ok_or_else(|| {
+            let gguf_name = self.translate(&weight_name).ok_or_else(|| {
                 FerrumError::model(format!(
                     "GgufLoader: fusion source '{weight_name}' has no GGUF mapping"
                 ))
@@ -215,7 +228,8 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
 
             // Bias on a fused part disqualifies the whole multi-quant
             // path; fall back to eager fusion which already handles bias.
-            let has_bias = ferrum_to_gguf(&format!("{stem}.bias"))
+            let has_bias = self
+                .translate(&format!("{stem}.bias"))
                 .map(|n| self.gguf.has_tensor(&n))
                 .unwrap_or(false);
             if has_bias {
@@ -284,7 +298,7 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
 
         for stem in parts {
             let weight_name = format!("{stem}.weight");
-            let gguf_name = ferrum_to_gguf(&weight_name).ok_or_else(|| {
+            let gguf_name = self.translate(&weight_name).ok_or_else(|| {
                 FerrumError::model(format!(
                     "GgufLoader: fusion source '{weight_name}' has no GGUF mapping"
                 ))
@@ -297,7 +311,8 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
 
             // Disqualifier 1: bias on this part — can't byte-concat that
             // into a single QuantLinear.
-            let bias_name = ferrum_to_gguf(&format!("{stem}.bias"))
+            let bias_name = self
+                .translate(&format!("{stem}.bias"))
                 .map(|n| self.gguf.has_tensor(&n))
                 .unwrap_or(false);
             if bias_name {
@@ -379,7 +394,7 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
 
         for stem in parts {
             let weight_name = format!("{stem}.weight");
-            let gguf_name = ferrum_to_gguf(&weight_name).ok_or_else(|| {
+            let gguf_name = self.translate(&weight_name).ok_or_else(|| {
                 FerrumError::model(format!(
                     "GgufLoader: fusion source '{weight_name}' has no GGUF mapping"
                 ))
@@ -420,7 +435,7 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> WeightLoader<B> for Ggu
 
     fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {
         // 1) Direct path: <name>.weight exists as a single GGUF tensor.
-        if let Some(gguf_weight) = ferrum_to_gguf(&format!("{name}.weight")) {
+        if let Some(gguf_weight) = self.translate(&format!("{name}.weight")) {
             if self.gguf.has_tensor(&gguf_weight) {
                 // Inspect the on-disk dtype before reading the payload.
                 // Q4_K_M (and future k-quant flavours) get the QuantLinear
@@ -457,7 +472,8 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> WeightLoader<B> for Ggu
                     // For quantised weights with bias, fall back to
                     // eager dequant so Phase 1B's bias support keeps
                     // working.
-                    let has_bias = ferrum_to_gguf(&format!("{name}.bias"))
+                    let has_bias = self
+                        .translate(&format!("{name}.bias"))
                         .map(|n| self.gguf.has_tensor(&n))
                         .unwrap_or(false);
                     if !has_bias {
@@ -485,7 +501,7 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> WeightLoader<B> for Ggu
                     .gguf
                     .read_tensor(&gguf_weight, &self.decode_device)
                     .map_err(candle_to_ferrum)?;
-                if let Some(gguf_bias) = ferrum_to_gguf(&format!("{name}.bias")) {
+                if let Some(gguf_bias) = self.translate(&format!("{name}.bias")) {
                     if self.gguf.has_tensor(&gguf_bias) {
                         let bqt = self
                             .gguf
@@ -518,7 +534,7 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> WeightLoader<B> for Ggu
     }
 
     fn has_tensor(&self, name: &str) -> bool {
-        match ferrum_to_gguf(name) {
+        match self.translate(name) {
             Some(g) => self.gguf.has_tensor(&g),
             None => false,
         }

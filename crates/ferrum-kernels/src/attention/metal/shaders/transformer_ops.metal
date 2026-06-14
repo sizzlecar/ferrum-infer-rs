@@ -608,3 +608,25 @@ kernel void silu_mul_split_f32(
     const float silu = g / (1.0f + exp(-g));
     out[(int)tid] = silu * u;
 }
+
+// GeGLU split variant: gelu_tanh(gate) * up. Matches HF
+// `gelu_pytorch_tanh` (Gemma family): 0.5x(1+tanh(√(2/π)(x+0.044715x³))).
+kernel void gelu_tanh_mul_split_f32(
+    device const float* gate_up    [[buffer(0)]],
+    device       float* out        [[buffer(1)]],
+    constant SiluMulSplitParams& p [[buffer(2)]],
+    uint tid                       [[thread_position_in_grid]])
+{
+    const int total = p.tokens * p.im;
+    if ((int)tid >= total) return;
+    const int t = (int)tid / p.im;
+    const int i = (int)tid % p.im;
+    const float g = gate_up[t * 2 * p.im + i];
+    const float u = gate_up[t * 2 * p.im + p.im + i];
+    const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+    // Metal fast-math tanh overflows to NaN for |x| ≳ 45 (exp(2x)=inf →
+    // inf/inf); clamp to the f32 saturation region first.
+    const float t_in = clamp(inner, -9.5f, 9.5f);
+    const float gelu = 0.5f * g * (1.0f + tanh(t_in));
+    out[(int)tid] = gelu * u;
+}

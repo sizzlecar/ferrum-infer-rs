@@ -277,6 +277,13 @@ fn model_decode_metadata_marks_structured_requests_for_full_logits() {
             .and_then(|value| value.as_bool()),
         None
     );
+    assert_eq!(
+        plain
+            .model_decode_metadata()
+            .get("ferrum_kv_capacity_hint")
+            .and_then(|value| value.as_u64()),
+        Some((1 + plain.sampling_params.max_tokens.saturating_sub(1)) as u64)
+    );
 
     let mut request = policy_request();
     request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
@@ -593,6 +600,10 @@ fn sample_allows_generated_control_tokens_above_base_vocab() {
     ));
     let mut state =
         SequenceState::new_with_tokenizer(policy_request(), vec![TokenId::new(0)], Some(tokenizer));
+    assert!(
+        state.requires_full_logits_for_sampling(),
+        "extended control-token masks require full logits; GPU argmax would bypass them"
+    );
     let mut logits = vec![0.0f32; 7];
     logits[4] = 1.0;
     logits[5] = 90.0;

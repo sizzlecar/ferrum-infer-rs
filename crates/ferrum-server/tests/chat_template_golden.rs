@@ -22,6 +22,12 @@ struct Meta {
     eos_token: Option<String>,
     #[serde(default)]
     render_kwargs: RenderKwargs,
+    /// Timestamp `strftime_now` was pinned to at generation time
+    /// (`%Y-%m-%dT%H:%M:%S`). Templates that date their system prompt
+    /// (Mistral-Small-3.2, Llama-3.x) only byte-match when rendered with
+    /// the same clock.
+    #[serde(default)]
+    now: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -69,6 +75,10 @@ fn chat_template_goldens_match_transformers() {
         template.eos_token = meta.eos_token.clone();
         let options = ChatTemplateOptions {
             enable_thinking: meta.render_kwargs.enable_thinking,
+            now_override: meta.now.as_deref().map(|s| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+                    .unwrap_or_else(|e| panic!("{}: bad meta.json now {s:?}: {e}", meta.model_id))
+            }),
         };
 
         let cases: BTreeMap<String, Case> =

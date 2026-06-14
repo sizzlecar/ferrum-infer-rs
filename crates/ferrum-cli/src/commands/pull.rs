@@ -42,9 +42,18 @@ pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
         };
 
         // Some GGUF repos (e.g. Qwen/Qwen3-*-GGUF) don't host
-        // tokenizer.json. Pull it from the safetensors sibling repo
-        // (`<repo>` minus `-GGUF`) and drop it next to the gguf file so
-        // serve / bench's auto_discover_tokenizer_path picks it up.
+        // tokenizer.json. Pull the small sidecar files from the
+        // safetensors sibling repo (`<repo>` minus `-GGUF`) — never its
+        // weights — and drop them next to the gguf file so serve /
+        // bench's auto_discover_tokenizer_path picks them up.
+        const SIDECAR_FILES: [&str; 6] = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "chat_template.json",
+            "chat_template.jinja",
+            "generation_config.json",
+        ];
         let snapshot_dir = gguf_path
             .parent()
             .map(|p| p.to_path_buf())
@@ -58,17 +67,14 @@ pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
                     sibling.dimmed()
                 );
                 let dl2 = HfDownloader::new(cache_dir.clone(), token.clone())?;
-                match dl2.download(&sibling, None).await {
+                match dl2
+                    .download_sidecar_files(&sibling, None, &SIDECAR_FILES)
+                    .await
+                {
                     Ok(sibling_dir) => {
-                        // Copy tokenizer.json + tokenizer_config.json into
-                        // the GGUF snapshot dir so they live next to the
-                        // gguf file.
-                        for tok_file in [
-                            "tokenizer.json",
-                            "tokenizer_config.json",
-                            "special_tokens_map.json",
-                            "chat_template.json",
-                        ] {
+                        // Copy the sidecars into the GGUF snapshot dir so
+                        // they live next to the gguf file.
+                        for tok_file in SIDECAR_FILES {
                             let src = sibling_dir.join(tok_file);
                             if src.is_file() {
                                 let dst = snapshot_dir.join(tok_file);
@@ -148,24 +154,8 @@ pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
 }
 
 fn resolve_model_alias(name: &str) -> String {
-    match name.to_lowercase().as_str() {
-        "tinyllama" | "tiny" => "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
-        "qwen2.5:0.5b" | "qwen:0.5b" => "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
-        "qwen2.5:1.5b" | "qwen:1.5b" => "Qwen/Qwen2.5-1.5B-Instruct".to_string(),
-        "qwen2.5:3b" | "qwen:3b" => "Qwen/Qwen2.5-3B-Instruct".to_string(),
-        "qwen2.5:7b" | "qwen:7b" => "Qwen/Qwen2.5-7B-Instruct".to_string(),
-        "llama3.2:1b" => "meta-llama/Llama-3.2-1B-Instruct".to_string(),
-        "llama3.2:3b" => "meta-llama/Llama-3.2-3B-Instruct".to_string(),
-        "whisper-tiny" | "whisper:tiny" => "openai/whisper-tiny".to_string(),
-        "whisper-base" | "whisper:base" => "openai/whisper-base".to_string(),
-        "whisper-small" | "whisper:small" => "openai/whisper-small".to_string(),
-        "whisper-medium" | "whisper:medium" => "openai/whisper-medium".to_string(),
-        "whisper-large-v3" | "whisper:large-v3" => "openai/whisper-large-v3".to_string(),
-        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => {
-            "openai/whisper-large-v3-turbo".to_string()
-        }
-        _ => name.to_string(),
-    }
+    // Single source of truth — see run.rs.
+    super::run::resolve_model_alias(name)
 }
 
 fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {

@@ -14,8 +14,31 @@ pub struct HuggingFaceTokenizer {
     special_tokens: SpecialTokens,
     info: TokenizerInfo,
     id_to_token: Vec<Option<String>>,
+    /// Reasoning-marker token ids mapped to the canonical tag emitted in
+    /// their place. Some vocabs mark think tags `special: true`
+    /// (Magistral's `[THINK]`/`[/THINK]`), so a skip-special decode would
+    /// silently drop them and the thinking text would leak into content.
+    /// Decode preserves these ids and normalizes every dialect to
+    /// `<think>`/`</think>`, which is what the serving layer splits on.
+    think_markers: Vec<(u32, &'static str)>,
     /// Incremental decode cache for efficiency
     decode_cache: RwLock<DecodeCache>,
+}
+
+/// Marker-string dialects mapped to the canonical tags. Probed against the
+/// vocab at construction; absent dialects cost nothing.
+const THINK_MARKER_DIALECTS: [(&str, &'static str); 4] = [
+    ("<think>", "<think>"),
+    ("</think>", "</think>"),
+    ("[THINK]", "<think>"),
+    ("[/THINK]", "</think>"),
+];
+
+fn probe_think_markers(tokenizer: &HfTokenizer) -> Vec<(u32, &'static str)> {
+    THINK_MARKER_DIALECTS
+        .iter()
+        .filter_map(|(text, canonical)| tokenizer.token_to_id(text).map(|id| (id, *canonical)))
+        .collect()
 }
 
 /// Incremental decoding state
@@ -86,11 +109,14 @@ impl HuggingFaceTokenizer {
             vocab_size
         );
 
+        let think_markers = probe_think_markers(&tokenizer);
+
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
             special_tokens,
             info,
             id_to_token,
+            think_markers,
             decode_cache: RwLock::new(DecodeCache::new(1000)),
         })
     }
@@ -160,6 +186,38 @@ impl Tokenizer for HuggingFaceTokenizer {
 
     fn decode(&self, tokens: &[TokenId], skip_special: bool) -> Result<String> {
         let token_ids: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
+
+        // Skip-special decode must not swallow reasoning markers: split at
+        // marker ids, decode the segments, and splice the canonical tags
+        // back in. The common no-marker case stays a single decode call.
+        if skip_special
+            && !self.think_markers.is_empty()
+            && token_ids
+                .iter()
+                .any(|id| self.think_markers.iter().any(|(mid, _)| mid == id))
+        {
+            let mut out = String::new();
+            let mut segment: Vec<u32> = Vec::with_capacity(token_ids.len());
+            for id in &token_ids {
+                if let Some((_, canonical)) = self.think_markers.iter().find(|(mid, _)| mid == id) {
+                    if !segment.is_empty() {
+                        out.push_str(&self.tokenizer.decode(&segment, true).map_err(|e| {
+                            ferrum_types::FerrumError::tokenizer(format!("Decoding failed: {}", e))
+                        })?);
+                        segment.clear();
+                    }
+                    out.push_str(canonical);
+                } else {
+                    segment.push(*id);
+                }
+            }
+            if !segment.is_empty() {
+                out.push_str(&self.tokenizer.decode(&segment, true).map_err(|e| {
+                    ferrum_types::FerrumError::tokenizer(format!("Decoding failed: {}", e))
+                })?);
+            }
+            return Ok(out);
+        }
 
         let text = self
             .tokenizer
@@ -959,5 +1017,38 @@ mod tests {
             loaded.special_tokens().eos_token.map(|t| t.get()),
             Some(eos_id)
         );
+    }
+
+    #[tokio::test]
+    async fn skip_special_decode_preserves_and_normalizes_think_markers() {
+        // Magistral-style: [THINK]/[/THINK] are `special: true`, so a plain
+        // skip-special decode would drop them and leak thinking into content.
+        let tokenizer = tiny_tokenizer_with_specials(&["[THINK]", "[/THINK]", "<eos>"]);
+        let think = tokenizer.token_to_id("[THINK]").unwrap();
+        let end_think = tokenizer.token_to_id("[/THINK]").unwrap();
+        let eos = tokenizer.token_to_id("<eos>").unwrap();
+        let hello = tokenizer.token_to_id("hello").unwrap();
+        let world = tokenizer.token_to_id("world").unwrap();
+
+        let loaded = HuggingFaceTokenizer::new(tokenizer).await.unwrap();
+        let tokens: Vec<TokenId> = [think, hello, end_think, world, eos]
+            .into_iter()
+            .map(TokenId::new)
+            .collect();
+        let text = loaded.decode(&tokens, true).unwrap();
+
+        assert_eq!(text, "<think>hello</think>world");
+    }
+
+    #[tokio::test]
+    async fn skip_special_decode_without_markers_is_unchanged() {
+        let tokenizer = tiny_tokenizer_with_specials(&["<eos>"]);
+        let eos = tokenizer.token_to_id("<eos>").unwrap();
+        let hello = tokenizer.token_to_id("hello").unwrap();
+
+        let loaded = HuggingFaceTokenizer::new(tokenizer).await.unwrap();
+        let tokens: Vec<TokenId> = [hello, eos].into_iter().map(TokenId::new).collect();
+
+        assert_eq!(loaded.decode(&tokens, true).unwrap(), "hello");
     }
 }

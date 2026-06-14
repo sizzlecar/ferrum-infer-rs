@@ -25,6 +25,11 @@ pub enum Architecture {
     /// Qwen3-MoE family (Qwen3-30B-A3B and friends). Distinct from Qwen3
     /// because the FFN per layer is replaced by a router + N experts.
     Qwen3Moe,
+    /// Gemma 3 text family (1B–27B): LlamaFamilyModel with 5:1
+    /// local/global attention scheduling, dual RoPE tables, GeGLU,
+    /// sandwich norms and Gemma RMSNorm conventions. The vision tower of
+    /// multimodal checkpoints is ignored (text-only support).
+    Gemma3,
     Mistral,
     Phi,
     GPT2,
@@ -42,6 +47,9 @@ impl Architecture {
             "qwen2" | "qwen2forcausallm" => Architecture::Qwen2,
             "qwen3" | "qwen3forcausallm" => Architecture::Qwen3,
             "qwen3_moe" | "qwen3moe" | "qwen3moeforcausallm" => Architecture::Qwen3Moe,
+            "gemma3" | "gemma3_text" | "gemma3forcausallm" | "gemma3forconditionalgeneration" => {
+                Architecture::Gemma3
+            }
             "mistral" | "mistralforcausallm" => Architecture::Mistral,
             "phi" | "phiforcausallm" => Architecture::Phi,
             "gpt2" | "gpt2lmheadmodel" => Architecture::GPT2,

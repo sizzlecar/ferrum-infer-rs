@@ -3,12 +3,12 @@
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
 
-> Rust-native LLM inference for fast, simple, OpenAI-compatible serving.
+> Rust-native LLM inference for OpenAI-compatible local and private serving.
 
 **One binary. No Python runtime. Hardware-accelerated on Apple Silicon and NVIDIA CUDA.**
 
 Ferrum is a lightweight inference engine for running and serving transformer LLMs with an OpenAI-compatible API.
-It is built for developers and teams who want simple deployment, practical serving performance, and a clean Rust-native runtime for local, edge, and production inference.
+It is built for developers and teams who want predictable deployment, practical serving performance, and a clean Rust-native runtime for local, edge, workstation, and production inference.
 
 [中文说明](README_zh.md)
 
@@ -38,6 +38,13 @@ ferrum serve --model qwen3:4b --port 8000
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Use the larger certified CUDA lane when you want a 27B-class agent model on a
+24 GB RTX 4090:
+
+```bash
+ferrum serve --model gemma3:27b-gptq --max-num-seqs 16 --kv-capacity 400 --port 8000
 ```
 
 ## Why Ferrum?
@@ -219,6 +226,7 @@ cargo build --release -p ferrum-cli --bin ferrum
 
 - CUDA vLLM comparison: [`docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/`](docs/bench/cuda-rtx4090-2026-05-30-m3-80pct-confirmed/)
 - Current 0.7.7 G0 source artifacts: [`docs/release/g0/0.7.7/`](docs/release/g0/0.7.7/)
+- 2026-06 model coverage evidence: [`docs/goals/model-coverage-2026-06-12/`](docs/goals/model-coverage-2026-06-12/)
 - Apple Silicon regression gate: `scripts/metal_readme_regression.py` and `scripts/release/validate_metal_readme_regression.py`
 - OpenAI API compatibility: [`docs/openai-api-compatibility.md`](docs/openai-api-compatibility.md)
 - Prefix/session cache product surface: [`docs/cache-product.md`](docs/cache-product.md)
@@ -229,13 +237,63 @@ cargo build --release -p ferrum-cli --bin ferrum
 | Architecture | Apple Silicon | CUDA | INT4 (GPTQ) | Tensor Parallel |
 |---|:---:|:---:|:---:|:---:|
 | LLaMA (3.x, TinyLlama, Vicuna, Mistral) | ✓ | ✓ | ✓ | ✓ |
-| Qwen3 dense (0.6B – 8B) | ✓ | ✓ | ✓ | ✓ |
-| Qwen3-MoE (30B-A3B) | ✓ | ✓ | ✓ | — |
+| Qwen3 dense (0.6B – 32B) | ✓ | ✓ | ✓ | ✓ |
+| Qwen3-MoE (30B-A3B, Coder-30B-A3B) | ✓ | ✓ | ✓ | — |
+| Gemma 3 text (1B, 27B) | 1B GGUF | ✓ | 27B GPTQ | — |
 | Qwen2 / Qwen2.5 | ✓ | ✓ | ✓ | — |
+| DeepSeek-R1 (0528-Qwen3-8B; Distill-Qwen-14B/32B; Distill-Llama-70B) | ✓ | ✓ | ✓ | 70B layer-split |
+| Mistral Small 3.2 / Magistral Small (24B) | ✓ | — | — | — |
 | BERT (embeddings) | ✓ | — | — | — |
 | Whisper ASR (tiny → large-v3-turbo) | ✓ | — | — | — |
 | Qwen3-TTS (0.6B / 1.7B) | ✓ | — | — | — |
 | CLIP / Chinese-CLIP / SigLIP (text + image) | ✓ | — | — | — |
+
+### Model coverage certification (2026-06)
+
+Rows below are model lanes with saved gate evidence, not marketing-only
+compatibility claims. W1 rows passed the ladder for the marked lanes:
+chat-template golden byte-equality vs `transformers` (L0), known-answer 10/10
+at temp 0, multi-turn KV reuse, stream==non-stream, natural EOS + custom stop +
+max_tokens mechanics (L2/L3), and the agent gate — required tool-call 10/10 +
+strict `json_schema` 20/20 (L4, "agent-grade"). W2 adds Gemma 3 27B on CUDA
+with L5 concurrency and a same-card llama.cpp performance floor. Artifacts:
+[`docs/goals/model-coverage-2026-06-12/artifacts/`](docs/goals/model-coverage-2026-06-12/artifacts/).
+Lane split: **GGUF serves on the Metal lane; CUDA serves GPTQ/safetensors**
+(GGUF decoding is not wired into the CUDA engine yet).
+
+| Model | Aliases | Metal (GGUF Q4_K_M) | CUDA | Agent-grade |
+|---|---|:---:|:---:|:---:|
+| Qwen3-Coder-30B-A3B-Instruct | `qwen3-coder:30b[-q4_k_m/-gptq]` | ✓ | GPTQ: known issue¹ | ✓ (Metal) |
+| Gemma 3 27B (text) | `gemma3:27b`, `gemma3:27b-gptq` | 1B GGUF smoke; 27B waived⁵ | ✓ GPTQ + L5⁵ | ✓ |
+| DeepSeek-R1-0528-Qwen3-8B | `deepseek-r1:8b[-q4_k_m]` | ✓ | ✓ BF16 | ✓ |
+| DeepSeek-R1-Distill-Qwen-32B | `deepseek-r1:32b[-q4_k_m/-gptq]` | 32 GB Mac: not practical² | ✓ GPTQ | tools ✓ / schema³ |
+| Qwen3-14B / Qwen3-32B | `qwen3:14b/32b[-q4_k_m/-gptq]` | 14B ✓ / 32B² | 32B ✓ GPTQ | 14B ✓ / 32B³ |
+| Qwen2.5-Coder-32B-Instruct | `qwen2.5-coder:32b[-q4_k_m/-gptq]` | —² | ✓ GPTQ | ✓ (CUDA) |
+| Mistral Small 3.2 (24B) | `mistral-small:24b-q4_k_m` | ✓ | — | ✓ |
+| Magistral Small (24B, reasoning) | `magistral:24b-q4_k_m` | ✓ | — | ✓ |
+| DeepSeek-R1-Distill-Llama-70B | `OPEA/...-70B-int4-gptq-sym-inc` | — | ✓ 2×4090 layer-split | chat/reasoning grade⁴ |
+| Devstral Small 2 (24B) | — | **not supported** (`mistral3` arch: YaRN-from-GGUF + attention temperature scaling; the loader refuses it loudly) | | |
+
+¹ jart25 GPTQ chat emits empty answers on CUDA (open issue; weights fine —
+Metal GGUF and CUDA random-context benches are clean).
+² 32B-dense on a 32 GB Mac re-reads evicted weights from SSD every token
+(~0.14 tok/s) — no practical deployment; use the CUDA lane.
+³ strict `json_schema` intermittently returns 500 on 32B-GPTQ (open issue);
+required tool-calls are 10/10.
+⁴ R1-distill templates force `<think>` and the 70B writes tool-call JSON
+inside the think block — reliable for chat/reasoning, not tool calling.
+DeepSeek-R1-Distill-Qwen-14B shares the 32B's template/config byte-for-byte
+and rides the same lanes.
+⁵ Gemma 3 W2 evidence has final validator line
+`MODEL_COVERAGE_W2 GOAL PASS: docs/goals/model-coverage-2026-06-12`.
+CUDA L5 covers random `256/128` at c=1/4/16/32, 100 prompts × 3 repeats per
+cell, zero errors, and usage-counted output tokens. On a 24 GB RTX 4090, the
+c=32 client lane uses product CLI admission `--max-num-seqs 16` with
+`--kv-capacity 400`. Same-card llama.cpp comparison is `0.500260x`, just above
+the required floor, so this is certified correctness/concurrency evidence with
+a known performance gap, not an optimization-complete claim. 27B GGUF Metal was
+waived on the degraded 32 GB Mac; Gemma 3 GGUF architecture coverage is pinned
+by the 1B Q4_K_M Metal smoke artifact.
 
 Use any HuggingFace model ID:
 
@@ -304,6 +362,7 @@ What works today:
 - Continuous batching, PagedAttention (CUDA + Metal pools), prefix caching, preemption
 - OpenAI-style function tool calling, including required tool calls and streaming `tool_calls` deltas
 - Custom CUDA decode runner (Qwen3, LLaMA): 2× over Candle baseline
+- Gemma 3 27B GPTQ on CUDA, including tool-call, strict-schema, streaming, multi-turn, and c=32 client pressure gates
 - Apple Silicon MoE inference (Qwen3-30B-A3B) — correctness, multi-turn, default serve startup, and multi-sequence serving gates covered by the Metal README gate
 - INT4 GPTQ with Marlin fused kernel (Blackwell + Ampere); also Triton w4a16
 - Tensor parallelism (multi-GPU NCCL, persistent per-rank threads)
@@ -323,7 +382,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full picture.
 Near-term:
 - v0.1: CUDA + Apple Silicon production release with concurrent serving benchmarks
 - v0.2: Broader release matrix and long-context serving benchmarks
-- v0.3: Long-context tuning (32k+), more architectures (Phi, DeepSeek, Gemma)
+- v0.3: Long-context tuning (32k+), more architectures and wider Gemma coverage
 
 ## License
 

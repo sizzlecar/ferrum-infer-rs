@@ -81,6 +81,7 @@ fn toy_config(n_experts: usize, hidden: usize, ffn: usize, top_k: usize) -> Qwen
         rope_interleaved: false,
         has_qk_norm: true,
         sliding_window: 0,
+        ..Default::default()
     };
     Qwen3MoeConfig::from_base(base, n_experts, top_k, ffn, true)
 }

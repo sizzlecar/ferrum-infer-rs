@@ -1210,6 +1210,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             | ferrum_models::Architecture::Qwen2
             | ferrum_models::Architecture::Qwen3
             | ferrum_models::Architecture::Qwen3Moe
+            | ferrum_models::Architecture::Gemma3
             | ferrum_models::Architecture::Mistral) => {
                 let _loader = ferrum_models::SafeTensorsLoader::new(&model_path);
                 let model_dir_path: std::path::PathBuf = model_path.clone().into();
@@ -1266,6 +1267,16 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                         info!("Loading Mistral via LlamaFamilyModel (sliding_window from config)");
                         (
                             ferrum_models::models::LlamaFamilyConfig::mistral_from_def(&model_def),
+                            None,
+                        )
+                    }
+                    ferrum_models::Architecture::Gemma3 => {
+                        info!(
+                            "Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, \
+                             sandwich norms)"
+                        );
+                        (
+                            ferrum_models::models::LlamaFamilyConfig::gemma3_from_def(&model_def),
                             None,
                         )
                     }
@@ -1706,6 +1717,7 @@ mod tests {
             rope_interleaved: false,
             has_qk_norm: false,
             sliding_window: 0,
+            ..Default::default()
         };
         let plan = crate::layer_split::parse_layer_split_plan(
             "stage0:cuda:0:layers=0-0;stage1:cuda:1:layers=1-1",

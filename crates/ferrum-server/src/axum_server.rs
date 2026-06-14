@@ -953,6 +953,9 @@ async fn handle_chat_completions_stream(
     let buffer_stream_output = buffer_json_object_stream
         || buffer_strict_json_schema_stream
         || buffer_structured_api_stream;
+    // R1-distill-style templates open the think block inside the prompt;
+    // the parser must know generation starts mid-think.
+    let started_in_think = has_unclosed_thinking_block(&inference_request.prompt);
     let mut stream = match engine.infer_stream(inference_request).await {
         Ok(stream) => stream,
         Err(e) => {
@@ -983,7 +986,11 @@ async fn handle_chat_completions_stream(
                             if should_defer_reasoning_stream_delta(&current_text) {
                                 continue;
                             }
-                            let parsed = parse_reasoning_response(&current_text);
+                            let parsed = if started_in_think {
+                                parse_reasoning_response_started_in_think(&current_text)
+                            } else {
+                                parse_reasoning_response(&current_text)
+                            };
                             let full_reasoning = parsed.reasoning.as_deref().unwrap_or("");
                             let reasoning_delta =
                                 stream_text_delta(full_reasoning, &mut sent_reasoning_len);
@@ -1027,7 +1034,11 @@ async fn handle_chat_completions_stream(
 
                     if chunk.finish_reason.is_some() {
                         let usage = chunk.usage.as_ref().map(openai_usage_from_token_usage);
-                        let mut parsed_final = parse_reasoning_response(&current_text);
+                        let mut parsed_final = if started_in_think {
+                            parse_reasoning_response_started_in_think(&current_text)
+                        } else {
+                            parse_reasoning_response(&current_text)
+                        };
                         parsed_final.content = normalize_structured_response_content(
                             &openai_request,
                             &parsed_final.content,
@@ -1239,6 +1250,8 @@ async fn handle_chat_completions_sync(
             }
             _ => None,
         });
+    // R1-distill-style templates open the think block inside the prompt.
+    let started_in_think = has_unclosed_thinking_block(&inference_request.prompt);
     match engine.infer(inference_request).await {
         Ok(output) => {
             let InferenceResponse {
@@ -1268,7 +1281,11 @@ async fn handle_chat_completions_sync(
             };
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
             let content = strip_after_stop(&after_fence, &stop_sequences);
-            let parsed = parse_reasoning_response(&content);
+            let parsed = if started_in_think {
+                parse_reasoning_response_started_in_think(&content)
+            } else {
+                parse_reasoning_response(&content)
+            };
             let visible_content =
                 normalize_structured_response_content(&openai_request, &parsed.content);
             let mut message = ChatMessage {
@@ -1767,6 +1784,31 @@ fn stream_text_delta(text: &str, sent_len: &mut usize) -> String {
 struct ParsedReasoningResponse {
     content: String,
     reasoning: Option<String>,
+}
+
+/// Parse generated text whose think block was OPENED BY THE PROMPT —
+/// R1-distill-style templates append `<think>\n` to the rendered prompt,
+/// so the generation never contains the start tag. Without this, the
+/// in-flight thinking streams as content deltas until `</think>` arrives.
+fn parse_reasoning_response_started_in_think(text: &str) -> ParsedReasoningResponse {
+    if text.contains(THINK_START_TAG) {
+        // Model re-opened a think block itself — defer to the normal parse.
+        return parse_reasoning_response(text);
+    }
+    let Some(end) = text.find(THINK_END_TAG) else {
+        return ParsedReasoningResponse {
+            content: String::new(),
+            reasoning: (!text.is_empty()).then(|| text.to_string()),
+        };
+    };
+    let reasoning = text[..end].to_string();
+    let content = text[end + THINK_END_TAG.len()..]
+        .trim_start_matches(['\r', '\n'])
+        .to_string();
+    ParsedReasoningResponse {
+        content,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
+    }
 }
 
 fn parse_reasoning_response(text: &str) -> ParsedReasoningResponse {
@@ -5660,6 +5702,25 @@ mod tests {
         assert_eq!(completion.status(), AxumStatusCode::OK);
         let completion_body = response_json(completion).await;
         assert_eq!(completion_body["choices"][0]["text"], "done");
+    }
+
+    #[test]
+    fn started_in_think_parse_streams_reasoning_before_end_tag() {
+        // R1-distill templates open `<think>` inside the prompt, so the
+        // generated text never contains the start tag. Mid-think text must
+        // be reasoning, not content (this leaked as content deltas before).
+        let parsed = parse_reasoning_response_started_in_think("Okay, the user wants");
+        assert_eq!(parsed.reasoning.as_deref(), Some("Okay, the user wants"));
+        assert_eq!(parsed.content, "");
+
+        let parsed = parse_reasoning_response_started_in_think("thinking...</think>\nanswer");
+        assert_eq!(parsed.reasoning.as_deref(), Some("thinking..."));
+        assert_eq!(parsed.content, "answer");
+
+        // Model re-opening its own think block defers to the normal parse.
+        let parsed = parse_reasoning_response_started_in_think("<think>\nx\n</think>\n\nanswer");
+        assert_eq!(parsed.reasoning.as_deref(), Some("\nx\n"));
+        assert_eq!(parsed.content, "answer");
     }
 
     #[tokio::test]

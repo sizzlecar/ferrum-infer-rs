@@ -1,0 +1,5 @@
+<s>[INST]Q1[/INST]<think>
+reasoning here
+</think>
+
+Answer1</s>[INST]Q2[/INST]

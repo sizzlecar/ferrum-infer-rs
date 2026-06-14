@@ -1,0 +1,64 @@
+Q: What is the capital of France?
+A: The capital of France is **Paris**.
+match=True
+---
+Q: What is 6 times 7?
+A: 6 times 7 is 42.
+match=True
+---
+Q: What color is the sky on a clear day?
+A: This is a classic question! The sky on a clear day is **blue**.
+
+However, it's important to note that this is a bit of a trick! The color we perceive is actually a combination of several things:
+
+*
+match=True
+---
+Q: How many days are in a week?
+A: There are 7 days in a week. 😊 
+
+That’s a pretty fundamental fact!
+match=True
+---
+Q: What is the largest planet in our solar system?
+A: The largest planet in our solar system is **Jupiter**.
+
+Here's a breakdown of why:
+
+*   **Mass:** Jupiter has a mass about 318 times that of all the other planets combined.
+*   **
+match=True
+---
+Q: What gas do plants absorb from the air?
+A: Plants absorb a fascinating array of gases from the air! Here's a breakdown of the key ones they absorb and how they benefit them:
+
+**1. Carbon Dioxide (CO2):**
+
+* **Why it's important:**
+match=True
+---
+Q: Who wrote Romeo and Juliet?
+A: The author of Romeo and Juliet is **William Shakespeare**. 
+
+He wrote the play in 1594. 
+
+While it's a collaborative work, Shakespeare is widely credited as the primary author of the story.
+match=True
+---
+Q: What is the boiling point of water in Celsius?
+A: The boiling point of water is 100 degrees Celsius.
+
+However, it’s important to note that this is the boiling point at standard atmospheric pressure.  At higher altitudes, where the atmospheric pressure is lower, the boiling point
+match=True
+---
+Q: How many legs does a spider have?
+A: Spiders have **eight** legs! 
+
+It’s a common misconception that they have six legs, but that’s incorrect. They have a unique body plan with eight legs arranged in pairs. 😊
+match=True
+---
+Q: What is the chemical symbol for gold?
+A: The chemical symbol for gold is **Au**.
+match=True
+---
+known-answer: 10/10 (gemma3-1b Q4_K_M, Metal GGUF lane)
