@@ -1,0 +1,30 @@
+layer_25.bin   skipped (HF stores it post-final-norm; logits cover it)
+embed.bin      n=    17280 max_abs=0.046875 mean_abs=0.00095499 peak=25.250 thr=0.394531
+layer_00.bin   n=    17280 max_abs=1.478378 mean_abs=0.00998727 peak=1552.429 thr=24.256704
+layer_01.bin   n=    17280 max_abs=1.996338 mean_abs=0.01519606 peak=1529.996 thr=23.906193
+layer_02.bin   n=    17280 max_abs=6.282715 mean_abs=0.02095766 peak=2432.000 thr=38.000000
+layer_03.bin   n=    17280 max_abs=7.938721 mean_abs=0.03018034 peak=5920.000 thr=92.500000
+layer_04.bin   n=    17280 max_abs=57.046875 mean_abs=0.04206073 peak=11392.000 thr=178.000000
+layer_05.bin   n=    17280 max_abs=11.127930 mean_abs=0.05193141 peak=15232.000 thr=238.000000
+layer_06.bin   n=    17280 max_abs=38.257812 mean_abs=0.06540477 peak=20006.258 thr=312.597778
+layer_07.bin   n=    17280 max_abs=55.312500 mean_abs=0.08375245 peak=26679.312 thr=416.864258
+layer_08.bin   n=    17280 max_abs=67.123047 mean_abs=0.10276777 peak=31171.123 thr=487.048798
+layer_09.bin   n=    17280 max_abs=21.549805 mean_abs=0.12695685 peak=37397.121 thr=584.330017
+layer_10.bin   n=    17280 max_abs=131.792969 mean_abs=0.14810053 peak=41091.793 thr=642.059265
+layer_11.bin   n=    17280 max_abs=42.765625 mean_abs=0.18277786 peak=45824.000 thr=716.000000
+layer_12.bin   n=    17280 max_abs=51.765625 mean_abs=0.22186990 peak=49664.000 thr=776.000000
+layer_13.bin   n=    17280 max_abs=88.166016 mean_abs=0.30281881 peak=52001.711 thr=812.526733
+layer_14.bin   n=    17280 max_abs=81.679688 mean_abs=0.39667307 peak=54016.000 thr=844.000000
+layer_15.bin   n=    17280 max_abs=259.574219 mean_abs=0.52700832 peak=55296.000 thr=864.000000
+layer_16.bin   n=    17280 max_abs=101.902344 mean_abs=0.61752059 peak=57088.000 thr=892.000000
+layer_17.bin   n=    17280 max_abs=75.773438 mean_abs=0.81407893 peak=58696.637 thr=917.134949
+layer_18.bin   n=    17280 max_abs=79.080566 mean_abs=0.96332425 peak=59204.148 thr=925.064819
+layer_19.bin   n=    17280 max_abs=269.527344 mean_abs=1.15078188 peak=59917.527 thr=936.211365
+layer_20.bin   n=    17280 max_abs=87.684570 mean_abs=1.42406250 peak=58430.906 thr=912.982910
+layer_21.bin   n=    17280 max_abs=110.225586 mean_abs=1.69046605 peak=58880.000 thr=920.000000
+layer_22.bin   n=    17280 max_abs=123.579102 mean_abs=2.09374498 peak=61039.957 thr=953.749329
+layer_23.bin   n=    17280 max_abs=142.946289 mean_abs=2.48899097 peak=55040.000 thr=860.000000
+layer_24.bin   n=    17280 max_abs=184.585938 mean_abs=2.97900175 peak=46336.000 thr=724.000000
+logits.bin     n=   262144 max_abs=0.557136 mean_abs=0.09010427 peak=39.750 thr=0.621094
+argmax: hf=818 ferrum=818 MATCH
+L1 DUMP COMPARE PASS

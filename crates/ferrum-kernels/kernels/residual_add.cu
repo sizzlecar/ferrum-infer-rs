@@ -28,6 +28,17 @@ extern "C" __global__ void residual_add_inplace_f16(
     }
 }
 
+extern "C" __global__ void residual_add_inplace_f32(
+    float* __restrict__ a,
+    const float* __restrict__ b,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        a[idx] += b[idx];
+    }
+}
+
 extern "C" __global__ void residual_add_f32(
     const float* __restrict__ a,
     const float* __restrict__ b,

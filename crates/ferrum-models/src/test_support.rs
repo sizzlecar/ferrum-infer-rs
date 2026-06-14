@@ -76,6 +76,7 @@ impl TinyLlamaConfig {
             rope_interleaved: false,
             has_qk_norm: false,
             sliding_window: 0,
+            ..Default::default()
         }
     }
 }

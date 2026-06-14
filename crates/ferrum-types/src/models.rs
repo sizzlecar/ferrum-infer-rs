@@ -316,7 +316,9 @@ pub enum NormType {
 pub enum Activation {
     /// Gaussian Error Linear Unit
     GELU,
-    /// Sigmoid Linear Unit  
+    /// GELU tanh approximation (HF `gelu_pytorch_tanh`, Gemma family)
+    GeluTanh,
+    /// Sigmoid Linear Unit
     SiLU,
     /// Rectified Linear Unit
     ReLU,

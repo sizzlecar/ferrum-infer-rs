@@ -1,0 +1,7 @@
+{
+  "model_id": "unsloth/Meta-Llama-3.1-8B-Instruct",
+  "bos_token": "<|begin_of_text|>",
+  "eos_token": "<|eot_id|>",
+  "render_kwargs": {},
+  "transformers_version": "5.11.0"
+}

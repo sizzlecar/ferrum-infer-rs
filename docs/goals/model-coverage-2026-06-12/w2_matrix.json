@@ -1,0 +1,76 @@
+{
+  "goal": "MODEL_COVERAGE_W2",
+  "goal_doc": "docs/goals/model-coverage-2026-06-12/GOAL.md",
+  "cell_legend": {
+    "statuses": [
+      "pass",
+      "fail",
+      "pending",
+      "waived"
+    ],
+    "rule": "Every cell must be pass, or waived with a reason that cites a GOAL.md amendment or recorded constraint. Artifacts are repo-relative paths and must exist.",
+    "cells": {
+      "l0_template": "golden byte-equal vs transformers (Gemma3 cases incl. system folding) + EOS/BOS from generation_config",
+      "l1_bf16": "new-family rule: Mac/CPU per-layer dump vs HF locates zero structural divergence + greedy byte-equal N>=20 on the code-path representative (gemma3-1b)",
+      "l2_gguf_metal": "GGUF known-answer smoke N>=10 on Metal, semantic answers correct",
+      "l2_gptq_cuda": "GPTQ known-answer smoke N>=10 on CUDA, semantic answers correct",
+      "l3_behavior": "smoke ladder mechanics on CUDA serve (stop/max_tokens/stream==non-stream/multi-turn)",
+      "l4_agent": "tools 10/10 + strict json_schema 20/20, temp 0",
+      "l5_concurrency": "bench-serve random 256/128 c=1/4/16/32, 100% completion zero errors",
+      "perf_vs_llamacpp": "same-card same-quant decode throughput >= 0.5x llama.cpp; 0.5-0.8x recorded as known-gap (non-blocking)"
+    }
+  },
+  "models": [
+    {
+      "id": "gemma3-27b",
+      "aliases": [
+        "gemma3:27b",
+        "gemma3:27b-gptq"
+      ],
+      "family": "Gemma3 (5:1 SWA, dual rope, GeGLU, sandwich norms)",
+      "representative_l1": "gemma3:1b (unsloth/gemma-3-1b-it)",
+      "cells": {
+        "l0_template": {
+          "status": "pass",
+          "artifact": "crates/ferrum-server/tests/fixtures/chat_template/unsloth__gemma-3-1b-it",
+          "note": "chat_template_golden green: single/system/multi_turn/think_history byte-equal (template shared across gemma3 sizes); Gemma has no native tools block — tools cases covered by L4 generic injection"
+        },
+        "l1_bf16": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/gemma3_l1",
+          "note": "dump compare PASS both CPU and Metal lanes (25/26 layers in bf16 thresholds, logits argmax match); greedy 18/20 byte-equal + 2 tie-flips at HF top1-top2 gap 0.25 (one bf16 ulp, amendment #3 methodology). Metal needed flash_attn acc[8] + gelu_tanh clamp fixes, pinned by gemma3_metal_ops_test"
+        },
+        "l2_gguf_metal": {
+          "status": "waived",
+          "reason": "27B Q4_K_M (~16.5GB weights) is impractical on the degraded 32GB Mac (W1 precedent: 32B-dense Metal cells, compressor-residue machine state, user-confirmed no reboot). The GGUF lane itself is proven on the same arch: gemma3-1b Q4_K_M Metal known-answer 10/10 with arch-aware tensor mapping, pre-baked (1+w) handling, q_scalar block-rule.",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/gemma3_l2_gguf/known_answer_1b_q4km_metal.log"
+        },
+        "l2_gptq_cuda": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log",
+          "note": "2026-06-13 1x4090 Iceland host 1647 native CUDA run after Gemma3 host/F32 residual-shadow fix: logits and layer dumps finite, known-answer 10/10, smoke PASS."
+        },
+        "l3_behavior": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log",
+          "note": "same smoke: natural EOS, multi-turn Bob recall, stream==non-stream, custom stop finish_reason/leak checks, and max_tokens behavior all pass."
+        },
+        "l4_agent": {
+          "status": "pass",
+          "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log",
+          "note": "same smoke: required tool-call 10/10 and strict json_schema 20/20 at temp 0."
+                },
+                "l5_concurrency": {
+                    "status": "pass",
+                    "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/l5_gemma3-27b-gptq_cuda.json",
+                    "note": "c=1/4/16 completed 100/100/100 with zero errors and usage token counts in artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/l5_gemma3-27b-gptq_cuda_1_4_16.json. c=32 kept client concurrency at 32 and used typed product CLI --max-num-seqs 16 with --kv-capacity 400; full gate completed three repeats with completed_per_run=[100,100,100], errored_per_run=[0,0,0], output_token_count_source=usage, and no server OOM/panic. Diagnostic history is retained in artifacts/w2_c32_admission_cap_diagnostics_2026-06-14: caps 31 and 30 still OOMed at the same 804864-element fp16 KV allocation, so the accepted product contract is client c=32 with active admission cap 16, not hidden env."
+                },
+                "perf_vs_llamacpp": {
+                    "status": "pass",
+                    "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/ratio.txt",
+                    "note": "same-card comparison on Vast 40826362 / RTX 4090: Ferrum c=1 decode 25.252275 tok/s vs llama.cpp tg128 50.478285 tok/s on Gemma3 27B Q4_K_M GGUF with CUDA n_gpu_layers=999; ratio 0.500260 PASS. This is just above the 0.5x floor and should be recorded as a known-gap, not a performance-ready claim."
+                }
+      }
+    }
+  ]
+}

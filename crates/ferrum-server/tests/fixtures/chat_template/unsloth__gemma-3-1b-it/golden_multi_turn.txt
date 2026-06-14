@@ -1,0 +1,7 @@
+<bos><start_of_turn>user
+A<end_of_turn>
+<start_of_turn>model
+B<end_of_turn>
+<start_of_turn>user
+C<end_of_turn>
+<start_of_turn>model

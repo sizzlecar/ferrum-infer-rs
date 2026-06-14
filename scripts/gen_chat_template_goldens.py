@@ -85,9 +85,35 @@ def template_supports_tools(template: str) -> bool:
     return re.search(r"(?<![A-Za-z0-9_])tools(?![A-Za-z0-9_])", template) is not None
 
 
+def pin_strftime_now() -> str:
+    """Freeze the `strftime_now` clock transformers exposes to templates.
+
+    Mistral-Small-3.2 / Llama-3.x date their system prompts; goldens only
+    stay byte-reproducible if generation and the Rust test agree on "now".
+    The pinned value is recorded in meta.json and replayed via
+    `ChatTemplateOptions::now_override`.
+    """
+    import datetime as _dt
+
+    import transformers.utils.chat_template_utils as _ctu
+
+    pinned = _dt.datetime(2026, 6, 12, 0, 0, 0)
+
+    class _FixedDatetime(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003 - signature parity
+            return pinned
+
+    # `strftime_now` is a closure resolving `datetime` from this module's
+    # globals at call time, so patching the module attribute is enough.
+    _ctu.datetime = _FixedDatetime
+    return pinned.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def main() -> None:
     from transformers import AutoTokenizer
 
+    pinned_now = pin_strftime_now()
     models = sys.argv[1:] or DEFAULT_MODELS
     for model_id in models:
         slug = model_id.replace("/", "__")
@@ -144,6 +170,7 @@ def main() -> None:
             "bos_token": tok.bos_token,
             "eos_token": tok.eos_token,
             "render_kwargs": kwargs,
+            "now": pinned_now,
             "transformers_version": __import__("transformers").__version__,
         }
         (out_dir / "meta.json").write_text(

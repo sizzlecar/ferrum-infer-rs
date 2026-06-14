@@ -52,3 +52,6 @@ bench_results/
 ferrum.toml
 crates/*/ferrum.toml
 docs/goals/test-architecture-2026-06-10/evidence/l1-metal-run/*.log
+
+# Large per-layer diagnostic dumps; keep summarized json/log artifacts instead.
+docs/goals/model-coverage-2026-06-12/artifacts/**/*.bin

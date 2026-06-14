@@ -548,6 +548,56 @@ unsafe impl DeviceRepr for FlashAttnParams {}
 
 pub struct CudaBackend;
 
+thread_local! {
+    static CUDA_ALLOC_LABELS: std::cell::RefCell<Vec<&'static str>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+#[must_use]
+pub struct CudaAllocLabelGuard;
+
+pub fn push_alloc_label(label: &'static str) -> CudaAllocLabelGuard {
+    CUDA_ALLOC_LABELS.with(|labels| labels.borrow_mut().push(label));
+    CudaAllocLabelGuard
+}
+
+impl Drop for CudaAllocLabelGuard {
+    fn drop(&mut self) {
+        CUDA_ALLOC_LABELS.with(|labels| {
+            labels.borrow_mut().pop();
+        });
+    }
+}
+
+fn current_cuda_alloc_label() -> String {
+    CUDA_ALLOC_LABELS.with(|labels| {
+        let labels = labels.borrow();
+        if labels.is_empty() {
+            "label=<none>".to_string()
+        } else {
+            format!("label={}", labels.join(">"))
+        }
+    })
+}
+
+fn cuda_alloc_failed(
+    op: &str,
+    dtype: crate::backend::Dtype,
+    n: usize,
+    elem_bytes: usize,
+    err: impl std::fmt::Debug,
+) -> ! {
+    let bytes = n.saturating_mul(elem_bytes);
+    let mem_info = cudarc::driver::result::mem_get_info()
+        .map(|(free, total)| format!("free={free} total={total}"))
+        .unwrap_or_else(|mem_err| format!("mem_get_info_failed={mem_err:?}"));
+    let alloc_label = current_cuda_alloc_label();
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    panic!(
+        "{op} failed: dtype={dtype:?} elements={n} bytes={bytes} {mem_info} {alloc_label}: {err:?}\n{backtrace}"
+    );
+}
+
 impl Backend for CudaBackend {
     // Phase B-2: typed-buffer migration. `CudaBuf` is an enum over
     // `CudaSlice<{f16,f32,u32,i32,i8}>` — Phase B-1 added the wrapper,
@@ -643,31 +693,56 @@ impl Backend for CudaBackend {
         use crate::backend::{CudaBuf, Dtype};
         let n = n.max(1);
         with_stream(|stream| match dtype {
-            Dtype::F32 => CudaBuf::from_f32(
-                stream
-                    .alloc_zeros::<f32>(n)
-                    .expect("CudaBackend::alloc_typed: alloc_zeros<f32>"),
-            ),
-            Dtype::F16 => CudaBuf::from_f16(
-                stream
-                    .alloc_zeros::<f16>(n)
-                    .expect("CudaBackend::alloc_typed: alloc_zeros<f16>"),
-            ),
-            Dtype::U32 => CudaBuf::from_u32(
-                stream
-                    .alloc_zeros::<u32>(n)
-                    .expect("CudaBackend::alloc_typed: alloc_zeros<u32>"),
-            ),
-            Dtype::I32 => CudaBuf::from_i32(
-                stream
-                    .alloc_zeros::<i32>(n)
-                    .expect("CudaBackend::alloc_typed: alloc_zeros<i32>"),
-            ),
-            Dtype::I8 => CudaBuf::from_i8(
-                stream
-                    .alloc_zeros::<i8>(n)
-                    .expect("CudaBackend::alloc_typed: alloc_zeros<i8>"),
-            ),
+            Dtype::F32 => match stream.alloc_zeros::<f32>(n) {
+                Ok(buf) => CudaBuf::from_f32(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc_typed alloc_zeros",
+                    dtype,
+                    n,
+                    std::mem::size_of::<f32>(),
+                    err,
+                ),
+            },
+            Dtype::F16 => match stream.alloc_zeros::<f16>(n) {
+                Ok(buf) => CudaBuf::from_f16(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc_typed alloc_zeros",
+                    dtype,
+                    n,
+                    std::mem::size_of::<f16>(),
+                    err,
+                ),
+            },
+            Dtype::U32 => match stream.alloc_zeros::<u32>(n) {
+                Ok(buf) => CudaBuf::from_u32(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc_typed alloc_zeros",
+                    dtype,
+                    n,
+                    std::mem::size_of::<u32>(),
+                    err,
+                ),
+            },
+            Dtype::I32 => match stream.alloc_zeros::<i32>(n) {
+                Ok(buf) => CudaBuf::from_i32(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc_typed alloc_zeros",
+                    dtype,
+                    n,
+                    std::mem::size_of::<i32>(),
+                    err,
+                ),
+            },
+            Dtype::I8 => match stream.alloc_zeros::<i8>(n) {
+                Ok(buf) => CudaBuf::from_i8(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc_typed alloc_zeros",
+                    dtype,
+                    n,
+                    std::mem::size_of::<i8>(),
+                    err,
+                ),
+            },
         })
     }
 
@@ -770,9 +845,17 @@ impl Backend for CudaBackend {
 
     fn alloc(len: usize) -> Self::Buffer {
         with_stream(|stream| {
-            crate::backend::CudaBuf::from_f16(
-                unsafe { stream.alloc::<f16>(len) }.expect("cuda alloc"),
-            )
+            let len = len.max(1);
+            match unsafe { stream.alloc::<f16>(len) } {
+                Ok(buf) => crate::backend::CudaBuf::from_f16(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc",
+                    crate::backend::Dtype::F16,
+                    len,
+                    std::mem::size_of::<f16>(),
+                    err,
+                ),
+            }
         })
     }
 
@@ -787,24 +870,53 @@ impl Backend for CudaBackend {
         if data.is_empty() {
             return;
         }
-        let host: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
-        let mut dst_view = dst.as_f16_mut().slice_mut(0..data.len());
-        ctx.stream
-            .memcpy_htod(&host, &mut dst_view)
-            .expect("cuda write_f32_to_activation");
+        match dst.dtype() {
+            crate::backend::Dtype::F16 => {
+                let host: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
+                let mut dst_view = dst.as_f16_mut().slice_mut(0..data.len());
+                ctx.stream
+                    .memcpy_htod(&host, &mut dst_view)
+                    .expect("cuda write_f32_to_activation f16");
+            }
+            crate::backend::Dtype::F32 => {
+                let mut dst_view = dst.as_f32_mut().slice_mut(0..data.len());
+                ctx.stream
+                    .memcpy_htod(data, &mut dst_view)
+                    .expect("cuda write_f32_to_activation f32");
+            }
+            other => panic!(
+                "CudaBackend::write_f32_to_activation unsupported dtype {}",
+                other.name()
+            ),
+        }
     }
 
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
         with_stream(|stream| {
-            let mut host = vec![f16::ZERO; len];
             // cudarc asserts host.len() >= buf.len() — but we may want a
             // PARTIAL read (len < buf capacity), e.g. reading only 4 rows
             // out of a batch_logits buffer sized for max_batch. Slice the
             // device buffer so its reported length matches `len`.
-            let view = buf.as_f16().slice(0..len);
-            stream.memcpy_dtoh(&view, &mut host).expect("cuda dtoh");
-            stream.synchronize().expect("cuda dtoh sync");
-            host.into_iter().map(|x| x.to_f32()).collect()
+            match buf.dtype() {
+                crate::backend::Dtype::F16 => {
+                    let mut host = vec![f16::ZERO; len];
+                    let view = buf.as_f16().slice(0..len);
+                    stream.memcpy_dtoh(&view, &mut host).expect("cuda dtoh f16");
+                    stream.synchronize().expect("cuda dtoh sync");
+                    host.into_iter().map(|x| x.to_f32()).collect()
+                }
+                crate::backend::Dtype::F32 => {
+                    let mut host = vec![0.0f32; len];
+                    let view = buf.as_f32().slice(0..len);
+                    stream.memcpy_dtoh(&view, &mut host).expect("cuda dtoh f32");
+                    stream.synchronize().expect("cuda dtoh sync");
+                    host
+                }
+                other => panic!(
+                    "CudaBackend::to_vec unsupported dtype {} (expected F16 or F32)",
+                    other.name()
+                ),
+            }
         })
     }
 
@@ -1335,6 +1447,65 @@ impl Backend for CudaBackend {
         .expect("fused_silu_mul_split launch");
     }
 
+    fn scale_inplace(ctx: &mut Self::Context, buf: &mut Self::Buffer, scale: f32, len: usize) {
+        // The trait's host-roundtrip default would rebuild the buffer via
+        // from_slice (F32) and silently flip the CUDA lane's f16 dtype —
+        // every downstream kernel then misreads the residual. Keep it
+        // on-device and typed.
+        let func = ctx.func("fused_silu_mul", ptx::FUSED_SILU_MUL, "scale_inplace_f16");
+        let n_i32 = len as i32;
+        let block = 256u32;
+        let grid = ((len as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(buf);
+        b.arg(&scale);
+        b.arg(&n_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("scale_inplace launch");
+    }
+
+    fn fused_gelu_tanh_mul_split(
+        ctx: &mut Self::Context,
+        gate_up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        im: usize,
+    ) {
+        // GeGLU (Gemma family): same interleaved [tokens, 2*im] layout as
+        // the SiLU variant, gelu_pytorch_tanh activation.
+        let func = ctx.func(
+            "fused_silu_mul",
+            ptx::FUSED_SILU_MUL,
+            "fused_gelu_tanh_mul_interleaved_f16",
+        );
+        let im_i32 = im as i32;
+        let total = tokens * im;
+        let total_i32 = total as i32;
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(gate_up);
+        b.arg(out);
+        b.arg(&im_i32);
+        b.arg(&total_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .expect("fused_gelu_tanh_mul_split launch");
+    }
+
     fn kv_cache_append_batched_per_cache(
         ctx: &mut Self::Context,
         caches: &[&Self::Buffer],
@@ -1854,11 +2025,24 @@ impl Backend for CudaBackend {
     ) {
         // In-place variant avoids the Rust borrow conflict of aliasing
         // `residual` as both read and write in a single kernel call.
-        let func = ctx.func(
-            "residual_add",
-            ptx::RESIDUAL_ADD,
-            "residual_add_inplace_f16",
+        let residual_dtype = residual.dtype();
+        let x_dtype = x.dtype();
+        assert_eq!(
+            residual_dtype,
+            x_dtype,
+            "CudaBackend::add_inplace dtype mismatch: residual={} x={}",
+            residual_dtype.name(),
+            x_dtype.name()
         );
+        let fn_name = match residual_dtype {
+            crate::backend::Dtype::F16 => "residual_add_inplace_f16",
+            crate::backend::Dtype::F32 => "residual_add_inplace_f32",
+            other => panic!(
+                "CudaBackend::add_inplace unsupported dtype {}",
+                other.name()
+            ),
+        };
+        let func = ctx.func("residual_add", ptx::RESIDUAL_ADD, fn_name);
         let n_i32 = len as i32;
         let block = 256u32;
         let grid = ((len as u32) + block - 1) / block;

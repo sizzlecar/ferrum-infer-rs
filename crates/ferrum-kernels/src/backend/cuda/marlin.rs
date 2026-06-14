@@ -247,6 +247,42 @@ pub fn marlin_gemm(
     let n = weight.n as i32;
     let k = weight.k as i32;
 
+    // Layers with n % 256 != 0 (e.g. a quantized 2048x128 MoE router or a
+    // 151936-wide lm_head from repacked repos) only have valid kernel
+    // instantiations for the small-m 128x128 tile (THREAD_M_BLOCKS == 1,
+    // i.e. m <= 16); the m > 16 auto-config picks 64x256 tiles and the
+    // kernel rejects the shape. Split such GEMMs into m <= 16 chunks —
+    // a handful of extra ~5us launches on at most two tiny/tall layers.
+    if n % 256 != 0 && m > 16 {
+        let mut row = 0usize;
+        while row < m as usize {
+            let chunk = (m as usize - row).min(16);
+            let a_view = input.slice(row * weight.k..(row + chunk) * weight.k);
+            let mut c_view = output.slice_mut(row * weight.n..(row + chunk) * weight.n);
+            marlin_gemm_chunk(stream, &a_view, weight, &mut c_view, chunk as i32)?;
+            row += chunk;
+        }
+        return Ok(());
+    }
+    marlin_gemm_chunk(
+        stream,
+        &input.slice(..),
+        weight,
+        &mut output.slice_mut(..),
+        m,
+    )
+}
+
+fn marlin_gemm_chunk(
+    stream: &Arc<CudaStream>,
+    input: &cudarc::driver::CudaView<'_, half::f16>,
+    weight: &MarlinWeight,
+    output: &mut cudarc::driver::CudaViewMut<'_, half::f16>,
+    m: i32,
+) -> candle_core::Result<()> {
+    let n = weight.n as i32;
+    let k = weight.k as i32;
+
     let raw_stream = stream.cu_stream();
 
     // Zero workspace on the runner's stream — Marlin uses it as mutex locks.

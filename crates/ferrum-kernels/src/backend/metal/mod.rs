@@ -777,6 +777,29 @@ impl Backend for MetalBackend {
         st().pipes.silu_mul_split_enc(enc, gu, out, tokens, im);
     }
 
+    fn fused_gelu_tanh_mul_split(
+        ctx: &mut Self::Context,
+        gu: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        im: usize,
+    ) {
+        let gu = gu.expect_f32("fused_gelu_tanh_mul_split gate_up");
+        let out = out.expect_f32_mut("fused_gelu_tanh_mul_split out");
+        let enc = ctx.compute_encoder();
+        st().pipes.gelu_tanh_mul_split_enc(enc, gu, out, tokens, im);
+    }
+
+    fn scale_inplace(ctx: &mut Self::Context, buf: &mut Self::Buffer, scale: f32, len: usize) {
+        // mul_scale with scale_len=1 broadcasts a scalar; in/out aliasing is
+        // safe for the 1:1 elementwise kernel.
+        let scale_buf = Self::from_slice(&[scale]);
+        let scale_mb = scale_buf.expect_f32("scale_inplace scale");
+        let buf = buf.expect_f32_mut("scale_inplace buf");
+        let enc = ctx.compute_encoder();
+        st().pipes.mul_scale_enc(enc, buf, scale_mb, buf, len, 1);
+    }
+
     fn qk_norm_rope(
         ctx: &mut Self::Context,
         input: &Self::Buffer,

@@ -2,6 +2,1258 @@
 
 进度日志,倒序。
 
+## 2026-06-14(早 VI)— W2 L5/perf 打通:客户端 c=32 + admission cap 16 PASS
+
+- 继续复用 stopped/cache-retained native CUDA instance `40826362`,没有重新租
+  pod 或重装环境。全部验证结束后已复制 artifact 并停机,Vast API 确认
+  `cur_state=stopped`,`actual_status=exited`。
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/`。
+- L5 c=32 最终产品合同:
+  - 客户端并发仍是 W2 要求的 `bench-serve --concurrency-sweep 32`;
+  - 服务端使用 typed product CLI `--max-num-seqs 16 --kv-capacity 400`;
+  - 这是产品入口参数,不是隐藏 env。health/auto_config 记录
+    `selected_admission_limit=16`。
+- 先跑小探针 `num_prompts=32,n_repeats=1`:32/32 completed,0 errored,
+  throughput 24.9 tok/s。随后跑正式门:
+  `num_prompts=100,n_repeats=3,--fail-on-error,--require-ci,--seed 9271`。
+- 正式 c=32 结果:
+  - repeat 1:`100 completed / 0 errored / 521.3s`
+  - repeat 2:`100 completed / 0 errored / 515.1s`
+  - repeat 3:`100 completed / 0 errored / 514.0s`
+  - JSON: `full/full/l5_gemma3-27b-gptq_cuda_c32_admission16.json`;
+  - merged L5 JSON:
+    `l5_gemma3-27b-gptq_cuda.json`,覆盖 c=1/4/16/32。
+- llama.cpp same-card perf:
+  - 远端缺 `llama-bench` binary,保留源码/缓存;为避免全架构 CUDA 编译浪费,
+    中断了误启动的全架构 build,重新配置 `build-sm89` 只编译
+    `CMAKE_CUDA_ARCHITECTURES=89`;
+  - 命令:`llama-bench -m <Gemma3-27B-Q4_K_M.gguf> -ngl 999 -p 0 -n 128 -r 3 -o json`;
+  - llama.cpp tg128:50.478285 tok/s;
+  - Ferrum c=1 decode:25.252275 tok/s;
+  - ratio:0.500260 PASS,刚过 0.5 floor,应记录为 known-gap,不是性能优化完成声明。
+- 当前结论:
+  - W2 矩阵 8/8 可满足;待 validator exact PASS 作为最终 W2 完成证据。
+  - W3 仍只交付立项合同,不在本目标内宣称 W3 完成。
+
+## 2026-06-14(凌晨 V)— W2 c=32 admission cap 31/30 验证:排队不足以解除 24GB OOM
+
+- 按用户建议继续复用 stopped/cache-retained native CUDA instance
+  `40826362`,没有重新开机器或重装环境。验证/诊断完成后已复制 artifact 并停机,
+  Vast API 确认 `cur_state=stopped`,`actual_status=exited`。
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission_cap_diagnostics_2026-06-14/`。
+- 产品路径 admission-cap 复测:
+  - 客户端仍保持 W2 L5 要求的 `bench-serve random 256/128 c=32`
+    三轮命令形态;
+  - 服务端分别使用 typed CLI 参数 `--max-num-seqs 31` 和
+    `--max-num-seqs 30`,并保持 `--kv-capacity 400`;
+  - 两轮均 health 第 60 秒通过,进入
+    `closed_loop c=32 — repeat 1/3`,随后 OOM。
+- 两个 cap 的 OOM 同形:
+  `CudaBackend::alloc failed: dtype=F16 elements=804864 bytes=1609728 free=17498112 total=25278087168`.
+  也就是 unified product-path KV hint 已把单 cache 物理容量降到
+  `393 * 16 * 128`,但 24GB 总显存仍不足。
+- 附加 scheduler 诊断(非 PASS 证据):开启 `FERRUM_SCHED_NONE_PROF=1`
+  做短 c=32 trace,拿到第一条
+  `[sched-some] n=0 returning_batch=4 | decode_queue=0 prefill_queue=6 waiting_queue=0`,
+  说明首个 iteration 不是直接一次性塞满 30/32 个请求;当前 blocker 更像是
+  活跃请求累计 + Gemma3-27B fp16 contiguous KV 生命周期/总峰值问题,不是简单的
+  首批 admission 数过大。
+- 当前结论:
+  - W2 仍不是 PASS。矩阵保持 l0/l1/l2_gptq/l3/l4 pass,
+    l2_gguf waived,l5_concurrency fail,perf_vs_llamacpp pending。
+  - `--max-num-seqs 31/30` 不能作为 L5 绕过;继续往下盲调 cap 价值低。
+  - 下一步应在本地先定位 KV 生命周期/释放/复用或 Gemma3 paged-window 结构方案,
+    再用 GPU 做最小验证;否则需要目标合同明确修订 L5。
+
+## 2026-06-14(凌晨 IV)— W2 c=32 KV-hint 产品路径验证:hint 生效但 24GB 仍不足
+
+- 按用户建议继续复用同一台 stopped/cache-retained native CUDA instance
+  `40826362`,没有重新开机器或重装环境。验证结束后已复制 artifact 并停机,
+  Vast API 确认 `cur_state=stopped`,`actual_status=exited`。
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_kv_hint_diagnostics_2026-06-14/`。
+- 代码侧保留的产品路径改动:
+  - engine 在请求 metadata 中写入 `ferrum_kv_capacity_hint`;
+  - `LlmExecutor` 的 `prefill`/`batch_prefill`/`unified_decode` 在 fresh
+    prefill 前调用 `prepare_kv_capacity`;
+  - contiguous fp16 KV 支持按 hint 分配物理容量,逻辑 `kv_capacity`
+    仍用于上下文校验;
+  - hint 使用实际会写入 KV 的上限:`input_tokens + max_tokens - 1`
+    (prefill 后采样出的首 token 不写入 KV)。
+- native CUDA c=32 结果:
+  1. 初版只覆盖 `prefill`/`batch_prefill`,但 W2 serve 走
+     `unified_decode`;c=32 仍按 400 分配并 OOM:
+     `elements=819200 = 400 * 16 * 128`。
+  2. 补上 unified prefill hook 后,hint 生效;失败分配降为
+     `elements=806912 = 394 * 16 * 128`,但仍 OOM。
+  3. 修正 off-by-one 后,失败分配继续降为
+     `elements=804864 = 393 * 16 * 128`,但仍 OOM;OOM 时 `free`
+     仍约 17.5MiB,说明不是 prompt inflation 或 hook 缺失,而是 fp16
+     contiguous KV c=32 峰值在 24GB 4090 上仍压线失败。
+- 当前结论:
+  - W2 仍不是 PASS。矩阵保持 l0/l1/l2_gptq/l3/l4 pass,
+    l2_gguf waived,l5_concurrency fail,perf_vs_llamacpp pending。
+  - `--kv-dtype int8` 已在上一轮证明 correctness 不可接受;不能作为绕过。
+  - 后续若继续推进,需要结构性内存方案(例如可验证的 Gemma3 paged-window
+    支持、正确的 KV quant、或经目标文档批准的 L5 合同调整),不是继续重复
+    同一 c=32 fp16 KV 命令。
+
+### 本轮验证
+
+- Local:
+  - `cargo fmt --all`
+  - `cargo test -q -p ferrum-engine model_decode_metadata_marks_structured_requests_for_full_logits -- --nocapture`
+  - `cargo test -q -p ferrum-models unified_decode_prepares_fresh_prefill_kv_capacity_hint -- --nocapture`
+  - `cargo test -q -p ferrum-models unified_decode_full_logits_prefill_prepares_kv_capacity_hint -- --nocapture`
+  - `cargo test -q -p ferrum-models contiguous_kv_capacity_hint_sizes_physical_cache -- --nocapture`
+  - `cargo check -q -p ferrum-models --tests`
+  - `git diff --check`
+- Remote CUDA:
+  - `kv_hint_c32_initial/build.log`: release CUDA build PASS in 3m26s.
+  - `kv_hint_unified_c32/build.log`: release CUDA build PASS in 3m26s.
+  - `kv_hint_actual_c32/build.log`: release CUDA build PASS in 3m12s.
+
+## 2026-06-14(凌晨 III)— W2 c=32 根因收敛:Gemma3-27B fp16 KV 在 24GB 4090 上无法满足 c=32/400
+
+- 按用户建议继续复用 stopped/cache-retained native CUDA instance `40826362`,
+  未新租机器、未重装环境。全部诊断完成后已复制 artifact 并停机,Vast API
+  确认 `cur_state=stopped`,`actual_status=exited`。
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_kv_allocator_diagnostics_2026-06-14/`。
+- 代码侧做了两个诊断/减峰尝试并本地验证:
+  - CUDA allocator OOM 日志增加 thread-local allocation label;
+  - `batch_logits` 从 prefill scratch 中拆成 lazy grow,避免无谓保留
+    `seq_len * vocab` logits;本地
+    `prefill_scratch_keeps_batch_logits_lazy` PASS。
+- native CUDA c=32 复测结论:
+  1. `kv-capacity=400/max-num-seqs=32` 仍 OOM,失败 allocation
+     `elements=819200 = 400 * 16 kv_heads * 128 head_dim`,确认是
+     Gemma3 contiguous KV cache 单个 K/V layer buffer,不是 scratch/logits。
+  2. `kv-capacity=396` 仍 OOM,失败 allocation
+     `elements=811008 = 396 * 16 * 128`;`kv=384` 已在上一轮证明会
+     context validation fail,所以单靠继续压 KV capacity 不可行。
+  3. prefill scratch 收缩实验仍在同一 KV allocation OOM,已撤回,不作为产品改动保留。
+  4. 短窗口 paged fp16 实验把失败转移为单个 paged pool allocation
+     `elements=26214400`/约 52MiB,仍因 free 约 23MiB OOM;该实验也已撤回。
+  5. `--kv-dtype int8` 能启动 CUDA paged INT8 KV,但 sanity known-answer
+     第一题输出乱码(`'ㄝ Task sera exquisiteFolrbatovski'`),correctness 不可接受,
+     不能作为 W2 L5 绕过方案。
+- 当前结论:
+  - W2 仍不是 PASS。矩阵保持 l0/l1/l2_gptq/l3/l4 pass,
+    l2_gguf waived,l5_concurrency fail,perf_vs_llamacpp pending。
+  - c=32 blocker 已从"未知 OOM"收敛为"Gemma3-27B GPTQ + fp16 KV +
+    c=32/400 在 24GB 4090 上总显存不足";可选后续是结构性 KV 内存方案
+    (正确的 Gemma3 paged-window 支持、可验证的 KV quant correctness,或
+    合同调整),不是继续重跑同一 L5。
+
+### 本轮验证
+
+- Local:
+  - `cargo fmt --all`
+  - `cargo check -q -p ferrum-models --tests`
+  - `cargo check -q -p ferrum-cli --tests`
+  - `cargo test -q -p ferrum-models prefill_scratch_keeps_batch_logits_lazy -- --nocapture`
+  - `git diff --check`
+- Remote CUDA:
+  - `build.log`: release CUDA build PASS in 3m26s.
+  - `build_shrink.log`: release CUDA build PASS in 3m25s (failed experiment, not retained).
+  - `build_paged_window.log`: release CUDA build PASS in 3m24s (failed experiment, not retained).
+
+## 2026-06-14(凌晨 II)— W2 c=32 allocator 诊断:OOM 是整体显存峰值贴满,不是单个大分配
+
+- 继续按 native CUDA 最小验证策略复用 stopped/cache-retained instance
+  `40826362`。没有新租机器;诊断完成后已停机,Vast API 确认
+  `cur_state=stopped`,`actual_status=exited`。
+- 本轮 paid GPU lane 合同:
+  - lane: W2 Gemma3-27B CUDA L5 c=32 allocator-diagnostic rerun,existing 1x RTX 4090;
+  - expected runtime/cost:15-45min,约 $0.10-$0.30 at ~$0.402/hr plus storage;
+  - stop condition:first OOM backtrace artifact collected / c=32 unexpected PASS / 45min no progress;
+  - correctness/performance command:同一条 c=32
+    `bench-serve random 256/128 --concurrency-sweep 32 --fail-on-error --require-ci --seed 9271`。
+- 为定位 OOM,增强 CUDA allocator 失败日志:
+  `CudaBackend::alloc` / `alloc_typed` 现在在失败时打印 dtype、元素数、
+  字节数、`cuMemGetInfo` free/total,以及强制 backtrace。该改动只改善失败
+  诊断,不改变产品行为。
+- 远端增量 release build 通过:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_alloc_diag_oom_2026-06-14/build.log`
+  记录 `Finished release profile [optimized] target(s) in 28m 55s`。
+- 第一次诊断运行 `c32/` 未进入模型请求:脚本把 `--tokenizer` 误传成
+  `tokenizer.json` 文件路径,CLI 又追加 `/tokenizer.json`,因此 bench 立即报
+  `Not a directory`。该运行只保留为脚本错误证据,不计入 W2。
+- 第二次诊断运行 `c32_retry/` 使用 tokenizer snapshot 目录,服务成功启动并进入
+  `closed_loop c=32 — repeat 1/3`。关键 OOM 行:
+  `CudaBackend::alloc failed: dtype=F16 elements=819200 bytes=1638400 free=17498112 total=25278087168: DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")`。
+- bench 侧写出失败 JSON
+  `c32_retry/l5_gemma3-27b-gptq_cuda_c32_alloc_diag.json`;
+  `bench.log` 记录 `0 completed / 100 errored` 和
+  `bench-serve error rate 1.0000 exceeds max 0.0000`。
+- 最新结论:
+  1. c=32 OOM 不是某个巨型 allocation;失败 allocation 只有约 1.56MiB;
+  2. OOM 时整卡只剩约 16.7MiB free,说明 c=32 的稳态/瞬态总峰值贴满 24GB;
+  3. backtrace 因 release strip 显示 `<unknown>`,下一步要加 shape/caller label
+     或做非 strip diagnostic,而不是继续盲目调 `kv-capacity`;
+  4. W2 仍是 l0/l1/l2_gptq/l3/l4 pass,l2_gguf waived,
+     l5_concurrency fail,perf_vs_llamacpp pending;**不宣称 W2 PASS**。
+
+### 下一步
+
+- 本地先沿 `elements=819200` 反查可能 shape/callsite,优先看 Gemma3
+  c=32 单序 forward 下每步 activation/logits/scratch 分配。
+- 下一次 GPU 只跑更小诊断:给 allocator callsite 加标签或禁用 strip 的 backtrace,
+  目标是拿到"哪个张量/阶段"把 free 压到 17MB,而不是重复完整 L5。
+- 修复方向要减少 c=32 总峰值,例如缩小可配置 batch token/scratch 峰值、释放可复用
+  scratch、或修正 per-request retained buffer 生命周期;若改变 gate 合同必须写入
+  W2 文档/矩阵,不能靠隐藏 env。
+
+## 2026-06-14(凌晨 I)— W2 c=32 最小复测:prompt 长度问题已排除,运行期 OOM 仍阻塞
+
+- 按用户建议复用现有 native CUDA GPU 机器,没有重新租新 pod/重装环境:
+  instance `40826362`,1x RTX 4090,Iceland host 1647。复测完成后立即停机,
+  Vast API 已确认 `cur_state=stopped`,`actual_status=exited`。
+- 本轮 paid GPU lane 合同:
+  - lane: W2 Gemma3-27B CUDA L5 c=32 minimal regression,existing 1x RTX 4090;
+  - expected runtime/cost:30-90min,约 $0.20-$0.60 at $0.402/hr;
+  - stop condition:c=32 PASS artifact / c=32 OOM or context failure artifact / 90min no progress;
+  - correctness/performance command:`bench-serve random 256/128 --concurrency-sweep 32 --fail-on-error --require-ci --seed 9271`。
+- 先修正并本地验证 `bench-serve` random prompt 生成:
+  `--random-input-len 256` 现在按 tokenizer 重新编码后的实际 token 数逼近目标,
+  避免 Gemma tokenizer 把随机 token 文本重编码成 270+ tokens。
+  本地用 `unsloth/gemma-3-1b-it` tokenizer fixture 跑
+  `random_prompt_generation_targets_reencoded_length_when_fixture_is_set` PASS。
+- 远端只同步最小改动并 release build:
+  `target/release/ferrum` build finished in 3m26s;远端 `.env.local` 在一次误同步后已立即删除,
+  本轮正式运行目录的 `c32/ferrum_env.txt` 为空,没有隐藏 `FERRUM_` env 修复。
+- c=32 复测命令使用产品 CLI 参数:
+  `ferrum serve --model gemma3:27b-gptq --port 8402 --kv-capacity 400 --max-num-seqs 32`
+  加 `ferrum bench-serve --random-input-len 256 --random-output-len 128 --concurrency-sweep 32 --num-prompts 100 --n-repeats 3 --fail-on-error --require-ci --seed 9271`。
+- 新证据:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_prompt_exact_oom_2026-06-14/`。
+  `serve.log` 证明 `kv-capacity=400` 能启动 800 blocks/32 seqs 并进入服务;
+  `bench.log` 进入 `closed_loop c=32 — repeat 1/3`;
+  随后服务端在 `crates/ferrum-kernels/src/backend/cuda/mod.rs:774`
+  报 `CUDA_ERROR_OUT_OF_MEMORY`。
+- 因此最新结论是:
+  1. 之前 `kv=400` 的"上下文不足"分支已被 prompt 精确化排除;
+  2. c=32 仍在运行期 OOM,不是 KV pool 启动失败;
+  3. W2 L5 仍 FAIL,`perf_vs_llamacpp` 仍 pending,**不宣称 W2 PASS**。
+
+### 下一步
+
+- 保持同一台 stopped/cache-retained 4090 作为后续最小验证目标。
+- 下一轮不要再跑完整 L5。先定位运行期 CUDA transient/scratch/请求调度内存峰值:
+  优先用 c=32、kv=400、100 prompts 的同命令加最小显存 instrumentation,
+  看 OOM 前最后一次 allocator 请求大小和调用路径。
+- 如果需要改变 batch/scratch 上限,必须走 typed CLI/config/default 或目标合同修订,
+  不能靠用户不可见的隐藏 env 当作通过证据。
+
+## 2026-06-13(晚 XIX)— W2 correctness 打通,L5 c=32 首个内存阻塞点落证
+
+- 采用当前 1x RTX 4090 pod 原生 CUDA 最小验证,不重建环境:
+  instance `40826362`,Iceland host 1647,`/workspace/ferrum-infer-rs`。
+  本轮目标从"反复开机装环境"改为"同机快速定位,拿到证据后停机"。
+- 根因定位:Gemma3 sandwich-norm CUDA 路径把 residual/activation 存成 f16,
+  在中层出现合法的大幅值 norm 输出与 residual 相加后超过 f16 上限
+  65504,导致后续 logits NaN。Gemma3 27B 的 post-ffn norm 权重可到
+  700 级,该路径必须保留 f32/bf16 语义,不能把 residual shadow 降成 f16。
+- 修复方式:CUDA f16 activation 后端为 Gemma3 sandwich-norm 路径启用
+  host/F32 residual shadow;prefill/decode 的 norm、residual add、final norm
+  通过 f32 shadow 保持有限值。该行为走产品默认路径,不是隐藏 env 修复。
+- 最小 CUDA 验证:
+  - `cargo test -p ferrum-kernels --features cuda --release --test cuda_activation_precision -- --nocapture`
+    PASS,2 tests;
+  - `ferrum run` 一 token smoke 输出 `content:"5"`,layer dump/logits 全 finite;
+  - layer dump summary:64 entries,`first_nonfinite=None`,logits
+    `262208/262208` finite,`maxabs=41.84375`。
+- W2 L2/L3/L4 smoke 已过:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log`
+  记录 `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`:
+  known-answer 10/10,natural EOS,multi-turn Bob,stream==non-stream,
+  custom stop,max_tokens,required tool-call 10/10,strict json_schema 20/20。
+- W2 L5 未过,所以**不宣称 W2 PASS**:
+  - `gates/l5_gemma3-27b-gptq_cuda_1_4_16.json` 已记录
+    c=1/4/16 三档均 `completed_per_run=[100,100,100]`,
+    `errored_per_run=[0,0,0]`,`output_token_count_source=usage`,
+    decode throughput 约 25.1 tok/s;
+  - required c=32 在 `--kv-capacity 448 --max-num-seqs 32` 触发
+    `CUDA_ERROR_OUT_OF_MEMORY`,日志见
+    `gates/serve_l5_gemma3-27b-gptq_32.log`;
+  - targeted diagnostics:kv-capacity 400 可启动但上下文不足
+    (`278 input + 128 output > 400`),kv-capacity 408/416 因 KV block
+    rounding 仍 OOM;
+  - 因 L5 首败即停,未进入 llama.cpp same-card ratio,`perf_vs_llamacpp`
+    仍 pending。
+- 当前矩阵结论:
+  W1 PASS;W2 现在是 l0/l1/l2_gptq/l3/l4 pass,l2_gguf waived,
+  l5_concurrency fail,perf_vs_llamacpp pending;W3 仍只有 charter 草案。
+
+### 下一步
+
+- 不再跑完整重装 pod。优先在现有 CUDA 内存模型上做一个小改动:
+  让 c=32 gate 真正降低 per-seq/context 占用或改为可解释的 W2 合同修订;
+  不能只把 kv-capacity 降到 400,因为该设置已被实测证明不满足
+  256/128 bench prompt 的上下文需求。
+
+## 2026-06-13(晚 XVIII)— W2 pod 脚本固化 parity-first:失败即停,通过才跑 Gemma3 early-smoke
+
+- 没有新开 GPU。W2 仍是 Gemma3-27B GPTQ CUDA correctness blocking,
+  不进入 L5/perf,不宣称 W2 PASS。
+- `scripts/pod_w2_gemma3.sh` 已把下一次 1x4090 执行顺序固化:
+  - `build.ok` 后立即运行 synthetic CUDA desc_act parity,不等待 27B 权重下载:
+    1. `cuda_desc_act_gemma3_qproj_shape_vs_cpu_reference`;
+    2. `cuda_desc_act_gemma3_attention_shapes_vs_cpu_reference`;
+  - parity 日志写入 `$W/diagnostics/desc_act_parity.log`,
+    return code 写入 `$W/diagnostics/desc_act_parity.rc`;
+  - parity fail 会写 `$W/desc_act_parity.fail`,停止 HF 下载/llama.cpp build,
+    touch `$W/w2_session.done`,不进入 Gemma3 smoke/L5/perf;
+  - parity pass 才写 `$W/desc_act_parity.ok`,随后 early-smoke 等待
+    `build.ok + dl_gptq.ok + desc_act_parity.ok`。
+- early-smoke 默认诊断也更新:
+  - `FERRUM_SMOKE_NAN_TRACE="${FERRUM_W2_NAN_TRACE:-layer0}"`;
+  - `FERRUM_SMOKE_OP_DUMP_DIR="${FERRUM_W2_OP_DUMP_DIR:-/workspace/w2/gates_early/op_dump_layer0}"`;
+  - 因晚 XVII 已支持 `layer0` 选择语法,下一次默认只写首层 op dump,
+    而不是全模型 `all` dump。
+- 下一次 paid GPU lane 合同(尚未启动):
+  - lane: W2 Gemma3-27B CUDA GPTQ correctness micro-diagnostic,1x RTX 4090;
+  - expected runtime/cost:约 1-2h,按最近 Vast $0.35-$0.45/hr 估算约 $0.35-$0.90,
+    若需要继续 early-smoke/op-dump 可能到 3h/$1.35;
+  - stop condition: parity fail / early-smoke fail artifact collected / first
+    correctness PASS artifact collected / 3h 无进展;
+  - correctness gate:两个 CUDA desc_act parity 先 PASS;若 PASS,再跑
+    Gemma3 early-smoke L2 known-answer;
+  - performance command:不跑性能。只有 L2/L3/L4 correctness PASS 后,才恢复
+    `pod_w2_gates.sh` 的 L5 `bench-serve` 和 llama.cpp ratio。
+- 本地验证:
+  - `bash -n scripts/pod_w2_gemma3.sh scripts/pod_w2_gates.sh scripts/model_coverage_smoke.sh` PASS(本机 locale warning only)。
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test` PASS。
+  - `cargo test -q -p ferrum-models nan_trace_selector_accepts_all_or_layer_lists` PASS。
+  - `python3 -m py_compile scripts/analyze_layer_dump.py scripts/inspect_hf_gptq_tensor.py scripts/w1_goal_validator.py scripts/w2_goal_validator.py` PASS。
+
+### 下一步
+
+- 下一次 GPU 只跑 `scripts/pod_w2_gemma3.sh` 的新 parity-first 流程;
+  若 `desc_act_parity.fail`,直接修 CUDA Marlin desc_act/repack/scale layout;
+  若 parity 过而 early-smoke 仍失败,读取
+  `gates_early/op_dump_layer0/summary.jsonl` 的 `maxabs_row/maxabs_col`
+  定位首个产生 `row=0,col=104` 爆炸的 op。
+
+## 2026-06-13(晚 XVII)— W2 nan-trace 坐标化:下次 op 日志直接报 maxabs row/col
+
+- 没有新开 GPU。W2 仍是 Gemma3-27B GPTQ CUDA correctness blocking,
+  不进入 L5/perf,不宣称 W2 PASS。
+- 基于晚 XVI 的 `layer_00 row=0,col=104` 爆炸证据,增强
+  `crates/ferrum-models/src/models/llama_family.rs` 的诊断输出:
+  - `DumpStats` 现在记录 `maxabs_index`;
+  - `FERRUM_NAN_TRACE` 日志现在在知道 row width 时打印
+    `maxidx,row_width,row,col`;
+  - `FERRUM_OP_DUMP` 的 `summary.jsonl` 同步写入 `maxabs_index`,
+    且对有 row width 的 op 写入 `maxabs_row/maxabs_col`;
+  - `FERRUM_NAN_TRACE` 保留 `0` 作为关闭,新增显式 `layer0`/`l0`/
+    `source0` 语法,允许只抓首层 op 而不是 `all` 全模型 dump;
+  - 新增 `down_proj` 和 `resid_ffn` 两个 trace 点,补齐 MLP 输出与最终
+    residual add,避免下一次只看到 layer dump 爆炸却不知道 down-proj
+    之前/之后的边界。
+- row width 绑定:
+  - token-major hidden/residual/norm/o_proj/down_proj/resid_ffn → `hidden_size`;
+  - `qkv_proj` → `q_dim + 2*kv_dim`;
+  - head-major q/attention → `head_dim`;
+  - `gate_up` → `2*intermediate_size`;
+  - `act_mul` → `intermediate_size`。
+  这让下一次 Gemma3 early-smoke 日志能直接回答首层异常是否已经出现在
+  `qkv_proj`,还是 attention/o_proj/MLP 后才出现。
+- 本地验证:
+  - `python3 -m py_compile scripts/analyze_layer_dump.py scripts/inspect_hf_gptq_tensor.py` PASS。
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo check -q -p ferrum-models --tests` PASS。
+  - `cargo test -q -p ferrum-models dump_stats_counts_nonfinite_values` PASS。
+  - `cargo test -q -p ferrum-models nan_trace_selector_accepts_all_or_layer_lists` PASS。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test` PASS
+    (5 default tests;CUDA ignored tests未在本机执行)。
+  - `git diff --check` PASS。
+  - `python3 scripts/w1_goal_validator.py` PASS:
+    `MODEL_COVERAGE_W1 GOAL PASS: docs/goals/model-coverage-2026-06-12`。
+  - `python3 scripts/w2_goal_validator.py` 仍 3/8,5 blocking cells(预期)。
+
+### 下一步
+
+- 下一次可靠 1x4090 不跑完整 W2。先跑 CUDA desc_act parity;若过,再跑
+  Gemma3 early-smoke with `FERRUM_W2_NAN_TRACE=layer0` +
+  `FERRUM_W2_OP_DUMP_DIR=<artifact-dir>`,日志里重点看 layer0 每个 op 的
+  `row=0,col=104` 是否在 qkv/o_proj/MLP 哪一步首次出现。
+
+## 2026-06-13(晚 XVI)— W2 NaN artifact 机器化复盘:异常从 layer_00 内部开始,不是 logits-only
+
+- 没有新开 GPU。W2 仍是 Gemma3-27B GPTQ CUDA correctness blocking,
+  不进入 L5/perf,不宣称 W2 PASS。
+- 新增 `scripts/analyze_layer_dump.py`:无第三方依赖读取
+  `FERRUM_LAYER_DUMP` f32 `.bin`,统计 finite/nonfinite、max_abs、first
+  threshold crossing,并可用 `--last-dim` 把 flat index 标注为
+  `[row,col]` 坐标。
+- 用该脚本复盘既有
+  `artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke`
+  并生成:
+  `artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/layer_dump_summary.json`。
+- 机器化 summary 结论:
+  - `embed.bin`:shape `[24,5376]`,all finite,`max_abs=17.65625`;
+  - `layer_00.bin`:all finite,但 `max_abs=23056.0` 出现在
+    `row=0,col=104`;首个 `abs>100` 在 `row=0,col=61`,首个
+    `abs>1000/10000` 同在 `row=0,col=104`;
+  - `layer_01..layer_07`:仍 all finite,但异常值持续存在,`layer_07`
+    `max_abs=42432.0` 仍在 `row=0,col=104`;
+  - `logits.bin`:262208/262208 全 NaN,首个 nonfinite index 0。
+- 这把定位从"最终 logits 全 NaN"收紧为"首层输出已经爆炸,后续层仍 finite,
+  到 lm_head/logits 阶段才变全 NaN"。下一次 GPU op dump 不需要先扫全模型,
+  应优先捕获 layer0 的 qkv、attention score/output、o_proj、post-attn norm、
+  gate/up/down/activation/down_proj 输入输出,特别关注 token row 0、hidden col
+  61/104 附近。
+- 本轮新证据与晚 XV 的真实 GPTQ CPU dequant 结合后,当前最高概率分支仍是
+  CUDA Marlin desc_act/scale layout/act-order 或 Gemma3 layer0 CUDA forward
+  内某个 op,不是 HF 源权重本身、qzeros 形态、g_idx balance 或最终 logits
+  读回单点问题。
+
+### 下一步
+
+- 下一次可靠 1x4090 的执行顺序:
+  1. `cuda_desc_act_gemma3_qproj_shape_vs_cpu_reference`;
+  2. 若过,跑 `cuda_desc_act_gemma3_attention_shapes_vs_cpu_reference`;
+  3. 若仍过,跑 Gemma3 early-smoke + `FERRUM_W2_OP_DUMP_DIR`,优先 layer0
+     op dump,用本轮 `row=0,col=61/104` 作为检查坐标。
+
+## 2026-06-13(晚 XV)— W2 真实 layer0 attention 全投影 + MLP 采样:源权重继续排除,下轮直指 CUDA parity/op dump
+
+- 没有新开 GPU。W2 仍是 Gemma3-27B GPTQ CUDA correctness blocking,
+  不进入 L5/perf,不宣称 W2 PASS。
+- 新增可复用诊断脚本 `scripts/inspect_hf_gptq_tensor.py`:通过 HF
+  `model.safetensors.index.json` 定位 shard,用 HTTP Range 读取单个 GPTQ
+  tensor prefix 的 `qweight/scales/qzeros/g_idx`,输出 JSON summary。脚本默认
+  8MiB 分块读取,避免 50MB+ range 被远端断连;无第三方依赖。
+- 继续读取真实 `circulus/gemma-3-27b-it-gptq`
+  commit `70d89a3a6b401b5f56558cb5d4c0f1fd158980b2` 的 layer0 权重,生成:
+  - `artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/layer0_kproj_cpu_dequant_report.json`
+  - `artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/layer0_vproj_cpu_dequant_report.json`
+  - `artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/layer0_oproj_cpu_dequant_report.json`
+  - `artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/layer0_gateproj_cpu_dequant_sample_report.json`
+  - `artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/layer0_upproj_cpu_dequant_sample_report.json`
+  - `artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/layer0_downproj_cpu_dequant_sample_report.json`
+- layer0 self-attn 的 k/v/o 三个 projection 做完整列 CPU dequant + deterministic
+  matmul probe(晚 XIV 已覆盖 q_proj):
+  - k_proj: `K=5376,N=2048`,all finite,`max_abs=0.1303`;
+  - v_proj: `K=5376,N=2048`,all finite,`max_abs=0.2098`;
+  - o_proj: `K=4096,N=5376`,all finite,`max_abs=0.1708`;
+  - 三者均 `g_idx_balanced_full_groups=true`,
+    `g_idx_sequential_non_desc_act=false`,`qzeros_all_code7=true`,
+    `scales_all_finite=true`。
+- layer0 MLP 的 gate/up/down 三个 projection 做 512 个均匀输出列采样
+  (不是完整 MLP 证明,但覆盖真实 qweight/scales/qzeros/g_idx 读取和每个 K row):
+  - gate_proj: sampled all finite,`max_abs=0.1321`;
+  - up_proj: sampled all finite,`max_abs=0.2784`;
+  - down_proj: sampled all finite,`max_abs=0.0411`;
+  - 三者同样满足 balanced non-trivial `g_idx`、全 code7 `qzeros`、finite scales。
+- `crates/ferrum-quantization/tests/gptq_parity_test.rs` 新增 ignored CUDA
+  micro-diagnostic:
+  `cuda_desc_act_gemma3_attention_shapes_vs_cpu_reference`。它顺序覆盖真实
+  layer0 attention 的 `k_proj K5376/N2048`,`v_proj K5376/N2048`,
+  `o_proj K4096/N5376`,补足 q_proj-only parity 可能漏掉 tile/shape 问题。
+- 结合晚 XII-XIV,真实 Gemma3 GPTQ 源权重的基本形态、scale 有限性、
+  qzero 对称性、desc_act group balance、layer0 attention 全投影 dequant
+  都不像首层 2e4 级爆炸和最终全 NaN logits 的源头。当前优先级进一步收敛到:
+  1. CUDA Marlin desc_act/Gemma3 真实形状 parity;
+  2. 若 parity 过,用 `FERRUM_W2_OP_DUMP_DIR` 捕获 Gemma3 early-smoke
+     首层 qkv/attn/o_proj/MLP op 输入输出,定位 CUDA forward 内首个爆炸点。
+- 本地验证:
+  - `python3 -m py_compile scripts/inspect_hf_gptq_tensor.py scripts/w1_goal_validator.py scripts/w2_goal_validator.py` PASS。
+  - `git diff --check` PASS。
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo check -q -p ferrum-quantization --tests` PASS。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test` PASS
+    (5 default tests;CUDA ignored tests未在本机执行)。
+  - `python3 scripts/w1_goal_validator.py` PASS:
+    `MODEL_COVERAGE_W1 GOAL PASS: docs/goals/model-coverage-2026-06-12`。
+  - `python3 scripts/w2_goal_validator.py` 仍 3/8,5 blocking cells(预期)。
+
+### 下一步
+
+- 不跑完整 W2。下一次可靠 1x4090 先跑:
+  `cargo test -p ferrum-quantization --features cuda --release --test gptq_parity_test cuda_desc_act_gemma3_qproj_shape_vs_cpu_reference -- --ignored --nocapture`。
+- 若 q_proj shape 过,同一 pod 继续跑:
+  `cargo test -p ferrum-quantization --features cuda --release --test gptq_parity_test cuda_desc_act_gemma3_attention_shapes_vs_cpu_reference -- --ignored --nocapture`。
+- 若 Gemma3-shape parity 失败,修 CUDA Marlin repack/scale layout/act-order;
+  若通过,再跑 Gemma3 early-smoke + op dump。只有首步 logits finite 且 smoke
+  L2 过,才恢复 L3/L4/L5/perf。
+
+## 2026-06-13(晚 XIV)— W2 真实 layer0 q_proj CPU dequant:权重合成有限,不像首层爆炸源
+
+- 没有新开 GPU。W2 仍是 Gemma3-27B GPTQ CUDA correctness blocking,
+  不进入 L5/perf,不宣称 W2 PASS。
+- 用 HF Range 读取真实 `circulus/gemma-3-27b-it-gptq`
+  layer0 `self_attn.q_proj` 的完整 GPTQ 四件套:
+  `qweight [672,4096]`, `scales [42,4096]`, `qzeros [42,512]`,
+  `g_idx [5376]`,生成:
+  `artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/layer0_qproj_cpu_dequant_report.json`。
+- 本地 CPU 按 `g_idx` scale lookup 完整 dequant 该 projection:
+  - `g_idx_balanced_full_groups=true`;
+  - `qzeros_all_code7=true`;
+  - `scales_all_finite=true`;
+  - `dequant_weight_all_finite=true`;
+  - `dequant_weight_max_abs=0.1151123046875`。
+- 额外做两个 deterministic matmul probe:
+  - `x[k]=f16(sin(k*0.0041))` 时输出 `max_abs≈2.00`;
+  - 同一输入乘以 17.7(上一轮 embed dump maxabs 量级)时输出
+    `max_abs≈35.41`。
+  这不能替代 CUDA parity,但能排除"真实 layer0 q_proj 的 GPTQ
+  dequant 结果本身非 finite 或自然产生 2e4 级输出"这个分支。
+- 因此当前最高价值 GPU micro-diagnostic 仍是 CUDA Marlin vs CPU
+  reference,尤其是 Gemma3 q_proj 真实形状;若它过,再从 q_proj 之外的
+  首层 op dump 查爆炸边界。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test`
+    PASS(5 default tests;CUDA ignored tests未在本机执行)。
+  - artifact sanity PASS:报告 summary 七项均符合预期。
+
+### 下一步
+
+- 下一次可靠 1x4090 先跑:
+  `cuda_desc_act_gemma3_qproj_shape_vs_cpu_reference`。若失败,优先修
+  CUDA Marlin repack/kernel/scale layout;若通过,用 `FERRUM_W2_OP_DUMP_DIR`
+  捕获 Gemma3 early-smoke 首层 qkv/attn/mlp op 输入输出,定位 q_proj
+  之外的首个爆炸点。
+
+## 2026-06-13(晚 XIII)— W2 真实 Gemma3 scales 采样:源 scales 有限且量级正常
+
+- 没有新开 GPU。W2 仍是 Gemma3-27B GPTQ CUDA correctness blocking,
+  不进入 L5/perf,不宣称 W2 PASS。
+- 延续晚 XII 的 HF Range 采样,对同一 layers 0 / 31 / 61、同一 7 个
+  projection(`q/k/v/o/gate/up/down`)读取 `*.scales` 小样本,生成:
+  `artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/gptq_scale_sample_report.json`。
+- 第一次 scales 读取误按 F32 解码,发现异常小量级后已废弃并用
+  safetensors header 的 dtype-aware 解码覆盖报告。有效报告显示:
+  - `dtypes=["F16"]`;
+  - `sampled_scales_count=21`;
+  - `all_finite=true`;
+  - `bad_nonfinite_or_gt10_count=0`;
+  - `max_abs_overall=0.0723876953125`。
+  这排除了"真实 Gemma3 GPTQ 源 scales 本身非 finite 或异常大"这一分支。
+- 结合晚 XII:
+  - sampled `g_idx` 均 balanced full-group 且 non-trivial desc_act;
+  - sampled `qzeros` 均 code7;
+  - sampled `scales` 为有限 F16 且量级正常。
+  因此下一步仍应集中在 CUDA Marlin repack/kernel/scale layout 与
+  Gemma3 层内数值路径,不是权重 metadata 基本形态。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo check -q -p ferrum-quantization --tests` PASS。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test`
+    PASS(5 default tests;CUDA ignored tests未在本机执行)。
+  - artifact sanity PASS:layout summary 两项 true,scale summary all_finite
+    true且 dtype 为 F16。
+
+### 下一步
+
+- 下一次可靠 1x4090 的第一条仍是两条 CUDA ignored parity:
+  `cuda_desc_act_vs_cpu_reference` 与
+  `cuda_desc_act_gemma3_qproj_shape_vs_cpu_reference`。
+- 若 Gemma3-shape parity 仍过,就把 focus 从 GPTQ metadata/repack 前置条件
+  移到 Gemma3 forward 内的首层 op dump:全层 nan-trace 已默认打开,
+  必要时显式 `FERRUM_W2_OP_DUMP_DIR` 捕获首个爆炸算子输入输出。
+
+## 2026-06-13(晚 XII)— W2 真实 Gemma3 GPTQ layout 采样:guard 预计不拦截,下一步查 CUDA Marlin 数值
+
+- 没有新开 GPU。W2 仍是 Gemma3-27B GPTQ CUDA correctness blocking,
+  不进入 L5/perf,不宣称 W2 PASS。
+- 用 Hugging Face resolve HTTP Range 只读 `circulus/gemma-3-27b-it-gptq`
+  commit `70d89a3a6b401b5f56558cb5d4c0f1fd158980b2` 的 safetensors
+  header 与小 tensor 样本,未下载整模型权重:
+  `artifacts/w2_gemma3_hf_gptq_layout_2026-06-13/gptq_layout_sample_report.json`。
+- 采样范围:layers 0 / 31 / 61 的 7 个 projection
+  (`q/k/v/o/gate/up/down`),共 21 个 `g_idx` + 21 个 `qzeros`,
+  payload 约 5.47MB。一次全量 `g_idx` Range 尝试因远端 HTTP 408 停止,
+  没有作为证据使用。
+- 采样结论:
+  - `sampled_g_idx_all_balanced_full_groups=true`;
+  - `sampled_g_idx_sequential_non_desc_act_count=0`,确认样本确实是
+    non-trivial desc_act,不是顺序 g_idx;
+  - `sampled_qzeros_all_code7=true`。
+  因此晚 X/XI 新增的 qzeros / balanced-g_idx guard 在这些真实
+  Gemma3 GPTQ 样本上预计不会拦截;当前 L2 NaN blocker 更可能还在
+  CUDA Marlin repack/kernel/scale layout 或 Gemma3 层内数值路径。
+- `crates/ferrum-quantization/tests/gptq_parity_test.rs` 新增 ignored
+  CUDA micro-diagnostic:
+  `cuda_desc_act_gemma3_qproj_shape_vs_cpu_reference`。它使用真实
+  Gemma3 q_proj 形状 `K=5376,N=4096,group_size=128` 的 synthetic
+  desc_act/sym GPTQ,对比 CUDA Marlin 与 CPU `g_idx` reference;用于补足
+  旧 `K=512,N=256` 小形状 parity 不能覆盖真实 tile/scale 布局的缺口。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo check -q -p ferrum-quantization --tests` PASS。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test` PASS
+    (5 default tests;CUDA ignored tests未在本机执行)。
+  - `cargo test -q -p ferrum-quantization validate_cuda_marlin_desc_act`
+    PASS(3 tests)。
+  - artifact sanity PASS:`sampled_g_idx_count=21`,
+    `sampled_qzeros_count=21`,两项兼容性 summary 均为 true。
+  - `python3 scripts/w1_goal_validator.py` PASS:
+    `MODEL_COVERAGE_W1 GOAL PASS: docs/goals/model-coverage-2026-06-12`。
+  - `python3 scripts/w2_goal_validator.py` 仍 3/8,5 blocking cells(预期)。
+
+### 下一步
+
+- 下一次可靠 1x4090 仍不跑完整 W2。先跑:
+  `cargo test -p ferrum-quantization --features cuda --release --test gptq_parity_test cuda_desc_act_vs_cpu_reference -- --ignored --nocapture`
+  和
+  `cargo test -p ferrum-quantization --features cuda --release --test gptq_parity_test cuda_desc_act_gemma3_qproj_shape_vs_cpu_reference -- --ignored --nocapture`。
+- 若 small 过而 Gemma3-shape 失败,优先查 Marlin repack/scale layout 的
+  shape-specific 假设;若两者都过,再跑 Gemma3 early-smoke,使用全层
+  nan-trace 定位首个爆炸/非 finite 算子。
+
+## 2026-06-13(晚 XI)— W2 desc_act 前提硬化:CUDA Marlin 只接受 balanced full-group g_idx
+
+- 没有新开 GPU。W2 仍是 Gemma3-27B GPTQ CUDA correctness blocking,
+  不进入 L5/perf,不宣称 W2 PASS。
+- 继续审计 `desc_act=true/static_groups=false` GPTQ 与当前 CUDA Marlin
+  策略的等价前提。Ferrum 现策略是 load-time `argsort(g_idx)` 重排
+  qweight row,运行时按同一 perm gather A,再交给固定 group-boundary 的
+  IST-DASLab Marlin kernel。因此它只在每个 quant group 恰好有
+  `group_size` 个 K row 时成立;若真实 `g_idx` 某 group 多/少,row 排序后
+  的固定 `j/group_size` scale lookup 会错位。
+- `crates/ferrum-quantization/src/native_safetensors.rs` 新增
+  `validate_cuda_marlin_desc_act_g_idx()`:
+  - CUDA build 下,普通 GPTQ linear、fused qkv/gate_up linear、stacked GPTQ
+    experts 都会在 load 阶段校验 balanced full-group;
+  - `quantize_config desc_act=true` 但缺 `g_idx` 的 stacked GPTQ 现在也会
+    和普通 linear 一样显式报错,不再把 `None` 交给 backend 静默错跑;
+  - 非 CUDA 的 CPU/Metal desc_act dequant 仍保留按 `g_idx` lookup 的通用
+    fallback,不套 Marlin 前提。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `bash -n scripts/pod_w2_gemma3.sh scripts/model_coverage_smoke.sh scripts/pod_w2_gates.sh`
+    PASS(本机 locale warning only)。
+  - `cargo check -q -p ferrum-quantization --tests` PASS。
+  - `cargo check -q -p ferrum-kernels --tests` PASS。
+  - `cargo test -q -p ferrum-quantization validate_cuda_marlin_desc_act`
+    PASS(3 tests)。
+  - `cargo test -q -p ferrum-quantization validate_gptq_g_idx` PASS
+    (4 tests)。
+  - `cargo test -q -p ferrum-quantization qzero_stats` PASS(2 tests)。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test`
+    PASS(5 tests)。
+  - `python3 scripts/w1_goal_validator.py` PASS:
+    `MODEL_COVERAGE_W1 GOAL PASS: docs/goals/model-coverage-2026-06-12`。
+  - `python3 scripts/w2_goal_validator.py` 仍 3/8,5 blocking cells(预期)。
+
+### 下一步
+
+- 下一次可靠 1x4090 仍只跑 micro-diagnostic first:
+  `cargo test -p ferrum-quantization --features cuda --release --test gptq_parity_test cuda_desc_act_vs_cpu_reference -- --ignored --nocapture`。
+- 若 parity 过,再跑 Gemma3 early-smoke。新的 loader guard 会把真实
+  Gemma3 GPTQ 的 `g_idx`/`qzeros` 兼容性问题转成 load-stage 明确错误;
+  若两项兼容性 guard 都过但仍 NaN,全层 nan-trace 才是下一步定位依据。
+
+## 2026-06-13(晚 X)— W2 CUDA GPTQ guard 收紧:拒绝不安全 Marlin 路径,避免假诊断
+
+- 没有新开 GPU。W2 仍是 Gemma3-27B GPTQ CUDA correctness blocking,
+  不进入 L5/perf,不宣称 W2 PASS。
+- `crates/ferrum-kernels/src/backend/cuda/quant.rs` 收紧默认 CUDA Marlin:
+  - dense `FERRUM_VLLM_MARLIN=1` 现在显式 `unsupported`。原因:dense
+    `load_gptq` 保存的是 IST-DASLab Marlin tile,而 vLLM Marlin kernel
+    需要 vLLM-repacked weights;此前这个实验 env 可能让同一权重走错
+    kernel,污染 W2 诊断。vLLM-repacked Marlin 仍只保留在 stacked MoE
+    的 `FERRUM_VLLM_MOE` 路径。
+  - 默认 dense/stacked Marlin 在忽略 `qzeros` 前,现在要求所有 GPTQ
+    `qzeros` nibble 都是 code 7(GPTQ zero-1 编码下的对称 zero point 8)。
+    若真实 Gemma3 GPTQ 不是该形态,下一次 early-smoke 会在 load 阶段
+    明确失败并给出首个 bad code 位置,而不是继续进入可能全 NaN 的推理。
+- 同步 `docs/runtime-env-registry.tsv`:`FERRUM_VLLM_MARLIN` 标记为
+  dense GPTQ rejected,除非未来补 dense vLLM repack 证据,否则不能作为
+  产品验证或诊断开关。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo check -q -p ferrum-kernels --tests` PASS(默认 feature;CUDA 模块
+    不会在本机编译进来)。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test` PASS
+    (5 tests)。
+  - `python3 scripts/w1_goal_validator.py` PASS:
+    `MODEL_COVERAGE_W1 GOAL PASS: docs/goals/model-coverage-2026-06-12`。
+  - `python3 scripts/w2_goal_validator.py` 仍 3/8,5 blocking cells(预期)。
+  - `cargo check -q -p ferrum-kernels --features cuda --tests` 未跑到 Rust
+    语义编译:本机缺 `nvcc`/`nvidia-smi`,失败在 CUDA build scripts。
+
+### 下一步
+
+- 下一次可靠 1x4090 的第一项仍是最小 CUDA parity:
+  `cargo test -p ferrum-quantization --features cuda --release --test gptq_parity_test cuda_desc_act_vs_cpu_reference -- --ignored --nocapture`。
+- parity 通过后再跑 Gemma3 early-smoke。若新 qzeros guard 拦截真实权重,
+  W2 的 L2 blocker 变成"当前 Marlin 不支持该 GPTQ zero-point 形态";
+  若 qzeros 通过但仍 NaN,读取全层 nan-trace 定位首个非 finite op。
+
+## 2026-06-13(晚 IX)— W2 early-smoke 诊断默认升级:下轮直接收全层 nan-trace
+
+- 没有新开 GPU。W2 仍是 Gemma3-27B GPTQ CUDA correctness blocking,
+  不进入 L5/perf,不宣称 W2 PASS。
+- 复核上轮 NaN artifact:`FERRUM_LAYER_DUMP` 只给出 embed、layer_00..07
+  和最终 logits;虽然 layer_00 起 maxabs 已爆炸,但缺少每层关键算子
+  的 non-finite 边界,下一轮若仍失败会继续需要二次上卡定位。
+- `scripts/pod_w2_gemma3.sh` 的 early-smoke 默认改为
+  `FERRUM_SMOKE_NAN_TRACE="${FERRUM_W2_NAN_TRACE:-all}"`。这会让
+  `ferrum serve` 日志在每一层的 qkv、attn、o_proj、post_attn_norm、
+  gate_up、activation、down_proj 等关键点打印 finite/nan/inf/maxabs。
+  `FERRUM_W2_NAN_TRACE` 仍可覆盖成单层列表;`FERRUM_W2_OP_DUMP_DIR`
+  仍保持显式 opt-in,避免默认写出巨量 op dump。
+- 本地验证:
+  - `bash -n scripts/pod_w2_gemma3.sh` PASS(本机 locale warning only)。
+  - `cargo test -q -p ferrum-models nan_trace_selector_accepts_all_or_layer_lists`
+    PASS。
+  - `cargo test -q -p ferrum-models dump_stats_counts_nonfinite_values` PASS。
+
+### 下一步
+
+- 下一次可靠 1x4090 仍先跑最小 CUDA parity;若需要直接跑 Gemma3
+  early-smoke,它现在会一次性产出 g_idx/qzeros trace + 全层 nan-trace,
+  足以定位首个非 finite op 或确认只是数值爆炸但未 NaN。
+
+## 2026-06-13(晚 VIII)— W2 本地 qzeros/sym 审计:补真实模型 trace,CUDA parity fixture 收紧
+
+- 没有新开 GPU。W2 仍停在 Gemma3-27B GPTQ CUDA correctness:
+  首步 logits 全 NaN,不得进入 L5/perf,也不得宣称 W2 PASS。
+- 本地审计确认 Ferrum 默认 CUDA Marlin 路径仍不读取 `qzeros`:
+  Marlin no-zp/sym 路径隐含 int4 zero point = 8;GPTQ `qzeros`
+  按 zero-1 存储时,对称量化应表现为 nibble code 7。
+- `crates/ferrum-quantization/tests/gptq_parity_test.rs` 的 CUDA ignored
+  parity fixture 已改为 `sym=true` 代表性 qzeros:
+  `make_synthetic_symmetric()` 将所有 qzeros word 置为 `0x77777777`,
+  避免随机 qzeros 让 Marlin no-zp 路径产生非代表性失败。
+- `crates/ferrum-quantization/src/native_safetensors.rs` 增加
+  `FERRUM_GPTQ_GIDX_TRACE=1` 下的 qzeros 统计:
+  每个 GPTQ linear / fused GPTQ load 会打印 qzero nibble histogram、
+  `min_code/max_code`、`code7/total` 与 `all_code7`。下一次 W2
+  early-smoke artifact 可直接回答真实 Gemma3 GPTQ 是否满足
+  sym=true/no-zp Marlin 假设。
+- 复核加载路径:`ferrum run/serve` 的主 GPTQ product path 由
+  `NativeSafetensorsLoader::<B>::open()` + `WeightLoader::load_linear()`
+  承载;旧日志里的 `ferrum_models::loader::gptq_loader` 来自 registry
+  的兼容 `QuantizeConfig` probe,不能单独代表实际 linear loader。
+  因此本轮 trace 加在 `NativeSafetensorsLoader` 上,覆盖下一次 W2
+  early-smoke 的真实 GPTQ linear/fused-linear load。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test`
+    PASS(5 tests)。
+  - `cargo test -q -p ferrum-quantization qzero_stats` PASS(2 tests)。
+  - `cargo test -q -p ferrum-quantization validate_gptq_g_idx` PASS(4 tests)。
+  - `cargo check -q -p ferrum-quantization --tests` PASS。
+
+### 下一步
+
+- 仍不跑完整 W2。下一次有可靠 1x4090 通道时,先跑最小 CUDA parity:
+  `cargo test -p ferrum-quantization --features cuda --release --test gptq_parity_test cuda_desc_act_vs_cpu_reference -- --ignored --nocapture`。
+- 若 parity 通过,再跑 Gemma3 early-smoke,读取新增 qzeros/g_idx trace 与
+  layer/op dump 来定位首个非 finite 算子;若 parity 失败,先修 Marlin
+  repack/perm/scales/qzeros 假设,不要进入 L5/perf。
+
+## 2026-06-13(晚 VII)— W2 CUDA parity 租机未跑到:Vast SSH/proxy 失败,实例归零
+
+- 目标只是一条 W2 micro-diagnostic,不是完整 W2 gate:
+  `cargo test -p ferrum-quantization --features cuda --release --test gptq_parity_test cuda_desc_act_vs_cpu_reference -- --ignored --nocapture`。
+  correctness-only,无性能命令、无 W2 pass 声明。
+- Vast 四次尝试均未跑到测试:
+  - `40812709`(Vietnam host 55116,$0.356/hr):卡在
+    `actual_status=loading`,未 SSH,已销毁。
+  - `40813345`(Iceland host 1647,$0.402/hr):Vast reported running/onstart
+    success,但 SSH publickey 认证失败,已销毁。
+  - `40813765`(Iceland host 1647,$0.402/hr):按 Vast 文档改用
+    `runtype=ssh` + attach-key API 后进入 running;但 container log 显示
+    `remote port forwarding failed for listen port 13764`,proxy SSH 被关;
+    direct SSH 也 rejected attached key;已销毁。
+  - `40814425`(Ukraine host 103274,$0.401/hr):按下一步改用
+    `runtype=ssh_direct`,实例进入 running 且 direct port 打开;但
+    `root/ubuntu/vastai/user` 均 rejected associated public key;已销毁。
+- Artifact/证据:
+  `artifacts/w2_desc_act_cuda_parity_2026-06-13/` 保存 offer/创建响应
+  (instance key 已脱敏)、Vast logs、destroy responses。未产生
+  `cuda_desc_act_vs_cpu_reference` 输出。
+- Vast API 已确认 `instances_found: 0`;`ACTIVE_PODS.md` 已标记四台均
+  DESTROYED/ZERO-VERIFIED。
+
+### 下一步
+
+- Vast 通道暂停。下一步回到本地源码审计,优先核查 CUDA GPTQ Marlin
+  对 `qzeros`/sym 的假设与 CPU reference 是否一致;GPU 通道恢复前不再
+  循环租 offers。
+
+## 2026-06-13(晚 VI)— W2 desc_act 诊断收窄:补本地 parity,下一轮只测 CUDA repack/kernel
+
+- 没有新开 GPU。当前本机是 `Darwin arm64` 且无 `nvcc`,因此
+  `cuda_desc_act_vs_cpu_reference` 只能作为下一轮 4090 ignored test,
+  不能在本地执行。
+- `crates/ferrum-quantization/tests/gptq_parity_test.rs` 新增/修正
+  desc_act 合成诊断:
+  - 合成 `g_idx` 改为 balanced full-K 形态:每个 group 正好
+    `group_size` 个元素,但 K 轴交错,避免非现实非均匀 group 误报。
+  - `desc_act_reference_uses_g_idx_for_scale_lookup` 证明该 fixture
+    确实会区分顺序 group lookup 与 `g_idx[k]` lookup。
+  - `desc_act_perm_gather_is_equivalent_to_g_idx_reference` 证明在
+    balanced full-K 前提下,Ferrum 当前 host-level
+    `argsort(g_idx)` qweight 重排 + activation gather 的代数结果等价于
+    `g_idx` CPU reference。也就是说,晚 V 的“vLLM wrapper 未传 g_idx
+    必然不等价”表述过强;vendored vLLM 在 `has_act_order && is_k_full`
+    时同样会 permute A 后把 `has_act_order` 降为 false。
+- 新增可选诊断 `FERRUM_GPTQ_GIDX_TRACE=1`:GPTQ loader 会打印真实
+  `g_idx` 的 group count min/max、nonzero group 数、unbalanced group 数
+  和前 16 项。`scripts/pod_w2_gemma3.sh` 的 early-smoke 已打开该开关,
+  下一轮 artifact 能直接确认 Gemma3 GPTQ 的真实 g_idx 分布是否满足
+  balanced full-K 前提。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo check -q -p ferrum-quantization --tests` PASS。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test desc_act`
+    PASS(2 tests)。
+  - `cargo test -q -p ferrum-quantization --test gptq_parity_test cpu_selfcheck`
+    PASS。
+  - `bash -n scripts/pod_w2_gemma3.sh` PASS(本机 locale warning only)。
+  - `scripts/w2_goal_validator.py` 仍 3/8,5 blocking cells(预期)。
+
+### 下一步
+
+- 下一次付费 GPU 不跑完整 W2。先跑最小 CUDA parity:
+  `cargo test -p ferrum-quantization --features cuda --release --test gptq_parity_test cuda_desc_act_vs_cpu_reference -- --ignored --nocapture`。
+- 若 parity 失败,优先查 CUDA qweight repack/perm 方向、Marlin scale
+  repack、qzeros/sym 假设和 real `g_idx` 分布;若 parity 通过,再用
+  `FERRUM_GPTQ_GIDX_TRACE=1` + early-smoke 的 layer/op dump 定位
+  Gemma3 层内首个爆炸算子。
+
+## 2026-06-13(晚 V)— W2 本地定位:desc_act GPTQ/Marlin 成为主嫌,固化 early-smoke 止损
+
+- 基于 `w2_gemma3_cuda_nan_logits_2026-06-13` artifact 继续本地定位:
+  已回收层 dump 的 `embed.bin` 与 `layer_00..07.bin` 全 finite,但数值幅度
+  从 `embed maxabs=17.7` 到 `layer_00 maxabs=23056` 已明显爆炸,
+  `layer_07 maxabs=42432`,最终 `logits.bin` 为 262208/262208 NaN。
+  这说明不是最终 tokenizer/stop/template 问题,也不是 final softcap 缺失;
+  数值从首层 GPTQ transformer 路径开始异常。
+- HF config 落证:
+  - `circulus/gemma-3-27b-it-gptq`: `desc_act=true`, `sym=true`,
+    `group_size=128`, `static_groups=false`, `lm_head=false`;
+    `final_logit_softcapping=null`。
+  - `ISTA-DASLab/gemma-3-27b-it-GPTQ-4b-128g` 是
+    `compressed-tensors/pack-quantized`,不是当前 GPTQ loader 可用的
+    Marlin-clean 格式,不能直接替换成 W2 GPTQ 载体。
+  - `orvp/gemma-3-27b-it-gptq` 与 `circulus` 同样是
+    `desc_act=true/static_groups=false` GPTQModel 路径。
+- 对照 vLLM current path:其 GPTQ-Marlin apply 路径把 `g_idx` 与
+  `g_idx_sort_indices` 传入 Marlin op;ferrum 当前 CUDA act-order 路径是
+  load-time qweight permute + runtime gather A,并在 vendored vLLM Marlin
+  wrapper 中把 `g_idx/perm/a_tmp` 传 null、`has_act_order=false`。这与
+  vLLM current path 不等价,是当前 NaN 的最高优先级嫌疑。
+- 代码/脚本加固(不改变默认产品路径):
+  - `FERRUM_LAYER_DUMP` 现在写 `summary.jsonl`,记录每个 dump 的
+    finite/nan/inf/maxabs;smoke 会打印首个 non-finite entry。
+  - `FERRUM_NAN_TRACE` 从只跟 layer 0 改为支持 `all` 或逗号分隔层号;
+    `FERRUM_OP_DUMP` 输出文件名带 `layer_NN_` 前缀。
+  - `scripts/model_coverage_smoke.sh` 新增
+    `FERRUM_SMOKE_NAN_TRACE` / `FERRUM_SMOKE_OP_DUMP_DIR` 可选透传。
+  - `scripts/pod_w2_gemma3.sh` 固化 early-smoke:build+GPTQ 下载完成后
+    先跑 correctness smoke;若失败,写 `early_smoke.fail` 并停止 GGUF /
+    llama.cpp 后台工作,不再等待 perf 前置项。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `bash -n scripts/model_coverage_smoke.sh scripts/pod_w2_gates.sh scripts/pod_w2_gemma3.sh`
+    PASS。
+  - `cargo test -q -p ferrum-models dump_stats_counts_nonfinite_values` PASS。
+  - `cargo test -q -p ferrum-models nan_trace_selector_accepts_all_or_layer_lists` PASS。
+  - `cargo test -q -p ferrum-models gemma3` PASS。
+
+### 下一步
+
+- 不开完整 W2 gate。下一次 GPU 只做小诊断:
+  1. 先跑合成 `desc_act=true` GPTQ CUDA parity(补/跑 ignored test),证明
+     ferrum act-order Marlin 是否已偏离 CPU reference;
+  2. 若 parity 失败,修 `MarlinWeight` 保存 `g_idx`/sort indices,让
+     vendored vLLM Marlin wrapper 使用原生 act-order(`a_tmp` scratch +
+     `has_act_order=true`),或实现等价 kernel-side g_idx 路径;
+  3. 只有合成 parity 过、Gemma3 early-smoke 首步 logits finite 后,才恢复
+     W2 L2-L5 正式 gate。
+
+## 2026-06-13(晚 IV)— W2 CUDA 早停:首步 logits 全 NaN,实例销毁
+
+- Vast 实例 `40806710`(Iceland host 1647,1×RTX 4090,120GB,$0.402/hr)
+  用于 W2 Gemma3-27B CUDA retry。Ferrum release CUDA build 完成,
+  GPTQ/GGUF 下载完成;在 llama.cpp 仍编译时提前并行启动同参数
+  `model_coverage_smoke` early smoke,避免等待 perf 前置项。
+- 结果:Gemma3-27B GPTQ 仍不能转绿。服务能加载并进入首个 known-answer
+  prefill,但 `logit_dump_smoke/logits.bin` 为 **262208/262208 全 NaN**:
+  `finite=0, nan=262208, posinf=0, neginf=0`。`early_smoke.log` 记录
+  `logits-topk known-answer-0-prefill: n=262208 finite=0 nonfinite=262208`,
+  随后 known-answer 输出仍为空。
+- 按 correctness first-stop,未进入 L5/perf。artifact 已回收到
+  `artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/`;核心证据包括
+  `early_smoke.log`、`gates_early/nan_logits_summary.json`、
+  `gates_early/logit_dump_smoke/logits.bin` 与 serve/build/download 日志。
+- 已回收的 partial layer dump 显示 `embed.bin` 与 `layer_00.bin` 到
+  `layer_07.bin` 全部 finite,但最终 `logits.bin` 全 NaN。NaN 不是
+  tokenizer/embedding 入口即炸,下一步应定位 layer 8+ 或 final norm /
+  tied lm_head / logit softcap 边界。
+- 实例已销毁;Vast API 验证 `count: 0`。`w2_matrix.json` 仅更新
+  `l2_gptq_cuda` 的失败证据指向本轮 NaN artifact;`l3_behavior`/
+  `l4_agent` 仍引用上一轮完整 smoke 失败,`l5_concurrency` 与
+  `perf_vs_llamacpp` 继续 pending。
+
+### 下一步
+
+- 不再重跑整条 W2 gate。先本地/小远端定位 Gemma3 GPTQ CUDA NaN:
+  1. 用已有 layer dump 找首个 NaN 层/算子边界;
+  2. 优先查 GPTQ desc_act permutation、Gemma3 tied lm_head / embed scale、
+     `final_logit_softcapping` 和 CUDA dtype/scale 路径;
+  3. 修到首步 logits finite 后,再开 1×4090 smoke;只有 smoke PASS 才跑
+     L5/perf。
+
+## 2026-06-13(晚 III)— W2 本地诊断加固:修一个采样 mask 缺口,下轮收 top-k
+
+- 没有重开 GPU,先基于 `w2_gemma3_cuda_failure_2026-06-13` 失败证据做本地收口。
+  W2 仍是 correctness blocking,不得转 pass。
+- 代码修复:`SequenceState::requires_full_logits_for_sampling()` 现在会在 tokenizer
+  暴露 base vocab 之外的可生成 control token 时强制 full logits。此前若
+  `FERRUM_GREEDY_ARGMAX=1` 且模型 argmax 落在扩展/保留区,可能绕过
+  `sample_with_processors` 的 extended-vocab mask。Gemma3 的
+  model vocab/tokenizer base vocab 形态正好需要防这类风险。
+- 诊断加固:`scripts/model_coverage_smoke.sh` 新增可选
+  `FERRUM_SMOKE_LOGIT_DUMP_DIR`。设置后复用既有 `FERRUM_LAYER_DUMP`,
+  在首个 known-answer 请求后打印 prefill `logits.bin` 的 finite/nonfinite
+  统计与 top10 token id/logit。`scripts/pod_w2_gates.sh` 已为 W2 smoke
+  开启该 dump,并在 smoke 首败时复制 `/tmp/ferrum_w1_smoke_8400.log`
+  到 gate artifact 目录。
+- 本地验证:
+  - `cargo test -q -p ferrum-engine sample_allows_generated_control_tokens_above_base_vocab`
+    PASS。
+  - `cargo test -q -p ferrum-engine continuous_engine` PASS(18 tests)。
+  - `bash -n scripts/model_coverage_smoke.sh scripts/pod_w2_gates.sh scripts/pod_w2_gemma3.sh`
+    PASS。
+  - `cargo fmt --all -- --check` PASS。
+  - `scripts/w1_goal_validator.py` 仍 `MODEL_COVERAGE_W1 GOAL PASS`。
+  - `scripts/w2_goal_validator.py` 仍 3/8,5 blocking cells(预期)。
+
+### 下一步
+
+- 下一次 1×4090 W2 重跑前先看 smoke top-k:
+  - 若 top-k 集中在 `>= tokenizer_base_vocab_size` 或控制 token,优先验证本次
+    full-logits/extended-mask 修复是否已把输出拉回正常文本。
+  - 若 top-k 已是正常文本 token 但 decode 仍空,继续查 tokenizer decode /
+    streaming delta。
+  - 若 top-k 本身全异常/非数/同一保留 token,转向 GPTQ loader 或 Gemma3
+    lm_head/logit softcap/量化 scale 路径。
+
+## 2026-06-13(晚 II)— W2 Gemma3 CUDA gate 首败:加载成功,正确性失败,实例销毁
+
+- Vast 实例 `40798977`(Iceland host 1647,1×RTX 4090,120GB,$0.402/hr)完成
+  W2 重试并已销毁;API 验证 0 实例。artifact 已回收到
+  `artifacts/w2_gemma3_cuda_failure_2026-06-13/`。
+- 远端证据:
+  - `build.ok`:Ferrum release CUDA build 完成。
+  - `dl_gptq.ok` / `dl_gguf.ok`:circulus GPTQ 与 unsloth Q4_K_M 下载完成。
+  - `llamacpp.ok`:llama.cpp `llama-bench` 构建完成。
+  - `gates/session_metadata.json`:git SHA `86633c2d...`,dirty files,RTX 4090
+    24GB,driver 565.77,nvcc 12.4 已记录。
+- 环境修复:复现 W1 的 GeForce forward-compat `libcuda` 问题
+  (`CUDA_ERROR_SYSTEM_DRIVER_MISMATCH`);已在远端移走 `/usr/local/cuda/compat/libcuda*`,
+  并固化进 `scripts/pod_w2_gemma3.sh`。
+- Gate 结果:Gemma3-27B GPTQ **能加载并服务**,但 smoke 正确性首败:
+  - known-answer **0/10**,所有答案为空字符串,`finish_reason=length`。
+  - natural EOS / custom stop / multi-turn 失败;stream identity 与 max_tokens
+    mechanics 本身通过。
+  - required tool-call **0/10**(HTTP 400),strict json_schema **0/20**(HTTP 500)。
+  - 按 GOAL 首败即停,**未进入 L5/perf**。
+- 矩阵更新:`w2_matrix.json` 将 `l2_gptq_cuda`、`l3_behavior`、`l4_agent`
+  标为 fail 并引用 smoke artifact;`l5_concurrency` 与 `perf_vs_llamacpp`
+  仍 pending(正确性未过,不得 bench)。
+
+### 下一步
+
+- 不再重复整条 W2 gate。先本地/小远端诊断 Gemma3 GPTQ 空输出:
+  1. dump prompt token ids + first-step logits/top-k/EOS/PAD ids,判断是模板/EOS
+     还是 logits/quant 退化;
+  2. 用 1B BF16/GGUF 已绿路径对比同 prompt,确认 CUDA GPTQ-only 问题;
+  3. 重点查 desc_act GPTQ permutation、Gemma3 `final_logit_softcapping`、
+     tied lm_head / embed scale、logit mask/EOS stop。
+
+## 2026-06-13(晚)— W2 pod 停止后本地收口:证据仍缺 5 格,gate 脚本加固
+
+- 已按 `ACTIVE_PODS.md` 记录:W2 Gemma3 pod `40770078` 在 run 4 中途按用户
+  "pod 销毁停止" 指令销毁,API 归零验证 0 实例。该 pod 已把三个修复提交回
+  当前分支:smoke 阶梯不再钉死 KV、27B 16-kv-head capacity math、CUDA
+  `scale_inplace` 保持 device dtype。
+- 当前权威验证状态:
+  - `scripts/w1_goal_validator.py` → `MODEL_COVERAGE_W1 GOAL PASS`
+    (72/72)。
+  - `scripts/w2_goal_validator.py` → 3/8 satisfied,仍阻塞在
+    `l2_gptq_cuda`、`l3_behavior`、`l4_agent`、`l5_concurrency`、
+    `perf_vs_llamacpp`。27B GPTQ 已能加载并服务单请求,但没有完整 L2-L5
+    gate artifact,不得转 pass。
+- 本地加固:W2 pod gate 脚本改为原始判据对齐:
+  - `bench-serve` 强制 `--fail-on-error --require-ci --seed 9271`
+    且显式 `random 256/128`。
+  - c=32 不再 best-effort;`l5_gemma3-27b-gptq_cuda.json` 必须包含
+    c=1/4/16/32 全 cell,每 run 100/100 完成、零错误。
+  - llama.cpp 同卡比值 `<0.5x` 会让脚本失败,不只打印 FAIL。
+- 本地加固:W2 validator 不再只检查 artifact 存在。若矩阵 cell 标为 pass,
+  validator 会检查 smoke log 的 `SMOKE PASS`,L5 JSON 的
+  c=1/4/16/32、N=3、usage token count、零错误,以及 perf ratio ≥0.5。
+
+### 下一步
+
+- 若继续 W2,重新开 1×4090 pod 前沿用下方 W2 pod 执行合同;跑
+  `scripts/pod_w2_gemma3.sh`,回收 `/workspace/w2/gates/` 后只按
+  validator 可证明的 artifact 更新 `w2_matrix.json`。
+- 不得在缺少 `MODEL_COVERAGE_W2 GOAL PASS` 前启动 W3 实现;W3 当前只保持
+  `W3_CHARTER.md` 草案交付物。
+
+## 2026-06-13(凌晨)— CUDA pod 批次收官:实例归零,9 个产品 bug,4 模型 CUDA 认证
+
+**pod 全部销毁,API 验证 0 实例**(单卡 ~9h + 双卡 ~5h + 两台坏机即弃,
+总花费 ≈ $7)。夜班战果:
+
+- **CUDA 侧转绿**:R1-8B BF16 smoke 12/12 + L5(54.5/163.7/382.5);
+  R1-Distill-70B 双卡 L2/L3 + L5(21.4/67.3/68.1);R1-Distill-32B GPTQ
+  L2/L3(known-answer 10/10 @ kv8192×1);Qwen3-32B GPTQ L2(10/10 +
+  tools 10/10);Qwen2.5-Coder-32B GPTQ 全梯一次过(含 schema 20/20)。
+  M3 同 pod 基线锚点 c=32 556.5±84。
+- **修复并验证的引擎 bug**(夜班新增,均已推送):流式 think 泄漏
+  (distill 全家,70B 上 E2E 验证);Marlin n%256≠0 在 m>16 崩溃 →
+  m≤16 分块复用已证 128×128 路径(dense-dequant 首版方案引入新问题已
+  撤);GGUF 多卡 layers=auto 未物化;serve/pull 过期 alias 副本;
+  pod 构建缺 vllm-paged-attn-v2 的硬报错;smoke harness 两处
+  (异常计为 miss、KV 钉死与 autosizer 叠加)。
+- **L1 终局(等批提案 #3)**:20 分叉点中位 logit 间距 0.75/min 0 →
+  BF16 平票翻转,非数值缺陷;跨实现逐位一致原则上不可达。
+- **OPEN ISSUES(下一会话,按正确性优先排序)**:
+  1. strict json_schema 在 32B-GPTQ 上间歇 500(~25-30% 请求,
+     R1-32B 15/20、Qwen3-32B 14/20;R1-8B-BF16 与 Qwen2.5-Coder-32B
+     同路径 20/20)+ 500 不落引擎日志的可观测性缺口。
+  2. Coder-30B jart25-GPTQ 的 CUDA chat 首 token 即 EOS(Metal GGUF
+     同 prompt 正常、CUDA 随机上下文 L5 正常);prime suspect =
+     仓库自带魔改模板(sha 30b8ba8f ≠ 官方 5a38bfa0);待 prompt-ids
+     双端 dump 对照。
+  3. 同构 perf:Coder-30B c=32 411.6 vs M3 556.5(0.74×,宿主机噪声
+     stddev 15% 需复核)— 超 ≤10% 判据,按 GOAL 记接入问题待查。
+  4. CUDA autosizer:reasoning/32B-GPTQ 的 (seqs×capacity) 联合推导
+     (512/seq 400、0-blocks 报错两态)。
+- distill 系 tools-in-think 行为差异落档:32B 注入式 tools 10/10 可用,
+  70B 把调用写进未闭合 think(0528 系 10/10)→ README 按"agent 分级"
+  如实标注。
+
+## 2026-06-12(夜)— 用户决策落地:32B Metal 收束 + CUDA pod 批次启动
+
+- **用户指令**:32B 稠密不再在 32GB Mac 上折腾("同架构已证即可"——
+  Qwen3-14B/R1-8B 的 Metal pass 即同架构证明);Vast 已充值,批准开
+  GPU;**严格要求高效利用 + 异步并行 + 空闲即毁 + 结束全毁**(用户刚
+  手动清理了数台未销毁实例)。API 已核实当前 0 实例。
+- 矩阵落实:R1-Distill-32B 与 Qwen2.5-Coder-32B 的 `l2_gguf_metal`
+  waived(同架构证明 + 部署无场景);Qwen3 dense 行按 14B 证据 pass。
+- L5 Metal 批次进行中:Coder-30B ✅(c1/4/16/32 全零错)、R1-8B ✅
+  (22.9/23.4/54.2 tok/s)、14B/Mistral-Small/Magistral 排队自动跑。
+
+### CUDA pod 批量执行合同(开 pod 前置,GOAL 模板)
+
+```text
+Lever: W1 CUDA gate 批量 —— 单卡 4090:L1 代表(R1-8B BF16 byte-equal
+  N≥20 vs transformers)+ L2-GPTQ smoke(R1-Distill-32B/OPEA、
+  Qwen3-32B/JunHowie、Qwen2.5-Coder-32B/官方、Qwen3-Coder-30B/jart25)
+  + R1-8B CUDA BF16 smoke + 各模型 L5(c=1/4/16,30B 级补 32)
+  + C7/G0 存量回归(M2 Llama-8B-INT4、M3 Qwen3-30B-A3B-GPTQ floor)。
+  双卡 2×4090:R1-Distill-Llama-70B GGUF 4bit layer-split smoke + L5。
+Expected gain: ~18-20 个 gate cell 转绿,W1 除 README 外收口
+Files: scripts/model_coverage_smoke.sh(复用)+ pod 上逐步驱动
+Correctness gate: 每模型 smoke 全绿;首败即停该模型并记录
+Benchmark gate: L5 全 cell 100%/零错误;同构 ≤10%;C7/G0 不回退
+Budget cap: ≤2 pod-day;预计单卡 ~$0.35-0.5/hr + 双卡 ~$0.7-1/hr,
+  目标一晚收口(~$10-25)
+Stop condition: 单模型卡壳 >4h 降级记录;pod 空闲即毁;
+  结束后 API 验证实例数 = 0(用户硬性要求)
+```
+
+## 2026-06-12(晚 II)— Mistral 线 2/3 收口;Devstral 2 降级(mistral3);[THINK] 修复
+
+- ✅ **Mistral-Small-3.2 全过**(10/10,首个满足 L4 schema 20/20 新判据的
+  模型);✅ **Magistral 12/12 全过**——其 reasoning 走 `[THINK]` 特殊
+  token,暴露并修复了一个普适 bug:**skip-special 解码会吞掉标 special
+  的 think 标记**,思考文本漏进 content(Qwen3 标 special 的 `<think>`
+  同样潜伏)。修复:tokenizer 解码按标记 id 分段、规范化为
+  `<think>/</think>` 再拼接,下游零改动,带单测。
+- 🔻 **Devstral 2 按 GOAL 卡壳规则降级到 W2 末尾**:GGUF arch 是
+  **mistral3**(YaRN factor 48 / 原窗 8192 / `attention.temperature_scale
+  0.1`,全在 `mistral3.*` 命名空间)。loader 此前静默走 llama-family
+  路径 → 退化输出(known-answer 3/10、重复循环)。已加**未知架构硬报错**
+  守卫(带单测)——明确不支持好过悄悄输出垃圾。实现 mistral3 = 新
+  rope/注意力数学,超出 W1 SMALL 预算;W2 与 Gemma 3 异构注意力地基
+  一并评估。
+- 验证器 19/63 → **30/72**(Devstral 拆分出独立降级行)。
+- Mistral 线剩余 cell:L5 并发 + perf(pod)+ README。
+
+## 2026-06-12(傍晚)— 修订批准落实;32B 稠密 Metal 诊断(需重启)
+
+- **两个 GOAL 修订经用户批准并写入 GOAL.md 修订记录**:L1 按代码路径
+  代表执行(5 个不可行 cell 转 waived,R1-8B 是 dense 路径代表);
+  L3/L4 逐模型载体改为 smoke 阶梯(判据数字不变,schema 升 20/20)。
+  R1-8B 与 Coder-30B 的 L3 cell 凭既有扩展 smoke 证据转 pass。
+  验证器 12/63 → **19/63**。
+- **Qwen3-14B Metal smoke 10/10 过**(cell 与 32B 同行,等 32B)。
+- **32B 稠密 Metal 诊断**:R1-Distill-32B smoke 两次超时后实测解码
+  **0.14 tok/s**(TTFT 5.2s 正常)——每 token 把被驱逐的 18GB mmap 权重
+  从 SSD 重读(~2.6GB/s = SSD 速度)。llama.cpp 同文件对照**同样卡死**
+  (22 CPU 分钟未完成加载)→ 非 ferrum 接入 bug。根因:早上 KV 池
+  thrash 事故在压缩器里留下 ~9GB 系统级残留,可用内存 < 模型工作集。
+  **需要用户重启后公平复测**;若干净 32GB Mac 仍装不下 32B 稠密 + 服务
+  开销,则 32B 级稠密(R1-32B / Qwen3-32B / Qwen2.5-Coder-32B)的
+  Metal cell 按修订精神 waive 给 CUDA GPTQ lane。
+- 教训入库:32GB 机器一次只跑一个重负载(13GB 下载 + 18GB 常驻模型的
+  page-cache 互相驱逐就是第一次超时的原因)。
+
+## 2026-06-12(午后 II)— R1-8B L2-Metal cell 转绿;HF_ENDPOINT 落地
+
+- ✅ **R1-8B 扩展阶梯 12/12 全过**(known-answer 10/10 语义正确 + stop
+  不漏 + max_tokens 守预算 + reasoning/stream/tools/schema 机制),
+  `l2_gguf_metal` cell 转 pass,验证器 11/63。
+- **`HF_ENDPOINT` 支持落地**(huggingface_hub 同约定):本网络实测
+  hf-mirror 直连 2.08MB/s vs 代理 0.156MB/s(**13×**)。Coder-30B 下载
+  已切镜像直连续传(ETag 与 hub 一致,blob 无缝续);预计 ~1h 内落盘。
+- R1-Distill-Llama-70B 模板与 R1-Distill-Qwen-32B fixture 同 hash 同
+  EOS(`56a1447ad31926fd`),L0 模板面由现有 fixture 覆盖。
+
+## 2026-06-12(午后)— gate 矩阵 + 验证器落地;两个 GOAL 修订提案待批
+
+- **`w1_matrix.json` + `scripts/w1_goal_validator.py` 落地**:7 个模型 ×
+  9 个 cell = 63 cell,当前 10/63 满足(L0 ×6 + waived ×4)。验证器是唯一
+  允许打印 `MODEL_COVERAGE_W1 GOAL PASS` 的程序;cell 必须 pass(带
+  artifact)或 waived(带理由),引用的 artifact 必须存在。
+- **L0 完成度**:43/43 golden 全过(9 个 fixture 模型,新增 Mistral 线
+  ×3 + Llama-3.1;`strftime_now` 时钟注入 + `tojson(indent=N)` 两个真实
+  渲染缺口由 L0 抓出并已修,commit `c8f3703e`)。
+- smoke 阶梯扩充:known-answer 1x→10x(对齐 L2 判据),新增自定义 stop
+  机制断言 + max_tokens 截断断言(L3 缺口)。
+- **修订提案 #1(L1,需用户决定)**:L1 BF16 byte-equal 对 14B+ 在现有
+  硬件上物理不可行(14B BF16=28GB>24GB 单卡;32B=64GB;70B=140GB)。
+  提案:L1 按"代码路径代表"执行——每条代码路径取硬件放得下的最大代表
+  (Qwen3 dense → 8B/0.6B 已有 reference_match;Qwen3-MoE → 30B-A3B 需
+  pod 上 BF16?同样放不下,24GB 单卡上 MoE BF16 60GB 也不可行 → MoE 路径
+  L1 只能 waive 到"Mac/CPU 逐层激活对照"或双卡)。大尺寸模型靠"同代码
+  路径 + L2 行为对照"传递。**未批前 5 个 l1_bf16 cell 保持 pending。**
+- **修订提案 #2(L3,需用户决定)**:blast-radius 套件断言对 0.6B 哨兵
+  模型定制(canonical id、即答行为),对 8B-32B reasoning 模型强行参数化
+  会又重又脆。提案:L3 判据改为"model_coverage_smoke 的 L3 段全绿"
+  (多轮/stream/自然 EOS/自定义 stop/max_tokens/reasoning 提取,行为
+  断言与套件同源),blast-radius 套件保持小模型哨兵职责(引擎级回归)。
+  **未批前 L3 cell 不以 smoke 结果记 pass。**
+
+## 2026-06-12(午前)— L0 扩面:模板同一性 + Mistral/Llama golden
+
+- **模板同一性(HF raw tokenizer_config,sha256 前 16 位)**:
+  Qwen3-0.6B / 14B / 32B 模板逐字节同一份(`a55ee1b1660128b7`,EOS
+  `<|im_end|>`);R1-Distill-Qwen-14B / 32B 同一份(`56a1447ad31926fd`,
+  EOS `<｜end▁of▁sentence｜>`)。**结论:Qwen3-14B/32B 与 R1-Distill-14B
+  的 L0 由现有 golden fixture 直接覆盖**,各自只剩 per-model
+  EOS/generation_config 断言(T4 机制已通用)。
+- Mistral 24B 线 + Llama-3.1 golden fixture 生成中(来源 = serve 实际用的
+  tokenizer 仓库:unsloth 镜像 ×2 + mistralai 上游 ×1 + unsloth Llama)。
+  环境坑:huggingface_hub 新版走 httpx,SOCKS 代理需要 `httpx[socks]`
+  (socksio),`pysocks` 只管 requests。
+- Coder-30B GGUF(17.28GB)断点续传循环推进中(代理频繁断流,每次
+  尝试落 1–3GB,`.incomplete` blob 在涨)。
+
+## 2026-06-12(深夜 III)— ✅ R1-0528-Qwen3-8B GGUF Metal smoke 全绿
+
+**W1 第一个模型过本地阶梯**:`FERRUM W1 SMOKE PASS: deepseek-r1:8b-q4_k_m`
+(8/8:known-answer、自然 EOS、reasoning 提取、think 不漏入 content、
+多轮记忆、stream==non-stream、required tool 10/10、strict json_schema
+10/10)。证据:`artifacts/smoke_deepseek-r1-8b-q4_k_m_metal_2026-06-12.txt`。
+serve 参数:`--kv-capacity 8192 --max-num-seqs 4`(见下条 thrash 诊断)。
+注意:这是 L2/L3/L4 的可跑子集;最终认证仍需完整套件
+(json_schema 20/20 走 server_structured_output)+ CUDA 侧 gate。
+
+## 2026-06-12(深夜 II)— GGUF pull 产品缺口修复 + KV 池 thrash 诊断
+
+R1-8B GGUF smoke 调试中钉死三个真实产品问题(全部影响 W1 每个 GGUF alias):
+
+1. **pull sidecar 全量下载 bug(已修)**:GGUF 仓库缺 tokenizer.json 时,
+   兜底走 `HfDownloader::download(sibling)` —— 会把 sibling 的 **safetensors
+   权重(8B≈16GB)整库拉下来**,只为拿 tokenizer。磁盘紧张时必死,这就是
+   此前需要手工拷 tokenizer 的根因。新增
+   `HfDownloader::download_sidecar_files`(只拉指定小文件),pull 改用之,
+   清单补上 `generation_config.json`(EOS 解析第一优先级)+
+   `chat_template.jinja`。
+2. **bartowski 系 sibling 映射全断(已修)**:HF API 实测 9 个 W1 GGUF 仓库
+   **全部不带 tokenizer.json**,sibling 兜底是必经之路;而 strip `-GGUF`
+   约定对 bartowski/*(无 safetensors 镜像)全部失效。
+   `tokenizer_sibling_repo` 加显式映射(2026-06-12 HF API 逐个核实
+   tokenizer.json 存在):Qwen2.5-Coder→Qwen 官方;Mistral-Small-3.2 /
+   Magistral→unsloth 镜像(**mistralai 上游只有 tekken 格式,无 HF
+   tokenizer.json**);Devstral 2→mistralai 上游;Llama 系→unsloth 镜像
+   (meta-llama 上游 gated)。
+3. **`--kv-capacity` 单独抬高 = 32GB Mac 内存灾难(smoke 已加防护)**:
+   KV 池 = `max_num_seqs × kv_capacity`。autosizer server 档默认
+   (32, 512)≈2GB;只把 capacity 提到 8192 会得到 32×8192≈36GB 池
+   (8B/36 层/8KV头/128hd),Metal 分配直接把机器打进内存压缩 thrash
+   (实测:health 能过、首个请求触发 `ensure_kv` 后 600s 超时,压缩器
+   存页 38GB)。smoke 的 reasoning 档改为
+   `--kv-capacity 8192 --max-num-seqs 4`(池 32K token,与默认同量级)。
+   **autosizer 产品缺口升级**:reasoning 模型需要的不是"调大 capacity",
+   而是 (seqs × capacity) 在显存预算内的联合推导 + 长上下文低并发档位;
+   `--kv-capacity` 作为独立产品 flag 缺少联动护栏。
+
+## 2026-06-12(深夜)— 本地验证推进与环境修正
+
+- **修正**:HF 缓存里的 R1-0528-8B / R1-Distill-32B / Qwen3-Coder-30B /
+  Qwen2.5-Coder-32B 仅为 6–11MB 元数据壳(config/tokenizer),**无权重**。
+  W1 端到端一律需要下载。
+- 磁盘:删除 target/debug(15GB)后约 16GB 可用;R1-8B Q4_K_M GGUF(~5GB)
+  下载中(第一次因网络/代理 "error decoding response body" 失败,重试中);
+  Qwen3-Coder-30B Q4_K_M(~18.6GB)需要更多空间——待用户清理或换机。
+- 新增 `scripts/model_coverage_smoke.sh <alias> [--reasoning]`:
+  L2/L3/L4 阶梯(known-answer + 自然 EOS / 多轮 / stream==non-stream /
+  reasoning 提取 / required tool 10x / strict schema 10x),所有 W1 模型复用。
+- 下一步(按序):R1-8B GGUF smoke(--reasoning)→ 视磁盘跑
+  qwen3-coder:30b-q4_k_m → W1 收尾(README 矩阵 + 验证器)→ pod 合同。
+
+## 2026-06-12(深夜)— blast-radius 存量回归结果
+
+T3/T4/T5 处于 EOS/stop/模板爆炸半径,全套件(release + Metal,真模型)结果:
+
+- ✅ chat_smoke 13 / server_smoke 10 / chat_pty 3 / chat_stress 2 / server_stress 2
+- ✅ server_openai_compat 7/7 — 其中两处修复:
+  - `test_python_openai_sdk_*`:本机环境缺 `openai`/`socksio`(SOCKS 代理),
+    已 pip --user 安装,非代码问题。
+  - `test_openai_client_tools_stream_*`:模板修正后 prompt 与 transformers
+    字节一致(差 1 token),0.6B 贪心解码改为真的调用工具——服务器输出了
+    规范的 tool_calls delta + finish=tool_calls + usage。测试断言改为
+    "文本 XOR 合法工具调用"(7c69e2a7),钉住流式机制而非模型选择。
+- ⏸ reference_match:1 行 drift **等用户审核后 re-baseline**(分类器按
+  CLAUDE.md 拦截了自动重置,正确):case `qwen3-0.6b-arith-2-plus-3`
+  内容与 token 数完全一致,仅 `finish_reason: length → stop` ——
+  这是 EOS 修复的直接证据(此前 tokenizer 探测不到 Qwen EOS,自然停止
+  被误归因为 budget 耗尽)。审核通过后执行:
+  `FERRUM_UPDATE_FIXTURES=1 cargo test --release -p ferrum-cli --features metal --test reference_match -- --ignored --test-threads=1`
+
+## 2026-06-12(晚)
+
+- **T5 完成:L0 golden 基建落地并修出 7 处真实偏差**(PR #234,auto-merge):
+  - `scripts/gen_chat_template_goldens.py` + 5 模型 23 用例 fixture 入库,
+    `chat_template_golden` 测试 23/23 与 transformers 字节级一致。
+  - 修复项:trim_blocks/lstrip_blocks 对齐 transformers;tojson 改 Python
+    json.dumps 风格(自定义 filter);minijinja+serde_json 双 preserve_order
+    (minijinja 对 Rust struct 字段强制字母序,tools 改为有序 JSON 值进模板);
+    `PromptMessage::new` 不再急切剥离 assistant 历史的 `<think>`
+    (剥不剥是模板的政策:DeepSeek 剥、Qwen3-Coder 保留)。
+- **W1 全模型 alias 配齐**(均经 HF API 核实文件名):safetensors/GPTQ/GGUF
+  三组,含 deepseek-r1:8b/14b/32b、qwen3-coder:30b、qwen3:14b/32b、
+  qwen2.5-coder、mistral-small/devstral/magistral 24b 线。
+- **YaRN clamp 落地**:不支持的 rope_scaling → `max_seq_len` clamp 到
+  `original_max_position_embeddings` + 启动警告(R1-0528 由 131072 clamp 到
+  32768),含单测。
+- **环境约束发现**:本机磁盘 100%(HF 缓存 42GB);已清理 target/debug/
+  incremental 释放 7.3GB。**新模型权重无法下载**,但缓存中已有
+  R1-0528-Qwen3-8B、R1-Distill-32B、Qwen3-Coder-30B、Qwen2.5-Coder-32B 的
+  safetensors + blast-radius 三小模型 → 本地验证用缓存模型推进。
+- blast-radius 套件(chat_smoke/pty/stress + server 三件 + reference_match)
+  在后台执行中——T3/T4/T5 改动处于 EOS/stop/模板爆炸半径,存量回归必须绿。
+
 ## 2026-06-12(下午)
 
 - **T3 完成并提交(`778082a6`)**:minijinja-contrib pycompat 接入;模板渲染失败/
@@ -44,3 +1296,70 @@
 - CUDA 侧 gate(L2-GPTQ / L5 / C7 回归)需要 4090 pod:开 pod 前按 GOAL
   执行合同填表并征得用户预算批准(CLAUDE.md 要求)。当前无可用 pod
   (上一台 38237968 已失;见 memory)。本地(Metal/CPU)可推进项先行。
+
+## 2026-06-13 15:25 — W1 GOAL PASS
+
+- `scripts/w1_goal_validator.py`: **72/72 cells satisfied →
+  `MODEL_COVERAGE_W1 GOAL PASS`**。
+- 最后 6 cell(32B 三连 l5_concurrency + perf_same_arch)由冰岛 pod
+  40751023 一次干净会话收齐:
+  - `l5f_r1-32b_cuda.json` c=1/4/16/32 = 40.8/116.6/248.9/300.6 tok/s,
+    1200 请求 0 错误。
+  - `l5f_qwen3-32b_cuda.json` c=32 = 273.6 tok/s,0 错误。
+  - `l5f_qwen25-coder-32b_cuda.json` c=32 = 257.1 tok/s,0 错误。
+  - perf_same_arch(修订 #4 判据):三方互校最差偏差 8.5% ≤ 10% →
+    `W1_PERF_SPREAD PASS`。
+- GPU 纪律:三台问题宿主(台湾 docker_build 坏 / 阿根廷不开机 /
+  冰岛 cuInit=804)处置后,**API 归零验证 0 实例**。本夜累计 GPU 支出
+  约 $9。
+- 新宿主病理学(已固化进 `pod_w1_final_armored.sh`):
+  - cuInit=804 = 容器 compat libcuda(550)压住宿主驱动,GeForce 不在
+    compat 支持表;删 compat so + ldconfig 即愈。
+  - rsproxy.cn 在部分欧洲宿主被 TLS 劫持;脚本现在先探测 crates.io
+    再选镜像。
+  - hf xet/hf_transfer 在该宿主网络下饿死(0 MB/s);关 xet + 关
+    hf_transfer 的普通 HTTP 路径反而跑满 3.6 Gbps。
+- 待办移交(不阻塞 W1,记录在 GOAL.md 开放问题):schema-500、
+  Coder jart25 CUDA chat、CUDA autosizer、Metal L5 复跑(等本机恢复)。
+
+### 下一步
+
+- W2:Gemma 3 27B 家族接入(SWA 5:1 / 双 rope / GeGLU / 三明治 norm /
+  query_pre_attn_scalar),本地 Mac/CPU dump 对照先行,CUDA 验证晚开 pod。
+- W3:DeltaNet 调查(W1+W2 后解锁)。
+
+## 2026-06-13 — W2 Gemma3 接入(本地段完成)
+
+- W2-1 实现:Gemma3 经 config 门控并入 LlamaFamilyModel(5:1 SWA 逐层
+  调度 / 双 rope 表 + Linear scaling / GeGLU / 三明治 norm / (1+w) 与
+  q_scalar 载入期折叠 / embed×√h)。batched/varlen/paged 快路对
+  sandwich 家族构造期禁用(防静默错误),W2-3 再接。
+- W2-2 验证:L0 golden 4 例字节相等;L1 dump 对照 CPU+Metal 双 PASS;
+  greedy 18/20 byte-equal,2 例 HF top1-top2 gap=0.25(一个 bf16 ulp)
+  平局翻转(修订 #3 方法)。证据 `artifacts/gemma3_l1/`。
+- 顺带修复两个 Metal 内核潜伏 bug(Gemma3 首次踩出):
+  flash_attn 简单核 acc[4] 在 head_dim=256 寄存器越界(→acc[8]);
+  gelu_tanh fast-math 溢出 NaN(→clamp)。微基准 5 项钉死
+  (`gemma3_metal_ops_test.rs`)。
+- 27B 量化落证:ISTA-DASLab 是 compressed-tensors(不可直载);
+  **circulus/gemma-3-27b-it-gptq = 经典 GPTQ 4b/g128/sym/desc_act=true,
+  纯文本导出 `model.*` 命名** — ferrum perm-aware Marlin 已支持
+  desc_act(quant.rs:151)。GOAL 的"ISTA GPTQ"假设据此修正。
+- W2 矩阵 + 验证器就位(`w2_matrix.json` + `w2_goal_validator.py`),
+  当前 2/8(l0/l1 pass)。
+
+### W2 pod 执行合同(开 pod 前按 CLAUDE.md 填)
+
+```text
+Lever: Gemma3-27B CUDA gates(L2 GPTQ known-answer → L3 行为 → L4 agent
+  → L5 bench)+ 同卡 llama.cpp Q4_K_M decode ≥0.5× 对照
+Expected gain: w2_matrix 6 个 pending cell 出 pass/fail 结论
+Files: scripts/pod_w2_gemma3.sh(armored 模式复用 W1 套件)、
+  model_coverage_smoke.sh、bench-serve、pod 端构建 llama.cpp
+Correctness gate: known-answer 10/10 + smoke 机制全绿,任一 rung 失败
+  即停(不进 bench)
+Benchmark gate: bench-serve c=1/4/16/32 零错误;llama.cpp 同卡比 ≥0.5
+  (0.5–0.8 记 known-gap 不阻塞)
+Budget cap: 1 pod-day 硬顶;目标 ≤6h(约 $2.5,单卡 4090)
+Stop condition: 正确性 gate 失败 → 停手出报告;8h 无进展 → 销毁重估
+```

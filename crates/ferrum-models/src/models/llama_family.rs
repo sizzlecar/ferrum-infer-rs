@@ -46,7 +46,7 @@ pub(crate) static NORM_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OTHER_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OTHER_CALLS: AtomicU64 = AtomicU64::new(0);
 use ferrum_quantization::{Linear, WeightLoader};
-use ferrum_types::Result;
+use ferrum_types::{Activation, Result};
 
 use crate::common::paged_pool::block_hash_chain;
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
@@ -54,8 +54,230 @@ use crate::lora::{load_runtime_lora_adapter, ActiveLoraAdapter, RuntimeLoraAdapt
 
 const DEFAULT_KV_CAPACITY: usize = 512;
 
+fn alloc_model_buffer<B: QuantLlmBackend + BackendMoeFused>(
+    label: &'static str,
+    len: usize,
+) -> B::Buffer {
+    let _ = label;
+    #[cfg(feature = "cuda")]
+    let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(label);
+    B::alloc(len)
+}
+
+fn alloc_model_typed_buffer<B: QuantLlmBackend + BackendMoeFused>(
+    label: &'static str,
+    dtype: ferrum_kernels::backend::Dtype,
+    len: usize,
+) -> B::Buffer {
+    let _ = label;
+    #[cfg(feature = "cuda")]
+    let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(label);
+    B::alloc_typed(dtype, len)
+}
+
 pub(crate) fn elapsed_micros_u64_floor1(t0: std::time::Instant) -> u64 {
     t0.elapsed().as_micros().min(u64::MAX as u128).max(1) as u64
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DumpStats {
+    n: usize,
+    finite: usize,
+    nan: usize,
+    posinf: usize,
+    neginf: usize,
+    maxabs: f32,
+    maxabs_index: Option<usize>,
+}
+
+fn stats_for(values: &[f32]) -> DumpStats {
+    let mut stats = DumpStats {
+        n: values.len(),
+        finite: 0,
+        nan: 0,
+        posinf: 0,
+        neginf: 0,
+        maxabs: 0.0,
+        maxabs_index: None,
+    };
+    for (i, &x) in values.iter().enumerate() {
+        if x.is_finite() {
+            stats.finite += 1;
+            let abs = x.abs();
+            if abs > stats.maxabs || stats.maxabs_index.is_none() {
+                stats.maxabs = abs;
+                stats.maxabs_index = Some(i);
+            }
+        } else if x.is_nan() {
+            stats.nan += 1;
+        } else if x.is_sign_positive() {
+            stats.posinf += 1;
+        } else {
+            stats.neginf += 1;
+        }
+    }
+    stats
+}
+
+fn stat_coord(stats: DumpStats, row_width: Option<usize>) -> Option<(usize, usize)> {
+    let width = row_width?;
+    if width == 0 {
+        return None;
+    }
+    let index = stats.maxabs_index?;
+    Some((index / width, index % width))
+}
+
+fn append_dump_summary(dir: &str, label: &str, stats: DumpStats, row_width: Option<usize>) {
+    use std::io::Write;
+
+    let path = format!("{dir}/summary.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let label = label.replace('\\', "\\\\").replace('"', "\\\"");
+        let maxabs_index = stats
+            .maxabs_index
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        if let Some((row, col)) = stat_coord(stats, row_width) {
+            let _ = writeln!(
+                f,
+                "{{\"label\":\"{}\",\"n\":{},\"finite\":{},\"nan\":{},\"posinf\":{},\"neginf\":{},\"maxabs\":{},\"maxabs_index\":{},\"row_width\":{},\"maxabs_row\":{},\"maxabs_col\":{}}}",
+                label,
+                stats.n,
+                stats.finite,
+                stats.nan,
+                stats.posinf,
+                stats.neginf,
+                stats.maxabs,
+                maxabs_index,
+                row_width.unwrap_or(0),
+                row,
+                col
+            );
+        } else {
+            let _ = writeln!(
+                f,
+                "{{\"label\":\"{}\",\"n\":{},\"finite\":{},\"nan\":{},\"posinf\":{},\"neginf\":{},\"maxabs\":{},\"maxabs_index\":{}}}",
+                label,
+                stats.n,
+                stats.finite,
+                stats.nan,
+                stats.posinf,
+                stats.neginf,
+                stats.maxabs,
+                maxabs_index
+            );
+        }
+    }
+}
+
+fn write_f32_dump(dir: &str, label: &str, values: &[f32]) {
+    write_f32_dump_with_width(dir, label, values, None);
+}
+
+fn write_f32_dump_with_width(dir: &str, label: &str, values: &[f32], row_width: Option<usize>) {
+    let _ = std::fs::create_dir_all(dir);
+    let bytes: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let _ = std::fs::write(format!("{dir}/{label}.bin"), bytes);
+    append_dump_summary(dir, label, stats_for(values), row_width);
+}
+
+fn nan_trace_enabled_for_layer(local_layer: usize, source_layer: usize) -> bool {
+    let Ok(raw) = std::env::var("FERRUM_NAN_TRACE") else {
+        return false;
+    };
+    nan_trace_raw_matches(&raw, local_layer, source_layer)
+}
+
+fn nan_trace_raw_matches(raw: &str, local_layer: usize, source_layer: usize) -> bool {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+        return true;
+    }
+    if raw == "0" || raw.eq_ignore_ascii_case("false") {
+        return false;
+    }
+    raw.split(',').any(|part| {
+        let part = part.trim();
+        parse_nan_trace_layer_selector(part)
+            .is_some_and(|layer| layer == local_layer || layer == source_layer)
+    })
+}
+
+fn parse_nan_trace_layer_selector(part: &str) -> Option<usize> {
+    let part = part.trim();
+    if part.is_empty() {
+        return None;
+    }
+    if let Ok(layer) = part.parse::<usize>() {
+        return Some(layer);
+    }
+    for prefix in ["layer", "source", "l"] {
+        if part.len() > prefix.len() && part[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return part[prefix.len()..].parse::<usize>().ok();
+        }
+    }
+    None
+}
+
+fn nan_trace_dump<B: Backend>(
+    ctx: &mut B::Context,
+    source_layer: usize,
+    op: &str,
+    buf: &B::Buffer,
+    len: usize,
+    row_width: Option<usize>,
+) {
+    B::sync(ctx);
+    let v = B::to_vec(buf, len);
+    let stats = stats_for(&v);
+    let maxabs_index = stats
+        .maxabs_index
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    if let Some((row, col)) = stat_coord(stats, row_width) {
+        eprintln!(
+            "[nan-trace] layer={} op={} n={} finite={} nan={} posinf={} neginf={} maxabs={:.3} maxidx={} row_width={} row={} col={}",
+            source_layer,
+            op,
+            stats.n,
+            stats.finite,
+            stats.nan,
+            stats.posinf,
+            stats.neginf,
+            stats.maxabs,
+            maxabs_index,
+            row_width.unwrap_or(0),
+            row,
+            col
+        );
+    } else {
+        eprintln!(
+            "[nan-trace] layer={} op={} n={} finite={} nan={} posinf={} neginf={} maxabs={:.3} maxidx={}",
+            source_layer,
+            op,
+            stats.n,
+            stats.finite,
+            stats.nan,
+            stats.posinf,
+            stats.neginf,
+            stats.maxabs,
+            maxabs_index
+        );
+    }
+    if let Ok(dir) = std::env::var("FERRUM_OP_DUMP") {
+        let safe_op = op.replace('/', "_");
+        write_f32_dump_with_width(
+            &dir,
+            &format!("layer_{source_layer:02}_{safe_op}"),
+            &v,
+            row_width,
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -85,6 +307,10 @@ pub(crate) struct LlamaFamilyRuntimeEnv {
     pub(crate) prefix_cache: bool,
     pub(crate) cuda_graph: bool,
     pub(crate) decode_layer_profile: bool,
+    /// `FERRUM_LAYER_DUMP=<dir>`: write per-layer prefill residuals (f32
+    /// little-endian .bin) for numerical comparison against HF
+    /// transformers (W2 new-family L1 gate). Debug-only — syncs per layer.
+    pub(crate) layer_dump_dir: Option<String>,
 }
 
 impl LlamaFamilyRuntimeEnv {
@@ -119,6 +345,7 @@ impl LlamaFamilyRuntimeEnv {
             prefix_cache: false,
             cuda_graph: false,
             decode_layer_profile: false,
+            layer_dump_dir: None,
         };
         for (name, value) in vars {
             let value = value.as_ref();
@@ -135,6 +362,7 @@ impl LlamaFamilyRuntimeEnv {
                 "FERRUM_PREFIX_CACHE" => config.prefix_cache = value == "1",
                 "FERRUM_CUDA_GRAPH" => config.cuda_graph = true,
                 "FERRUM_DECODE_LAYER_PROFILE" => config.decode_layer_profile = true,
+                "FERRUM_LAYER_DUMP" => config.layer_dump_dir = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -170,6 +398,10 @@ pub enum RopeScalingConfig {
         high_freq_factor: f64,
         original_max_position_embeddings: f64,
     },
+    /// Plain positional interpolation (`rope_type: "linear"`): every
+    /// frequency divided by `factor`. Gemma 3 4B+ applies this (factor 8)
+    /// to the global-attention layers only.
+    Linear { factor: f64 },
 }
 
 impl RopeScalingConfig {
@@ -208,6 +440,66 @@ pub struct LlamaFamilyConfig {
     /// Sliding-window attention size. `0` disables (full causal).
     /// Mistral v0.1 sets 4096; Mistral v0.2+ removed the limitation (0).
     pub sliding_window: usize,
+    /// MLP activation. All pre-Gemma families use SiLU (SwiGLU); Gemma 3
+    /// uses `gelu_pytorch_tanh` (GeGLU).
+    pub activation: Activation,
+    /// Layer-pattern period for local/global attention scheduling.
+    /// `0` = uniform (every layer uses `sliding_window` as-is). Gemma 3
+    /// sets 6: every 6th layer (`(idx+1) % 6 == 0`) is global (full
+    /// attention, main rope table); the rest are local (sliding window,
+    /// local rope table).
+    pub sliding_window_pattern: usize,
+    /// RoPE θ for local-attention layers when the family keeps two rope
+    /// tables (Gemma 3: 10_000 local vs 1_000_000 global). `None` = one
+    /// table for all layers. The local table is never rope-scaled.
+    pub rope_local_theta: Option<f64>,
+    /// Softmax scale numerator override: attention scale becomes
+    /// `1/sqrt(query_pre_attn_scalar)` instead of `1/sqrt(head_dim)`.
+    /// Folded into the loaded `q_norm` weights (requires `has_qk_norm`),
+    /// so kernels stay untouched. Gemma 3 27B: 168 (head_dim is 128).
+    pub query_pre_attn_scalar: Option<f64>,
+    /// Gemma RMSNorm convention `x̂·(1+w)`: all norm weights get +1 folded
+    /// in at load time (kernels keep computing `x̂·w`).
+    pub rmsnorm_unit_offset: bool,
+    /// Gemma sandwich norms: `post_attention_layernorm` is applied to the
+    /// attention output BEFORE the residual add (not pre-MLP), and a
+    /// `post_feedforward_layernorm` wraps the MLP output. The pre-MLP
+    /// norm is `pre_feedforward_layernorm`.
+    pub sandwich_norms: bool,
+    /// Multiply embedding output by this constant (Gemma: √hidden_size,
+    /// rounded through bf16 like HF does).
+    pub embed_scale: Option<f32>,
+}
+
+impl Default for LlamaFamilyConfig {
+    /// Zeroed shape with legacy family semantics (SiLU, single rope table,
+    /// uniform window, plain RMSNorm). Exists so config literals can fill
+    /// only the fields they care about via struct-update syntax.
+    fn default() -> Self {
+        Self {
+            hidden_size: 0,
+            intermediate_size: 0,
+            num_heads: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            num_layers: 0,
+            vocab_size: 0,
+            max_seq_len: 0,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            rope_scaling: None,
+            rope_interleaved: false,
+            has_qk_norm: false,
+            sliding_window: 0,
+            activation: Activation::SiLU,
+            sliding_window_pattern: 0,
+            rope_local_theta: None,
+            query_pre_attn_scalar: None,
+            rmsnorm_unit_offset: false,
+            sandwich_norms: false,
+            embed_scale: None,
+        }
+    }
 }
 
 impl LlamaFamilyConfig {
@@ -250,7 +542,7 @@ impl LlamaFamilyConfig {
             head_dim,
             num_layers: def.num_hidden_layers,
             vocab_size: def.vocab_size,
-            max_seq_len: def.max_position_embeddings,
+            max_seq_len: effective_max_seq_len(def),
             rms_norm_eps: def.norm_eps as f32,
             rope_theta_opt: def.rope_theta,
             rope_scaling: rope_scaling_from_model_def(def),
@@ -274,6 +566,13 @@ impl LlamaFamilyConfig {
             rope_interleaved: false,
             has_qk_norm,
             sliding_window: b.sliding_window,
+            activation: Activation::SiLU,
+            sliding_window_pattern: 0,
+            rope_local_theta: None,
+            query_pre_attn_scalar: None,
+            rmsnorm_unit_offset: false,
+            sandwich_norms: false,
+            embed_scale: None,
         }
     }
 
@@ -300,6 +599,35 @@ impl LlamaFamilyConfig {
     pub fn mistral_from_def(def: &crate::definition::ModelDefinition) -> Self {
         Self::from_base(Self::from_def_base(def), 10_000.0, false)
     }
+
+    /// Gemma 3 text family (1B/4B/12B/27B): QK-norm on (Gemma-style),
+    /// global rope θ default 1e6 + optional linear scaling; local layers
+    /// get their own unscaled table (`rope_local_base_freq`, default 1e4);
+    /// 5:1 local/global scheduling (`sliding_window_pattern`, default 6);
+    /// GeGLU; sandwich norms; RMSNorm `x̂·(1+w)`; embeddings ×√hidden
+    /// (bf16-rounded like HF); attention scale 1/√query_pre_attn_scalar.
+    pub fn gemma3_from_def(def: &crate::definition::ModelDefinition) -> Self {
+        let mut cfg = Self::from_base(Self::from_def_base(def), 1_000_000.0, true);
+        cfg.activation = def.activation;
+        let extra = |key: &str| def.extra_params.get(key).and_then(|v| v.as_f64());
+        cfg.rope_local_theta = Some(extra("rope_local_base_freq").unwrap_or(10_000.0));
+        cfg.sliding_window_pattern = extra("sliding_window_pattern").unwrap_or(6.0) as usize;
+        cfg.query_pre_attn_scalar = extra("query_pre_attn_scalar");
+        cfg.rmsnorm_unit_offset = true;
+        cfg.sandwich_norms = true;
+        // HF computes `normalizer = hidden_size**0.5` then casts it to the
+        // embedding dtype (bf16) before multiplying — replicate the
+        // rounding for L1 byte-equality.
+        cfg.embed_scale = Some(bf16_round((cfg.hidden_size as f64).sqrt() as f32));
+        cfg
+    }
+}
+
+/// Round an f32 through bf16 (round-to-nearest-even), back to f32.
+pub(crate) fn bf16_round(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000;
+    f32::from_bits(rounded)
 }
 
 struct LlamaFamilyConfigBase {
@@ -317,6 +645,46 @@ struct LlamaFamilyConfigBase {
     sliding_window: usize,
 }
 
+/// Models whose long context depends on a rope_scaling variant ferrum does
+/// not implement (e.g. YaRN on DeepSeek-R1-0528-Qwen3-8B) must not claim the
+/// scaled window: positions past the original training window would rotate
+/// with unscaled frequencies and produce garbage. Clamp `max_seq_len` to the
+/// declared original window and warn.
+fn effective_max_seq_len(def: &crate::definition::ModelDefinition) -> usize {
+    let configured = def.max_position_embeddings;
+    let Some(obj) = def
+        .extra_params
+        .get("rope_scaling")
+        .and_then(|v| v.as_object())
+    else {
+        return configured;
+    };
+    let rope_type = obj
+        .get("rope_type")
+        .or_else(|| obj.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if rope_type == "llama3" || rope_type == "linear" {
+        // Implemented — the scaled window is real.
+        return configured;
+    }
+    let original = obj
+        .get("original_max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    match original {
+        Some(original) if original < configured => {
+            tracing::warn!(
+                "rope_scaling type '{rope_type}' is not implemented; clamping \
+                 context window from {configured} to the original training \
+                 window {original}"
+            );
+            original
+        }
+        _ => configured,
+    }
+}
+
 fn rope_scaling_from_model_def(
     def: &crate::definition::ModelDefinition,
 ) -> Option<RopeScalingConfig> {
@@ -326,6 +694,13 @@ fn rope_scaling_from_model_def(
         .get("rope_type")
         .or_else(|| obj.get("type"))
         .and_then(|v| v.as_str())?;
+    if rope_type == "linear" {
+        let factor = json_f64(obj.get("factor"))?;
+        if factor <= 0.0 {
+            return None;
+        }
+        return Some(RopeScalingConfig::Linear { factor });
+    }
     if rope_type != "llama3" {
         return None;
     }
@@ -370,7 +745,15 @@ pub struct LlamaFamilyLayer<B: QuantLlmBackend + BackendMoeFused> {
     pub q_norm_w: Option<B::Buffer>,
     pub k_norm_w: Option<B::Buffer>,
     pub o_proj: Box<dyn Linear<B>>,
+    /// Pre-MLP norm. Llama naming: `post_attention_layernorm`; Gemma 3
+    /// sandwich naming: `pre_feedforward_layernorm`.
     pub post_ln_w: B::Buffer,
+    /// Gemma 3 sandwich: norm applied to the attention output BEFORE the
+    /// residual add (`post_attention_layernorm` in Gemma naming).
+    pub post_attn_ln_w: Option<B::Buffer>,
+    /// Gemma 3 sandwich: norm applied to the MLP output before the
+    /// residual add (`post_feedforward_layernorm`).
+    pub post_ffn_ln_w: Option<B::Buffer>,
     pub gate_up_proj: Box<dyn Linear<B>>,
     pub down_proj: Box<dyn Linear<B>>,
 }
@@ -425,22 +808,43 @@ fn load_llama_family_layers<B: MoeLlmBackend>(
     }
 
     let mut layers = Vec::with_capacity(source_layers.end.saturating_sub(source_layers.start));
+    // Gemma 3 attention scale is 1/√query_pre_attn_scalar while the kernels
+    // hardcode 1/√head_dim; the ratio is folded into q_norm (norm output is
+    // scale-equivariant, RoPE is a rotation, so the fold commutes).
+    let q_norm_scale = cfg
+        .query_pre_attn_scalar
+        .map(|s| ((cfg.head_dim as f64 / s).sqrt()) as f32)
+        .unwrap_or(1.0);
     for li in source_layers {
         let prefix = format!("model.layers.{li}");
-        let input_ln_w = loader.load_tensor(&format!("{prefix}.input_layernorm.weight"))?;
+        let norm = |name: &str, len: usize, scale: f32| -> Result<B::Buffer> {
+            let t = loader.load_tensor(&format!("{prefix}.{name}.weight"))?;
+            Ok(fold_norm_weight::<B>(
+                t,
+                len,
+                cfg.rmsnorm_unit_offset,
+                scale,
+            ))
+        };
+        let h = cfg.hidden_size;
+        let input_ln_w = norm("input_layernorm", h, 1.0)?;
         let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
         let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
-        let post_ln_w = loader.load_tensor(&format!("{prefix}.post_attention_layernorm.weight"))?;
+        let (post_ln_w, post_attn_ln_w, post_ffn_ln_w) = if cfg.sandwich_norms {
+            (
+                norm("pre_feedforward_layernorm", h, 1.0)?,
+                Some(norm("post_attention_layernorm", h, 1.0)?),
+                Some(norm("post_feedforward_layernorm", h, 1.0)?),
+            )
+        } else {
+            (norm("post_attention_layernorm", h, 1.0)?, None, None)
+        };
         let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
         let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
 
         let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
-            let q = loader
-                .load_tensor(&format!("{prefix}.self_attn.q_norm.weight"))
-                .ok();
-            let k = loader
-                .load_tensor(&format!("{prefix}.self_attn.k_norm.weight"))
-                .ok();
+            let q = norm("self_attn.q_norm", cfg.head_dim, q_norm_scale).ok();
+            let k = norm("self_attn.k_norm", cfg.head_dim, 1.0).ok();
             (q, k)
         } else {
             (None, None)
@@ -453,11 +857,33 @@ fn load_llama_family_layers<B: MoeLlmBackend>(
             k_norm_w,
             o_proj,
             post_ln_w,
+            post_attn_ln_w,
+            post_ffn_ln_w,
             gate_up_proj,
             down_proj,
         });
     }
     Ok(layers)
+}
+
+/// Apply Gemma-family load-time weight folds to a norm tensor:
+/// `w' = (w + 1)·scale` when `unit_offset` (Gemma RMSNorm is `x̂·(1+w)`),
+/// plus an optional extra scale (query_pre_attn_scalar fold on q_norm).
+fn fold_norm_weight<B: MoeLlmBackend>(
+    buf: B::Buffer,
+    len: usize,
+    unit_offset: bool,
+    scale: f32,
+) -> B::Buffer {
+    if !unit_offset && scale == 1.0 {
+        return buf;
+    }
+    let mut v = B::to_vec(&buf, len);
+    let off = if unit_offset { 1.0 } else { 0.0 };
+    for x in v.iter_mut() {
+        *x = (*x + off) * scale;
+    }
+    B::from_slice(&v)
 }
 
 fn load_llama_family_lm_head<B: MoeLlmBackend>(
@@ -519,6 +945,10 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
     pub residual: Option<B::Buffer>,
     pub norm_out: B::Buffer,
     pub qkv_out: B::Buffer,
+    /// `[tokens, h]` temp for sandwich-norm families (Gemma 3): holds the
+    /// normed attention/MLP output before its residual add. `None` for
+    /// legacy families.
+    pub sandwich_tmp: Option<B::Buffer>,
     // ── Per-item scratch for batched decode path ──────────────────────
     // decode_batch_internal runs tokens=M batched ops for the GEMM-heavy
     // half (norm, qkv_proj, split_qkv, o_proj, post_norm, gate_up, silu,
@@ -534,9 +964,11 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
     pub v_head_major_single: B::Buffer,
     pub attn_head_major_single: B::Buffer,
     pub attn_flat_single: B::Buffer,
-    /// Batched logits output, sized `max_tokens * vocab_size`. Used only
-    /// in decode_batch; prefill/single-decode use the regular `logits`.
+    /// Batched logits output. Kept to one row for prefill-sized scratch and
+    /// grown only by the few paths that actually materialize multi-row logits.
+    /// Prefill/single-decode use the regular `logits`.
     pub batch_logits: B::Buffer,
+    pub batch_logits_capacity: usize,
     /// Token-major Q/K/V right after `split_qkv`. Stride: heads * hd per row.
     pub q_buf: B::Buffer,
     pub k_buf: B::Buffer,
@@ -651,33 +1083,61 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         let qkv_dim = q_dim + 2 * kv_dim;
         let t = max_tokens;
         Self {
-            residual: Some(B::alloc(t * h)),
-            norm_out: B::alloc(t * h),
-            qkv_out: B::alloc(t * qkv_dim),
-            q_buf: B::alloc(t * q_dim),
-            k_buf: B::alloc(t * kv_dim),
-            v_buf: B::alloc(t * kv_dim),
-            q_head_major: B::alloc(cfg.num_heads * t * cfg.head_dim),
-            k_head_major: B::alloc(cfg.num_kv_heads * t * cfg.head_dim),
-            v_head_major: B::alloc(cfg.num_kv_heads * t * cfg.head_dim),
-            attn_head_major_out: B::alloc(cfg.num_heads * t * cfg.head_dim),
-            attn_flat: B::alloc(t * q_dim),
-            o_proj_out: B::alloc(t * h),
-            gate_up_out: B::alloc(t * 2 * im),
-            silu_out: B::alloc(t * im),
-            mlp_out: B::alloc(t * h),
-            last_hidden: B::alloc(h),
-            last_normed: B::alloc(h),
-            logits: B::alloc(cfg.vocab_size),
-            q_single: B::alloc(q_dim),
-            k_single: B::alloc(kv_dim),
-            v_single: B::alloc(kv_dim),
-            q_head_major_single: B::alloc(q_dim),
-            k_head_major_single: B::alloc(kv_dim),
-            v_head_major_single: B::alloc(kv_dim),
-            attn_head_major_single: B::alloc(q_dim),
-            attn_flat_single: B::alloc(q_dim),
-            batch_logits: B::alloc(t * cfg.vocab_size),
+            residual: Some(alloc_model_buffer::<B>("llama.scratch.residual", t * h)),
+            norm_out: alloc_model_buffer::<B>("llama.scratch.norm_out", t * h),
+            qkv_out: alloc_model_buffer::<B>("llama.scratch.qkv_out", t * qkv_dim),
+            sandwich_tmp: cfg
+                .sandwich_norms
+                .then(|| alloc_model_buffer::<B>("llama.scratch.sandwich_tmp", t * h)),
+            q_buf: alloc_model_buffer::<B>("llama.scratch.q_buf", t * q_dim),
+            k_buf: alloc_model_buffer::<B>("llama.scratch.k_buf", t * kv_dim),
+            v_buf: alloc_model_buffer::<B>("llama.scratch.v_buf", t * kv_dim),
+            q_head_major: alloc_model_buffer::<B>(
+                "llama.scratch.q_head_major",
+                cfg.num_heads * t * cfg.head_dim,
+            ),
+            k_head_major: alloc_model_buffer::<B>(
+                "llama.scratch.k_head_major",
+                cfg.num_kv_heads * t * cfg.head_dim,
+            ),
+            v_head_major: alloc_model_buffer::<B>(
+                "llama.scratch.v_head_major",
+                cfg.num_kv_heads * t * cfg.head_dim,
+            ),
+            attn_head_major_out: alloc_model_buffer::<B>(
+                "llama.scratch.attn_head_major_out",
+                cfg.num_heads * t * cfg.head_dim,
+            ),
+            attn_flat: alloc_model_buffer::<B>("llama.scratch.attn_flat", t * q_dim),
+            o_proj_out: alloc_model_buffer::<B>("llama.scratch.o_proj_out", t * h),
+            gate_up_out: alloc_model_buffer::<B>("llama.scratch.gate_up_out", t * 2 * im),
+            silu_out: alloc_model_buffer::<B>("llama.scratch.silu_out", t * im),
+            mlp_out: alloc_model_buffer::<B>("llama.scratch.mlp_out", t * h),
+            last_hidden: alloc_model_buffer::<B>("llama.scratch.last_hidden", h),
+            last_normed: alloc_model_buffer::<B>("llama.scratch.last_normed", h),
+            logits: alloc_model_buffer::<B>("llama.scratch.logits", cfg.vocab_size),
+            q_single: alloc_model_buffer::<B>("llama.scratch.q_single", q_dim),
+            k_single: alloc_model_buffer::<B>("llama.scratch.k_single", kv_dim),
+            v_single: alloc_model_buffer::<B>("llama.scratch.v_single", kv_dim),
+            q_head_major_single: alloc_model_buffer::<B>(
+                "llama.scratch.q_head_major_single",
+                q_dim,
+            ),
+            k_head_major_single: alloc_model_buffer::<B>(
+                "llama.scratch.k_head_major_single",
+                kv_dim,
+            ),
+            v_head_major_single: alloc_model_buffer::<B>(
+                "llama.scratch.v_head_major_single",
+                kv_dim,
+            ),
+            attn_head_major_single: alloc_model_buffer::<B>(
+                "llama.scratch.attn_head_major_single",
+                q_dim,
+            ),
+            attn_flat_single: alloc_model_buffer::<B>("llama.scratch.attn_flat_single", q_dim),
+            batch_logits: alloc_model_buffer::<B>("llama.scratch.batch_logits", cfg.vocab_size),
+            batch_logits_capacity: 1,
             // Paged batched dispatch scratch. None until `enable_paged_batch`
             // is called from `ensure_kv` once the model knows max_seqs +
             // max_blocks_per_seq. This avoids paying the alloc cost when
@@ -688,13 +1148,29 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             paged_batch_context_lens: None,
             paged_max_blocks_per_seq: 0,
             paged_max_seqs: 0,
-            batch_positions: B::alloc_typed(ferrum_kernels::backend::Dtype::U32, t.max(1)),
-            batch_tokens: B::alloc_typed(ferrum_kernels::backend::Dtype::U32, t.max(1)),
-            batch_kv_lens_pre: B::alloc_typed(ferrum_kernels::backend::Dtype::U32, t.max(1)),
-            batch_kv_lens_post: B::alloc_typed(ferrum_kernels::backend::Dtype::U32, t.max(1)),
-            q_normed_batched: B::alloc(t * q_dim),
-            k_normed_batched: B::alloc(t * kv_dim),
-            v_normed_batched: B::alloc(t * kv_dim),
+            batch_positions: alloc_model_typed_buffer::<B>(
+                "llama.scratch.batch_positions",
+                ferrum_kernels::backend::Dtype::U32,
+                t.max(1),
+            ),
+            batch_tokens: alloc_model_typed_buffer::<B>(
+                "llama.scratch.batch_tokens",
+                ferrum_kernels::backend::Dtype::U32,
+                t.max(1),
+            ),
+            batch_kv_lens_pre: alloc_model_typed_buffer::<B>(
+                "llama.scratch.batch_kv_lens_pre",
+                ferrum_kernels::backend::Dtype::U32,
+                t.max(1),
+            ),
+            batch_kv_lens_post: alloc_model_typed_buffer::<B>(
+                "llama.scratch.batch_kv_lens_post",
+                ferrum_kernels::backend::Dtype::U32,
+                t.max(1),
+            ),
+            q_normed_batched: alloc_model_buffer::<B>("llama.scratch.q_normed_batched", t * q_dim),
+            k_normed_batched: alloc_model_buffer::<B>("llama.scratch.k_normed_batched", t * kv_dim),
+            v_normed_batched: alloc_model_buffer::<B>("llama.scratch.v_normed_batched", t * kv_dim),
             unified_capacity: 0,
             unified_residual: None,
             unified_norm_out: None,
@@ -712,6 +1188,16 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             unified_packed_logits: None,
             max_tokens: t,
         }
+    }
+
+    pub(crate) fn ensure_batch_logits(&mut self, cfg: &LlamaFamilyConfig, rows: usize) {
+        let rows = rows.max(1);
+        if rows <= self.batch_logits_capacity {
+            return;
+        }
+        self.batch_logits =
+            alloc_model_buffer::<B>("llama.scratch.batch_logits.grow", rows * cfg.vocab_size);
+        self.batch_logits_capacity = rows;
     }
 
     /// Grow unified-path scratch buffers to accommodate `m_total` query
@@ -737,30 +1223,62 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         let qkv_dim = q_dim + 2 * kv_dim;
         let im = cfg.intermediate_size;
         let v = cfg.vocab_size;
-        self.unified_residual = Some(B::alloc(cap * h));
-        self.unified_norm_out = Some(B::alloc(cap * h));
-        self.unified_qkv_out = Some(B::alloc(cap * qkv_dim));
-        self.unified_packed_q = Some(B::alloc(cap * q_dim));
-        self.unified_attn_out = Some(B::alloc(cap * q_dim));
-        self.unified_o_proj_out = Some(B::alloc(cap * h));
-        self.unified_gate_up_out = Some(B::alloc(cap * 2 * im));
-        self.unified_silu_out = Some(B::alloc(cap * im));
-        self.unified_mlp_out = Some(B::alloc(cap * h));
+        self.unified_residual = None;
+        self.unified_norm_out = None;
+        self.unified_qkv_out = None;
+        self.unified_packed_q = None;
+        self.unified_attn_out = None;
+        self.unified_o_proj_out = None;
+        self.unified_gate_up_out = None;
+        self.unified_silu_out = None;
+        self.unified_mlp_out = None;
+
+        self.unified_residual = Some(alloc_model_buffer::<B>("llama.unified.residual", cap * h));
+        self.unified_norm_out = Some(alloc_model_buffer::<B>("llama.unified.norm_out", cap * h));
+        self.unified_qkv_out = Some(alloc_model_buffer::<B>(
+            "llama.unified.qkv_out",
+            cap * qkv_dim,
+        ));
+        self.unified_packed_q = Some(alloc_model_buffer::<B>(
+            "llama.unified.packed_q",
+            cap * q_dim,
+        ));
+        self.unified_attn_out = Some(alloc_model_buffer::<B>(
+            "llama.unified.attn_out",
+            cap * q_dim,
+        ));
+        self.unified_o_proj_out =
+            Some(alloc_model_buffer::<B>("llama.unified.o_proj_out", cap * h));
+        self.unified_gate_up_out = Some(alloc_model_buffer::<B>(
+            "llama.unified.gate_up_out",
+            cap * 2 * im,
+        ));
+        self.unified_silu_out = Some(alloc_model_buffer::<B>("llama.unified.silu_out", cap * im));
+        self.unified_mlp_out = Some(alloc_model_buffer::<B>("llama.unified.mlp_out", cap * h));
         if self.unified_cu_seqlens_q.is_none() {
-            self.unified_cu_seqlens_q = Some(B::alloc_typed(
+            self.unified_cu_seqlens_q = Some(alloc_model_typed_buffer::<B>(
+                "llama.unified.cu_seqlens_q",
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs + 1,
             ));
-            self.unified_pos_offsets = Some(B::alloc_typed(
+            self.unified_pos_offsets = Some(alloc_model_typed_buffer::<B>(
+                "llama.unified.pos_offsets",
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs,
             ));
-            self.unified_block_tables = Some(B::alloc_typed(
+            self.unified_block_tables = Some(alloc_model_typed_buffer::<B>(
+                "llama.unified.block_tables",
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs * max_blocks_per_seq,
             ));
-            self.unified_packed_normed = Some(B::alloc(max_seqs * h));
-            self.unified_packed_logits = Some(B::alloc(max_seqs * v));
+            self.unified_packed_normed = Some(alloc_model_buffer::<B>(
+                "llama.unified.packed_normed",
+                max_seqs * h,
+            ));
+            self.unified_packed_logits = Some(alloc_model_buffer::<B>(
+                "llama.unified.packed_logits",
+                max_seqs * v,
+            ));
         }
         self.unified_capacity = cap;
     }
@@ -778,13 +1296,21 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             return;
         }
         let q_dim = cfg.num_heads * cfg.head_dim;
-        self.paged_batch_q = Some(B::alloc(max_seqs * q_dim));
-        self.paged_batch_o = Some(B::alloc(max_seqs * q_dim));
-        self.paged_batch_block_tables = Some(B::alloc_typed(
+        self.paged_batch_q = Some(alloc_model_buffer::<B>(
+            "llama.paged_batch.q",
+            max_seqs * q_dim,
+        ));
+        self.paged_batch_o = Some(alloc_model_buffer::<B>(
+            "llama.paged_batch.o",
+            max_seqs * q_dim,
+        ));
+        self.paged_batch_block_tables = Some(alloc_model_typed_buffer::<B>(
+            "llama.paged_batch.block_tables",
             ferrum_kernels::backend::Dtype::U32,
             max_seqs * max_blocks_per_seq,
         ));
-        self.paged_batch_context_lens = Some(B::alloc_typed(
+        self.paged_batch_context_lens = Some(alloc_model_typed_buffer::<B>(
+            "llama.paged_batch.context_lens",
             ferrum_kernels::backend::Dtype::U32,
             max_seqs,
         ));
@@ -837,6 +1363,9 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     pub lm_head: Option<Box<dyn Linear<B>>>,
 
     pub rope: RopeCache<B>,
+    /// Second rope table for local-attention layers (Gemma 3 dual-θ
+    /// scheduling). `None` for single-table families.
+    pub rope_local: Option<RopeCache<B>>,
     pub scratch: LlamaFamilyScratch<B>,
 
     /// Per-sequence KV caches, one `Vec<KvCache<B>>` of length `num_layers`.
@@ -983,6 +1512,13 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::reset_all_graphs(&mut ctx);
         }
         let rope = build_rope_cache::<B>(&cfg);
+        // Local-attention rope table (Gemma 3): own θ, never rope-scaled.
+        let rope_local = cfg.rope_local_theta.map(|theta| {
+            let mut local_cfg = cfg.clone();
+            local_cfg.rope_theta = theta;
+            local_cfg.rope_scaling = None;
+            build_rope_cache::<B>(&local_cfg)
+        });
         let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
         let embed = if stage.load_embedding {
             Some(loader.load_tensor("model.embed_tokens.weight")?)
@@ -996,15 +1532,31 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         } else {
             None
         };
-        let final_norm_w = loader.load_tensor("model.norm.weight")?;
+        let final_norm_w = fold_norm_weight::<B>(
+            loader.load_tensor("model.norm.weight")?,
+            cfg.hidden_size,
+            cfg.rmsnorm_unit_offset,
+            1.0,
+        );
 
         let layer_source_start = stage.source_layers.start;
         let layer_source_end = stage.source_layers.end;
         let runtime_cfg = cfg.to_runtime();
         // Construction-time capability resolution (GOAL-allowed): read once here
         // so the forward hot paths read self.* instead of B::supports_*().
-        let supports_varlen_qkv = B::supports_varlen_qkv();
-        let supports_batched_decode = B::supports_llama_family_batched_decode();
+        // Sandwich-norm families (Gemma 3) are pinned to the single-sequence
+        // forward path until the batched/varlen paths learn the Gemma layer
+        // semantics (GeGLU, post-attn/post-ffn norms, dual rope, per-layer
+        // windows) — running them would be silently wrong, not just slow.
+        let supports_varlen_qkv = B::supports_varlen_qkv() && !cfg.sandwich_norms;
+        let supports_batched_decode =
+            B::supports_llama_family_batched_decode() && !cfg.sandwich_norms;
+        if cfg.sandwich_norms {
+            tracing::info!(
+                "Gemma3 family: batched/varlen fast paths disabled pending Gemma semantics; \
+                 using single-sequence forward"
+            );
+        }
         let runtime_env = LlamaFamilyRuntimeEnv::from_env();
         let batched_cfg =
             super::llama_family_forward_batched::LlamaBatchedRuntimeConfig::from_env();
@@ -1022,6 +1574,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             final_norm_w,
             lm_head,
             rope,
+            rope_local,
             scratch,
             kv_caches: HashMap::new(),
             kv_free_pool: Vec::new(),
@@ -1079,34 +1632,45 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         Some(source_layer_index - self.layer_source_start)
     }
 
+    fn resize_scratch(&mut self, tokens: usize) {
+        let tokens = tokens.max(1);
+        if self.scratch.max_tokens == tokens {
+            return;
+        }
+        // Any captured decode graph holds pointers to the old scratch
+        // buffers; those are about to be freed. Invalidate ALL captured
+        // graphs (both single-item and per-m_padded batched) — every
+        // captured kernel-arg pointer into scratch is stale.
+        {
+            let mut ctx = B::new_context();
+            B::reset_all_graphs(&mut ctx);
+        }
+        let minimal = LlamaFamilyScratch::alloc(&self.cfg, 1);
+        let old = std::mem::replace(&mut self.scratch, minimal);
+        drop(old);
+        self.scratch = LlamaFamilyScratch::alloc(&self.cfg, tokens);
+        self.graph_warmup = 0;
+        self.graph_capture_failed = false;
+        self.batched_graph_keys_seen.clear();
+        self.batched_graph_warmup = 0;
+        self.batched_graph_failed = false;
+        self.unified_graph_keys_seen.clear();
+        self.unified_graph_warmup = 0;
+        self.unified_graph_failed = false;
+        // Realloc wiped paged_batch_*. Re-enable using the dims
+        // pinned at first ensure_kv. Without this, the next
+        // `forward_layer_batched_decode` panics on
+        // `paged_batch_block_tables missing`.
+        if let Some((max_seqs, max_blocks_per_seq)) = self.paged_dims {
+            self.scratch
+                .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+        }
+    }
+
     /// Grow scratch buffers if `tokens` exceeds the current sizing.
     pub(crate) fn ensure_scratch(&mut self, tokens: usize) {
         if self.scratch.max_tokens < tokens {
-            // Any captured decode graph holds pointers to the old scratch
-            // buffers; those are about to be freed. Invalidate ALL captured
-            // graphs (both single-item and per-m_padded batched) — every
-            // captured kernel-arg pointer into scratch is stale.
-            {
-                let mut ctx = B::new_context();
-                B::reset_all_graphs(&mut ctx);
-            }
-            self.scratch = LlamaFamilyScratch::alloc(&self.cfg, tokens);
-            self.graph_warmup = 0;
-            self.graph_capture_failed = false;
-            self.batched_graph_keys_seen.clear();
-            self.batched_graph_warmup = 0;
-            self.batched_graph_failed = false;
-            self.unified_graph_keys_seen.clear();
-            self.unified_graph_warmup = 0;
-            self.unified_graph_failed = false;
-            // Realloc wiped paged_batch_*. Re-enable using the dims
-            // pinned at first ensure_kv. Without this, the next
-            // `forward_layer_batched_decode` panics on
-            // `paged_batch_block_tables missing`.
-            if let Some((max_seqs, max_blocks_per_seq)) = self.paged_dims {
-                self.scratch
-                    .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
-            }
+            self.resize_scratch(tokens);
         }
     }
 
@@ -1114,6 +1678,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// `max_seq_len` slots per head. Enables the in-place
     /// `kv_cache_append_head_major` path — no realloc per layer.
     pub(crate) fn ensure_kv(&mut self, cache_id: &str) {
+        self.ensure_kv_with_capacity_hint(cache_id, None);
+    }
+
+    pub(crate) fn ensure_kv_with_capacity_hint(
+        &mut self,
+        cache_id: &str,
+        capacity_hint: Option<usize>,
+    ) {
         if self.kv_caches.contains_key(cache_id) {
             return;
         }
@@ -1136,6 +1708,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // can `FERRUM_KV_CAPACITY=4096` and accept lower max_seqs.
         let runtime_env = &self.runtime_env;
         let max = runtime_env.kv_capacity_for_model(model_max);
+        let contig_initial_capacity = capacity_hint
+            .map(|hint| hint.max(1).min(max.max(1)))
+            .unwrap_or(max.max(1));
 
         // Paged-KV mode: `FERRUM_METAL_PAGED_KV=1` switches every cache
         // for this model into block-table-indirect layout. Kernels from
@@ -1152,7 +1727,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // opt-in pre-0.7.2; flipping the default so default `ferrum
         // serve` matches the bench-quality numbers without requiring
         // env-var knowledge.
-        let paged = runtime_env.paged_kv_enabled::<B>();
+        // Per-layer window scheduling (Gemma 3) is not plumbed through the
+        // paged attention dispatch yet — local layers would silently attend
+        // past their window once the context exceeds it. Pin sandwich-norm
+        // families to contiguous KV until paged learns per-layer windows
+        // (W2-3 work item).
+        let paged = runtime_env.paged_kv_enabled::<B>() && self.cfg.sliding_window_pattern == 0;
         const PAGED_BLOCK_SIZE: usize = 16;
 
         // Phase 4 shared-pool sizing. The pool sees ALL concurrent
@@ -1203,17 +1783,42 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // right cache layout (FP16 → KvCache, INT8 → KvCacheQuant) per the
         // model's K marker. INT8 supports paged mode only — KvInt8::alloc_contig
         // panics, surfacing the misconfiguration here at first ensure_kv.
-        let mut caches = self.kv_free_pool.pop().unwrap_or_else(|| {
-            self.local_layer_indices()
+        let local_layer_count = self.local_layer_count();
+        let allocate_caches = || {
+            (0..local_layer_count)
                 .map(|_| {
                     if paged {
                         K::alloc_paged(max_blocks_per_seq, PAGED_BLOCK_SIZE, nkv, hd)
                     } else {
-                        K::alloc_contig(max, nkv, hd)
+                        K::alloc_contig(contig_initial_capacity, nkv, hd)
                     }
                 })
                 .collect()
-        });
+        };
+        let mut caches = match self.kv_free_pool.pop() {
+            Some(mut cached)
+                if !paged
+                    && capacity_hint.is_some()
+                    && cached
+                        .first()
+                        .is_some_and(|cache| K::capacity(cache) != contig_initial_capacity) =>
+            {
+                for cache in cached.iter_mut() {
+                    K::set_len(cache, 0);
+                }
+                drop(cached);
+                allocate_caches()
+            }
+            Some(mut cached) => {
+                if !paged {
+                    for cache in cached.iter_mut() {
+                        K::set_len(cache, 0);
+                    }
+                }
+                cached
+            }
+            None => allocate_caches(),
+        };
 
         // Allocate physical blocks for THIS cache_id from the shared
         // pool. We allocate all `max_blocks_per_seq` upfront for
@@ -1537,6 +2142,68 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         })
     }
 
+    fn use_host_residual_shadow(&self) -> bool {
+        self.cfg.sandwich_norms && B::activation_elem_size_bytes() < std::mem::size_of::<f32>()
+    }
+
+    fn rms_norm_host(
+        input: &[f32],
+        weight: &[f32],
+        tokens: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        assert_eq!(input.len(), tokens * dim);
+        assert_eq!(weight.len(), dim);
+        let mut out = vec![0.0f32; input.len()];
+        for row in 0..tokens {
+            let off = row * dim;
+            let row_in = &input[off..off + dim];
+            let mut variance = 0.0f32;
+            for &x in row_in {
+                variance += x * x;
+            }
+            let inv_rms = (variance / dim as f32 + eps).sqrt().recip();
+            for i in 0..dim {
+                out[off + i] = row_in[i] * inv_rms * weight[i];
+            }
+        }
+        out
+    }
+
+    fn rms_norm_host_to_activation(
+        ctx: &mut B::Context,
+        input: &[f32],
+        weight: &B::Buffer,
+        eps: f32,
+        out: &mut B::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        let weight_h = B::to_vec(weight, dim);
+        let normed = Self::rms_norm_host(input, &weight_h, tokens, dim, eps);
+        B::write_f32_to_activation(ctx, out, &normed);
+    }
+
+    fn rms_norm_device_to_host(
+        input: &B::Buffer,
+        weight: &B::Buffer,
+        eps: f32,
+        tokens: usize,
+        dim: usize,
+    ) -> Vec<f32> {
+        let input_h = B::to_vec(input, tokens * dim);
+        let weight_h = B::to_vec(weight, dim);
+        Self::rms_norm_host(&input_h, &weight_h, tokens, dim, eps)
+    }
+
+    fn add_host_residual(residual: &mut [f32], branch: &[f32]) {
+        assert_eq!(residual.len(), branch.len());
+        for (r, &x) in residual.iter_mut().zip(branch) {
+            *r += x;
+        }
+    }
+
     /// Run one transformer layer. Mutates `residual` in place.
     ///
     /// `pos_offset` is the absolute position of token 0 in this batch
@@ -1551,6 +2218,22 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         pos_offset: usize,
         tokens: usize,
     ) {
+        self.forward_layer_with_host_residual(
+            ctx, li, cache_id, residual, pos_offset, tokens, None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_layer_with_host_residual(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        cache_id: &str,
+        residual: &mut B::Buffer,
+        pos_offset: usize,
+        tokens: usize,
+        mut host_residual: Option<&mut [f32]>,
+    ) {
         let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
         let cfg = &self.cfg;
@@ -1563,6 +2246,19 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let q_dim = nh * hd;
         let kv_dim = nkv * hd;
 
+        // FERRUM_NAN_TRACE=all or a comma-separated layer list: after each
+        // op of matching layers, sync and report non-finite counts.
+        // Debug-only; intentionally not part of the product path.
+        let nan_trace = nan_trace_enabled_for_layer(li, source_li);
+        macro_rules! nt {
+            ($name:expr, $buf:expr, $len:expr, $row_width:expr) => {
+                if nan_trace {
+                    nan_trace_dump::<B>(ctx, source_li, $name, $buf, $len, Some($row_width));
+                }
+            };
+        }
+        nt!("residual-in", residual, tokens * h, h);
+
         // 1. Input RMSNorm
         let _t0 = if self.runtime_env.decode_op_profile {
             B::sync(ctx);
@@ -1570,15 +2266,28 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         } else {
             None
         };
-        B::rms_norm(
-            ctx,
-            residual,
-            &layer.input_ln_w,
-            eps,
-            &mut self.scratch.norm_out,
-            tokens,
-            h,
-        );
+        if let Some(host) = host_residual.as_deref() {
+            Self::rms_norm_host_to_activation(
+                ctx,
+                host,
+                &layer.input_ln_w,
+                eps,
+                &mut self.scratch.norm_out,
+                tokens,
+                h,
+            );
+        } else {
+            B::rms_norm(
+                ctx,
+                residual,
+                &layer.input_ln_w,
+                eps,
+                &mut self.scratch.norm_out,
+                tokens,
+                h,
+            );
+        }
+        nt!("input_norm", &self.scratch.norm_out, tokens * h, h);
         if let Some(t0) = _t0 {
             B::sync(ctx);
             NORM_TIME_US.fetch_add(
@@ -1595,11 +2304,22 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         } else {
             None
         };
-        layer.qkv_proj.forward(
-            ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.qkv_out,
-            tokens,
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.qkv_proj");
+            layer.qkv_proj.forward(
+                ctx,
+                &self.scratch.norm_out,
+                &mut self.scratch.qkv_out,
+                tokens,
+            );
+        }
+        nt!(
+            "qkv_proj",
+            &self.scratch.qkv_out,
+            tokens * (q_dim + 2 * kv_dim),
+            q_dim + 2 * kv_dim
         );
         if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
             // SAFETY: `lora_adapters` is not mutated during a forward pass;
@@ -1650,6 +2370,25 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy);
 
+        // Per-layer attention scheduling (Gemma 3 `sliding_window_pattern`):
+        // every Nth layer is global (full window, main rope table); the rest
+        // are local (sliding window, local rope table). Pattern 0 = uniform
+        // legacy behavior. Field-precise rope refs keep the later
+        // `&mut self.scratch` / `kv_caches` borrows legal.
+        let pattern = cfg.sliding_window_pattern;
+        let is_global_layer = pattern == 0 || (source_li + 1) % pattern == 0;
+        let layer_window = if pattern == 0 {
+            cfg.sliding_window
+        } else if is_global_layer {
+            0
+        } else {
+            cfg.sliding_window
+        };
+        let (rope_cos, rope_sin) = match (&self.rope_local, is_global_layer) {
+            (Some(local), false) => (&local.cos, &local.sin),
+            _ => (&self.rope.cos, &self.rope.sin),
+        };
+
         // Grab the per-layer KV cache up front so the deepest fusion can
         // write K/V straight into it.
         //
@@ -1674,20 +2413,31 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // Read shared metadata (variant-agnostic) once. The K-aware
         // attn section below re-borrows the right enum variant.
         let cache_len_before = K::len(&caches[li]);
-        let cache_capacity = K::capacity(&caches[li]);
-        let cache_block_size = K::block_size(&caches[li]);
+        let cache_block_size_before = K::block_size(&caches[li]);
+        let required_kv_len = cache_len_before + tokens;
+        let logical_capacity = if cache_block_size_before > 0 {
+            K::capacity(&caches[li])
+        } else {
+            self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
+        };
 
         // Defense in depth: refuse to write past the KV buffer. The
         // graceful path is the caller pre-checking via `kv_capacity()`
         // and either compacting or refusing the request; this panic only
         // fires when that contract is broken (and silent overflow would
         // otherwise corrupt the cache + adjacent allocations).
-        if cache_len_before + tokens > cache_capacity {
+        if required_kv_len > logical_capacity {
             panic!(
-                "KV cache overflow on source layer {source_li} (local layer {li}): would write tokens [{cache_len_before}..{}) but capacity is {cache_capacity} (cache_id={cache_id:?}). Increase FERRUM_KV_CAPACITY or call /clear in the REPL.",
-                cache_len_before + tokens
+                "KV cache overflow on source layer {source_li} (local layer {li}): would write tokens [{cache_len_before}..{}) but capacity is {logical_capacity} (cache_id={cache_id:?}). Increase FERRUM_KV_CAPACITY or call /clear in the REPL.",
+                required_kv_len
             );
         }
+        if cache_block_size_before == 0 {
+            K::ensure_contig_capacity(ctx, &mut caches[li], required_kv_len, nkv, hd)
+                .expect("K::ensure_contig_capacity");
+        }
+        let cache_capacity = K::capacity(&caches[li]);
+        let cache_block_size = K::block_size(&caches[li]);
 
         // Paged path: K::paged_write fuses split_qkv_norm_rope + cache append
         // (FP16: into_paged_cache; INT8: split_qkv_norm_rope + int8_kv_append_paged).
@@ -1707,8 +2457,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 &self.scratch.qkv_out,
                 q_norm_w,
                 k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
+                rope_cos,
+                rope_sin,
                 &mut self.scratch.q_head_major,
                 &mut self.scratch.k_head_major,
                 &mut self.scratch.v_head_major,
@@ -1744,7 +2494,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             )
             .expect("K::paged_decode_attention");
 
-            return self.forward_layer_post_attn(ctx, li, cache_id, residual, tokens);
+            return self.forward_layer_post_attn_with_host_residual(
+                ctx,
+                li,
+                cache_id,
+                residual,
+                tokens,
+                host_residual,
+            );
         }
 
         // Non-paged (contig) path. INT8 path doesn't reach here:
@@ -1761,8 +2518,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             &self.scratch.qkv_out,
             q_norm_w,
             k_norm_w,
-            &self.rope.cos,
-            &self.rope.sin,
+            rope_cos,
+            rope_sin,
             &mut self.scratch.q_head_major,
             &mut self.scratch.k_head_major,
             &mut self.scratch.v_head_major,
@@ -1778,6 +2535,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             qk_mode,
         )
         .expect("K::contig_write");
+        nt!(
+            "contig_write.q",
+            &self.scratch.q_head_major,
+            nh * tokens * hd,
+            hd
+        );
         if let Some(t0) = _qkr_t0 {
             B::sync(ctx);
             QKR_TIME_US.fetch_add(
@@ -1803,7 +2566,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             causal: true,
             scale: 1.0 / (hd as f32).sqrt(),
             kv_seq_stride: kv_stride,
-            sliding_window: cfg.sliding_window,
+            sliding_window: layer_window,
         };
         K::contig_decode_attention(
             ctx,
@@ -1815,6 +2578,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             pos_offset,
         )
         .expect("K::contig_decode_attention");
+        nt!(
+            "attn",
+            &self.scratch.attn_head_major_out,
+            nh * tokens * hd,
+            hd
+        );
         let _ = q_dim;
         let _ = kv_dim;
         let _ = dummy;
@@ -1827,7 +2596,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        self.forward_layer_post_attn(ctx, li, cache_id, residual, tokens);
+        self.forward_layer_post_attn_with_host_residual(
+            ctx,
+            li,
+            cache_id,
+            residual,
+            tokens,
+            host_residual,
+        );
     }
 
     /// Post-attention tail of `forward_layer`: untranspose Q (if needed),
@@ -1842,6 +2618,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         residual: &mut B::Buffer,
         tokens: usize,
     ) {
+        self.forward_layer_post_attn_with_host_residual(ctx, li, cache_id, residual, tokens, None);
+    }
+
+    pub(crate) fn forward_layer_post_attn_with_host_residual(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        cache_id: &str,
+        residual: &mut B::Buffer,
+        tokens: usize,
+        mut host_residual: Option<&mut [f32]>,
+    ) {
         let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
         let cfg = &self.cfg;
@@ -1850,6 +2638,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let hd = cfg.head_dim;
         let im = cfg.intermediate_size;
         let eps = cfg.rms_norm_eps;
+
+        let nan_trace = nan_trace_enabled_for_layer(li, source_li);
+        macro_rules! nt {
+            ($name:expr, $buf:expr, $len:expr, $row_width:expr) => {
+                if nan_trace {
+                    nan_trace_dump::<B>(ctx, source_li, $name, $buf, $len, Some($row_width));
+                }
+            };
+        }
 
         // 7. Untranspose head-major → token-major for O-proj input.
         let attn_token_major = if tokens == 1 {
@@ -1867,9 +2664,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         };
 
         // 8. O projection.
-        layer
-            .o_proj
-            .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.o_proj");
+            layer
+                .o_proj
+                .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
+        }
         if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
             // SAFETY: see qkv_proj LoRA application above.
             let applied = unsafe { &*adapter }
@@ -1884,26 +2686,86 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 .expect("validated LoRA o_proj");
             self.lora_projection_applications += applied as u64;
         }
+        nt!("o_proj", &self.scratch.o_proj_out, tokens * h, h);
 
-        // 9. Fused residual-add + post-attention RMSNorm.
-        B::fused_add_rms_norm(
-            ctx,
-            residual,
-            &self.scratch.o_proj_out,
-            &layer.post_ln_w,
-            eps,
-            &mut self.scratch.norm_out,
-            tokens,
-            h,
-        );
+        // 9. Residual + pre-MLP norm.
+        //
+        // Sandwich families (Gemma 3): norm the attention output FIRST
+        // (post_attention_layernorm in Gemma naming), add to residual,
+        // then norm the residual with pre_feedforward_layernorm.
+        // Legacy families: single fused residual-add + post-attn norm.
+        if let Some(post_attn_w) = &layer.post_attn_ln_w {
+            if let Some(host) = host_residual.as_deref_mut() {
+                let branch = Self::rms_norm_device_to_host(
+                    &self.scratch.o_proj_out,
+                    post_attn_w,
+                    eps,
+                    tokens,
+                    h,
+                );
+                Self::add_host_residual(host, &branch);
+                Self::rms_norm_host_to_activation(
+                    ctx,
+                    host,
+                    &layer.post_ln_w,
+                    eps,
+                    &mut self.scratch.norm_out,
+                    tokens,
+                    h,
+                );
+            } else {
+                let tmp = self
+                    .scratch
+                    .sandwich_tmp
+                    .as_mut()
+                    .expect("sandwich_tmp allocated for sandwich-norm config");
+                B::rms_norm(
+                    ctx,
+                    &self.scratch.o_proj_out,
+                    post_attn_w,
+                    eps,
+                    tmp,
+                    tokens,
+                    h,
+                );
+                nt!("post_attn_norm", &*tmp, tokens * h, h);
+                B::add_inplace(ctx, residual, tmp, tokens * h);
+                nt!("resid_attn", &*residual, tokens * h, h);
+                B::rms_norm(
+                    ctx,
+                    residual,
+                    &layer.post_ln_w,
+                    eps,
+                    &mut self.scratch.norm_out,
+                    tokens,
+                    h,
+                );
+            }
+        } else {
+            B::fused_add_rms_norm(
+                ctx,
+                residual,
+                &self.scratch.o_proj_out,
+                &layer.post_ln_w,
+                eps,
+                &mut self.scratch.norm_out,
+                tokens,
+                h,
+            );
+        }
 
         // 10. Fused gate+up projection.
-        layer.gate_up_proj.forward(
-            ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.gate_up_out,
-            tokens,
-        );
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.gate_up_proj");
+            layer.gate_up_proj.forward(
+                ctx,
+                &self.scratch.norm_out,
+                &mut self.scratch.gate_up_out,
+                tokens,
+            );
+        }
         if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
             // SAFETY: see qkv_proj LoRA application above.
             let applied = unsafe { &*adapter }
@@ -1919,22 +2781,44 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             self.lora_projection_applications += applied as u64;
         }
 
-        // 11. SwiGLU: silu(gate) * up.
-        B::fused_silu_mul_split(
-            ctx,
+        nt!("pre_mlp_norm", &self.scratch.norm_out, tokens * h, h);
+        nt!(
+            "gate_up",
             &self.scratch.gate_up_out,
-            &mut self.scratch.silu_out,
-            tokens,
-            im,
+            tokens * 2 * im,
+            2 * im
         );
+        // 11. Gated activation: SwiGLU (silu) or GeGLU (gelu_tanh, Gemma).
+        match cfg.activation {
+            Activation::GeluTanh => B::fused_gelu_tanh_mul_split(
+                ctx,
+                &self.scratch.gate_up_out,
+                &mut self.scratch.silu_out,
+                tokens,
+                im,
+            ),
+            _ => B::fused_silu_mul_split(
+                ctx,
+                &self.scratch.gate_up_out,
+                &mut self.scratch.silu_out,
+                tokens,
+                im,
+            ),
+        }
 
+        nt!("act_mul", &self.scratch.silu_out, tokens * im, im);
         // 12. Down projection.
-        layer.down_proj.forward(
-            ctx,
-            &self.scratch.silu_out,
-            &mut self.scratch.mlp_out,
-            tokens,
-        );
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.down_proj");
+            layer.down_proj.forward(
+                ctx,
+                &self.scratch.silu_out,
+                &mut self.scratch.mlp_out,
+                tokens,
+            );
+        }
         if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
             // SAFETY: see qkv_proj LoRA application above.
             let applied = unsafe { &*adapter }
@@ -1949,9 +2833,36 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 .expect("validated LoRA down_proj");
             self.lora_projection_applications += applied as u64;
         }
+        nt!("down_proj", &self.scratch.mlp_out, tokens * h, h);
 
-        // 13. Final residual add.
-        B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
+        // 13. Final residual add. Sandwich families norm the MLP output
+        // (post_feedforward_layernorm) before adding it to the residual.
+        if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
+            if let Some(host) = host_residual.as_deref_mut() {
+                let branch = Self::rms_norm_device_to_host(
+                    &self.scratch.mlp_out,
+                    post_ffn_w,
+                    eps,
+                    tokens,
+                    h,
+                );
+                Self::add_host_residual(host, &branch);
+            } else {
+                let tmp = self
+                    .scratch
+                    .sandwich_tmp
+                    .as_mut()
+                    .expect("sandwich_tmp allocated for sandwich-norm config");
+                B::rms_norm(ctx, &self.scratch.mlp_out, post_ffn_w, eps, tmp, tokens, h);
+                nt!("post_ffn_norm", &*tmp, tokens * h, h);
+                B::add_inplace(ctx, residual, tmp, tokens * h);
+            }
+        } else {
+            B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
+        }
+        if host_residual.is_none() {
+            nt!("resid_ffn", &*residual, tokens * h, h);
+        }
     }
 
     /// Multi-position decode-verify: run one forward pass over `tokens`
@@ -1969,6 +2880,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let seq_len = tokens.len();
         assert!(seq_len > 0, "forward_verify called with empty tokens");
         self.ensure_scratch(seq_len);
+        self.scratch.ensure_batch_logits(&self.cfg, seq_len);
         self.ensure_kv(cache_id);
 
         let h = self.cfg.hidden_size;
@@ -1993,6 +2905,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("forward_verify called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
+        if let Some(scale) = self.cfg.embed_scale {
+            B::scale_inplace(&mut ctx, &mut residual, scale, seq_len * h);
+        }
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
@@ -2017,12 +2932,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .lm_head
             .as_ref()
             .expect("forward_verify called on backbone-only model (no lm_head)");
-        lm_head.forward(
-            &mut ctx,
-            &self.scratch.norm_out,
-            &mut self.scratch.batch_logits,
-            seq_len,
-        );
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_verify.lm_head");
+            lm_head.forward(
+                &mut ctx,
+                &self.scratch.norm_out,
+                &mut self.scratch.batch_logits,
+                seq_len,
+            );
+        }
 
         B::sync(&mut ctx);
         self.scratch.residual = Some(residual);
@@ -2121,6 +3041,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("prefill_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, suffix_tokens, &mut residual, h);
+        if let Some(scale) = self.cfg.embed_scale {
+            B::scale_inplace(&mut ctx, &mut residual, scale, suffix_tokens.len() * h);
+        }
+        let use_host_residual_shadow = self.use_host_residual_shadow();
+        let mut host_residual = if use_host_residual_shadow {
+            B::sync(&mut ctx);
+            Some(B::to_vec(&residual, seq_len * h))
+        } else {
+            None
+        };
 
         let prefill_profile = self.runtime_env.prefill_op_profile;
         let prefill_t0 = if prefill_profile {
@@ -2130,8 +3060,42 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             None
         };
 
+        // W2 L1 gate: per-layer residual dumps for HF comparison.
+        let layer_dump = self.runtime_env.layer_dump_dir.clone();
+        let dump = |ctx: &mut B::Context, buf: &B::Buffer, name: &str| {
+            if let Some(dir) = &layer_dump {
+                B::sync(ctx);
+                let v = B::to_vec(buf, seq_len * h);
+                write_f32_dump(dir, name, &v);
+            }
+        };
+        if let Some(dir) = &layer_dump {
+            if let Some(host) = host_residual.as_deref() {
+                write_f32_dump(dir, "embed", host);
+            } else {
+                dump(&mut ctx, &residual, "embed");
+            }
+        }
+
         for li in self.local_layer_indices() {
-            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
+            self.forward_layer_with_host_residual(
+                &mut ctx,
+                li,
+                cache_id,
+                &mut residual,
+                pos_offset,
+                seq_len,
+                host_residual.as_deref_mut(),
+            );
+            if layer_dump.is_some() {
+                if let Some(host) = host_residual.as_deref() {
+                    if let Some(dir) = &layer_dump {
+                        write_f32_dump(dir, &format!("layer_{li:02}"), host);
+                    }
+                } else {
+                    dump(&mut ctx, &residual, &format!("layer_{li:02}"));
+                }
+            }
         }
 
         if let Some(t0) = prefill_t0 {
@@ -2169,38 +3133,56 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             bucket("other", other_n, other_us);
         }
 
-        // Take the last token's hidden state: residual[(seq_len-1)*h .. seq_len*h]
-        B::copy_slice(
-            &mut ctx,
-            &residual,
-            (seq_len - 1) * h,
-            &mut self.scratch.last_hidden,
-            0,
-            h,
-        );
+        if let Some(host) = host_residual.as_deref() {
+            let last = &host[(seq_len - 1) * h..seq_len * h];
+            Self::rms_norm_host_to_activation(
+                &mut ctx,
+                last,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.last_normed,
+                1,
+                h,
+            );
+        } else {
+            // Take the last token's hidden state: residual[(seq_len-1)*h .. seq_len*h]
+            B::copy_slice(
+                &mut ctx,
+                &residual,
+                (seq_len - 1) * h,
+                &mut self.scratch.last_hidden,
+                0,
+                h,
+            );
 
-        // Final RMSNorm on the last hidden.
-        B::rms_norm(
-            &mut ctx,
-            &self.scratch.last_hidden,
-            &self.final_norm_w,
-            self.cfg.rms_norm_eps,
-            &mut self.scratch.last_normed,
-            1,
-            h,
-        );
+            // Final RMSNorm on the last hidden.
+            B::rms_norm(
+                &mut ctx,
+                &self.scratch.last_hidden,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.last_normed,
+                1,
+                h,
+            );
+        }
 
         // LM head (m=1 — triggers GEMV on MetalBackend).
         let lm_head = self
             .lm_head
             .as_ref()
             .expect("prefill_internal called on backbone-only model (no lm_head)");
-        lm_head.forward(
-            &mut ctx,
-            &self.scratch.last_normed,
-            &mut self.scratch.logits,
-            1,
-        );
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.prefill.lm_head");
+            lm_head.forward(
+                &mut ctx,
+                &self.scratch.last_normed,
+                &mut self.scratch.logits,
+                1,
+            );
+        }
 
         // Sync ctx before to_vec: on Metal, `to_vec` just reads the shared
         // buffer's CPU pointer without flushing the command buffer, so the
@@ -2209,6 +3191,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // the call redundant there (~50µs/step cost), but correctness on
         // Metal requires the explicit flush here.
         B::sync(&mut ctx);
+
+        if let Some(dir) = &layer_dump {
+            let v = B::to_vec(&self.scratch.logits, vocab);
+            write_f32_dump(dir, "logits", &v);
+        }
 
         // Restore residual into scratch for reuse on the next call.
         self.scratch.residual = Some(residual);
@@ -2236,7 +3223,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // docs/phase-e-cuda-status.md). In pure eager mode, we skip the
         // per-step device-state memcpy_htod trio entirely.
         const GRAPH_WARMUP: usize = 3;
-        let graph_enabled = self.runtime_env.cuda_graph;
+        let use_host_residual_shadow = self.use_host_residual_shadow();
+        let graph_enabled = self.runtime_env.cuda_graph && !use_host_residual_shadow;
 
         if graph_enabled {
             // Refresh device-side dynamic state (token/pos/kv_len) before
@@ -2282,6 +3270,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("decode_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, &[token], &mut residual, h);
+        if let Some(scale) = self.cfg.embed_scale {
+            B::scale_inplace(&mut ctx, &mut residual, scale, h);
+        }
+        let mut host_residual = if use_host_residual_shadow {
+            B::sync(&mut ctx);
+            Some(B::to_vec(&residual, h))
+        } else {
+            None
+        };
 
         // Per-layer wall-time profile (env-gated, off by default — adds
         // a B::sync between layers which serializes the pipeline). Helps
@@ -2296,14 +3293,30 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         for li in self.local_layer_indices() {
             if layer_profile {
                 let t0 = std::time::Instant::now();
-                self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
+                self.forward_layer_with_host_residual(
+                    &mut ctx,
+                    li,
+                    cache_id,
+                    &mut residual,
+                    pos as usize,
+                    1,
+                    host_residual.as_deref_mut(),
+                );
                 B::sync(&mut ctx);
                 let elapsed_us = t0.elapsed().as_micros() as u64;
                 if let Some(v) = layer_times.as_mut() {
                     v.push(elapsed_us);
                 }
             } else {
-                self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
+                self.forward_layer_with_host_residual(
+                    &mut ctx,
+                    li,
+                    cache_id,
+                    &mut residual,
+                    pos as usize,
+                    1,
+                    host_residual.as_deref_mut(),
+                );
             }
         }
         if let Some(times) = layer_times.take() {
@@ -2366,26 +3379,43 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             );
         }
 
-        B::rms_norm(
-            &mut ctx,
-            &residual,
-            &self.final_norm_w,
-            self.cfg.rms_norm_eps,
-            &mut self.scratch.last_normed,
-            1,
-            h,
-        );
+        if let Some(host) = host_residual.as_deref() {
+            Self::rms_norm_host_to_activation(
+                &mut ctx,
+                host,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.last_normed,
+                1,
+                h,
+            );
+        } else {
+            B::rms_norm(
+                &mut ctx,
+                &residual,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.last_normed,
+                1,
+                h,
+            );
+        }
 
         let lm_head = self
             .lm_head
             .as_ref()
             .expect("decode_internal called on backbone-only model (no lm_head)");
-        lm_head.forward(
-            &mut ctx,
-            &self.scratch.last_normed,
-            &mut self.scratch.logits,
-            1,
-        );
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.decode.lm_head");
+            lm_head.forward(
+                &mut ctx,
+                &self.scratch.last_normed,
+                &mut self.scratch.logits,
+                1,
+            );
+        }
 
         if should_capture && !self.graph_capture_failed {
             if B::end_graph_capture(&mut ctx, SINGLE_ITEM_GRAPH_KEY).is_err() {
@@ -2441,6 +3471,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("stage token forward called on stage without embedding");
         B::embedding_lookup(&mut ctx, embed, tokens, &mut residual, h);
+        if let Some(scale) = self.cfg.embed_scale {
+            B::scale_inplace(&mut ctx, &mut residual, scale, tokens.len() * h);
+        }
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
@@ -2598,12 +3631,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .lm_head
             .as_ref()
             .expect("logits_from_hidden called on stage without lm_head");
-        lm_head.forward(
-            &mut ctx,
-            &self.scratch.last_normed,
-            &mut self.scratch.logits,
-            1,
-        );
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.logits_from_hidden.lm_head");
+            lm_head.forward(
+                &mut ctx,
+                &self.scratch.last_normed,
+                &mut self.scratch.logits,
+                1,
+            );
+        }
         B::sync(&mut ctx);
         B::to_vec(&self.scratch.logits, vocab)
     }
@@ -2853,6 +3891,10 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         }
     }
 
+    fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
+        self.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
+    }
+
     fn kv_capacity(&self) -> usize {
         self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
     }
@@ -3038,6 +4080,10 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         }
     }
 
+    fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
+        self.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
+    }
+
     fn kv_capacity(&self) -> usize {
         self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
     }
@@ -3143,6 +4189,7 @@ fn rope_freq(cfg: &LlamaFamilyConfig, pair_idx: usize) -> f64 {
             *high_freq_factor,
             *original_max_position_embeddings,
         ),
+        Some(RopeScalingConfig::Linear { factor }) => base_freq / factor,
         None => base_freq,
     }
 }
@@ -3174,12 +4221,53 @@ mod tests {
 
     use ferrum_kernels::backend::cpu::CpuBackend;
     use ferrum_quantization::{DenseLinear, QuantConfig, WeightLoader};
-    use ferrum_types::Result;
+    use ferrum_types::{Activation, Result};
 
     use super::{
-        load_llama_family_layers, LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel,
-        LlamaFamilyRuntimeEnv, DEFAULT_KV_CAPACITY,
+        bf16_round, load_llama_family_layers, nan_trace_raw_matches, rope_freq, stats_for,
+        LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel, LlamaFamilyRuntimeEnv,
+        LlamaFamilyScratch, RopeScalingConfig, DEFAULT_KV_CAPACITY,
     };
+
+    #[test]
+    fn unsupported_rope_scaling_clamps_max_seq_len() {
+        // DeepSeek-R1-0528-Qwen3-8B: YaRN factor 4 over a 32k training
+        // window. Ferrum has no YaRN, so the claimed 131072 window must
+        // clamp to the original 32768.
+        let mut def = crate::definition::ModelDefinition::default();
+        def.max_position_embeddings = 131072;
+        def.extra_params = serde_json::json!({
+            "rope_scaling": {
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768
+            }
+        });
+        let cfg = LlamaFamilyConfig::qwen3_from_def(&def);
+        assert_eq!(cfg.max_seq_len, 32768);
+        assert!(cfg.rope_scaling.is_none());
+    }
+
+    #[test]
+    fn llama3_rope_scaling_keeps_configured_window() {
+        let mut def = crate::definition::ModelDefinition::default();
+        def.max_position_embeddings = 131072;
+        def.extra_params = serde_json::json!({
+            "rope_scaling": {
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192
+            }
+        });
+        let cfg = LlamaFamilyConfig::llama_from_def(&def);
+        assert_eq!(cfg.max_seq_len, 131072);
+        assert!(matches!(
+            cfg.rope_scaling,
+            Some(RopeScalingConfig::Llama3 { .. })
+        ));
+    }
 
     #[derive(Default)]
     struct RecordingLoader {
@@ -3226,6 +4314,7 @@ mod tests {
             rope_interleaved: false,
             has_qk_norm,
             sliding_window: 0,
+            ..Default::default()
         }
     }
 
@@ -3297,6 +4386,26 @@ mod tests {
         assert_eq!(
             model.kv_caches["test-cache"].len(),
             model.local_layer_count()
+        );
+    }
+
+    #[test]
+    fn contiguous_kv_capacity_hint_sizes_physical_cache() {
+        let mut cfg = test_llama_config(2, false);
+        cfg.max_seq_len = 64;
+        cfg.sliding_window_pattern = 6;
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
+
+        model.ensure_kv_with_capacity_hint("short", Some(17));
+        assert_eq!(model.kv_caches["short"][0].capacity, 17);
+        assert_eq!(model.kv_caches["short"][1].capacity, 17);
+
+        crate::common::DecoderOnlyLLM::release(&mut model, "short");
+        model.ensure_kv_with_capacity_hint("longer", Some(19));
+        assert_eq!(
+            model.kv_caches["longer"][0].capacity, 19,
+            "free-pool reuse must not keep a larger or smaller hinted cache"
         );
     }
 
@@ -3423,5 +4532,190 @@ mod tests {
             env.kv_capacity_for_model(DEFAULT_KV_CAPACITY * 2),
             DEFAULT_KV_CAPACITY
         );
+    }
+
+    #[test]
+    fn dump_stats_counts_nonfinite_values() {
+        let stats = stats_for(&[1.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -2.0]);
+
+        assert_eq!(stats.n, 5);
+        assert_eq!(stats.finite, 2);
+        assert_eq!(stats.nan, 1);
+        assert_eq!(stats.posinf, 1);
+        assert_eq!(stats.neginf, 1);
+        assert_eq!(stats.maxabs, 2.0);
+        assert_eq!(stats.maxabs_index, Some(4));
+    }
+
+    #[test]
+    fn prefill_scratch_keeps_batch_logits_lazy() {
+        let cfg = test_llama_config(1, false);
+        let mut scratch = LlamaFamilyScratch::<CpuBackend>::alloc(&cfg, 128);
+
+        assert_eq!(scratch.max_tokens, 128);
+        assert_eq!(scratch.batch_logits_capacity, 1);
+        assert_eq!(scratch.batch_logits.len(), cfg.vocab_size);
+
+        scratch.ensure_batch_logits(&cfg, 128);
+        assert_eq!(scratch.batch_logits_capacity, 128);
+        assert_eq!(scratch.batch_logits.len(), 128 * cfg.vocab_size);
+    }
+
+    #[test]
+    fn nan_trace_selector_accepts_all_or_layer_lists() {
+        assert!(nan_trace_raw_matches("all", 3, 9));
+        assert!(nan_trace_raw_matches("1", 3, 9));
+        assert!(nan_trace_raw_matches("3", 3, 9));
+        assert!(nan_trace_raw_matches("9", 3, 9));
+        assert!(nan_trace_raw_matches("2, 9, 12", 3, 9));
+        assert!(!nan_trace_raw_matches("0", 3, 9));
+        assert!(!nan_trace_raw_matches("false", 3, 9));
+        assert!(!nan_trace_raw_matches("2,4,6", 3, 9));
+        assert!(nan_trace_raw_matches("layer0", 0, 0));
+        assert!(nan_trace_raw_matches("l0", 0, 0));
+        assert!(nan_trace_raw_matches("source0", 1, 0));
+        assert!(nan_trace_raw_matches("layer0, layer3", 3, 9));
+    }
+
+    #[test]
+    fn bf16_round_matches_known_values() {
+        // sqrt(1152) = 33.941...; bf16 mantissa keeps 8 bits.
+        let r = bf16_round((1152f64).sqrt() as f32);
+        let bits = r.to_bits();
+        assert_eq!(bits & 0xFFFF, 0, "low mantissa bits must be cleared");
+        assert!((r - 33.941125).abs() < 0.25, "rounded value far off: {r}");
+        // Exact powers of two are fixed points.
+        assert_eq!(bf16_round(32.0), 32.0);
+    }
+
+    #[test]
+    fn gemma3_from_def_parses_real_1b_config() {
+        let config = serde_json::json!({
+            "architectures": ["Gemma3ForCausalLM"],
+            "model_type": "gemma3_text",
+            "hidden_size": 1152,
+            "intermediate_size": 6912,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "num_hidden_layers": 26,
+            "head_dim": 256,
+            "vocab_size": 262144,
+            "max_position_embeddings": 32768,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "rope_local_base_freq": 10000.0,
+            "sliding_window": 512,
+            "sliding_window_pattern": 6,
+            "query_pre_attn_scalar": 256,
+            "hidden_activation": "gelu_pytorch_tanh"
+        });
+        let mut mgr = crate::definition::ConfigManager::new();
+        let def = mgr.parse_config_for_tests(&config).unwrap();
+        assert_eq!(def.architecture, crate::registry::Architecture::Gemma3);
+        assert_eq!(def.activation, Activation::GeluTanh);
+        let cfg = LlamaFamilyConfig::gemma3_from_def(&def);
+        assert_eq!(cfg.hidden_size, 1152);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.sliding_window, 512);
+        assert_eq!(cfg.sliding_window_pattern, 6);
+        assert_eq!(cfg.rope_theta, 1_000_000.0);
+        assert_eq!(cfg.rope_local_theta, Some(10_000.0));
+        assert_eq!(cfg.query_pre_attn_scalar, Some(256.0));
+        assert!(cfg.rmsnorm_unit_offset);
+        assert!(cfg.sandwich_norms);
+        assert!(cfg.has_qk_norm);
+        let scale = cfg.embed_scale.unwrap();
+        assert!((scale - 33.941125f32).abs() < 0.25);
+        // 5:1 pattern: layers 5, 11, 17, 23 are global.
+        for li in 0..26usize {
+            let global = (li + 1) % 6 == 0;
+            assert_eq!(global, matches!(li, 5 | 11 | 17 | 23), "layer {li}");
+        }
+    }
+
+    #[test]
+    fn gemma3_nested_text_config_flattens() {
+        let config = serde_json::json!({
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "model_type": "gemma3",
+            "eos_token_id": [1, 106],
+            "text_config": {
+                "hidden_size": 5376,
+                "intermediate_size": 21504,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 16,
+                "num_hidden_layers": 62,
+                "head_dim": 128,
+                "vocab_size": 262208,
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000.0,
+                "rope_local_base_freq": 10000.0,
+                "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
+                "sliding_window": 1024,
+                "sliding_window_pattern": 6,
+                "query_pre_attn_scalar": 168,
+                "hidden_activation": "gelu_pytorch_tanh"
+            },
+            "vision_config": {"hidden_size": 1152}
+        });
+        let mut mgr = crate::definition::ConfigManager::new();
+        let def = mgr.parse_config_for_tests(&config).unwrap();
+        let cfg = LlamaFamilyConfig::gemma3_from_def(&def);
+        assert_eq!(cfg.hidden_size, 5376);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.num_layers, 62);
+        assert_eq!(cfg.sliding_window, 1024);
+        assert_eq!(cfg.query_pre_attn_scalar, Some(168.0));
+        assert_eq!(
+            cfg.rope_scaling,
+            Some(RopeScalingConfig::Linear { factor: 8.0 })
+        );
+        assert_eq!(cfg.max_seq_len, 131072);
+        // q_norm fold factor sqrt(128/168) ~= 0.8729
+        let fold = (cfg.head_dim as f64 / cfg.query_pre_attn_scalar.unwrap()).sqrt();
+        assert!((fold - 0.872871).abs() < 1e-5);
+    }
+
+    #[test]
+    fn linear_rope_scaling_divides_frequency() {
+        let mut cfg = LlamaFamilyConfig::default();
+        cfg.head_dim = 4;
+        cfg.rope_theta = 10_000.0;
+        cfg.rope_scaling = Some(RopeScalingConfig::Linear { factor: 8.0 });
+        let scaled = rope_freq(&cfg, 0);
+        cfg.rope_scaling = None;
+        let unscaled = rope_freq(&cfg, 0);
+        assert!((scaled - unscaled / 8.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cpu_gelu_tanh_mul_split_matches_reference() {
+        use ferrum_kernels::backend::cpu::CpuBackend;
+        use ferrum_kernels::backend::Backend;
+        let mut ctx = <CpuBackend as Backend>::new_context();
+        let im = 3usize;
+        // one token: gate = [-1, 0.5, 2], up = [1, 2, 3]
+        let gate_up = vec![-1.0f32, 0.5, 2.0, 1.0, 2.0, 3.0];
+        let gu = <CpuBackend as Backend>::from_slice(&gate_up);
+        let mut out = <CpuBackend as Backend>::alloc(im);
+        <CpuBackend as Backend>::fused_gelu_tanh_mul_split(&mut ctx, &gu, &mut out, 1, im);
+        let v = <CpuBackend as Backend>::to_vec(&out, im);
+        let gelu = |x: f32| 0.5 * x * (1.0 + (0.79788456f32 * (x + 0.044715 * x * x * x)).tanh());
+        for i in 0..im {
+            let expect = gelu(gate_up[i]) * gate_up[im + i];
+            assert!((v[i] - expect).abs() < 1e-6, "i={i}: {} vs {expect}", v[i]);
+        }
+    }
+
+    #[test]
+    fn cpu_scale_inplace_scales() {
+        use ferrum_kernels::backend::cpu::CpuBackend;
+        use ferrum_kernels::backend::Backend;
+        let mut ctx = <CpuBackend as Backend>::new_context();
+        let mut buf = <CpuBackend as Backend>::from_slice(&[1.0f32, -2.0, 0.5]);
+        <CpuBackend as Backend>::scale_inplace(&mut ctx, &mut buf, 33.9375, 3);
+        let v = <CpuBackend as Backend>::to_vec(&buf, 3);
+        assert_eq!(v, vec![33.9375, -67.875, 16.96875]);
     }
 }

@@ -1,0 +1,27 @@
+[smoke] waiting for http://127.0.0.1:8271/health (model: qwen3:32b-gptq)
+[smoke] ok   known-answer 10/10
+[smoke] ok   natural EOS stop
+[smoke] ok   multi-turn recall Bob
+[smoke] ok   stream == non-stream
+[smoke] ok   custom stop finish_reason
+[smoke] ok   custom stop does not leak
+[smoke] ok   max_tokens finish_reason length
+[smoke] ok   max_tokens budget respected
+[smoke] ok   required tool-call 10/10
+Traceback (most recent call last):
+  File "<stdin>", line 133, in <module>
+  File "<stdin>", line 21, in chat
+  File "/usr/lib/python3.10/urllib/request.py", line 216, in urlopen
+    return opener.open(url, data, timeout)
+  File "/usr/lib/python3.10/urllib/request.py", line 525, in open
+    response = meth(req, response)
+  File "/usr/lib/python3.10/urllib/request.py", line 634, in http_response
+    response = self.parent.error(
+  File "/usr/lib/python3.10/urllib/request.py", line 563, in error
+    return self._call_chain(*args)
+  File "/usr/lib/python3.10/urllib/request.py", line 496, in _call_chain
+    result = func(*args)
+  File "/usr/lib/python3.10/urllib/request.py", line 643, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 500: Internal Server Error
+FERRUM W1 SMOKE FAIL: qwen3:32b-gptq (see /tmp/ferrum_w1_smoke_8271.log)

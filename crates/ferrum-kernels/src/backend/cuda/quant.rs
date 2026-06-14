@@ -147,6 +147,53 @@ fn cuda_quant_runtime_config() -> &'static CudaQuantRuntimeConfig {
     static CONFIG: OnceLock<CudaQuantRuntimeConfig> = OnceLock::new();
     CONFIG.get_or_init(CudaQuantRuntimeConfig::from_env)
 }
+
+fn reject_dense_vllm_marlin_if_requested(config: &CudaQuantRuntimeConfig) -> Result<()> {
+    if config.vllm_marlin {
+        return Err(FerrumError::unsupported(
+            "FERRUM_VLLM_MARLIN=1 is disabled for dense GPTQ: dense load_gptq \
+             stores IST-DASLab Marlin tiles, while the vLLM Marlin kernel \
+             requires vLLM-repacked weights. Use the default dense Marlin path; \
+             vLLM-repacked Marlin remains wired through FERRUM_VLLM_MOE for \
+             stacked MoE weights.",
+        ));
+    }
+    Ok(())
+}
+
+fn marlin_qzeros_are_symmetric_code7(qzeros: &[i32]) -> bool {
+    !qzeros.is_empty()
+        && qzeros.iter().all(|&word| {
+            let word = word as u32;
+            (0..8).all(|i| ((word >> (i * 4)) & 0xF) == 7)
+        })
+}
+
+fn reject_unsupported_marlin_qzeros(context: &str, qzeros: &[i32]) -> Result<()> {
+    if marlin_qzeros_are_symmetric_code7(qzeros) {
+        return Ok(());
+    }
+
+    let first_bad = qzeros.iter().enumerate().find_map(|(word_idx, &word)| {
+        let word = word as u32;
+        (0..8).find_map(|nibble_idx| {
+            let code = (word >> (nibble_idx * 4)) & 0xF;
+            (code != 7).then_some((word_idx, nibble_idx, code))
+        })
+    });
+
+    match first_bad {
+        Some((word_idx, nibble_idx, code)) => Err(FerrumError::unsupported(format!(
+            "{context}: CUDA Marlin currently supports only symmetric GPTQ \
+             zero-points encoded as qzeros nibble code 7; found code {code} \
+             at word {word_idx}, nibble {nibble_idx}"
+        ))),
+        None => Err(FerrumError::unsupported(format!(
+            "{context}: CUDA Marlin requires non-empty qzeros encoded with \
+             GPTQ symmetric zero-point code 7"
+        ))),
+    }
+}
 // ────────────────────────────────────────────────────────────────────────
 // Perm-aware Marlin GEMM (desc_act=true GPTQ act-order)
 // ────────────────────────────────────────────────────────────────────────
@@ -390,7 +437,9 @@ pub fn marlin_gemm_with_perm(
     out: &mut CudaSlice<f16>,
     m: usize,
 ) -> Result<()> {
-    let use_vllm = cuda_quant_runtime_config().vllm_marlin;
+    let runtime_config = cuda_quant_runtime_config();
+    reject_dense_vllm_marlin_if_requested(runtime_config)?;
+    let use_vllm = runtime_config.vllm_marlin;
 
     if let Some(perm) = weight.perm.as_ref() {
         let k = weight.k;
@@ -556,7 +605,17 @@ impl BackendQuantMarlin for CudaBackend {
                 "CUDA GPTQ: only bits=4 supported (got {bits})"
             )));
         }
-        let _ = qzeros; // qzeros baked into Marlin scales path; unused for Marlin store
+
+        // Marlin's smallest instantiated tile is 128x128 (m <= 16; larger
+        // m chunks down to it in marlin_gemm), so n and k must both be
+        // multiples of 128. Refuse anything else loudly — silently
+        // garbled layers are worse than a load error.
+        if n % 128 != 0 || k % 128 != 0 {
+            return Err(FerrumError::unsupported(format!(
+                "CUDA GPTQ: layer shape K={k} N={n} violates Marlin tile \
+                 constraints (both must be multiples of 128)"
+            )));
+        }
 
         // Path B: triton-rs w4a16 GPTQ kernel — operates on the on-disk
         // GPTQ tensor layout directly. Just upload the three tensors and
@@ -593,6 +652,8 @@ impl BackendQuantMarlin for CudaBackend {
                 },
             ));
         }
+
+        reject_unsupported_marlin_qzeros("CUDA GPTQ Marlin", qzeros)?;
 
         // Detect desc_act=true (act-order GPTQ): g_idx is non-trivial.
         // AutoGPTQ writes g_idx[k] = k/group_size for desc_act=false; any
@@ -708,7 +769,12 @@ impl BackendQuantMarlin for CudaBackend {
                 qzeros.len()
             )));
         }
-        let _ = qzeros; // Marlin doesn't read qzeros (sym=true)
+        for (idx, qz) in qzeros.iter().enumerate() {
+            reject_unsupported_marlin_qzeros(
+                &format!("CUDA GPTQ stacked Marlin expert {idx}"),
+                qz,
+            )?;
+        }
 
         // vLLM marlin_moe_wna16 path: stacked weight in vLLM Marlin tile
         // format (NOT IST-DASLab). Run gptq_marlin_repack per expert,
@@ -1076,7 +1142,10 @@ impl BackendQuantGguf for CudaBackend {}
 
 #[cfg(test)]
 mod tests {
-    use super::CudaQuantRuntimeConfig;
+    use super::{
+        marlin_qzeros_are_symmetric_code7, reject_dense_vllm_marlin_if_requested,
+        reject_unsupported_marlin_qzeros, CudaQuantRuntimeConfig,
+    };
 
     #[test]
     fn cuda_quant_runtime_config_parses_marlin_and_moe_knobs() {
@@ -1117,5 +1186,38 @@ mod tests {
         assert!(!config.vllm_fp32_reduce);
         assert!(config.moe_fused);
         assert_eq!(config.moe_streams, 4);
+    }
+
+    #[test]
+    fn dense_vllm_marlin_env_is_rejected() {
+        let config = CudaQuantRuntimeConfig::from_env_vars([("FERRUM_VLLM_MARLIN", "1")]);
+        let err = reject_dense_vllm_marlin_if_requested(&config).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("FERRUM_VLLM_MARLIN=1 is disabled for dense GPTQ"));
+        assert!(message.contains("vLLM-repacked weights"));
+
+        let default_config = CudaQuantRuntimeConfig::from_env_vars([]);
+        reject_dense_vllm_marlin_if_requested(&default_config).unwrap();
+    }
+
+    #[test]
+    fn marlin_qzeros_must_be_symmetric_code7() {
+        let sym = [0x7777_7777i32, 0x7777_7777i32];
+        assert!(marlin_qzeros_are_symmetric_code7(&sym));
+        reject_unsupported_marlin_qzeros("test", &sym).unwrap();
+
+        let bad = [0x7777_7778i32];
+        assert!(!marlin_qzeros_are_symmetric_code7(&bad));
+        let err = reject_unsupported_marlin_qzeros("test", &bad).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("code 8"));
+        assert!(message.contains("word 0"));
+        assert!(message.contains("nibble 0"));
+
+        let empty: [i32; 0] = [];
+        assert!(!marlin_qzeros_are_symmetric_code7(&empty));
+        let err = reject_unsupported_marlin_qzeros("test", &empty).unwrap_err();
+        assert!(err.to_string().contains("non-empty qzeros"));
     }
 }

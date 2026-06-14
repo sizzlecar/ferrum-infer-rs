@@ -71,11 +71,13 @@ kernel void flash_attn_f32(
 
     // Output accumulator in registers (one float per head_dim element)
     // Each thread handles d/32 elements (32 threads in simdgroup)
-    // For head_dim=128: each thread handles 4 elements
+    // head_dim=128 → 4 per thread; Gemma3's head_dim=256 → 8 per thread.
+    // Indexing past the array is silent corruption (caught live on
+    // gemma3:1b — acc[4] at d=256 garbled every local-attention layer).
     const int elems_per_thread = d / 32;
 
-    // Local output accumulator
-    float acc[4] = {0, 0, 0, 0}; // supports up to head_dim=128 (4 per thread)
+    // Local output accumulator (supports up to head_dim=256)
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
     // Process KV in blocks, starting at `attend_start` so sliding-window
     // positions that are too old don't contribute.

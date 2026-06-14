@@ -51,6 +51,18 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
     fn paged_block_indices(layer: &Self::Layer) -> &[u32];
     fn paged_block_indices_mut(layer: &mut Self::Layer) -> &mut Vec<u32>;
 
+    /// Ensure a contiguous cache has physical room for `required_capacity`
+    /// KV positions. Paged caches and fixed-size cache dtypes may no-op.
+    fn ensure_contig_capacity(
+        _ctx: &mut B::Context,
+        _layer: &mut Self::Layer,
+        _required_capacity: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn is_paged(layer: &Self::Layer) -> bool {
         Self::block_size(layer) > 0
     }
@@ -223,6 +235,36 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
     }
     fn paged_block_indices_mut(layer: &mut Self::Layer) -> &mut Vec<u32> {
         &mut layer.paged_block_indices
+    }
+
+    fn ensure_contig_capacity(
+        ctx: &mut B::Context,
+        layer: &mut Self::Layer,
+        required_capacity: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        if layer.block_size > 0 || required_capacity <= layer.capacity {
+            return Ok(());
+        }
+        let old_capacity = layer.capacity;
+        let old_len = layer.len;
+        let mut new_k = B::alloc(num_kv_heads * required_capacity * head_dim);
+        let mut new_v = B::alloc(num_kv_heads * required_capacity * head_dim);
+        if old_len > 0 {
+            let copy_len = old_len * head_dim;
+            for head in 0..num_kv_heads {
+                let old_offset = head * old_capacity * head_dim;
+                let new_offset = head * required_capacity * head_dim;
+                B::copy_slice(ctx, &layer.k, old_offset, &mut new_k, new_offset, copy_len);
+                B::copy_slice(ctx, &layer.v, old_offset, &mut new_v, new_offset, copy_len);
+            }
+            B::sync(ctx);
+        }
+        layer.k = new_k;
+        layer.v = new_v;
+        layer.capacity = required_capacity;
+        Ok(())
     }
 
     fn paged_write(

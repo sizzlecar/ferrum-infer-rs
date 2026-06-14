@@ -1,0 +1,8 @@
+{
+  "model_id": "unsloth/gemma-3-1b-it",
+  "bos_token": "<bos>",
+  "eos_token": "<end_of_turn>",
+  "render_kwargs": {},
+  "now": "2026-06-12T00:00:00",
+  "transformers_version": "4.51.3"
+}

@@ -6,6 +6,11 @@
 //! Run (GPU, needs --features cuda):
 //!   cargo test -p ferrum-quantization --features cuda --release \
 //!     --test gptq_parity_test cuda_vs_cpu -- --ignored --nocapture
+//!   cargo test -p ferrum-quantization --features cuda --release \
+//!     --test gptq_parity_test cuda_desc_act_vs_cpu_reference -- --ignored --nocapture
+//!   cargo test -p ferrum-quantization --features cuda --release \
+//!     --test gptq_parity_test cuda_desc_act_gemma3_attention_shapes_vs_cpu_reference \
+//!     -- --ignored --nocapture
 //!
 //! Uses randomly-generated GPTQ tensors (not a real model) so the test
 //! doesn't depend on HF cache. Validates that the CUDA Marlin pipeline
@@ -42,6 +47,17 @@ struct SyntheticGptq {
     qzeros: Vec<i32>,  // [K/group, N/8]
 }
 
+fn make_desc_act_g_idx(k: usize, group_size: usize) -> Vec<i32> {
+    assert_eq!(k % group_size, 0);
+    let num_groups = k / group_size;
+    assert!(num_groups >= 4, "test g_idx pattern expects >=4 groups");
+
+    // Deliberately non-monotonic but balanced: every quant group appears
+    // exactly group_size times, so full-K act-order kernels can legally
+    // sort by g_idx and recover contiguous full groups.
+    (0..k).map(|i| (i % num_groups) as i32).collect()
+}
+
 fn make_synthetic(k: usize, n: usize, group_size: usize, seed: u64) -> SyntheticGptq {
     assert_eq!(k % 8, 0);
     assert_eq!(n % 8, 0);
@@ -74,6 +90,16 @@ fn make_synthetic(k: usize, n: usize, group_size: usize, seed: u64) -> Synthetic
         scales,
         qzeros,
     }
+}
+
+fn make_synthetic_symmetric(k: usize, n: usize, group_size: usize, seed: u64) -> SyntheticGptq {
+    let mut syn = make_synthetic(k, n, group_size, seed);
+    for qz in syn.qzeros.iter_mut() {
+        // Marlin's sym=true/no-zp path has an implicit int4 zero point of 8.
+        // GPTQ qzeros stores zero-1, packed along N, so code 7 encodes zero=8.
+        *qz = 0x7777_7777u32 as i32;
+    }
+    syn
 }
 
 /// CPU-side self-check: feed the GPTQ tensors through CpuBackend's
@@ -139,6 +165,161 @@ fn dequant_reference(syn: &SyntheticGptq) -> Vec<f32> {
     w
 }
 
+fn dequant_reference_with_g_idx(syn: &SyntheticGptq, g_idx: &[i32]) -> Vec<f32> {
+    assert_eq!(g_idx.len(), syn.k);
+    let num_groups = syn.k / syn.group_size;
+    let mut w = vec![0f32; syn.n * syn.k];
+    let packed_rows = syn.k / 8;
+    for pr in 0..packed_rows {
+        for col in 0..syn.n {
+            let packed = syn.qweight[pr * syn.n + col] as u32;
+            for bi in 0..8 {
+                let ki = pr * 8 + bi;
+                let q = ((packed >> (bi * 4)) & 0xF) as i32;
+                let grp = g_idx[ki] as usize;
+                assert!(grp < num_groups);
+                let scale = syn.scales[grp * syn.n + col];
+                let z_packed = syn.qzeros[grp * (syn.n / 8) + (col / 8)] as u32;
+                let zero = (((z_packed >> ((col % 8) * 4)) & 0xF) as i32) + 1;
+                w[col * syn.k + ki] = (q - zero) as f32 * scale;
+            }
+        }
+    }
+    w
+}
+
+fn argsort_g_idx(g_idx: &[i32]) -> Vec<usize> {
+    let mut perm: Vec<usize> = (0..g_idx.len()).collect();
+    perm.sort_by_key(|&i| g_idx[i]);
+    perm
+}
+
+fn permute_qweight_rows_for_test(qweight: &[i32], perm: &[usize], k: usize, n: usize) -> Vec<i32> {
+    assert_eq!(perm.len(), k);
+    assert_eq!(qweight.len(), (k / 8) * n);
+
+    let packed_rows = k / 8;
+    let mut unpacked = vec![0u8; k * n];
+    for pr in 0..packed_rows {
+        for col in 0..n {
+            let packed = qweight[pr * n + col] as u32;
+            for bi in 0..8 {
+                unpacked[(pr * 8 + bi) * n + col] = ((packed >> (bi * 4)) & 0xF) as u8;
+            }
+        }
+    }
+
+    let mut sorted = vec![0u8; k * n];
+    for (dst_row, &src_row) in perm.iter().enumerate() {
+        let dst = dst_row * n;
+        let src = src_row * n;
+        sorted[dst..dst + n].copy_from_slice(&unpacked[src..src + n]);
+    }
+
+    let mut packed = vec![0i32; packed_rows * n];
+    for pr in 0..packed_rows {
+        for col in 0..n {
+            let mut word = 0u32;
+            for bi in 0..8 {
+                word |= (sorted[(pr * 8 + bi) * n + col] as u32) << (bi * 4);
+            }
+            packed[pr * n + col] = word as i32;
+        }
+    }
+    packed
+}
+
+#[test]
+fn desc_act_reference_uses_g_idx_for_scale_lookup() {
+    let syn = make_synthetic(512, 256, 128, 0x51A7E5);
+    let g_idx = make_desc_act_g_idx(syn.k, syn.group_size);
+    let mut counts = vec![0usize; syn.k / syn.group_size];
+    for &g in &g_idx {
+        counts[g as usize] += 1;
+    }
+    assert!(counts.iter().all(|&count| count == syn.group_size));
+
+    let sequential = dequant_reference(&syn);
+    let desc_act = dequant_reference_with_g_idx(&syn, &g_idx);
+    let max_diff = sequential
+        .iter()
+        .zip(&desc_act)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+
+    assert!(
+        max_diff > 1e-3,
+        "synthetic desc_act fixture must exercise non-sequential scale lookup"
+    );
+}
+
+#[test]
+fn symmetric_qzeros_encode_marlin_zero_point() {
+    let syn = make_synthetic_symmetric(512, 256, 128, 0x51A7_E501);
+    assert!(syn.qzeros.iter().all(|&qz| qz as u32 == 0x7777_7777));
+
+    let w = dequant_reference(&syn);
+    let has_positive = w.iter().any(|&x| x > 0.0);
+    let has_negative = w.iter().any(|&x| x < 0.0);
+    assert!(
+        has_positive && has_negative,
+        "sym=true qzeros fixture should dequantize around zero"
+    );
+}
+
+#[test]
+fn desc_act_perm_gather_is_equivalent_to_g_idx_reference() {
+    let syn = make_synthetic(512, 256, 128, 0x5A17_0A7);
+    let g_idx = make_desc_act_g_idx(syn.k, syn.group_size);
+    let perm = argsort_g_idx(&g_idx);
+
+    let ref_w = dequant_reference_with_g_idx(&syn, &g_idx);
+    let permuted_qweight = permute_qweight_rows_for_test(&syn.qweight, &perm, syn.k, syn.n);
+    let sorted_syn = SyntheticGptq {
+        k: syn.k,
+        n: syn.n,
+        bits: syn.bits,
+        group_size: syn.group_size,
+        qweight: permuted_qweight,
+        scales: syn.scales.clone(),
+        qzeros: syn.qzeros.clone(),
+    };
+    let sorted_w = dequant_reference(&sorted_syn);
+
+    let m = 3;
+    let input: Vec<f32> = (0..m * syn.k).map(|i| (i as f32 * 0.0041).sin()).collect();
+    let mut gathered = vec![0.0f32; input.len()];
+    for row in 0..m {
+        for (dst_k, &src_k) in perm.iter().enumerate() {
+            gathered[row * syn.k + dst_k] = input[row * syn.k + src_k];
+        }
+    }
+
+    let mut out_ref = vec![0.0f32; m * syn.n];
+    <CpuBackend as Backend>::gemm(&mut (), &input, &ref_w, &mut out_ref, m, syn.n, syn.k);
+
+    let mut out_perm = vec![0.0f32; m * syn.n];
+    <CpuBackend as Backend>::gemm(
+        &mut (),
+        &gathered,
+        &sorted_w,
+        &mut out_perm,
+        m,
+        syn.n,
+        syn.k,
+    );
+
+    let max_diff = out_ref
+        .iter()
+        .zip(&out_perm)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        max_diff < 1e-3,
+        "desc_act perm/gather transform diverged from g_idx reference: {max_diff}"
+    );
+}
+
 /// CUDA Marlin vs CPU dequant reference.
 /// Requires `--features cuda` AND a working GPU. Marked #[ignore] so it
 /// doesn't run in default CPU builds.
@@ -153,7 +334,7 @@ fn cuda_vs_cpu() {
     let k = 512;
     let n = 256;
     let gs = 128;
-    let syn = make_synthetic(k, n, gs, 0xC0FFEE);
+    let syn = make_synthetic_symmetric(k, n, gs, 0xC0FFEE);
 
     // CPU reference (fp32).
     let cpu_linear = GptqLinear::<CpuBackend>::from_raw(
@@ -220,6 +401,290 @@ fn cuda_vs_cpu() {
     assert!(
         rel_err < 0.05,
         "GPTQ CUDA/CPU mismatch too large: rel_err={rel_err}"
+    );
+}
+
+/// CUDA Marlin desc_act=true path vs CPU reference using g_idx scale lookup.
+///
+/// This is the smallest paid-GPU diagnostic for the W2 Gemma3-27B failure:
+/// Gemma3's GPTQ checkpoint is desc_act=true/static_groups=false, and its
+/// first-layer residuals explode before final logits become all-NaN.
+#[cfg(feature = "cuda")]
+fn run_cuda_desc_act_vs_cpu_reference_shape(label: &str, k: usize, n: usize, m: usize, seed: u64) {
+    use ferrum_kernels::backend::cuda::CudaBackend;
+    use half::f16;
+
+    let gs = 128;
+    let syn = make_synthetic_symmetric(k, n, gs, seed);
+    let g_idx = make_desc_act_g_idx(k, gs);
+
+    let ref_w = dequant_reference_with_g_idx(&syn, &g_idx);
+    let input_f32: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.0041).sin()).collect();
+    let input_f16: Vec<f32> = input_f32
+        .iter()
+        .map(|&x| f16::from_f32(x).to_f32())
+        .collect();
+
+    let mut cpu_out = vec![0.0f32; m * n];
+    <CpuBackend as Backend>::gemm(&mut (), &input_f16, &ref_w, &mut cpu_out, m, n, k);
+
+    let cuda_linear = GptqLinear::<CudaBackend>::from_raw(
+        &syn.qweight,
+        &syn.scales,
+        &syn.qzeros,
+        Some(&g_idx),
+        None,
+        syn.bits,
+        syn.group_size,
+        syn.k,
+        syn.n,
+    )
+    .expect("CUDA load_gptq desc_act (Marlin repack + upload)");
+
+    let mut cuda_ctx = <CudaBackend as Backend>::new_context();
+    let input_dev = CudaBackend::from_slice(&input_f32);
+    let mut out_dev = CudaBackend::alloc(m * n);
+    cuda_linear.forward(&mut cuda_ctx, &input_dev, &mut out_dev, m);
+    <CudaBackend as Backend>::sync(&mut cuda_ctx);
+    let cuda_out = CudaBackend::to_vec(&out_dev, m * n);
+
+    let nonfinite = cuda_out.iter().filter(|x| !x.is_finite()).count();
+    assert_eq!(
+        nonfinite, 0,
+        "CUDA desc_act output contains non-finite values"
+    );
+
+    let max_diff = cpu_out
+        .iter()
+        .zip(&cuda_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let rel_err = max_diff
+        / cpu_out
+            .iter()
+            .map(|x| x.abs())
+            .fold(0f32, f32::max)
+            .max(1e-6);
+    eprintln!("CUDA↔CPU GPTQ desc_act ({label}): max|diff|={max_diff:.4}, rel={rel_err:.4}");
+    assert!(
+        rel_err < 0.05,
+        "GPTQ CUDA desc_act/CPU mismatch too large for {label}: rel_err={rel_err}"
+    );
+}
+
+#[cfg(feature = "cuda")]
+fn read_f32_bin(path: &std::path::Path) -> Vec<f32> {
+    let raw = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert_eq!(
+        raw.len() % 4,
+        0,
+        "{} byte length is not f32-aligned",
+        path.display()
+    );
+    raw.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("4-byte chunk")))
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn run_real_gptq_prefix_vs_cpu_reference(label: &str, prefix: &str, input_path: &std::path::Path) {
+    use ferrum_kernels::backend::cuda::CudaBackend;
+    use ferrum_quantization::NativeSafetensorsLoader;
+    use half::f16;
+
+    let model_dir = std::env::var("FERRUM_GPTQ_PARITY_MODEL_DIR")
+        .expect("set FERRUM_GPTQ_PARITY_MODEL_DIR to a GPTQ safetensors snapshot");
+    let loader =
+        NativeSafetensorsLoader::<CudaBackend>::open(&model_dir).expect("open GPTQ model dir");
+    let qcfg = loader
+        .quant_config_ref()
+        .expect("quantize_config.json required for real GPTQ parity")
+        .clone();
+    let (qweight, scales, qzeros, g_idx, k, n) = loader
+        .read_gptq_raw(prefix)
+        .expect("read real GPTQ tensors");
+    let g_idx = g_idx.expect("real desc_act GPTQ tensor must include g_idx");
+    let input_f32 = read_f32_bin(input_path);
+    assert_eq!(
+        input_f32.len() % k,
+        0,
+        "{} input len {} is not divisible by K={k}",
+        input_path.display(),
+        input_f32.len()
+    );
+    let m = input_f32.len() / k;
+    let input_f16: Vec<f32> = input_f32
+        .iter()
+        .map(|&x| f16::from_f32(x).to_f32())
+        .collect();
+
+    let syn = SyntheticGptq {
+        k,
+        n,
+        bits: qcfg.bits,
+        group_size: qcfg.group_size,
+        qweight: qweight.clone(),
+        scales: scales.clone(),
+        qzeros: qzeros.clone(),
+    };
+    let ref_w = dequant_reference_with_g_idx(&syn, &g_idx);
+    let mut cpu_out = vec![0.0f32; m * n];
+    <CpuBackend as Backend>::gemm(&mut (), &input_f16, &ref_w, &mut cpu_out, m, n, k);
+
+    let cuda_linear = GptqLinear::<CudaBackend>::from_raw(
+        &qweight,
+        &scales,
+        &qzeros,
+        Some(&g_idx),
+        None,
+        qcfg.bits,
+        qcfg.group_size,
+        k,
+        n,
+    )
+    .expect("CUDA load real GPTQ prefix");
+
+    let mut cuda_ctx = <CudaBackend as Backend>::new_context();
+    let input_dev = CudaBackend::from_slice(&input_f32);
+    let mut out_dev = CudaBackend::alloc(m * n);
+    cuda_linear.forward(&mut cuda_ctx, &input_dev, &mut out_dev, m);
+    <CudaBackend as Backend>::sync(&mut cuda_ctx);
+    let cuda_out = CudaBackend::to_vec(&out_dev, m * n);
+
+    let cuda_nonfinite = cuda_out.iter().filter(|x| !x.is_finite()).count();
+    let cpu_nonfinite = cpu_out.iter().filter(|x| !x.is_finite()).count();
+    assert_eq!(cpu_nonfinite, 0, "CPU reference contains non-finite values");
+    assert_eq!(cuda_nonfinite, 0, "CUDA output contains non-finite values");
+
+    let max_diff = cpu_out
+        .iter()
+        .zip(&cuda_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let cpu_max = cpu_out.iter().map(|x| x.abs()).fold(0f32, f32::max);
+    let cuda_max = cuda_out.iter().map(|x| x.abs()).fold(0f32, f32::max);
+    let rel_err = max_diff / cpu_max.max(1e-6);
+    eprintln!(
+        "CUDA↔CPU real GPTQ desc_act ({label}): M={m} K={k} N={n} \
+         cpu_max={cpu_max:.4} cuda_max={cuda_max:.4} max|diff|={max_diff:.4} rel={rel_err:.4}"
+    );
+    assert!(
+        rel_err < 0.05,
+        "real GPTQ CUDA desc_act/CPU mismatch too large for {label}: rel_err={rel_err}"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn cuda_desc_act_vs_cpu_reference() {
+    run_cuda_desc_act_vs_cpu_reference_shape("small", 512, 256, 3, 0xD35C_AC7);
+}
+
+/// Same synthetic desc_act parity as `cuda_desc_act_vs_cpu_reference`,
+/// but with Gemma3-27B q_proj's real GPTQ dimensions from
+/// `circulus/gemma-3-27b-it-gptq`:
+///   g_idx [5376], qzeros [42, 512] => K=5376, N=4096, group_size=128.
+/// This catches shape/tile bugs that the tiny diagnostic can miss.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn cuda_desc_act_gemma3_qproj_shape_vs_cpu_reference() {
+    run_cuda_desc_act_vs_cpu_reference_shape(
+        "gemma3-q_proj K5376 N4096",
+        5376,
+        4096,
+        2,
+        0x6E33_A027,
+    );
+}
+
+/// Same diagnostic over the other layer0 attention projection shapes observed
+/// in `circulus/gemma-3-27b-it-gptq`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn cuda_desc_act_gemma3_attention_shapes_vs_cpu_reference() {
+    run_cuda_desc_act_vs_cpu_reference_shape(
+        "gemma3-k_proj K5376 N2048",
+        5376,
+        2048,
+        2,
+        0x6E33_A02B,
+    );
+    run_cuda_desc_act_vs_cpu_reference_shape(
+        "gemma3-v_proj K5376 N2048",
+        5376,
+        2048,
+        2,
+        0x6E33_A02C,
+    );
+    run_cuda_desc_act_vs_cpu_reference_shape(
+        "gemma3-o_proj K4096 N5376",
+        4096,
+        5376,
+        2,
+        0x6E33_A02D,
+    );
+}
+
+/// Same diagnostic over Gemma3-27B layer0 MLP projection shapes. W2 CUDA
+/// evidence currently shows finite attention parity but large layer0 FFN
+/// amplification before layer8 overflows, so keep this as a narrow native-CUDA
+/// diagnostic before running another product smoke.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn cuda_desc_act_gemma3_mlp_shapes_vs_cpu_reference() {
+    run_cuda_desc_act_vs_cpu_reference_shape(
+        "gemma3-gate_proj K5376 N21504",
+        5376,
+        21504,
+        2,
+        0x6E33_A031,
+    );
+    run_cuda_desc_act_vs_cpu_reference_shape(
+        "gemma3-up_proj K5376 N21504",
+        5376,
+        21504,
+        2,
+        0x6E33_A032,
+    );
+    run_cuda_desc_act_vs_cpu_reference_shape(
+        "gemma3-down_proj K21504 N5376",
+        21504,
+        5376,
+        2,
+        0x6E33_A033,
+    );
+}
+
+/// Real-tensor version of the MLP diagnostic. Requires:
+///
+/// - `FERRUM_GPTQ_PARITY_MODEL_DIR`: local HF snapshot directory for
+///   `circulus/gemma-3-27b-it-gptq`.
+/// - `FERRUM_GPTQ_PARITY_DUMP_DIR`: optional op-dump dir containing
+///   `layer_00_pre_mlp_norm.bin` and `layer_00_act_mul.bin`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn cuda_real_gemma3_layer0_mlp_vs_cpu_reference() {
+    let dump_dir = std::env::var("FERRUM_GPTQ_PARITY_DUMP_DIR")
+        .unwrap_or_else(|_| "/workspace/w2/gates_early/op_dump_layer0".to_string());
+    let dump_dir = std::path::PathBuf::from(dump_dir);
+    let pre_mlp = dump_dir.join("layer_00_pre_mlp_norm.bin");
+    let act_mul = dump_dir.join("layer_00_act_mul.bin");
+
+    run_real_gptq_prefix_vs_cpu_reference(
+        "layer0 gate_proj",
+        "model.layers.0.mlp.gate_proj",
+        &pre_mlp,
+    );
+    run_real_gptq_prefix_vs_cpu_reference("layer0 up_proj", "model.layers.0.mlp.up_proj", &pre_mlp);
+    run_real_gptq_prefix_vs_cpu_reference(
+        "layer0 down_proj",
+        "model.layers.0.mlp.down_proj",
+        &act_mul,
     );
 }
 
