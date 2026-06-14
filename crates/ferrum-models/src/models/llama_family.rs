@@ -186,26 +186,8 @@ fn write_f32_dump_with_width(dir: &str, label: &str, values: &[f32], row_width: 
     append_dump_summary(dir, label, stats_for(values), row_width);
 }
 
-fn nan_trace_enabled_for_layer(local_layer: usize, source_layer: usize) -> bool {
-    let Ok(raw) = std::env::var("FERRUM_NAN_TRACE") else {
-        return false;
-    };
-    nan_trace_raw_matches(&raw, local_layer, source_layer)
-}
-
 fn nan_trace_raw_matches(raw: &str, local_layer: usize, source_layer: usize) -> bool {
-    let raw = raw.trim();
-    if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
-        return true;
-    }
-    if raw == "0" || raw.eq_ignore_ascii_case("false") {
-        return false;
-    }
-    raw.split(',').any(|part| {
-        let part = part.trim();
-        parse_nan_trace_layer_selector(part)
-            .is_some_and(|layer| layer == local_layer || layer == source_layer)
-    })
+    LlamaNanTraceConfig::from_raw(raw).matches_layer(local_layer, source_layer)
 }
 
 fn parse_nan_trace_layer_selector(part: &str) -> Option<usize> {
@@ -224,6 +206,50 @@ fn parse_nan_trace_layer_selector(part: &str) -> Option<usize> {
     None
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LlamaNanTraceConfig {
+    Disabled,
+    All,
+    Layers(Vec<usize>),
+}
+
+impl Default for LlamaNanTraceConfig {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl LlamaNanTraceConfig {
+    fn from_raw(raw: &str) -> Self {
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
+            return Self::All;
+        }
+        if raw == "0" || raw.eq_ignore_ascii_case("false") {
+            return Self::Disabled;
+        }
+        let layers: Vec<_> = raw
+            .split(',')
+            .filter_map(parse_nan_trace_layer_selector)
+            .collect();
+        if layers.is_empty() {
+            Self::Disabled
+        } else {
+            Self::Layers(layers)
+        }
+    }
+
+    fn matches_layer(&self, local_layer: usize, source_layer: usize) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::All => true,
+            Self::Layers(layers) => layers
+                .iter()
+                .any(|&layer| layer == local_layer || layer == source_layer),
+        }
+    }
+}
+
 fn nan_trace_dump<B: Backend>(
     ctx: &mut B::Context,
     source_layer: usize,
@@ -231,6 +257,7 @@ fn nan_trace_dump<B: Backend>(
     buf: &B::Buffer,
     len: usize,
     row_width: Option<usize>,
+    op_dump_dir: Option<&str>,
 ) {
     B::sync(ctx);
     let v = B::to_vec(buf, len);
@@ -269,10 +296,10 @@ fn nan_trace_dump<B: Backend>(
             maxabs_index
         );
     }
-    if let Ok(dir) = std::env::var("FERRUM_OP_DUMP") {
+    if let Some(dir) = op_dump_dir {
         let safe_op = op.replace('/', "_");
         write_f32_dump_with_width(
-            &dir,
+            dir,
             &format!("layer_{source_layer:02}_{safe_op}"),
             &v,
             row_width,
@@ -307,6 +334,10 @@ pub(crate) struct LlamaFamilyRuntimeEnv {
     pub(crate) prefix_cache: bool,
     pub(crate) cuda_graph: bool,
     pub(crate) decode_layer_profile: bool,
+    pub(crate) nan_trace: LlamaNanTraceConfig,
+    /// `FERRUM_OP_DUMP=<dir>`: when nan tracing is enabled, write each traced
+    /// op buffer as f32 little-endian `.bin` plus summary JSONL. Debug-only.
+    pub(crate) op_dump_dir: Option<String>,
     /// `FERRUM_LAYER_DUMP=<dir>`: write per-layer prefill residuals (f32
     /// little-endian .bin) for numerical comparison against HF
     /// transformers (W2 new-family L1 gate). Debug-only — syncs per layer.
@@ -345,6 +376,8 @@ impl LlamaFamilyRuntimeEnv {
             prefix_cache: false,
             cuda_graph: false,
             decode_layer_profile: false,
+            nan_trace: LlamaNanTraceConfig::Disabled,
+            op_dump_dir: None,
             layer_dump_dir: None,
         };
         for (name, value) in vars {
@@ -362,6 +395,8 @@ impl LlamaFamilyRuntimeEnv {
                 "FERRUM_PREFIX_CACHE" => config.prefix_cache = value == "1",
                 "FERRUM_CUDA_GRAPH" => config.cuda_graph = true,
                 "FERRUM_DECODE_LAYER_PROFILE" => config.decode_layer_profile = true,
+                "FERRUM_NAN_TRACE" => config.nan_trace = LlamaNanTraceConfig::from_raw(value),
+                "FERRUM_OP_DUMP" => config.op_dump_dir = Some(value.to_string()),
                 "FERRUM_LAYER_DUMP" => config.layer_dump_dir = Some(value.to_string()),
                 _ => {}
             }
@@ -2249,11 +2284,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // FERRUM_NAN_TRACE=all or a comma-separated layer list: after each
         // op of matching layers, sync and report non-finite counts.
         // Debug-only; intentionally not part of the product path.
-        let nan_trace = nan_trace_enabled_for_layer(li, source_li);
+        let nan_trace = self.runtime_env.nan_trace.matches_layer(li, source_li);
+        let op_dump_dir = self.runtime_env.op_dump_dir.as_deref();
         macro_rules! nt {
             ($name:expr, $buf:expr, $len:expr, $row_width:expr) => {
                 if nan_trace {
-                    nan_trace_dump::<B>(ctx, source_li, $name, $buf, $len, Some($row_width));
+                    nan_trace_dump::<B>(
+                        ctx,
+                        source_li,
+                        $name,
+                        $buf,
+                        $len,
+                        Some($row_width),
+                        op_dump_dir,
+                    );
                 }
             };
         }
@@ -2639,11 +2683,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let im = cfg.intermediate_size;
         let eps = cfg.rms_norm_eps;
 
-        let nan_trace = nan_trace_enabled_for_layer(li, source_li);
+        let nan_trace = self.runtime_env.nan_trace.matches_layer(li, source_li);
+        let op_dump_dir = self.runtime_env.op_dump_dir.as_deref();
         macro_rules! nt {
             ($name:expr, $buf:expr, $len:expr, $row_width:expr) => {
                 if nan_trace {
-                    nan_trace_dump::<B>(ctx, source_li, $name, $buf, $len, Some($row_width));
+                    nan_trace_dump::<B>(
+                        ctx,
+                        source_li,
+                        $name,
+                        $buf,
+                        $len,
+                        Some($row_width),
+                        op_dump_dir,
+                    );
                 }
             };
         }
@@ -4226,7 +4279,7 @@ mod tests {
     use super::{
         bf16_round, load_llama_family_layers, nan_trace_raw_matches, rope_freq, stats_for,
         LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel, LlamaFamilyRuntimeEnv,
-        LlamaFamilyScratch, RopeScalingConfig, DEFAULT_KV_CAPACITY,
+        LlamaFamilyScratch, LlamaNanTraceConfig, RopeScalingConfig, DEFAULT_KV_CAPACITY,
     };
 
     #[test]
@@ -4505,6 +4558,8 @@ mod tests {
             ("FERRUM_PREFILL_OP_PROFILE", ""),
             ("FERRUM_CUDA_GRAPH", ""),
             ("FERRUM_DECODE_LAYER_PROFILE", "false"),
+            ("FERRUM_NAN_TRACE", "layer3, source9"),
+            ("FERRUM_OP_DUMP", "/tmp/ferrum-op-dump"),
         ]);
 
         assert_eq!(env.kv_capacity, Some(4096));
@@ -4514,6 +4569,8 @@ mod tests {
         assert!(env.prefill_op_profile);
         assert!(env.cuda_graph);
         assert!(env.decode_layer_profile);
+        assert!(env.nan_trace.matches_layer(3, 9));
+        assert_eq!(env.op_dump_dir.as_deref(), Some("/tmp/ferrum-op-dump"));
         assert_eq!(env.kv_capacity_for_model(2048), 2048);
     }
 
@@ -4532,6 +4589,8 @@ mod tests {
             env.kv_capacity_for_model(DEFAULT_KV_CAPACITY * 2),
             DEFAULT_KV_CAPACITY
         );
+        assert_eq!(env.nan_trace, LlamaNanTraceConfig::Disabled);
+        assert_eq!(env.op_dump_dir, None);
     }
 
     #[test]
