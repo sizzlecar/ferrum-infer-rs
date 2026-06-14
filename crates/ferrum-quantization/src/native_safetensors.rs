@@ -1063,7 +1063,7 @@ fn trace_gptq_g_idx_if_requested(
     in_features: usize,
     is_desc_act: bool,
 ) {
-    if std::env::var("FERRUM_GPTQ_GIDX_TRACE").ok().as_deref() != Some("1") {
+    if !gptq_gidx_trace_enabled() {
         return;
     }
 
@@ -1163,7 +1163,7 @@ fn trace_gptq_qzeros_if_requested(
     qzeros: &[i32],
     out_features: usize,
 ) {
-    if std::env::var("FERRUM_GPTQ_GIDX_TRACE").ok().as_deref() != Some("1") {
+    if !gptq_gidx_trace_enabled() {
         return;
     }
 
@@ -1183,6 +1183,18 @@ fn trace_gptq_qzeros_if_requested(
         stats.all_code7(),
         stats.histogram
     );
+}
+
+fn gptq_gidx_trace_enabled() -> bool {
+    runtime_snapshot_value("FERRUM_GPTQ_GIDX_TRACE").as_deref() == Some("1")
+}
+
+fn runtime_snapshot_value(key: &str) -> Option<String> {
+    ferrum_types::active_runtime_snapshot()
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.effective_value.clone())
 }
 
 fn validate_gptq_g_idx(

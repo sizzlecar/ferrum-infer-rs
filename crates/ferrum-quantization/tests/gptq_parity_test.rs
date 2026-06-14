@@ -492,7 +492,7 @@ fn run_real_gptq_prefix_vs_cpu_reference(label: &str, prefix: &str, input_path: 
     use ferrum_quantization::NativeSafetensorsLoader;
     use half::f16;
 
-    let model_dir = std::env::var("FERRUM_GPTQ_PARITY_MODEL_DIR")
+    let model_dir = ferrum_env_value("FERRUM_GPTQ_PARITY_MODEL_DIR")
         .expect("set FERRUM_GPTQ_PARITY_MODEL_DIR to a GPTQ safetensors snapshot");
     let loader =
         NativeSafetensorsLoader::<CudaBackend>::open(&model_dir).expect("open GPTQ model dir");
@@ -669,8 +669,8 @@ fn cuda_desc_act_gemma3_mlp_shapes_vs_cpu_reference() {
 #[test]
 #[ignore]
 fn cuda_real_gemma3_layer0_mlp_vs_cpu_reference() {
-    let dump_dir = std::env::var("FERRUM_GPTQ_PARITY_DUMP_DIR")
-        .unwrap_or_else(|_| "/workspace/w2/gates_early/op_dump_layer0".to_string());
+    let dump_dir = ferrum_env_value("FERRUM_GPTQ_PARITY_DUMP_DIR")
+        .unwrap_or_else(|| "/workspace/w2/gates_early/op_dump_layer0".to_string());
     let dump_dir = std::path::PathBuf::from(dump_dir);
     let pre_mlp = dump_dir.join("layer_00_pre_mlp_norm.bin");
     let act_mul = dump_dir.join("layer_00_act_mul.bin");
@@ -686,6 +686,15 @@ fn cuda_real_gemma3_layer0_mlp_vs_cpu_reference() {
         "model.layers.0.mlp.down_proj",
         &act_mul,
     );
+}
+
+#[cfg(feature = "cuda")]
+fn ferrum_env_value(key: &str) -> Option<String> {
+    ferrum_types::RuntimeConfigSnapshot::capture_current()
+        .entries
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.effective_value)
 }
 
 /// CUDA offset GEMM parity vs per-expert dedicated GptqLinear.
