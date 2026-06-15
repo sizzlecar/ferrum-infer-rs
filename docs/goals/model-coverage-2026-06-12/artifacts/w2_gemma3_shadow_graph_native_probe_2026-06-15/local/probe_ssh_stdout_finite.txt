@@ -1,0 +1,16 @@
+[microbench] compiling scripts/microbenches/gemma3_shadow_graph_bench.cu
+-rwxr-xr-x 1 root root 62088 Jun 15 13:55 /tmp/gemma3_shadow_graph_bench
+
+[microbench] running /tmp/gemma3_shadow_graph_bench
+GPU: NVIDIA GeForce RTX 4090
+Pattern: Gemma3-style shadow decode, layers=62, batch=16, hidden=5376, kernels/step=498
+Timed iterations: 120, warmup iterations: 8
+
+Results (host wall time, includes state upload and final stream sync):
+  eager ordered state upload : 1.143 ms/step
+  eager pre-sync state upload: 1.137 ms/step
+  graph ordered state upload : 0.565 ms/step (speedup 2.02x vs eager ordered)
+  graph pre-sync state upload: 0.568 ms/step (speedup 2.00x vs eager pre-sync)
+  checksum16: 127.94618988
+
+VERDICT: Gemma3 shadow graph native CUDA probe complete

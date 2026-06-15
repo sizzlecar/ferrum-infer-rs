@@ -1,0 +1,5 @@
+The bundle contains this ref:
+c46d95408d12c8c1e177145f7c4c217a34080e62 refs/heads/bundle/w2-shadow-graph-finite
+The bundle requires this ref:
+e927e4c19b29958c3036e885e54c2d5f46f3392d
+The bundle uses this hash algorithm: sha1
