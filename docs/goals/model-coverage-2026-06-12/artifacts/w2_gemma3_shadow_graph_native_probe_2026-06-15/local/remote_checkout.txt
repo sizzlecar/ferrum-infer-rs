@@ -1,0 +1,2 @@
+HEAD is now at 23d8569b test(cuda): add gemma3 shadow graph probe
+23d8569b8bd270a6b7c4a1e55aa9428868ccb26e

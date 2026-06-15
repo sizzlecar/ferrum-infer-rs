@@ -1,0 +1,5 @@
+The bundle contains this ref:
+e927e4c19b29958c3036e885e54c2d5f46f3392d refs/heads/bundle/w2-shadow-graph-fix
+The bundle requires this ref:
+23d8569b8bd270a6b7c4a1e55aa9428868ccb26e
+The bundle uses this hash algorithm: sha1

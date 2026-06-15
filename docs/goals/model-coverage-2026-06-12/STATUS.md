@@ -2,6 +2,49 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LVII — W2 native checkpoint: Gemma3 shadow graph native probe PASS
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/`。
+- 源码 checkpoints:
+  - `23d8569b test(cuda): add gemma3 shadow graph probe`;
+  - `e927e4c1 test(cuda): make shadow graph probe relocatable`;
+  - `c46d9540 test(cuda): keep shadow graph probe finite`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 shadow graph native CUDA probe`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:5-10min,hard cap 20min;
+  - stop condition:Vast start/SSH/CUDA/nvcc compile/probe 首败,或 probe
+    artifact 复制完成后立即停机;
+  - correctness gate:`nvcc` 编译 rc `0`,probe rc `0`,checksum finite,
+    stdout 含 `VERDICT: Gemma3 shadow graph native CUDA probe complete`;
+  - performance command:`bash scripts/microbenches/build_and_run_gemma3_shadow_graph_bench.sh`,
+    diagnostic-only,不是 release 性能证据。
+- 执行环境:
+  - remote HEAD:`c46d95408d12c8c1e177145f7c4c217a34080e62`;
+  - GPU:`NVIDIA GeForce RTX 4090`,24564 MiB,driver `565.77`;
+  - CUDA compiler:`Build cuda_12.4.r12.4/compiler.34097967_0`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Native probe result:
+  - simulated shape:Gemma3-style device F32 residual shadow decode,
+    `62` layers,`batch=16`,`hidden=5376`,`498` kernel launches/step;
+  - eager ordered state upload:`1.143 ms/step`;
+  - eager pre-sync state upload:`1.137 ms/step`;
+  - graph ordered state upload:`0.565 ms/step`,`2.02x` vs eager ordered;
+  - graph pre-sync state upload:`0.568 ms/step`,`2.00x` vs eager pre-sync;
+  - checksum16:`127.94618988`;
+  - verdict line present。
+- Interpretation:
+  - native CUDA 层面已证明 Gemma3 device-shadow-like decode step 可以稳定
+    graph capture/replay,并且 launch-overhead headroom 约 `2x`;
+  - 这不是产品性能修复;当前 Ferrum product path 仍在 host/device residual
+    shadow 路径禁用 legacy batched graph;
+  - 下一步应做窄产品改动:shadow-safe graph eligibility/guard,然后先跑
+    `ferrum run` + `ferrum serve` correctness smoke,再做 c16 diagnostic。
+- Release status:
+  - 没有 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍不是 release-grade。
+
 ## 2026-06-15 LVI — W2 source checkpoint: add Gemma3 shadow graph native probe
 
 - 本轮没有启动 GPU,不产生性能结论;这是针对 decode integration/graph
