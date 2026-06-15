@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXI — W2 CUDA checkpoint: profiler path passes with graph capture disabled
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_profiler_graph_disabled_retry_2026-06-16/`。
+- GPU 执行合同:
+  - lane:`W2 profiler graph-disabled retry`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:8-15min,hard cap 25min;
+  - stop condition:build/server/chat/bench/profile 首败,或最小 c16
+    profile 完成后复制 artifact 并停机;
+  - correctness gate:CUDA release build,`ferrum serve` ready,chat smoke,
+    `bench-serve --fail-on-error` c16 single cell;
+  - performance command:diagnostic-only c16 ShareGPT single-run profile,
+    no CI/no `--require-ci`。
+- Execution evidence:
+  - remote HEAD:`f7612c3a2a17c7e051f326ed7bac54484b25eb3a`;
+  - non-artifact source status clean;
+  - CUDA release build rc `0`,binary SHA256:
+    `2a2ed419f3e80ede06ceaf54ba4495b66265c5ce2ba14b66dc39a35257cb6844`;
+  - `ferrum serve` ready after poll `62`,chat smoke passed with content
+    `5` and `completion_tokens=3`;
+  - `bench_sharegpt_c16.rc=0`,`run_profile.rc=0`,
+    `run_remote_profile.outer.rc=0`;
+  - c16 diagnostic profile completed `16/16`,errors `0`,
+    `output_token_count_source=usage`;
+  - `capture_unsupported_panic=false`,`graph_capture_line_count=0`;
+  - profile lines: `prefill-profile=297`,`batched-op-profile=128`,
+    `unified-prof=67`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Diagnostic performance,not release evidence:
+  - profile/eager path output throughput mean:`312.22668693855985 tok/s`;
+  - same-artifact orientation vs prior vLLM c16 baseline:
+    `60.18294525342617%`;
+  - because this is `n_repeats=1`,profiler/eager path,no CI/no
+    `--require-ci`,it is diagnostic only。
+- Bottleneck signal:
+  - c16 decode profile is now stable enough to use;
+  - repeated `batched-op-profile m=16` shows `tail_mlp` around
+    `13.7ms` of `27.5-28.1ms` total per decode iteration;
+  - `tail_gate_up` around `9.0ms`, `tail_down` around `4.7ms`,
+    matmul bucket around `7.0ms`, attention around `2.1-2.7ms`;
+  - next performance lever should focus on Gemma3 tail MLP / GeGLU
+    projection path before broad scheduler or engine work。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXX — W2 source checkpoint: disable graph capture for syncing diagnostics
 
 - 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成
