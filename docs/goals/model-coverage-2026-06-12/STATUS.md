@@ -2,6 +2,69 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXXVIII — W2 CUDA checkpoint: default paged-unified run/serve correctness passes, c16 still below target
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_unified_default_path_cuda_smoke_2026-06-16/`。
+- Source checkpoint:
+  `d6d872c1e12fc364886117b0431aec752b2d78ac`,远端通过 git bundle clone,
+  `git status --short` clean,无 remote diagnostic source patch。
+- GPU 执行合同:
+  - lane:`W2 default-path paged-unified correctness smoke`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - stop condition:启动/SSH/CUDA/source sync/build/run/serve 任一失败即收集
+    日志并停止;run+serve 正确性通过后同次启动内跑一个 c16 diagnostic;
+  - correctness gate:默认产品路径 `ferrum run` 和 `ferrum serve`;
+  - performance command:correctness clean 后 `bench-serve --fail-on-error
+    --require-ci` c16 diagnostic,非 release evidence。
+- Build evidence:
+  - CUDA release build rc `0`;
+  - binary SHA256
+    `11b26df2b8dccf3138b2fe294e80ef618cc6255e56af626213e6aaabe8b2e48f`;
+  - CUDA environment:driver `565.77`,runtime CUDA `12.7`,`nvcc 12.4.131`。
+- Correctness evidence:
+  - `ferrum run` rc `0`,one-shot JSONL output content `"5"`,
+    `finish_reason=stop`;
+  - `ferrum serve` readiness poll `8`,chat rc `0`,response content `"5"`,
+    `finish_reason=length`,`usage.prompt_tokens=23`,`completion_tokens=1`;
+  - health after bench:`successful_requests=331`,`failed_requests=0`;
+  - server log scan file has `0` lines for panic/error/NaN/`<unk>`/`[PAD]`/
+    invalid UTF patterns used in this artifact;
+  - server stopped cleanly,post-stop `nvidia-smi` shows no running GPU
+    processes;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Effective server config:
+  - `selected_kv_layout=paged`;
+  - `selected_attention_impl=legacy_paged_decode`;
+  - `selected_graph_mode=graph_disabled`;
+  - `selected_max_sequences=16`,`selected_kv_capacity=512`,
+    `selected_max_batched_tokens=2048`。
+- c16 diagnostic performance:
+  - command shape:`bench-serve --random-input-len 256 --random-output-len 128
+    --concurrency-sweep 16 --num-prompts 100 --n-repeats 3 --fail-on-error
+    --require-ci --seed 9271`;
+  - rc `0`,completed per run `[100,100,100]`,errored per run `[0,0,0]`,
+    output token count source `usage`;
+  - output throughput `295.8064415567493 ± 5.210666937312439 tok/s`;
+  - goodput `2.3204614024423846 ± 0.031239672060048216 req/s`;
+  - TTFT p50 `798.748ms`,TPOT p50 `45.528ms`。
+- Performance interpretation:
+  - 直接同形状 random-prompt vLLM artifact 约 `381.5 tok/s`,但该 vLLM
+    run 有 `1` 个 bad output/errored request,所以只能做 diagnostic;
+    按该不干净 baseline 计算,Ferrum 约 `77.6%`;
+  - 更干净的 same-instance vLLM ShareGPT baseline 是 `518.796 tok/s`,但本轮
+    Ferrum 没有复跑同一 ShareGPT dataset,不能拿它做严格当前同数据集比例;
+  - 因此本轮仍不能证明 `>=80%` mainstream-engine target。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+- Required next:
+  - 先补一个干净 same-dataset current Ferrum/vLLM comparison,再更新性能结论;
+  - 当前 correctness blocker 已解除,剩余问题回到性能瓶颈,重点看
+    graph-disabled/default runtime policy、decode cadence、scheduler/admission
+    与 per-token tail latency。
+
 ## 2026-06-16 LXXXVII — W2 source checkpoint: allow paged KV for windowed Gemma3 on varlen backends
 
 - 本轮源码修复:

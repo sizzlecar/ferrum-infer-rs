@@ -1,0 +1,4 @@
+drwxr-xr-x 56 root root  8192 Jun 15 21:28 /workspace
+drwxr-xr-x 13  501 staff 4096 Jun 12 19:16 /workspace/ferrum-infer-rs
+drwxr-xr-x  5  501 staff  122 Jun 12 02:14 /workspace/ferrum-infer-rs/target
+/root/.cargo/bin

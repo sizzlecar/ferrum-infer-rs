@@ -1,0 +1,8 @@
+poll 1 rc=7
+poll 2 rc=7
+poll 3 rc=7
+poll 4 rc=7
+poll 5 rc=7
+poll 6 rc=7
+poll 7 rc=7
+poll 8 rc=0
