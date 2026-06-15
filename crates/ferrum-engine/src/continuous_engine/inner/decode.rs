@@ -58,6 +58,7 @@ impl EngineInner {
                     pos_offset,
                     is_final_chunk: true,
                     metadata: seq.model_decode_metadata(),
+                    logits_policy: seq.model_decode_logits_policy(),
                 });
             }
         }
@@ -95,18 +96,14 @@ impl EngineInner {
                 let seq = sequences
                     .get_mut(rid)
                     .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                // Greedy fast path: the model did GPU argmax and emitted
-                // one f32 carrying the token id (under `FERRUM_GREEDY_ARGMAX=1`).
-                // Skip sample_with_processors entirely — at vocab=152064
-                // (Qwen3), the host argmax scan is ~150 µs per item and
-                // dominates the engine's per-iter overhead at c=32.
+                // Greedy fast path: the model did GPU argmax and emitted one
+                // f32 carrying the token id. The sequence still validates that
+                // this request is eligible for model-side argmax and that the
+                // returned token satisfies the same hard token-quality masks.
                 let token = if logits.len() == 1 {
-                    if seq.requires_full_logits_for_sampling() {
-                        return Err(FerrumError::model(
-                            "model returned greedy token sentinel for request requiring full logits",
-                        ));
-                    }
-                    TokenId::new(logits[0] as u32)
+                    let token = TokenId::new(logits[0] as u32);
+                    seq.accept_model_greedy_argmax_token(Some(self.tokenizer.as_ref()), token)?;
+                    token
                 } else {
                     seq.sample_with_processors_with_tokenizer(
                         &mut logits,

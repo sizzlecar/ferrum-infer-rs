@@ -7,6 +7,7 @@ const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/fused_add_rms_norm.cu",
     "kernels/fused_silu_mul.cu",
     "kernels/rms_norm.cu",
+    "kernels/sandwich_norm.cu",
     "kernels/rope.cu",
     "kernels/decode_attention.cu",
     "kernels/residual_add.cu",

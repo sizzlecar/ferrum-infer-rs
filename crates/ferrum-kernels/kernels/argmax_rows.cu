@@ -79,3 +79,72 @@ extern "C" __global__ void argmax_rows_f16(
         }
     }
 }
+
+extern "C" __global__ void argmax_rows_f16_masked(
+    const __half* __restrict__ logits,      // [m, n] row-major
+    int n,                                  // vocab size
+    const signed char* __restrict__ valid,  // [mask_len], nonzero = selectable
+    int mask_len,
+    int* __restrict__ out_idx               // [m]
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+
+    const __half* row_ptr = logits + (size_t)row * (size_t)n;
+
+    float local_max = -INFINITY;
+    int local_idx = -1;
+    for (int i = tid; i < n; i += block_size) {
+        if (i >= mask_len || valid[i] == 0) {
+            continue;
+        }
+        float v = __half2float(row_ptr[i]);
+        if (!isfinite(v)) {
+            continue;
+        }
+        if (local_idx < 0 || v > local_max || (v == local_max && i < local_idx)) {
+            local_max = v;
+            local_idx = i;
+        }
+    }
+
+    const unsigned mask = 0xFFFFFFFFu;
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other_max = __shfl_xor_sync(mask, local_max, offset);
+        int   other_idx = __shfl_xor_sync(mask, local_idx, offset);
+        if (other_idx >= 0 && (local_idx < 0 || other_max > local_max ||
+                               (other_max == local_max && other_idx < local_idx))) {
+            local_max = other_max;
+            local_idx = other_idx;
+        }
+    }
+
+    __shared__ float s_max[32];
+    __shared__ int   s_idx[32];
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    if (lane == 0) {
+        s_max[warp_id] = local_max;
+        s_idx[warp_id] = local_idx;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int num_warps = (block_size + 31) / 32;
+        local_max = (lane < num_warps) ? s_max[lane] : -INFINITY;
+        local_idx = (lane < num_warps) ? s_idx[lane] : -1;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float other_max = __shfl_xor_sync(mask, local_max, offset);
+            int   other_idx = __shfl_xor_sync(mask, local_idx, offset);
+            if (other_idx >= 0 && (local_idx < 0 || other_max > local_max ||
+                                   (other_max == local_max && other_idx < local_idx))) {
+                local_max = other_max;
+                local_idx = other_idx;
+            }
+        }
+        if (lane == 0) {
+            out_idx[row] = local_idx;
+        }
+    }
+}

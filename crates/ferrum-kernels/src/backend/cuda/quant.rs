@@ -1197,7 +1197,7 @@ mod tests {
         assert!(message.contains("FERRUM_VLLM_MARLIN=1 is disabled for dense GPTQ"));
         assert!(message.contains("vLLM-repacked weights"));
 
-        let default_config = CudaQuantRuntimeConfig::from_env_vars([]);
+        let default_config = CudaQuantRuntimeConfig::from_env_vars([] as [(&str, &str); 0]);
         reject_dense_vllm_marlin_if_requested(&default_config).unwrap();
     }
 

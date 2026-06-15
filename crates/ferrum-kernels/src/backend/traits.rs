@@ -429,6 +429,9 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// `kernels/batched_decode_attention.cu`).
     /// `kv_lens`: device buffer (u32 storage, length ≥ m) — same
     /// design as `kv_cache_append_batched_per_cache::cache_lens`.
+    /// `sliding_window`: common decode window for every item; `0` means
+    /// full causal attention, `w > 0` means each item attends only to the
+    /// last `w` valid KV positions.
     fn flash_attention_batched_per_cache(
         _ctx: &mut Self::Context,
         _q: &Self::Buffer,
@@ -442,6 +445,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
         _scale: f32,
         _max_valid_kv: usize,
         _capacity: usize,
+        _sliding_window: usize,
         _slot: usize,
     ) -> Result<()> {
         Err(FerrumError::unsupported(
@@ -706,6 +710,83 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Self::copy_slice(ctx, &src, 0, dst, 0, data.len());
     }
 
+    /// Whether this backend can keep Gemma-style sandwich residuals in a
+    /// device-side F32 shadow while continuing to feed FP16 activations into
+    /// projection kernels. The default is false so existing CPU/Metal paths
+    /// keep their current host-side fallback behavior.
+    fn supports_device_f32_residual_shadow() -> bool {
+        false
+    }
+
+    /// Copy an activation buffer into a typed F32 shadow buffer.
+    fn activation_to_f32_shadow(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst_f32: &mut Self::Buffer,
+        len: usize,
+    ) {
+        let data = Self::to_vec(src, len);
+        Self::write_typed::<f32>(ctx, dst_f32, &data);
+    }
+
+    /// RMSNorm an activation buffer and write the result into a typed F32
+    /// scratch buffer. Used for Gemma post-attn/post-ffn branch norms.
+    fn rms_norm_activation_to_f32(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        out_f32: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        let input_h = Self::to_vec(input, tokens * dim);
+        let weight_h = Self::to_vec(weight, dim);
+        let mut out = vec![0.0f32; tokens * dim];
+        for row in 0..tokens {
+            let offset = row * dim;
+            let mut variance = 0.0f32;
+            for i in 0..dim {
+                let x = input_h[offset + i];
+                variance += x * x;
+            }
+            let inv_rms = (variance / dim as f32 + eps).sqrt().recip();
+            for i in 0..dim {
+                out[offset + i] = input_h[offset + i] * inv_rms * weight_h[i];
+            }
+        }
+        Self::write_typed::<f32>(ctx, out_f32, &out);
+    }
+
+    /// RMSNorm a typed F32 shadow buffer and write the normalized result back
+    /// to the backend's regular activation dtype.
+    fn rms_norm_f32_to_activation(
+        ctx: &mut Self::Context,
+        input_f32: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        let input_h = Self::to_vec(input_f32, tokens * dim);
+        let weight_h = Self::to_vec(weight, dim);
+        let mut normed = vec![0.0f32; tokens * dim];
+        for row in 0..tokens {
+            let offset = row * dim;
+            let mut variance = 0.0f32;
+            for i in 0..dim {
+                let x = input_h[offset + i];
+                variance += x * x;
+            }
+            let inv_rms = (variance / dim as f32 + eps).sqrt().recip();
+            for i in 0..dim {
+                normed[offset + i] = input_h[offset + i] * inv_rms * weight_h[i];
+            }
+        }
+        Self::write_f32_to_activation(ctx, out, &normed);
+    }
+
     /// Greedy-decode fast path: GPU argmax over each row of a
     /// `[m, n]` FP16 logits buffer, returning the m token indices on the
     /// host. Saves `m × n × 2` bytes of D2H per call (e.g. 19.5 MB at
@@ -736,6 +817,19 @@ pub trait Backend: Send + Sync + Sized + 'static {
             out.push(max_idx as u32);
         }
         Ok(out)
+    }
+
+    fn argmax_rows_f16_masked(
+        _ctx: &mut Self::Context,
+        _logits: &Self::Buffer,
+        _valid_token_mask: &Self::Buffer,
+        _mask_len: usize,
+        _m: usize,
+        _n: usize,
+    ) -> Result<Vec<u32>> {
+        Err(FerrumError::unsupported(
+            "masked GPU argmax is not implemented for this backend",
+        ))
     }
 
     /// Load a weight tensor straight from its on-disk byte representation,

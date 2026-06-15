@@ -33,7 +33,8 @@ extern "C" __global__ void batched_decode_attention_f16(
     const int num_kv_heads,
     const int head_dim,
     const int capacity,
-    const float scale
+    const float scale,
+    const int sliding_window
 ) {
     const int q_head = blockIdx.x;
     const int batch_idx = blockIdx.y;
@@ -41,6 +42,9 @@ extern "C" __global__ void batched_decode_attention_f16(
     const int kv_head = q_head / num_kv_groups;
 
     const int valid_kv_len = valid_kv_lens[batch_idx];
+    const int attend_start = (sliding_window > 0 && valid_kv_len > sliding_window)
+        ? valid_kv_len - sliding_window : 0;
+    const int active_kv_len = valid_kv_len - attend_start;
 
     // Q pointer for this (batch, head)
     const int q_dim = num_q_heads * head_dim;
@@ -71,7 +75,8 @@ extern "C" __global__ void batched_decode_attention_f16(
     int num_warps = blockDim.x / WARP_SIZE;
 
     float local_max = -1e20f;
-    for (int kv_pos = warp_id; kv_pos < valid_kv_len; kv_pos += num_warps) {
+    for (int local_pos = warp_id; local_pos < active_kv_len; local_pos += num_warps) {
+        const int kv_pos = attend_start + local_pos;
         // Head-major: K[kv_head, kv_pos, :head_dim].
         const __half* k_row = k_head_base + (size_t)kv_pos * head_dim;
         float partial = 0.0f;
@@ -82,7 +87,7 @@ extern "C" __global__ void batched_decode_attention_f16(
         }
         float score = warp_reduce_sum(partial) * scale;
         if (lane_id == 0) {
-            s_scores[kv_pos] = score;
+            s_scores[local_pos] = score;
             local_max = fmaxf(local_max, score);
         }
     }
@@ -90,7 +95,7 @@ extern "C" __global__ void batched_decode_attention_f16(
 
     // ====== Step 2: Softmax ======
     float thread_max = -1e20f;
-    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x)
+    for (int i = threadIdx.x; i < active_kv_len; i += blockDim.x)
         thread_max = fmaxf(thread_max, s_scores[i]);
 
     __shared__ float s_global_max;
@@ -100,7 +105,7 @@ extern "C" __global__ void batched_decode_attention_f16(
     float global_max = s_global_max;
 
     float thread_sum = 0.0f;
-    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x) {
+    for (int i = threadIdx.x; i < active_kv_len; i += blockDim.x) {
         float val = expf(s_scores[i] - global_max);
         s_scores[i] = val;
         thread_sum += val;
@@ -113,15 +118,16 @@ extern "C" __global__ void batched_decode_attention_f16(
     __syncthreads();
     float inv_sum = 1.0f / s_global_sum;
 
-    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x)
+    for (int i = threadIdx.x; i < active_kv_len; i += blockDim.x)
         s_scores[i] *= inv_sum;
     __syncthreads();
 
     // ====== Step 3: Weighted sum of V (head-major V[kv_head, kv_pos, d]) ======
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int kv_pos = 0; kv_pos < valid_kv_len; kv_pos++) {
-            acc += s_scores[kv_pos] *
+        for (int local_pos = 0; local_pos < active_kv_len; local_pos++) {
+            const int kv_pos = attend_start + local_pos;
+            acc += s_scores[local_pos] *
                    __half2float(v_head_base[(size_t)kv_pos * head_dim + d]);
         }
         out_ptr[d] = __float2half(acc);

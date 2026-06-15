@@ -5,6 +5,8 @@
 //! `LlmExecutor` (living in `ferrum-engine`) holds a `Box<dyn DecoderOnlyLLM>`
 //! and adapts it to the `ModelExecutor` trait that the scheduler calls.
 
+use ferrum_interfaces::model_executor::LogitsReturnPolicy;
+
 /// Runtime configuration every decoder-only LLM must expose.
 ///
 /// This is the *execution-facing* config — the bare minimum the surrounding
@@ -148,6 +150,14 @@ pub trait DecoderOnlyLLM: Send + Sync {
         _force_full_logits: bool,
     ) -> Vec<Vec<f32>> {
         self.decode_batch(batch)
+    }
+
+    fn decode_batch_with_logits_policy(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        _policies: &[LogitsReturnPolicy],
+    ) -> Vec<Vec<f32>> {
+        self.decode_batch_with_full_logits(batch, true)
     }
 
     /// Multi-position decode-verify: run a single forward over `tokens`

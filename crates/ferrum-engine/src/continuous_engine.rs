@@ -10,6 +10,7 @@ use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
+    model_executor::{LogitsReturnPolicy, TokenSelectionMask},
     KvCacheHandle, KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler,
     TensorFactory, TensorRef, Tokenizer,
 };
@@ -305,6 +306,40 @@ fn resolve_sampling_token_constraints(
     (forbidden, Some(tok.vocab_size()), allowed_extended)
 }
 
+fn build_argmax_token_mask(
+    tok: &(dyn Tokenizer + Send + Sync),
+    forbidden_token_ids: &HashSet<u32>,
+    initial_forbidden_token_ids: &HashSet<u32>,
+    stop_token_ids: &HashSet<u32>,
+    allowed_extended_token_ids: &HashSet<u32>,
+) -> TokenSelectionMask {
+    let mut valid = vec![1i8; tok.vocab_size()];
+    for &token_id in forbidden_token_ids
+        .iter()
+        .chain(initial_forbidden_token_ids.iter())
+    {
+        if let Some(slot) = valid.get_mut(token_id as usize) {
+            *slot = 0;
+        }
+    }
+    for &token_id in allowed_extended_token_ids {
+        if stop_token_ids.contains(&token_id) {
+            continue;
+        }
+        let token = TokenId::new(token_id);
+        let should_mask = tok
+            .decode(&[token], true)
+            .map(|text| decoded_delta_has_forbidden_quality(&text, 0, false, true))
+            .unwrap_or(true);
+        if should_mask {
+            if let Some(slot) = valid.get_mut(token_id as usize) {
+                *slot = 0;
+            }
+        }
+    }
+    TokenSelectionMask::new(valid)
+}
+
 fn cached_forbidden_generation_tokens(
     tok: &(dyn Tokenizer + Send + Sync),
     allowed_generated_controls: &HashSet<u32>,
@@ -530,6 +565,10 @@ pub struct SequenceState {
     /// Multi-token text stop sequences (`stop_sequences` entries that don't
     /// resolve to a single token). Checked via accumulated decoded text.
     pub stop_text_seqs: Vec<String>,
+    /// Base token-validity mask for model-side greedy argmax.
+    pub argmax_token_mask: Option<TokenSelectionMask>,
+    /// First-token variant that also applies `initial_forbidden_token_ids`.
+    pub initial_argmax_token_mask: Option<TokenSelectionMask>,
     /// Bytes of decoded `generated_tokens` already flushed via the stream
     /// channel. Used by `send_stream_update` to compute per-call delta from
     /// the full-history decode, so multi-byte UTF-8 sequences (Chinese chars,
@@ -617,6 +656,29 @@ impl SequenceState {
                 }
             }
         }
+        let empty_initial_forbidden = HashSet::new();
+        let argmax_token_mask = tokenizer.as_deref().map(|tok| {
+            build_argmax_token_mask(
+                tok,
+                &forbidden_token_ids,
+                &empty_initial_forbidden,
+                &stop_token_ids,
+                &allowed_extended_token_ids,
+            )
+        });
+        let initial_argmax_token_mask = if initial_forbidden_token_ids.is_empty() {
+            None
+        } else {
+            tokenizer.as_deref().map(|tok| {
+                build_argmax_token_mask(
+                    tok,
+                    &forbidden_token_ids,
+                    &initial_forbidden_token_ids,
+                    &stop_token_ids,
+                    &allowed_extended_token_ids,
+                )
+            })
+        };
         Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
@@ -647,6 +709,8 @@ impl SequenceState {
             tokenizer_base_vocab_size,
             allowed_extended_token_ids,
             stop_text_seqs,
+            argmax_token_mask,
+            initial_argmax_token_mask,
             streamed_text_len: 0,
         }
     }
@@ -670,6 +734,142 @@ impl SequenceState {
             ),
         );
         metadata
+    }
+
+    pub fn model_decode_logits_policy(&self) -> LogitsReturnPolicy {
+        if !self.can_use_model_greedy_argmax() {
+            return LogitsReturnPolicy::FullLogits;
+        }
+        let token_mask =
+            if self.generated_tokens.is_empty() && self.initial_argmax_token_mask.is_some() {
+                self.initial_argmax_token_mask.clone()
+            } else {
+                self.argmax_token_mask.clone()
+            };
+        LogitsReturnPolicy::GreedyArgmax { token_mask }
+    }
+
+    fn can_use_model_greedy_argmax(&self) -> bool {
+        use ferrum_types::ResponseFormat;
+
+        let params = &self.sampling_params;
+        params.temperature == 0.0
+            && params.top_p == 1.0
+            && params.top_k.is_none()
+            && params.repetition_penalty == 1.0
+            && params.presence_penalty == 0.0
+            && params.frequency_penalty == 0.0
+            && params.min_p.is_none()
+            && params.tfs.is_none()
+            && params.typical_p.is_none()
+            && params.mirostat.is_none()
+            && self.json_processor.is_none()
+            && self.regex_processor.is_none()
+            && matches!(params.response_format, ResponseFormat::Text)
+    }
+
+    pub fn accept_model_greedy_argmax_token(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+    ) -> Result<()> {
+        let token_detail = || self.describe_model_greedy_argmax_token(tokenizer, token);
+        if !self.can_use_model_greedy_argmax() {
+            return Err(FerrumError::model(format!(
+                "model returned greedy token sentinel for request requiring full logits ({})",
+                token_detail()
+            )));
+        }
+
+        let token_id = token.get();
+        if self.forbidden_token_ids.contains(&token_id) {
+            return Err(FerrumError::model(format!(
+                "model greedy argmax returned a forbidden token ({})",
+                token_detail()
+            )));
+        }
+        if self.generated_tokens.is_empty() && self.initial_forbidden_token_ids.contains(&token_id)
+        {
+            return Err(FerrumError::model(format!(
+                "model greedy argmax returned an initially forbidden token ({})",
+                token_detail()
+            )));
+        }
+        if self
+            .tokenizer_base_vocab_size
+            .is_some_and(|base| token_id as usize >= base)
+            && !self.allowed_extended_token_ids.contains(&token_id)
+        {
+            return Err(FerrumError::model(format!(
+                "model greedy argmax returned a disallowed extended-vocab token ({})",
+                token_detail()
+            )));
+        }
+        if self.sample_candidate_decodes_to_forbidden_output(
+            tokenizer,
+            self.streamed_text_len,
+            token,
+        ) {
+            return Err(FerrumError::model(format!(
+                "model greedy argmax token decoded to forbidden output ({})",
+                token_detail()
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn describe_model_greedy_argmax_token(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+    ) -> String {
+        let token_text = tokenizer
+            .and_then(|tokenizer| tokenizer.token_text(token))
+            .map(|text| format!("{text:?}"))
+            .unwrap_or_else(|| "None".to_string());
+        let decoded_delta = tokenizer
+            .map(|tokenizer| tokenizer.decode_incremental(&self.generated_tokens, token))
+            .map(|result| match result {
+                Ok(text) => format!("{text:?}"),
+                Err(err) => format!("decode_error:{err}"),
+            })
+            .unwrap_or_else(|| "None".to_string());
+        format!(
+            "token_id={}, token_text={}, decoded_delta={}, generated_tokens={}, \
+             forbidden_count={}, initial_forbidden_count={}, base_vocab_size={:?}, \
+             allowed_extended_count={}, argmax_mask={}, initial_argmax_mask={}",
+            token.get(),
+            token_text,
+            decoded_delta,
+            self.generated_tokens.len(),
+            self.forbidden_token_ids.len(),
+            self.initial_forbidden_token_ids.len(),
+            self.tokenizer_base_vocab_size,
+            self.allowed_extended_token_ids.len(),
+            Self::describe_argmax_mask_value(self.argmax_token_mask.as_ref(), token),
+            Self::describe_argmax_mask_value(self.initial_argmax_token_mask.as_ref(), token)
+        )
+    }
+
+    fn describe_argmax_mask_value(mask: Option<&TokenSelectionMask>, token: TokenId) -> String {
+        match mask {
+            Some(mask) => {
+                let value = mask
+                    .valid_token_mask
+                    .get(token.get() as usize)
+                    .copied()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "out_of_range".to_string());
+                format!(
+                    "fingerprint={},len={},value={}",
+                    mask.fingerprint,
+                    mask.len(),
+                    value
+                )
+            }
+            None => "none".to_string(),
+        }
     }
 
     pub fn requires_full_logits_for_sampling(&self) -> bool {

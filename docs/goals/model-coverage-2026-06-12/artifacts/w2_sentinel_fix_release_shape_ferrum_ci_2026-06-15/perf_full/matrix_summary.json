@@ -1,0 +1,86 @@
+[
+  {
+    "concurrency": 1,
+    "n_repeats": 3,
+    "n_requests_per_run": 100,
+    "completed_per_run": [
+      100,
+      100,
+      100
+    ],
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "output_token_count_source": "usage",
+    "output_tps_mean": 39.15163171090094,
+    "output_tps_ci95_hw": 0.05288116238730443,
+    "output_tps_lcb": 39.09875054851364,
+    "p95_itl_ms": 24.61783696666667,
+    "p95_itl_ci95_hw": 0.032019078602484215
+  },
+  {
+    "concurrency": 4,
+    "n_repeats": 3,
+    "n_requests_per_run": 100,
+    "completed_per_run": [
+      100,
+      100,
+      100
+    ],
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "output_token_count_source": "usage",
+    "output_tps_mean": 125.98056583522138,
+    "output_tps_ci95_hw": 2.3965771868141346,
+    "output_tps_lcb": 123.58398864840726,
+    "p95_itl_ms": 26.236106700000004,
+    "p95_itl_ci95_hw": 2.677478512813936
+  },
+  {
+    "concurrency": 16,
+    "n_repeats": 3,
+    "n_requests_per_run": 100,
+    "completed_per_run": [
+      100,
+      100,
+      100
+    ],
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "output_token_count_source": "usage",
+    "output_tps_mean": 259.1300497968025,
+    "output_tps_ci95_hw": 80.14503432879275,
+    "output_tps_lcb": 178.98501546800975,
+    "p95_itl_ms": 38.33362744999999,
+    "p95_itl_ci95_hw": 20.2134956338008
+  },
+  {
+    "concurrency": 32,
+    "n_repeats": 3,
+    "n_requests_per_run": 100,
+    "completed_per_run": [
+      100,
+      100,
+      100
+    ],
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "output_token_count_source": "usage",
+    "output_tps_mean": 281.5250238349826,
+    "output_tps_ci95_hw": 15.552278524715522,
+    "output_tps_lcb": 265.9727453102671,
+    "p95_itl_ms": 39.5611242,
+    "p95_itl_ci95_hw": 24.577565137412492
+  }
+]

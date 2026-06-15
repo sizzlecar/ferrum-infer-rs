@@ -7,7 +7,73 @@ use crate::{KvCacheHandle, TensorRef};
 use async_trait::async_trait;
 use ferrum_types::{ModelInfo, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
+
+/// Token-validity mask for model-side greedy argmax.
+///
+/// `valid_token_mask[id] != 0` means token `id` may be selected. Tokens at or
+/// above `valid_token_mask.len()` are invalid. The fingerprint lets model
+/// backends cache an uploaded device mask without comparing the full vector on
+/// every decode step.
+#[derive(Clone)]
+pub struct TokenSelectionMask {
+    pub fingerprint: u64,
+    pub valid_token_mask: Arc<[i8]>,
+}
+
+impl TokenSelectionMask {
+    pub fn new(valid_token_mask: Vec<i8>) -> Self {
+        let mut hasher = DefaultHasher::new();
+        valid_token_mask.hash(&mut hasher);
+        Self {
+            fingerprint: hasher.finish(),
+            valid_token_mask: Arc::from(valid_token_mask),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.valid_token_mask.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.valid_token_mask.is_empty()
+    }
+}
+
+impl std::fmt::Debug for TokenSelectionMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let valid_count = self.valid_token_mask.iter().filter(|&&v| v != 0).count();
+        f.debug_struct("TokenSelectionMask")
+            .field("fingerprint", &self.fingerprint)
+            .field("len", &self.valid_token_mask.len())
+            .field("valid_count", &valid_count)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum LogitsReturnPolicy {
+    FullLogits,
+    GreedyArgmax {
+        token_mask: Option<TokenSelectionMask>,
+    },
+}
+
+impl Default for LogitsReturnPolicy {
+    fn default() -> Self {
+        Self::FullLogits
+    }
+}
+
+impl LogitsReturnPolicy {
+    pub fn requires_full_logits(&self) -> bool {
+        matches!(self, Self::FullLogits)
+    }
+}
 
 /// Input for prefill phase (processing the initial prompt)
 #[derive(Debug, Clone)]
@@ -130,6 +196,8 @@ pub struct DecodeInput {
     pub position_ids: Option<TensorRef>,
     /// Request metadata that can affect model execution.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// How the model may return final-position logits for this request.
+    pub logits_policy: LogitsReturnPolicy,
 }
 
 impl DecodeInput {
@@ -140,6 +208,7 @@ impl DecodeInput {
             kv_cache,
             position_ids: None,
             metadata: HashMap::new(),
+            logits_policy: LogitsReturnPolicy::FullLogits,
         }
     }
 
@@ -152,6 +221,11 @@ impl DecodeInput {
     /// Attach request metadata.
     pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    pub fn with_logits_policy(mut self, policy: LogitsReturnPolicy) -> Self {
+        self.logits_policy = policy;
         self
     }
 
@@ -194,6 +268,8 @@ pub struct UnifiedBatchItem {
     pub is_final_chunk: bool,
     /// Request metadata that can affect model execution.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// How the model may return final-position logits for this item.
+    pub logits_policy: LogitsReturnPolicy,
 }
 
 impl std::fmt::Debug for UnifiedBatchItem {

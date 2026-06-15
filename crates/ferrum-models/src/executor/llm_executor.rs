@@ -898,10 +898,17 @@ impl ModelExecutor for LlmExecutor {
                         active_lora_from_metadata(&item.metadata)?,
                     )?;
                 }
-                let force_full_logits = decode_indices
+                let policies: Vec<_> = decode_indices
                     .iter()
-                    .any(|&i| metadata_requires_full_logits(&batch.items[i].metadata));
-                model.decode_batch_with_full_logits(&tuples, force_full_logits)
+                    .map(|&i| batch.items[i].logits_policy.clone())
+                    .collect();
+                if policies.iter().any(
+                    ferrum_interfaces::model_executor::LogitsReturnPolicy::requires_full_logits,
+                ) {
+                    model.decode_batch_with_full_logits(&tuples, true)
+                } else {
+                    model.decode_batch_with_logits_policy(&tuples, &policies)
+                }
             };
             for (j, &i) in decode_indices.iter().enumerate() {
                 results[i] = Some(logits_vec[j].clone());
@@ -1165,6 +1172,7 @@ mod tests {
             pos_offset: 3,
             is_final_chunk: true,
             metadata: full_logits_metadata(),
+            logits_policy: Default::default(),
         });
 
         let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
@@ -1187,6 +1195,7 @@ mod tests {
             pos_offset: 0,
             is_final_chunk: true,
             metadata: kv_capacity_hint_metadata(7),
+            logits_policy: Default::default(),
         });
         batch.items.push(UnifiedBatchItem {
             seq_id: "decode-cache".to_string(),
@@ -1195,6 +1204,7 @@ mod tests {
             pos_offset: 3,
             is_final_chunk: true,
             metadata: kv_capacity_hint_metadata(9),
+            logits_policy: Default::default(),
         });
 
         let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
@@ -1219,6 +1229,7 @@ mod tests {
             pos_offset: 0,
             is_final_chunk: true,
             metadata,
+            logits_policy: Default::default(),
         });
 
         let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();

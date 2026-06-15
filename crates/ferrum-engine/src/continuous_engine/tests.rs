@@ -327,6 +327,93 @@ fn model_decode_metadata_marks_sampling_masks_for_full_logits() {
             .and_then(|value| value.as_bool()),
         Some(true)
     );
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("plain greedy decode should use a masked model-side argmax policy");
+    };
+    assert_eq!(mask.valid_token_mask[0], 1);
+    assert_eq!(mask.valid_token_mask[2], 0);
+}
+
+#[test]
+fn model_decode_logits_policy_requires_full_for_non_greedy_sampling() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        4,
+        &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
+    ));
+    let mut request = policy_request();
+    request.sampling_params.repetition_penalty = 1.1;
+    let state = SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+
+    assert!(matches!(
+        state.model_decode_logits_policy(),
+        LogitsReturnPolicy::FullLogits
+    ));
+}
+
+#[test]
+fn model_decode_logits_policy_requires_full_for_structured_output() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        4,
+        &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
+    ));
+    let mut request = policy_request();
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
+    let state = SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+
+    assert!(matches!(
+        state.model_decode_logits_policy(),
+        LogitsReturnPolicy::FullLogits
+    ));
+}
+
+#[test]
+fn model_greedy_argmax_sentinel_accepts_masked_policy_token() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        4,
+        &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
+    ));
+    let state = SequenceState::new_with_tokenizer(
+        policy_request(),
+        vec![TokenId::new(0)],
+        Some(tokenizer.clone()),
+    );
+
+    assert!(state.requires_full_logits_for_sampling());
+    state
+        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(0))
+        .unwrap();
+    let err = state
+        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(2))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("model greedy argmax returned a forbidden token"),
+        "model-side greedy argmax must not bypass forbidden token masks: {err}"
+    );
+    assert!(err.contains("token_id=2"), "{err}");
+    assert!(err.contains("token_text=\"<unk>\""), "{err}");
+    assert!(err.contains("forbidden_count="), "{err}");
+    assert!(err.contains("argmax_mask="), "{err}");
+    assert!(err.contains("value=0"), "{err}");
+}
+
+#[test]
+fn model_greedy_argmax_sentinel_rejects_non_greedy_request() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        4,
+        &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
+    ));
+    let mut request = policy_request();
+    request.sampling_params.top_p = 0.8;
+    let state =
+        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer.clone()));
+
+    assert!(state
+        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(0))
+        .is_err());
 }
 
 #[test]
@@ -682,6 +769,13 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
     );
     let mut state =
         SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("first greedy decode should use the initial token mask");
+    };
+    assert_eq!(mask.valid_token_mask[5], 0);
 
     let mut first_logits = vec![0.0f32; 6];
     first_logits[0] = 1.0;
@@ -691,6 +785,13 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
     assert_eq!(first_logits[5], f32::NEG_INFINITY);
 
     state.generated_tokens.push(first);
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("subsequent greedy decode should use the regular token mask");
+    };
+    assert_eq!(mask.valid_token_mask[5], 1);
     let mut next_logits = vec![0.0f32; 6];
     next_logits[0] = 1.0;
     next_logits[5] = 100.0;

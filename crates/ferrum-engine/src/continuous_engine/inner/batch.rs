@@ -287,6 +287,7 @@ impl EngineInner {
                 pos_offset: work.chunk_start,
                 is_final_chunk: work.is_final_chunk,
                 metadata: work.metadata.clone(),
+                logits_policy: Default::default(),
             });
             prefill_meta.push(work);
         }
@@ -325,6 +326,7 @@ impl EngineInner {
                     pos_offset,
                     is_final_chunk: true,
                     metadata: seq.model_decode_metadata(),
+                    logits_policy: seq.model_decode_logits_policy(),
                 });
                 decode_meta.push(rid.clone());
             }
@@ -428,12 +430,9 @@ impl EngineInner {
                 seq.reset_guided_processors()?;
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
-                    if seq.requires_full_logits_for_sampling() {
-                        return Err(FerrumError::model(
-                            "model returned greedy token sentinel for request requiring full logits",
-                        ));
-                    }
-                    TokenId::new(logits[0] as u32)
+                    let token = TokenId::new(logits[0] as u32);
+                    seq.accept_model_greedy_argmax_token(Some(self.tokenizer.as_ref()), token)?;
+                    token
                 } else {
                     seq.sample_with_processors_with_tokenizer(
                         &mut logits,
@@ -479,12 +478,9 @@ impl EngineInner {
                 };
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
-                    if seq.requires_full_logits_for_sampling() {
-                        return Err(FerrumError::model(
-                            "model returned greedy token sentinel for request requiring full logits",
-                        ));
-                    }
-                    TokenId::new(logits[0] as u32)
+                    let token = TokenId::new(logits[0] as u32);
+                    seq.accept_model_greedy_argmax_token(Some(self.tokenizer.as_ref()), token)?;
+                    token
                 } else {
                     seq.sample_with_processors_with_tokenizer(
                         &mut logits,

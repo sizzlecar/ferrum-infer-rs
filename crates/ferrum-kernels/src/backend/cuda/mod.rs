@@ -891,6 +891,141 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn supports_device_f32_residual_shadow() -> bool {
+        true
+    }
+
+    fn activation_to_f32_shadow(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst_f32: &mut Self::Buffer,
+        len: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        assert_eq!(
+            dst_f32.dtype(),
+            crate::backend::Dtype::F32,
+            "CudaBackend::activation_to_f32_shadow dst must be F32, got {}",
+            dst_f32.dtype().name()
+        );
+        match src.dtype() {
+            crate::backend::Dtype::F16 => {
+                let func = ctx.func(
+                    "sandwich_norm",
+                    ptx::SANDWICH_NORM,
+                    "activation_to_f32_shadow_f16",
+                );
+                let n_i32 = len as i32;
+                let block = 256u32;
+                let grid = ((len as u32) + block - 1) / block;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(src);
+                b.arg(dst_f32);
+                b.arg(&n_i32);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("activation_to_f32_shadow launch");
+            }
+            crate::backend::Dtype::F32 => {
+                Self::copy_slice(ctx, src, 0, dst_f32, 0, len);
+            }
+            other => panic!(
+                "CudaBackend::activation_to_f32_shadow unsupported src dtype {}",
+                other.name()
+            ),
+        }
+    }
+
+    fn rms_norm_activation_to_f32(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        out_f32: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        match (input.dtype(), weight.dtype(), out_f32.dtype()) {
+            (crate::backend::Dtype::F16, crate::backend::Dtype::F16, crate::backend::Dtype::F32) => {
+                let func = ctx.func("sandwich_norm", ptx::SANDWICH_NORM, "rms_norm_f16_to_f32");
+                let dim_i32 = dim as i32;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(input);
+                b.arg(weight);
+                b.arg(out_f32);
+                b.arg(&dim_i32);
+                b.arg(&eps);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (tokens as u32, 1, 1),
+                        block_dim: (dim.min(1024) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("rms_norm_activation_to_f32 launch");
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F32, crate::backend::Dtype::F32) => {
+                Self::rms_norm(ctx, input, weight, eps, out_f32, tokens, dim);
+            }
+            (input_dtype, weight_dtype, out_dtype) => panic!(
+                "CudaBackend::rms_norm_activation_to_f32 unsupported dtypes input={} weight={} out={}",
+                input_dtype.name(),
+                weight_dtype.name(),
+                out_dtype.name()
+            ),
+        }
+    }
+
+    fn rms_norm_f32_to_activation(
+        ctx: &mut Self::Context,
+        input_f32: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        match (input_f32.dtype(), weight.dtype(), out.dtype()) {
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F16, crate::backend::Dtype::F16) => {
+                let func = ctx.func("sandwich_norm", ptx::SANDWICH_NORM, "rms_norm_f32_to_f16");
+                let dim_i32 = dim as i32;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(input_f32);
+                b.arg(weight);
+                b.arg(out);
+                b.arg(&dim_i32);
+                b.arg(&eps);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (tokens as u32, 1, 1),
+                        block_dim: (dim.min(1024) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("rms_norm_f32_to_activation launch");
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F32, crate::backend::Dtype::F32) => {
+                Self::rms_norm(ctx, input_f32, weight, eps, out, tokens, dim);
+            }
+            (input_dtype, weight_dtype, out_dtype) => panic!(
+                "CudaBackend::rms_norm_f32_to_activation unsupported dtypes input={} weight={} out={}",
+                input_dtype.name(),
+                weight_dtype.name(),
+                out_dtype.name()
+            ),
+        }
+    }
+
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
         with_stream(|stream| {
             // cudarc asserts host.len() >= buf.len() — but we may want a
@@ -966,6 +1101,46 @@ impl Backend for CudaBackend {
         Ok(host.into_iter().map(|x| x as u32).collect())
     }
 
+    fn argmax_rows_f16_masked(
+        ctx: &mut Self::Context,
+        logits: &Self::Buffer,
+        valid_token_mask: &Self::Buffer,
+        mask_len: usize,
+        m: usize,
+        n: usize,
+    ) -> Result<Vec<u32>> {
+        let func = ctx.func("argmax_rows", ptx::ARGMAX_ROWS, "argmax_rows_f16_masked");
+        let stream = ctx.stream.clone();
+        let host = with_argmax_out(&stream, ctx.ordinal, m, |out_dev| -> Result<Vec<i32>> {
+            let n_i32 = n as i32;
+            let mask_len_i32 = mask_len as i32;
+            let mut b = stream.launch_builder(&func);
+            b.arg(logits);
+            b.arg(&n_i32);
+            b.arg(valid_token_mask);
+            b.arg(&mask_len_i32);
+            b.arg(&mut *out_dev);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (m as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::internal(format!("argmax_rows_masked launch: {e}")))?;
+            let mut host = vec![0i32; m];
+            let view = out_dev.slice(0..m);
+            stream
+                .memcpy_dtoh(&view, &mut host)
+                .map_err(|e| FerrumError::internal(format!("argmax_rows_masked dtoh: {e}")))?;
+            stream
+                .synchronize()
+                .map_err(|e| FerrumError::internal(format!("argmax_rows_masked sync: {e}")))?;
+            Ok(host)
+        })?;
+        Ok(host.into_iter().map(|x| x as u32).collect())
+    }
+
     // ── Norms ────────────────────────────────────────────────────────────
 
     fn rms_norm(
@@ -977,7 +1152,27 @@ impl Backend for CudaBackend {
         tokens: usize,
         dim: usize,
     ) {
-        let func = ctx.func("rms_norm", ptx::RMS_NORM, "rms_norm_f16");
+        let x_dtype = x.dtype();
+        assert_eq!(
+            x_dtype,
+            w.dtype(),
+            "CudaBackend::rms_norm dtype mismatch: x={} w={}",
+            x_dtype.name(),
+            w.dtype().name()
+        );
+        assert_eq!(
+            x_dtype,
+            out.dtype(),
+            "CudaBackend::rms_norm dtype mismatch: x={} out={}",
+            x_dtype.name(),
+            out.dtype().name()
+        );
+        let fn_name = match x_dtype {
+            crate::backend::Dtype::F16 => "rms_norm_f16",
+            crate::backend::Dtype::F32 => "rms_norm_f32",
+            other => panic!("CudaBackend::rms_norm unsupported dtype {}", other.name()),
+        };
+        let func = ctx.func("rms_norm", ptx::RMS_NORM, fn_name);
         let dim_i32 = dim as i32;
         let stream = ctx.stream.clone();
         let mut b = stream.launch_builder(&func);
@@ -1146,6 +1341,7 @@ impl Backend for CudaBackend {
             };
             let valid_kv_scalar = kv_len as i32;
             let scale = cfg.scale;
+            let sliding_window = cfg.sliding_window as i32;
             // Shared-memory sizing (graph-safe):
             // - Kernel writes `s_scores[0..valid_kv_len]` per step. valid_kv_len
             //   grows over time; captured graph has a fixed shared_mem_bytes.
@@ -1161,7 +1357,12 @@ impl Backend for CudaBackend {
                 .cuda_max_kv
                 .unwrap_or(DECODE_MAX_KV_POS_DEFAULT);
             let max_kv_pos = capacity.min(env_cap as i32) as u32;
-            let shared_mem = max_kv_pos * 4;
+            let active_kv_pos = if cfg.sliding_window > 0 {
+                max_kv_pos.min(cfg.sliding_window as u32)
+            } else {
+                max_kv_pos
+            };
+            let shared_mem = active_kv_pos * 4;
             // If user bumped the cap beyond 48 KB default, opt into the
             // higher limit on Blackwell (up to 228 KB).
             if shared_mem > 48 * 1024 {
@@ -1197,6 +1398,7 @@ impl Backend for CudaBackend {
                 bld.arg(&valid_kv_scalar);
             }
             bld.arg(&scale);
+            bld.arg(&sliding_window);
             unsafe {
                 bld.launch(LaunchConfig {
                     grid_dim: (cfg.num_heads as u32, 1, 1),
@@ -1262,11 +1464,27 @@ impl Backend for CudaBackend {
         dst_offset: usize,
         len: usize,
     ) {
-        let src_view = src.as_f16().slice(src_offset..src_offset + len);
-        let mut dst_view = dst.as_f16_mut().slice_mut(dst_offset..dst_offset + len);
-        ctx.stream
-            .memcpy_dtod(&src_view, &mut dst_view)
-            .expect("copy_slice dtod");
+        match (src.dtype(), dst.dtype()) {
+            (crate::backend::Dtype::F16, crate::backend::Dtype::F16) => {
+                let src_view = src.as_f16().slice(src_offset..src_offset + len);
+                let mut dst_view = dst.as_f16_mut().slice_mut(dst_offset..dst_offset + len);
+                ctx.stream
+                    .memcpy_dtod(&src_view, &mut dst_view)
+                    .expect("copy_slice f16 dtod");
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F32) => {
+                let src_view = src.as_f32().slice(src_offset..src_offset + len);
+                let mut dst_view = dst.as_f32_mut().slice_mut(dst_offset..dst_offset + len);
+                ctx.stream
+                    .memcpy_dtod(&src_view, &mut dst_view)
+                    .expect("copy_slice f32 dtod");
+            }
+            (src_dtype, dst_dtype) => panic!(
+                "CudaBackend::copy_slice unsupported dtypes src={} dst={}",
+                src_dtype.name(),
+                dst_dtype.name()
+            ),
+        }
     }
 
     // ── Embedding ───────────────────────────────────────────────────────
@@ -1612,6 +1830,7 @@ impl Backend for CudaBackend {
         scale: f32,
         max_valid_kv: usize,
         capacity: usize,
+        sliding_window: usize,
         slot: usize,
     ) -> Result<()> {
         use cudarc::driver::DevicePtr;
@@ -1646,10 +1865,16 @@ impl Backend for CudaBackend {
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;
         let capacity_i32 = capacity as i32;
+        let sliding_window_i32 = sliding_window as i32;
         // Shared mem must cover post-append max kv_len. Caller passes
         // `max_valid_kv` already accounting for the +1; sizing also
         // bounded by capacity to mirror the per-item kernel's pattern.
-        let shared_bytes = (max_valid_kv.min(capacity).max(1) as u32) * 4;
+        let active_kv = if sliding_window > 0 {
+            max_valid_kv.min(sliding_window)
+        } else {
+            max_valid_kv
+        };
+        let shared_bytes = (active_kv.min(capacity).max(1) as u32) * 4;
         with_batched_scratch_mut(ctx.ordinal, |slot_g| {
             for i in 0..m {
                 let (kp, _) = k_caches[i].as_f16().device_ptr(&stream);
@@ -1690,6 +1915,7 @@ impl Backend for CudaBackend {
             b.arg(&hd_i32);
             b.arg(&capacity_i32);
             b.arg(&scale);
+            b.arg(&sliding_window_i32);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: (nq as u32, m as u32, 1),

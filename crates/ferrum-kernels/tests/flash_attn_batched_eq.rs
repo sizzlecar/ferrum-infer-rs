@@ -116,6 +116,7 @@ fn flash_attn_batched_matches_per_item() {
         SCALE,
         VALID_KV, // max_valid_kv (post-bump)
         CAPACITY,
+        0, // sliding_window
         0, // slot
     )
     .expect("flash_attention_batched_per_cache");
@@ -162,5 +163,69 @@ fn flash_attn_batched_matches_per_item() {
     assert!(
         max_abs < 5e-3,
         "max_abs_diff {max_abs} exceeds 5e-3 — batched flash_attn diverges"
+    );
+}
+
+#[test]
+fn flash_attn_batched_sliding_window_one_selects_latest_v() {
+    let mut ctx = CudaBackend::new_context();
+
+    let q_h = det_f32(100, M * NH * HD);
+    let q_dev = CudaBackend::from_slice(&q_h);
+
+    let k0_h = det_f32(110, NKV * CAPACITY * HD);
+    let v0_h = det_f32(111, NKV * CAPACITY * HD);
+    let k1_h = det_f32(120, NKV * CAPACITY * HD);
+    let v1_h = det_f32(121, NKV * CAPACITY * HD);
+    let k0_dev = CudaBackend::from_slice(&k0_h);
+    let v0_dev = CudaBackend::from_slice(&v0_h);
+    let k1_dev = CudaBackend::from_slice(&k1_h);
+    let v1_dev = CudaBackend::from_slice(&v1_h);
+
+    let kv_lens_h: Vec<u32> = vec![VALID_KV as u32; M];
+    let mut kv_lens_dev = CudaBackend::alloc_typed(ferrum_kernels::backend::Dtype::U32, M);
+    CudaBackend::write_typed::<u32>(&mut ctx, &mut kv_lens_dev, &kv_lens_h);
+
+    let mut out_batched_dev = CudaBackend::alloc(M * NH * HD);
+    let k_caches: Vec<&_> = vec![&k0_dev, &k1_dev];
+    let v_caches: Vec<&_> = vec![&v0_dev, &v1_dev];
+
+    CudaBackend::flash_attention_batched_per_cache(
+        &mut ctx,
+        &q_dev,
+        &k_caches,
+        &v_caches,
+        &kv_lens_dev,
+        &mut out_batched_dev,
+        NH,
+        NKV,
+        HD,
+        SCALE,
+        VALID_KV,
+        CAPACITY,
+        1, // sliding_window: only the latest KV position is visible
+        1, // slot
+    )
+    .expect("flash_attention_batched_per_cache sliding_window=1");
+    CudaBackend::sync(&mut ctx);
+    let out = CudaBackend::to_vec(&out_batched_dev, M * NH * HD);
+
+    let mut max_abs = 0.0f32;
+    for item in 0..M {
+        let v_h = if item == 0 { &v0_h } else { &v1_h };
+        for q_head in 0..NH {
+            let kv_head = q_head / (NH / NKV);
+            for d in 0..HD {
+                let got = out[item * NH * HD + q_head * HD + d];
+                let expected = v_h[kv_head * CAPACITY * HD + (VALID_KV - 1) * HD + d];
+                max_abs = max_abs.max((got - expected).abs());
+            }
+        }
+    }
+
+    println!("flash_attn batched sliding_window=1 max_abs_diff={max_abs:.3e}");
+    assert!(
+        max_abs < 5e-3,
+        "sliding_window=1 should select only latest V row; max_abs_diff={max_abs}"
     );
 }
