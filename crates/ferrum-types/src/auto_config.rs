@@ -640,6 +640,8 @@ impl FerrumConfigBuilder {
         let graph = self.bool_value("FERRUM_MOE_GRAPH", false, AutoConfigSource::WorkloadPreset)?;
         let batched_graph =
             self.bool_value("FERRUM_BATCHED_GRAPH", false, AutoConfigSource::Default)?;
+        let unified_graph =
+            self.bool_value("FERRUM_UNIFIED_GRAPH", false, AutoConfigSource::Default)?;
         let greedy = self.bool_value(
             "FERRUM_GREEDY_ARGMAX",
             (cuda_backend || self.hardware.backend.eq_ignore_ascii_case("metal"))
@@ -691,6 +693,7 @@ impl FerrumConfigBuilder {
             graph.value,
         )?;
         self.validate_batched_graph(batched_graph.value)?;
+        self.validate_unified_graph(unified_graph.value)?;
         self.validate_memory(
             kv_blocks.value,
             max_sequences.value,
@@ -724,6 +727,7 @@ impl FerrumConfigBuilder {
             ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
             ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
             ("FERRUM_BATCHED_GRAPH", &batched_graph),
+            ("FERRUM_UNIFIED_GRAPH", &unified_graph),
             ("FERRUM_GREEDY_ARGMAX", &greedy),
         ] {
             if resolved.source != AutoConfigSource::Env {
@@ -736,7 +740,7 @@ impl FerrumConfigBuilder {
         }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
-        decisions.push(self.decode_graph_decision(batched_graph));
+        decisions.push(self.decode_graph_decision(batched_graph, unified_graph));
         decisions.push(self.scalar_decision(
             "kv_block_count",
             kv_blocks,
@@ -1148,6 +1152,34 @@ impl FerrumConfigBuilder {
         Ok(())
     }
 
+    fn validate_unified_graph(&self, graph: bool) -> Result<(), AutoConfigError> {
+        if !graph {
+            return Ok(());
+        }
+        if self.model.moe.is_some() {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH",
+                "unified decode graph does not apply to MoE models",
+            );
+        }
+        if !self.is_cuda_backend() {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH",
+                "unified decode graph requires CUDA backend",
+            );
+        }
+        if !self.hardware.graph_support {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH",
+                "hardware/backend does not support CUDA graph replay",
+            );
+        }
+        if !self.hardware.compiled_features.cuda_graph {
+            return self.invalid("FERRUM_UNIFIED_GRAPH", "CUDA graph support is not compiled");
+        }
+        Ok(())
+    }
+
     fn validate_sampling(&self, greedy: bool) -> Result<(), AutoConfigError> {
         if greedy && !self.hardware.compiled_features.greedy_argmax {
             return self.invalid("FERRUM_GREEDY_ARGMAX", "GPU argmax is not compiled");
@@ -1424,26 +1456,44 @@ impl FerrumConfigBuilder {
         )
     }
 
-    fn decode_graph_decision(&self, graph: ResolvedValue<bool>) -> AutoConfigDecision {
-        let selected = if graph.value {
+    fn decode_graph_decision(
+        &self,
+        batched_graph: ResolvedValue<bool>,
+        unified_graph: ResolvedValue<bool>,
+    ) -> AutoConfigDecision {
+        let selected = if unified_graph.value {
+            "unified_decode_graph"
+        } else if batched_graph.value {
             "legacy_batched_decode_graph"
         } else {
             "graph_disabled"
         };
+        let source_value = if unified_graph.value
+            || (!batched_graph.value && unified_graph.source != AutoConfigSource::Default)
+        {
+            unified_graph
+        } else {
+            batched_graph
+        };
         self.decision(
             "decode_graph_policy",
             selected,
-            graph.source,
-            graph.source_key,
-            ["legacy_batched_decode_graph", "graph_disabled"],
+            source_value.source,
+            source_value.source_key,
+            [
+                "unified_decode_graph",
+                "legacy_batched_decode_graph",
+                "graph_disabled",
+            ],
             self.rejected_except(
                 selected,
                 [
+                    ("unified_decode_graph", "unified decode graph not selected"),
                     (
                         "legacy_batched_decode_graph",
                         "legacy batched decode graph not selected",
                     ),
-                    ("graph_disabled", "legacy batched decode graph selected"),
+                    ("graph_disabled", "decode graph selected"),
                 ],
             ),
             vec![
@@ -2560,6 +2610,40 @@ mod tests {
     }
 
     #[test]
+    fn unified_graph_override_materializes_decode_graph_policy() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[(
+            "FERRUM_UNIFIED_GRAPH",
+            "1",
+            RuntimeConfigSource::Cli,
+        )]))
+        .with_model_capabilities(ModelCapabilities::unknown())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(decisions["decode_graph_policy"], "unified_decode_graph");
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_UNIFIED_GRAPH")
+            .expect("unified graph entry");
+        assert_eq!(entry.effective_value, "1");
+        assert_eq!(
+            resolved.effective_config_document()["selected_graph_mode"],
+            "unified_decode_graph"
+        );
+    }
+
+    #[test]
     fn batched_graph_requires_cuda_graph_support() {
         let mut features = CompiledKernelFeatures::m3_fast_path_without_fa2();
         features.cuda_graph = false;
@@ -2574,6 +2658,24 @@ mod tests {
         assert!(matches!(
             err,
             AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_BATCHED_GRAPH"
+        ));
+    }
+
+    #[test]
+    fn unified_graph_requires_cuda_graph_support() {
+        let mut features = CompiledKernelFeatures::m3_fast_path_without_fa2();
+        features.cuda_graph = false;
+        let hardware = HardwareCapabilities::rtx4090_cuda(features);
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_UNIFIED_GRAPH", "1")]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .expect_err("unified graph should require compiled graph support");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_UNIFIED_GRAPH"
         ));
     }
 
