@@ -2,6 +2,84 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXXV — W2 source checkpoint: apply Gemma embed scale in unified forward
+
+- 本轮源码修复:
+  - `unified_forward_internal` 在 `embedding_lookup` 后补上
+    `cfg.embed_scale` 的 `B::scale_inplace`;
+  - 缩放发生在 `activation_to_f32_shadow` 之前,因此 Gemma3 CUDA 的 F32
+    residual shadow 也接收缩放后的 residual;
+  - 这与 legacy `decode_batch_internal`,`prefill_internal`,`decode_internal`
+    等路径保持一致。
+- Why:
+  - LXXXIV 的 product logits diagnostic 证明 paged-unified 首步 logits 全
+    finite,但 eos/stop token id `106` 排 top;
+  - native split-QKV + paged-varlen attention 已在 LXXXIII 通过,所以问题
+    更可能在 product unified path 的模型语义差异;
+  - 源码对比发现 unified embedding path 漏掉 Gemma3 的
+    `embed_scale = sqrt(hidden_size)` 语义,这是与已正确 legacy path 的
+    直接差异。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models llm_executor -- --nocapture` PASS
+    (13 tests);
+  - `cargo test -p ferrum-models unified_varlen_qkv_requires_gemma_sandwich_prerequisites -- --nocapture`
+    PASS。
+- Required next validation:
+  - rerun only the LXXXIV minimal CUDA product smoke shape with the same
+    diagnostic paged-KV guard override;
+  - success criterion for this diagnostic: chat response content should no
+    longer be empty/stop-at-first-token, and `[unified-logits]` should no
+    longer rank eos token id `106` as top-1;
+  - do not run c16/c32 performance until this correctness smoke is clean。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
+## 2026-06-16 LXXXIV — W2 CUDA product diagnostic: paged-unified logits rank eos top-1
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_unified_logits_product_diag_2026-06-16/`。
+- Source checkpoint:
+  `b768073a80c8a7519c1107083f5a10b478d0fe1a` plus a remote-only
+  diagnostic patch that temporarily allowed paged KV for windowed Gemma3
+  when CUDA supports varlen QKV。默认 checked-in path remains protected。
+- GPU 执行合同:
+  - lane:`W2 paged-unified product logits diagnostic`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - stop condition:启动/SSH/CUDA/source sync/diagnostic patch/build/serve/chat
+    任一失败,或 `[unified-logits]` evidence collected 后停机;
+  - correctness command:`ferrum serve` + one non-stream chat smoke with
+    `max_tokens=1`;
+  - performance command:none。
+- Execution evidence:
+  - CUDA release build rc `0`;
+  - binary SHA256
+    `1d046a81f5194f80a946b2c0e2f37f1de97fdde69668ad359135f032e32af5d9`;
+  - response empty,`finish_reason=stop`,`completion_tokens=1`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Key result:
+  - `[unified-decode] call#0 items=1 prefill=1 decode=0 total_q=23
+    attempted_unified=true fallback=false fallback_reason=none elapsed=136978us`;
+  - `[unified-logits] call#0 row=0 orig_idx=0 global=22 finite=262208
+    nan=0 pos_inf=0 neg_inf=0
+    top=[106:11.039062,108:9.445312,107:8.882812,245526:8.460938,236743:8.304688]`;
+  - tokenizer/generation metadata confirms eos token ids `[1,106]`,and token
+    id `106` is `<end_of_turn>`。
+- Interpretation:
+  - paged-unified product path is not producing NaN/Inf or uninitialized
+    sampled logits in this repro;
+  - the wrong behavior is specifically that the first sampled logits row ranks
+    the stop token highest;
+  - after LXXXIII ruled out the standalone split-QKV + paged-varlen attention
+    chain, the next source diff to fix is product unified model semantics
+    above those kernels。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXXIII — W2 native checkpoint: split-QKV + paged-varlen combo probe PASS
 
 - 本轮 artifact:
