@@ -7,8 +7,7 @@
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CudaMarlinRuntimeConfig {
@@ -59,6 +58,128 @@ pub static MARLIN_WS_ZERO_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub static MARLIN_WS_ZERO_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MARLIN_KERNEL_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub static MARLIN_KERNEL_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarlinProfileBucketStats {
+    pub ws_zero_us: u64,
+    pub ws_zero_calls: u64,
+    pub kernel_us: u64,
+    pub kernel_calls: u64,
+}
+
+impl MarlinProfileBucketStats {
+    pub const ZERO: Self = Self {
+        ws_zero_us: 0,
+        ws_zero_calls: 0,
+        kernel_us: 0,
+        kernel_calls: 0,
+    };
+
+    fn record_ws_zero(&mut self, us: u64) {
+        self.ws_zero_us += us;
+        self.ws_zero_calls += 1;
+    }
+
+    fn record_kernel(&mut self, us: u64) {
+        self.kernel_us += us;
+        self.kernel_calls += 1;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarlinProfileByProjection {
+    pub qkv: MarlinProfileBucketStats,
+    pub o_proj: MarlinProfileBucketStats,
+    pub gate_up: MarlinProfileBucketStats,
+    pub down: MarlinProfileBucketStats,
+    pub lm_head: MarlinProfileBucketStats,
+    pub other: MarlinProfileBucketStats,
+}
+
+impl MarlinProfileByProjection {
+    pub const ZERO: Self = Self {
+        qkv: MarlinProfileBucketStats::ZERO,
+        o_proj: MarlinProfileBucketStats::ZERO,
+        gate_up: MarlinProfileBucketStats::ZERO,
+        down: MarlinProfileBucketStats::ZERO,
+        lm_head: MarlinProfileBucketStats::ZERO,
+        other: MarlinProfileBucketStats::ZERO,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarlinProfileBucket {
+    Qkv,
+    OProj,
+    GateUp,
+    Down,
+    LmHead,
+    Other,
+}
+
+static MARLIN_PROFILE_BY_PROJECTION: Mutex<MarlinProfileByProjection> =
+    Mutex::new(MarlinProfileByProjection::ZERO);
+
+fn marlin_profile_bucket_from_label(label: &str) -> MarlinProfileBucket {
+    if label.contains("qkv_proj") {
+        MarlinProfileBucket::Qkv
+    } else if label.contains("o_proj") {
+        MarlinProfileBucket::OProj
+    } else if label.contains("gate_up_proj") {
+        MarlinProfileBucket::GateUp
+    } else if label.contains("down_proj") {
+        MarlinProfileBucket::Down
+    } else if label.contains("lm_head") {
+        MarlinProfileBucket::LmHead
+    } else {
+        MarlinProfileBucket::Other
+    }
+}
+
+fn current_marlin_profile_bucket() -> MarlinProfileBucket {
+    marlin_profile_bucket_from_label(&super::current_cuda_alloc_label())
+}
+
+fn marlin_profile_bucket_mut(
+    stats: &mut MarlinProfileByProjection,
+    bucket: MarlinProfileBucket,
+) -> &mut MarlinProfileBucketStats {
+    match bucket {
+        MarlinProfileBucket::Qkv => &mut stats.qkv,
+        MarlinProfileBucket::OProj => &mut stats.o_proj,
+        MarlinProfileBucket::GateUp => &mut stats.gate_up,
+        MarlinProfileBucket::Down => &mut stats.down,
+        MarlinProfileBucket::LmHead => &mut stats.lm_head,
+        MarlinProfileBucket::Other => &mut stats.other,
+    }
+}
+
+fn with_marlin_profile_bucket_stats(
+    bucket: MarlinProfileBucket,
+    f: impl FnOnce(&mut MarlinProfileBucketStats),
+) {
+    let mut stats = MARLIN_PROFILE_BY_PROJECTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(marlin_profile_bucket_mut(&mut stats, bucket));
+}
+
+fn record_marlin_ws_zero(bucket: MarlinProfileBucket, us: u64) {
+    with_marlin_profile_bucket_stats(bucket, |stats| stats.record_ws_zero(us));
+}
+
+fn record_marlin_kernel(bucket: MarlinProfileBucket, us: u64) {
+    with_marlin_profile_bucket_stats(bucket, |stats| stats.record_kernel(us));
+}
+
+pub fn drain_marlin_profile_by_projection() -> MarlinProfileByProjection {
+    let mut stats = MARLIN_PROFILE_BY_PROJECTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = *stats;
+    *stats = MarlinProfileByProjection::ZERO;
+    snapshot
+}
 
 fn profile_marlin() -> bool {
     cuda_marlin_runtime_config().profile
@@ -300,11 +421,12 @@ fn marlin_gemm_chunk(
     let k = weight.k as i32;
 
     let raw_stream = stream.cu_stream();
+    let profile = profile_marlin();
+    let profile_bucket = profile.then(current_marlin_profile_bucket);
 
     // Zero workspace on the runner's stream — Marlin uses it as mutex locks.
     // All operations (memset + kernel) on same stream → naturally ordered.
     {
-        let profile = profile_marlin();
         if profile {
             stream
                 .synchronize()
@@ -319,8 +441,12 @@ fn marlin_gemm_chunk(
             stream.synchronize().map_err(|e| {
                 candle_core::Error::Msg(format!("marlin ws profile post-sync: {e}"))
             })?;
-            MARLIN_WS_ZERO_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let elapsed_us = t0.elapsed().as_micros() as u64;
+            MARLIN_WS_ZERO_TIME_US.fetch_add(elapsed_us, Ordering::Relaxed);
             MARLIN_WS_ZERO_CALLS.fetch_add(1, Ordering::Relaxed);
+            if let Some(bucket) = profile_bucket {
+                record_marlin_ws_zero(bucket, elapsed_us);
+            }
         }
     }
 
@@ -331,7 +457,6 @@ fn marlin_gemm_chunk(
     let (s_ptr, _s_guard) = weight.scales.device_ptr(stream);
     let (ws_ptr, _ws_guard) = weight.workspace.device_ptr(stream);
 
-    let profile = profile_marlin();
     if profile {
         stream
             .synchronize()
@@ -362,8 +487,12 @@ fn marlin_gemm_chunk(
         stream.synchronize().map_err(|e| {
             candle_core::Error::Msg(format!("marlin kernel profile post-sync: {e}"))
         })?;
-        MARLIN_KERNEL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let elapsed_us = t0.elapsed().as_micros() as u64;
+        MARLIN_KERNEL_TIME_US.fetch_add(elapsed_us, Ordering::Relaxed);
         MARLIN_KERNEL_CALLS.fetch_add(1, Ordering::Relaxed);
+        if let Some(bucket) = profile_bucket {
+            record_marlin_kernel(bucket, elapsed_us);
+        }
     }
 
     if ret != 0 {
@@ -1163,7 +1292,7 @@ fn build_marlin_perm() -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::CudaMarlinRuntimeConfig;
+    use super::{marlin_profile_bucket_from_label, CudaMarlinRuntimeConfig, MarlinProfileBucket};
 
     #[test]
     fn cuda_marlin_runtime_config_parses_skip_ws_zero() {
@@ -1183,5 +1312,33 @@ mod tests {
         ]);
         assert!(!config.profile);
         assert!(!config.skip_ws_zero);
+    }
+
+    #[test]
+    fn marlin_profile_bucket_labels_match_projection_names() {
+        assert_eq!(
+            marlin_profile_bucket_from_label("label=llama.batched_layer.qkv_proj"),
+            MarlinProfileBucket::Qkv
+        );
+        assert_eq!(
+            marlin_profile_bucket_from_label("label=llama.forward_layer.o_proj"),
+            MarlinProfileBucket::OProj
+        );
+        assert_eq!(
+            marlin_profile_bucket_from_label("label=llama.forward_layer.gate_up_proj"),
+            MarlinProfileBucket::GateUp
+        );
+        assert_eq!(
+            marlin_profile_bucket_from_label("label=llama.forward_layer.down_proj"),
+            MarlinProfileBucket::Down
+        );
+        assert_eq!(
+            marlin_profile_bucket_from_label("label=llama.batched.lm_head"),
+            MarlinProfileBucket::LmHead
+        );
+        assert_eq!(
+            marlin_profile_bucket_from_label("label=<none>"),
+            MarlinProfileBucket::Other
+        );
     }
 }
