@@ -2,6 +2,42 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXVI — W2 profile instrumentation: split dense Marlin counters by projection
+
+- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- 代码侧推进:
+  - `FERRUM_MARLIN_PROFILE=1` 的 dense Marlin nested counters 现在按
+    projection label 细分输出:
+    `qkv`,`o_proj`,`gate_up`,`down`,`lm_head`,`other`;
+  - 每个 projection bucket 分别记录 `ws_zero` 与 `kernel` 的时间和调用数;
+  - `[batched-op-profile]` 保留原有 aggregate
+    `marlin_ws_zero`/`marlin_kernel`,并新增
+    `marlin_qkv_*`,`marlin_o_*`,`marlin_gate_up_*`,
+    `marlin_down_*`,`marlin_lm_head_*`,`marlin_other_*`;
+  - 给 batched decode 的 `o_proj` 补上 CUDA alloc label,避免它在
+    projection profile 中落入 `other`;
+  - 默认路径不变;新增分桶只在 `FERRUM_MARLIN_PROFILE=1` 的诊断路径累加。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check -- crates/ferrum-kernels/src/backend/cuda/marlin.rs crates/ferrum-models/src/models/llama_family_forward_batched.rs`
+    PASS;
+  - `cargo check -q -p ferrum-models --tests` PASS;
+  - `cargo test -q -p ferrum-models llama_batched_runtime_config_parses_startup_knobs --lib`
+    PASS,1 test passed。
+- Evidence caveat:
+  - 本机未做 CUDA feature 编译;该 checkpoint 需要下一轮 4090 release
+    build/profile artifact 来验证 CUDA profile fields 的实际日志输出。
+- Next step:
+  - 复用 1x4090 cache-retained instance 做一个小样本
+    `FERRUM_DECODE_OP_PROFILE=1` + `FERRUM_MARLIN_PROFILE=1` profile,
+    确认 gate/up Marlin kernel 是否确实主导 dense GPTQ time;如果成立,
+    下一步再比较 Triton INT4 或 vLLM dense GPTQ packing path。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-15 XXV — W2 dense-Marlin nested profile: kernel dominates, workspace zero is not first lever
 
 - 本轮 artifact:

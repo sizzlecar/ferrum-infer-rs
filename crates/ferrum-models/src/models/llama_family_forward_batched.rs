@@ -21,7 +21,8 @@ use ferrum_types::Result;
 
 #[cfg(feature = "cuda")]
 use ferrum_kernels::backend::cuda::marlin::{
-    MARLIN_KERNEL_CALLS, MARLIN_KERNEL_TIME_US, MARLIN_WS_ZERO_CALLS, MARLIN_WS_ZERO_TIME_US,
+    drain_marlin_profile_by_projection, MARLIN_KERNEL_CALLS, MARLIN_KERNEL_TIME_US,
+    MARLIN_WS_ZERO_CALLS, MARLIN_WS_ZERO_TIME_US,
 };
 
 use super::llama_family::{
@@ -1070,12 +1071,17 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         } else {
             None
         };
-        layer.o_proj.forward(
-            ctx,
-            &self.scratch.attn_flat,
-            &mut self.scratch.o_proj_out,
-            m,
-        );
+        {
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.batched_layer.o_proj");
+            layer.o_proj.forward(
+                ctx,
+                &self.scratch.attn_flat,
+                &mut self.scratch.o_proj_out,
+                m,
+            );
+        }
         if let Some(t0) = _t {
             B::sync(ctx);
             MATMUL_TIME_US.fetch_add(
@@ -2125,6 +2131,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     MARLIN_WS_ZERO_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                     MARLIN_KERNEL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                     MARLIN_KERNEL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    let _ = drain_marlin_profile_by_projection();
                 }
                 TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                 TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -2264,6 +2271,51 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 #[cfg(not(feature = "cuda"))]
                 let (marlin_ws_zero_us, marlin_ws_zero_n, marlin_kernel_us, marlin_kernel_n) =
                     (0, 0, 0, 0);
+                #[cfg(feature = "cuda")]
+                let marlin_proj = {
+                    let p = drain_marlin_profile_by_projection();
+                    format!(
+                        "marlin_qkv_ws={}us({}) marlin_qkv_kernel={}us({}) \
+                         marlin_o_ws={}us({}) marlin_o_kernel={}us({}) \
+                         marlin_gate_up_ws={}us({}) marlin_gate_up_kernel={}us({}) \
+                         marlin_down_ws={}us({}) marlin_down_kernel={}us({}) \
+                         marlin_lm_head_ws={}us({}) marlin_lm_head_kernel={}us({}) \
+                         marlin_other_ws={}us({}) marlin_other_kernel={}us({})",
+                        p.qkv.ws_zero_us,
+                        p.qkv.ws_zero_calls,
+                        p.qkv.kernel_us,
+                        p.qkv.kernel_calls,
+                        p.o_proj.ws_zero_us,
+                        p.o_proj.ws_zero_calls,
+                        p.o_proj.kernel_us,
+                        p.o_proj.kernel_calls,
+                        p.gate_up.ws_zero_us,
+                        p.gate_up.ws_zero_calls,
+                        p.gate_up.kernel_us,
+                        p.gate_up.kernel_calls,
+                        p.down.ws_zero_us,
+                        p.down.ws_zero_calls,
+                        p.down.kernel_us,
+                        p.down.kernel_calls,
+                        p.lm_head.ws_zero_us,
+                        p.lm_head.ws_zero_calls,
+                        p.lm_head.kernel_us,
+                        p.lm_head.kernel_calls,
+                        p.other.ws_zero_us,
+                        p.other.ws_zero_calls,
+                        p.other.kernel_us,
+                        p.other.kernel_calls,
+                    )
+                };
+                #[cfg(not(feature = "cuda"))]
+                let marlin_proj = concat!(
+                    "marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) ",
+                    "marlin_o_ws=0us(0) marlin_o_kernel=0us(0) ",
+                    "marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) ",
+                    "marlin_down_ws=0us(0) marlin_down_kernel=0us(0) ",
+                    "marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) ",
+                    "marlin_other_ws=0us(0) marlin_other_kernel=0us(0)"
+                );
                 let tail_act_us = TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let tail_act_n = TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let tail_resid_us =
@@ -2281,7 +2333,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     + tail_resid_us;
                 let unwrapped_us = total_us.saturating_sub(wrapped_us);
                 eprintln!(
-                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({}) tail_norm={}us({}) tail_mlp={}us({}) tail_gate_up={}us({}) tail_down={}us({}) marlin_ws_zero={}us({}) marlin_kernel={}us({}) tail_act={}us({}) tail_resid={}us({})  unwrapped={}us",
+                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({}) tail_norm={}us({}) tail_mlp={}us({}) tail_gate_up={}us({}) tail_down={}us({}) marlin_ws_zero={}us({}) marlin_kernel={}us({}) {} tail_act={}us({}) tail_resid={}us({})  unwrapped={}us",
                     m,
                     total_us,
                     mm_us, mm_n,
@@ -2295,6 +2347,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     tail_down_us, tail_down_n,
                     marlin_ws_zero_us, marlin_ws_zero_n,
                     marlin_kernel_us, marlin_kernel_n,
+                    marlin_proj,
                     tail_act_us, tail_act_n,
                     tail_resid_us, tail_resid_n,
                     unwrapped_us,
