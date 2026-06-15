@@ -218,6 +218,11 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub batch_decode_prof: Option<bool>,
 
+    /// Emit executor batch prefill profile logs, equivalent to
+    /// `FERRUM_BATCH_PREFILL_PROF`.
+    #[serde(default)]
+    pub batch_prefill_prof: Option<bool>,
+
     /// Emit engine next-batch scheduler profile logs, equivalent to
     /// `FERRUM_NEXT_BATCH_PROF`.
     #[serde(default)]
@@ -232,6 +237,16 @@ pub struct RuntimeCliConfig {
     /// `FERRUM_UNIFIED_POST_PROF`.
     #[serde(default)]
     pub unified_post_prof: Option<bool>,
+
+    /// Emit model decode operator profile logs, equivalent to
+    /// `FERRUM_DECODE_OP_PROFILE`.
+    #[serde(default)]
+    pub decode_op_profile: Option<bool>,
+
+    /// Emit model prefill operator profile logs, equivalent to
+    /// `FERRUM_PREFILL_OP_PROFILE`.
+    #[serde(default)]
+    pub prefill_op_profile: Option<bool>,
 
     /// vLLM paged attention policy, equivalent to
     /// `FERRUM_USE_VLLM_PAGED_ATTN`.
@@ -316,12 +331,27 @@ impl RuntimeCliConfig {
             "FERRUM_BATCH_DECODE_PROF",
             self.batch_decode_prof,
         );
+        push_true_entry(
+            &mut entries,
+            "FERRUM_BATCH_PREFILL_PROF",
+            self.batch_prefill_prof,
+        );
         push_true_entry(&mut entries, "FERRUM_NEXT_BATCH_PROF", self.next_batch_prof);
         push_true_entry(&mut entries, "FERRUM_RBD_PROF", self.rbd_prof);
         push_true_entry(
             &mut entries,
             "FERRUM_UNIFIED_POST_PROF",
             self.unified_post_prof,
+        );
+        push_true_entry(
+            &mut entries,
+            "FERRUM_DECODE_OP_PROFILE",
+            self.decode_op_profile,
+        );
+        push_true_entry(
+            &mut entries,
+            "FERRUM_PREFILL_OP_PROFILE",
+            self.prefill_op_profile,
         );
         push_bool_entry(
             &mut entries,
@@ -595,9 +625,12 @@ mod tests {
             moe_graph: Some(true),
             batched_graph: Some(true),
             batch_decode_prof: Some(true),
+            batch_prefill_prof: Some(true),
             next_batch_prof: Some(true),
             rbd_prof: Some(true),
             unified_post_prof: Some(true),
+            decode_op_profile: Some(true),
+            prefill_op_profile: Some(true),
             use_vllm_paged_attn: Some(true),
             vllm_paged_attn_v1_short: Some(false),
             vllm_moe: Some(true),
@@ -612,7 +645,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 25);
+        assert_eq!(entries.len(), 28);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -646,9 +679,12 @@ mod tests {
         assert!(entry("FERRUM_BATCH_DECODE_PROF")
             .affects
             .contains(&RuntimeConfigEffect::Diagnostics));
+        assert_eq!(entry("FERRUM_BATCH_PREFILL_PROF").effective_value, "1");
         assert_eq!(entry("FERRUM_NEXT_BATCH_PROF").effective_value, "1");
         assert_eq!(entry("FERRUM_RBD_PROF").effective_value, "1");
         assert_eq!(entry("FERRUM_UNIFIED_POST_PROF").effective_value, "1");
+        assert_eq!(entry("FERRUM_DECODE_OP_PROFILE").effective_value, "1");
+        assert_eq!(entry("FERRUM_PREFILL_OP_PROFILE").effective_value, "1");
         assert_eq!(entry("FERRUM_USE_VLLM_PAGED_ATTN").effective_value, "1");
         assert_eq!(
             entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
@@ -672,9 +708,12 @@ mod tests {
     fn runtime_cli_config_diagnostic_presence_flags_are_opt_in() {
         let entries = RuntimeCliConfig {
             batch_decode_prof: Some(false),
+            batch_prefill_prof: Some(false),
             next_batch_prof: Some(false),
             rbd_prof: Some(false),
             unified_post_prof: Some(false),
+            decode_op_profile: Some(false),
+            prefill_op_profile: Some(false),
             ..Default::default()
         }
         .runtime_config_entries();

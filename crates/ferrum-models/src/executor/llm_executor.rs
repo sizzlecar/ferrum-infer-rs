@@ -38,7 +38,16 @@ struct LlmExecutorRuntimeEnv {
 
 impl LlmExecutorRuntimeEnv {
     fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
+        Self::from_runtime_config_snapshot(&ferrum_types::active_runtime_snapshot())
+    }
+
+    fn from_runtime_config_snapshot(snapshot: &ferrum_types::RuntimeConfigSnapshot) -> Self {
+        Self::from_env_vars(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry.effective_value.as_str())),
+        )
     }
 
     fn from_env_vars<I, K, V>(vars: I) -> Self
@@ -1106,6 +1115,26 @@ mod tests {
             ("FERRUM_BATCH_PREFILL_PROF", ""),
             ("FERRUM_BATCH_DECODE_PROF", "0"),
         ]);
+
+        assert!(env.batch_prefill_prof);
+        assert!(env.batch_decode_prof);
+    }
+
+    #[test]
+    fn llm_executor_runtime_env_parses_runtime_snapshot_profile_flags() {
+        let snapshot = ferrum_types::RuntimeConfigSnapshot::from_entries([
+            ferrum_types::RuntimeConfigEntry::new(
+                "FERRUM_BATCH_PREFILL_PROF",
+                "1",
+                ferrum_types::RuntimeConfigSource::ConfigFile,
+            ),
+            ferrum_types::RuntimeConfigEntry::new(
+                "FERRUM_BATCH_DECODE_PROF",
+                "1",
+                ferrum_types::RuntimeConfigSource::ConfigFile,
+            ),
+        ]);
+        let env = LlmExecutorRuntimeEnv::from_runtime_config_snapshot(&snapshot);
 
         assert!(env.batch_prefill_prof);
         assert!(env.batch_decode_prof);

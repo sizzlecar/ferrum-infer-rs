@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXIV — W2 source checkpoint: expose prefill profiler knobs through runtime config
+
+- 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - config-file `runtime` 现在可显式开启:
+    - `batch_prefill_prof` -> `FERRUM_BATCH_PREFILL_PROF`;
+    - `decode_op_profile` -> `FERRUM_DECODE_OP_PROFILE`;
+    - `prefill_op_profile` -> `FERRUM_PREFILL_OP_PROFILE`;
+  - `LlmExecutorRuntimeEnv` 不再从 `std::env::vars()` 直接冻结 profiler
+    flags,改为读取 composition root 安装的 `RuntimeConfigSnapshot`;
+  - profiler flags 仍保持 presence-flag 语义:只有 config `true` 才
+    materialize runtime entry,`false`/unset 不会生成 `FERRUM_*_PROF=0`。
+- Why:
+  - 上一轮 typed decode integration profile 已排除 scheduler/postprocess/普通
+    host loop gap 为主因;
+  - W2 c16 剩余风险集中在 Gemma3 模型侧 decode/prefill,尤其 ShareGPT TTFT
+    和 batched prefill 是否仍有 fallback;
+  - 下一次 CUDA 只需用 typed config 打开 prefill/decode profiler 做最小
+    ShareGPT c16 诊断,不需要隐藏 env 组合或重复 full sweep。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-cli runtime_cli_config -- --nocapture` PASS,3/3;
+  - `cargo test -p ferrum-models llm_executor_runtime_env -- --nocapture`
+    PASS,3/3;
+  - `git diff --check` PASS。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXIII — W2 CUDA checkpoint: typed-config decode integration profile points back to model-side decode
 
 - 本轮 artifact:
