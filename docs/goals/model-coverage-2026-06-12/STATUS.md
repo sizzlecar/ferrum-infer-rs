@@ -2,6 +2,60 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXXIX — W2 prefill bucket profile: profiler 修复有效,瓶颈落在 tail MLP + prefill attention
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_bucket_profile_2026-06-15/`。
+- 复用 Vast/cache-retained native CUDA instance `40826362`,1x RTX 4090。验证结束后
+  已复制 artifact 并停机;Vast shutdown poll 3 记录 `actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA prefill profile buckets validation`;
+  - expected runtime/cost:15-35min,hard cap 45min,约 USD 0.425/hr;
+  - stop condition:instance start/SSH/CUDA/source sync/build 首败、serve readiness
+    首败、chat smoke 首败、c16 diagnostic 完成,或 45min cap;
+  - correctness gate:CUDA release build,serve readiness,non-stream chat smoke,
+    then `bench-serve --fail-on-error`;
+  - performance command:diagnostic-only natural ASCII ShareGPT c16,
+    `bench-serve --fail-on-error --seed 9271 --n-repeats 1 --num-prompts 16`;
+  - profile scope:`FERRUM_PREFILL_OP_PROFILE=1`,只作诊断。
+- Build/evidence:
+  - remote source commit:`3c407faf25eed833fbb785057c6a7f39d0578e5b`;
+  - binary SHA256:
+    `5873e674ed0aff9a301af532e0f38c898595d02fd12441125240cf24abea9403`;
+  - `cargo_build.rc=0`,release build 用时 `3m27s`;
+  - remote full `git status --short` 不干净,原因是本轮为最小源码同步,
+    有意没有同步历史 docs artifact;构建相关源码已同步到上述 commit。
+- Correctness/perf diagnostic:
+  - `run.status=PASS`,`bench-serve.rc=0`;
+  - chat smoke content `5`,usage `completion_tokens=3`;
+  - c16:`16 completed / 0 errored`,bad_output `[0]`;
+  - c16 with profiler:`321.551 tok/s`,request throughput `5.024 req/s`,
+    TTFT p50 `925.570ms`,TTFT p95 `1516.331ms`,TPOT p50 `35.035ms`,
+    ITL p50 `26.578ms`,ITL p99 `295.802ms`,
+    `output_token_count_source=usage`;
+  - 因为本轮开启 profiler,吞吐只用于诊断,不作为正式性能 claim。
+- Prefill bucket evidence:
+  - captured 27 prefill profiles;其中 ShareGPT `tokens=122` 有 26 个;
+  - ShareGPT prefill total mean `83.577ms`,range `83-92ms`;
+  - `tail_mlp` mean `37.654ms`,约 `45.1%`;
+  - `flash_attn` mean `30.192ms`,约 `36.1%`;
+  - ordinary `matmuls` mean `6.000ms`,约 `7.2%`;
+  - `qk_norm_rope` mean `1.000ms`,约 `1.2%`;
+  - `tail_mlp` 内部:`tail_gate_up` mean `23.115ms`,
+    `tail_down` mean `13.115ms`。
+- Interpretation:
+  - profiler source fix 有效;prefill bucket 不再为空;
+  - prefill/TTFT 侧的主热区是 Gemma GPTQ MLP tail 和 prefill attention,
+    不是普通 QKV/O matmul;
+  - typed vLLM paged attention 已经验证无 end-to-end 收益,下一步应优先看
+    Gemma GPTQ MLP tail 的 prefill/decode 共享实现与 kernel launch/Marlin 调度,
+    再看 prefill attention 是否仍有可替换路径。
+- Release-grade status:
+  - 本轮是 N=1 diagnostic,没有 `--require-ci`,没有
+    `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍未达到 release-grade。
+
 ## 2026-06-15 XXXVIII — W2 prefill/TTFT first profile:正确性干净,发现 prefill profiler bucket 缺口并修复源码
 
 - 本轮 artifact:
