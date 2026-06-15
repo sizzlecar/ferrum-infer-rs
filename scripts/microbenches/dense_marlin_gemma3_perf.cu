@@ -13,6 +13,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,6 +51,7 @@ constexpr int MAX_PAR = 16;
 constexpr int WARMUP_ITERS = 5;
 constexpr int TIMED_ITERS = 80;
 constexpr double RTX4090_FP16_TFLOPS_PEAK = 165.0;
+constexpr size_t L2_FLUSH_BYTES = 256ull * 1024ull * 1024ull;
 
 static size_t round_up(size_t value, size_t align) {
     return ((value + align - 1) / align) * align;
@@ -78,7 +80,9 @@ static float time_one(
     int m,
     const Tile& tile,
     bool include_workspace_zero,
-    int sms) {
+    int sms,
+    void* flush_buffer,
+    size_t flush_bytes) {
     cudaEvent_t start;
     cudaEvent_t stop;
     CHK(cudaEventCreate(&start));
@@ -87,12 +91,16 @@ static float time_one(
     float total_ms = 0.0f;
     const int total_iters = WARMUP_ITERS + TIMED_ITERS;
     for (int iter = 0; iter < total_iters; ++iter) {
+        if (!include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+        }
+        if (flush_buffer != nullptr && flush_bytes > 0) {
+            CHK(cudaMemsetAsync(flush_buffer, iter & 0xff, flush_bytes, stream));
+            CHK(cudaStreamSynchronize(stream));
+        }
+        CHK(cudaEventRecord(start, stream));
         if (include_workspace_zero) {
-            CHK(cudaEventRecord(start, stream));
             CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
-        } else {
-            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
-            CHK(cudaEventRecord(start, stream));
         }
         int ret = marlin_cuda(
             a,
@@ -131,6 +139,62 @@ static float time_one(
     return (total_ms * 1000.0f) / static_cast<float>(TIMED_ITERS);
 }
 
+static float time_one_host_sync(
+    cudaStream_t stream,
+    void* a,
+    void* b,
+    void* c,
+    void* scales,
+    void* workspace,
+    size_t workspace_bytes,
+    const Shape& shape,
+    int m,
+    const Tile& tile,
+    bool include_workspace_zero,
+    int sms) {
+    double total_us = 0.0;
+    const int total_iters = WARMUP_ITERS + TIMED_ITERS;
+    for (int iter = 0; iter < total_iters; ++iter) {
+        if (!include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+            CHK(cudaStreamSynchronize(stream));
+        } else {
+            CHK(cudaStreamSynchronize(stream));
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+        }
+        int ret = marlin_cuda(
+            a,
+            b,
+            c,
+            scales,
+            m,
+            shape.n,
+            shape.k,
+            workspace,
+            GROUP_SIZE,
+            0,
+            stream,
+            tile.thread_k,
+            tile.thread_n,
+            sms,
+            MAX_PAR,
+            -1);
+        if (ret != 0) {
+            return -static_cast<float>(ret);
+        }
+        CHK(cudaStreamSynchronize(stream));
+        CHK(cudaGetLastError());
+        const auto stop = std::chrono::steady_clock::now();
+        if (iter >= WARMUP_ITERS) {
+            total_us += std::chrono::duration<double, std::micro>(stop - start).count();
+        }
+    }
+    return static_cast<float>(total_us / static_cast<double>(TIMED_ITERS));
+}
+
 static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
     int sms = 0;
     CHK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
@@ -152,6 +216,7 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
     void* c = cuda_alloc_bytes(c_bytes, 0x00);
     void* scales = cuda_alloc_bytes(scale_bytes, 0x3c);
     void* workspace = cuda_alloc_bytes(workspace_bytes, 0x00);
+    void* flush_buffer = cuda_alloc_bytes(L2_FLUSH_BYTES, 0x5a);
 
     const Tile tiles[] = {
         {"auto", -1, -1},
@@ -168,8 +233,55 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
     std::printf("mode,m,tile,us,useful_tflops,padded_tflops,ret\n");
     for (int m : m_values) {
         for (const Tile& tile : tiles) {
-            for (int mode_idx = 0; mode_idx < 2; ++mode_idx) {
-                bool include_ws = mode_idx != 0;
+            for (int mode_idx = 0; mode_idx < 4; ++mode_idx) {
+                const bool include_ws = (mode_idx % 2) != 0;
+                const bool host_sync = mode_idx >= 2;
+                float us = host_sync
+                    ? time_one_host_sync(
+                          stream,
+                          a,
+                          b,
+                          c,
+                          scales,
+                          workspace,
+                          workspace_bytes,
+                          shape,
+                          m,
+                          tile,
+                          include_ws,
+                          sms)
+                    : time_one(
+                          stream,
+                          a,
+                          b,
+                          c,
+                          scales,
+                          workspace,
+                          workspace_bytes,
+                          shape,
+                          m,
+                          tile,
+                          include_ws,
+                          sms,
+                          nullptr,
+                          0);
+                const char* mode = host_sync
+                    ? (include_ws ? "host_sync_ws_plus_kernel" : "host_sync_kernel")
+                    : (include_ws ? "ws_plus_kernel" : "kernel_only");
+                if (us < 0.0f) {
+                    std::printf("%s,%d,%s,NA,NA,NA,%d\n", mode, m, tile.name,
+                                static_cast<int>(-us));
+                    continue;
+                }
+                double useful_ops = 2.0 * static_cast<double>(m) * shape.k * shape.n;
+                double padded_ops =
+                    2.0 * static_cast<double>(padded_m(m)) * shape.k * shape.n;
+                double useful_tflops = useful_ops / (static_cast<double>(us) * 1.0e6);
+                double padded_tflops = padded_ops / (static_cast<double>(us) * 1.0e6);
+                std::printf("%s,%d,%s,%.3f,%.2f,%.2f,0\n", mode, m, tile.name, us,
+                            useful_tflops, padded_tflops);
+            }
+            if (std::strcmp(tile.name, "auto") == 0 && (m == 16 || m == 23 || m == 32)) {
                 float us = time_one(
                     stream,
                     a,
@@ -181,9 +293,11 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
                     shape,
                     m,
                     tile,
-                    include_ws,
-                    sms);
-                const char* mode = include_ws ? "ws_plus_kernel" : "kernel_only";
+                    false,
+                    sms,
+                    flush_buffer,
+                    L2_FLUSH_BYTES);
+                const char* mode = "cold_cache_kernel";
                 if (us < 0.0f) {
                     std::printf("%s,%d,%s,NA,NA,NA,%d\n", mode, m, tile.name,
                                 static_cast<int>(-us));
@@ -205,6 +319,7 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
     CHK(cudaFree(c));
     CHK(cudaFree(scales));
     CHK(cudaFree(workspace));
+    CHK(cudaFree(flush_buffer));
     CHK(cudaStreamDestroy(stream));
 }
 
