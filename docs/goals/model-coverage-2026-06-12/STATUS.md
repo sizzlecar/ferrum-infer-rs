@@ -2,6 +2,70 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXV — W2 dense-Marlin nested profile: kernel dominates, workspace zero is not first lever
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_nested_profile_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `poll=01 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=02 cur_state=stopped actual_status=exited intended_status=stopped`;
+  - stop timestamp: `2026-06-15T05:38:17Z`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA dense-Marlin nested profile diagnostic`;
+  - expected runtime/cost:15-35min,hard cap 45min,1x RTX 4090 instance
+    `40826362` at about USD 0.402/hr;
+  - stop condition:start/SSH/CUDA/source sync/build/server readiness first
+    failure,dense Marlin nested profile c16/c32 small sample complete and
+    copied,or 45min cap;
+  - correctness gate:release build plus server readiness and
+    `bench-serve --fail-on-error` zero-error diagnostic;
+  - performance command:diagnostic-only natural ASCII ShareGPT dataset with
+    `FERRUM_DECODE_OP_PROFILE=1` and `FERRUM_MARLIN_PROFILE=1`,
+    `num_prompts=16`,`n_repeats=1`,`random-output-len=64`,`seed=9271`,
+    c16/c32.
+- Evidence scope:
+  - release build PASS,binary SHA256:
+    `3c503a7cabcc0acba90fd35ac40704c19f631f4f2a6f206f8a8374758b20a280`;
+  - remote git HEAD was `95a27d7738d4834fa09b52ee5a86cf084c16de75`;
+  - remote git status is dirty because local `docs/.../artifacts/` was
+    excluded from source rsync to avoid copying old evidence directories,so
+    this remains profiling evidence only,not final clean performance evidence;
+  - `FERRUM_MARLIN_PROFILE=1` adds per-Marlin-call syncs,so the lower
+    throughput in this artifact is profiling overhead and not a product
+    performance claim.
+- Build/bench result:
+  - `run.status=PASS`,`nohup.rc=0`,`bench-serve.rc=0`;
+  - build completed in `3m 29s`;
+  - c16:completed `[16]`,errored `[0]`,mean `288.575 tok/s`,p95 ITL
+    `32.181 ms`,p95 TTFT `1570.866 ms`;
+  - c32 client / active cap16:completed `[16]`,errored `[0]`,mean
+    `289.619 tok/s`,p95 ITL `32.077 ms`,p95 TTFT `1560.208 ms`.
+- Op-profile result:
+  - server log captured `264` `[batched-op-profile]` rows;
+  - for batch `m=16` (`118` rows),mean total per decode step
+    `30134 us`; nested dense Marlin kernel aggregate was `54.9%`
+    (`16550 us`),workspace zero aggregate was `3.9%` (`1181 us`);
+    `tail_gate_up` was `31.6%` (`9526 us`),`tail_down` `17.6%`
+    (`5299 us`),combined `tail_mlp` `49.2%` (`14825 us`);
+  - for batch `m=10` (`123` rows),nested dense Marlin kernel aggregate was
+    `55.5%` (`16350 us`),workspace zero aggregate `3.9%` (`1145 us`);
+    `tail_gate_up` was `31.8%` (`9379 us`),`tail_down` `17.7%`
+    (`5212 us`).
+- Interpretation:
+  - workspace zero is measurable but not the first lever; it is roughly
+    `1.1-1.2 ms` per decode step across all dense Marlin calls;
+  - most of the remaining time is dense Marlin kernel work,with the fused
+    Gemma3 gate/up projection still the largest projection-level bucket;
+  - next useful checkpoint should focus on the gate/up Marlin shape itself:
+    kernel launch/shape behavior, existing Triton INT4 diagnostic viability,
+    or a source comparison against the vLLM dense GPTQ path. Avoid changing
+    product defaults until correctness and same-dataset diagnostics support it.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+
 ## 2026-06-15 XXIV — W2 profile instrumentation: add dense Marlin nested counters
 
 - 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
