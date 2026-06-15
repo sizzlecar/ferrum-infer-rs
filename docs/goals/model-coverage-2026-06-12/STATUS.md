@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXX — W2 CUDA checkpoint: paged unified removes fallback but fails chat correctness
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_kv_unified_cuda_smoke_2026-06-16/`。
+- Source checkpoint tested:
+  `103c7013e849b198cabaa7ad47cd45063bf21e6d`。
+- GPU 执行合同:
+  - lane:`W2 CUDA paged-KV unified smoke after guard fix`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - stop condition:build + serve/chat smoke + c16 profiler evidence,或首个失败;
+  - correctness gate:build rc `0`,serve ready,chat smoke content `5`,
+    bench rc `0`;
+  - performance command:c16/n=16/n_repeats=1 `bench-serve --fail-on-error
+    --seed 9271`,但本轮因 correctness failure 未进入 bench。
+- Execution evidence:
+  - remote git head `103c7013e849b198cabaa7ad47cd45063bf21e6d`,
+    remote source status clean;
+  - binary SHA256
+    `0d4595b6dbb6f4920ec5ed4af286ce7fbd89ad936d8dba1c76ad99d15806ac70`;
+  - `build/build.rc=0`,serve ready poll `61`;
+  - chat smoke failed:content empty,`completion_tokens=1`,
+    `finish_reason=stop`;
+  - `run_profile.rc=1`;bench did not start;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Key result:
+  - `[unified-decode] call#0 items=1 prefill=1 decode=0 total_q=23
+    attempted_unified=true fallback=false fallback_reason=none elapsed=336326us`;
+  - `[unified-op]` confirms `split_qkv_norm_rope_paged` and
+    `paged_varlen_attention` executed;
+  - so `paged_kv_required` was removed, but the paged-unified Gemma3 path
+    is not product-correct yet。
+- Source follow-up in current HEAD:
+  - keep windowed Gemma3 on contiguous KV by default;
+  - update the helper/test so `sliding_window_pattern != 0` remains
+    non-paged until paged-varlen correctness is fixed;
+  - this prevents `103c7013` from leaving a product correctness regression
+    active at HEAD。
+- Required next work:
+  - do not run another c16 perf bench until a smaller correctness repro
+    isolates paged-varlen wrong output;
+  - preferred next probe: native CUDA/minimal kernel or model-layer smoke for
+    `split_qkv_norm_rope_paged` + `paged_varlen_attention` against the
+    contiguous Gemma3 path, then re-enable only after chat smoke passes。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXIX — W2 source checkpoint: allow CUDA paged KV for Gemma3 windowed unified path
 
 - 本轮没有再次启动 GPU,不产生新的性能结论,也没有生成

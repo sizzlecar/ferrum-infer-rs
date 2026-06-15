@@ -1,0 +1,11 @@
+{
+  "lane": "W2 CUDA paged-KV unified smoke after guard fix",
+  "instance_id": "40826362",
+  "hardware": "1x RTX 4090",
+  "hourly_usd": "0.425",
+  "expected_runtime_cost": "10-20min expected; stopped at chat correctness failure",
+  "stop_condition": "build + serve/chat smoke + c16 profiler evidence, or first failure",
+  "correctness_gate": "build rc=0, serve ready, chat smoke content 5, bench rc=0",
+  "performance_command": "bench-serve c16/n=16/n_repeats=1 --fail-on-error --seed 9271; diagnostic only",
+  "release_grade": false
+}
