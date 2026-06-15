@@ -111,9 +111,28 @@ impl LlamaBatchedRuntimeConfig {
     }
 }
 
+const BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT: u64 = 1u64 << 62;
+
+fn should_use_batched_decode_graph(config_enabled: bool, use_host_residual_shadow: bool) -> bool {
+    config_enabled && !use_host_residual_shadow
+}
+
+fn batched_decode_graph_key(m_padded: usize, use_device_residual_shadow: bool) -> u64 {
+    let shape_key = m_padded as u64;
+    debug_assert!(shape_key < BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT);
+    if use_device_residual_shadow {
+        BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT | shape_key
+    } else {
+        shape_key
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::LlamaBatchedRuntimeConfig;
+    use super::{
+        batched_decode_graph_key, should_use_batched_decode_graph, LlamaBatchedRuntimeConfig,
+        BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
+    };
 
     #[test]
     fn llama_batched_runtime_config_parses_startup_knobs() {
@@ -148,6 +167,24 @@ mod tests {
         assert!(!config.batched_graph);
         assert!(!config.batched_trace);
         assert!(!config.greedy_argmax);
+    }
+
+    #[test]
+    fn batched_decode_graph_allows_device_shadow_not_host_shadow() {
+        assert!(should_use_batched_decode_graph(true, false));
+        assert!(!should_use_batched_decode_graph(true, true));
+        assert!(!should_use_batched_decode_graph(false, false));
+    }
+
+    #[test]
+    fn batched_decode_graph_key_separates_device_shadow() {
+        let plain = batched_decode_graph_key(16, false);
+        let shadow = batched_decode_graph_key(16, true);
+
+        assert_eq!(plain, 16);
+        assert_ne!(plain, shadow);
+        assert_eq!(shadow, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT | 16);
+        assert_eq!(shadow & (1u64 << 63), 0);
     }
 }
 
@@ -2085,17 +2122,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // captured `stream.memcpy_htod` records host pointers and the
         // 2nd pure-replay reads stale/corrupted data → ILLEGAL_ADDRESS.
         //
-        // populate_batched_pointers was intended to support
-        // FERRUM_BATCHED_GRAPH=1 (Phase 4d graph capture) by pre-filling
-        // device scratch outside the captured forward. Phase 4d is
-        // shelved (CUDA driver state accumulates and SIGSEGVs after
-        // ~14 launches even with all the right knobs), so the populate
-        // call adds overhead with no benefit on the OFF path. Skip it —
-        // the kv_cache_append / flash_attn batched impls fall back to
-        // their inline captured memcpy when scratch isn't pre-populated.
-        // batched_pointers_for kept for future use; revisit when we
-        // either (a) get graph capture working, or (b) move scratch to
-        // process-global static.
+        // The CUDA backend now keeps batched pointer scratch process-global,
+        // so inline pointer uploads are graph-stable without pre-populating
+        // this model-local table. Keep the no-op on the default path.
         let _ = &self.batched_pointers_for;
 
         // 0. Embed all M tokens into residual [M, H]. Eager, OUTSIDE
@@ -2147,15 +2176,16 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // ── Phase 4d: CUDA-graph replay path ─────────────────────────
         // gated on FERRUM_BATCHED_GRAPH=1; skipped on backends without
         // graph support (begin_graph_capture returns Err).
-        let graph_enabled = self.batched_cfg.batched_graph
-            && !use_host_residual_shadow
-            && !use_device_residual_shadow;
+        let graph_enabled = should_use_batched_decode_graph(
+            self.batched_cfg.batched_graph,
+            use_host_residual_shadow,
+        );
         let m_padded = m.next_power_of_two();
         // Per-m_padded graph cache: each batch shape gets its own
         // captured graph instead of thrashing a single slot. Native
         // CUDA microbench (graph_upload_bench) confirmed multi-slot
         // replay is stable.
-        let graph_key = m_padded as u64;
+        let graph_key = batched_decode_graph_key(m_padded, use_device_residual_shadow);
         let cache_has_key = self.batched_graph_keys_seen.contains(&graph_key);
 
         let mut did_pure_replay = false;
