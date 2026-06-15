@@ -2,6 +2,56 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XL — W2 native CUDA checkpoint: down slowdown is cache/producer-state, not GeGLU value sensitivity
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_down_input_source_native_probe_2026-06-16/`.
+- Paid GPU lane:
+  `W2 Gemma3 down input-source native probe` on the cached 1x RTX 4090 Vast
+  instance.
+- Contract:
+  - expected runtime/cost: 10-20 minutes, about USD 0.07-0.15 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/compile first failure, probe non-zero or
+    timeout, or VERDICT plus artifact copyback;
+  - correctness gate: native probe exit 0 and
+    `VERDICT: gemma3 down input-source native CUDA probe complete`;
+  - performance command:
+    `bash scripts/microbenches/build_and_run_gemma3_down_input_source_perf.sh`.
+- Evidence:
+  - remote HEAD `cea63ef0b5c933a2a39802a82010b34eaa1a9d45`;
+  - probe rc `0`;
+  - binary SHA256
+    `dd1a5ba3cd0f244603bc1fbebe8f2a6a224004f98943a5c31a21001e9aa7bfb0`;
+  - stdout contains
+    `VERDICT: gemma3 down input-source native CUDA probe complete`;
+  - Vast cleanup confirmed `stopped/exited`.
+- Key m16 rows:
+  - constant input baseline: `32.606us`;
+  - small constant input baseline: `32.670us`;
+  - constant input after gate_up+GeGLU producer: `69.793us`;
+  - GeGLU output immediate: `68.356us`;
+  - GeGLU output after sync: `70.200us`;
+  - copied GeGLU output after sync: `70.098us`;
+  - constant input after L2 flush: `90.343us`.
+- Interpretation:
+  - the isolated Marlin down row is fast only when repeated on warm constant
+    input;
+  - running the product-shaped gate_up+GeGLU producer immediately before down
+    makes down slow even when down reads a separate constant input;
+  - small constant input is not slower, so this is not GeGLU numeric magnitude
+    or subnormal value sensitivity;
+  - the remaining W2 tail-MLP lever is cache/producer-state or weight residency
+    around the `gate_up -> down` sequence, not the existing Triton W4A16 path
+    or GeGLU data sensitivity.
+- Scope:
+  - this is diagnostic evidence, not release performance evidence;
+  - the remote worktree had old tracked artifact-log modifications after
+    syncing `.git`; those are recorded in `git_verify.txt` and are not used for
+    release performance claims.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XK — W2 source checkpoint: native down input-source probe
 
 - Added `scripts/microbenches/gemma3_down_input_source_perf.cu` plus

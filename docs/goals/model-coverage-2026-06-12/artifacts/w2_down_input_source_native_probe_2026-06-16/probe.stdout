@@ -1,0 +1,43 @@
+[microbench] compiling scripts/microbenches/gemma3_down_input_source_perf.cu
+-rwxr-xr-x 1 root root 699112 Jun 15 23:27 /workspace/ferrum-artifacts/w2_down_input_source_native_probe_2026-06-16/gemma3_down_input_source_perf
+
+[microbench] running /workspace/ferrum-artifacts/w2_down_input_source_native_probe_2026-06-16/gemma3_down_input_source_perf
+gemma3_down_input_source_perf device=NVIDIA GeForce RTX 4090 sm=8.9 h=5376 im=21504
+mode,m,down_us,useful_tflops,ret
+const_baseline,1,34.654,6.67,0
+small_const_baseline,1,34.690,6.67,0
+const_after_geglu_immediate,1,68.742,3.36,0
+const_after_l2_flush,1,89.394,2.59,0
+geglu_immediate,1,69.243,3.34,0
+geglu_after_sync,1,70.548,3.28,0
+copied_geglu_after_sync,1,70.490,3.28,0
+const_baseline,10,35.395,65.32,0
+small_const_baseline,10,35.645,64.86,0
+const_after_geglu_immediate,10,69.527,33.25,0
+const_after_l2_flush,10,90.108,25.66,0
+geglu_immediate,10,68.626,33.69,0
+geglu_after_sync,10,70.197,32.94,0
+copied_geglu_after_sync,10,70.386,32.85,0
+const_baseline,16,32.606,113.46,0
+small_const_baseline,16,32.670,113.23,0
+const_after_geglu_immediate,16,69.793,53.00,0
+const_after_l2_flush,16,90.343,40.95,0
+geglu_immediate,16,68.356,54.12,0
+geglu_after_sync,16,70.200,52.70,0
+copied_geglu_after_sync,16,70.098,52.77,0
+const_baseline,23,54.694,97.23,0
+small_const_baseline,23,54.558,97.47,0
+const_after_geglu_immediate,23,73.800,72.06,0
+const_after_l2_flush,23,95.544,55.66,0
+geglu_immediate,23,72.650,73.20,0
+geglu_after_sync,23,74.434,71.44,0
+copied_geglu_after_sync,23,74.577,71.31,0
+const_baseline,32,55.480,133.36,0
+small_const_baseline,32,55.449,133.43,0
+const_after_geglu_immediate,32,74.608,99.17,0
+const_after_l2_flush,32,96.932,76.33,0
+geglu_immediate,32,73.788,100.27,0
+geglu_after_sync,32,75.136,98.47,0
+copied_geglu_after_sync,32,75.045,98.59,0
+
+VERDICT: gemma3 down input-source native CUDA probe complete
