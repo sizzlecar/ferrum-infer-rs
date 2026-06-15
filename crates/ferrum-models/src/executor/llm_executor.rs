@@ -844,7 +844,7 @@ impl ModelExecutor for LlmExecutor {
             .items
             .iter()
             .any(|item| metadata_requires_full_logits(&item.metadata));
-        if !force_full_logits {
+        {
             let model_result = {
                 let mut model = self.lock_model();
                 for item in &batch.items {
@@ -858,23 +858,29 @@ impl ModelExecutor for LlmExecutor {
                         }
                     }
                 }
-                model.unified_forward(&unified_items)
+                if force_full_logits && !model.unified_forward_can_return_full_logits() {
+                    None
+                } else {
+                    Some(model.unified_forward(&unified_items))
+                }
             };
-            match model_result {
-                Ok(per_item) => {
-                    if per_item.len() != batch.items.len() {
-                        return Err(FerrumError::model(format!(
-                            "unified_forward returned {} entries for {} items",
-                            per_item.len(),
-                            batch.items.len(),
-                        )));
+            if let Some(model_result) = model_result {
+                match model_result {
+                    Ok(per_item) => {
+                        if per_item.len() != batch.items.len() {
+                            return Err(FerrumError::model(format!(
+                                "unified_forward returned {} entries for {} items",
+                                per_item.len(),
+                                batch.items.len(),
+                            )));
+                        }
+                        return Ok(per_item);
                     }
-                    return Ok(per_item);
+                    Err(FerrumError::Unsupported { .. }) => {
+                        // Fall through to the dispatch fallback below.
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(FerrumError::Unsupported { .. }) => {
-                    // Fall through to the dispatch fallback below.
-                }
-                Err(e) => return Err(e),
             }
         }
 
@@ -1018,6 +1024,7 @@ mod tests {
         calls: Arc<Mutex<RecordingCalls>>,
         config: crate::common::LlmRuntimeConfig,
         unified_unsupported_message: Option<String>,
+        unified_full_logits_supported: bool,
     }
 
     impl RecordingLlm {
@@ -1025,6 +1032,7 @@ mod tests {
             Self {
                 calls,
                 unified_unsupported_message: None,
+                unified_full_logits_supported: true,
                 config: crate::common::LlmRuntimeConfig {
                     hidden_size: 4,
                     num_layers: 1,
@@ -1042,6 +1050,13 @@ mod tests {
         ) -> Self {
             Self {
                 unified_unsupported_message: Some(message.into()),
+                ..Self::new(calls)
+            }
+        }
+
+        fn without_unified_full_logits(calls: Arc<Mutex<RecordingCalls>>) -> Self {
+            Self {
+                unified_full_logits_supported: false,
                 ..Self::new(calls)
             }
         }
@@ -1084,8 +1099,12 @@ mod tests {
             }
             Ok(items
                 .iter()
-                .map(|(_, _, _, is_final_chunk)| is_final_chunk.then_some(vec![99.0]))
+                .map(|(_, _, _, is_final_chunk)| is_final_chunk.then_some(vec![0.0, 1.0, 2.0, 3.0]))
                 .collect())
+        }
+
+        fn unified_forward_can_return_full_logits(&self) -> bool {
+            self.unified_full_logits_supported
         }
 
         fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
@@ -1135,6 +1154,15 @@ mod tests {
             Box::new(RecordingLlm::with_unified_unsupported_message(
                 calls, message,
             )),
+            test_model_info(),
+        )
+    }
+
+    fn recording_executor_without_unified_full_logits(
+        calls: Arc<Mutex<RecordingCalls>>,
+    ) -> LlmExecutor {
+        LlmExecutor::new(
+            Box::new(RecordingLlm::without_unified_full_logits(calls)),
             test_model_info(),
         )
     }
@@ -1288,9 +1316,32 @@ mod tests {
     }
 
     #[test]
-    fn unified_decode_skips_unified_forward_when_full_logits_required() {
+    fn unified_decode_uses_unified_forward_when_full_logits_supported() {
         let calls = Arc::new(Mutex::new(RecordingCalls::default()));
         let executor = recording_executor(calls.clone());
+        let mut batch = UnifiedBatch::new();
+        batch.items.push(UnifiedBatchItem {
+            seq_id: "decode-cache".to_string(),
+            q_tokens: vec![7],
+            kv_cache: test_kv_handle("decode-cache", 3),
+            pos_offset: 3,
+            is_final_chunk: true,
+            metadata: full_logits_metadata(),
+            logits_policy: Default::default(),
+        });
+
+        let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
+
+        assert_eq!(output[0].as_ref().unwrap().len(), 4);
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 1);
+        assert!(calls.decode_batch_force_full_logits.is_empty());
+    }
+
+    #[test]
+    fn unified_decode_skips_unified_forward_when_full_logits_unsupported() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor_without_unified_full_logits(calls.clone());
         let mut batch = UnifiedBatch::new();
         batch.items.push(UnifiedBatchItem {
             seq_id: "decode-cache".to_string(),
@@ -1343,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_decode_full_logits_prefill_prepares_kv_capacity_hint() {
+    fn unified_decode_full_logits_prefill_uses_unified_forward_and_prepares_kv_capacity_hint() {
         let calls = Arc::new(Mutex::new(RecordingCalls::default()));
         let executor = recording_executor(calls.clone());
         let mut metadata = full_logits_metadata();
@@ -1363,8 +1414,8 @@ mod tests {
 
         assert_eq!(output[0].as_ref().unwrap().len(), 4);
         let calls = calls.lock();
-        assert_eq!(calls.unified_forward, 0);
-        assert_eq!(calls.prefill, 1);
+        assert_eq!(calls.unified_forward, 1);
+        assert_eq!(calls.prefill, 0);
         assert_eq!(calls.prepared_kv, vec![("prefill-cache".to_string(), 11)]);
     }
 
