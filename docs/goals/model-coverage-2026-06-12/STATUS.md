@@ -2,6 +2,70 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXXIX — W2 CUDA A/B: `--batched-graph` correct but not a c16 performance lever
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_ab_cuda_diag_2026-06-16/`。
+- Source/binary:
+  - local head at launch:`0adb292a`;
+  - remote reused clean source `d6d872c1e12fc364886117b0431aec752b2d78ac`;
+  - reused binary SHA256
+    `11b26df2b8dccf3138b2fe294e80ef618cc6255e56af626213e6aaabe8b2e48f`;
+  - no rebuild/reinstall performed,只复用上一轮环境和模型缓存。
+- GPU 执行合同:
+  - lane:`W2 batched-graph default-path A/B diagnostic`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - stop condition:启动/SSH/binary check/run/serve 首败即停,或 run+serve
+    correctness + c16 diagnostic 后停止实例;
+  - correctness gate:`ferrum run --batched-graph` 与
+    `ferrum serve --batched-graph`;
+  - performance command:`bench-serve --fail-on-error --require-ci` c16
+    diagnostic,非 release evidence。
+- Correctness evidence:
+  - `ferrum run --batched-graph` rc `0`,output content `"5"`,
+    `finish_reason=stop`;
+  - `ferrum serve --batched-graph` readiness poll `8`,chat rc `0`,response
+    content `"5"`,`finish_reason=length`,`completion_tokens=1`;
+  - health after bench:`successful_requests=331`,`failed_requests=0`;
+  - server log scan file has `0` lines for panic/error/NaN/`<unk>`/`[PAD]`/
+    invalid UTF/fallback/graph-failed/capture-failed patterns;
+  - server stopped cleanly,Vast shutdown verified
+    `cur_state=stopped actual_status=exited`。
+- Effective server config:
+  - `selected_graph_mode=legacy_batched_decode_graph`;
+  - `selected_kv_layout=paged`;
+  - `selected_attention_impl=legacy_paged_decode`;
+  - `selected_max_sequences=16`,`selected_kv_capacity=512`,
+    `selected_max_batched_tokens=2048`。
+- c16 diagnostic performance:
+  - command shape:`bench-serve --random-input-len 256 --random-output-len 128
+    --concurrency-sweep 16 --num-prompts 100 --n-repeats 3 --fail-on-error
+    --require-ci --seed 9271`;
+  - rc `0`,completed per run `[100,100,100]`,errored per run `[0,0,0]`,
+    output token count source `usage`;
+  - output throughput `287.1167006548677 ± 41.632552793935645 tok/s`;
+  - goodput `2.251751298484382 ± 0.3173552733445153 req/s`;
+  - TTFT p50 `798.304ms`,TPOT p50 `46.950ms`。
+- Interpretation:
+  - previous same-binary default-path c16 was
+    `295.8064415567493 ± 5.210666937312439 tok/s`;
+  - `--batched-graph/default = 0.970624`,so graph replay is not the current
+    W2-P2 throughput lever;
+  - vs direct random-prompt vLLM diagnostic baseline
+    `381.3929242134927 tok/s`,this is `75.2811%`,still below 80%;
+  - remaining bottleneck likely sits in decode cadence, scheduler/admission,
+    or per-token tail work above/beside graph replay。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+- Required next:
+  - stop spending full sweeps on graph toggle;
+  - inspect c16 execution cadence and tail latency with the smallest profiler
+    that does not perturb correctness more than necessary;
+  - consider comparing default vs graph profile traces only if trace overhead is
+    bounded and the hypothesis is specific。
+
 ## 2026-06-16 LXXXVIII — W2 CUDA checkpoint: default paged-unified run/serve correctness passes, c16 still below target
 
 - 本轮 artifact:
