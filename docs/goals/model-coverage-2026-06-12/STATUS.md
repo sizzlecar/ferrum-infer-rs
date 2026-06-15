@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XLV — W2 CUDA checkpoint: Gemma3 unified tail 产品 smoke 通过
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma_unified_tail_cuda_smoke_2026-06-15/`。
+- 复用 Vast/cache-retained native CUDA instance `40826362`,1x RTX 4090。验证结束后
+  已复制 artifact 并停机;`vast_shutdown/cleanup_check.txt` 记录
+  `cur_state=stopped actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA unified-tail product correctness smoke`;
+  - expected runtime/cost:10-25min,hard cap 35min,约 USD 0.425/hr;
+  - stop condition:instance start/SSH/CUDA/source sync/build 首败、`ferrum run`
+    首败、`ferrum serve` smoke 首败、乱码/缺 usage/stream `[DONE]` 等首败,
+    或 smoke PASS 后复制 artifact 并停机;
+  - correctness gate:CUDA release build + `ferrum run` + `scripts/model_coverage_smoke.sh`;
+  - performance command:none;本轮不产出性能结论。
+- Build:
+  - remote HEAD:`ab0dc99cdc71345e236513dbe0300ce52b162416`;
+  - `cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`
+    PASS,`cargo_build.rc=0`;
+  - binary SHA256:
+    `4ebf50b5c64a5f72d929e1aeaefde61b0f1bb9ec6fed9dd0d84596f5b803be89`;
+  - remote git status has only expected artifact noise from rsync artifact exclusion。
+- Product correctness:
+  - `run.status=PASS`;
+  - `ferrum run gemma3:27b-gptq --backend cuda ...` rc `0`;
+  - run validation:assistant content `"5"`,finish_reason `stop`,n_tokens `3`,
+    bad_output `false`;
+  - run stderr contains
+    `Gemma3 family: legacy batched_decode=true varlen_unified=true`;
+  - `scripts/model_coverage_smoke.sh gemma3:27b-gptq --port 8491 --kv-capacity 2560 --max-seqs 2`
+    rc `0`;
+  - serve stdout contains `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`;
+  - serve log contains
+    `Gemma3 family: legacy batched_decode=true varlen_unified=true`;
+  - validation scan did not find `panic`,`CUDA_ERROR`,`<unk>`,or `[PAD]` markers.
+- Interpretation:
+  - Gemma3 unified tail source change is now product-smoke validated on CUDA
+    for both `ferrum run` and `ferrum serve`;
+  - this is still a smoke checkpoint,not full L0-L5 release evidence and not
+    a performance claim;
+  - next high-value correctness/perf checkpoint is a tiny c16 ShareGPT
+    diagnostic with `--fail-on-error`,checking that fresh prefill no longer
+    falls back to serial per-item profiles and measuring the new gap vs vLLM。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-15 XLIV — W2 source checkpoint: Gemma3 unified tail 接入 sandwich/F32 residual 语义
 
 - 本轮没有启动 GPU;在上一个 native CUDA window probe 通过后,继续补
