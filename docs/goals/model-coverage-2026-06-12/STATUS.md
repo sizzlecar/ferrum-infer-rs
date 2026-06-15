@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LVI — W2 source checkpoint: add Gemma3 shadow graph native probe
+
+- 本轮没有启动 GPU,不产生性能结论;这是针对 decode integration/graph
+  瓶颈的源码和诊断工具 checkpoint。
+- 实质定位:
+  - Gemma3 sandwich-norm CUDA 正确性路径依赖 device F32 residual shadow;
+  - legacy batched decode graph 入口当前要求
+    `FERRUM_BATCHED_GRAPH && !host_residual_shadow && !device_residual_shadow`,
+    因此目标 Gemma3 路径即使设置 `FERRUM_BATCHED_GRAPH=1` 也不会进入
+    batched graph replay;
+  - 这解释了为什么继续扫 graph env 开关不能作为有效性能定位手段。
+- 新增最小 native CUDA probe:
+  - `scripts/microbenches/gemma3_shadow_graph_bench.cu`;
+  - `scripts/microbenches/build_and_run_gemma3_shadow_graph_bench.sh`;
+  - probe 模拟 Gemma3-style `62` 层、`batch=16`、device F32 residual
+    shadow update 的 decode step,比较 eager launch 与 graph replay;
+  - 不加载模型,不跑产品 entrypoint,不改变默认产品路径。
+- 本地验证:
+  - `git diff --check -- scripts/microbenches/gemma3_shadow_graph_bench.cu scripts/microbenches/build_and_run_gemma3_shadow_graph_bench.sh scripts/microbenches/README.md` PASS;
+  - `bash -n scripts/microbenches/build_and_run_gemma3_shadow_graph_bench.sh`
+    PASS;
+  - 本地无 `nvcc`,CUDA compile/run 待在已有 1x4090 cache-retained instance 上
+    执行单 probe。
+- 下一步:
+  - 只启动已有 4090 实例跑该 native probe,保存 `VERDICT: Gemma3 shadow graph
+    native CUDA probe complete`、stdout、GPU metadata 和 shutdown 记录;
+  - 若 native graph replay 稳定且有足够 headroom,再设计产品侧 shadow-safe
+    graph eligibility/guard;若不稳定,转向 tail MLP launch/copy fusion,不做
+    产品默认 graph 改动。
+- Release status:
+  - 没有 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍不是 release-grade。
+
 ## 2026-06-15 LV — W2 CUDA checkpoint: prompt-token admission 默认路径正确但不是主瓶颈
 
 - 本轮 artifact:
