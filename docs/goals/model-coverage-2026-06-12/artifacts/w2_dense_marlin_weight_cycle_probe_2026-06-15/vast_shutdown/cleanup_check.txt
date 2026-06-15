@@ -1,0 +1,1 @@
+Vast instance 40826362 stopped: cur_state=stopped actual_status=exited
