@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 struct CudaMarlinRuntimeConfig {
     profile: bool,
     skip_ws_zero: bool,
+    trace_shapes: bool,
+    trace_shapes_max: u64,
 }
 
 impl CudaMarlinRuntimeConfig {
@@ -29,11 +31,19 @@ impl CudaMarlinRuntimeConfig {
         let mut config = Self {
             profile: false,
             skip_ws_zero: false,
+            trace_shapes: false,
+            trace_shapes_max: 256,
         };
         for (name, value) in vars {
             match name.as_ref() {
                 "FERRUM_MARLIN_PROFILE" => config.profile = value.as_ref() == "1",
                 "FERRUM_MARLIN_SKIP_WS_ZERO" => config.skip_ws_zero = value.as_ref() == "1",
+                "FERRUM_MARLIN_TRACE_SHAPES" => config.trace_shapes = value.as_ref() == "1",
+                "FERRUM_MARLIN_TRACE_SHAPES_MAX" => {
+                    if let Ok(max) = value.as_ref().parse::<u64>() {
+                        config.trace_shapes_max = max;
+                    }
+                }
                 _ => {}
             }
         }
@@ -58,6 +68,7 @@ pub static MARLIN_WS_ZERO_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub static MARLIN_WS_ZERO_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MARLIN_KERNEL_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub static MARLIN_KERNEL_CALLS: AtomicU64 = AtomicU64::new(0);
+static MARLIN_TRACE_SHAPE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarlinProfileBucketStats {
@@ -183,6 +194,14 @@ pub fn drain_marlin_profile_by_projection() -> MarlinProfileByProjection {
 
 fn profile_marlin() -> bool {
     cuda_marlin_runtime_config().profile
+}
+
+fn trace_marlin_shapes() -> bool {
+    cuda_marlin_runtime_config().trace_shapes
+}
+
+fn marlin_shape_trace_max() -> u64 {
+    cuda_marlin_runtime_config().trace_shapes_max
 }
 
 // FFI declaration for the Marlin CUDA kernel.
@@ -456,6 +475,32 @@ fn marlin_gemm_chunk(
     let (c_ptr, _c_guard) = output.device_ptr(stream);
     let (s_ptr, _s_guard) = weight.scales.device_ptr(stream);
     let (ws_ptr, _ws_guard) = weight.workspace.device_ptr(stream);
+
+    if trace_marlin_shapes() {
+        let call = MARLIN_TRACE_SHAPE_CALLS.fetch_add(1, Ordering::Relaxed);
+        if call < marlin_shape_trace_max() {
+            let label = super::current_cuda_alloc_label();
+            let bucket = marlin_profile_bucket_from_label(&label);
+            eprintln!(
+                "[marlin-shape-trace] call={} label={} bucket={:?} m={} n={} k={} gs={} qweight_len={} scales_len={} workspace_len={} a=0x{:x} b=0x{:x} c=0x{:x} s=0x{:x} ws=0x{:x}",
+                call,
+                label,
+                bucket,
+                m,
+                n,
+                k,
+                weight.group_size,
+                weight.qweight.len(),
+                weight.scales.len(),
+                weight.workspace.len(),
+                a_ptr,
+                b_ptr,
+                c_ptr,
+                s_ptr,
+                ws_ptr,
+            );
+        }
+    }
 
     if profile {
         stream
@@ -1299,9 +1344,13 @@ mod tests {
         let config = CudaMarlinRuntimeConfig::from_env_vars([
             ("FERRUM_MARLIN_PROFILE", "1"),
             ("FERRUM_MARLIN_SKIP_WS_ZERO", "1"),
+            ("FERRUM_MARLIN_TRACE_SHAPES", "1"),
+            ("FERRUM_MARLIN_TRACE_SHAPES_MAX", "17"),
         ]);
         assert!(config.profile);
         assert!(config.skip_ws_zero);
+        assert!(config.trace_shapes);
+        assert_eq!(config.trace_shapes_max, 17);
     }
 
     #[test]
@@ -1309,9 +1358,13 @@ mod tests {
         let config = CudaMarlinRuntimeConfig::from_env_vars([
             ("FERRUM_MARLIN_PROFILE", "true"),
             ("FERRUM_MARLIN_SKIP_WS_ZERO", "true"),
+            ("FERRUM_MARLIN_TRACE_SHAPES", "true"),
+            ("FERRUM_MARLIN_TRACE_SHAPES_MAX", "not-a-number"),
         ]);
         assert!(!config.profile);
         assert!(!config.skip_ws_zero);
+        assert!(!config.trace_shapes);
+        assert_eq!(config.trace_shapes_max, 256);
     }
 
     #[test]
