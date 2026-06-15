@@ -1,0 +1,169 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_gather_profile_2026-06-16",
+  "breakdown": {
+    "down_pct": {
+      "gather_pct": 9.9438202247191,
+      "kernel_pct": 81.40449438202248,
+      "residual_pct": 3.838951310861423,
+      "ws_pct": 4.812734082397004
+    },
+    "gate_up_pct": {
+      "gather_pct": 3.452966412053992,
+      "kernel_pct": 91.0955320707335,
+      "residual_pct": 2.176415193052213,
+      "ws_pct": 3.275086324160301
+    },
+    "last_calls": {
+      "attn": 62,
+      "marlin_down_gather": 62,
+      "marlin_down_kernel": 62,
+      "marlin_down_ws": 62,
+      "marlin_gate_up_gather": 62,
+      "marlin_gate_up_kernel": 62,
+      "marlin_gate_up_ws": 62,
+      "marlin_gather": 248,
+      "marlin_kernel": 248,
+      "marlin_ws_zero": 248,
+      "matmul": 125,
+      "qkr": 62,
+      "tail_act": 62,
+      "tail_down": 62,
+      "tail_gate_up": 62,
+      "tail_mlp": 124,
+      "tail_resid": 62,
+      "total": 1
+    },
+    "last_line": "[batched-op-profile] m=16 total=30490us  matmul=8077us(125) attn=2742us(62) qkr=683us(62) norm=453us(63) other=1367us(124) tail_norm=691us(62) tail_mlp=14897us(124) tail_gate_up=9557us(62) tail_down=5340us(62) marlin_ws_zero=1140us(248) marlin_gather=1523us(248) marlin_kernel=16548us(248) marlin_qkv_ws=314us(62) marlin_qkv_gather=349us(62) marlin_qkv_kernel=2149us(62) marlin_o_ws=256us(62) marlin_o_gather=313us(62) marlin_o_kernel=1346us(62) marlin_gate_up_ws=313us(62) marlin_gate_up_gather=330us(62) marlin_gate_up_kernel=8706us(62) marlin_down_ws=257us(62) marlin_down_gather=531us(62) marlin_down_kernel=4347us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) tail_act=435us(62) tail_resid=499us(62)  unwrapped=646us",
+    "last_line_number": 692,
+    "last_us": {
+      "attn": 2742,
+      "marlin_down_gather": 531,
+      "marlin_down_kernel": 4347,
+      "marlin_down_ws": 257,
+      "marlin_gate_up_gather": 330,
+      "marlin_gate_up_kernel": 8706,
+      "marlin_gate_up_ws": 313,
+      "marlin_gather": 1523,
+      "marlin_kernel": 16548,
+      "marlin_ws_zero": 1140,
+      "matmul": 8077,
+      "qkr": 683,
+      "tail_act": 435,
+      "tail_down": 5340,
+      "tail_gate_up": 9557,
+      "tail_mlp": 14897,
+      "tail_resid": 499,
+      "total": 30490
+    },
+    "mlp_parts_us": {
+      "down_gather_us": 531,
+      "down_kernel_us": 4347,
+      "down_residual_us": 205,
+      "down_ws_us": 257,
+      "gate_down_gather_us": 861,
+      "gate_down_kernel_us": 13053,
+      "gate_down_residual_us": 413,
+      "gate_down_ws_us": 570,
+      "gate_up_gather_us": 330,
+      "gate_up_kernel_us": 8706,
+      "gate_up_residual_us": 208,
+      "gate_up_ws_us": 313,
+      "tail_act_us": 435,
+      "tail_resid_us": 499
+    },
+    "tail_mlp_pct": {
+      "gate_down_gather_of_tail_mlp_pct": 5.77968718533933,
+      "gate_down_kernel_of_tail_mlp_pct": 87.62166879237431,
+      "gate_down_residual_of_tail_mlp_pct": 2.7723702758944753,
+      "gate_down_ws_of_tail_mlp_pct": 3.826273746391891,
+      "tail_mlp_of_total_pct": 48.8586421777632
+    }
+  },
+  "diagnostic_not_release_evidence": true,
+  "finding": {
+    "bottleneck": "Dense GPTQ tail MLP Marlin kernel time dominates; desc_act gather is measurable but not the main bottleneck.",
+    "evidence": "Last steady-state c16 profile has gate_up gather 330us vs kernel 8706us, down gather 531us vs kernel 4347us, and gate+down gather is about 5.8% of tail_mlp while gate+down kernels are about 87.6% of tail_mlp.",
+    "next_lever": "Use native CUDA microbench/kernel-level comparison for Gemma3 GPTQ tail MLP shapes instead of tuning outer gather or workspace zeroing first."
+  },
+  "m_values": [
+    9,
+    10,
+    15,
+    16
+  ],
+  "means": {
+    "attn": {
+      "mean_calls": 62.0,
+      "mean_us": 2288.190476190476
+    },
+    "marlin_down_gather": {
+      "mean_calls": 62.0,
+      "mean_us": 502.6507936507937
+    },
+    "marlin_down_kernel": {
+      "mean_calls": 62.0,
+      "mean_us": 4348.309523809524
+    },
+    "marlin_down_ws": {
+      "mean_calls": 62.0,
+      "mean_us": 257.3095238095238
+    },
+    "marlin_gate_up_gather": {
+      "mean_calls": 62.0,
+      "mean_us": 336.93650793650795
+    },
+    "marlin_gate_up_kernel": {
+      "mean_calls": 62.0,
+      "mean_us": 8642.047619047618
+    },
+    "marlin_gate_up_ws": {
+      "mean_calls": 62.0,
+      "mean_us": 313.58730158730157
+    },
+    "marlin_gather": {
+      "mean_calls": 248.0,
+      "mean_us": 1473.595238095238
+    },
+    "marlin_kernel": {
+      "mean_calls": 248.0,
+      "mean_us": 16448.97619047619
+    },
+    "marlin_ws_zero": {
+      "mean_calls": 248.0,
+      "mean_us": 1118.111111111111
+    },
+    "matmul": {
+      "mean_calls": 125.0,
+      "mean_us": 7992.746031746032
+    },
+    "qkr": {
+      "mean_calls": 62.0,
+      "mean_us": 686.4920634920635
+    },
+    "tail_act": {
+      "mean_calls": 62.0,
+      "mean_us": 405.25396825396825
+    },
+    "tail_down": {
+      "mean_calls": 62.0,
+      "mean_us": 5309.3015873015875
+    },
+    "tail_gate_up": {
+      "mean_calls": 62.0,
+      "mean_us": 9492.34126984127
+    },
+    "tail_mlp": {
+      "mean_calls": 124.0,
+      "mean_us": 14801.642857142857
+    },
+    "tail_resid": {
+      "mean_calls": 62.0,
+      "mean_us": 496.12698412698415
+    },
+    "total": {
+      "mean_calls": 1.0,
+      "mean_us": 29837.396825396827
+    }
+  },
+  "profile_line_count": 126
+}
