@@ -2,6 +2,42 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XL — W2 source trace:Gemma3 prefill 是 serial fallback,不是 unified cohort prefill
+
+- 本轮没有再开 GPU;基于已提交 artifact
+  `w2_prefill_bucket_profile_2026-06-15/` 和源码追踪完成定位。
+- Evidence:
+  - artifact 中 26 个 ShareGPT 测量请求对应 26 条
+    `[prefill-profile] tokens=122` row;如果 cohort prefill 真实合批,不应表现为
+    每个请求一条 `prefill_internal` profile;
+  - `LlamaFamilyModel::load` 对 sandwich-norm families(Gemma 3)设置
+    `supports_varlen_qkv = B::supports_varlen_qkv() && !cfg.sandwich_norms`,
+    并记录 `Gemma3 family: legacy batched_decode=... varlen_unified=false`;
+  - `LlamaFamilyModel::unified_forward` 在 `!supports_varlen_qkv` 时返回
+    `Unsupported`,原因是 Gemma3 unified/paged attention 尚未支持 per-layer
+    local/global window semantics;
+  - `LlmExecutor::batch_prefill` 在 `model.unified_forward(...)` 返回
+    `Unsupported` 后,在同一个 model lock 下循环 `model.prefill(cid,toks)`,
+    即 serial prefill fallback。
+- Interpretation:
+  - c16 TTFT p50 约 `0.9s` 与单个 122-token prefill 约 `84ms`
+    一致:初始 cohort 大概率被 serial full-prefill 队列放大;
+  - 这比单个 Marlin GEMM 微优化更能解释 Ferrum vs vLLM 的 14-15 percentage
+    points 缺口;
+  - `tail_mlp`/`flash_attn` 仍是单次 prefill 的局部热区,但高杠杆方向是
+    Gemma3 unified/batched prefill 或等价 cohort prefill path,而不是继续扫
+    `FERRUM_MARLIN_SKIP_WS_ZERO` 这类历史上已显示收益接近 0 的开关。
+- Next implementation direction:
+  - 不直接打开现有 `supports_varlen_qkv` guard;该 guard 保护 Gemma3 的 sandwich
+    norms、dual rope、per-layer local/global attention correctness;
+  - 先做一个小型设计/代码切点:复用 Llama unified scaffolding,给 Gemma3 增加
+    explicit unsupported reason/profile 或受测的 narrow cohort-prefill path;
+  - 任何真正启用 Gemma3 unified prefill 的改动都必须先过 Paris/chat smoke,
+    再跑 native CUDA c16 最小验证。
+- Release-grade status:
+  - 没有 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍未达到 release-grade。
+
 ## 2026-06-15 XXXIX — W2 prefill bucket profile: profiler 修复有效,瓶颈落在 tail MLP + prefill attention
 
 - 本轮 artifact:
