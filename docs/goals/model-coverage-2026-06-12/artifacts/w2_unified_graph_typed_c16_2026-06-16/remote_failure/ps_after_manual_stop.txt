@@ -1,0 +1,12 @@
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.0   2884   964 ?        Ss   22:27   0:00 /bin/sh -c while [ ! -e /.launch ]; do sleep 1; done; bash /.launch
+root          44  0.0  0.0   4356  3396 ?        S    22:27   0:00 bash /.launch
+root          52  0.0  0.0   4356  1552 ?        S    22:27   0:00 bash /.launch
+root          55  0.0  0.0   4356  3280 ?        S    22:27   0:00 bash /root/onstart.sh
+root          56  0.0  0.0   2788  1004 ?        S    22:27   0:00 tee -a /var/log/onstart.log
+root          59  0.0  0.0  15432  5452 ?        Ss   22:27   0:00 sshd: /usr/sbin/sshd -E /proc/1/fd/1 [listener] 0 of 10-100 startups
+root          65  0.0  0.0  11960  8796 ?        S    22:27   0:00 ssh -i /etc/forward_key -R *:26362:localhost:22 -R *:26363:localhost:8080 -N -o TCPKeepAlive=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 ubuntu@ssh9.vast.ai -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o RequestTTY=no -o ExitOnForwardFailure=yes
+root         329  0.0  0.0   2784  1012 ?        S    22:27   0:00 sleep infinity
+root         980  0.5  0.0  16680 10676 ?        Ss   22:39   0:00 sshd: root@notty
+root         991  0.0  0.0   4776  3320 ?        Ss   22:39   0:00 bash -c  set +e OUT=/workspace/w2_unified_graph_typed_c16_2026-06-16 mkdir -p "$OUT/remote_failure" "$OUT/remote" echo "FAIL_UNIFIED_GRAPH_CUDA_ILLEGAL_ADDRESS" > "$OUT/run.status" echo "143" > "$OUT/run_remote.rc" date -u +%FT%TZ > "$OUT/remote/end_utc.txt" ps auxww > "$OUT/remote_failure/ps_after_manual_stop.txt" nvidia-smi > "$OUT/remote_failure/nvidia_smi_after_manual_stop.txt" 2>&1 cat > "$OUT/summary.json" <<JSON {   "status": "FAIL",   "release_grade": false,   "lane": "W2 Gemma3-27B CUDA typed unified graph c16 diagnostic",   "failure": "CUDA_ERROR_ILLEGAL_ADDRESS during unified graph replay in c16 bench",   "run_validation": "$(cat "$OUT/correctness/run_validation.txt" 2>/dev/null)",   "serve_validation": "$(cat "$OUT/correctness/serve_chat_validation.txt" 2>/dev/null)",   "run_remote_rc": 143,   "pass_line": null } JSON
+root         994  0.0  0.0   7476  3204 ?        R    22:39   0:00 ps auxww

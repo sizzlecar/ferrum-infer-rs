@@ -1,0 +1,40 @@
+    PID ELAPSED %CPU %MEM CMD
+    474     468  0.0  0.0 bash /workspace/w2_unified_graph_typed_c16_2026-06-16/run_remote_unified_graph_c16.sh
+800 target/release/ferrum serve --model gemma3:27b-gptq --backend cuda --host 127.0.0.1 --port 18123 --kv-capacity 512 --max-num-seqs 16 --max-num-batched-tokens 2048 --unified-graph --effective-config-json /workspace/w2_unified_graph_typed_c16_2026-06-16/server/serve_effective_config.json --decision-trace-jsonl /workspace/w2_unified_graph_typed_c16_2026-06-16/server/serve_decision_trace.jsonl
+884 target/release/ferrum bench-serve --base-url http://127.0.0.1:18123 --model gemma3:27b-gptq --tokenizer /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 --dataset sharegpt --sharegpt-path /workspace/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl --random-output-len 64 --concurrency 16 --num-prompts 16 --n-repeats 3 --fail-on-error --require-ci --seed 9271 --out /workspace/w2_unified_graph_typed_c16_2026-06-16/bench/bench_sharegpt_c16.json
+928 bash -c  set +e OUT=/workspace/w2_unified_graph_typed_c16_2026-06-16 ps -o pid,etimes,pcpu,pmem,cmd -p $(cat "$OUT/remote_runner.pid" 2>/dev/null) 2>/dev/null || true pgrep -af "ferrum serve|bench-serve" | head -40 || true echo "--- rc"; cat "$OUT/run_remote.rc" 2>/dev/null || true echo "--- bench stderr"; tail -160 "$OUT/bench/bench_sharegpt_c16.stderr" 2>/dev/null || true echo "--- bench stdout"; tail -80 "$OUT/bench/bench_sharegpt_c16.stdout" 2>/dev/null || true echo "--- summary"; cat "$OUT/summary.json" 2>/dev/null || true echo "--- server log tail"; tail -80 "$OUT/server/server.log" 2>/dev/null || true
+--- rc
+--- bench stderr
+ferrum bench-serve — dataset=sharegpt num_prompts=16 warmup=10 n_repeats=3
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/3 (26 prompts including 10 warmup)
+    16 completed / 0 errored / 3.1s
+  cell closed_loop c=16 — repeat 2/3 (26 prompts including 10 warmup)
+    16 completed / 0 errored / 3.1s
+  cell closed_loop c=16 — repeat 3/3 (26 prompts including 10 warmup)
+--- bench stdout
+--- summary
+--- server log tail
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 3.9 GB → max_blocks=512
+[auto-size] requested runtime floor requires KV_MAX_BLOCKS=512 above estimated budget 338; honoring explicit runtime limits
+[auto-size] KV_MAX_BLOCKS=512 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+[2m2026-06-15T22:35:19.932281Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-15T22:35:19.932307Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-15T22:35:19.932364Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-15T22:35:20.979420Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-15T22:35:20.979459Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-15T22:35:20.979463Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-15T22:35:20.979628Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=512
+[2m2026-06-15T22:35:20.979802Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-15T22:35:20.979932Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-15T22:35:21.172869Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-15T22:35:21.172958Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-15T22:35:21.172966Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-15T22:35:21.172975Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-15T22:36:10.514810Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+[2m2026-06-15T22:36:15.061013Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m Gemma3 family: legacy batched_decode=true varlen_unified=true
+[unified-graph] replay err: Unsupported operation: post-launch sync: CUDA_ERROR_ILLEGAL_ADDRESS
+
+thread 'tokio-runtime-worker' (804) panicked at crates/ferrum-kernels/src/backend/cuda/mod.rs:521:33:
+CudaBackend: load_function(rms_norm_f32_to_f16): DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, "an illegal memory access was encountered")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

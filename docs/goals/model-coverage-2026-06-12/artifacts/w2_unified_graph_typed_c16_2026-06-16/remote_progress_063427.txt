@@ -1,0 +1,27 @@
+    PID ELAPSED %CPU %MEM CMD
+    474     220  0.0  0.0 bash /workspace/w2_unified_graph_typed_c16_2026-06-16/run_remote_unified_graph_c16.sh
+753 timeout 1200 target/release/ferrum run gemma3:27b-gptq --backend cuda --prompt What is 2+3? Answer with just the number. --max-tokens 64 --temperature 0 --kv-capacity 2560 --max-num-seqs 2 --unified-graph --output-format jsonl --effective-config-json /workspace/w2_unified_graph_typed_c16_2026-06-16/correctness/run_effective_config.json --decision-trace-jsonl /workspace/w2_unified_graph_typed_c16_2026-06-16/correctness/run_decision_trace.jsonl
+754 target/release/ferrum run gemma3:27b-gptq --backend cuda --prompt What is 2+3? Answer with just the number. --max-tokens 64 --temperature 0 --kv-capacity 2560 --max-num-seqs 2 --unified-graph --output-format jsonl --effective-config-json /workspace/w2_unified_graph_typed_c16_2026-06-16/correctness/run_effective_config.json --decision-trace-jsonl /workspace/w2_unified_graph_typed_c16_2026-06-16/correctness/run_decision_trace.jsonl
+780 bash -c  set +e OUT=/workspace/w2_unified_graph_typed_c16_2026-06-16 ps -o pid,etimes,pcpu,pmem,cmd -p $(cat "$OUT/remote_runner.pid" 2>/dev/null) 2>/dev/null || true pgrep -af "cargo|rustc|cc1plus|nvcc|ferrum run|ferrum serve|bench-serve" | head -40 || true echo "--- rc"; cat "$OUT/run_remote.rc" 2>/dev/null || true echo "--- build sha"; cat "$OUT/build/ferrum.sha256" 2>/dev/null || true echo "--- build stderr tail"; tail -120 "$OUT/build/release_build.stderr" 2>/dev/null || true echo "--- run validation"; cat "$OUT/correctness/run_validation.txt" 2>/dev/null || true echo "--- serve validation"; cat "$OUT/correctness/serve_chat_validation.txt" 2>/dev/null || true echo "--- bench stderr"; tail -80 "$OUT/bench/bench_sharegpt_c16.stderr" 2>/dev/null || true echo "--- summary"; cat "$OUT/summary.json" 2>/dev/null || true
+--- rc
+--- build sha
+05f18a4cd8d8f34530758584122afad9e12f0bb929b450fc283449bb7d3180bd  target/release/ferrum
+--- build stderr tail
+   Compiling ferrum-types v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-types)
+   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-interfaces)
+   Compiling ferrum-bench-core v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-bench-core)
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)
+   Compiling ferrum-scheduler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-scheduler)
+   Compiling ferrum-kv v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kv)
+   Compiling ferrum-sampler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-sampler)
+   Compiling ferrum-tokenizer v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-tokenizer)
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 3m 33s
+--- run validation
+--- serve validation
+--- bench stderr
+--- summary

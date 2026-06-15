@@ -1,0 +1,7 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=16 warmup=10 n_repeats=3
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/3 (26 prompts including 10 warmup)
+    16 completed / 0 errored / 3.1s
+  cell closed_loop c=16 — repeat 2/3 (26 prompts including 10 warmup)
+    16 completed / 0 errored / 3.1s
+  cell closed_loop c=16 — repeat 3/3 (26 prompts including 10 warmup)
