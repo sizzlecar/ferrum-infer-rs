@@ -2,6 +2,28 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XO — W2 source checkpoint: native multi-layer L2 persistence cycle probe
+
+- Added `scripts/microbenches/gemma3_down_l2_persist_cycle_perf.cu` plus
+  `scripts/microbenches/build_and_run_gemma3_down_l2_persist_cycle_perf.sh`.
+- Purpose:
+  - XN proved stream access-policy can keep a single layer's down qweight hot
+    across that same layer's `gate_up -> GeGLU` producer;
+  - product decode revisits one layer only after many other layer weights run,
+    so the single-layer loop may overstate productizable benefit;
+  - this probe allocates 8 synthetic Gemma3 layer weight sets and compares
+    single-layer no-policy/persist against 8-layer no-policy/persist and an
+    explicit down-warm upper bound.
+- Expected GPU use:
+  - run one native CUDA validation before productizing L2 policy;
+  - if 8-layer persist does not improve over no-policy, reject simple per-layer
+    access-policy as insufficient for product performance;
+  - if 8-layer persist still helps materially, implement a typed product
+    policy and validate `ferrum run` / `ferrum serve` correctness before any
+    endpoint performance claim.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XN — W2 native CUDA checkpoint: down qweight L2 persistence restores post-gate_up down speed
 
 - Artifact:
