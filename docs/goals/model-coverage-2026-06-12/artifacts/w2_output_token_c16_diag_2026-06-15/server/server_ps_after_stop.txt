@@ -1,0 +1,1 @@
+836 bash -c ART=/workspace/w2_output_token_c16_diag_2026-06-15; pgrep -af "target/release/ferrum serve --model" > "$ART/server/server_ps_after_stop.txt" || true; echo OK

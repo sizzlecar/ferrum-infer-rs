@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LXI — W2 CUDA checkpoint: c16 output-token/batch-shape diagnostic narrows remaining bottleneck
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_output_token_c16_diag_2026-06-15/`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 c16 output-token/batch-shape diagnostic`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:10-20min,hard cap 30min;
+  - stop condition:启动/SSH/build/server/smoke/bench 首败,或 c16 诊断完成后
+    复制 artifact 并停机;
+  - correctness gate:CUDA release build,`ferrum serve` ready,chat smoke,
+    `bench-serve --fail-on-error` 零错误;
+  - performance command:diagnostic-only c16
+    `bench-serve --fail-on-error --seed 9271 --num-prompts 16 --random-input-len 32 --random-output-len 32`,
+    `n_repeats=1`,no CI/no `--require-ci`。
+- Execution evidence:
+  - remote HEAD:`25c32dac9305eb62acd733bd491b2d1294a3ba64`;
+  - non-artifact source status clean;
+  - CUDA release build rc `0`,binary SHA256:
+    `a7f561a5f49a6858e8a63040a595143395f369ab7da1a5983d94927469b3861a`;
+  - chat smoke content `5`,usage completion_tokens `3`;
+  - bench rc `0`,`completed=[16]`,`errored=[0]`,
+    `output_token_count_source=usage`;
+  - new `output_tokens_per_request`:
+    `[[32,32,32,28,32,32,32,32,32,30,32,32,32,32,32,32]]`;
+  - c16 diagnostic throughput `363.087 tok/s`,TTFT p50 `496.040ms`,
+    TPOT p50 `27.226ms`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Interpretation:
+  - short outputs are only `6` tokens below the `16*32=512` cap,so early stop
+    cannot explain the remaining W2 performance gap;
+  - first batched decode trace saw `m=13`,but the main captured/replayed graph
+    was `m=16 m_padded=16`;the previous `m=15` graph capture is not a stable
+    sustained-decode bottleneck;
+  - drain shape captured at `m=3 m_padded=4`,consistent with the two shorter
+    requests finishing before the rest;
+  - remaining high-probability bottleneck is still decode integration/host
+    scheduling + tail MLP/Marlin projection/weight-residency,not graph replay
+    absence,not stable c16 underfill,not output-token early stop。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-15 LX — W2 source checkpoint: bench-serve records per-request output token counts
 
 - 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成

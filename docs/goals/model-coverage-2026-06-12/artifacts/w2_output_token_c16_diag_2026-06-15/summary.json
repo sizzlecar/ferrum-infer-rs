@@ -1,0 +1,44 @@
+{
+  "remote_head": "25c32dac9305eb62acd733bd491b2d1294a3ba64",
+  "binary_sha256": "a7f561a5f49a6858e8a63040a595143395f369ab7da1a5983d94927469b3861a  target/release/ferrum",
+  "bench_rc": "0",
+  "completed_per_run": [
+    16
+  ],
+  "errored_per_run": [
+    0
+  ],
+  "output_tokens_per_request": [
+    [
+      32,
+      32,
+      32,
+      28,
+      32,
+      32,
+      32,
+      32,
+      32,
+      30,
+      32,
+      32,
+      32,
+      32,
+      32,
+      32
+    ]
+  ],
+  "output_token_count_source": "usage",
+  "output_throughput_tps_mean": 363.0868797206277,
+  "ttft_p50_ms": 496.0399835,
+  "tpot_p50_ms": 27.226174516129035,
+  "graph_lines": [
+    "[batched-graph-capture] key=4611686018427387920 m=16 m_padded=16 device_shadow=true",
+    "[batched-graph-replay] origin=post_capture count=1 key=4611686018427387920 m=16 m_padded=16 device_shadow=true",
+    "[batched-graph-replay] origin=pure count=2 key=4611686018427387920 m=16 m_padded=16 device_shadow=true",
+    "[batched-graph-replay] origin=pure count=4 key=4611686018427387920 m=16 m_padded=16 device_shadow=true",
+    "[batched-graph-replay] origin=pure count=8 key=4611686018427387920 m=16 m_padded=16 device_shadow=true",
+    "[batched-graph-replay] origin=pure count=16 key=4611686018427387920 m=16 m_padded=16 device_shadow=true",
+    "[batched-graph-capture] key=4611686018427387908 m=3 m_padded=4 device_shadow=true"
+  ]
+}

@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=random num_prompts=16 warmup=0 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (16 prompts including 0 warmup)
+    16 completed / 0 errored / 1.4s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=496.0  p95=651.8  p99=651.9
+      TPOT_ms  p50=27.2  p95=27.5  p99=27.7
+      ITL_ms   p50=23.5  p95=29.6  p99=131.3
+      throughput      363.1 tok/s
+      goodput         11.48 req/s
+
+→ wrote /workspace/w2_output_token_c16_diag_2026-06-15/bench/bench_c16.json

@@ -1,0 +1,7 @@
+21:[batched-graph-capture] key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+22:[batched-graph-replay] origin=post_capture count=1 key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+23:[batched-graph-replay] origin=pure count=2 key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+24:[batched-graph-replay] origin=pure count=4 key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+25:[batched-graph-replay] origin=pure count=8 key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+26:[batched-graph-replay] origin=pure count=16 key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+27:[batched-graph-capture] key=4611686018427387908 m=3 m_padded=4 device_shadow=true
