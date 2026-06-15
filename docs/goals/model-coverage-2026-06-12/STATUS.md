@@ -2,6 +2,46 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXVII — W2 source checkpoint: expose unified_decode fallback reason
+
+- 本轮没有启动 GPU,不产生性能结论,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - `LlmExecutor::unified_decode` 在现有 typed profiler 开关
+    `FERRUM_BATCH_PREFILL_PROF` / `FERRUM_BATCH_DECODE_PROF` 下新增
+    `[unified-decode]` 结构化日志;
+  - 日志记录 `items`、`prefill`、`decode`、`total_q`、
+    `attempted_unified`、`fallback`、`fallback_reason` 和 elapsed time;
+  - full-logits 不可用时稳定输出
+    `fallback_reason=requires_full_logits_unavailable`;
+  - `model.unified_forward` 返回 Unsupported 时复用既有短码分类,例如
+    `unified_varlen_qkv_disabled`、`sandwich_f32_shadow_required`、
+    `paged_kv_required`、`active_lora_adapter`。
+- Why:
+  - LXXVI 证明 full-logits guard 修复只带来约 `+4.7%`,并且
+    `prefill-profile tokens=122` 仍重复出现,说明 Gemma3 c16 prefill cohort
+    仍在 `unified_decode` 内部回落到 serial prefill;
+  - 继续做 full c16 sweep 前,需要一次最小 CUDA 验证直接读出 fallback reason,
+    避免继续猜测瓶颈。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models unified_decode_prof_logs_prefill_fallback_and_sampled_decode -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models llm_executor -- --nocapture` PASS
+    (13 tests);
+  - `git diff --check -- crates/ferrum-models/src/executor/llm_executor.rs`
+    PASS。
+- Required next CUDA validation:
+  - reuse cached 4090 lane,run minimal serve/chat+c16 diagnostic with profiler on;
+  - target evidence is the first `[unified-decode]` prefill line and its
+    `fallback_reason`,not a repeated full performance sweep;
+  - if it reports a source guard such as `unified_varlen_qkv_disabled` or
+    `sandwich_f32_shadow_required`,fix that exact guard before measuring again。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXVI — W2 CUDA checkpoint: full-logits unified prefill fix is insufficient
 
 - 本轮 artifact:

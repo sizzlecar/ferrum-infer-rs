@@ -141,6 +141,15 @@ fn unified_fallback_reason_code(message: &str) -> &'static str {
     }
 }
 
+fn should_log_unified_decode_prof(call: u64, prefill_items: usize, fallback: bool) -> bool {
+    fallback || prefill_items > 0 || call < 8 || call.is_multiple_of(32)
+}
+
+fn next_unified_decode_prof_call() -> u64 {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    CALLS.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Map a `ferrum_types::Device` to the matching `candle_core::Device`.
 /// Used when materialising KV cache handles so downstream readers see
 /// the real backend the model runs on (Metal / CUDA / CPU) rather than
@@ -821,6 +830,16 @@ impl ModelExecutor for LlmExecutor {
         if batch.items.is_empty() {
             return Ok(results);
         }
+        let env = llm_executor_runtime_env();
+        let prof = env.batch_prefill_prof || env.batch_decode_prof;
+        let prof_t0 = prof.then(std::time::Instant::now);
+        let total_q: usize = batch.items.iter().map(|item| item.q_tokens.len()).sum();
+        let profile_decode_items = batch
+            .items
+            .iter()
+            .filter(|item| item.q_tokens.len() == 1 && item.is_final_chunk)
+            .count();
+        let profile_prefill_items = batch.items.len().saturating_sub(profile_decode_items);
 
         // ── Real unified path (Step 5b+): if the model implements
         // `DecoderOnlyLLM::unified_forward`, route the entire batch
@@ -844,6 +863,8 @@ impl ModelExecutor for LlmExecutor {
             .items
             .iter()
             .any(|item| metadata_requires_full_logits(&item.metadata));
+        let mut attempted_unified = false;
+        let mut fallback_reason = "none";
         {
             let model_result = {
                 let mut model = self.lock_model();
@@ -859,8 +880,10 @@ impl ModelExecutor for LlmExecutor {
                     }
                 }
                 if force_full_logits && !model.unified_forward_can_return_full_logits() {
+                    fallback_reason = "requires_full_logits_unavailable";
                     None
                 } else {
+                    attempted_unified = true;
                     Some(model.unified_forward(&unified_items))
                 }
             };
@@ -874,9 +897,25 @@ impl ModelExecutor for LlmExecutor {
                                 batch.items.len(),
                             )));
                         }
+                        if let Some(t0) = prof_t0 {
+                            let n = next_unified_decode_prof_call();
+                            if should_log_unified_decode_prof(n, profile_prefill_items, false) {
+                                eprintln!(
+                                    "[unified-decode] call#{} items={} prefill={} decode={} total_q={} attempted_unified={} fallback=false fallback_reason=none elapsed={}us",
+                                    n,
+                                    batch.items.len(),
+                                    profile_prefill_items,
+                                    profile_decode_items,
+                                    total_q,
+                                    attempted_unified,
+                                    t0.elapsed().as_micros()
+                                );
+                            }
+                        }
                         return Ok(per_item);
                     }
-                    Err(FerrumError::Unsupported { .. }) => {
+                    Err(FerrumError::Unsupported { message }) => {
+                        fallback_reason = unified_fallback_reason_code(&message);
                         // Fall through to the dispatch fallback below.
                     }
                     Err(e) => return Err(e),
@@ -958,6 +997,22 @@ impl ModelExecutor for LlmExecutor {
             }
         }
 
+        if let Some(t0) = prof_t0 {
+            let n = next_unified_decode_prof_call();
+            if should_log_unified_decode_prof(n, profile_prefill_items, true) {
+                eprintln!(
+                    "[unified-decode] call#{} items={} prefill={} decode={} total_q={} attempted_unified={} fallback=true fallback_reason={} elapsed={}us",
+                    n,
+                    batch.items.len(),
+                    profile_prefill_items,
+                    profile_decode_items,
+                    total_q,
+                    attempted_unified,
+                    fallback_reason,
+                    t0.elapsed().as_micros()
+                );
+            }
+        }
         Ok(results)
     }
 
@@ -1251,6 +1306,15 @@ mod tests {
             unified_fallback_reason_code("unrecognized model-specific reason"),
             "unified_unsupported"
         );
+    }
+
+    #[test]
+    fn unified_decode_prof_logs_prefill_fallback_and_sampled_decode() {
+        assert!(should_log_unified_decode_prof(100, 1, false));
+        assert!(should_log_unified_decode_prof(100, 0, true));
+        assert!(should_log_unified_decode_prof(0, 0, false));
+        assert!(should_log_unified_decode_prof(32, 0, false));
+        assert!(!should_log_unified_decode_prof(31, 0, false));
     }
 
     #[test]
