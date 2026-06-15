@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXXVI — W2 CUDA diagnostic: embed-scale fix restores first-token correctness
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_unified_embed_scale_fix_cuda_smoke_2026-06-16/`。
+- Source checkpoint:
+  `fb6789c7f99cc08f05842503846ea42af2be842d` plus a remote-only
+  diagnostic patch that temporarily allowed paged KV for windowed Gemma3 when
+  CUDA supports varlen QKV。默认 checked-in guard 仍未放开。
+- GPU 执行合同:
+  - lane:`W2 paged-unified embed-scale fix product smoke`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - stop condition:启动/SSH/source sync/diagnostic guard patch/build/serve/chat
+    任一失败,或 fixed-path `[unified-logits]` 与 response evidence collected
+    后停机;
+  - correctness command:`ferrum serve` + one non-stream chat request with
+    `max_tokens=1`;
+  - performance command:none。
+- Execution evidence:
+  - CUDA release build rc `0`;
+  - binary SHA256
+    `e131ce885efb3f8aeb6049a9181f646638c4c8f81d0c993cfb33da29a4d7bc65`;
+  - response content `"5"`,`finish_reason=length`,`completion_tokens=1`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`;
+  - `nvidia_smi_after_stop.txt` shows no running GPU processes。
+- Key result:
+  - `[unified-decode] call#0 items=1 prefill=1 decode=0 total_q=23
+    attempted_unified=true fallback=false fallback_reason=none elapsed=141708us`;
+  - `[unified-logits] call#0 row=0 orig_idx=0 global=22 finite=262208
+    nan=0 pos_inf=0 neg_inf=0
+    top=[236810:42.031250,239374:20.453125,247918:20.453125,239341:20.187500,242323:20.015625]`。
+- Interpretation:
+  - LXXXIV 的 pre-fix 同形状 smoke 首 token 直接 EOS/stop;本轮同形状
+    smoke 返回 expected first token `"5"`;
+  - logits row 仍全 finite,且 EOS token id `106` 不再是 top-1;
+  - 这证明 `unified_forward_internal` 漏乘 Gemma3 `embed_scale` 是一个真实
+    paged-unified 正确性 bug,不是单纯性能测量噪声。
+- Release-grade status:
+  - 这是 diagnostic evidence,不是 release evidence,因为远端用了临时
+    paged-KV guard override;
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+- Required next:
+  - 将 paged-KV guard 放开逻辑以源码形式提交并更新单测;
+  - 之后不用远端 dirty patch,按默认产品路径最小验证 `ferrum run` 和
+    `ferrum serve`;
+  - 默认路径 correctness 过之前不跑 c16/c32 performance。
+
 ## 2026-06-16 LXXXV — W2 source checkpoint: apply Gemma embed scale in unified forward
 
 - 本轮源码修复:
