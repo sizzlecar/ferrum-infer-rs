@@ -1,0 +1,36 @@
+2026-06-15T04:52:09Z
+NVIDIA GeForce RTX 4090, 24564 MiB, 1 MiB, 565.77
+Build cuda_12.4.r12.4/compiler.34097967_0
+c51002b793f00c8345e160b99b6b74217ca273d9
+ M crates/ferrum-types/src/auto_config.rs
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/full/nvidia_smi_after_bench.txt
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/full/server.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/full/server.pid
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/nohup.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/nohup.pid
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/nvidia_smi_before.txt
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/model_release_grade_goal_gate.manifest.json
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/perf_llamacpp/llama_bench_build_sm89_20260614.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/perf_llamacpp/llama_bench_config_sm89_20260614.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/perf_llamacpp/llamacpp_tg128.err
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/perf_llamacpp/nvidia_smi_after.txt
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/perf_llamacpp/nvidia_smi_before.txt
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/probe/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission_cap_diagnostics_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_alloc_diag_oom_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_kv384_context_fail_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_kv_allocator_diagnostics_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_kv_hint_diagnostics_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_lazy_scratch_oom_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_prompt_exact_oom_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c4_ci_pregate_2026-06-15/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_decode_batch_stats_probe_2026-06-15/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_desc_act_cuda_parity_2026-06-13/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_ferrum_natural_prompt_diag_2026-06-15/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_failure_2026-06-13/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/diagnostics/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/serve_l5_gemma3-27b-gptq_1416.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/serve_l5_gemma3-27b-gptq_32.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/serve_smoke_gemma3-27b-gptq.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/w2_gate_20260613_154658.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/w2_gate_20260613_154658.rc
