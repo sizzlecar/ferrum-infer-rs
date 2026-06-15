@@ -302,6 +302,14 @@ pub struct RunCommand {
     #[arg(long, conflicts_with = "batched_graph")]
     pub disable_batched_graph: bool,
 
+    /// Enable Llama/Gemma unified decode CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_unified_graph")]
+    pub unified_graph: bool,
+
+    /// Disable Llama/Gemma unified decode CUDA graph replay.
+    #[arg(long, conflicts_with = "unified_graph")]
+    pub disable_unified_graph: bool,
+
     /// KV cache element dtype (Dim 5 polymorphism point). Accepts
     /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
     /// require model wire-up; today only the kernel + type layer ships.
@@ -1711,6 +1719,13 @@ fn run_startup_cli_runtime_entries(
             RuntimeConfigSource::Cli,
         ));
     }
+    if let Some(enabled) = bool_cli_override(cmd.unified_graph, cmd.disable_unified_graph) {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
     crate::layer_split_pipeline::push_cli_runtime_entry(
         &mut entries,
         cmd.layer_split_pipeline_mode,
@@ -1838,6 +1853,8 @@ mod tests {
             max_num_batched_tokens: None,
             batched_graph: false,
             disable_batched_graph: false,
+            unified_graph: false,
+            disable_unified_graph: false,
             kv_dtype: None,
             kv_capacity: None,
             kv_max_blocks: None,
@@ -1897,15 +1914,26 @@ mod tests {
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let mut cmd = test_run_cmd();
         cmd.batched_graph = true;
+        cmd.unified_graph = true;
         let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
         let effective = run_effective_runtime_config(&snapshot, &cli_entries);
-        let entry = effective
-            .entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_BATCHED_GRAPH")
-            .expect("missing batched graph entry");
-        assert_eq!(entry.effective_value, "1");
-        assert_eq!(entry.source, RuntimeConfigSource::Cli);
+        let entry = |key: &str| {
+            effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key} entry"))
+        };
+        assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_BATCHED_GRAPH").source,
+            RuntimeConfigSource::Cli
+        );
+        assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH").source,
+            RuntimeConfigSource::Cli
+        );
     }
 
     #[test]
