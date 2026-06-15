@@ -2,6 +2,26 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XQ — W2 source checkpoint: native down prefetch-overlap probe
+
+- Added `scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu` plus
+  `scripts/microbenches/build_and_run_gemma3_down_prefetch_overlap_perf.sh`.
+- Purpose:
+  - XP showed simple L2 access-policy is not enough under 8-layer rotation;
+  - explicit down-warm is an upper bound but adds an extra down read;
+  - this probe launches a lightweight down qweight/scales read kernel on a
+    second CUDA stream while the main stream runs gate_up+GeGLU, then measures
+    both down kernel time and host-synchronized segment time.
+- Expected GPU use:
+  - run one native CUDA validation before touching product code;
+  - if overlap prefetch reduces down time but increases segment time by a
+    comparable amount, reject it as non-productizable;
+  - if it reduces down time and keeps segment time flat or lower, evaluate a
+    typed product prefetch policy and then validate `ferrum run`/`serve`
+    correctness before endpoint performance claims.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XP — W2 native CUDA checkpoint: simple L2 policy fails under multi-layer weight rotation
 
 - Artifact:
