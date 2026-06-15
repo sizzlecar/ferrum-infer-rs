@@ -1,0 +1,35 @@
+[microbench] compiling selector-enabled vLLM dense Marlin objects
+[microbench] compiling scripts/microbenches/dense_vllm_marlin_gemma3_perf.cu
+-rwxr-xr-x 1 root root 7762424 Jun 15 12:10 /tmp/dense_vllm_marlin_gemma3_perf
+
+[microbench] running /tmp/dense_vllm_marlin_gemma3_perf
+dense_vllm_marlin_gemma3_perf device=NVIDIA GeForce RTX 4090 sm=8.9 peak_ref_tflops=165.0
+
+shape=qkv k=5376 n=8192 qweight_mb=21.0 scale_mb=0.7
+mode,m,us,useful_tflops,padded_tflops,ret
+hot,16,18.315,76.95,76.95,0
+weight_cycle,16,30.950,45.53,45.53,0
+hot,23,27.960,72.46,100.81,0
+weight_cycle,23,30.287,66.89,93.06,0
+hot,32,29.590,95.26,95.26,0
+weight_cycle,32,31.135,90.53,90.53,0
+
+shape=gate_up k=5376 n=43008 qweight_mb=110.2 scale_mb=3.4
+mode,m,us,useful_tflops,padded_tflops,ret
+hot,16,136.988,54.01,54.01,0
+weight_cycle,16,137.524,53.80,53.80,0
+hot,23,139.114,76.45,106.37,0
+weight_cycle,23,139.112,76.45,106.37,0
+hot,32,140.838,105.07,105.07,0
+weight_cycle,32,140.424,105.38,105.38,0
+
+shape=down k=21504 n=5376 qweight_mb=55.1 scale_mb=1.7
+mode,m,us,useful_tflops,padded_tflops,ret
+hot,16,36.027,102.68,102.68,0
+weight_cycle,16,69.268,53.41,53.41,0
+hot,23,64.506,82.44,114.70,0
+weight_cycle,23,70.177,75.78,105.43,0
+hot,32,65.204,113.47,113.47,0
+weight_cycle,32,69.526,106.42,106.42,0
+
+VERDICT: dense vLLM Marlin native CUDA probe complete
