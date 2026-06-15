@@ -3064,17 +3064,30 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                         .as_mut()
                         .expect("device F32 sandwich branch scratch missing");
                     let branch = &mut **branch;
-                    B::rms_norm_activation_to_f32(
-                        ctx,
-                        &self.scratch.o_proj_out,
-                        post_attn_w,
-                        eps,
-                        branch,
-                        tokens,
-                        h,
-                    );
-                    nt!("post_attn_norm", &*branch, tokens * h, h);
-                    B::add_inplace(ctx, device, branch, tokens * h);
+                    if nan_trace {
+                        B::rms_norm_activation_to_f32(
+                            ctx,
+                            &self.scratch.o_proj_out,
+                            post_attn_w,
+                            eps,
+                            branch,
+                            tokens,
+                            h,
+                        );
+                        nt!("post_attn_norm", &*branch, tokens * h, h);
+                        B::add_inplace(ctx, device, branch, tokens * h);
+                    } else {
+                        B::rms_norm_activation_add_to_f32(
+                            ctx,
+                            &self.scratch.o_proj_out,
+                            post_attn_w,
+                            eps,
+                            device,
+                            branch,
+                            tokens,
+                            h,
+                        );
+                    }
                     nt!("resid_attn", &*device, tokens * h, h);
                     B::rms_norm_f32_to_activation(
                         ctx,
@@ -3233,17 +3246,30 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                         .as_mut()
                         .expect("device F32 sandwich branch scratch missing");
                     let branch = &mut **branch;
-                    B::rms_norm_activation_to_f32(
-                        ctx,
-                        &self.scratch.mlp_out,
-                        post_ffn_w,
-                        eps,
-                        branch,
-                        tokens,
-                        h,
-                    );
-                    nt!("post_ffn_norm", &*branch, tokens * h, h);
-                    B::add_inplace(ctx, device, branch, tokens * h);
+                    if nan_trace {
+                        B::rms_norm_activation_to_f32(
+                            ctx,
+                            &self.scratch.mlp_out,
+                            post_ffn_w,
+                            eps,
+                            branch,
+                            tokens,
+                            h,
+                        );
+                        nt!("post_ffn_norm", &*branch, tokens * h, h);
+                        B::add_inplace(ctx, device, branch, tokens * h);
+                    } else {
+                        B::rms_norm_activation_add_to_f32(
+                            ctx,
+                            &self.scratch.mlp_out,
+                            post_ffn_w,
+                            eps,
+                            device,
+                            branch,
+                            tokens,
+                            h,
+                        );
+                    }
                 } else {
                     let tmp = self
                         .scratch
