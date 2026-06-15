@@ -1,0 +1,30 @@
+{
+  "cmd": [
+    "timeout",
+    "10800",
+    "target/release/ferrum",
+    "bench-serve",
+    "--base-url",
+    "http://127.0.0.1:8431",
+    "--model",
+    "gemma3:27b-gptq",
+    "--tokenizer",
+    "/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+    "--random-input-len",
+    "256",
+    "--random-output-len",
+    "128",
+    "--concurrency-sweep",
+    "1,4,16",
+    "--num-prompts",
+    "100",
+    "--n-repeats",
+    "3",
+    "--fail-on-error",
+    "--require-ci",
+    "--seed",
+    "9271",
+    "--out",
+    "/workspace/w2_sentinel_fix_release_shape_ferrum_ci_2026-06-15/perf_full/bench_c1_4_16.json"
+  ]
+}

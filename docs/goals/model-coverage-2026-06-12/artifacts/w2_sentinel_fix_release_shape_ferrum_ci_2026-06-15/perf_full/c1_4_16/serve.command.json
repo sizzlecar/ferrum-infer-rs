@@ -1,0 +1,18 @@
+{
+  "cmd": [
+    "target/release/ferrum",
+    "serve",
+    "--model",
+    "gemma3:27b-gptq",
+    "--port",
+    "8431",
+    "--kv-capacity",
+    "512",
+    "--max-num-seqs",
+    "16",
+    "--effective-config-json",
+    "/workspace/w2_sentinel_fix_release_shape_ferrum_ci_2026-06-15/perf_full/c1_4_16_serve_effective_config.json",
+    "--decision-trace-jsonl",
+    "/workspace/w2_sentinel_fix_release_shape_ferrum_ci_2026-06-15/perf_full/c1_4_16_serve_decision_trace.jsonl"
+  ]
+}

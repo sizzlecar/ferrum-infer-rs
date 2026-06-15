@@ -8,6 +8,8 @@ This directory keeps release gates, CUDA/M3 runners, benchmark utilities, and mi
 - `scripts/release/validate_metal_readme_regression.py`: hard validator for `scripts/metal_readme_regression.py` artifacts.
 - `scripts/release/release_binary_gate.py`: official release tarball and Homebrew binary/fetch gates.
 - `scripts/release/g0_release_summary.py`: release gate summary aggregator.
+- `scripts/release/model_release_grade_goal_gate.py`: W2/W3 model release-grade
+  validator for correctness plus same-hardware 80% performance manifests.
 - `scripts/release/inventory_tree.py`: crates/docs/scripts inventory generator required before cleanup.
 - `scripts/release/selftest_g0_validators.py`: tiny positive/negative selftest for the release validators. It does not run models or GPUs.
 

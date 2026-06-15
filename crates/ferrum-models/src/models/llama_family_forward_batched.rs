@@ -8,7 +8,10 @@
 
 use std::sync::atomic::Ordering;
 
-use ferrum_interfaces::kv_dtype::KvFp16;
+use ferrum_interfaces::{
+    kv_dtype::KvFp16,
+    model_executor::{LogitsReturnPolicy, TokenSelectionMask},
+};
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
     KvCache, MoeLlmBackend, MAX_LAYERS_FOR_GRAPH,
@@ -32,6 +35,21 @@ pub(crate) struct LlamaBatchedRuntimeConfig {
     batched_graph: bool,
     batched_trace: bool,
     greedy_argmax: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DecodeLogitsReturn<'a> {
+    Full,
+    LegacyDefault,
+    GreedyArgmax {
+        token_mask: Option<&'a TokenSelectionMask>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArgmaxMode<'a> {
+    Raw,
+    Masked(&'a TokenSelectionMask),
 }
 
 impl LlamaBatchedRuntimeConfig {
@@ -170,6 +188,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         batch: &[(String, u32, u32)],
         residual: &mut B::Buffer,
         m: usize,
+        host_residual: Option<&mut [f32]>,
+        device_residual: Option<&mut B::Buffer>,
+        device_branch: Option<&mut B::Buffer>,
     ) {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -181,6 +202,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let q_dim = nh * hd;
         let kv_dim = nkv * hd;
 
+        let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
         let qk_mode: i32 = if cfg.has_qk_norm {
             1
@@ -193,6 +215,23 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
 
+        // Match the single-sequence Gemma3 attention schedule. Local layers
+        // use the local RoPE table and a sliding window; global layers use
+        // the main RoPE table and full causal attention.
+        let pattern = cfg.sliding_window_pattern;
+        let is_global_layer = pattern == 0 || (source_li + 1) % pattern == 0;
+        let layer_window = if pattern == 0 {
+            cfg.sliding_window
+        } else if is_global_layer {
+            0
+        } else {
+            cfg.sliding_window
+        };
+        let (rope_cos, rope_sin) = match (&self.rope_local, is_global_layer) {
+            (Some(local), false) => (&local.cos, &local.sin),
+            _ => (&self.rope.cos, &self.rope.sin),
+        };
+
         let _bp = self.batched_cfg.decode_op_profile;
 
         // 1. rms_norm [M, H]  → norm_out
@@ -202,15 +241,37 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         } else {
             None
         };
-        B::rms_norm(
-            ctx,
-            residual,
-            &layer.input_ln_w,
-            eps,
-            &mut self.scratch.norm_out,
-            m,
-            h,
-        );
+        if let Some(host) = host_residual.as_deref() {
+            Self::rms_norm_host_to_activation(
+                ctx,
+                host,
+                &layer.input_ln_w,
+                eps,
+                &mut self.scratch.norm_out,
+                m,
+                h,
+            );
+        } else if let Some(device) = device_residual.as_ref() {
+            B::rms_norm_f32_to_activation(
+                ctx,
+                &**device,
+                &layer.input_ln_w,
+                eps,
+                &mut self.scratch.norm_out,
+                m,
+                h,
+            );
+        } else {
+            B::rms_norm(
+                ctx,
+                residual,
+                &layer.input_ln_w,
+                eps,
+                &mut self.scratch.norm_out,
+                m,
+                h,
+            );
+        }
         if let Some(t0) = _t {
             B::sync(ctx);
             NORM_TIME_US.fetch_add(
@@ -444,7 +505,15 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
 
             // Skip the contig split_qkv + per-item loop below.
-            return self.forward_layer_batched_decode_post_attn(ctx, li, residual, m);
+            return self.forward_layer_batched_decode_post_attn(
+                ctx,
+                li,
+                residual,
+                m,
+                host_residual,
+                device_residual,
+                device_branch,
+            );
         }
 
         // 3. split_qkv [M, QKV] → q_buf [M, Q], k_buf [M, KV], v_buf [M, KV]
@@ -494,8 +563,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             ctx,
             &self.scratch.q_buf,
             q_norm_w,
-            &self.rope.cos,
-            &self.rope.sin,
+            rope_cos,
+            rope_sin,
             &mut self.scratch.q_normed_batched,
             &self.scratch.batch_positions,
             m,
@@ -508,8 +577,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             ctx,
             &self.scratch.k_buf,
             k_norm_w,
-            &self.rope.cos,
-            &self.rope.sin,
+            rope_cos,
+            rope_sin,
             &mut self.scratch.k_normed_batched,
             &self.scratch.batch_positions,
             m,
@@ -525,8 +594,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             ctx,
             &self.scratch.v_buf,
             dummy_w,
-            &self.rope.cos,
-            &self.rope.sin,
+            rope_cos,
+            rope_sin,
             &mut self.scratch.v_normed_batched,
             &self.scratch.batch_positions,
             m,
@@ -654,8 +723,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // scratch.batch_kv_lens_post (also pre-populated).
         let _ = kv_lens_host;
 
-        // 6. Per-item loop: only runs when the batched paths are NOT
-        //    in effect, OR when batched_kv_append failed (Err fallback).
+        // 6. Per-item loop: only runs when the batched paths are NOT in
+        // effect, or when batched_kv_append failed (Err fallback). Gemma
+        // local-window layers still use the batched attention kernel:
+        // `layer_window` is passed into flash_attention_batched_per_cache.
         for (i, (cache_id, _token, pos)) in batch.iter().enumerate() {
             if use_batched_qkr && batched_kv_append_ok {
                 // Already handled by batched kv_append above. Skip
@@ -668,22 +739,24 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 // batched_kv_append fallback: still need per-item
                 // copy_slice for K/V into single buffers for the
                 // per-item kv_append below.
-                B::copy_slice(
-                    ctx,
-                    &self.scratch.k_normed_batched,
-                    i * kv_dim,
-                    &mut self.scratch.k_head_major_single,
-                    0,
-                    kv_dim,
-                );
-                B::copy_slice(
-                    ctx,
-                    &self.scratch.v_normed_batched,
-                    i * kv_dim,
-                    &mut self.scratch.v_head_major_single,
-                    0,
-                    kv_dim,
-                );
+                if !batched_kv_append_ok {
+                    B::copy_slice(
+                        ctx,
+                        &self.scratch.k_normed_batched,
+                        i * kv_dim,
+                        &mut self.scratch.k_head_major_single,
+                        0,
+                        kv_dim,
+                    );
+                    B::copy_slice(
+                        ctx,
+                        &self.scratch.v_normed_batched,
+                        i * kv_dim,
+                        &mut self.scratch.v_head_major_single,
+                        0,
+                        kv_dim,
+                    );
+                }
             } else {
                 // Fallback: extract item i's Q/K/V then run per-item
                 // qk_norm_rope. Same dispatch budget as before this
@@ -717,8 +790,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     ctx,
                     &self.scratch.q_single,
                     q_norm_w,
-                    &self.rope.cos,
-                    &self.rope.sin,
+                    rope_cos,
+                    rope_sin,
                     &mut self.scratch.q_head_major_single,
                     1,
                     nh,
@@ -731,8 +804,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     ctx,
                     &self.scratch.k_single,
                     k_norm_w,
-                    &self.rope.cos,
-                    &self.rope.sin,
+                    rope_cos,
+                    rope_sin,
                     &mut self.scratch.k_head_major_single,
                     1,
                     nkv,
@@ -745,8 +818,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     ctx,
                     &self.scratch.v_single,
                     dummy_w,
-                    &self.rope.cos,
-                    &self.rope.sin,
+                    rope_cos,
+                    rope_sin,
                     &mut self.scratch.v_head_major_single,
                     1,
                     nkv,
@@ -763,18 +836,20 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .get_mut(cache_id)
                 .expect("ensure_kv must be called before forward_layer_batched");
             let cache = &mut caches[li];
-            B::kv_cache_append_head_major(
-                ctx,
-                &mut cache.k,
-                &mut cache.v,
-                cache.len,
-                cache.capacity,
-                &self.scratch.k_head_major_single,
-                &self.scratch.v_head_major_single,
-                1,
-                nkv,
-                hd,
-            );
+            if !(use_batched_qkr && batched_kv_append_ok) {
+                B::kv_cache_append_head_major(
+                    ctx,
+                    &mut cache.k,
+                    &mut cache.v,
+                    cache.len,
+                    cache.capacity,
+                    &self.scratch.k_head_major_single,
+                    &self.scratch.v_head_major_single,
+                    1,
+                    nkv,
+                    hd,
+                );
+            }
             // cache.len bump moved to decode_batch_internal post-forward
             // for graph-replay correctness. flash_attn below uses
             // cache.len + 1 directly.
@@ -782,10 +857,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             let kv_stride = cache.capacity;
             kv_lens_host.push(kv_len as u32);
 
-            // Per-item flash_attn ONLY when batched qkr fallback is in
-            // use. Otherwise the batched flash_attn after the loop
-            // covers it in one launch. Q comes from the already-normed
-            // q_head_major_single populated by per-item qk_norm_rope.
+            // Per-item flash_attn runs only when the batched qkr fallback is
+            // in use. If batched qkr works, the single-launch batched
+            // attention below covers both full and local-window layers.
             if !use_batched_qkr {
                 let attn_cfg = ferrum_kernels::backend::AttnConfig {
                     num_heads: nh,
@@ -794,7 +868,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     causal: true,
                     scale: 1.0 / (hd as f32).sqrt(),
                     kv_seq_stride: kv_stride,
-                    sliding_window: cfg.sliding_window,
+                    sliding_window: layer_window,
                 };
                 B::flash_attention(
                     ctx,
@@ -877,6 +951,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 scale,
                 max_kv,
                 capacity_for_kernel,
+                layer_window,
                 li,
             );
             if let Some(t0) = _t_attn {
@@ -927,7 +1002,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         causal: true,
                         scale: 1.0 / (hd as f32).sqrt(),
                         kv_seq_stride: kv_stride,
-                        sliding_window: cfg.sliding_window,
+                        sliding_window: layer_window,
                     };
                     B::flash_attention(
                         ctx,
@@ -937,7 +1012,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         &mut self.scratch.attn_head_major_single,
                         1,
                         1,
-                        cache.len,
+                        cache.len + 1,
                         pos_i,
                         &attn_cfg,
                     );
@@ -953,7 +1028,15 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
         }
 
-        self.forward_layer_batched_decode_post_attn(ctx, li, residual, m);
+        self.forward_layer_batched_decode_post_attn(
+            ctx,
+            li,
+            residual,
+            m,
+            host_residual,
+            device_residual,
+            device_branch,
+        );
     }
 
     pub(crate) fn forward_layer_batched_decode_post_attn(
@@ -962,11 +1045,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         li: usize,
         residual: &mut B::Buffer,
         m: usize,
+        host_residual: Option<&mut [f32]>,
+        device_residual: Option<&mut B::Buffer>,
+        device_branch: Option<&mut B::Buffer>,
     ) {
-        let cfg = &self.cfg;
-        let h = cfg.hidden_size;
-        let im = cfg.intermediate_size;
-        let eps = cfg.rms_norm_eps;
         let layer = &self.layers[li];
         let _bp = self.batched_cfg.decode_op_profile;
 
@@ -992,122 +1074,16 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // 8. Fused residual add + post-attention RMSNorm.
-        let _t = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        B::fused_add_rms_norm(
+        self.forward_layer_post_o_proj_with_residual_shadow(
             ctx,
+            li,
+            None,
             residual,
-            &self.scratch.o_proj_out,
-            &layer.post_ln_w,
-            eps,
-            &mut self.scratch.norm_out,
             m,
-            h,
+            host_residual,
+            device_residual,
+            device_branch,
         );
-        if let Some(t0) = _t {
-            B::sync(ctx);
-            NORM_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 9. gate_up_proj (GEMM m=M)
-        let _t = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.batched_layer.gate_up_proj");
-            layer.gate_up_proj.forward(
-                ctx,
-                &self.scratch.norm_out,
-                &mut self.scratch.gate_up_out,
-                m,
-            );
-        }
-        if let Some(t0) = _t {
-            B::sync(ctx);
-            MATMUL_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 10. SwiGLU
-        let _t = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        B::fused_silu_mul_split(
-            ctx,
-            &self.scratch.gate_up_out,
-            &mut self.scratch.silu_out,
-            m,
-            im,
-        );
-        if let Some(t0) = _t {
-            B::sync(ctx);
-            OTHER_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 11. down_proj (GEMM m=M)
-        let _t = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.batched_layer.down_proj");
-            layer
-                .down_proj
-                .forward(ctx, &self.scratch.silu_out, &mut self.scratch.mlp_out, m);
-        }
-        if let Some(t0) = _t {
-            B::sync(ctx);
-            MATMUL_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // 12. Residual add
-        let _t = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        B::add_inplace(ctx, residual, &self.scratch.mlp_out, m * h);
-        if let Some(t0) = _t {
-            B::sync(ctx);
-            OTHER_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
     }
 
     /// Unified mixed-batch forward (chunked-prefill workhorse).
@@ -1838,12 +1814,77 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         batch: &[(String, u32, u32)],
         force_full_logits: bool,
     ) -> Vec<Vec<f32>> {
+        let logits_return = if force_full_logits {
+            DecodeLogitsReturn::Full
+        } else {
+            DecodeLogitsReturn::LegacyDefault
+        };
+        self.decode_batch_internal_with_logits_return(batch, logits_return)
+    }
+
+    pub fn decode_batch_internal_with_logits_policy(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        policies: &[LogitsReturnPolicy],
+    ) -> Vec<Vec<f32>> {
+        if policies.len() != batch.len() {
+            return self.decode_batch_internal_with_full_logits(batch, true);
+        }
+
+        let mut selected_mask: Option<&TokenSelectionMask> = None;
+        let mut saw_unmasked = false;
+        for policy in policies {
+            match policy {
+                LogitsReturnPolicy::FullLogits => {
+                    return self.decode_batch_internal_with_full_logits(batch, true);
+                }
+                LogitsReturnPolicy::GreedyArgmax { token_mask } => match token_mask.as_ref() {
+                    Some(mask) => {
+                        if saw_unmasked {
+                            return self.decode_batch_internal_with_full_logits(batch, true);
+                        }
+                        if let Some(selected) = selected_mask {
+                            if selected.fingerprint != mask.fingerprint
+                                || selected.len() != mask.len()
+                            {
+                                return self.decode_batch_internal_with_full_logits(batch, true);
+                            }
+                        } else {
+                            selected_mask = Some(mask);
+                        }
+                    }
+                    None => {
+                        if selected_mask.is_some() {
+                            return self.decode_batch_internal_with_full_logits(batch, true);
+                        }
+                        saw_unmasked = true;
+                    }
+                },
+            }
+        }
+
+        self.decode_batch_internal_with_logits_return(
+            batch,
+            DecodeLogitsReturn::GreedyArgmax {
+                token_mask: selected_mask,
+            },
+        )
+    }
+
+    fn decode_batch_internal_with_logits_return(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        logits_return: DecodeLogitsReturn<'_>,
+    ) -> Vec<Vec<f32>> {
+        let force_full_logits = matches!(logits_return, DecodeLogitsReturn::Full);
         let m = batch.len();
         if m == 0 {
             return Vec::new();
         }
+        self.decode_batch_stats.record_call(m, force_full_logits);
         if m == 1 && !force_full_logits {
             let (cid, tok, pos) = &batch[0];
+            self.decode_batch_stats.record_singleton_fast_path();
             return vec![self.decode_internal(cid, *tok, *pos)];
         }
         if !self.supports_batched_decode {
@@ -1852,6 +1893,17 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             // serving. Preserve user-visible correctness by falling back to
             // the known-good per-item decode path until that backend's
             // batched kernels pass the dedicated multi-turn gate.
+            self.decode_batch_stats.record_unsupported_fallback();
+            return batch
+                .iter()
+                .map(|(cid, tok, pos)| self.decode_internal(cid, *tok, *pos))
+                .collect();
+        }
+        if batch
+            .iter()
+            .any(|(cid, _, _)| self.active_lora_adapter_for_cache(cid).is_some())
+        {
+            self.decode_batch_stats.record_lora_fallback();
             return batch
                 .iter()
                 .map(|(cid, tok, pos)| self.decode_internal(cid, *tok, *pos))
@@ -1924,11 +1976,45 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             .as_ref()
             .expect("decode_batch_internal called on backbone-only model (no embed)");
         B::embedding_lookup(&mut ctx, embed, &tokens, &mut residual, h);
+        if let Some(scale) = self.cfg.embed_scale {
+            B::scale_inplace(&mut ctx, &mut residual, scale, m * h);
+        }
+        let use_host_residual_shadow = self.use_host_residual_shadow();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        let mut host_residual = if use_host_residual_shadow {
+            B::sync(&mut ctx);
+            Some(B::to_vec(&residual, m * h))
+        } else {
+            None
+        };
+        let mut device_residual_shadow = if use_device_residual_shadow {
+            let mut shadow = self
+                .scratch
+                .residual_f32_shadow
+                .take()
+                .expect("device F32 residual shadow scratch missing");
+            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, m * h);
+            Some(shadow)
+        } else {
+            None
+        };
+        let mut device_branch_shadow = if use_device_residual_shadow {
+            Some(
+                self.scratch
+                    .sandwich_branch_f32
+                    .take()
+                    .expect("device F32 sandwich branch scratch missing"),
+            )
+        } else {
+            None
+        };
 
         // ── Phase 4d: CUDA-graph replay path ─────────────────────────
         // gated on FERRUM_BATCHED_GRAPH=1; skipped on backends without
         // graph support (begin_graph_capture returns Err).
-        let graph_enabled = self.batched_cfg.batched_graph;
+        let graph_enabled = self.batched_cfg.batched_graph
+            && !use_host_residual_shadow
+            && !use_device_residual_shadow;
         let m_padded = m.next_power_of_two();
         // Per-m_padded graph cache: each batch shape gets its own
         // captured graph instead of thrashing a single slot. Native
@@ -2024,7 +2110,16 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
             // Eager forward (records into graph if capture is active).
             for li in 0..num_layers {
-                self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+                self.forward_layer_batched_decode(
+                    &mut ctx,
+                    li,
+                    batch,
+                    &mut residual,
+                    m,
+                    host_residual.as_deref_mut(),
+                    device_residual_shadow.as_mut(),
+                    device_branch_shadow.as_mut(),
+                );
                 tracesync!(format!("after layer {}", li));
             }
             let _t0_norm = if batched_profile {
@@ -2033,15 +2128,37 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             } else {
                 None
             };
-            B::rms_norm(
-                &mut ctx,
-                &residual,
-                &self.final_norm_w,
-                self.cfg.rms_norm_eps,
-                &mut self.scratch.norm_out,
-                m,
-                h,
-            );
+            if let Some(host) = host_residual.as_deref() {
+                Self::rms_norm_host_to_activation(
+                    &mut ctx,
+                    host,
+                    &self.final_norm_w,
+                    self.cfg.rms_norm_eps,
+                    &mut self.scratch.norm_out,
+                    m,
+                    h,
+                );
+            } else if let Some(device) = device_residual_shadow.as_ref() {
+                B::rms_norm_f32_to_activation(
+                    &mut ctx,
+                    device,
+                    &self.final_norm_w,
+                    self.cfg.rms_norm_eps,
+                    &mut self.scratch.norm_out,
+                    m,
+                    h,
+                );
+            } else {
+                B::rms_norm(
+                    &mut ctx,
+                    &residual,
+                    &self.final_norm_w,
+                    self.cfg.rms_norm_eps,
+                    &mut self.scratch.norm_out,
+                    m,
+                    h,
+                );
+            }
             if let Some(t0) = _t0_norm {
                 B::sync(&mut ctx);
                 NORM_TIME_US.fetch_add(
@@ -2136,6 +2253,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         // Sync before to_vec (Metal: no internal sync on buffer read).
         B::sync(&mut ctx);
+        if use_device_residual_shadow {
+            self.scratch.residual_f32_shadow = device_residual_shadow;
+            self.scratch.sandwich_branch_f32 = device_branch_shadow;
+        }
         self.scratch.residual = Some(residual);
 
         // Greedy fast path: FERRUM_GREEDY_ARGMAX=1 → GPU argmax + tiny
@@ -2143,17 +2264,50 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Saves ~5 ms / iter at c=32 on Qwen3 vocab=152064. Engine has a
         // matching size-1-Vec fast path in run_batch_decode that picks
         // `logits[0] as u32` and skips sample_with_processors entirely.
-        let greedy = self.batched_cfg.greedy_argmax && !force_full_logits;
-        if greedy {
-            let tokens = B::argmax_rows_f16(&mut ctx, &self.scratch.batch_logits, m, vocab)
-                .expect("argmax_rows_f16");
-            tokens.into_iter().map(|t| vec![t as f32]).collect()
-        } else {
-            let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
-            (0..m)
-                .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
-                .collect()
+        let argmax_mode = match logits_return {
+            DecodeLogitsReturn::Full => None,
+            DecodeLogitsReturn::LegacyDefault if self.batched_cfg.greedy_argmax => {
+                Some(ArgmaxMode::Raw)
+            }
+            DecodeLogitsReturn::LegacyDefault => None,
+            DecodeLogitsReturn::GreedyArgmax { token_mask } => {
+                token_mask.map(ArgmaxMode::Masked).or(Some(ArgmaxMode::Raw))
+            }
+        };
+        if let Some(argmax_mode) = argmax_mode {
+            let tokens = match argmax_mode {
+                ArgmaxMode::Raw => {
+                    B::argmax_rows_f16(&mut ctx, &self.scratch.batch_logits, m, vocab)
+                }
+                ArgmaxMode::Masked(mask) => {
+                    self.scratch.ensure_argmax_token_mask(&mut ctx, mask);
+                    let mask_len = self.scratch.argmax_token_mask_len;
+                    let device_mask = self
+                        .scratch
+                        .argmax_token_mask
+                        .as_ref()
+                        .expect("argmax token mask upload failed");
+                    B::argmax_rows_f16_masked(
+                        &mut ctx,
+                        &self.scratch.batch_logits,
+                        device_mask,
+                        mask_len,
+                        m,
+                        vocab,
+                    )
+                }
+            };
+            if let Ok(tokens) = tokens {
+                if tokens.iter().all(|&token| token != u32::MAX) {
+                    return tokens.into_iter().map(|t| vec![t as f32]).collect();
+                }
+            }
         }
+
+        let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
+        (0..m)
+            .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
+            .collect()
     }
 }
 
@@ -2165,7 +2319,7 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         if batch.is_empty() {
             return PipelineHidden::host(Vec::new(), 0, self.cfg.hidden_size);
         }
-        if batch.len() == 1 || !self.supports_batched_decode {
+        if batch.len() == 1 || !self.supports_batched_decode || self.cfg.sandwich_norms {
             let h = self.cfg.hidden_size;
             let mut hidden = Vec::with_capacity(batch.len() * h);
             for (cache_id, token, pos) in batch {
@@ -2189,7 +2343,16 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         B::embedding_lookup(&mut ctx, embed, &tokens, &mut residual, h);
 
         for li in 0..self.local_layer_count() {
-            self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+            self.forward_layer_batched_decode(
+                &mut ctx,
+                li,
+                batch,
+                &mut residual,
+                m,
+                None,
+                None,
+                None,
+            );
         }
         self.bump_local_batched_decode_kv_lengths(batch);
 
@@ -2219,7 +2382,7 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             hidden_slice.len(),
             batch.len() * h
         );
-        if batch.len() == 1 || !self.supports_batched_decode {
+        if batch.len() == 1 || !self.supports_batched_decode || self.cfg.sandwich_norms {
             let mut out = Vec::with_capacity(hidden_slice.len());
             let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
             for (row, (cache_id, _, pos)) in batch.iter().enumerate() {
@@ -2252,7 +2415,16 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         };
 
         for li in 0..self.local_layer_count() {
-            self.forward_layer_batched_decode(&mut ctx, li, batch, &mut residual, m);
+            self.forward_layer_batched_decode(
+                &mut ctx,
+                li,
+                batch,
+                &mut residual,
+                m,
+                None,
+                None,
+                None,
+            );
         }
         self.bump_local_batched_decode_kv_lengths(batch);
 
@@ -2281,7 +2453,7 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             hidden_slice.len(),
             row_count * h
         );
-        if row_count == 1 || !self.supports_batched_decode {
+        if row_count == 1 || !self.supports_batched_decode || self.cfg.sandwich_norms {
             return (0..row_count)
                 .map(|row| {
                     let start = row * h;

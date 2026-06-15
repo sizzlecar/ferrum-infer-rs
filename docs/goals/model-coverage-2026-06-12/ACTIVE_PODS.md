@@ -65,3 +65,21 @@ Verify zero: instances list must return 0 before declaring the goal done.
 **2026-06-14 06:51 CST — W2 40826362 stopped again after admission-cap diagnostics. Artifact `w2_c32_admission_cap_diagnostics_2026-06-14` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; no Ferrum process or GPU allocation remained before stop.**
 
 **2026-06-14 07:57 CST — W2 40826362 stopped again after final c32/cap16 L5 and llama.cpp ratio evidence. Artifact `w2_c32_admission16_l5_pass_2026-06-14` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; no Ferrum/llama.cpp process or GPU allocation remained before stop.**
+
+**2026-06-15 07:39 CST — W2 40826362 stopped again after decode-batch-stats probe. Artifact `w2_decode_batch_stats_probe_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; `nvidia-smi` before stop showed no running processes and 1 MiB GPU memory.**
+
+**2026-06-15 07:59 CST — W2 40826362 stopped again after sliding-window batched-attn probe. Artifact `w2_sliding_batched_attn_probe_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; `nvidia-smi` before stop showed no running processes and 1 MiB GPU memory.**
+
+**2026-06-15 08:53 CST — W2 40826362 stopped again after masked-argmax first probe. Artifact `w2_masked_argmax_probe_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; run stopped for greedy-sentinel/full-logits triage after product correctness had passed.**
+
+**2026-06-15 09:09 CST — W2 40826362 stopped again after masked-argmax retry. Artifact `w2_masked_argmax_retry_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; run stopped after c=4 result and forbidden-token warnings during c=16 triage.**
+
+**2026-06-15 09:37 CST — W2 40826362 stopped again after masked-argmax mask diagnostic. Artifact `w2_masked_argmax_maskdiag_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; GPU returned to 1 MiB after manually stopping on the first forbidden-token diagnostic.**
+
+**2026-06-15 10:14 CST — W2 40826362 stopped again after masked-argmax sentinel-fix validation. Artifact `w2_masked_argmax_sentinel_fix_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; c16 diagnostic completed zero-error with no greedy-argmax forbidden-token warnings.**
+
+**2026-06-15 10:26 CST — W2 40826362 stopped again after sentinel-fix c4/c16 diagnostic. Artifact `w2_sentinel_fix_c4_c16_diag_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; c4/c16 completed zero-error with no greedy-argmax warnings, and c4 diagnostic mean crossed the 80% baseline line.**
+
+**2026-06-15 10:38 CST — W2 40826362 stopped again after c4 CI pre-gate. Artifact `w2_c4_ci_pregate_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; c4 `--require-ci --n-repeats 3` completed zero-error and lower bound cleared the 80% baseline line.**
+
+**2026-06-15 11:26 CST — W2 40826362 stopped again after sentinel-fix full Ferrum release-shape matrix. Artifact `w2_sentinel_fix_release_shape_ferrum_ci_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; c=1/4/16/32 completed N=3, 100 prompts/repeat, zero errors, usage token counts, and zero blocker warnings.**

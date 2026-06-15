@@ -40,8 +40,9 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Use the larger certified CUDA lane when you want a 27B-class agent model on a
-24 GB RTX 4090:
+Use the larger functional CUDA lane when you want a 27B-class agent model on a
+24 GB RTX 4090. This lane has correctness and concurrency evidence, but it has
+a known performance gap and is not release-grade yet:
 
 ```bash
 ferrum serve --model gemma3:27b-gptq --max-num-seqs 16 --kv-capacity 400 --port 8000
@@ -239,7 +240,7 @@ cargo build --release -p ferrum-cli --bin ferrum
 | LLaMA (3.x, TinyLlama, Vicuna, Mistral) | ✓ | ✓ | ✓ | ✓ |
 | Qwen3 dense (0.6B – 32B) | ✓ | ✓ | ✓ | ✓ |
 | Qwen3-MoE (30B-A3B, Coder-30B-A3B) | ✓ | ✓ | ✓ | — |
-| Gemma 3 text (1B, 27B) | 1B GGUF | ✓ | 27B GPTQ | — |
+| Gemma 3 text (1B, 27B) | 1B GGUF | functional | 27B GPTQ known-gap | — |
 | Qwen2 / Qwen2.5 | ✓ | ✓ | ✓ | — |
 | DeepSeek-R1 (0528-Qwen3-8B; Distill-Qwen-14B/32B; Distill-Llama-70B) | ✓ | ✓ | ✓ | 70B layer-split |
 | Mistral Small 3.2 / Magistral Small (24B) | ✓ | — | — | — |
@@ -255,8 +256,9 @@ compatibility claims. W1 rows passed the ladder for the marked lanes:
 chat-template golden byte-equality vs `transformers` (L0), known-answer 10/10
 at temp 0, multi-turn KV reuse, stream==non-stream, natural EOS + custom stop +
 max_tokens mechanics (L2/L3), and the agent gate — required tool-call 10/10 +
-strict `json_schema` 20/20 (L4, "agent-grade"). W2 adds Gemma 3 27B on CUDA
-with L5 concurrency and a same-card llama.cpp performance floor. Artifacts:
+strict `json_schema` 20/20 (L4, "agent-grade"). W2 adds Gemma 3 27B on CUDA as
+functional coverage, with L5 concurrency and a same-card llama.cpp sanity
+floor. It does not yet meet the release-grade 80% baseline target. Artifacts:
 [`docs/goals/model-coverage-2026-06-12/artifacts/`](docs/goals/model-coverage-2026-06-12/artifacts/).
 Lane split: **GGUF serves on the Metal lane; CUDA serves GPTQ/safetensors**
 (GGUF decoding is not wired into the CUDA engine yet).
@@ -264,7 +266,7 @@ Lane split: **GGUF serves on the Metal lane; CUDA serves GPTQ/safetensors**
 | Model | Aliases | Metal (GGUF Q4_K_M) | CUDA | Agent-grade |
 |---|---|:---:|:---:|:---:|
 | Qwen3-Coder-30B-A3B-Instruct | `qwen3-coder:30b[-q4_k_m/-gptq]` | ✓ | GPTQ: known issue¹ | ✓ (Metal) |
-| Gemma 3 27B (text) | `gemma3:27b`, `gemma3:27b-gptq` | 1B GGUF smoke; 27B waived⁵ | ✓ GPTQ + L5⁵ | ✓ |
+| Gemma 3 27B (text) | `gemma3:27b`, `gemma3:27b-gptq` | 1B GGUF smoke; 27B waived⁵ | GPTQ functional + L5⁵ | ✓ (correctness) |
 | DeepSeek-R1-0528-Qwen3-8B | `deepseek-r1:8b[-q4_k_m]` | ✓ | ✓ BF16 | ✓ |
 | DeepSeek-R1-Distill-Qwen-32B | `deepseek-r1:32b[-q4_k_m/-gptq]` | 32 GB Mac: not practical² | ✓ GPTQ | tools ✓ / schema³ |
 | Qwen3-14B / Qwen3-32B | `qwen3:14b/32b[-q4_k_m/-gptq]` | 14B ✓ / 32B² | 32B ✓ GPTQ | 14B ✓ / 32B³ |
@@ -290,8 +292,9 @@ CUDA L5 covers random `256/128` at c=1/4/16/32, 100 prompts × 3 repeats per
 cell, zero errors, and usage-counted output tokens. On a 24 GB RTX 4090, the
 c=32 client lane uses product CLI admission `--max-num-seqs 16` with
 `--kv-capacity 400`. Same-card llama.cpp comparison is `0.500260x`, just above
-the required floor, so this is certified correctness/concurrency evidence with
-a known performance gap, not an optimization-complete claim. 27B GGUF Metal was
+the coverage floor but below the release-grade `0.8x` target, so this is
+functional correctness/concurrency evidence with a known performance gap, not
+release-grade support or an optimization-complete claim. 27B GGUF Metal was
 waived on the degraded 32 GB Mac; Gemma 3 GGUF architecture coverage is pinned
 by the 1B Q4_K_M Metal smoke artifact.
 
@@ -362,7 +365,7 @@ What works today:
 - Continuous batching, PagedAttention (CUDA + Metal pools), prefix caching, preemption
 - OpenAI-style function tool calling, including required tool calls and streaming `tool_calls` deltas
 - Custom CUDA decode runner (Qwen3, LLaMA): 2× over Candle baseline
-- Gemma 3 27B GPTQ on CUDA, including tool-call, strict-schema, streaming, multi-turn, and c=32 client pressure gates
+- Gemma 3 27B GPTQ functional on CUDA, including tool-call, strict-schema, streaming, multi-turn, and c=32 client pressure gates; release-grade performance is still a known gap
 - Apple Silicon MoE inference (Qwen3-30B-A3B) — correctness, multi-turn, default serve startup, and multi-sequence serving gates covered by the Metal README gate
 - INT4 GPTQ with Marlin fused kernel (Blackwell + Ampere); also Triton w4a16
 - Tensor parallelism (multi-GPU NCCL, persistent per-rank threads)

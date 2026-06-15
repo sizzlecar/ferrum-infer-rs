@@ -1,0 +1,13 @@
+{
+  "cmd": [
+    "bash",
+    "scripts/model_coverage_smoke.sh",
+    "gemma3:27b-gptq",
+    "--port",
+    "8401",
+    "--kv-capacity",
+    "2560",
+    "--max-seqs",
+    "2"
+  ]
+}

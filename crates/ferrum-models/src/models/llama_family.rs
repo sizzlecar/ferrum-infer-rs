@@ -20,7 +20,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 
-use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
+use ferrum_interfaces::{
+    kv_dtype::{KvDtypeKind, KvFp16, KvInt8},
+    model_executor::LogitsReturnPolicy,
+};
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendInt8KvOps, BackendMoeFused, BackendPagedKv, BackendQuantGguf,
     BackendQuantMarlin, KvCache, KvLayer, LlmBackend, MoeLlmBackend, QuantLlmBackend,
@@ -955,6 +958,101 @@ fn load_llama_family_lm_head<B: MoeLlmBackend>(
     Ok(lm_head)
 }
 
+fn supports_sandwich_legacy_batched_decode(
+    cfg: &LlamaFamilyConfig,
+    backend_supports_device_f32_residual_shadow: bool,
+) -> bool {
+    cfg.sandwich_norms
+        && cfg.sliding_window_pattern != 0
+        && backend_supports_device_f32_residual_shadow
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LlamaDecodeBatchStats {
+    calls: u64,
+    total_items: u64,
+    max_items: u64,
+    last_items: u64,
+    force_full_logits_calls: u64,
+    singleton_fast_path_calls: u64,
+    unsupported_fallback_calls: u64,
+    lora_fallback_calls: u64,
+    m1_calls: u64,
+    m2_calls: u64,
+    m3_4_calls: u64,
+    m5_8_calls: u64,
+    m9_16_calls: u64,
+    m17_32_calls: u64,
+    m_gt_32_calls: u64,
+}
+
+impl LlamaDecodeBatchStats {
+    pub(crate) fn record_call(&mut self, items: usize, force_full_logits: bool) {
+        let items = items as u64;
+        self.calls += 1;
+        self.total_items += items;
+        self.max_items = self.max_items.max(items);
+        self.last_items = items;
+        if force_full_logits {
+            self.force_full_logits_calls += 1;
+        }
+        match items {
+            0 => {}
+            1 => self.m1_calls += 1,
+            2 => self.m2_calls += 1,
+            3..=4 => self.m3_4_calls += 1,
+            5..=8 => self.m5_8_calls += 1,
+            9..=16 => self.m9_16_calls += 1,
+            17..=32 => self.m17_32_calls += 1,
+            _ => self.m_gt_32_calls += 1,
+        }
+    }
+
+    pub(crate) fn record_singleton_fast_path(&mut self) {
+        self.singleton_fast_path_calls += 1;
+    }
+
+    pub(crate) fn record_unsupported_fallback(&mut self) {
+        self.unsupported_fallback_calls += 1;
+    }
+
+    pub(crate) fn record_lora_fallback(&mut self) {
+        self.lora_fallback_calls += 1;
+    }
+
+    fn average_items_per_call(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.total_items as f64 / self.calls as f64
+        }
+    }
+
+    fn snapshot_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "calls": self.calls,
+            "total_items": self.total_items,
+            "avg_items_per_call": self.average_items_per_call(),
+            "max_items": self.max_items,
+            "last_items": self.last_items,
+            "force_full_logits_calls": self.force_full_logits_calls,
+            "singleton_fast_path_calls": self.singleton_fast_path_calls,
+            "unsupported_fallback_calls": self.unsupported_fallback_calls,
+            "lora_fallback_calls": self.lora_fallback_calls,
+            "bucket_calls": {
+                "m1": self.m1_calls,
+                "m2": self.m2_calls,
+                "m3_4": self.m3_4_calls,
+                "m5_8": self.m5_8_calls,
+                "m9_16": self.m9_16_calls,
+                "m17_32": self.m17_32_calls,
+                "m_gt_32": self.m_gt_32_calls,
+            },
+        })
+    }
+}
+
 /// Precomputed RoPE cos/sin tables (shape `[max_seq, head_dim / 2]` each).
 pub struct RopeCache<B: QuantLlmBackend + BackendMoeFused> {
     pub cos: B::Buffer,
@@ -984,6 +1082,12 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
     /// normed attention/MLP output before its residual add. `None` for
     /// legacy families.
     pub sandwich_tmp: Option<B::Buffer>,
+    /// Device-side F32 residual shadow for sandwich-norm families on CUDA.
+    /// Keeps Gemma3's residual stream finite without per-layer D2H syncs.
+    pub residual_f32_shadow: Option<B::Buffer>,
+    /// Device-side F32 branch scratch for post-attn/post-ffn norms and final
+    /// last-token normalization staging.
+    pub sandwich_branch_f32: Option<B::Buffer>,
     // ── Per-item scratch for batched decode path ──────────────────────
     // decode_batch_internal runs tokens=M batched ops for the GEMM-heavy
     // half (norm, qkv_proj, split_qkv, o_proj, post_norm, gate_up, silu,
@@ -1004,6 +1108,9 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
     /// Prefill/single-decode use the regular `logits`.
     pub batch_logits: B::Buffer,
     pub batch_logits_capacity: usize,
+    pub argmax_token_mask: Option<B::Buffer>,
+    pub argmax_token_mask_fingerprint: Option<u64>,
+    pub argmax_token_mask_len: usize,
     /// Token-major Q/K/V right after `split_qkv`. Stride: heads * hd per row.
     pub q_buf: B::Buffer,
     pub k_buf: B::Buffer,
@@ -1124,6 +1231,22 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             sandwich_tmp: cfg
                 .sandwich_norms
                 .then(|| alloc_model_buffer::<B>("llama.scratch.sandwich_tmp", t * h)),
+            residual_f32_shadow: (cfg.sandwich_norms && B::supports_device_f32_residual_shadow())
+                .then(|| {
+                    alloc_model_typed_buffer::<B>(
+                        "llama.scratch.residual_f32_shadow",
+                        ferrum_kernels::backend::Dtype::F32,
+                        t * h,
+                    )
+                }),
+            sandwich_branch_f32: (cfg.sandwich_norms && B::supports_device_f32_residual_shadow())
+                .then(|| {
+                    alloc_model_typed_buffer::<B>(
+                        "llama.scratch.sandwich_branch_f32",
+                        ferrum_kernels::backend::Dtype::F32,
+                        t * h,
+                    )
+                }),
             q_buf: alloc_model_buffer::<B>("llama.scratch.q_buf", t * q_dim),
             k_buf: alloc_model_buffer::<B>("llama.scratch.k_buf", t * kv_dim),
             v_buf: alloc_model_buffer::<B>("llama.scratch.v_buf", t * kv_dim),
@@ -1173,6 +1296,9 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             attn_flat_single: alloc_model_buffer::<B>("llama.scratch.attn_flat_single", q_dim),
             batch_logits: alloc_model_buffer::<B>("llama.scratch.batch_logits", cfg.vocab_size),
             batch_logits_capacity: 1,
+            argmax_token_mask: None,
+            argmax_token_mask_fingerprint: None,
+            argmax_token_mask_len: 0,
             // Paged batched dispatch scratch. None until `enable_paged_batch`
             // is called from `ensure_kv` once the model knows max_seqs +
             // max_blocks_per_seq. This avoids paying the alloc cost when
@@ -1233,6 +1359,29 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         self.batch_logits =
             alloc_model_buffer::<B>("llama.scratch.batch_logits.grow", rows * cfg.vocab_size);
         self.batch_logits_capacity = rows;
+    }
+
+    pub(crate) fn ensure_argmax_token_mask(
+        &mut self,
+        ctx: &mut B::Context,
+        mask: &ferrum_interfaces::model_executor::TokenSelectionMask,
+    ) -> &B::Buffer {
+        let needs_upload = self.argmax_token_mask_fingerprint != Some(mask.fingerprint)
+            || self.argmax_token_mask_len != mask.len();
+        if needs_upload {
+            let mut device_mask = alloc_model_typed_buffer::<B>(
+                "llama.scratch.argmax_token_mask",
+                ferrum_kernels::backend::Dtype::I8,
+                mask.len().max(1),
+            );
+            B::write_typed::<i8>(ctx, &mut device_mask, &mask.valid_token_mask);
+            self.argmax_token_mask = Some(device_mask);
+            self.argmax_token_mask_fingerprint = Some(mask.fingerprint);
+            self.argmax_token_mask_len = mask.len();
+        }
+        self.argmax_token_mask
+            .as_ref()
+            .expect("argmax token mask upload failed")
     }
 
     /// Grow unified-path scratch buffers to accommodate `m_total` query
@@ -1473,6 +1622,7 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     prefix_cache_hits: u64,
     prefix_cache_misses: u64,
     prefix_cache_saved_prefill_tokens: u64,
+    pub(crate) decode_batch_stats: LlamaDecodeBatchStats,
 
     // ── Startup LoRA runtime state ──────────────────────────────────────
     lora_adapters: HashMap<String, RuntimeLoraAdapter<B>>,
@@ -1579,17 +1729,21 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let runtime_cfg = cfg.to_runtime();
         // Construction-time capability resolution (GOAL-allowed): read once here
         // so the forward hot paths read self.* instead of B::supports_*().
-        // Sandwich-norm families (Gemma 3) are pinned to the single-sequence
-        // forward path until the batched/varlen paths learn the Gemma layer
+        // Sandwich-norm families (Gemma 3) can use the legacy contiguous
+        // batched-decode path only after that path has the Gemma layer
         // semantics (GeGLU, post-attn/post-ffn norms, dual rope, per-layer
-        // windows) — running them would be silently wrong, not just slow.
+        // windows) and a device-side F32 residual shadow. Varlen unified
+        // stays pinned off until paged/unified attention learns per-layer
+        // local-window semantics.
+        let supports_sandwich_batched_decode =
+            supports_sandwich_legacy_batched_decode(&cfg, B::supports_device_f32_residual_shadow());
         let supports_varlen_qkv = B::supports_varlen_qkv() && !cfg.sandwich_norms;
-        let supports_batched_decode =
-            B::supports_llama_family_batched_decode() && !cfg.sandwich_norms;
+        let supports_batched_decode = B::supports_llama_family_batched_decode()
+            && (!cfg.sandwich_norms || supports_sandwich_batched_decode);
         if cfg.sandwich_norms {
             tracing::info!(
-                "Gemma3 family: batched/varlen fast paths disabled pending Gemma semantics; \
-                 using single-sequence forward"
+                "Gemma3 family: legacy batched_decode={} varlen_unified=false",
+                supports_batched_decode
             );
         }
         let runtime_env = LlamaFamilyRuntimeEnv::from_env();
@@ -1628,6 +1782,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             prefix_cache_hits: 0,
             prefix_cache_misses: 0,
             prefix_cache_saved_prefill_tokens: 0,
+            decode_batch_stats: LlamaDecodeBatchStats::default(),
             lora_adapters: HashMap::new(),
             lora_cache_adapters: HashMap::new(),
             lora_projection_applications: 0,
@@ -1654,7 +1809,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         0..self.local_layer_count()
     }
 
-    fn source_layer_index(&self, local_layer_index: usize) -> usize {
+    pub(crate) fn source_layer_index(&self, local_layer_index: usize) -> usize {
         self.layer_source_start + local_layer_index
     }
 
@@ -2076,6 +2231,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             "bytes": entries.saturating_mul(bytes_per_entry),
             "block_size": block_size,
             "kv_dtype": K::NAME,
+            "decode_batch": self.decode_batch_stats.snapshot_json(),
         })
     }
 
@@ -2153,7 +2309,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         Ok(())
     }
 
-    fn active_lora_adapter_for_cache(&self, cache_id: &str) -> Option<&RuntimeLoraAdapter<B>> {
+    pub(crate) fn active_lora_adapter_for_cache(
+        &self,
+        cache_id: &str,
+    ) -> Option<&RuntimeLoraAdapter<B>> {
         let adapter_name = self.lora_cache_adapters.get(cache_id)?;
         self.lora_adapters.get(adapter_name)
     }
@@ -2177,8 +2336,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         })
     }
 
-    fn use_host_residual_shadow(&self) -> bool {
-        self.cfg.sandwich_norms && B::activation_elem_size_bytes() < std::mem::size_of::<f32>()
+    pub(crate) fn use_host_residual_shadow(&self) -> bool {
+        self.cfg.sandwich_norms
+            && B::activation_elem_size_bytes() < std::mem::size_of::<f32>()
+            && !B::supports_device_f32_residual_shadow()
+    }
+
+    pub(crate) fn use_device_residual_shadow(&self) -> bool {
+        self.cfg.sandwich_norms
+            && B::activation_elem_size_bytes() < std::mem::size_of::<f32>()
+            && B::supports_device_f32_residual_shadow()
     }
 
     fn rms_norm_host(
@@ -2206,7 +2373,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         out
     }
 
-    fn rms_norm_host_to_activation(
+    pub(crate) fn rms_norm_host_to_activation(
         ctx: &mut B::Context,
         input: &[f32],
         weight: &B::Buffer,
@@ -2269,6 +2436,32 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         tokens: usize,
         mut host_residual: Option<&mut [f32]>,
     ) {
+        self.forward_layer_with_residual_shadow(
+            ctx,
+            li,
+            cache_id,
+            residual,
+            pos_offset,
+            tokens,
+            host_residual.as_deref_mut(),
+            None,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_layer_with_residual_shadow(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        cache_id: &str,
+        residual: &mut B::Buffer,
+        pos_offset: usize,
+        tokens: usize,
+        mut host_residual: Option<&mut [f32]>,
+        mut device_residual: Option<&mut B::Buffer>,
+        mut device_branch: Option<&mut B::Buffer>,
+    ) {
         let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
         let cfg = &self.cfg;
@@ -2314,6 +2507,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             Self::rms_norm_host_to_activation(
                 ctx,
                 host,
+                &layer.input_ln_w,
+                eps,
+                &mut self.scratch.norm_out,
+                tokens,
+                h,
+            );
+        } else if let Some(device) = device_residual.as_ref() {
+            B::rms_norm_f32_to_activation(
+                ctx,
+                &**device,
                 &layer.input_ln_w,
                 eps,
                 &mut self.scratch.norm_out,
@@ -2545,6 +2748,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 residual,
                 tokens,
                 host_residual,
+                device_residual,
+                device_branch,
             );
         }
 
@@ -2647,6 +2852,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             residual,
             tokens,
             host_residual,
+            device_residual,
+            device_branch,
         );
     }
 
@@ -2662,9 +2869,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         residual: &mut B::Buffer,
         tokens: usize,
     ) {
-        self.forward_layer_post_attn_with_host_residual(ctx, li, cache_id, residual, tokens, None);
+        self.forward_layer_post_attn_with_host_residual(
+            ctx, li, cache_id, residual, tokens, None, None, None,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_layer_post_attn_with_host_residual(
         &mut self,
         ctx: &mut B::Context,
@@ -2673,6 +2883,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         residual: &mut B::Buffer,
         tokens: usize,
         mut host_residual: Option<&mut [f32]>,
+        mut device_residual: Option<&mut B::Buffer>,
+        mut device_branch: Option<&mut B::Buffer>,
     ) {
         let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
@@ -2741,6 +2953,55 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
         nt!("o_proj", &self.scratch.o_proj_out, tokens * h, h);
 
+        self.forward_layer_post_o_proj_with_residual_shadow(
+            ctx,
+            li,
+            Some(cache_id),
+            residual,
+            tokens,
+            host_residual,
+            device_residual,
+            device_branch,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_layer_post_o_proj_with_residual_shadow(
+        &mut self,
+        ctx: &mut B::Context,
+        li: usize,
+        cache_id: Option<&str>,
+        residual: &mut B::Buffer,
+        tokens: usize,
+        mut host_residual: Option<&mut [f32]>,
+        mut device_residual: Option<&mut B::Buffer>,
+        mut device_branch: Option<&mut B::Buffer>,
+    ) {
+        let source_li = self.source_layer_index(li);
+        let layer = &self.layers[li];
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let im = cfg.intermediate_size;
+        let eps = cfg.rms_norm_eps;
+
+        let nan_trace = self.runtime_env.nan_trace.matches_layer(li, source_li);
+        let op_dump_dir = self.runtime_env.op_dump_dir.as_deref();
+        macro_rules! nt {
+            ($name:expr, $buf:expr, $len:expr, $row_width:expr) => {
+                if nan_trace {
+                    nan_trace_dump::<B>(
+                        ctx,
+                        source_li,
+                        $name,
+                        $buf,
+                        $len,
+                        Some($row_width),
+                        op_dump_dir,
+                    );
+                }
+            };
+        }
+
         // 9. Residual + pre-MLP norm.
         //
         // Sandwich families (Gemma 3): norm the attention output FIRST
@@ -2760,6 +3021,33 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 Self::rms_norm_host_to_activation(
                     ctx,
                     host,
+                    &layer.post_ln_w,
+                    eps,
+                    &mut self.scratch.norm_out,
+                    tokens,
+                    h,
+                );
+            } else if let Some(device) = device_residual.as_mut() {
+                let device = &mut **device;
+                let branch = device_branch
+                    .as_mut()
+                    .expect("device F32 sandwich branch scratch missing");
+                let branch = &mut **branch;
+                B::rms_norm_activation_to_f32(
+                    ctx,
+                    &self.scratch.o_proj_out,
+                    post_attn_w,
+                    eps,
+                    branch,
+                    tokens,
+                    h,
+                );
+                nt!("post_attn_norm", &*branch, tokens * h, h);
+                B::add_inplace(ctx, device, branch, tokens * h);
+                nt!("resid_attn", &*device, tokens * h, h);
+                B::rms_norm_f32_to_activation(
+                    ctx,
+                    device,
                     &layer.post_ln_w,
                     eps,
                     &mut self.scratch.norm_out,
@@ -2819,7 +3107,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 tokens,
             );
         }
-        if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
+        if let Some(adapter) =
+            cache_id.and_then(|cache_id| self.active_lora_adapter_ptr_for_cache(cache_id))
+        {
             // SAFETY: see qkv_proj LoRA application above.
             let applied = unsafe { &*adapter }
                 .apply_projection(
@@ -2872,7 +3162,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 tokens,
             );
         }
-        if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
+        if let Some(adapter) =
+            cache_id.and_then(|cache_id| self.active_lora_adapter_ptr_for_cache(cache_id))
+        {
             // SAFETY: see qkv_proj LoRA application above.
             let applied = unsafe { &*adapter }
                 .apply_projection(
@@ -2900,6 +3192,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     h,
                 );
                 Self::add_host_residual(host, &branch);
+            } else if let Some(device) = device_residual.as_mut() {
+                let device = &mut **device;
+                let branch = device_branch
+                    .as_mut()
+                    .expect("device F32 sandwich branch scratch missing");
+                let branch = &mut **branch;
+                B::rms_norm_activation_to_f32(
+                    ctx,
+                    &self.scratch.mlp_out,
+                    post_ffn_w,
+                    eps,
+                    branch,
+                    tokens,
+                    h,
+                );
+                nt!("post_ffn_norm", &*branch, tokens * h, h);
+                B::add_inplace(ctx, device, branch, tokens * h);
             } else {
                 let tmp = self
                     .scratch
@@ -2913,7 +3222,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         } else {
             B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
         }
-        if host_residual.is_none() {
+        if let Some(device) = device_residual.as_ref() {
+            nt!("resid_ffn", &**device, tokens * h, h);
+        } else if host_residual.is_none() {
             nt!("resid_ffn", &*residual, tokens * h, h);
         }
     }
@@ -2961,22 +3272,83 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         if let Some(scale) = self.cfg.embed_scale {
             B::scale_inplace(&mut ctx, &mut residual, scale, seq_len * h);
         }
+        let use_host_residual_shadow = self.use_host_residual_shadow();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        let mut host_residual = if use_host_residual_shadow {
+            B::sync(&mut ctx);
+            Some(B::to_vec(&residual, seq_len * h))
+        } else {
+            None
+        };
+        let mut device_residual_shadow = if use_device_residual_shadow {
+            let mut shadow = self
+                .scratch
+                .residual_f32_shadow
+                .take()
+                .expect("device F32 residual shadow scratch missing");
+            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, seq_len * h);
+            Some(shadow)
+        } else {
+            None
+        };
+        let mut device_branch_shadow = if use_device_residual_shadow {
+            Some(
+                self.scratch
+                    .sandwich_branch_f32
+                    .take()
+                    .expect("device F32 sandwich branch scratch missing"),
+            )
+        } else {
+            None
+        };
 
         for li in self.local_layer_indices() {
-            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
+            self.forward_layer_with_residual_shadow(
+                &mut ctx,
+                li,
+                cache_id,
+                &mut residual,
+                pos_offset,
+                seq_len,
+                host_residual.as_deref_mut(),
+                device_residual_shadow.as_mut(),
+                device_branch_shadow.as_mut(),
+            );
         }
 
         // RMSNorm on ALL seq_len positions (prefill_internal only norms
         // the last one; verify needs the full grid).
-        B::rms_norm(
-            &mut ctx,
-            &residual,
-            &self.final_norm_w,
-            self.cfg.rms_norm_eps,
-            &mut self.scratch.norm_out,
-            seq_len,
-            h,
-        );
+        if let Some(host) = host_residual.as_deref() {
+            Self::rms_norm_host_to_activation(
+                &mut ctx,
+                host,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.norm_out,
+                seq_len,
+                h,
+            );
+        } else if let Some(device) = device_residual_shadow.as_ref() {
+            B::rms_norm_f32_to_activation(
+                &mut ctx,
+                device,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.norm_out,
+                seq_len,
+                h,
+            );
+        } else {
+            B::rms_norm(
+                &mut ctx,
+                &residual,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.norm_out,
+                seq_len,
+                h,
+            );
+        }
 
         // LM head applied to all positions → `seq_len * vocab` logits.
         // Reuses the existing `batch_logits` scratch (sized max_tokens *
@@ -2998,6 +3370,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
 
         B::sync(&mut ctx);
+        if use_device_residual_shadow {
+            self.scratch.residual_f32_shadow = device_residual_shadow;
+            self.scratch.sandwich_branch_f32 = device_branch_shadow;
+        }
         self.scratch.residual = Some(residual);
         B::to_vec(&self.scratch.batch_logits, seq_len * vocab)
     }
@@ -3098,9 +3474,31 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::scale_inplace(&mut ctx, &mut residual, scale, suffix_tokens.len() * h);
         }
         let use_host_residual_shadow = self.use_host_residual_shadow();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
         let mut host_residual = if use_host_residual_shadow {
             B::sync(&mut ctx);
             Some(B::to_vec(&residual, seq_len * h))
+        } else {
+            None
+        };
+        let mut device_residual_shadow = if use_device_residual_shadow {
+            let mut shadow = self
+                .scratch
+                .residual_f32_shadow
+                .take()
+                .expect("device F32 residual shadow scratch missing");
+            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, seq_len * h);
+            Some(shadow)
+        } else {
+            None
+        };
+        let mut device_branch_shadow = if use_device_residual_shadow {
+            Some(
+                self.scratch
+                    .sandwich_branch_f32
+                    .take()
+                    .expect("device F32 sandwich branch scratch missing"),
+            )
         } else {
             None
         };
@@ -3125,13 +3523,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         if let Some(dir) = &layer_dump {
             if let Some(host) = host_residual.as_deref() {
                 write_f32_dump(dir, "embed", host);
+            } else if let Some(device) = device_residual_shadow.as_ref() {
+                dump(&mut ctx, device, "embed");
             } else {
                 dump(&mut ctx, &residual, "embed");
             }
         }
 
         for li in self.local_layer_indices() {
-            self.forward_layer_with_host_residual(
+            self.forward_layer_with_residual_shadow(
                 &mut ctx,
                 li,
                 cache_id,
@@ -3139,12 +3539,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 pos_offset,
                 seq_len,
                 host_residual.as_deref_mut(),
+                device_residual_shadow.as_mut(),
+                device_branch_shadow.as_mut(),
             );
             if layer_dump.is_some() {
                 if let Some(host) = host_residual.as_deref() {
                     if let Some(dir) = &layer_dump {
                         write_f32_dump(dir, &format!("layer_{li:02}"), host);
                     }
+                } else if let Some(device) = device_residual_shadow.as_ref() {
+                    dump(&mut ctx, device, &format!("layer_{li:02}"));
                 } else {
                     dump(&mut ctx, &residual, &format!("layer_{li:02}"));
                 }
@@ -3191,6 +3595,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             Self::rms_norm_host_to_activation(
                 &mut ctx,
                 last,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.last_normed,
+                1,
+                h,
+            );
+        } else if let Some(device) = device_residual_shadow.as_mut() {
+            let branch = device_branch_shadow
+                .as_mut()
+                .expect("device F32 sandwich branch scratch missing");
+            B::copy_slice(&mut ctx, device, (seq_len - 1) * h, branch, 0, h);
+            B::rms_norm_f32_to_activation(
+                &mut ctx,
+                branch,
                 &self.final_norm_w,
                 self.cfg.rms_norm_eps,
                 &mut self.scratch.last_normed,
@@ -3251,6 +3669,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
 
         // Restore residual into scratch for reuse on the next call.
+        if use_device_residual_shadow {
+            self.scratch.residual_f32_shadow = device_residual_shadow;
+            self.scratch.sandwich_branch_f32 = device_branch_shadow;
+        }
         self.scratch.residual = Some(residual);
         if self.runtime_env.prefix_cache && cache_len_before == 0 {
             self.register_prefix_cache(cache_id, tokens, cached_prefix_tokens);
@@ -3277,7 +3699,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // per-step device-state memcpy_htod trio entirely.
         const GRAPH_WARMUP: usize = 3;
         let use_host_residual_shadow = self.use_host_residual_shadow();
-        let graph_enabled = self.runtime_env.cuda_graph && !use_host_residual_shadow;
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        let graph_enabled =
+            self.runtime_env.cuda_graph && !use_host_residual_shadow && !use_device_residual_shadow;
 
         if graph_enabled {
             // Refresh device-side dynamic state (token/pos/kv_len) before
@@ -3332,6 +3756,27 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         } else {
             None
         };
+        let mut device_residual_shadow = if use_device_residual_shadow {
+            let mut shadow = self
+                .scratch
+                .residual_f32_shadow
+                .take()
+                .expect("device F32 residual shadow scratch missing");
+            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, h);
+            Some(shadow)
+        } else {
+            None
+        };
+        let mut device_branch_shadow = if use_device_residual_shadow {
+            Some(
+                self.scratch
+                    .sandwich_branch_f32
+                    .take()
+                    .expect("device F32 sandwich branch scratch missing"),
+            )
+        } else {
+            None
+        };
 
         // Per-layer wall-time profile (env-gated, off by default — adds
         // a B::sync between layers which serializes the pipeline). Helps
@@ -3346,7 +3791,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         for li in self.local_layer_indices() {
             if layer_profile {
                 let t0 = std::time::Instant::now();
-                self.forward_layer_with_host_residual(
+                self.forward_layer_with_residual_shadow(
                     &mut ctx,
                     li,
                     cache_id,
@@ -3354,6 +3799,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     pos as usize,
                     1,
                     host_residual.as_deref_mut(),
+                    device_residual_shadow.as_mut(),
+                    device_branch_shadow.as_mut(),
                 );
                 B::sync(&mut ctx);
                 let elapsed_us = t0.elapsed().as_micros() as u64;
@@ -3361,7 +3808,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     v.push(elapsed_us);
                 }
             } else {
-                self.forward_layer_with_host_residual(
+                self.forward_layer_with_residual_shadow(
                     &mut ctx,
                     li,
                     cache_id,
@@ -3369,6 +3816,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     pos as usize,
                     1,
                     host_residual.as_deref_mut(),
+                    device_residual_shadow.as_mut(),
+                    device_branch_shadow.as_mut(),
                 );
             }
         }
@@ -3442,6 +3891,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 1,
                 h,
             );
+        } else if let Some(device) = device_residual_shadow.as_ref() {
+            B::rms_norm_f32_to_activation(
+                &mut ctx,
+                device,
+                &self.final_norm_w,
+                self.cfg.rms_norm_eps,
+                &mut self.scratch.last_normed,
+                1,
+                h,
+            );
         } else {
             B::rms_norm(
                 &mut ctx,
@@ -3496,6 +3955,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // the call redundant there (~50µs/step cost), but correctness on
         // Metal requires the explicit flush here.
         B::sync(&mut ctx);
+        if use_device_residual_shadow {
+            self.scratch.residual_f32_shadow = device_residual_shadow;
+            self.scratch.sandwich_branch_f32 = device_branch_shadow;
+        }
         self.scratch.residual = Some(residual);
 
         B::to_vec(&self.scratch.logits, vocab)
@@ -3527,13 +3990,62 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         if let Some(scale) = self.cfg.embed_scale {
             B::scale_inplace(&mut ctx, &mut residual, scale, tokens.len() * h);
         }
+        let use_host_residual_shadow = self.use_host_residual_shadow();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        let mut host_residual = if use_host_residual_shadow {
+            B::sync(&mut ctx);
+            Some(B::to_vec(&residual, seq_len * h))
+        } else {
+            None
+        };
+        let mut device_residual_shadow = if use_device_residual_shadow {
+            let mut shadow = self
+                .scratch
+                .residual_f32_shadow
+                .take()
+                .expect("device F32 residual shadow scratch missing");
+            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, seq_len * h);
+            Some(shadow)
+        } else {
+            None
+        };
+        let mut device_branch_shadow = if use_device_residual_shadow {
+            Some(
+                self.scratch
+                    .sandwich_branch_f32
+                    .take()
+                    .expect("device F32 sandwich branch scratch missing"),
+            )
+        } else {
+            None
+        };
 
         for li in self.local_layer_indices() {
-            self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
+            self.forward_layer_with_residual_shadow(
+                &mut ctx,
+                li,
+                cache_id,
+                &mut residual,
+                pos_offset,
+                seq_len,
+                host_residual.as_deref_mut(),
+                device_residual_shadow.as_mut(),
+                device_branch_shadow.as_mut(),
+            );
         }
 
         B::sync(&mut ctx);
-        let out = B::to_vec(&residual, seq_len * h);
+        let out = if let Some(host) = host_residual.as_deref() {
+            host.to_vec()
+        } else if let Some(device) = device_residual_shadow.as_ref() {
+            B::to_vec(device, seq_len * h)
+        } else {
+            B::to_vec(&residual, seq_len * h)
+        };
+        if use_device_residual_shadow {
+            self.scratch.residual_f32_shadow = device_residual_shadow;
+            self.scratch.sandwich_branch_f32 = device_branch_shadow;
+        }
         self.scratch.residual = Some(residual);
         out
     }
@@ -3972,6 +4484,14 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         self.decode_batch_internal_with_full_logits(batch, force_full_logits)
     }
 
+    fn decode_batch_with_logits_policy(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        policies: &[LogitsReturnPolicy],
+    ) -> Vec<Vec<f32>> {
+        self.decode_batch_internal_with_logits_policy(batch, policies)
+    }
+
     fn unified_forward(
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
@@ -4278,9 +4798,35 @@ mod tests {
 
     use super::{
         bf16_round, load_llama_family_layers, nan_trace_raw_matches, rope_freq, stats_for,
-        LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel, LlamaFamilyRuntimeEnv,
-        LlamaFamilyScratch, LlamaNanTraceConfig, RopeScalingConfig, DEFAULT_KV_CAPACITY,
+        supports_sandwich_legacy_batched_decode, LlamaDecodeBatchStats, LlamaFamilyConfig,
+        LlamaFamilyLayerStageConfig, LlamaFamilyModel, LlamaFamilyRuntimeEnv, LlamaFamilyScratch,
+        LlamaNanTraceConfig, RopeScalingConfig, DEFAULT_KV_CAPACITY,
     };
+
+    #[test]
+    fn decode_batch_stats_snapshot_records_shape_and_fallbacks() {
+        let mut stats = LlamaDecodeBatchStats::default();
+        stats.record_call(1, false);
+        stats.record_singleton_fast_path();
+        stats.record_call(4, true);
+        stats.record_unsupported_fallback();
+        stats.record_call(16, false);
+        stats.record_lora_fallback();
+
+        let snapshot = stats.snapshot_json();
+        assert_eq!(snapshot["schema_version"], 1);
+        assert_eq!(snapshot["calls"], 3);
+        assert_eq!(snapshot["total_items"], 21);
+        assert_eq!(snapshot["max_items"], 16);
+        assert_eq!(snapshot["last_items"], 16);
+        assert_eq!(snapshot["force_full_logits_calls"], 1);
+        assert_eq!(snapshot["singleton_fast_path_calls"], 1);
+        assert_eq!(snapshot["unsupported_fallback_calls"], 1);
+        assert_eq!(snapshot["lora_fallback_calls"], 1);
+        assert_eq!(snapshot["bucket_calls"]["m1"], 1);
+        assert_eq!(snapshot["bucket_calls"]["m3_4"], 1);
+        assert_eq!(snapshot["bucket_calls"]["m9_16"], 1);
+    }
 
     #[test]
     fn unsupported_rope_scaling_clamps_max_seq_len() {
@@ -4369,6 +4915,24 @@ mod tests {
             sliding_window: 0,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sandwich_legacy_batched_decode_requires_device_shadow_and_layer_schedule() {
+        let mut cfg = test_llama_config(1, true);
+        cfg.sandwich_norms = true;
+        cfg.sliding_window = 512;
+        cfg.sliding_window_pattern = 6;
+
+        assert!(supports_sandwich_legacy_batched_decode(&cfg, true));
+        assert!(!supports_sandwich_legacy_batched_decode(&cfg, false));
+
+        cfg.sliding_window_pattern = 0;
+        assert!(!supports_sandwich_legacy_batched_decode(&cfg, true));
+
+        cfg.sandwich_norms = false;
+        cfg.sliding_window_pattern = 6;
+        assert!(!supports_sandwich_legacy_batched_decode(&cfg, true));
     }
 
     #[test]

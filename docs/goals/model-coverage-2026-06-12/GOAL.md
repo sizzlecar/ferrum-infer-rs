@@ -14,6 +14,11 @@ MODEL_COVERAGE_W2 GOAL PASS: <out_dir>
 
 W3 不在本目标内宣称完成,本目标只交付 W3 的立项合同(见下)。
 
+发布级补充:本目标里的 `≥0.5× llama.cpp` 只是模型覆盖阶段 sanity floor。
+W2/W3 若要进入 release-grade/README 发布矩阵,以
+`RELEASE_GRADE_GOAL.md` 为准:正确性必须全过,性能必须达到同硬件同模型
+主流推理引擎至少 80%。
+
 ## 目标
 
 把 `ferrum run <model>` 对 2026-06 本地部署需求榜 top-15 的可跑数从当前约 4 个

@@ -2,6 +2,832 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XIV — W2 sentinel-fix Ferrum release-shape matrix PASS;baseline still blocks release-grade
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_sentinel_fix_release_shape_ferrum_ci_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `poll=01 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=02 cur_state=stopped actual_status=exited intended_status=stopped`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA sentinel-fix release-shape Ferrum CI matrix`;
+  - expected runtime/cost:1.5-3h,hard cap 3h,1x RTX 4090 instance
+    `40826362` at about USD 0.425/hr;
+  - stop condition:startup/SSH/CUDA/build/correctness first failure,any bench
+    cell nonzero or blocker warning,full matrix artifact copied,or 3h cap;
+  - correctness gate:CUDA `argmax_rows` test,`ferrum run`,
+    `scripts/model_coverage_smoke.sh gemma3:27b-gptq`;
+  - performance command:
+    `ferrum bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3 --num-prompts 100`
+    for c=1/4/16/32。
+- Build/correctness:
+  - CUDA `argmax_rows` test PASS,including sentinel case;
+  - release build PASS/cache-hit,binary SHA256:
+    `6883cc81f3c0a9e16c6c8d374cc98d5c154309e75bd1d7cac7cad832902cbcfb`;
+  - `ferrum run` rc=0,content `"5"`;
+  - serve smoke PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- Ferrum release-shape matrix result(all `n_repeats=3`, `num_prompts=100`,
+  `output_token_count_source=usage`,zero errors,blocker warning count `0`):
+  - c=1:`39.152 tok/s`,ci95 half-width `0.053`,LCB `39.099`,
+    completed `[100,100,100]`,errored `[0,0,0]`,p95 ITL `24.618 ms`;
+  - c=4:`125.981 tok/s`,ci95 half-width `2.397`,LCB `123.584`,
+    completed `[100,100,100]`,errored `[0,0,0]`,p95 ITL `26.236 ms`;
+  - c=16:`259.130 tok/s`,ci95 half-width `80.145`,LCB `178.985`,
+    completed `[100,100,100]`,errored `[0,0,0]`,p95 ITL `38.334 ms`;
+  - c=32 client / typed active cap16 (`--kv-capacity 400 --max-num-seqs 16`):
+    `281.525 tok/s`,ci95 half-width `15.552`,LCB `265.973`,
+    completed `[100,100,100]`,errored `[0,0,0]`,p95 ITL `39.561 ms`。
+- Interpretation:
+  - Ferrum product-path correctness and full release-shape matrix now pass on
+    the sentinel-fix build;
+  - c4 release-shape LCB `123.584` clears same-hardware vLLM c4 80% threshold
+    `123.335` by a narrow margin, replacing the earlier 32-request pre-gate as
+    better c4 evidence;
+  - c16 remains release-grade risk:LCB `178.985` is far below 80% of the
+    previous vLLM diagnostic c16 mean (`381.5 * 0.8 = 305.2`), though that vLLM
+    c16 run itself had invalid UTF-8 and cannot be final baseline evidence;
+  - c32 must be represented as requested c=32 with effective/published
+    concurrency 16 unless true active c=32 is implemented.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - create a checkpoint commit for the sentinel-fix/full-matrix evidence;
+  - resolve release-grade baseline coverage for c=16/c=32, then assemble
+    `model_release_grade_manifest.json` and run
+    `python3 scripts/release/model_release_grade_goal_gate.py w2 <out_dir>`。
+
+## 2026-06-15 XIII — W2 c4 CI pre-gate: c4 lower bound clears 80%
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_c4_ci_pregate_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `10:38:02 cur_state=stopped actual_status=running`;
+  - `10:38:13 cur_state=stopped actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA c4 release-grade confidence pre-gate`;
+  - expected runtime/cost:25-55min,stop cap 75min,1x RTX 4090 instance
+    `40826362` at about USD 0.402/hr;
+  - stop condition:startup/SSH/CUDA/build failure,CUDA argmax test failure,
+    `ferrum run` failure,serve smoke failure,c4 `--require-ci --n-repeats 3`
+    nonzero/error/warning,c4 CI evidence completes,or 75min cap;
+  - correctness gate:CUDA `argmax_rows` test,`ferrum run`,
+    `scripts/model_coverage_smoke.sh gemma3:27b-gptq`;
+  - performance command:
+    `ferrum bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`
+    at c=4;
+  - baseline:same-hardware vLLM 0.10.1.1 c4 baseline `154.169 tok/s`,
+    80% threshold `123.335 tok/s`。
+- Correctness:
+  - CUDA `argmax_rows` test PASS,including sentinel case;
+  - release build cache-hit PASS;
+  - `ferrum run` rc=0,content `"5"`;
+  - serve smoke PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- c4 CI result:
+  - repeats: `32/32/32 completed`, `0/0/0 errored`;
+  - output token count source:`usage`;
+  - greedy argmax warning count:`0`;
+  - throughput mean:`128.988 tok/s`,stddev:`0.501`,ci95 half-width:`1.246`;
+  - lower bound:`127.742 tok/s`,ratio to baseline:`0.829`;
+  - mean ratio:`128.988 / 154.169 = 0.837`;
+  - c4 p95 ITL mean:`25.582 ms`,ci95 half-width:`0.004 ms`;
+  - c4 p95 TTFT mean:`814.284 ms`,ci95 half-width:`61.656 ms`;
+  - c4 p95 TPOT mean:`27.212 ms`,ci95 half-width:`4.918 ms`。
+- Interpretation:
+  - c4 now has CI evidence clearing the 80% throughput line;
+  - this is still a pre-gate,not final W2 release-grade, because required W2 cells
+    c=1/16/32 and final manifest/validator are still missing, and c16/c32
+    mainstream baseline handling must be resolved.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - collect Ferrum release-shape CI evidence for c=1/16/32 on the sentinel-fix
+    build, then assemble/validate the W2 manifest;
+  - in parallel, resolve release-grade baseline coverage for c=16/c=32, because
+    previous vLLM c16 failed invalid UTF-8 and cannot be used as final baseline
+    evidence as-is.
+
+## 2026-06-15 XII — W2 sentinel-fix c4/c16 diagnostic: c4 mean crosses 80% line
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_sentinel_fix_c4_c16_diag_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `10:26:19 cur_state=stopped actual_status=running`;
+  - `10:26:30 cur_state=stopped actual_status=running`;
+  - `10:26:43 cur_state=stopped actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA sentinel-fix c4/c16 performance diagnostic`;
+  - expected runtime/cost:20-50min,stop cap 70min,1x RTX 4090 instance
+    `40826362` at about USD 0.402/hr;
+  - stop condition:startup/SSH/CUDA/build failure,CUDA argmax test failure,
+    `ferrum run` failure,serve smoke failure,any bench cell nonzero error,
+    greedy-argmax warning reproduces,c4/c16 diagnostic completes,or 70min cap;
+  - correctness gate:CUDA `argmax_rows` test,`ferrum run`,
+    `scripts/model_coverage_smoke.sh gemma3:27b-gptq`;
+  - performance command:diagnostic-only
+    `ferrum bench-serve --fail-on-error --seed 9271 --n-repeats 1`
+    for c=4 and c=16;
+  - baseline:reuse previously saved same-hardware vLLM 0.10.1.1 c4 baseline
+    `154.169 tok/s`;baseline not rerun in this diagnostic.
+- Correctness:
+  - CUDA `argmax_rows` test PASS,including sentinel case;
+  - release build cache-hit PASS;
+  - `ferrum run` rc=0,content `"5"`;
+  - serve smoke PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- Diagnostic bench result(非 release evidence,N=1,无 CI):
+  - c4:`32 completed / 0 errored`, `125.057 tok/s`;
+  - c16:`32 completed / 0 errored`, `305.287 tok/s`;
+  - output token count source:`usage`;
+  - greedy argmax warning count:`0`;
+  - c4 p95 ITL:`25.562 ms`,p95 TTFT:`828.434 ms`,p95 TPOT:`30.289 ms`;
+  - c16 p95 ITL:`28.539 ms`,p95 TTFT:`3251.742 ms`,p95 TPOT:`47.267 ms`;
+  - health after c16:`force_full_logits_calls=0`,`calls=1805`,
+    `total_items=10570`,`avg_items_per_call=5.856`,`max_items=16`,
+    buckets `m3_4=1271`,`m9_16=379`。
+- Interpretation:
+  - c4 now crosses the 80% mean line versus same-hardware vLLM baseline:
+    `125.057 / 154.169 = 0.811`;80% threshold is `123.335 tok/s`;
+  - this is still only N=1 diagnostic evidence,not release-grade performance
+    evidence under `RELEASE_GRADE_GOAL.md`;
+  - next step should be release-grade performance collection with
+    `--fail-on-error --require-ci --seed 9271 --n-repeats 3` for the required
+    cells, plus manifest/validator wiring.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade until CI/variance evidence and the final
+    validator pass.
+
+## 2026-06-15 XI — W2 masked-argmax sentinel fix: CUDA c16 diagnostic clean
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_masked_argmax_sentinel_fix_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `10:13:50 cur_state=stopped actual_status=running`;
+  - `10:14:01 cur_state=stopped actual_status=running`;
+  - `10:14:13 cur_state=stopped actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA masked-argmax sentinel-fix validation`;
+  - expected runtime/cost:20-45min,stop cap 60min,1x RTX 4090 instance
+    `40826362` at about USD 0.402/hr;
+  - stop condition:startup/SSH/CUDA/build failure,CUDA argmax test failure,
+    `ferrum run` failure,serve smoke failure,c16 repeats forbidden-token diagnostic,
+    c16 diagnostic clean completes,or 60min cap;
+  - correctness gate:CUDA `argmax_rows` masked test including sentinel case,
+    `ferrum run`,`scripts/model_coverage_smoke.sh gemma3:27b-gptq`;
+  - performance command:diagnostic-only
+    `ferrum bench-serve --fail-on-error --seed 9271 --n-repeats 1` at c=16;
+  - baseline:reuse previously saved same-hardware vLLM 0.10.1.1 c4 baseline
+    `154.169 tok/s`;baseline not rerun in this diagnostic.
+- CUDA validation:
+  - `argmax_rows_f16_masked_skips_invalid_tokens` PASS;
+  - `argmax_rows_f16_masked_returns_sentinel_without_finite_valid_token` PASS;
+  - release build PASS:`cargo build --release -j 8 -p ferrum-cli --features cuda,vllm-paged-attn-v2`;
+  - `ferrum run` rc=0,content `"5"`;
+  - serve smoke PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- Diagnostic bench result(非 release evidence,N=1,无 CI):
+  - c16:`32 completed / 0 errored`, `305.275 tok/s`;
+  - output token count source:`usage`;
+  - greedy argmax warning count:`0`;
+  - decode stats:`force_full_logits_calls=0`,`calls=392`,`total_items=5334`,
+    `avg_items_per_call=13.607`,`max_items=16`,bucket `m9_16=379`;
+  - run status:`diagnostic_clean`,run rc:`0`。
+- Interpretation:
+  - sentinel fix removed the reproduced c16 forbidden-token failure in this
+    diagnostic shape;
+  - c16 diagnostic throughput improved relative to masked-argmax retry
+    (`300.242 -> 305.275 tok/s`),but this is still diagnostic and not a
+    release-grade performance claim;
+  - c4 remains the known release-grade bottleneck:latest valid diagnostic is
+    still `120.056 tok/s` vs same-hardware vLLM c4 baseline `154.169 tok/s`,
+    ratio `0.779`,below 80% (`123.335 tok/s`).
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - run a targeted c4/c16 diagnostic on the sentinel-fix build,then either:
+    c4 clears the 80% mean line and we move to release-grade N>=3/CI evidence,
+    or c4 remains below target and we move to the next performance lever;
+  - likely next lever remains model hot path/kernel profiling,not scheduler
+    formation, because c16 batches are already reaching `avg_m≈13.6`.
+
+## 2026-06-15 X — W2 masked-argmax mask diagnostic:定位到 GPU masked argmax 返回被 mask token
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_masked_argmax_maskdiag_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `09:37:08 cur_state=stopped actual_status=running`;
+  - `09:37:19 cur_state=stopped actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA masked-argmax forbidden-token diagnostic`;
+  - expected runtime/cost:20-45min,stop cap 60min,1x RTX 4090 instance
+    `40826362` at about USD 0.402/hr;
+  - stop condition:startup/SSH/CUDA/build failure,`ferrum run` failure,serve
+    smoke failure,c16 diagnostic completes,forbidden-token diagnostic is captured,or
+    60min cap;
+  - correctness gate:CUDA `argmax_rows` masked test,`ferrum run`,
+    `scripts/model_coverage_smoke.sh gemma3:27b-gptq`;
+  - performance command:diagnostic-only
+    `ferrum bench-serve --fail-on-error --seed 9271 --n-repeats 1` at c=16;
+  - baseline:reuse previously saved same-hardware vLLM 0.10.1.1 c4 baseline
+    `154.169 tok/s`;baseline not rerun in this diagnostic.
+- Correctness before diagnostic bench:
+  - CUDA `argmax_rows` masked test PASS;
+  - release build PASS:`cargo build --release -j 8 -p ferrum-cli --features cuda,vllm-paged-attn-v2`;
+  - `ferrum run` rc=0,content `"5"`;
+  - serve smoke PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- Diagnostic result:
+  - c16 diagnostic was manually stopped after the first forbidden-token warning;
+  - server warning:
+    `token_id=0`, `token_text="<pad>"`, `generated_tokens=126`,
+    `forbidden_count=6380`, `base_vocab_size=Some(262144)`,
+    `argmax_mask=...len=262144,value=0`;
+  - health at stop confirms this was the typed masked-argmax path:
+    `force_full_logits_calls=0`, `calls=391`, `total_items=5336`,
+    `avg_items_per_call=13.647`, `max_items=16`, bucket `m9_16=379`;
+  - GPU memory returned to 1 MiB after manual stop.
+- Conclusion:
+  - engine-side mask construction was correct for the returned token (`value=0`);
+  - the remaining correctness bug is in the CUDA/model masked-argmax path returning
+    a token that should have been excluded, specifically the no-finite-valid-token
+    fallback/default behavior returning index 0.
+- Follow-up source fix:
+  - CUDA `argmax_rows_f16_masked` now ignores non-finite logits and returns
+    sentinel `u32::MAX` (`-1` as i32) when no finite valid token exists;
+  - `LlamaFamilyModel` falls back to full logits if any row returns the sentinel,
+    preserving correctness instead of emitting a masked token id;
+  - CUDA test added:
+    `argmax_rows_f16_masked_returns_sentinel_without_finite_valid_token`;
+  - local validation:
+    `cargo fmt --all -- --check`,
+    `cargo check -q -p ferrum-models --tests`,
+    `cargo check -q -p ferrum-kernels --tests`,
+    `cargo test -q -p ferrum-engine model_greedy_argmax_sentinel -- --nocapture`,
+    `cargo test -q -p ferrum-engine model_decode_logits_policy -- --nocapture`,
+    `git diff --check`。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - run a minimal CUDA validation of the sentinel fix: CUDA `argmax_rows` test,
+    `ferrum run`,serve smoke,and c16 diagnostic;
+  - only after c16 stays clean should we resume c4/c16 performance work toward
+    the 80% line.
+
+## 2026-06-15 IX — W2 masked GPU argmax probe: c4 小幅改善,但 c16 暴露 forbidden-token 风险
+
+- 本轮 artifacts:
+  - 首次探针:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w2_masked_argmax_probe_2026-06-15/`;
+  - sentinel 修正后重试:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w2_masked_argmax_retry_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。两轮结束后均已同步
+  artifact 并停机;stop poll 分别记录:
+  - `08:53:13 cur_state=stopped actual_status=exited`;
+  - `09:09:09 cur_state=stopped actual_status=exited`。
+- 改动:
+  - 引入 typed `LogitsReturnPolicy::GreedyArgmax` 与 `TokenSelectionMask`;
+  - CUDA `argmax_rows_f16_masked` 支持 GPU 侧 masked greedy argmax;
+  - Gemma/Llama-family batched decode 在确定性 greedy/text 输出路径上可避免
+    full-logits readback;
+  - engine 仍保留 product-side forbidden/initial/extended-vocab/output-quality 校验,
+    不允许模型侧 argmax 绕过采样 mask。
+- 本地验证:
+  - `cargo fmt --all -- --check`;
+  - `cargo check -q -p ferrum-interfaces --tests`;
+  - `cargo check -q -p ferrum-engine --tests`;
+  - `cargo check -q -p ferrum-models --tests`;
+  - `cargo check -q -p ferrum-kernels --tests`;
+  - targeted engine/model tests for logits policy, sentinel acceptance, decode stats;
+  - `git diff --check`。
+- GPU correctness:
+  - CUDA `argmax_rows` masked test PASS;
+  - CUDA `flash_attn_batched_eq` tests PASS;
+  - retry build:`CUDA_COMPUTE_CAP=89 cargo build --release -j 8 -p ferrum-cli --features cuda,vllm-paged-attn-v2`;
+  - retry `ferrum run` rc=0,content `"5"`;
+  - retry serve smoke PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- 首次探针结果:
+  - `ferrum run` 与 serve smoke 通过后,c=4 bench 启动即出现
+    `model returned greedy token sentinel for request requiring full logits`;
+  - 随后 server log 记录 CUDA illegal-address failure,本轮停止并复制 artifact;
+  - 结论是 sentinel 接受条件仍按旧 `requires_full_logits_for_sampling()` 判断,
+    未识别 typed masked-greedy product policy。
+- 重试结果(非 release evidence,N=1,无 CI):
+  - c=4:`32 completed / 0 errored`, `120.056 tok/s`,
+    output token count source:`usage`;
+  - c=4 health stats:`force_full_logits_calls=0`,
+    `avg_items_per_call=3.595`,`max_items=4`;
+  - 相比 sliding-window probe c=4 `117.172 tok/s`,增量约 `+2.5%`;
+  - 相比 same-hardware vLLM c=4 baseline `154.169 tok/s`,ratio 约 `0.779`,
+    仍低于 W2 80% 目标。
+- c16 风险:
+  - retry 进入 c=16 后 server log 出现 124 次
+    `model greedy argmax returned a forbidden token`;
+  - 虽然 artifact 中有 c=16 诊断 JSON,本轮已按 first-triage 原则停止,不把
+    c=16 作为有效性能证据;
+  - 下一步必须先定位 forbidden token id/mask 来源,再继续性能验证。
+- 本地 follow-up:
+  - `accept_model_greedy_argmax_token` 错误已补充 token id、token text、
+    decoded delta、generated token 数、forbidden/initial-forbidden 数量、
+    base vocab size 和 allowed-extended 数量;
+  - 新增 targeted test 断言 forbidden-token 错误包含关键诊断字段;
+  - 验证命令:
+    `cargo fmt --all -- --check`,
+    `cargo check -q -p ferrum-engine --tests`,
+    `cargo test -q -p ferrum-engine model_greedy_argmax_sentinel -- --nocapture`,
+    `cargo test -q -p ferrum-engine model_decode_logits_policy -- --nocapture`,
+    `git diff --check`。
+- 发布级判定:
+  - 未生成 `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍未完成。
+- 下一步:
+  - 用新增诊断跑一次小 CUDA 探针,确认 masked argmax 是否仍返回被 mask token,
+    或是 per-sequence mask/fingerprint 选择错误;
+  - 正确性修复后还需要继续找至少约 `3.3 tok/s` 的 c=4 增量,才能越过
+    `0.80 * 154.169 = 123.335 tok/s`。
+
+## 2026-06-15 VIII — W2 sliding-window batched attention: c16 明显改善,c4 仍未达 80%
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_sliding_batched_attn_probe_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。结束后已同步
+  artifact 并停机;Vast API poll 记录 `cur_state=stopped`,
+  `actual_status=exited`。停止前 `nvidia-smi` 显示无运行进程,GPU memory 1 MiB。
+- 改动:
+  - CUDA head-major single decode attention 增加 `sliding_window` 实现;
+  - CUDA `flash_attention_batched_per_cache` 增加 common `sliding_window` 参数;
+  - Gemma3 local-window 层不再强制 per-item attention fallback,而是通过 batched
+    attention kernel 处理 local window;
+  - 新增 CUDA test:
+    `flash_attn_batched_sliding_window_one_selects_latest_v`。
+- 本地验证:
+  - `cargo fmt --all -- --check`;
+  - `cargo check -q -p ferrum-models --tests`;
+  - `cargo test -q -p ferrum-models decode_batch_stats_snapshot_records_shape_and_fallbacks -- --nocapture`;
+  - `cargo check -q -p ferrum-kernels --tests`;
+  - `git diff --check`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA sliding-window batched-attn probe`;
+  - expected runtime/cost:45-75min,stop cap 90min / 约 USD 0.65;
+  - stop condition:CUDA kernel test 失败、`ferrum run`/serve smoke 失败、c=4/c=16
+    诊断完成,或达到 90min;
+  - correctness gate:
+    `cargo test --release -p ferrum-kernels --features cuda --test flash_attn_batched_eq -- --nocapture`,
+    再跑 `ferrum run` 与 `scripts/model_coverage_smoke.sh gemma3:27b-gptq`;
+  - performance command:诊断型
+    `ferrum bench-serve --fail-on-error --seed 9271 --n-repeats 1`
+    分别跑 c=4 与 c=16。
+- CUDA kernel test:
+  - `flash_attn_batched_matches_per_item`:max diff `3.052e-5`;
+  - `flash_attn_batched_sliding_window_one_selects_latest_v`:max diff `1.206e-4`;
+  - `test result: ok. 2 passed`。
+- Product correctness:
+  - release build:`CUDA_COMPUTE_CAP=89 cargo build --release -j 8 -p ferrum-cli --features cuda,vllm-paged-attn-v2`;
+  - `ferrum run` rc=0,content `"5"`;
+  - serve smoke PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- Diagnostic bench 结果(非 release evidence,N=1,无 CI):
+  - c=4:`32 completed / 0 errored`, `117.172 tok/s`;
+  - c=16:`32 completed / 0 errored`, `245.801 tok/s`;
+  - output token count source:`usage`。
+- 对比上一轮 stats probe:
+  - c=4:`105.050 -> 117.172 tok/s`,约 `+11.5%`;
+  - c=16:`177.364 -> 245.801 tok/s`,约 `+38.6%`;
+  - c=16 段增量仍形成大 batch:`avg_m=13.677`,bucket `m9_16=379/390`。
+- 发布级判定:
+  - 同硬件 vLLM c=4 baseline 为 `154.169 tok/s`;本轮 Ferrum c=4 诊断 ratio
+    约 `0.760`,仍低于 80%;
+  - c=16 vLLM baseline 仍因 invalid UTF-8 不能作为 release-grade evidence,但
+    诊断 ratio 约 `245.8 / 381.4 = 0.645`;
+  - 未生成 `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍未完成。
+- 下一步:
+  - 继续一个窄性能 lever,优先用 `FERRUM_DECODE_OP_PROFILE` 或等价可记录 artifact
+    确认剩余 c=4 gap 是否主要在 full-logits/lm_head readback、qkr/kv append、
+    MLP/GEMM 小 m 效率,或 attention 本身;
+  - 不重复 full sweep,直到 c=4 diagnostic ratio 明确越过 80% 或定位出下一个
+    高收益修复。
+
+## 2026-06-15 VII — W2 decode batch stats probe: c16 已形成大 batch,瓶颈转向模型/kernel 路径
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_decode_batch_stats_probe_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。结束后已同步
+  artifact 并停机;Vast API poll 记录 `cur_state=stopped`,
+  `actual_status=exited`。停止前 `nvidia-smi` 显示无运行进程,GPU memory 1 MiB。
+- 本轮新增 source instrumentation:
+  - `LlamaFamilyModel` 通过 `/health.cache.prefix_cache.decode_batch` 暴露
+    decode_batch 调用数、total rows、max m、m bucket、fallback 计数;
+  - 只记录 metrics,不改变 scheduler/model/kernel/sampling 行为;
+  - 本地验证:
+    `cargo test -q -p ferrum-models decode_batch_stats_snapshot_records_shape_and_fallbacks -- --nocapture`,
+    `cargo fmt --all -- --check`,
+    `cargo check -q -p ferrum-models --tests`,
+    `git diff --check`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA batched-decode stats probe`;
+  - expected runtime/cost:35-60min,stop cap 90min / 约 USD 0.60;
+  - stop condition:启动/SSH/构建失败、`ferrum run`/serve smoke 失败、c=16
+    bench 出错、或采集完 health stats;
+  - correctness gate:`ferrum run` + `scripts/model_coverage_smoke.sh gemma3:27b-gptq`;
+  - performance command:诊断型
+    `ferrum bench-serve --fail-on-error --seed 9271 --n-repeats 1`
+    分别跑 c=4 与 c=16。
+- Correctness:
+  - release build:`CUDA_COMPUTE_CAP=89 cargo build --release -j 8 -p ferrum-cli --features cuda,vllm-paged-attn-v2`;
+  - `ferrum run` rc=0;
+  - serve smoke PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- Diagnostic bench 结果(非 release evidence,N=1,无 CI):
+  - c=4:`32 completed / 0 errored`, `105.050 tok/s`;
+  - c=16:`32 completed / 0 errored`, `177.364 tok/s`;
+  - output token count source:`usage`。
+- Decode batch stats:
+  - c=4 段后累计:`calls=1422,total_items=5334,avg_m=3.751,max_m=4`;
+    bucket:`m1=13,m2=151,m3_4=1258`;
+  - c=16 段增量:`calls=391,total_items=5334,avg_m=13.642,max_m=16`;
+    bucket:`m1=1,m3_4=4,m5_8=8,m9_16=378`;
+  - fallback:`unsupported_fallback_calls=0,lora_fallback_calls=0`;
+  - server log 首个 batched decode:`m=4 use_batched_qkr=true`,
+    `batched-kv-append ok=true`, `batched-attn ok=true`。
+- 结论:
+  - c=16 扩展性差不是 scheduler 没形成大 batch;闭环 c=16 段实际平均 m≈13.6,
+    绝大多数调用在 m=9..16;
+  - 下一步应转向模型/kernel hot path,尤其是 Gemma local-window 层是否仍大量
+    per-item attention、full-logits readback/sampling、以及 per-layer qkr/attention/MLP
+    profile;
+  - W2 仍未完成:没有 `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+
+## 2026-06-15 VI — W2 CUDA12 vLLM baseline probe:server 可用,但 release-grade 失败
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm0101_cuda12_baseline_probe_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。结束后已同步
+  artifact 并停机;Vast API poll 记录 `cur_state=stopped`,
+  `actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3-27B CUDA vLLM 0.10.1.1/CUDA12 baseline probe`;
+  - expected runtime/cost:45-120min,约 USD 0.32-0.85;
+  - stop condition:torch CUDA smoke 失败、vLLM Gemma3/GPTQ 不支持并保存日志、
+    vLLM OpenAI smoke + baseline 完成,或任一 baseline cell 非零错误;
+  - correctness gate:`torch.cuda` smoke,再走 vLLM OpenAI
+    `/v1/chat/completions` 非空内容 + usage;
+  - performance command:`ferrum bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`。
+- 环境与依赖:
+  - GPU:`NVIDIA GeForce RTX 4090,24564 MiB,driver 565.77`;
+  - `vllm==0.10.1.1`, `torch==2.7.1+cu126`;
+  - 初始 pip 解析到 `transformers 5.12.0`,导致 Gemma3TextConfig 的 nested
+    rope_scaling 与 vLLM 0.10.1.1 不兼容:
+    `rope_scaling should have a 'rope_type' key`;
+  - pin `transformers==4.55.4` 后模型 config smoke 通过;
+  - 初始 pip 解析到 `fastapi 0.137.0` / `starlette 1.3.1` /
+    `prometheus-fastapi-instrumentator 8.0.0`, `/v1/models` 触发
+    `'_IncludedRouter' object has no attribute 'path'`;
+  - pin `fastapi==0.116.1`, `starlette==0.47.2`,
+    `prometheus-fastapi-instrumentator==7.1.0` 后 `pip check` clean。
+- vLLM product-path smoke:
+  - server 成功加载同一 HF/safetensors GPTQ model,日志显示
+    `Resolved architecture: Gemma3ForCausalLM` 与
+    `Using gptq_marlin kernel`;
+  - `/v1/models` rc=0;
+  - `/v1/chat/completions` 非流式 smoke rc=0,返回非空 content 且 usage 含
+    completion tokens。
+- Baseline 结果:
+  - c=1: vLLM `43.486 tok/s`,Ferrum `40.021 tok/s`,mean ratio `0.920`;
+  - c=4: vLLM `154.169 tok/s`,Ferrum `105.158 tok/s`,mean ratio `0.682`;
+  - c=16: vLLM 两次 N=3 rerun 都在第三轮产生
+    `bad output invalid-utf8: �"`;`--fail-on-error` 非零,因此 c=16 不能作为
+    release-grade baseline evidence。诊断均值约 `381.4 tok/s`,Ferrum c=16
+    `165.469 tok/s`,mean ratio 约 `0.434`。
+- 发布级判定:
+  - 有效 c=4 same-hardware mainstream baseline 已证明当前 Ferrum 低于 80%;
+  - vLLM c=16 baseline 自身没有零错误,仍不能进入 final manifest;
+  - 未生成 `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 release-grade 仍未完成。
+- 下一步:
+  - 继续 W2-P2 性能修复,重点缩小 c=4/c=16 gap,不能用 hidden env 或 sampler
+    参数绕过输出问题;
+  - 优先审计 Gemma3 batched decode 是否实际形成 m=4 以上的 decode batch、
+    local/sliding attention 是否仍强制小 batch fallback、以及 per-layer residual/
+    norm/GeGLU 是否还有 host sync 或重复 materialize;
+  - 下一轮 CUDA 只跑 targeted A/B 或 smoke,不要重复 full sweep,直到有明确
+    高收益改动。
+
+## 2026-06-15 V — W2 baseline probe:latest vLLM 0.23.0 安装成功但 CUDA13/driver565 不可用
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_baseline_probe_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。验证结束后已
+  复制 artifact 并停机;Vast API poll 记录 `cur_state=stopped`,
+  `actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3-27B CUDA vLLM/GPTQ baseline probe`;
+  - expected runtime/cost:30-90min,约 USD 0.21-0.64;
+  - stop condition:vLLM 明确不支持该模型/量化并保存日志、vLLM smoke 通过并完成
+    baseline、安装/启动超过 90min 无进展,或任一 baseline cell 非零错误;
+  - correctness gate:vLLM OpenAI `/v1/chat/completions` 简单问题返回有效非空内容;
+  - performance command:通过 smoke 后用
+    `ferrum bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`。
+- 环境:
+  - GPU:`NVIDIA GeForce RTX 4090,24564 MiB,driver 565.77`;
+  - CUDA compiler:`cuda_12.4.r12.4`;
+  - Python:`3.10.12`;
+  - 初始环境无 `vllm`/`torch`,Gemma3 GPTQ cache 存在。
+- 安装过程:
+  - 初次 `python3 -m venv /workspace/vllm-venv` 失败,因为镜像缺
+    `python3.10-venv`;
+  - 安装 `python3.10-venv` 后重建 venv;
+  - `pip install vllm` 成功,解析到 `vllm 0.23.0` 与 `torch 2.11.0`;
+  - 该 torch wheel 依赖 CUDA13 运行时包,包括 `cuda-toolkit 13.0.2`,
+    `nvidia-cublas 13.1.0.3`, `nvidia-cudnn-cu13 9.19.0.56`,
+    `nvidia-nccl-cu13 2.28.9` 等。
+- CUDA smoke:
+  - 命令:`/workspace/vllm-venv/bin/python import_smoke`;
+  - 失败位置:`torch.cuda.get_device_name(0)` 触发 `_cuda_init()`;
+  - 错误:
+    `RuntimeError: The NVIDIA driver on your system is too old (found version 12070)`;
+  - 因此 latest vLLM 0.23.0/CUDA13 wheel 栈不能在当前 driver 565.77 机器上作为
+    W2 same-hardware baseline。
+- 发布级判定:
+  - 本轮没有生成 baseline throughput,没有 `model_release_grade_manifest.json`,
+    没有 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 release-grade 仍未完成。
+- 下一步:
+  - 不再继续 latest vLLM/CUDA13 路线,除非先更换/升级同硬件 driver;
+  - 在同一 4090/cache-retained instance 上尝试 CUDA12 兼容的 vLLM 版本
+    (独立 venv,先 `torch.cuda` smoke,再 vLLM server smoke);
+  - 若 CUDA12-compatible vLLM 也不支持 Gemma3 GPTQ,保存明确模型/量化不支持证据,
+    再选择 `RELEASE_GRADE_GOAL.md` 允许的最快同模型同格式 mainstream engine。
+
+## 2026-06-15 IV — W2 Ferrum release-shape 全矩阵 PASS,release-grade 仍缺 mainstream baseline
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_release_shape_ferrum_cuda_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。验证结束后已
+  复制 artifact 并停机;Vast API poll 记录 `cur_state=stopped`,
+  `actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3-27B CUDA Ferrum release-shape matrix`;
+  - expected runtime/cost:1.5-3h,约 USD 0.64-1.28;
+  - stop condition:correctness 首败、任一 release-shape cell 非零错误、全矩阵
+    完成并回收 artifact,或 3h;
+  - correctness gate:`ferrum run` + `ferrum serve` smoke;
+  - performance command:`bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`
+    覆盖 c=1/4/16/32。
+- 远端源码/硬件:
+  - git SHA `2656cc1a4c1b4f722f14700a5e50d4e0af37db14`;
+  - 远端 dirty status 保存于 `remote_metadata.txt`;
+  - GPU:`NVIDIA GeForce RTX 4090,24564 MiB,driver 565.77`;
+  - CUDA compiler:`cuda_12.4.r12.4`;
+  - Rust:`cargo 1.96.0`, `rustc 1.96.0`。
+- CUDA release build:
+  - `CUDA_COMPUTE_CAP=89 cargo build --release -j 8 -p ferrum-cli --features cuda,vllm-paged-attn-v2`
+    PASS;
+  - binary SHA256:
+    `5fa06ab8dc93285bccca692702d5386bfbb39a8a6ba3e8e6b66a2467ee99c6b8`。
+- Correctness/product path:
+  - `ferrum run gemma3:27b-gptq --backend cuda ... --kv-capacity 2560 --max-num-seqs 2`
+    rc=0,输出 `content:"5"`, `finish_reason:"stop"`;
+  - `scripts/model_coverage_smoke.sh gemma3:27b-gptq --port 8401 --kv-capacity 2560 --max-seqs 2`
+    rc=0,stdout 打印 `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- Ferrum release-shape L5:
+  - c=1:`40.0214 tok/s`,completed `[100,100,100]`,errored `[0,0,0]`,
+    usage count,n_repeats=3;
+  - c=4:`105.1577 tok/s`,completed `[100,100,100]`,errored `[0,0,0]`,
+    usage count,n_repeats=3;
+  - c=16:`165.4689 tok/s`,completed `[100,100,100]`,errored `[0,0,0]`,
+    usage count,n_repeats=3;
+  - c=32 typed cap16 (`--kv-capacity 400 --max-num-seqs 16`):
+    `169.4372 tok/s`,completed `[100,100,100]`,errored `[0,0,0]`,
+    usage count,n_repeats=3;
+  - c=32 server log 首个并发 decode 为
+    `[batched-qkr] first batched_decode call: m=4 use_batched_qkr=true`,
+    证明 release-shape 并发路径实际触发 legacy batched decode。
+- 发布级判定:
+  - Ferrum 侧 release-shape correctness/perf matrix 已干净,且相对上一轮
+    flat 40 tok/s 有明确 c=4/16/32 提升;
+  - 仍未补同硬件、同模型、同量化/格式的 mainstream baseline,也未生成
+    `model_release_grade_manifest.json` 与最终
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - 因此 W2 仍不能宣称 release-grade。
+- 下一步:
+  - 在同一 RTX 4090 上优先尝试 vLLM/GPTQ baseline;若当前 vLLM 不支持
+    Gemma3 27B GPTQ,必须保存不支持证据并选择目标文档允许的最快同模型同格式
+    mainstream engine;
+  - baseline 必须用同一 prompt/cell、同一 effective active cap(c=32 cap16 时),
+    并保存 engine version/build/runtime config;
+  - 之后生成 `model_release_grade_manifest.json` 并运行
+    `python3 scripts/release/model_release_grade_goal_gate.py w2 <out_dir>`。
+
+## 2026-06-15 III — W2-P2 legacy batched decode CUDA 诊断:correctness PASS,并发路径已触发
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_legacy_batched_cuda_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。验证结束后已
+  复制 artifact 并停机;Vast API poll 记录 `cur_state=stopped`,
+  `actual_status=exited`。
+- 远端源码状态:
+  - git SHA `2656cc1a4c1b4f722f14700a5e50d4e0af37db14`;
+  - 远端 `git status --short` 保存于 `remote_metadata.txt`,包含本轮源码改动与既有
+    未跟踪 W2 artifacts;
+  - 为减少付费 GPU 空转,第二次 rsync 排除了历史 `docs/.../artifacts/`;
+    本轮是 diagnostic,不是最终 release-grade artifact collection。
+- CUDA release build:
+  - `CUDA_COMPUTE_CAP=89 cargo build --release -j 8 -p ferrum-cli --features cuda,vllm-paged-attn-v2`
+    PASS;
+  - binary SHA256:
+    `5fa06ab8dc93285bccca692702d5386bfbb39a8a6ba3e8e6b66a2467ee99c6b8`。
+- Correctness/product path:
+  - `ferrum run gemma3:27b-gptq --backend cuda ... --kv-capacity 2560 --max-num-seqs 2`
+    rc=0,输出 `content:"5"`, `finish_reason:"stop"`;
+  - `scripts/model_coverage_smoke.sh gemma3:27b-gptq --port 8401 --kv-capacity 2560 --max-seqs 2`
+    rc=0,stdout 打印 `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`,覆盖
+    known-answer 10/10,multi-turn,stream==non-stream,custom stop,tool-call,
+    strict json_schema;
+  - run/serve 日志均显示 `Gemma3 family: legacy batched_decode=true varlen_unified=false`。
+- Diagnostic perf/correctness:
+  - typed serve:`--kv-capacity 512 --max-num-seqs 16`;
+  - `bench-serve --random-input-len 256 --random-output-len 128 --concurrency-sweep 4,16 --num-prompts 32 --n-repeats 1 --fail-on-error --seed 9271`;
+  - c=4:completed `[32]`,errored `[0]`,usage count,105.5 tok/s;
+  - c=16:completed `[32]`,errored `[0]`,usage count,177.3 tok/s;
+  - server log 首个并发 decode 为
+    `[batched-qkr] first batched_decode call: m=4 use_batched_qkr=true`,证明本轮
+    legacy batched decode 窄开关在 CUDA 并发路径上实际触发。
+- 发布级判定:
+  - 未运行 `--require-ci --n-repeats 3` 全矩阵,未跑 c=32,未补同硬件主流引擎
+    80% baseline,未生成 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - 因此 W2 仍是 functional/diagnostic 进展,不能宣称 release-grade。
+- 下一步:
+  - 在相同路径上跑 release-grade 形状的 c=1/4/16/32 correctness/perf,并补 baseline;
+  - 若 c=32 仍需 active admission cap,release-grade manifest 必须把 effective
+    concurrency/cap 与 baseline 对齐;
+  - 继续审计 `batched-attn m=4 ok=true` 是否在 local-window 层走了预期 per-item
+    fallback,以及是否还有 Gemma3 tail/attention 可融合热点。
+
+## 2026-06-15 II — W2-P2 legacy batched decode 窄开关:CUDA 候选,待 GPU 验证
+
+- 本轮仍未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- 代码侧推进:
+  - Gemma/sandwich family 的 `supports_batched_decode` 不再无条件禁用;
+  - 窄开关条件为: sandwich norms + 非零 `sliding_window_pattern` + 后端支持
+    device-side F32 residual shadow。当前目标是只让 CUDA Gemma3 进入 legacy
+    contiguous batched decode 候选路径;
+  - `supports_varlen_qkv` 对 sandwich 仍禁用,因为 paged/unified attention 还没有
+    per-layer local-window 语义;
+  - active LoRA cache 继续 fallback 到 per-item decode,因为 legacy batched qkv/o/gate/down
+    仍不携带 per-cache LoRA adapter;
+  - layer-split pipeline 的 batch stage 对 sandwich family 继续 fallback,避免 full-model
+    decode_batch capability 影响未验证的 pipeline hidden path。
+- 新增/更新测试:
+  - `sandwich_legacy_batched_decode_requires_device_shadow_and_layer_schedule` 锁定
+    capability 条件,避免后续扩大到无 device shadow 或无 Gemma layer schedule。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - `cargo check -q -p ferrum-models --tests` PASS;
+  - `cargo test -q -p ferrum-models sandwich_legacy_batched_decode_requires_device_shadow_and_layer_schedule -- --nocapture` PASS;
+  - `cargo test -q -p ferrum-models --lib` PASS,123 tests passed;
+  - `cargo check -q -p ferrum-cli --all-targets` PASS.
+- 下一步:
+  - 必须在 1x RTX 4090 上跑 CUDA correctness smoke,确认 `ferrum run` 和
+    `ferrum serve` 在新 legacy batched decode 路径下无 `<unk>`/`[PAD]`/
+    NaN/stream DONE 问题;
+  - 通过 correctness 后再跑短 c=4/16 diagnostic,观察吞吐是否不再完全平坦。
+
+## 2026-06-15 — W2-P2 batched decode 语义铺垫:共享 Gemma tail,fast path 仍禁用
+
+- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- 代码侧推进:
+  - `LlamaFamilyModel` 抽出 `forward_layer_post_o_proj_with_residual_shadow`,
+    让单序列 post-attn tail 与 legacy batched decode 在 o_proj 后共享同一套
+    sandwich norm / GeGLU / device-F32 residual shadow 语义;
+  - legacy batched decode layer 现在可从 host/device residual shadow 做 input
+    RMSNorm,并把 Gemma embedding scale、shadow 初始化、final norm、shadow 归还
+    接入 `decode_batch_internal_with_full_logits`;
+  - legacy contig batched decode attention 现在按 source layer 选择 Gemma3
+    local/global rope 与 `layer_window`;由于 single-launch batched attention
+    kernel 尚无 sliding-window 参数,local-window 层会强制走 per-item attention
+    fallback,保留正确性语义;
+  - batched CUDA graph 在 host/device residual shadow 路径下保持禁用,避免 graph
+    replay 在未验证的 Gemma shadow 状态上成为隐式产品路径。
+- 仍未完成:
+  - `supports_batched_decode` / `supports_varlen_qkv` 对 `sandwich_norms` 仍保持
+    false,所以用户路径仍走已验证的 per-item decode;
+  - paged/unified attention kernel API 仍未完整支持 Gemma3 per-layer local-window
+    语义;unified tail 仍需单独接入 sandwich/shadow 语义;
+  - 因此这只是 W2-P2 的语义地基,不是性能通过声明。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -q -p ferrum-models --tests` PASS;
+  - `cargo test -q -p ferrum-models --lib` PASS,122 tests passed。
+
+## 2026-06-14(发布级 II)— W2 device-side F32 shadow:正确性 PASS,诊断 L5 提升,仍非 release-grade
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_release_grade_device_shadow_cuda_2026-06-14/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`。验证结束后已复制 artifact 并
+  停机;Vast API poll 记录 `cur_state=stopped`,`actual_status=exited`。
+- 代码修正范围:
+  - Gemma3 CUDA sandwich-norm 路径改为 device-side F32 residual shadow,避免每层
+    host F32 shadow readback/copy;
+  - `common.cuh` 的 block reduce helper 修正 `blockDim < 32` 时的
+    `num_warps=(blockDim.x+31)/32`,否则小尺寸 CUDA precision tests 会把 variance
+    归零并放大到 `rsqrt(eps)`;
+  - `cuda/quant.rs` 的空 env-var test fixture 加显式类型,只影响测试编译。
+- CUDA feature build/test:
+  - `CUDA_COMPUTE_CAP=89 cargo check -q -p ferrum-kernels --tests --features cuda`
+    PASS;
+  - `CUDA_COMPUTE_CAP=89 cargo test -q -p ferrum-kernels --test cuda_activation_precision --features cuda`
+    PASS,4 tests passed;
+  - release binary command:
+    `CUDA_COMPUTE_CAP=89 cargo build --release -j 8 -p ferrum-cli --features cuda,vllm-paged-attn-v2`;
+  - binary SHA256:
+    `3af53becc860a5e038cda486da69de4fc5aa6e8d81543d04aba0dbebbe6a393f`.
+- 产品 correctness:
+  - `ferrum run gemma3:27b-gptq --backend cuda --prompt ... --kv-capacity 2560 --max-num-seqs 2 --output-format jsonl`
+    PASS:assistant content `5`,finish_reason `stop`,n_tokens `3`;
+  - `ferrum serve` smoke PASS:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`,覆盖 known-answer 10/10,
+    natural EOS,multi-turn,stream/non-stream,custom stop,max_tokens,
+    tool-call 10/10,strict json_schema 20/20。
+- Ferrum post-device-shadow diagnostic L5:
+  - c=1:`40.5367 tok/s`,100/100/100 completed,0 errors;
+  - c=4:`40.4754 tok/s`,100/100/100 completed,0 errors;
+  - c=16:`40.3856 tok/s`,100/100/100 completed,0 errors;
+  - c=32 typed cap16 (`--kv-capacity 400 --max-num-seqs 16`):
+    `40.3111 tok/s`,100/100/100 completed,0 errors.
+- 对旧同卡 llama.cpp GGUF sanity baseline `50.478 tok/s` 的诊断 ratio:
+  c=1 `0.8031`,c=4 `0.8018`,c=16 `0.8001`,c=32 `0.7986`。
+  这些数字只能说明 device-side F32 shadow 把旧 host-shadow 的约 `25 tok/s`
+  提升到约 `40 tok/s`;按 `RELEASE_GRADE_GOAL.md`,跨格式 llama.cpp 不能作为
+  CUDA GPTQ 正式 80% baseline。
+- 当前结论:
+  - W2 Gemma3 CUDA GPTQ correctness/product path 已保持 PASS;
+  - c=1/4/16/32 Ferrum diagnostic L5 已干净,但并发吞吐仍基本平坦,说明
+    batched/varlen Gemma3 fast path 仍是 release-grade 性能工作项;
+  - 未生成 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`,W2 仍不得宣称
+    release-grade。
+
+## 2026-06-14(发布级 I)— release-grade gate 与发布口径收窄
+
+- 新增发布级目标文档 `RELEASE_GRADE_GOAL.md`:明确 W2 coverage PASS 不等于
+  release-grade,后续 README/release notes/性能宣传以 80% 主流引擎 baseline
+  为硬门。
+- 新增 validator:
+  `scripts/release/model_release_grade_goal_gate.py`。
+  - 命令:`python3 scripts/release/model_release_grade_goal_gate.py w2 <out_dir>`
+    或 `w3 <out_dir>`;
+  - 输入:`<out_dir>/model_release_grade_manifest.json`;
+  - 输出:`model_release_grade_goal_gate.manifest.json`;
+  - 只有 stdout 打印 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` 或
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` 才能宣称本文目标完成。
+- validator self-test 已覆盖:
+  - 合格 W2 manifest 可 PASS;
+  - ratio `0.79` 会 FAIL;
+  - `runtime_config.hidden_env` 非空会 FAIL。
+- README/README_zh 已把 Gemma 3 27B CUDA 口径从 "certified/release-like"
+  收窄为 "functional / known-gap":当前同卡 llama.cpp ratio `0.500260x`,
+  低于 release-grade `0.8x`,因此不能写成 release-grade 支持。
+- W2-P2 预备修正:
+  - CUDA `Backend::rms_norm` 现在按 buffer dtype 分派 `rms_norm_f16` /
+    `rms_norm_f32`,不再无条件调用 F16 kernel;
+  - 新增 `cuda_activation_precision::f32_rms_norm_uses_f32_kernel`,为后续
+    device-side F32 residual shadow / sandwich-norm 路径铺路;
+  - 这不是 release-grade 性能修复,也没有启用 Gemma3 batched/varlen fast path。
+- 本轮本地验证:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py`
+    PASS;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS:`MODEL RELEASE GRADE GOAL SELFTEST PASS`;
+  - `python3 scripts/release/selftest_g0_validators.py`
+    PASS:`G0 VALIDATOR SELFTEST PASS`;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -q -p ferrum-kernels --tests` PASS;
+  - `cargo test -q -p ferrum-kernels --test cuda_activation_precision`
+    PASS locally with 0 tests because CUDA feature is not enabled on this host.
+
 ## 2026-06-14(早 VI)— W2 L5/perf 打通:客户端 c=32 + admission cap 16 PASS
 
 - 继续复用 stopped/cache-retained native CUDA instance `40826362`,没有重新租
@@ -1363,3 +2189,37 @@ Benchmark gate: bench-serve c=1/4/16/32 零错误;llama.cpp 同卡比 ≥0.5
 Budget cap: 1 pod-day 硬顶;目标 ≤6h(约 $2.5,单卡 4090)
 Stop condition: 正确性 gate 失败 → 停手出报告;8h 无进展 → 销毁重估
 ```
+
+## 2026-06-14 — 发布级推进 II:Gemma3 CUDA device F32 residual shadow
+
+- 实现:Gemma3 sandwich-norm 残差流在 CUDA 上改为设备侧 F32 shadow,只把
+  norm 后的投影输入物化回常规 activation dtype。覆盖 `prefill_internal`、
+  `decode_internal`、speculative `forward_verify` 和 layer-split stage helper;
+  CPU/Metal 保持原 host/default fallback。batched/varlen 快路仍在构造期对
+  sandwich 家族禁用,避免未实现 Gemma 语义时静默走错路径。
+- CUDA backend 增加 `sandwich_norm.cu` 三个 helper kernel:
+  activation→F32 shadow、activation RMSNorm→F32 branch、F32 shadow
+  RMSNorm→activation;同时 `rms_norm` 支持 F32 typed buffer,`copy_slice`
+  支持 F32→F32。
+- 目标意义:移除上一轮 W2 c=32 证据里的每层 D2H/F32 host shadow sync/copy
+  热路径,为后续同卡 A/B 重新测 `Ferrum / llama.cpp >= 0.8x` 做源代码准备。
+  这仍不是发布级通过声明;W2 release-grade 需要
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo check -q --workspace --all-targets` PASS。
+  - `cargo test -q -p ferrum-kernels --tests` PASS。
+  - `cargo test -q -p ferrum-kernels --test cuda_activation_precision` PASS
+    (本机默认特性下 0 CUDA tests)。
+  - `cargo test -q -p ferrum-models --tests` PASS。
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS:`MODEL RELEASE GRADE GOAL SELFTEST PASS`。
+  - `python3 scripts/release/selftest_g0_validators.py`
+    PASS:`G0 VALIDATOR SELFTEST PASS`。
+  - `python3 scripts/w2_goal_validator.py`
+    PASS:`MODEL_COVERAGE_W2 GOAL PASS: docs/goals/model-coverage-2026-06-12`。
+- 本机 CUDA feature check 受环境阻塞:
+  `cargo check -q -p ferrum-kernels --tests --features cuda` 在 build script
+  阶段因缺少 `nvcc`/`nvidia-smi` 失败,未能在本机编译 CUDA 源码。下一步需
+  4090 CUDA pod 运行 feature build、CUDA precision tests、Gemma3 smoke 和
+  release-grade W2 manifest/gate。
