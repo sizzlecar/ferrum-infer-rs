@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXVIII — W2 source checkpoint: wire diagnostic dense vLLM Marlin GPTQ load path
+
+- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- 代码侧推进:
+  - `FERRUM_VLLM_MARLIN=1` 不再在 dense GPTQ dispatch 入口被提前拒绝;
+  - 当二进制带 `vllm-marlin` feature 且设置 `FERRUM_VLLM_MARLIN=1` 时,
+    dense `load_gptq` 会:
+    - 上传 GPTQ qweight;
+    - 通过已有 `ferrum_vllm_gptq_marlin_repack` FFI 生成
+      vLLM Marlin tile qweight;
+    - 使用与 vLLM stacked path 一致的 Marlin scale permutation;
+    - 构造 `MarlinWeight` 后复用现有 `launch_vllm_marlin` dispatch;
+  - 如果设置 `FERRUM_VLLM_MARLIN=1` 但未编译 `vllm-marlin`,现在会在
+    load 阶段明确报错;
+  - 默认路径不变:未设置 `FERRUM_VLLM_MARLIN=1` 时仍走
+    IST-DASLab Marlin repack/dispatch。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check -- crates/ferrum-kernels/src/backend/cuda/quant.rs`
+    PASS;
+  - `cargo check -q -p ferrum-kernels --tests` PASS;
+  - `cargo test -q -p ferrum-kernels cuda_quant_runtime_config_parses_marlin_and_moe_knobs --lib`
+    PASS,0 tests matched in the non-CUDA local build.
+- Evidence caveat:
+  - 本机没有做 CUDA/vLLM feature build;该 checkpoint 必须通过下一轮
+    4090 release CUDA build and diagnostic run 才能证明 dense vLLM Marlin
+    path可加载、可正确生成、并有可比较性能。
+- Next step:
+  - 复用 1x4090 cache-retained instance 做 first-fail 小样本:
+    release build with `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`,
+    再跑 `FERRUM_VLLM_MARLIN=1` 的 `ferrum run` smoke 和
+    c16/c32 diagnostic;如果 load/correctness 失败,立刻拷回失败 artifact
+    并停机。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-15 XXVII — W2 projection-level Marlin profile: gate/up kernel is the dominant dense GPTQ target
 
 - 本轮 artifact:
