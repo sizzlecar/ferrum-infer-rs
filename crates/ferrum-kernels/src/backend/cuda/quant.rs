@@ -459,6 +459,13 @@ pub fn marlin_gemm_with_perm(
         // even a weaker single-slot pool is correct as long as we
         // don't leave the function before the kernel queues complete.
         with_marlin_gather_scratch(&stream, ctx.ordinal, m * k, |a_gathered| -> Result<()> {
+            let profile = crate::marlin::profile_marlin();
+            if profile {
+                stream.synchronize().map_err(|e| {
+                    FerrumError::model(format!("marlin gather profile pre-sync: {e}"))
+                })?;
+            }
+            let t0 = profile.then(std::time::Instant::now);
             let mut b = stream.launch_builder(&func);
             b.arg(a);
             b.arg(perm);
@@ -473,6 +480,14 @@ pub fn marlin_gemm_with_perm(
                 })
             }
             .map_err(|e| FerrumError::model(format!("gather_columns launch: {e}")))?;
+            if let Some(t0) = t0 {
+                stream.synchronize().map_err(|e| {
+                    FerrumError::model(format!("marlin gather profile post-sync: {e}"))
+                })?;
+                crate::marlin::record_marlin_gather_for_current_label(
+                    t0.elapsed().as_micros() as u64
+                );
+            }
             if use_vllm {
                 return launch_vllm_marlin(&ctx.stream, a_gathered, weight, out, m);
             }
