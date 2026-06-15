@@ -5,7 +5,7 @@
 # This intentionally bypasses Cargo and model loading:
 #   - compiles only the probe plus marlin_cuda_kernel.cu with nvcc;
 #   - allocates synthetic buffers for Gemma3-27B GPTQ projection shapes;
-#   - reports per-call kernel and workspace+kernel timing.
+#   - reports per-call hot, host-sync, cold-cache, and multi-weight-cycle timing.
 #
 # Usage:
 #   bash scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh

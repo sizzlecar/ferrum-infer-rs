@@ -50,6 +50,7 @@ constexpr int GROUP_SIZE = 128;
 constexpr int MAX_PAR = 16;
 constexpr int WARMUP_ITERS = 5;
 constexpr int TIMED_ITERS = 80;
+constexpr int WEIGHT_CYCLE_SETS = 8;
 constexpr double RTX4090_FP16_TFLOPS_PEAK = 165.0;
 constexpr size_t L2_FLUSH_BYTES = 256ull * 1024ull * 1024ull;
 
@@ -195,6 +196,76 @@ static float time_one_host_sync(
     return static_cast<float>(total_us / static_cast<double>(TIMED_ITERS));
 }
 
+static float time_weight_cycle(
+    cudaStream_t stream,
+    void* a,
+    const std::vector<void*>& b_set,
+    void* c,
+    const std::vector<void*>& scale_set,
+    const std::vector<void*>& workspace_set,
+    size_t workspace_bytes,
+    const Shape& shape,
+    int m,
+    const Tile& tile,
+    bool include_workspace_zero,
+    int sms) {
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CHK(cudaEventCreate(&start));
+    CHK(cudaEventCreate(&stop));
+
+    float total_ms = 0.0f;
+    const int total_iters = WARMUP_ITERS + TIMED_ITERS;
+    const int set_count = static_cast<int>(b_set.size());
+    for (int iter = 0; iter < total_iters; ++iter) {
+        int slot = iter % set_count;
+        void* b = b_set[slot];
+        void* scales = scale_set[slot];
+        void* workspace = workspace_set[slot];
+        if (!include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+        }
+        CHK(cudaEventRecord(start, stream));
+        if (include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+        }
+        int ret = marlin_cuda(
+            a,
+            b,
+            c,
+            scales,
+            m,
+            shape.n,
+            shape.k,
+            workspace,
+            GROUP_SIZE,
+            0,
+            stream,
+            tile.thread_k,
+            tile.thread_n,
+            sms,
+            MAX_PAR,
+            -1);
+        if (ret != 0) {
+            CHK(cudaEventDestroy(start));
+            CHK(cudaEventDestroy(stop));
+            return -static_cast<float>(ret);
+        }
+        CHK(cudaEventRecord(stop, stream));
+        CHK(cudaEventSynchronize(stop));
+        CHK(cudaGetLastError());
+        if (iter >= WARMUP_ITERS) {
+            float ms = 0.0f;
+            CHK(cudaEventElapsedTime(&ms, start, stop));
+            total_ms += ms;
+        }
+    }
+
+    CHK(cudaEventDestroy(start));
+    CHK(cudaEventDestroy(stop));
+    return (total_ms * 1000.0f) / static_cast<float>(TIMED_ITERS);
+}
+
 static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
     int sms = 0;
     CHK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
@@ -217,6 +288,17 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
     void* scales = cuda_alloc_bytes(scale_bytes, 0x3c);
     void* workspace = cuda_alloc_bytes(workspace_bytes, 0x00);
     void* flush_buffer = cuda_alloc_bytes(L2_FLUSH_BYTES, 0x5a);
+    std::vector<void*> b_cycle;
+    std::vector<void*> scale_cycle;
+    std::vector<void*> workspace_cycle;
+    b_cycle.reserve(WEIGHT_CYCLE_SETS);
+    scale_cycle.reserve(WEIGHT_CYCLE_SETS);
+    workspace_cycle.reserve(WEIGHT_CYCLE_SETS);
+    for (int i = 0; i < WEIGHT_CYCLE_SETS; ++i) {
+        b_cycle.push_back(cuda_alloc_bytes(b_bytes, 0x20 + i));
+        scale_cycle.push_back(cuda_alloc_bytes(scale_bytes, 0x40 + i));
+        workspace_cycle.push_back(cuda_alloc_bytes(workspace_bytes, 0x00));
+    }
 
     const Tile tiles[] = {
         {"auto", -1, -1},
@@ -310,6 +392,41 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
                 double padded_tflops = padded_ops / (static_cast<double>(us) * 1.0e6);
                 std::printf("%s,%d,%s,%.3f,%.2f,%.2f,0\n", mode, m, tile.name, us,
                             useful_tflops, padded_tflops);
+
+                for (int cycle_mode = 0; cycle_mode < 2; ++cycle_mode) {
+                    const bool include_ws = cycle_mode != 0;
+                    float cycle_us = time_weight_cycle(
+                        stream,
+                        a,
+                        b_cycle,
+                        c,
+                        scale_cycle,
+                        workspace_cycle,
+                        workspace_bytes,
+                        shape,
+                        m,
+                        tile,
+                        include_ws,
+                        sms);
+                    const char* cycle_label =
+                        include_ws ? "weight_cycle_ws_plus_kernel" : "weight_cycle_kernel";
+                    if (cycle_us < 0.0f) {
+                        std::printf("%s,%d,%s,NA,NA,NA,%d\n", cycle_label, m, tile.name,
+                                    static_cast<int>(-cycle_us));
+                        continue;
+                    }
+                    double cycle_useful_tflops =
+                        useful_ops / (static_cast<double>(cycle_us) * 1.0e6);
+                    double cycle_padded_tflops =
+                        padded_ops / (static_cast<double>(cycle_us) * 1.0e6);
+                    std::printf("%s,%d,%s,%.3f,%.2f,%.2f,0\n",
+                                cycle_label,
+                                m,
+                                tile.name,
+                                cycle_us,
+                                cycle_useful_tflops,
+                                cycle_padded_tflops);
+                }
             }
         }
     }
@@ -320,6 +437,9 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
     CHK(cudaFree(scales));
     CHK(cudaFree(workspace));
     CHK(cudaFree(flush_buffer));
+    for (void* ptr : b_cycle) CHK(cudaFree(ptr));
+    for (void* ptr : scale_cycle) CHK(cudaFree(ptr));
+    for (void* ptr : workspace_cycle) CHK(cudaFree(ptr));
     CHK(cudaStreamDestroy(stream));
 }
 
