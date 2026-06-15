@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LI — W2 source checkpoint: add Marlin shape trace for decode integration probe
+
+- 本轮代码改动:
+  `crates/ferrum-kernels/src/backend/cuda/marlin.rs`。
+- 背景:
+  - dense Marlin kernel swap 已被 native hot/weight-cycle A/B 排除;
+  - W2 c16 剩余差距应继续追 decode integration/scheduling,而不是继续
+    跑 full sweep 或 blind kernel flip;
+  - 已有 `FERRUM_MARLIN_PROFILE=1` 能聚合 projection bucket 时间,但缺少
+    每次 Marlin dispatch 的 shape/pointer/label trace。
+- 改动:
+  - 新增默认关闭的 `FERRUM_MARLIN_TRACE_SHAPES=1`;
+  - 新增 `FERRUM_MARLIN_TRACE_SHAPES_MAX=<N>`,默认最多 `256` 条;
+  - trace 行记录 call id,当前 CUDA alloc label,bucket,m/n/k,group size,
+    qweight/scales/workspace len,以及 A/B/C/scales/workspace device pointer;
+  - 仅在显式 env 打开时输出,不改变默认产品路径。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-kernels cuda_marlin_runtime_config -- --nocapture`
+    PASS,但默认 feature 下未命中 CUDA-gated Marlin tests;
+  - `cargo test -p ferrum-kernels --features cuda,marlin cuda_marlin_runtime_config -- --nocapture`
+    在本机失败,原因是本地无 `nvcc`/`nvidia-smi`,不是代码测试失败。
+- 下一步:
+  - 在 1x4090 上做最小 CUDA 编译验证,并用
+    `FERRUM_MARLIN_TRACE_SHAPES=1 FERRUM_MARLIN_TRACE_SHAPES_MAX=128`
+    跑短 product diagnostic,确认 trace 输出可解析且不引入 correctness
+    回归。
+
 ## 2026-06-15 L — W2 CUDA checkpoint: vLLM dense Marlin weight-cycle 也落在同一瓶颈带
 
 - 本轮 artifact:
