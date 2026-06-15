@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LX — W2 source checkpoint: bench-serve records per-request output token counts
+
+- 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - `BenchReport` 增加 `output_tokens_per_request`;
+  - `compute_metrics` 从每个 `RunRecord` 写出每次 repeat 的 measured request
+    output token 数,失败请求保留记录值(通常为 0);
+  - `bench-serve` 失败策略测试现在断言 fail-on-error 路径仍会先写出该字段。
+- Why:
+  - 最新 batched graph artifact 已证明 graph replay 真实发生,但主 replay shape
+    是 `m=15` 而不是满 `m=16`;
+  - 旧 report 只有总吞吐,缺少每请求 output token 分布,无法快速区分
+    早停/尾部 drain 与持续调度不满批;
+  - 下一次 CUDA 最小验证可直接用该字段判断 c16 诊断是否被某些请求短输出
+    拉低,避免再做无信息 full sweep。
+- Local validation:
+  - `cargo test -p ferrum-bench-core` PASS,45/45;
+  - `cargo test -p ferrum-cli fail_on_error_still_writes_json_report -- --nocapture`
+    PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS。
+- Bottleneck status:
+  - 已有证据仍指向 decode integration + tail MLP/Marlin projection + batch
+    cadence 的组合问题;
+  - workspace zero 和直接 dense vLLM Marlin kernel swap 均不是当前第一杠杆;
+  - W2 仍不是 release-grade。
+
 ## 2026-06-15 LIX — W2 CUDA checkpoint: batched graph replay confirmed, not sufficient for 80%
 
 - 本轮源码 checkpoint:
