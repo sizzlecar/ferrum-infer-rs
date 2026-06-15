@@ -2,6 +2,30 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XK — W2 source checkpoint: native down input-source probe
+
+- Added `scripts/microbenches/gemma3_down_input_source_perf.cu` plus
+  `scripts/microbenches/build_and_run_gemma3_down_input_source_perf.sh`.
+- Purpose:
+  - XG measured the product-shaped tail MLP chain and found m16 `down_proj`
+    around `68-71us` when it consumes GeGLU output;
+  - XJ measured isolated Marlin down at the same Gemma3 shape around `30-33us`
+    at m16 with synthetic constant input;
+  - this probe keeps the Marlin down shape fixed and varies only input source /
+    producer state: constant input, small constant input, constant after GeGLU,
+    constant after L2 flush, immediate GeGLU output, synced GeGLU output, and
+    device-copied GeGLU output.
+- Expected GPU use:
+  - run as a native CUDA minimal verification before any product change;
+  - if GeGLU-derived input remains slow after sync/copy, inspect activation
+    value range or down-kernel data sensitivity;
+  - if constant input slows after preceding GeGLU/flush, inspect cache/producer
+    state instead;
+  - if the gap disappears, treat the previous difference as measurement setup
+    and avoid this branch.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XJ — W2 native CUDA checkpoint: existing Triton W4A16 is slower than Marlin on Gemma3 MLP
 
 - Artifact:
