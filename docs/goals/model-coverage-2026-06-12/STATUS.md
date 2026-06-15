@@ -2,6 +2,62 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXIX — W2 dense vLLM Marlin first-fail: prefill launch config aborts before generation
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_diag_2026-06-15/`。
+- Scope:
+  - 这不是 release-grade gate,也没有生成 `MODEL_RELEASE_GRADE_W2 PASS:
+    <out_dir>`;
+  - 失败只覆盖新接入的诊断路径 `FERRUM_VLLM_MARLIN=1`,默认 dense GPTQ
+    Marlin 路径未因本轮诊断改判为失败;
+  - remote git HEAD:`ce960292cf3132b982770a4cc727a9a6b19d2f4e`;
+  - remote git status 因 artifacts 目录 rsync 排除显示旧 artifact 删除,所以本轮
+    只能作为 first-fail/debug evidence,不是 clean performance evidence。
+- GPU execution:
+  - lane:`W2 Gemma3 CUDA dense vLLM Marlin first-fail diagnostic`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD 0.425/hr;
+  - release CUDA build PASS in `3m 28s`;
+  - binary SHA256:
+    `abd576f024776ed6df39c9e4c939b28344d93e6e69429cb663a749de28a1f3c8`;
+  - sensitive scan of copied artifact: no `VAST_API_KEY`,`HF_TOKEN`,
+    private-key,`jupyter_token`,or startup-script hits.
+- Product-path result:
+  - command: `FERRUM_VLLM_MARLIN=1 target/release/ferrum run
+    gemma3:27b-gptq --backend cuda --prompt "What is 2+3? Answer with just
+    the number." --max-tokens 64 --temperature 0 --kv-capacity 2560
+    --max-num-seqs 2 --output-format jsonl`;
+  - `run.status=FAIL`;
+  - `correctness/run.rc=134`,`nohup.rc=134`;
+  - model load completed,then the first dense vLLM Marlin launch aborted before
+    token generation:
+    `m=23 n=8192 k=5376 group_size=128`;
+  - vLLM Marlin error:
+    `Invalid thread config: thread_m_blocks = 1, thread_k = -1,
+    thread_n = -1, num_threads = -1 for MKN = [23, 5376, 8192] and
+    num_bits = 4, prob_m_split = 16, group_size = 128`;
+  - server readiness and `bench-serve` did not run because the correctness
+    first-fail stop condition triggered.
+- Interpretation:
+  - dense vLLM Marlin load/repack path is wired far enough to reach the kernel
+    launch;
+  - the current launch path is not safe for the skinny prefill shape seen by
+    `ferrum run`,so it is a blocker for using `FERRUM_VLLM_MARLIN=1` as a
+    product path;
+  - this does not invalidate the previously collected default-path Ferrum
+    zero-error diagnostics, but W2 still remains not release-grade until the
+    final validator prints the required PASS line.
+- GPU cleanup:
+  - artifact copied locally before shutdown;
+  - stop poll reached `cur_state=stopped actual_status=exited`;
+  - stopped timestamp:`2026-06-15T06:23:32Z`.
+- Next step:
+  - inspect vLLM Marlin shape/config constraints and make the smallest safe
+    source change: either route unsupported skinny prefill shapes to the
+    existing IST-DASLab Marlin path,or correct the vLLM launch config;
+  - validate on the same cache-retained 4090 with a minimal `ferrum run`
+    first,then only run c16/c32 diagnostic if correctness passes.
+
 ## 2026-06-15 XXVIII — W2 source checkpoint: wire diagnostic dense vLLM Marlin GPTQ load path
 
 - 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
