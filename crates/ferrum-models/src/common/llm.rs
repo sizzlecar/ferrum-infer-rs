@@ -215,6 +215,15 @@ pub trait DecoderOnlyLLM: Send + Sync {
         ))
     }
 
+    /// Whether `unified_forward` can satisfy requests that require full logits.
+    ///
+    /// The trait contract returns logits for every final chunk, so the default
+    /// is true. Implementations with an opt-in sentinel/argmax return path must
+    /// override this while that path is active.
+    fn unified_forward_can_return_full_logits(&self) -> bool {
+        true
+    }
+
     /// Release the KV cache for a completed sequence.
     fn release(&mut self, cache_id: &str);
 

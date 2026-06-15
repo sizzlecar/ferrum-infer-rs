@@ -2,6 +2,47 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXV — W2 source checkpoint: allow full-logits unified prefill
+
+- 本轮没有启动 GPU,不产生性能结论,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - `DecoderOnlyLLM` 新增 `unified_forward_can_return_full_logits()`,默认
+    `true`;
+  - `LlmExecutor::unified_decode` 不再因为 batch 中存在
+    `ferrum_require_full_logits` 就无条件跳过 `model.unified_forward`;
+  - 只有模型声明 unified path 不能返回 full logits 时才保留旧 fallback;
+  - Qwen3 MoE 在 `unified_greedy_argmax` sentinel 路径开启时返回 `false`,
+    保持 full-logits correctness 保护。
+- Why:
+  - LXXIV artifact 里的 engine `[unified-prof] items=10 prefill=10` 只能证明
+    engine 构造了 unified batch,不能证明 model 层走了 true unified prefill;
+  - 同一日志中 `prefill-profile tokens=122` 重复 10 次,与
+    `LlmExecutor::unified_decode` 的 full-logits guard 对应:普通请求带
+    tokenizer/sampling mask 时会设置 `ferrum_require_full_logits`,从而把
+    Gemma3 c16 prefill cohort 退回 serial `model.prefill`;
+  - 此改动把产品路径从“full-logits 必定 serial fallback”改为“模型能返回
+    full logits 时仍用 unified prefill”,直接对齐 W2-P2 的 batched/unified
+    Gemma3 fast path 目标。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models llm_executor -- --nocapture` PASS
+    (12 tests);
+  - targeted tests PASS:
+    `unified_decode_uses_unified_forward_when_full_logits_supported`,
+    `unified_decode_skips_unified_forward_when_full_logits_unsupported`,
+    `unified_decode_full_logits_prefill_uses_unified_forward_and_prepares_kv_capacity_hint`,
+    `batch_prefill_falls_back_after_unified_unsupported`。
+- Required next CUDA validation:
+  - build CUDA release binary on the cached 4090 lane;
+  - rerun minimal c16 serve/chat/bench diagnostic;
+  - verify `prefill-profile tokens=122` no longer repeats serially before
+    the c16 prefill batch, and compare throughput/TTFT against LXXIV。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXIV — W2 CUDA checkpoint: batch-prefill fallback hypothesis rejected
 
 - 本轮 artifact:

@@ -172,6 +172,10 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
         Ok(self.unified_forward_internal(items))
     }
 
+    fn unified_forward_can_return_full_logits(&self) -> bool {
+        !self.runtime_env.unified_greedy_argmax
+    }
+
     fn release(&mut self, cache_id: &str) {
         // Mirror LlamaFamilyModel::release — do NOT reset the captured
         // graphs here. Graphs reference paged_pool addresses (model-
