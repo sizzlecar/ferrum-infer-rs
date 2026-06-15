@@ -2,6 +2,31 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXVIII — W2 source checkpoint: end capture based on active capture state
+
+- 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - legacy single decode、unified graph、batched graph 的 capture-end 条件
+    从 `should_capture && !*_graph_failed` 改成
+    `should_capture && B::graph_capture_in_flight(&ctx)`;
+  - 如果 begin capture 成功,即使后续 failure flag 已被置位,也会尝试
+    `end_graph_capture` 收口,避免 capture window 泄漏到后续普通
+    `B::sync`。
+- Why:
+  - LXVII retry 说明第一刀 guarded profiler sync 还不够;
+  - 失败形态更像 capture window 没有正常结束,导致后续正常同步命中
+    `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`;
+  - 以 backend active-capture state 作为 end 条件比 failure flag 更直接。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models llama_batched_runtime_config -- --nocapture`
+    PASS,2/2。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXVII — W2 CUDA checkpoint: first graph-safe profiler fix still leaves capture open
 
 - 本轮 artifact:
