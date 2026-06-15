@@ -1372,6 +1372,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             .as_ref()
             .expect("unified_forward_internal called on backbone-only model");
         B::embedding_lookup(&mut ctx, embed, &all_tokens, &mut residual, h);
+        if let Some(scale) = self.cfg.embed_scale {
+            B::scale_inplace(&mut ctx, &mut residual, scale, m_total * h);
+        }
         let use_device_residual_shadow =
             self.cfg.sandwich_norms && B::supports_device_f32_residual_shadow();
         let mut device_residual_shadow = if use_device_residual_shadow {

@@ -1,0 +1,4 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+bash: line 1: /workspace/w2_paged_unified_logits_product_diag_2026-06-16/server/server.pid: No such file or directory

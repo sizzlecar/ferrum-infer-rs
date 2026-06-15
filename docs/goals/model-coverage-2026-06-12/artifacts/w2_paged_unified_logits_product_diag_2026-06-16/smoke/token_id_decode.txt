@@ -1,0 +1,30 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+base /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2
+--- config.json ---
+eos_token_id 1
+bos_token_id 2
+pad_token_id 0
+--- generation_config.json ---
+eos_token_id [1, 106]
+bos_token_id 2
+pad_token_id 0
+--- tokenizer_config.json ---
+eos_token <end_of_turn>
+bos_token <bos>
+pad_token <pad>
+unk_token <unk>
+--- special_tokens_map.json ---
+eos_token {'content': '<end_of_turn>', 'lstrip': False, 'normalized': False, 'rstrip': False, 'single_word': False}
+bos_token {'content': '<bos>', 'lstrip': False, 'normalized': False, 'rstrip': False, 'single_word': False}
+pad_token <pad>
+unk_token {'content': '<unk>', 'lstrip': False, 'normalized': False, 'rstrip': False, 'single_word': False}
+id 106 token <end_of_turn>
+id 107 token 
+
+id 108 token 
+
+
+id 236743 token ▁
+id 245526 token 💩
