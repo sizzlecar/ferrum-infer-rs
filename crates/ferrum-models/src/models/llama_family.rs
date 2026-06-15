@@ -977,6 +977,41 @@ fn supports_sandwich_legacy_batched_decode(
         && backend_supports_device_f32_residual_shadow
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LlamaLayerAttentionSchedule {
+    pub is_global_layer: bool,
+    pub sliding_window: usize,
+}
+
+pub(crate) fn llama_qk_mode(cfg: &LlamaFamilyConfig) -> i32 {
+    if cfg.has_qk_norm {
+        1
+    } else if cfg.rope_interleaved {
+        3
+    } else {
+        2
+    }
+}
+
+pub(crate) fn llama_layer_attention_schedule(
+    cfg: &LlamaFamilyConfig,
+    source_layer_index: usize,
+) -> LlamaLayerAttentionSchedule {
+    let pattern = cfg.sliding_window_pattern;
+    let is_global_layer = pattern == 0 || (source_layer_index + 1) % pattern == 0;
+    let sliding_window = if pattern == 0 {
+        cfg.sliding_window
+    } else if is_global_layer {
+        0
+    } else {
+        cfg.sliding_window
+    };
+    LlamaLayerAttentionSchedule {
+        is_global_layer,
+        sliding_window,
+    }
+}
+
 fn unified_varlen_qkv_unsupported_reason(
     cfg: &LlamaFamilyConfig,
     backend_supports_varlen_qkv: bool,
@@ -993,6 +1028,8 @@ fn unified_varlen_qkv_unsupported_reason(
              Gemma3 layer semantics (local/global attention windows, local RoPE, \
              GeGLU, and post-attn/post-ffn sandwich norms); unified varlen \
              prefill is disabled until that path implements those semantics. \
+             The backend varlen attention surface must carry per-layer \
+             sliding-window semantics before this guard can be relaxed. \
              Engine will fall back to per-item dispatch.",
         );
     }
@@ -2641,13 +2678,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         //          2 = half-split RoPE only;
         //          3 = interleaved RoPE only (GGUF LLaMA / llama.cpp layout).
         // V always passes apply_norm=0.
-        let qk_mode: i32 = if cfg.has_qk_norm {
-            1
-        } else if cfg.rope_interleaved {
-            3
-        } else {
-            2
-        };
+        let qk_mode: i32 = llama_qk_mode(cfg);
         let dummy = &layer.input_ln_w;
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy);
@@ -2657,16 +2688,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // are local (sliding window, local rope table). Pattern 0 = uniform
         // legacy behavior. Field-precise rope refs keep the later
         // `&mut self.scratch` / `kv_caches` borrows legal.
-        let pattern = cfg.sliding_window_pattern;
-        let is_global_layer = pattern == 0 || (source_li + 1) % pattern == 0;
-        let layer_window = if pattern == 0 {
-            cfg.sliding_window
-        } else if is_global_layer {
-            0
-        } else {
-            cfg.sliding_window
-        };
-        let (rope_cos, rope_sin) = match (&self.rope_local, is_global_layer) {
+        let schedule = llama_layer_attention_schedule(cfg, source_li);
+        let layer_window = schedule.sliding_window;
+        let (rope_cos, rope_sin) = match (&self.rope_local, schedule.is_global_layer) {
             (Some(local), false) => (&local.cos, &local.sin),
             _ => (&self.rope.cos, &self.rope.sin),
         };
@@ -4928,11 +4952,11 @@ mod tests {
     use ferrum_types::{Activation, Result};
 
     use super::{
-        bf16_round, load_llama_family_layers, nan_trace_raw_matches, rope_freq, stats_for,
-        supports_sandwich_legacy_batched_decode, unified_varlen_qkv_unsupported_reason,
-        LlamaDecodeBatchStats, LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel,
-        LlamaFamilyRuntimeEnv, LlamaFamilyScratch, LlamaNanTraceConfig, RopeScalingConfig,
-        DEFAULT_KV_CAPACITY,
+        bf16_round, llama_layer_attention_schedule, llama_qk_mode, load_llama_family_layers,
+        nan_trace_raw_matches, rope_freq, stats_for, supports_sandwich_legacy_batched_decode,
+        unified_varlen_qkv_unsupported_reason, LlamaDecodeBatchStats, LlamaFamilyConfig,
+        LlamaFamilyLayerStageConfig, LlamaFamilyModel, LlamaFamilyRuntimeEnv, LlamaFamilyScratch,
+        LlamaNanTraceConfig, RopeScalingConfig, DEFAULT_KV_CAPACITY,
     };
 
     #[test]
@@ -5068,6 +5092,33 @@ mod tests {
     }
 
     #[test]
+    fn llama_attention_semantics_cover_qk_mode_and_layer_windows() {
+        let mut cfg = test_llama_config(12, false);
+        assert_eq!(llama_qk_mode(&cfg), 2);
+
+        cfg.rope_interleaved = true;
+        assert_eq!(llama_qk_mode(&cfg), 3);
+
+        cfg.has_qk_norm = true;
+        assert_eq!(llama_qk_mode(&cfg), 1);
+
+        cfg.sliding_window = 512;
+        cfg.sliding_window_pattern = 0;
+        let uniform = llama_layer_attention_schedule(&cfg, 0);
+        assert!(uniform.is_global_layer);
+        assert_eq!(uniform.sliding_window, 512);
+
+        cfg.sliding_window_pattern = 6;
+        let local = llama_layer_attention_schedule(&cfg, 4);
+        assert!(!local.is_global_layer);
+        assert_eq!(local.sliding_window, 512);
+
+        let global = llama_layer_attention_schedule(&cfg, 5);
+        assert!(global.is_global_layer);
+        assert_eq!(global.sliding_window, 0);
+    }
+
+    #[test]
     fn unified_varlen_qkv_rejects_sandwich_configs_even_when_backend_supports_varlen() {
         let mut cfg = test_llama_config(1, true);
         cfg.sandwich_norms = true;
@@ -5081,6 +5132,7 @@ mod tests {
         assert!(reason.contains("sandwich-norm family"));
         assert!(reason.contains("local/global attention windows"));
         assert!(reason.contains("post-attn/post-ffn sandwich norms"));
+        assert!(reason.contains("per-layer sliding-window semantics"));
 
         cfg.sandwich_norms = false;
         assert!(unified_varlen_qkv_unsupported_reason(&cfg, true).is_none());

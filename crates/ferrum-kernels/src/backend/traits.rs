@@ -1065,8 +1065,9 @@ pub trait BackendPagedKv: Backend {
     ///   position of each seq's first q token (= prior `kv_len`).
     /// - `block_tables`: `[num_seqs, max_num_blocks_per_seq]` i32 grid.
     ///
-    /// Each query token attends causally to all KV positions
-    /// `[0, pos_offsets[s] + local_idx]`.
+    /// Each query token attends causally to KV positions
+    /// `[0, pos_offsets[s] + local_idx]` when `sliding_window == 0`, or
+    /// only the most recent `sliding_window` positions when non-zero.
     #[allow(clippy::too_many_arguments)]
     fn paged_varlen_attention(
         _ctx: &mut Self::Context,
@@ -1083,6 +1084,7 @@ pub trait BackendPagedKv: Backend {
         _num_heads: usize,
         _num_kv_heads: usize,
         _head_dim: usize,
+        _sliding_window: usize,
         _block_size: usize,
         _max_num_blocks_per_seq: usize,
     ) -> Result<()> {

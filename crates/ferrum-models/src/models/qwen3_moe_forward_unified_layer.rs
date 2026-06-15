@@ -280,6 +280,7 @@ where
                             nh,
                             nkv,
                             hd,
+                            0,
                             block_size,
                             max_blocks_per_seq,
                         )
@@ -353,6 +354,7 @@ where
                     nh,
                     nkv,
                     hd,
+                    0,
                     block_size,
                     max_blocks_per_seq,
                 )

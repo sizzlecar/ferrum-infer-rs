@@ -26,12 +26,12 @@ use ferrum_kernels::backend::cuda::marlin::{
 };
 
 use super::llama_family::{
-    elapsed_micros_u64_floor1, LlamaFamilyModel, LlamaStageHiddenBridgeTiming, ATTN_CALLS,
-    ATTN_TIME_US, BATCHED_GRAPH_EAGER_COUNT, BATCHED_GRAPH_REPLAY_COUNT, MATMUL_CALLS,
-    MATMUL_TIME_US, NORM_CALLS, NORM_TIME_US, OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US,
-    SINGLE_ITEM_GRAPH_KEY, TAIL_ACT_CALLS, TAIL_ACT_TIME_US, TAIL_DOWN_CALLS, TAIL_DOWN_TIME_US,
-    TAIL_GATE_UP_CALLS, TAIL_GATE_UP_TIME_US, TAIL_NORM_CALLS, TAIL_NORM_TIME_US, TAIL_RESID_CALLS,
-    TAIL_RESID_TIME_US,
+    elapsed_micros_u64_floor1, llama_layer_attention_schedule, llama_qk_mode, LlamaFamilyModel,
+    LlamaStageHiddenBridgeTiming, ATTN_CALLS, ATTN_TIME_US, BATCHED_GRAPH_EAGER_COUNT,
+    BATCHED_GRAPH_REPLAY_COUNT, MATMUL_CALLS, MATMUL_TIME_US, NORM_CALLS, NORM_TIME_US,
+    OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US, SINGLE_ITEM_GRAPH_KEY, TAIL_ACT_CALLS,
+    TAIL_ACT_TIME_US, TAIL_DOWN_CALLS, TAIL_DOWN_TIME_US, TAIL_GATE_UP_CALLS, TAIL_GATE_UP_TIME_US,
+    TAIL_NORM_CALLS, TAIL_NORM_TIME_US, TAIL_RESID_CALLS, TAIL_RESID_TIME_US,
 };
 use super::llama_family_pipeline::{LlamaPipelineStageBatchOps, PipelineHidden};
 
@@ -216,13 +216,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
-        let qk_mode: i32 = if cfg.has_qk_norm {
-            1
-        } else if cfg.rope_interleaved {
-            3
-        } else {
-            2
-        };
+        let qk_mode: i32 = llama_qk_mode(cfg);
         let dummy_w = &layer.input_ln_w;
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
@@ -230,16 +224,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Match the single-sequence Gemma3 attention schedule. Local layers
         // use the local RoPE table and a sliding window; global layers use
         // the main RoPE table and full causal attention.
-        let pattern = cfg.sliding_window_pattern;
-        let is_global_layer = pattern == 0 || (source_li + 1) % pattern == 0;
-        let layer_window = if pattern == 0 {
-            cfg.sliding_window
-        } else if is_global_layer {
-            0
-        } else {
-            cfg.sliding_window
-        };
-        let (rope_cos, rope_sin) = match (&self.rope_local, is_global_layer) {
+        let schedule = llama_layer_attention_schedule(cfg, source_li);
+        let layer_window = schedule.sliding_window;
+        let (rope_cos, rope_sin) = match (&self.rope_local, schedule.is_global_layer) {
             (Some(local), false) => (&local.cos, &local.sin),
             _ => (&self.rope.cos, &self.rope.sin),
         };
@@ -1141,7 +1128,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let kv_dim = nkv * hd;
         let qkv_stride = q_dim + 2 * kv_dim;
         let eps = self.cfg.rms_norm_eps;
-        let qk_mode: i32 = if self.cfg.has_qk_norm { 1 } else { 2 };
+        let qk_mode: i32 = llama_qk_mode(&self.cfg);
         let vocab = self.cfg.vocab_size;
         let num_layers = self.cfg.num_layers;
         let num_seqs = items.len();
@@ -1538,10 +1525,17 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         eps: f32,
         qk_mode: i32,
     ) {
+        let source_li = self.source_layer_index(li);
         let layer = &self.layers[li];
         let dummy_w = &layer.input_ln_w;
         let q_norm_w = layer.q_norm_w.as_ref().unwrap_or(dummy_w);
         let k_norm_w = layer.k_norm_w.as_ref().unwrap_or(dummy_w);
+        let schedule = llama_layer_attention_schedule(&self.cfg, source_li);
+        let layer_window = schedule.sliding_window;
+        let (rope_cos, rope_sin) = match (&self.rope_local, schedule.is_global_layer) {
+            (Some(local), false) => (&local.cos, &local.sin),
+            _ => (&self.rope.cos, &self.rope.sin),
+        };
         let op_prof = self.batched_cfg.decode_op_profile;
 
         macro_rules! time_op {
@@ -1640,8 +1634,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 qkv_out,
                 q_norm_w,
                 k_norm_w,
-                &self.rope.cos,
-                &self.rope.sin,
+                rope_cos,
+                rope_sin,
                 packed_q,
                 pool_k,
                 pool_v,
@@ -1703,6 +1697,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 nh,
                 nkv,
                 hd,
+                layer_window,
                 block_size,
                 max_blocks_per_seq,
             )

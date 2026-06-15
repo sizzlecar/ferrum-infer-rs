@@ -2,6 +2,51 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XLII — W2 source checkpoint: varlen attention 接入 per-layer sliding-window 语义
+
+- 本轮没有启动 GPU;按最小源码验证推进,避免重复开关机器、重装环境和完整 sweep。
+- Source change:
+  - `BackendPagedKv::paged_varlen_attention` 增加显式 `sliding_window`
+    参数;`0` 表示 full causal,非 0 表示只看最近窗口;
+  - CUDA `paged_varlen_attn_f16` 和 split-K phase1 都按
+    `attend_start..valid_kv_len` 计算 QK、softmax 和 V 汇聚;
+  - Llama/Gemma attention 语义抽成 `llama_qk_mode` 和
+    `llama_layer_attention_schedule`,统一 single path、legacy batched
+    decode 和 unified varlen path 的 q/k norm、interleaved rope、本地/全局
+    layer window 决策;
+  - Qwen3 MoE unified callsite 显式传 `0`,保持既有 full causal 行为。
+- Why:
+  - 上一个 checkpoint 证明 Gemma3 W2 的 c16 fresh prefill cohort 仍走
+    serial fallback;直接放开 `supports_varlen_qkv` guard 会绕过 Gemma3
+    sandwich norm、GeGLU、local/global window 和 dual RoPE correctness 保护;
+  - 本 checkpoint 先补齐 backend varlen attention 的 window 语义,为后续
+    Gemma3 unified prefill correctness 做前置切点。
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models llama_attention_semantics_cover_qk_mode_and_layer_windows --lib`
+    PASS;
+  - `cargo test -p ferrum-models unified_varlen_qkv_rejects_sandwich_configs_even_when_backend_supports_varlen --lib`
+    PASS;
+  - `cargo check -p ferrum-kernels -p ferrum-models` PASS;
+  - `git diff --check` PASS;
+  - local Mac 没有 `nvcc`,因此 CUDA kernel 编译/运行验证尚未在本 checkpoint
+    本地完成。
+- Correctness status:
+  - 没有放开 Gemma3 unified varlen guard,所以默认产品路径不应因本轮改变而
+    启用未验证 Gemma3 unified prefill;
+  - 目前没有新增已知产品 correctness blocker,但 CUDA 编译和产品 smoke 仍是
+    下一 checkpoint 必须验证项。
+- Performance status:
+  - 本轮不是性能证据;Ferrum W2 Gemma3 27B GPTQ 仍约为同机 vLLM c16 baseline
+    的 `~65%`,距离 `80%` 目标约 `14-15` percentage points;
+  - W2 仍没有 `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Next step:
+  - 先做 native CUDA 最小编译/attention-window probe 或产品 CUDA smoke,确认
+    新 kernel 参数和窗口语义没有破坏现有 path;
+  - 再补 Gemma3 unified tail 的 sandwich norm/GeGLU 语义,通过 Paris/chat smoke
+    后才考虑放开 Gemma3 unified prefill guard。
+
 ## 2026-06-15 XLI — W2 native checkpoint: dense Marlin 多权重轮转 probe 完成
 
 - 本轮 artifact:

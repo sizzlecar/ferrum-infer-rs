@@ -228,6 +228,7 @@ fn paged_varlen_split_k_dispatch(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    sliding_window: usize,
     block_size: usize,
     max_blocks_per_seq: usize,
 ) -> Result<()> {
@@ -281,6 +282,7 @@ fn paged_varlen_split_k_dispatch(
             let hdi = head_dim as i32;
             let mbps = max_blocks_per_seq as i32;
             let bsi = block_size as i32;
+            let swi = sliding_window as i32;
             let nsp = num_splits as i32;
 
             // Phase 1: (num_heads, M_total, num_splits)
@@ -301,6 +303,7 @@ fn paged_varlen_split_k_dispatch(
             b1.arg(&mbps);
             b1.arg(&bsi);
             b1.arg(&scale);
+            b1.arg(&swi);
             b1.arg(&nsp);
             let shmem1 = (chunk.max(1) as u32) * 4;
             unsafe {
@@ -751,6 +754,7 @@ impl BackendPagedKv for CudaBackend {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        sliding_window: usize,
         block_size: usize,
         max_blocks_per_seq: usize,
     ) -> Result<()> {
@@ -792,6 +796,7 @@ impl BackendPagedKv for CudaBackend {
                 num_heads,
                 num_kv_heads,
                 head_dim,
+                sliding_window,
                 block_size,
                 max_blocks_per_seq,
             );
@@ -821,6 +826,7 @@ impl BackendPagedKv for CudaBackend {
         let hdi = head_dim as i32;
         let mbps = max_blocks_per_seq as i32;
         let bsi = block_size as i32;
+        let swi = sliding_window as i32;
         // Compute shared_bytes BEFORE the launch builder so we can opt into
         // the extended dynamic shared-memory limit if needed.
         //
@@ -860,6 +866,7 @@ impl BackendPagedKv for CudaBackend {
         b.arg(&mbps);
         b.arg(&bsi);
         b.arg(&scale);
+        b.arg(&swi);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (num_heads as u32, total_q_tokens as u32, 1),
@@ -1080,6 +1087,7 @@ impl BackendPagedKv for CudaBackend {
                 num_heads,
                 num_kv_heads,
                 head_dim,
+                0,
                 block_size,
                 max_num_blocks_per_seq,
             )?;
