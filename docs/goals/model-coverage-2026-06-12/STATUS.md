@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXX — W2 source checkpoint: disable graph capture for syncing diagnostics
+
+- 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - `LlamaFamilyRuntimeEnv::graph_capture_allowed()` 新增 single decode
+    graph capture 保护;
+  - `LlamaBatchedRuntimeConfig::graph_capture_allowed()` 新增 batched/unified
+    graph capture 保护;
+  - single decode CUDA graph 在 decode/prefill/layer profile、nan trace、
+    op dump、layer dump 任一诊断开关启用时不再 capture;
+  - batched/unified graph 在 `decode_op_profile`、`unified_profile`、
+    `batched_trace` 任一同步型诊断开关启用时不再 capture。
+- Why:
+  - LXIX 证明 profile+batched graph 组合仍能在 capture window 内走到
+    普通 `B::sync`;
+  - profiler/trace 本质上依赖同步计时边界,不应和 CUDA graph capture 同时
+    生效;
+  - 正常产品 graph path 保持可用,diagnostic profile path 改为 eager,
+    用于稳定采集热点分解。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models llama_batched_runtime_config -- --nocapture`
+    PASS,2/2;
+  - `cargo test -p ferrum-models llama_family_runtime_env -- --nocapture`
+    PASS,2/2;
+  - `cargo test -p ferrum-models batched_graph_capture_is_disabled_by_syncing_diagnostics -- --nocapture`
+    PASS,1/1;
+  - `git diff --check` PASS。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXIX — W2 CUDA checkpoint: capture-lifecycle retry still fails under profile
 
 - 本轮 artifact:

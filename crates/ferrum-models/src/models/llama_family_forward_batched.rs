@@ -65,6 +65,10 @@ impl LlamaBatchedRuntimeConfig {
         self.decode_op_profile
     }
 
+    fn graph_capture_allowed(&self) -> bool {
+        !self.decode_op_profile && !self.unified_profile && !self.batched_trace
+    }
+
     /// Resolve from the process-wide snapshot installed at the composition root
     /// (was a direct `std::env::vars()` read). The model holds this in a
     /// `batched_cfg` field, resolved once at construction.
@@ -172,6 +176,7 @@ mod tests {
         assert!(config.batched_graph);
         assert!(config.batched_trace);
         assert!(config.greedy_argmax);
+        assert!(!config.graph_capture_allowed());
     }
 
     #[test]
@@ -188,6 +193,23 @@ mod tests {
         assert!(!config.batched_graph);
         assert!(!config.batched_trace);
         assert!(!config.greedy_argmax);
+        assert!(config.graph_capture_allowed());
+    }
+
+    #[test]
+    fn batched_graph_capture_is_disabled_by_syncing_diagnostics() {
+        for (key, value) in [
+            ("FERRUM_DECODE_OP_PROFILE", "1"),
+            ("FERRUM_UNIFIED_PROFILE", "1"),
+            ("FERRUM_BATCHED_TRACE", "1"),
+        ] {
+            let config = LlamaBatchedRuntimeConfig::from_env_vars([
+                ("FERRUM_BATCHED_GRAPH", "1"),
+                (key, value),
+            ]);
+
+            assert!(!config.graph_capture_allowed());
+        }
     }
 
     #[test]
@@ -1340,7 +1362,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Bench (RTX 4090, Llama-3.1-8B GPTQ-INT4, c=16):
         //   varlen-only:     680 tok/s, TPOT 19.3 ms
         //   varlen + graph:  714 tok/s, TPOT 18.3 ms  (+5% / -5%)
-        let graph_enabled = self.batched_cfg.unified_graph;
+        let graph_enabled =
+            self.batched_cfg.unified_graph && self.batched_cfg.graph_capture_allowed();
         let graph_key = crate::common::decoder_unified::unified_graph_key(m_total, num_seqs);
         let cache_has_key = self.unified_graph_keys_seen.contains(&graph_key);
 
@@ -2206,7 +2229,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // gated on FERRUM_BATCHED_GRAPH=1; skipped on backends without
         // graph support (begin_graph_capture returns Err).
         let graph_enabled = should_use_batched_decode_graph(
-            self.batched_cfg.batched_graph,
+            self.batched_cfg.batched_graph && self.batched_cfg.graph_capture_allowed(),
             use_host_residual_shadow,
         );
         let m_padded = m.next_power_of_two();

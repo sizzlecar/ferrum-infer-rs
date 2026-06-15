@@ -427,6 +427,15 @@ impl LlamaFamilyRuntimeEnv {
         self.metal_paged_kv
             .unwrap_or_else(|| B::supports_paged_kv())
     }
+
+    pub(crate) fn graph_capture_allowed(&self) -> bool {
+        !self.decode_op_profile
+            && !self.prefill_op_profile
+            && !self.decode_layer_profile
+            && self.nan_trace == LlamaNanTraceConfig::Disabled
+            && self.op_dump_dir.is_none()
+            && self.layer_dump_dir.is_none()
+    }
 }
 
 /// Whether decode-op profiling is enabled, resolved from the runtime snapshot
@@ -3895,8 +3904,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         const GRAPH_WARMUP: usize = 3;
         let use_host_residual_shadow = self.use_host_residual_shadow();
         let use_device_residual_shadow = self.use_device_residual_shadow();
-        let graph_enabled =
-            self.runtime_env.cuda_graph && !use_host_residual_shadow && !use_device_residual_shadow;
+        let graph_enabled = self.runtime_env.cuda_graph
+            && self.runtime_env.graph_capture_allowed()
+            && !use_host_residual_shadow
+            && !use_device_residual_shadow;
 
         if graph_enabled {
             // Refresh device-side dynamic state (token/pos/kv_len) before
@@ -5395,6 +5406,7 @@ mod tests {
         assert!(env.decode_layer_profile);
         assert!(env.nan_trace.matches_layer(3, 9));
         assert_eq!(env.op_dump_dir.as_deref(), Some("/tmp/ferrum-op-dump"));
+        assert!(!env.graph_capture_allowed());
         assert_eq!(env.kv_capacity_for_model(2048), 2048);
     }
 
@@ -5415,6 +5427,7 @@ mod tests {
         );
         assert_eq!(env.nan_trace, LlamaNanTraceConfig::Disabled);
         assert_eq!(env.op_dump_dir, None);
+        assert!(env.graph_capture_allowed());
     }
 
     #[test]
