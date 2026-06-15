@@ -2,6 +2,66 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XLVI — W2 CUDA checkpoint: Gemma3 unified prefill c16 诊断通过但性能仍约 65.8% vLLM
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_prefill_c16_diag_2026-06-15/`。
+- 复用 Vast/cache-retained native CUDA instance `40826362`,1x RTX 4090,
+  约 USD 0.425/hr。artifact 复制回本地后已停机;`vast_shutdown/cleanup_check.txt`
+  记录 `cur_state=stopped actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA unified-prefill c16 diagnostic`;
+  - expected runtime/cost:10-20min,hard cap 30min,约 USD 0.425/hr;
+  - stop condition:instance start/SSH/source sync/server readiness 首败,
+    chat smoke 首败,`bench-serve` 首败,malformed/missing usage 首败,或
+    c16 diagnostic 完成后复制 artifact 并停机;
+  - correctness gate:`ferrum serve` readiness + non-stream chat smoke +
+    `bench-serve --fail-on-error`;
+  - performance command:diagnostic-only
+    `bench-serve --fail-on-error --seed 9271 --n-repeats 1 --concurrency-sweep 16 --num-prompts 16`,
+    no `--require-ci`,不产出 release 性能结论。
+- Build/runtime evidence:
+  - remote HEAD:`d5f82822b56527b47a9d3884639fe737cbb37570`;
+  - CUDA release build rc `0`;
+  - binary SHA256:
+    `4ebf50b5c64a5f72d929e1aeaefde61b0f1bb9ec6fed9dd0d84596f5b803be89`;
+  - server log contains
+    `Gemma3 family: legacy batched_decode=true varlen_unified=true`;
+  - remote git status contains only historical artifact deletion noise from
+    rsync artifact exclusion;no non-artifact source dirty rows were present.
+- Correctness:
+  - `run.status=PASS`,`bench-serve.rc=0`;
+  - non-stream chat smoke returned content `"5\n"`,finish_reason `stop`,
+    completion_tokens `3`,bad_output `false`;
+  - c16 ShareGPT diagnostic reported `completed_per_run=[16]`,
+    `errored_per_run=[0]`,`bad_output_per_run=[0]`,
+    `zero_output_tokens_per_run=[0]`,`malformed_stream_per_run=[0]`,
+    `missing_done_per_run=[0]`,`duplicate_done_per_run=[0]`,
+    `panic_per_run=[0]`,`http_500_per_run=[0]`;
+  - `output_token_count_source="usage"`;
+  - log/bad-marker scan found no product correctness blocker;this checkpoint
+    does not replace the full W2 L0-L5 release gate.
+- Performance diagnostic:
+  - Ferrum unified-prefill c16: `341.2397 tok/s`;
+  - same-hardware vLLM c16 baseline:
+    `518.7960 tok/s`;
+  - Ferrum/vLLM ratio: `65.78%`;
+  - previous Ferrum c16 baseline was `340.0029 tok/s`,so enabling
+    Gemma3 unified path did not materially close the gap.
+- Interpretation:
+  - current known correctness state is clean for this narrow product-path
+    diagnostic;
+  - the main W2 blocker is now performance:still about `14.2` percentage
+    points below the 80% vLLM target at c16;
+  - next high-value step is not another full sweep;use a minimal targeted
+    profile/native CUDA probe to locate the remaining bottleneck, likely in
+    decode/projection/attention scheduling rather than the unified-prefill
+    enablement guard itself.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-15 XLV — W2 CUDA checkpoint: Gemma3 unified tail 产品 smoke 通过
 
 - 本轮 artifact:

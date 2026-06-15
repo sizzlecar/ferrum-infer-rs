@@ -1,0 +1,23 @@
+{
+  "status": "PASS",
+  "bench_rc": 0,
+  "chat_pass": true,
+  "varlen_unified_in_log": true,
+  "concurrency": 16,
+  "n_repeats": 1,
+  "n_requests_per_run": 16,
+  "completed_per_run": [
+    16
+  ],
+  "errored_per_run": [
+    0
+  ],
+  "bad_output_per_run": [
+    0
+  ],
+  "output_token_count_source": "usage",
+  "output_throughput_tps_mean": 341.23969568213283,
+  "vllm_c16_tps_baseline": 518.7959572662905,
+  "ferrum_vs_vllm_ratio": 0.6577531896744897,
+  "ferrum_vs_vllm_percent": 65.77531896744897
+}
