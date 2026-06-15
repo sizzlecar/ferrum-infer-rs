@@ -629,10 +629,9 @@ impl FerrumConfigBuilder {
         let graph = self.bool_value("FERRUM_MOE_GRAPH", false, AutoConfigSource::WorkloadPreset)?;
         let greedy = self.bool_value(
             "FERRUM_GREEDY_ARGMAX",
-            self.workload.is_m3_preset()
-                && cuda_backend
+            (cuda_backend || self.hardware.backend.eq_ignore_ascii_case("metal"))
                 && self.hardware.compiled_features.greedy_argmax,
-            AutoConfigSource::WorkloadPreset,
+            AutoConfigSource::HardwareCapability,
         )?;
         let prefix_cache = self.bool_value(
             "FERRUM_PREFIX_CACHE",
@@ -710,6 +709,7 @@ impl FerrumConfigBuilder {
             ("FERRUM_VLLM_MOE", &vllm_moe),
             ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
             ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
+            ("FERRUM_GREEDY_ARGMAX", &greedy),
         ] {
             if resolved.source != AutoConfigSource::Env {
                 runtime_config.upsert(
@@ -2246,6 +2246,64 @@ mod tests {
             .find(|decision| decision.selection == "max_sequences")
             .unwrap();
         assert_eq!(max_sequences.selected, "32");
+    }
+
+    #[test]
+    fn accelerator_serving_default_enables_greedy_argmax_when_compiled() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let sampling = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "sampling_readback_path")
+            .unwrap();
+        assert_eq!(sampling.selected, "gpu_greedy_argmax");
+        assert_eq!(sampling.source, AutoConfigSource::HardwareCapability);
+        let greedy_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_GREEDY_ARGMAX")
+            .unwrap_or_else(|| panic!("missing FERRUM_GREEDY_ARGMAX entry"));
+        assert_eq!(greedy_entry.effective_value, "1");
+    }
+
+    #[test]
+    fn explicit_greedy_argmax_disable_keeps_logits_readback() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[(
+            "FERRUM_GREEDY_ARGMAX",
+            "0",
+            RuntimeConfigSource::Cli,
+        )]))
+        .with_model_capabilities(ModelCapabilities::unknown())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let sampling = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "sampling_readback_path")
+            .unwrap();
+        assert_eq!(sampling.selected, "logits_readback");
+        assert_eq!(sampling.source, AutoConfigSource::Cli);
+        let greedy_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_GREEDY_ARGMAX")
+            .unwrap_or_else(|| panic!("missing FERRUM_GREEDY_ARGMAX entry"));
+        assert_eq!(greedy_entry.effective_value, "0");
     }
 
     #[test]
