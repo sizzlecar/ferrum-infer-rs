@@ -1,0 +1,335 @@
+{
+  "chat_content": "5\n",
+  "distinct_label_bucket_m": [
+    [
+      "label=llama.forward_layer.down_proj",
+      "Down",
+      1
+    ],
+    [
+      "label=llama.forward_layer.down_proj",
+      "Down",
+      23
+    ],
+    [
+      "label=llama.forward_layer.gate_up_proj",
+      "GateUp",
+      1
+    ],
+    [
+      "label=llama.forward_layer.gate_up_proj",
+      "GateUp",
+      23
+    ],
+    [
+      "label=llama.forward_layer.o_proj",
+      "OProj",
+      1
+    ],
+    [
+      "label=llama.forward_layer.o_proj",
+      "OProj",
+      23
+    ],
+    [
+      "label=llama.forward_layer.qkv_proj",
+      "Qkv",
+      1
+    ],
+    [
+      "label=llama.forward_layer.qkv_proj",
+      "Qkv",
+      23
+    ]
+  ],
+  "first_shapes": [
+    {
+      "bucket": "Qkv",
+      "k": 5376,
+      "label": "label=llama.forward_layer.qkv_proj",
+      "m": 23,
+      "n": 8192
+    },
+    {
+      "bucket": "OProj",
+      "k": 4096,
+      "label": "label=llama.forward_layer.o_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "GateUp",
+      "k": 5376,
+      "label": "label=llama.forward_layer.gate_up_proj",
+      "m": 23,
+      "n": 43008
+    },
+    {
+      "bucket": "Down",
+      "k": 21504,
+      "label": "label=llama.forward_layer.down_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "Qkv",
+      "k": 5376,
+      "label": "label=llama.forward_layer.qkv_proj",
+      "m": 23,
+      "n": 8192
+    },
+    {
+      "bucket": "OProj",
+      "k": 4096,
+      "label": "label=llama.forward_layer.o_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "GateUp",
+      "k": 5376,
+      "label": "label=llama.forward_layer.gate_up_proj",
+      "m": 23,
+      "n": 43008
+    },
+    {
+      "bucket": "Down",
+      "k": 21504,
+      "label": "label=llama.forward_layer.down_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "Qkv",
+      "k": 5376,
+      "label": "label=llama.forward_layer.qkv_proj",
+      "m": 23,
+      "n": 8192
+    },
+    {
+      "bucket": "OProj",
+      "k": 4096,
+      "label": "label=llama.forward_layer.o_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "GateUp",
+      "k": 5376,
+      "label": "label=llama.forward_layer.gate_up_proj",
+      "m": 23,
+      "n": 43008
+    },
+    {
+      "bucket": "Down",
+      "k": 21504,
+      "label": "label=llama.forward_layer.down_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "Qkv",
+      "k": 5376,
+      "label": "label=llama.forward_layer.qkv_proj",
+      "m": 23,
+      "n": 8192
+    },
+    {
+      "bucket": "OProj",
+      "k": 4096,
+      "label": "label=llama.forward_layer.o_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "GateUp",
+      "k": 5376,
+      "label": "label=llama.forward_layer.gate_up_proj",
+      "m": 23,
+      "n": 43008
+    },
+    {
+      "bucket": "Down",
+      "k": 21504,
+      "label": "label=llama.forward_layer.down_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "Qkv",
+      "k": 5376,
+      "label": "label=llama.forward_layer.qkv_proj",
+      "m": 23,
+      "n": 8192
+    },
+    {
+      "bucket": "OProj",
+      "k": 4096,
+      "label": "label=llama.forward_layer.o_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "GateUp",
+      "k": 5376,
+      "label": "label=llama.forward_layer.gate_up_proj",
+      "m": 23,
+      "n": 43008
+    },
+    {
+      "bucket": "Down",
+      "k": 21504,
+      "label": "label=llama.forward_layer.down_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "Qkv",
+      "k": 5376,
+      "label": "label=llama.forward_layer.qkv_proj",
+      "m": 23,
+      "n": 8192
+    },
+    {
+      "bucket": "OProj",
+      "k": 4096,
+      "label": "label=llama.forward_layer.o_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "GateUp",
+      "k": 5376,
+      "label": "label=llama.forward_layer.gate_up_proj",
+      "m": 23,
+      "n": 43008
+    },
+    {
+      "bucket": "Down",
+      "k": 21504,
+      "label": "label=llama.forward_layer.down_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "Qkv",
+      "k": 5376,
+      "label": "label=llama.forward_layer.qkv_proj",
+      "m": 23,
+      "n": 8192
+    },
+    {
+      "bucket": "OProj",
+      "k": 4096,
+      "label": "label=llama.forward_layer.o_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "GateUp",
+      "k": 5376,
+      "label": "label=llama.forward_layer.gate_up_proj",
+      "m": 23,
+      "n": 43008
+    },
+    {
+      "bucket": "Down",
+      "k": 21504,
+      "label": "label=llama.forward_layer.down_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "Qkv",
+      "k": 5376,
+      "label": "label=llama.forward_layer.qkv_proj",
+      "m": 23,
+      "n": 8192
+    },
+    {
+      "bucket": "OProj",
+      "k": 4096,
+      "label": "label=llama.forward_layer.o_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "GateUp",
+      "k": 5376,
+      "label": "label=llama.forward_layer.gate_up_proj",
+      "m": 23,
+      "n": 43008
+    },
+    {
+      "bucket": "Down",
+      "k": 21504,
+      "label": "label=llama.forward_layer.down_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "Qkv",
+      "k": 5376,
+      "label": "label=llama.forward_layer.qkv_proj",
+      "m": 23,
+      "n": 8192
+    },
+    {
+      "bucket": "OProj",
+      "k": 4096,
+      "label": "label=llama.forward_layer.o_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "GateUp",
+      "k": 5376,
+      "label": "label=llama.forward_layer.gate_up_proj",
+      "m": 23,
+      "n": 43008
+    },
+    {
+      "bucket": "Down",
+      "k": 21504,
+      "label": "label=llama.forward_layer.down_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "Qkv",
+      "k": 5376,
+      "label": "label=llama.forward_layer.qkv_proj",
+      "m": 23,
+      "n": 8192
+    },
+    {
+      "bucket": "OProj",
+      "k": 4096,
+      "label": "label=llama.forward_layer.o_proj",
+      "m": 23,
+      "n": 5376
+    },
+    {
+      "bucket": "GateUp",
+      "k": 5376,
+      "label": "label=llama.forward_layer.gate_up_proj",
+      "m": 23,
+      "n": 43008
+    },
+    {
+      "bucket": "Down",
+      "k": 21504,
+      "label": "label=llama.forward_layer.down_proj",
+      "m": 23,
+      "n": 5376
+    }
+  ],
+  "parsed_shape_lines": 256,
+  "shape_trace_lines": 256,
+  "status": "pass",
+  "usage": {
+    "completion_tokens": 3,
+    "prompt_tokens": 23,
+    "total_tokens": 26
+  }
+}
