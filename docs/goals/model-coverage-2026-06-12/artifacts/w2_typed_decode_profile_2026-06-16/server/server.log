@@ -1,0 +1,153 @@
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 2.6 GB → max_blocks=338
+[auto-size] KV_MAX_BLOCKS=338 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+[2m2026-06-15T16:45:04.638925Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-15T16:45:04.638947Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-15T16:45:04.639005Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-15T16:45:05.677750Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-15T16:45:05.677790Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-15T16:45:05.677794Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-15T16:45:05.677809Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=338
+[2m2026-06-15T16:45:05.677989Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-15T16:45:05.678265Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-15T16:45:05.853666Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-15T16:45:05.853759Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-15T16:45:05.853765Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-15T16:45:05.853774Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-15T16:46:00.158341Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+[2m2026-06-15T16:46:04.873243Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m Gemma3 family: legacy batched_decode=true varlen_unified=true
+[unified-prof] iter#0 items=1 prefill=1 decode=0 total=126957us model=126558us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[iter-prof] iter#0 total=127387us sched=9us process=127377us batch_size=1
+[unified-prof] iter#1 items=1 prefill=0 decode=1 total=22248us model=22075us decode_post=171us | sample=170 sched=0 stream=1 stop=0 complete=0 (us)
+[iter-prof] iter#1 total=22291us sched=7us process=22284us batch_size=1
+[unified-prof] iter#2 items=1 prefill=0 decode=1 total=21938us model=21749us decode_post=187us | sample=172 sched=0 stream=0 stop=0 complete=15 (us)
+[iter-prof] iter#2 total=21972us sched=2us process=21969us batch_size=1
+[bg-loop-gap] call#8 inter_iter=2us
+[bg-loop-gap] call#16 inter_iter=2us
+[bg-loop-gap] call#24 inter_iter=2us
+[bg-loop-gap] call#32 inter_iter=0us
+[bg-loop-gap] call#40 inter_iter=2us
+[bg-loop-gap] call#48 inter_iter=2us
+[bg-loop-gap] call#56 inter_iter=2us
+[bg-loop-gap] call#64 inter_iter=2us
+[bg-loop-gap] call#72 inter_iter=2us
+[bg-loop-gap] call#80 inter_iter=2us
+[bg-loop-gap] call#88 inter_iter=1us
+[bg-loop-gap] call#96 inter_iter=2us
+[bg-loop-gap] call#104 inter_iter=2us
+[bg-loop-gap] call#112 inter_iter=2us
+[bg-loop-gap] call#120 inter_iter=1us
+[bg-loop-gap] call#128 inter_iter=2us
+[bg-loop-gap] call#136 inter_iter=1us
+[bg-loop-gap] call#144 inter_iter=2us
+[bg-loop-gap] call#152 inter_iter=1us
+[bg-loop-gap] call#160 inter_iter=1us
+[bg-loop-gap] call#168 inter_iter=2us
+[bg-loop-gap] call#176 inter_iter=1us
+[bg-loop-gap] call#184 inter_iter=2us
+[bg-loop-gap] call#192 inter_iter=3us
+[bg-loop-gap] call#200 inter_iter=3us
+[bg-loop-gap] call#208 inter_iter=3us
+[bg-loop-gap] call#216 inter_iter=1us
+[bg-loop-gap] call#224 inter_iter=2us
+[bg-loop-gap] call#232 inter_iter=3us
+[bg-loop-gap] call#240 inter_iter=2us
+[bg-loop-gap] call#248 inter_iter=3us
+[bg-loop-gap] call#256 inter_iter=3us
+[bg-loop-gap] call#264 inter_iter=2us
+[bg-loop-gap] call#272 inter_iter=3us
+[bg-loop-gap] call#280 inter_iter=7us
+[bg-loop-gap] call#288 inter_iter=2us
+[bg-loop-gap] call#296 inter_iter=3us
+[bg-loop-gap] call#304 inter_iter=4us
+[bg-loop-gap] call#312 inter_iter=3us
+[bg-loop-gap] call#320 inter_iter=3us
+[bg-loop-gap] call#328 inter_iter=5us
+[bg-loop-gap] call#336 inter_iter=3us
+[bg-loop-gap] call#344 inter_iter=3us
+[bg-loop-gap] call#352 inter_iter=2us
+[bg-loop-gap] call#360 inter_iter=3us
+[bg-loop-gap] call#368 inter_iter=4us
+[bg-loop-gap] call#376 inter_iter=2us
+[bg-loop-gap] call#384 inter_iter=4us
+[bg-loop-gap] call#392 inter_iter=4us
+[bg-loop-gap] call#400 inter_iter=3us
+[bg-loop-gap] call#408 inter_iter=3us
+[bg-loop-gap] call#416 inter_iter=3us
+[bg-loop-gap] call#424 inter_iter=3us
+[bg-loop-gap] call#432 inter_iter=3us
+[bg-loop-gap] call#440 inter_iter=3us
+[bg-loop-gap] call#448 inter_iter=4us
+[bg-loop-gap] call#456 inter_iter=4us
+[bg-loop-gap] call#464 inter_iter=3us
+[bg-loop-gap] call#472 inter_iter=3us
+[bg-loop-gap] call#480 inter_iter=3us
+[bg-loop-gap] call#488 inter_iter=3us
+[bg-loop-gap] call#496 inter_iter=4us
+[unified-prof] iter#3 items=16 prefill=16 decode=0 total=575101us model=571317us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[batched-qkr] first batched_decode call: m=16 use_batched_qkr=true (q=None k=None v=None)
+[batched-kv-append] first call: m=16 ok=true k_err=None v_err=None
+[batched-attn] first call: m=16 ok=true err=None
+[unified-prof] iter#4 items=16 prefill=0 decode=16 total=23726us model=23478us decode_post=230us | sample=27 sched=0 stream=203 stop=0 complete=0 (us)
+[bg-loop-gap] call#504 inter_iter=2us
+[unified-prof] iter#5 items=16 prefill=0 decode=16 total=23077us model=22854us decode_post=202us | sample=23 sched=0 stream=179 stop=0 complete=0 (us)
+[unified-prof] iter#6 items=16 prefill=0 decode=16 total=23095us model=22862us decode_post=211us | sample=32 sched=0 stream=179 stop=0 complete=0 (us)
+[batched-graph-capture] key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+[batched-graph-replay] origin=post_capture count=1 key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+[unified-prof] iter#7 items=16 prefill=0 decode=16 total=30291us model=29941us decode_post=330us | sample=65 sched=0 stream=265 stop=0 complete=0 (us)
+[batched-graph-replay] origin=pure count=2 key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+[unified-prof] iter#8 items=16 prefill=0 decode=16 total=23210us model=22949us decode_post=239us | sample=45 sched=0 stream=194 stop=0 complete=0 (us)
+[unified-prof] iter#9 items=16 prefill=0 decode=16 total=23181us model=22916us decode_post=249us | sample=53 sched=0 stream=196 stop=0 complete=0 (us)
+[batched-graph-replay] origin=pure count=4 key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+[unified-prof] iter#10 items=16 prefill=0 decode=16 total=23230us model=22946us decode_post=264us | sample=57 sched=0 stream=207 stop=0 complete=0 (us)
+[unified-prof] iter#11 items=16 prefill=0 decode=16 total=23274us model=22963us decode_post=291us | sample=66 sched=0 stream=225 stop=0 complete=0 (us)
+[iter-prof] iter#511 total=23352us sched=18us process=23333us batch_size=16
+[unified-prof] iter#12 items=16 prefill=0 decode=16 total=23272us model=22969us decode_post=279us | sample=69 sched=0 stream=210 stop=0 complete=0 (us)
+[bg-loop-gap] call#512 inter_iter=2us
+[unified-prof] iter#13 items=16 prefill=0 decode=16 total=23293us model=22970us decode_post=302us | sample=79 sched=0 stream=223 stop=0 complete=0 (us)
+[batched-graph-replay] origin=pure count=8 key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+[unified-prof] iter#14 items=16 prefill=0 decode=16 total=23324us model=22993us decode_post=312us | sample=84 sched=0 stream=228 stop=0 complete=0 (us)
+[unified-prof] iter#15 items=16 prefill=0 decode=16 total=23366us model=22998us decode_post=349us | sample=93 sched=0 stream=256 stop=0 complete=0 (us)
+[unified-prof] iter#16 items=16 prefill=0 decode=16 total=23441us model=23021us decode_post=399us | sample=109 sched=0 stream=290 stop=0 complete=0 (us)
+[unified-prof] iter#17 items=16 prefill=0 decode=16 total=23475us model=23102us decode_post=351us | sample=101 sched=0 stream=250 stop=0 complete=0 (us)
+[unified-prof] iter#18 items=16 prefill=0 decode=16 total=23408us model=23033us decode_post=353us | sample=102 sched=0 stream=251 stop=0 complete=0 (us)
+[unified-prof] iter#19 items=16 prefill=0 decode=16 total=23453us model=23070us decode_post=362us | sample=117 sched=0 stream=245 stop=0 complete=0 (us)
+[unified-prof] iter#20 items=16 prefill=0 decode=16 total=23466us model=23077us decode_post=370us | sample=119 sched=0 stream=251 stop=0 complete=0 (us)
+[bg-loop-gap] call#520 inter_iter=2us
+[unified-prof] iter#21 items=16 prefill=0 decode=16 total=23458us model=23068us decode_post=372us | sample=123 sched=0 stream=249 stop=0 complete=0 (us)
+[batched-graph-replay] origin=pure count=16 key=4611686018427387920 m=16 m_padded=16 device_shadow=true
+[unified-prof] iter#22 items=16 prefill=0 decode=16 total=23507us model=23100us decode_post=386us | sample=129 sched=0 stream=257 stop=0 complete=0 (us)
+[unified-prof] iter#23 items=16 prefill=0 decode=16 total=23509us model=23094us decode_post=397us | sample=137 sched=0 stream=260 stop=0 complete=0 (us)
+[unified-prof] iter#24 items=16 prefill=0 decode=16 total=23536us model=23114us decode_post=404us | sample=140 sched=0 stream=264 stop=0 complete=0 (us)
+[unified-prof] iter#25 items=16 prefill=0 decode=16 total=23533us model=23096us decode_post=417us | sample=145 sched=0 stream=272 stop=0 complete=0 (us)
+[unified-prof] iter#26 items=16 prefill=0 decode=16 total=23577us model=23120us decode_post=438us | sample=153 sched=0 stream=285 stop=0 complete=0 (us)
+[unified-prof] iter#27 items=16 prefill=0 decode=16 total=23609us model=23152us decode_post=436us | sample=157 sched=0 stream=279 stop=0 complete=0 (us)
+[unified-prof] iter#28 items=16 prefill=0 decode=16 total=23652us model=23175us decode_post=457us | sample=166 sched=0 stream=291 stop=0 complete=0 (us)
+[bg-loop-gap] call#528 inter_iter=2us
+[unified-prof] iter#29 items=16 prefill=0 decode=16 total=23653us model=23169us decode_post=464us | sample=169 sched=0 stream=295 stop=0 complete=0 (us)
+[unified-prof] iter#30 items=16 prefill=0 decode=16 total=23722us model=23174us decode_post=528us | sample=180 sched=0 stream=323 stop=0 complete=25 (us)
+[unified-prof] iter#31 items=15 prefill=0 decode=15 total=23666us model=23176us decode_post=470us | sample=168 sched=0 stream=302 stop=0 complete=0 (us)
+[unified-prof] iter#32 items=15 prefill=0 decode=15 total=23726us model=23201us decode_post=507us | sample=181 sched=0 stream=298 stop=0 complete=28 (us)
+[unified-prof] iter#33 items=14 prefill=0 decode=14 total=23739us model=23230us decode_post=490us | sample=178 sched=0 stream=287 stop=0 complete=25 (us)
+[unified-prof] iter#34 items=13 prefill=0 decode=13 total=24205us model=23214us decode_post=969us | sample=204 sched=0 stream=356 stop=0 complete=409 (us)
+[bg-loop-gap] call#536 inter_iter=6us
+[bg-loop-gap] call#544 inter_iter=4us
+[bg-loop-gap] call#552 inter_iter=8us
+[bg-loop-gap] call#560 inter_iter=3us
+[bg-loop-gap] call#568 inter_iter=8us
+[bg-loop-gap] call#576 inter_iter=5us
+[bg-loop-gap] call#584 inter_iter=3us
+[bg-loop-gap] call#592 inter_iter=4us
+[bg-loop-gap] call#600 inter_iter=4us
+[bg-loop-gap] call#608 inter_iter=4us
+[bg-loop-gap] call#616 inter_iter=3us
+[bg-loop-gap] call#624 inter_iter=3us
+[bg-loop-gap] call#632 inter_iter=4us
+[bg-loop-gap] call#640 inter_iter=5us
+[bg-loop-gap] call#648 inter_iter=3us
+[bg-loop-gap] call#656 inter_iter=3us
+[bg-loop-gap] call#664 inter_iter=3us
+[bg-loop-gap] call#672 inter_iter=5us
+[bg-loop-gap] call#680 inter_iter=3us
+[bg-loop-gap] call#688 inter_iter=5us
+[bg-loop-gap] call#696 inter_iter=3us
+[bg-loop-gap] call#704 inter_iter=3us

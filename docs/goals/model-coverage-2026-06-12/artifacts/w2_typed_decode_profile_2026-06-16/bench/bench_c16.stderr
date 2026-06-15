@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=random num_prompts=16 warmup=0 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (16 prompts including 0 warmup)
+    16 completed / 0 errored / 1.3s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=587.9  p95=589.2  p99=589.4
+      TPOT_ms  p50=23.8  p95=23.9  p99=23.9
+      ITL_ms   p50=23.6  p95=25.2  p99=30.4
+      throughput      380.5 tok/s
+      goodput         12.06 req/s
+
+→ wrote /workspace/w2_typed_decode_profile_2026-06-16/bench/bench_c16.json

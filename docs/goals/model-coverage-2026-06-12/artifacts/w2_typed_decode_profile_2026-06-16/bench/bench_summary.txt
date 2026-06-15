@@ -1,0 +1,6 @@
+completed_requests None
+errored_requests None
+output_throughput_tps_mean 380.4915241647801
+ttft_ms_p50 None
+tpot_ms_p50 None
+output_tokens_per_request [[32, 32, 32, 28, 32, 32, 32, 31, 32, 32, 32, 32, 32, 30, 32, 32]]
