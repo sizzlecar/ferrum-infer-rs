@@ -977,6 +977,28 @@ fn supports_sandwich_legacy_batched_decode(
         && backend_supports_device_f32_residual_shadow
 }
 
+fn unified_varlen_qkv_unsupported_reason(
+    cfg: &LlamaFamilyConfig,
+    backend_supports_varlen_qkv: bool,
+) -> Option<&'static str> {
+    if !backend_supports_varlen_qkv {
+        return Some(
+            "LlamaFamilyModel::unified_forward: backend lacks varlen \
+             QKV kernels. Engine will fall back to per-item dispatch.",
+        );
+    }
+    if cfg.sandwich_norms {
+        return Some(
+            "LlamaFamilyModel::unified_forward: sandwich-norm family requires \
+             Gemma3 layer semantics (local/global attention windows, local RoPE, \
+             GeGLU, and post-attn/post-ffn sandwich norms); unified varlen \
+             prefill is disabled until that path implements those semantics. \
+             Engine will fall back to per-item dispatch.",
+        );
+    }
+    None
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LlamaDecodeBatchStats {
     calls: u64,
@@ -1747,7 +1769,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // local-window semantics.
         let supports_sandwich_batched_decode =
             supports_sandwich_legacy_batched_decode(&cfg, B::supports_device_f32_residual_shadow());
-        let supports_varlen_qkv = B::supports_varlen_qkv() && !cfg.sandwich_norms;
+        let supports_varlen_qkv =
+            unified_varlen_qkv_unsupported_reason(&cfg, B::supports_varlen_qkv()).is_none();
         let supports_batched_decode = B::supports_llama_family_batched_decode()
             && (!cfg.sandwich_norms || supports_sandwich_batched_decode);
         if cfg.sandwich_norms {
@@ -4617,10 +4640,12 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
             ));
         }
         if !self.supports_varlen_qkv {
-            return Err(ferrum_types::FerrumError::unsupported(
-                "LlamaFamilyModel::unified_forward: backend lacks varlen \
-                 QKV kernels. Engine will fall back to per-item dispatch.",
-            ));
+            let reason = unified_varlen_qkv_unsupported_reason(&self.cfg, B::supports_varlen_qkv())
+                .unwrap_or(
+                    "LlamaFamilyModel::unified_forward: varlen QKV support disabled. Engine will \
+                     fall back to per-item dispatch.",
+                );
+            return Err(ferrum_types::FerrumError::unsupported(reason));
         }
         if items
             .iter()
@@ -4904,9 +4929,10 @@ mod tests {
 
     use super::{
         bf16_round, load_llama_family_layers, nan_trace_raw_matches, rope_freq, stats_for,
-        supports_sandwich_legacy_batched_decode, LlamaDecodeBatchStats, LlamaFamilyConfig,
-        LlamaFamilyLayerStageConfig, LlamaFamilyModel, LlamaFamilyRuntimeEnv, LlamaFamilyScratch,
-        LlamaNanTraceConfig, RopeScalingConfig, DEFAULT_KV_CAPACITY,
+        supports_sandwich_legacy_batched_decode, unified_varlen_qkv_unsupported_reason,
+        LlamaDecodeBatchStats, LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel,
+        LlamaFamilyRuntimeEnv, LlamaFamilyScratch, LlamaNanTraceConfig, RopeScalingConfig,
+        DEFAULT_KV_CAPACITY,
     };
 
     #[test]
@@ -5039,6 +5065,28 @@ mod tests {
         cfg.sandwich_norms = false;
         cfg.sliding_window_pattern = 6;
         assert!(!supports_sandwich_legacy_batched_decode(&cfg, true));
+    }
+
+    #[test]
+    fn unified_varlen_qkv_rejects_sandwich_configs_even_when_backend_supports_varlen() {
+        let mut cfg = test_llama_config(1, true);
+        cfg.sandwich_norms = true;
+        cfg.sliding_window = 512;
+        cfg.sliding_window_pattern = 6;
+        cfg.activation = Activation::GeluTanh;
+
+        let reason = unified_varlen_qkv_unsupported_reason(&cfg, true)
+            .expect("sandwich configs must not enter legacy unified varlen path");
+
+        assert!(reason.contains("sandwich-norm family"));
+        assert!(reason.contains("local/global attention windows"));
+        assert!(reason.contains("post-attn/post-ffn sandwich norms"));
+
+        cfg.sandwich_norms = false;
+        assert!(unified_varlen_qkv_unsupported_reason(&cfg, true).is_none());
+        assert!(unified_varlen_qkv_unsupported_reason(&cfg, false)
+            .expect("backend without varlen support should be rejected")
+            .contains("backend lacks varlen"));
     }
 
     #[test]
