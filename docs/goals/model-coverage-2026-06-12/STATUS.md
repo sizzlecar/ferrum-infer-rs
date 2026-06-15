@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXXVI — W2 typed prefix-cache ShareGPT diagnostic: 正确性干净,0 hit,性能无改善
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_prefix_cache_sharegpt_diag_2026-06-15/`。
+- 复用 Vast/cache-retained native CUDA instance `40826362`,1x RTX 4090。验证结束后
+  已复制 artifact 并停机;Vast poll 1 记录 `cur_state=stopped`,
+  `actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA typed prefix-cache ShareGPT diagnostic`;
+  - expected runtime/cost:10-25min,hard cap 35min,约 USD 0.425/hr;
+  - stop condition:启动/SSH/CUDA/server readiness 首败、chat smoke 首败、
+    c16/c32 ShareGPT diagnostic 完成并复制 artifact,或 35min cap;
+  - correctness gate:`ferrum serve --enable-prefix-cache` readiness plus
+    non-stream chat smoke before `bench-serve`;
+  - performance command:diagnostic-only natural ASCII ShareGPT c16/c32,
+    `bench-serve --fail-on-error --seed 9271 --n-repeats 1 --num-prompts 16`。
+- Correctness:
+  - `run.status=PASS`,`bench-serve.rc=0`;
+  - chat smoke content `5`,usage `completion_tokens=3`;
+  - c16:`16 completed / 0 errored`,bad_output `[0]`;
+  - c32:`16 completed / 0 errored`,bad_output `[0]`;
+  - 本轮没有发现新的 Ferrum product correctness 问题。
+- Prefix-cache observation:
+  - decision trace 显示 `prefix_cache_policy=prefix_cache_enabled`,
+    source `cli`;
+  - health after 显示 `enabled=true`,`hits=0`,`misses=53`,
+    `saved_prefill_tokens=0`,`entries=0`;
+  - 结论:typed product prefix cache 已打开,但没有命中这个 repeated-prompt
+    ShareGPT 场景。
+- Diagnostic bench(非 release evidence,N=1,无 CI):
+  - c16:`340.618 tok/s`,TTFT p50 `889.469ms`,TTFT p95 `1453.788ms`;
+  - c32:`342.350 tok/s`,TTFT p50 `887.527ms`,TTFT p95 `1438.820ms`。
+- Diagnostic ratio vs clean vLLM ShareGPT baseline:
+  - c16:`340.618 / 518.796 = 0.657`,差距约 `34.3%`,
+    距 80% 线约 `14.3` percentage points;
+  - c32:`342.350 / 524.128 = 0.653`,差距约 `34.7%`,
+    距 80% 线约 `14.7` percentage points。
+- Interpretation:
+  - prefix cache 不是当前差距的现成解;c16 相比 no-prefix 只 `+0.18%`,
+    c32 只 `+0.02%`;
+  - 下一步若追 prefix-cache,应查 why zero hits/entries,不要重复 full sweep;
+  - 否则继续回到已定位的 Gemma tail/GEMM 热点,尤其 `tail_gate_up` 与
+    `tail_down`。
+- Release-grade status:
+  - 本轮是 N=1 diagnostic,没有 `--require-ci`,没有
+    `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍未达到 release-grade。
+
 ## 2026-06-15 XXXV — W2 vLLM natural ShareGPT baseline clean;Ferrum c16/c32 约 65%
 
 - 本轮 artifact:
