@@ -2,6 +2,64 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXI — W2 tail-profile bucket validation: Gemma3 MLP projections dominate decode
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_profile_buckets_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `poll=01 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=02 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=03 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=04 cur_state=stopped actual_status=exited intended_status=stopped`;
+  - stop timestamp: `2026-06-15T05:00:20Z`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA tail-profile bucket validation`;
+  - expected runtime/cost:15-35min,hard cap 45min,1x RTX 4090 instance
+    `40826362` at about USD 0.402/hr;
+  - stop condition:start/SSH/CUDA/source sync/build/server readiness first
+    failure,tail bucket profile c16/c32 small sample complete and copied,or
+    45min cap;
+  - correctness gate:release build plus server readiness and
+    `bench-serve --fail-on-error` zero-error diagnostic;
+  - performance command:diagnostic-only natural ASCII ShareGPT dataset,
+    `num_prompts=16`,`n_repeats=1`,`random-output-len=64`,`seed=9271`,
+    c16/c32.
+- Evidence scope:
+  - release build PASS,binary SHA256:
+    `c32bb67c8ee9aee90b0054bcb0fb0eca0e1d127fad5c99929941b714bdf741ed`;
+  - remote git HEAD remained `c51002b793f00c8345e160b99b6b74217ca273d9`
+    with the profiling source files dirty-synced from the local checkpoint,so
+    this is profiling evidence only,not final clean performance evidence;
+  - decision trace selected `attention_decode_backend=legacy_paged_decode`
+    and `sampling_readback_path=gpu_greedy_argmax`;
+  - `bench-serve` rc=0,run status `PASS`,server log captured `264`
+    `[batched-op-profile]` rows.
+- Bench/profile result:
+  - c16:completed `[16]`,errored `[0]`,mean `305.182 tok/s`;
+  - c32 client / active cap16:completed `[16]`,errored `[0]`,mean
+    `305.181 tok/s`;
+  - for batch `m=16` (`118` rows),mean total per decode step
+    `28037 us`; mean shares:tail_mlp `49.0%` (`13744 us`),matmul
+    `24.9%` (`6971 us`),attention `8.6%` (`2406 us`),tail_norm `2.9%`,
+    tail_resid `2.0%`,tail_act `1.5%`,QKR `2.3%`,norm `1.6%`,
+    remaining unwrapped `2.3%` (`649 us`);
+  - for batch `m=10` (`122` rows),tail_mlp was again the largest bucket:
+    `49.3%` (`13516 us`),with remaining unwrapped down to `2.4%`
+    (`663 us`).
+- Interpretation:
+  - the previous `unwrapped` bucket was mostly Gemma3 tail MLP projection work
+    rather than attention/QKR or logits readback;
+  - current top target is the Gemma3 tail gate/up/down GPTQ linear path. The
+    next useful profiling checkpoint is to split `tail_mlp` into gate/up and
+    down projection buckets before choosing an optimization patch;
+  - do not run a full `--require-ci` release sweep until this c16/c32 decode
+    bottleneck is reduced.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+
 ## 2026-06-15 XX — W2 profile instrumentation: split Gemma3 tail buckets
 
 - 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
