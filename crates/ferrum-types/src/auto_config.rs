@@ -1399,33 +1399,47 @@ impl FerrumConfigBuilder {
 
     fn scheduler_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
         let entries = self.entries();
-        let mut selected = "continuous_default".to_string();
-        let mut source_key = None;
-        if let Some(chunk) = entries.get("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK") {
+        let (selected, source, source_key) = if let Some(chunk) =
+            entries.get("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
+        {
             parse_usize_env_value(chunk).map_err(|reason| AutoConfigError::InvalidOverride {
                 key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
                 reason,
             })?;
-            selected = format!("active_decode_prefill_chunk:{chunk}");
-            source_key = Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string());
+            let key = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
+            (
+                format!("active_decode_prefill_chunk:{chunk}"),
+                self.source_for_key(key, AutoConfigSource::Default),
+                Some(key.to_string()),
+            )
         } else if let Some(until) = entries.get("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE") {
             parse_usize_env_value(until).map_err(|reason| AutoConfigError::InvalidOverride {
                 key: "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE".to_string(),
                 reason,
             })?;
-            selected = format!("prefill_first_until_active:{until}");
-            source_key = Some("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE".to_string());
-        } else if self
-            .bool_value(
+            let key = "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE";
+            (
+                format!("prefill_first_until_active:{until}"),
+                self.source_for_key(key, AutoConfigSource::Default),
+                Some(key.to_string()),
+            )
+        } else {
+            let prompt_token_estimate = self.bool_value(
                 "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
-                false,
+                true,
                 AutoConfigSource::Default,
-            )?
-            .value
-        {
-            selected = "prompt_token_estimate".to_string();
-            source_key = Some("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE".to_string());
-        }
+            )?;
+            let selected = if prompt_token_estimate.value {
+                "prompt_token_estimate"
+            } else {
+                "continuous_default"
+            };
+            (
+                selected.to_string(),
+                prompt_token_estimate.source,
+                prompt_token_estimate.source_key,
+            )
+        };
         self.unsupported_if(
             source_key.as_deref() == Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
                 && selected.ends_with(":0"),
@@ -1435,10 +1449,7 @@ impl FerrumConfigBuilder {
         Ok(self.decision(
             "scheduler_admission_policy",
             &selected,
-            source_key
-                .as_deref()
-                .map(|key| self.source_for_key(key, AutoConfigSource::Default))
-                .unwrap_or(AutoConfigSource::Default),
+            source,
             source_key,
             [
                 "continuous_default",
@@ -2454,6 +2465,42 @@ mod tests {
         assert_eq!(
             scheduler.source_key.as_deref(),
             Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
+        );
+    }
+
+    #[test]
+    fn scheduler_prompt_token_estimate_is_default_policy() {
+        let resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
+            .resolve()
+            .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(scheduler.selected, "prompt_token_estimate");
+        assert_eq!(scheduler.source, AutoConfigSource::Default);
+        assert_eq!(scheduler.source_key, None);
+    }
+
+    #[test]
+    fn scheduler_prompt_token_estimate_can_be_disabled_in_decision_trace() {
+        let resolved = m3(
+            &[("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE", "0")],
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        )
+        .resolve()
+        .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(scheduler.selected, "continuous_default");
+        assert_eq!(scheduler.source, AutoConfigSource::Env);
+        assert_eq!(
+            scheduler.source_key.as_deref(),
+            Some("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE")
         );
     }
 
