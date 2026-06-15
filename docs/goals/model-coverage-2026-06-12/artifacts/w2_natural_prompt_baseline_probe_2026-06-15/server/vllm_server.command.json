@@ -1,0 +1,21 @@
+{
+  "cmd": [
+    "/workspace/vllm-venv-0101-cu126/bin/python",
+    "-m",
+    "vllm.entrypoints.openai.api_server",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8441",
+    "--model",
+    "/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+    "--served-model-name",
+    "gemma3:27b-gptq",
+    "--max-model-len",
+    "512",
+    "--max-num-seqs",
+    "16",
+    "--gpu-memory-utilization",
+    "0.92"
+  ]
+}
