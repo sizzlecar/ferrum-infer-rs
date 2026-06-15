@@ -148,19 +148,6 @@ fn cuda_quant_runtime_config() -> &'static CudaQuantRuntimeConfig {
     CONFIG.get_or_init(CudaQuantRuntimeConfig::from_env)
 }
 
-fn reject_dense_vllm_marlin_if_requested(config: &CudaQuantRuntimeConfig) -> Result<()> {
-    if config.vllm_marlin {
-        return Err(FerrumError::unsupported(
-            "FERRUM_VLLM_MARLIN=1 is disabled for dense GPTQ: dense load_gptq \
-             stores IST-DASLab Marlin tiles, while the vLLM Marlin kernel \
-             requires vLLM-repacked weights. Use the default dense Marlin path; \
-             vLLM-repacked Marlin remains wired through FERRUM_VLLM_MOE for \
-             stacked MoE weights.",
-        ));
-    }
-    Ok(())
-}
-
 fn marlin_qzeros_are_symmetric_code7(qzeros: &[i32]) -> bool {
     !qzeros.is_empty()
         && qzeros.iter().all(|&word| {
@@ -438,7 +425,6 @@ pub fn marlin_gemm_with_perm(
     m: usize,
 ) -> Result<()> {
     let runtime_config = cuda_quant_runtime_config();
-    reject_dense_vllm_marlin_if_requested(runtime_config)?;
     let use_vllm = runtime_config.vllm_marlin;
 
     if let Some(perm) = weight.perm.as_ref() {
@@ -688,6 +674,77 @@ impl BackendQuantMarlin for CudaBackend {
             } else {
                 (qweight.to_vec(), None)
             };
+
+        #[cfg(feature = "vllm-marlin")]
+        if cuda_quant_runtime_config().vllm_marlin {
+            let stream = default_stream();
+            let qweight_in_dev = stream
+                .clone_htod(&qweight_for_repack)
+                .map_err(|e| FerrumError::model(format!("vllm dense qweight htod: {e}")))?;
+            let mut qweight_out_dev = stream
+                .alloc_zeros::<i32>((k / 8) * n)
+                .map_err(|e| FerrumError::model(format!("vllm dense qweight alloc: {e}")))?;
+            crate::vllm_marlin::vllm_gptq_marlin_repack(
+                &stream,
+                &qweight_in_dev,
+                &mut qweight_out_dev,
+                k as i32,
+                n as i32,
+            )
+            .map_err(|e| FerrumError::model(format!("vllm dense gptq_marlin_repack: {e}")))?;
+
+            let scales_f16: Vec<f16> = scales.iter().map(|&x| f16::from_f32(x)).collect();
+            let marlin_scales_f16 =
+                crate::marlin::repack_scales_to_marlin(&scales_f16, k, n, group_size);
+            let scales_dev = stream
+                .clone_htod(&marlin_scales_f16)
+                .map_err(|e| FerrumError::model(format!("vllm dense scales htod: {e}")))?;
+
+            // vLLM's Marlin workspace is lock-based and indexed by output
+            // column tiles. Mirror the stacked vLLM path's N/64*max_par sizing.
+            let max_par = 16usize;
+            let ws_len = (n / 64).max(1) * max_par;
+            let workspace_dev = stream
+                .alloc_zeros::<i32>(ws_len)
+                .map_err(|e| FerrumError::model(format!("vllm dense ws alloc: {e}")))?;
+            stream
+                .synchronize()
+                .map_err(|e| FerrumError::model(format!("vllm dense load sync: {e}")))?;
+
+            tracing::info!(
+                "GPTQ load (vLLM dense Marlin): K={k} N={n} gs={group_size} desc_act_perm={}",
+                perm_dev_opt.is_some()
+            );
+            let marlin_weight = crate::marlin::MarlinWeight {
+                qweight: qweight_out_dev,
+                scales: scales_dev,
+                workspace: workspace_dev,
+                k,
+                n,
+                group_size: group_size as i32,
+                perm: perm_dev_opt,
+            };
+            #[cfg(feature = "triton-kernels")]
+            let store = GptqStoreCuda::Marlin(marlin_weight);
+            #[cfg(not(feature = "triton-kernels"))]
+            let store: GptqStoreCuda = marlin_weight;
+            let bias = bias_host.map(<Self as crate::backend::Backend>::from_slice);
+            return Ok(Box::new(
+                crate::quant_linear::cuda_marlin::CudaMarlinLinear {
+                    store,
+                    bias,
+                    in_features: k,
+                    out_features: n,
+                },
+            ));
+        }
+
+        #[cfg(not(feature = "vllm-marlin"))]
+        if cuda_quant_runtime_config().vllm_marlin {
+            return Err(FerrumError::unsupported(
+                "FERRUM_VLLM_MARLIN=1 set but binary not built with --features vllm-marlin",
+            ));
+        }
 
         // Path A (default): Marlin. Repack on CPU, then upload. Matches
         // IST-DASLab/marlin Layer.pack().
@@ -1143,8 +1200,7 @@ impl BackendQuantGguf for CudaBackend {}
 #[cfg(test)]
 mod tests {
     use super::{
-        marlin_qzeros_are_symmetric_code7, reject_dense_vllm_marlin_if_requested,
-        reject_unsupported_marlin_qzeros, CudaQuantRuntimeConfig,
+        marlin_qzeros_are_symmetric_code7, reject_unsupported_marlin_qzeros, CudaQuantRuntimeConfig,
     };
 
     #[test]
@@ -1186,19 +1242,6 @@ mod tests {
         assert!(!config.vllm_fp32_reduce);
         assert!(config.moe_fused);
         assert_eq!(config.moe_streams, 4);
-    }
-
-    #[test]
-    fn dense_vllm_marlin_env_is_rejected() {
-        let config = CudaQuantRuntimeConfig::from_env_vars([("FERRUM_VLLM_MARLIN", "1")]);
-        let err = reject_dense_vllm_marlin_if_requested(&config).unwrap_err();
-
-        let message = err.to_string();
-        assert!(message.contains("FERRUM_VLLM_MARLIN=1 is disabled for dense GPTQ"));
-        assert!(message.contains("vLLM-repacked weights"));
-
-        let default_config = CudaQuantRuntimeConfig::from_env_vars([] as [(&str, &str); 0]);
-        reject_dense_vllm_marlin_if_requested(&default_config).unwrap();
     }
 
     #[test]
