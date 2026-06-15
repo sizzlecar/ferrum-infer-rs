@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXXIII — W2 native checkpoint: split-QKV + paged-varlen combo probe PASS
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_varlen_split_qkv_native_probe_2026-06-16/`。
+- Source checkpoint:
+  `7dc711ef817af737903098f14c068852c04d7dbf`。
+- GPU 执行合同:
+  - lane:`W2 paged-varlen split-QKV native correctness probe`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - stop condition:启动/SSH/CUDA/source sync/compile/probe 任一失败,
+    或 probe PASS 后复制 artifact 并停机;
+  - correctness command:
+    `bash scripts/microbenches/build_and_run_paged_varlen_split_qkv_correctness.sh`;
+  - performance command:none。
+- Execution evidence:
+  - remote/source head `7dc711ef817af737903098f14c068852c04d7dbf`;
+  - CUDA environment:driver `565.77`,runtime-reported CUDA `12.7`,
+    `nvcc 12.4.131`;
+  - `probe/paged_varlen_split_qkv_correctness.rc` = `0`;
+  - stdout contains
+    `VERDICT: paged varlen split-qkv correctness PASS`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Native CUDA result:
+  - `qk_mode=1 sliding_window=0`:q/k/v err all `0`,
+    attention err `0.00012147`;
+  - `qk_mode=1 sliding_window=3`:q/k/v err all `0`,
+    attention err `0.00012141`;
+  - `qk_mode=2 sliding_window=3`:q/k/v err all `0`,
+    attention err `0.00011945`;
+  - `qk_mode=3 sliding_window=3`:q/k/v err all `0`,
+    attention err `0.00011978`;
+  - `qk_mode=1 semantic_delta_full_vs_window=0.06742159`,证明 full
+    causal 和 sliding-window 语义确实不同,不是等价空测。
+- Interpretation:
+  - standalone native CUDA chain
+    `split_qkv_norm_rope_into_paged_cache_varlen_f16` ->
+    `paged_varlen_attn_f16` 在合成非零 historical KV、当前 varlen 写入、
+    QK-norm/RoPE modes 和 sliding-window attention 上对齐 CPU reference;
+  - LXXX 的 Gemma3 paged-unified empty output 更可能在这对 kernels 之上
+    或依赖真实 product/model state,例如后续 residual/tail/lm_head、sampled
+    logits/stop token,或真实形状/权重数据;
+  - 下一步应使用 LXXXI 的 `[unified-logits]` 做一次最小 product smoke,
+    不跑 c16/c32,以判断首 token 是否 EOS/stop、logits row 错位或数值异常。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXXII — W2 source checkpoint: native split-QKV + paged-varlen combo probe
 
 - 本轮没有启动 GPU,没有新的性能数字,也没有生成
