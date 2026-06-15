@@ -2,6 +2,28 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XM — W2 source checkpoint: native down L2 persistence probe
+
+- Added `scripts/microbenches/gemma3_down_l2_persist_perf.cu` plus
+  `scripts/microbenches/build_and_run_gemma3_down_l2_persist_perf.sh`.
+- Purpose:
+  - XL showed down is cold after product-shaped `gate_up -> GeGLU`, even when
+    down reads a separate constant input;
+  - this probe applies CUDA's stream access-policy window to down `qweight`
+    and compares no-policy, full-window, half-window, lower hit-ratio, and
+    explicit down-warm cases;
+  - it is a native CUDA minimal verification of whether simple persisting L2
+    hints are a productizable lever for the `gate_up -> down` sequence.
+- Expected GPU use:
+  - run one cached 1x4090 native probe, not a release sweep;
+  - if no-policy and persisting modes match, reject stream-level L2 persistence
+    as a W2 lever;
+  - if persisting materially narrows the m16/m32 down gap, inspect whether the
+    same policy can be represented as a typed CUDA runtime option without
+    hidden env and then validate product correctness before performance claims.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XL — W2 native CUDA checkpoint: down slowdown is cache/producer-state, not GeGLU value sensitivity
 
 - Artifact:
