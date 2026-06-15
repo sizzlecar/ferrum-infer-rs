@@ -66,6 +66,8 @@ fn skip_ws_zero() -> bool {
 /// of normal model timings because callers already time the full projection.
 pub static MARLIN_WS_ZERO_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub static MARLIN_WS_ZERO_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static MARLIN_GATHER_TIME_US: AtomicU64 = AtomicU64::new(0);
+pub static MARLIN_GATHER_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MARLIN_KERNEL_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub static MARLIN_KERNEL_CALLS: AtomicU64 = AtomicU64::new(0);
 static MARLIN_TRACE_SHAPE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -74,6 +76,8 @@ static MARLIN_TRACE_SHAPE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub struct MarlinProfileBucketStats {
     pub ws_zero_us: u64,
     pub ws_zero_calls: u64,
+    pub gather_us: u64,
+    pub gather_calls: u64,
     pub kernel_us: u64,
     pub kernel_calls: u64,
 }
@@ -82,6 +86,8 @@ impl MarlinProfileBucketStats {
     pub const ZERO: Self = Self {
         ws_zero_us: 0,
         ws_zero_calls: 0,
+        gather_us: 0,
+        gather_calls: 0,
         kernel_us: 0,
         kernel_calls: 0,
     };
@@ -89,6 +95,11 @@ impl MarlinProfileBucketStats {
     fn record_ws_zero(&mut self, us: u64) {
         self.ws_zero_us += us;
         self.ws_zero_calls += 1;
+    }
+
+    fn record_gather(&mut self, us: u64) {
+        self.gather_us += us;
+        self.gather_calls += 1;
     }
 
     fn record_kernel(&mut self, us: u64) {
@@ -179,8 +190,18 @@ fn record_marlin_ws_zero(bucket: MarlinProfileBucket, us: u64) {
     with_marlin_profile_bucket_stats(bucket, |stats| stats.record_ws_zero(us));
 }
 
+fn record_marlin_gather(bucket: MarlinProfileBucket, us: u64) {
+    with_marlin_profile_bucket_stats(bucket, |stats| stats.record_gather(us));
+}
+
 fn record_marlin_kernel(bucket: MarlinProfileBucket, us: u64) {
     with_marlin_profile_bucket_stats(bucket, |stats| stats.record_kernel(us));
+}
+
+pub fn record_marlin_gather_for_current_label(us: u64) {
+    MARLIN_GATHER_TIME_US.fetch_add(us, Ordering::Relaxed);
+    MARLIN_GATHER_CALLS.fetch_add(1, Ordering::Relaxed);
+    record_marlin_gather(current_marlin_profile_bucket(), us);
 }
 
 pub fn drain_marlin_profile_by_projection() -> MarlinProfileByProjection {
@@ -192,7 +213,7 @@ pub fn drain_marlin_profile_by_projection() -> MarlinProfileByProjection {
     snapshot
 }
 
-fn profile_marlin() -> bool {
+pub fn profile_marlin() -> bool {
     cuda_marlin_runtime_config().profile
 }
 
@@ -1393,5 +1414,21 @@ mod tests {
             marlin_profile_bucket_from_label("label=<none>"),
             MarlinProfileBucket::Other
         );
+    }
+
+    #[test]
+    fn marlin_profile_bucket_stats_record_all_profile_phases() {
+        let mut stats = MarlinProfileBucketStats::ZERO;
+
+        stats.record_ws_zero(3);
+        stats.record_gather(5);
+        stats.record_kernel(7);
+
+        assert_eq!(stats.ws_zero_us, 3);
+        assert_eq!(stats.ws_zero_calls, 1);
+        assert_eq!(stats.gather_us, 5);
+        assert_eq!(stats.gather_calls, 1);
+        assert_eq!(stats.kernel_us, 7);
+        assert_eq!(stats.kernel_calls, 1);
     }
 }
