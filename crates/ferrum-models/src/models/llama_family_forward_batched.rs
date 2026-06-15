@@ -1550,7 +1550,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // post-capture replay the layer loop's kernels never actually
         // execute and packed_logits stays uninitialised. Mirrors the
         // legacy `forward_layer_batched_decode_post_attn` pattern.
-        if should_capture && !self.unified_graph_failed {
+        if should_capture && B::graph_capture_in_flight(&ctx) {
             if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
                 eprintln!("[unified-graph] end_capture err: {e}");
                 self.unified_graph_failed = true;
@@ -2538,7 +2538,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 );
             }
 
-            if should_capture && !self.batched_graph_failed {
+            if should_capture && B::graph_capture_in_flight(&ctx) {
                 if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
                     eprintln!("[batched-trace] end_capture err: {}", e);
                     self.batched_graph_failed = true;

@@ -4124,7 +4124,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             );
         }
 
-        if should_capture && !self.graph_capture_failed {
+        if should_capture && B::graph_capture_in_flight(&ctx) {
             if B::end_graph_capture(&mut ctx, SINGLE_ITEM_GRAPH_KEY).is_err() {
                 self.graph_capture_failed = true;
             } else {
