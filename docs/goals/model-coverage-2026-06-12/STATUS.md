@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XE — W2 source guard: reject Gemma3 typed unified graph before CUDA runtime
+
+- 本轮无新增 GPU run;这是对 `w2_unified_graph_typed_c16_2026-06-16`
+  correctness failure 的 source guard checkpoint。
+- Source change:
+  - `FerrumConfigBuilder::validate_unified_graph` now rejects
+    `FERRUM_UNIFIED_GRAPH=1` when model capabilities report
+    `architecture=gemma3`;
+  - failure message:`unified decode graph is disabled for Gemma3 sandwich-norm
+    models`;
+  - `docs/runtime-env-registry.tsv` notes that `FERRUM_UNIFIED_GRAPH` is typed
+    but rejected for Gemma3 until graph replay is correctness-safe。
+- Rationale:
+  - typed unified graph passed one-shot `ferrum run`/`ferrum serve`,but c16
+    bench hit `CUDA_ERROR_ILLEGAL_ADDRESS`;
+  - since the flag is now product-visible,it must fail early rather than
+    allowing users or release scripts to reach a CUDA illegal-address path。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-types unified_graph -- --nocapture` PASS;
+  - `cargo test -p ferrum-types batched_graph_override_materializes_decode_graph_policy -- --nocapture` PASS;
+  - `cargo test -p ferrum-cli run_effective_runtime_config_records_batched_graph_flag -- --nocapture` PASS。
+- Release-grade status:
+  - this closes a correctness hazard only;it does not improve W2 performance;
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 XD — W2 typed unified graph smoke passes but c16 bench hits CUDA illegal address
 
 - 本轮 artifact:
