@@ -2,6 +2,61 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XP — W2 native CUDA checkpoint: simple L2 policy fails under multi-layer weight rotation
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_down_l2_persist_cycle_native_probe_2026-06-16/`.
+- Paid GPU lane:
+  `W2 Gemma3 down L2 persistence cycle native probe` on the cached 1x RTX
+  4090 Vast instance.
+- Contract:
+  - expected runtime/cost: 10-20 minutes, about USD 0.07-0.15 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/compile first failure, probe non-zero or
+    timeout, or VERDICT plus artifact copyback;
+  - correctness gate: native probe exit 0 and
+    `VERDICT: gemma3 down L2 persistence cycle native CUDA probe complete`;
+  - performance command:
+    `bash scripts/microbenches/build_and_run_gemma3_down_l2_persist_cycle_perf.sh`.
+- Evidence:
+  - remote HEAD `357a4b98a2eb80744b8beacf256b91bbff8ae0f2`;
+  - probe rc `0`;
+  - binary SHA256
+    `f9c3e69f4407c4b4bd42b7f28593efcc7eb1c2bc81dff7c10ba98baf10b510f1`;
+  - stdout contains
+    `VERDICT: gemma3 down L2 persistence cycle native CUDA probe complete`;
+  - Vast cleanup confirmed `stopped/exited`.
+- Key rows:
+  - m16 single-layer no-policy: `69.832us`;
+  - m16 single-layer persist hit60: `34.493us`;
+  - m16 8-layer cycle no-policy: `69.736us`;
+  - m16 8-layer cycle persist hit60: `69.743us`;
+  - m16 8-layer cycle persist plus explicit down-warm: `34.634us`;
+  - m32 single-layer no-policy: `75.903us`;
+  - m32 single-layer persist hit60: `58.984us`;
+  - m32 8-layer cycle no-policy: `75.745us`;
+  - m32 8-layer cycle persist hit60: `75.117us`;
+  - m32 8-layer cycle persist plus explicit down-warm: `54.067us`.
+- Interpretation:
+  - XN's single-layer L2 persistence win is real but not sufficient for product
+    decode because one layer's next down call is separated by many other layer
+    weights;
+  - simple per-layer stream access-policy does not improve 8-layer rotation;
+  - explicit down-warm remains a useful upper bound but reads down weights an
+    extra time, so it is not a free product fix;
+  - do not productize simple access-policy alone as the W2 performance lever.
+- Next:
+  - if staying on this branch, test an overlap/prefetch strategy that can warm
+    down qweight concurrently with gate_up work; otherwise return to another
+    dense MLP reduction lever.
+- Scope:
+  - this is diagnostic native CUDA evidence, not release performance evidence;
+  - the remote worktree had old tracked artifact-log modifications after
+    syncing `.git`; those are recorded in `git_verify.txt` and are not used for
+    release performance claims.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XO — W2 source checkpoint: native multi-layer L2 persistence cycle probe
 
 - Added `scripts/microbenches/gemma3_down_l2_persist_cycle_perf.cu` plus
