@@ -1,0 +1,254 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_block_policy_probe_2026-06-16",
+  "comparison_auto_weight_cycle": {
+    "down": {
+      "16": {
+        "best_mode": "weight_cycle_kernel",
+        "best_us": 68.689,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 74.354,
+          "vs_default": 1.082473176199974
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 74.203,
+          "vs_default": 1.0802748620594274
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 68.689,
+          "vs_default": 1.0
+        }
+      },
+      "23": {
+        "best_mode": "weight_cycle_kernel",
+        "best_us": 72.709,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 97.94,
+          "vs_default": 1.3470134371260778
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 258.896,
+          "vs_default": 3.5607146295506746
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 72.709,
+          "vs_default": 1.0
+        }
+      },
+      "32": {
+        "best_mode": "weight_cycle_kernel",
+        "best_us": 73.591,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 99.286,
+          "vs_default": 1.3491595439659743
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 259.195,
+          "vs_default": 3.5221018874590646
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 73.591,
+          "vs_default": 1.0
+        }
+      }
+    },
+    "gate_up": {
+      "16": {
+        "best_mode": "weight_cycle_kernel",
+        "best_us": 133.956,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 134.647,
+          "vs_default": 1.0051584102242528
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 134.284,
+          "vs_default": 1.0024485652005137
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 133.956,
+          "vs_default": 1.0
+        }
+      },
+      "23": {
+        "best_mode": "weight_cycle_kernel",
+        "best_us": 136.971,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 142.649,
+          "vs_default": 1.0414540304151974
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 166.969,
+          "vs_default": 1.2190098634017419
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 136.971,
+          "vs_default": 1.0
+        }
+      },
+      "32": {
+        "best_mode": "weight_cycle_kernel",
+        "best_us": 138.446,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 144.447,
+          "vs_default": 1.043345419874897
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 168.623,
+          "vs_default": 1.217969461017292
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 138.446,
+          "vs_default": 1.0
+        }
+      }
+    },
+    "o_proj": {
+      "16": {
+        "best_mode": "weight_cycle_blocks_n_tiles_kernel",
+        "best_us": 19.15,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 23.642,
+          "vs_default": 1.195368591364142
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 19.15,
+          "vs_default": 0.968247547780362
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 19.778,
+          "vs_default": 1.0
+        }
+      },
+      "23": {
+        "best_mode": "weight_cycle_kernel",
+        "best_us": 23.07,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 33.728,
+          "vs_default": 1.4619852622453404
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 54.392,
+          "vs_default": 2.3576939748591244
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 23.07,
+          "vs_default": 1.0
+        }
+      },
+      "32": {
+        "best_mode": "weight_cycle_kernel",
+        "best_us": 23.826,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 35.81,
+          "vs_default": 1.5029799378829851
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 54.567,
+          "vs_default": 2.290229161420297
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 23.826,
+          "vs_default": 1.0
+        }
+      }
+    },
+    "qkv": {
+      "16": {
+        "best_mode": "weight_cycle_blocks_n_tiles_kernel",
+        "best_us": 30.11,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 33.944,
+          "vs_default": 1.0948264740033544
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 30.11,
+          "vs_default": 0.9711650109663269
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 31.004,
+          "vs_default": 1.0
+        }
+      },
+      "23": {
+        "best_mode": "weight_cycle_kernel",
+        "best_us": 33.96,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 40.615,
+          "vs_default": 1.1959658421672557
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 69.696,
+          "vs_default": 2.0522968197879856
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 33.96,
+          "vs_default": 1.0
+        }
+      },
+      "32": {
+        "best_mode": "weight_cycle_kernel",
+        "best_us": 34.658,
+        "weight_cycle_blocks_2sms_kernel": {
+          "ret": 0,
+          "us": 42.02,
+          "vs_default": 1.2124184892376941
+        },
+        "weight_cycle_blocks_n_tiles_kernel": {
+          "ret": 0,
+          "us": 69.952,
+          "vs_default": 2.0183507415315365
+        },
+        "weight_cycle_kernel": {
+          "ret": 0,
+          "us": 34.658,
+          "vs_default": 1.0
+        }
+      }
+    }
+  },
+  "diagnostic_only": true,
+  "finding": {
+    "bottleneck_hypothesis": "Dense Marlin small-m block policy / gridDim.x override.",
+    "evidence": "For m=16 auto tile, gate_up default weight_cycle is 133.956us vs blocks_n_tiles 134.284us and blocks_2sms 134.647us; down default is 68.689us vs blocks_n_tiles 74.203us and blocks_2sms 74.354us. m=23/32 are worse for n_tiles/2sms on gate_up/down.",
+    "next_lever": "Do not change dense Marlin block policy. Continue with decode integration / non-Marlin scheduling and prefill/TTFT work, or a narrower launch-count/overlap probe.",
+    "result": "Rejected for current W2 product optimization."
+  },
+  "local_commit": "da8d8b25a3f0aa28e826cfd75f3bcfae7b70ea3e",
+  "probe_rc": 0,
+  "release_grade": false,
+  "remote_base_head": "935777e9feb8c1606631761ec8e0fb6c3f3f0a06",
+  "status": "PASS",
+  "verdict_present": true
+}

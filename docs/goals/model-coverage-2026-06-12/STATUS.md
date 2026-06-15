@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXII — W2 native checkpoint: dense Marlin block-policy probe rejects grid override
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_block_policy_probe_2026-06-16/`。
+- Source checkpoint:
+  `da8d8b25 test(cuda): probe dense marlin block policy`。
+- GPU 执行合同:
+  - lane:`W2 dense Marlin block-policy native probe`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:8-15min,约 USD `0.06-0.12`;
+  - stop condition:nvcc 编译失败或 native probe 打出 `VERDICT` 后复制
+    artifact 并停机;
+  - correctness gate:native CUDA compile rc `0`,probe rc `0`;
+  - performance command:
+    `timeout 1800 bash scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh`。
+- Execution evidence:
+  - remote base HEAD:`935777e9feb8c1606631761ec8e0fb6c3f3f0a06`;
+  - local source checkpoint:`da8d8b25a3f0aa28e826cfd75f3bcfae7b70ea3e`;
+  - 本轮为节省时间只同步 native microbench 相关 dirty diff,不作为
+    release performance evidence;
+  - `probe/dense_marlin_gemma3_perf.rc=0`;
+  - stdout 包含 `VERDICT: dense Marlin native CUDA probe complete`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Key result:
+  - `gate_up m=16 auto` weight-cycle default `133.956us`,
+    `blocks_n_tiles` `134.284us`,`blocks_2sms` `134.647us`;
+  - `down m=16 auto` weight-cycle default `68.689us`,
+    `blocks_n_tiles` `74.203us`,`blocks_2sms` `74.354us`;
+  - `m=23/32` 上 `blocks_n_tiles`/`2sms` 对 `gate_up/down` 更差。
+- Interpretation:
+  - dense Marlin `gridDim.x`/block policy override 不是当前 W2 产品优化杠杆;
+  - 不应把 `blocks=n_tiles` 或 `2sms` 推进到产品内核;
+  - 下一步回到 decode integration / non-Marlin scheduling / prefill TTFT,
+    或做更窄的 launch-count/overlap native probe。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXI — W2 CUDA checkpoint: profiler path passes with graph capture disabled
 
 - 本轮 artifact:
