@@ -1,0 +1,11 @@
+{
+  "lane": "W2 unified_decode fallback_reason CUDA diagnostic",
+  "instance_id": "40826362",
+  "hardware": "1x RTX 4090",
+  "hourly_usd": "0.425",
+  "expected_runtime_cost": "10-20min expected; actual included CUDA release relink",
+  "stop_condition": "build + serve/chat smoke + c16 profiler fallback_reason evidence, or first failure",
+  "correctness_gate": "build rc=0, serve ready, chat smoke content 5, bench rc=0",
+  "performance_command": "bench-serve c16/n=16/n_repeats=1 --fail-on-error --seed 9271; diagnostic only",
+  "release_grade": false
+}

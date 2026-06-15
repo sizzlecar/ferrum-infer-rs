@@ -2,6 +2,98 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXIX — W2 source checkpoint: allow CUDA paged KV for Gemma3 windowed unified path
+
+- 本轮没有再次启动 GPU,不产生新的性能结论,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - `ensure_kv` 不再用 `sliding_window_pattern == 0` 一刀切禁用 paged KV;
+  - 新增 `paged_kv_allowed_for_layer_schedule(...)`,规则是:
+    paged enabled 且 (`sliding_window_pattern == 0` 或后端支持
+    `varlen_qkv`);
+  - 结果:CUDA 这类已有 paged-varlen/sliding-window 参数的后端可以给
+    Gemma3 windowed layers 分配 paged pools,从而满足 `unified_forward`
+    的 paged KV 前置条件;
+  - Metal paged decode 仍未暴露 per-layer window 到 paged dispatch,所以
+    Gemma3/windowed family 仍保持 contiguous KV 保护。
+- Why:
+  - LXXVIII CUDA artifact 显示所有 observed `unified_decode` 都
+    `attempted_unified=true`,但全部
+    `fallback_reason=paged_kv_required`;
+  - 源码确认 `ensure_kv` 里 Gemma3 因 `sliding_window_pattern != 0`
+    禁用 paged pools,而 `unified_forward` 又硬要求 `paged_pools`,
+    形成真实设计矛盾。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models paged_kv_layer_schedule_allows_windowed_models_only_with_varlen_backend -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models unified_varlen_qkv_requires_gemma_sandwich_prerequisites -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models llm_executor -- --nocapture` PASS
+    (13 tests);
+  - `git diff --check -- crates/ferrum-models/src/models/llama_family.rs ...`
+    PASS。
+- Required next validation:
+  - one minimal CUDA smoke only: build current checkpoint, serve/chat,
+    c16 profiler-on bench;
+  - expected first check is that `[unified-decode]` prefill lines no longer
+    report `fallback_reason=paged_kv_required`;
+  - if correctness fails, stop and inspect token/logit/KV state before any
+    performance measurement。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
+## 2026-06-16 LXXVIII — W2 CUDA checkpoint: unified_decode fallback is paged_kv_required
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_decode_fallback_reason_cuda_diag_2026-06-16/`。
+- Source checkpoint:
+  `5e9ae1514247e1ea7c34459dae3e2d1198c5e77d`。
+- GPU 执行合同:
+  - lane:`W2 unified_decode fallback_reason CUDA diagnostic`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:10-20min;实际包含 release relink;
+  - stop condition:build + serve/chat smoke + c16 profiler fallback_reason
+    evidence complete,或首个失败;
+  - correctness gate:build rc `0`,serve ready,chat smoke pass,bench rc `0`;
+  - performance command:c16/n=16/n_repeats=1 `bench-serve --fail-on-error
+    --seed 9271`,diagnostic only。
+- Execution evidence:
+  - remote git head `5e9ae1514247e1ea7c34459dae3e2d1198c5e77d`,
+    remote source status clean;
+  - binary SHA256
+    `9ef89f43cc5f8675f85aaa32811ba2a3ee9ea704f79f2f87fd250a913363913e`;
+  - `build/build.rc=0`,`run_profile.rc=0`,
+    `bench/bench_sharegpt_c16.rc=0`;
+  - serve ready poll `60`;chat response content `5`,usage present,
+    bad_output false;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Key result:
+  - c16 diagnostic:16 completed / 0 errored,`output_token_count_source=usage`;
+  - throughput `315.39451845233344 tok/s`;
+  - orientation-only vLLM baseline `518.7959572662905 tok/s`,Ferrum/vLLM
+    ratio `0.6079355747378077`;
+  - `[unified-decode]` line count `131`,prefill line count `3`;
+  - all observed fallback reasons:
+    `{"paged_kv_required": 131}`;
+  - c16 prefill cohort:
+    `call#3 items=10 prefill=10 decode=0 total_q=1220 attempted_unified=true fallback=true fallback_reason=paged_kv_required elapsed=890406us`;
+  - later c16 cohort:
+    `call#67 items=16 prefill=16 decode=0 total_q=1952 attempted_unified=true fallback=true fallback_reason=paged_kv_required elapsed=1396576us`。
+- Interpretation:
+  - LXXV full-logits fix was not the main bottleneck;
+  - `LlmExecutor::unified_decode` now proves the model unified path is
+    attempted,then falls back because Gemma3 CUDA lacks paged pools;
+  - source trace confirms `ensure_kv` disables paged KV for
+    `sliding_window_pattern != 0`,while `unified_forward` requires
+    `paged_pools`。This is the next real bottleneck。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXVII — W2 source checkpoint: expose unified_decode fallback reason
 
 - 本轮没有启动 GPU,不产生性能结论,也没有生成
