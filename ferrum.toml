@@ -58,3 +58,6 @@ test_data_dir = "./test_data"
 # max_batched_tokens = 2048
 # prefix_cache = false
 # moe_graph = true
+# marlin_profile = true
+# marlin_trace_shapes = true
+# marlin_trace_shapes_max = 64
