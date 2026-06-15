@@ -12,7 +12,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/workspace/ferrum-infer-rs}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="${REPO_ROOT:-$DEFAULT_REPO_ROOT}"
 cd "$REPO_ROOT"
 
 NVCC="${NVCC:-nvcc}"
