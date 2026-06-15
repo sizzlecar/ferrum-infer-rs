@@ -1759,6 +1759,10 @@ mod tests {
         assert_eq!(json["completed_per_run"], serde_json::json!([1]));
         assert_eq!(json["errored_per_run"], serde_json::json!([1]));
         assert_eq!(json["http_500_per_run"], serde_json::json!([1]));
+        assert_eq!(
+            json["output_tokens_per_request"],
+            serde_json::json!([[3, 0]])
+        );
         let _ = std::fs::remove_file(out);
     }
 }
