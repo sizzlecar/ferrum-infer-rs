@@ -1,0 +1,4 @@
+poll=1 cur_state=running actual_status=exited ssh=ssh9.vast.ai:26362
+poll=2 cur_state=running actual_status=exited ssh=ssh9.vast.ai:26362
+poll=3 cur_state=running actual_status=exited ssh=ssh9.vast.ai:26362
+poll=4 cur_state=running actual_status=running ssh=ssh9.vast.ai:26362

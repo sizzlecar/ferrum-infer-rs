@@ -2,6 +2,51 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXVI — W2 CUDA checkpoint: full-logits unified prefill fix is insufficient
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_full_logits_unified_prefill_cuda_diag_2026-06-16/`。
+- Source checkpoint:
+  `40186c75e393ef58e81b9f5acfe529186505a0bc`。
+- GPU 执行合同:
+  - lane:`W2 full-logits unified-prefill CUDA diagnostic`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:15-30min,约 USD `0.11-0.22`;
+  - stop condition:CUDA build + serve/chat smoke + c16 diagnostic bench +
+    log evidence complete,或首个失败;
+  - correctness gate:build rc `0`,serve ready,deterministic chat smoke pass,
+    bench rc `0`;
+  - performance command:c16/n=16/n_repeats=1 `bench-serve --fail-on-error
+    --seed 9271`,diagnostic only。
+- Execution evidence:
+  - `build/build.rc=0`,`run_profile.rc=0`,
+    `bench/bench_sharegpt_c16.rc=0`;
+  - smoke response content `5`,usage present,bad_output false;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`;
+  - remote source dirty includes the 3 synced source files for
+    `40186c75`,so this is not release performance evidence。
+- Key result:
+  - c16 diagnostic:16 completed / 0 errored,`output_token_count_source=usage`;
+  - throughput `298.24957600538823 tok/s` vs previous `284.90049780836483`,
+    about `+4.7%`;
+  - orientation-only vLLM baseline `518.7959572662905 tok/s`,Ferrum/vLLM
+    ratio `0.5748880110341743`;
+  - `prefill-profile tokens=122` lines remain `26`;
+  - first c16 prefill cohort still shows
+    `iter#3 items=10 prefill=10 total=927027us model=924576us` plus repeated
+    serial 122-token `prefill-profile` rows。
+- Interpretation:
+  - LXXV full-logits guard fix was locally correct but insufficient for W2-P2;
+  - main TTFT/prefill wall time remains,so do not run another CUDA c16
+    diagnostic until `LlmExecutor::unified_decode` records why
+    `model.unified_forward` still falls back;
+  - next source step: add unified_decode fallback reason observability
+    analogous to `batch_prefill`。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXV — W2 source checkpoint: allow full-logits unified prefill
 
 - 本轮没有启动 GPU,不产生性能结论,也没有生成
