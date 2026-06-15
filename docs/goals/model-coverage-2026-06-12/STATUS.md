@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXXI — W2 source checkpoint: add native CUDA dense Marlin Gemma3 probe
+
+- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source/tooling change:
+  - added `scripts/microbenches/dense_marlin_gemma3_perf.cu`;
+  - added `scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh`;
+  - updated `scripts/microbenches/README.md`.
+- Probe purpose:
+  - bypass Cargo, model loading, tokenizer, server, and bench client;
+  - compile only the probe plus `crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu`
+    with `nvcc`;
+  - call `marlin_cuda` directly on synthetic buffers for Gemma3-27B GPTQ
+    `qkv`, `o_proj`, `gate_up`, and `down` shapes;
+  - report `kernel_only` and `ws_plus_kernel` µs/call plus useful and padded
+    TFLOPS for `m={1,3,6,9,12,16,23,32}` and tile choices
+    `auto`, `128x128`, `64x256`.
+- Why this checkpoint matters:
+  - before changing dense Marlin tile selection or grid policy, we can now get
+    a native CUDA kernel-ceiling result in minutes on the cached 4090 instead
+    of paying a full Ferrum release build/product run for each hypothesis.
+- Local validation:
+  - `git diff --check -- scripts/microbenches/dense_marlin_gemma3_perf.cu
+    scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh
+    scripts/microbenches/README.md` PASS;
+  - `bash -n scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh`
+    PASS;
+  - local machine has no `nvcc`,so native CUDA compile/run is pending on the
+    CUDA host.
+- Next step:
+  - on the same cache-retained 4090, run only this native CUDA probe first;
+  - keep the machine running during tight source/probe iterations; stop only
+    after artifacts are copied or the iteration is no longer active.
+
 ## 2026-06-15 XXX — W2 source checkpoint: restore dense vLLM Marlin guard after first-fail evidence
 
 - 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
