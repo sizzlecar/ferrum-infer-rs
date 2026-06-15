@@ -2,6 +2,70 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XD — W2 typed unified graph smoke passes but c16 bench hits CUDA illegal address
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_graph_typed_c16_2026-06-16/`。
+- Source/binary:
+  - remote source head:`7f15a3ef9a57e2c23d889975ab629d25e8638803`;
+  - source status clean for `crates/`,`scripts/`,`Cargo.toml`,`Cargo.lock`,
+    and `ferrum.toml`;
+  - release binary SHA256:
+    `05f18a4cd8d8f34530758584122afad9e12f0bb929b450fc283449bb7d3180bd`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3-27B CUDA typed unified graph c16 diagnostic`;
+  - reused Vast/cache-retained instance `40826362`,1x RTX 4090,about
+    USD `0.425/hr`;
+  - stop condition:start/SSH/CUDA/source sync/build,`ferrum run
+    --unified-graph`,`ferrum serve --unified-graph`,or c16 bench first
+    failure;otherwise copy artifacts and stop the instance;
+  - correctness gate:`ferrum run --unified-graph` known-answer smoke plus
+    `ferrum serve --unified-graph` chat smoke with usage;
+  - performance command:c16-only `bench-serve --fail-on-error --require-ci
+    --seed 9271 --n-repeats 3`,diagnostic only。
+- Runtime config evidence:
+  - `serve_decision_trace.jsonl` selected `decode_graph_policy =
+    unified_decode_graph` with `source=cli` and
+    `source_key=FERRUM_UNIFIED_GRAPH`;
+  - `serve_effective_config.json` selected
+    `selected_graph_mode=unified_decode_graph`;
+  - this run uses the typed CLI/config path,not a hidden env-only toggle。
+- Correctness smoke:
+  - `ferrum run --unified-graph` PASS:
+    `RUN_SMOKE_PASS content='5' tokens=3`;
+  - `ferrum serve --unified-graph` PASS:
+    `SERVE_SMOKE_PASS content='5' completion_tokens=3`。
+- c16 bench result:
+  - repeat 1/3: `16 completed / 0 errored / 3.1s`;
+  - repeat 2/3: `16 completed / 0 errored / 3.1s`;
+  - repeat 3/3 started,then server hit CUDA illegal address;
+  - no throughput result is valid,bench did not complete。
+- Failure:
+  - server log:
+    `[unified-graph] replay err: Unsupported operation: post-launch sync:
+    CUDA_ERROR_ILLEGAL_ADDRESS`;
+  - follow-on panic:
+    `CudaBackend: load_function(rms_norm_f32_to_f16):
+    DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, "an illegal memory access was
+    encountered")`;
+  - run was stopped per first-fail rule;GPU process list was clear afterward。
+- Vast cleanup:
+  - final poll verified `cur_state=stopped actual_status=exited`;
+  - Vast JSON artifacts have `jupyter_token` redacted。
+- Interpretation:
+  - typed unified graph is now proven product-visible,but not product-safe for
+    W2 performance work;
+  - it passes one-shot run/serve smoke but fails under c16 bench,so it is a
+    correctness blocker and cannot be used as performance evidence;
+  - this reinforces the current path:avoid broad graph toggles,keep unified
+    graph disabled for release evidence, and pursue the model-side
+    Gemma3 MLP/Marlin bottleneck or a native CUDA graph-capture minimal repro
+    before re-enabling this path.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 XC — W2 bottleneck narrowed after graph A/B: model-side Gemma3 MLP/Marlin dominates
 
 - 本轮未新增 GPU run,没有新 release-grade artifact;这是基于最新
