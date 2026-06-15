@@ -6,11 +6,13 @@
 //! Constraints: K % 128 == 0, N % 256 == 0, SM >= 8.0 (Ampere+).
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CudaMarlinRuntimeConfig {
+    profile: bool,
     skip_ws_zero: bool,
 }
 
@@ -26,11 +28,14 @@ impl CudaMarlinRuntimeConfig {
         V: AsRef<str>,
     {
         let mut config = Self {
+            profile: false,
             skip_ws_zero: false,
         };
         for (name, value) in vars {
-            if name.as_ref() == "FERRUM_MARLIN_SKIP_WS_ZERO" {
-                config.skip_ws_zero = value.as_ref() == "1";
+            match name.as_ref() {
+                "FERRUM_MARLIN_PROFILE" => config.profile = value.as_ref() == "1",
+                "FERRUM_MARLIN_SKIP_WS_ZERO" => config.skip_ws_zero = value.as_ref() == "1",
+                _ => {}
             }
         }
         config
@@ -46,6 +51,17 @@ fn cuda_marlin_runtime_config() -> &'static CudaMarlinRuntimeConfig {
 /// access, cheap for hot paths (called per Marlin GEMM dispatch).
 fn skip_ws_zero() -> bool {
     cuda_marlin_runtime_config().skip_ws_zero
+}
+
+/// Profile-only nested dense Marlin counters. They are intentionally not part
+/// of normal model timings because callers already time the full projection.
+pub static MARLIN_WS_ZERO_TIME_US: AtomicU64 = AtomicU64::new(0);
+pub static MARLIN_WS_ZERO_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static MARLIN_KERNEL_TIME_US: AtomicU64 = AtomicU64::new(0);
+pub static MARLIN_KERNEL_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn profile_marlin() -> bool {
+    cuda_marlin_runtime_config().profile
 }
 
 // FFI declaration for the Marlin CUDA kernel.
@@ -288,9 +304,23 @@ fn marlin_gemm_chunk(
     // Zero workspace on the runner's stream — Marlin uses it as mutex locks.
     // All operations (memset + kernel) on same stream → naturally ordered.
     {
+        let profile = profile_marlin();
+        if profile {
+            stream
+                .synchronize()
+                .map_err(|e| candle_core::Error::Msg(format!("marlin ws profile pre-sync: {e}")))?;
+        }
+        let t0 = profile.then(std::time::Instant::now);
         let (ws_ptr, _guard) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, weight.workspace.len(), raw_stream);
+        }
+        if let Some(t0) = t0 {
+            stream.synchronize().map_err(|e| {
+                candle_core::Error::Msg(format!("marlin ws profile post-sync: {e}"))
+            })?;
+            MARLIN_WS_ZERO_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            MARLIN_WS_ZERO_CALLS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -301,6 +331,13 @@ fn marlin_gemm_chunk(
     let (s_ptr, _s_guard) = weight.scales.device_ptr(stream);
     let (ws_ptr, _ws_guard) = weight.workspace.device_ptr(stream);
 
+    let profile = profile_marlin();
+    if profile {
+        stream
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("marlin kernel profile pre-sync: {e}")))?;
+    }
+    let t0 = profile.then(std::time::Instant::now);
     let ret = unsafe {
         marlin_cuda(
             a_ptr as *const _,
@@ -321,6 +358,13 @@ fn marlin_gemm_chunk(
             -1, // prob_n_full = prob_n (non-stacked)
         )
     };
+    if let Some(t0) = t0 {
+        stream.synchronize().map_err(|e| {
+            candle_core::Error::Msg(format!("marlin kernel profile post-sync: {e}"))
+        })?;
+        MARLIN_KERNEL_TIME_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        MARLIN_KERNEL_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
 
     if ret != 0 {
         return Err(candle_core::Error::Msg(format!(
@@ -1123,14 +1167,21 @@ mod tests {
 
     #[test]
     fn cuda_marlin_runtime_config_parses_skip_ws_zero() {
-        let config = CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "1")]);
+        let config = CudaMarlinRuntimeConfig::from_env_vars([
+            ("FERRUM_MARLIN_PROFILE", "1"),
+            ("FERRUM_MARLIN_SKIP_WS_ZERO", "1"),
+        ]);
+        assert!(config.profile);
         assert!(config.skip_ws_zero);
     }
 
     #[test]
     fn cuda_marlin_runtime_config_defaults_to_zero_workspace() {
-        let config =
-            CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "true")]);
+        let config = CudaMarlinRuntimeConfig::from_env_vars([
+            ("FERRUM_MARLIN_PROFILE", "true"),
+            ("FERRUM_MARLIN_SKIP_WS_ZERO", "true"),
+        ]);
+        assert!(!config.profile);
         assert!(!config.skip_ws_zero);
     }
 }
