@@ -2,6 +2,58 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXIII — W2 CUDA checkpoint: typed-config decode integration profile points back to model-side decode
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_decode_profile_2026-06-16/`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 typed-config decode integration profile`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:10-20min,hard cap 30min;
+  - stop condition:启动/SSH/source sync/build/server/smoke/bench 首败,或 profile
+    artifact 完成后复制 artifact 并停机;
+  - correctness gate:CUDA release build,`ferrum serve` ready,chat smoke,
+    `bench-serve --fail-on-error` 零错误;
+  - performance command:diagnostic-only c16
+    `bench-serve --fail-on-error --seed 9271 --num-prompts 16 --random-input-len 32 --random-output-len 32`,
+    `n_repeats=1`,no CI/no `--require-ci`。
+- Execution evidence:
+  - remote HEAD:`4fea56ec79d0c8a9edcf99dd90b3889d422869e9`;
+  - non-artifact source status clean;
+  - CUDA release build rc `0`,binary SHA256:
+    `23f04a49e361c836ab6a8afb125d68e771df361219013bee0d32ecf630a2559d`;
+  - profiler flags came from typed config-file entries:
+    `FERRUM_BATCH_DECODE_PROF`,`FERRUM_NEXT_BATCH_PROF`,
+    `FERRUM_UNIFIED_POST_PROF`;
+  - `ferrum serve` ready after poll `62`,selected graph mode
+    `legacy_batched_decode_graph`;
+  - chat smoke content `5`,usage completion_tokens `3`;
+  - bench rc `0`,`completed_per_run=[16]`,`errored_per_run=[0]`,
+    `bad_output_per_run=[0]`,`zero_output_tokens_per_run=[0]`,
+    `output_token_count_source=usage`;
+  - c16 diagnostic throughput `380.492 tok/s`,TTFT p50 `587.854ms`,
+    TPOT p50 `23.822ms`;
+  - `output_tokens_per_request`:
+    `[[32,32,32,28,32,32,32,31,32,32,32,32,32,30,32,32]]`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Profile result:
+  - full `decode=16` iterations:`27`;
+  - mean full decode iteration total:`23679.2us`;
+  - mean model time:`23311.3us`,mean model share:`98.44%`;
+  - mean decode postprocess time:`347.9us`,mean postprocess share:`1.47%`;
+  - `bg-loop-gap` mostly single-digit microseconds,scheduler/process loop gap is
+    not the main bottleneck。
+- Interpretation:
+  - 这次最小 profile 没有发现新的正确性问题;
+  - engine scheduler、postprocess、streaming、普通 host loop gap 都不足以解释
+    W2 c16 与 vLLM 的差距;
+  - 继续扫 admission/开关的收益很低,下一步应集中在 Gemma3 模型侧 decode,
+    尤其 tail/Marlin/projection behavior 与 weight-residency 类问题。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXII — W2 source checkpoint: expose decode profiler knobs through runtime config
 
 - 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成
