@@ -2,6 +2,62 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XVII — W2 Ferrum natural-prompt diagnostic: correctness clean, c16/c32 below 80%
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_ferrum_natural_prompt_diag_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `poll=01 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=02 cur_state=stopped actual_status=exited intended_status=stopped`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA natural-prompt Ferrum diagnostic`;
+  - expected runtime/cost:20-45min,hard cap 60min,1x RTX 4090 instance
+    `40826362` at about USD 0.425/hr;
+  - stop condition:startup/SSH/CUDA/build/product-smoke first failure,c16/c32
+    diagnostic complete and artifact copied,or 60min cap;
+  - correctness gate:`ferrum run` plus
+    `scripts/model_coverage_smoke.sh gemma3:27b-gptq`;
+  - performance command:diagnostic-only
+    `ferrum bench-serve --dataset sharegpt --sharegpt-path ascii_sharegpt.jsonl --fail-on-error --seed 9271`
+    for c16/c32 small sample first.
+- Build/correctness:
+  - release build PASS,binary SHA256:
+    `90a30cafef8ea1fe9f1edf3ea326d04dd2f0ca1b8226923ffec559d61d8c5d78`;
+  - `ferrum run` rc=0,content `"5"`;
+  - serve smoke rc=0,PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- Dataset:
+  - exact same `ascii_sharegpt.jsonl` as
+    `w2_natural_prompt_baseline_probe_2026-06-15`;
+  - diagnostic run used `num_prompts=32`,`n_repeats=1`,so it is not final
+    release evidence and has no CI lower bound.
+- Diagnostic result(all usage token counts,zero errors,bad_output `[0]`):
+  - c16:completed `[32]`,errored `[0]`,mean `350.868 tok/s`,
+    ratio vs vLLM natural baseline LCB `0.714`,ratio vs baseline mean `0.661`,
+    required 80% of baseline LCB `392.920 tok/s`,p95 ITL `109.550 ms`
+    vs baseline `28.130 ms`;
+  - c32 client / Ferrum active cap16:completed `[32]`,errored `[0]`,
+    mean `354.291 tok/s`,ratio vs vLLM natural baseline LCB `0.645`,
+    ratio vs baseline mean `0.630`,required 80% of baseline LCB
+    `439.514 tok/s`,p95 ITL `109.782 ms` vs baseline `27.716 ms`.
+- Interpretation:
+  - product-path correctness remains clean on the current build;
+  - same natural prompt dataset removes the baseline correctness ambiguity and
+    shows the remaining W2 blocker is performance,especially tail ITL and c32
+    throughput under active cap16;
+  - do not expand to a full `--require-ci` release sweep until a targeted
+    optimization/profiler step moves c16/c32 close to the 80% thresholds.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - profile/optimize the decode path under natural prompts,with emphasis on
+    high p95 ITL and the remaining c16/c32 throughput gap;
+  - after a targeted fix, rerun the same natural dataset diagnostic before any
+    full release-grade CI sweep.
+
 ## 2026-06-15 XVI — W2 natural-prompt baseline probe: vLLM c16/c32 zero-error
 
 - 本轮 artifact:

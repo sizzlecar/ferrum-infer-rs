@@ -87,3 +87,5 @@ Verify zero: instances list must return 0 before declaring the goal done.
 **2026-06-15 11:39 CST — W2 40826362 stopped again after vLLM baseline safety probe. Artifact `w2_baseline_safety_probe_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; vLLM c16 release-shape rerun reproduced invalid-UTF8 bad output on repeat 3, so c32 was not run.**
 
 **2026-06-15 11:49 CST — W2 40826362 stopped again after natural-prompt vLLM baseline probe. Artifact `w2_natural_prompt_baseline_probe_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; vLLM sharegpt-style ASCII c16/c32 completed N=3, 100 prompts/repeat, zero errors and usage token counts.**
+
+**2026-06-15 12:10 CST — W2 40826362 stopped again after Ferrum natural-prompt diagnostic. Artifact `w2_ferrum_natural_prompt_diag_2026-06-15` copied locally; API verified `cur_state=stopped`,`actual_status=exited`; Ferrum run and serve smoke passed, but same-dataset c16/c32 diagnostic remained below the 80% vLLM natural baseline line.**
