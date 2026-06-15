@@ -2,6 +2,65 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XLIII — W2 native checkpoint: paged varlen sliding-window CUDA probe 通过
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_varlen_window_native_probe_2026-06-15/`。
+- 复用 Vast/cache-retained native CUDA instance `40826362`,1x RTX 4090,
+  `nvidia/cuda:12.4.0-devel-ubuntu22.04`,driver `565.77`,CUDA compiler
+  `12.4`。验证结束后已复制 artifact 并停机;`vast_shutdown/cleanup_check.txt`
+  记录 `cur_state=stopped actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA paged-varlen sliding-window native correctness probe`
+    plus `W2 CUDA product build smoke after varlen-window ABI change`;
+  - expected runtime/cost:5-15min native probe,额外 3-8min build smoke,
+    hard cap 25min,约 USD 0.425/hr;
+  - stop condition:instance start/SSH/CUDA/source sync/compile/probe 首败,
+    CUDA release build 首败,或 PASS 后复制 artifact 并停机;
+  - correctness command:
+    `bash scripts/microbenches/build_and_run_paged_varlen_window_correctness.sh`;
+  - product build smoke:
+    `cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - performance command: none;本轮不产出性能结论。
+- Source/tooling change:
+  - 新增 `scripts/microbenches/paged_varlen_window_correctness.cu`;
+  - 新增 `scripts/microbenches/build_and_run_paged_varlen_window_correctness.sh`;
+  - README 记录该 probe 用于 Gemma3 unified prefill 前验证 paged-varlen
+    one-pass 和 split-K sliding-window 语义。
+- Native CUDA result:
+  - `paged_varlen_window_correctness.rc` = `0`;
+  - stdout contains `VERDICT: paged varlen window correctness PASS`;
+  - `sliding_window=0`: one-pass/split-K max abs err both `0.00003045`;
+  - `sliding_window=3`: one-pass/split-K max abs err both `0.00002996`;
+  - full causal vs window CPU reference semantic delta `0.02593978`,证明
+    probe 实际覆盖了不同语义,不是只测等价路径。
+- CUDA product build smoke:
+  - `cargo_cuda_build.rc` = `0`;
+  - build finished release profile in `3m 46s`;
+  - binary SHA256:
+    `3d5ce5a0dd931a88f26d2d3e23c27805deeb91c77f804e140dff3304e7afcc4a`;
+  - first build attempt failed with rc `127` only because non-login SSH PATH
+    lacked `/root/.cargo/bin`;rerun after `source /root/.cargo/env` passed.
+- Evidence caveat:
+  - remote HEAD was `aa741f90b5a135d974fbb824283252a6b66d5857`;
+  - remote git status is dirty because this checkpoint's new microbench files
+    were not yet committed at sync time and rsync deliberately excluded local
+    historical artifact directories;this is diagnostic correctness evidence,
+    not a performance claim.
+- Correctness/performance status:
+  - the varlen-window CUDA ABI/semantics checkpoint is now validated by native
+    CUDA and product CUDA build smoke;
+  - Gemma3 unified prefill guard is still not relaxed;W2 still requires
+    sandwich norm/GeGLU unified-tail semantics and product `ferrum run`/`serve`
+    smoke before performance evidence;
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains functional / known-gap,not release-grade。
+- Next step:
+  - implement the next Gemma3 unified prefill correctness piece: device-side
+    unified tail support for Gemma3 sandwich post-attn/post-ffn norms and GeGLU,
+    keeping the guard closed until Paris/chat smoke passes。
+
 ## 2026-06-15 XLII — W2 source checkpoint: varlen attention 接入 per-layer sliding-window 语义
 
 - 本轮没有启动 GPU;按最小源码验证推进,避免重复开关机器、重装环境和完整 sweep。
