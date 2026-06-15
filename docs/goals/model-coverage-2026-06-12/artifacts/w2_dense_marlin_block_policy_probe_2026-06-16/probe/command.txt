@@ -1,0 +1,1 @@
+timeout 1800 bash scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh
