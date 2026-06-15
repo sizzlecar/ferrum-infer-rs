@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XLI — W2 source checkpoint: dense Marlin probe 增加多权重轮转模式
+
+- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source/tooling change:
+  - `scripts/microbenches/dense_marlin_gemma3_perf.cu` 增加
+    `weight_cycle_kernel` 与 `weight_cycle_ws_plus_kernel` 输出行;
+  - 关键 auto-tile `m=16/23/32` 会轮转 `8` 份独立 synthetic
+    qweight/scales/workspace,用于判断 Gemma3 gate/up/down Marlin shape 的
+    产品侧表现更接近热缓存、冷缓存还是多权重轮转;
+  - 更新 `build_and_run_dense_marlin_gemma3_perf.sh` 与 microbench README。
+- Why:
+  - 既有 native probe 的 repeated-hot timing 对小投影过于乐观,而真实 W2
+    Gemma3 27B decode 会在 62 层和多投影权重间切换;
+  - 本改动提供比完整 Ferrum release build/bench 更便宜的 native CUDA
+    最小验证入口,用于选择下一步是否值得改 Marlin tile/grid/repack path。
+- Local validation:
+  - `git diff --check -- scripts/microbenches/dense_marlin_gemma3_perf.cu scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh scripts/microbenches/README.md`
+    PASS;
+  - `bash -n scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh`
+    PASS;
+  - local machine has no `nvcc` and no CUDA headers,so compile/run is pending
+    on the native CUDA host.
+- Next step:
+  - 在 cache-retained 4090 上先运行该 native probe,不要先跑完整
+    Ferrum build/sweep;
+  - 若 `weight_cycle_*` 接近产品 profile 的 gate/up/down timing,再基于该
+    证据尝试 shape-specific Marlin lever;否则回到 Gemma3 prefill/unified
+    串行化方向。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-15 XL — W2 source trace:Gemma3 prefill 是 serial fallback,不是 unified cohort prefill
 
 - 本轮没有再开 GPU;基于已提交 artifact
