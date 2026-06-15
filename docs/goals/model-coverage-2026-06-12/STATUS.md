@@ -2,6 +2,61 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXXII — W2 native CUDA dense Marlin probe: gate/up still top target, no tile-default change
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_native_probe_2026-06-15/`。
+- Scope:
+  - 这是 native CUDA kernel-ceiling diagnostic,不是 release-grade gate;
+  - 没有运行 `ferrum run` 或 `ferrum serve`;
+  - 没有生成 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`,W2 仍不是
+    release-grade。
+- GPU execution:
+  - reused Vast instance `40826362`,1x RTX 4090,约 USD 0.425/hr;
+  - source sync 后远端 HEAD:`951348b23956caab8c459823708ddc4b63b90a8e`;
+  - first native probe rc=`0`,printed
+    `VERDICT: dense Marlin native CUDA probe complete`;
+  - host-sync/cold-cache probe rc=`0`,printed the same `VERDICT`;
+  - artifact copied back locally;
+  - Vast stop poll verified `cur_state=stopped`,`actual_status=exited` at
+    `2026-06-15T06:52:02Z`。
+- Source/tooling change in this checkpoint:
+  - extended `scripts/microbenches/dense_marlin_gemma3_perf.cu` with
+    product-profile-style `host_sync_kernel` / `host_sync_ws_plus_kernel`
+    modes;
+  - added limited `cold_cache_kernel` rows for auto-tile `m=16/23/32`
+    by flushing a 256MiB scratch buffer before timing;
+  - updated `scripts/microbenches/README.md`.
+- Key m=16 auto-tile native timings:
+  - `qkv`: hot event `17.207 us`,host-sync `18.887 us`,cold-cache
+    `39.929 us`;
+  - `o_proj`: hot event `12.058 us`,host-sync `13.695 us`,cold-cache
+    `24.447 us`;
+  - `gate_up`: hot event `133.650 us`,host-sync `135.924 us`,cold-cache
+    `177.144 us`;
+  - `down`: hot event `30.395 us`,host-sync `32.049 us`,cold-cache
+    `93.558 us`.
+- Interpretation:
+  - host-sync overhead alone does not explain product-profile `qkv/o/down`
+    time; repeated-hot native timing was too optimistic for smaller
+    projections because the same synthetic weight buffer is reused;
+  - forced cold-cache timing is too pessimistic but brackets product behavior,
+    confirming cache residency is a major measurement variable;
+  - tile override evidence is weak: `64x256` only marginally improves hot
+    `gate_up` and regresses `down`,so this checkpoint does not justify a
+    default tile change;
+  - no new product correctness issue was found in this diagnostic.
+- Local validation:
+  - `git diff --check -- scripts/microbenches/dense_marlin_gemma3_perf.cu`
+    PASS;
+  - `bash -n scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh`
+    PASS.
+- Next step:
+  - continue from the correct default path, but choose the next lever based on
+    product-representative weight/cache behavior rather than repeated-hot
+    synthetic kernel timings alone;
+  - do not claim performance or release readiness from this native diagnostic.
+
 ## 2026-06-15 XXXI — W2 source checkpoint: add native CUDA dense Marlin Gemma3 probe
 
 - 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
