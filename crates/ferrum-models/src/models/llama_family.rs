@@ -438,6 +438,14 @@ impl LlamaFamilyRuntimeEnv {
     }
 }
 
+fn paged_kv_allowed_for_layer_schedule(
+    paged_enabled: bool,
+    backend_supports_varlen_qkv: bool,
+    sliding_window_pattern: usize,
+) -> bool {
+    paged_enabled && (sliding_window_pattern == 0 || backend_supports_varlen_qkv)
+}
+
 /// Whether decode-op profiling is enabled, resolved from the runtime snapshot
 /// installed at the composition root. Used by pipeline paths that operate on a
 /// `LlamaFamilyPipelineModel` and so don't hold a `LlamaFamilyModel`'s
@@ -2038,12 +2046,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // opt-in pre-0.7.2; flipping the default so default `ferrum
         // serve` matches the bench-quality numbers without requiring
         // env-var knowledge.
-        // Per-layer window scheduling (Gemma 3) is not plumbed through the
-        // paged attention dispatch yet — local layers would silently attend
-        // past their window once the context exceeds it. Pin sandwich-norm
-        // families to contiguous KV until paged learns per-layer windows
-        // (W2-3 work item).
-        let paged = runtime_env.paged_kv_enabled::<B>() && self.cfg.sliding_window_pattern == 0;
+        // Per-layer window scheduling (Gemma 3) can only use paged KV on
+        // backends whose paged-varlen path receives the layer's sliding
+        // window. CUDA has that path; Metal paged decode does not yet expose
+        // a per-layer window in its paged dispatch, so keep it on contiguous
+        // KV for sandwich/windowed families.
+        let paged = paged_kv_allowed_for_layer_schedule(
+            runtime_env.paged_kv_enabled::<B>(),
+            B::supports_varlen_qkv(),
+            self.cfg.sliding_window_pattern,
+        );
         const PAGED_BLOCK_SIZE: usize = 16;
 
         // Phase 4 shared-pool sizing. The pool sees ALL concurrent
@@ -5010,10 +5022,11 @@ mod tests {
 
     use super::{
         bf16_round, llama_layer_attention_schedule, llama_qk_mode, load_llama_family_layers,
-        nan_trace_raw_matches, rope_freq, stats_for, supports_sandwich_legacy_batched_decode,
-        unified_varlen_qkv_unsupported_reason, LlamaDecodeBatchStats, LlamaFamilyConfig,
-        LlamaFamilyLayerStageConfig, LlamaFamilyModel, LlamaFamilyRuntimeEnv, LlamaFamilyScratch,
-        LlamaNanTraceConfig, RopeScalingConfig, DEFAULT_KV_CAPACITY,
+        nan_trace_raw_matches, paged_kv_allowed_for_layer_schedule, rope_freq, stats_for,
+        supports_sandwich_legacy_batched_decode, unified_varlen_qkv_unsupported_reason,
+        LlamaDecodeBatchStats, LlamaFamilyConfig, LlamaFamilyLayerStageConfig, LlamaFamilyModel,
+        LlamaFamilyRuntimeEnv, LlamaFamilyScratch, LlamaNanTraceConfig, RopeScalingConfig,
+        DEFAULT_KV_CAPACITY,
     };
 
     #[test]
@@ -5204,6 +5217,15 @@ mod tests {
 
         cfg.sliding_window_pattern = 6;
         assert!(unified_varlen_qkv_unsupported_reason(&cfg, true, true).is_none());
+    }
+
+    #[test]
+    fn paged_kv_layer_schedule_allows_windowed_models_only_with_varlen_backend() {
+        assert!(paged_kv_allowed_for_layer_schedule(true, false, 0));
+        assert!(paged_kv_allowed_for_layer_schedule(true, true, 0));
+        assert!(!paged_kv_allowed_for_layer_schedule(true, false, 6));
+        assert!(paged_kv_allowed_for_layer_schedule(true, true, 6));
+        assert!(!paged_kv_allowed_for_layer_schedule(false, true, 6));
     }
 
     #[test]

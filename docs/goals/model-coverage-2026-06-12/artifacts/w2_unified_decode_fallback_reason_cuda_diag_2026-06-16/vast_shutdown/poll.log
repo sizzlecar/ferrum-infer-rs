@@ -1,0 +1,5 @@
+2026-06-15T20:22:01Z poll=1 cur=stopped actual=running intended=stopped
+2026-06-15T20:22:08Z poll=2 cur=stopped actual=running intended=stopped
+2026-06-15T20:22:14Z poll=3 cur=stopped actual=running intended=stopped
+2026-06-15T20:22:20Z poll=4 cur=stopped actual=running intended=stopped
+2026-06-15T20:22:26Z poll=5 cur=stopped actual=exited intended=stopped
