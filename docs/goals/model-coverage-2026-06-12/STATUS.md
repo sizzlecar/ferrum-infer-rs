@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXIV — W2 profile instrumentation: add dense Marlin nested counters
+
+- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- 代码侧推进:
+  - 新增 `FERRUM_MARLIN_PROFILE=1` profile-only 开关;
+  - 在 dense Marlin `marlin_gemm_chunk` 内部新增 nested counters:
+    `marlin_ws_zero` 和 `marlin_kernel`;
+  - batched decode `[batched-op-profile]` 日志会输出这两个 nested
+    字段,但不会把它们加入 `wrapped_us`,避免和 `tail_gate_up` /
+    `tail_down` 双计;
+  - 默认路径不变,`FERRUM_MARLIN_PROFILE` 未设置时不增加同步计时;
+  - 未改变 `FERRUM_MARLIN_SKIP_WS_ZERO` 行为。该开关仍只用于已有的
+    strided path,没有扩展到 dense path。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check -- crates/ferrum-kernels/src/backend/cuda/marlin.rs crates/ferrum-models/src/models/llama_family_forward_batched.rs`
+    PASS;
+  - `cargo check -q -p ferrum-models --tests` PASS;
+  - `cargo test -q -p ferrum-models llama_batched_runtime_config_parses_startup_knobs --lib`
+    PASS,1 test passed。
+- Evidence caveat:
+  - local non-CUDA checks passed, but the new CUDA-feature path still needs a
+    4090 release build in the next diagnostic checkpoint before relying on the
+    new Marlin nested fields.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - rerun the c16/c32 CUDA profile diagnostic with both
+    `FERRUM_DECODE_OP_PROFILE=1` and `FERRUM_MARLIN_PROFILE=1` to split
+    gate/up projection time into workspace-zero and Marlin kernel work.
+
 ## 2026-06-15 XXIII — W2 tail-gate/down profile: gate/up projection is the largest single decode bucket
 
 - 本轮 artifact:

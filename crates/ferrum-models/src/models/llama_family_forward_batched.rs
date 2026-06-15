@@ -19,6 +19,11 @@ use ferrum_kernels::backend::{
 use ferrum_quantization::Linear;
 use ferrum_types::Result;
 
+#[cfg(feature = "cuda")]
+use ferrum_kernels::backend::cuda::marlin::{
+    MARLIN_KERNEL_CALLS, MARLIN_KERNEL_TIME_US, MARLIN_WS_ZERO_CALLS, MARLIN_WS_ZERO_TIME_US,
+};
+
 use super::llama_family::{
     elapsed_micros_u64_floor1, LlamaFamilyModel, LlamaStageHiddenBridgeTiming, ATTN_CALLS,
     ATTN_TIME_US, BATCHED_GRAPH_EAGER_COUNT, BATCHED_GRAPH_REPLAY_COUNT, MATMUL_CALLS,
@@ -2114,6 +2119,13 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 TAIL_GATE_UP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 TAIL_DOWN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                 TAIL_DOWN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "cuda")]
+                {
+                    MARLIN_WS_ZERO_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    MARLIN_WS_ZERO_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    MARLIN_KERNEL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    MARLIN_KERNEL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                }
                 TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                 TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -2238,6 +2250,20 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 let tail_down_n = TAIL_DOWN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let tail_mlp_us = tail_gate_up_us + tail_down_us;
                 let tail_mlp_n = tail_gate_up_n + tail_down_n;
+                #[cfg(feature = "cuda")]
+                let (marlin_ws_zero_us, marlin_ws_zero_n, marlin_kernel_us, marlin_kernel_n) = {
+                    let ws_us =
+                        MARLIN_WS_ZERO_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    let ws_n = MARLIN_WS_ZERO_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    let kernel_us =
+                        MARLIN_KERNEL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    let kernel_n =
+                        MARLIN_KERNEL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    (ws_us, ws_n, kernel_us, kernel_n)
+                };
+                #[cfg(not(feature = "cuda"))]
+                let (marlin_ws_zero_us, marlin_ws_zero_n, marlin_kernel_us, marlin_kernel_n) =
+                    (0, 0, 0, 0);
                 let tail_act_us = TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let tail_act_n = TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let tail_resid_us =
@@ -2255,7 +2281,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     + tail_resid_us;
                 let unwrapped_us = total_us.saturating_sub(wrapped_us);
                 eprintln!(
-                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({}) tail_norm={}us({}) tail_mlp={}us({}) tail_gate_up={}us({}) tail_down={}us({}) tail_act={}us({}) tail_resid={}us({})  unwrapped={}us",
+                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({}) tail_norm={}us({}) tail_mlp={}us({}) tail_gate_up={}us({}) tail_down={}us({}) marlin_ws_zero={}us({}) marlin_kernel={}us({}) tail_act={}us({}) tail_resid={}us({})  unwrapped={}us",
                     m,
                     total_us,
                     mm_us, mm_n,
@@ -2267,6 +2293,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     tail_mlp_us, tail_mlp_n,
                     tail_gate_up_us, tail_gate_up_n,
                     tail_down_us, tail_down_n,
+                    marlin_ws_zero_us, marlin_ws_zero_n,
+                    marlin_kernel_us, marlin_kernel_n,
                     tail_act_us, tail_act_n,
                     tail_resid_us, tail_resid_n,
                     unwrapped_us,
