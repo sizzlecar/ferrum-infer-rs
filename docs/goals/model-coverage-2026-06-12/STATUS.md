@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XR — W2 native CUDA checkpoint: overlap prefetch warms down but worsens wall time
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_down_prefetch_overlap_native_probe_2026-06-16/`.
+- Paid GPU lane:
+  `W2 Gemma3 down prefetch-overlap native probe` on the cached 1x RTX 4090
+  Vast instance.
+- Contract:
+  - expected runtime/cost: 10-20 minutes, about USD 0.07-0.15 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/compile first failure, probe non-zero or
+    timeout, or VERDICT plus artifact copyback;
+  - correctness gate: native probe exit 0 and
+    `VERDICT: gemma3 down prefetch-overlap native CUDA probe complete`;
+  - performance command:
+    `bash scripts/microbenches/build_and_run_gemma3_down_prefetch_overlap_perf.sh`.
+- Evidence:
+  - remote HEAD `432e6588bac59902b7488484934494c751534221`;
+  - probe rc `0`;
+  - binary SHA256
+    `58491a34483c8c4ba0ccbd4b1d9c9b127676b1f520a6ba42a0409daae5cc64bc`;
+  - stdout contains
+    `VERDICT: gemma3 down prefetch-overlap native CUDA probe complete`;
+  - Vast cleanup confirmed `stopped/exited`.
+- Key rows:
+  - m16 no prefetch: down `69.744us`, segment `216.072us`;
+  - m16 overlap qweight: down `34.063us`, segment `239.437us`;
+  - m16 overlap qweight+scales: down `32.560us`, segment `238.979us`;
+  - m32 no prefetch: down `74.849us`, segment `227.628us`;
+  - m32 overlap qweight: down `53.836us`, segment `268.300us`;
+  - m32 overlap qweight+scales: down `53.790us`, segment `269.916us`.
+- Interpretation:
+  - explicit warm/prefetch does make down fast under 8-layer rotation;
+  - it increases end-to-end segment wall time, so the current warm kernel shifts
+    cost rather than reducing wall time;
+  - do not productize this cache-warm branch as W2 performance work unless a
+    cheaper producer-integrated prefetch design is found.
+- Next:
+  - return to dense MLP work-reduction/kernel-design options rather than
+    stream-level L2 policy or standalone warm kernels.
+- Scope:
+  - this is diagnostic native CUDA evidence, not release performance evidence;
+  - the remote worktree had old tracked artifact-log modifications after
+    syncing `.git`; those are recorded in `git_verify.txt` and are not used for
+    release performance claims.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XQ — W2 source checkpoint: native down prefetch-overlap probe
 
 - Added `scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu` plus
