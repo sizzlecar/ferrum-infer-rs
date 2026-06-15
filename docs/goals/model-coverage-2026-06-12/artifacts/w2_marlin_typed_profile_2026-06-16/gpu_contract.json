@@ -1,0 +1,13 @@
+{
+  "lane": "W2 Marlin tail-MLP diagnostic profile",
+  "instance_id": 40826362,
+  "hardware": "1x RTX 4090",
+  "hourly_cost_usd": 0.42488888888888887,
+  "expected_runtime": "20-40 minutes",
+  "expected_cost_usd": "0.15-0.30",
+  "stop_condition": "Stop after chat smoke plus one c16/n=16/n_repeats=1 diagnostic profile collects typed-config Marlin gate_up/down counters, or at the first build/smoke/profile failure.",
+  "correctness_gate": "serve ready check plus deterministic non-stream chat smoke: What is 2+3? Answer with only the number.",
+  "performance_command": "ferrum bench-serve --dataset sharegpt --concurrency-sweep 16 --num-prompts 16 --n-repeats 1 --fail-on-error --seed 9271",
+  "release_grade": false,
+  "notes": "Diagnostic only. This run does not use --require-ci and does not satisfy MODEL_RELEASE_GRADE_W2."
+}
