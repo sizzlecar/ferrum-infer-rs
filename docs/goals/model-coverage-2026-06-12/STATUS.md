@@ -2,6 +2,51 @@
 
 进度日志,倒序。
 
+## 2026-06-15 L — W2 CUDA checkpoint: vLLM dense Marlin weight-cycle 也落在同一瓶颈带
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_weight_cycle_probe_2026-06-15/`。
+- 源码 checkpoint:
+  `2b6e1922 test(cuda): add vllm marlin weight cycle probe`。
+- GPU 执行合同:
+  - lane:`W2 dense vLLM Marlin weight-cycle native probe`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD 0.425/hr;
+  - expected runtime/cost:5-12min,hard cap 20min;
+  - stop condition:start/SSH/CUDA/source sync/compile/probe 首败,或 verdict
+    后复制 artifact 并停机;
+  - correctness gate:native compile success + probe rc `0` + verdict line;
+  - performance command:diagnostic-only
+    `bash scripts/microbenches/build_and_run_dense_vllm_marlin_gemma3_perf.sh`,
+    只比较 hot vs weight-cycle,不产生 release 性能声明。
+- 执行结果:
+  - remote HEAD:`2b6e192205f01ef9106a7c12dbce38198c2584a3`;
+  - probe rc `0`,`run.status=PASS`;
+  - stdout 含
+    `VERDICT: dense vLLM Marlin native CUDA probe complete`;
+  - artifact 复制回本地后已停机;`vast_shutdown/cleanup_check.txt`
+    记录 `cur_state=stopped actual_status=exited`。
+- m=16 A/B/weight-cycle 关键数据:
+  - qkv: Ferrum hot `17.005us`,Ferrum weight-cycle `30.278us`,
+    vLLM hot `18.315us`,vLLM weight-cycle `30.950us`;
+  - gate_up: Ferrum hot `133.715us`,Ferrum weight-cycle `133.985us`,
+    vLLM hot `136.988us`,vLLM weight-cycle `137.524us`;
+  - down: Ferrum hot `30.356us`,Ferrum weight-cycle `68.651us`,
+    vLLM hot `36.027us`,vLLM weight-cycle `69.268us`。
+- Interpretation:
+  - down projection 的 vLLM dense Marlin hot 看起来快,但一旦模拟 product
+    跨层权重轮换,它同样落到 `~69us`,与 Ferrum default weight-cycle
+    只差约 `1%`;
+  - gate_up 在 hot/weight-cycle 下基本不变,说明它是 compute-bound 大投影;
+  - 因此当前剩余 c16 端到端差距不应继续押注 dense Marlin kernel swap;
+  - 下一步应转向 decode integration/scheduling:每 token launch 数、非
+    Marlin 时间、batch cadence、host/device sync、以及 vLLM 是否在请求调度
+    或 decode loop 层面减少了空转/间隙。
+- Correctness/performance status:
+  - 当前窄产品 correctness 仍无新增 blocker;
+  - Ferrum c16 最新 product diagnostic 仍约 `341.24 tok/s`,vLLM same-hardware
+    c16 `518.80 tok/s`,约 `65.8%`;
+  - W2 仍无 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+
 ## 2026-06-15 XLIX — W2 source checkpoint: extend vLLM dense Marlin probe with weight-cycle mode
 
 - 本轮代码改动:

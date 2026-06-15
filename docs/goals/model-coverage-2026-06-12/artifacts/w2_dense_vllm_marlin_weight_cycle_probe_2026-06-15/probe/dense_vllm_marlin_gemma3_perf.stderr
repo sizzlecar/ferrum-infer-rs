@@ -1,0 +1,15 @@
+/tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/marlin_template.h(245): warning #2190-D: GNU attributes on a template redeclaration have no effect (the attributes of the original declaration at line 43 of /tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/kernel.h apply instead)
+  __attribute__((visibility("default")))
+                 ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/marlin_template.h(245): warning #2190-D: GNU attributes on a template redeclaration have no effect (the attributes of the original declaration at line 43 of /tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/kernel.h apply instead)
+  __attribute__((visibility("default")))
+                 ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/marlin_template.h:273:15: warning: ‘visibility’ attribute ignored [-Wattributes]
+  273 |     int max_shared_mem) {
+      |               ^

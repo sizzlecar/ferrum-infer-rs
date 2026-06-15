@@ -1,0 +1,42 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_weight_cycle_probe_2026-06-15",
+  "comparison_m16_us": {
+    "down": {
+      "ferrum_hot": 30.356,
+      "ferrum_weight_cycle": 68.651,
+      "vllm_hot": 36.027,
+      "vllm_hot_vs_ferrum_hot": 1.1868164448543945,
+      "vllm_weight_cycle": 69.268,
+      "vllm_weight_cycle_vs_ferrum_weight_cycle": 1.008987487436454
+    },
+    "gate_up": {
+      "ferrum_hot": 133.715,
+      "ferrum_weight_cycle": 133.985,
+      "vllm_hot": 136.988,
+      "vllm_hot_vs_ferrum_hot": 1.024477433347044,
+      "vllm_weight_cycle": 137.524,
+      "vllm_weight_cycle_vs_ferrum_weight_cycle": 1.0264134044855766
+    },
+    "qkv": {
+      "ferrum_hot": 17.005,
+      "ferrum_weight_cycle": 30.278,
+      "vllm_hot": 18.315,
+      "vllm_hot_vs_ferrum_hot": 1.0770361658335785,
+      "vllm_weight_cycle": 30.95,
+      "vllm_weight_cycle_vs_ferrum_weight_cycle": 1.0221943325186604
+    }
+  },
+  "interpretation": [
+    "vLLM dense Marlin also falls to the same down-projection weight-cycle band as Ferrum default; m16 down is 69.268us vs Ferrum 68.651us.",
+    "Gate_up remains compute-bound and effectively unchanged under weight cycling for both kernels.",
+    "The remaining end-to-end gap is not explained by dense Marlin kernel selection. The next bottleneck search should focus on decode integration and scheduling: per-step launch count, non-Marlin work, request batching cadence, and whether vLLM overlaps or batches decode work differently."
+  ],
+  "product_profile_batch": 16,
+  "product_profile_per_layer_us": {
+    "down": 70.19792236194642,
+    "gate_up": 140.77378348824493,
+    "o_proj": 21.544696555494806,
+    "qkv": 34.39324767632586
+  },
+  "status": "PASS"
+}
