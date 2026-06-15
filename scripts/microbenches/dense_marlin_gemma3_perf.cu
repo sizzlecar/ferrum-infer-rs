@@ -46,6 +46,11 @@ struct Tile {
     int thread_n;
 };
 
+struct BlockPolicy {
+    const char* name;
+    int blocks;
+};
+
 constexpr int GROUP_SIZE = 128;
 constexpr int MAX_PAR = 16;
 constexpr int WARMUP_ITERS = 5;
@@ -60,6 +65,13 @@ static size_t round_up(size_t value, size_t align) {
 
 static int padded_m(int m) {
     return ((m + 15) / 16) * 16;
+}
+
+static int resolved_thread_n(const Tile& tile, int m) {
+    if (tile.thread_n > 0) {
+        return tile.thread_n;
+    }
+    return m <= 16 ? 128 : 256;
 }
 
 static void* cuda_alloc_bytes(size_t bytes, int pattern) {
@@ -426,6 +438,57 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
                                 cycle_us,
                                 cycle_useful_tflops,
                                 cycle_padded_tflops);
+                }
+
+                int n_tiles = shape.n / resolved_thread_n(tile, m);
+                BlockPolicy policies[] = {
+                    {"n_tiles", n_tiles},
+                    {"2sms", sms * 2},
+                };
+                for (const BlockPolicy& policy : policies) {
+                    if (policy.blocks <= 0 || policy.blocks == sms) {
+                        continue;
+                    }
+                    if (std::strcmp(policy.name, "2sms") == 0 && policy.blocks == n_tiles) {
+                        continue;
+                    }
+                    float policy_us = time_weight_cycle(
+                        stream,
+                        a,
+                        b_cycle,
+                        c,
+                        scale_cycle,
+                        workspace_cycle,
+                        workspace_bytes,
+                        shape,
+                        m,
+                        tile,
+                        false,
+                        policy.blocks);
+                    char policy_label[96];
+                    std::snprintf(policy_label,
+                                  sizeof(policy_label),
+                                  "weight_cycle_blocks_%s_kernel",
+                                  policy.name);
+                    if (policy_us < 0.0f) {
+                        std::printf("%s,%d,%s,NA,NA,NA,%d\n",
+                                    policy_label,
+                                    m,
+                                    tile.name,
+                                    static_cast<int>(-policy_us));
+                        continue;
+                    }
+                    double policy_useful_tflops =
+                        useful_ops / (static_cast<double>(policy_us) * 1.0e6);
+                    double policy_padded_tflops =
+                        padded_ops / (static_cast<double>(policy_us) * 1.0e6);
+                    std::printf("%s,%d,%s,%.3f,%.2f,%.2f,0\n",
+                                policy_label,
+                                m,
+                                tile.name,
+                                policy_us,
+                                policy_useful_tflops,
+                                policy_padded_tflops);
                 }
             }
         }
