@@ -1,0 +1,18 @@
+{
+  "lane": "W2 full-logits unified-prefill CUDA diagnostic",
+  "vast_instance_id": 40826362,
+  "hardware": "1x RTX 4090",
+  "estimated_rate_usd_per_hour": 0.425,
+  "expected_runtime_minutes": "15-30",
+  "expected_cost_usd": "0.11-0.22",
+  "stop_condition": "CUDA build + serve/chat smoke + c16 diagnostic bench + log evidence complete, or first failure",
+  "correctness_gate": [
+    "CUDA release build rc=0",
+    "ferrum serve ready",
+    "deterministic chat smoke returns 5",
+    "bench-serve rc=0"
+  ],
+  "performance_command": "bench-serve c16, num-prompts=16, n-repeats=1, --fail-on-error, --seed 9271",
+  "release_evidence": false,
+  "local_source_commit": "40186c75e393ef58e81b9f5acfe529186505a0bc"
+}
