@@ -1,0 +1,35 @@
+REMOTE_HEAD
+d6d872c1e12fc364886117b0431aec752b2d78ac
+REMOTE_STATUS
+NVIDIA_SMI_BEFORE_BUILD
+Mon Jun 15 21:42:41 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 565.77                 Driver Version: 565.77         CUDA Version: 12.7     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4090        On  |   00000000:61:00.0 Off |                  Off |
+| 30%   25C    P8             19W /  350W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+NVCC_VERSION
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2024 NVIDIA Corporation
+Built on Thu_Mar_28_02:18:24_PDT_2024
+Cuda compilation tools, release 12.4, V12.4.131
+Build cuda_12.4.r12.4/compiler.34097967_0
+BUILD_COMMAND cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source
+FERRUM_SHA256
+11b26df2b8dccf3138b2fe294e80ef618cc6255e56af626213e6aaabe8b2e48f  /workspace/ferrum-infer-rs/target/release/ferrum
+FERRUM_VERSION
+ferrum 0.7.7
