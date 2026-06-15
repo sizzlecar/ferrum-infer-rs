@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXXVII — W2 source checkpoint: allow paged KV for windowed Gemma3 on varlen backends
+
+- 本轮源码修复:
+  - `paged_kv_allowed_for_layer_schedule(...)` 不再对所有
+    `sliding_window_pattern != 0` 模型一刀切禁用 paged KV;
+  - 新规则: paged enabled 且 (`sliding_window_pattern == 0` 或 backend
+    supports varlen QKV);
+  - 注释更新为:windowed Gemma3 只有在后端 varlen QKV 路径能接收 per-layer
+    sliding-window schedule 时才允许 paged KV;
+  - 单测改名并覆盖正反例:
+    `paged_kv_layer_schedule_allows_windowed_models_with_varlen_backend`。
+- Why:
+  - LXXXVI 已用同形状 CUDA product diagnostic 证明,在放开 paged KV guard
+    且应用 embed-scale 修复后,`ferrum serve` 最小 chat smoke 从空输出
+    恢复为 expected first token `"5"`;
+  - LXXXIII 的 native CUDA probe 已排除 split-QKV + paged-varlen attention
+    pair 的独立正确性问题;
+  - 因此可以把远端 diagnostic guard override 提升为受测试覆盖的源码逻辑,
+    但仍需要无 dirty patch 的默认产品路径验证。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models paged_kv_layer_schedule_allows_windowed_models_with_varlen_backend -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models unified_varlen_qkv_requires_gemma_sandwich_prerequisites -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models llm_executor -- --nocapture` PASS
+    (13 tests)。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+- Required next:
+  - CUDA default-path correctness smoke without any remote diagnostic source
+    patch;
+  - because this changes product behavior, validate both `ferrum run` and
+    `ferrum serve` before using performance numbers as evidence;
+  - only after default-path correctness is clean should c16/c32 same-hardware
+    performance comparison resume。
+
 ## 2026-06-16 LXXXVI — W2 CUDA diagnostic: embed-scale fix restores first-token correctness
 
 - 本轮 artifact:
