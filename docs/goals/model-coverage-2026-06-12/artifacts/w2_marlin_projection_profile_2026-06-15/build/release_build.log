@@ -1,0 +1,7 @@
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 3m 28s

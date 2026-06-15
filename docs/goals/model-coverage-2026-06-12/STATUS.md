@@ -2,6 +2,75 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXVII — W2 projection-level Marlin profile: gate/up kernel is the dominant dense GPTQ target
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_projection_profile_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `poll=01 cur_state=stopped actual_status=exited intended_status=stopped`;
+  - stop timestamp: `2026-06-15T06:02:00Z`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA projection-level dense Marlin profile diagnostic`;
+  - expected runtime/cost:15-35min,hard cap 45min,1x RTX 4090 instance
+    `40826362` at about USD 0.425/hr;
+  - stop condition:start/SSH/CUDA/source sync/build/server readiness first
+    failure,projection-level dense Marlin profile c16/c32 small sample complete
+    and copied,or 45min cap;
+  - correctness gate:release build plus server readiness and
+    `bench-serve --fail-on-error` zero-error diagnostic;
+  - performance command:diagnostic-only natural ASCII ShareGPT dataset with
+    `FERRUM_DECODE_OP_PROFILE=1` and `FERRUM_MARLIN_PROFILE=1`,
+    `num_prompts=16`,`n_repeats=1`,`random-output-len=64`,`seed=9271`,
+    c16/c32.
+- Evidence scope:
+  - release build PASS in `3m 28s`,binary SHA256:
+    `0991e89489c205f6fdffec5dbf138923367e51c02f0356ddd8828c276003a950`;
+  - remote git HEAD was `5fac46d8a45b99932d06c462d7be50d8825d9d55`;
+  - remote git status had `337` lines because local `docs/.../artifacts/`
+    was excluded from source rsync to avoid copying old evidence directories,
+    so this remains profiling evidence only,not final clean performance
+    evidence;
+  - `FERRUM_MARLIN_PROFILE=1` adds per-Marlin-call syncs,so throughput in
+    this artifact is profiling overhead and not a product performance claim.
+- Build/bench result:
+  - `run.status=PASS`,`nohup.rc=0`,`bench-serve.rc=0`;
+  - server readiness poll: `29`;
+  - c16:completed `[16]`,errored `[0]`,mean `290.042 tok/s`,p95 ITL
+    `31.777 ms`,p95 TTFT `1567.437 ms`,output token source `usage`;
+  - c32 client / active cap16:completed `[16]`,errored `[0]`,mean
+    `290.221 tok/s`,p95 ITL `31.855 ms`,p95 TTFT `1561.008 ms`,
+    output token source `usage`.
+- Op-profile result:
+  - server log captured `264` `[batched-op-profile]` rows with projection
+    fields populated and `marlin_other_* = 0`,so the profile labels covered
+    all dense Marlin calls in this path;
+  - for batch `m=16` (`118` rows),mean total per decode step
+    `30063 us`; aggregate dense Marlin kernel was `55.0%` (`16548 us`);
+    projection kernel split:
+    - gate/up `29.0%` (`8728 us`);
+    - down `14.5%` (`4352 us`);
+    - qkv `7.1%` (`2132 us`);
+    - o_proj `4.4%` (`1336 us`);
+    aggregate workspace zero was `3.8%` (`1137 us`);
+  - for batch `m=10` (`123` rows),aggregate dense Marlin kernel was
+    `55.6%` (`16349 us`); projection kernel split:
+    gate/up `29.2%` (`8593 us`),down `14.8%` (`4344 us`),
+    qkv `7.1%` (`2099 us`),o_proj `4.5%` (`1313 us`);
+    workspace zero was `3.8%` (`1120 us`).
+- Interpretation:
+  - gate/up dense Marlin kernel alone is the largest single measured decode
+    cost and is bigger than any other dense GPTQ projection bucket;
+  - workspace zero remains measurable but small relative to kernel time;
+  - next useful checkpoint should compare/alter the gate/up dense GPTQ kernel
+    path itself: Triton INT4 diagnostic viability, vLLM dense GPTQ repack/path
+    comparison, or a shape-specific Marlin lever. Do not change product
+    defaults from this artifact alone.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-15 XXVI — W2 profile instrumentation: split dense Marlin counters by projection
 
 - 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
