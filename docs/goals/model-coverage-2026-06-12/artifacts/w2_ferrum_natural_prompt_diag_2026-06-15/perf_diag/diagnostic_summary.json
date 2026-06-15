@@ -1,0 +1,53 @@
+{
+  "cells": [
+    {
+      "bad_output_per_run": [
+        0
+      ],
+      "baseline_output_tps_lcb": 491.1502991847319,
+      "baseline_output_tps_mean": 530.8289868112075,
+      "baseline_p95_itl_ms": 28.130182716666667,
+      "completed_per_run": [
+        32
+      ],
+      "concurrency": 16,
+      "errored_per_run": [
+        0
+      ],
+      "ferrum_output_tps_mean_diagnostic": 350.86772140192494,
+      "ferrum_p95_itl_ms": 109.550364,
+      "n_repeats": 1,
+      "output_token_count_source": "usage",
+      "ratio_vs_baseline_lcb": 0.714379533076404,
+      "ratio_vs_baseline_mean": 0.6609807115275586,
+      "requests_per_run": 32,
+      "required_80pct_of_baseline_lcb": 392.9202393477856,
+      "required_80pct_of_baseline_mean": 424.663189448966
+    },
+    {
+      "bad_output_per_run": [
+        0
+      ],
+      "baseline_output_tps_lcb": 549.3925829326378,
+      "baseline_output_tps_mean": 562.6846018763553,
+      "baseline_p95_itl_ms": 27.7155429,
+      "completed_per_run": [
+        32
+      ],
+      "concurrency": 32,
+      "errored_per_run": [
+        0
+      ],
+      "ferrum_output_tps_mean_diagnostic": 354.29064720506955,
+      "ferrum_p95_itl_ms": 109.78239149999999,
+      "n_repeats": 1,
+      "output_token_count_source": "usage",
+      "ratio_vs_baseline_lcb": 0.6448770118334668,
+      "ratio_vs_baseline_mean": 0.6296434024027578,
+      "requests_per_run": 32,
+      "required_80pct_of_baseline_lcb": 439.5140663461102,
+      "required_80pct_of_baseline_mean": 450.1476815010842
+    }
+  ],
+  "status": "diagnostic"
+}

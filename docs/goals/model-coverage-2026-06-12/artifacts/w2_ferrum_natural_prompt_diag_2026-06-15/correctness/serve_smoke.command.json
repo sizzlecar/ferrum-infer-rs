@@ -1,0 +1,15 @@
+{
+  "cmd": [
+    "timeout",
+    "1800",
+    "bash",
+    "scripts/model_coverage_smoke.sh",
+    "gemma3:27b-gptq",
+    "--port",
+    "8450",
+    "--kv-capacity",
+    "2560",
+    "--max-seqs",
+    "2"
+  ]
+}
