@@ -2,6 +2,65 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXXVIII — W2 prefill/TTFT first profile:正确性干净,发现 prefill profiler bucket 缺口并修复源码
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_ttft_profile_2026-06-15/`。
+- 复用 Vast/cache-retained native CUDA instance `40826362`,1x RTX 4090。验证结束后
+  已复制 artifact 并停机;Vast shutdown poll 1 记录 `cur_state=stopped`,
+  `actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA prefill/TTFT profile diagnostic`;
+  - expected runtime/cost:8-20min,hard cap 30min,约 USD 0.425/hr;
+  - stop condition:启动/SSH/CUDA/server readiness 首败、chat smoke 首败、
+    c16 ShareGPT diagnostic 完成并复制 artifact,或 30min cap;
+  - correctness gate:`ferrum serve` readiness plus non-stream chat smoke before
+    `bench-serve`;`bench-serve` 使用 `--fail-on-error`;
+  - performance command:diagnostic-only natural ASCII ShareGPT c16,
+    `bench-serve --fail-on-error --seed 9271 --n-repeats 1 --num-prompts 16`;
+  - profile scope:server 使用 `FERRUM_PREFILL_OP_PROFILE=1`,只作诊断。
+- Correctness/perf diagnostic:
+  - `run.status=PASS`,`bench-serve.rc=0`;
+  - chat smoke content `5`,usage `completion_tokens=3`;
+  - c16:`16 completed / 0 errored`,bad_output `[0]`;
+  - c16 throughput `340.882 tok/s`,TTFT p50 `889.558ms`,
+    TTFT p95 `1452.948ms`,TPOT p50 `32.804ms`,ITL p50 `24.678ms`,
+    ITL p99 `281.837ms`;
+  - ratio vs clean vLLM c16 baseline:`340.882 / 518.796 = 0.657`,
+    距 80% 线约 `14.3` percentage points。
+- Prefill observation:
+  - captured 27 `[prefill-profile]` total rows;
+  - smoke prefill:`tokens=23,total=29ms`;
+  - ShareGPT prefills:`tokens=122,total=80-88ms`,median `80ms`;
+  - bucket breakdown 为空。
+- Source fix in this checkpoint:
+  - prefill profile now enables ordinary op timers for `tokens > 1`
+    (`decode_op_profile || prefill_op_profile`);
+  - prefill start clears stale op/tail counters before timing;
+  - prefill summary now drains and prints tail buckets:
+    `tail_norm`,`tail_gate_up`,`tail_act`,`tail_down`,`tail_mlp`,
+    `tail_resid`;
+  - default product path is unchanged; this only affects diagnostic runs with
+    `FERRUM_PREFILL_OP_PROFILE=1`。
+- Local validation after source fix:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check -- crates/ferrum-models/src/models/llama_family.rs
+    docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_ttft_profile_2026-06-15`
+    PASS;
+  - `cargo check -q -p ferrum-models --tests` PASS;
+  - `cargo test -q -p ferrum-models
+    llama_family_runtime_env_parses_startup_knobs --lib` PASS。
+- Next step:
+  - rerun the same native CUDA prefill profile after rebuilding on
+    `40826362`,then use bucket evidence to choose the next small source lever;
+  - do not treat this first profile as release evidence or as proof W2 is
+    release-grade。
+- Release-grade status:
+  - 本轮是 N=1 diagnostic,没有 `--require-ci`,没有
+    `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍未达到 release-grade。
+
 ## 2026-06-15 XXXVII — W2 typed vLLM paged-attn diagnostic:正确性通过,性能无改善
 
 - 本轮 artifact:
