@@ -2,6 +2,64 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LV — W2 CUDA checkpoint: prompt-token admission 默认路径正确但不是主瓶颈
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/`。
+- 源码 checkpoint:
+  `2f732131 perf(scheduler): default to prompt-token admission`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA prompt-token admission c16 A/B diagnostic`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD 0.425/hr;
+  - expected runtime/cost:10-20min,hard cap 30min;
+  - stop condition:start/SSH/CUDA/clean worktree/build/product smoke/c16
+    bench 首败,或 artifact 复制完成后停机;
+  - correctness gate:`ferrum run` known-answer smoke plus `ferrum serve`
+    chat smoke with usage and zero benchmark errors;
+  - performance command:diagnostic-only `bench-serve` ShareGPT c16,
+    `--num-prompts 16 --n-repeats 1 --fail-on-error --seed 9271`。
+- 执行环境:
+  - remote clean worktree HEAD
+    `2f73213181475ba4bdff3e907e45182c24981a0e`;
+  - remote `git status --short` 为空;
+  - binary SHA256
+    `551f83921ea1fb6eb0cfb75170fc2325e31d887530ba084ab72ef77b238ebaf0`;
+  - Vast shutdown verified:`cur_state=stopped`,
+    `actual_status=exited`。
+- Correctness:
+  - CUDA release build rc `0`;
+  - `ferrum run` rc `0`,answer `5`,n_tokens `3`;
+  - `ferrum serve` chat smoke rc `0`,content `5`,usage
+    `prompt_tokens=23`,`completion_tokens=3`;
+  - `bench-serve --fail-on-error` rc `0`,c16 completed `16/16`,
+    `0` errored,`0` bad_output,output token count source `usage`;
+  - both run and serve decision traces selected
+    `scheduler_admission_policy=prompt_token_estimate` from default。
+- Performance diagnostic:
+  - prior same-host Ferrum c16 natural ShareGPT baseline:
+    `340.003 tok/s`,p50 TTFT `887.683ms`,p50 TPOT `32.817ms`;
+  - new default prompt-token admission c16:
+    `344.714 tok/s`,p50 TTFT `931.776ms`,p50 TPOT `31.592ms`;
+  - delta vs Ferrum baseline:`+1.39%`,single-run diagnostic only;
+  - ratio vs same-host vLLM c16 `518.796 tok/s`:`66.4%`,
+    still well below W2 80% line。
+- Conclusion:
+  - 默认 prompt-token admission 是正确的产品默认修复,并由 decision trace
+    证明已生效;
+  - 但它不是当前 c16 性能主瓶颈;不要继续围绕 admission/env flip
+    做 sweep;
+  - 下一步回到已经定位的 decode/Marlin tail MLP,尤其是 gate_up/down
+    投影与每步 integration 开销。
+- Artifact note:
+  - remote driver 的最后 summary helper 对 single-c `bench-serve` JSON schema
+    假设错误,benchmark 完成后触发 `KeyError: 0`;
+  - build/run/smoke/bench rc 均已是 `0`,`summary.json` 由 bench JSON
+    重新生成,`run.status` 记录为
+    `PASS_CORE_WITH_POSTPROCESS_WARNING`。
+- Release status:
+  - 没有 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍不是 release-grade。
+
 ## 2026-06-15 LIV — W2 source checkpoint: default scheduler admission uses prompt-token metadata
 
 - 本轮没有启动 GPU,不产生性能结论;这是针对 c16 TTFT/prefill/scheduler
