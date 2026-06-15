@@ -2,6 +2,69 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXIII — W2 tail-gate/down profile: gate/up projection is the largest single decode bucket
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_gate_down_profile_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `poll=01 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=02 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=03 cur_state=stopped actual_status=exited intended_status=stopped`;
+  - stop timestamp: `2026-06-15T05:20:40Z`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA tail-gate/down profile diagnostic`;
+  - expected runtime/cost:15-35min,hard cap 45min,1x RTX 4090 instance
+    `40826362` at about USD 0.402/hr;
+  - stop condition:start/SSH/CUDA/source sync/build/server readiness first
+    failure,tail gate/down profile c16/c32 small sample complete and copied,
+    or 45min cap;
+  - correctness gate:release build plus server readiness and
+    `bench-serve --fail-on-error` zero-error diagnostic;
+  - performance command:diagnostic-only natural ASCII ShareGPT dataset,
+    `num_prompts=16`,`n_repeats=1`,`random-output-len=64`,`seed=9271`,
+    c16/c32.
+- Evidence scope:
+  - release build PASS,binary SHA256:
+    `fb45a77d328c90233ffeb19cb4576bc12ef7079c2096632fe145431c83fcfe2a`;
+  - remote git HEAD was `ccc58aba9f5333f1ecd258d841de0fd5ab40a379`;
+  - remote git status is dirty because local `docs/.../artifacts/` was
+    excluded from source rsync to avoid copying old evidence directories,so
+    this remains profiling evidence only,not final clean performance evidence;
+  - first remote tmux attempt failed before build because Rust was not on PATH
+    in the non-login shell; runner was fixed to source `/root/.cargo/env`,
+    the remote output directory was removed, and the corrected rerun produced
+    the copied artifact.
+- Build/bench result:
+  - `run.status=PASS`,`nohup.rc=0`,`bench-serve.rc=0`;
+  - build completed in `3m 25s`;
+  - c16:completed `[16]`,errored `[0]`,mean `304.328 tok/s`,p95 ITL
+    `30.068 ms`,p95 TTFT `1523.492 ms`;
+  - c32 client / active cap16:completed `[16]`,errored `[0]`,mean
+    `305.245 tok/s`,p95 ITL `29.929 ms`,p95 TTFT `1512.247 ms`.
+- Op-profile result:
+  - server log captured `264` `[batched-op-profile]` rows;
+  - for batch `m=16` (`118` rows),mean total per decode step
+    `28076 us`; `tail_gate_up` was `32.2%` (`9039 us`),`tail_down`
+    `16.8%` (`4709 us`),combined `tail_mlp` `49.0%` (`13748 us`);
+    remaining unwrapped was `2.3%` (`658 us`);
+  - for batch `m=10` (`123` rows),`tail_gate_up` was `32.5%`
+    (`8901 us`),`tail_down` `16.8%` (`4621 us`),combined `tail_mlp`
+    `49.3%` (`13522 us`).
+- Interpretation:
+  - the largest single decode bucket is the fused Gemma3 gate/up GPTQ
+    projection,not down projection,attention/QKR,or logits readback;
+  - current next target is the dense GPTQ Marlin path for the fused
+    `gate_up_proj` shape. A useful next checkpoint is to measure Marlin
+    fixed overhead/workspace-zero and vLLM-Marlin/Triton alternatives as
+    explicit diagnostics before changing product defaults;
+  - do not run a full `--require-ci` release sweep until this gate/up
+    projection bottleneck is reduced.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+
 ## 2026-06-15 XXII — W2 profile instrumentation: split tail MLP into gate/up and down
 
 - 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
