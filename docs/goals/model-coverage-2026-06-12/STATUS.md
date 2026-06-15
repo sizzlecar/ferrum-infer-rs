@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXII — W2 profile instrumentation: split tail MLP into gate/up and down
+
+- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- 代码侧推进:
+  - `FERRUM_DECODE_OP_PROFILE` 的 batched decode 日志继续保留
+    `tail_mlp` 聚合字段;
+  - 新增 `tail_gate_up` 和 `tail_down` 子字段,分别计时 Gemma3 tail
+    的 fused gate/up projection 和 down projection;
+  - `unwrapped` 现在扣除 `tail_gate_up + tail_down`,避免双计
+    `tail_mlp` 聚合值;
+  - 非 profile 路径不改变。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check -- crates/ferrum-models/src/models/llama_family.rs crates/ferrum-models/src/models/llama_family_forward_batched.rs`
+    PASS;
+  - `cargo check -q -p ferrum-models --tests` PASS;
+  - `cargo test -q -p ferrum-models llama_batched_runtime_config_parses_startup_knobs --lib`
+    PASS,1 test passed。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - rerun a small c16/c32 CUDA profile diagnostic to quantify
+    `tail_gate_up` vs `tail_down` before choosing the MLP projection
+    optimization target.
+
 ## 2026-06-15 XXI — W2 tail-profile bucket validation: Gemma3 MLP projections dominate decode
 
 - 本轮 artifact:
