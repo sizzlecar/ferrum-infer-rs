@@ -50,7 +50,7 @@ __device__ __forceinline__ float mix_value(float x, float scale, int state, int 
     for (int i = 0; i < kInnerWork; ++i) {
         y = y * 1.00017f + 0.00031f * static_cast<float>((salt + i) & 15);
     }
-    return y;
+    return fminf(fmaxf(y, -8.0f), 8.0f);
 }
 
 __global__ void init_buffers(__half* residual, float* shadow, float* branch, int* state, int n) {
@@ -92,14 +92,19 @@ __global__ void fake_activation(float* branch, const int* state, int n, int salt
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float x = branch[i];
-        branch[i] = x / (1.0f + fabsf(x)) + static_cast<float>((state[0] + salt) & 1) * 0.0002f;
+        branch[i] = fminf(
+            fmaxf(x / (1.0f + fabsf(x)) + static_cast<float>((state[0] + salt) & 1) * 0.0002f,
+                  -8.0f),
+            8.0f);
     }
 }
 
 __global__ void add_branch_to_shadow(float* shadow, const float* branch, const int* state, int n, int salt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        shadow[i] += branch[i] * (0.125f + static_cast<float>((state[0] + salt) & 3) * 0.005f);
+        float updated =
+            shadow[i] + branch[i] * (0.125f + static_cast<float>((state[0] + salt) & 3) * 0.005f);
+        shadow[i] = fminf(fmaxf(updated, -8.0f), 8.0f);
     }
 }
 
