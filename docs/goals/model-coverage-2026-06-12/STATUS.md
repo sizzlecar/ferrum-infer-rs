@@ -2,6 +2,52 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXIV — W2 CUDA checkpoint: batch-prefill fallback hypothesis rejected
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_batch_prefill_fallback_reason_diag_2026-06-16/`。
+- GPU 执行合同:
+  - lane:`W2 batch-prefill fallback-reason diagnostic`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:15-25min,约 USD `0.11-0.18`;
+  - stop condition:CUDA build + serve/chat smoke + c16 diagnostic bench +
+    captured prefill/fallback evidence,或首个失败;
+  - correctness gate:build rc `0`,serve ready,deterministic chat smoke pass,
+    bench rc `0`;
+  - performance command:c16/n=16/n_repeats=1 `bench-serve --fail-on-error
+    --seed 9271`,diagnostic only。
+- Execution evidence:
+  - local source checkpoint:`7eb1747703e63ba7ac58ef2133a991f98c21e413`;
+  - remote base HEAD:`935777e9feb8c1606631761ec8e0fb6c3f3f0a06`,只同步本轮
+    instrumentation diff,因此不作为 release performance evidence;
+  - `build/build.rc=0`,`run_profile.rc=0`,
+    `bench/bench_sharegpt_c16.rc=0`;
+  - smoke response content `5`,usage present,bad_output false;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Key result:
+  - `FERRUM_BATCH_PREFILL_PROF` 来自 typed config,但完整 server/profile 日志中
+    `[batch-prefill]`/`fallback_reason=` 行数为 `0`;
+  - continuous unified path 明确已跑 batch prefill:
+    `iter#3 items=10 prefill=10 total=946123us model=943620us`;
+  - 因此此前“c16 TTFT 主要是 `LlmExecutor::batch_prefill` serial fallback”的
+    假设被本轮产品路径证据推翻。
+- Diagnostic performance shape:
+  - c16 diagnostic:16 completed / 0 errored,`output_token_count_source=usage`;
+  - throughput `284.90049780836483 tok/s`;
+  - orientation-only vLLM baseline `518.7959572662905 tok/s`,Ferrum/vLLM
+    ratio `0.549157127803387`;
+  - 该数字为 single-run diagnostic,不是 release 或最终性能声明。
+- Interpretation:
+  - 下一步不要继续围绕 `LlmExecutor::batch_prefill` fallback 猜测消耗;
+  - 真瓶颈转向 unified prefill wall time 本身,并结合已确认的 dense GPTQ
+    Marlin MLP kernel 热点和 prefill attention 成本做最小验证;
+  - dense Marlin block-policy native probe 已排除 grid override,不能作为
+    产品优化杠杆。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXIII — W2 source checkpoint: expose batch-prefill fallback reason
 
 - 本轮没有启动 GPU,不产生性能结论,也没有生成
