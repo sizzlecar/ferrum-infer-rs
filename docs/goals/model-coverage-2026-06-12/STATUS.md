@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXXVII — W2 typed vLLM paged-attn diagnostic:正确性通过,性能无改善
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_paged_attn_gemma_diag_2026-06-15/`。
+- 复用 Vast/cache-retained native CUDA instance `40826362`,1x RTX 4090。验证结束后
+  已复制 artifact 并停机;Vast shutdown poll 2 记录 `cur_state=stopped`,
+  `actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA typed vLLM paged-attn ShareGPT diagnostic`;
+  - expected runtime/cost:10-25min,hard cap 35min,约 USD 0.425/hr;
+  - stop condition:启动/SSH/CUDA/server readiness 首败、typed attention-selection
+    assertion 首败、chat smoke 首败、c16/c32 ShareGPT diagnostic 完成并复制
+    artifact,或 35min cap;
+  - correctness gate:artifact-local `ferrum.toml` 设置
+    `runtime.use_vllm_paged_attn=true` 后 `ferrum serve` readiness、
+    decision-trace assertion、non-stream chat smoke,之后才跑 `bench-serve`;
+  - performance command:diagnostic-only natural ASCII ShareGPT c16/c32,
+    `bench-serve --fail-on-error --seed 9271 --n-repeats 1 --num-prompts 16`。
+- Correctness:
+  - `run.status=PASS`,`bench-serve.rc=0`;
+  - decision trace 明确 `attention_prefill_mixed_backend=vllm_paged_varlen`,
+    source `config_file`,key `FERRUM_USE_VLLM_PAGED_ATTN`;
+  - decode selected `vllm_paged_attn_v1_short`;
+  - chat smoke content `5`,usage `completion_tokens=3`;
+  - c16:`16 completed / 0 errored`,bad_output `[0]`;
+  - c32 diagnostic cell:`16 completed / 0 errored`,bad_output `[0]`;
+  - 本轮没有发现新的 Ferrum product correctness 问题。
+- Diagnostic bench(非 release evidence,N=1,无 CI):
+  - c16:`340.443 tok/s`,TTFT p50 `890.332ms`,TTFT p95 `1453.858ms`;
+  - c32 diagnostic cell:`341.419 tok/s`,TTFT p50 `889.279ms`,
+    TTFT p95 `1440.689ms`。
+- Diagnostic ratio vs clean vLLM ShareGPT baseline:
+  - c16:`340.443 / 518.796 = 0.656`,差距约 `34.4%`,
+    距 80% 线约 `14.4` percentage points;
+  - c32 diagnostic cell:`341.419 / 524.128 = 0.651`,差距约 `34.9%`,
+    距 80% 线约 `14.9` percentage points。
+- Interpretation:
+  - typed config VPA 路径已经生效,不是 hidden env 组合;
+  - 相比 no-VPA Ferrum ShareGPT,c16 只 `+0.13%`,c32 diagnostic cell
+    `-0.25%`,没有性能收益;
+  - VPA 不是当前缺失的 14-15 percentage points 的主要杠杆,下一步继续回到
+    已定位的 Gemma tail/GEMM 热点,尤其 `tail_gate_up` 与 `tail_down`。
+- Release-grade status:
+  - 本轮是 N=1 diagnostic,没有 `--require-ci`,没有
+    `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍未达到 release-grade。
+
 ## 2026-06-15 XXXVI — W2 typed prefix-cache ShareGPT diagnostic: 正确性干净,0 hit,性能无改善
 
 - 本轮 artifact:
