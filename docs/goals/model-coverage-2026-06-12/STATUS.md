@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XV — W2 baseline safety probe: vLLM c16 invalid-UTF8 reproduces
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_baseline_safety_probe_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `poll=01 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=02 cur_state=stopped actual_status=exited intended_status=stopped`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA mainstream baseline safety probe`;
+  - expected runtime/cost:20-50min,hard cap 60min,1x RTX 4090 instance
+    `40826362` at about USD 0.425/hr;
+  - stop condition:startup/SSH/CUDA/vLLM server smoke failure,any probe cell
+    nonzero,invalid-UTF8 reproduction,probe complete and artifact copied,or
+    60min cap;
+  - correctness gate:torch CUDA smoke plus vLLM OpenAI smoke;
+  - performance command:
+    `ferrum bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3 --num-prompts 100`
+    for vLLM c16 first,then c32/cap16 only if c16 passes.
+- vLLM setup:
+  - venv:`/workspace/vllm-venv-0101-cu126`;
+  - server:vLLM OpenAI API,`v0.10.1.1`,`transformers==4.55.4`,
+    `--max-model-len 512 --max-num-seqs 16 --gpu-memory-utilization 0.92`;
+  - smoke request returned content `"5\n"` with usage.
+- Probe result:
+  - c16 release-shape rerun reproduced the exact blocker:
+    `[err] bad output invalid-utf8: �\"`;
+  - repeats completed `[100,100,99]`,errored `[0,0,1]`,bad_output
+    `[0,0,1]`,rc=`1`;
+  - output token count source:`usage`;
+  - diagnostic throughput mean:`385.332 tok/s`,ci95 half-width:`7.385`,LCB
+    `377.947`,p95 ITL `27.353 ms`.
+- Interpretation:
+  - vLLM c16 is fast but not zero-error under the release-shape
+    `bench-serve --fail-on-error --require-ci` contract;
+  - this confirms the earlier `w2_vllm0101_cuda12_baseline_probe_2026-06-15`
+    failure and means vLLM c16 cannot be used in the final W2 manifest as-is;
+  - c32 was intentionally not run after the c16 first-fail stop.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - choose a final baseline strategy that can produce zero-error c16/c32
+    evidence: either an alternate mainstream engine/config allowed by
+    `RELEASE_GRADE_GOAL.md`,or a same-dataset rerun path where both Ferrum and
+    baseline are release-clean.
+
 ## 2026-06-15 XIV — W2 sentinel-fix Ferrum release-shape matrix PASS;baseline still blocks release-grade
 
 - 本轮 artifact:
