@@ -2,10 +2,13 @@
 
 进度日志,倒序。
 
-## 2026-06-15 XLI — W2 source checkpoint: dense Marlin probe 增加多权重轮转模式
+## 2026-06-15 XLI — W2 native checkpoint: dense Marlin 多权重轮转 probe 完成
 
-- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
-  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_weight_cycle_probe_2026-06-15/`。
+- 复用 Vast/cache-retained native CUDA instance `40826362`,1x RTX 4090。验证结束后
+  已复制 artifact 并停机;`vast_shutdown/cleanup_check.txt` 记录
+  `cur_state=stopped actual_status=exited`。
 - Source/tooling change:
   - `scripts/microbenches/dense_marlin_gemma3_perf.cu` 增加
     `weight_cycle_kernel` 与 `weight_cycle_ws_plus_kernel` 输出行;
@@ -18,19 +21,39 @@
     Gemma3 27B decode 会在 62 层和多投影权重间切换;
   - 本改动提供比完整 Ferrum release build/bench 更便宜的 native CUDA
     最小验证入口,用于选择下一步是否值得改 Marlin tile/grid/repack path。
-- Local validation:
+- Validation:
   - `git diff --check -- scripts/microbenches/dense_marlin_gemma3_perf.cu scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh scripts/microbenches/README.md`
     PASS;
   - `bash -n scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh`
     PASS;
-  - local machine has no `nvcc` and no CUDA headers,so compile/run is pending
-    on the native CUDA host.
+  - remote native CUDA command:
+    `timeout 1800 bash scripts/microbenches/build_and_run_dense_marlin_gemma3_perf.sh`;
+  - `probe/dense_marlin_gemma3_perf.rc` = `0`;
+  - `probe/dense_marlin_gemma3_perf.stdout` contains
+    `VERDICT: dense Marlin native CUDA probe complete`;
+  - remote HEAD `82fb3272451083bc7f79c7aeca4610793ef579aa`;
+  - remote git status is dirty only as diagnostic evidence because rsync excluded
+    local artifact directories and the remote checkout reports 812 artifact deletes.
+- Key auto-tile results, kernel-only us:
+  - `gate_up`: hot/weight-cycle/cold at m16 `133.715/133.985/176.844`,
+    m23 `137.396/136.962/181.151`,m32 `138.025/138.386/181.254`;
+  - `down`: hot/weight-cycle/cold at m16 `30.356/68.651/93.560`,
+    m23 `52.520/72.835/98.045`,m32 `53.017/73.524/99.045`;
+  - `qkv` and `o_proj` also show cache sensitivity on small m, but they are not the
+    dominant W2 decode bucket.
+- Interpretation:
+  - `gate_up` does not move under 8-weight cycling,so the large Gemma3 dense GPTQ
+    gate/up bucket is compute/path-bound rather than a simple weight-cache artifact;
+  - `down` is materially cache sensitive,so product-side timing should be compared
+    against weight-cycle/cold-cache brackets rather than repeated-hot microbench rows;
+  - this narrows the next useful native lever to shape-specific gate/up Marlin path
+    review, while the higher-level W2 gap still also includes Gemma3 serial prefill
+    fallback from the previous checkpoint.
 - Next step:
-  - 在 cache-retained 4090 上先运行该 native probe,不要先跑完整
-    Ferrum build/sweep;
-  - 若 `weight_cycle_*` 接近产品 profile 的 gate/up/down timing,再基于该
-    证据尝试 shape-specific Marlin lever;否则回到 Gemma3 prefill/unified
-    串行化方向。
+  - 不跑新的完整 sweep;先做 `gate_up` Marlin shape-specific source review或更小的
+    native CUDA A/B;
+  - 真正改产品路径后再按顺序跑 Paris/chat smoke、产品 `ferrum run`/`serve` quick
+    regression,最后才进入 W2 release-grade gate。
 - Release-grade status:
   - no `model_release_grade_manifest.json`,no
     `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
