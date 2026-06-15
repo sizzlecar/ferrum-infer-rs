@@ -1,0 +1,2 @@
+-rw-r--r-- 1 root root 58K Jun 15 04:23 /workspace/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl
+w2_marlin_nested: 1 windows (created Mon Jun 15 05:30:24 2026)
