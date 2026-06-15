@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXIII — W2 source checkpoint: expose batch-prefill fallback reason
+
+- 本轮没有启动 GPU,不产生性能结论,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - `LlmExecutor::batch_prefill` 在 `FERRUM_BATCH_PREFILL_PROF` profiler 行中新增
+    `fallback_reason=<code>`;
+  - unified prefill `Unsupported` 文本会被归类为稳定短码,包括
+    `unified_varlen_qkv_disabled`,`sandwich_f32_shadow_required`,
+    `paged_kv_required`,`active_lora_adapter`,`requires_full_logits` 等;
+  - 行为不变:unsupported 时仍 fallback 到 serial per-item `model.prefill`。
+- Why:
+  - W2 c16 TTFT 侧已定位为 Gemma3 serial prefill fallback;
+  - 之前 profiler 只能看到 `fallback=true`,不能结构化证明是 varlen/Gemma3
+    guard、prefix cache、LoRA、paged KV 还是 full-logits 触发;
+  - 下一次 CUDA prefill diagnostic 可以直接验证产品路径的 fallback reason,
+    为 narrow Gemma3 cohort-prefill 实现提供可回归证据。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models unified_fallback_reason_code -- --nocapture` PASS;
+  - `cargo test -p ferrum-models batch_prefill_falls_back_after_unified_unsupported -- --nocapture`
+    PASS;
+  - `git diff --check -- crates/ferrum-models/src/executor/llm_executor.rs` PASS。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXII — W2 native checkpoint: dense Marlin block-policy probe rejects grid override
 
 - 本轮 artifact:
