@@ -1162,6 +1162,12 @@ impl FerrumConfigBuilder {
                 "unified decode graph does not apply to MoE models",
             );
         }
+        if self.model.architecture.eq_ignore_ascii_case("gemma3") {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH",
+                "unified decode graph is disabled for Gemma3 sandwich-norm models",
+            );
+        }
         if !self.is_cuda_backend() {
             return self.invalid(
                 "FERRUM_UNIFIED_GRAPH",
@@ -1823,6 +1829,21 @@ mod tests {
             ("FERRUM_MAX_BATCHED_TOKENS", "1536", source),
             ("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE", "16", source),
         ])
+    }
+
+    fn gemma3_gptq_model() -> ModelCapabilities {
+        ModelCapabilities {
+            architecture: "gemma3".to_string(),
+            quantization: Some("gptq_int4".to_string()),
+            moe: None,
+            max_context_len: Some(131_072),
+            num_hidden_layers: Some(62),
+            head_dim: Some(256),
+            kv_heads: Some(16),
+            estimated_weight_bytes: Some(15 * GIB),
+            supported_dtypes: vec!["fp16".to_string()],
+            graph_safe_moe: false,
+        }
     }
 
     fn expect_invalid_key(vars: &[(&str, &str)], key: &str) {
@@ -2676,6 +2697,28 @@ mod tests {
         assert!(matches!(
             err,
             AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_UNIFIED_GRAPH"
+        ));
+    }
+
+    #[test]
+    fn unified_graph_rejects_gemma3_sandwich_models() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot_with_sources(&[(
+            "FERRUM_UNIFIED_GRAPH",
+            "1",
+            RuntimeConfigSource::Cli,
+        )]))
+        .with_model_capabilities(gemma3_gptq_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .expect_err("Gemma3 unified graph should be rejected before CUDA runtime");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, reason }
+                if key == "FERRUM_UNIFIED_GRAPH" && reason.contains("Gemma3")
         ));
     }
 
