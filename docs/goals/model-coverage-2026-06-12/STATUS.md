@@ -2,6 +2,65 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XN — W2 native CUDA checkpoint: down qweight L2 persistence restores post-gate_up down speed
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_down_l2_persist_native_probe_2026-06-16/`.
+- Paid GPU lane:
+  `W2 Gemma3 down L2 persistence native probe` on the cached 1x RTX 4090 Vast
+  instance.
+- Contract:
+  - expected runtime/cost: 10-20 minutes, about USD 0.07-0.15 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/compile first failure, probe non-zero or
+    timeout, or VERDICT plus artifact copyback;
+  - correctness gate: native probe exit 0 and
+    `VERDICT: gemma3 down L2 persistence native CUDA probe complete`;
+  - performance command:
+    `bash scripts/microbenches/build_and_run_gemma3_down_l2_persist_perf.sh`.
+- Evidence:
+  - remote HEAD `6cf26ca99f1958d2e326245bbe55fd8ed22c7e4a`;
+  - probe rc `0`;
+  - binary SHA256
+    `c3fafa5657c5dbc1496f6a9790ffc4440cb4f17ddf01014f55df1212226826f3`;
+  - stdout contains
+    `VERDICT: gemma3 down L2 persistence native CUDA probe complete`;
+  - Vast cleanup confirmed `stopped/exited`.
+- Device/context:
+  - RTX 4090 L2 cache: `75,497,472` bytes;
+  - persisting L2 max: `51,904,512` bytes;
+  - access window max: `134,213,632` bytes;
+  - down qweight policy window: `57,802,752` bytes.
+- Key rows:
+  - m16 warm repeated baseline: `35.135us`;
+  - m16 no-policy after gate_up+GeGLU: `70.342us`;
+  - m16 down qweight full-window persist hit100: `35.088us`;
+  - m16 down qweight full-window persist hit60: `33.158us`;
+  - m32 warm repeated baseline: `55.127us`;
+  - m32 no-policy after gate_up+GeGLU: `75.148us`;
+  - m32 down qweight full-window persist hit100: `55.545us`;
+  - m32 down qweight full-window persist hit60: `54.434us`.
+- Interpretation:
+  - simple CUDA stream access-policy on down qweight is a real W2 lever;
+  - it restores down performance after the product-shaped `gate_up -> GeGLU`
+    producer sequence instead of only improving isolated warm microbench rows;
+  - expected product upside is bounded to the dense Marlin down component, so it
+    will not by itself prove W2 release-grade, but it is the first currently
+    measured lever with material tail-MLP savings.
+- Next:
+  - productize as a typed CUDA runtime/config policy, not a hidden env-only
+    requirement;
+  - validate `ferrum run` and `ferrum serve` correctness before performance;
+  - only after correctness passes, run a focused c16/c32 diagnostic and then
+    decide whether to promote to release evidence.
+- Scope:
+  - this is diagnostic native CUDA evidence, not release performance evidence;
+  - the remote worktree had old tracked artifact-log modifications after
+    syncing `.git`; those are recorded in `git_verify.txt` and are not used for
+    release performance claims.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XM — W2 source checkpoint: native down L2 persistence probe
 
 - Added `scripts/microbenches/gemma3_down_l2_persist_perf.cu` plus
