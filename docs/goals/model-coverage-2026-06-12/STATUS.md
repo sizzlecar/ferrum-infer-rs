@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XLVII — W2 source checkpoint: add dense vLLM Marlin native A/B probe
+
+- 本轮代码改动:
+  - `scripts/microbenches/dense_vllm_marlin_gemma3_perf.cu`;
+  - `scripts/microbenches/build_and_run_dense_vllm_marlin_gemma3_perf.sh`;
+  - `scripts/microbenches/README.md`。
+- 目的:
+  - 当前 c16 产品路径正确性窄门干净,但 unified prefill 与 vLLM paged
+    attention 诊断均没有提升吞吐;
+  - 已有 op profile 将主要热区压缩到 dense GPTQ decode MLP/Marlin,
+    尤其 gate_up/down;
+  - 下一步用 native CUDA 同形状 A/B 直接测 vendored vLLM dense GPTQ-Marlin
+    在 Gemma3 qkv/gate_up/down 形状上的核耗时,避免继续启动整套
+    Cargo/product gate 做盲目验证。
+- Probe 设计:
+  - 直接调用 vendored `ferrum_marlin_mm_f16_u4b8` C ABI;
+  - 覆盖 Gemma3-27B GPTQ 关键 dense 形状:
+    `qkv k=5376 n=8192`,`gate_up k=5376 n=43008`,
+    `down k=21504 n=5376`;
+  - 覆盖 decode 常见 m 值 `16/23/32`;
+  - companion build script 只在 `/tmp` 临时副本中打开 minimal
+    `kernel_selector.h`,不改变产品 dense GPTQ routing。
+- 验证状态:
+  - 本 checkpoint 未启动 GPU,不产生性能结论;
+  - 下一次 paid CUDA 只需运行
+    `bash scripts/microbenches/build_and_run_dense_vllm_marlin_gemma3_perf.sh`
+    并保存 `VERDICT: dense vLLM Marlin native CUDA probe complete`;
+  - 如果同形状 vLLM dense Marlin 明显快于当前 `dense_marlin_gemma3_perf`
+    的 hot/weight-cycle 数据,再考虑产品侧 selector/核接入;否则继续转向
+    host scheduling/weight residency/launch overhead。
+
 ## 2026-06-15 XLVI — W2 CUDA checkpoint: Gemma3 unified prefill c16 诊断通过但性能仍约 65.8% vLLM
 
 - 本轮 artifact:
