@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XH — W2 source checkpoint: native Triton W4A16 vs Marlin dense MLP probe
+
+- No new GPU run in this checkpoint; this adds the next minimal native CUDA
+  probe for the dense MLP compute lever.
+- Added `scripts/microbenches/dense_triton_w4a16_gemma3_perf.cu` plus
+  `scripts/microbenches/build_and_run_dense_triton_w4a16_gemma3_perf.sh`.
+- Probe scope:
+  - loads the committed `w4a16_gptq_f16.ptx` through the CUDA Driver API,
+    outside Cargo and outside product model loading;
+  - compares the existing Marlin path against Triton W4A16 at Gemma3 W2
+    `gate_up` (`k=5376,n=43008`) and `down` (`k=21504,n=5376`) shapes;
+  - reports `m={1,10,16,23,32}` rows for product Marlin workspace-zero,
+    Marlin kernel-only diagnostic, and Triton W4A16.
+- Why this is aligned:
+  - XG showed the measured product `tail_mlp` cost is explained by dense MLP
+    compute across 62 layers, not by a hidden launch-chain overhead;
+  - the next useful question is whether an existing alternative dense W4A16
+    backend can materially beat Marlin on the exact Gemma3 MLP shapes before
+    spending product-code effort on typed runtime wiring.
+- Next:
+  - run this probe once on the cached 1x4090 lane, capture stdout, binary
+    SHA256, and cleanup evidence; if Triton is not faster enough or fails, do
+    not wire it into product defaults.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XG — W2 native CUDA checkpoint: tail-MLP chain PASS, bottleneck is dense MLP compute across layers
 
 - Artifact:
