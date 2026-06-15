@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XJ — W2 native CUDA checkpoint: existing Triton W4A16 is slower than Marlin on Gemma3 MLP
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_triton_w4a16_native_probe_2026-06-16/`.
+- Lane:
+  `W2 Gemma3 dense Triton W4A16 vs Marlin native probe` on cached 1x RTX
+  4090 Vast instance `40826362`.
+- Paid GPU contract:
+  - expected runtime/cost: 10-20 minutes, about USD 0.07-0.15 at prior
+    USD 0.425/hr;
+  - stop condition: startup/SSH/CUDA failure, nvcc compile failure, probe
+    nonzero/timeout, or VERDICT line with artifacts copied back;
+  - correctness gate: native probe exit 0 and VERDICT line;
+  - performance command:
+    `bash scripts/microbenches/build_and_run_dense_triton_w4a16_gemma3_perf.sh`.
+- Lifecycle:
+  - instance started from `stopped/exited`;
+  - CUDA verified with 1x RTX 4090, driver 565.77, nvcc 12.4;
+  - source synced to remote HEAD
+    `2847822395e857cbe23196b9590b88479eadeb60`;
+  - remote source status was clean after restoring tracked artifact files
+    affected by the source rsync exclude;
+  - artifact copied back;
+  - instance stopped and final Vast poll confirmed `stopped/exited`.
+- Probe result:
+  - `probe.rc=0`;
+  - stdout contains
+    `VERDICT: dense Triton W4A16 Gemma3 native CUDA probe complete`;
+  - binary SHA256:
+    `83a8112f31951e930b90736fcc7a7a99db69936fdebfa1f92b17449159a6e77c`.
+- Key timings:
+  - m16 `gate_up`: Marlin product workspace-zero `137.111us`,
+    Triton W4A16 `618.924us`, so Triton is `4.51x` slower;
+  - m16 `down`: Marlin product workspace-zero `32.527us`, Triton W4A16
+    `609.813us`, so Triton is `18.75x` slower;
+  - m32 `gate_up`: Marlin `141.253us`, Triton `781.304us`;
+  - m32 `down`: Marlin `54.504us`, Triton `749.147us`.
+- Interpretation:
+  - existing `w4a16_gptq_f16.ptx` is not a W2 dense MLP performance lever;
+  - do not productize `FERRUM_TRITON_INT4=1` for W2 release-grade work;
+  - any Triton direction would require a new kernel/tile design, not the
+    currently committed dense W4A16 PTX.
+- Next:
+  - continue with levers that can reduce dense GPTQ MLP work or improve the
+    Marlin path itself; the direct alternative backend path is now rejected.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XH — W2 source checkpoint: native Triton W4A16 vs Marlin dense MLP probe
 
 - No new GPU run in this checkpoint; this adds the next minimal native CUDA
