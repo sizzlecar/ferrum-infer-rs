@@ -1,0 +1,38 @@
+[microbench] compiling scripts/microbenches/gemma3_down_l2_persist_perf.cu
+-rwxr-xr-x 1 root root 695240 Jun 15 23:37 /workspace/ferrum-artifacts/w2_down_l2_persist_native_probe_2026-06-16/gemma3_down_l2_persist_perf
+
+[microbench] running /workspace/ferrum-artifacts/w2_down_l2_persist_native_probe_2026-06-16/gemma3_down_l2_persist_perf
+gemma3_down_l2_persist_perf device=NVIDIA GeForce RTX 4090 sm=8.9 h=5376 im=21504 l2=75497472 persist_max=51904512 access_window_max=134213632
+mode,m,policy_window_bytes,down_us,useful_tflops,ret
+down_repeated_warm_baseline,1,0,34.571,6.69,0
+no_policy_after_gate_up,1,0,69.147,3.34,0
+persist_down_full_hit_100,1,57802752,37.150,6.22,0
+persist_down_half_hit_100,1,28901376,41.672,5.55,0
+persist_down_full_hit_60,1,57802752,34.440,6.71,0
+persist_down_full_hit_100_after_down_warm,1,57802752,36.744,6.29,0
+down_repeated_warm_baseline,10,0,35.602,64.94,0
+no_policy_after_gate_up,10,0,69.406,33.31,0
+persist_down_full_hit_100,10,57802752,36.882,62.69,0
+persist_down_half_hit_100,10,28901376,41.812,55.30,0
+persist_down_full_hit_60,10,57802752,34.263,67.48,0
+persist_down_full_hit_100_after_down_warm,10,57802752,36.928,62.61,0
+down_repeated_warm_baseline,16,0,35.135,105.29,0
+no_policy_after_gate_up,16,0,70.342,52.59,0
+persist_down_full_hit_100,16,57802752,35.088,105.43,0
+persist_down_half_hit_100,16,28901376,40.936,90.37,0
+persist_down_full_hit_60,16,57802752,33.158,111.57,0
+persist_down_full_hit_100_after_down_warm,16,57802752,34.696,106.62,0
+down_repeated_warm_baseline,23,0,54.319,97.90,0
+no_policy_after_gate_up,23,0,73.669,72.19,0
+persist_down_full_hit_100,23,57802752,54.434,97.69,0
+persist_down_half_hit_100,23,28901376,53.870,98.72,0
+persist_down_full_hit_60,23,57802752,53.445,99.50,0
+persist_down_full_hit_100_after_down_warm,23,57802752,54.510,97.56,0
+down_repeated_warm_baseline,32,0,55.127,134.21,0
+no_policy_after_gate_up,32,0,75.148,98.46,0
+persist_down_full_hit_100,32,57802752,55.545,133.20,0
+persist_down_half_hit_100,32,28901376,54.904,134.76,0
+persist_down_full_hit_60,32,57802752,54.434,135.92,0
+persist_down_full_hit_100_after_down_warm,32,57802752,55.090,134.30,0
+
+VERDICT: gemma3 down L2 persistence native CUDA probe complete
