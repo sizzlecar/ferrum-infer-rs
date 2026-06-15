@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXVII — W2 CUDA checkpoint: first graph-safe profiler fix still leaves capture open
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_retry_2026-06-16/`。
+- GPU 执行合同:
+  - lane:`W2 typed prefill profile graph-safe retry`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:8-15min,hard cap 25min;
+  - stop condition:启动/SSH/source sync/build/server/smoke/bench 首败,或
+    retry artifact 完成后复制 artifact 并停机;
+  - correctness gate:CUDA release build,`ferrum serve` ready,chat smoke,
+    `bench-serve --fail-on-error` 零错误;
+  - performance command:diagnostic-only c16 ShareGPT single-run profile,
+    no CI/no `--require-ci`。
+- Execution evidence:
+  - remote HEAD:`f352ff3f6b596418659ff5912995d07f5e9fc1fc`;
+  - non-artifact source status clean;
+  - CUDA release build rc `0`,binary SHA256:
+    `f3742953afabfa1ad3ac99d58978d0508825085b4a2b706e4f7e508a1a1944f7`;
+  - `ferrum serve` ready after poll `59`,chat smoke passed with content
+    `5` and `completion_tokens=3`;
+  - retry still hit
+    `CudaBackend: stream sync: DriverError(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, "operation not permitted when stream is capturing")`;
+  - bench was manually stopped after panic;`run_profile.rc=143`,
+    `bench_sharegpt_c16.rc=143`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Interpretation:
+  - first source fix guarded profile sync calls, but did not fully fix capture
+    lifecycle;
+  - evidence points to a capture window remaining open when a later normal
+    `B::sync` runs;
+  - next source fix should end graph capture whenever
+    `B::graph_capture_in_flight(&ctx)` is true, instead of relying on
+    `!*_graph_failed` flags。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXVI — W2 source checkpoint: make batched op profiler graph-capture safe
 
 - 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成
