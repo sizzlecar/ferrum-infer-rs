@@ -2,6 +2,28 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XLIX — W2 source checkpoint: extend vLLM dense Marlin probe with weight-cycle mode
+
+- 本轮代码改动:
+  `scripts/microbenches/dense_vllm_marlin_gemma3_perf.cu`。
+- 背景:
+  - XLVIII 的 native vLLM dense Marlin probe 已经排除 gate_up 上的
+    kernel-swap 主假设;
+  - 但 down projection 的 product profile 接近 Ferrum default
+    weight-cycle,而 XLVIII 只测了 vLLM hot repeated weight;
+  - 因此不能只用 vLLM hot down `36.277us` 与 Ferrum weight-cycle
+    `68.651us` 做最终判断。
+- 改动:
+  - 为每个 Gemma3 qkv/gate_up/down shape 和 `m=16/23/32` 同时输出
+    `hot` 与 `weight_cycle`;
+  - `weight_cycle` 使用 8 组 synthetic qweight/scales/workspace 轮换,
+    模拟 product decode 跨层权重切换;
+  - 仍是 native CUDA probe,不加载模型,不改变 product dense GPTQ routing。
+- 验证状态:
+  - 本 checkpoint 未启动 GPU,不产生性能结论;
+  - 下一次 paid CUDA 只跑同一 build script,用于确认 vLLM dense Marlin
+    down projection 在 weight-cycle 下是否仍明显优于 Ferrum default。
+
 ## 2026-06-15 XLVIII — W2 CUDA checkpoint: native vLLM dense Marlin A/B 排除 kernel-swap 主假设
 
 - 本轮 artifact:

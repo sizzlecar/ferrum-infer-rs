@@ -41,6 +41,7 @@ struct Shape {
 constexpr int GROUP_SIZE = 128;
 constexpr int WARMUP_ITERS = 5;
 constexpr int TIMED_ITERS = 80;
+constexpr int WEIGHT_CYCLE_SETS = 8;
 constexpr double RTX4090_FP16_TFLOPS_PEAK = 165.0;
 
 static size_t round_up(size_t value, size_t align) {
@@ -61,15 +62,16 @@ static void* cuda_alloc_bytes(size_t bytes, int pattern) {
 static float time_vllm_marlin(
     cudaStream_t stream,
     void* a,
-    void* b,
     void* c,
     void* c_tmp,
-    void* scales,
-    void* workspace,
+    const std::vector<void*>& b_set,
+    const std::vector<void*>& scale_set,
+    const std::vector<void*>& workspace_set,
     size_t workspace_bytes,
     const Shape& shape,
     int m,
-    int sms) {
+    int sms,
+    bool weight_cycle) {
     cudaEvent_t start;
     cudaEvent_t stop;
     CHK(cudaEventCreate(&start));
@@ -78,6 +80,10 @@ static float time_vllm_marlin(
     float total_ms = 0.0f;
     const int total_iters = WARMUP_ITERS + TIMED_ITERS;
     for (int iter = 0; iter < total_iters; ++iter) {
+        size_t set_idx = weight_cycle ? static_cast<size_t>(iter % b_set.size()) : 0;
+        void* b = b_set[set_idx];
+        void* scales = scale_set[set_idx];
+        void* workspace = workspace_set[set_idx];
         CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
         CHK(cudaEventRecord(start, stream));
         ferrum_marlin_mm_f16_u4b8(
@@ -141,11 +147,19 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
     size_t workspace_bytes = round_up(workspace_ints * sizeof(int), 16);
 
     void* a = cuda_alloc_bytes(a_bytes, 0x3c);
-    void* b = cuda_alloc_bytes(b_bytes, 0x11);
     void* c = cuda_alloc_bytes(c_bytes, 0x00);
     void* c_tmp = cuda_alloc_bytes(c_bytes, 0x00);
-    void* scales = cuda_alloc_bytes(scale_bytes, 0x3c);
-    void* workspace = cuda_alloc_bytes(workspace_bytes, 0x00);
+    std::vector<void*> b_set;
+    std::vector<void*> scale_set;
+    std::vector<void*> workspace_set;
+    b_set.reserve(WEIGHT_CYCLE_SETS);
+    scale_set.reserve(WEIGHT_CYCLE_SETS);
+    workspace_set.reserve(WEIGHT_CYCLE_SETS);
+    for (int i = 0; i < WEIGHT_CYCLE_SETS; ++i) {
+        b_set.push_back(cuda_alloc_bytes(b_bytes, 0x11 + i));
+        scale_set.push_back(cuda_alloc_bytes(scale_bytes, 0x3c + i));
+        workspace_set.push_back(cuda_alloc_bytes(workspace_bytes, 0x00));
+    }
 
     std::printf("\nshape=%s k=%d n=%d qweight_mb=%.1f scale_mb=%.1f\n",
                 shape.name,
@@ -155,33 +169,41 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
                 static_cast<double>(scale_bytes) / (1024.0 * 1024.0));
     std::printf("mode,m,us,useful_tflops,padded_tflops,ret\n");
     for (int m : m_values) {
-        float us = time_vllm_marlin(
-            stream,
-            a,
-            b,
-            c,
-            c_tmp,
-            scales,
-            workspace,
-            workspace_bytes,
-            shape,
-            m,
-            sms);
-        double useful_ops = 2.0 * static_cast<double>(m) * shape.k * shape.n;
-        double padded_ops =
-            2.0 * static_cast<double>(padded_m(m)) * shape.k * shape.n;
-        double useful_tflops = useful_ops / (static_cast<double>(us) * 1.0e6);
-        double padded_tflops = padded_ops / (static_cast<double>(us) * 1.0e6);
-        std::printf("auto,%d,%.3f,%.2f,%.2f,0\n", m, us, useful_tflops,
-                    padded_tflops);
+        const bool modes[] = {false, true};
+        for (bool weight_cycle : modes) {
+            float us = time_vllm_marlin(
+                stream,
+                a,
+                c,
+                c_tmp,
+                b_set,
+                scale_set,
+                workspace_set,
+                workspace_bytes,
+                shape,
+                m,
+                sms,
+                weight_cycle);
+            double useful_ops = 2.0 * static_cast<double>(m) * shape.k * shape.n;
+            double padded_ops =
+                2.0 * static_cast<double>(padded_m(m)) * shape.k * shape.n;
+            double useful_tflops = useful_ops / (static_cast<double>(us) * 1.0e6);
+            double padded_tflops = padded_ops / (static_cast<double>(us) * 1.0e6);
+            std::printf("%s,%d,%.3f,%.2f,%.2f,0\n",
+                        weight_cycle ? "weight_cycle" : "hot",
+                        m,
+                        us,
+                        useful_tflops,
+                        padded_tflops);
+        }
     }
 
     CHK(cudaFree(a));
-    CHK(cudaFree(b));
     CHK(cudaFree(c));
     CHK(cudaFree(c_tmp));
-    CHK(cudaFree(scales));
-    CHK(cudaFree(workspace));
+    for (void* b : b_set) CHK(cudaFree(b));
+    for (void* scales : scale_set) CHK(cudaFree(scales));
+    for (void* workspace : workspace_set) CHK(cudaFree(workspace));
     CHK(cudaStreamDestroy(stream));
 }
 
