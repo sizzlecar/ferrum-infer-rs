@@ -297,7 +297,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             _ => (&self.rope.cos, &self.rope.sin),
         };
 
-        let _bp = self.batched_cfg.decode_op_profile;
+        let _bp = self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(ctx);
 
         // 1. rms_norm [M, H]  → norm_out
         let _t = if _bp {
@@ -1115,7 +1115,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         device_branch: Option<&mut B::Buffer>,
     ) {
         let layer = &self.layers[li];
-        let _bp = self.batched_cfg.decode_op_profile;
+        let _bp = self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(ctx);
 
         // 7. o_proj (GEMM m=M): attn_flat [M, Q] → o_proj_out [M, H]
         let _t = if _bp {
@@ -1427,7 +1427,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 );
             }
         }
-        if let Some(t0) = layer_t0 {
+        if let Some(t0) = layer_t0.filter(|_| !B::graph_capture_in_flight(&ctx)) {
             B::sync(&mut ctx);
             static UNIFIED_PROF_CALLS: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
@@ -1643,7 +1643,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             (Some(local), false) => (&local.cos, &local.sin),
             _ => (&self.rope.cos, &self.rope.sin),
         };
-        let op_prof = self.batched_cfg.decode_op_profile;
+        let op_prof = self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(ctx);
 
         macro_rules! time_op {
             ($bucket_us:expr, $bucket_n:expr, $body:block) => {{
@@ -2288,7 +2288,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             // pure replay short-circuits above and does not increment
             // the per-op counters since the wrapped ops aren't executed
             // by the Rust dispatch path).
-            let batched_profile = self.batched_cfg.decode_op_profile;
+            let batched_profile =
+                self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(&ctx);
             let batched_iter_t0 = if batched_profile {
                 // Drain shared counters first so this iter's print isn't
                 // contaminated by prior prefill/single-decode contributions.
