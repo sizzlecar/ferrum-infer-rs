@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXXIV — W2 fused sandwich residual-add: native CUDA minimal validation PASS,收益有限
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_fused_sandwich_residual_2026-06-15/`。
+- 复用 Vast/cache-retained native CUDA instance `40826362`,1x RTX 4090。验证结束后
+  已复制 artifact 并停机;Vast API poll 5 记录 `cur_state=stopped`,
+  `actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA fused sandwich residual-add minimal validation`;
+  - expected runtime/cost:15-35min,hard cap 45min,约 USD 0.425/hr;
+  - stop condition:启动/SSH/CUDA/source sync/build 首败、`ferrum run`
+    correctness 首败、serve/bench diagnostic 完成并复制 artifact,或 45min cap;
+  - correctness gate:CUDA release build + product `ferrum run`,通过后才进入
+    `serve/bench-serve --fail-on-error`;
+  - performance command:diagnostic-only natural ASCII ShareGPT c16/c32 小样本,
+    `n_repeats=1`,seed 9271,`FERRUM_DECODE_OP_PROFILE=1`。
+- 远端源码/构建:
+  - git HEAD:`4eeea0ba76a2ac8b0671941bcba0d66020c31ed4`;
+  - 本轮 rsync 为减少付费 GPU 空转排除了历史 artifacts,远端 git status
+    因旧 artifact 缺失显示 docs 删除;本轮只作为 diagnostic evidence;
+  - `CUDA_COMPUTE_CAP=89 cargo build --release -p ferrum-cli --bin ferrum
+    --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source` PASS;
+  - binary SHA256:
+    `3e28a4cf37b2e25b127dbd591e8891b141863d8082d1757486707c785e6869ce`。
+- Product correctness:
+  - `ferrum run gemma3:27b-gptq --backend cuda --max-tokens 64 --temperature 0
+    --kv-capacity 2560 --max-num-seqs 2 --output-format jsonl`
+    rc=0,assistant content `5`,finish_reason `stop`;
+  - `ferrum serve` readiness PASS,poll 29;
+  - `bench-serve --fail-on-error` rc=0。
+- Diagnostic bench(非 release evidence,N=1,无 CI):
+  - c=16:`16 completed / 0 errored`,output token count source `usage`,
+    throughput `306.061 tok/s`;
+  - c=32:`16 completed / 0 errored`,output token count source `usage`,
+    throughput `307.373 tok/s`。
+- Profile interpretation:
+  - 相比 `w2_tail_gate_down_profile_2026-06-15`,batch=16
+    `tail_norm_us_mean` 约 `806.5us -> 685.2us`,
+    `tail_resid_us_mean` 约 `567.0us -> 494.8us`;
+  - batch=16 total decode step 约 `28.08ms -> 27.82ms`,诊断收益约 `0.9%`;
+  - 最大热点仍是 `tail_gate_up` 约 `9.01ms` 与 `tail_down` 约 `4.70ms`,
+    因此下一步不应继续围绕 residual add 小项重复验证,应转向 gate/up/down
+    或更高收益的 Gemma tail/GEMM 路径。
+- Correctness status:
+  - 本轮未发现新的 product correctness 问题;
+  - 但没有 `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍未达到 release-grade。
+
 ## 2026-06-15 XXXIII — W2 source checkpoint: fuse Gemma sandwich branch norm into F32 residual add
 
 - 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
