@@ -1,0 +1,1 @@
+{"env":{"FERRUM_BIN":"target/release/ferrum","SMOKE_REQ_TIMEOUT":"240"},"cmd":["bash","scripts/model_coverage_smoke.sh","gemma3:27b-gptq","--port","8491","--kv-capacity","2560","--max-seqs","2"]}
