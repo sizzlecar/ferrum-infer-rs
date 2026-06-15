@@ -52,7 +52,7 @@ else if (a_type == vllm::kFloat16 && b_type == vllm::kU4B8 &&
                   vllm::kFloat16.id(), 128, 2, 4, 8, false, 4, 8, false>;
 EOF
 
-perl -0pi -e 's@// #include "kernel_selector\\.h"@#include "kernel_selector.h"@' \
+perl -0pi -e 's@// #include "kernel_selector\.h"@#include "kernel_selector.h"@' \
   "$BUILD_DIR/vllm_marlin/marlin.cu"
 
 echo "[microbench] compiling selector-enabled vLLM dense Marlin objects"
