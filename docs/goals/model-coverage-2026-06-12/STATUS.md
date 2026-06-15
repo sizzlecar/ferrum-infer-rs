@@ -2,6 +2,67 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LIII — W2 bottleneck synthesis: c16 gap is split between TTFT/prefill and sustained decode
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_bottleneck_synthesis_2026-06-15/summary.md`。
+- 本轮没有新增 GPU run;这是对 2026-06-15 已有 c16 evidence 的综合。
+- 使用的主要证据:
+  - Ferrum/vLLM ShareGPT c16/c32 baseline:
+    `w2_vllm_sharegpt_baseline_probe_2026-06-15`;
+  - Ferrum c16 `[batched-op-profile]`:
+    `w2_tail_profile_buckets_2026-06-15`;
+  - Ferrum Marlin projection split:
+    `w2_marlin_projection_profile_2026-06-15`;
+  - native Ferrum/vLLM Marlin weight-cycle:
+    `w2_dense_vllm_marlin_weight_cycle_probe_2026-06-15`;
+  - product Marlin shape trace:
+    `w2_marlin_shape_trace_probe_2026-06-15`。
+- Same-hardware c16 端到端差距:
+  - Ferrum:`340.003 tok/s`,`5.328 req/s`;
+  - vLLM:`518.796 tok/s`,`8.106 req/s`;
+  - ratio:`65.5%`,仍低于 W2 80% 目标。
+- latency 拆分:
+  - Ferrum p50 TTFT `887.683ms`,vLLM p50 TTFT `411.903ms`,
+    差 `+475.780ms`;
+  - Ferrum p50 TPOT `32.817ms`,vLLM p50 TPOT `24.789ms`,
+    差 `+8.027ms/token`;
+  - 以约 63 个 inter-token gap 估算,TPOT 差距约 `506ms`;
+  - c16 batch wall-time 差约 `16/5.328 - 16/8.106 = 1.03s`;
+  - TTFT + TPOT 基本解释该差距,说明剩余性能问题不是一个单点内核。
+- batch/cadence 结论:
+  - 既有 decode batch stats:c16 段 `calls=391`,
+    `total_items=5334`,`avg_m=13.642`,`max_m=16`;
+  - `w2_tail_profile_buckets` 中 batch `m=16` 有 `118` 行;
+  - 因此当前主问题不是“c16 batch 完全没有形成”。
+- decode breakdown:
+  - `w2_tail_profile_buckets` batch `m=16` mean decode step
+    `28.037ms`;
+  - `tail_mlp` `13.744ms` (`49.0%`),`matmul` `6.971ms`
+    (`24.9%`),`attention` `2.406ms` (`8.6%`),
+    `unwrapped` `0.649ms` (`2.3%`);
+  - `w2_marlin_projection_profile` batch `m=16` with Marlin profiling:
+    Marlin kernels `16.548ms` (`55.0%`),其中 `gate_up`
+    `8.728ms`,`down` `4.352ms`,`qkv` `2.132ms`,`o_proj`
+    `1.336ms`。
+- Current bottleneck statement:
+  - c16 batching 大体有效,但平均 batch 仍低于 16,尾段会 drain;
+  - 端到端差距约一半来自 TTFT/prefill/scheduling,一半来自持续
+    TPOT/decode;
+  - decode 内部主要是 Gemma3 tail MLP / Marlin projection 时间;
+  - native Ferrum/vLLM Marlin weight-cycle 已经排除“直接换 dense Marlin
+    单核即可解决”的主假设。
+- 下一步:
+  - first-token 侧:查 Ferrum c16 ShareGPT 是否串行/弱批处理 prefill,
+    以及 chunked/batched prefill 是否能降低 TTFT;
+  - decode 侧:继续从 native CUDA 最小 probe 入手,针对 Gemma3
+    tail MLP 的 gate_up/down 调度、activation、residual/norm 边界找可
+    落地优化。
+- Correctness/performance status:
+  - 没有新的 correctness blocker;
+  - 没有 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`,W2 仍不是
+    release-grade。
+
 ## 2026-06-15 LII — W2 CUDA checkpoint: product Marlin shape trace wired and single-request decode is m=1
 
 - 本轮 artifact:
