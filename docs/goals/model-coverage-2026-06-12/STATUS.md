@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XC — W2 bottleneck narrowed after graph A/B: model-side Gemma3 MLP/Marlin dominates
+
+- 本轮未新增 GPU run,没有新 release-grade artifact;这是基于最新
+  `--batched-graph` A/B 与既有 profiler artifact 的 source/evidence
+  checkpoint。
+- 当前 head:`c5ff183f`。
+- Evidence used:
+  - `w2_paged_unified_default_path_cuda_smoke_2026-06-16`:
+    default paged-unified product path `ferrum run` / `ferrum serve` correctness
+    passes, c16 diagnostic `295.806 ± 5.211 tok/s`, health shows
+    `decode_batch.calls=0`, `executor_model_lock.samples=4097`,
+    `model_execution_time_ms=46.761`;
+  - `w2_batched_graph_ab_cuda_diag_2026-06-16`: `--batched-graph`
+    correctness passes, c16 diagnostic `287.117 ± 41.633 tok/s`,
+    so `--batched-graph/default=0.9706` and graph toggle is not the current
+    high-return lever;
+  - `w2_typed_decode_profile_2026-06-16`: full `decode=16` iterations had
+    mean total `23679.2us`, model time `23311.3us`, decode postprocess
+    `347.9us`; model share `98.44%`, postprocess share `1.47%`;
+  - `w2_profiler_graph_disabled_retry_2026-06-16` and
+    `w2_marlin_typed_profile_2026-06-16`: c16 model-side profile repeatedly
+    shows Gemma3 decode dominated by tail MLP / dense Marlin projections:
+    `tail_mlp` around `13.6-14.9ms` per step, `matmul` around `7-8ms`,
+    attention around `2.7ms`, QKV/RoPE around `0.7ms`; Marlin kernel aggregate
+    around `16.5ms`, with `gate_up` around `8.7-9.5ms` and `down` around
+    `4.3-5.3ms`.
+- Updated bottleneck statement:
+  - current c16 requests are reaching the paged unified model path; legacy
+    `decode_batch` graph replay metrics stay at zero because that path is not
+    serving the steady-state decode;
+  - scheduler/HTTP/postprocess is not the primary c16 gap in the profiled
+    steady-state path;
+  - the highest-confidence bottleneck is Gemma3 model-side decode, especially
+    tail MLP dense GPTQ/Marlin `gate_up` and `down` work;
+  - dense Marlin grid/block-policy override and legacy batched graph toggle have
+    already been falsified as main levers.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+- Required next:
+  - avoid more broad graph/scheduler sweeps;
+  - use native CUDA or a very small product profiler cell to test one concrete
+    Gemma3 MLP/Marlin lever at a time;
+  - after any source change, validate correctness first with product
+    `ferrum run` and `ferrum serve`, then a minimal c16 diagnostic before any
+    broader performance run。
+
 ## 2026-06-16 LXXXIX — W2 CUDA A/B: `--batched-graph` correct but not a c16 performance lever
 
 - 本轮 artifact:
