@@ -17,7 +17,7 @@ use ferrum_kernels::backend::{
     KvCache, MoeLlmBackend, MAX_LAYERS_FOR_GRAPH,
 };
 use ferrum_quantization::Linear;
-use ferrum_types::Result;
+use ferrum_types::{Activation, Result};
 
 #[cfg(feature = "cuda")]
 use ferrum_kernels::backend::cuda::marlin::{
@@ -1195,6 +1195,29 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             .as_ref()
             .expect("unified_forward_internal called on backbone-only model");
         B::embedding_lookup(&mut ctx, embed, &all_tokens, &mut residual, h);
+        let use_device_residual_shadow =
+            self.cfg.sandwich_norms && B::supports_device_f32_residual_shadow();
+        let mut device_residual_shadow = if use_device_residual_shadow {
+            let mut shadow = self
+                .scratch
+                .unified_residual_f32_shadow
+                .take()
+                .expect("unified F32 residual shadow missing for sandwich unified path");
+            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, m_total * h);
+            Some(shadow)
+        } else {
+            None
+        };
+        let mut device_branch_shadow = if use_device_residual_shadow {
+            Some(
+                self.scratch
+                    .unified_sandwich_branch_f32
+                    .take()
+                    .expect("unified F32 sandwich branch scratch missing"),
+            )
+        } else {
+            None
+        };
 
         // Upload index buffers.
         {
@@ -1318,6 +1341,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     &cu_seqlens_q,
                     &pos_offsets,
                     &mut residual,
+                    device_residual_shadow.as_mut(),
+                    device_branch_shadow.as_mut(),
                     m_total,
                     max_kv_len,
                     num_seqs,
@@ -1406,15 +1431,27 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             .expect("unified_norm_out missing");
 
         if !did_pure_replay {
-            B::rms_norm(
-                &mut ctx,
-                &residual,
-                final_norm_w,
-                eps,
-                &mut norm_out,
-                m_total,
-                h,
-            );
+            if let Some(device) = device_residual_shadow.as_ref() {
+                B::rms_norm_f32_to_activation(
+                    &mut ctx,
+                    device,
+                    final_norm_w,
+                    eps,
+                    &mut norm_out,
+                    m_total,
+                    h,
+                );
+            } else {
+                B::rms_norm(
+                    &mut ctx,
+                    &residual,
+                    final_norm_w,
+                    eps,
+                    &mut norm_out,
+                    m_total,
+                    h,
+                );
+            }
             if num_sampled > 0 {
                 let packed_normed = self
                     .scratch
@@ -1490,6 +1527,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
 
         // Restore scratch for next call.
+        self.scratch.unified_residual_f32_shadow = device_residual_shadow;
+        self.scratch.unified_sandwich_branch_f32 = device_branch_shadow;
         self.scratch.unified_residual = Some(residual);
         self.scratch.unified_norm_out = Some(norm_out);
 
@@ -1509,6 +1548,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         cu_seqlens_q: &[u32],
         pos_offsets: &[u32],
         residual: &mut B::Buffer,
+        mut device_residual: Option<&mut B::Buffer>,
+        mut device_branch: Option<&mut B::Buffer>,
         m_total: usize,
         max_kv_len: usize,
         num_seqs: usize,
@@ -1560,7 +1601,19 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_norm_out
                 .as_mut()
                 .expect("unified_norm_out missing");
-            B::rms_norm(ctx, residual, &layer.input_ln_w, eps, norm_out, m_total, h);
+            if let Some(device) = device_residual.as_mut() {
+                B::rms_norm_f32_to_activation(
+                    ctx,
+                    &**device,
+                    &layer.input_ln_w,
+                    eps,
+                    norm_out,
+                    m_total,
+                    h,
+                );
+            } else {
+                B::rms_norm(ctx, residual, &layer.input_ln_w, eps, norm_out, m_total, h);
+            }
         });
 
         // 2. qkv_proj GEMM (m=M_total): unified_norm_out → unified_qkv_out
@@ -1722,8 +1775,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             layer.o_proj.forward(ctx, attn_out, o_proj_out, m_total);
         });
 
-        // 6. fused_add_rms_norm: residual = residual + o_proj_out;
-        //    norm_out = rms_norm(new_residual, post_ln_w)
+        // 6. residual + pre-MLP norm.
+        //    Legacy Llama path: fused residual add + RMSNorm.
+        //    Gemma sandwich path: RMSNorm(o_proj_out) -> F32 residual add,
+        //    then RMSNorm(F32 residual) for pre-MLP input.
         time_op!(NORM_TIME_US, NORM_CALLS, {
             let o_proj_out = self
                 .scratch
@@ -1735,16 +1790,52 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_norm_out
                 .as_mut()
                 .expect("unified_norm_out missing");
-            B::fused_add_rms_norm(
-                ctx,
-                residual,
-                o_proj_out,
-                &layer.post_ln_w,
-                eps,
-                norm_out,
-                m_total,
-                h,
-            );
+            if let Some(post_attn_w) = &layer.post_attn_ln_w {
+                if let Some(device) = device_residual.as_mut() {
+                    let branch = device_branch
+                        .as_mut()
+                        .expect("unified F32 sandwich branch scratch missing");
+                    B::rms_norm_activation_add_to_f32(
+                        ctx,
+                        o_proj_out,
+                        post_attn_w,
+                        eps,
+                        &mut **device,
+                        &mut **branch,
+                        m_total,
+                        h,
+                    );
+                    B::rms_norm_f32_to_activation(
+                        ctx,
+                        &**device,
+                        &layer.post_ln_w,
+                        eps,
+                        norm_out,
+                        m_total,
+                        h,
+                    );
+                } else {
+                    let tmp = self
+                        .scratch
+                        .unified_sandwich_tmp
+                        .as_mut()
+                        .expect("unified sandwich tmp missing");
+                    B::rms_norm(ctx, o_proj_out, post_attn_w, eps, tmp, m_total, h);
+                    B::add_inplace(ctx, residual, tmp, m_total * h);
+                    B::rms_norm(ctx, residual, &layer.post_ln_w, eps, norm_out, m_total, h);
+                }
+            } else {
+                B::fused_add_rms_norm(
+                    ctx,
+                    residual,
+                    o_proj_out,
+                    &layer.post_ln_w,
+                    eps,
+                    norm_out,
+                    m_total,
+                    h,
+                );
+            }
         });
 
         // 7. gate_up_proj
@@ -1767,7 +1858,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .forward(ctx, norm_out, gate_up_out, m_total);
         });
 
-        // 8. SwiGLU
+        // 8. Gated activation: SwiGLU for Llama, GeGLU for Gemma.
         time_op!(OTHER_TIME_US, OTHER_CALLS, {
             let gate_up_out = self
                 .scratch
@@ -1779,7 +1870,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_silu_out
                 .as_mut()
                 .expect("unified_silu_out missing");
-            B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im);
+            match self.cfg.activation {
+                Activation::GeluTanh => {
+                    B::fused_gelu_tanh_mul_split(ctx, gate_up_out, silu_out, m_total, im)
+                }
+                _ => B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im),
+            }
         });
 
         // 9. down_proj
@@ -1800,14 +1896,41 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             layer.down_proj.forward(ctx, silu_out, mlp_out, m_total);
         });
 
-        // 10. residual_add
+        // 10. final residual add. Gemma sandwich path normalizes the MLP
+        //     branch before adding it to the F32 residual shadow.
         time_op!(OTHER_TIME_US, OTHER_CALLS, {
             let mlp_out = self
                 .scratch
                 .unified_mlp_out
                 .as_ref()
                 .expect("unified_mlp_out missing");
-            B::add_inplace(ctx, residual, mlp_out, m_total * h);
+            if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
+                if let Some(device) = device_residual.as_mut() {
+                    let branch = device_branch
+                        .as_mut()
+                        .expect("unified F32 sandwich branch scratch missing");
+                    B::rms_norm_activation_add_to_f32(
+                        ctx,
+                        mlp_out,
+                        post_ffn_w,
+                        eps,
+                        &mut **device,
+                        &mut **branch,
+                        m_total,
+                        h,
+                    );
+                } else {
+                    let tmp = self
+                        .scratch
+                        .unified_sandwich_tmp
+                        .as_mut()
+                        .expect("unified sandwich tmp missing");
+                    B::rms_norm(ctx, mlp_out, post_ffn_w, eps, tmp, m_total, h);
+                    B::add_inplace(ctx, residual, tmp, m_total * h);
+                }
+            } else {
+                B::add_inplace(ctx, residual, mlp_out, m_total * h);
+            }
         });
     }
     /// Batched decode: process M concurrent requests at potentially different

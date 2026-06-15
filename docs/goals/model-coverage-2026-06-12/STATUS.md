@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XLIV — W2 source checkpoint: Gemma3 unified tail 接入 sandwich/F32 residual 语义
+
+- 本轮没有启动 GPU;在上一个 native CUDA window probe 通过后,继续补
+  Gemma3 unified prefill 的源码正确性前置件。
+- Source change:
+  - unified mixed-batch scratch 增加 `unified_sandwich_tmp`,
+    `unified_residual_f32_shadow`, `unified_sandwich_branch_f32`;
+  - `ensure_unified_scratch` 会在 sandwich-norm family 且 backend 支持
+    device-side F32 residual shadow 时分配 unified F32 residual/branch buffer;
+  - `unified_forward_internal` 在 embedding 后把 activation residual 写入
+    F32 residual shadow,并在返回前恢复 shadow scratch;
+  - `unified_forward_layer` 现在对 sandwich layer:
+    - input RMSNorm 从 F32 residual shadow 读;
+    - post-attn path 执行 `rms_norm(o_proj_out, post_attn_ln_w)` 后加到
+      F32 residual,再对 F32 residual 做 `post_ln_w` pre-MLP norm;
+    - gated activation 按 `Activation::GeluTanh` 走 GeGLU,否则走 SwiGLU;
+    - post-ffn path 执行 `rms_norm(mlp_out, post_ffn_ln_w)` 后加到
+      F32 residual;
+    - final norm 从 F32 residual shadow 读;
+  - `unified_varlen_qkv_unsupported_reason` 现在把 Gemma3 unified prereq
+    明确为:backend varlen QKV + local/global layer pattern +
+    device-side F32 residual shadow。
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-models` PASS;
+  - `cargo test -p ferrum-models unified_varlen_qkv_requires_gemma_sandwich_prerequisites --lib`
+    PASS;
+  - `cargo test -p ferrum-models llama_attention_semantics_cover_qk_mode_and_layer_windows --lib`
+    PASS;
+  - `git diff --check` PASS。
+- Correctness status:
+  - this is not release evidence and not a product correctness PASS;
+  - source now has the missing Gemma3 unified tail semantics,so the next
+    checkpoint must run CUDA product smoke (`ferrum run` and `ferrum serve`)
+    before trusting the newly-enabled unified path;
+  - if CUDA smoke fails, stop at the failing artifact and do minimal triage,
+    not a full perf sweep。
+- Performance status:
+  - no performance command in this checkpoint;
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains functional / known-gap,not release-grade。
+- Next step:
+  - reuse the cached 1x4090 only once for a minimal CUDA correctness smoke:
+    CUDA build, `ferrum run` Paris/multi-turn smoke, `ferrum serve` non-stream
+    and streaming smoke, then a small c16 diagnostic only if correctness is clean。
+
 ## 2026-06-15 XLIII — W2 native checkpoint: paged varlen sliding-window CUDA probe 通过
 
 - 本轮 artifact:
