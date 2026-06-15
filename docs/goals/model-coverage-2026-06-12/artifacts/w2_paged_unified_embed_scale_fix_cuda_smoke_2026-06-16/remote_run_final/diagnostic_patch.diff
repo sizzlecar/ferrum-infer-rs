@@ -1,0 +1,17 @@
+diff --git a/crates/ferrum-models/src/models/llama_family.rs b/crates/ferrum-models/src/models/llama_family.rs
+index 2d7aba21..e7e19f0b 100644
+--- a/crates/ferrum-models/src/models/llama_family.rs
++++ b/crates/ferrum-models/src/models/llama_family.rs
+@@ -440,10 +440,10 @@ impl LlamaFamilyRuntimeEnv {
+ 
+ fn paged_kv_allowed_for_layer_schedule(
+     paged_enabled: bool,
+-    _backend_supports_varlen_qkv: bool,
++    backend_supports_varlen_qkv: bool,
+     sliding_window_pattern: usize,
+ ) -> bool {
+-    paged_enabled && sliding_window_pattern == 0
++    paged_enabled && (sliding_window_pattern == 0 || backend_supports_varlen_qkv)
+ }
+ 
+ /// Whether decode-op profiling is enabled, resolved from the runtime snapshot
