@@ -2,6 +2,71 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XVIII — W2 greedy-argmax default diagnostic: product default confirmed, performance still below 80%
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_greedy_argmax_default_diag_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `poll=01 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=02 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=03 cur_state=stopped actual_status=exited intended_status=stopped`。
+- Source checkpoint:
+  - `9a338235 fix(types): enable greedy argmax for accelerator defaults`;
+  - `FERRUM_GREEDY_ARGMAX` now auto-resolves to true on CUDA/Metal when the
+    compiled accelerator supports greedy argmax, unless explicitly disabled.
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA greedy-argmax default validation`;
+  - expected runtime/cost:20-45min,hard cap 60min,1x RTX 4090 instance
+    `40826362` at about USD 0.425/hr;
+  - stop condition:startup/SSH/CUDA/build/`ferrum run`/serve smoke first
+    failure,decision trace missing `gpu_greedy_argmax`,c16/c32 diagnostic
+    complete and artifact copied,or 60min cap;
+  - correctness gate:`ferrum run` plus
+    `scripts/model_coverage_smoke.sh gemma3:27b-gptq`;
+  - performance command:diagnostic-only
+    `ferrum bench-serve --dataset sharegpt --sharegpt-path ascii_sharegpt.jsonl --fail-on-error --seed 9271`
+    for c16/c32 small sample first.
+- Build/correctness:
+  - release build PASS,binary SHA256:
+    `a942a2e79880bbc821c26a1c60720fa753d6b8e66a62a73900a4592d123abb0e`;
+  - `ferrum run` rc=0,content `"5"`;
+  - serve smoke rc=0,PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`。
+- Runtime default evidence:
+  - both `ferrum run` and diagnostic `ferrum serve` decision traces selected
+    `sampling_readback_path=gpu_greedy_argmax`;
+  - selected source:`hardware_capability`;
+  - `diagnostic_summary.json` reports
+    `sampling_trace_has_gpu_greedy_argmax=true`.
+- Diagnostic result(same natural ASCII ShareGPT dataset as the vLLM baseline
+  and previous Ferrum diagnostic; `num_prompts=32`,`n_repeats=1`,zero errors,
+  `output_token_count_source=usage`):
+  - c16:completed `[32]`,errored `[0]`,mean `347.880 tok/s`,
+    ratio vs vLLM natural baseline LCB `0.708`,ratio vs baseline mean
+    `0.655`,required 80% of baseline LCB `392.920 tok/s`,p95 ITL
+    `109.763 ms`;
+  - c32 client / Ferrum active cap16:completed `[32]`,errored `[0]`,
+    mean `356.835 tok/s`,ratio vs vLLM natural baseline LCB `0.650`,
+    ratio vs baseline mean `0.634`,required 80% of baseline LCB
+    `439.514 tok/s`,p95 ITL `109.657 ms`.
+- Interpretation:
+  - the typed default fix is product-visible and no hidden env var is needed;
+  - performance did not materially improve versus the previous Ferrum natural
+    diagnostic(c16 `350.868 tok/s`,c32 `354.291 tok/s`),so the remaining W2
+    blocker is not an accidental logits-readback default;
+  - continue with targeted decode/attention/batching evidence before any
+    full `--require-ci` release sweep.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - inspect current CUDA decode path against the decision trace: notably the
+    earlier diagnostic still selected `legacy_paged_decode`;
+  - choose one targeted optimization/profiler step that can move c16/c32 tail
+    ITL before rerunning the same natural dataset diagnostic.
+
 ## 2026-06-15 XVII — W2 Ferrum natural-prompt diagnostic: correctness clean, c16/c32 below 80%
 
 - 本轮 artifact:
