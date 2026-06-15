@@ -2,6 +2,53 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LII — W2 CUDA checkpoint: product Marlin shape trace wired and single-request decode is m=1
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_shape_trace_probe_2026-06-15/`。
+- 源码 checkpoint:
+  `b3403dd5 test(cuda): add marlin shape trace probe`。
+- GPU 执行合同:
+  - lane:`W2 Marlin shape-trace compile/product smoke`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD 0.425/hr;
+  - expected runtime/cost:10-20min,hard cap 30min;
+  - stop condition:start/SSH/CUDA/source sync/CUDA feature test/build/server/chat
+    smoke 首败,或 trace 输出 + artifact 复制后停机;
+  - correctness gate:CUDA/marlin feature compile retry rc `0`,release build rc
+    `0`,`ferrum serve` ready,non-stream chat smoke 有内容和 usage;
+  - performance command:无 release perf;本轮只做 diagnostic product trace。
+- 执行结果:
+  - remote HEAD:`b3403dd5394bb044690c918535a71ccc202cd3e7`;
+  - release CUDA build rc `0`,binary SHA256
+    `730df7d84ede559b7ace54abcf1a6c16a3a81e55113789c5e3bc37c9f3844b8f`;
+  - `run.status=PASS`;
+  - chat smoke 返回 `5`,usage 为 `prompt_tokens=23`,
+    `completion_tokens=3`;
+  - artifact 已复制回本地;`vast_shutdown/stopped.json` 记录
+    `cur_state=stopped actual_status=exited`。
+- shape trace 结果:
+  - `shape_trace_lines=256`,全部可解析;
+  - calls `0..247`:prefill,`m=23`,62 层 × 4 个 Marlin projection;
+  - calls `248..255`:decode,`m=1`,trace cap 前 2 层 × 4 个 projection;
+  - projection shapes:
+    `qkv n=8192 k=5376`,`o n=5376 k=4096`,
+    `gate_up n=43008 k=5376`,`down n=5376 k=21504`。
+- Interpretation:
+  - trace 已接入真实 `ferrum serve` 产品路径,不是 standalone
+    microbench;
+  - 单请求 decode 明确是 `m=1`;这本身符合预期,但还不能解释 c16
+    端到端差距;
+  - 结合上一轮 native Ferrum/vLLM Marlin weight-cycle probe,当前主假设应
+    继续收敛到 c16 decode integration/cadence:并发 decode 是否稳定形成
+    `m≈16`,是否存在 scheduler gap、非 Marlin op 或 per-step sync。
+- Correctness/performance status:
+  - 该窄 smoke 没有发现新的 correctness blocker;
+  - `decode_op_profile.log` 本轮为空,不能据此做非 Marlin 时间结论;
+  - 没有生成 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`,W2 仍不是
+    release-grade;
+  - 最新可引用性能仍是 Ferrum c16 `341.24 tok/s` vs vLLM c16
+    `518.80 tok/s`,约 `65.8%`。
+
 ## 2026-06-15 LI — W2 source checkpoint: add Marlin shape trace for decode integration probe
 
 - 本轮代码改动:

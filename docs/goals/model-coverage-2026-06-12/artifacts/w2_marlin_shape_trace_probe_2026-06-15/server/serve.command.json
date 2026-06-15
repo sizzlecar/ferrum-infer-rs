@@ -1,0 +1,23 @@
+{
+  "env": {
+    "FERRUM_MARLIN_TRACE_SHAPES": "1",
+    "FERRUM_MARLIN_TRACE_SHAPES_MAX": "256",
+    "FERRUM_DECODE_OP_PROFILE": "1"
+  },
+  "cmd": [
+    "/workspace/ferrum-infer-rs/target/release/ferrum",
+    "serve",
+    "--model",
+    "gemma3:27b-gptq",
+    "--port",
+    "8497",
+    "--kv-capacity",
+    "512",
+    "--max-num-seqs",
+    "16",
+    "--effective-config-json",
+    "/workspace/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_shape_trace_probe_2026-06-15/server/serve_effective_config.json",
+    "--decision-trace-jsonl",
+    "/workspace/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_shape_trace_probe_2026-06-15/server/serve_decision_trace.jsonl"
+  ]
+}

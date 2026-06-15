@@ -1,0 +1,170 @@
+   Compiling ferrum-types v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-types)
+   Compiling candle-kernels v0.9.2
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)
+   Compiling candle-core v0.9.2
+   Compiling ferrum-bench-core v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-bench-core)
+   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-interfaces)
+warning: variable does not need to be mutable
+  --> crates/ferrum-kernels/tests/kv_cache_append_batched_eq.rs:57:17
+   |
+57 |             let mut seed_buf = CudaBackend::from_slice(&sentinel);
+   |                 ----^^^^^^^^
+   |                 |
+   |                 help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:102:27
+    |
+102 |     let slot_dev = stream.memcpy_stod(&slot_mapping).unwrap();
+    |                           ^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: variable does not need to be mutable
+  --> crates/ferrum-kernels/tests/kv_cache_append_batched_eq.rs:96:9
+   |
+96 |     let mut batched_caches: Vec<_> = (0..M)
+   |         ----^^^^^^^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:121:36
+    |
+121 |     let k_pool_h: Vec<i8> = stream.memcpy_dtov(&k_pool).unwrap();
+    |                                    ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:122:36
+    |
+122 |     let v_pool_h: Vec<i8> = stream.memcpy_dtov(&v_pool).unwrap();
+    |                                    ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:123:39
+    |
+123 |     let k_scales_h: Vec<f16> = stream.memcpy_dtov(&k_scales).unwrap();
+    |                                       ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:124:39
+    |
+124 |     let v_scales_h: Vec<f16> = stream.memcpy_dtov(&v_scales).unwrap();
+    |                                       ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:258:28
+    |
+258 |     let k_pool_i8 = stream.memcpy_stod(&k_q).unwrap();
+    |                            ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:259:28
+    |
+259 |     let v_pool_i8 = stream.memcpy_stod(&v_q).unwrap();
+    |                            ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:262:31
+    |
+262 |     let k_scales_dev = stream.memcpy_stod(&k_scales_h).unwrap();
+    |                               ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:263:31
+    |
+263 |     let v_scales_dev = stream.memcpy_stod(&v_scales_h).unwrap();
+    |                               ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:264:25
+    |
+264 |     let bt_dev = stream.memcpy_stod(&block_table).unwrap();
+    |                         ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:411:27
+    |
+411 |     let slot_dev = stream.memcpy_stod(&slot_mapping).unwrap();
+    |                           ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:412:25
+    |
+412 |     let bt_dev = stream.memcpy_stod(&block_table).unwrap();
+    |                         ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:545:27
+    |
+545 |     let slot_dev = stream.memcpy_stod(&slot_mapping).unwrap();
+    |                           ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/int8_kv_parity.rs:546:25
+    |
+546 |     let bt_dev = stream.memcpy_stod(&block_table).unwrap();
+    |                         ^^^^^^^^^^^
+
+warning: `ferrum-kernels` (test "kv_cache_append_batched_eq") generated 2 warnings (run `cargo fix --test "kv_cache_append_batched_eq" -p ferrum-kernels` to apply 2 suggestions)
+warning: `ferrum-kernels` (test "int8_kv_parity") generated 14 warnings
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> crates/ferrum-kernels/tests/cudarc_graph_repro.rs:354:38
+    |
+354 |     let dev1_host: Vec<u64> = stream.memcpy_dtov(&dev1).expect("dtov dev1");
+    |                                      ^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> crates/ferrum-kernels/tests/cudarc_graph_repro.rs:355:38
+    |
+355 |     let dev2_host: Vec<u64> = stream.memcpy_dtov(&dev2).expect("dtov dev2");
+    |                                      ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/cudarc_graph_repro.rs:406:28
+    |
+406 |     let alpha_f32 = stream.memcpy_stod(&[1.0f32]).expect("alpha");
+    |                            ^^^^^^^^^^^
+
+warning: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> crates/ferrum-kernels/tests/cudarc_graph_repro.rs:407:27
+    |
+407 |     let beta_f32 = stream.memcpy_stod(&[0.0f32]).expect("beta");
+    |                           ^^^^^^^^^^^
+
+warning: `ferrum-kernels` (test "cudarc_graph_repro") generated 4 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.14s
+     Running unittests src/lib.rs (target/debug/deps/ferrum_kernels-38a5b07254597d15)
+     Running tests/argmax_rows.rs (target/debug/deps/argmax_rows-0f503cec2f815bc0)
+     Running tests/attention_gemm_test.rs (target/debug/deps/attention_gemm_test-f50bd23e96ad0ad1)
+     Running tests/attention_metal_test.rs (target/debug/deps/attention_metal_test-96b73b489e3c9ae2)
+     Running tests/attention_paged_attention_test.rs (target/debug/deps/attention_paged_attention_test-e30e7dc9ec95096d)
+     Running tests/attention_paged_kv_append_test.rs (target/debug/deps/attention_paged_kv_append_test-dc476da527ee6d8d)
+     Running tests/attention_transformer_test.rs (target/debug/deps/attention_transformer_test-7a759715f5af714b)
+     Running tests/cuda_activation_precision.rs (target/debug/deps/cuda_activation_precision-2c07724a7a54b5b3)
+     Running tests/cudarc_graph_repro.rs (target/debug/deps/cudarc_graph_repro-51710f32190fa833)
+     Running tests/flash_attn_batched_eq.rs (target/debug/deps/flash_attn_batched_eq-0728883ce7409fae)
+     Running tests/gemma3_metal_ops_test.rs (target/debug/deps/gemma3_metal_ops_test-5c75b9f01ddd00ff)
+     Running tests/int8_kv_parity.rs (target/debug/deps/int8_kv_parity-7f4870baa050cf32)
+     Running tests/kv_cache_append_batched_eq.rs (target/debug/deps/kv_cache_append_batched_eq-42c04296c689d3c0)
+     Running tests/moe_align_block_size_eq.rs (target/debug/deps/moe_align_block_size_eq-7336c88fc9e9032d)
+     Running tests/paged_decode_attn_bench.rs (target/debug/deps/paged_decode_attn_bench-c65068b20bf8d98d)
+     Running tests/qk_norm_rope_batched_eq.rs (target/debug/deps/qk_norm_rope_batched_eq-88216571e24939eb)
+     Running tests/triton_add_bias_eq.rs (target/debug/deps/triton_add_bias_eq-1362360a76cac837)
+     Running tests/triton_fused_add_rms_norm_eq.rs (target/debug/deps/triton_fused_add_rms_norm_eq-db9bdb4cdd9917ad)
+     Running tests/triton_fused_moe_bench.rs (target/debug/deps/triton_fused_moe_bench-d271e31c76913ebb)
+     Running tests/triton_fused_moe_eq.rs (target/debug/deps/triton_fused_moe_eq-74ba820d64adf7ea)
+     Running tests/triton_fused_moe_tile_sweep.rs (target/debug/deps/triton_fused_moe_tile_sweep-9769d920d0a4588a)
+     Running tests/triton_fused_silu_mul_eq.rs (target/debug/deps/triton_fused_silu_mul_eq-6dfd106a51a8afca)
+     Running tests/triton_gelu_eq.rs (target/debug/deps/triton_gelu_eq-ed64fe0f9ed9db9f)
+     Running tests/triton_layer_norm_eq.rs (target/debug/deps/triton_layer_norm_eq-b8a610216a1654e5)
+     Running tests/triton_residual_add_eq.rs (target/debug/deps/triton_residual_add_eq-dea109d020c8cd19)
+     Running tests/triton_residual_add_inplace_eq.rs (target/debug/deps/triton_residual_add_inplace_eq-f6956d95018b3bd7)
+     Running tests/triton_rms_norm_eq.rs (target/debug/deps/triton_rms_norm_eq-43e6155233277925)
+     Running tests/triton_softmax_eq.rs (target/debug/deps/triton_softmax_eq-0733c06ce811924a)
+     Running tests/triton_w4a16_eq.rs (target/debug/deps/triton_w4a16_eq-bd75f6d2ddf35999)
+     Running tests/vllm_gptq_repack_smoke.rs (target/debug/deps/vllm_gptq_repack_smoke-4864cffcd06ca6b1)
