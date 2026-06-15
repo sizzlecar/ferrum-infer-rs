@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXXI — W2 source checkpoint: unified logits diagnostic for paged-varlen failure
+
+- 本轮没有启动 GPU,没有新的性能数字,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - 在 `FERRUM_DECODE_OP_PROFILE` 已启用时,`unified_forward_internal`
+    读回 sampled logits 后打印 `[unified-logits]`;
+  - 每行日志包含前两条 sampled row 的 `orig_idx/global`,
+    finite/NaN/+Inf/-Inf 计数,以及 top-5 token id/logit;
+  - 诊断采样规则为前 8 次 unified logits readback 必打,之后每 64
+    次打一条,避免长 bench 日志爆量;
+  - 默认产品路径不启用该日志,不改变 scheduler/KV/sampling 行为。
+- Why:
+  - LXXX 证明 paged-unified Gemma3 可以去掉
+    `fallback_reason=paged_kv_required`,但首个 chat smoke 变成空输出
+    且 `finish_reason=stop`;
+  - 下一次 CUDA 应该先跑 `max_tokens=1` 的最小 correctness smoke,
+    用 `[unified-logits]` 判断是 EOS/stop token 排在 top,logits row
+    错位,还是 NaN/Inf/未初始化等数值问题;
+  - 在这个结果出来前,不要再跑 c16/c32 性能 sweep。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models logit_row_diagnostics_counts_and_sorts_top_values -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models unified_logits_diag_uses_front_loaded_sampling -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models llm_executor -- --nocapture` PASS
+    (13 tests)。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXX — W2 CUDA checkpoint: paged unified removes fallback but fails chat correctness
 
 - 本轮 artifact:

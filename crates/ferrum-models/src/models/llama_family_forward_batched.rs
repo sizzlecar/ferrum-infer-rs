@@ -6,7 +6,7 @@
 //! `impl` block in a peer file (Rust allows multiple `impl` blocks for
 //! the same type across the crate).
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrum_interfaces::{
     kv_dtype::KvFp16,
@@ -151,10 +151,63 @@ fn record_batched_graph_replay(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct LogitRowDiagnostics {
+    finite_count: usize,
+    nan_count: usize,
+    pos_inf_count: usize,
+    neg_inf_count: usize,
+    top: Vec<(usize, f32)>,
+}
+
+fn logit_row_diagnostics(row: &[f32], k: usize) -> LogitRowDiagnostics {
+    let mut diag = LogitRowDiagnostics {
+        finite_count: 0,
+        nan_count: 0,
+        pos_inf_count: 0,
+        neg_inf_count: 0,
+        top: Vec::new(),
+    };
+
+    for (idx, &value) in row.iter().enumerate() {
+        if value.is_nan() {
+            diag.nan_count += 1;
+        } else if value == f32::INFINITY {
+            diag.pos_inf_count += 1;
+        } else if value == f32::NEG_INFINITY {
+            diag.neg_inf_count += 1;
+        } else {
+            diag.finite_count += 1;
+            if k > 0 {
+                diag.top.push((idx, value));
+                diag.top
+                    .sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                diag.top.truncate(k);
+            }
+        }
+    }
+
+    diag
+}
+
+fn format_logit_top(top: &[(usize, f32)]) -> String {
+    let entries = top
+        .iter()
+        .map(|(idx, value)| format!("{idx}:{value:.6}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{entries}]")
+}
+
+fn should_log_unified_logits_diag(call: u64) -> bool {
+    call < 8 || call.is_multiple_of(64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        batched_decode_graph_key, should_log_batched_graph_replay_count,
+        batched_decode_graph_key, format_logit_top, logit_row_diagnostics,
+        should_log_batched_graph_replay_count, should_log_unified_logits_diag,
         should_use_batched_decode_graph, LlamaBatchedRuntimeConfig,
         BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
     };
@@ -236,6 +289,42 @@ mod tests {
         assert!(should_log_batched_graph_replay_count(2));
         assert!(!should_log_batched_graph_replay_count(3));
         assert!(should_log_batched_graph_replay_count(4));
+    }
+
+    #[test]
+    fn logit_row_diagnostics_counts_and_sorts_top_values() {
+        let diag = logit_row_diagnostics(
+            &[
+                1.0,
+                f32::NAN,
+                5.0,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                5.5,
+                -0.0,
+            ],
+            3,
+        );
+
+        assert_eq!(diag.finite_count, 4);
+        assert_eq!(diag.nan_count, 1);
+        assert_eq!(diag.pos_inf_count, 1);
+        assert_eq!(diag.neg_inf_count, 1);
+        assert_eq!(diag.top, vec![(5, 5.5), (2, 5.0), (0, 1.0)]);
+        assert_eq!(
+            format_logit_top(&diag.top),
+            "[5:5.500000,2:5.000000,0:1.000000]"
+        );
+    }
+
+    #[test]
+    fn unified_logits_diag_uses_front_loaded_sampling() {
+        for call in 0..8 {
+            assert!(should_log_unified_logits_diag(call));
+        }
+        assert!(!should_log_unified_logits_diag(8));
+        assert!(!should_log_unified_logits_diag(63));
+        assert!(should_log_unified_logits_diag(64));
     }
 }
 
@@ -1596,6 +1685,28 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .as_ref()
                 .expect("unified_packed_logits missing");
             let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
+            if self.batched_cfg.decode_op_profile {
+                static UNIFIED_LOGITS_DIAG_CALLS: AtomicU64 = AtomicU64::new(0);
+                let call = UNIFIED_LOGITS_DIAG_CALLS.fetch_add(1, Ordering::Relaxed);
+                if should_log_unified_logits_diag(call) {
+                    for (j, &(orig_idx, global)) in final_indices.iter().take(2).enumerate() {
+                        let row = &logits_flat[j * vocab..(j + 1) * vocab];
+                        let diag = logit_row_diagnostics(row, 5);
+                        eprintln!(
+                            "[unified-logits] call#{} row={} orig_idx={} global={} finite={} nan={} pos_inf={} neg_inf={} top={}",
+                            call,
+                            j,
+                            orig_idx,
+                            global,
+                            diag.finite_count,
+                            diag.nan_count,
+                            diag.pos_inf_count,
+                            diag.neg_inf_count,
+                            format_logit_top(&diag.top)
+                        );
+                    }
+                }
+            }
             for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
                 let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
                 out[orig_idx] = Some(row);
