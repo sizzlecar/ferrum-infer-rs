@@ -2,6 +2,38 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XF — W2 source checkpoint: native CUDA Gemma3 tail-MLP chain probe
+
+- No new GPU run in this checkpoint; this adds a minimal native CUDA probe for
+  the next paid diagnostic lane.
+- Added `scripts/microbenches/gemma3_tail_mlp_chain_perf.cu` plus
+  `scripts/microbenches/build_and_run_gemma3_tail_mlp_chain_perf.sh`.
+- Probe scope:
+  - models the product Gemma3 tail MLP sequence
+    `rms_norm_f32_to_f16 -> Marlin gate_up -> GeGLU -> Marlin down ->
+    rms_norm_f16_add_to_f32`;
+  - uses product-shaped W2 dimensions (`h=5376`, `intermediate=21504`,
+    `gate_up n=43008`, `down n=5376`) and calls the existing product CUDA
+    kernels directly;
+  - emits phase timing plus full-chain event and host-sync timing for
+    `m={1,10,16,23,32}`;
+  - keeps `product_ws_zero` as the primary row and labels the workspace-prezero
+    kernel-only row as diagnostic only, so it cannot be mistaken for product
+    evidence or for an unsafe skip-workspace-zero runtime mode.
+- Why this checkpoint matters:
+  - earlier evidence already ruled out legacy `--batched-graph`, Marlin block
+    policy override, direct vLLM dense Marlin kernel swap, and scheduler/HTTP
+    as first-order W2 c16 levers;
+  - current c16 profiling points to model-side Gemma3 tail MLP / dense Marlin,
+    so this probe is the next smallest native CUDA validation before any full
+    product benchmark.
+- Next:
+  - run this build script once on the cached 1x4090 lane, capture stdout and
+    binary SHA256 under a new artifact dir, then choose a concrete optimization
+    from the phase split.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XE — W2 source guard: reject Gemma3 typed unified graph before CUDA runtime
 
 - 本轮无新增 GPU run;这是对 `w2_unified_graph_typed_c16_2026-06-16`
