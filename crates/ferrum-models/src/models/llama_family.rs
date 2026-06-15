@@ -2505,9 +2505,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             };
         }
         nt!("residual-in", residual, tokens * h, h);
+        let op_profile = self.runtime_env.decode_op_profile
+            || (self.runtime_env.prefill_op_profile && tokens > 1);
 
         // 1. Input RMSNorm
-        let _t0 = if self.runtime_env.decode_op_profile {
+        let _t0 = if op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -2555,7 +2557,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
 
         // 2. Fused QKV projection (Linear dispatches to Dense/GPTQ/AWQ/GGUF)
-        let _t0 = if self.runtime_env.decode_op_profile {
+        let _t0 = if op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -2765,7 +2767,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // Non-paged (contig) path. INT8 path doesn't reach here:
         // KvInt8::alloc_contig panics in ensure_kv.
-        let _qkr_t0 = if self.runtime_env.decode_op_profile {
+        let _qkr_t0 = if op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -2812,7 +2814,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         K::set_len(&mut caches[li], new_len);
         let kv_stride = cache_capacity;
 
-        let _attn_t0 = if self.runtime_env.decode_op_profile {
+        let _attn_t0 = if op_profile {
             B::sync(ctx);
             Some(std::time::Instant::now())
         } else {
@@ -3011,8 +3013,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 }
             };
         }
-        let tail_profile =
-            self.runtime_env.decode_op_profile || self.batched_cfg.decode_op_profile_enabled();
+        let tail_profile = self.runtime_env.decode_op_profile
+            || (self.runtime_env.prefill_op_profile && tokens > 1)
+            || self.batched_cfg.decode_op_profile_enabled();
         macro_rules! time_tail {
             ($bucket_us:expr, $bucket_n:expr, $body:block) => {{
                 if tail_profile {
@@ -3568,6 +3571,26 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let prefill_profile = self.runtime_env.prefill_op_profile;
         let prefill_t0 = if prefill_profile {
             B::sync(&mut ctx);
+            ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            TAIL_NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            TAIL_NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            TAIL_GATE_UP_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            TAIL_GATE_UP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            TAIL_DOWN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            TAIL_DOWN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
             Some(std::time::Instant::now())
         } else {
             None
@@ -3630,6 +3653,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
             let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
             let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tail_norm_us = TAIL_NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tail_norm_n = TAIL_NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tail_gate_up_us =
+                TAIL_GATE_UP_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tail_gate_up_n = TAIL_GATE_UP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tail_act_us = TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tail_act_n = TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tail_down_us = TAIL_DOWN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tail_down_n = TAIL_DOWN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tail_resid_us = TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let tail_resid_n = TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
             eprintln!(
                 "[prefill-profile] tokens={} layers total={} ms",
                 seq_len,
@@ -3650,6 +3684,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             bucket("matmuls", mm_n, mm_us);
             bucket("norms", norm_n, norm_us);
             bucket("other", other_n, other_us);
+            bucket("tail_norm", tail_norm_n, tail_norm_us);
+            bucket("tail_gate_up", tail_gate_up_n, tail_gate_up_us);
+            bucket("tail_act", tail_act_n, tail_act_us);
+            bucket("tail_down", tail_down_n, tail_down_us);
+            bucket(
+                "tail_mlp",
+                tail_gate_up_n.max(tail_act_n).max(tail_down_n),
+                tail_gate_up_us + tail_act_us + tail_down_us,
+            );
+            bucket("tail_resid", tail_resid_n, tail_resid_us);
         }
 
         if let Some(host) = host_residual.as_deref() {

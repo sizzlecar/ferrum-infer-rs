@@ -1,0 +1,147 @@
+{
+  "bucket_ms_mean": {},
+  "calls": [
+    {
+      "buckets": {},
+      "tokens": 23,
+      "total_ms": 29
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 88
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 88
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 88
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 82
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    },
+    {
+      "buckets": {},
+      "tokens": 122,
+      "total_ms": 80
+    }
+  ],
+  "num_prefills": 27,
+  "total_ms": {
+    "max": 88,
+    "mean": 79.07407407407408,
+    "median": 80,
+    "min": 29
+  }
+}
