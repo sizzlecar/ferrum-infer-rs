@@ -758,6 +758,23 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Self::write_typed::<f32>(ctx, out_f32, &out);
     }
 
+    /// RMSNorm an activation buffer and add the F32 result directly into an
+    /// existing F32 residual shadow. `scratch_f32` is provided for backend
+    /// fallbacks that need to materialize the normalized branch.
+    fn rms_norm_activation_add_to_f32(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        residual_f32: &mut Self::Buffer,
+        scratch_f32: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        Self::rms_norm_activation_to_f32(ctx, input, weight, eps, scratch_f32, tokens, dim);
+        Self::add_inplace(ctx, residual_f32, scratch_f32, tokens * dim);
+    }
+
     /// RMSNorm a typed F32 shadow buffer and write the normalized result back
     /// to the backend's regular activation dtype.
     fn rms_norm_f32_to_activation(

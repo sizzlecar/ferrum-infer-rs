@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXXIII — W2 source checkpoint: fuse Gemma sandwich branch norm into F32 residual add
+
+- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - added backend trait method `rms_norm_activation_add_to_f32` with a safe
+    fallback that materializes the F32 branch then calls `add_inplace`;
+  - added CUDA kernel `rms_norm_f16_add_to_f32` in `sandwich_norm.cu`;
+  - CUDA backend now launches the fused kernel for F16 activation +
+    F16 norm weight + F32 residual shadow;
+  - Gemma sandwich device-shadow path now uses the fused helper for
+    post-attention and post-FFN residual updates;
+  - `nan_trace` keeps the old two-step path so `post_attn_norm` /
+    `post_ffn_norm` intermediate dumps remain available for diagnostics.
+- Expected effect:
+  - removes one F32 residual-add kernel launch and one F32 branch scratch
+    write/read at each Gemma sandwich branch residual update;
+  - affects default CUDA Gemma3 device-shadow path only,not CPU/Metal
+    fallback semantics.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `git diff --check -- crates/ferrum-kernels/src/backend/traits.rs
+    crates/ferrum-kernels/kernels/sandwich_norm.cu
+    crates/ferrum-kernels/src/backend/cuda/mod.rs
+    crates/ferrum-models/src/models/llama_family.rs` PASS;
+  - `cargo check -q -p ferrum-kernels -p ferrum-models --tests` PASS;
+  - `cargo test -q -p ferrum-kernels --lib` PASS,8/8 tests;
+  - `cargo test -q -p ferrum-models --lib` PASS,124/124 tests.
+- Validation still required:
+  - CUDA build must compile the new `sandwich_norm.cu` symbol;
+  - run a minimal product correctness check on the same cache-retained 4090
+    before any performance measurement;
+  - if correctness passes, run a small same-dataset diagnostic to see whether
+    the fused branch update moves W2 throughput or profile buckets.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-15 XXXII — W2 native CUDA dense Marlin probe: gate/up still top target, no tile-default change
 
 - 本轮 artifact:

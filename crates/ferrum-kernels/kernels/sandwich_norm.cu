@@ -50,6 +50,37 @@ extern "C" __global__ void rms_norm_f16_to_f32(
     }
 }
 
+extern "C" __global__ void rms_norm_f16_add_to_f32(
+    const __half* __restrict__ input,
+    const __half* __restrict__ weight,
+    float* __restrict__ residual,
+    const int row_size,
+    const float eps
+) {
+    const int row = blockIdx.x;
+    const int offset = row * row_size;
+
+    float variance = 0.0f;
+    for (int i = threadIdx.x; i < row_size; i += blockDim.x) {
+        float x = __half2float(input[offset + i]);
+        variance += x * x;
+    }
+
+    variance = block_reduce_sum(variance);
+    __shared__ float s_inv_rms;
+    if (threadIdx.x == 0) {
+        s_inv_rms = rsqrtf(variance / (float)row_size + eps);
+    }
+    __syncthreads();
+    float inv_rms = s_inv_rms;
+
+    for (int i = threadIdx.x; i < row_size; i += blockDim.x) {
+        float x = __half2float(input[offset + i]);
+        float w = __half2float(weight[i]);
+        residual[offset + i] += x * inv_rms * w;
+    }
+}
+
 extern "C" __global__ void rms_norm_f32_to_f16(
     const float* __restrict__ input,
     const __half* __restrict__ weight,

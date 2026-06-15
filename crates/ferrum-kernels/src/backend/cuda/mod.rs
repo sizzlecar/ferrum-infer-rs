@@ -985,6 +985,57 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn rms_norm_activation_add_to_f32(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        residual_f32: &mut Self::Buffer,
+        scratch_f32: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        match (
+            input.dtype(),
+            weight.dtype(),
+            residual_f32.dtype(),
+            scratch_f32.dtype(),
+        ) {
+            (
+                crate::backend::Dtype::F16,
+                crate::backend::Dtype::F16,
+                crate::backend::Dtype::F32,
+                crate::backend::Dtype::F32,
+            ) => {
+                let func = ctx.func(
+                    "sandwich_norm",
+                    ptx::SANDWICH_NORM,
+                    "rms_norm_f16_add_to_f32",
+                );
+                let dim_i32 = dim as i32;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(input);
+                b.arg(weight);
+                b.arg(residual_f32);
+                b.arg(&dim_i32);
+                b.arg(&eps);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (tokens as u32, 1, 1),
+                        block_dim: (dim.min(1024) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("rms_norm_activation_add_to_f32 launch");
+            }
+            _ => {
+                Self::rms_norm_activation_to_f32(ctx, input, weight, eps, scratch_f32, tokens, dim);
+                Self::add_inplace(ctx, residual_f32, scratch_f32, tokens * dim);
+            }
+        }
+    }
+
     fn rms_norm_f32_to_activation(
         ctx: &mut Self::Context,
         input_f32: &Self::Buffer,
