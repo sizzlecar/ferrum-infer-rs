@@ -2,6 +2,61 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LIX — W2 CUDA checkpoint: batched graph replay confirmed, not sufficient for 80%
+
+- 本轮源码 checkpoint:
+  `22f92677 test(cuda): log batched graph replay progress`。
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_replay_observability_2026-06-15/`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 batched graph replay observability smoke`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:10-15min,hard cap 20min;
+  - stop condition:收集 capture/replay 日志 + serve correctness smoke,或首败并
+    复制 artifact,或 20min hard cap;
+  - correctness gate:远端 HEAD `22f92677`,CUDA release build rc `0`,
+    `ferrum serve` ready,OpenAI chat smoke 输出 `5`,日志无实际 panic/CUDA
+    error/`<unk>`/`[PAD]`;
+  - performance command:diagnostic-only c16
+    `bench-serve --fail-on-error --seed 9271 --num-prompts 16 --random-output-len 32`,
+    `n_repeats=1`,不是 release 性能证据。
+- 源码改动:
+  - capture 成功时输出 `[batched-graph-capture]`;
+  - post-capture replay 与 pure replay 成功时输出低频
+    `[batched-graph-replay]`;
+  - post-capture replay 现在也计入 `BATCHED_GRAPH_REPLAY_COUNT`;
+  - replay 日志按 1/2/4/8/... 次数打印,避免长 bench 刷屏。
+- 本地验证:
+  - `cargo test -p ferrum-models batched_decode_graph --lib -- --nocapture`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`。
+- CUDA result:
+  - remote HEAD:`22f92677b34bab932407215fcb8c11dd0b372faf`;
+  - binary SHA256:
+    `f6d6828290c330749f1523c191c3e4034759f97d7c53e0ad4948d7e786995b1b`;
+  - `serve_selected_graph_mode=legacy_batched_decode_graph`,
+    `serve_selected_max_sequences=16`;
+  - chat smoke content `5`;
+  - c16 diagnostic bench rc `0`,`completed=16`,`errored=0`,
+    output throughput mean `348.0 tok/s`;
+  - replay evidence in server log:
+    - capture `m=15 m_padded=16 device_shadow=true`;
+    - post-capture replay count `1`;
+    - pure replay counts `2,4,8,16` on the same `m_padded=16` graph;
+    - an additional drain-shape capture `m=7 m_padded=8 device_shadow=true`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Interpretation:
+  - 现在已证明 Gemma3 device-shadow product path 真实进入 legacy batched
+    CUDA graph capture/replay;
+  - 单次 c16 throughput 没有稳定越过 80%,说明 graph launch overhead 不是
+    剩余唯一主瓶颈;
+  - 观测到 replay 主 shape 是 `m=15` 而非满 `m=16`,且 drain shape 会额外
+    capture;下一步应回到 W2-P2 的剩余两条:batch cadence/TTFT 与
+    sustained decode tail MLP/Marlin 投影成本。
+- Release status:
+  - 没有 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍不是 release-grade。
+
 ## 2026-06-15 LVIII — W2 CUDA checkpoint: batched graph product path enabled, c16 diagnostic improves but remains below 80%
 
 - 本轮源码 checkpoint:
