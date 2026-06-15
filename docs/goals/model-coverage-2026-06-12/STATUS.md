@@ -2,6 +2,61 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XLVIII — W2 CUDA checkpoint: native vLLM dense Marlin A/B 排除 kernel-swap 主假设
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_native_probe_retry_2026-06-15/`。
+- 源码 checkpoint:
+  - `09734267 test(cuda): add dense vllm marlin gemma probe`;
+  - `5ce9299e fix(cuda): enable dense vllm marlin probe selector`。
+- GPU 执行合同:
+  - lane:`W2 dense vLLM Marlin native same-shape A/B probe`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD 0.425/hr;
+  - expected runtime/cost:5-12min,hard cap 20min;
+  - stop condition:start/SSH/CUDA/source sync/compile/probe 首败,或
+    `VERDICT: dense vLLM Marlin native CUDA probe complete` 后复制 artifact
+    并停机;
+  - correctness gate:native compile success + probe rc `0` + verdict line;
+  - performance command:diagnostic-only
+    `bash scripts/microbenches/build_and_run_dense_vllm_marlin_gemma3_perf.sh`,
+    不产生 release 性能声明。
+- 执行结果:
+  - first attempt artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_native_probe_2026-06-15/`;
+  - first attempt rc `134`,原因是 build script 的 temporary `perl`
+    selector include 替换没有命中,临时 `marlin.cu` 仍保留注释 include;
+  - 修正脚本后 retry rc `0`,`run.status=PASS`;
+  - stdout 含
+    `VERDICT: dense vLLM Marlin native CUDA probe complete`;
+  - artifact 复制回本地后已停机;`vast_shutdown/cleanup_check.txt`
+    记录 `cur_state=stopped actual_status=exited`。
+- m=16 native A/B 关键数据:
+  - qkv: Ferrum hot `17.005us`,Ferrum weight-cycle `30.278us`,
+    vLLM dense Marlin `18.354us`;
+  - gate_up: Ferrum hot `133.715us`,Ferrum weight-cycle `133.985us`,
+    vLLM dense Marlin `136.581us`;
+  - down: Ferrum hot `30.356us`,Ferrum weight-cycle `68.651us`,
+    vLLM dense Marlin `36.277us`。
+- Product profile 对照:
+  - c16 profile batch `16`;
+  - product per-layer gate_up kernel 约 `140.77us`,与 native Ferrum/vLLM
+    gate_up 基本同量级;
+  - product per-layer down kernel 约 `70.20us`,接近 Ferrum weight-cycle
+    `68.651us`,而不是 Ferrum hot `30.356us`。
+- Interpretation:
+  - “直接换 vLLM dense Marlin kernel 能补齐 c16 14 个百分点差距”这个
+    主假设已被本轮 native A/B 排除;
+  - 当前更可信的瓶颈方向是 product 集成侧的 weight residency/cache-cycle,
+    down projection 的权重访问状态,以及 decode launch/host scheduling
+    组合开销;
+  - 下一步不跑 full sweep,应做最小产品/原生关联 probe:在 decode loop
+    里记录 projection 权重地址/调用顺序/stream sync 与 down projection
+    cache-cycle 状态,确认为什么 product down 落在 weight-cycle 而不是 hot
+    kernel 轨道。
+- Release-grade status:
+  - 这是诊断证据,不是 release gate;
+  - W2 仍无 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+
 ## 2026-06-15 XLVII — W2 source checkpoint: add dense vLLM Marlin native A/B probe
 
 - 本轮代码改动:

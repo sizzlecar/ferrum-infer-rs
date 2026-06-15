@@ -1,0 +1,26 @@
+[microbench] compiling selector-enabled vLLM dense Marlin objects
+[microbench] compiling scripts/microbenches/dense_vllm_marlin_gemma3_perf.cu
+-rwxr-xr-x 1 root root 7758048 Jun 15 11:53 /tmp/dense_vllm_marlin_gemma3_perf
+
+[microbench] running /tmp/dense_vllm_marlin_gemma3_perf
+dense_vllm_marlin_gemma3_perf device=NVIDIA GeForce RTX 4090 sm=8.9 peak_ref_tflops=165.0
+
+shape=qkv k=5376 n=8192 qweight_mb=21.0 scale_mb=0.7
+mode,m,us,useful_tflops,padded_tflops,ret
+auto,16,18.354,76.79,76.79,0
+auto,23,28.178,71.90,100.03,0
+auto,32,29.656,95.04,95.04,0
+
+shape=gate_up k=5376 n=43008 qweight_mb=110.2 scale_mb=3.4
+mode,m,us,useful_tflops,padded_tflops,ret
+auto,16,136.581,54.17,54.17,0
+auto,23,139.395,76.30,106.16,0
+auto,32,140.978,104.96,104.96,0
+
+shape=down k=21504 n=5376 qweight_mb=55.1 scale_mb=1.7
+mode,m,us,useful_tflops,padded_tflops,ret
+auto,16,36.277,101.98,101.98,0
+auto,23,64.657,82.25,114.43,0
+auto,32,65.534,112.90,112.90,0
+
+VERDICT: dense vLLM Marlin native CUDA probe complete

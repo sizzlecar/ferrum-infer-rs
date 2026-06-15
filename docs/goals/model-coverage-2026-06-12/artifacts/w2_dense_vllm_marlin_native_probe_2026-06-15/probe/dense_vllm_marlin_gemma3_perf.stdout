@@ -1,0 +1,5 @@
+[microbench] compiling selector-enabled vLLM dense Marlin objects
+[microbench] compiling scripts/microbenches/dense_vllm_marlin_gemma3_perf.cu
+-rwxr-xr-x 1 root root 7758048 Jun 15 11:48 /tmp/dense_vllm_marlin_gemma3_perf
+
+[microbench] running /tmp/dense_vllm_marlin_gemma3_perf
