@@ -1,0 +1,22 @@
+## remote source
+head: aa741f90b5a135d974fbb824283252a6b66d5857
+
+## remote git status caveat
+The remote worktree was intentionally dirty for this diagnostic checkpoint:
+- the new native CUDA probe files were synced before being committed locally;
+- local historical artifact directories were excluded from rsync, which made old
+  artifact paths appear deleted in `git status --short` on the remote host.
+
+Relevant uncommitted files for this checkpoint at probe time:
+?? scripts/microbenches/build_and_run_paged_varlen_window_correctness.sh
+?? scripts/microbenches/paged_varlen_window_correctness.cu
+
+## nvidia-smi
+Mon Jun 15 10:23:24 2026
+NVIDIA-SMI 565.77, Driver Version: 565.77, CUDA Version: 12.7
+GPU 0: NVIDIA GeForce RTX 4090, 24564 MiB total, no running processes before probe
+
+## nvcc
+nvcc: NVIDIA (R) Cuda compiler driver
+Cuda compilation tools, release 12.4, V12.4.131
+Build cuda_12.4.r12.4/compiler.34097967_0
