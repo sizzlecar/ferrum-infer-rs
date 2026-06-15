@@ -368,7 +368,7 @@ impl ResolvedFerrumConfig {
             "selected_weight_placement": if selected_layer_split_plan.is_some() { "layer_split" } else { "single_device" },
             "selected_kv_layout": if backend.eq_ignore_ascii_case("cpu") { "contiguous" } else { "paged" },
             "selected_attention_impl": self.selected_string("attention_decode_backend"),
-            "selected_graph_mode": self.selected_string("moe_graph_policy"),
+            "selected_graph_mode": self.selected_graph_mode(),
             "selected_max_sequences": selected_max_sequences,
             "selected_max_model_len": selected_max_model_len,
             "selected_kv_capacity": selected_kv_capacity,
@@ -453,6 +453,17 @@ impl ResolvedFerrumConfig {
             .iter()
             .find(|decision| decision.selection == selection)
             .map(|decision| decision.selected.clone())
+    }
+
+    fn selected_graph_mode(&self) -> Option<String> {
+        let decode_graph = self.selected_string("decode_graph_policy");
+        if decode_graph
+            .as_deref()
+            .is_some_and(|mode| mode != "graph_disabled")
+        {
+            return decode_graph;
+        }
+        self.selected_string("moe_graph_policy")
     }
 
     fn runtime_entry_value(&self, key: &str) -> Option<String> {
@@ -627,6 +638,8 @@ impl FerrumConfigBuilder {
             AutoConfigSource::WorkloadPreset,
         )?;
         let graph = self.bool_value("FERRUM_MOE_GRAPH", false, AutoConfigSource::WorkloadPreset)?;
+        let batched_graph =
+            self.bool_value("FERRUM_BATCHED_GRAPH", false, AutoConfigSource::Default)?;
         let greedy = self.bool_value(
             "FERRUM_GREEDY_ARGMAX",
             (cuda_backend || self.hardware.backend.eq_ignore_ascii_case("metal"))
@@ -677,6 +690,7 @@ impl FerrumConfigBuilder {
             pair_ids.value,
             graph.value,
         )?;
+        self.validate_batched_graph(batched_graph.value)?;
         self.validate_memory(
             kv_blocks.value,
             max_sequences.value,
@@ -709,6 +723,7 @@ impl FerrumConfigBuilder {
             ("FERRUM_VLLM_MOE", &vllm_moe),
             ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
             ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
+            ("FERRUM_BATCHED_GRAPH", &batched_graph),
             ("FERRUM_GREEDY_ARGMAX", &greedy),
         ] {
             if resolved.source != AutoConfigSource::Env {
@@ -721,6 +736,7 @@ impl FerrumConfigBuilder {
         }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
+        decisions.push(self.decode_graph_decision(batched_graph));
         decisions.push(self.scalar_decision(
             "kv_block_count",
             kv_blocks,
@@ -1104,6 +1120,34 @@ impl FerrumConfigBuilder {
         Ok(())
     }
 
+    fn validate_batched_graph(&self, graph: bool) -> Result<(), AutoConfigError> {
+        if !graph {
+            return Ok(());
+        }
+        if self.model.moe.is_some() {
+            return self.invalid(
+                "FERRUM_BATCHED_GRAPH",
+                "legacy batched decode graph does not apply to MoE models",
+            );
+        }
+        if !self.is_cuda_backend() {
+            return self.invalid(
+                "FERRUM_BATCHED_GRAPH",
+                "legacy batched decode graph requires CUDA backend",
+            );
+        }
+        if !self.hardware.graph_support {
+            return self.invalid(
+                "FERRUM_BATCHED_GRAPH",
+                "hardware/backend does not support CUDA graph replay",
+            );
+        }
+        if !self.hardware.compiled_features.cuda_graph {
+            return self.invalid("FERRUM_BATCHED_GRAPH", "CUDA graph support is not compiled");
+        }
+        Ok(())
+    }
+
     fn validate_sampling(&self, greedy: bool) -> Result<(), AutoConfigError> {
         if greedy && !self.hardware.compiled_features.greedy_argmax {
             return self.invalid("FERRUM_GREEDY_ARGMAX", "GPU argmax is not compiled");
@@ -1371,6 +1415,35 @@ impl FerrumConfigBuilder {
                 [
                     ("graph_clean_decode", "graph decode not selected"),
                     ("graph_disabled", "graph decode selected"),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Performance,
+                RuntimeConfigEffect::Correctness,
+            ],
+        )
+    }
+
+    fn decode_graph_decision(&self, graph: ResolvedValue<bool>) -> AutoConfigDecision {
+        let selected = if graph.value {
+            "legacy_batched_decode_graph"
+        } else {
+            "graph_disabled"
+        };
+        self.decision(
+            "decode_graph_policy",
+            selected,
+            graph.source,
+            graph.source_key,
+            ["legacy_batched_decode_graph", "graph_disabled"],
+            self.rejected_except(
+                selected,
+                [
+                    (
+                        "legacy_batched_decode_graph",
+                        "legacy batched decode graph not selected",
+                    ),
+                    ("graph_disabled", "legacy batched decode graph selected"),
                 ],
             ),
             vec![
@@ -1765,6 +1838,7 @@ mod tests {
             "vllm_marlin_moe_device_route_pair_ids"
         );
         assert_eq!(decisions["moe_graph_policy"], "graph_disabled");
+        assert_eq!(decisions["decode_graph_policy"], "graph_disabled");
         assert_eq!(decisions["prefix_cache_policy"], "prefix_cache_disabled");
         assert_eq!(decisions["sampling_readback_path"], "gpu_greedy_argmax");
         assert_eq!(
@@ -2445,6 +2519,78 @@ mod tests {
                 selection,
                 ..
             } if selection == "moe_graph_policy"
+        ));
+    }
+
+    #[test]
+    fn batched_graph_override_materializes_decode_graph_policy() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[(
+            "FERRUM_BATCHED_GRAPH",
+            "1",
+            RuntimeConfigSource::Cli,
+        )]))
+        .with_model_capabilities(ModelCapabilities::unknown())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(
+            decisions["decode_graph_policy"],
+            "legacy_batched_decode_graph"
+        );
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_BATCHED_GRAPH")
+            .expect("batched graph entry");
+        assert_eq!(entry.effective_value, "1");
+        assert_eq!(
+            resolved.effective_config_document()["selected_graph_mode"],
+            "legacy_batched_decode_graph"
+        );
+    }
+
+    #[test]
+    fn batched_graph_requires_cuda_graph_support() {
+        let mut features = CompiledKernelFeatures::m3_fast_path_without_fa2();
+        features.cuda_graph = false;
+        let hardware = HardwareCapabilities::rtx4090_cuda(features);
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_BATCHED_GRAPH", "1")]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .expect_err("batched graph should require compiled graph support");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_BATCHED_GRAPH"
+        ));
+    }
+
+    #[test]
+    fn batched_graph_rejects_non_cuda_backend() {
+        let hardware =
+            cpu_hardware_with_features(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_BATCHED_GRAPH", "1")]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .expect_err("batched graph should require CUDA");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_BATCHED_GRAPH"
         ));
     }
 

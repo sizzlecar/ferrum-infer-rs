@@ -145,6 +145,14 @@ pub struct ServeCommand {
     #[arg(long, conflicts_with = "greedy_argmax")]
     pub disable_greedy_argmax: bool,
 
+    /// Enable legacy Llama/Gemma batched decode CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_batched_graph")]
+    pub batched_graph: bool,
+
+    /// Disable legacy Llama/Gemma batched decode CUDA graph replay.
+    #[arg(long, conflicts_with = "batched_graph")]
+    pub disable_batched_graph: bool,
+
     /// Named startup/runtime preset, for example
     /// `m3_qwen3_30b_a3b_int4`.
     #[arg(long, value_name = "PRESET")]
@@ -219,6 +227,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         kv_capacity,
         greedy_argmax,
         disable_greedy_argmax,
+        batched_graph,
+        disable_batched_graph,
         runtime_preset,
         effective_config_json,
         decision_trace_jsonl,
@@ -579,6 +589,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_runtime_flags_json.as_deref(),
         layer_split_pipeline_mode,
     );
+    if let Some(enabled) = batched_graph_cli_override(batched_graph, disable_batched_graph) {
+        startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+            "FERRUM_BATCHED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
     if let Some(selection) = &gpu_selection {
         startup_cli_runtime_entries.extend(selection.runtime_config_entries());
     }
@@ -1125,6 +1142,16 @@ fn prefix_cache_cli_override(
 }
 
 fn greedy_argmax_cli_override(enable: bool, disable: bool) -> Option<bool> {
+    if enable {
+        Some(true)
+    } else if disable {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn batched_graph_cli_override(enable: bool, disable: bool) -> Option<bool> {
     if enable {
         Some(true)
     } else if disable {
@@ -2580,6 +2607,13 @@ mod tests {
 
         assert_eq!(enabled_entries, product_enabled_entries);
         assert_eq!(disabled_entries, product_disabled_entries);
+    }
+
+    #[test]
+    fn batched_graph_cli_override_records_flag_state() {
+        assert_eq!(batched_graph_cli_override(true, false), Some(true));
+        assert_eq!(batched_graph_cli_override(false, true), Some(false));
+        assert_eq!(batched_graph_cli_override(false, false), None);
     }
 
     #[test]

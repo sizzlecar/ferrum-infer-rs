@@ -10,7 +10,7 @@ use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, Promp
 use ferrum_types::{
     FerrumConfigBuilder, FerrumError, FinishReason, InferenceRequest, ModelCapabilities, Priority,
     RequestId, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
-    SamplingParams, WorkloadProfile,
+    RuntimeConfigSource, SamplingParams, WorkloadProfile,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -293,6 +293,14 @@ pub struct RunCommand {
     /// vLLM-compatible alias for `FERRUM_MAX_BATCHED_TOKENS`.
     #[arg(long, value_name = "N")]
     pub max_num_batched_tokens: Option<usize>,
+
+    /// Enable legacy Llama/Gemma batched decode CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_batched_graph")]
+    pub batched_graph: bool,
+
+    /// Disable legacy Llama/Gemma batched decode CUDA graph replay.
+    #[arg(long, conflicts_with = "batched_graph")]
+    pub disable_batched_graph: bool,
 
     /// KV cache element dtype (Dim 5 polymorphism point). Accepts
     /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
@@ -1696,6 +1704,13 @@ fn run_startup_cli_runtime_entries(
         "FERRUM_MAX_BATCHED_TOKENS",
         cmd.max_num_batched_tokens,
     );
+    if let Some(enabled) = bool_cli_override(cmd.batched_graph, cmd.disable_batched_graph) {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_BATCHED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
     crate::layer_split_pipeline::push_cli_runtime_entry(
         &mut entries,
         cmd.layer_split_pipeline_mode,
@@ -1704,6 +1719,16 @@ fn run_startup_cli_runtime_entries(
         entries.extend(selection.runtime_config_entries());
     }
     entries
+}
+
+fn bool_cli_override(enable: bool, disable: bool) -> Option<bool> {
+    if enable {
+        Some(true)
+    } else if disable {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn materialize_run_cli_runtime_entries(entries: &[RuntimeConfigEntry]) {
@@ -1811,6 +1836,8 @@ mod tests {
             max_model_len: None,
             max_num_seqs: None,
             max_num_batched_tokens: None,
+            batched_graph: false,
+            disable_batched_graph: false,
             kv_dtype: None,
             kv_capacity: None,
             kv_max_blocks: None,
@@ -1862,6 +1889,22 @@ mod tests {
             .find(|entry| entry.key == crate::layer_split_pipeline::LAYER_SPLIT_PIPELINE_MODE_KEY)
             .expect("missing layer split pipeline mode entry");
         assert_eq!(entry.effective_value, "batch");
+        assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_batched_graph_flag() {
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let mut cmd = test_run_cmd();
+        cmd.batched_graph = true;
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let entry = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_BATCHED_GRAPH")
+            .expect("missing batched graph entry");
+        assert_eq!(entry.effective_value, "1");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
     }
 
