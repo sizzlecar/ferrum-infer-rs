@@ -2,6 +2,67 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LVIII — W2 CUDA checkpoint: batched graph product path enabled, c16 diagnostic improves but remains below 80%
+
+- 本轮源码 checkpoint:
+  `2b3b5891 perf(cuda): expose batched decode graph policy`。
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_product_smoke_2026-06-15/`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 batched decode graph product correctness smoke`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:15-25min,hard cap 30min;
+  - stop condition:`ferrum run` + `ferrum serve` smoke 通过、首个明确失败并收集
+    artifact、或 30min hard cap;
+  - correctness gate:CUDA release build,`ferrum run` known-answer,
+    `ferrum serve` OpenAI chat smoke,effective config/decision trace 证明
+    `decode_graph_policy=legacy_batched_decode_graph`;
+  - performance command:diagnostic-only c16 `bench-serve --fail-on-error --seed 9271`,
+    `n_repeats=1`,不是 release 性能证据。
+- 源码/产品路径:
+  - `ferrum run` 与 `ferrum serve` 均新增公开
+    `--batched-graph/--disable-batched-graph`;
+  - config file 支持 `runtime.batched_graph`;
+  - auto-config 新增 `decode_graph_policy` decision,并 materialize
+    `FERRUM_BATCHED_GRAPH`;
+  - legacy batched decode graph 仍禁止 host residual shadow,但允许 Gemma3
+    device residual shadow,并使用独立 graph key namespace。
+- 本地验证:
+  - `cargo test -p ferrum-types batched_graph -- --nocapture`;
+  - `cargo test -p ferrum-cli batched_graph -- --nocapture`;
+  - `cargo test -p ferrum-cli runtime_cli_config_emits_config_file_source_entries -- --nocapture`;
+  - `cargo test -p ferrum-cli batched_graph_cli_override_records_flag_state -- --nocapture`;
+  - `cargo test -p ferrum-models batched_decode_graph --lib -- --nocapture`;
+  - `cargo test -p ferrum-types m3_preset_selects_current_safe_fast_path_without_fa2 -- --nocapture`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`。
+- CUDA product smoke:
+  - remote HEAD:`2b3b5891ff94d6a4d793bb39bd6cab148af49588`;
+  - binary SHA256:
+    `c31d8b4af03f4669f7fac4fc49035adff97ca4d680d80775703aff99474b3d33`;
+  - model path:
+    `/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2`;
+  - `ferrum run` rc `0`,content `5`,
+    `selected_graph_mode=legacy_batched_decode_graph`;
+  - `ferrum serve` ready,OpenAI chat content `5`,
+    `selected_graph_mode=legacy_batched_decode_graph`,
+    `selected_max_sequences=16`;
+  - c16 diagnostic bench rc `0`,`16 completed / 0 errored`,
+    `372.3 tok/s`;
+  - log scan found no actual panic/CUDA error/illegal address/OOM/`<unk>`/`[PAD]`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Interpretation:
+  - 产品入口已能用公开 typed path 打开 batched decode graph policy;
+  - c16 diagnostic 从 prompt-token admission checkpoint 的 `344.7 tok/s`
+    提升到 `372.3 tok/s`,但与同机 vLLM c16 `518.8 tok/s` 相比仍约
+    `71.8%`,没有达到 80%;
+  - 当前 artifact 证明 policy 生效和产品 correctness smoke 通过,但没有明确
+    记录 graph replay counter;下一步应补最小 replay 可观测性,再用同一 c16
+    diagnostic 验证 replay 是否确实发生。
+- Release status:
+  - 没有 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍不是 release-grade。
+
 ## 2026-06-15 LVII — W2 native checkpoint: Gemma3 shadow graph native probe PASS
 
 - 本轮 artifact:
