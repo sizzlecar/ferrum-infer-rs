@@ -2,6 +2,60 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XVI — W2 natural-prompt baseline probe: vLLM c16/c32 zero-error
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_natural_prompt_baseline_probe_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `poll=01 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=02 cur_state=stopped actual_status=exited intended_status=stopped`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA natural-prompt baseline safety probe`;
+  - expected runtime/cost:20-50min,hard cap 60min,1x RTX 4090 instance
+    `40826362` at about USD 0.425/hr;
+  - stop condition:startup/SSH/CUDA/vLLM smoke failure,ShareGPT-style ASCII
+    dataset c16 nonzero,c16 pass then c32/cap16 nonzero,probe complete and
+    artifact copied,or 60min cap;
+  - correctness gate:torch CUDA smoke plus vLLM OpenAI smoke;
+  - performance command:diagnostic-only
+    `ferrum bench-serve --dataset sharegpt --sharegpt-path <artifact>/ascii_sharegpt.jsonl --fail-on-error --require-ci --seed 9271 --n-repeats 3 --num-prompts 100`
+    for c16 then c32.
+- Dataset:
+  - generated artifact-local JSONL:
+    `dataset/ascii_sharegpt.jsonl`;
+  - actual tokenizer-counted input length:requested `256`,min/max/mean `112`.
+- vLLM setup:
+  - venv:`/workspace/vllm-venv-0101-cu126`;
+  - server:vLLM OpenAI API,`v0.10.1.1`,`transformers==4.55.4`,
+    `--max-model-len 512 --max-num-seqs 16 --gpu-memory-utilization 0.92`;
+  - smoke request returned content `"5\n"` with usage.
+- Probe result(all `n_repeats=3`, `num_prompts=100`,
+  `output_token_count_source=usage`,zero errors,bad_output `[0,0,0]`):
+  - c16:completed `[100,100,100]`,errored `[0,0,0]`,
+    mean `530.829 tok/s`,ci95 half-width `39.679`,LCB `491.150`,
+    p95 ITL `28.130 ms`;
+  - c32 client / vLLM `--max-num-seqs 16`:completed `[100,100,100]`,
+    errored `[0,0,0]`,mean `562.685 tok/s`,ci95 half-width `13.292`,
+    LCB `549.393`,p95 ITL `27.716 ms`.
+- Interpretation:
+  - natural ASCII ShareGPT-style prompts avoid the vLLM invalid-UTF8 failure
+    seen on random-token prompts,so this is a viable correctness-clean
+    baseline dataset candidate;
+  - the baseline is substantially faster than current Ferrum random-matrix
+    c16/c32,so the final W2 80% line would be about c16 `392.9 tok/s`
+    and c32 `439.5 tok/s` if this dataset is adopted;
+  - no final claim yet: Ferrum must be rerun on the exact same JSONL dataset
+    and c32 effective concurrency must be published as 16.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - use this dataset for targeted Ferrum diagnostics or optimization;
+  - avoid another full release sweep until there is evidence that Ferrum c16/c32
+    can approach the natural-prompt baseline 80% thresholds.
+
 ## 2026-06-15 XV — W2 baseline safety probe: vLLM c16 invalid-UTF8 reproduces
 
 - 本轮 artifact:

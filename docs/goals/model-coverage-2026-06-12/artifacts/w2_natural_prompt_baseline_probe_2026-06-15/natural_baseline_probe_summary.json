@@ -1,0 +1,62 @@
+[
+  {
+    "concurrency": 16,
+    "actual_input_tokens": {
+      "requested": 256,
+      "min": 112,
+      "max": 112,
+      "mean": 112.0
+    },
+    "completed_per_run": [
+      100,
+      100,
+      100
+    ],
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "bad_output_per_run": [
+      0,
+      0,
+      0
+    ],
+    "output_tps_mean": 530.8289868112075,
+    "output_tps_ci95_hw": 39.6786876264756,
+    "output_tps_lcb": 491.1502991847319,
+    "p95_itl_ms": 28.130182716666667,
+    "p95_itl_ci95_hw": 4.434975376568679,
+    "output_token_count_source": "usage"
+  },
+  {
+    "concurrency": 32,
+    "actual_input_tokens": {
+      "requested": 256,
+      "min": 112,
+      "max": 112,
+      "mean": 112.0
+    },
+    "completed_per_run": [
+      100,
+      100,
+      100
+    ],
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "bad_output_per_run": [
+      0,
+      0,
+      0
+    ],
+    "output_tps_mean": 562.6846018763553,
+    "output_tps_ci95_hw": 13.292018943717538,
+    "output_tps_lcb": 549.3925829326378,
+    "p95_itl_ms": 27.7155429,
+    "p95_itl_ci95_hw": 1.3809025903239343,
+    "output_token_count_source": "usage"
+  }
+]
