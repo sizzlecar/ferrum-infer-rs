@@ -1130,8 +1130,11 @@ mod tests {
     }
 
     #[test]
-    fn prompt_token_metadata_is_opt_in_for_prefill_admission() {
-        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+    fn prompt_token_metadata_can_be_disabled_for_prefill_admission() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: false,
+            ..SchedulerConfig::default()
+        });
 
         for _ in 0..16 {
             enqueue_waiting(

@@ -2,6 +2,43 @@
 
 进度日志,倒序。
 
+## 2026-06-15 LIV — W2 source checkpoint: default scheduler admission uses prompt-token metadata
+
+- 本轮没有启动 GPU,不产生性能结论;这是针对 c16 TTFT/prefill/scheduler
+  半边差距的源码 checkpoint。
+- 源码改动:
+  - `SchedulerConfig::default()` 现在默认
+    `prompt_token_estimate=true`;
+  - `#[serde(default)]` 改为显式 true default,避免配置文件省略字段时回到
+    bool 的 false;
+  - auto-config 默认 decision trace 现在选择
+    `scheduler_admission_policy=prompt_token_estimate`;
+  - 显式 `FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE=0` 仍可回到
+    `continuous_default`,且 trace 保留该 source key;
+  - scheduler 测试保留显式禁用路径,验证旧 admission 行为仍可复现。
+- 为什么这个 checkpoint 有意义:
+  - 产品 `ferrum run` / `ferrum serve` 已在提交 scheduler 前写入真实
+    `ferrum_prompt_tokens`;
+  - 旧默认 false 会让初始 prefill admission 用 `prefill_chunk_size=512`
+    粗估,在 `max_num_batched_tokens=2048` 下 c16 短 prompt 首批只能进
+    约 4 个请求;
+  - 默认 true 后,短 prompt admission 会按真实 prompt token 计入预算,目标是
+    降低 c16 TTFT/prefill 排队部分,不是直接改 decode kernel。
+- 本地验证:
+  - `cargo fmt --all -- --check`;
+  - `cargo test -p ferrum-types scheduler_config -- --nocapture`;
+  - `cargo test -p ferrum-types scheduler_prompt_token_estimate -- --nocapture`;
+  - `cargo test -p ferrum-scheduler prompt_token_metadata -- --nocapture`;
+  - `cargo test -p ferrum-types engine_config_default_sane -- --nocapture`。
+- 下一步:
+  - 只做最小 CUDA c16 A/B/product smoke,验证默认 prompt-token admission
+    是否实际降低 TTFT/提升 c16 ratio;
+  - 若没有明显收益,继续回到已定位的 decode/Marlin tail MLP 半边。
+- Correctness/performance status:
+  - 本地配置和 scheduler 单元测试通过,没有发现新的 correctness blocker;
+  - 没有 `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`,W2 仍不是
+    release-grade。
+
 ## 2026-06-15 LIII — W2 bottleneck synthesis: c16 gap is split between TTFT/prefill and sustained decode
 
 - 本轮 artifact:

@@ -7,6 +7,7 @@ fn engine_config_default_sane() {
     assert!(cfg.batching.max_batch_size >= 1);
     assert_eq!(cfg.kv_cache.max_blocks, 2048);
     assert_eq!(cfg.batching.max_num_batched_tokens, 2048);
+    assert!(cfg.scheduler.prompt_token_estimate);
     assert!(cfg.monitoring.enable_metrics);
 }
 
@@ -104,9 +105,22 @@ fn scheduler_config_default_sane() {
     let cfg = SchedulerConfig::default();
     assert!(matches!(cfg.policy, SchedulingPolicy::Priority));
     assert!(cfg.max_waiting_requests >= 1);
-    assert!(!cfg.prompt_token_estimate);
+    assert!(cfg.prompt_token_estimate);
     assert_eq!(cfg.prefill_first_until_active, None);
     assert_eq!(cfg.active_decode_prefill_chunk, None);
+}
+
+#[test]
+fn scheduler_config_missing_prompt_token_estimate_uses_default_true() {
+    let mut value = serde_json::to_value(SchedulerConfig::default()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("prompt_token_estimate");
+
+    let cfg: SchedulerConfig = serde_json::from_value(value).unwrap();
+
+    assert!(cfg.prompt_token_estimate);
 }
 
 #[test]

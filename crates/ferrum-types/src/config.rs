@@ -168,7 +168,7 @@ pub struct SchedulerConfig {
     /// SLA enforcement enabled
     pub enable_sla_enforcement: bool,
     /// Use prompt-token metadata for initial continuous-batch admission estimates.
-    #[serde(default)]
+    #[serde(default = "default_prompt_token_estimate")]
     pub prompt_token_estimate: bool,
     /// Prefer new prefills over early decodes until this many requests are active.
     #[serde(default)]
@@ -191,12 +191,16 @@ impl Default for SchedulerConfig {
             enable_load_balancing: false,
             fair_share_weights: HashMap::new(),
             enable_sla_enforcement: false,
-            prompt_token_estimate: false,
+            prompt_token_estimate: default_prompt_token_estimate(),
             prefill_first_until_active: None,
             active_decode_prefill_chunk: None,
             scheduler_none_prof: false,
         }
     }
+}
+
+fn default_prompt_token_estimate() -> bool {
+    true
 }
 
 impl SchedulerConfig {
