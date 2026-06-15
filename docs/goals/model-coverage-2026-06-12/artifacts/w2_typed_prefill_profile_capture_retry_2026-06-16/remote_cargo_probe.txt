@@ -1,0 +1,7 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+lrwxrwxrwx 1 root root   6 Jun 13 14:17 /root/.cargo/bin/cargo -> rustup
+-rw-r--r-- 1 root root 300 Jun 13 14:17 /root/.cargo/env
+/root/.cargo/bin/cargo
+cargo 1.96.0 (30a34c682 2026-05-25)
