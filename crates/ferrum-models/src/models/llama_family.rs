@@ -1015,6 +1015,7 @@ pub(crate) fn llama_layer_attention_schedule(
 fn unified_varlen_qkv_unsupported_reason(
     cfg: &LlamaFamilyConfig,
     backend_supports_varlen_qkv: bool,
+    backend_supports_device_f32_residual_shadow: bool,
 ) -> Option<&'static str> {
     if !backend_supports_varlen_qkv {
         return Some(
@@ -1023,15 +1024,21 @@ fn unified_varlen_qkv_unsupported_reason(
         );
     }
     if cfg.sandwich_norms {
-        return Some(
-            "LlamaFamilyModel::unified_forward: sandwich-norm family requires \
-             Gemma3 layer semantics (local/global attention windows, local RoPE, \
-             GeGLU, and post-attn/post-ffn sandwich norms); unified varlen \
-             prefill is disabled until that path implements those semantics. \
-             The backend varlen attention surface must carry per-layer \
-             sliding-window semantics before this guard can be relaxed. \
-             Engine will fall back to per-item dispatch.",
-        );
+        if cfg.sliding_window_pattern == 0 {
+            return Some(
+                "LlamaFamilyModel::unified_forward: sandwich-norm family requires \
+                 an explicit local/global sliding-window layer pattern. Engine will \
+                 fall back to per-item dispatch.",
+            );
+        }
+        if !backend_supports_device_f32_residual_shadow {
+            return Some(
+                "LlamaFamilyModel::unified_forward: sandwich-norm family requires \
+                 backend device-side F32 residual shadow support for unified \
+                 GeGLU and post-attn/post-ffn sandwich norms. Engine will fall \
+                 back to per-item dispatch.",
+            );
+        }
     }
     None
 }
@@ -1258,6 +1265,9 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
     pub unified_packed_q: Option<B::Buffer>,
     pub unified_attn_out: Option<B::Buffer>,
     pub unified_o_proj_out: Option<B::Buffer>,
+    pub unified_sandwich_tmp: Option<B::Buffer>,
+    pub unified_residual_f32_shadow: Option<B::Buffer>,
+    pub unified_sandwich_branch_f32: Option<B::Buffer>,
     pub unified_gate_up_out: Option<B::Buffer>,
     pub unified_silu_out: Option<B::Buffer>,
     pub unified_mlp_out: Option<B::Buffer>,
@@ -1408,6 +1418,9 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             unified_packed_q: None,
             unified_attn_out: None,
             unified_o_proj_out: None,
+            unified_sandwich_tmp: None,
+            unified_residual_f32_shadow: None,
+            unified_sandwich_branch_f32: None,
             unified_gate_up_out: None,
             unified_silu_out: None,
             unified_mlp_out: None,
@@ -1466,6 +1479,11 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         if m_total <= self.unified_capacity
             && self.unified_residual.is_some()
             && self.unified_cu_seqlens_q.is_some()
+            && (!cfg.sandwich_norms
+                || (self.unified_sandwich_tmp.is_some()
+                    && (!B::supports_device_f32_residual_shadow()
+                        || (self.unified_residual_f32_shadow.is_some()
+                            && self.unified_sandwich_branch_f32.is_some()))))
         {
             return;
         }
@@ -1482,6 +1500,9 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         self.unified_packed_q = None;
         self.unified_attn_out = None;
         self.unified_o_proj_out = None;
+        self.unified_sandwich_tmp = None;
+        self.unified_residual_f32_shadow = None;
+        self.unified_sandwich_branch_f32 = None;
         self.unified_gate_up_out = None;
         self.unified_silu_out = None;
         self.unified_mlp_out = None;
@@ -1502,6 +1523,24 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         ));
         self.unified_o_proj_out =
             Some(alloc_model_buffer::<B>("llama.unified.o_proj_out", cap * h));
+        if cfg.sandwich_norms {
+            self.unified_sandwich_tmp = Some(alloc_model_buffer::<B>(
+                "llama.unified.sandwich_tmp",
+                cap * h,
+            ));
+            if B::supports_device_f32_residual_shadow() {
+                self.unified_residual_f32_shadow = Some(alloc_model_typed_buffer::<B>(
+                    "llama.unified.residual_f32_shadow",
+                    ferrum_kernels::backend::Dtype::F32,
+                    cap * h,
+                ));
+                self.unified_sandwich_branch_f32 = Some(alloc_model_typed_buffer::<B>(
+                    "llama.unified.sandwich_branch_f32",
+                    ferrum_kernels::backend::Dtype::F32,
+                    cap * h,
+                ));
+            }
+        }
         self.unified_gate_up_out = Some(alloc_model_buffer::<B>(
             "llama.unified.gate_up_out",
             cap * 2 * im,
@@ -1798,22 +1837,25 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let runtime_cfg = cfg.to_runtime();
         // Construction-time capability resolution (GOAL-allowed): read once here
         // so the forward hot paths read self.* instead of B::supports_*().
-        // Sandwich-norm families (Gemma 3) can use the legacy contiguous
-        // batched-decode path only after that path has the Gemma layer
-        // semantics (GeGLU, post-attn/post-ffn norms, dual rope, per-layer
-        // windows) and a device-side F32 residual shadow. Varlen unified
-        // stays pinned off until paged/unified attention learns per-layer
-        // local-window semantics.
+        // Sandwich-norm families (Gemma 3) require the Gemma layer semantics
+        // (GeGLU, post-attn/post-ffn norms, dual rope, per-layer windows)
+        // and a device-side F32 residual shadow before a batched/unified
+        // fast path is enabled.
         let supports_sandwich_batched_decode =
             supports_sandwich_legacy_batched_decode(&cfg, B::supports_device_f32_residual_shadow());
-        let supports_varlen_qkv =
-            unified_varlen_qkv_unsupported_reason(&cfg, B::supports_varlen_qkv()).is_none();
+        let supports_varlen_qkv = unified_varlen_qkv_unsupported_reason(
+            &cfg,
+            B::supports_varlen_qkv(),
+            B::supports_device_f32_residual_shadow(),
+        )
+        .is_none();
         let supports_batched_decode = B::supports_llama_family_batched_decode()
             && (!cfg.sandwich_norms || supports_sandwich_batched_decode);
         if cfg.sandwich_norms {
             tracing::info!(
-                "Gemma3 family: legacy batched_decode={} varlen_unified=false",
-                supports_batched_decode
+                "Gemma3 family: legacy batched_decode={} varlen_unified={}",
+                supports_batched_decode,
+                supports_varlen_qkv
             );
         }
         let runtime_env = LlamaFamilyRuntimeEnv::from_env();
@@ -4664,11 +4706,15 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
             ));
         }
         if !self.supports_varlen_qkv {
-            let reason = unified_varlen_qkv_unsupported_reason(&self.cfg, B::supports_varlen_qkv())
-                .unwrap_or(
-                    "LlamaFamilyModel::unified_forward: varlen QKV support disabled. Engine will \
+            let reason = unified_varlen_qkv_unsupported_reason(
+                &self.cfg,
+                B::supports_varlen_qkv(),
+                B::supports_device_f32_residual_shadow(),
+            )
+            .unwrap_or(
+                "LlamaFamilyModel::unified_forward: varlen QKV support disabled. Engine will \
                      fall back to per-item dispatch.",
-                );
+            );
             return Err(ferrum_types::FerrumError::unsupported(reason));
         }
         if items
@@ -5119,26 +5165,34 @@ mod tests {
     }
 
     #[test]
-    fn unified_varlen_qkv_rejects_sandwich_configs_even_when_backend_supports_varlen() {
+    fn unified_varlen_qkv_requires_gemma_sandwich_prerequisites() {
         let mut cfg = test_llama_config(1, true);
         cfg.sandwich_norms = true;
         cfg.sliding_window = 512;
         cfg.sliding_window_pattern = 6;
         cfg.activation = Activation::GeluTanh;
 
-        let reason = unified_varlen_qkv_unsupported_reason(&cfg, true)
-            .expect("sandwich configs must not enter legacy unified varlen path");
+        let reason = unified_varlen_qkv_unsupported_reason(&cfg, true, false)
+            .expect("sandwich configs without device F32 shadow must be rejected");
 
         assert!(reason.contains("sandwich-norm family"));
-        assert!(reason.contains("local/global attention windows"));
+        assert!(reason.contains("device-side F32 residual shadow"));
         assert!(reason.contains("post-attn/post-ffn sandwich norms"));
-        assert!(reason.contains("per-layer sliding-window semantics"));
 
         cfg.sandwich_norms = false;
-        assert!(unified_varlen_qkv_unsupported_reason(&cfg, true).is_none());
-        assert!(unified_varlen_qkv_unsupported_reason(&cfg, false)
+        assert!(unified_varlen_qkv_unsupported_reason(&cfg, true, false).is_none());
+        assert!(unified_varlen_qkv_unsupported_reason(&cfg, false, false)
             .expect("backend without varlen support should be rejected")
             .contains("backend lacks varlen"));
+
+        cfg.sandwich_norms = true;
+        cfg.sliding_window_pattern = 0;
+        assert!(unified_varlen_qkv_unsupported_reason(&cfg, true, true)
+            .expect("sandwich configs without layer schedule must be rejected")
+            .contains("local/global sliding-window layer pattern"));
+
+        cfg.sliding_window_pattern = 6;
+        assert!(unified_varlen_qkv_unsupported_reason(&cfg, true, true).is_none());
     }
 
     #[test]
