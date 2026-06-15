@@ -23,7 +23,8 @@ use super::llama_family::{
     elapsed_micros_u64_floor1, LlamaFamilyModel, LlamaStageHiddenBridgeTiming, ATTN_CALLS,
     ATTN_TIME_US, BATCHED_GRAPH_EAGER_COUNT, BATCHED_GRAPH_REPLAY_COUNT, MATMUL_CALLS,
     MATMUL_TIME_US, NORM_CALLS, NORM_TIME_US, OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US,
-    SINGLE_ITEM_GRAPH_KEY,
+    SINGLE_ITEM_GRAPH_KEY, TAIL_ACT_CALLS, TAIL_ACT_TIME_US, TAIL_MLP_CALLS, TAIL_MLP_TIME_US,
+    TAIL_NORM_CALLS, TAIL_NORM_TIME_US, TAIL_RESID_CALLS, TAIL_RESID_TIME_US,
 };
 use super::llama_family_pipeline::{LlamaPipelineStageBatchOps, PipelineHidden};
 
@@ -53,6 +54,10 @@ enum ArgmaxMode<'a> {
 }
 
 impl LlamaBatchedRuntimeConfig {
+    pub(crate) fn decode_op_profile_enabled(&self) -> bool {
+        self.decode_op_profile
+    }
+
     /// Resolve from the process-wide snapshot installed at the composition root
     /// (was a direct `std::env::vars()` read). The model holds this in a
     /// `batched_cfg` field, resolved once at construction.
@@ -2102,6 +2107,14 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                 OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                TAIL_NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                TAIL_NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                TAIL_MLP_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                TAIL_MLP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 B::sync(&mut ctx);
                 Some(std::time::Instant::now())
             } else {
@@ -2212,10 +2225,27 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let wrapped_us = attn_us + qkr_us + mm_us + norm_us + other_us;
+                let tail_norm_us = TAIL_NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let tail_norm_n = TAIL_NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let tail_mlp_us = TAIL_MLP_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let tail_mlp_n = TAIL_MLP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let tail_act_us = TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let tail_act_n = TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let tail_resid_us =
+                    TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let tail_resid_n = TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let wrapped_us = attn_us
+                    + qkr_us
+                    + mm_us
+                    + norm_us
+                    + other_us
+                    + tail_norm_us
+                    + tail_mlp_us
+                    + tail_act_us
+                    + tail_resid_us;
                 let unwrapped_us = total_us.saturating_sub(wrapped_us);
                 eprintln!(
-                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({})  unwrapped={}us",
+                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({}) tail_norm={}us({}) tail_mlp={}us({}) tail_act={}us({}) tail_resid={}us({})  unwrapped={}us",
                     m,
                     total_us,
                     mm_us, mm_n,
@@ -2223,6 +2253,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     qkr_us, qkr_n,
                     norm_us, norm_n,
                     other_us, other_n,
+                    tail_norm_us, tail_norm_n,
+                    tail_mlp_us, tail_mlp_n,
+                    tail_act_us, tail_act_n,
+                    tail_resid_us, tail_resid_n,
                     unwrapped_us,
                 );
             }

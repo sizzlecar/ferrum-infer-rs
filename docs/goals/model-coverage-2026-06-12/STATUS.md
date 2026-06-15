@@ -2,6 +2,31 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XX — W2 profile instrumentation: split Gemma3 tail buckets
+
+- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- 代码侧推进:
+  - `FERRUM_DECODE_OP_PROFILE` 的 batched decode 输出新增 tail bucket:
+    `tail_norm`,`tail_mlp`,`tail_act`,`tail_resid`;
+  - 新 bucket 细分 Gemma3 sandwich tail 的 post-attn/post-ffn norms、
+    gate/up/down projections、GeGLU/SwiGLU activation、residual add;
+  - `unwrapped` 现在会扣除这些 tail bucket,用于下一轮 GPU diagnostic
+    定位 2026-06-15 XIX 里约 `55.6%` 的未拆分 decode-step 时间;
+  - 非 profile 路径不改变。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -q -p ferrum-models --tests` PASS;
+  - `cargo test -q -p ferrum-models llama_batched_runtime_config_parses_startup_knobs --lib`
+    PASS,1 test passed。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+- Next step:
+  - rerun a small c16/c32 decode-op-profile diagnostic on CUDA to quantify the
+    new tail buckets before choosing an optimization target.
+
 ## 2026-06-15 XIX — W2 decode-op profile: bottleneck is mostly unwrapped decode work
 
 - 本轮 artifact:
