@@ -213,6 +213,26 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub batched_graph: Option<bool>,
 
+    /// Emit engine batch iteration profile logs, equivalent to
+    /// `FERRUM_BATCH_DECODE_PROF`.
+    #[serde(default)]
+    pub batch_decode_prof: Option<bool>,
+
+    /// Emit engine next-batch scheduler profile logs, equivalent to
+    /// `FERRUM_NEXT_BATCH_PROF`.
+    #[serde(default)]
+    pub next_batch_prof: Option<bool>,
+
+    /// Emit route/batched-decode profile logs, equivalent to
+    /// `FERRUM_RBD_PROF`.
+    #[serde(default)]
+    pub rbd_prof: Option<bool>,
+
+    /// Emit unified decode postprocess profile logs, equivalent to
+    /// `FERRUM_UNIFIED_POST_PROF`.
+    #[serde(default)]
+    pub unified_post_prof: Option<bool>,
+
     /// vLLM paged attention policy, equivalent to
     /// `FERRUM_USE_VLLM_PAGED_ATTN`.
     #[serde(default)]
@@ -291,6 +311,18 @@ impl RuntimeCliConfig {
         );
         push_bool_entry(&mut entries, "FERRUM_MOE_GRAPH", self.moe_graph);
         push_bool_entry(&mut entries, "FERRUM_BATCHED_GRAPH", self.batched_graph);
+        push_true_entry(
+            &mut entries,
+            "FERRUM_BATCH_DECODE_PROF",
+            self.batch_decode_prof,
+        );
+        push_true_entry(&mut entries, "FERRUM_NEXT_BATCH_PROF", self.next_batch_prof);
+        push_true_entry(&mut entries, "FERRUM_RBD_PROF", self.rbd_prof);
+        push_true_entry(
+            &mut entries,
+            "FERRUM_UNIFIED_POST_PROF",
+            self.unified_post_prof,
+        );
         push_bool_entry(
             &mut entries,
             "FERRUM_USE_VLLM_PAGED_ATTN",
@@ -355,6 +387,16 @@ fn push_bool_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Opti
         entries.push(RuntimeConfigEntry::new(
             key,
             if value { "1" } else { "0" },
+            RuntimeConfigSource::ConfigFile,
+        ));
+    }
+}
+
+fn push_true_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<bool>) {
+    if value == Some(true) {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            "1".to_string(),
             RuntimeConfigSource::ConfigFile,
         ));
     }
@@ -552,6 +594,10 @@ mod tests {
             layer_split_pipeline_mode: Some("batch".to_string()),
             moe_graph: Some(true),
             batched_graph: Some(true),
+            batch_decode_prof: Some(true),
+            next_batch_prof: Some(true),
+            rbd_prof: Some(true),
+            unified_post_prof: Some(true),
             use_vllm_paged_attn: Some(true),
             vllm_paged_attn_v1_short: Some(false),
             vllm_moe: Some(true),
@@ -566,7 +612,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 21);
+        assert_eq!(entries.len(), 25);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -596,6 +642,13 @@ mod tests {
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
+        assert_eq!(entry("FERRUM_BATCH_DECODE_PROF").effective_value, "1");
+        assert!(entry("FERRUM_BATCH_DECODE_PROF")
+            .affects
+            .contains(&RuntimeConfigEffect::Diagnostics));
+        assert_eq!(entry("FERRUM_NEXT_BATCH_PROF").effective_value, "1");
+        assert_eq!(entry("FERRUM_RBD_PROF").effective_value, "1");
+        assert_eq!(entry("FERRUM_UNIFIED_POST_PROF").effective_value, "1");
         assert_eq!(entry("FERRUM_USE_VLLM_PAGED_ATTN").effective_value, "1");
         assert_eq!(
             entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
@@ -613,6 +666,23 @@ mod tests {
         );
         assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
         assert_eq!(entry("FERRUM_MOE_BATCH_THRESHOLD").effective_value, "4");
+    }
+
+    #[test]
+    fn runtime_cli_config_diagnostic_presence_flags_are_opt_in() {
+        let entries = RuntimeCliConfig {
+            batch_decode_prof: Some(false),
+            next_batch_prof: Some(false),
+            rbd_prof: Some(false),
+            unified_post_prof: Some(false),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+
+        assert!(
+            entries.is_empty(),
+            "false diagnostic presence flags must not materialize as FERRUM_*_PROF=0"
+        );
     }
 
     #[test]

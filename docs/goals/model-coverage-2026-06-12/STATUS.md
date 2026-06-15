@@ -2,6 +2,31 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXII — W2 source checkpoint: expose decode profiler knobs through runtime config
+
+- 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - config-file `runtime` 现在可显式开启:
+    - `batch_decode_prof` → `FERRUM_BATCH_DECODE_PROF`;
+    - `next_batch_prof` → `FERRUM_NEXT_BATCH_PROF`;
+    - `rbd_prof` → `FERRUM_RBD_PROF`;
+    - `unified_post_prof` → `FERRUM_UNIFIED_POST_PROF`;
+  - 这些 profiler 是 presence flags,所以 config `true` 才 materialize runtime
+    entry;`false`/unset 都不会生成 `FERRUM_*_PROF=0`,避免误触发。
+- Why:
+  - 最新 c16 诊断排除了稳定 `m=15` underfill 与输出早停主因;
+  - 下一步需要量化 engine/process_batch/model/decode_post/scheduler 开销;
+  - 通过 typed config-file 暴露现有 profiler 后,CUDA profile 诊断不需要隐藏
+    env 组合,更符合 release-grade 证据路径。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-cli runtime_cli_config -- --nocapture` PASS,3/3。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-15 LXI — W2 CUDA checkpoint: c16 output-token/batch-shape diagnostic narrows remaining bottleneck
 
 - 本轮 artifact:
