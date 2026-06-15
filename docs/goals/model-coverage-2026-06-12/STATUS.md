@@ -2,6 +2,63 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XG — W2 native CUDA checkpoint: tail-MLP chain PASS, bottleneck is dense MLP compute across layers
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_mlp_chain_native_probe_2026-06-16/`.
+- Lane:
+  `W2 Gemma3 native tail-MLP chain probe` on the cached 1x RTX 4090 Vast
+  instance `40826362`.
+- Paid GPU contract:
+  - expected runtime/cost: 10-20 minutes, about USD 0.07-0.15 at prior
+    USD 0.425/hr;
+  - stop condition: nvcc compile failure, probe nonzero/timeout, or VERDICT
+    line with artifacts copied back;
+  - correctness gate: native probe exit 0 and VERDICT line;
+  - performance command:
+    `bash scripts/microbenches/build_and_run_gemma3_tail_mlp_chain_perf.sh`.
+- Lifecycle:
+  - instance started from `stopped/exited`;
+  - CUDA verified with 1x RTX 4090, driver 565.77, nvcc 12.4;
+  - source synced to remote HEAD
+    `2c281e56557c11486cbdec5da9dae1234dcae78d`;
+  - remote source status was clean after restoring tracked artifact files
+    affected by the source rsync exclude;
+  - artifact copied back;
+  - instance stopped and final Vast poll confirmed `stopped/exited`.
+- Probe result:
+  - `probe.rc=0`;
+  - stdout contains
+    `VERDICT: gemma3 tail MLP chain native CUDA probe complete`;
+  - binary SHA256:
+    `7dd82cd65a02958533c65b45d018e0b49600b1a30d394c7fa567a41f0d4ccca7`.
+- Key timings:
+  - m16 `product_ws_zero`:
+    `chain_event_us=215.750`, `chain_host_sync_us=217.782`;
+  - m16 product phase split:
+    `pre_norm=5.914us`, `gate_up=139.671us`, `geglu=4.680us`,
+    `down=70.903us`, `final_norm=6.352us`;
+  - m16 `kernel_only_ws_prezero_diagnostic`:
+    `chain_event_us=212.986`.
+- Interpretation:
+  - the single-layer Gemma3 tail-MLP chain is about `216us`; multiplied by
+    62 layers this is about `13.4ms`, matching the earlier product profile
+    band where `tail_mlp` was about `13.6-14.9ms` per decode step;
+  - this rejects the hypothesis that W2 c16 is blocked by a hidden multi-ms
+    launch-chain overhead outside the measured kernels;
+  - the remaining W2 performance gap is dense GPTQ MLP compute across layers,
+    dominated by `gate_up` and `down`, not HTTP/scheduler/postprocess,
+    legacy graph routing, Marlin block-policy, or direct dense Marlin kernel
+    swap.
+- Next:
+  - choose an optimization that changes the dense MLP compute path itself
+    rather than doing another scheduling/env sweep: viable candidates are a
+    different W4A16 backend for dense Gemma3 MLP, layer/prompt-level MLP
+    work reduction if correctness-safe, or a product-profile check that
+    compares exact per-layer call counts with the native chain.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XF — W2 source checkpoint: native CUDA Gemma3 tail-MLP chain probe
 
 - No new GPU run in this checkpoint; this adds a minimal native CUDA probe for
