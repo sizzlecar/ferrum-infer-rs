@@ -1,0 +1,222 @@
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 3.9 GB → max_blocks=512
+[auto-size] requested runtime floor requires KV_MAX_BLOCKS=512 above estimated budget 338; honoring explicit runtime limits
+[auto-size] KV_MAX_BLOCKS=512 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+[2m2026-06-15T17:38:33.383700Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-15T17:38:33.383716Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-15T17:38:33.383761Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-15T17:38:34.429444Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-15T17:38:34.429484Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-15T17:38:34.429488Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-15T17:38:34.429502Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=512
+[2m2026-06-15T17:38:34.429687Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-15T17:38:34.429922Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-15T17:38:34.626685Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-15T17:38:34.626775Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-15T17:38:34.626782Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-15T17:38:34.626790Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-15T17:39:26.889439Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+[2m2026-06-15T17:39:31.388968Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m Gemma3 family: legacy batched_decode=true varlen_unified=true
+[prefill-profile] tokens=23 layers total=33 ms
+[prefill-profile] flash_attn: 62 calls 5 ms (avg 93 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 28 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 112 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 9 ms (avg 149 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 7 us)
+[prefill-profile] tail_down: 62 calls 5 ms (avg 83 us)
+[prefill-profile] tail_mlp: 62 calls 14 ms (avg 240 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 8 us)
+[unified-prof] iter#0 items=1 prefill=1 decode=0 total=128313us model=127951us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[iter-prof] iter#0 total=128734us sched=9us process=128724us batch_size=1
+[unified-prof] iter#1 items=1 prefill=0 decode=1 total=26010us model=25837us decode_post=171us | sample=170 sched=0 stream=1 stop=0 complete=0 (us)
+[iter-prof] iter#1 total=26058us sched=8us process=26050us batch_size=1
+[unified-prof] iter#2 items=1 prefill=0 decode=1 total=25444us model=25260us decode_post=183us | sample=168 sched=0 stream=0 stop=0 complete=15 (us)
+[iter-prof] iter#2 total=25482us sched=4us process=25477us batch_size=1
+[bg-loop-gap] call#8 inter_iter=3us
+[bg-loop-gap] call#16 inter_iter=3us
+[bg-loop-gap] call#24 inter_iter=3us
+[bg-loop-gap] call#32 inter_iter=1us
+[bg-loop-gap] call#40 inter_iter=3us
+[bg-loop-gap] call#48 inter_iter=3us
+[bg-loop-gap] call#56 inter_iter=3us
+[bg-loop-gap] call#64 inter_iter=3us
+[bg-loop-gap] call#72 inter_iter=3us
+[bg-loop-gap] call#80 inter_iter=3us
+[bg-loop-gap] call#88 inter_iter=8us
+[bg-loop-gap] call#96 inter_iter=5us
+[bg-loop-gap] call#104 inter_iter=2us
+[bg-loop-gap] call#112 inter_iter=2us
+[bg-loop-gap] call#120 inter_iter=5us
+[bg-loop-gap] call#128 inter_iter=5us
+[bg-loop-gap] call#136 inter_iter=3us
+[bg-loop-gap] call#144 inter_iter=5us
+[bg-loop-gap] call#152 inter_iter=2us
+[bg-loop-gap] call#160 inter_iter=2us
+[bg-loop-gap] call#168 inter_iter=4us
+[bg-loop-gap] call#176 inter_iter=1us
+[bg-loop-gap] call#184 inter_iter=3us
+[bg-loop-gap] call#192 inter_iter=2us
+[bg-loop-gap] call#200 inter_iter=9us
+[bg-loop-gap] call#208 inter_iter=10us
+[bg-loop-gap] call#216 inter_iter=6us
+[bg-loop-gap] call#224 inter_iter=6us
+[bg-loop-gap] call#232 inter_iter=6us
+[bg-loop-gap] call#240 inter_iter=7us
+[bg-loop-gap] call#248 inter_iter=5us
+[bg-loop-gap] call#256 inter_iter=5us
+[bg-loop-gap] call#264 inter_iter=2us
+[bg-loop-gap] call#272 inter_iter=2us
+[bg-loop-gap] call#280 inter_iter=5us
+[bg-loop-gap] call#288 inter_iter=3us
+[bg-loop-gap] call#296 inter_iter=3us
+[bg-loop-gap] call#304 inter_iter=4us
+[bg-loop-gap] call#312 inter_iter=3us
+[bg-loop-gap] call#320 inter_iter=2us
+[bg-loop-gap] call#328 inter_iter=2us
+[bg-loop-gap] call#336 inter_iter=2us
+[bg-loop-gap] call#344 inter_iter=2us
+[bg-loop-gap] call#352 inter_iter=2us
+[bg-loop-gap] call#360 inter_iter=3us
+[bg-loop-gap] call#368 inter_iter=2us
+[bg-loop-gap] call#376 inter_iter=3us
+[bg-loop-gap] call#384 inter_iter=4us
+[bg-loop-gap] call#392 inter_iter=5us
+[bg-loop-gap] call#400 inter_iter=5us
+[bg-loop-gap] call#408 inter_iter=5us
+[bg-loop-gap] call#416 inter_iter=6us
+[bg-loop-gap] call#424 inter_iter=2us
+[bg-loop-gap] call#432 inter_iter=5us
+[bg-loop-gap] call#440 inter_iter=4us
+[bg-loop-gap] call#448 inter_iter=3us
+[bg-loop-gap] call#456 inter_iter=3us
+[bg-loop-gap] call#464 inter_iter=2us
+[bg-loop-gap] call#472 inter_iter=3us
+[bg-loop-gap] call#480 inter_iter=2us
+[bg-loop-gap] call#488 inter_iter=3us
+[bg-loop-gap] call#496 inter_iter=4us
+[prefill-profile] tokens=122 layers total=92 ms
+[prefill-profile] flash_attn: 62 calls 33 ms (avg 545 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 29 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 108 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 13 us)
+[prefill-profile] tail_gate_up: 62 calls 25 ms (avg 412 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 15 ms (avg 249 us)
+[prefill-profile] tail_mlp: 62 calls 42 ms (avg 678 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tokens=122 layers total=91 ms
+[prefill-profile] flash_attn: 62 calls 33 ms (avg 544 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 29 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 106 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 13 us)
+[prefill-profile] tail_gate_up: 62 calls 25 ms (avg 411 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 15 ms (avg 246 us)
+[prefill-profile] tail_mlp: 62 calls 41 ms (avg 673 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tokens=122 layers total=86 ms
+[prefill-profile] flash_attn: 62 calls 31 ms (avg 515 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 101 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 13 us)
+[prefill-profile] tail_gate_up: 62 calls 24 ms (avg 390 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 14 ms (avg 233 us)
+[prefill-profile] tail_mlp: 62 calls 39 ms (avg 639 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 13 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 14 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 38 ms (avg 613 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 14 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 37 ms (avg 612 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 37 ms (avg 612 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 37 ms (avg 612 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 493 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 38 ms (avg 613 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 493 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 375 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 224 us)
+[prefill-profile] tail_mlp: 62 calls 38 ms (avg 614 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[unified-prof] iter#3 items=9 prefill=9 decode=0 total=810684us model=808447us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[batched-qkr] first batched_decode call: m=9 use_batched_qkr=true (q=None k=None v=None)
+[batched-kv-append] first call: m=9 ok=true k_err=None v_err=None
+[batched-attn] first call: m=9 ok=true err=None
+[batched-op-profile] m=9 total=27737us  matmul=7069us(125) attn=1993us(62) qkr=922us(62) norm=445us(63) other=1464us(124) tail_norm=687us(62) tail_mlp=13544us(124) tail_gate_up=8898us(62) tail_down=4646us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=399us(62) tail_resid=496us(62)  unwrapped=718us
+[unified-prof] iter#4 items=9 prefill=0 decode=9 total=28560us model=28428us decode_post=119us | sample=6 sched=0 stream=113 stop=0 complete=0 (us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 493 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 98 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 375 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 38 ms (avg 614 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[batched-op-profile] m=9 total=26898us  matmul=6894us(125) attn=1867us(62) qkr=629us(62) norm=453us(63) other=1377us(124) tail_norm=687us(62) tail_mlp=13459us(124) tail_gate_up=8860us(62) tail_down=4599us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=372us(62) tail_resid=496us(62)  unwrapped=664us
+[unified-prof] iter#5 items=10 prefill=1 decode=9 total=115906us model=115357us decode_post=139us | sample=11 sched=0 stream=128 stop=0 complete=0 (us)
+[bg-loop-gap] call#504 inter_iter=1us
+[batched-op-profile] m=10 total=27036us  matmul=6947us(125) attn=1878us(62) qkr=633us(62) norm=465us(63) other=1349us(124) tail_norm=683us(62) tail_mlp=13532us(124) tail_gate_up=8916us(62) tail_down=4616us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=373us(62) tail_resid=518us(62)  unwrapped=658us
+[unified-prof] iter#6 items=10 prefill=0 decode=10 total=27785us model=27637us decode_post=133us | sample=14 sched=0 stream=119 stop=0 complete=0 (us)
+
+thread 'tokio-runtime-worker' (604) panicked at crates/ferrum-kernels/src/backend/cuda/mod.rs:843:34:
+CudaBackend: stream sync: DriverError(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, "operation not permitted when stream is capturing")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
