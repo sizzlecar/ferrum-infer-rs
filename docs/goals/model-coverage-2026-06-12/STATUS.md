@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXXV — W2 vLLM natural ShareGPT baseline clean;Ferrum c16/c32 约 65%
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_sharegpt_baseline_probe_2026-06-15/`。
+- 复用 Vast/cache-retained native CUDA instance `40826362`,1x RTX 4090。验证结束后
+  已复制 artifact 并停机;Vast poll 2 记录 `cur_state=stopped`,
+  `actual_status=exited`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA vLLM ShareGPT baseline-cleanliness probe`;
+  - expected runtime/cost:20-45min,hard cap 60min,约 USD 0.425/hr;
+  - stop condition:启动/SSH/CUDA/vLLM server 首败、baseline smoke 首败、
+    c16/c32 ShareGPT diagnostic 完成并复制 artifact,或 60min cap;
+  - correctness gate:vLLM `/v1/models` + 非流式 chat smoke;
+  - performance command:diagnostic-only natural ASCII ShareGPT c16/c32,
+    `bench-serve --fail-on-error --seed 9271 --n-repeats 1 --num-prompts 16`。
+- vLLM baseline diagnostic:
+  - engine:`vllm 0.10.1.1`,GPTQ Marlin,同一 HF/safetensors GPTQ model;
+  - `/v1/models` ready,poll 33;
+  - chat smoke rc=0,content `5`,usage `completion_tokens=3`;
+  - c16:`16 completed / 0 errored`,bad_output `[0]`,
+    `518.796 tok/s`;
+  - c32:`16 completed / 0 errored`,bad_output `[0]`,
+    `524.128 tok/s`。
+- Ferrum same-dataset no-profile compare:
+  - binary SHA256:
+    `3e28a4cf37b2e25b127dbd591e8891b141863d8082d1757486707c785e6869ce`;
+  - `ferrum serve --model gemma3:27b-gptq --kv-capacity 512 --max-num-seqs 16`
+    ready,poll 29;
+  - c16:`16 completed / 0 errored`,bad_output `[0]`,
+    `340.003 tok/s`;
+  - c32:`16 completed / 0 errored`,bad_output `[0]`,
+    `342.284 tok/s`。
+- Diagnostic ratio:
+  - c16:`340.003 / 518.796 = 0.655`,差距约 `34.5%`;
+  - c32:`342.284 / 524.128 = 0.653`,差距约 `34.7%`;
+  - 距 80% release-grade 线仍差约 `14.5` percentage points。
+- Interpretation:
+  - 本轮没有发现新的 Ferrum product correctness 问题;
+  - 之前 vLLM random-prompt c16 baseline 自身 invalid-UTF8,不能做 final
+    baseline;本轮 natural ShareGPT vLLM c16/c32 是 zero-error,说明 baseline
+    路线可以考虑改成自然 prompt 数据集并正式 N>=3 化;
+  - 但按这个 clean baseline,Ferrum c16/c32 仍显著低于 80%,W2-P2 仍要继续
+    优先优化 Gemma tail/GEMM 路径。
+- Release-grade status:
+  - 本轮是 N=1 diagnostic,没有 `--require-ci`,没有
+    `model_release_grade_manifest.json`,没有
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 仍未达到 release-grade。
+
 ## 2026-06-15 XXXIV — W2 fused sandwich residual-add: native CUDA minimal validation PASS,收益有限
 
 - 本轮 artifact:
