@@ -127,10 +127,31 @@ fn batched_decode_graph_key(m_padded: usize, use_device_residual_shadow: bool) -
     }
 }
 
+fn should_log_batched_graph_replay_count(count: u64) -> bool {
+    count.is_power_of_two()
+}
+
+fn record_batched_graph_replay(
+    origin: &str,
+    graph_key: u64,
+    m: usize,
+    m_padded: usize,
+    use_device_residual_shadow: bool,
+) {
+    let count = BATCHED_GRAPH_REPLAY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if should_log_batched_graph_replay_count(count) {
+        eprintln!(
+            "[batched-graph-replay] origin={origin} count={count} key={graph_key} \
+             m={m} m_padded={m_padded} device_shadow={use_device_residual_shadow}",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        batched_decode_graph_key, should_use_batched_decode_graph, LlamaBatchedRuntimeConfig,
+        batched_decode_graph_key, should_log_batched_graph_replay_count,
+        should_use_batched_decode_graph, LlamaBatchedRuntimeConfig,
         BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
     };
 
@@ -185,6 +206,14 @@ mod tests {
         assert_ne!(plain, shadow);
         assert_eq!(shadow, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT | 16);
         assert_eq!(shadow & (1u64 << 63), 0);
+    }
+
+    #[test]
+    fn batched_decode_graph_replay_log_is_power_of_two() {
+        assert!(should_log_batched_graph_replay_count(1));
+        assert!(should_log_batched_graph_replay_count(2));
+        assert!(!should_log_batched_graph_replay_count(3));
+        assert!(should_log_batched_graph_replay_count(4));
     }
 }
 
@@ -2197,7 +2226,13 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             match B::replay_graph(&mut ctx, graph_key) {
                 Ok(true) => {
                     did_pure_replay = true;
-                    BATCHED_GRAPH_REPLAY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    record_batched_graph_replay(
+                        "pure",
+                        graph_key,
+                        m,
+                        m_padded,
+                        use_device_residual_shadow,
+                    );
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -2508,9 +2543,21 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     self.batched_graph_failed = true;
                 } else {
                     self.batched_graph_keys_seen.insert(graph_key);
+                    eprintln!(
+                        "[batched-graph-capture] key={graph_key} m={m} m_padded={m_padded} \
+                         device_shadow={use_device_residual_shadow}"
+                    );
                     if let Err(e) = B::replay_graph(&mut ctx, graph_key) {
                         eprintln!("[batched-trace] post-capture replay err: {}", e);
                         self.batched_graph_failed = true;
+                    } else {
+                        record_batched_graph_replay(
+                            "post_capture",
+                            graph_key,
+                            m,
+                            m_padded,
+                            use_device_residual_shadow,
+                        );
                     }
                 }
             }
