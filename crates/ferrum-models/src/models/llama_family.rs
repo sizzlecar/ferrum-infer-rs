@@ -48,6 +48,14 @@ pub(crate) static NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NORM_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OTHER_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OTHER_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_NORM_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_MLP_TIME_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_MLP_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_ACT_TIME_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_ACT_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_RESID_TIME_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_RESID_CALLS: AtomicU64 = AtomicU64::new(0);
 use ferrum_quantization::{Linear, WeightLoader};
 use ferrum_types::{Activation, Result};
 
@@ -3001,6 +3009,26 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 }
             };
         }
+        let tail_profile =
+            self.runtime_env.decode_op_profile || self.batched_cfg.decode_op_profile_enabled();
+        macro_rules! time_tail {
+            ($bucket_us:expr, $bucket_n:expr, $body:block) => {{
+                if tail_profile {
+                    B::sync(ctx);
+                    let t0 = std::time::Instant::now();
+                    let out = { $body };
+                    B::sync(ctx);
+                    $bucket_us.fetch_add(
+                        t0.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    $bucket_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    out
+                } else {
+                    $body
+                }
+            }};
+        }
 
         // 9. Residual + pre-MLP norm.
         //
@@ -3008,73 +3036,86 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // (post_attention_layernorm in Gemma naming), add to residual,
         // then norm the residual with pre_feedforward_layernorm.
         // Legacy families: single fused residual-add + post-attn norm.
-        if let Some(post_attn_w) = &layer.post_attn_ln_w {
-            if let Some(host) = host_residual.as_deref_mut() {
-                let branch = Self::rms_norm_device_to_host(
-                    &self.scratch.o_proj_out,
-                    post_attn_w,
-                    eps,
-                    tokens,
-                    h,
-                );
-                Self::add_host_residual(host, &branch);
-                Self::rms_norm_host_to_activation(
-                    ctx,
-                    host,
-                    &layer.post_ln_w,
-                    eps,
-                    &mut self.scratch.norm_out,
-                    tokens,
-                    h,
-                );
-            } else if let Some(device) = device_residual.as_mut() {
-                let device = &mut **device;
-                let branch = device_branch
-                    .as_mut()
-                    .expect("device F32 sandwich branch scratch missing");
-                let branch = &mut **branch;
-                B::rms_norm_activation_to_f32(
-                    ctx,
-                    &self.scratch.o_proj_out,
-                    post_attn_w,
-                    eps,
-                    branch,
-                    tokens,
-                    h,
-                );
-                nt!("post_attn_norm", &*branch, tokens * h, h);
-                B::add_inplace(ctx, device, branch, tokens * h);
-                nt!("resid_attn", &*device, tokens * h, h);
-                B::rms_norm_f32_to_activation(
-                    ctx,
-                    device,
-                    &layer.post_ln_w,
-                    eps,
-                    &mut self.scratch.norm_out,
-                    tokens,
-                    h,
-                );
+        time_tail!(TAIL_NORM_TIME_US, TAIL_NORM_CALLS, {
+            if let Some(post_attn_w) = &layer.post_attn_ln_w {
+                if let Some(host) = host_residual.as_deref_mut() {
+                    let branch = Self::rms_norm_device_to_host(
+                        &self.scratch.o_proj_out,
+                        post_attn_w,
+                        eps,
+                        tokens,
+                        h,
+                    );
+                    Self::add_host_residual(host, &branch);
+                    Self::rms_norm_host_to_activation(
+                        ctx,
+                        host,
+                        &layer.post_ln_w,
+                        eps,
+                        &mut self.scratch.norm_out,
+                        tokens,
+                        h,
+                    );
+                } else if let Some(device) = device_residual.as_mut() {
+                    let device = &mut **device;
+                    let branch = device_branch
+                        .as_mut()
+                        .expect("device F32 sandwich branch scratch missing");
+                    let branch = &mut **branch;
+                    B::rms_norm_activation_to_f32(
+                        ctx,
+                        &self.scratch.o_proj_out,
+                        post_attn_w,
+                        eps,
+                        branch,
+                        tokens,
+                        h,
+                    );
+                    nt!("post_attn_norm", &*branch, tokens * h, h);
+                    B::add_inplace(ctx, device, branch, tokens * h);
+                    nt!("resid_attn", &*device, tokens * h, h);
+                    B::rms_norm_f32_to_activation(
+                        ctx,
+                        device,
+                        &layer.post_ln_w,
+                        eps,
+                        &mut self.scratch.norm_out,
+                        tokens,
+                        h,
+                    );
+                } else {
+                    let tmp = self
+                        .scratch
+                        .sandwich_tmp
+                        .as_mut()
+                        .expect("sandwich_tmp allocated for sandwich-norm config");
+                    B::rms_norm(
+                        ctx,
+                        &self.scratch.o_proj_out,
+                        post_attn_w,
+                        eps,
+                        tmp,
+                        tokens,
+                        h,
+                    );
+                    nt!("post_attn_norm", &*tmp, tokens * h, h);
+                    B::add_inplace(ctx, residual, tmp, tokens * h);
+                    nt!("resid_attn", &*residual, tokens * h, h);
+                    B::rms_norm(
+                        ctx,
+                        residual,
+                        &layer.post_ln_w,
+                        eps,
+                        &mut self.scratch.norm_out,
+                        tokens,
+                        h,
+                    );
+                }
             } else {
-                let tmp = self
-                    .scratch
-                    .sandwich_tmp
-                    .as_mut()
-                    .expect("sandwich_tmp allocated for sandwich-norm config");
-                B::rms_norm(
-                    ctx,
-                    &self.scratch.o_proj_out,
-                    post_attn_w,
-                    eps,
-                    tmp,
-                    tokens,
-                    h,
-                );
-                nt!("post_attn_norm", &*tmp, tokens * h, h);
-                B::add_inplace(ctx, residual, tmp, tokens * h);
-                nt!("resid_attn", &*residual, tokens * h, h);
-                B::rms_norm(
+                B::fused_add_rms_norm(
                     ctx,
                     residual,
+                    &self.scratch.o_proj_out,
                     &layer.post_ln_w,
                     eps,
                     &mut self.scratch.norm_out,
@@ -3082,21 +3123,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     h,
                 );
             }
-        } else {
-            B::fused_add_rms_norm(
-                ctx,
-                residual,
-                &self.scratch.o_proj_out,
-                &layer.post_ln_w,
-                eps,
-                &mut self.scratch.norm_out,
-                tokens,
-                h,
-            );
-        }
+        });
 
         // 10. Fused gate+up projection.
-        {
+        time_tail!(TAIL_MLP_TIME_US, TAIL_MLP_CALLS, {
             #[cfg(feature = "cuda")]
             let _alloc_label =
                 ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.gate_up_proj");
@@ -3106,23 +3136,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 &mut self.scratch.gate_up_out,
                 tokens,
             );
-        }
-        if let Some(adapter) =
-            cache_id.and_then(|cache_id| self.active_lora_adapter_ptr_for_cache(cache_id))
-        {
-            // SAFETY: see qkv_proj LoRA application above.
-            let applied = unsafe { &*adapter }
-                .apply_projection(
-                    ctx,
-                    source_li,
-                    "gate_up_proj",
-                    &self.scratch.norm_out,
-                    &mut self.scratch.gate_up_out,
-                    tokens,
-                )
-                .expect("validated LoRA gate_up_proj");
-            self.lora_projection_applications += applied as u64;
-        }
+            if let Some(adapter) =
+                cache_id.and_then(|cache_id| self.active_lora_adapter_ptr_for_cache(cache_id))
+            {
+                // SAFETY: see qkv_proj LoRA application above.
+                let applied = unsafe { &*adapter }
+                    .apply_projection(
+                        ctx,
+                        source_li,
+                        "gate_up_proj",
+                        &self.scratch.norm_out,
+                        &mut self.scratch.gate_up_out,
+                        tokens,
+                    )
+                    .expect("validated LoRA gate_up_proj");
+                self.lora_projection_applications += applied as u64;
+            }
+        });
 
         nt!("pre_mlp_norm", &self.scratch.norm_out, tokens * h, h);
         nt!(
@@ -3132,26 +3162,28 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             2 * im
         );
         // 11. Gated activation: SwiGLU (silu) or GeGLU (gelu_tanh, Gemma).
-        match cfg.activation {
-            Activation::GeluTanh => B::fused_gelu_tanh_mul_split(
-                ctx,
-                &self.scratch.gate_up_out,
-                &mut self.scratch.silu_out,
-                tokens,
-                im,
-            ),
-            _ => B::fused_silu_mul_split(
-                ctx,
-                &self.scratch.gate_up_out,
-                &mut self.scratch.silu_out,
-                tokens,
-                im,
-            ),
-        }
+        time_tail!(TAIL_ACT_TIME_US, TAIL_ACT_CALLS, {
+            match cfg.activation {
+                Activation::GeluTanh => B::fused_gelu_tanh_mul_split(
+                    ctx,
+                    &self.scratch.gate_up_out,
+                    &mut self.scratch.silu_out,
+                    tokens,
+                    im,
+                ),
+                _ => B::fused_silu_mul_split(
+                    ctx,
+                    &self.scratch.gate_up_out,
+                    &mut self.scratch.silu_out,
+                    tokens,
+                    im,
+                ),
+            }
+        });
 
         nt!("act_mul", &self.scratch.silu_out, tokens * im, im);
         // 12. Down projection.
-        {
+        time_tail!(TAIL_MLP_TIME_US, TAIL_MLP_CALLS, {
             #[cfg(feature = "cuda")]
             let _alloc_label =
                 ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.down_proj");
@@ -3161,67 +3193,69 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 &mut self.scratch.mlp_out,
                 tokens,
             );
-        }
-        if let Some(adapter) =
-            cache_id.and_then(|cache_id| self.active_lora_adapter_ptr_for_cache(cache_id))
-        {
-            // SAFETY: see qkv_proj LoRA application above.
-            let applied = unsafe { &*adapter }
-                .apply_projection(
-                    ctx,
-                    source_li,
-                    "down_proj",
-                    &self.scratch.silu_out,
-                    &mut self.scratch.mlp_out,
-                    tokens,
-                )
-                .expect("validated LoRA down_proj");
-            self.lora_projection_applications += applied as u64;
-        }
+            if let Some(adapter) =
+                cache_id.and_then(|cache_id| self.active_lora_adapter_ptr_for_cache(cache_id))
+            {
+                // SAFETY: see qkv_proj LoRA application above.
+                let applied = unsafe { &*adapter }
+                    .apply_projection(
+                        ctx,
+                        source_li,
+                        "down_proj",
+                        &self.scratch.silu_out,
+                        &mut self.scratch.mlp_out,
+                        tokens,
+                    )
+                    .expect("validated LoRA down_proj");
+                self.lora_projection_applications += applied as u64;
+            }
+        });
         nt!("down_proj", &self.scratch.mlp_out, tokens * h, h);
 
         // 13. Final residual add. Sandwich families norm the MLP output
         // (post_feedforward_layernorm) before adding it to the residual.
-        if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
-            if let Some(host) = host_residual.as_deref_mut() {
-                let branch = Self::rms_norm_device_to_host(
-                    &self.scratch.mlp_out,
-                    post_ffn_w,
-                    eps,
-                    tokens,
-                    h,
-                );
-                Self::add_host_residual(host, &branch);
-            } else if let Some(device) = device_residual.as_mut() {
-                let device = &mut **device;
-                let branch = device_branch
-                    .as_mut()
-                    .expect("device F32 sandwich branch scratch missing");
-                let branch = &mut **branch;
-                B::rms_norm_activation_to_f32(
-                    ctx,
-                    &self.scratch.mlp_out,
-                    post_ffn_w,
-                    eps,
-                    branch,
-                    tokens,
-                    h,
-                );
-                nt!("post_ffn_norm", &*branch, tokens * h, h);
-                B::add_inplace(ctx, device, branch, tokens * h);
+        time_tail!(TAIL_RESID_TIME_US, TAIL_RESID_CALLS, {
+            if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
+                if let Some(host) = host_residual.as_deref_mut() {
+                    let branch = Self::rms_norm_device_to_host(
+                        &self.scratch.mlp_out,
+                        post_ffn_w,
+                        eps,
+                        tokens,
+                        h,
+                    );
+                    Self::add_host_residual(host, &branch);
+                } else if let Some(device) = device_residual.as_mut() {
+                    let device = &mut **device;
+                    let branch = device_branch
+                        .as_mut()
+                        .expect("device F32 sandwich branch scratch missing");
+                    let branch = &mut **branch;
+                    B::rms_norm_activation_to_f32(
+                        ctx,
+                        &self.scratch.mlp_out,
+                        post_ffn_w,
+                        eps,
+                        branch,
+                        tokens,
+                        h,
+                    );
+                    nt!("post_ffn_norm", &*branch, tokens * h, h);
+                    B::add_inplace(ctx, device, branch, tokens * h);
+                } else {
+                    let tmp = self
+                        .scratch
+                        .sandwich_tmp
+                        .as_mut()
+                        .expect("sandwich_tmp allocated for sandwich-norm config");
+                    B::rms_norm(ctx, &self.scratch.mlp_out, post_ffn_w, eps, tmp, tokens, h);
+                    nt!("post_ffn_norm", &*tmp, tokens * h, h);
+                    B::add_inplace(ctx, residual, tmp, tokens * h);
+                }
             } else {
-                let tmp = self
-                    .scratch
-                    .sandwich_tmp
-                    .as_mut()
-                    .expect("sandwich_tmp allocated for sandwich-norm config");
-                B::rms_norm(ctx, &self.scratch.mlp_out, post_ffn_w, eps, tmp, tokens, h);
-                nt!("post_ffn_norm", &*tmp, tokens * h, h);
-                B::add_inplace(ctx, residual, tmp, tokens * h);
+                B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
             }
-        } else {
-            B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
-        }
+        });
         if let Some(device) = device_residual.as_ref() {
             nt!("resid_ffn", &**device, tokens * h, h);
         } else if host_residual.is_none() {
