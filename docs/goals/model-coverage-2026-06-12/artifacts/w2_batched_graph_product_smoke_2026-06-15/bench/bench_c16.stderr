@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=random num_prompts=16 warmup=0 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (16 prompts including 0 warmup)
+    16 completed / 0 errored / 1.4s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=619.9  p95=621.3  p99=621.5
+      TPOT_ms  p50=23.8  p95=23.9  p99=23.9
+      ITL_ms   p50=23.5  p95=25.2  p99=28.9
+      throughput      372.3 tok/s
+      goodput         11.77 req/s
+
+→ wrote docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_product_smoke_2026-06-15/bench/bench_c16.json

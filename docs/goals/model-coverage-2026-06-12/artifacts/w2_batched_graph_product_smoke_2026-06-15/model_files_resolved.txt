@@ -1,0 +1,17 @@
+.gitattributes	1570
+README.md	24
+added_tokens.json	35
+config.json	1429
+generation_config.json	192
+model-00001-of-00005.safetensors	3987545168
+model-00002-of-00005.safetensors	3997409744
+model-00003-of-00005.safetensors	3948698944
+model-00004-of-00005.safetensors	3997409896
+model-00005-of-00005.safetensors	203308424
+model.safetensors.index.json	173714
+quant_log.csv	18220
+quantize_config.json	427
+special_tokens_map.json	556
+tokenizer.json	33384568
+tokenizer.model	4689074
+tokenizer_config.json	1157008

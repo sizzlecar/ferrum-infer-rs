@@ -1,0 +1,4 @@
+ERROR_SCAN
+docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_product_smoke_2026-06-15/bench/bench_c16.json:138:  "panic_per_run": [
+docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_product_smoke_2026-06-15/bench/bench_c16.json:150:      "panic": 0
+GRAPH_LOGS

@@ -1,0 +1,5 @@
+/workspace/ferrum-infer-rs/target/debug/incremental/gemma3_metal_ops_test-0wa638xxkv8yb
+/workspace/ferrum-infer-rs/target/debug/incremental/gemma3_metal_ops_test-0fsjeg7oy1el6
+/workspace/w2_vllm_paged_attn_gemma_diag_2026-06-15
+/workspace/w2_gemma_unified_tail_cuda_smoke_2026-06-15
+/workspace/w2_gemma3_shadow_graph_native_probe_2026-06-15

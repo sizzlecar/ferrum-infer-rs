@@ -1,0 +1,186 @@
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_bottleneck_synthesis_2026-06-15/summary.md
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_native_probe_2026-06-15/local/rsync_artifact.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_native_probe_2026-06-15/local/rsync_artifact_cold_cache.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_native_probe_2026-06-15/local/rsync_artifact_host_sync.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_native_probe_2026-06-15/local/rsync_source.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_native_probe_2026-06-15/local/rsync_source_cold_cache.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_native_probe_2026-06-15/local/rsync_source_host_sync.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_weight_cycle_probe_2026-06-15/local/remote_probe_command.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_weight_cycle_probe_2026-06-15/local/rsync_back.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_weight_cycle_probe_2026-06-15/local/rsync_source.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_weight_cycle_probe_2026-06-15/remote/pre_probe_check.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_marlin_weight_cycle_probe_2026-06-15/vast/ssh_cuda_check.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_diag_2026-06-15/local/rsync_artifact.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_diag_2026-06-15/local/rsync_runner.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_diag_2026-06-15/local/rsync_source.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/gpu_contract.md
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/bundle_finite_verify.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/bundle_fix_verify.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/bundle_verify.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/local_git_head.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/probe_ssh_stderr.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/probe_ssh_stderr_finite.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/probe_ssh_stderr_retry.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/probe_ssh_stdout.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/probe_ssh_stdout_finite.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/probe_ssh_stdout_retry.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_checkout.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_checkout.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_checkout_finite.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_checkout_finite.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_checkout_fix.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_checkout_fix.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_file_check.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_file_check.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_sync.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_sync.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_worktree_precheck.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/remote_worktree_precheck.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/rsync_artifact.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/rsync_artifact.log
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/scp_bundle.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/scp_bundle.log
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/scp_bundle_finite.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/scp_bundle_finite.log
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/scp_bundle_fix.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/scp_bundle_fix.log
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/ssh_cuda_verify.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/ssh_cuda_verify.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/ssh_endpoint.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/start_response.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/status_1.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/remote/metadata.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/remote/probe.rc
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/remote/probe.stderr
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/remote/probe.stdout
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/summary.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/summary.md
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/vast_shutdown/cleanup_check.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/vast_shutdown/status_1.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/vast_shutdown/stop_response.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/vast_shutdown/stopped.sanitized.json
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_nested_profile_2026-06-15/local/nvidia_smi_before_copy_stop.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_nested_profile_2026-06-15/local/remote_git_after_sync.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_nested_profile_2026-06-15/local/remote_run_start.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_nested_profile_2026-06-15/local/remote_summary_compact.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_nested_profile_2026-06-15/local/rsync_artifact.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_nested_profile_2026-06-15/local/rsync_runner.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_nested_profile_2026-06-15/local/rsync_source.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_nested_profile_2026-06-15/local/rsync_wrapper.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_nested_profile_2026-06-15/local/ssh_cuda_verify.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_projection_profile_2026-06-15/local/rsync_artifact.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_projection_profile_2026-06-15/local/rsync_runner.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_projection_profile_2026-06-15/local/rsync_source.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_shape_trace_probe_2026-06-15/summary.md
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_shape_trace_probe_2026-06-15/vast_shutdown/stop_poll_01.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_shape_trace_probe_2026-06-15/vast_shutdown/stop_poll_02.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_shape_trace_probe_2026-06-15/vast_shutdown/stop_response.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_shape_trace_probe_2026-06-15/vast_shutdown/stopped.json
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_bucket_profile_2026-06-15/local/remote_start_run.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_bucket_profile_2026-06-15/local/rsync_back.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_bucket_profile_2026-06-15/local/rsync_git.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_bucket_profile_2026-06-15/local/rsync_script.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_bucket_profile_2026-06-15/local/rsync_worktree.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_bucket_profile_2026-06-15/remote/post_sync_git_check.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_bucket_profile_2026-06-15/vast/ssh_cuda_check.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_ttft_profile_2026-06-15/local/remote_prepare.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_ttft_profile_2026-06-15/local/remote_start_run.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_ttft_profile_2026-06-15/local/rsync_back.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_ttft_profile_2026-06-15/local/rsync_script.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_prefill_ttft_profile_2026-06-15/vast/ssh_cuda_check.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/bench/bench-serve.command.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/bench/bench-serve.rc
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/bench/bench-serve.stderr
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/bench/bench-serve.stdout
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/bench/bench_ferrum_prompt_token_admission_c16_16x1.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/build/ferrum.sha256
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/build/release_build.command.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/build/release_build.rc
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/build/release_build.stderr
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/build/release_build.stdout
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/correctness/run.command.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/correctness/run.rc
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/correctness/run.stderr
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/correctness/run.stdout
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/correctness/run_decision_trace.jsonl
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/correctness/run_effective_config.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/driver.nohup.log
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/driver.pid
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/gpu_contract.md
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/local/run_remote_prompt_token_admission_c16_ab.sh
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/remote/cargo_version.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/remote/end_utc.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/remote/git_head.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/remote/git_status_short.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/remote/nvcc_version.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/remote/nvidia_smi_after_bench.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/remote/nvidia_smi_before.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/remote/rustc_version.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/remote/start_utc.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/run.status
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/server/models.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/server/models.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/server/ready_poll.txt
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/server/serve.command.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/server/serve_decision_trace.jsonl
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/server/serve_effective_config.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/server/server.log
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/server/server.pid
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/smoke/chat_request.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/smoke/chat_response.err
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/smoke/chat_response.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/smoke/chat_response.rc
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/smoke/chat_validation.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/summary.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/summary.md
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/vast_shutdown/poll_1.sanitized.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/vast_shutdown/poll_2.sanitized.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/vast_shutdown/stop_response.sanitized.json
+ D docs/goals/model-coverage-2026-06-12/artifacts/w2_prompt_token_admission_c16_ab_2026-06-15/vast_shutdown/stopped.sanitized.json
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_gate_down_profile_2026-06-15/local/nvidia_smi_before_copy_stop.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_gate_down_profile_2026-06-15/local/remote_git_after_sync.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_gate_down_profile_2026-06-15/local/remote_rerun_start.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_gate_down_profile_2026-06-15/local/remote_run_start.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_gate_down_profile_2026-06-15/local/remote_summary_compact.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_gate_down_profile_2026-06-15/local/rsync_artifact.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_gate_down_profile_2026-06-15/local/rsync_runner.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_gate_down_profile_2026-06-15/local/rsync_source.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_gate_down_profile_2026-06-15/local/ssh_cuda_verify.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_paged_attn_gemma_diag_2026-06-15/local/remote_prepare.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_paged_attn_gemma_diag_2026-06-15/local/remote_start_run.err
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_paged_attn_gemma_diag_2026-06-15/local/rsync_back.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_paged_attn_gemma_diag_2026-06-15/local/rsync_script.stderr
+ M docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_paged_attn_gemma_diag_2026-06-15/vast/ssh_cuda_check.err
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_product_smoke_2026-06-15/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/full/nvidia_smi_after_bench.txt
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/full/server.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/full/server.pid
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/nohup.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/nohup.pid
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/full/nvidia_smi_before.txt
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/model_release_grade_goal_gate.manifest.json
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/perf_llamacpp/llama_bench_build_sm89_20260614.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/perf_llamacpp/llama_bench_config_sm89_20260614.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/perf_llamacpp/llamacpp_tg128.err
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/perf_llamacpp/nvidia_smi_after.txt
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/perf_llamacpp/nvidia_smi_before.txt
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/probe/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission_cap_diagnostics_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_alloc_diag_oom_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_kv384_context_fail_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_kv_allocator_diagnostics_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_kv_hint_diagnostics_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_lazy_scratch_oom_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_prompt_exact_oom_2026-06-14/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_c4_ci_pregate_2026-06-15/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_decode_batch_stats_probe_2026-06-15/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_desc_act_cuda_parity_2026-06-13/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_ferrum_natural_prompt_diag_2026-06-15/local/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_ferrum_natural_prompt_diag_2026-06-15/remote/ssh_cuda_verify.txt
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_failure_2026-06-13/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/diagnostics/
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/serve_l5_gemma3-27b-gptq_1416.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/serve_l5_gemma3-27b-gptq_32.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/serve_smoke_gemma3-27b-gptq.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/w2_gate_20260613_154658.log
+?? docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/w2_gate_20260613_154658.rc
