@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXVI — W2 source checkpoint: make batched op profiler graph-capture safe
+
+- 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - `Backend` 新增 `graph_capture_in_flight(&Context) -> bool`,默认返回
+    `false`;
+  - CUDA backend 返回 `CudaState.capture_in_flight`;
+  - Llama/Gemma batched/unified decode op profiler 在 graph-capture window
+    自动跳过 `B::sync` 型计时边界,避免
+    `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`。
+- Why:
+  - LXV 失败证据显示 typed `decode_op_profile/prefill_op_profile` 与
+    batched CUDA graph capture 同时开启时,profiler 的同步型计时触发
+    CUDA stream-capture 不支持错误;
+  - 这不是默认产品 graph 路径的性能问题,而是诊断观测路径的正确性问题;
+  - 修复保持 graph 开启,只让 graph capture iteration 不执行 graph-unsafe
+    sync profiler。
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-kernels cpu_timer -- --nocapture` PASS,2/2;
+  - `cargo test -p ferrum-models llama_batched_runtime_config -- --nocapture`
+    PASS,2/2。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXV — W2 CUDA checkpoint: typed prefill profile exposes graph-capture profiler correctness bug
 
 - 本轮 artifact:

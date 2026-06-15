@@ -88,6 +88,16 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// CPU: no-op. Metal: commit + waitUntilCompleted. CUDA: stream sync.
     fn sync(ctx: &mut Self::Context);
 
+    /// Whether the backend context is currently inside a graph-capture window.
+    ///
+    /// Synchronizing a CUDA stream while capture is active raises
+    /// `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`; diagnostic probes that time
+    /// sub-ops with explicit sync boundaries must skip those boundaries while
+    /// this returns true. Backends without graph capture use the default.
+    fn graph_capture_in_flight(_ctx: &Self::Context) -> bool {
+        false
+    }
+
     /// Prepare pending GPU work for a following host readback.
     ///
     /// Most backends either execute eagerly or synchronize as part of their

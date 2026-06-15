@@ -843,6 +843,10 @@ impl Backend for CudaBackend {
         ctx.stream.synchronize().expect("CudaBackend: stream sync");
     }
 
+    fn graph_capture_in_flight(ctx: &Self::Context) -> bool {
+        ctx.capture_in_flight
+    }
+
     fn alloc(len: usize) -> Self::Buffer {
         with_stream(|stream| {
             let len = len.max(1);
