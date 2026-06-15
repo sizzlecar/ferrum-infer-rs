@@ -1,0 +1,315 @@
+
+  ______
+ |  ____|
+ | |__ ___ _ __ _ __ _   _ _ __ ___
+ |  __/ _ \ '__| '__| | | | '_ ` _ \
+ | | |  __/ |  | |  | |_| | | | | |
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.7
+
+Model: circulus/gemma-3-27b-it-gptq
+Path: /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2
+Device: CUDA(0)
+
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Server)
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 3.9 GB → max_blocks=512
+[auto-size] requested runtime floor requires KV_MAX_BLOCKS=512 above estimated budget 338; honoring explicit runtime limits
+[auto-size] KV_MAX_BLOCKS=512 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+Initializing engine (continuous batching)...
+[2m2026-06-15T04:39:45.892026Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-15T04:39:45.892044Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-15T04:39:45.892100Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-15T04:39:46.936722Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-15T04:39:46.936764Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-15T04:39:46.936768Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-15T04:39:46.936772Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=512
+[2m2026-06-15T04:39:46.936956Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-15T04:39:46.937241Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-15T04:39:47.110458Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-15T04:39:47.110551Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-15T04:39:47.110560Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-15T04:39:47.110571Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-15T04:40:39.300578Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+[2m2026-06-15T04:40:43.889128Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m Gemma3 family: legacy batched_decode=true varlen_unified=false
+
+🚀 Server running at http://127.0.0.1:8462
+
+Endpoints:
+  POST /v1/chat/completions      - OpenAI-compatible chat
+  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)
+  POST /v1/audio/speech          - Text-to-speech (TTS)
+  POST /v1/embeddings            - Text/image embeddings
+  GET  /v1/models                - List models
+  GET  /health                   - Health check
+
+Press Ctrl+C to stop.
+
+[batched-qkr] first batched_decode call: m=4 use_batched_qkr=true (q=None k=None v=None)
+[batched-kv-append] first call: m=4 ok=true k_err=None v_err=None
+[batched-attn] first call: m=4 ok=true err=None
+[batched-op-profile] m=4 total=25962us  matmul=6919us(125) attn=1895us(62) qkr=902us(62) norm=503us(63) other=1410us(124)  unwrapped=14333us
+[batched-op-profile] m=6 total=25516us  matmul=6836us(125) attn=1803us(62) qkr=625us(62) norm=503us(63) other=1352us(124)  unwrapped=14397us
+[batched-op-profile] m=9 total=25824us  matmul=6909us(125) attn=1870us(62) qkr=628us(62) norm=502us(63) other=1373us(124)  unwrapped=14542us
+[batched-op-profile] m=10 total=26278us  matmul=7084us(125) attn=1910us(62) qkr=683us(62) norm=523us(63) other=1414us(124)  unwrapped=14664us
+[batched-op-profile] m=10 total=25888us  matmul=6893us(125) attn=1906us(62) qkr=626us(62) norm=510us(63) other=1343us(124)  unwrapped=14610us
+[batched-op-profile] m=10 total=25830us  matmul=6882us(125) attn=1890us(62) qkr=624us(62) norm=499us(63) other=1343us(124)  unwrapped=14592us
+[batched-op-profile] m=10 total=25878us  matmul=6891us(125) attn=1912us(62) qkr=629us(62) norm=503us(63) other=1355us(124)  unwrapped=14588us
+[batched-op-profile] m=10 total=25928us  matmul=6888us(125) attn=1970us(62) qkr=626us(62) norm=504us(63) other=1332us(124)  unwrapped=14608us
+[batched-op-profile] m=10 total=25939us  matmul=6908us(125) attn=1948us(62) qkr=625us(62) norm=503us(63) other=1352us(124)  unwrapped=14603us
+[batched-op-profile] m=10 total=25953us  matmul=6908us(125) attn=1943us(62) qkr=634us(62) norm=503us(63) other=1357us(124)  unwrapped=14608us
+[batched-op-profile] m=10 total=25960us  matmul=6898us(125) attn=1955us(62) qkr=630us(62) norm=503us(63) other=1352us(124)  unwrapped=14622us
+[batched-op-profile] m=10 total=25976us  matmul=6901us(125) attn=1978us(62) qkr=630us(62) norm=509us(63) other=1355us(124)  unwrapped=14603us
+[batched-op-profile] m=10 total=25968us  matmul=6901us(125) attn=1991us(62) qkr=628us(62) norm=501us(63) other=1349us(124)  unwrapped=14598us
+[batched-op-profile] m=10 total=25960us  matmul=6905us(125) attn=1982us(62) qkr=633us(62) norm=503us(63) other=1344us(124)  unwrapped=14593us
+[batched-op-profile] m=10 total=25967us  matmul=6897us(125) attn=1985us(62) qkr=636us(62) norm=504us(63) other=1343us(124)  unwrapped=14602us
+[batched-op-profile] m=10 total=25991us  matmul=6890us(125) attn=2012us(62) qkr=627us(62) norm=503us(63) other=1343us(124)  unwrapped=14616us
+[batched-op-profile] m=10 total=26020us  matmul=6902us(125) attn=2028us(62) qkr=630us(62) norm=502us(63) other=1344us(124)  unwrapped=14614us
+[batched-op-profile] m=10 total=25986us  matmul=6892us(125) attn=2029us(62) qkr=626us(62) norm=503us(63) other=1352us(124)  unwrapped=14584us
+[batched-op-profile] m=10 total=26004us  matmul=6889us(125) attn=2043us(62) qkr=631us(62) norm=504us(63) other=1354us(124)  unwrapped=14583us
+[batched-op-profile] m=10 total=26005us  matmul=6894us(125) attn=2051us(62) qkr=631us(62) norm=502us(63) other=1345us(124)  unwrapped=14582us
+[batched-op-profile] m=10 total=26034us  matmul=6893us(125) attn=2056us(62) qkr=629us(62) norm=500us(63) other=1350us(124)  unwrapped=14606us
+[batched-op-profile] m=10 total=26021us  matmul=6886us(125) attn=2053us(62) qkr=629us(62) norm=503us(63) other=1355us(124)  unwrapped=14595us
+[batched-op-profile] m=10 total=26024us  matmul=6899us(125) attn=2060us(62) qkr=629us(62) norm=503us(63) other=1337us(124)  unwrapped=14596us
+[batched-op-profile] m=10 total=26045us  matmul=6886us(125) attn=2085us(62) qkr=625us(62) norm=504us(63) other=1348us(124)  unwrapped=14597us
+[batched-op-profile] m=10 total=26073us  matmul=6886us(125) attn=2123us(62) qkr=625us(62) norm=502us(63) other=1335us(124)  unwrapped=14602us
+[batched-op-profile] m=10 total=26116us  matmul=6898us(125) attn=2110us(62) qkr=634us(62) norm=504us(63) other=1358us(124)  unwrapped=14612us
+[batched-op-profile] m=10 total=26096us  matmul=6880us(125) attn=2120us(62) qkr=629us(62) norm=504us(63) other=1359us(124)  unwrapped=14604us
+[batched-op-profile] m=10 total=26108us  matmul=6889us(125) attn=2126us(62) qkr=626us(62) norm=506us(63) other=1357us(124)  unwrapped=14604us
+[batched-op-profile] m=10 total=26131us  matmul=6896us(125) attn=2165us(62) qkr=622us(62) norm=502us(63) other=1344us(124)  unwrapped=14602us
+[batched-op-profile] m=10 total=26132us  matmul=6893us(125) attn=2133us(62) qkr=647us(62) norm=500us(63) other=1361us(124)  unwrapped=14598us
+[batched-op-profile] m=10 total=26123us  matmul=6886us(125) attn=2142us(62) qkr=630us(62) norm=502us(63) other=1361us(124)  unwrapped=14602us
+[batched-op-profile] m=10 total=26123us  matmul=6885us(125) attn=2170us(62) qkr=632us(62) norm=504us(63) other=1348us(124)  unwrapped=14584us
+[batched-op-profile] m=10 total=26150us  matmul=6895us(125) attn=2186us(62) qkr=624us(62) norm=503us(63) other=1342us(124)  unwrapped=14600us
+[batched-op-profile] m=10 total=26190us  matmul=6932us(125) attn=2174us(62) qkr=623us(62) norm=504us(63) other=1339us(124)  unwrapped=14618us
+[batched-op-profile] m=10 total=26280us  matmul=6934us(125) attn=2191us(62) qkr=634us(62) norm=504us(63) other=1372us(124)  unwrapped=14645us
+[batched-op-profile] m=10 total=26209us  matmul=6908us(125) attn=2197us(62) qkr=624us(62) norm=501us(63) other=1363us(124)  unwrapped=14616us
+[batched-op-profile] m=10 total=26172us  matmul=6890us(125) attn=2202us(62) qkr=624us(62) norm=504us(63) other=1343us(124)  unwrapped=14609us
+[batched-op-profile] m=10 total=26186us  matmul=6908us(125) attn=2205us(62) qkr=625us(62) norm=504us(63) other=1353us(124)  unwrapped=14591us
+[batched-op-profile] m=10 total=26208us  matmul=6886us(125) attn=2223us(62) qkr=626us(62) norm=502us(63) other=1379us(124)  unwrapped=14592us
+[batched-op-profile] m=10 total=26197us  matmul=6883us(125) attn=2242us(62) qkr=624us(62) norm=501us(63) other=1341us(124)  unwrapped=14606us
+[batched-op-profile] m=10 total=26214us  matmul=6883us(125) attn=2255us(62) qkr=625us(62) norm=507us(63) other=1340us(124)  unwrapped=14604us
+[batched-op-profile] m=10 total=26220us  matmul=6886us(125) attn=2249us(62) qkr=624us(62) norm=505us(63) other=1343us(124)  unwrapped=14613us
+[batched-op-profile] m=10 total=26240us  matmul=6894us(125) attn=2261us(62) qkr=623us(62) norm=502us(63) other=1351us(124)  unwrapped=14609us
+[batched-op-profile] m=10 total=26262us  matmul=6890us(125) attn=2278us(62) qkr=634us(62) norm=504us(63) other=1358us(124)  unwrapped=14598us
+[batched-op-profile] m=10 total=26248us  matmul=6885us(125) attn=2291us(62) qkr=628us(62) norm=504us(63) other=1351us(124)  unwrapped=14589us
+[batched-op-profile] m=10 total=26271us  matmul=6905us(125) attn=2293us(62) qkr=628us(62) norm=503us(63) other=1343us(124)  unwrapped=14599us
+[batched-op-profile] m=10 total=26230us  matmul=6896us(125) attn=2291us(62) qkr=625us(62) norm=499us(63) other=1326us(124)  unwrapped=14593us
+[batched-op-profile] m=10 total=26302us  matmul=6890us(125) attn=2325us(62) qkr=629us(62) norm=502us(63) other=1360us(124)  unwrapped=14596us
+[batched-op-profile] m=10 total=26322us  matmul=6898us(125) attn=2348us(62) qkr=624us(62) norm=506us(63) other=1339us(124)  unwrapped=14607us
+[batched-op-profile] m=10 total=26299us  matmul=6885us(125) attn=2330us(62) qkr=628us(62) norm=502us(63) other=1353us(124)  unwrapped=14601us
+[batched-op-profile] m=10 total=26306us  matmul=6891us(125) attn=2345us(62) qkr=623us(62) norm=503us(63) other=1348us(124)  unwrapped=14596us
+[batched-op-profile] m=10 total=26347us  matmul=6904us(125) attn=2367us(62) qkr=625us(62) norm=504us(63) other=1342us(124)  unwrapped=14605us
+[batched-op-profile] m=10 total=26337us  matmul=6891us(125) attn=2363us(62) qkr=631us(62) norm=504us(63) other=1349us(124)  unwrapped=14599us
+[batched-op-profile] m=10 total=26357us  matmul=6904us(125) attn=2361us(62) qkr=635us(62) norm=508us(63) other=1351us(124)  unwrapped=14598us
+[batched-op-profile] m=10 total=26346us  matmul=6889us(125) attn=2363us(62) qkr=628us(62) norm=503us(63) other=1348us(124)  unwrapped=14615us
+[batched-op-profile] m=10 total=26371us  matmul=6899us(125) attn=2403us(62) qkr=627us(62) norm=504us(63) other=1345us(124)  unwrapped=14593us
+[batched-op-profile] m=10 total=26438us  matmul=6902us(125) attn=2419us(62) qkr=638us(62) norm=511us(63) other=1352us(124)  unwrapped=14616us
+[batched-op-profile] m=10 total=26987us  matmul=7078us(125) attn=2460us(62) qkr=682us(62) norm=535us(63) other=1457us(124)  unwrapped=14775us
+[batched-op-profile] m=10 total=26461us  matmul=6921us(125) attn=2427us(62) qkr=626us(62) norm=503us(63) other=1359us(124)  unwrapped=14625us
+[batched-op-profile] m=9 total=26384us  matmul=6895us(125) attn=2419us(62) qkr=635us(62) norm=507us(63) other=1371us(124)  unwrapped=14557us
+[batched-op-profile] m=9 total=26419us  matmul=6910us(125) attn=2428us(62) qkr=633us(62) norm=508us(63) other=1360us(124)  unwrapped=14580us
+[batched-op-profile] m=9 total=26582us  matmul=6984us(125) attn=2427us(62) qkr=635us(62) norm=517us(63) other=1399us(124)  unwrapped=14620us
+[batched-op-profile] m=9 total=26445us  matmul=6937us(125) attn=2435us(62) qkr=630us(62) norm=503us(63) other=1350us(124)  unwrapped=14590us
+[batched-op-profile] m=6 total=25989us  matmul=6813us(125) attn=2332us(62) qkr=622us(62) norm=501us(63) other=1315us(124)  unwrapped=14406us
+[batched-op-profile] m=4 total=26452us  matmul=6988us(125) attn=2338us(62) qkr=731us(62) norm=527us(63) other=1433us(124)  unwrapped=14435us
+[batched-op-profile] m=4 total=25279us  matmul=6784us(125) attn=1760us(62) qkr=624us(62) norm=504us(63) other=1316us(124)  unwrapped=14291us
+[batched-op-profile] m=7 total=25654us  matmul=6871us(125) attn=1808us(62) qkr=625us(62) norm=502us(63) other=1371us(124)  unwrapped=14477us
+[batched-op-profile] m=10 total=25943us  matmul=6911us(125) attn=1890us(62) qkr=622us(62) norm=505us(63) other=1386us(124)  unwrapped=14629us
+[batched-op-profile] m=13 total=26258us  matmul=6962us(125) attn=1987us(62) qkr=625us(62) norm=503us(63) other=1431us(124)  unwrapped=14750us
+[batched-op-profile] m=16 total=26466us  matmul=6988us(125) attn=2096us(62) qkr=634us(62) norm=496us(63) other=1372us(124)  unwrapped=14880us
+[batched-op-profile] m=16 total=26416us  matmul=6968us(125) attn=2094us(62) qkr=625us(62) norm=504us(63) other=1365us(124)  unwrapped=14860us
+[batched-op-profile] m=16 total=26429us  matmul=6964us(125) attn=2103us(62) qkr=630us(62) norm=495us(63) other=1372us(124)  unwrapped=14865us
+[batched-op-profile] m=16 total=26440us  matmul=6969us(125) attn=2118us(62) qkr=633us(62) norm=497us(63) other=1363us(124)  unwrapped=14860us
+[batched-op-profile] m=16 total=26446us  matmul=6959us(125) attn=2131us(62) qkr=629us(62) norm=495us(63) other=1362us(124)  unwrapped=14870us
+[batched-op-profile] m=16 total=26473us  matmul=6974us(125) attn=2148us(62) qkr=631us(62) norm=500us(63) other=1367us(124)  unwrapped=14853us
+[batched-op-profile] m=16 total=26505us  matmul=6972us(125) attn=2162us(62) qkr=632us(62) norm=491us(63) other=1361us(124)  unwrapped=14887us
+[batched-op-profile] m=16 total=26489us  matmul=6967us(125) attn=2168us(62) qkr=626us(62) norm=503us(63) other=1364us(124)  unwrapped=14861us
+[batched-op-profile] m=16 total=26506us  matmul=6961us(125) attn=2182us(62) qkr=634us(62) norm=495us(63) other=1364us(124)  unwrapped=14870us
+[batched-op-profile] m=16 total=26536us  matmul=6978us(125) attn=2182us(62) qkr=633us(62) norm=494us(63) other=1365us(124)  unwrapped=14884us
+[batched-op-profile] m=16 total=26511us  matmul=6965us(125) attn=2188us(62) qkr=627us(62) norm=499us(63) other=1364us(124)  unwrapped=14868us
+[batched-op-profile] m=16 total=26548us  matmul=6974us(125) attn=2202us(62) qkr=636us(62) norm=501us(63) other=1366us(124)  unwrapped=14869us
+[batched-op-profile] m=16 total=26632us  matmul=6984us(125) attn=2228us(62) qkr=652us(62) norm=497us(63) other=1376us(124)  unwrapped=14895us
+[batched-op-profile] m=16 total=26605us  matmul=6971us(125) attn=2240us(62) qkr=654us(62) norm=492us(63) other=1365us(124)  unwrapped=14883us
+[batched-op-profile] m=16 total=26548us  matmul=6963us(125) attn=2239us(62) qkr=630us(62) norm=497us(63) other=1361us(124)  unwrapped=14858us
+[batched-op-profile] m=16 total=26554us  matmul=6963us(125) attn=2243us(62) qkr=629us(62) norm=496us(63) other=1362us(124)  unwrapped=14861us
+[batched-op-profile] m=16 total=26599us  matmul=6968us(125) attn=2258us(62) qkr=644us(62) norm=499us(63) other=1363us(124)  unwrapped=14867us
+[batched-op-profile] m=16 total=26580us  matmul=6964us(125) attn=2264us(62) qkr=629us(62) norm=492us(63) other=1364us(124)  unwrapped=14867us
+[batched-op-profile] m=16 total=26619us  matmul=6972us(125) attn=2285us(62) qkr=630us(62) norm=502us(63) other=1368us(124)  unwrapped=14862us
+[batched-op-profile] m=16 total=26658us  matmul=6978us(125) attn=2310us(62) qkr=628us(62) norm=504us(63) other=1367us(124)  unwrapped=14871us
+[batched-op-profile] m=16 total=26628us  matmul=6969us(125) attn=2307us(62) qkr=631us(62) norm=497us(63) other=1361us(124)  unwrapped=14863us
+[batched-op-profile] m=16 total=26648us  matmul=6970us(125) attn=2323us(62) qkr=627us(62) norm=495us(63) other=1367us(124)  unwrapped=14866us
+[batched-op-profile] m=16 total=26692us  matmul=6971us(125) attn=2341us(62) qkr=635us(62) norm=500us(63) other=1363us(124)  unwrapped=14882us
+[batched-op-profile] m=16 total=26688us  matmul=6977us(125) attn=2337us(62) qkr=640us(62) norm=499us(63) other=1370us(124)  unwrapped=14865us
+[batched-op-profile] m=16 total=27168us  matmul=6962us(125) attn=2841us(62) qkr=628us(62) norm=500us(63) other=1366us(124)  unwrapped=14871us
+[batched-op-profile] m=16 total=26699us  matmul=6972us(125) attn=2360us(62) qkr=625us(62) norm=498us(63) other=1375us(124)  unwrapped=14869us
+[batched-op-profile] m=16 total=26731us  matmul=6984us(125) attn=2369us(62) qkr=629us(62) norm=497us(63) other=1367us(124)  unwrapped=14885us
+[batched-op-profile] m=16 total=26712us  matmul=6971us(125) attn=2375us(62) qkr=636us(62) norm=496us(63) other=1367us(124)  unwrapped=14867us
+[batched-op-profile] m=16 total=26726us  matmul=6954us(125) attn=2401us(62) qkr=636us(62) norm=502us(63) other=1364us(124)  unwrapped=14869us
+[batched-op-profile] m=16 total=26761us  matmul=6974us(125) attn=2422us(62) qkr=630us(62) norm=498us(63) other=1375us(124)  unwrapped=14862us
+[batched-op-profile] m=16 total=26741us  matmul=6976us(125) attn=2418us(62) qkr=626us(62) norm=503us(63) other=1359us(124)  unwrapped=14859us
+[batched-op-profile] m=16 total=26771us  matmul=6969us(125) attn=2434us(62) qkr=630us(62) norm=501us(63) other=1366us(124)  unwrapped=14871us
+[batched-op-profile] m=16 total=26769us  matmul=6963us(125) attn=2437us(62) qkr=623us(62) norm=499us(63) other=1364us(124)  unwrapped=14883us
+[batched-op-profile] m=16 total=26779us  matmul=6977us(125) attn=2442us(62) qkr=629us(62) norm=498us(63) other=1372us(124)  unwrapped=14861us
+[batched-op-profile] m=16 total=26784us  matmul=6974us(125) attn=2452us(62) qkr=631us(62) norm=496us(63) other=1363us(124)  unwrapped=14868us
+[batched-op-profile] m=16 total=26773us  matmul=6958us(125) attn=2468us(62) qkr=623us(62) norm=496us(63) other=1361us(124)  unwrapped=14867us
+[batched-op-profile] m=16 total=26808us  matmul=6963us(125) attn=2479us(62) qkr=627us(62) norm=497us(63) other=1365us(124)  unwrapped=14877us
+[batched-op-profile] m=16 total=26832us  matmul=6965us(125) attn=2498us(62) qkr=630us(62) norm=502us(63) other=1362us(124)  unwrapped=14875us
+[batched-op-profile] m=16 total=26851us  matmul=6965us(125) attn=2508us(62) qkr=623us(62) norm=509us(63) other=1371us(124)  unwrapped=14875us
+[batched-op-profile] m=16 total=26833us  matmul=6961us(125) attn=2515us(62) qkr=628us(62) norm=498us(63) other=1364us(124)  unwrapped=14867us
+[batched-op-profile] m=16 total=26856us  matmul=6974us(125) attn=2525us(62) qkr=628us(62) norm=499us(63) other=1363us(124)  unwrapped=14867us
+[batched-op-profile] m=16 total=26858us  matmul=6955us(125) attn=2538us(62) qkr=626us(62) norm=497us(63) other=1362us(124)  unwrapped=14880us
+[batched-op-profile] m=16 total=26874us  matmul=6969us(125) attn=2558us(62) qkr=628us(62) norm=491us(63) other=1366us(124)  unwrapped=14862us
+[batched-op-profile] m=16 total=26893us  matmul=6972us(125) attn=2562us(62) qkr=635us(62) norm=499us(63) other=1365us(124)  unwrapped=14860us
+[batched-op-profile] m=16 total=26905us  matmul=6972us(125) attn=2578us(62) qkr=626us(62) norm=500us(63) other=1362us(124)  unwrapped=14867us
+[batched-op-profile] m=16 total=26947us  matmul=6988us(125) attn=2594us(62) qkr=629us(62) norm=490us(63) other=1371us(124)  unwrapped=14875us
+[batched-op-profile] m=16 total=26925us  matmul=6973us(125) attn=2595us(62) qkr=629us(62) norm=498us(63) other=1360us(124)  unwrapped=14870us
+[batched-op-profile] m=16 total=26914us  matmul=6956us(125) attn=2602us(62) qkr=623us(62) norm=497us(63) other=1359us(124)  unwrapped=14877us
+[batched-op-profile] m=16 total=26918us  matmul=6959us(125) attn=2613us(62) qkr=631us(62) norm=498us(63) other=1364us(124)  unwrapped=14853us
+[batched-op-profile] m=16 total=26955us  matmul=6969us(125) attn=2616us(62) qkr=626us(62) norm=501us(63) other=1365us(124)  unwrapped=14878us
+[batched-op-profile] m=16 total=26993us  matmul=6991us(125) attn=2633us(62) qkr=633us(62) norm=498us(63) other=1367us(124)  unwrapped=14871us
+[batched-op-profile] m=16 total=27006us  matmul=6986us(125) attn=2647us(62) qkr=632us(62) norm=498us(63) other=1366us(124)  unwrapped=14877us
+[batched-op-profile] m=16 total=27043us  matmul=6979us(125) attn=2668us(62) qkr=628us(62) norm=496us(63) other=1378us(124)  unwrapped=14894us
+[batched-op-profile] m=16 total=27030us  matmul=6971us(125) attn=2677us(62) qkr=637us(62) norm=496us(63) other=1368us(124)  unwrapped=14881us
+[batched-op-profile] m=16 total=27011us  matmul=6970us(125) attn=2680us(62) qkr=626us(62) norm=500us(63) other=1370us(124)  unwrapped=14865us
+[batched-op-profile] m=16 total=27039us  matmul=6966us(125) attn=2694us(62) qkr=627us(62) norm=497us(63) other=1370us(124)  unwrapped=14885us
+[batched-op-profile] m=16 total=27051us  matmul=6966us(125) attn=2713us(62) qkr=632us(62) norm=495us(63) other=1365us(124)  unwrapped=14880us
+[batched-op-profile] m=16 total=27082us  matmul=6973us(125) attn=2717us(62) qkr=641us(62) norm=497us(63) other=1370us(124)  unwrapped=14884us
+[batched-op-profile] m=15 total=26999us  matmul=6988us(125) attn=2674us(62) qkr=633us(62) norm=501us(63) other=1368us(124)  unwrapped=14835us
+[batched-op-profile] m=11 total=26528us  matmul=6914us(125) attn=2491us(62) qkr=627us(62) norm=502us(63) other=1346us(124)  unwrapped=14648us
+[batched-op-profile] m=8 total=26177us  matmul=6875us(125) attn=2376us(62) qkr=620us(62) norm=503us(63) other=1314us(124)  unwrapped=14489us
+[batched-op-profile] m=5 total=25933us  matmul=6836us(125) attn=2305us(62) qkr=627us(62) norm=503us(63) other=1320us(124)  unwrapped=14342us
+[batched-op-profile] m=3 total=25697us  matmul=6788us(125) attn=2263us(62) qkr=622us(62) norm=503us(63) other=1308us(124)  unwrapped=14213us
+[batched-op-profile] m=4 total=25705us  matmul=6971us(125) attn=1789us(62) qkr=637us(62) norm=533us(63) other=1375us(124)  unwrapped=14400us
+[batched-op-profile] m=7 total=25734us  matmul=6912us(125) attn=1819us(62) qkr=632us(62) norm=503us(63) other=1376us(124)  unwrapped=14492us
+[batched-op-profile] m=10 total=25897us  matmul=6906us(125) attn=1890us(62) qkr=623us(62) norm=502us(63) other=1366us(124)  unwrapped=14610us
+[batched-op-profile] m=10 total=26718us  matmul=7137us(125) attn=1966us(62) qkr=715us(62) norm=552us(63) other=1510us(124)  unwrapped=14838us
+[batched-op-profile] m=10 total=26371us  matmul=7034us(125) attn=1960us(62) qkr=672us(62) norm=507us(63) other=1417us(124)  unwrapped=14781us
+[batched-op-profile] m=10 total=26077us  matmul=6930us(125) attn=1932us(62) qkr=648us(62) norm=506us(63) other=1382us(124)  unwrapped=14679us
+[batched-op-profile] m=10 total=25906us  matmul=6891us(125) attn=1926us(62) qkr=624us(62) norm=504us(63) other=1353us(124)  unwrapped=14608us
+[batched-op-profile] m=10 total=26119us  matmul=6926us(125) attn=1962us(62) qkr=658us(62) norm=503us(63) other=1375us(124)  unwrapped=14695us
+[batched-op-profile] m=10 total=26196us  matmul=6950us(125) attn=1983us(62) qkr=663us(62) norm=504us(63) other=1389us(124)  unwrapped=14707us
+[batched-op-profile] m=10 total=26097us  matmul=6926us(125) attn=1976us(62) qkr=650us(62) norm=505us(63) other=1390us(124)  unwrapped=14650us
+[batched-op-profile] m=10 total=25966us  matmul=6897us(125) attn=1974us(62) qkr=629us(62) norm=501us(63) other=1360us(124)  unwrapped=14605us
+[batched-op-profile] m=10 total=26167us  matmul=6946us(125) attn=1995us(62) qkr=656us(62) norm=504us(63) other=1392us(124)  unwrapped=14674us
+[batched-op-profile] m=10 total=26252us  matmul=6951us(125) attn=2016us(62) qkr=663us(62) norm=504us(63) other=1394us(124)  unwrapped=14724us
+[batched-op-profile] m=10 total=26081us  matmul=6917us(125) attn=2007us(62) qkr=640us(62) norm=504us(63) other=1364us(124)  unwrapped=14649us
+[batched-op-profile] m=10 total=25953us  matmul=6885us(125) attn=1990us(62) qkr=624us(62) norm=503us(63) other=1345us(124)  unwrapped=14606us
+[batched-op-profile] m=10 total=26218us  matmul=6946us(125) attn=2032us(62) qkr=655us(62) norm=508us(63) other=1374us(124)  unwrapped=14703us
+[batched-op-profile] m=10 total=26261us  matmul=6950us(125) attn=2067us(62) qkr=659us(62) norm=505us(63) other=1378us(124)  unwrapped=14702us
+[batched-op-profile] m=10 total=26253us  matmul=6951us(125) attn=2062us(62) qkr=666us(62) norm=512us(63) other=1384us(124)  unwrapped=14678us
+[batched-op-profile] m=10 total=26026us  matmul=6891us(125) attn=2048us(62) qkr=640us(62) norm=504us(63) other=1354us(124)  unwrapped=14589us
+[batched-op-profile] m=10 total=26311us  matmul=6951us(125) attn=2084us(62) qkr=663us(62) norm=507us(63) other=1397us(124)  unwrapped=14709us
+[batched-op-profile] m=10 total=26227us  matmul=6931us(125) attn=2077us(62) qkr=650us(62) norm=502us(63) other=1378us(124)  unwrapped=14689us
+[batched-op-profile] m=10 total=26041us  matmul=6889us(125) attn=2063us(62) qkr=630us(62) norm=502us(63) other=1340us(124)  unwrapped=14617us
+[batched-op-profile] m=10 total=26139us  matmul=6930us(125) attn=2070us(62) qkr=636us(62) norm=510us(63) other=1369us(124)  unwrapped=14624us
+[batched-op-profile] m=10 total=26109us  matmul=6909us(125) attn=2095us(62) qkr=628us(62) norm=505us(63) other=1360us(124)  unwrapped=14612us
+[batched-op-profile] m=10 total=26093us  matmul=6894us(125) attn=2113us(62) qkr=626us(62) norm=504us(63) other=1353us(124)  unwrapped=14603us
+[batched-op-profile] m=10 total=26088us  matmul=6887us(125) attn=2114us(62) qkr=626us(62) norm=503us(63) other=1367us(124)  unwrapped=14591us
+[batched-op-profile] m=10 total=26096us  matmul=6894us(125) attn=2114us(62) qkr=625us(62) norm=503us(63) other=1353us(124)  unwrapped=14607us
+[batched-op-profile] m=10 total=26179us  matmul=6917us(125) attn=2123us(62) qkr=636us(62) norm=506us(63) other=1353us(124)  unwrapped=14644us
+[batched-op-profile] m=10 total=26132us  matmul=6889us(125) attn=2141us(62) qkr=626us(62) norm=504us(63) other=1359us(124)  unwrapped=14613us
+[batched-op-profile] m=10 total=26122us  matmul=6893us(125) attn=2142us(62) qkr=627us(62) norm=503us(63) other=1355us(124)  unwrapped=14602us
+[batched-op-profile] m=10 total=26140us  matmul=6888us(125) attn=2152us(62) qkr=629us(62) norm=504us(63) other=1352us(124)  unwrapped=14615us
+[batched-op-profile] m=10 total=26196us  matmul=6918us(125) attn=2175us(62) qkr=629us(62) norm=503us(63) other=1363us(124)  unwrapped=14608us
+[batched-op-profile] m=10 total=26384us  matmul=6961us(125) attn=2195us(62) qkr=637us(62) norm=506us(63) other=1393us(124)  unwrapped=14692us
+[batched-op-profile] m=10 total=26197us  matmul=6922us(125) attn=2186us(62) qkr=628us(62) norm=504us(63) other=1351us(124)  unwrapped=14606us
+[batched-op-profile] m=10 total=26198us  matmul=6905us(125) attn=2195us(62) qkr=626us(62) norm=502us(63) other=1361us(124)  unwrapped=14609us
+[batched-op-profile] m=10 total=26190us  matmul=6894us(125) attn=2205us(62) qkr=632us(62) norm=504us(63) other=1360us(124)  unwrapped=14595us
+[batched-op-profile] m=10 total=26238us  matmul=6903us(125) attn=2226us(62) qkr=628us(62) norm=512us(63) other=1352us(124)  unwrapped=14617us
+[batched-op-profile] m=10 total=26417us  matmul=6971us(125) attn=2238us(62) qkr=644us(62) norm=509us(63) other=1409us(124)  unwrapped=14646us
+[batched-op-profile] m=10 total=26326us  matmul=6956us(125) attn=2239us(62) qkr=624us(62) norm=505us(63) other=1370us(124)  unwrapped=14632us
+[batched-op-profile] m=10 total=26242us  matmul=6898us(125) attn=2240us(62) qkr=629us(62) norm=505us(63) other=1348us(124)  unwrapped=14622us
+[batched-op-profile] m=10 total=26272us  matmul=6930us(125) attn=2264us(62) qkr=622us(62) norm=503us(63) other=1349us(124)  unwrapped=14604us
+[batched-op-profile] m=10 total=26314us  matmul=6913us(125) attn=2267us(62) qkr=640us(62) norm=506us(63) other=1352us(124)  unwrapped=14636us
+[batched-op-profile] m=10 total=26242us  matmul=6891us(125) attn=2270us(62) qkr=625us(62) norm=502us(63) other=1345us(124)  unwrapped=14609us
+[batched-op-profile] m=10 total=26274us  matmul=6893us(125) attn=2280us(62) qkr=627us(62) norm=502us(63) other=1362us(124)  unwrapped=14610us
+[batched-op-profile] m=10 total=26312us  matmul=6892us(125) attn=2312us(62) qkr=627us(62) norm=505us(63) other=1351us(124)  unwrapped=14625us
+[batched-op-profile] m=10 total=26360us  matmul=6927us(125) attn=2310us(62) qkr=630us(62) norm=512us(63) other=1361us(124)  unwrapped=14620us
+[batched-op-profile] m=10 total=26303us  matmul=6906us(125) attn=2301us(62) qkr=623us(62) norm=503us(63) other=1357us(124)  unwrapped=14613us
+[batched-op-profile] m=10 total=26316us  matmul=6901us(125) attn=2333us(62) qkr=623us(62) norm=502us(63) other=1355us(124)  unwrapped=14602us
+[batched-op-profile] m=10 total=26357us  matmul=6895us(125) attn=2342us(62) qkr=631us(62) norm=505us(63) other=1350us(124)  unwrapped=14634us
+[batched-op-profile] m=10 total=26333us  matmul=6899us(125) attn=2347us(62) qkr=626us(62) norm=504us(63) other=1352us(124)  unwrapped=14605us
+[batched-op-profile] m=10 total=26396us  matmul=6923us(125) attn=2352us(62) qkr=624us(62) norm=502us(63) other=1376us(124)  unwrapped=14619us
+[batched-op-profile] m=10 total=26324us  matmul=6891us(125) attn=2353us(62) qkr=628us(62) norm=502us(63) other=1355us(124)  unwrapped=14595us
+[batched-op-profile] m=10 total=26349us  matmul=6897us(125) attn=2369us(62) qkr=629us(62) norm=504us(63) other=1360us(124)  unwrapped=14590us
+[batched-op-profile] m=10 total=26338us  matmul=6892us(125) attn=2372us(62) qkr=623us(62) norm=500us(63) other=1341us(124)  unwrapped=14610us
+[batched-op-profile] m=10 total=26577us  matmul=6953us(125) attn=2405us(62) qkr=647us(62) norm=517us(63) other=1390us(124)  unwrapped=14665us
+[batched-op-profile] m=10 total=26386us  matmul=6902us(125) attn=2401us(62) qkr=627us(62) norm=504us(63) other=1353us(124)  unwrapped=14599us
+[batched-op-profile] m=10 total=26394us  matmul=6899us(125) attn=2414us(62) qkr=620us(62) norm=504us(63) other=1356us(124)  unwrapped=14601us
+[batched-op-profile] m=10 total=26411us  matmul=6898us(125) attn=2420us(62) qkr=626us(62) norm=504us(63) other=1367us(124)  unwrapped=14596us
+[batched-op-profile] m=10 total=26489us  matmul=6929us(125) attn=2431us(62) qkr=633us(62) norm=510us(63) other=1362us(124)  unwrapped=14624us
+[batched-op-profile] m=10 total=26460us  matmul=6926us(125) attn=2436us(62) qkr=627us(62) norm=504us(63) other=1362us(124)  unwrapped=14605us
+[batched-op-profile] m=10 total=26439us  matmul=6893us(125) attn=2448us(62) qkr=630us(62) norm=505us(63) other=1351us(124)  unwrapped=14612us
+[batched-op-profile] m=10 total=26412us  matmul=6888us(125) attn=2443us(62) qkr=624us(62) norm=503us(63) other=1352us(124)  unwrapped=14602us
+[batched-op-profile] m=10 total=26417us  matmul=6892us(125) attn=2450us(62) qkr=623us(62) norm=503us(63) other=1336us(124)  unwrapped=14613us
+[batched-op-profile] m=6 total=26301us  matmul=6928us(125) attn=2352us(62) qkr=639us(62) norm=519us(63) other=1383us(124)  unwrapped=14480us
+[batched-op-profile] m=3 total=25727us  matmul=6799us(125) attn=2258us(62) qkr=621us(62) norm=503us(63) other=1308us(124)  unwrapped=14238us
+[batched-op-profile] m=4 total=25338us  matmul=6790us(125) attn=1759us(62) qkr=627us(62) norm=504us(63) other=1337us(124)  unwrapped=14321us
+[batched-op-profile] m=7 total=25752us  matmul=6884us(125) attn=1825us(62) qkr=643us(62) norm=502us(63) other=1386us(124)  unwrapped=14512us
+[batched-op-profile] m=10 total=26114us  matmul=6981us(125) attn=1900us(62) qkr=628us(62) norm=504us(63) other=1398us(124)  unwrapped=14703us
+[batched-op-profile] m=13 total=26413us  matmul=6994us(125) attn=1988us(62) qkr=641us(62) norm=505us(63) other=1461us(124)  unwrapped=14824us
+[batched-op-profile] m=16 total=26710us  matmul=7052us(125) attn=2125us(62) qkr=656us(62) norm=503us(63) other=1425us(124)  unwrapped=14949us
+[batched-op-profile] m=16 total=26610us  matmul=7030us(125) attn=2118us(62) qkr=642us(62) norm=503us(63) other=1386us(124)  unwrapped=14931us
+[batched-op-profile] m=16 total=26680us  matmul=7046us(125) attn=2117us(62) qkr=658us(62) norm=503us(63) other=1399us(124)  unwrapped=14957us
+[batched-op-profile] m=16 total=26666us  matmul=7031us(125) attn=2137us(62) qkr=649us(62) norm=505us(63) other=1383us(124)  unwrapped=14961us
+[batched-op-profile] m=16 total=26741us  matmul=7039us(125) attn=2167us(62) qkr=663us(62) norm=502us(63) other=1408us(124)  unwrapped=14962us
+[batched-op-profile] m=16 total=26625us  matmul=6999us(125) attn=2176us(62) qkr=663us(62) norm=503us(63) other=1379us(124)  unwrapped=14905us
+[batched-op-profile] m=16 total=26598us  matmul=6991us(125) attn=2167us(62) qkr=639us(62) norm=504us(63) other=1376us(124)  unwrapped=14921us
+[batched-op-profile] m=16 total=26647us  matmul=6995us(125) attn=2175us(62) qkr=646us(62) norm=504us(63) other=1421us(124)  unwrapped=14906us
+[batched-op-profile] m=16 total=26577us  matmul=6974us(125) attn=2203us(62) qkr=636us(62) norm=502us(63) other=1368us(124)  unwrapped=14894us
+[batched-op-profile] m=16 total=26565us  matmul=6971us(125) attn=2182us(62) qkr=640us(62) norm=502us(63) other=1380us(124)  unwrapped=14890us
+[batched-op-profile] m=16 total=26557us  matmul=6974us(125) attn=2189us(62) qkr=638us(62) norm=505us(63) other=1365us(124)  unwrapped=14886us
+[batched-op-profile] m=16 total=26614us  matmul=6971us(125) attn=2222us(62) qkr=650us(62) norm=504us(63) other=1367us(124)  unwrapped=14900us
+[batched-op-profile] m=16 total=26608us  matmul=6985us(125) attn=2244us(62) qkr=641us(62) norm=503us(63) other=1364us(124)  unwrapped=14871us
+[batched-op-profile] m=16 total=26637us  matmul=6988us(125) attn=2245us(62) qkr=643us(62) norm=503us(63) other=1365us(124)  unwrapped=14893us
+[batched-op-profile] m=16 total=26619us  matmul=6973us(125) attn=2242us(62) qkr=637us(62) norm=503us(63) other=1369us(124)  unwrapped=14895us
+[batched-op-profile] m=16 total=26654us  matmul=6975us(125) attn=2266us(62) qkr=636us(62) norm=514us(63) other=1369us(124)  unwrapped=14894us
+[batched-op-profile] m=16 total=26656us  matmul=6983us(125) attn=2269us(62) qkr=647us(62) norm=504us(63) other=1370us(124)  unwrapped=14883us
+[batched-op-profile] m=16 total=26660us  matmul=6976us(125) attn=2275us(62) qkr=631us(62) norm=503us(63) other=1364us(124)  unwrapped=14911us
+[batched-op-profile] m=16 total=26656us  matmul=6987us(125) attn=2288us(62) qkr=634us(62) norm=503us(63) other=1369us(124)  unwrapped=14875us
+[batched-op-profile] m=16 total=26743us  matmul=6991us(125) attn=2316us(62) qkr=649us(62) norm=502us(63) other=1368us(124)  unwrapped=14917us
+[batched-op-profile] m=16 total=26704us  matmul=6975us(125) attn=2319us(62) qkr=638us(62) norm=504us(63) other=1369us(124)  unwrapped=14899us
+[batched-op-profile] m=16 total=26717us  matmul=6987us(125) attn=2334us(62) qkr=637us(62) norm=502us(63) other=1370us(124)  unwrapped=14887us
+[batched-op-profile] m=16 total=26714us  matmul=6983us(125) attn=2329us(62) qkr=637us(62) norm=503us(63) other=1368us(124)  unwrapped=14894us
+[batched-op-profile] m=16 total=26713us  matmul=6984us(125) attn=2349us(62) qkr=641us(62) norm=503us(63) other=1366us(124)  unwrapped=14870us
+[batched-op-profile] m=16 total=26742us  matmul=6975us(125) attn=2372us(62) qkr=631us(62) norm=502us(63) other=1369us(124)  unwrapped=14893us
+[batched-op-profile] m=16 total=26748us  matmul=6986us(125) attn=2369us(62) qkr=636us(62) norm=503us(63) other=1364us(124)  unwrapped=14890us
+[batched-op-profile] m=16 total=26822us  matmul=6999us(125) attn=2374us(62) qkr=646us(62) norm=518us(63) other=1382us(124)  unwrapped=14903us
+[batched-op-profile] m=16 total=26797us  matmul=6991us(125) attn=2382us(62) qkr=635us(62) norm=524us(63) other=1384us(124)  unwrapped=14881us
+[batched-op-profile] m=16 total=26769us  matmul=6975us(125) attn=2412us(62) qkr=641us(62) norm=502us(63) other=1368us(124)  unwrapped=14871us
+[batched-op-profile] m=16 total=26779us  matmul=6976us(125) attn=2419us(62) qkr=632us(62) norm=498us(63) other=1368us(124)  unwrapped=14886us
+[batched-op-profile] m=16 total=26829us  matmul=6999us(125) attn=2424us(62) qkr=647us(62) norm=503us(63) other=1370us(124)  unwrapped=14886us
+[batched-op-profile] m=16 total=26810us  matmul=6978us(125) attn=2439us(62) qkr=631us(62) norm=509us(63) other=1374us(124)  unwrapped=14879us
+[batched-op-profile] m=16 total=27029us  matmul=7084us(125) attn=2456us(62) qkr=637us(62) norm=506us(63) other=1424us(124)  unwrapped=14922us
+[batched-op-profile] m=16 total=27015us  matmul=7072us(125) attn=2464us(62) qkr=641us(62) norm=499us(63) other=1386us(124)  unwrapped=14953us
+[batched-op-profile] m=16 total=26796us  matmul=6973us(125) attn=2460us(62) qkr=632us(62) norm=500us(63) other=1366us(124)  unwrapped=14865us
+[batched-op-profile] m=16 total=26821us  matmul=6982us(125) attn=2486us(62) qkr=629us(62) norm=500us(63) other=1368us(124)  unwrapped=14856us
+[batched-op-profile] m=16 total=26878us  matmul=6970us(125) attn=2501us(62) qkr=646us(62) norm=504us(63) other=1370us(124)  unwrapped=14887us
+[batched-op-profile] m=16 total=26853us  matmul=6968us(125) attn=2501us(62) qkr=644us(62) norm=501us(63) other=1368us(124)  unwrapped=14871us
+[batched-op-profile] m=16 total=26851us  matmul=6966us(125) attn=2506us(62) qkr=627us(62) norm=501us(63) other=1367us(124)  unwrapped=14884us
+[batched-op-profile] m=16 total=27077us  matmul=7023us(125) attn=2539us(62) qkr=655us(62) norm=507us(63) other=1396us(124)  unwrapped=14957us
+[batched-op-profile] m=16 total=27044us  matmul=7009us(125) attn=2554us(62) qkr=656us(62) norm=503us(63) other=1392us(124)  unwrapped=14930us
+[batched-op-profile] m=16 total=26893us  matmul=6995us(125) attn=2540us(62) qkr=632us(62) norm=498us(63) other=1363us(124)  unwrapped=14865us
+[batched-op-profile] m=16 total=26856us  matmul=6964us(125) attn=2542us(62) qkr=631us(62) norm=500us(63) other=1364us(124)  unwrapped=14855us
+[batched-op-profile] m=16 total=26898us  matmul=6963us(125) attn=2567us(62) qkr=627us(62) norm=502us(63) other=1366us(124)  unwrapped=14873us
+[batched-op-profile] m=16 total=26891us  matmul=6964us(125) attn=2585us(62) qkr=624us(62) norm=501us(63) other=1358us(124)  unwrapped=14859us
+[batched-op-profile] m=16 total=26935us  matmul=6967us(125) attn=2592us(62) qkr=642us(62) norm=500us(63) other=1368us(124)  unwrapped=14866us
+[batched-op-profile] m=16 total=26931us  matmul=6966us(125) attn=2605us(62) qkr=628us(62) norm=498us(63) other=1366us(124)  unwrapped=14868us
+[batched-op-profile] m=16 total=27120us  matmul=7010us(125) attn=2628us(62) qkr=651us(62) norm=503us(63) other=1392us(124)  unwrapped=14936us
+[batched-op-profile] m=16 total=27188us  matmul=7009us(125) attn=2655us(62) qkr=673us(62) norm=502us(63) other=1398us(124)  unwrapped=14951us
+[batched-op-profile] m=16 total=26961us  matmul=6966us(125) attn=2627us(62) qkr=625us(62) norm=497us(63) other=1366us(124)  unwrapped=14880us
+[batched-op-profile] m=16 total=26957us  matmul=6967us(125) attn=2629us(62) qkr=632us(62) norm=502us(63) other=1362us(124)  unwrapped=14865us
+[batched-op-profile] m=16 total=26990us  matmul=6964us(125) attn=2650us(62) qkr=632us(62) norm=500us(63) other=1371us(124)  unwrapped=14873us
+[batched-op-profile] m=16 total=27013us  matmul=6974us(125) attn=2672us(62) qkr=629us(62) norm=501us(63) other=1369us(124)  unwrapped=14868us
+[batched-op-profile] m=16 total=27019us  matmul=6981us(125) attn=2679us(62) qkr=629us(62) norm=500us(63) other=1372us(124)  unwrapped=14858us
+[batched-op-profile] m=16 total=27017us  matmul=6967us(125) attn=2680us(62) qkr=629us(62) norm=503us(63) other=1372us(124)  unwrapped=14866us
+[batched-op-profile] m=16 total=27249us  matmul=7015us(125) attn=2729us(62) qkr=663us(62) norm=501us(63) other=1397us(124)  unwrapped=14944us
+[batched-op-profile] m=16 total=27242us  matmul=7007us(125) attn=2733us(62) qkr=653us(62) norm=507us(63) other=1395us(124)  unwrapped=14947us
+[batched-op-profile] m=16 total=27070us  matmul=6966us(125) attn=2718us(62) qkr=627us(62) norm=499us(63) other=1372us(124)  unwrapped=14888us
+[batched-op-profile] m=16 total=27060us  matmul=6975us(125) attn=2721us(62) qkr=629us(62) norm=499us(63) other=1366us(124)  unwrapped=14870us
+[batched-op-profile] m=12 total=26635us  matmul=6942us(125) attn=2515us(62) qkr=623us(62) norm=504us(63) other=1347us(124)  unwrapped=14704us
+[batched-op-profile] m=9 total=26354us  matmul=6895us(125) attn=2427us(62) qkr=631us(62) norm=504us(63) other=1360us(124)  unwrapped=14537us
+[batched-op-profile] m=6 total=25972us  matmul=6808us(125) attn=2314us(62) qkr=623us(62) norm=503us(63) other=1313us(124)  unwrapped=14411us
+[batched-op-profile] m=3 total=25667us  matmul=6756us(125) attn=2252us(62) qkr=624us(62) norm=501us(63) other=1320us(124)  unwrapped=14214us

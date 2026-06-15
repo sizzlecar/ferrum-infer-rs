@@ -1,0 +1,22 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=16 warmup=10 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (26 prompts including 10 warmup)
+    16 completed / 0 errored / 3.3s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=914.0  p95=1500.6  p99=1500.7
+      TPOT_ms  p50=36.3  p95=44.5  p99=44.5
+      ITL_ms   p50=27.9  p95=28.5  p99=292.3
+      throughput      313.3 tok/s
+      goodput         4.91 req/s
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/1 (26 prompts including 10 warmup)
+    16 completed / 0 errored / 3.2s
+    summary c=32 (n_repeats=1, no CI)
+      TTFT_ms  p50=916.2  p95=1487.1  p99=1487.2
+      TPOT_ms  p50=36.1  p95=44.3  p99=44.3
+      ITL_ms   p50=28.0  p95=28.7  p99=285.6
+      throughput      315.4 tok/s
+      goodput         4.93 req/s
+
+→ wrote /workspace/w2_decode_op_profile_2026-06-15/profile/bench_sharegpt_c16_c32_16x1_profile.json

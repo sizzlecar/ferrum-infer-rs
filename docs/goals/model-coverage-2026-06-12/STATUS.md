@@ -2,6 +2,62 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XIX — W2 decode-op profile: bottleneck is mostly unwrapped decode work
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_decode_op_profile_2026-06-15/`。
+- 复用 Vast/cache-retained CUDA instance `40826362`,1x RTX 4090。artifact 已同步
+  回本地并停机;stop poll 记录:
+  - `poll=01 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=02 cur_state=stopped actual_status=running intended_status=stopped`;
+  - `poll=03 cur_state=stopped actual_status=exited intended_status=stopped`。
+- GPU 执行合同:
+  - lane:`W2 Gemma3 CUDA decode-op-profile diagnostic`;
+  - expected runtime/cost:10-25min,hard cap 40min,1x RTX 4090 instance
+    `40826362` at about USD 0.402/hr;
+  - stop condition:start/SSH/CUDA/server readiness first failure,profile log
+    captures c16/c32 small sample,or 40min cap;
+  - correctness gate:server readiness plus first
+    `bench-serve --fail-on-error` zero-error diagnostic;
+  - performance command:diagnostic-only natural ASCII ShareGPT dataset,
+    `num_prompts=16`,`n_repeats=1`,`random-output-len=64`,`seed=9271`,
+    c16/c32.
+- Evidence scope:
+  - reused existing release binary SHA256:
+    `a942a2e79880bbc821c26a1c60720fa753d6b8e66a62a73900a4592d123abb0e`;
+  - remote git HEAD remained `c51002b793f00c8345e160b99b6b74217ca273d9`
+    with `crates/ferrum-types/src/auto_config.rs` dirty-synced from the
+    current checkpoint,so this is profiling evidence only,not final clean
+    performance evidence;
+  - decision trace still selected `attention_decode_backend=legacy_paged_decode`
+    and `sampling_readback_path=gpu_greedy_argmax`.
+- Bench/profile result:
+  - `bench-serve` rc=0,run status `PASS`;
+  - c16:completed `[16]`,errored `[0]`,mean `313.252 tok/s`;
+  - c32 client / active cap16:completed `[16]`,errored `[0]`,mean
+    `315.362 tok/s`;
+  - server log captured `264` `[batched-op-profile]` rows.
+- Op-profile summary:
+  - for batch `m=16` (`117` rows),mean total per decode step
+    `26785 us`,p95 `27077 us`;
+  - mean shares:unwrapped `55.6%` (`14884 us`),matmul `26.1%`
+    (`6980 us`),attention `9.0%` (`2414 us`),QKR `2.4%`
+    (`636 us`),norm `1.9%` (`500 us`),other `5.1%` (`1371 us`);
+  - for batch `m=10` (`119` rows),shares were similar:unwrapped `55.8%`,
+    matmul `26.4%`,attention `8.3%`.
+- Interpretation:
+  - the current profile does not point first at attention kernels; more than
+    half of the measured decode-step time is outside the existing op counters;
+  - the next useful checkpoint is to split the `unwrapped` bucket into concrete
+    sections,likely Gemma3 sandwich tail/GeGLU/projector glue, device-shadow
+    handling, sync/copy, or uninstrumented linear/activation work;
+  - avoid a full `--require-ci` performance sweep until that unwrapped bucket
+    is explained and reduced.
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade.
+
 ## 2026-06-15 XVIII — W2 greedy-argmax default diagnostic: product default confirmed, performance still below 80%
 
 - 本轮 artifact:
