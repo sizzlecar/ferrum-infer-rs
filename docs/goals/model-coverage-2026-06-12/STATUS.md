@@ -2,6 +2,35 @@
 
 进度日志,倒序。
 
+## 2026-06-15 XXX — W2 source checkpoint: restore dense vLLM Marlin guard after first-fail evidence
+
+- 本轮未启动 GPU,没有新增 release-grade artifact,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source change:
+  - restored `reject_dense_vllm_marlin_if_requested`;
+  - dense GPTQ load now rejects `FERRUM_VLLM_MARLIN=1` before building a
+    dense vLLM Marlin store;
+  - removed the diagnostic dense vLLM load path added in `ce960292`,because
+    first-fail evidence showed it reaches vendored vLLM Marlin `abort()`
+    before generation;
+  - updated the unsupported message with the real blocker: vendored dense
+    vLLM Marlin currently compiles with `kernel_selector.h` disabled for the
+    CUDA hidden-symbol workaround,so it cannot select a real GEMM kernel
+    safely;
+  - default dense Marlin remains unchanged; vLLM Marlin MoE remains behind
+    `FERRUM_VLLM_MOE` for stacked MoE weights.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -q -p ferrum-kernels --tests` PASS;
+  - `cargo test -q -p ferrum-kernels --lib` PASS,8/8 tests;
+  - `git diff --check -- crates/ferrum-kernels/src/backend/cuda/quant.rs`
+    PASS.
+- Next step:
+  - do not spend more time on dense vLLM Marlin unless explicitly taking on
+    the broader `kernel_selector.h` / CUDA hidden-symbol linker problem;
+  - continue W2 performance work on the existing correct default path with
+    minimal same-pod validation.
+
 ## 2026-06-15 XXIX — W2 dense vLLM Marlin first-fail: prefill launch config aborts before generation
 
 - 本轮 artifact:
