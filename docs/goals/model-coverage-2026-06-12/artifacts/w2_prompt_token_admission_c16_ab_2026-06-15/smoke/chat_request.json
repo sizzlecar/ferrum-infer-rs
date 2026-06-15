@@ -1,0 +1,1 @@
+{"model":"gemma3:27b-gptq","messages":[{"role":"user","content":"What is 2+3? Answer with just the number."}],"max_tokens":8,"temperature":0,"stream":false}

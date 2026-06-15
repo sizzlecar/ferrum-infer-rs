@@ -1,0 +1,36 @@
+{
+  "artifact": "/workspace/w2_prompt_token_admission_c16_ab_2026-06-15",
+  "baseline_ferrum_c16_output_tps": 340.0028770570583,
+  "baseline_vllm_c16_output_tps": 518.796,
+  "bench_rc": "0",
+  "binary_sha256": "551f83921ea1fb6eb0cfb75170fc2325e31d887530ba084ab72ef77b238ebaf0  /workspace/ferrum-infer-rs/target/release/ferrum",
+  "build_rc": "0",
+  "delta_vs_baseline_ferrum_pct": 1.3855042243832605,
+  "git_head": "2f73213181475ba4bdff3e907e45182c24981a0e",
+  "git_status_short": "",
+  "postprocess_warning": "driver summary helper expected a list and hit KeyError after build/run/smoke/bench rc files were already 0; this summary was regenerated from the benchmark JSON",
+  "ratio_vs_vllm_c16": 0.6644492850401863,
+  "result": {
+    "bad_output_per_run": [
+      0
+    ],
+    "completed_per_run": [
+      16
+    ],
+    "concurrency": 16,
+    "errored_per_run": [
+      0
+    ],
+    "output_throughput_tps": 344.7136312817085,
+    "output_token_count_source": "usage",
+    "request_throughput_rps": 5.386150488776695,
+    "tpot_p50_ms": 31.591643761904763,
+    "tpot_p95_ms": 31.62296416666667,
+    "ttft_p50_ms": 931.7761555,
+    "ttft_p95_ms": 1410.9340120000002
+  },
+  "run_rc": "0",
+  "scheduler_decision": "prompt_token_estimate",
+  "serve_smoke_rc": "0",
+  "status": "PASS_CORE_WITH_POSTPROCESS_WARNING"
+}
