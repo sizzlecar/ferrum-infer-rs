@@ -2,6 +2,48 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXXXII — W2 source checkpoint: native split-QKV + paged-varlen combo probe
+
+- 本轮没有启动 GPU,没有新的性能数字,也没有生成
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`。
+- Source/tooling change:
+  - 新增
+    `scripts/microbenches/paged_varlen_split_qkv_correctness.cu`;
+  - 新增
+    `scripts/microbenches/build_and_run_paged_varlen_split_qkv_correctness.sh`;
+  - probe 直接用 `nvcc` 链接
+    `split_qkv_norm_rope_into_paged_cache.cu` 和
+    `paged_varlen_attention.cu`,不走 Cargo,不加载模型;
+  - 覆盖 `qk_mode=1`(QK-norm + half-split RoPE, Gemma/Qwen-style),
+    `qk_mode=2`,`qk_mode=3`,以及 full causal / sliding-window;
+  - cache_k/cache_v 预置非零 historical KV,再由 varlen split 覆盖当前
+    q tokens,最后由 paged-varlen attention 消费同一套 Q/K/V buffers。
+- Why:
+  - XLIII 已证明孤立 `paged_varlen_attention` 的 sliding-window 语义正确;
+  - LXXX 失败发生在 product 链路
+    `split_qkv_norm_rope_paged` -> `paged_varlen_attention` 之后,所以需要
+    native CUDA 组合 probe,而不是继续跑 c16/c32 或只测 attention。
+- Local validation:
+  - `bash -n scripts/microbenches/build_and_run_paged_varlen_split_qkv_correctness.sh`
+    PASS;
+  - `git diff --check -- scripts/microbenches/paged_varlen_split_qkv_correctness.cu scripts/microbenches/build_and_run_paged_varlen_split_qkv_correctness.sh`
+    PASS;
+  - local machine has no `nvcc`,so native CUDA compile/run is pending on the
+    cached 1x4090 instance。
+- Required next validation:
+  - run only:
+    `bash scripts/microbenches/build_and_run_paged_varlen_split_qkv_correctness.sh`;
+  - expected PASS line:
+    `VERDICT: paged varlen split-qkv correctness PASS`;
+  - if it fails, fix the native kernel issue before any product smoke or
+    performance sweep;
+  - if it passes, use the `[unified-logits]` product smoke from LXXXI to
+    classify the remaining empty-output cause。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXXXI — W2 source checkpoint: unified logits diagnostic for paged-varlen failure
 
 - 本轮没有启动 GPU,没有新的性能数字,也没有生成
