@@ -1,0 +1,73 @@
+# Ferrum CLI Configuration for MVP Testing
+
+[client]
+base_url = "http://localhost:8080"
+timeout_seconds = 300
+
+[client.retry]
+max_attempts = 3
+initial_delay_ms = 100
+max_delay_ms = 5000
+backoff_multiplier = 2.0
+
+[models]
+model_dir = "./models"
+cache_dir = "./model_cache"
+default_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+[models.aliases]
+
+[models.download]
+# 使用 HuggingFace 标准缓存目录（与 Python transformers 库共享）
+# 支持环境变量 HF_HOME 覆盖
+hf_cache_dir = "~/.cache/huggingface"
+timeout_seconds = 300
+max_concurrent = 4
+retry_attempts = 3
+
+[benchmark]
+num_requests = 100
+concurrency = 10
+prompt_length = 512
+max_tokens = 256
+warmup_requests = 10
+output_dir = "./benchmark_results"
+
+[server]
+host = "127.0.0.1"
+port = 8000
+config_path = "server.toml"
+log_level = "info"
+hot_reload = false
+
+[dev]
+debug = false
+profile_memory = false
+profile_gpu = false
+mock_backends = false
+test_data_dir = "./test_data"
+
+[runtime]
+# Optional startup runtime overrides. Precedence is CLI > env > config file.
+# Keep product-facing config small; advanced M3/FA2/debug selectors are accepted
+# by the config schema for benchmark artifacts, but are intentionally not
+# listed here as normal user settings.
+# kv_dtype = "fp16"
+# kv_max_blocks = 2048
+# paged_max_seqs = 32
+# max_batched_tokens = 2048
+# prefix_cache = false
+# moe_graph = true
+# marlin_profile = true
+# marlin_trace_shapes = true
+# marlin_trace_shapes_max = 64
+batch_decode_prof = true
+batch_prefill_prof = true
+decode_op_profile = true
+prefill_op_profile = true
+unified_post_prof = true
+next_batch_prof = true
+batched_graph = true
+marlin_profile = true
+marlin_trace_shapes = true
+marlin_trace_shapes_max = 96
