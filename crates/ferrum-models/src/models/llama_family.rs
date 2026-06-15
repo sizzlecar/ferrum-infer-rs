@@ -50,8 +50,10 @@ pub(crate) static OTHER_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static OTHER_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TAIL_NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TAIL_NORM_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_MLP_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_MLP_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_GATE_UP_TIME_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_DOWN_TIME_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TAIL_DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TAIL_ACT_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TAIL_ACT_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TAIL_RESID_TIME_US: AtomicU64 = AtomicU64::new(0);
@@ -3126,7 +3128,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         });
 
         // 10. Fused gate+up projection.
-        time_tail!(TAIL_MLP_TIME_US, TAIL_MLP_CALLS, {
+        time_tail!(TAIL_GATE_UP_TIME_US, TAIL_GATE_UP_CALLS, {
             #[cfg(feature = "cuda")]
             let _alloc_label =
                 ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.gate_up_proj");
@@ -3183,7 +3185,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         nt!("act_mul", &self.scratch.silu_out, tokens * im, im);
         // 12. Down projection.
-        time_tail!(TAIL_MLP_TIME_US, TAIL_MLP_CALLS, {
+        time_tail!(TAIL_DOWN_TIME_US, TAIL_DOWN_CALLS, {
             #[cfg(feature = "cuda")]
             let _alloc_label =
                 ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.down_proj");
