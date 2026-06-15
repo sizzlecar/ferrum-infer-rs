@@ -2,6 +2,53 @@
 
 进度日志,倒序。
 
+## 2026-06-16 LXIX — W2 CUDA checkpoint: capture-lifecycle retry still fails under profile
+
+- 本轮 artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_capture_retry_2026-06-16/`。
+- GPU 执行合同:
+  - lane:`W2 typed prefill profile capture-lifecycle retry`;
+  - Vast instance:`40826362`,1x RTX 4090,约 USD `0.425/hr`;
+  - expected runtime/cost:8-15min,hard cap 25min;
+  - stop condition:build/server/chat/bench/profile 首败,或最小 c16
+    profile 完成后复制 artifact 并停机;
+  - correctness gate:CUDA release build,`ferrum serve` ready,chat smoke,
+    `bench-serve --fail-on-error` c16 single cell;
+  - performance command:diagnostic-only c16 ShareGPT single-run profile,
+    no CI/no `--require-ci`。
+- Execution evidence:
+  - remote HEAD:`a9d8b439097f89011fb02dc78e1046ddb07d73e6`;
+  - non-artifact source status clean;
+  - CUDA release build rc `0`,binary SHA256:
+    `e111e6ec9653fd141ad5eb8ed504f18997a7d29244dbbe685be9955d2277a350`;
+  - `ferrum serve` ready after poll `58`,chat smoke passed with content
+    `5` and `completion_tokens=3`;
+  - typed profiler config came from config file for
+    `FERRUM_BATCH_DECODE_PROF`,`FERRUM_BATCH_PREFILL_PROF`,
+    `FERRUM_DECODE_OP_PROFILE`,`FERRUM_PREFILL_OP_PROFILE`,
+    `FERRUM_NEXT_BATCH_PROF`,`FERRUM_UNIFIED_POST_PROF`;
+  - c16 profile emitted usable partial profile lines before failure:
+    `prefill-profile` lines `121`,`batched-op-profile` lines `3`,
+    `unified-prof` lines `7`;
+  - failure remained:
+    `CudaBackend: stream sync: DriverError(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, "operation not permitted when stream is capturing")`;
+  - run was stopped at first failure;`run_profile.rc=143`,
+    `bench_sharegpt_c16.rc=143`;
+  - Vast shutdown verified:`cur_state=stopped actual_status=exited`。
+- Interpretation:
+  - LXVIII fixed one capture-end condition, but this retry proves the
+    profile+batched-graph path can still reach a normal `B::sync` while CUDA
+    capture is in flight;
+  - this is still a correctness blocker for profiler-backed performance
+    diagnosis, even though product chat smoke passed;
+  - partial profiles still narrow the hot region: c16 prefill sample shows
+    `tail_mlp` about `37-41ms/62 layers`, and batched decode sample shows
+    `tail_mlp` about `13.5ms` per m=10 decode iteration。
+- Release-grade status:
+  - no `model_release_grade_manifest.json`,no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - W2 remains not release-grade。
+
 ## 2026-06-16 LXVIII — W2 source checkpoint: end capture based on active capture state
 
 - 本轮没有启动 GPU,没有新增 release-grade artifact,也没有生成
