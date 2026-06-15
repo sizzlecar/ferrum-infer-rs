@@ -1,0 +1,14 @@
+{
+  "artifact_dir": "docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_kv_unified_cuda_smoke_2026-06-16",
+  "source_commit": "103c7013e849b198cabaa7ad47cd45063bf21e6d",
+  "binary_sha256": "0d4595b6dbb6f4920ec5ed4af286ce7fbd89ad936d8dba1c76ad99d15806ac70",
+  "shutdown_actual_status": "exited",
+  "build_rc": 0,
+  "run_profile_rc": 1,
+  "bench_started": false,
+  "chat_pass": false,
+  "chat_content": "",
+  "completion_tokens": 1,
+  "release_grade": false,
+  "conclusion": "allowing Gemma3 CUDA windowed paged KV removes unified_decode fallback, but product chat smoke returns an empty answer; keep windowed Gemma3 on contiguous KV until paged-varlen correctness is fixed"
+}

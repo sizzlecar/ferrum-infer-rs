@@ -440,10 +440,10 @@ impl LlamaFamilyRuntimeEnv {
 
 fn paged_kv_allowed_for_layer_schedule(
     paged_enabled: bool,
-    backend_supports_varlen_qkv: bool,
+    _backend_supports_varlen_qkv: bool,
     sliding_window_pattern: usize,
 ) -> bool {
-    paged_enabled && (sliding_window_pattern == 0 || backend_supports_varlen_qkv)
+    paged_enabled && sliding_window_pattern == 0
 }
 
 /// Whether decode-op profiling is enabled, resolved from the runtime snapshot
@@ -2046,11 +2046,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // opt-in pre-0.7.2; flipping the default so default `ferrum
         // serve` matches the bench-quality numbers without requiring
         // env-var knowledge.
-        // Per-layer window scheduling (Gemma 3) can only use paged KV on
-        // backends whose paged-varlen path receives the layer's sliding
-        // window. CUDA has that path; Metal paged decode does not yet expose
-        // a per-layer window in its paged dispatch, so keep it on contiguous
-        // KV for sandwich/windowed families.
+        // Keep windowed Gemma3 on contiguous KV until the paged-varlen path
+        // has model-level correctness coverage. CUDA exposes a sliding-window
+        // parameter, but the current paged unified smoke returns an empty
+        // answer for Gemma3-27B when enabled.
         let paged = paged_kv_allowed_for_layer_schedule(
             runtime_env.paged_kv_enabled::<B>(),
             B::supports_varlen_qkv(),
@@ -5220,11 +5219,11 @@ mod tests {
     }
 
     #[test]
-    fn paged_kv_layer_schedule_allows_windowed_models_only_with_varlen_backend() {
+    fn paged_kv_layer_schedule_keeps_windowed_models_contiguous() {
         assert!(paged_kv_allowed_for_layer_schedule(true, false, 0));
         assert!(paged_kv_allowed_for_layer_schedule(true, true, 0));
         assert!(!paged_kv_allowed_for_layer_schedule(true, false, 6));
-        assert!(paged_kv_allowed_for_layer_schedule(true, true, 6));
+        assert!(!paged_kv_allowed_for_layer_schedule(true, true, 6));
         assert!(!paged_kv_allowed_for_layer_schedule(false, true, 6));
     }
 
