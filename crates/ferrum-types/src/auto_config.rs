@@ -647,6 +647,11 @@ impl FerrumConfigBuilder {
             false,
             AutoConfigSource::Default,
         )?;
+        let unified_graph_lm_head_eager = self.bool_value(
+            "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+            false,
+            AutoConfigSource::Default,
+        )?;
         let greedy = self.bool_value(
             "FERRUM_GREEDY_ARGMAX",
             (cuda_backend || self.hardware.backend.eq_ignore_ascii_case("metal"))
@@ -698,7 +703,11 @@ impl FerrumConfigBuilder {
             graph.value,
         )?;
         self.validate_batched_graph(batched_graph.value)?;
-        self.validate_unified_graph(unified_graph.value, unified_graph_layers_only.value)?;
+        self.validate_unified_graph(
+            unified_graph.value,
+            unified_graph_layers_only.value,
+            unified_graph_lm_head_eager.value,
+        )?;
         self.validate_memory(
             kv_blocks.value,
             max_sequences.value,
@@ -737,6 +746,10 @@ impl FerrumConfigBuilder {
                 "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
                 &unified_graph_layers_only,
             ),
+            (
+                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+                &unified_graph_lm_head_eager,
+            ),
             ("FERRUM_GREEDY_ARGMAX", &greedy),
         ] {
             if resolved.source != AutoConfigSource::Env {
@@ -753,6 +766,7 @@ impl FerrumConfigBuilder {
             batched_graph,
             unified_graph,
             unified_graph_layers_only,
+            unified_graph_lm_head_eager,
         ));
         decisions.push(self.scalar_decision(
             "kv_block_count",
@@ -1169,11 +1183,24 @@ impl FerrumConfigBuilder {
         &self,
         graph: bool,
         layers_only: bool,
+        lm_head_eager: bool,
     ) -> Result<(), AutoConfigError> {
         if layers_only && !graph {
             return self.invalid(
                 "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
                 "layers-only unified graph capture requires FERRUM_UNIFIED_GRAPH=1",
+            );
+        }
+        if lm_head_eager && !graph {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+                "lm-head-eager unified graph capture requires FERRUM_UNIFIED_GRAPH=1",
+            );
+        }
+        if layers_only && lm_head_eager {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+                "lm-head-eager unified graph capture conflicts with layers-only capture",
             );
         }
         if !graph {
@@ -1185,7 +1212,8 @@ impl FerrumConfigBuilder {
                 "unified decode graph does not apply to MoE models",
             );
         }
-        if self.model.architecture.eq_ignore_ascii_case("gemma3") && !layers_only {
+        if self.model.architecture.eq_ignore_ascii_case("gemma3") && !layers_only && !lm_head_eager
+        {
             return self.invalid(
                 "FERRUM_UNIFIED_GRAPH",
                 "full unified decode graph is disabled for Gemma3 sandwich-norm models",
@@ -1490,9 +1518,12 @@ impl FerrumConfigBuilder {
         batched_graph: ResolvedValue<bool>,
         unified_graph: ResolvedValue<bool>,
         unified_graph_layers_only: ResolvedValue<bool>,
+        unified_graph_lm_head_eager: ResolvedValue<bool>,
     ) -> AutoConfigDecision {
         let selected = if unified_graph.value && unified_graph_layers_only.value {
             "unified_decode_graph_layers_only"
+        } else if unified_graph.value && unified_graph_lm_head_eager.value {
+            "unified_decode_graph_lm_head_eager"
         } else if unified_graph.value {
             "unified_decode_graph"
         } else if batched_graph.value {
@@ -1502,6 +1533,8 @@ impl FerrumConfigBuilder {
         };
         let source_value = if unified_graph_layers_only.value {
             unified_graph_layers_only
+        } else if unified_graph_lm_head_eager.value {
+            unified_graph_lm_head_eager
         } else if unified_graph.value
             || (!batched_graph.value && unified_graph.source != AutoConfigSource::Default)
         {
@@ -1516,6 +1549,7 @@ impl FerrumConfigBuilder {
             source_value.source_key,
             [
                 "unified_decode_graph_layers_only",
+                "unified_decode_graph_lm_head_eager",
                 "unified_decode_graph",
                 "legacy_batched_decode_graph",
                 "graph_disabled",
@@ -1526,6 +1560,10 @@ impl FerrumConfigBuilder {
                     (
                         "unified_decode_graph_layers_only",
                         "layers-only unified decode graph not selected",
+                    ),
+                    (
+                        "unified_decode_graph_lm_head_eager",
+                        "lm-head-eager unified decode graph not selected",
                     ),
                     ("unified_decode_graph", "unified decode graph not selected"),
                     (
@@ -2738,6 +2776,46 @@ mod tests {
     }
 
     #[test]
+    fn unified_graph_lm_head_eager_override_materializes_decode_graph_policy() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[
+            ("FERRUM_UNIFIED_GRAPH", "1", RuntimeConfigSource::Cli),
+            (
+                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+                "1",
+                RuntimeConfigSource::Cli,
+            ),
+        ]))
+        .with_model_capabilities(gemma3_gptq_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(
+            decisions["decode_graph_policy"],
+            "unified_decode_graph_lm_head_eager"
+        );
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER")
+            .expect("unified graph lm-head-eager entry");
+        assert_eq!(entry.effective_value, "1");
+        assert_eq!(
+            resolved.effective_config_document()["selected_graph_mode"],
+            "unified_decode_graph_lm_head_eager"
+        );
+    }
+
+    #[test]
     fn unified_graph_layers_only_requires_unified_graph() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
@@ -2752,6 +2830,47 @@ mod tests {
             err,
             AutoConfigError::InvalidOverride { key, .. }
                 if key == "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY"
+        ));
+    }
+
+    #[test]
+    fn unified_graph_lm_head_eager_requires_unified_graph() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err =
+            FerrumConfigBuilder::new(snapshot(&[("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", "1")]))
+                .with_model_capabilities(ModelCapabilities::unknown())
+                .with_hardware_capabilities(hardware)
+                .with_workload_profile(workload)
+                .resolve()
+                .expect_err("lm-head-eager graph scope should require unified graph");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. }
+                if key == "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER"
+        ));
+    }
+
+    #[test]
+    fn unified_graph_lm_head_eager_conflicts_with_layers_only() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[
+            ("FERRUM_UNIFIED_GRAPH", "1"),
+            ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "1"),
+            ("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", "1"),
+        ]))
+        .with_model_capabilities(ModelCapabilities::unknown())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .expect_err("lm-head-eager graph scope should conflict with layers-only graph scope");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. }
+                if key == "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER"
         ));
     }
 

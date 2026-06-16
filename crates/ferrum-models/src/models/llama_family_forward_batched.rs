@@ -40,11 +40,39 @@ pub(crate) struct LlamaBatchedRuntimeConfig {
     decode_op_profile: bool,
     unified_graph: bool,
     unified_graph_layers_only: bool,
+    unified_graph_lm_head_eager: bool,
     unified_profile: bool,
     batched_graph: bool,
     batched_trace: bool,
     greedy_argmax: bool,
     split_k_attn: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnifiedGraphCaptureScope {
+    LayersOnly,
+    LmHeadEager,
+    Full,
+}
+
+impl UnifiedGraphCaptureScope {
+    fn from_config(config: &LlamaBatchedRuntimeConfig) -> Self {
+        if config.unified_graph_layers_only {
+            Self::LayersOnly
+        } else if config.unified_graph_lm_head_eager {
+            Self::LmHeadEager
+        } else {
+            Self::Full
+        }
+    }
+
+    fn captures_final_pack(self) -> bool {
+        matches!(self, Self::LmHeadEager | Self::Full)
+    }
+
+    fn captures_lm_head(self) -> bool {
+        matches!(self, Self::Full)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,6 +125,7 @@ impl LlamaBatchedRuntimeConfig {
             decode_op_profile: false,
             unified_graph: false,
             unified_graph_layers_only: false,
+            unified_graph_lm_head_eager: false,
             unified_profile: false,
             batched_graph: false,
             batched_trace: false,
@@ -110,6 +139,9 @@ impl LlamaBatchedRuntimeConfig {
                 "FERRUM_UNIFIED_GRAPH" => config.unified_graph = value == "1",
                 "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY" => {
                     config.unified_graph_layers_only = value == "1"
+                }
+                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER" => {
+                    config.unified_graph_lm_head_eager = value == "1"
                 }
                 "FERRUM_UNIFIED_PROFILE" => config.unified_profile = true,
                 "FERRUM_BATCHED_GRAPH" => config.batched_graph = value != "0",
@@ -176,18 +208,18 @@ fn should_log_unified_graph_count(count: u64) -> bool {
     count.is_power_of_two()
 }
 
-fn unified_graph_scope_label(layers_only: bool) -> &'static str {
-    if layers_only {
-        "layers_only"
-    } else {
-        "full"
+fn unified_graph_scope_label(scope: UnifiedGraphCaptureScope) -> &'static str {
+    match scope {
+        UnifiedGraphCaptureScope::LayersOnly => "layers_only",
+        UnifiedGraphCaptureScope::LmHeadEager => "lm_head_eager",
+        UnifiedGraphCaptureScope::Full => "full",
     }
 }
 
 fn record_unified_graph_replay(
     origin: &str,
     graph_key: u64,
-    layers_only: bool,
+    scope: UnifiedGraphCaptureScope,
     attention_launch_key: u64,
     m_total: usize,
     num_seqs: usize,
@@ -195,7 +227,7 @@ fn record_unified_graph_replay(
 ) {
     let count = UNIFIED_GRAPH_REPLAY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if should_log_unified_graph_count(count) {
-        let scope = unified_graph_scope_label(layers_only);
+        let scope = unified_graph_scope_label(scope);
         eprintln!(
             "[unified-graph-replay] origin={origin} count={count} scope={scope} key={graph_key} \
              attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
@@ -206,7 +238,7 @@ fn record_unified_graph_replay(
 
 fn record_unified_graph_capture(
     graph_key: u64,
-    layers_only: bool,
+    scope: UnifiedGraphCaptureScope,
     attention_launch_key: u64,
     m_total: usize,
     num_seqs: usize,
@@ -214,7 +246,7 @@ fn record_unified_graph_capture(
 ) {
     let count = UNIFIED_GRAPH_CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if should_log_unified_graph_count(count) {
-        let scope = unified_graph_scope_label(layers_only);
+        let scope = unified_graph_scope_label(scope);
         eprintln!(
             "[unified-graph-capture] count={count} scope={scope} key={graph_key} \
              attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
@@ -226,7 +258,7 @@ fn record_unified_graph_capture(
 fn record_unified_graph_capture_skip(
     reason: &str,
     graph_key: u64,
-    layers_only: bool,
+    scope: UnifiedGraphCaptureScope,
     attention_launch_key: u64,
     m_total: usize,
     num_seqs: usize,
@@ -235,7 +267,7 @@ fn record_unified_graph_capture_skip(
 ) {
     let count = UNIFIED_GRAPH_CAPTURE_SKIP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if should_log_unified_graph_count(count) {
-        let scope = unified_graph_scope_label(layers_only);
+        let scope = unified_graph_scope_label(scope);
         eprintln!(
             "[unified-graph-skip] reason={reason} count={count} scope={scope} key={graph_key} \
              attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
@@ -260,7 +292,7 @@ fn unified_graph_capture_skip_reason(
 
 fn record_unified_graph_eager(
     graph_key: u64,
-    layers_only: bool,
+    scope: UnifiedGraphCaptureScope,
     attention_launch_key: u64,
     m_total: usize,
     num_seqs: usize,
@@ -268,7 +300,7 @@ fn record_unified_graph_eager(
 ) {
     let count = UNIFIED_GRAPH_EAGER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_multiple_of(256) {
-        let scope = unified_graph_scope_label(layers_only);
+        let scope = unified_graph_scope_label(scope);
         eprintln!(
             "[unified-graph-stats] scope={scope} key={graph_key} \
              attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
@@ -340,7 +372,8 @@ mod tests {
         should_log_batched_graph_replay_count, should_log_unified_graph_count,
         should_log_unified_logits_diag, should_use_batched_decode_graph,
         unified_graph_capture_skip_reason, unified_graph_scope_label, LlamaBatchedRuntimeConfig,
-        BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT, UNIFIED_GRAPH_MAX_CACHED_KEYS,
+        UnifiedGraphCaptureScope, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
+        UNIFIED_GRAPH_MAX_CACHED_KEYS,
     };
 
     #[test]
@@ -349,6 +382,7 @@ mod tests {
             ("FERRUM_DECODE_OP_PROFILE", "0"),
             ("FERRUM_UNIFIED_GRAPH", "1"),
             ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "1"),
+            ("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", "1"),
             ("FERRUM_UNIFIED_PROFILE", ""),
             ("FERRUM_BATCHED_GRAPH", "1"),
             ("FERRUM_BATCHED_TRACE", "0"),
@@ -359,6 +393,7 @@ mod tests {
         assert!(config.decode_op_profile);
         assert!(config.unified_graph);
         assert!(config.unified_graph_layers_only);
+        assert!(config.unified_graph_lm_head_eager);
         assert!(config.unified_profile);
         assert!(config.batched_graph);
         assert!(config.batched_trace);
@@ -372,6 +407,7 @@ mod tests {
         let config = LlamaBatchedRuntimeConfig::from_env_vars([
             ("FERRUM_UNIFIED_GRAPH", "true"),
             ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "true"),
+            ("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", "true"),
             ("FERRUM_BATCHED_GRAPH", "0"),
             ("FERRUM_GREEDY_ARGMAX", "true"),
             ("FERRUM_SPLIT_K_ATTN", "auto"),
@@ -380,6 +416,7 @@ mod tests {
         assert!(!config.decode_op_profile);
         assert!(!config.unified_graph);
         assert!(!config.unified_graph_layers_only);
+        assert!(!config.unified_graph_lm_head_eager);
         assert!(!config.unified_profile);
         assert!(!config.batched_graph);
         assert!(!config.batched_trace);
@@ -436,8 +473,18 @@ mod tests {
         assert!(should_log_unified_graph_count(2));
         assert!(!should_log_unified_graph_count(3));
         assert!(should_log_unified_graph_count(4));
-        assert_eq!(unified_graph_scope_label(true), "layers_only");
-        assert_eq!(unified_graph_scope_label(false), "full");
+        assert_eq!(
+            unified_graph_scope_label(UnifiedGraphCaptureScope::LayersOnly),
+            "layers_only"
+        );
+        assert_eq!(
+            unified_graph_scope_label(UnifiedGraphCaptureScope::LmHeadEager),
+            "lm_head_eager"
+        );
+        assert_eq!(
+            unified_graph_scope_label(UnifiedGraphCaptureScope::Full),
+            "full"
+        );
     }
 
     #[test]
@@ -1649,7 +1696,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         //   varlen + graph:  714 tok/s, TPOT 18.3 ms  (+5% / -5%)
         let graph_enabled =
             self.batched_cfg.unified_graph && self.batched_cfg.graph_capture_allowed();
-        let graph_layers_only = self.batched_cfg.unified_graph_layers_only;
+        let graph_scope = UnifiedGraphCaptureScope::from_config(&self.batched_cfg);
         let attention_launch_key = crate::common::decoder_unified::unified_attention_launch_key(
             m_total,
             num_seqs,
@@ -1657,11 +1704,18 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len),
             self.batched_cfg.split_k_attn,
         );
-        let graph_key = if graph_layers_only {
+        let graph_key = if graph_scope == UnifiedGraphCaptureScope::LayersOnly {
             crate::common::decoder_unified::unified_layers_only_graph_key(
                 m_total,
                 num_seqs,
                 attention_launch_key,
+            )
+        } else if graph_scope == UnifiedGraphCaptureScope::LmHeadEager {
+            crate::common::decoder_unified::unified_lm_head_eager_graph_key(
+                m_total,
+                num_seqs,
+                attention_launch_key,
+                &final_indices,
             )
         } else {
             crate::common::decoder_unified::unified_graph_key(
@@ -1738,7 +1792,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     record_unified_graph_replay(
                         "pure",
                         graph_key,
-                        graph_layers_only,
+                        graph_scope,
                         attention_launch_key,
                         m_total,
                         num_seqs,
@@ -1775,7 +1829,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         if graph_enabled && !did_pure_replay {
             record_unified_graph_eager(
                 graph_key,
-                graph_layers_only,
+                graph_scope,
                 attention_launch_key,
                 m_total,
                 num_seqs,
@@ -1786,7 +1840,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             record_unified_graph_capture_skip(
                 reason,
                 graph_key,
-                graph_layers_only,
+                graph_scope,
                 attention_launch_key,
                 m_total,
                 num_seqs,
@@ -1804,17 +1858,22 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         let capture_started = should_capture && B::graph_capture_in_flight(&ctx);
         let mut layers_ready = did_pure_replay;
-        if !did_pure_replay {
-            run_unified_layers!();
-            if capture_started && graph_layers_only && B::graph_capture_in_flight(&ctx) {
+        let mut final_pack_ready = did_pure_replay && graph_scope.captures_final_pack();
+        let mut lm_head_ready = did_pure_replay && graph_scope.captures_lm_head();
+        macro_rules! finish_unified_graph_capture {
+            () => {{
+                let scope_label = unified_graph_scope_label(graph_scope);
                 if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
-                    eprintln!("[unified-graph] layers-only end_capture err: {e}");
+                    eprintln!("[unified-graph] {scope_label} end_capture err: {e}");
                     self.unified_graph_failed = true;
+                    layers_ready = false;
+                    final_pack_ready = false;
+                    lm_head_ready = false;
                 } else {
                     self.unified_graph_keys_seen.insert(graph_key);
                     record_unified_graph_capture(
                         graph_key,
-                        graph_layers_only,
+                        graph_scope,
                         attention_launch_key,
                         m_total,
                         num_seqs,
@@ -1823,10 +1882,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     match B::replay_graph(&mut ctx, graph_key) {
                         Ok(true) => {
                             layers_ready = true;
+                            final_pack_ready = graph_scope.captures_final_pack();
+                            lm_head_ready = graph_scope.captures_lm_head();
                             record_unified_graph_replay(
                                 "post_capture",
                                 graph_key,
-                                graph_layers_only,
+                                graph_scope,
                                 attention_launch_key,
                                 m_total,
                                 num_seqs,
@@ -1834,24 +1895,41 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                             );
                         }
                         Ok(false) => {
-                            eprintln!("[unified-graph] layers-only post-capture replay skipped");
+                            eprintln!("[unified-graph] {scope_label} post-capture replay skipped");
                             self.unified_graph_failed = true;
+                            layers_ready = false;
+                            final_pack_ready = false;
+                            lm_head_ready = false;
                         }
                         Err(e) => {
-                            eprintln!("[unified-graph] layers-only post-capture replay err: {e}");
+                            eprintln!("[unified-graph] {scope_label} post-capture replay err: {e}");
                             self.unified_graph_failed = true;
+                            layers_ready = false;
+                            final_pack_ready = false;
+                            lm_head_ready = false;
                         }
                     }
                 }
+            }};
+        }
+        if !did_pure_replay {
+            run_unified_layers!();
+            if capture_started
+                && graph_scope == UnifiedGraphCaptureScope::LayersOnly
+                && B::graph_capture_in_flight(&ctx)
+            {
+                finish_unified_graph_capture!();
             } else if !B::graph_capture_in_flight(&ctx) {
                 layers_ready = true;
             }
-            if capture_started && graph_layers_only && !layers_ready {
+            if capture_started
+                && graph_scope == UnifiedGraphCaptureScope::LayersOnly
+                && !layers_ready
+            {
                 run_unified_layers!();
                 layers_ready = true;
             }
         }
-        let mut final_ready = did_pure_replay && !graph_layers_only;
         if let Some(t0) = layer_t0.filter(|_| !B::graph_capture_in_flight(&ctx)) {
             B::sync(&mut ctx);
             static UNIFIED_PROF_CALLS: std::sync::atomic::AtomicU64 =
@@ -1912,7 +1990,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             .take()
             .expect("unified_norm_out missing");
 
-        macro_rules! run_unified_final {
+        macro_rules! run_unified_final_pack {
             () => {{
                 if let Some(device) = device_residual_shadow.as_ref() {
                     B::rms_norm_f32_to_activation(
@@ -1944,6 +2022,18 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     for (j, &(_, global)) in final_indices.iter().enumerate() {
                         B::copy_slice(&mut ctx, &norm_out, global * h, packed_normed, j * h, h);
                     }
+                }
+            }};
+        }
+
+        macro_rules! run_unified_lm_head {
+            () => {{
+                if num_sampled > 0 {
+                    let packed_normed = self
+                        .scratch
+                        .unified_packed_normed
+                        .as_ref()
+                        .expect("unified_packed_normed missing");
                     let lm_head = self
                         .lm_head
                         .as_ref()
@@ -1964,73 +2054,70 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }};
         }
 
-        if !final_ready {
-            run_unified_final!();
-            if !B::graph_capture_in_flight(&ctx) {
-                final_ready = true;
+        if !final_pack_ready {
+            run_unified_final_pack!();
+            if capture_started
+                && graph_scope == UnifiedGraphCaptureScope::LmHeadEager
+                && B::graph_capture_in_flight(&ctx)
+            {
+                finish_unified_graph_capture!();
+            } else if !B::graph_capture_in_flight(&ctx) {
+                final_pack_ready = true;
             }
         }
-
-        // End full-scope capture (if active), install graph, and immediately
-        // replay it. Capture only RECORDS the launches, so without a
-        // post-capture replay the layer loop/final kernels never execute.
-        // The layers-only scope already ended and replayed before final.
-        if should_capture && !graph_layers_only && B::graph_capture_in_flight(&ctx) {
-            if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
-                eprintln!("[unified-graph] end_capture err: {e}");
-                self.unified_graph_failed = true;
-                layers_ready = false;
-                final_ready = false;
-            } else {
-                self.unified_graph_keys_seen.insert(graph_key);
-                record_unified_graph_capture(
-                    graph_key,
-                    graph_layers_only,
-                    attention_launch_key,
-                    m_total,
-                    num_seqs,
-                    max_kv_len,
-                );
-                match B::replay_graph(&mut ctx, graph_key) {
-                    Ok(true) => {
-                        layers_ready = true;
-                        final_ready = true;
-                        record_unified_graph_replay(
-                            "post_capture",
-                            graph_key,
-                            graph_layers_only,
-                            attention_launch_key,
-                            m_total,
-                            num_seqs,
-                            max_kv_len,
-                        );
-                    }
-                    Ok(false) => {
-                        eprintln!("[unified-graph] post-capture replay skipped");
-                        self.unified_graph_failed = true;
-                        layers_ready = false;
-                        final_ready = false;
-                    }
-                    Err(e) => {
-                        eprintln!("[unified-graph] post-capture replay err: {e}");
-                        self.unified_graph_failed = true;
-                        layers_ready = false;
-                        final_ready = false;
-                    }
-                }
-            }
-        }
-
-        if should_capture && !graph_layers_only && !final_ready {
+        if capture_started
+            && graph_scope == UnifiedGraphCaptureScope::LmHeadEager
+            && !final_pack_ready
+        {
             if !layers_ready {
                 run_unified_layers!();
                 layers_ready = true;
             }
-            run_unified_final!();
-            final_ready = true;
+            run_unified_final_pack!();
+            final_pack_ready = true;
         }
+
+        if !lm_head_ready {
+            run_unified_lm_head!();
+            if capture_started
+                && graph_scope == UnifiedGraphCaptureScope::Full
+                && B::graph_capture_in_flight(&ctx)
+            {
+                finish_unified_graph_capture!();
+            } else if !B::graph_capture_in_flight(&ctx) {
+                lm_head_ready = true;
+            }
+        }
+
+        if capture_started && graph_scope == UnifiedGraphCaptureScope::Full && !lm_head_ready {
+            if !layers_ready {
+                run_unified_layers!();
+                layers_ready = true;
+            }
+            if !final_pack_ready {
+                run_unified_final_pack!();
+                final_pack_ready = true;
+            }
+            run_unified_lm_head!();
+            lm_head_ready = true;
+        }
+        if !final_pack_ready {
+            run_unified_final_pack!();
+            final_pack_ready = true;
+        }
+        if !lm_head_ready {
+            run_unified_lm_head!();
+            lm_head_ready = true;
+        }
+
+        if !layers_ready {
+            run_unified_layers!();
+            layers_ready = true;
+        }
+
         debug_assert!(layers_ready);
-        debug_assert!(final_ready);
+        debug_assert!(final_pack_ready);
+        debug_assert!(lm_head_ready);
 
         // Sync + readback. ALWAYS eager — to_vec needs the host result.
         B::sync(&mut ctx);
