@@ -2,6 +2,35 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YE — W2 release-grade validator checkpoint: baseline bench cells must be clean
+
+- Source checkpoint:
+  - `8cf42094 test(release): require clean baseline bench cells`.
+- Scope:
+  - no GPU instance was started;
+  - no performance measurement was taken;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Validator changes:
+  - each performance cell must now include baseline `n_repeats`,
+    `requests_per_run`, completed/error counts, quality counts, usage-token
+    source, streaming usage flag, and baseline `bench-serve` command line;
+  - baseline cells must use `--fail-on-error`, `--require-ci`, `--seed 9271`,
+    and matching `--n-repeats`;
+  - baseline completed counts must be full, error counts must be zero, and
+    bad-output / malformed-stream / missing-DONE / duplicate-DONE /
+    zero-output / bulk-flush / HTTP-500 / panic counts must all be zero.
+- Local validation:
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS;
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py`
+    PASS;
+  - `git diff --check` PASS;
+  - `python3 scripts/release/selftest_g0_validators.py` PASS.
+- Rationale:
+  - the W2 80% denominator must be a correctness-clean same-dataset baseline;
+  - the final gate should not accept a bare baseline throughput number without
+    the same zero-error/usage-token evidence required from Ferrum.
+
 ## 2026-06-16 YD — W2 release-grade validator checkpoint: baseline evidence gate hardened
 
 - Source checkpoints:
