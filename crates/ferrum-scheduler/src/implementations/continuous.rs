@@ -38,6 +38,8 @@ struct ContinuousBatchRuntimeConfig {
     scheduler_none_prof: bool,
 }
 
+const ACTIVE_DECODE_PREFILL_CHUNKS_PER_ITERATION: usize = 2;
+
 impl ContinuousBatchRuntimeConfig {
     fn from_scheduler_config(config: &SchedulerConfig) -> Self {
         Self {
@@ -526,6 +528,7 @@ impl ContinuousBatchScheduler {
         let mut active_decode_prefill_tokens_remaining = self
             .runtime_config
             .active_decode_prefill_chunk
+            .map(|chunk| chunk.saturating_mul(ACTIVE_DECODE_PREFILL_CHUNKS_PER_ITERATION))
             .filter(|_| scheduled_decode_count > 0);
 
         // Then, add prefill requests up to the per-iter token budget.
@@ -1439,10 +1442,10 @@ mod tests {
         let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(
             mixed_batch.requests.len(),
-            2,
-            "active decode should admit only one 64-token prefill chunk per iteration"
+            3,
+            "active decode should admit only two 64-token prefill chunks per iteration"
         );
-        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 64) * 16);
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 128) * 16);
         assert_eq!(
             scheduler.prefilling_count(),
             4,
