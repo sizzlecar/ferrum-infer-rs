@@ -223,6 +223,11 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub unified_graph: Option<bool>,
 
+    /// Diagnostic unified graph scope that captures only transformer layers,
+    /// equivalent to `FERRUM_UNIFIED_GRAPH_LAYERS_ONLY`.
+    #[serde(default)]
+    pub unified_graph_layers_only: Option<bool>,
+
     /// Emit engine batch iteration profile logs, equivalent to
     /// `FERRUM_BATCH_DECODE_PROF`.
     #[serde(default)]
@@ -357,6 +362,11 @@ impl RuntimeCliConfig {
         push_bool_entry(&mut entries, "FERRUM_MOE_GRAPH", self.moe_graph);
         push_bool_entry(&mut entries, "FERRUM_BATCHED_GRAPH", self.batched_graph);
         push_bool_entry(&mut entries, "FERRUM_UNIFIED_GRAPH", self.unified_graph);
+        push_bool_entry(
+            &mut entries,
+            "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+            self.unified_graph_layers_only,
+        );
         push_true_entry(
             &mut entries,
             "FERRUM_BATCH_DECODE_PROF",
@@ -668,6 +678,7 @@ mod tests {
             moe_graph: Some(true),
             batched_graph: Some(true),
             unified_graph: Some(true),
+            unified_graph_layers_only: Some(true),
             batch_decode_prof: Some(true),
             batch_prefill_prof: Some(true),
             next_batch_prof: Some(true),
@@ -692,7 +703,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 33);
+        assert_eq!(entries.len(), 34);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -727,6 +738,10 @@ mod tests {
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").effective_value,
+            "1"
+        );
         assert_eq!(entry("FERRUM_BATCH_DECODE_PROF").effective_value, "1");
         assert!(entry("FERRUM_BATCH_DECODE_PROF")
             .affects

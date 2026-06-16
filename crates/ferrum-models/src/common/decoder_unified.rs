@@ -116,6 +116,29 @@ pub fn unified_graph_key(
     max_kv_len: usize,
     final_indices: &[(usize, usize)],
 ) -> u64 {
+    scoped_unified_graph_key(
+        0x6675_6c6c_5f67_7261,
+        m_total,
+        num_seqs,
+        max_kv_len,
+        final_indices,
+    )
+}
+
+/// Graph cache key for a diagnostic unified graph that captures only the
+/// transformer layer loop. Final norm, final-row packing, and lm_head remain
+/// eager, so final-token offsets are intentionally not part of the key.
+pub fn unified_layers_only_graph_key(m_total: usize, num_seqs: usize, max_kv_len: usize) -> u64 {
+    scoped_unified_graph_key(0x6c61_7965_725f_6772, m_total, num_seqs, max_kv_len, &[])
+}
+
+fn scoped_unified_graph_key(
+    scope_tag: u64,
+    m_total: usize,
+    num_seqs: usize,
+    max_kv_len: usize,
+    final_indices: &[(usize, usize)],
+) -> u64 {
     fn feed(mut hash: u64, value: u64) -> u64 {
         hash ^= value;
         hash = hash.wrapping_mul(0x100000001b3);
@@ -123,6 +146,7 @@ pub fn unified_graph_key(
     }
 
     let mut hash = 0xcbf29ce484222325u64;
+    hash = feed(hash, scope_tag);
     hash = feed(hash, m_total as u64);
     hash = feed(hash, num_seqs as u64);
     hash = feed(hash, max_kv_len as u64);
@@ -206,6 +230,14 @@ mod tests {
 
         let no_sample = unified_graph_key(6, 2, 128, &[]);
         assert_ne!(different_final_offsets, no_sample);
+    }
+
+    #[test]
+    fn graph_key_distinguishes_capture_scope() {
+        let full_no_sample = unified_graph_key(6, 2, 128, &[]);
+        let layers_only = unified_layers_only_graph_key(6, 2, 128);
+        assert_ne!(full_no_sample, layers_only);
+        assert_ne!(layers_only, unified_layers_only_graph_key(6, 2, 640));
     }
 
     #[test]

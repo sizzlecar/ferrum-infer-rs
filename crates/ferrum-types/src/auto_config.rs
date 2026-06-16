@@ -642,6 +642,11 @@ impl FerrumConfigBuilder {
             self.bool_value("FERRUM_BATCHED_GRAPH", false, AutoConfigSource::Default)?;
         let unified_graph =
             self.bool_value("FERRUM_UNIFIED_GRAPH", false, AutoConfigSource::Default)?;
+        let unified_graph_layers_only = self.bool_value(
+            "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+            false,
+            AutoConfigSource::Default,
+        )?;
         let greedy = self.bool_value(
             "FERRUM_GREEDY_ARGMAX",
             (cuda_backend || self.hardware.backend.eq_ignore_ascii_case("metal"))
@@ -693,7 +698,7 @@ impl FerrumConfigBuilder {
             graph.value,
         )?;
         self.validate_batched_graph(batched_graph.value)?;
-        self.validate_unified_graph(unified_graph.value)?;
+        self.validate_unified_graph(unified_graph.value, unified_graph_layers_only.value)?;
         self.validate_memory(
             kv_blocks.value,
             max_sequences.value,
@@ -728,6 +733,10 @@ impl FerrumConfigBuilder {
             ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
             ("FERRUM_BATCHED_GRAPH", &batched_graph),
             ("FERRUM_UNIFIED_GRAPH", &unified_graph),
+            (
+                "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+                &unified_graph_layers_only,
+            ),
             ("FERRUM_GREEDY_ARGMAX", &greedy),
         ] {
             if resolved.source != AutoConfigSource::Env {
@@ -740,7 +749,11 @@ impl FerrumConfigBuilder {
         }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
-        decisions.push(self.decode_graph_decision(batched_graph, unified_graph));
+        decisions.push(self.decode_graph_decision(
+            batched_graph,
+            unified_graph,
+            unified_graph_layers_only,
+        ));
         decisions.push(self.scalar_decision(
             "kv_block_count",
             kv_blocks,
@@ -1152,7 +1165,17 @@ impl FerrumConfigBuilder {
         Ok(())
     }
 
-    fn validate_unified_graph(&self, graph: bool) -> Result<(), AutoConfigError> {
+    fn validate_unified_graph(
+        &self,
+        graph: bool,
+        layers_only: bool,
+    ) -> Result<(), AutoConfigError> {
+        if layers_only && !graph {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+                "layers-only unified graph capture requires FERRUM_UNIFIED_GRAPH=1",
+            );
+        }
         if !graph {
             return Ok(());
         }
@@ -1162,10 +1185,10 @@ impl FerrumConfigBuilder {
                 "unified decode graph does not apply to MoE models",
             );
         }
-        if self.model.architecture.eq_ignore_ascii_case("gemma3") {
+        if self.model.architecture.eq_ignore_ascii_case("gemma3") && !layers_only {
             return self.invalid(
                 "FERRUM_UNIFIED_GRAPH",
-                "unified decode graph is disabled for Gemma3 sandwich-norm models",
+                "full unified decode graph is disabled for Gemma3 sandwich-norm models",
             );
         }
         if !self.is_cuda_backend() {
@@ -1466,15 +1489,20 @@ impl FerrumConfigBuilder {
         &self,
         batched_graph: ResolvedValue<bool>,
         unified_graph: ResolvedValue<bool>,
+        unified_graph_layers_only: ResolvedValue<bool>,
     ) -> AutoConfigDecision {
-        let selected = if unified_graph.value {
+        let selected = if unified_graph.value && unified_graph_layers_only.value {
+            "unified_decode_graph_layers_only"
+        } else if unified_graph.value {
             "unified_decode_graph"
         } else if batched_graph.value {
             "legacy_batched_decode_graph"
         } else {
             "graph_disabled"
         };
-        let source_value = if unified_graph.value
+        let source_value = if unified_graph_layers_only.value {
+            unified_graph_layers_only
+        } else if unified_graph.value
             || (!batched_graph.value && unified_graph.source != AutoConfigSource::Default)
         {
             unified_graph
@@ -1487,6 +1515,7 @@ impl FerrumConfigBuilder {
             source_value.source,
             source_value.source_key,
             [
+                "unified_decode_graph_layers_only",
                 "unified_decode_graph",
                 "legacy_batched_decode_graph",
                 "graph_disabled",
@@ -1494,6 +1523,10 @@ impl FerrumConfigBuilder {
             self.rejected_except(
                 selected,
                 [
+                    (
+                        "unified_decode_graph_layers_only",
+                        "layers-only unified decode graph not selected",
+                    ),
                     ("unified_decode_graph", "unified decode graph not selected"),
                     (
                         "legacy_batched_decode_graph",
@@ -2662,6 +2695,64 @@ mod tests {
             resolved.effective_config_document()["selected_graph_mode"],
             "unified_decode_graph"
         );
+    }
+
+    #[test]
+    fn unified_graph_layers_only_override_materializes_decode_graph_policy() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[
+            ("FERRUM_UNIFIED_GRAPH", "1", RuntimeConfigSource::Cli),
+            (
+                "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+                "1",
+                RuntimeConfigSource::Cli,
+            ),
+        ]))
+        .with_model_capabilities(gemma3_gptq_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(
+            decisions["decode_graph_policy"],
+            "unified_decode_graph_layers_only"
+        );
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY")
+            .expect("unified graph layers-only entry");
+        assert_eq!(entry.effective_value, "1");
+        assert_eq!(
+            resolved.effective_config_document()["selected_graph_mode"],
+            "unified_decode_graph_layers_only"
+        );
+    }
+
+    #[test]
+    fn unified_graph_layers_only_requires_unified_graph() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "1")]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .expect_err("layers-only graph scope should require unified graph");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. }
+                if key == "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY"
+        ));
     }
 
     #[test]

@@ -165,6 +165,14 @@ pub struct ServeCommand {
     #[arg(long, conflicts_with = "unified_graph")]
     pub disable_unified_graph: bool,
 
+    /// Capture only Llama/Gemma unified transformer layers in CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_unified_graph_layers_only")]
+    pub unified_graph_layers_only: bool,
+
+    /// Disable layers-only unified CUDA graph capture scope.
+    #[arg(long, conflicts_with = "unified_graph_layers_only")]
+    pub disable_unified_graph_layers_only: bool,
+
     /// Named startup/runtime preset, for example
     /// `m3_qwen3_30b_a3b_int4`.
     #[arg(long, value_name = "PRESET")]
@@ -244,6 +252,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         disable_batched_graph,
         unified_graph,
         disable_unified_graph,
+        unified_graph_layers_only,
+        disable_unified_graph_layers_only,
         runtime_preset,
         effective_config_json,
         decision_trace_jsonl,
@@ -615,6 +625,15 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     if let Some(enabled) = batched_graph_cli_override(unified_graph, disable_unified_graph) {
         startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
             "FERRUM_UNIFIED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) =
+        batched_graph_cli_override(unified_graph_layers_only, disable_unified_graph_layers_only)
+    {
+        startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
             if enabled { "1" } else { "0" },
             RuntimeConfigSource::Cli,
         ));
