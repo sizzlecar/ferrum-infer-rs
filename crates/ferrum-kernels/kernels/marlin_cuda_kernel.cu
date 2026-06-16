@@ -71,12 +71,26 @@ __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool
 __device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
   const int BYTES = 16;
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+#if defined(FERRUM_MARLIN_CP_ASYNC_EVICT_FIRST) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1200)
+  // Diagnostic variant for Ampere/Ada native probes. Keep it compile-time
+  // only until same-hardware evidence shows the cache policy helps product
+  // tail-MLP wall time.
+  asm volatile(
+    "{\n"
+    "   .reg .b64 cache_policy;\n"
+    "   createpolicy.fractional.L2::evict_first.b64 cache_policy, 1.0;\n"
+    "   cp.async.cg.shared.global.L2::cache_hint [%0], [%1], %2, cache_policy;\n"
+    "}\n"
+    :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
+  );
+#else
   // Use plain cp.async.cg without L2 cache hint (createpolicy.fractional
   // is not supported on all architectures, e.g. Blackwell sm_120).
   asm volatile(
     "cp.async.cg.shared.global [%0], [%1], %2;\n"
     :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
   );
+#endif
 }
 
 // Async copy fence.
