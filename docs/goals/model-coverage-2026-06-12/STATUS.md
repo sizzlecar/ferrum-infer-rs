@@ -2,6 +2,64 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XY — W2 CUDA checkpoint: FA2 source product path is correct but slower on Gemma3 ShareGPT c16
+
+- Artifacts:
+  - corrected FA2 product smoke:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/`;
+  - initial minimal-config attempt:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_smoke_2026-06-16/`.
+- Paid GPU lane:
+  `W2 Gemma3 typed FA2-source full-config product smoke` on the cached 1x RTX
+  4090 Vast instance.
+- Contract:
+  - expected runtime/cost: 10-20 minutes, about USD 0.07-0.15 at
+    USD 0.42488888888888887/h for each small smoke attempt;
+  - stop condition: startup/SSH/CUDA/config assertion/serve readiness/chat
+    smoke/minimal c16 bench first failure, or artifact collected, then stop the
+    instance;
+  - correctness gate: product `ferrum serve` from artifact-local complete
+    `ferrum.toml`, decision trace must select
+    `attention_prefill_mixed_backend=fa2_source`, chat smoke must return `5`
+    with usage, and bench must return rc 0 with zero request errors;
+  - performance command:
+    `ferrum bench-serve --dataset sharegpt --sharegpt-path ascii_sharegpt.jsonl --random-output-len 64 --concurrency-sweep 16 --num-prompts 16 --n-repeats 1 --fail-on-error --seed 9271`.
+- Config finding:
+  - the first `[runtime]`-only config attempt did not inject runtime entries;
+    decision trace selected `legacy_paged_varlen`, so no bench was run;
+  - the corrected full-config attempt selected `fa2_source` from config-file
+    `FERRUM_FA2_SOURCE`, selected decode backend `vllm_paged_attn_v1_short`,
+    and autosize logged `KV pool copies=2 (FA-compatible attention path)`.
+- Corrected smoke evidence:
+  - remote HEAD `017300426514d62e8e50ac1546ff77d4d54fd6ce`;
+  - binary SHA256
+    `d38caf704f252045c29bdfe02795606937f400ab00edef05647da74179b215d5`;
+  - chat smoke response content `"5"`, usage present;
+  - bench rc `0`, `output_token_count_source=usage`;
+  - server log scan has `0` lines;
+  - Vast cleanup confirmed `stopped/exited`.
+- Results:
+  - c16: `16 completed / 0 errored / 0 bad_output / 0 zero_output`,
+    `313.472 tok/s`;
+  - compared with the current graph-disabled Ferrum same-dataset c16
+    `339.9306 tok/s`, FA2 source is `-26.4586 tok/s`, or `-7.78%`;
+  - compared with the clean vLLM ShareGPT c16 baseline `518.796 tok/s`, the
+    ratio is `0.6042`.
+- Interpretation:
+  - FA2's principle is still valid for prefill/mixed attention: fused tiled
+    attention reduces HBM traffic and intermediate materialization;
+  - however, on current W2 Gemma3 ShareGPT c16, enabling the actual product
+    `fa2_source` path is correct but slower than the default path;
+  - this rules out "FA2 is missing from the product path" as the current
+    14-15 percentage point W2 bottleneck. The next work should return to the
+    model-step dominant path, especially Gemma GPTQ dense MLP/tail and decode
+    integration, rather than continuing FA2 sweeps.
+- Scope:
+  - this is diagnostic evidence only: `n_repeats=1`, no `--require-ci`, and no
+    final release-grade manifest.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XX — W2 CUDA checkpoint: product batched graph is not the endpoint bottleneck
 
 - Artifact:

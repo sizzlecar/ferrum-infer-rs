@@ -1,0 +1,30 @@
+{
+  "bench_rc": 0,
+  "ok": true,
+  "reason": "diagnostic n_repeats=1; no --require-ci; final W2 validator not run",
+  "release_grade": false,
+  "rows": [
+    {
+      "bad_output": 0,
+      "completed": 16,
+      "concurrency": 16,
+      "delta_vs_graph_disabled_pct": -0.07783539266603501,
+      "delta_vs_graph_disabled_tps": -26.458632834397235,
+      "errored": 0,
+      "graph_disabled_current_tps": 339.93061418630174,
+      "http_500": 0,
+      "itl_p50_ms": 38.637463,
+      "n_repeats": 1,
+      "output_throughput_tps_mean": 313.4719813519045,
+      "output_token_count_source": "usage",
+      "panic": 0,
+      "ratio_to_vllm": 0.6042297576540769,
+      "tpot_p50_ms": 43.17809785714286,
+      "ttft_p50_ms": 489.5638315,
+      "vllm_baseline_tps": 518.796,
+      "zero_output_tokens": 0
+    }
+  ],
+  "selected_attention_prefill_mixed_backend": "fa2_source",
+  "server_error_scan_lines": 0
+}
