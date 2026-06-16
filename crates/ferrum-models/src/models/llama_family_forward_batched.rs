@@ -156,6 +156,77 @@ fn record_batched_graph_replay(
     }
 }
 
+static UNIFIED_GRAPH_REPLAY_COUNT: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_GRAPH_EAGER_COUNT: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_GRAPH_CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn should_log_unified_graph_count(count: u64) -> bool {
+    count.is_power_of_two()
+}
+
+fn unified_graph_scope_label(layers_only: bool) -> &'static str {
+    if layers_only {
+        "layers_only"
+    } else {
+        "full"
+    }
+}
+
+fn record_unified_graph_replay(
+    origin: &str,
+    graph_key: u64,
+    layers_only: bool,
+    m_total: usize,
+    num_seqs: usize,
+    max_kv_len: usize,
+) {
+    let count = UNIFIED_GRAPH_REPLAY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if should_log_unified_graph_count(count) {
+        let scope = unified_graph_scope_label(layers_only);
+        eprintln!(
+            "[unified-graph-replay] origin={origin} count={count} scope={scope} key={graph_key} \
+             m_total={m_total} num_seqs={num_seqs} max_kv_len={max_kv_len}",
+        );
+    }
+}
+
+fn record_unified_graph_capture(
+    graph_key: u64,
+    layers_only: bool,
+    m_total: usize,
+    num_seqs: usize,
+    max_kv_len: usize,
+) {
+    let count = UNIFIED_GRAPH_CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if should_log_unified_graph_count(count) {
+        let scope = unified_graph_scope_label(layers_only);
+        eprintln!(
+            "[unified-graph-capture] count={count} scope={scope} key={graph_key} \
+             m_total={m_total} num_seqs={num_seqs} max_kv_len={max_kv_len}",
+        );
+    }
+}
+
+fn record_unified_graph_eager(
+    graph_key: u64,
+    layers_only: bool,
+    m_total: usize,
+    num_seqs: usize,
+    max_kv_len: usize,
+) {
+    let count = UNIFIED_GRAPH_EAGER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_multiple_of(256) {
+        let scope = unified_graph_scope_label(layers_only);
+        eprintln!(
+            "[unified-graph-stats] scope={scope} key={graph_key} m_total={m_total} \
+             num_seqs={num_seqs} max_kv_len={max_kv_len} replays={} eagers={} captures={}",
+            UNIFIED_GRAPH_REPLAY_COUNT.load(Ordering::Relaxed),
+            UNIFIED_GRAPH_EAGER_COUNT.load(Ordering::Relaxed),
+            UNIFIED_GRAPH_CAPTURE_COUNT.load(Ordering::Relaxed),
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct LogitRowDiagnostics {
     finite_count: usize,
@@ -212,9 +283,9 @@ fn should_log_unified_logits_diag(call: u64) -> bool {
 mod tests {
     use super::{
         batched_decode_graph_key, format_logit_top, logit_row_diagnostics,
-        should_log_batched_graph_replay_count, should_log_unified_logits_diag,
-        should_use_batched_decode_graph, LlamaBatchedRuntimeConfig,
-        BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
+        should_log_batched_graph_replay_count, should_log_unified_graph_count,
+        should_log_unified_logits_diag, should_use_batched_decode_graph, unified_graph_scope_label,
+        LlamaBatchedRuntimeConfig, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
     };
 
     #[test]
@@ -298,6 +369,16 @@ mod tests {
         assert!(should_log_batched_graph_replay_count(2));
         assert!(!should_log_batched_graph_replay_count(3));
         assert!(should_log_batched_graph_replay_count(4));
+    }
+
+    #[test]
+    fn unified_graph_observability_uses_sparse_power_of_two_logs() {
+        assert!(should_log_unified_graph_count(1));
+        assert!(should_log_unified_graph_count(2));
+        assert!(!should_log_unified_graph_count(3));
+        assert!(should_log_unified_graph_count(4));
+        assert_eq!(unified_graph_scope_label(true), "layers_only");
+        assert_eq!(unified_graph_scope_label(false), "full");
     }
 
     #[test]
@@ -1559,7 +1640,17 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let mut did_pure_replay = false;
         if graph_enabled && cache_has_key && !self.unified_graph_failed {
             match B::replay_graph(&mut ctx, graph_key) {
-                Ok(true) => did_pure_replay = true,
+                Ok(true) => {
+                    did_pure_replay = true;
+                    record_unified_graph_replay(
+                        "pure",
+                        graph_key,
+                        graph_layers_only,
+                        m_total,
+                        num_seqs,
+                        max_kv_len,
+                    );
+                }
                 Ok(false) => {}
                 Err(e) => {
                     self.unified_graph_failed = true;
@@ -1576,6 +1667,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             && !did_pure_replay;
         if !did_pure_replay {
             self.unified_graph_warmup += 1;
+        }
+        if graph_enabled && !did_pure_replay {
+            record_unified_graph_eager(graph_key, graph_layers_only, m_total, num_seqs, max_kv_len);
         }
 
         if should_capture {
@@ -1595,8 +1689,25 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     self.unified_graph_failed = true;
                 } else {
                     self.unified_graph_keys_seen.insert(graph_key);
+                    record_unified_graph_capture(
+                        graph_key,
+                        graph_layers_only,
+                        m_total,
+                        num_seqs,
+                        max_kv_len,
+                    );
                     match B::replay_graph(&mut ctx, graph_key) {
-                        Ok(true) => layers_ready = true,
+                        Ok(true) => {
+                            layers_ready = true;
+                            record_unified_graph_replay(
+                                "post_capture",
+                                graph_key,
+                                graph_layers_only,
+                                m_total,
+                                num_seqs,
+                                max_kv_len,
+                            );
+                        }
                         Ok(false) => {
                             eprintln!("[unified-graph] layers-only post-capture replay skipped");
                             self.unified_graph_failed = true;
@@ -1747,10 +1858,25 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 final_ready = false;
             } else {
                 self.unified_graph_keys_seen.insert(graph_key);
+                record_unified_graph_capture(
+                    graph_key,
+                    graph_layers_only,
+                    m_total,
+                    num_seqs,
+                    max_kv_len,
+                );
                 match B::replay_graph(&mut ctx, graph_key) {
                     Ok(true) => {
                         layers_ready = true;
                         final_ready = true;
+                        record_unified_graph_replay(
+                            "post_capture",
+                            graph_key,
+                            graph_layers_only,
+                            m_total,
+                            num_seqs,
+                            max_kv_len,
+                        );
                     }
                     Ok(false) => {
                         eprintln!("[unified-graph] post-capture replay skipped");
