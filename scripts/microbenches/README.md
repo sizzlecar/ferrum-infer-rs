@@ -23,6 +23,7 @@ nvcc -O3 -arch=sm_89 -std=c++17 -I<include-path> \
 | file | what it verifies |
 |---|---|
 | `graph_bench.cu` | CUDA Graph capture+replay speedup vs naive serial kernel launches. Measures launch-overhead headroom. |
+| `cuda_graph_segment_probe.cu` | Native CUDA probe comparing one monolithic graph with vLLM-style segmented graph replay for a Gemma3-like decode launch count. Use it before changing product graph capture granularity. |
 | `sync_barrier_bench.cu` | Cost of `cuStreamSynchronize` per layer vs async pipeline. Validates the host-route DtoH-barrier hypothesis. |
 | `layer_split_overlap_probe.cu` | Two-GPU layer-split scheduling probe. Simulates stage0, host bridge, stage1, logits, and microbatch overlap without Rust/Cargo or model loading. Use it before changing the product overlap path. |
 | `scalar_type_id_test.cu` (+ `_other_tu.cu`) | Verifies `vllm::ScalarType::id()` constexpr produces consistent values across translation units, and that template specializations keyed on those IDs dispatch correctly. **Two-TU compile required.** |
