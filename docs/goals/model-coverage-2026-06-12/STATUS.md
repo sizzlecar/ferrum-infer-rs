@@ -2,6 +2,57 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XV — W2 CUDA checkpoint: Marlin evict-first product run/serve correctness passes
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_cache_policy_product_correctness_2026-06-16/`.
+- Paid GPU lane:
+  `W2 Marlin evict-first product correctness smoke` on the cached 1x RTX 4090
+  Vast instance.
+- Contract:
+  - expected runtime/cost: 30-60 minutes, about USD 0.21-0.43 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/clean checkout/build/`ferrum run`/
+    `ferrum serve` first failure, or run+serve correctness evidence collected;
+  - correctness gate: product-default CUDA binary, `ferrum run` and
+    `ferrum serve` both return expected `5`, usage present for serve, and log
+    scan has no panic/error/NaN/`<unk>`/`[PAD]`/invalid UTF patterns;
+  - performance command: none for this lane; correctness-only after the Marlin
+    default-path source change.
+- Evidence:
+  - remote HEAD `212b2bf925c998062ef22767a1da41ba47ed5101`;
+  - clean worktree: `remote/git_status_short.txt` has `0` lines;
+  - CUDA release build rc `0`;
+  - binary SHA256
+    `d38caf704f252045c29bdfe02795606937f400ab00edef05647da74179b215d5`;
+  - `ferrum run` rc `0`, JSONL assistant content `"5"`,
+    `finish_reason=stop`, `n_tokens=3`;
+  - `ferrum serve` chat rc `0`, response content `"5"`,
+    `finish_reason=length`, usage `prompt_tokens=23`, `completion_tokens=1`,
+    `total_tokens=24`;
+  - `server/error_scan.txt` has `0` lines;
+  - `correctness_check.json` reports `ok=true`;
+  - Vast cleanup confirmed `stopped/exited`.
+- Note:
+  - the first background attempt failed before build because the script did not
+    include `/root/.cargo/bin` in `PATH`; preserved under
+    `build_initial_env_failure/`;
+  - the retry used the same instance and clean worktree and passed.
+- Interpretation:
+  - the Marlin B-weight `L2::evict_first` default path has now cleared the
+    required product-entrypoint correctness smoke for both `ferrum run` and
+    `ferrum serve`;
+  - this unlocks endpoint performance diagnostics for this source change, but
+    it is not itself performance or release-grade evidence.
+- Next:
+  - run a focused same-dataset Ferrum diagnostic against the existing clean
+    vLLM ShareGPT baseline before deciding whether the 1-2% MLP gain moves the
+    endpoint ratio materially;
+  - continue searching for a higher-return dense MLP `gate_up` /
+    work-reduction lever.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XU — W2 native CUDA checkpoint: product-default Marlin evict-first validated
 
 - Artifact:
