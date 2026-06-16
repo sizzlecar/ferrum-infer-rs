@@ -187,7 +187,14 @@ def flag_value(parts: list[str], flag: str) -> str | None:
     return None
 
 
-def validate_bench_command(parts: list[str], n_repeats: int, label: str, problems: list[str]) -> None:
+def validate_bench_command(
+    parts: list[str],
+    n_repeats: int,
+    label: str,
+    problems: list[str],
+    *,
+    requests_per_run: int | None,
+) -> None:
     if not any(part == "bench-serve" or part.endswith("/bench-serve") for part in parts):
         problems.append(f"{label} command must invoke ferrum bench-serve")
     for flag in ["--fail-on-error", "--require-ci"]:
@@ -201,6 +208,14 @@ def validate_bench_command(parts: list[str], n_repeats: int, label: str, problem
     elif repeat_value != str(n_repeats):
         problems.append(
             f"{label} command --n-repeats={repeat_value}, expected manifest n_repeats={n_repeats}"
+        )
+    prompt_value = flag_value(parts, "--num-prompts")
+    if requests_per_run is not None and prompt_value is None:
+        problems.append(f"{label} command missing --num-prompts")
+    elif requests_per_run is not None and prompt_value != str(requests_per_run):
+        problems.append(
+            f"{label} command --num-prompts={prompt_value}, "
+            f"expected manifest requests_per_run={requests_per_run}"
         )
     for part in parts:
         if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
@@ -472,6 +487,44 @@ def validate_run_quality_counts(
             problems.append(f"{label}.{key} must be all zero")
 
 
+def validate_matching_prompt_dataset(
+    cell: dict[str, Any],
+    label: str,
+    problems: list[str],
+) -> None:
+    dataset_id = cell.get("prompt_dataset_id")
+    baseline_dataset_id = cell.get("baseline_prompt_dataset_id")
+    if not isinstance(dataset_id, str) or not dataset_id.strip():
+        problems.append(f"{label}.prompt_dataset_id must be a non-empty string")
+    if not isinstance(baseline_dataset_id, str) or not baseline_dataset_id.strip():
+        problems.append(f"{label}.baseline_prompt_dataset_id must be a non-empty string")
+    if (
+        isinstance(dataset_id, str)
+        and dataset_id.strip()
+        and isinstance(baseline_dataset_id, str)
+        and baseline_dataset_id.strip()
+        and dataset_id != baseline_dataset_id
+    ):
+        problems.append(f"{label}.baseline_prompt_dataset_id must match prompt_dataset_id")
+
+    dataset_sha = cell.get("prompt_dataset_sha256")
+    baseline_dataset_sha = cell.get("baseline_prompt_dataset_sha256")
+    if not isinstance(dataset_sha, str) or not HEX64.match(dataset_sha):
+        problems.append(f"{label}.prompt_dataset_sha256 must be a 64-character hex digest")
+    if not isinstance(baseline_dataset_sha, str) or not HEX64.match(baseline_dataset_sha):
+        problems.append(
+            f"{label}.baseline_prompt_dataset_sha256 must be a 64-character hex digest"
+        )
+    if (
+        isinstance(dataset_sha, str)
+        and HEX64.match(dataset_sha)
+        and isinstance(baseline_dataset_sha, str)
+        and HEX64.match(baseline_dataset_sha)
+        and dataset_sha.lower() != baseline_dataset_sha.lower()
+    ):
+        problems.append(f"{label}.baseline_prompt_dataset_sha256 must match prompt_dataset_sha256")
+
+
 def validate_performance_cell(
     cell: dict[str, Any],
     baseline: dict[str, Any],
@@ -565,6 +618,7 @@ def validate_performance_cell(
     )
     for key in ["same_hardware", "same_model", "same_quantization", "same_prompt_or_dataset"]:
         require_true(cell.get(key, baseline.get(key)), f"{label}.{key}", problems)
+    validate_matching_prompt_dataset(cell, label, problems)
 
     command = command_parts(
         cell.get("bench_command_line", perf.get("bench_command_line")),
@@ -572,14 +626,26 @@ def validate_performance_cell(
         problems,
     )
     if command and n_repeats is not None:
-        validate_bench_command(command, n_repeats, label, problems)
+        validate_bench_command(
+            command,
+            n_repeats,
+            label,
+            problems,
+            requests_per_run=requests,
+        )
     baseline_command = command_parts(
         cell.get("baseline_bench_command_line", baseline.get("bench_command_line")),
         f"{label}.baseline_bench_command_line",
         problems,
     )
     if baseline_command and baseline_n_repeats is not None:
-        validate_bench_command(baseline_command, baseline_n_repeats, f"{label}.baseline", problems)
+        validate_bench_command(
+            baseline_command,
+            baseline_n_repeats,
+            f"{label}.baseline",
+            problems,
+            requests_per_run=baseline_requests,
+        )
 
     ferrum_metric = metric_from_cell(cell, problems, label)
     baseline_metric = baseline_tps_from_cell(cell, baseline, problems, label)
@@ -759,6 +825,10 @@ def write_selftest_manifest(root: Path, *, ratio: float = 0.82) -> Path:
                 "same_model": True,
                 "same_quantization": True,
                 "same_prompt_or_dataset": True,
+                "prompt_dataset_id": "selftest/sharegpt-100-seed9271",
+                "baseline_prompt_dataset_id": "selftest/sharegpt-100-seed9271",
+                "prompt_dataset_sha256": "b" * 64,
+                "baseline_prompt_dataset_sha256": "b" * 64,
                 "bench_command_line": [
                     "ferrum",
                     "bench-serve",
@@ -766,6 +836,8 @@ def write_selftest_manifest(root: Path, *, ratio: float = 0.82) -> Path:
                     "--require-ci",
                     "--seed",
                     "9271",
+                    "--num-prompts",
+                    "100",
                     "--n-repeats",
                     "3",
                 ],
@@ -776,6 +848,8 @@ def write_selftest_manifest(root: Path, *, ratio: float = 0.82) -> Path:
                     "--require-ci",
                     "--seed",
                     "9271",
+                    "--num-prompts",
+                    "100",
                     "--n-repeats",
                     "3",
                 ],
@@ -987,6 +1061,8 @@ def run_selftest() -> int:
             "--require-ci",
             "--seed",
             "9271",
+            "--num-prompts",
+            "100",
             "--n-repeats",
             "4",
         ]
@@ -1010,6 +1086,42 @@ def run_selftest() -> int:
             for problem in bad_baseline_requests_problems
         ):
             raise AssertionError("bad baseline request-count selftest did not fail as expected")
+
+        bad_num_prompts = tmp_root / "bad-num-prompts-command"
+        bad_num_prompts_manifest = write_selftest_manifest(bad_num_prompts, ratio=0.82)
+        data = load_json(bad_num_prompts_manifest)
+        command = data["performance"]["cells"][0]["bench_command_line"]
+        command[command.index("--num-prompts") + 1] = "32"
+        write_json(bad_num_prompts_manifest, data)
+        bad_num_prompts_problems = validate_manifest(data, "w2", bad_num_prompts)
+        if not any(
+            "command --num-prompts=32" in problem for problem in bad_num_prompts_problems
+        ):
+            raise AssertionError("bad num-prompts command selftest did not fail as expected")
+
+        bad_prompt_dataset_id = tmp_root / "bad-prompt-dataset-id"
+        bad_prompt_dataset_id_manifest = write_selftest_manifest(bad_prompt_dataset_id, ratio=0.82)
+        data = load_json(bad_prompt_dataset_id_manifest)
+        data["performance"]["cells"][0]["baseline_prompt_dataset_id"] = "selftest/other"
+        write_json(bad_prompt_dataset_id_manifest, data)
+        bad_prompt_dataset_id_problems = validate_manifest(data, "w2", bad_prompt_dataset_id)
+        if not any(
+            "baseline_prompt_dataset_id must match prompt_dataset_id" in problem
+            for problem in bad_prompt_dataset_id_problems
+        ):
+            raise AssertionError("bad prompt dataset id selftest did not fail as expected")
+
+        bad_prompt_dataset_sha = tmp_root / "bad-prompt-dataset-sha"
+        bad_prompt_dataset_sha_manifest = write_selftest_manifest(bad_prompt_dataset_sha, ratio=0.82)
+        data = load_json(bad_prompt_dataset_sha_manifest)
+        data["performance"]["cells"][0]["baseline_prompt_dataset_sha256"] = "c" * 64
+        write_json(bad_prompt_dataset_sha_manifest, data)
+        bad_prompt_dataset_sha_problems = validate_manifest(data, "w2", bad_prompt_dataset_sha)
+        if not any(
+            "baseline_prompt_dataset_sha256 must match prompt_dataset_sha256" in problem
+            for problem in bad_prompt_dataset_sha_problems
+        ):
+            raise AssertionError("bad prompt dataset sha selftest did not fail as expected")
 
     print("MODEL RELEASE GRADE GOAL SELFTEST PASS")
     return 0
