@@ -1317,6 +1317,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             crate::common::decoder_unified::compute_cu_seqlens_q(items);
         let pos_offsets = crate::common::decoder_unified::compute_pos_offsets(items);
         let max_kv_len = crate::common::decoder_unified::compute_max_kv_len(items);
+        let final_indices =
+            crate::common::decoder_unified::compute_final_indices(items, &cu_seqlens_q);
+        let num_sampled = final_indices.len();
 
         // Ensure all items' KV caches exist.
         for (cid, _, _, _) in items {
@@ -1356,8 +1359,24 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // already snapshotted above into h/nh/etc — cfg is just for the
         // shape constants ensure_unified_scratch needs).
         let cfg_for_alloc = self.cfg.clone();
-        self.scratch
-            .ensure_unified_scratch(&cfg_for_alloc, m_total, max_seqs, max_blocks_per_seq);
+        let prev_unified_capacity = self.scratch.unified_capacity;
+        let unified_scratch_rebuilt = self.scratch.ensure_unified_scratch(
+            &cfg_for_alloc,
+            m_total,
+            max_seqs,
+            max_blocks_per_seq,
+        );
+        if unified_scratch_rebuilt && prev_unified_capacity > 0 {
+            let old_graph_keys: Vec<u64> = self.unified_graph_keys_seen.drain().collect();
+            if !old_graph_keys.is_empty() {
+                let mut graph_ctx = B::new_context();
+                for key in old_graph_keys {
+                    B::reset_graph(&mut graph_ctx, key);
+                }
+            }
+            self.unified_graph_warmup = 0;
+            self.unified_graph_failed = false;
+        }
 
         let mut ctx = B::new_context();
 
@@ -1435,11 +1454,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
 
         // ── CUDA-graph capture/replay control ────────────────────────
-        // `FERRUM_UNIFIED_GRAPH=1` opts in. Per-shape graph cache keyed
-        // by (m_total, num_seqs); high bit set so we never collide with
-        // legacy keys (SINGLE_ITEM = 0, batched = m_padded). The captured
-        // region covers the layer loop + final rms_norm + per-item
-        // copy_slice + lm_head — every kernel that's stable across iters.
+        // `FERRUM_UNIFIED_GRAPH=1` opts in. The graph key includes launch
+        // shape plus host-side decisions that capture records as constants
+        // (attention kv/shared-memory shape and final-row copy offsets);
+        // high bit set so we never collide with legacy keys
+        // (SINGLE_ITEM = 0, batched = m_padded). The captured region covers
+        // the layer loop + final rms_norm + per-item copy_slice + lm_head.
         // Pre-work (write_u32 + embedding_lookup) and post-work (sync +
         // to_vec) stay eager.
         //
@@ -1456,7 +1476,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         //   varlen + graph:  714 tok/s, TPOT 18.3 ms  (+5% / -5%)
         let graph_enabled =
             self.batched_cfg.unified_graph && self.batched_cfg.graph_capture_allowed();
-        let graph_key = crate::common::decoder_unified::unified_graph_key(m_total, num_seqs);
+        let graph_key = crate::common::decoder_unified::unified_graph_key(
+            m_total,
+            num_seqs,
+            max_kv_len,
+            &final_indices,
+        );
         let cache_has_key = self.unified_graph_keys_seen.contains(&graph_key);
 
         // Pre-grow the marlin gather scratch slot to the worst-case
@@ -1592,14 +1617,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 bucket("silu/residual_add", other_n, other_us);
             }
         }
-
-        // Identify per-item last-token global indices for is_final_chunk
-        // items. Pure host work — same shape across iters at c=16
-        // steady state, so the captured copy_slice + lm_head launches
-        // record stable offsets.
-        let final_indices =
-            crate::common::decoder_unified::compute_final_indices(items, &cu_seqlens_q);
-        let num_sampled = final_indices.len();
 
         // Take scratch buffers we'll either record into the graph or
         // restore on return — outside the !did_pure_replay branch so
