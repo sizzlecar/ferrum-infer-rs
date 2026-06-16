@@ -2,6 +2,79 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZE — W2 CUDA diagnostic: aggregate mixed-prefill cap fixes c16 p95 but over-throttles throughput
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget_c16_cuda_2026-06-17/`.
+- Scope:
+  - W2 Gemma3 CUDA GPTQ post-scheduler-change c16 diagnostic only;
+  - reused same 1x RTX 4090 Vast instance `41241013`;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- GPU lifecycle:
+  - started cached instance `41241013`, 1x RTX 4090, quoted rate
+    `0.47111111111111115 USD/h`;
+  - verified CUDA with driver `580.95.05`, CUDA toolkit `12.4`, and
+    24GB RTX 4090 visibility;
+  - synced clean source to commit
+    `699add71ad4a86cfaf6ee6ee00a98d87c27d18d2`;
+  - copied artifacts back locally, then stopped the instance;
+  - final sanitized Vast state recorded `cur_state=stopped`,
+    `actual_status=exited`.
+- Source/runtime evidence:
+  - remote worktree was clean at
+    `699add71ad4a86cfaf6ee6ee00a98d87c27d18d2`;
+  - Ferrum binary SHA256
+    `49a60008497419336dafd283eb7394c334494ee25ea36fb2f308c87d10c2dee4`;
+  - dataset SHA256
+    `58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e`;
+  - model snapshot:
+    `/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2`;
+  - effective config check confirmed
+    `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK=16`.
+- Correctness result:
+  - product `ferrum run` smoke passed with stdout content `5`,
+    `n_tokens=3`;
+  - product `ferrum serve` streaming smoke passed with content `5\n`,
+    exactly one `[DONE]`, and usage present
+    (`prompt_tokens=23`, `completion_tokens=3`, `total_tokens=26`);
+  - c16 `bench-serve` completed `[100,100,100]` requests with
+    errors `[0,0,0]`;
+  - `output_token_count_source=usage`;
+  - no correctness issue was observed in this diagnostic artifact.
+- Performance command:
+  - `ferrum bench-serve --dataset sharegpt --sharegpt-path
+    /workspace/ascii_sharegpt_w2_100.jsonl --random-output-len 128
+    --concurrency-sweep 16 --num-prompts 100 --n-repeats 3
+    --fail-on-error --require-ci --seed 9271`;
+  - same model snapshot and same ASCII ShareGPT 100 dataset as the same-pod
+    vLLM reference from `w2_vllm_same_hw_c16_sharegpt_2026-06-17`.
+- Result:
+  - Ferrum output throughput mean/LCB:
+    `339.927090896005 / 333.10968230699876 tok/s`;
+  - same-pod vLLM reference mean/LCB:
+    `500.67038762731977 / 478.39462812583776 tok/s`;
+  - Ferrum LCB / vLLM LCB = `0.6963073218693773`, so c16 throughput now
+    fails the 80% diagnostic line;
+  - Ferrum p95 ITL mean `26.63676561666667 ms`;
+  - same-pod vLLM reference p95 ITL mean `33.06958213333332 ms`;
+  - Ferrum p95 ITL / vLLM p95 ITL = `0.8054763289499648`, so c16 p95
+    diagnostic now passes;
+  - relative to previous Ferrum c16 same-pod result, LCB changed by
+    `-81.4818495619952 tok/s` and p95 ITL changed by `-26.182588216666662 ms`.
+- Interpretation:
+  - the active-decode mixed-prefill root cause was real: c16 p95 dropped from
+    `52.819ms` to `26.637ms`;
+  - the aggregate cap at exactly `16` tokens is too strict for throughput:
+    it converts a tail-latency win into an overall release-grade failure;
+  - this patch is therefore not a final W2 fix and must not be widened to the
+    full matrix as-is.
+- Next direction:
+  - keep the aggregate mixed-prefill concept, but make the active-decode
+    budget adaptive or larger under healthy decode cadence so p95 remains
+    controlled while c16 LCB returns above the vLLM 80% line;
+  - run the next validation as another native CUDA c16 minimum only before
+    considering any c=1/4/32 expansion.
+
 ## 2026-06-17 ZD — W2 source checkpoint: cap aggregate mixed prefill during active decode
 
 - Artifact:
