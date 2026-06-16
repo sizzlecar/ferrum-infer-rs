@@ -99,6 +99,13 @@ pub trait Linear<B: Backend>: Send + Sync {
         LinearMetadata::default()
     }
 
+    #[cfg(feature = "cuda")]
+    fn cuda_marlin_touch_ref(
+        &self,
+    ) -> Option<crate::quant_linear::cuda_marlin::CudaMarlinTouchRef<'_>> {
+        None
+    }
+
     /// Append GEMM work onto `ctx`. Caller flushes the context when results
     /// must be materialised.
     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize);
