@@ -1,0 +1,60 @@
+[diag] start 2026-06-16T19:24:46Z
+[diag] root=/workspace/ferrum-infer-rs out=/workspace/w2_active_decode_chunk_c16_cuda_diag_2026-06-17 model=gemma3:27b-gptq hf_home=/workspace/hf-cache
+[diag] installing rustup minimal toolchain
+[diag] ensuring native build/python dependencies
+[diag] creating HF helper venv
+[diag] starting anonymous HF prefetch for circulus/gemma-3-27b-it-gptq
+[diag] starting CUDA release build
+
+real	29m25.806s
+user	37m45.095s
+sys	1m53.492s
+[diag] waiting for HF prefetch pid=6615
+[diag] correctness: ferrum run
+[diag] correctness: ferrum serve streaming smoke
+[diag] profile: ferrum serve + c16 bench
+{
+  "artifact_dir": "/workspace/w2_active_decode_chunk_c16_cuda_diag_2026-06-17",
+  "bench_top_level_keys": [
+    "actual_input_tokens",
+    "actual_input_tokens_per_request",
+    "backend",
+    "bad_output_per_run",
+    "completed_per_run",
+    "concurrency",
+    "duplicate_done_per_run",
+    "e2e_ms",
+    "env",
+    "env_hash",
+    "errored_per_run",
+    "goodput_rps",
+    "http_500_per_run",
+    "itl_ms",
+    "malformed_stream_per_run",
+    "missing_done_per_run",
+    "model",
+    "n_gen",
+    "n_prompt",
+    "n_repeats",
+    "n_requests_per_run",
+    "output_throughput_tps",
+    "output_token_count_source",
+    "output_tokens_per_request",
+    "panic_per_run",
+    "quality_issues_per_run",
+    "request_throughput_rps",
+    "scenario",
+    "slo",
+    "stream_bulk_flush_per_run",
+    "total_throughput_tps",
+    "tpot_ms",
+    "ttft_ms",
+    "warmup_requests",
+    "zero_output_tokens_per_run"
+  ],
+  "large_mixed_prefill_decode_lines": [],
+  "model": "gemma3:27b-gptq",
+  "profile_line_count": 41,
+  "release_claim": false
+}
+[diag] complete 2026-06-16T19:59:14Z

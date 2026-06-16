@@ -1,0 +1,11 @@
+{
+  "cancel_unavail": true,
+  "client_id": "me",
+  "disk": 260,
+  "image": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+  "label": "ferrum-w2-active-chunk-c16-20260617",
+  "offer": 36368074,
+  "onstart_present": true,
+  "runtype": "ssh",
+  "target_state": "running"
+}

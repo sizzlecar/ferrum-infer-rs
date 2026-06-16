@@ -2,6 +2,62 @@
 
 进度日志,倒序。
 
+## 2026-06-17 YX — W2 CUDA diagnostic: active-decode prefill chunk removes large mixed prefill/decode frames
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_chunk_c16_cuda_diag_2026-06-17/`.
+- Source checkpoint:
+  `eed031e334c78cf181a4b1077c1ba2089d0d6d6f`
+  (`perf(types): default gemma3 gptq active prefill chunk`).
+- GPU lifecycle:
+  - reused-start attempts for cached instances were unavailable;
+  - run used Vast instance `41230499`, 1x RTX 4090, driver `590.48.01`,
+    quoted USD `0.5766666666666667/h`;
+  - artifacts copied back, then instance stopped; final status
+    `cur_state=stopped`, `actual_status=exited`.
+- Build/runtime evidence:
+  - CUDA release build passed with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - build time `29m25.806s`;
+  - binary sha256
+    `426c9b029d08ede6edb986a7dd80e5330e2a9f7489ce7de6224a1b482361d4c7`;
+  - remote worktree was clean at
+    `eed031e334c78cf181a4b1077c1ba2089d0d6d6f`.
+- Correctness result:
+  - product `ferrum run` smoke passed with stdout content `5`;
+  - product `ferrum serve` streaming smoke passed with content `5\n`,
+    exactly one `[DONE]`, and usage present;
+  - no correctness issue observed in this diagnostic artifact.
+- Runtime config result:
+  - effective config materialized
+    `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK=16`;
+  - decision trace selected
+    `scheduler_admission_policy=active_decode_prefill_chunk:16` from
+    `model_metadata`.
+- c16 diagnostic performance:
+  - command used random 256/128, concurrency `16`, `num-prompts=16`,
+    `n-repeats=1`, `--fail-on-error`, seed `9271`;
+  - bench completed `[16]`, errored `[0]`,
+    `output_token_count_source=usage`;
+  - diagnostic output throughput was `294.61885808275144 tok/s`;
+  - this is smoke/diagnostic evidence only, not release performance evidence.
+- Profile result:
+  - summary reported `large_mixed_prefill_decode_lines=[]`;
+  - the previous target bad frame was
+    `m_total=897 num_seqs=16 prefill=12 decode=4 total=383684us`;
+  - this run's largest mixed prefill+decode frame was chunk-shaped
+    `m_total=151 num_seqs=16 prefill=9 decode=7`, with sampled examples
+    around `79ms` to `107ms`;
+  - large full-prompt prefill still appears as pure prefill, e.g.
+    `m_total=1866 prefill=7 decode=0`, which is expected.
+- Status:
+  - active-decode chunking is now the concrete W2 scheduler lever to carry
+    forward;
+  - still no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`;
+  - next step is either same-shape default-vs-chunk A/B for a clean delta, or
+    the W2 goal gate once the remaining release-grade acceptance matrix is
+    ready.
+
 ## 2026-06-17 YW — W2 source checkpoint: Gemma3 CUDA GPTQ defaults active-decode prefill chunking
 
 - Artifact:
