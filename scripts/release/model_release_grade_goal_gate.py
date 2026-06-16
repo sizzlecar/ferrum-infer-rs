@@ -378,14 +378,20 @@ def needs_vllm_baseline(manifest: dict[str, Any]) -> bool:
     )
 
 
+def is_vllm_baseline_engine(engine: Any) -> bool:
+    text = str(engine).strip().lower()
+    if text == "vllm":
+        return True
+    return text.startswith(("vllm ", "vllm-", "vllm_", "vllm/"))
+
+
 def validate_baseline_selection(
     manifest: dict[str, Any],
     baseline: dict[str, Any],
     out_dir: Path,
     problems: list[str],
 ) -> None:
-    engine = str(baseline.get("engine", "")).lower()
-    if not needs_vllm_baseline(manifest) or "vllm" in engine:
+    if not needs_vllm_baseline(manifest) or is_vllm_baseline_engine(baseline.get("engine")):
         return
 
     exception = baseline.get("selection_exception")
@@ -788,6 +794,22 @@ def run_selftest() -> int:
         bad_baseline_engine_problems = validate_manifest(data, "w2", bad_baseline_engine)
         if not any("must be vLLM" in problem for problem in bad_baseline_engine_problems):
             raise AssertionError("bad baseline engine selftest did not fail as expected")
+
+        misleading_baseline_engine = tmp_root / "misleading-baseline-engine"
+        misleading_baseline_engine_manifest = write_selftest_manifest(
+            misleading_baseline_engine,
+            ratio=0.82,
+        )
+        data = load_json(misleading_baseline_engine_manifest)
+        data["performance"]["baseline"]["engine"] = "not-vllm"
+        write_json(misleading_baseline_engine_manifest, data)
+        misleading_baseline_engine_problems = validate_manifest(
+            data,
+            "w2",
+            misleading_baseline_engine,
+        )
+        if not any("must be vLLM" in problem for problem in misleading_baseline_engine_problems):
+            raise AssertionError("misleading baseline engine selftest did not fail as expected")
 
         baseline_exception = tmp_root / "baseline-exception"
         baseline_exception_manifest = write_selftest_manifest(baseline_exception, ratio=0.82)
