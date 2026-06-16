@@ -1,0 +1,26 @@
+{
+  "status": "DIAGNOSTIC_SOURCE_DIFF",
+  "release_grade": false,
+  "pass_line": null,
+  "date": "2026-06-16",
+  "vllm_source_dir": "/Users/chejinxuan/py_ws/vllm",
+  "vllm_source_head": "0b3ba88f1 Revert \"[CPU] Experimentally enable Triton and MRV2 (#43225)\"",
+  "ferrum_checkpoint_before_note": "20ee9751 docs(cuda): record active prefill chunk c16 diag",
+  "local_python_cuda_note": "Local Mac vLLM import cannot execute CUDA ops because torch is not installed.",
+  "primary_findings": [
+    "Gemma3 model semantics are broadly aligned between vLLM and Ferrum.",
+    "Existing native probes rule out dense Marlin kernel selection as the main c16 gap.",
+    "The remaining source-level gap is decode integration: vLLM uses persistent buffers and CUDA graph dispatch, while Ferrum's usable Gemma3 unified path remains eager.",
+    "Ferrum unified graph is the closest matching lever but is currently not correctness-clean under c16 diagnostics."
+  ],
+  "reused_artifacts": [
+    "docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_sharegpt_baseline_probe_2026-06-15/",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_native_probe_retry_2026-06-15/",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_weight_cycle_probe_2026-06-15/",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_typed_profile_2026-06-16/",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_sharegpt_current_diag_2026-06-16/",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_graph_typed_c16_2026-06-16/"
+  ],
+  "next_minimal_validation": "Target unified-graph correctness/memory safety for one Gemma3 unified decode shape before any broader performance sweep."
+}
