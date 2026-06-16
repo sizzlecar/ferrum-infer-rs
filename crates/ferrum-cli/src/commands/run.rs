@@ -310,6 +310,14 @@ pub struct RunCommand {
     #[arg(long, conflicts_with = "unified_graph")]
     pub disable_unified_graph: bool,
 
+    /// Capture only Llama/Gemma unified transformer layers in CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_unified_graph_layers_only")]
+    pub unified_graph_layers_only: bool,
+
+    /// Disable layers-only unified CUDA graph capture scope.
+    #[arg(long, conflicts_with = "unified_graph_layers_only")]
+    pub disable_unified_graph_layers_only: bool,
+
     /// KV cache element dtype (Dim 5 polymorphism point). Accepts
     /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
     /// require model wire-up; today only the kernel + type layer ships.
@@ -1726,6 +1734,16 @@ fn run_startup_cli_runtime_entries(
             RuntimeConfigSource::Cli,
         ));
     }
+    if let Some(enabled) = bool_cli_override(
+        cmd.unified_graph_layers_only,
+        cmd.disable_unified_graph_layers_only,
+    ) {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
     crate::layer_split_pipeline::push_cli_runtime_entry(
         &mut entries,
         cmd.layer_split_pipeline_mode,
@@ -1855,6 +1873,8 @@ mod tests {
             disable_batched_graph: false,
             unified_graph: false,
             disable_unified_graph: false,
+            unified_graph_layers_only: false,
+            disable_unified_graph_layers_only: false,
             kv_dtype: None,
             kv_capacity: None,
             kv_max_blocks: None,
@@ -1915,6 +1935,7 @@ mod tests {
         let mut cmd = test_run_cmd();
         cmd.batched_graph = true;
         cmd.unified_graph = true;
+        cmd.unified_graph_layers_only = true;
         let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
         let effective = run_effective_runtime_config(&snapshot, &cli_entries);
         let entry = |key: &str| {
@@ -1932,6 +1953,14 @@ mod tests {
         assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
         assert_eq!(
             entry("FERRUM_UNIFIED_GRAPH").source,
+            RuntimeConfigSource::Cli
+        );
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").effective_value,
+            "1"
+        );
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").source,
             RuntimeConfigSource::Cli
         );
     }

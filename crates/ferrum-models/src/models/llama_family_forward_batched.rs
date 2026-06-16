@@ -39,6 +39,7 @@ use super::llama_family_pipeline::{LlamaPipelineStageBatchOps, PipelineHidden};
 pub(crate) struct LlamaBatchedRuntimeConfig {
     decode_op_profile: bool,
     unified_graph: bool,
+    unified_graph_layers_only: bool,
     unified_profile: bool,
     batched_graph: bool,
     batched_trace: bool,
@@ -94,6 +95,7 @@ impl LlamaBatchedRuntimeConfig {
         let mut config = Self {
             decode_op_profile: false,
             unified_graph: false,
+            unified_graph_layers_only: false,
             unified_profile: false,
             batched_graph: false,
             batched_trace: false,
@@ -104,6 +106,9 @@ impl LlamaBatchedRuntimeConfig {
             match name.as_ref() {
                 "FERRUM_DECODE_OP_PROFILE" => config.decode_op_profile = true,
                 "FERRUM_UNIFIED_GRAPH" => config.unified_graph = value == "1",
+                "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY" => {
+                    config.unified_graph_layers_only = value == "1"
+                }
                 "FERRUM_UNIFIED_PROFILE" => config.unified_profile = true,
                 "FERRUM_BATCHED_GRAPH" => config.batched_graph = value != "0",
                 "FERRUM_BATCHED_TRACE" => config.batched_trace = true,
@@ -217,6 +222,7 @@ mod tests {
         let config = LlamaBatchedRuntimeConfig::from_env_vars([
             ("FERRUM_DECODE_OP_PROFILE", "0"),
             ("FERRUM_UNIFIED_GRAPH", "1"),
+            ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "1"),
             ("FERRUM_UNIFIED_PROFILE", ""),
             ("FERRUM_BATCHED_GRAPH", "1"),
             ("FERRUM_BATCHED_TRACE", "0"),
@@ -225,6 +231,7 @@ mod tests {
 
         assert!(config.decode_op_profile);
         assert!(config.unified_graph);
+        assert!(config.unified_graph_layers_only);
         assert!(config.unified_profile);
         assert!(config.batched_graph);
         assert!(config.batched_trace);
@@ -236,12 +243,14 @@ mod tests {
     fn llama_batched_runtime_config_preserves_opt_out_values() {
         let config = LlamaBatchedRuntimeConfig::from_env_vars([
             ("FERRUM_UNIFIED_GRAPH", "true"),
+            ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "true"),
             ("FERRUM_BATCHED_GRAPH", "0"),
             ("FERRUM_GREEDY_ARGMAX", "true"),
         ]);
 
         assert!(!config.decode_op_profile);
         assert!(!config.unified_graph);
+        assert!(!config.unified_graph_layers_only);
         assert!(!config.unified_profile);
         assert!(!config.batched_graph);
         assert!(!config.batched_trace);
@@ -1454,14 +1463,13 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
 
         // ── CUDA-graph capture/replay control ────────────────────────
-        // `FERRUM_UNIFIED_GRAPH=1` opts in. The graph key includes launch
+        // `FERRUM_UNIFIED_GRAPH=1` opts in. The full graph key includes launch
         // shape plus host-side decisions that capture records as constants
-        // (attention kv/shared-memory shape and final-row copy offsets);
-        // high bit set so we never collide with legacy keys
-        // (SINGLE_ITEM = 0, batched = m_padded). The captured region covers
-        // the layer loop + final rms_norm + per-item copy_slice + lm_head.
-        // Pre-work (write_u32 + embedding_lookup) and post-work (sync +
-        // to_vec) stay eager.
+        // (attention kv/shared-memory shape and final-row copy offsets).
+        // `FERRUM_UNIFIED_GRAPH_LAYERS_ONLY=1` switches to a diagnostic scope
+        // that captures only the layer loop, leaving final rms_norm,
+        // per-item copy_slice, and lm_head eager. Pre-work (write_u32 +
+        // embedding_lookup) and post-work (sync + to_vec) stay eager.
         //
         // Status (2026-05-05): WORKING. The earlier
         // `gather_columns launch: CUDA_ERROR_INVALID_VALUE` was caused
@@ -1476,12 +1484,19 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         //   varlen + graph:  714 tok/s, TPOT 18.3 ms  (+5% / -5%)
         let graph_enabled =
             self.batched_cfg.unified_graph && self.batched_cfg.graph_capture_allowed();
-        let graph_key = crate::common::decoder_unified::unified_graph_key(
-            m_total,
-            num_seqs,
-            max_kv_len,
-            &final_indices,
-        );
+        let graph_layers_only = self.batched_cfg.unified_graph_layers_only;
+        let graph_key = if graph_layers_only {
+            crate::common::decoder_unified::unified_layers_only_graph_key(
+                m_total, num_seqs, max_kv_len,
+            )
+        } else {
+            crate::common::decoder_unified::unified_graph_key(
+                m_total,
+                num_seqs,
+                max_kv_len,
+                &final_indices,
+            )
+        };
         let cache_has_key = self.unified_graph_keys_seen.contains(&graph_key);
 
         // Pre-grow the marlin gather scratch slot to the worst-case
@@ -1507,6 +1522,39 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         } else {
             None
         };
+
+        macro_rules! run_unified_layers {
+            () => {
+                for li in 0..num_layers {
+                    self.unified_forward_layer(
+                        &mut ctx,
+                        li,
+                        items,
+                        &q_lens,
+                        &cu_seqlens_q,
+                        &pos_offsets,
+                        &mut residual,
+                        device_residual_shadow.as_mut(),
+                        device_branch_shadow.as_mut(),
+                        m_total,
+                        max_kv_len,
+                        num_seqs,
+                        max_blocks_per_seq,
+                        block_size,
+                        qkv_stride,
+                        q_dim,
+                        kv_dim,
+                        nh,
+                        nkv,
+                        hd,
+                        im,
+                        h,
+                        eps,
+                        qk_mode,
+                    );
+                }
+            };
+        }
 
         let mut did_pure_replay = false;
         if graph_enabled && cache_has_key && !self.unified_graph_failed {
@@ -1537,36 +1585,37 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
         }
 
+        let capture_started = should_capture && B::graph_capture_in_flight(&ctx);
+        let mut layers_ready = did_pure_replay;
         if !did_pure_replay {
-            for li in 0..num_layers {
-                self.unified_forward_layer(
-                    &mut ctx,
-                    li,
-                    items,
-                    &q_lens,
-                    &cu_seqlens_q,
-                    &pos_offsets,
-                    &mut residual,
-                    device_residual_shadow.as_mut(),
-                    device_branch_shadow.as_mut(),
-                    m_total,
-                    max_kv_len,
-                    num_seqs,
-                    max_blocks_per_seq,
-                    block_size,
-                    qkv_stride,
-                    q_dim,
-                    kv_dim,
-                    nh,
-                    nkv,
-                    hd,
-                    im,
-                    h,
-                    eps,
-                    qk_mode,
-                );
+            run_unified_layers!();
+            if capture_started && graph_layers_only && B::graph_capture_in_flight(&ctx) {
+                if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
+                    eprintln!("[unified-graph] layers-only end_capture err: {e}");
+                    self.unified_graph_failed = true;
+                } else {
+                    self.unified_graph_keys_seen.insert(graph_key);
+                    match B::replay_graph(&mut ctx, graph_key) {
+                        Ok(true) => layers_ready = true,
+                        Ok(false) => {
+                            eprintln!("[unified-graph] layers-only post-capture replay skipped");
+                            self.unified_graph_failed = true;
+                        }
+                        Err(e) => {
+                            eprintln!("[unified-graph] layers-only post-capture replay err: {e}");
+                            self.unified_graph_failed = true;
+                        }
+                    }
+                }
+            } else if !B::graph_capture_in_flight(&ctx) {
+                layers_ready = true;
+            }
+            if capture_started && graph_layers_only && !layers_ready {
+                run_unified_layers!();
+                layers_ready = true;
             }
         }
+        let mut final_ready = did_pure_replay && !graph_layers_only;
         if let Some(t0) = layer_t0.filter(|_| !B::graph_capture_in_flight(&ctx)) {
             B::sync(&mut ctx);
             static UNIFIED_PROF_CALLS: std::sync::atomic::AtomicU64 =
@@ -1621,79 +1670,114 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Take scratch buffers we'll either record into the graph or
         // restore on return — outside the !did_pure_replay branch so
         // both paths can put them back.
-        let final_norm_w = &self.final_norm_w;
         let mut norm_out = self
             .scratch
             .unified_norm_out
             .take()
             .expect("unified_norm_out missing");
 
-        if !did_pure_replay {
-            if let Some(device) = device_residual_shadow.as_ref() {
-                B::rms_norm_f32_to_activation(
-                    &mut ctx,
-                    device,
-                    final_norm_w,
-                    eps,
-                    &mut norm_out,
-                    m_total,
-                    h,
-                );
-            } else {
-                B::rms_norm(
-                    &mut ctx,
-                    &residual,
-                    final_norm_w,
-                    eps,
-                    &mut norm_out,
-                    m_total,
-                    h,
-                );
-            }
-            if num_sampled > 0 {
-                let packed_normed = self
-                    .scratch
-                    .unified_packed_normed
-                    .as_mut()
-                    .expect("unified_packed_normed missing");
-                for (j, &(_, global)) in final_indices.iter().enumerate() {
-                    B::copy_slice(&mut ctx, &norm_out, global * h, packed_normed, j * h, h);
+        macro_rules! run_unified_final {
+            () => {{
+                if let Some(device) = device_residual_shadow.as_ref() {
+                    B::rms_norm_f32_to_activation(
+                        &mut ctx,
+                        device,
+                        &self.final_norm_w,
+                        eps,
+                        &mut norm_out,
+                        m_total,
+                        h,
+                    );
+                } else {
+                    B::rms_norm(
+                        &mut ctx,
+                        &residual,
+                        &self.final_norm_w,
+                        eps,
+                        &mut norm_out,
+                        m_total,
+                        h,
+                    );
                 }
-                let lm_head = self
-                    .lm_head
-                    .as_ref()
-                    .expect("unified_forward_internal called on backbone-only model");
-                let packed_logits = self
-                    .scratch
-                    .unified_packed_logits
-                    .as_mut()
-                    .expect("unified_packed_logits missing");
-                {
-                    #[cfg(feature = "cuda")]
-                    let _alloc_label =
-                        ferrum_kernels::backend::cuda::push_alloc_label("llama.unified.lm_head");
-                    lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
+                if num_sampled > 0 {
+                    let packed_normed = self
+                        .scratch
+                        .unified_packed_normed
+                        .as_mut()
+                        .expect("unified_packed_normed missing");
+                    for (j, &(_, global)) in final_indices.iter().enumerate() {
+                        B::copy_slice(&mut ctx, &norm_out, global * h, packed_normed, j * h, h);
+                    }
+                    let lm_head = self
+                        .lm_head
+                        .as_ref()
+                        .expect("unified_forward_internal called on backbone-only model");
+                    let packed_logits = self
+                        .scratch
+                        .unified_packed_logits
+                        .as_mut()
+                        .expect("unified_packed_logits missing");
+                    {
+                        #[cfg(feature = "cuda")]
+                        let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(
+                            "llama.unified.lm_head",
+                        );
+                        lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
+                    }
+                }
+            }};
+        }
+
+        if !final_ready {
+            run_unified_final!();
+            if !B::graph_capture_in_flight(&ctx) {
+                final_ready = true;
+            }
+        }
+
+        // End full-scope capture (if active), install graph, and immediately
+        // replay it. Capture only RECORDS the launches, so without a
+        // post-capture replay the layer loop/final kernels never execute.
+        // The layers-only scope already ended and replayed before final.
+        if should_capture && !graph_layers_only && B::graph_capture_in_flight(&ctx) {
+            if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
+                eprintln!("[unified-graph] end_capture err: {e}");
+                self.unified_graph_failed = true;
+                layers_ready = false;
+                final_ready = false;
+            } else {
+                self.unified_graph_keys_seen.insert(graph_key);
+                match B::replay_graph(&mut ctx, graph_key) {
+                    Ok(true) => {
+                        layers_ready = true;
+                        final_ready = true;
+                    }
+                    Ok(false) => {
+                        eprintln!("[unified-graph] post-capture replay skipped");
+                        self.unified_graph_failed = true;
+                        layers_ready = false;
+                        final_ready = false;
+                    }
+                    Err(e) => {
+                        eprintln!("[unified-graph] post-capture replay err: {e}");
+                        self.unified_graph_failed = true;
+                        layers_ready = false;
+                        final_ready = false;
+                    }
                 }
             }
         }
 
-        // End capture (if active), install graph, and immediately
-        // replay it — capture only RECORDS the launches, so without a
-        // post-capture replay the layer loop's kernels never actually
-        // execute and packed_logits stays uninitialised. Mirrors the
-        // legacy `forward_layer_batched_decode_post_attn` pattern.
-        if should_capture && B::graph_capture_in_flight(&ctx) {
-            if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
-                eprintln!("[unified-graph] end_capture err: {e}");
-                self.unified_graph_failed = true;
-            } else {
-                self.unified_graph_keys_seen.insert(graph_key);
-                if let Err(e) = B::replay_graph(&mut ctx, graph_key) {
-                    eprintln!("[unified-graph] post-capture replay err: {e}");
-                    self.unified_graph_failed = true;
-                }
+        if should_capture && !graph_layers_only && !final_ready {
+            if !layers_ready {
+                run_unified_layers!();
+                layers_ready = true;
             }
+            run_unified_final!();
+            final_ready = true;
         }
+        debug_assert!(layers_ready);
+        debug_assert!(final_ready);
 
         // Sync + readback. ALWAYS eager — to_vec needs the host result.
         B::sync(&mut ctx);
