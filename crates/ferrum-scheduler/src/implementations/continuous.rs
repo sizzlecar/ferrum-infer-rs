@@ -435,6 +435,7 @@ impl ContinuousBatchScheduler {
         batch_requests: &mut Vec<ScheduledRequest>,
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
+        active_decode_prefill_tokens_remaining: &mut Option<usize>,
     ) {
         if batch_requests.len() >= hint.max_batch_size || *total_tokens >= hint.max_tokens {
             return;
@@ -456,6 +457,14 @@ impl ContinuousBatchScheduler {
             if prefill_chunk_tokens == 0 {
                 continue;
             }
+            if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
+                if *remaining == 0 {
+                    break;
+                }
+                if prefill_chunk_tokens > *remaining {
+                    continue;
+                }
+            }
 
             if *total_tokens + prefill_chunk_tokens <= hint.max_tokens {
                 let mut scheduled = req.inner.clone();
@@ -463,6 +472,9 @@ impl ContinuousBatchScheduler {
                 scheduled_request_ids.insert(scheduled.request.id.clone());
                 batch_requests.push(scheduled);
                 *total_tokens += prefill_chunk_tokens;
+                if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(prefill_chunk_tokens);
+                }
             }
         }
     }
@@ -510,6 +522,11 @@ impl ContinuousBatchScheduler {
             }
             drop(decode_queue);
         }
+        let scheduled_decode_count = batch_requests.len();
+        let mut active_decode_prefill_tokens_remaining = self
+            .runtime_config
+            .active_decode_prefill_chunk
+            .filter(|_| scheduled_decode_count > 0);
 
         // Then, add prefill requests up to the per-iter token budget.
         // Phase 3: `max_prefill_batch=8` no longer caps the count —
@@ -524,6 +541,7 @@ impl ContinuousBatchScheduler {
             &mut batch_requests,
             &mut total_tokens,
             &mut scheduled_request_ids,
+            &mut active_decode_prefill_tokens_remaining,
         );
 
         // Check if we should admit new requests from waiting queue
@@ -559,6 +577,7 @@ impl ContinuousBatchScheduler {
             &mut batch_requests,
             &mut total_tokens,
             &mut scheduled_request_ids,
+            &mut active_decode_prefill_tokens_remaining,
         );
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
@@ -1386,6 +1405,49 @@ mod tests {
         let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(mixed_batch.requests.len(), 2);
         assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 64) * 16);
+    }
+
+    #[test]
+    fn active_decode_prefill_chunk_caps_aggregate_mixed_prefill_tokens() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            active_decode_prefill_chunk: Some(64),
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 2048,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let first = create_test_request_with_prompt_tokens(Priority::Normal, 256);
+        let first_id = first.id.clone();
+        enqueue_waiting(&scheduler, first);
+        let initial_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(initial_batch.requests.len(), 1);
+        scheduler.mark_prefill_complete(&first_id, 256);
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(
+            mixed_batch.requests.len(),
+            2,
+            "active decode should admit only one 64-token prefill chunk per iteration"
+        );
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 64) * 16);
+        assert_eq!(
+            scheduler.prefilling_count(),
+            4,
+            "waiting requests may be promoted, but scheduling must respect the mixed-prefill budget"
+        );
     }
 
     #[tokio::test]

@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZD — W2 source checkpoint: cap aggregate mixed prefill during active decode
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_scheduler_active_decode_prefill_budget_source_2026-06-17/`.
+- Scope:
+  - W2 Gemma3 CUDA GPTQ source-only p95 latency lever;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Bottleneck refinement from existing c16 profile:
+  - same-pod c16 throughput already cleared the 80% diagnostic line:
+    Ferrum/vLLM LCB ratio `0.8666308262975292`;
+  - p95 ITL still failed: Ferrum/vLLM p95 ratio
+    `1.597218665188174`;
+  - pure decode frames in
+    `w2_tail_latency_profile_c16_samepod_2026-06-17` had p95
+    `27.978ms`, close to the vLLM c16 p95 ITL `33.0696ms`;
+  - mixed prefill+decode frames had p95 `74.050ms`;
+  - decode-token-weighted frame p95 was `64.029ms`;
+  - `68.9%` of decoded tokens were emitted from frames with at least
+    3 active prefill requests mixed into the decode step.
+- Source change:
+  - `active_decode_prefill_chunk` now acts as an aggregate per-iteration
+    mixed-prefill budget when decode requests are scheduled, not only as a
+    per-prefill-request chunk cap;
+  - with the Gemma3 CUDA GPTQ default `active_decode_prefill_chunk=16`, an
+    active decode iteration can admit at most one 16-token prefill chunk
+    instead of `N waiting requests * 16 tokens`;
+  - added scheduler regression test
+    `active_decode_prefill_chunk_caps_aggregate_mixed_prefill_tokens`.
+- Local validation:
+  - `cargo test -p ferrum-scheduler active_decode_prefill_chunk -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler newly_admitted_prefill_uses_remaining_budget_with_decode -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler` PASS: `52 passed`;
+  - `cargo fmt --all -- --check` PASS.
+- Next required validation:
+  - run Gemma3 product `ferrum run` and `ferrum serve` smoke on native CUDA;
+  - then run same-pod c16 ShareGPT A/B with
+    `bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`;
+  - expected profile change: active-decode mixed frames should stop showing
+    `prefill=7-11`; if p95 still fails, rerun the focused tail profile with
+    both `FERRUM_DECODE_OP_PROFILE=1` and `FERRUM_MARLIN_PROFILE=1`.
+
 ## 2026-06-17 ZC — W2 CUDA diagnostic: c16 tail profile points to Gemma3 GPTQ dense/MLP decode path
 
 - Artifact:
