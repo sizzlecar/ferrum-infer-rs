@@ -764,7 +764,7 @@ def run_gate(lane: str, out_dir: Path, manifest_path: Path) -> int:
     return 0
 
 
-def write_selftest_manifest(root: Path, *, ratio: float = 0.82) -> Path:
+def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     for rel in [
         "hardware.json",
@@ -861,12 +861,43 @@ def write_selftest_manifest(root: Path, *, ratio: float = 0.82) -> Path:
                 "artifact": f"c{concurrency}.json",
             }
         )
+    correctness = {
+        "l0_template": {"status": "pass", "artifact": "l0.json"},
+        "l1_numeric": {"status": "pass", "artifact": "l1.json"},
+        "l2_quantized": {"status": "pass", "artifact": "l2.json"},
+        "l3_behavior": {"status": "pass", "artifact": "l3.json"},
+        "l4_agent": {"status": "pass", "artifact": "l4.json"},
+        "l5_concurrency": {"status": "pass", "artifact": "l5.json"},
+    }
+    if lane == "w3":
+        for rel in [
+            "w3_s0_design.json",
+            "w3_s0_microbench.json",
+            "w3_s1_single_layer.json",
+            "w3_s2_whole_model_product_path.json",
+        ]:
+            write_json(root / rel, {"status": "pass", "name": rel})
+        correctness.update(
+            {
+                "w3_s0_design": {"status": "pass", "artifact": "w3_s0_design.json"},
+                "w3_s0_microbench": {"status": "pass", "artifact": "w3_s0_microbench.json"},
+                "w3_s1_single_layer": {
+                    "status": "pass",
+                    "artifact": "w3_s1_single_layer.json",
+                },
+                "w3_s2_whole_model_product_path": {
+                    "status": "pass",
+                    "artifact": "w3_s2_whole_model_product_path.json",
+                },
+            }
+        )
+
     manifest = {
         "schema_version": 1,
-        "lane": "w2",
+        "lane": lane,
         "status": "pass",
         "goal_doc": str(GOAL_DOC.relative_to(REPO_ROOT)),
-        "model_id": "gemma3-27b",
+        "model_id": "gemma3-27b" if lane == "w2" else "gated-deltanet-selftest",
         "backend": "cuda",
         "quantization": "gptq-int4",
         "git_sha": "0123456789abcdef",
@@ -887,14 +918,7 @@ def write_selftest_manifest(root: Path, *, ratio: float = 0.82) -> Path:
             "hidden_env": [],
             "snapshot": "runtime.json",
         },
-        "correctness": {
-            "l0_template": {"status": "pass", "artifact": "l0.json"},
-            "l1_numeric": {"status": "pass", "artifact": "l1.json"},
-            "l2_quantized": {"status": "pass", "artifact": "l2.json"},
-            "l3_behavior": {"status": "pass", "artifact": "l3.json"},
-            "l4_agent": {"status": "pass", "artifact": "l4.json"},
-            "l5_concurrency": {"status": "pass", "artifact": "l5.json"},
-        },
+        "correctness": correctness,
         "product_entrypoints": {
             "ferrum_run": {"status": "pass", "artifact": "run.json"},
             "ferrum_serve": {"status": "pass", "artifact": "serve.json"},
@@ -926,6 +950,23 @@ def run_selftest() -> int:
         good_problems = validate_manifest(load_json(good_manifest), "w2", good)
         if good_problems:
             raise AssertionError("good selftest manifest failed: " + "; ".join(good_problems))
+
+        good_w3 = tmp_root / "good-w3"
+        good_w3_manifest = write_selftest_manifest(good_w3, lane="w3", ratio=0.82)
+        good_w3_problems = validate_manifest(load_json(good_w3_manifest), "w3", good_w3)
+        if good_w3_problems:
+            raise AssertionError("good W3 selftest manifest failed: " + "; ".join(good_w3_problems))
+
+        bad_w3 = tmp_root / "bad-w3-missing-s0"
+        bad_w3_manifest = write_selftest_manifest(bad_w3, lane="w3", ratio=0.82)
+        data = load_json(bad_w3_manifest)
+        del data["correctness"]["w3_s0_microbench"]
+        write_json(bad_w3_manifest, data)
+        bad_w3_problems = validate_manifest(data, "w3", bad_w3)
+        if not any(
+            "correctness missing w3_s0_microbench" in problem for problem in bad_w3_problems
+        ):
+            raise AssertionError("bad W3 missing-S0 selftest did not fail as expected")
 
         bad = tmp_root / "bad-ratio"
         bad_manifest = write_selftest_manifest(bad, ratio=0.79)
