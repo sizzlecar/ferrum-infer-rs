@@ -2,6 +2,69 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZG — W2 CUDA diagnostic: two mixed-prefill chunks pass c16 throughput and p95
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/`.
+- Scope:
+  - W2 Gemma3 CUDA GPTQ c16 same-pod diagnostic for commit
+    `a7444587ebdceb6a62f5ee475e0244c111d340ac`;
+  - reused same 1x RTX 4090 Vast instance `41241013`;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- GPU lifecycle:
+  - started cached instance `41241013`, 1x RTX 4090, quoted rate
+    `0.47111111111111115 USD/h`;
+  - verified CUDA with driver `580.95.05`, CUDA toolkit `12.4`, and
+    24GB RTX 4090 visibility;
+  - synced clean source to commit
+    `a7444587ebdceb6a62f5ee475e0244c111d340ac`;
+  - copied artifacts back locally, then stopped the instance;
+  - final sanitized Vast state recorded `cur_state=stopped`,
+    `actual_status=exited`.
+- Correctness result:
+  - product `ferrum run` smoke passed with stdout content `5`,
+    `n_tokens=3`;
+  - product `ferrum serve` streaming smoke passed with content `5\n`,
+    exactly one `[DONE]`, and usage present
+    (`prompt_tokens=23`, `completion_tokens=3`, `total_tokens=26`);
+  - c16 `bench-serve` completed `[100,100,100]` requests with
+    errors `[0,0,0]`;
+  - `output_token_count_source=usage`;
+  - no correctness issue was observed in this diagnostic artifact.
+- Performance command:
+  - `ferrum bench-serve --dataset sharegpt --sharegpt-path
+    /workspace/ascii_sharegpt_w2_100.jsonl --random-output-len 128
+    --concurrency-sweep 16 --num-prompts 100 --n-repeats 3
+    --fail-on-error --require-ci --seed 9271`;
+  - same model snapshot and same ASCII ShareGPT 100 dataset as the same-pod
+    vLLM reference from `w2_vllm_same_hw_c16_sharegpt_2026-06-17`.
+- Result:
+  - Ferrum output throughput mean/LCB:
+    `463.405 / 460.553 tok/s`;
+  - same-pod vLLM reference mean/LCB:
+    `500.670 / 478.395 tok/s`;
+  - Ferrum LCB / vLLM LCB = `0.9627`, so c16 throughput clears the 80%
+    diagnostic line;
+  - Ferrum p95 ITL mean `29.247 ms`;
+  - same-pod vLLM reference p95 ITL mean `33.070 ms`;
+  - Ferrum p95 ITL / vLLM p95 ITL = `0.8844`, so c16 p95 also passes;
+  - relative to the one-chunk cap run, c16 LCB improved by
+    `127.443 tok/s` while p95 ITL regressed only `2.610 ms`.
+- Interpretation:
+  - two active-decode mixed-prefill chunks is the first candidate that passes
+    both c16 throughput and c16 p95 against the same-pod vLLM reference;
+  - this validates the scheduler cadence direction more strongly than the
+    one-chunk cap, and avoids returning to the old unbounded mixed-prefill
+    behavior;
+  - W2 is still not release-grade because this is only c16 diagnostic
+    evidence, not the required final W2 gate or full c=1/4/16/32 matrix.
+- Next required validation:
+  - expand same-hardware validation to c=1/4/32 with the same correctness and
+    `bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`
+    standards;
+  - only after the expanded matrix passes should the W2 release-grade
+    validator be run for `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`.
+
 ## 2026-06-17 ZF — W2 source checkpoint: allow two mixed-prefill chunks during active decode
 
 - Artifact:
