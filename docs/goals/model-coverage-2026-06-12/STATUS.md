@@ -2,6 +2,60 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XX — W2 CUDA checkpoint: product batched graph is not the endpoint bottleneck
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_sharegpt_current_diag_2026-06-16/`.
+- Paid GPU lane:
+  `W2 current HEAD --batched-graph ShareGPT same-dataset diagnostic` on the
+  cached 1x RTX 4090 Vast instance.
+- Contract:
+  - expected runtime/cost: 15-30 minutes, about USD 0.11-0.22 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/sync/serve/bench first failure, or c16/c32
+    diagnostic artifact collected, then stop the instance;
+  - correctness gate: server readiness, chat smoke response `5` with usage,
+    bench rc 0, completed requests, zero request errors, zero bad output, zero
+    zero-output responses, zero HTTP 500, and clean server error scan;
+  - performance command:
+    `ferrum serve --batched-graph` plus
+    `ferrum bench-serve --dataset sharegpt --sharegpt-path ascii_sharegpt.jsonl --random-output-len 64 --concurrency-sweep 16,32 --num-prompts 16 --n-repeats 1 --fail-on-error --seed 9271`.
+- Evidence:
+  - remote HEAD `017300426514d62e8e50ac1546ff77d4d54fd6ce`;
+  - clean remote worktree: `local/remote_clean_worktree.txt` has `0` tracked
+    changes;
+  - binary SHA256
+    `d38caf704f252045c29bdfe02795606937f400ab00edef05647da74179b215d5`;
+  - effective graph mode `legacy_batched_decode_graph`;
+  - server ready at `ready_at_poll=29`;
+  - chat smoke response content `"5"`, usage present;
+  - bench rc `0`, `output_token_count_source=usage`;
+  - server log scan has `0` lines;
+  - Vast cleanup confirmed `stopped/exited` in
+    `vast_shutdown/shutdown_complete.txt`.
+- Results against the existing clean vLLM ShareGPT baseline:
+  - c16: `16 completed / 0 errored / 0 bad_output`,
+    `337.6359 tok/s`; ratio `337.6359 / 518.796 = 0.6508`;
+  - c32: `16 completed / 0 errored / 0 bad_output`,
+    `340.1011 tok/s`; ratio `340.1011 / 524.128 = 0.6489`;
+  - compared with the current graph-disabled Ferrum same-dataset diagnostic,
+    c16 changed by `-0.675%` and c32 by `-0.133%`.
+- Interpretation:
+  - no new product `serve` correctness issue was found;
+  - product `--batched-graph` is wired through the CLI and selects
+    `legacy_batched_decode_graph`, but it does not improve ShareGPT endpoint
+    throughput on current HEAD;
+  - the W2 performance gap remains about 15 percentage points below the 80%
+    same-hardware mainstream baseline target, so the next lever should move
+    away from graph-enable diagnostics and toward the model-step dominant path,
+    especially dense MLP `gate_up`, work reduction, and launch/graph
+    integration backed by profiler evidence.
+- Scope:
+  - this is diagnostic evidence only: `n_repeats=1`, no `--require-ci`, and no
+    final release-grade manifest.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XW — W2 CUDA checkpoint: Marlin evict-first does not move ShareGPT endpoint throughput
 
 - Artifact:
