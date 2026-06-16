@@ -2,6 +2,48 @@
 
 进度日志,倒序。
 
+## 2026-06-17 YW — W2 source checkpoint: Gemma3 CUDA GPTQ defaults active-decode prefill chunking
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_active_decode_chunk_source_2026-06-17/`.
+- Scope:
+  - source-only checkpoint; no paid GPU instance was started;
+  - no release performance claim and no `MODEL_RELEASE_GRADE_W2 PASS` was
+    produced.
+- Bottleneck interpretation update:
+  - latest c16 profile after the logits-readback fix still names
+    MLP/Marlin as the largest bucket, but prior native Ferrum-vs-vLLM dense
+    Marlin probes already rejected a direct kernel swap;
+  - the actionable new signal is scheduler cadence: sampled frames include
+    `prefill=12 decode=4 m_total=897`, while pure decode frames are
+    `prefill=0 decode=4` and much smaller;
+  - local vLLM source uses running-first scheduling plus token-budgeted
+    chunked prefill, while Ferrum had the typed knob but did not select it by
+    default for Gemma3 CUDA GPTQ.
+- Source change:
+  - added a capability-gated Gemma3 CUDA GPTQ/int4 auto-config default:
+    `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK=16`;
+  - the default materializes into the runtime snapshot and decision trace as
+    `scheduler_admission_policy=active_decode_prefill_chunk:16`;
+  - explicit user/config/CLI scheduler choices still override it:
+    `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK`,
+    `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`, or
+    `FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE`.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-types auto_config -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler active_decode_prefill_chunk_only_caps_when_decode_is_active -- --nocapture` PASS;
+  - `cargo test -p ferrum-engine continuous_engine_runtime_config_parses_env_snapshot -- --nocapture` PASS;
+  - `cargo check -q -p ferrum-types -p ferrum-scheduler -p ferrum-engine -p ferrum-cli` PASS;
+  - `git diff --check` PASS.
+- Required next validation:
+  - one 1x4090 diagnostic with product `ferrum run` and `ferrum serve`
+    correctness smoke before performance;
+  - c16 `bench-serve --fail-on-error` with the existing profile knobs;
+  - accept the lever only if effective config shows the typed chunk default and
+    profile frames replace full-prompt mixed batches with small active-decode
+    prefill chunks.
+
 ## 2026-06-17 YV — W2 CUDA diagnostic: dense unified argmax removes readback bottleneck
 
 - Artifact:
