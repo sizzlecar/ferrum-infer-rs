@@ -1,0 +1,16 @@
+GPU: NVIDIA GeForce RTX 4090
+Config: layers=62 kernels_per_layer=8 final_kernels=2 total_kernels=498
+Config: batch=16 hidden=5376 elements=86016 work_iters=8 segment_layers=1 eager_gap=1
+Config: warmup_iters=6 timed_iters=60
+
+METRIC eager_ms_per_step 1.108744
+METRIC monolithic_instantiate_ms 1.963643
+METRIC monolithic_replay_ms_per_step 0.795237
+METRIC monolithic_speedup_vs_eager 1.394231
+METRIC segmented_graphs 62
+METRIC segmented_instantiate_total_ms 2.662781
+METRIC segmented_replay_ms_per_step 0.880079
+METRIC segmented_speedup_vs_eager 1.259823
+METRIC segmented_over_monolithic_replay 1.194735
+METRIC checksum32 104.03074646
+VERDICT: CUDA graph segment probe complete
