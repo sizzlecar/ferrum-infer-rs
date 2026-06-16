@@ -1364,7 +1364,7 @@ fn build_marlin_perm() -> Vec<usize> {
 mod tests {
     use super::{
         marlin_profile_bucket_from_label, should_zero_workspace, CudaMarlinRuntimeConfig,
-        MarlinProfileBucket,
+        MarlinProfileBucket, MarlinProfileBucketStats,
     };
 
     #[test]
@@ -1397,7 +1397,7 @@ mod tests {
 
     #[test]
     fn marlin_workspace_zeroing_follows_runtime_config() {
-        let default_config = CudaMarlinRuntimeConfig::from_env_vars([]);
+        let default_config = CudaMarlinRuntimeConfig::from_env_vars(Vec::<(&str, &str)>::new());
         assert!(should_zero_workspace(&default_config));
 
         let skip_config =
