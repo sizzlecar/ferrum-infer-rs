@@ -1,0 +1,20 @@
+{
+  "id": 41218739,
+  "cur_state": "running",
+  "actual_status": "running",
+  "gpu_name": "RTX 4090",
+  "num_gpus": 1,
+  "label": "ferrum-w2-unified-argmax-c16-20260617b",
+  "machine_id": 51751,
+  "cost_per_hour": 0.4696296296296296,
+  "ssh_host": "ssh8.vast.ai",
+  "ssh_port": 18738,
+  "driver_version": "580.95.05",
+  "cuda_max_good": 13.0,
+  "disk_space": 260.0,
+  "disk_bw": 7579.2,
+  "inet_down": 1653.8,
+  "inet_up": 1310.4,
+  "reliability2": 0.9904971,
+  "geolocation": "The Netherlands, NL"
+}

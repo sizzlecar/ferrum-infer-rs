@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=random num_prompts=16 warmup=4 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (20 prompts including 4 warmup)
+    16 completed / 0 errored / 1.5s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=777.3  p95=876.3  p99=884.2
+      TPOT_ms  p50=49.8  p95=84.5  p99=86.0
+      ITL_ms   p50=39.5  p95=85.4  p99=645.0
+      throughput      167.1 tok/s
+      goodput         10.44 req/s
+
+→ wrote /workspace/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/profile_rerun_c16/c16_profile/bench.json
