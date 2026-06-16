@@ -47,6 +47,7 @@ W3_REQUIRED_CORRECTNESS = {
 MIN_RATIO = 0.8
 MAX_ITL_MULTIPLE = 1.25
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
+DIRTY_CLEAN_STRINGS = {"", "clean", "false", "0", "no tracked changes"}
 
 
 class ValidationError(Exception):
@@ -227,6 +228,33 @@ def validate_release_scope(scope: dict[str, Any], lane: str, problems: list[str]
                 )
 
 
+def validate_dirty_status(value: Any, problems: list[str]) -> None:
+    if isinstance(value, dict):
+        dirty = value.get("dirty")
+        if dirty is True:
+            problems.append("dirty_status.dirty must be false for release-grade evidence")
+        files = value.get("files", value.get("dirty_files", []))
+        if files:
+            problems.append("dirty_status files must be empty for release-grade evidence")
+        if dirty is None and not any(key in value for key in ["clean", "status_short"]):
+            problems.append("dirty_status must explicitly record clean/dirty state")
+        if value.get("clean") is False:
+            problems.append("dirty_status.clean must not be false for release-grade evidence")
+        status_short = value.get("status_short")
+        if isinstance(status_short, str) and status_short.strip():
+            problems.append("dirty_status.status_short must be empty for release-grade evidence")
+        return
+    if isinstance(value, list):
+        if value:
+            problems.append("dirty_status list must be empty for release-grade evidence")
+        return
+    if isinstance(value, str):
+        if value.strip().lower() not in DIRTY_CLEAN_STRINGS:
+            problems.append("dirty_status string must indicate a clean worktree")
+        return
+    problems.append("dirty_status must be a dict, list, or string")
+
+
 def validate_runtime_config(runtime: dict[str, Any], out_dir: Path, problems: list[str]) -> None:
     product_surface = runtime.get("product_surface")
     allowed = {"typed_cli", "typed_config", "typed_defaults", "model_defaults"}
@@ -268,8 +296,7 @@ def validate_top_level(manifest: dict[str, Any], lane: str, out_dir: Path, probl
     git_sha = manifest.get("git_sha")
     if not isinstance(git_sha, str) or not re.match(r"^[0-9a-fA-F]{7,40}$", git_sha):
         problems.append("git_sha must be a 7-40 character hex string")
-    if not isinstance(manifest.get("dirty_status"), (dict, list, str)):
-        problems.append("dirty_status must be recorded")
+    validate_dirty_status(manifest.get("dirty_status"), problems)
     digest = manifest.get("binary_sha256")
     if not isinstance(digest, str) or not HEX64.match(digest):
         problems.append("binary_sha256 must be a 64-character hex digest")
@@ -436,7 +463,9 @@ def validate_performance_cell(
                     f"{label} ratio {ratio:.6f} < required {MIN_RATIO:.3f}"
                 )
     validate_tail_latency(cell, perf, label, problems)
-    if "artifact" in cell:
+    if "artifact" not in cell:
+        problems.append(f"{label} must include a Ferrum performance artifact")
+    else:
         validate_evidence_entry(cell["artifact"], f"{label}.artifact", out_dir, problems)
     return concurrency
 
@@ -447,7 +476,9 @@ def validate_performance(manifest: dict[str, Any], out_dir: Path, problems: list
     for key in ["engine", "version", "build_command_line", "command_line"]:
         if key not in baseline:
             problems.append(f"performance.baseline missing {key}")
-    if "artifact" in baseline:
+    if "artifact" not in baseline:
+        problems.append("performance.baseline must include an artifact")
+    else:
         validate_evidence_entry(baseline["artifact"], "performance.baseline.artifact", out_dir, problems)
     command_parts(baseline.get("command_line"), "performance.baseline.command_line", problems)
     command_parts(baseline.get("build_command_line"), "performance.baseline.build_command_line", problems)
@@ -666,6 +697,39 @@ def run_selftest() -> int:
         hidden_problems = validate_manifest(data, "w2", hidden)
         if not any("hidden_env" in problem for problem in hidden_problems):
             raise AssertionError("hidden env selftest did not fail as expected")
+
+        dirty = tmp_root / "dirty"
+        dirty_manifest = write_selftest_manifest(dirty, ratio=0.82)
+        data = load_json(dirty_manifest)
+        data["dirty_status"] = {"dirty": True, "files": ["crates/ferrum-models/src/lib.rs"]}
+        write_json(dirty_manifest, data)
+        dirty_problems = validate_manifest(data, "w2", dirty)
+        if not any("dirty_status" in problem for problem in dirty_problems):
+            raise AssertionError("dirty status selftest did not fail as expected")
+
+        missing_baseline = tmp_root / "missing-baseline-artifact"
+        missing_baseline_manifest = write_selftest_manifest(missing_baseline, ratio=0.82)
+        data = load_json(missing_baseline_manifest)
+        del data["performance"]["baseline"]["artifact"]
+        write_json(missing_baseline_manifest, data)
+        missing_baseline_problems = validate_manifest(data, "w2", missing_baseline)
+        if not any(
+            "performance.baseline must include an artifact" in problem
+            for problem in missing_baseline_problems
+        ):
+            raise AssertionError("missing baseline artifact selftest did not fail as expected")
+
+        missing_cell = tmp_root / "missing-cell-artifact"
+        missing_cell_manifest = write_selftest_manifest(missing_cell, ratio=0.82)
+        data = load_json(missing_cell_manifest)
+        del data["performance"]["cells"][0]["artifact"]
+        write_json(missing_cell_manifest, data)
+        missing_cell_problems = validate_manifest(data, "w2", missing_cell)
+        if not any(
+            "must include a Ferrum performance artifact" in problem
+            for problem in missing_cell_problems
+        ):
+            raise AssertionError("missing cell artifact selftest did not fail as expected")
 
     print("MODEL RELEASE GRADE GOAL SELFTEST PASS")
     return 0
