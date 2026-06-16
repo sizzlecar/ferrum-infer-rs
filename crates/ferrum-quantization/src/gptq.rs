@@ -101,6 +101,13 @@ impl<B: Backend + BackendQuantMarlin> Linear<B> for GptqLinear<B> {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    fn cuda_marlin_touch_ref(
+        &self,
+    ) -> Option<ferrum_kernels::quant_linear::cuda_marlin::CudaMarlinTouchRef<'_>> {
+        self.inner.cuda_marlin_touch_ref()
+    }
+
     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize) {
         self.inner.forward(ctx, input, out, m);
     }
