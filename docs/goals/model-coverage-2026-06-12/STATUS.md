@@ -2,6 +2,48 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YC — W2 CUDA checkpoint: producer-touch product prototype is not safe as a default
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_producer_touch_sharegpt_diag_2026-06-16/`.
+- Paid GPU lane:
+  `W2 producer-touch ShareGPT endpoint diagnostic` on the cached 1x RTX 4090
+  Vast instance.
+- Contract:
+  - expected runtime/cost: 15-30 minutes, about USD 0.11-0.22 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/server readiness/chat smoke/bench first
+    failure or c16/c32 diagnostic artifact collected, then stop;
+  - correctness gate: prior product run/serve smoke plus this run's server
+    readiness, chat smoke `5` with usage, bench rc 0, zero request errors, and
+    clean server log scan;
+  - performance command:
+    `ferrum bench-serve --dataset sharegpt --sharegpt-path ascii_sharegpt.jsonl --random-output-len 64 --concurrency-sweep 16,32 --num-prompts 16 --n-repeats 1 --fail-on-error --seed 9271`.
+- Correctness evidence:
+  - bench rc `0`;
+  - c16/c32 both `16 completed / 0 errored / 0 bad_output / 0 zero_output`;
+  - `output_token_count_source=usage`;
+  - server error scan has `0` lines;
+  - Vast cleanup confirmed `stopped/exited`.
+- Results:
+  - c16 producer-touch `313.3996 tok/s` vs current default
+    `339.9306 tok/s`: `-7.80%`;
+  - c32 producer-touch `348.5895 tok/s` vs current default
+    `340.5554 tok/s`: `+2.36%`;
+  - c16 ratio to vLLM `0.6041`;
+  - c32 ratio to vLLM `0.6651`.
+- Interpretation:
+  - the native producer-touch signal is real, but the product default prototype
+    is mixed: it slightly helps c32 and materially hurts c16;
+  - this is not a safe default optimization and should not be used for
+    release-grade performance work without a narrower variant and fresh product
+    c16 evidence;
+  - the immediate source follow-up is to return the default product path to the
+    previous GeGLU behavior while preserving the diagnostic artifact.
+- Scope:
+  - this is diagnostic evidence only: `n_repeats=1`, no `--require-ci`;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
 ## 2026-06-16 YB — W2 CUDA checkpoint: producer-touch product prototype compiles and passes run/serve smoke
 
 - Artifacts:

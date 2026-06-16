@@ -3289,13 +3289,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // 11. Gated activation: SwiGLU (silu) or GeGLU (gelu_tanh, Gemma).
         time_tail!(TAIL_ACT_TIME_US, TAIL_ACT_CALLS, {
             match cfg.activation {
-                Activation::GeluTanh => B::fused_gelu_tanh_mul_split_with_down_hint(
+                Activation::GeluTanh => B::fused_gelu_tanh_mul_split(
                     ctx,
                     &self.scratch.gate_up_out,
                     &mut self.scratch.silu_out,
                     tokens,
                     im,
-                    Some(&*layer.down_proj),
                 ),
                 _ => B::fused_silu_mul_split(
                     ctx,

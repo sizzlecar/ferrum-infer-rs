@@ -1779,50 +1779,6 @@ impl Backend for CudaBackend {
         .expect("fused_gelu_tanh_mul_split launch");
     }
 
-    fn fused_gelu_tanh_mul_split_with_down_hint(
-        ctx: &mut Self::Context,
-        gate_up: &Self::Buffer,
-        out: &mut Self::Buffer,
-        tokens: usize,
-        im: usize,
-        down_proj: Option<&dyn crate::Linear<Self>>,
-    ) {
-        let Some(down_weight) = down_proj
-            .and_then(|linear| linear.as_cuda_marlin_linear())
-            .and_then(|linear| linear.marlin_weight())
-        else {
-            return Self::fused_gelu_tanh_mul_split(ctx, gate_up, out, tokens, im);
-        };
-
-        let func = ctx.func(
-            "fused_silu_mul",
-            ptx::FUSED_SILU_MUL,
-            "fused_gelu_tanh_mul_interleaved_f16_touch_down_qweight",
-        );
-        let im_i32 = im as i32;
-        let total = tokens * im;
-        let total_i32 = total as i32;
-        let qweight_words = down_weight.qweight.len() as i32;
-        let block = 256u32;
-        let grid = ((total as u32) + block - 1) / block;
-        let stream = ctx.stream.clone();
-        let mut b = stream.launch_builder(&func);
-        b.arg(gate_up);
-        b.arg(out);
-        b.arg(&im_i32);
-        b.arg(&total_i32);
-        b.arg(&down_weight.qweight);
-        b.arg(&qweight_words);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (block, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .expect("fused_gelu_tanh_mul_split_with_down_hint launch");
-    }
-
     fn kv_cache_append_batched_per_cache(
         ctx: &mut Self::Context,
         caches: &[&Self::Buffer],
