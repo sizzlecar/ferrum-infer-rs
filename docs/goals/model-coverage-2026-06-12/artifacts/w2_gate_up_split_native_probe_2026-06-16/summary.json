@@ -1,0 +1,56 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gate_up_split_native_probe_2026-06-16",
+  "lane": "W2 Gemma3 gate_up split-vs-fused native probe",
+  "source_head": "50abea26c005c3115a7deb931434f53d0803de51",
+  "source_status": "clean-tracked-before-remote-sync",
+  "command": "bash scripts/microbenches/build_and_run_gemma3_gate_up_split_perf.sh",
+  "exit_code": 0,
+  "verdict": "VERDICT: gemma3 gate_up split native CUDA probe complete",
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 4090",
+    "memory_mib": 24564,
+    "driver": "565.77",
+    "cuda_visible": "12.7",
+    "nvcc": "12.4.131"
+  },
+  "binary_sha256": "f0939e6164e17e6d24b18dc127ff567f5a464913bbcd36b6cfea925caf1140e5",
+  "cleanup": {
+    "vast_instance_id": "40826362",
+    "stop_poll": "poll=00 cur_state=stopped actual_status=exited intended_status=stopped",
+    "final_api_status_file": "vast_instance_40826362.final.json"
+  },
+  "rows": [
+    {
+      "m": 1,
+      "product_fused_segment_host_us": 135.473,
+      "split_serial_speedup_vs_product": 0.9615,
+      "split_overlap_speedup_vs_product": 1.0005
+    },
+    {
+      "m": 10,
+      "product_fused_segment_host_us": 139.265,
+      "split_serial_speedup_vs_product": 0.9714,
+      "split_overlap_speedup_vs_product": 1.0116
+    },
+    {
+      "m": 16,
+      "product_fused_segment_host_us": 139.507,
+      "split_serial_speedup_vs_product": 0.9771,
+      "split_overlap_speedup_vs_product": 1.0136
+    },
+    {
+      "m": 23,
+      "product_fused_segment_host_us": 143.324,
+      "split_serial_speedup_vs_product": 0.9416,
+      "split_overlap_speedup_vs_product": 0.9828
+    },
+    {
+      "m": 32,
+      "product_fused_segment_host_us": 145.377,
+      "split_serial_speedup_vs_product": 0.9473,
+      "split_overlap_speedup_vs_product": 0.9899
+    }
+  ],
+  "conclusion": "Reject split gate/up productization for W2: serial split is slower for every tested m; two-stream split peaks at 1.0136x isolated segment speedup near m=16 and regresses at m=23/m=32.",
+  "release_gate_status": "diagnostic-only; no MODEL_RELEASE_GRADE_W2 PASS"
+}
