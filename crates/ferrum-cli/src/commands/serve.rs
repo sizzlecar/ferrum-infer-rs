@@ -92,6 +92,10 @@ pub struct ServeCommand {
     #[arg(long, value_name = "N")]
     pub scheduler_prefill_first_until_active: Option<usize>,
 
+    /// Cap prefill chunks while decode requests are active.
+    #[arg(long, value_name = "N")]
+    pub scheduler_active_decode_prefill_chunk: Option<usize>,
+
     /// Enable prefix caching (`FERRUM_PREFIX_CACHE=1`).
     #[arg(
         long,
@@ -224,6 +228,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_num_seqs,
         max_num_batched_tokens,
         scheduler_prefill_first_until_active,
+        scheduler_active_decode_prefill_chunk,
         enable_prefix_caching,
         no_enable_prefix_caching,
         enable_prefix_cache,
@@ -581,6 +586,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_num_seqs,
         max_num_batched_tokens,
         scheduler_prefill_first_until_active,
+        scheduler_active_decode_prefill_chunk,
         greedy_argmax_cli_override(greedy_argmax, disable_greedy_argmax),
         prefix_cache_cli_override(
             enable_prefix_caching,
@@ -1050,6 +1056,7 @@ fn serve_cli_runtime_entries(
     max_num_seqs: Option<usize>,
     max_num_batched_tokens: Option<usize>,
     scheduler_prefill_first_until_active: Option<usize>,
+    scheduler_active_decode_prefill_chunk: Option<usize>,
     greedy_argmax: Option<bool>,
     prefix_cache: Option<bool>,
     session_cache: Option<&str>,
@@ -1077,6 +1084,11 @@ fn serve_cli_runtime_entries(
         &mut entries,
         "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
         scheduler_prefill_first_until_active,
+    );
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+        scheduler_active_decode_prefill_chunk,
     );
     if let Some(enabled) = greedy_argmax {
         entries.push(RuntimeConfigEntry::new(
@@ -1778,6 +1790,7 @@ mod tests {
             Some(64),
             Some(2048),
             Some(8),
+            Some(24),
             Some(true),
             Some(false),
             Some("memory"),
@@ -1812,6 +1825,10 @@ mod tests {
         assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
             "8"
+        );
+        assert_eq!(
+            entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
+            "24"
         );
         assert_eq!(entry("FERRUM_GREEDY_ARGMAX").effective_value, "1");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
@@ -1894,6 +1911,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(
@@ -1952,6 +1970,7 @@ mod tests {
             Some(8),
             Some(512),
             Some(8),
+            Some(32),
             Some(false),
             Some(false),
             None,
@@ -1981,6 +2000,10 @@ mod tests {
         assert_eq!(
             entry(&cli_over_env, "FERRUM_MAX_BATCHED_TOKENS").effective_value,
             "512"
+        );
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
+            "32"
         );
         assert_eq!(
             entry(&cli_over_env, "FERRUM_PREFIX_CACHE").effective_value,
@@ -2510,6 +2533,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -2549,6 +2573,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(true, false, false, false),
             None,
             None,
@@ -2562,6 +2587,7 @@ mod tests {
             None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,
@@ -2589,6 +2615,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(false, true, false, false),
             None,
             None,
@@ -2602,6 +2629,7 @@ mod tests {
             None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,

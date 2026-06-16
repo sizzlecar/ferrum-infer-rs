@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YK — W2 source checkpoint: expose active decode prefill chunk
+
+- No GPU instance was started in this checkpoint; no performance measurement
+  was taken and no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Current bottleneck read from existing evidence:
+  - c16 same-shape release-style evidence remains correctness-clean but below
+    gate: Ferrum LCB `325.184 tok/s` vs vLLM LCB `491.150 tok/s`, and Ferrum
+    p95 ITL `83.979 ms` vs vLLM `28.130 ms`;
+  - native tail-MLP probes show the steady decode chain is real model work,
+    but the release-style p95 ITL is worse than steady decode alone explains;
+  - existing profiler evidence includes long mixed prefill+decode steps such
+    as `items=10 prefill=3 decode=7 total=291754us`, which can create the
+    observed ITL tail.
+- Source change:
+  - added `--scheduler-active-decode-prefill-chunk <N>` to `ferrum serve`;
+  - added `runtime.scheduler_active_decode_prefill_chunk` to CLI config;
+  - both map to the already-supported typed runtime key
+    `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK`;
+  - defaults are unchanged.
+- Why this matters:
+  - the next c16 validation can test active-decode prefill chunking through a
+    visible product setting rather than a hidden environment variable;
+  - this directly targets the suspected mixed prefill+decode ITL tail, not the
+    already-rejected `gate_up` split branch.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-cli runtime_cli_config_emits_config_file_source_entries -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-cli serve_cli_runtime_entries_are_cli_sourced_and_classified -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-cli vllm_compat_runtime_flags_follow_existing_precedence -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-cli serve_runtime_snapshot_prefers_cli_over_config_file -- --nocapture`
+    PASS.
+- Required next validation:
+  - one cached 1x4090 c16 diagnostic using the new CLI/config knob, with
+    profiler lines enabled, to confirm whether mixed prefill+decode steps and
+    p95 ITL fall materially before any default change is considered.
+
 ## 2026-06-16 YJ — W2 native gate_up split probe: branch rejected, not a material lever
 
 - Artifact:
