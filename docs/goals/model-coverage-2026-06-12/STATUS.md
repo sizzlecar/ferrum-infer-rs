@@ -2,6 +2,56 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XU — W2 native CUDA checkpoint: product-default Marlin evict-first validated
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_cache_policy_default_native_probe_2026-06-16/`.
+- Paid GPU lane:
+  `W2 Marlin cache-policy product-default native probe` on the cached 1x RTX
+  4090 Vast instance.
+- Contract:
+  - expected runtime/cost: 10-20 minutes, about USD 0.07-0.15 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/compile first failure, probe non-zero or
+    timeout, or VERDICT plus artifact copyback;
+  - correctness gate: native probe exit 0 and
+    `VERDICT: gemma3 Marlin cache-policy native CUDA probe complete`;
+  - performance command:
+    `bash scripts/microbenches/build_and_run_gemma3_marlin_cache_policy_perf.sh`.
+- Evidence:
+  - remote HEAD `c76bfcfa2b00a73a816e6d44bbd999a621b12a49`;
+  - probe rc `0`;
+  - legacy plain binary SHA256
+    `b0ee9ba92b2a3ab74c382273ea2fc82763277671b436581b5fc47e0d9b896e00`;
+  - product default binary SHA256
+    `82edfb8e6561f87eef067d3ea7fe5327b54f3cc9450d6c42cf63fe72963aec66`;
+  - stdout contains
+    `VERDICT: gemma3 Marlin cache-policy native CUDA probe complete`;
+  - Vast cleanup confirmed `stopped/exited`.
+- Key rows:
+  - m16 product chain event: legacy plain `215.344us`, product default
+    `211.791us` (`-1.6%`);
+  - m16 product down: legacy plain `70.496us`, product default `68.852us`;
+  - m32 product chain event: legacy plain `227.980us`, product default
+    `225.103us` (`-1.3%`);
+  - m32 product down: legacy plain `75.653us`, product default `75.414us`.
+- Interpretation:
+  - after `c76bfcfa`, the product-default Marlin path matches the previously
+    validated evict-first variant;
+  - this is a real default-path kernel improvement, but only a 1-2% MLP segment
+    lever, so it does not close the W2 release-grade performance gap alone.
+- Next:
+  - validate `ferrum run` and `ferrum serve` correctness on a CUDA product
+    binary before any endpoint performance claim;
+  - continue searching for a larger dense MLP `gate_up` / work-reduction lever.
+- Scope:
+  - this is diagnostic native CUDA evidence, not release performance evidence;
+  - the remote worktree had old tracked artifact-log modifications after
+    syncing `.git`; those are recorded in `remote/git_status_short.txt` and are
+    not used for release performance claims.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XT — W2 source checkpoint: productize Marlin B-weight evict-first cache policy
 
 - Changed `crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu` so Marlin
