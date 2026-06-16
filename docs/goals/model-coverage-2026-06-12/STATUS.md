@@ -2,6 +2,73 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YL — W2 active-decode prefill chunk c16 diagnostic: latency tradeoff, not throughput lever
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/`.
+- Paid GPU lane:
+  `W2 c16 active-decode prefill chunk diagnostic` on cached Vast instance
+  `40826362`, 1x RTX 4090.
+- Contract:
+  - expected runtime/cost: 25-45 minutes, hard cap 60 minutes, about
+    USD 0.18-0.32 at USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/build/`ferrum run`/serve smoke first
+    failure, or complete default vs `--scheduler-active-decode-prefill-chunk 32`
+    c16 diagnostic, copy artifact, and confirm instance exited;
+  - correctness gate: release CUDA build, `ferrum run` 2+3, default and
+    chunk32 `ferrum serve` chat smoke;
+  - performance command:
+    `ferrum bench-serve --dataset sharegpt --random-output-len 128 --concurrency-sweep 16 --num-prompts 64 --n-repeats 1 --fail-on-error --seed 9271`.
+- Evidence hygiene:
+  - source head `8bc7cf087ae5fe6e7e2e34405ca5781cc8d0acdc`;
+  - binary SHA256
+    `786bbd8bf2536d46328e1daf4453cc81dbb24213d23914e3f34893582bb32717`;
+  - build features `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - GPU `NVIDIA GeForce RTX 4090`, driver `565.77`, `nvidia-smi` CUDA
+    `12.7`, `nvcc` `12.4.131`;
+  - runtime `2026-06-16T05:43:39Z` to `2026-06-16T06:17:03Z`, estimated
+    GPU cost USD `0.237`;
+  - Vast cleanup confirmed `actual_status=exited`, `cur_state=stopped`,
+    `intended_status=stopped`.
+- Correctness:
+  - CUDA release build rc `0`;
+  - `ferrum run` validation PASS, content `5`;
+  - default `ferrum serve` smoke PASS, content `5`;
+  - chunk32 `ferrum serve` smoke PASS, content `5`;
+  - both bench arms completed `[64]`, errored `[0]`, and used
+    `output_token_count_source=usage`.
+- Performance result, diagnostic only (`n_repeats=1`, no CI):
+  - default c16 throughput `320.311 tok/s`, `65.22%` of vLLM c16 LCB
+    `491.150 tok/s`, gap to 80% threshold `72.609 tok/s`;
+  - chunk32 c16 throughput `312.911 tok/s`, `63.71%` of vLLM c16 LCB,
+    gap to 80% threshold `80.009 tok/s`;
+  - chunk32 vs default: throughput `-2.31%`, ITL p95 `-21.26%`,
+    TTFT p95 `-18.26%`, TPOT p95 `-5.35%`, E2E p95 `+2.68%`.
+- Profile:
+  - remote `rg` was unavailable, so profile extracts were regenerated locally
+    from `server.log`;
+  - default had `73` decode-only rows, p50 `33908 us`, p95 `40314 us`, max
+    `42826 us`, and zero mixed prefill+decode rows;
+  - chunk32 had `67` decode-only rows, p50 `33090 us`, p95 `40967 us`, max
+    `45903 us`, plus `6` bounded mixed rows with p50 `73604 us`, p95
+    `84571.5 us`, max `85609 us`.
+- Interpretation:
+  - chunk32 reduces c16 ITL tail latency but lowers throughput, so it is a
+    latency tradeoff rather than the main W2 throughput lever;
+  - the default arm did not show mixed prefill+decode rows in this run, so
+    continuing to sweep active-decode prefill chunk is not supported by the
+    evidence;
+  - the remaining gap is now more likely in model-side per-step decode cost,
+    batched execution, attention/MLP fusion, or host sync/copy paths.
+- Gate status:
+  - this checkpoint is diagnostic only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Next direction:
+  - stop sweeping active prefill chunk as the main lever;
+  - compare Ferrum against local vLLM source under `/Users/chejinxuan/py_ws/vllm`,
+    identify concrete Gemma3/GPTQ decode-path differences, then validate with
+    minimal Python or native CUDA probes before any broader GPU sweep.
+
 ## 2026-06-16 YK — W2 source checkpoint: expose active decode prefill chunk
 
 - No GPU instance was started in this checkpoint; no performance measurement

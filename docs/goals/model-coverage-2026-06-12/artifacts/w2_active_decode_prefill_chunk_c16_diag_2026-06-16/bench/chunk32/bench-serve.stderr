@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=64 warmup=10 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (74 prompts including 10 warmup)
+    64 completed / 0 errored / 15.0s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=421.3  p95=697.1  p99=1005.6
+      TPOT_ms  p50=44.4  p95=46.5  p99=48.8
+      ITL_ms   p50=38.8  p95=67.8  p99=89.3
+      throughput      312.9 tok/s
+      goodput         4.26 req/s
+
+→ wrote /workspace/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/bench/chunk32/bench_sharegpt_c16.json

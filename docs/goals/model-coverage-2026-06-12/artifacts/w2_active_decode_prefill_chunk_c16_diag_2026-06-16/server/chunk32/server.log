@@ -1,0 +1,412 @@
+[auto-size] gpu=24.0 GB total / 1.2 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 3.9 GB → max_blocks=512
+[auto-size] requested runtime floor requires KV_MAX_BLOCKS=512 above estimated budget 338; honoring explicit runtime limits
+[auto-size] KV_MAX_BLOCKS=512 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+[2m2026-06-16T06:15:41.861407Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-16T06:15:41.861429Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-16T06:15:41.861484Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-16T06:15:42.916485Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-16T06:15:42.916524Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-16T06:15:42.916528Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-16T06:15:42.916542Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=512
+[2m2026-06-16T06:15:42.916723Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-16T06:15:42.916984Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-16T06:15:43.060711Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-16T06:15:43.060797Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-16T06:15:43.060808Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-16T06:15:43.060817Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-16T06:16:37.550010Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+[2m2026-06-16T06:16:42.098555Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m Gemma3 family: legacy batched_decode=true varlen_unified=true
+[unified-op] drain#0 (over last 64 unified_forward calls):
+[unified-op] rms_norm/fused_rms: 124 calls 1 ms total avg=9us
+[unified-op] matmul (qkv/o/gate_up/down): 248 calls 22 ms total avg=90us
+[unified-op] split_qkv_norm_rope_paged: 62 calls 0 ms total avg=9us
+[unified-op] paged_varlen_attention: 62 calls 1 ms total avg=22us
+[unified-op] silu/residual_add: 124 calls 0 ms total avg=7us
+[unified-logits] call#0 row=0 orig_idx=0 global=22 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[236810:42.031250,239374:20.453125,247918:20.453125,239341:20.187500,242323:20.015625]
+[unified-decode] call#0 items=1 prefill=1 decode=0 total_q=23 attempted_unified=true fallback=false fallback_reason=none elapsed=135861us
+[unified-prof] iter#0 items=1 prefill=1 decode=0 total=136071us model=135884us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[iter-prof] iter#0 total=136452us sched=9us process=136443us batch_size=1
+[unified-logits] call#1 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[107:41.906250,106:38.000000,236743:26.656250,236761:24.437500,108:23.656250]
+[unified-decode] call#1 items=1 prefill=0 decode=1 total_q=1 attempted_unified=true fallback=false fallback_reason=none elapsed=26298us
+[unified-prof] iter#1 items=1 prefill=0 decode=1 total=26485us model=26313us decode_post=171us | sample=170 sched=0 stream=1 stop=0 complete=0 (us)
+[iter-prof] iter#1 total=26531us sched=8us process=26522us batch_size=1
+[unified-logits] call#2 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[106:45.750000,954:18.828125,236743:18.828125,236770:18.750000,236761:18.453125]
+[unified-decode] call#2 items=1 prefill=0 decode=1 total_q=1 attempted_unified=true fallback=false fallback_reason=none elapsed=25913us
+[unified-prof] iter#2 items=1 prefill=0 decode=1 total=26110us model=25927us decode_post=182us | sample=168 sched=0 stream=0 stop=0 complete=14 (us)
+[iter-prof] iter#2 total=26140us sched=2us process=26137us batch_size=1
+[bg-loop-gap] call#8 inter_iter=3us
+[bg-loop-gap] call#16 inter_iter=3us
+[bg-loop-gap] call#24 inter_iter=3us
+[bg-loop-gap] call#32 inter_iter=1us
+[bg-loop-gap] call#40 inter_iter=3us
+[bg-loop-gap] call#48 inter_iter=2us
+[bg-loop-gap] call#56 inter_iter=2us
+[bg-loop-gap] call#64 inter_iter=3us
+[bg-loop-gap] call#72 inter_iter=3us
+[bg-loop-gap] call#80 inter_iter=3us
+[bg-loop-gap] call#88 inter_iter=3us
+[bg-loop-gap] call#96 inter_iter=2us
+[bg-loop-gap] call#104 inter_iter=2us
+[bg-loop-gap] call#112 inter_iter=2us
+[bg-loop-gap] call#120 inter_iter=6us
+[bg-loop-gap] call#128 inter_iter=3us
+[bg-loop-gap] call#136 inter_iter=2us
+[bg-loop-gap] call#144 inter_iter=2us
+[bg-loop-gap] call#152 inter_iter=2us
+[bg-loop-gap] call#160 inter_iter=2us
+[bg-loop-gap] call#168 inter_iter=2us
+[bg-loop-gap] call#176 inter_iter=2us
+[bg-loop-gap] call#184 inter_iter=4us
+[bg-loop-gap] call#192 inter_iter=3us
+[bg-loop-gap] call#200 inter_iter=2us
+[bg-loop-gap] call#208 inter_iter=3us
+[bg-loop-gap] call#216 inter_iter=1us
+[bg-loop-gap] call#224 inter_iter=3us
+[bg-loop-gap] call#232 inter_iter=5us
+[bg-loop-gap] call#240 inter_iter=3us
+[bg-loop-gap] call#248 inter_iter=5us
+[bg-loop-gap] call#256 inter_iter=3us
+[bg-loop-gap] call#264 inter_iter=4us
+[bg-loop-gap] call#272 inter_iter=3us
+[bg-loop-gap] call#280 inter_iter=3us
+[bg-loop-gap] call#288 inter_iter=4us
+[bg-loop-gap] call#296 inter_iter=4us
+[bg-loop-gap] call#304 inter_iter=3us
+[bg-loop-gap] call#312 inter_iter=5us
+[bg-loop-gap] call#320 inter_iter=3us
+[bg-loop-gap] call#328 inter_iter=3us
+[bg-loop-gap] call#336 inter_iter=3us
+[bg-loop-gap] call#344 inter_iter=3us
+[bg-loop-gap] call#352 inter_iter=3us
+[bg-loop-gap] call#360 inter_iter=3us
+[bg-loop-gap] call#368 inter_iter=3us
+[bg-loop-gap] call#376 inter_iter=3us
+[bg-loop-gap] call#384 inter_iter=3us
+[bg-loop-gap] call#392 inter_iter=3us
+[bg-loop-gap] call#400 inter_iter=5us
+[bg-loop-gap] call#408 inter_iter=4us
+[bg-loop-gap] call#416 inter_iter=3us
+[bg-loop-gap] call#424 inter_iter=3us
+[bg-loop-gap] call#432 inter_iter=3us
+[bg-loop-gap] call#440 inter_iter=8us
+[bg-loop-gap] call#448 inter_iter=3us
+[bg-loop-gap] call#456 inter_iter=3us
+[bg-loop-gap] call#464 inter_iter=4us
+[bg-loop-gap] call#472 inter_iter=3us
+[bg-loop-gap] call#480 inter_iter=4us
+[bg-loop-gap] call#488 inter_iter=3us
+[bg-loop-gap] call#496 inter_iter=4us
+[unified-logits] call#3 row=0 orig_idx=0 global=121 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[8291:54.281250,1408:50.625000,1018:47.500000,81330:46.250000,7243:44.250000]
+[unified-logits] call#3 row=1 orig_idx=1 global=243 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[8291:56.531250,1408:48.312500,81330:47.593750,1018:46.125000,24355:44.406250]
+[unified-decode] call#3 items=6 prefill=6 decode=0 total_q=732 attempted_unified=true fallback=false fallback_reason=none elapsed=321108us
+[unified-prof] iter#3 items=6 prefill=6 decode=0 total=322454us model=321130us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[unified-logits] call#4 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[236789:46.218750,236858:42.187500,563:38.250000,659:31.000000,239111:25.265625]
+[unified-logits] call#4 row=1 orig_idx=1 global=1 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[236789:45.500000,236858:41.375000,563:37.718750,659:30.375000,239111:25.062500]
+[unified-decode] call#4 items=6 prefill=0 decode=6 total_q=6 attempted_unified=true fallback=false fallback_reason=none elapsed=32231us
+[unified-prof] iter#4 items=6 prefill=0 decode=6 total=33507us model=32258us decode_post=1239us | sample=1107 sched=0 stream=132 stop=0 complete=0 (us)
+[bg-loop-gap] call#504 inter_iter=2us
+[unified-logits] call#5 row=0 orig_idx=4 global=128 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[236751:50.843750,503:24.453125,236746:23.187500,236744:21.781250,236773:20.765625]
+[unified-logits] call#5 row=1 orig_idx=5 global=129 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[236751:48.000000,236746:23.000000,503:22.984375,236744:20.656250,236773:20.015625]
+[unified-decode] call#5 items=10 prefill=4 decode=6 total_q=134 attempted_unified=true fallback=false fallback_reason=none elapsed=84279us
+[unified-prof] iter#5 items=10 prefill=4 decode=6 total=85609us model=84300us decode_post=1287us | sample=1136 sched=0 stream=151 stop=0 complete=0 (us)
+[unified-logits] call#6 row=0 orig_idx=4 global=128 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[496:46.218750,506:37.437500,614:31.234375,822:31.093750,12323:29.593750]
+[unified-logits] call#6 row=1 orig_idx=5 global=129 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[496:46.687500,506:38.093750,822:31.796875,614:31.781250,12323:30.156250]
+[unified-decode] call#6 items=10 prefill=4 decode=6 total_q=134 attempted_unified=true fallback=false fallback_reason=none elapsed=78063us
+[unified-prof] iter#6 items=10 prefill=4 decode=6 total=79355us model=78081us decode_post=1254us | sample=1127 sched=0 stream=127 stop=0 complete=0 (us)
+[unified-logits] call#7 row=0 orig_idx=4 global=128 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[12323:47.343750,63510:42.187500,16000:38.593750,126446:36.625000,36813:36.156250]
+[unified-logits] call#7 row=1 orig_idx=5 global=129 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[12323:45.750000,63510:40.687500,16000:37.156250,126446:35.687500,36813:34.812500]
+[unified-decode] call#7 items=10 prefill=4 decode=6 total_q=134 attempted_unified=true fallback=false fallback_reason=none elapsed=80140us
+[unified-prof] iter#7 items=10 prefill=4 decode=6 total=81459us model=80159us decode_post=1279us | sample=1123 sched=0 stream=156 stop=0 complete=0 (us)
+[unified-decode] call#8 items=10 prefill=4 decode=6 total_q=110 attempted_unified=true fallback=false fallback_reason=none elapsed=63621us
+[unified-prof] iter#8 items=10 prefill=4 decode=6 total=65906us model=63666us decode_post=1256us | sample=1160 sched=0 stream=96 stop=0 complete=0 (us)
+[unified-prof] iter#9 items=10 prefill=0 decode=10 total=32430us model=30209us decode_post=2205us | sample=1982 sched=0 stream=223 stop=0 complete=0 (us)
+[unified-prof] iter#10 items=10 prefill=0 decode=10 total=32397us model=30174us decode_post=2208us | sample=1989 sched=1 stream=218 stop=0 complete=0 (us)
+[unified-prof] iter#11 items=10 prefill=0 decode=10 total=32426us model=30204us decode_post=2208us | sample=1984 sched=0 stream=224 stop=0 complete=0 (us)
+[iter-prof] iter#511 total=32539us sched=28us process=32510us batch_size=10
+[unified-prof] iter#12 items=10 prefill=0 decode=10 total=32493us model=30253us decode_post=2224us | sample=1991 sched=1 stream=232 stop=0 complete=0 (us)
+[bg-loop-gap] call#512 inter_iter=2us
+[unified-prof] iter#13 items=10 prefill=0 decode=10 total=32452us model=30183us decode_post=2254us | sample=2017 sched=0 stream=237 stop=0 complete=0 (us)
+[unified-prof] iter#14 items=10 prefill=0 decode=10 total=32443us model=30188us decode_post=2243us | sample=2002 sched=0 stream=241 stop=0 complete=0 (us)
+[unified-prof] iter#15 items=10 prefill=0 decode=10 total=32475us model=30197us decode_post=2263us | sample=2021 sched=1 stream=241 stop=0 complete=0 (us)
+[unified-prof] iter#16 items=10 prefill=0 decode=10 total=32481us model=30228us decode_post=2238us | sample=1994 sched=1 stream=243 stop=0 complete=0 (us)
+[unified-prof] iter#17 items=10 prefill=0 decode=10 total=32495us model=30210us decode_post=2268us | sample=2008 sched=1 stream=259 stop=0 complete=0 (us)
+[unified-prof] iter#18 items=10 prefill=0 decode=10 total=32525us model=30237us decode_post=2273us | sample=2010 sched=1 stream=262 stop=0 complete=0 (us)
+[unified-prof] iter#19 items=10 prefill=0 decode=10 total=32593us model=30289us decode_post=2290us | sample=2040 sched=1 stream=249 stop=0 complete=0 (us)
+[unified-prof] iter#20 items=10 prefill=0 decode=10 total=32578us model=30272us decode_post=2291us | sample=2031 sched=1 stream=259 stop=0 complete=0 (us)
+[bg-loop-gap] call#520 inter_iter=2us
+[unified-prof] iter#21 items=10 prefill=0 decode=10 total=32589us model=30274us decode_post=2301us | sample=2037 sched=1 stream=263 stop=0 complete=0 (us)
+[unified-prof] iter#22 items=10 prefill=0 decode=10 total=32607us model=30315us decode_post=2278us | sample=2024 sched=0 stream=254 stop=0 complete=0 (us)
+[unified-prof] iter#23 items=10 prefill=0 decode=10 total=32580us model=30294us decode_post=2271us | sample=2018 sched=0 stream=253 stop=0 complete=0 (us)
+[unified-prof] iter#24 items=10 prefill=0 decode=10 total=32649us model=30346us decode_post=2291us | sample=2032 sched=1 stream=258 stop=0 complete=0 (us)
+[unified-prof] iter#25 items=10 prefill=0 decode=10 total=32603us model=30281us decode_post=2306us | sample=2052 sched=0 stream=254 stop=0 complete=0 (us)
+[unified-prof] iter#26 items=10 prefill=0 decode=10 total=32619us model=30308us decode_post=2298us | sample=2044 sched=1 stream=253 stop=0 complete=0 (us)
+[unified-prof] iter#27 items=10 prefill=0 decode=10 total=32697us model=30392us decode_post=2291us | sample=2037 sched=1 stream=253 stop=0 complete=0 (us)
+[unified-prof] iter#28 items=10 prefill=0 decode=10 total=32692us model=30354us decode_post=2326us | sample=2059 sched=0 stream=267 stop=0 complete=0 (us)
+[bg-loop-gap] call#528 inter_iter=2us
+[unified-prof] iter#29 items=10 prefill=0 decode=10 total=32674us model=30332us decode_post=2329us | sample=2058 sched=1 stream=270 stop=0 complete=0 (us)
+[unified-prof] iter#30 items=10 prefill=0 decode=10 total=32699us model=30359us decode_post=2327us | sample=2059 sched=0 stream=268 stop=0 complete=0 (us)
+[unified-prof] iter#31 items=10 prefill=0 decode=10 total=32732us model=30380us decode_post=2335us | sample=2062 sched=0 stream=273 stop=0 complete=0 (us)
+[unified-decode] call#32 items=10 prefill=0 decode=10 total_q=10 attempted_unified=true fallback=false fallback_reason=none elapsed=30403us
+[unified-prof] iter#32 items=10 prefill=0 decode=10 total=32799us model=30449us decode_post=2335us | sample=2070 sched=1 stream=264 stop=0 complete=0 (us)
+[unified-prof] iter#33 items=10 prefill=0 decode=10 total=32774us model=30420us decode_post=2339us | sample=2061 sched=1 stream=277 stop=0 complete=0 (us)
+[unified-prof] iter#34 items=10 prefill=0 decode=10 total=32844us model=30413us decode_post=2415us | sample=2116 sched=1 stream=298 stop=0 complete=0 (us)
+[unified-prof] iter#35 items=10 prefill=0 decode=10 total=32885us model=30475us decode_post=2398us | sample=2099 sched=1 stream=298 stop=0 complete=0 (us)
+[unified-prof] iter#36 items=10 prefill=0 decode=10 total=32896us model=30504us decode_post=2377us | sample=2087 sched=0 stream=290 stop=0 complete=0 (us)
+[bg-loop-gap] call#536 inter_iter=2us
+[unified-prof] iter#37 items=10 prefill=0 decode=10 total=32884us model=30476us decode_post=2394us | sample=2103 sched=1 stream=290 stop=0 complete=0 (us)
+[unified-prof] iter#38 items=10 prefill=0 decode=10 total=32847us model=30439us decode_post=2394us | sample=2096 sched=0 stream=298 stop=0 complete=0 (us)
+[unified-prof] iter#39 items=10 prefill=0 decode=10 total=32895us model=30462us decode_post=2419us | sample=2119 sched=1 stream=299 stop=0 complete=0 (us)
+[unified-prof] iter#40 items=10 prefill=0 decode=10 total=33299us model=30540us decode_post=2741us | sample=2383 sched=0 stream=358 stop=0 complete=0 (us)
+[unified-prof] iter#41 items=10 prefill=0 decode=10 total=35763us model=32314us decode_post=3429us | sample=2766 sched=1 stream=662 stop=0 complete=0 (us)
+[unified-prof] iter#42 items=10 prefill=0 decode=10 total=33601us model=31101us decode_post=2486us | sample=2162 sched=1 stream=323 stop=0 complete=0 (us)
+[unified-prof] iter#43 items=10 prefill=0 decode=10 total=33090us model=30596us decode_post=2479us | sample=2161 sched=1 stream=317 stop=0 complete=0 (us)
+[iter-prof] iter#543 total=33216us sched=29us process=33186us batch_size=10
+[unified-prof] iter#44 items=10 prefill=0 decode=10 total=33181us model=30719us decode_post=2447us | sample=2128 sched=1 stream=318 stop=0 complete=0 (us)
+[bg-loop-gap] call#544 inter_iter=1us
+[unified-prof] iter#45 items=10 prefill=0 decode=10 total=33106us model=30642us decode_post=2448us | sample=2129 sched=1 stream=318 stop=0 complete=0 (us)
+[unified-prof] iter#46 items=10 prefill=0 decode=10 total=33160us model=30657us decode_post=2489us | sample=2159 sched=1 stream=329 stop=0 complete=0 (us)
+[unified-prof] iter#47 items=10 prefill=0 decode=10 total=33153us model=30673us decode_post=2465us | sample=2135 sched=1 stream=329 stop=0 complete=0 (us)
+[unified-prof] iter#48 items=10 prefill=0 decode=10 total=33188us model=30676us decode_post=2498us | sample=2165 sched=1 stream=332 stop=0 complete=0 (us)
+[unified-prof] iter#49 items=10 prefill=0 decode=10 total=33162us model=30645us decode_post=2502us | sample=2165 sched=1 stream=336 stop=0 complete=0 (us)
+[unified-prof] iter#50 items=10 prefill=0 decode=10 total=33191us model=30694us decode_post=2481us | sample=2142 sched=1 stream=338 stop=0 complete=0 (us)
+[unified-prof] iter#51 items=10 prefill=0 decode=10 total=33176us model=30667us decode_post=2494us | sample=2141 sched=1 stream=352 stop=0 complete=0 (us)
+[unified-prof] iter#52 items=10 prefill=0 decode=10 total=33222us model=30690us decode_post=2516us | sample=2172 sched=1 stream=343 stop=0 complete=0 (us)
+[bg-loop-gap] call#552 inter_iter=1us
+[unified-prof] iter#53 items=10 prefill=0 decode=10 total=33218us model=30705us decode_post=2499us | sample=2151 sched=1 stream=347 stop=0 complete=0 (us)
+[unified-prof] iter#54 items=10 prefill=0 decode=10 total=33214us model=30671us decode_post=2526us | sample=2170 sched=1 stream=355 stop=0 complete=0 (us)
+[unified-prof] iter#55 items=10 prefill=0 decode=10 total=33241us model=30702us decode_post=2523us | sample=2167 sched=1 stream=355 stop=0 complete=0 (us)
+[unified-prof] iter#56 items=10 prefill=0 decode=10 total=33266us model=30745us decode_post=2507us | sample=2161 sched=1 stream=345 stop=0 complete=0 (us)
+[unified-prof] iter#57 items=10 prefill=0 decode=10 total=33252us model=30701us decode_post=2535us | sample=2174 sched=0 stream=361 stop=0 complete=0 (us)
+[unified-prof] iter#58 items=10 prefill=0 decode=10 total=33242us model=30682us decode_post=2547us | sample=2179 sched=1 stream=367 stop=0 complete=0 (us)
+[unified-prof] iter#59 items=10 prefill=0 decode=10 total=33398us model=30823us decode_post=2561us | sample=2197 sched=1 stream=363 stop=0 complete=0 (us)
+[unified-prof] iter#60 items=10 prefill=0 decode=10 total=33390us model=30822us decode_post=2553us | sample=2198 sched=0 stream=355 stop=0 complete=0 (us)
+[bg-loop-gap] call#560 inter_iter=1us
+[unified-prof] iter#61 items=10 prefill=0 decode=10 total=33352us model=30756us decode_post=2583us | sample=2210 sched=1 stream=372 stop=0 complete=0 (us)
+[unified-prof] iter#62 items=10 prefill=0 decode=10 total=33376us model=30791us decode_post=2570us | sample=2208 sched=0 stream=362 stop=0 complete=0 (us)
+[unified-prof] iter#63 items=10 prefill=0 decode=10 total=33397us model=30805us decode_post=2578us | sample=2205 sched=0 stream=373 stop=0 complete=0 (us)
+[unified-op] drain#64 (over last 64 unified_forward calls):
+[unified-op] rms_norm/fused_rms: 7936 calls 76 ms total avg=9us
+[unified-op] matmul (qkv/o/gate_up/down): 15872 calls 1486 ms total avg=93us
+[unified-op] split_qkv_norm_rope_paged: 3968 calls 30 ms total avg=7us
+[unified-op] paged_varlen_attention: 3968 calls 184 ms total avg=46us
+[unified-op] silu/residual_add: 7936 calls 61 ms total avg=7us
+[unified-logits] call#64 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[12207:45.218750,1921:44.093750,3548:42.656250,236789:41.187500,27592:40.375000]
+[unified-logits] call#64 row=1 orig_idx=1 global=1 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[4338:52.218750,11459:49.218750,54089:48.406250,808:45.687500,6684:45.437500]
+[unified-decode] call#64 items=10 prefill=0 decode=10 total_q=10 attempted_unified=true fallback=false fallback_reason=none elapsed=35266us
+[unified-prof] iter#64 items=10 prefill=0 decode=10 total=37900us model=35290us decode_post=2594us | sample=2229 sched=1 stream=364 stop=0 complete=0 (us)
+[bg-loop-gap] call#568 inter_iter=13us
+[iter-prof] iter#575 total=30932us sched=22us process=30909us batch_size=7
+[bg-loop-gap] call#576 inter_iter=2us
+[bg-loop-gap] call#584 inter_iter=25us
+[unified-decode] call#84 items=14 prefill=14 decode=0 total_q=1708 attempted_unified=true fallback=false fallback_reason=none elapsed=685031us
+[unified-decode] call#86 items=16 prefill=2 decode=14 total_q=78 attempted_unified=true fallback=false fallback_reason=none elapsed=64071us
+[unified-decode] call#87 items=16 prefill=2 decode=14 total_q=78 attempted_unified=true fallback=false fallback_reason=none elapsed=61343us
+[unified-decode] call#88 items=16 prefill=2 decode=14 total_q=78 attempted_unified=true fallback=false fallback_reason=none elapsed=62203us
+[unified-decode] call#89 items=16 prefill=2 decode=14 total_q=66 attempted_unified=true fallback=false fallback_reason=none elapsed=64113us
+[bg-loop-gap] call#592 inter_iter=2us
+[unified-decode] call#96 items=16 prefill=0 decode=16 total_q=16 attempted_unified=true fallback=false fallback_reason=none elapsed=37709us
+[unified-prof] iter#96 items=16 prefill=0 decode=16 total=41438us model=37755us decode_post=3661us | sample=3314 sched=0 stream=347 stop=0 complete=0 (us)
+[bg-loop-gap] call#600 inter_iter=3us
+[iter-prof] iter#607 total=41631us sched=44us process=41586us batch_size=16
+[bg-loop-gap] call#608 inter_iter=2us
+[bg-loop-gap] call#616 inter_iter=2us
+[bg-loop-gap] call#624 inter_iter=3us
+[unified-op] drain#128 (over last 64 unified_forward calls):
+[unified-op] rms_norm/fused_rms: 7936 calls 80 ms total avg=10us
+[unified-op] matmul (qkv/o/gate_up/down): 15872 calls 1736 ms total avg=109us
+[unified-op] split_qkv_norm_rope_paged: 3968 calls 31 ms total avg=7us
+[unified-op] paged_varlen_attention: 3968 calls 217 ms total avg=54us
+[unified-op] silu/residual_add: 7936 calls 71 ms total avg=9us
+[unified-logits] call#128 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[14120:57.937500,1527:54.156250,18558:52.093750,1161:50.281250,11749:47.812500]
+[unified-logits] call#128 row=1 orig_idx=1 global=1 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[107:33.187500,236743:28.062500,255968:20.046875,432:19.609375,138:19.000000]
+[unified-decode] call#128 items=16 prefill=0 decode=16 total_q=16 attempted_unified=true fallback=false fallback_reason=none elapsed=41676us
+[unified-prof] iter#128 items=16 prefill=0 decode=16 total=45903us model=41703us decode_post=4178us | sample=3647 sched=1 stream=530 stop=0 complete=0 (us)
+[bg-loop-gap] call#632 inter_iter=2us
+[iter-prof] iter#639 total=43655us sched=46us process=43609us batch_size=16
+[bg-loop-gap] call#640 inter_iter=1us
+[unified-decode] call#147 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37882us
+[bg-loop-gap] call#648 inter_iter=1us
+[unified-decode] call#148 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37808us
+[unified-decode] call#149 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=38455us
+[unified-decode] call#150 items=16 prefill=1 decode=15 total_q=41 attempted_unified=true fallback=false fallback_reason=none elapsed=39200us
+[unified-decode] call#154 items=15 prefill=2 decode=13 total_q=77 attempted_unified=true fallback=false fallback_reason=none elapsed=58195us
+[unified-decode] call#155 items=14 prefill=2 decode=12 total_q=76 attempted_unified=true fallback=false fallback_reason=none elapsed=57428us
+[bg-loop-gap] call#656 inter_iter=2us
+[unified-decode] call#156 items=16 prefill=4 decode=12 total_q=140 attempted_unified=true fallback=false fallback_reason=none elapsed=80893us
+[unified-decode] call#157 items=16 prefill=4 decode=12 total_q=128 attempted_unified=true fallback=false fallback_reason=none elapsed=66418us
+[unified-decode] call#158 items=15 prefill=2 decode=13 total_q=77 attempted_unified=true fallback=false fallback_reason=none elapsed=59182us
+[unified-decode] call#159 items=14 prefill=2 decode=12 total_q=64 attempted_unified=true fallback=false fallback_reason=none elapsed=44711us
+[unified-decode] call#160 items=14 prefill=2 decode=12 total_q=76 attempted_unified=true fallback=false fallback_reason=none elapsed=57450us
+[unified-prof] iter#160 items=14 prefill=2 decode=12 total=60698us model=57499us decode_post=3170us | sample=2666 sched=32 stream=355 stop=0 complete=117 (us)
+[unified-decode] call#161 items=13 prefill=3 decode=10 total_q=106 attempted_unified=true fallback=false fallback_reason=none elapsed=60691us
+[unified-decode] call#162 items=13 prefill=4 decode=9 total_q=137 attempted_unified=true fallback=false fallback_reason=none elapsed=78524us
+[unified-decode] call#163 items=15 prefill=7 decode=8 total_q=220 attempted_unified=true fallback=false fallback_reason=none elapsed=105849us
+[bg-loop-gap] call#664 inter_iter=2us
+[unified-decode] call#164 items=16 prefill=6 decode=10 total_q=196 attempted_unified=true fallback=false fallback_reason=none elapsed=103150us
+[unified-decode] call#165 items=15 prefill=5 decode=10 total_q=164 attempted_unified=true fallback=false fallback_reason=none elapsed=85156us
+[unified-decode] call#166 items=15 prefill=5 decode=10 total_q=152 attempted_unified=true fallback=false fallback_reason=none elapsed=86004us
+[unified-decode] call#167 items=16 prefill=3 decode=13 total_q=103 attempted_unified=true fallback=false fallback_reason=none elapsed=64019us
+[unified-decode] call#168 items=16 prefill=2 decode=14 total_q=78 attempted_unified=true fallback=false fallback_reason=none elapsed=59116us
+[unified-decode] call#169 items=15 prefill=2 decode=13 total_q=71 attempted_unified=true fallback=false fallback_reason=none elapsed=58843us
+[unified-decode] call#170 items=15 prefill=1 decode=14 total_q=40 attempted_unified=true fallback=false fallback_reason=none elapsed=37360us
+[iter-prof] iter#671 total=40956us sched=47us process=40909us batch_size=15
+[unified-decode] call#171 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37252us
+[bg-loop-gap] call#672 inter_iter=2us
+[unified-decode] call#172 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37238us
+[unified-decode] call#173 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=38042us
+[unified-decode] call#174 items=16 prefill=1 decode=15 total_q=41 attempted_unified=true fallback=false fallback_reason=none elapsed=39041us
+[bg-loop-gap] call#680 inter_iter=2us
+[bg-loop-gap] call#688 inter_iter=2us
+[unified-op] drain#192 (over last 64 unified_forward calls):
+[unified-op] rms_norm/fused_rms: 7936 calls 76 ms total avg=9us
+[unified-op] matmul (qkv/o/gate_up/down): 15872 calls 1642 ms total avg=103us
+[unified-op] split_qkv_norm_rope_paged: 3968 calls 31 ms total avg=8us
+[unified-op] paged_varlen_attention: 3968 calls 242 ms total avg=61us
+[unified-op] silu/residual_add: 7936 calls 61 ms total avg=7us
+[unified-logits] call#192 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[3980:54.500000,4133:53.156250,6340:51.906250,14529:51.406250,54089:49.312500]
+[unified-logits] call#192 row=1 orig_idx=1 global=1 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[1816:54.406250,236764:48.750000,88724:46.093750,532:42.750000,236772:41.843750]
+[unified-decode] call#192 items=16 prefill=0 decode=16 total_q=16 attempted_unified=true fallback=false fallback_reason=none elapsed=38910us
+[unified-prof] iter#192 items=16 prefill=0 decode=16 total=42859us model=38944us decode_post=3893us | sample=3470 sched=1 stream=422 stop=0 complete=0 (us)
+[bg-loop-gap] call#696 inter_iter=2us
+[iter-prof] iter#703 total=38424us sched=45us process=38379us batch_size=16
+[bg-loop-gap] call#704 inter_iter=2us
+[bg-loop-gap] call#712 inter_iter=2us
+[bg-loop-gap] call#720 inter_iter=1us
+[unified-decode] call#224 items=16 prefill=0 decode=16 total_q=16 attempted_unified=true fallback=false fallback_reason=none elapsed=34550us
+[unified-prof] iter#224 items=16 prefill=0 decode=16 total=38823us model=34599us decode_post=4203us | sample=3619 sched=1 stream=583 stop=0 complete=0 (us)
+[unified-decode] call#227 items=16 prefill=2 decode=14 total_q=78 attempted_unified=true fallback=false fallback_reason=none elapsed=58880us
+[bg-loop-gap] call#728 inter_iter=2us
+[unified-decode] call#228 items=15 prefill=2 decode=13 total_q=77 attempted_unified=true fallback=false fallback_reason=none elapsed=59398us
+[unified-decode] call#229 items=16 prefill=3 decode=13 total_q=109 attempted_unified=true fallback=false fallback_reason=none elapsed=64473us
+[unified-decode] call#230 items=16 prefill=3 decode=13 total_q=97 attempted_unified=true fallback=false fallback_reason=none elapsed=64628us
+[unified-decode] call#231 items=14 prefill=1 decode=13 total_q=45 attempted_unified=true fallback=false fallback_reason=none elapsed=38471us
+[unified-decode] call#232 items=15 prefill=2 decode=13 total_q=71 attempted_unified=true fallback=false fallback_reason=none elapsed=59159us
+[unified-decode] call#233 items=15 prefill=2 decode=13 total_q=77 attempted_unified=true fallback=false fallback_reason=none elapsed=59274us
+[unified-decode] call#234 items=15 prefill=2 decode=13 total_q=77 attempted_unified=true fallback=false fallback_reason=none elapsed=59660us
+[iter-prof] iter#735 total=63699us sched=47us process=63651us batch_size=15
+[unified-decode] call#235 items=16 prefill=3 decode=13 total_q=103 attempted_unified=true fallback=false fallback_reason=none elapsed=63191us
+[bg-loop-gap] call#736 inter_iter=3us
+[unified-decode] call#236 items=16 prefill=2 decode=14 total_q=72 attempted_unified=true fallback=false fallback_reason=none elapsed=59563us
+[unified-decode] call#237 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=38486us
+[unified-decode] call#238 items=16 prefill=1 decode=15 total_q=41 attempted_unified=true fallback=false fallback_reason=none elapsed=38646us
+[unified-decode] call#241 items=12 prefill=2 decode=10 total_q=74 attempted_unified=true fallback=false fallback_reason=none elapsed=56154us
+[unified-decode] call#242 items=13 prefill=5 decode=8 total_q=168 attempted_unified=true fallback=false fallback_reason=none elapsed=81089us
+[unified-decode] call#243 items=16 prefill=8 decode=8 total_q=264 attempted_unified=true fallback=false fallback_reason=none elapsed=125092us
+[bg-loop-gap] call#744 inter_iter=2us
+[unified-decode] call#244 items=16 prefill=8 decode=8 total_q=252 attempted_unified=true fallback=false fallback_reason=none elapsed=113166us
+[unified-decode] call#245 items=16 prefill=6 decode=10 total_q=184 attempted_unified=true fallback=false fallback_reason=none elapsed=95839us
+[unified-decode] call#246 items=15 prefill=3 decode=12 total_q=90 attempted_unified=true fallback=false fallback_reason=none elapsed=62807us
+[unified-decode] call#247 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37635us
+[unified-decode] call#248 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37250us
+[unified-decode] call#249 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37867us
+[unified-decode] call#250 items=15 prefill=1 decode=14 total_q=40 attempted_unified=true fallback=false fallback_reason=none elapsed=37320us
+[unified-decode] call#251 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37293us
+[bg-loop-gap] call#752 inter_iter=2us
+[unified-decode] call#252 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37225us
+[unified-decode] call#253 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37898us
+[unified-decode] call#254 items=16 prefill=1 decode=15 total_q=41 attempted_unified=true fallback=false fallback_reason=none elapsed=38610us
+[unified-op] drain#256 (over last 64 unified_forward calls):
+[unified-op] rms_norm/fused_rms: 7936 calls 76 ms total avg=9us
+[unified-op] matmul (qkv/o/gate_up/down): 15872 calls 1635 ms total avg=103us
+[unified-op] split_qkv_norm_rope_paged: 3968 calls 31 ms total avg=8us
+[unified-op] paged_varlen_attention: 3968 calls 244 ms total avg=61us
+[unified-op] silu/residual_add: 7936 calls 61 ms total avg=7us
+[unified-logits] call#256 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[236829:54.312500,236772:40.406250,237213:34.406250,808:32.406250,1018:29.734375]
+[unified-logits] call#256 row=1 orig_idx=1 global=1 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[236751:50.593750,503:23.875000,236746:23.234375,236744:20.937500,236773:20.468750]
+[unified-decode] call#256 items=16 prefill=0 decode=16 total_q=16 attempted_unified=true fallback=false fallback_reason=none elapsed=38375us
+[unified-prof] iter#256 items=16 prefill=0 decode=16 total=42139us model=38410us decode_post=3707us | sample=3332 sched=1 stream=374 stop=0 complete=0 (us)
+[bg-loop-gap] call#760 inter_iter=2us
+[iter-prof] iter#767 total=38063us sched=48us process=38014us batch_size=16
+[bg-loop-gap] call#768 inter_iter=2us
+[bg-loop-gap] call#776 inter_iter=2us
+[bg-loop-gap] call#784 inter_iter=2us
+[unified-decode] call#288 items=16 prefill=0 decode=16 total_q=16 attempted_unified=true fallback=false fallback_reason=none elapsed=34409us
+[unified-prof] iter#288 items=16 prefill=0 decode=16 total=38514us model=34456us decode_post=4018us | sample=3506 sched=1 stream=511 stop=0 complete=0 (us)
+[bg-loop-gap] call#792 inter_iter=2us
+[iter-prof] iter#799 total=38754us sched=44us process=38710us batch_size=16
+[bg-loop-gap] call#800 inter_iter=2us
+[unified-decode] call#304 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37916us
+[unified-decode] call#305 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37847us
+[unified-decode] call#306 items=14 prefill=1 decode=13 total_q=45 attempted_unified=true fallback=false fallback_reason=none elapsed=38653us
+[unified-decode] call#307 items=15 prefill=2 decode=13 total_q=71 attempted_unified=true fallback=false fallback_reason=none elapsed=59164us
+[bg-loop-gap] call#808 inter_iter=3us
+[unified-decode] call#308 items=14 prefill=2 decode=12 total_q=76 attempted_unified=true fallback=false fallback_reason=none elapsed=57573us
+[unified-decode] call#309 items=15 prefill=3 decode=12 total_q=108 attempted_unified=true fallback=false fallback_reason=none elapsed=61543us
+[unified-decode] call#310 items=15 prefill=4 decode=11 total_q=133 attempted_unified=true fallback=false fallback_reason=none elapsed=79581us
+[unified-decode] call#311 items=14 prefill=3 decode=11 total_q=101 attempted_unified=true fallback=false fallback_reason=none elapsed=62273us
+[unified-decode] call#312 items=16 prefill=4 decode=12 total_q=134 attempted_unified=true fallback=false fallback_reason=none elapsed=82134us
+[unified-decode] call#313 items=15 prefill=3 decode=12 total_q=102 attempted_unified=true fallback=false fallback_reason=none elapsed=63735us
+[unified-decode] call#314 items=14 prefill=2 decode=12 total_q=76 attempted_unified=true fallback=false fallback_reason=none elapsed=58437us
+[unified-decode] call#315 items=14 prefill=3 decode=11 total_q=95 attempted_unified=true fallback=false fallback_reason=none elapsed=62736us
+[bg-loop-gap] call#816 inter_iter=28us
+[unified-decode] call#316 items=15 prefill=2 decode=13 total_q=77 attempted_unified=true fallback=false fallback_reason=none elapsed=59374us
+[unified-decode] call#317 items=16 prefill=3 decode=13 total_q=109 attempted_unified=true fallback=false fallback_reason=none elapsed=63229us
+[unified-decode] call#318 items=15 prefill=3 decode=12 total_q=102 attempted_unified=true fallback=false fallback_reason=none elapsed=64299us
+[unified-decode] call#319 items=16 prefill=3 decode=13 total_q=103 attempted_unified=true fallback=false fallback_reason=none elapsed=63517us
+[unified-op] drain#320 (over last 64 unified_forward calls):
+[unified-op] rms_norm/fused_rms: 7936 calls 74 ms total avg=9us
+[unified-op] matmul (qkv/o/gate_up/down): 15872 calls 1478 ms total avg=93us
+[unified-op] split_qkv_norm_rope_paged: 3968 calls 30 ms total avg=7us
+[unified-op] paged_varlen_attention: 3968 calls 220 ms total avg=55us
+[unified-op] silu/residual_add: 7936 calls 58 ms total avg=7us
+[unified-logits] call#320 row=0 orig_idx=0 global=25 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[8291:55.156250,1408:47.906250,81330:46.968750,1018:45.187500,24355:43.468750]
+[unified-logits] call#320 row=1 orig_idx=2 global=58 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[236761:36.625000,1024:27.718750,1680:27.578125,573:27.484375,1208:27.453125]
+[unified-decode] call#320 items=16 prefill=2 decode=14 total_q=72 attempted_unified=true fallback=false fallback_reason=none elapsed=64052us
+[unified-prof] iter#320 items=16 prefill=2 decode=14 total=67853us model=64081us decode_post=3419us | sample=2999 sched=13 stream=337 stop=0 complete=70 (us)
+[unified-decode] call#321 items=15 prefill=1 decode=14 total_q=46 attempted_unified=true fallback=false fallback_reason=none elapsed=37771us
+[unified-decode] call#322 items=14 prefill=2 decode=12 total_q=70 attempted_unified=true fallback=false fallback_reason=none elapsed=59606us
+[unified-decode] call#323 items=16 prefill=3 decode=13 total_q=109 attempted_unified=true fallback=false fallback_reason=none elapsed=63150us
+[bg-loop-gap] call#824 inter_iter=3us
+[unified-decode] call#324 items=16 prefill=3 decode=13 total_q=109 attempted_unified=true fallback=false fallback_reason=none elapsed=63949us
+[unified-decode] call#325 items=16 prefill=3 decode=13 total_q=103 attempted_unified=true fallback=false fallback_reason=none elapsed=64806us
+[unified-decode] call#326 items=15 prefill=2 decode=13 total_q=65 attempted_unified=true fallback=false fallback_reason=none elapsed=59762us
+[unified-decode] call#328 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37570us
+[unified-decode] call#329 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37283us
+[unified-decode] call#330 items=15 prefill=1 decode=14 total_q=46 attempted_unified=true fallback=false fallback_reason=none elapsed=37438us
+[iter-prof] iter#831 total=40804us sched=43us process=40760us batch_size=15
+[unified-decode] call#331 items=16 prefill=2 decode=14 total_q=72 attempted_unified=true fallback=false fallback_reason=none elapsed=59131us
+[bg-loop-gap] call#832 inter_iter=2us
+[unified-decode] call#332 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=37230us
+[unified-decode] call#333 items=16 prefill=1 decode=15 total_q=47 attempted_unified=true fallback=false fallback_reason=none elapsed=38289us
+[unified-decode] call#334 items=16 prefill=1 decode=15 total_q=41 attempted_unified=true fallback=false fallback_reason=none elapsed=38652us
+[bg-loop-gap] call#840 inter_iter=2us
+[bg-loop-gap] call#848 inter_iter=2us
+[unified-decode] call#352 items=16 prefill=0 decode=16 total_q=16 attempted_unified=true fallback=false fallback_reason=none elapsed=34233us
+[unified-prof] iter#352 items=16 prefill=0 decode=16 total=38212us model=34282us decode_post=3907us | sample=3443 sched=0 stream=464 stop=0 complete=0 (us)
+[bg-loop-gap] call#856 inter_iter=2us
+[iter-prof] iter#863 total=38533us sched=43us process=38490us batch_size=16
+[bg-loop-gap] call#864 inter_iter=2us
+[bg-loop-gap] call#872 inter_iter=2us
+[bg-loop-gap] call#880 inter_iter=2us
+[unified-op] drain#384 (over last 64 unified_forward calls):
+[unified-op] rms_norm/fused_rms: 7936 calls 73 ms total avg=9us
+[unified-op] matmul (qkv/o/gate_up/down): 15872 calls 1260 ms total avg=79us
+[unified-op] split_qkv_norm_rope_paged: 3968 calls 29 ms total avg=7us
+[unified-op] paged_varlen_attention: 3968 calls 197 ms total avg=49us
+[unified-op] silu/residual_add: 7936 calls 55 ms total avg=6us
+[unified-logits] call#384 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[106:34.250000,110:32.343750,107:30.984375,236743:27.140625,15316:26.109375]
+[unified-logits] call#384 row=1 orig_idx=1 global=1 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[3938:41.531250,236764:40.937500,1651:39.812500,607:39.250000,528:38.750000]
+[unified-decode] call#384 items=12 prefill=0 decode=12 total_q=12 attempted_unified=true fallback=false fallback_reason=none elapsed=36578us
+[unified-prof] iter#384 items=12 prefill=0 decode=12 total=39869us model=36606us decode_post=3245us | sample=2727 sched=0 stream=447 stop=0 complete=71 (us)
+[bg-loop-gap] call#888 inter_iter=2us
+[iter-prof] iter#895 total=30211us sched=21us process=30190us batch_size=6
+[bg-loop-gap] call#896 inter_iter=2us
+[bg-loop-gap] call#904 inter_iter=27us
+[bg-loop-gap] call#912 inter_iter=2us
+[bg-loop-gap] call#920 inter_iter=2us
+[bg-loop-gap] call#928 inter_iter=2us
+[bg-loop-gap] call#936 inter_iter=2us
+[bg-loop-gap] call#944 inter_iter=2us
+[bg-loop-gap] call#952 inter_iter=2us
+[bg-loop-gap] call#960 inter_iter=2us
+[bg-loop-gap] call#968 inter_iter=2us
+[bg-loop-gap] call#976 inter_iter=2us
+[bg-loop-gap] call#984 inter_iter=2us
+[bg-loop-gap] call#992 inter_iter=3us
+[bg-loop-gap] call#1000 inter_iter=3us
+[bg-loop-gap] call#1008 inter_iter=3us
+[bg-loop-gap] call#1016 inter_iter=2us
+[nb-prof] total=1024 some=406 none=618 ratio=0.396 | some_avg=40us none_avg=0us last_batch_size=0 last_was_some=false
+[bg-loop-gap] call#1024 inter_iter=7us
+[bg-loop-gap] call#1032 inter_iter=4us
+[bg-loop-gap] call#1040 inter_iter=3us

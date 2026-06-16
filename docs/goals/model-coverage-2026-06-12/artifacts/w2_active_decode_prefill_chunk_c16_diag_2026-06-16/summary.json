@@ -1,0 +1,302 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16",
+  "commands": {
+    "bench_shape": "--dataset sharegpt --random-output-len 128 --concurrency-sweep 16 --num-prompts 64 --n-repeats 1 --fail-on-error --seed 9271",
+    "build_features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source"
+  },
+  "correctness": {
+    "bench_chunk32_rc": 0,
+    "bench_default_rc": 0,
+    "build_rc": 0,
+    "chunk32_serve_smoke": {
+      "bad_output": false,
+      "content": "5\n",
+      "pass": true
+    },
+    "default_serve_smoke": {
+      "bad_output": false,
+      "content": "5\n",
+      "pass": true
+    },
+    "run_rc": 0,
+    "run_validation": {
+      "bad_output": false,
+      "content": "5",
+      "pass": true
+    }
+  },
+  "hardware": {
+    "driver": "565.77",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "instance_id": 40826362,
+    "nvcc": "12.4.131",
+    "nvidia_smi_cuda": "12.7"
+  },
+  "interpretation": {
+    "diagnostic_limitations": "n_repeats=1 and num_prompts=64; no CI and no release-grade performance claim. No MODEL_RELEASE_GRADE_W2 PASS was produced.",
+    "next_direction": "Return to model-side per-step decode cost and batched execution profile: tail MLP/down-proj/attention fusion or host sync/copy paths, using minimal native/product probes before any broad sweep.",
+    "reason": "default had no mixed prefill+decode unified-prof rows in this run, while chunk32 introduced bounded mixed rows and lower prefill-only totals. Decode-only cost remains materially above the vLLM ITL target, so the main gap likely remains model-side decode/batching work rather than active-decode prefill chunking.",
+    "summary": "chunk32 reduced c16 ITL tail latency but reduced throughput; it is a latency tradeoff, not the main W2 throughput lever."
+  },
+  "performance": {
+    "baseline_vllm_c16_lcb_tps": 491.15,
+    "chunk32": {
+      "completed_per_run": [
+        64
+      ],
+      "concurrency": 16,
+      "e2e_ms_p95_mean": 4305.748883199999,
+      "errored_per_run": [
+        0
+      ],
+      "gap_to_80pct_threshold_tps": 80.00936082063646,
+      "itl_ms_p50_mean": 38.7758635,
+      "itl_ms_p95_mean": 67.81585849999999,
+      "itl_ms_p99_mean": 89.2770225,
+      "n_repeats": 1,
+      "n_requests_per_run": 64,
+      "output_throughput_tps_mean": 312.91063917936356,
+      "output_token_count_source": "usage",
+      "quality_counters": {
+        "bad_output_per_run": [
+          0
+        ],
+        "duplicate_done_per_run": [
+          0
+        ],
+        "http_500_per_run": [
+          0
+        ],
+        "malformed_stream_per_run": [
+          0
+        ],
+        "missing_done_per_run": [
+          0
+        ],
+        "panic_per_run": [
+          0
+        ],
+        "stream_bulk_flush_per_run": [
+          0
+        ],
+        "zero_output_tokens_per_run": [
+          0
+        ]
+      },
+      "ratio_vs_vllm_c16_lcb": 0.6370979113903361,
+      "tpot_ms_p50_mean": 44.42138527123288,
+      "tpot_ms_p95_mean": 46.4611221766923,
+      "ttft_ms_p50_mean": 421.34572349999996,
+      "ttft_ms_p95_mean": 697.1003812
+    },
+    "chunk32_vs_default": {
+      "e2e_p95_delta_pct": 0.026791277199372777,
+      "itl_p95_delta_pct": -0.21261292028681475,
+      "throughput_delta_pct": -0.023102752432794627,
+      "tpot_p95_delta_pct": -0.05346403852237111,
+      "ttft_p95_delta_pct": -0.182562124776667
+    },
+    "default": {
+      "completed_per_run": [
+        64
+      ],
+      "concurrency": 16,
+      "e2e_ms_p95_mean": 4193.4022803,
+      "errored_per_run": [
+        0
+      ],
+      "gap_to_80pct_threshold_tps": 72.60930206466065,
+      "itl_ms_p50_mean": 38.348624,
+      "itl_ms_p95_mean": 86.12772580000004,
+      "itl_ms_p99_mean": 142.59986479999546,
+      "n_repeats": 1,
+      "n_requests_per_run": 64,
+      "output_throughput_tps_mean": 320.31069793533936,
+      "output_token_count_source": "usage",
+      "quality_counters": {
+        "bad_output_per_run": [
+          0
+        ],
+        "duplicate_done_per_run": [
+          0
+        ],
+        "http_500_per_run": [
+          0
+        ],
+        "malformed_stream_per_run": [
+          0
+        ],
+        "missing_done_per_run": [
+          0
+        ],
+        "panic_per_run": [
+          0
+        ],
+        "stream_bulk_flush_per_run": [
+          0
+        ],
+        "zero_output_tokens_per_run": [
+          0
+        ]
+      },
+      "ratio_vs_vllm_c16_lcb": 0.6521647112599804,
+      "tpot_ms_p50_mean": 45.52610599450118,
+      "tpot_ms_p95_mean": 49.08542735572588,
+      "ttft_ms_p50_mean": 294.0712495,
+      "ttft_ms_p95_mean": 852.7869852000001
+    },
+    "threshold_80pct_tps": 392.92
+  },
+  "profile": {
+    "chunk32": {
+      "categories": {
+        "decode_only": {
+          "max_us": 45903,
+          "n": 67,
+          "p50_us": 33090.0,
+          "p95_us": 40967.3,
+          "p99_us": 43893.96000000001
+        },
+        "empty": {
+          "max_us": null,
+          "n": 0,
+          "p50_us": null,
+          "p95_us": null,
+          "p99_us": null
+        },
+        "mixed": {
+          "max_us": 85609,
+          "n": 6,
+          "p50_us": 73604.0,
+          "p95_us": 84571.5,
+          "p99_us": 85401.5
+        },
+        "prefill_only": {
+          "max_us": 322454,
+          "n": 2,
+          "p50_us": 229262.5,
+          "p95_us": 313134.85,
+          "p99_us": 320590.17000000004
+        }
+      },
+      "extract_note": "Remote rg was unavailable; profile_extract.log was regenerated locally from server.log.",
+      "mixed_rows": [
+        {
+          "category": "mixed",
+          "decode": 6,
+          "decode_post_us": 1287,
+          "items": 10,
+          "model_us": 84300,
+          "prefill": 4,
+          "total_us": 85609
+        },
+        {
+          "category": "mixed",
+          "decode": 6,
+          "decode_post_us": 1254,
+          "items": 10,
+          "model_us": 78081,
+          "prefill": 4,
+          "total_us": 79355
+        },
+        {
+          "category": "mixed",
+          "decode": 6,
+          "decode_post_us": 1279,
+          "items": 10,
+          "model_us": 80159,
+          "prefill": 4,
+          "total_us": 81459
+        },
+        {
+          "category": "mixed",
+          "decode": 6,
+          "decode_post_us": 1256,
+          "items": 10,
+          "model_us": 63666,
+          "prefill": 4,
+          "total_us": 65906
+        },
+        {
+          "category": "mixed",
+          "decode": 12,
+          "decode_post_us": 3170,
+          "items": 14,
+          "model_us": 57499,
+          "prefill": 2,
+          "total_us": 60698
+        },
+        {
+          "category": "mixed",
+          "decode": 14,
+          "decode_post_us": 3419,
+          "items": 16,
+          "model_us": 64081,
+          "prefill": 2,
+          "total_us": 67853
+        }
+      ],
+      "unified_prof_rows": 75
+    },
+    "default": {
+      "categories": {
+        "decode_only": {
+          "max_us": 42826,
+          "n": 73,
+          "p50_us": 33908.0,
+          "p95_us": 40314.000000000015,
+          "p99_us": 42758.32
+        },
+        "empty": {
+          "max_us": null,
+          "n": 0,
+          "p50_us": null,
+          "p95_us": null,
+          "p99_us": null
+        },
+        "mixed": {
+          "max_us": null,
+          "n": 0,
+          "p50_us": null,
+          "p95_us": null,
+          "p99_us": null
+        },
+        "prefill_only": {
+          "max_us": 516535,
+          "n": 2,
+          "p50_us": 324712.0,
+          "p95_us": 497352.7,
+          "p99_us": 512698.54000000004
+        }
+      },
+      "extract_note": "Remote rg was unavailable; profile_extract.log was regenerated locally from server.log.",
+      "mixed_rows": [],
+      "unified_prof_rows": 75
+    }
+  },
+  "release_grade_pass": false,
+  "required_pass_line": "MODEL_RELEASE_GRADE_W2 PASS: <out_dir>",
+  "required_pass_line_produced": false,
+  "source": {
+    "binary_sha256": "786bbd8bf2536d46328e1daf4453cc81dbb24213d23914e3f34893582bb32717  /workspace/ferrum-active-chunk-8bc7cf08/target/release/ferrum",
+    "ferrum_version": "ferrum 0.7.7",
+    "local_git_head": "8bc7cf087ae5fe6e7e2e34405ca5781cc8d0acdc",
+    "remote_git_head": "",
+    "remote_git_note": "remote source was rsynced from tracked files and did not include .git, so git_head is intentionally empty"
+  },
+  "status": "diagnostic_complete",
+  "timing": {
+    "cargo_build_elapsed": "29m48s",
+    "duration_minutes": 33.4,
+    "duration_seconds": 2004.0,
+    "end_utc": "2026-06-16T06:17:03Z",
+    "estimated_gpu_cost_usd": 0.23652148148148147,
+    "start_utc": "2026-06-16T05:43:39Z"
+  },
+  "vast_cleanup": {
+    "final_actual_status": "exited",
+    "final_cur_state": "stopped",
+    "final_intended_status": "stopped",
+    "stop_response_success": true
+  }
+}
