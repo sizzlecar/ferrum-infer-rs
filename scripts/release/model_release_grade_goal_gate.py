@@ -367,6 +367,47 @@ def baseline_tps_from_cell(cell: dict[str, Any], baseline: dict[str, Any], probl
     return number(value, f"{label}.baseline_output_tps", problems)
 
 
+def needs_vllm_baseline(manifest: dict[str, Any]) -> bool:
+    backend = str(manifest.get("backend", "")).lower()
+    quantization = str(manifest.get("quantization", "")).lower()
+    if backend != "cuda":
+        return False
+    return any(
+        token in quantization
+        for token in ["gptq", "awq", "safetensors", "hf", "huggingface"]
+    )
+
+
+def validate_baseline_selection(
+    manifest: dict[str, Any],
+    baseline: dict[str, Any],
+    out_dir: Path,
+    problems: list[str],
+) -> None:
+    engine = str(baseline.get("engine", "")).lower()
+    if not needs_vllm_baseline(manifest) or "vllm" in engine:
+        return
+
+    exception = baseline.get("selection_exception")
+    if not isinstance(exception, dict):
+        problems.append(
+            "performance.baseline.engine must be vLLM for CUDA HF/safetensors/GPTQ/AWQ "
+            "lanes, or include selection_exception evidence"
+        )
+        return
+    reason = str(exception.get("reason", "")).strip()
+    if not reason:
+        problems.append("performance.baseline.selection_exception.reason must be non-empty")
+    if exception.get("vllm_supported") is not False:
+        problems.append("performance.baseline.selection_exception.vllm_supported must be false")
+    validate_evidence_entry(
+        exception.get("artifact"),
+        "performance.baseline.selection_exception.artifact",
+        out_dir,
+        problems,
+    )
+
+
 def validate_tail_latency(
     cell: dict[str, Any],
     perf: dict[str, Any],
@@ -505,6 +546,7 @@ def validate_performance(manifest: dict[str, Any], out_dir: Path, problems: list
     command_parts(baseline.get("build_command_line"), "performance.baseline.build_command_line", problems)
     for key in ["same_hardware", "same_model", "same_quantization"]:
         require_true(baseline.get(key), f"performance.baseline.{key}", problems)
+    validate_baseline_selection(manifest, baseline, out_dir, problems)
 
     cells = as_list(perf.get("cells"), "performance.cells", problems)
     seen: set[int] = set()
@@ -686,10 +728,10 @@ def write_selftest_manifest(root: Path, *, ratio: float = 0.82) -> Path:
         },
         "performance": {
             "baseline": {
-                "engine": "llama.cpp",
+                "engine": "vLLM",
                 "version": "selftest",
-                "build_command_line": ["cmake", "--build", "build"],
-                "command_line": ["llama-bench", "-ngl", "999"],
+                "build_command_line": ["python", "-m", "pip", "show", "vllm"],
+                "command_line": ["vllm", "serve", "gemma3-27b"],
                 "same_hardware": True,
                 "same_model": True,
                 "same_quantization": True,
@@ -735,6 +777,40 @@ def run_selftest() -> int:
         dirty_problems = validate_manifest(data, "w2", dirty)
         if not any("dirty_status" in problem for problem in dirty_problems):
             raise AssertionError("dirty status selftest did not fail as expected")
+
+        bad_baseline_engine = tmp_root / "bad-baseline-engine"
+        bad_baseline_engine_manifest = write_selftest_manifest(bad_baseline_engine, ratio=0.82)
+        data = load_json(bad_baseline_engine_manifest)
+        data["performance"]["baseline"]["engine"] = "llama.cpp"
+        data["performance"]["baseline"]["build_command_line"] = ["cmake", "--build", "build"]
+        data["performance"]["baseline"]["command_line"] = ["llama-bench", "-ngl", "999"]
+        write_json(bad_baseline_engine_manifest, data)
+        bad_baseline_engine_problems = validate_manifest(data, "w2", bad_baseline_engine)
+        if not any("must be vLLM" in problem for problem in bad_baseline_engine_problems):
+            raise AssertionError("bad baseline engine selftest did not fail as expected")
+
+        baseline_exception = tmp_root / "baseline-exception"
+        baseline_exception_manifest = write_selftest_manifest(baseline_exception, ratio=0.82)
+        write_json(
+            baseline_exception / "vllm_unsupported.json",
+            {"status": "pass", "reason": "selftest unsupported lane"},
+        )
+        data = load_json(baseline_exception_manifest)
+        data["performance"]["baseline"]["engine"] = "llama.cpp"
+        data["performance"]["baseline"]["build_command_line"] = ["cmake", "--build", "build"]
+        data["performance"]["baseline"]["command_line"] = ["llama-bench", "-ngl", "999"]
+        data["performance"]["baseline"]["selection_exception"] = {
+            "artifact": "vllm_unsupported.json",
+            "reason": "vLLM does not support this selftest lane",
+            "vllm_supported": False,
+        }
+        write_json(baseline_exception_manifest, data)
+        baseline_exception_problems = validate_manifest(data, "w2", baseline_exception)
+        if baseline_exception_problems:
+            raise AssertionError(
+                "baseline exception selftest failed: "
+                + "; ".join(baseline_exception_problems)
+            )
 
         missing_baseline = tmp_root / "missing-baseline-artifact"
         missing_baseline_manifest = write_selftest_manifest(missing_baseline, ratio=0.82)
