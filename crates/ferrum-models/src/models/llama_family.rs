@@ -1486,13 +1486,15 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
     /// Grow unified-path scratch buffers to accommodate `m_total` query
     /// tokens. Called lazily from `unified_forward_internal` so single-
     /// path workloads (no chunked prefill) don't pay the alloc cost.
+    /// Returns true when buffers were rebuilt and any captured graph that
+    /// references the previous pointers must be invalidated by the caller.
     pub(crate) fn ensure_unified_scratch(
         &mut self,
         cfg: &LlamaFamilyConfig,
         m_total: usize,
         max_seqs: usize,
         max_blocks_per_seq: usize,
-    ) {
+    ) -> bool {
         if m_total <= self.unified_capacity
             && self.unified_residual.is_some()
             && self.unified_cu_seqlens_q.is_some()
@@ -1502,7 +1504,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
                         || (self.unified_residual_f32_shadow.is_some()
                             && self.unified_sandwich_branch_f32.is_some()))))
         {
-            return;
+            return false;
         }
         let cap = m_total.max(self.unified_capacity).max(1);
         let h = cfg.hidden_size;
@@ -1590,6 +1592,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             ));
         }
         self.unified_capacity = cap;
+        true
     }
 
     /// Allocate scratch for batched paged dispatch (Phase 4b). Called

@@ -101,13 +101,37 @@ pub fn compute_final_indices(
 /// never collide with legacy decode/batched keys (which use the low 63
 /// bits for `m_padded` / `SINGLE_ITEM = 0`).
 ///
-/// Keyed by `(m_total, num_seqs)` because the captured kernel launches
-/// bake in grid_dim / per-seq scratch indexing for that specific shape;
-/// reusing a graph for a different shape leads to wrong-shape memory
-/// access. (See memory `project_moe_phase3_graph_bug.md` for the same
-/// rationale in the legacy MoE path.)
-pub const fn unified_graph_key(m_total: usize, num_seqs: usize) -> u64 {
-    (1u64 << 63) | ((m_total as u64) << 32) | (num_seqs as u64)
+/// The captured region bakes in more than launch grid shape:
+/// - varlen attention freezes the dynamic shared-memory size and split-K
+///   branch chosen from `max_kv_len`;
+/// - final-token packing records concrete `copy_slice` offsets from
+///   `final_indices`.
+///
+/// Include those host-side shape decisions in the key so a graph is only
+/// replayed for the same captured launch/memcpy layout. Device buffers
+/// such as cu_seqlens, position offsets, and block tables remain dynamic.
+pub fn unified_graph_key(
+    m_total: usize,
+    num_seqs: usize,
+    max_kv_len: usize,
+    final_indices: &[(usize, usize)],
+) -> u64 {
+    fn feed(mut hash: u64, value: u64) -> u64 {
+        hash ^= value;
+        hash = hash.wrapping_mul(0x100000001b3);
+        hash
+    }
+
+    let mut hash = 0xcbf29ce484222325u64;
+    hash = feed(hash, m_total as u64);
+    hash = feed(hash, num_seqs as u64);
+    hash = feed(hash, max_kv_len as u64);
+    hash = feed(hash, final_indices.len() as u64);
+    for &(orig_idx, global_idx) in final_indices {
+        hash = feed(hash, orig_idx as u64);
+        hash = feed(hash, global_idx as u64);
+    }
+    (1u64 << 63) | (hash & !(1u64 << 63))
 }
 
 #[cfg(test)]
@@ -161,11 +185,27 @@ mod tests {
 
     #[test]
     fn graph_key_high_bit_set() {
-        let k = unified_graph_key(32, 4);
+        let k = unified_graph_key(32, 4, 128, &[(0, 0), (1, 1), (2, 2), (3, 3)]);
         assert!(k & (1u64 << 63) != 0, "high bit must be set");
         // Legacy key with same low bits should differ.
         let legacy = ((32u64) << 32) | 4u64;
         assert_ne!(k, legacy);
+    }
+
+    #[test]
+    fn graph_key_distinguishes_dynamic_capture_shape() {
+        let decode_final = vec![(0, 0), (1, 1)];
+        let same_grid_short_kv = unified_graph_key(2, 2, 128, &decode_final);
+        let same_grid_long_kv = unified_graph_key(2, 2, 640, &decode_final);
+        assert_ne!(same_grid_short_kv, same_grid_long_kv);
+
+        let prefill_final = vec![(0, 4), (1, 5)];
+        let different_final_offsets = unified_graph_key(6, 2, 128, &prefill_final);
+        let same_grid_other_offsets = unified_graph_key(6, 2, 128, &[(0, 2), (1, 5)]);
+        assert_ne!(different_final_offsets, same_grid_other_offsets);
+
+        let no_sample = unified_graph_key(6, 2, 128, &[]);
+        assert_ne!(different_final_offsets, no_sample);
     }
 
     #[test]
