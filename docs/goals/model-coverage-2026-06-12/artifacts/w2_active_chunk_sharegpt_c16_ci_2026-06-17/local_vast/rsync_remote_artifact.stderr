@@ -1,0 +1,55 @@
+Warning: Permanently added '[ssh7.vast.ai]:30498' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Transfer starting: 48 files
+./
+build/
+correctness/
+env/
+perf/
+server/
+run.log (2.6 KB, 100.0% downloaded)
+summary.json (2.1 KB, 100.0% downloaded)
+summary.md (621 B, 100.0% downloaded)
+build/build.command.txt (115 B, 100.0% downloaded)
+build/cargo_build_release.log (62 B, 100.0% downloaded)
+correctness/models.json (164 B, 100.0% downloaded)
+correctness/run.command.json (647 B, 100.0% downloaded)
+correctness/run.stderr (3.0 KB, 100.0% downloaded)
+correctness/run.stdout (121 B, 100.0% downloaded)
+correctness/run_decision_trace.jsonl (3.9 KB, 100.0% downloaded)
+correctness/run_effective_config.json (11.6 KB, 100.0% downloaded)
+correctness/serve.log (3.7 KB, 100.0% downloaded)
+correctness/serve_decision_trace.jsonl (3.9 KB, 100.0% downloaded)
+correctness/serve_effective_config.json (11.2 KB, 100.0% downloaded)
+correctness/stream_request.json (260 B, 100.0% downloaded)
+correctness/stream_response.sse (847 B, 100.0% downloaded)
+correctness/stream_summary.json (136 B, 100.0% downloaded)
+env/cargo_version.txt (36 B, 100.0% downloaded)
+env/dataset.sha256 (105 B, 100.0% downloaded)
+env/dataset.wc (43 B, 100.0% downloaded)
+env/df_before.txt (129 B, 100.0% downloaded)
+env/end_utc.txt (21 B, 100.0% downloaded)
+env/ferrum.sha256 (88 B, 100.0% downloaded)
+env/git_sha.txt (41 B, 100.0% downloaded)
+env/git_status_short.txt (0 B, 100.0% downloaded)
+env/model_files.txt (0 B, 100.0% downloaded)
+env/model_path.txt (113 B, 100.0% downloaded)
+env/nvcc_version.txt (209 B, 100.0% downloaded)
+env/nvidia_smi_after.txt (1.6 KB, 100.0% downloaded)
+env/nvidia_smi_before.txt (1.6 KB, 100.0% downloaded)
+env/rustc_version.txt (36 B, 100.0% downloaded)
+env/rustup_install.log (1.3 KB, 100.0% downloaded)
+perf/bench-serve.command.txt (554 B, 100.0% downloaded)
+perf/bench-serve.stderr (854 B, 100.0% downloaded)
+perf/bench-serve.stdout (0 B, 100.0% downloaded)
+perf/bench_ferrum_sharegpt_c16_100x3.json (10.9 KB, 100.0% downloaded)
+perf/nvidia_smi_after_bench.txt (1.6 KB, 100.0% downloaded)
+server/active_chunk_check.json (193 B, 100.0% downloaded)
+server/models.json (164 B, 100.0% downloaded)
+server/serve_decision_trace.jsonl (3.9 KB, 100.0% downloaded)
+server/serve_effective_config.json (11.2 KB, 100.0% downloaded)
+server/server.log (3.7 KB, 100.0% downloaded)
+
+sent 940 bytes  received 88372 bytes  178624 bytes/sec
+total size is 85310  speedup is 0.96

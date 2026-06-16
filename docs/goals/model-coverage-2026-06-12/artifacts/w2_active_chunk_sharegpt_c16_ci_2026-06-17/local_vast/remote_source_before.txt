@@ -1,0 +1,2 @@
+eed031e334c78cf181a4b1077c1ba2089d0d6d6f
+-rwxr-xr-x 2 root root 74982832 Jun 16 19:55 target/release/ferrum
