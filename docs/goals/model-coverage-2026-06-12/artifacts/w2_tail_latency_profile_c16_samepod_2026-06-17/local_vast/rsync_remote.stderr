@@ -1,0 +1,45 @@
+Warning: Permanently added '[ssh3.vast.ai]:11012' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Transfer starting: 38 files
+./
+analysis/
+env/
+perf/
+server/
+smoke/
+run.log (135 B, 100.0% downloaded)
+analysis/postprocess.log (95 B, 100.0% downloaded)
+analysis/profile_summary.json (170.1 KB, 100.0% downloaded)
+analysis/summary.md (1.1 KB, 100.0% downloaded)
+env/dataset.sha256 (105 B, 100.0% downloaded)
+env/dataset.wc (43 B, 100.0% downloaded)
+env/df_after.txt (129 B, 100.0% downloaded)
+env/df_before.txt (129 B, 100.0% downloaded)
+env/end_utc.txt (21 B, 100.0% downloaded)
+env/ferrum.sha256 (115 B, 100.0% downloaded)
+env/ferrum_version.txt (13 B, 100.0% downloaded)
+env/git_sha.txt (41 B, 100.0% downloaded)
+env/git_status_short.txt (0 B, 100.0% downloaded)
+env/hf_home_du.txt (24 B, 100.0% downloaded)
+env/model_files.txt (0 B, 100.0% downloaded)
+env/model_path.txt (113 B, 100.0% downloaded)
+env/nvcc_version.txt (209 B, 100.0% downloaded)
+env/nvidia_smi_before.txt (1.6 KB, 100.0% downloaded)
+env/start_utc.txt (21 B, 100.0% downloaded)
+perf/bench-ferrum-profile.command.txt (544 B, 100.0% downloaded)
+perf/bench-ferrum-profile.stderr (640 B, 100.0% downloaded)
+perf/bench-ferrum-profile.stdout (0 B, 100.0% downloaded)
+perf/bench_ferrum_profile_c16_100x1.json (4.8 KB, 100.0% downloaded)
+perf/nvidia_smi_after_bench.txt (1.6 KB, 100.0% downloaded)
+server/active_chunk_check.json (193 B, 100.0% downloaded)
+server/models.json (164 B, 100.0% downloaded)
+server/serve_decision_trace.jsonl (3.9 KB, 100.0% downloaded)
+server/serve_effective_config.json (11.3 KB, 100.0% downloaded)
+server/server.log (173.1 KB, 100.0% downloaded)
+smoke/stream_request.json (260 B, 100.0% downloaded)
+smoke/stream_response.sse (852 B, 100.0% downloaded)
+smoke/stream_summary.json (179 B, 100.0% downloaded)
+
+sent 720 bytes  received 382920 bytes  767280 bytes/sec
+total size is 380484  speedup is 0.99

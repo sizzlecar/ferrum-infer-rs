@@ -1,0 +1,9 @@
+Warning: Permanently added '[ssh3.vast.ai]:11012' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Transfer starting: 2 files
+postprocess_tail_profile_c16.py
+run_remote_tail_profile_c16.sh
+
+sent 13513 bytes  received 178 bytes  1095 bytes/sec
+total size is 25084  speedup is 1.83

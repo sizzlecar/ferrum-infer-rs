@@ -2,6 +2,66 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZC — W2 CUDA diagnostic: c16 tail profile points to Gemma3 GPTQ dense/MLP decode path
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_latency_profile_c16_samepod_2026-06-17/`.
+- Scope:
+  - W2 Gemma3 CUDA GPTQ current-default c16 tail-latency/profile diagnostic
+    only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- GPU lifecycle:
+  - reused Vast instance `41241013`, 1x RTX 4090, with the retained
+    same-pod model/source/build environment from the c16 vLLM/Ferrum A/B;
+  - copied artifacts back locally, then stopped the instance;
+  - final sanitized Vast state records `cur_state=stopped` and
+    `actual_status=exited`.
+- Source/runtime evidence:
+  - remote worktree was clean at
+    `96d2df73e82ab4c0d643ced32d1f424b29dc5353`;
+  - Ferrum binary SHA256
+    `ca11f78f9e1be27a26bd12f50e377f3def602f14220cb10e1099eadb4f35ca93`;
+  - dataset SHA256
+    `58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e`;
+  - model snapshot:
+    `/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2`.
+- Correctness result:
+  - product `ferrum serve` streaming smoke passed with content `5\n`,
+    exactly one `[DONE]`, and usage present
+    (`prompt_tokens=23`, `completion_tokens=3`, `total_tokens=26`);
+  - diagnostic `bench-serve` completed `[100]` requests with errors `[0]`;
+  - `output_token_count_source=usage`;
+  - no correctness issue was observed in this diagnostic artifact.
+- Diagnostic command:
+  - current-default Ferrum product server with
+    `FERRUM_DECODE_OP_PROFILE=1`;
+  - `ferrum bench-serve --dataset sharegpt --sharegpt-path
+    /workspace/ascii_sharegpt_w2_100.jsonl --random-output-len 128
+    --concurrency-sweep 16 --num-prompts 100 --n-repeats 1
+    --fail-on-error --seed 9271`;
+  - this is not release performance evidence because profile logging changes
+    runtime cost and the run intentionally omitted `--require-ci`.
+- Profile result:
+  - profile parser found `176` `unified-op-profile` rows, including `21`
+    decode-only rows;
+  - profile-run output throughput mean was `372.00153904953766 tok/s` and
+    p95 ITL mean was `57.69527414999998 ms`;
+  - decode-only `total_us` mean/p95/max:
+    `27052.52380952381 / 27978 / 28153`;
+  - decode-only `generic_matmul` share was `0.7742046776728868`;
+  - decode-only `gate_up + down` share was `0.5074167888569503`;
+  - decode-only attention share was `0.08208370665178674`;
+  - decode-only lm_head share was `0.11125447322052515`;
+  - `marlin_*` profile buckets were zero in the captured product path.
+- Interpretation:
+  - the remaining c16 tail issue is not primarily FA2/attention;
+  - the current evidence points to Gemma3 GPTQ dense matmul, especially MLP
+    `gate_up` and `down`, as the dominant decode cost;
+  - the next source step should compare Ferrum's Gemma3 GPTQ dense dispatch
+    and packing against vLLM's GPTQ/Marlin path, then use a native CUDA
+    microbench for the exact Gemma3 `gate_up/down` shapes before changing
+    product defaults.
+
 ## 2026-06-17 ZB — W2 CUDA diagnostic: same-pod vLLM/Ferrum c16 throughput passes, p95 remains blocker
 
 - Artifact:
