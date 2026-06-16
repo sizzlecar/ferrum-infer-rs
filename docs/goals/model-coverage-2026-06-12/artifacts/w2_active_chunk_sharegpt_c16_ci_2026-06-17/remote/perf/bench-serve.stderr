@@ -1,0 +1,16 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=100 warmup=10 n_repeats=3
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 18.6s
+  cell closed_loop c=16 — repeat 2/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 18.6s
+  cell closed_loop c=16 — repeat 3/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 18.6s
+    summary c=16 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=630.5±204.4  p95=944.5±456.0  p99=1068.5±208.9
+      TPOT_ms  p50=29.9±2.3  p95=33.6±1.5  p99=34.3±0.8
+      ITL_ms   p50=24.8±0.2  p95=58.7±3.7  p99=79.2±17.8
+      throughput      393.3 ± 6.8 tok/s
+      goodput         5.37 ± 0.01 req/s
+
+→ wrote /workspace/w2_active_chunk_sharegpt_c16_ci_2026-06-17/perf/bench_ferrum_sharegpt_c16_100x3.json

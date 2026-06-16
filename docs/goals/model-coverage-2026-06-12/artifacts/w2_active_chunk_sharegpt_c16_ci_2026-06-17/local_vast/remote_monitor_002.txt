@@ -1,0 +1,31 @@
+[w2-c16] start 2026-06-16T20:14:56Z
+[w2-c16] root=/workspace/ferrum-infer-rs out=/workspace/w2_active_chunk_sharegpt_c16_ci_2026-06-17 model=gemma3:27b-gptq hf_home=/workspace/hf-cache dataset=/workspace/ascii_sharegpt_w2_100.jsonl
+[w2-c16] installing rustup minimal toolchain
+[w2-c16] CUDA release build
+
+real	0m0.298s
+user	0m0.214s
+sys	0m0.077s
+[w2-c16] correctness: ferrum run
+--- run stderr ---
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 2.6 GB → max_blocks=338
+[auto-size] KV_MAX_BLOCKS=338 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+Loading circulus/gemma-3-27b-it-gptq...
+Using CUDA(0) backend
+Loading weights to GPU... (30s+ for >10 GB models)
+[2m2026-06-16T20:15:09.074320Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-16T20:15:09.074374Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-16T20:15:09.074458Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-16T20:15:10.068581Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-16T20:15:10.068649Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-16T20:15:10.068654Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-16T20:15:10.068854Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating default KV cache manager: device=CUDA(0), block_size=16, max_blocks=338
+[2m2026-06-16T20:15:10.068926Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-16T20:15:10.069346Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-16T20:15:10.276690Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-16T20:15:10.276816Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-16T20:15:10.276826Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-16T20:15:10.276838Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+--- tmux ---
+w2_c16_ci: 1 windows (created Tue Jun 16 20:14:56 2026)

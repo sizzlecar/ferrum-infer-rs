@@ -2,6 +2,63 @@
 
 进度日志,倒序。
 
+## 2026-06-17 YY — W2 CUDA diagnostic: active chunk reaches 78.69% of historical vLLM c16 LCB
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_chunk_sharegpt_c16_ci_2026-06-17/`.
+- Scope:
+  - W2 Gemma3 CUDA GPTQ c16 ShareGPT CI diagnostic only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- GPU lifecycle:
+  - restarted cached Vast instance `41230499`, 1x RTX 4090, driver
+    `590.48.01`, quoted USD `0.5766666666666667/h`;
+  - reused existing model/build cache; CUDA release build completed in
+    `0.298s`;
+  - artifacts copied back, then instance stopped; final status
+    `cur_state=stopped`, `actual_status=exited`.
+- Source/runtime evidence:
+  - remote worktree was clean at
+    `b99afdea19c11cdb4e6244ab2f5bedda20624bdb`;
+  - binary sha256
+    `426c9b029d08ede6edb986a7dd80e5330e2a9f7489ce7de6224a1b482361d4c7`;
+  - dataset sha256
+    `58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e`;
+  - effective config showed
+    `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK=16`.
+- Correctness result:
+  - product `ferrum run` smoke passed with stdout content `5`,
+    `n_tokens=3`;
+  - product `ferrum serve` streaming smoke passed with content `5\n`,
+    exactly one `[DONE]`, and usage present
+    (`prompt_tokens=23`, `completion_tokens=3`, `total_tokens=26`);
+  - no correctness issue observed in this diagnostic artifact.
+- Performance command:
+  - `ferrum bench-serve --dataset sharegpt --random-output-len 128
+    --concurrency-sweep 16 --num-prompts 100 --n-repeats 3
+    --fail-on-error --require-ci --seed 9271`;
+  - completed_per_run `[100, 100, 100]`, errored_per_run `[0, 0, 0]`;
+  - all quality/error counts were zero;
+  - `output_token_count_source=usage`.
+- c16 result:
+  - output throughput mean `393.3008267456301 tok/s`;
+  - CI half-width `6.8386526650326855 tok/s`;
+  - LCB `386.46217408059744 tok/s`;
+  - historical same-dataset vLLM c16 LCB from
+    `w2_ferrum_natural_c16_same_shape_2026-06-16` was `491.150 tok/s`;
+  - diagnostic LCB ratio vs that historical vLLM baseline is `78.69%`;
+  - historical 80% threshold is `392.920 tok/s`, so the remaining gap is
+    `6.45782591940258 tok/s`;
+  - p95 ITL improved from the old Ferrum `83.979 ms` to `58.728 ms`, but this
+    still exceeds the historical vLLM p95 ITL `28.130 ms` by about `2.09x`.
+- Status:
+  - this is a real performance movement from the prior release-shaped Ferrum
+    c16 LCB `325.184 tok/s` to `386.462 tok/s`;
+  - c16 is now close enough that the next release-grade step should be a
+    same-hardware vLLM baseline on the same instance/shape before deciding
+    whether to tune the final ~6.5 tok/s gap or proceed to c=1/4/32;
+  - W2 remains not release-grade until the final validator prints
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>`.
+
 ## 2026-06-17 YX — W2 CUDA diagnostic: active-decode prefill chunk removes large mixed prefill/decode frames
 
 - Artifact:
