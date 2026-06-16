@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZF — W2 source checkpoint: allow two mixed-prefill chunks during active decode
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_scheduler_active_decode_prefill_budget2_source_2026-06-17/`.
+- Scope:
+  - W2 Gemma3 CUDA GPTQ source-only throughput recovery candidate;
+  - no paid GPU instance was started for this source checkpoint;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Motivation:
+  - the one-chunk aggregate active-decode mixed-prefill cap proved the p95
+    root cause by moving c16 p95 ITL from `52.819ms` to `26.637ms`;
+  - the same run over-throttled throughput, dropping c16 LCB from
+    `414.592 tok/s` to `333.110 tok/s`;
+  - therefore the next candidate should recover throughput without going back
+    to the old unbounded waiting-request count.
+- Source change:
+  - introduced `ACTIVE_DECODE_PREFILL_CHUNKS_PER_ITERATION = 2`;
+  - when decode requests are scheduled, the aggregate mixed-prefill token
+    budget is now `2 * active_decode_prefill_chunk`;
+  - each prefill request is still chunked by `active_decode_prefill_chunk`;
+  - with the Gemma3 CUDA GPTQ default `active_decode_prefill_chunk=16`, an
+    active decode iteration can mix at most two 16-token prefill chunks.
+- Local validation:
+  - `cargo test -p ferrum-scheduler active_decode_prefill_chunk -- --nocapture`
+    PASS: `2 passed`;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-scheduler` PASS: `52 passed`.
+- Required next validation:
+  - run Gemma3 product `ferrum run` and `ferrum serve` smoke on native CUDA;
+  - then rerun same-pod c16 ShareGPT with
+    `bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`;
+  - diagnostic candidate only passes if throughput LCB clears the vLLM 80%
+    line while p95 ITL remains at or below the same-pod vLLM p95.
+
 ## 2026-06-17 ZE — W2 CUDA diagnostic: aggregate mixed-prefill cap fixes c16 p95 but over-throttles throughput
 
 - Artifact:
