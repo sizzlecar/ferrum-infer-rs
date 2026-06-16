@@ -1,0 +1,44 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Tue Jun 16 09:09:21 UTC 2026
+w2-attention-key-smoke: 1 windows (created Tue Jun 16 09:03:50 2026)
+540 tmux new-session -d -s w2-attention-key-smoke bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh > /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stdout 2> /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stderr
+541 bash -c bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh > /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stdout 2> /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stderr
+544 bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh
+964 /workspace/ferrum-infer-rs/target/release/ferrum serve --model gemma3:27b-gptq --backend cuda --host 127.0.0.1 --port 18166 --kv-capacity 512 --max-num-seqs 16 --max-num-batched-tokens 2048 --unified-graph --unified-graph-layers-only --effective-config-json /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/serve_effective_config.json --decision-trace-jsonl /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/serve_decision_trace.jsonl
+1069 bash -c set -e; date -u; tmux ls || true; pgrep -af "w2_unified_graph_attention_key|ferrum run|ferrum serve|bench-serve" | head -80 || true; echo RUN; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_validation.txt 2>/dev/null || true; echo SERVE; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/serve_chat_validation.txt 2>/dev/null || true; echo BENCH_STDERR; tail -140 /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/bench/bench_sharegpt_c16.stderr 2>/dev/null || true; echo SERVER_GRAPH; grep -aE "\[unified-graph-(capture|replay|skip|stats)\]|CUDA_ERROR|illegal|panic|end_capture" /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/server.log 2>/dev/null | tail -120 || true; echo FILES; find /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16 -maxdepth 2 -type f | sort | sed -n "1,280p"; echo RC; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/run_remote.rc 2>/dev/null || true
+RUN
+RUN_SMOKE_PASS content='5' tokens=3
+SERVE
+BENCH_STDERR
+SERVER_GRAPH
+FILES
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/ferrum.sha256
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/ferrum_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/release_build.command.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/release_build.stderr
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/release_build.stdout
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run.command.json
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run.stderr
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run.stdout
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_decision_trace.jsonl
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_effective_config.json
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_validation.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/cargo_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/git_head.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/git_status_short.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/git_status_source_short.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/nvcc_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/nvidia_smi_before.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/rustc_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/start_utc.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/models.json.tmp
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/models_curl_last.err
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/serve.command.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/serve_decision_trace.jsonl
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/serve_effective_config.json
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/server.log
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/server.pid
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/server.stdout
+RC
