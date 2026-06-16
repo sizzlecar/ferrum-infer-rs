@@ -1,0 +1,72 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_scheduler_active_decode_prefill_budget_source_2026-06-17",
+  "date": "2026-06-17",
+  "source_profile_artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_tail_latency_profile_c16_samepod_2026-06-17",
+  "release_gate": false,
+  "same_pod_c16_reference": {
+    "ferrum_output_tps_lcb": 414.59153186899397,
+    "vllm_output_tps_lcb": 478.39462812583776,
+    "throughput_lcb_ratio": 0.8666308262975292,
+    "ferrum_p95_itl_ms_mean": 52.81935383333333,
+    "vllm_p95_itl_ms_mean": 33.06958213333332,
+    "p95_itl_ratio": 1.597218665188174
+  },
+  "profile_split": {
+    "pure_decode": {
+      "rows": 21,
+      "decode_tokens_in_rows": 208,
+      "total_ms_p95": 27.978,
+      "generic_matmul_ms_p95": 21.075,
+      "gate_up_plus_down_ms_p95": 13.872
+    },
+    "mixed_prefill_decode": {
+      "rows": 152,
+      "decode_tokens_in_rows": 1666,
+      "total_ms_p95": 74.05,
+      "generic_matmul_ms_p95": 63.228,
+      "gate_up_plus_down_ms_p95": 49.019999999999996
+    },
+    "decode_token_weighted_frame_total_ms": {
+      "count": 1874,
+      "mean": 44.10547171824973,
+      "p50": 38.151,
+      "p90": 61.689,
+      "p95": 64.029,
+      "max": 85.103
+    },
+    "decode_token_share_by_frame_type": {
+      "pure_decode": 0.111,
+      "prefill_1_2": 0.2,
+      "prefill_3_4": 0.428,
+      "prefill_5_plus": 0.261
+    }
+  },
+  "source_change": {
+    "file": "crates/ferrum-scheduler/src/implementations/continuous.rs",
+    "summary": "Cap aggregate active-decode mixed prefill tokens per iteration using active_decode_prefill_chunk, instead of allowing every waiting prefill request to consume a full chunk in the same decode step."
+  },
+  "local_validation": [
+    {
+      "command": "cargo test -p ferrum-scheduler active_decode_prefill_chunk -- --nocapture",
+      "status": "pass"
+    },
+    {
+      "command": "cargo test -p ferrum-scheduler newly_admitted_prefill_uses_remaining_budget_with_decode -- --nocapture",
+      "status": "pass"
+    },
+    {
+      "command": "cargo test -p ferrum-scheduler",
+      "status": "pass",
+      "result": "52 passed"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "status": "pass"
+    }
+  ],
+  "next_cuda_validation": [
+    "ferrum run Gemma3 27B GPTQ product smoke",
+    "ferrum serve Gemma3 27B GPTQ streaming smoke",
+    "same-pod c16 ShareGPT bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3"
+  ]
+}
