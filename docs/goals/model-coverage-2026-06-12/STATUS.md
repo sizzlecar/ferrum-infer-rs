@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YQ — W2 TTFT bottleneck direction: token-budget scheduling, not graph/kernel swapping
+
+- Scope:
+  - no GPU instance was started;
+  - compared Ferrum continuous-batch scheduling with vLLM v1 scheduler source;
+  - added typed-diagnostic profile output on existing `batch_decode_prof` /
+    `unified_post_prof` paths:
+    - `first-token-prof`: request age at unified-prefill model start, unified
+      model batch time, and request age when first token is sampled;
+    - `stream-ttft-prof`: request age when the first non-empty SSE chunk is
+      emitted.
+- Current interpretation:
+  - previous evidence showed single prefill around tens of ms while client
+    TTFT was hundreds of ms under c=16 ShareGPT;
+  - vLLM schedules work through one token-budget model over running/waiting
+    requests, while Ferrum still exposes stronger prefill/decode phase queues;
+  - the next W2 lever should test scheduler token-budget/admission behavior
+    with this instrumentation before touching Marlin or graph code again.
+- Local validation:
+  - `cargo test -p ferrum-engine --lib continuous_engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Gate status:
+  - diagnostic instrumentation only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
 ## 2026-06-16 YP — Release-grade validator W3 self-test hardening
 
 - Scope:
