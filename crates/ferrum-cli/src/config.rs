@@ -195,6 +195,11 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub scheduler_prefill_first_until_active: Option<usize>,
 
+    /// Cap prefill chunks while decode requests are active, equivalent to
+    /// `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK`.
+    #[serde(default)]
+    pub scheduler_active_decode_prefill_chunk: Option<usize>,
+
     /// Prefix cache opt-in, equivalent to `FERRUM_PREFIX_CACHE`.
     #[serde(default)]
     pub prefix_cache: Option<bool>,
@@ -337,6 +342,11 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
             self.scheduler_prefill_first_until_active,
+        );
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+            self.scheduler_active_decode_prefill_chunk,
         );
         push_bool_entry(&mut entries, "FERRUM_PREFIX_CACHE", self.prefix_cache);
         push_string_entry(
@@ -652,6 +662,7 @@ mod tests {
             paged_max_seqs: Some(64),
             max_batched_tokens: Some(2048),
             scheduler_prefill_first_until_active: Some(16),
+            scheduler_active_decode_prefill_chunk: Some(24),
             prefix_cache: Some(false),
             layer_split_pipeline_mode: Some("batch".to_string()),
             moe_graph: Some(true),
@@ -681,7 +692,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 32);
+        assert_eq!(entries.len(), 33);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -703,6 +714,10 @@ mod tests {
         assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
             "16"
+        );
+        assert_eq!(
+            entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
+            "24"
         );
         assert_eq!(
             entry("FERRUM_LAYER_SPLIT_PIPELINE_MODE").effective_value,
