@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YN — W2 native CUDA graph segment probe: launch count alone does not explain unified-graph OOM
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_cuda_graph_segment_native_probe_2026-06-16/`.
+- Source checkpoint:
+  `c7250e82 test(cuda): add graph segment probe`.
+- Scope:
+  - compared vLLM's graph structure against Ferrum's unified graph path;
+  - added a native CUDA probe that bypasses Cargo, Torch, vLLM runtime, model
+    loading, and Ferrum server startup;
+  - ran it once on the cached 1x RTX 4090 Vast instance `40826362`.
+- GPU contract:
+  - lane: `W2 Gemma3 graph capture granularity native diagnostic`;
+  - expected runtime/cost: 5-10 minutes, hard cap 15 minutes, about USD
+    `0.04-0.08`;
+  - stop condition: compile/run failure or probe `VERDICT`, then collect
+    artifacts and stop the instance;
+  - correctness gate: process returns 0 and prints
+    `VERDICT: CUDA graph segment probe complete`;
+  - performance command:
+    `./cuda_graph_segment_probe --segment-layers=1 --timed-iters=60 --warmup-iters=6`.
+- Evidence:
+  - binary SHA256
+    `9614573b5df34e77e971e57cc3a43f0b2154368912c4fe9d022eb5fa2cdd2a9b`;
+  - GPU `NVIDIA GeForce RTX 4090`, driver `565.77`, `nvidia-smi` CUDA
+    `12.7`, `nvcc` `12.4.131`;
+  - Vast cleanup confirmed `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`.
+- Probe result:
+  - eager simplified Gemma3-like launch pattern: `1.108744 ms/step`;
+  - one monolithic simple graph: instantiate `1.963643 ms`, replay
+    `0.795237 ms/step`;
+  - 62 segmented simple graphs: instantiate total `2.662781 ms`, replay
+    `0.880079 ms/step`;
+  - segmented replay overhead versus monolithic replay: `1.194735x`;
+  - verdict printed.
+- Interpretation:
+  - a Gemma3-like launch count alone does not reproduce Ferrum's prior
+    `CUDA_ERROR_OUT_OF_MEMORY` during `--unified-graph` instantiation;
+  - the remaining suspect is the real captured content/scope: Marlin and
+    attention resource usage, graph memory-pool interaction, and/or final
+    norm/lm_head/logit packing being captured into one large graph;
+  - next implementation direction is vLLM-style segmented/breakable diagnostic
+    graph capture with persistent buffers, not another runtime knob sweep.
+- Gate status:
+  - diagnostic CUDA evidence only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
 ## 2026-06-16 YM — W2 vLLM source diff checkpoint: dense Marlin ruled out, focus unified graph correctness
 
 - Artifact:

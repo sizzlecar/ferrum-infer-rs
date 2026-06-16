@@ -1,0 +1,44 @@
+{
+  "artifact_dir": "docs/goals/model-coverage-2026-06-12/artifacts/w2_cuda_graph_segment_native_probe_2026-06-16",
+  "binary_sha256": "9614573b5df34e77e971e57cc3a43f0b2154368912c4fe9d022eb5fa2cdd2a9b",
+  "command": "nvcc -O3 -arch=sm_89 -std=c++17 cuda_graph_segment_probe.cu -lcuda -lcudart -o cuda_graph_segment_probe && ./cuda_graph_segment_probe --segment-layers=1 --timed-iters=60 --warmup-iters=6",
+  "hardware": {
+    "driver": "565.77",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "instance_id": 40826362,
+    "nvcc": "12.4.131",
+    "nvidia_smi_cuda": "12.7"
+  },
+  "interpretation": {
+    "monolithic_simple_graph_instantiated": true,
+    "next_direction": "segment/break real Ferrum unified graph around attention/layer groups and exclude final logits/lm_head from the large captured region before using graph for performance claims",
+    "segmented_simple_graph_instantiated": true,
+    "simple_launch_count_is_not_sufficient_to_explain_ferrum_unified_graph_oom": true
+  },
+  "lane": "W2 Gemma3 graph capture granularity native diagnostic",
+  "local_git_head": "c7250e824131168ea59babb7efad6b944a3d6fcf",
+  "local_git_status_short_for_touched_files": "",
+  "metrics": {
+    "checksum32": 104.03074646,
+    "eager_ms_per_step": 1.108744,
+    "monolithic_instantiate_ms": 1.963643,
+    "monolithic_replay_ms_per_step": 0.795237,
+    "monolithic_speedup_vs_eager": 1.394231,
+    "segmented_graphs": 62,
+    "segmented_instantiate_total_ms": 2.662781,
+    "segmented_over_monolithic_replay": 1.194735,
+    "segmented_replay_ms_per_step": 0.880079,
+    "segmented_speedup_vs_eager": 1.259823
+  },
+  "pass_line": null,
+  "release_grade": false,
+  "status": "PASS",
+  "vast_cleanup": {
+    "actual_status": "exited",
+    "cur_state": "stopped",
+    "intended_status": "stopped",
+    "stop_poll_file": "docs/goals/model-coverage-2026-06-12/artifacts/w2_cuda_graph_segment_native_probe_2026-06-16/vast/stop_poll_02.json"
+  },
+  "verdict": true,
+  "vllm_source_path": "/Users/chejinxuan/py_ws/vllm"
+}
