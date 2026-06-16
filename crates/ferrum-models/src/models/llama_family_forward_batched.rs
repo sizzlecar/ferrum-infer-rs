@@ -21,8 +21,9 @@ use ferrum_types::{Activation, Result};
 
 #[cfg(feature = "cuda")]
 use ferrum_kernels::backend::cuda::marlin::{
-    drain_marlin_profile_by_projection, MARLIN_GATHER_CALLS, MARLIN_GATHER_TIME_US,
-    MARLIN_KERNEL_CALLS, MARLIN_KERNEL_TIME_US, MARLIN_WS_ZERO_CALLS, MARLIN_WS_ZERO_TIME_US,
+    drain_marlin_profile_by_projection, MarlinProfileBucketStats, MARLIN_GATHER_CALLS,
+    MARLIN_GATHER_TIME_US, MARLIN_KERNEL_CALLS, MARLIN_KERNEL_TIME_US, MARLIN_WS_ZERO_CALLS,
+    MARLIN_WS_ZERO_TIME_US,
 };
 
 use super::llama_family::{
@@ -204,8 +205,78 @@ static UNIFIED_GRAPH_CAPTURE_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const UNIFIED_GRAPH_MAX_CACHED_KEYS: usize = 16;
 
+static UNIFIED_QKV_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_QKV_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_QKR_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_QKR_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_ATTN_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_O_PROJ_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_O_PROJ_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_NORM_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_GATE_UP_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_ACT_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_ACT_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_DOWN_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_RESID_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_RESID_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_FINAL_NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_FINAL_NORM_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_FINAL_COPY_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_FINAL_COPY_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_LM_HEAD_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_LM_HEAD_CALLS: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_READBACK_TIME_US: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_READBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+
 fn should_log_unified_graph_count(count: u64) -> bool {
     count.is_power_of_two()
+}
+
+fn should_log_unified_op_profile_call(call: u64) -> bool {
+    call < 16 || call.is_multiple_of(64)
+}
+
+#[cfg(feature = "cuda")]
+fn format_marlin_projection_bucket(label: &str, stats: MarlinProfileBucketStats) -> String {
+    format!(
+        "{label}_ws={}us({}) {label}_gather={}us({}) {label}_kernel={}us({})",
+        stats.ws_zero_us,
+        stats.ws_zero_calls,
+        stats.gather_us,
+        stats.gather_calls,
+        stats.kernel_us,
+        stats.kernel_calls
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn drain_and_format_marlin_projection_profile() -> String {
+    let profile = drain_marlin_profile_by_projection();
+    [
+        format_marlin_projection_bucket("marlin_qkv", profile.qkv),
+        format_marlin_projection_bucket("marlin_o", profile.o_proj),
+        format_marlin_projection_bucket("marlin_gate_up", profile.gate_up),
+        format_marlin_projection_bucket("marlin_down", profile.down),
+        format_marlin_projection_bucket("marlin_lm_head", profile.lm_head),
+        format_marlin_projection_bucket("marlin_other", profile.other),
+    ]
+    .join(" ")
+}
+
+#[cfg(not(feature = "cuda"))]
+fn drain_and_format_marlin_projection_profile() -> &'static str {
+    concat!(
+        "marlin_qkv_ws=0us(0) marlin_qkv_gather=0us(0) marlin_qkv_kernel=0us(0) ",
+        "marlin_o_ws=0us(0) marlin_o_gather=0us(0) marlin_o_kernel=0us(0) ",
+        "marlin_gate_up_ws=0us(0) marlin_gate_up_gather=0us(0) marlin_gate_up_kernel=0us(0) ",
+        "marlin_down_ws=0us(0) marlin_down_gather=0us(0) marlin_down_kernel=0us(0) ",
+        "marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) ",
+        "marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0)"
+    )
 }
 
 fn unified_graph_scope_label(scope: UnifiedGraphCaptureScope) -> &'static str {
@@ -370,10 +441,10 @@ mod tests {
     use super::{
         batched_decode_graph_key, format_logit_top, logit_row_diagnostics,
         should_log_batched_graph_replay_count, should_log_unified_graph_count,
-        should_log_unified_logits_diag, should_use_batched_decode_graph,
-        unified_graph_capture_skip_reason, unified_graph_scope_label, LlamaBatchedRuntimeConfig,
-        UnifiedGraphCaptureScope, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
-        UNIFIED_GRAPH_MAX_CACHED_KEYS,
+        should_log_unified_logits_diag, should_log_unified_op_profile_call,
+        should_use_batched_decode_graph, unified_graph_capture_skip_reason,
+        unified_graph_scope_label, LlamaBatchedRuntimeConfig, UnifiedGraphCaptureScope,
+        BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT, UNIFIED_GRAPH_MAX_CACHED_KEYS,
     };
 
     #[test]
@@ -546,6 +617,16 @@ mod tests {
         assert!(!should_log_unified_logits_diag(8));
         assert!(!should_log_unified_logits_diag(63));
         assert!(should_log_unified_logits_diag(64));
+    }
+
+    #[test]
+    fn unified_op_profile_uses_front_loaded_sampling() {
+        for call in 0..16 {
+            assert!(should_log_unified_op_profile_call(call));
+        }
+        assert!(!should_log_unified_op_profile_call(16));
+        assert!(!should_log_unified_op_profile_call(63));
+        assert!(should_log_unified_op_profile_call(64));
     }
 }
 
@@ -1743,6 +1824,61 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // must be settled.
         B::sync(&mut ctx);
 
+        macro_rules! reset_profile_counter {
+            ($us:expr, $n:expr) => {{
+                $us.swap(0, Ordering::Relaxed);
+                $n.swap(0, Ordering::Relaxed);
+            }};
+        }
+        macro_rules! take_profile_counter {
+            ($us:expr, $n:expr) => {{
+                (
+                    $us.swap(0, Ordering::Relaxed),
+                    $n.swap(0, Ordering::Relaxed),
+                )
+            }};
+        }
+        macro_rules! add_profile_counter {
+            ($us:expr, $n:expr, $elapsed_us:expr) => {{
+                $us.fetch_add($elapsed_us, Ordering::Relaxed);
+                $n.fetch_add(1, Ordering::Relaxed);
+            }};
+        }
+
+        let unified_op_profile =
+            self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(&ctx);
+        let unified_op_t0 = if unified_op_profile {
+            reset_profile_counter!(ATTN_TIME_US, ATTN_CALLS);
+            reset_profile_counter!(QKR_TIME_US, QKR_CALLS);
+            reset_profile_counter!(MATMUL_TIME_US, MATMUL_CALLS);
+            reset_profile_counter!(NORM_TIME_US, NORM_CALLS);
+            reset_profile_counter!(OTHER_TIME_US, OTHER_CALLS);
+            reset_profile_counter!(UNIFIED_QKV_TIME_US, UNIFIED_QKV_CALLS);
+            reset_profile_counter!(UNIFIED_QKR_TIME_US, UNIFIED_QKR_CALLS);
+            reset_profile_counter!(UNIFIED_ATTN_TIME_US, UNIFIED_ATTN_CALLS);
+            reset_profile_counter!(UNIFIED_O_PROJ_TIME_US, UNIFIED_O_PROJ_CALLS);
+            reset_profile_counter!(UNIFIED_NORM_TIME_US, UNIFIED_NORM_CALLS);
+            reset_profile_counter!(UNIFIED_GATE_UP_TIME_US, UNIFIED_GATE_UP_CALLS);
+            reset_profile_counter!(UNIFIED_ACT_TIME_US, UNIFIED_ACT_CALLS);
+            reset_profile_counter!(UNIFIED_DOWN_TIME_US, UNIFIED_DOWN_CALLS);
+            reset_profile_counter!(UNIFIED_RESID_TIME_US, UNIFIED_RESID_CALLS);
+            reset_profile_counter!(UNIFIED_FINAL_NORM_TIME_US, UNIFIED_FINAL_NORM_CALLS);
+            reset_profile_counter!(UNIFIED_FINAL_COPY_TIME_US, UNIFIED_FINAL_COPY_CALLS);
+            reset_profile_counter!(UNIFIED_LM_HEAD_TIME_US, UNIFIED_LM_HEAD_CALLS);
+            reset_profile_counter!(UNIFIED_READBACK_TIME_US, UNIFIED_READBACK_CALLS);
+            #[cfg(feature = "cuda")]
+            {
+                reset_profile_counter!(MARLIN_WS_ZERO_TIME_US, MARLIN_WS_ZERO_CALLS);
+                reset_profile_counter!(MARLIN_GATHER_TIME_US, MARLIN_GATHER_CALLS);
+                reset_profile_counter!(MARLIN_KERNEL_TIME_US, MARLIN_KERNEL_CALLS);
+                let _ = drain_marlin_profile_by_projection();
+            }
+            B::sync(&mut ctx);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let unified_profile = self.batched_cfg.unified_profile;
         let layer_t0 = if unified_profile {
             B::sync(&mut ctx);
@@ -1943,43 +2079,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 );
             }
         }
-        // Drain per-op counters every 64 calls when DECODE_OP_PROFILE is on.
-        // The op-profile macro inside unified_forward_layer adds to these
-        // global atomics; without a swap the totals would just keep growing.
-        if self.batched_cfg.decode_op_profile {
-            static OP_DRAIN_CALLS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = OP_DRAIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n.is_multiple_of(64) {
-                use std::sync::atomic::Ordering;
-                let norm_us = NORM_TIME_US.swap(0, Ordering::Relaxed);
-                let norm_n = NORM_CALLS.swap(0, Ordering::Relaxed);
-                let mm_us = MATMUL_TIME_US.swap(0, Ordering::Relaxed);
-                let mm_n = MATMUL_CALLS.swap(0, Ordering::Relaxed);
-                let qkr_us = QKR_TIME_US.swap(0, Ordering::Relaxed);
-                let qkr_n = QKR_CALLS.swap(0, Ordering::Relaxed);
-                let attn_us = ATTN_TIME_US.swap(0, Ordering::Relaxed);
-                let attn_n = ATTN_CALLS.swap(0, Ordering::Relaxed);
-                let other_us = OTHER_TIME_US.swap(0, Ordering::Relaxed);
-                let other_n = OTHER_CALLS.swap(0, Ordering::Relaxed);
-                let bucket = |label: &str, n: u64, us: u64| {
-                    if n > 0 {
-                        eprintln!(
-                            "[unified-op] {label}: {} calls {} ms total avg={}us",
-                            n,
-                            us / 1000,
-                            us / n.max(1)
-                        );
-                    }
-                };
-                eprintln!("[unified-op] drain#{n} (over last 64 unified_forward calls):");
-                bucket("rms_norm/fused_rms", norm_n, norm_us);
-                bucket("matmul (qkv/o/gate_up/down)", mm_n, mm_us);
-                bucket("split_qkv_norm_rope_paged", qkr_n, qkr_us);
-                bucket("paged_varlen_attention", attn_n, attn_us);
-                bucket("silu/residual_add", other_n, other_us);
-            }
-        }
+        // Unified op profiling is drained once near function exit so a single
+        // line covers layers, final pack, lm_head, and logits readback.
 
         // Take scratch buffers we'll either record into the graph or
         // restore on return — outside the !did_pure_replay branch so
@@ -1992,6 +2093,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         macro_rules! run_unified_final_pack {
             () => {{
+                let final_norm_t0 = if unified_op_profile {
+                    B::sync(&mut ctx);
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 if let Some(device) = device_residual_shadow.as_ref() {
                     B::rms_norm_f32_to_activation(
                         &mut ctx,
@@ -2013,7 +2120,23 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         h,
                     );
                 }
+                if let Some(t0) = final_norm_t0 {
+                    B::sync(&mut ctx);
+                    let elapsed_us = t0.elapsed().as_micros() as u64;
+                    add_profile_counter!(NORM_TIME_US, NORM_CALLS, elapsed_us);
+                    add_profile_counter!(
+                        UNIFIED_FINAL_NORM_TIME_US,
+                        UNIFIED_FINAL_NORM_CALLS,
+                        elapsed_us
+                    );
+                }
                 if num_sampled > 0 {
+                    let final_copy_t0 = if unified_op_profile {
+                        B::sync(&mut ctx);
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let packed_normed = self
                         .scratch
                         .unified_packed_normed
@@ -2022,6 +2145,16 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     for (j, &(_, global)) in final_indices.iter().enumerate() {
                         B::copy_slice(&mut ctx, &norm_out, global * h, packed_normed, j * h, h);
                     }
+                    if let Some(t0) = final_copy_t0 {
+                        B::sync(&mut ctx);
+                        let elapsed_us = t0.elapsed().as_micros() as u64;
+                        add_profile_counter!(OTHER_TIME_US, OTHER_CALLS, elapsed_us);
+                        add_profile_counter!(
+                            UNIFIED_FINAL_COPY_TIME_US,
+                            UNIFIED_FINAL_COPY_CALLS,
+                            elapsed_us
+                        );
+                    }
                 }
             }};
         }
@@ -2029,6 +2162,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         macro_rules! run_unified_lm_head {
             () => {{
                 if num_sampled > 0 {
+                    let lm_head_t0 = if unified_op_profile {
+                        B::sync(&mut ctx);
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let packed_normed = self
                         .scratch
                         .unified_packed_normed
@@ -2049,6 +2188,16 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                             "llama.unified.lm_head",
                         );
                         lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
+                    }
+                    if let Some(t0) = lm_head_t0 {
+                        B::sync(&mut ctx);
+                        let elapsed_us = t0.elapsed().as_micros() as u64;
+                        add_profile_counter!(MATMUL_TIME_US, MATMUL_CALLS, elapsed_us);
+                        add_profile_counter!(
+                            UNIFIED_LM_HEAD_TIME_US,
+                            UNIFIED_LM_HEAD_CALLS,
+                            elapsed_us
+                        );
                     }
                 }
             }};
@@ -2128,7 +2277,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_packed_logits
                 .as_ref()
                 .expect("unified_packed_logits missing");
+            let readback_t0 = unified_op_profile.then(std::time::Instant::now);
             let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
+            if let Some(t0) = readback_t0 {
+                let elapsed_us = t0.elapsed().as_micros() as u64;
+                add_profile_counter!(UNIFIED_READBACK_TIME_US, UNIFIED_READBACK_CALLS, elapsed_us);
+            }
             if self.batched_cfg.decode_op_profile {
                 static UNIFIED_LOGITS_DIAG_CALLS: AtomicU64 = AtomicU64::new(0);
                 let call = UNIFIED_LOGITS_DIAG_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -2154,6 +2308,140 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
                 let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
                 out[orig_idx] = Some(row);
+            }
+        }
+
+        if let Some(t0) = unified_op_t0 {
+            B::sync(&mut ctx);
+            static UNIFIED_OP_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
+            let call = UNIFIED_OP_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed);
+            let total_us = t0.elapsed().as_micros() as u64;
+            let (attn_us, attn_n) = take_profile_counter!(ATTN_TIME_US, ATTN_CALLS);
+            let (qkr_us, qkr_n) = take_profile_counter!(QKR_TIME_US, QKR_CALLS);
+            let (mm_us, mm_n) = take_profile_counter!(MATMUL_TIME_US, MATMUL_CALLS);
+            let (norm_us, norm_n) = take_profile_counter!(NORM_TIME_US, NORM_CALLS);
+            let (other_us, other_n) = take_profile_counter!(OTHER_TIME_US, OTHER_CALLS);
+            let (qkv_us, qkv_n) = take_profile_counter!(UNIFIED_QKV_TIME_US, UNIFIED_QKV_CALLS);
+            let (uqkr_us, uqkr_n) = take_profile_counter!(UNIFIED_QKR_TIME_US, UNIFIED_QKR_CALLS);
+            let (uattn_us, uattn_n) =
+                take_profile_counter!(UNIFIED_ATTN_TIME_US, UNIFIED_ATTN_CALLS);
+            let (o_proj_us, o_proj_n) =
+                take_profile_counter!(UNIFIED_O_PROJ_TIME_US, UNIFIED_O_PROJ_CALLS);
+            let (unorm_us, unorm_n) =
+                take_profile_counter!(UNIFIED_NORM_TIME_US, UNIFIED_NORM_CALLS);
+            let (gate_up_us, gate_up_n) =
+                take_profile_counter!(UNIFIED_GATE_UP_TIME_US, UNIFIED_GATE_UP_CALLS);
+            let (act_us, act_n) = take_profile_counter!(UNIFIED_ACT_TIME_US, UNIFIED_ACT_CALLS);
+            let (down_us, down_n) = take_profile_counter!(UNIFIED_DOWN_TIME_US, UNIFIED_DOWN_CALLS);
+            let (resid_us, resid_n) =
+                take_profile_counter!(UNIFIED_RESID_TIME_US, UNIFIED_RESID_CALLS);
+            let (final_norm_us, final_norm_n) =
+                take_profile_counter!(UNIFIED_FINAL_NORM_TIME_US, UNIFIED_FINAL_NORM_CALLS);
+            let (final_copy_us, final_copy_n) =
+                take_profile_counter!(UNIFIED_FINAL_COPY_TIME_US, UNIFIED_FINAL_COPY_CALLS);
+            let (lm_head_us, lm_head_n) =
+                take_profile_counter!(UNIFIED_LM_HEAD_TIME_US, UNIFIED_LM_HEAD_CALLS);
+            let (readback_us, readback_n) =
+                take_profile_counter!(UNIFIED_READBACK_TIME_US, UNIFIED_READBACK_CALLS);
+            #[cfg(feature = "cuda")]
+            let (
+                marlin_ws_zero_us,
+                marlin_ws_zero_n,
+                marlin_gather_us,
+                marlin_gather_n,
+                marlin_kernel_us,
+                marlin_kernel_n,
+            ) = {
+                let ws_us = MARLIN_WS_ZERO_TIME_US.swap(0, Ordering::Relaxed);
+                let ws_n = MARLIN_WS_ZERO_CALLS.swap(0, Ordering::Relaxed);
+                let gather_us = MARLIN_GATHER_TIME_US.swap(0, Ordering::Relaxed);
+                let gather_n = MARLIN_GATHER_CALLS.swap(0, Ordering::Relaxed);
+                let kernel_us = MARLIN_KERNEL_TIME_US.swap(0, Ordering::Relaxed);
+                let kernel_n = MARLIN_KERNEL_CALLS.swap(0, Ordering::Relaxed);
+                (ws_us, ws_n, gather_us, gather_n, kernel_us, kernel_n)
+            };
+            #[cfg(not(feature = "cuda"))]
+            let (
+                marlin_ws_zero_us,
+                marlin_ws_zero_n,
+                marlin_gather_us,
+                marlin_gather_n,
+                marlin_kernel_us,
+                marlin_kernel_n,
+            ) = (0, 0, 0, 0, 0, 0);
+            let marlin_proj = drain_and_format_marlin_projection_profile();
+            let wrapped_us = qkv_us
+                + uqkr_us
+                + uattn_us
+                + o_proj_us
+                + unorm_us
+                + gate_up_us
+                + act_us
+                + down_us
+                + resid_us
+                + final_norm_us
+                + final_copy_us
+                + lm_head_us
+                + readback_us;
+            let unwrapped_us = total_us.saturating_sub(wrapped_us);
+            if should_log_unified_op_profile_call(call) {
+                let prefill_items = items.iter().filter(|(_, q, _, _)| q.len() > 1).count();
+                let decode_items = items.len().saturating_sub(prefill_items);
+                eprintln!(
+                    "[unified-op-profile] call#{} m_total={} num_seqs={} prefill={} decode={} max_kv={} sampled={} total={}us qkv={}us({}) qkr={}us({}) attn={}us({}) o_proj={}us({}) norm={}us({}) gate_up={}us({}) act={}us({}) down={}us({}) resid={}us({}) final_norm={}us({}) final_copy={}us({}) lm_head={}us({}) readback={}us({}) generic_matmul={}us({}) generic_attn={}us({}) generic_qkr={}us({}) generic_norm={}us({}) generic_other={}us({}) marlin_ws_zero={}us({}) marlin_gather={}us({}) marlin_kernel={}us({}) {} unwrapped={}us",
+                    call,
+                    m_total,
+                    num_seqs,
+                    prefill_items,
+                    decode_items,
+                    max_kv_len,
+                    num_sampled,
+                    total_us,
+                    qkv_us,
+                    qkv_n,
+                    uqkr_us,
+                    uqkr_n,
+                    uattn_us,
+                    uattn_n,
+                    o_proj_us,
+                    o_proj_n,
+                    unorm_us,
+                    unorm_n,
+                    gate_up_us,
+                    gate_up_n,
+                    act_us,
+                    act_n,
+                    down_us,
+                    down_n,
+                    resid_us,
+                    resid_n,
+                    final_norm_us,
+                    final_norm_n,
+                    final_copy_us,
+                    final_copy_n,
+                    lm_head_us,
+                    lm_head_n,
+                    readback_us,
+                    readback_n,
+                    mm_us,
+                    mm_n,
+                    attn_us,
+                    attn_n,
+                    qkr_us,
+                    qkr_n,
+                    norm_us,
+                    norm_n,
+                    other_us,
+                    other_n,
+                    marlin_ws_zero_us,
+                    marlin_ws_zero_n,
+                    marlin_gather_us,
+                    marlin_gather_n,
+                    marlin_kernel_us,
+                    marlin_kernel_n,
+                    marlin_proj,
+                    unwrapped_us
+                );
             }
         }
 
@@ -2224,14 +2512,17 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let op_prof = self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(ctx);
 
         macro_rules! time_op {
-            ($bucket_us:expr, $bucket_n:expr, $body:block) => {{
+            ($bucket_us:expr, $bucket_n:expr, $detail_us:expr, $detail_n:expr, $body:block) => {{
                 if op_prof {
                     B::sync(ctx);
                     let _t0 = std::time::Instant::now();
                     $body
                     B::sync(ctx);
-                    $bucket_us.fetch_add(_t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let elapsed_us = _t0.elapsed().as_micros() as u64;
+                    $bucket_us.fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
                     $bucket_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    $detail_us.fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+                    $detail_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
                     $body
                 }
@@ -2239,44 +2530,56 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
 
         // 1. rms_norm [M_total, h] → unified_norm_out
-        time_op!(NORM_TIME_US, NORM_CALLS, {
-            let norm_out = self
-                .scratch
-                .unified_norm_out
-                .as_mut()
-                .expect("unified_norm_out missing");
-            if let Some(device) = device_residual.as_mut() {
-                B::rms_norm_f32_to_activation(
-                    ctx,
-                    &**device,
-                    &layer.input_ln_w,
-                    eps,
-                    norm_out,
-                    m_total,
-                    h,
-                );
-            } else {
-                B::rms_norm(ctx, residual, &layer.input_ln_w, eps, norm_out, m_total, h);
+        time_op!(
+            NORM_TIME_US,
+            NORM_CALLS,
+            UNIFIED_NORM_TIME_US,
+            UNIFIED_NORM_CALLS,
+            {
+                let norm_out = self
+                    .scratch
+                    .unified_norm_out
+                    .as_mut()
+                    .expect("unified_norm_out missing");
+                if let Some(device) = device_residual.as_mut() {
+                    B::rms_norm_f32_to_activation(
+                        ctx,
+                        &**device,
+                        &layer.input_ln_w,
+                        eps,
+                        norm_out,
+                        m_total,
+                        h,
+                    );
+                } else {
+                    B::rms_norm(ctx, residual, &layer.input_ln_w, eps, norm_out, m_total, h);
+                }
             }
-        });
+        );
 
         // 2. qkv_proj GEMM (m=M_total): unified_norm_out → unified_qkv_out
-        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
-            let norm_out = self
-                .scratch
-                .unified_norm_out
-                .as_ref()
-                .expect("unified_norm_out missing");
-            let qkv_out = self
-                .scratch
-                .unified_qkv_out
-                .as_mut()
-                .expect("unified_qkv_out missing");
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.qkv_proj");
-            layer.qkv_proj.forward(ctx, norm_out, qkv_out, m_total);
-        });
+        time_op!(
+            MATMUL_TIME_US,
+            MATMUL_CALLS,
+            UNIFIED_QKV_TIME_US,
+            UNIFIED_QKV_CALLS,
+            {
+                let norm_out = self
+                    .scratch
+                    .unified_norm_out
+                    .as_ref()
+                    .expect("unified_norm_out missing");
+                let qkv_out = self
+                    .scratch
+                    .unified_qkv_out
+                    .as_mut()
+                    .expect("unified_qkv_out missing");
+                #[cfg(feature = "cuda")]
+                let _alloc_label =
+                    ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.qkv_proj");
+                layer.qkv_proj.forward(ctx, norm_out, qkv_out, m_total);
+            }
+        );
 
         // 3. Single-launch varlen split_qkv_norm_rope. Reads
         //    cu_seqlens_q / pos_offsets / block_tables from device
@@ -2300,282 +2603,332 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let _ = pos_offsets;
         let _ = qkv_stride;
 
-        time_op!(QKR_TIME_US, QKR_CALLS, {
-            let qkv_out = self
-                .scratch
-                .unified_qkv_out
-                .as_ref()
-                .expect("unified_qkv_out missing");
-            let packed_q = self
-                .scratch
-                .unified_packed_q
-                .as_mut()
-                .expect("unified_packed_q missing");
-            let cu_seqlens_buf = self
-                .scratch
-                .unified_cu_seqlens_q
-                .as_ref()
-                .expect("unified_cu_seqlens_q missing");
-            let pos_offsets_buf = self
-                .scratch
-                .unified_pos_offsets
-                .as_ref()
-                .expect("unified_pos_offsets missing");
-            let bt_buf = self
-                .scratch
-                .unified_block_tables
-                .as_ref()
-                .expect("unified_block_tables missing");
-            B::split_qkv_norm_rope_into_paged_cache_varlen(
-                ctx,
-                qkv_out,
-                q_norm_w,
-                k_norm_w,
-                rope_cos,
-                rope_sin,
-                packed_q,
-                pool_k,
-                pool_v,
-                cu_seqlens_buf,
-                pos_offsets_buf,
-                bt_buf,
-                num_seqs,
-                m_total,
-                nh,
-                nkv,
-                hd,
-                eps,
-                qk_mode,
-                block_size,
-                max_blocks_per_seq,
-            )
-            .expect("paged unified: split_qkv_norm_rope_into_paged_cache_varlen");
-        });
+        time_op!(
+            QKR_TIME_US,
+            QKR_CALLS,
+            UNIFIED_QKR_TIME_US,
+            UNIFIED_QKR_CALLS,
+            {
+                let qkv_out = self
+                    .scratch
+                    .unified_qkv_out
+                    .as_ref()
+                    .expect("unified_qkv_out missing");
+                let packed_q = self
+                    .scratch
+                    .unified_packed_q
+                    .as_mut()
+                    .expect("unified_packed_q missing");
+                let cu_seqlens_buf = self
+                    .scratch
+                    .unified_cu_seqlens_q
+                    .as_ref()
+                    .expect("unified_cu_seqlens_q missing");
+                let pos_offsets_buf = self
+                    .scratch
+                    .unified_pos_offsets
+                    .as_ref()
+                    .expect("unified_pos_offsets missing");
+                let bt_buf = self
+                    .scratch
+                    .unified_block_tables
+                    .as_ref()
+                    .expect("unified_block_tables missing");
+                B::split_qkv_norm_rope_into_paged_cache_varlen(
+                    ctx,
+                    qkv_out,
+                    q_norm_w,
+                    k_norm_w,
+                    rope_cos,
+                    rope_sin,
+                    packed_q,
+                    pool_k,
+                    pool_v,
+                    cu_seqlens_buf,
+                    pos_offsets_buf,
+                    bt_buf,
+                    num_seqs,
+                    m_total,
+                    nh,
+                    nkv,
+                    hd,
+                    eps,
+                    qk_mode,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("paged unified: split_qkv_norm_rope_into_paged_cache_varlen");
+            }
+        );
 
         // 4. paged_varlen_attention: one call covering all M_total tokens.
-        time_op!(ATTN_TIME_US, ATTN_CALLS, {
-            let packed_q = self
-                .scratch
-                .unified_packed_q
-                .as_ref()
-                .expect("unified_packed_q missing");
-            let cu_seqlens_buf = self
-                .scratch
-                .unified_cu_seqlens_q
-                .as_ref()
-                .expect("unified_cu_seqlens_q missing");
-            let pos_offsets_buf = self
-                .scratch
-                .unified_pos_offsets
-                .as_ref()
-                .expect("unified_pos_offsets missing");
-            let bt_buf = self
-                .scratch
-                .unified_block_tables
-                .as_ref()
-                .expect("unified_block_tables missing");
-            let attn_out = self
-                .scratch
-                .unified_attn_out
-                .as_mut()
-                .expect("unified_attn_out missing");
-            B::paged_varlen_attention(
-                ctx,
-                packed_q,
-                pool_k,
-                pool_v,
-                attn_out,
-                cu_seqlens_buf,
-                pos_offsets_buf,
-                bt_buf,
-                num_seqs,
-                m_total,
-                max_kv_len,
-                nh,
-                nkv,
-                hd,
-                layer_window,
-                block_size,
-                max_blocks_per_seq,
-            )
-            .expect("paged_varlen_attention");
-        });
+        time_op!(
+            ATTN_TIME_US,
+            ATTN_CALLS,
+            UNIFIED_ATTN_TIME_US,
+            UNIFIED_ATTN_CALLS,
+            {
+                let packed_q = self
+                    .scratch
+                    .unified_packed_q
+                    .as_ref()
+                    .expect("unified_packed_q missing");
+                let cu_seqlens_buf = self
+                    .scratch
+                    .unified_cu_seqlens_q
+                    .as_ref()
+                    .expect("unified_cu_seqlens_q missing");
+                let pos_offsets_buf = self
+                    .scratch
+                    .unified_pos_offsets
+                    .as_ref()
+                    .expect("unified_pos_offsets missing");
+                let bt_buf = self
+                    .scratch
+                    .unified_block_tables
+                    .as_ref()
+                    .expect("unified_block_tables missing");
+                let attn_out = self
+                    .scratch
+                    .unified_attn_out
+                    .as_mut()
+                    .expect("unified_attn_out missing");
+                B::paged_varlen_attention(
+                    ctx,
+                    packed_q,
+                    pool_k,
+                    pool_v,
+                    attn_out,
+                    cu_seqlens_buf,
+                    pos_offsets_buf,
+                    bt_buf,
+                    num_seqs,
+                    m_total,
+                    max_kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    layer_window,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("paged_varlen_attention");
+            }
+        );
 
         // 5. o_proj (M_total): attn_out → o_proj_out
-        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
-            let attn_out = self
-                .scratch
-                .unified_attn_out
-                .as_ref()
-                .expect("unified_attn_out missing");
-            let o_proj_out = self
-                .scratch
-                .unified_o_proj_out
-                .as_mut()
-                .expect("unified_o_proj_out missing");
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.o_proj");
-            layer.o_proj.forward(ctx, attn_out, o_proj_out, m_total);
-        });
+        time_op!(
+            MATMUL_TIME_US,
+            MATMUL_CALLS,
+            UNIFIED_O_PROJ_TIME_US,
+            UNIFIED_O_PROJ_CALLS,
+            {
+                let attn_out = self
+                    .scratch
+                    .unified_attn_out
+                    .as_ref()
+                    .expect("unified_attn_out missing");
+                let o_proj_out = self
+                    .scratch
+                    .unified_o_proj_out
+                    .as_mut()
+                    .expect("unified_o_proj_out missing");
+                #[cfg(feature = "cuda")]
+                let _alloc_label =
+                    ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.o_proj");
+                layer.o_proj.forward(ctx, attn_out, o_proj_out, m_total);
+            }
+        );
 
         // 6. residual + pre-MLP norm.
         //    Legacy Llama path: fused residual add + RMSNorm.
         //    Gemma sandwich path: RMSNorm(o_proj_out) -> F32 residual add,
         //    then RMSNorm(F32 residual) for pre-MLP input.
-        time_op!(NORM_TIME_US, NORM_CALLS, {
-            let o_proj_out = self
-                .scratch
-                .unified_o_proj_out
-                .as_ref()
-                .expect("unified_o_proj_out missing");
-            let norm_out = self
-                .scratch
-                .unified_norm_out
-                .as_mut()
-                .expect("unified_norm_out missing");
-            if let Some(post_attn_w) = &layer.post_attn_ln_w {
-                if let Some(device) = device_residual.as_mut() {
-                    let branch = device_branch
-                        .as_mut()
-                        .expect("unified F32 sandwich branch scratch missing");
-                    B::rms_norm_activation_add_to_f32(
+        time_op!(
+            NORM_TIME_US,
+            NORM_CALLS,
+            UNIFIED_NORM_TIME_US,
+            UNIFIED_NORM_CALLS,
+            {
+                let o_proj_out = self
+                    .scratch
+                    .unified_o_proj_out
+                    .as_ref()
+                    .expect("unified_o_proj_out missing");
+                let norm_out = self
+                    .scratch
+                    .unified_norm_out
+                    .as_mut()
+                    .expect("unified_norm_out missing");
+                if let Some(post_attn_w) = &layer.post_attn_ln_w {
+                    if let Some(device) = device_residual.as_mut() {
+                        let branch = device_branch
+                            .as_mut()
+                            .expect("unified F32 sandwich branch scratch missing");
+                        B::rms_norm_activation_add_to_f32(
+                            ctx,
+                            o_proj_out,
+                            post_attn_w,
+                            eps,
+                            &mut **device,
+                            &mut **branch,
+                            m_total,
+                            h,
+                        );
+                        B::rms_norm_f32_to_activation(
+                            ctx,
+                            &**device,
+                            &layer.post_ln_w,
+                            eps,
+                            norm_out,
+                            m_total,
+                            h,
+                        );
+                    } else {
+                        let tmp = self
+                            .scratch
+                            .unified_sandwich_tmp
+                            .as_mut()
+                            .expect("unified sandwich tmp missing");
+                        B::rms_norm(ctx, o_proj_out, post_attn_w, eps, tmp, m_total, h);
+                        B::add_inplace(ctx, residual, tmp, m_total * h);
+                        B::rms_norm(ctx, residual, &layer.post_ln_w, eps, norm_out, m_total, h);
+                    }
+                } else {
+                    B::fused_add_rms_norm(
                         ctx,
+                        residual,
                         o_proj_out,
-                        post_attn_w,
-                        eps,
-                        &mut **device,
-                        &mut **branch,
-                        m_total,
-                        h,
-                    );
-                    B::rms_norm_f32_to_activation(
-                        ctx,
-                        &**device,
                         &layer.post_ln_w,
                         eps,
                         norm_out,
                         m_total,
                         h,
                     );
-                } else {
-                    let tmp = self
-                        .scratch
-                        .unified_sandwich_tmp
-                        .as_mut()
-                        .expect("unified sandwich tmp missing");
-                    B::rms_norm(ctx, o_proj_out, post_attn_w, eps, tmp, m_total, h);
-                    B::add_inplace(ctx, residual, tmp, m_total * h);
-                    B::rms_norm(ctx, residual, &layer.post_ln_w, eps, norm_out, m_total, h);
                 }
-            } else {
-                B::fused_add_rms_norm(
-                    ctx,
-                    residual,
-                    o_proj_out,
-                    &layer.post_ln_w,
-                    eps,
-                    norm_out,
-                    m_total,
-                    h,
-                );
             }
-        });
+        );
 
         // 7. gate_up_proj
-        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
-            let norm_out = self
-                .scratch
-                .unified_norm_out
-                .as_ref()
-                .expect("unified_norm_out missing");
-            let gate_up_out = self
-                .scratch
-                .unified_gate_up_out
-                .as_mut()
-                .expect("unified_gate_up_out missing");
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.gate_up_proj");
-            layer
-                .gate_up_proj
-                .forward(ctx, norm_out, gate_up_out, m_total);
-        });
+        time_op!(
+            MATMUL_TIME_US,
+            MATMUL_CALLS,
+            UNIFIED_GATE_UP_TIME_US,
+            UNIFIED_GATE_UP_CALLS,
+            {
+                let norm_out = self
+                    .scratch
+                    .unified_norm_out
+                    .as_ref()
+                    .expect("unified_norm_out missing");
+                let gate_up_out = self
+                    .scratch
+                    .unified_gate_up_out
+                    .as_mut()
+                    .expect("unified_gate_up_out missing");
+                #[cfg(feature = "cuda")]
+                let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(
+                    "llama.unified_layer.gate_up_proj",
+                );
+                layer
+                    .gate_up_proj
+                    .forward(ctx, norm_out, gate_up_out, m_total);
+            }
+        );
 
         // 8. Gated activation: SwiGLU for Llama, GeGLU for Gemma.
-        time_op!(OTHER_TIME_US, OTHER_CALLS, {
-            let gate_up_out = self
-                .scratch
-                .unified_gate_up_out
-                .as_ref()
-                .expect("unified_gate_up_out missing");
-            let silu_out = self
-                .scratch
-                .unified_silu_out
-                .as_mut()
-                .expect("unified_silu_out missing");
-            match self.cfg.activation {
-                Activation::GeluTanh => {
-                    B::fused_gelu_tanh_mul_split(ctx, gate_up_out, silu_out, m_total, im)
+        time_op!(
+            OTHER_TIME_US,
+            OTHER_CALLS,
+            UNIFIED_ACT_TIME_US,
+            UNIFIED_ACT_CALLS,
+            {
+                let gate_up_out = self
+                    .scratch
+                    .unified_gate_up_out
+                    .as_ref()
+                    .expect("unified_gate_up_out missing");
+                let silu_out = self
+                    .scratch
+                    .unified_silu_out
+                    .as_mut()
+                    .expect("unified_silu_out missing");
+                match self.cfg.activation {
+                    Activation::GeluTanh => {
+                        B::fused_gelu_tanh_mul_split(ctx, gate_up_out, silu_out, m_total, im)
+                    }
+                    _ => B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im),
                 }
-                _ => B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im),
             }
-        });
+        );
 
         // 9. down_proj
-        time_op!(MATMUL_TIME_US, MATMUL_CALLS, {
-            let silu_out = self
-                .scratch
-                .unified_silu_out
-                .as_ref()
-                .expect("unified_silu_out missing");
-            let mlp_out = self
-                .scratch
-                .unified_mlp_out
-                .as_mut()
-                .expect("unified_mlp_out missing");
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.down_proj");
-            layer.down_proj.forward(ctx, silu_out, mlp_out, m_total);
-        });
+        time_op!(
+            MATMUL_TIME_US,
+            MATMUL_CALLS,
+            UNIFIED_DOWN_TIME_US,
+            UNIFIED_DOWN_CALLS,
+            {
+                let silu_out = self
+                    .scratch
+                    .unified_silu_out
+                    .as_ref()
+                    .expect("unified_silu_out missing");
+                let mlp_out = self
+                    .scratch
+                    .unified_mlp_out
+                    .as_mut()
+                    .expect("unified_mlp_out missing");
+                #[cfg(feature = "cuda")]
+                let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(
+                    "llama.unified_layer.down_proj",
+                );
+                layer.down_proj.forward(ctx, silu_out, mlp_out, m_total);
+            }
+        );
 
         // 10. final residual add. Gemma sandwich path normalizes the MLP
         //     branch before adding it to the F32 residual shadow.
-        time_op!(OTHER_TIME_US, OTHER_CALLS, {
-            let mlp_out = self
-                .scratch
-                .unified_mlp_out
-                .as_ref()
-                .expect("unified_mlp_out missing");
-            if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
-                if let Some(device) = device_residual.as_mut() {
-                    let branch = device_branch
-                        .as_mut()
-                        .expect("unified F32 sandwich branch scratch missing");
-                    B::rms_norm_activation_add_to_f32(
-                        ctx,
-                        mlp_out,
-                        post_ffn_w,
-                        eps,
-                        &mut **device,
-                        &mut **branch,
-                        m_total,
-                        h,
-                    );
+        time_op!(
+            OTHER_TIME_US,
+            OTHER_CALLS,
+            UNIFIED_RESID_TIME_US,
+            UNIFIED_RESID_CALLS,
+            {
+                let mlp_out = self
+                    .scratch
+                    .unified_mlp_out
+                    .as_ref()
+                    .expect("unified_mlp_out missing");
+                if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
+                    if let Some(device) = device_residual.as_mut() {
+                        let branch = device_branch
+                            .as_mut()
+                            .expect("unified F32 sandwich branch scratch missing");
+                        B::rms_norm_activation_add_to_f32(
+                            ctx,
+                            mlp_out,
+                            post_ffn_w,
+                            eps,
+                            &mut **device,
+                            &mut **branch,
+                            m_total,
+                            h,
+                        );
+                    } else {
+                        let tmp = self
+                            .scratch
+                            .unified_sandwich_tmp
+                            .as_mut()
+                            .expect("unified sandwich tmp missing");
+                        B::rms_norm(ctx, mlp_out, post_ffn_w, eps, tmp, m_total, h);
+                        B::add_inplace(ctx, residual, tmp, m_total * h);
+                    }
                 } else {
-                    let tmp = self
-                        .scratch
-                        .unified_sandwich_tmp
-                        .as_mut()
-                        .expect("unified sandwich tmp missing");
-                    B::rms_norm(ctx, mlp_out, post_ffn_w, eps, tmp, m_total, h);
-                    B::add_inplace(ctx, residual, tmp, m_total * h);
+                    B::add_inplace(ctx, residual, mlp_out, m_total * h);
                 }
-            } else {
-                B::add_inplace(ctx, residual, mlp_out, m_total * h);
             }
-        });
+        );
     }
     /// Batched decode: process M concurrent requests at potentially different
     /// positions in one forward pass. GEMM-heavy ops (qkv_proj, o_proj,
