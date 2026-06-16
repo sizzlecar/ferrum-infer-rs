@@ -2,6 +2,47 @@
 
 进度日志,倒序。
 
+## 2026-06-17 YZ — W2 source checkpoint: same-iteration admission uses remaining decode-step budget
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_scheduler_same_iteration_admit_source_2026-06-17/`.
+- Scope:
+  - source-only scheduler checkpoint;
+  - no paid GPU instance was started;
+  - no release performance claim and no `MODEL_RELEASE_GRADE_W2 PASS` was
+    produced.
+- Bottleneck interpretation:
+  - the latest c16 CI diagnostic moved Ferrum from historical c16 LCB
+    `325.184 tok/s` to `386.462 tok/s`, but p95 ITL is still `58.728 ms`;
+  - vLLM's scheduler spends remaining per-step token budget on waiting
+    requests after running requests in the same scheduler step;
+  - Ferrum admitted waiting requests after decode/existing-prefill collection,
+    but only scheduled newly admitted prefills in the same iteration when the
+    current batch was otherwise empty;
+  - this creates a concrete one-iteration delay for closed-loop replacement
+    requests and is consistent with the remaining TTFT/ITL tail.
+- Source change:
+  - factored prefill collection into `add_prefill_requests_to_batch`;
+  - added request-ID de-duplication so prefill requests already scheduled
+    before admission cannot be scheduled twice;
+  - after waiting admission, newly admitted prefills can now use remaining
+    batch slot/token budget even when decode work is already present.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-scheduler newly_admitted_prefill_uses_remaining_budget_with_decode -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler active_decode_prefill_chunk_only_caps_when_decode_is_active -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler continuous -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler --lib` PASS;
+  - `cargo check -q -p ferrum-scheduler -p ferrum-engine -p ferrum-cli` PASS;
+  - `git diff --check` PASS.
+- Required next validation:
+  - restart the cached 1x4090 instance only for a minimal c16 ShareGPT CI
+    diagnostic;
+  - run product `ferrum run` and `ferrum serve` correctness first;
+  - then rerun the same c16 `bench-serve --fail-on-error --require-ci
+    --seed 9271 --n-repeats 3 --num-prompts 100` shape to see whether p95 ITL
+    and the remaining ~`6.46 tok/s` historical 80% gap move.
+
 ## 2026-06-17 YY — W2 CUDA diagnostic: active chunk reaches 78.69% of historical vLLM c16 LCB
 
 - Artifact:
