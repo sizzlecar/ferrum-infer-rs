@@ -2,6 +2,63 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YB — W2 CUDA checkpoint: producer-touch product prototype compiles and passes run/serve smoke
+
+- Artifacts:
+  - compile smoke:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w2_producer_touch_product_compile_2026-06-16/`;
+  - product correctness smoke:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w2_producer_touch_product_correctness_2026-06-16/`.
+- Source change:
+  - added typed backend API
+    `fused_gelu_tanh_mul_split_with_down_hint(...)`, with default fallback to
+    existing GeGLU behavior;
+  - CUDA uses the hint only when the downstream projection is a
+    `CudaMarlinLinear` backed by Marlin weights;
+  - Gemma unified and non-unified paths pass `layer.down_proj` as the hint for
+    `Activation::GeluTanh`;
+  - added CUDA kernel
+    `fused_gelu_tanh_mul_interleaved_f16_touch_down_qweight`, the product
+    analogue of the native `producer_touch_qweight_1x` signal.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -q -p ferrum-kernels -p ferrum-models` PASS.
+- Paid GPU compile lane:
+  - expected runtime/cost: 10-25 minutes, about USD 0.07-0.18 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/sync/build first failure or build
+    artifact collected;
+  - correctness gate:
+    `cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - build rc `0`, release profile finished in `3m 27s`.
+- Paid GPU correctness lane:
+  - expected runtime/cost: 10-25 minutes, about USD 0.07-0.18;
+  - stop condition: `ferrum run`/serve readiness/chat smoke/log scan first
+    hard failure or artifact collected, then stop instance;
+  - correctness gate: run output `5`, serve chat output `5` with usage, and
+    server error scan 0;
+  - performance command: none.
+- Correctness evidence:
+  - binary SHA256
+    `5078ea014ee5299a936de62f34475456f9a3c0500d34ab41a96ebcaf9c69fbd8`;
+  - `ferrum run` rc `0`, assistant content `5`, finish_reason `stop`,
+    `n_tokens=3`;
+  - `ferrum serve` readiness passed, chat rc `0`, response content `5`,
+    usage `prompt_tokens=23`, `completion_tokens=1`, `total_tokens=24`;
+  - `server/error_scan.txt` has `0` lines;
+  - `correctness_check.json` reports `ok=true`;
+  - Vast cleanup confirmed `stopped/exited`.
+- Interpretation:
+  - the native producer-touch cache-residency signal has now been converted to
+    a typed product prototype and cleared minimal product-entrypoint
+    correctness;
+  - this is still not performance evidence. The next step is a focused
+    same-dataset endpoint diagnostic before deciding whether to keep,
+    tune, or revert this product optimization.
+- Scope:
+  - no release-grade performance matrix was run;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
 ## 2026-06-16 YA — W2 native CUDA checkpoint: producer-integrated qweight touch has a real segment-time signal
 
 - Artifact:

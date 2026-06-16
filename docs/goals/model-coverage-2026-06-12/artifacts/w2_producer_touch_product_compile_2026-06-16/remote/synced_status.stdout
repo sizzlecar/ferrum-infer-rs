@@ -1,0 +1,7 @@
+ M crates/ferrum-kernels/kernels/fused_silu_mul.cu
+ M crates/ferrum-kernels/src/backend/cuda/mod.rs
+ M crates/ferrum-kernels/src/backend/traits.rs
+ M crates/ferrum-kernels/src/linear.rs
+ M crates/ferrum-kernels/src/quant_linear/cuda_marlin.rs
+ M crates/ferrum-models/src/models/llama_family.rs
+ M crates/ferrum-models/src/models/llama_family_forward_batched.rs

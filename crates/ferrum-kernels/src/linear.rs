@@ -23,6 +23,11 @@ pub trait Linear<B: Backend>: Send + Sync {
     fn in_features(&self) -> usize;
     fn out_features(&self) -> usize;
 
+    #[cfg(feature = "cuda")]
+    fn as_cuda_marlin_linear(&self) -> Option<&crate::quant_linear::cuda_marlin::CudaMarlinLinear> {
+        None
+    }
+
     /// Append GEMM work onto `ctx`. Caller flushes the context when results
     /// must be materialised.
     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize);

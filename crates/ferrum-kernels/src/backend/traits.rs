@@ -344,6 +344,20 @@ pub trait Backend: Send + Sync + Sized + 'static {
         panic!("fused_gelu_tanh_mul_split not implemented for this backend");
     }
 
+    /// GeGLU with an optional projection hint for backends that can use the
+    /// next down-projection metadata to preserve cache residency. The default
+    /// keeps existing behavior.
+    fn fused_gelu_tanh_mul_split_with_down_hint(
+        ctx: &mut Self::Context,
+        gate_up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        im: usize,
+        _down_proj: Option<&dyn crate::Linear<Self>>,
+    ) {
+        Self::fused_gelu_tanh_mul_split(ctx, gate_up, out, tokens, im);
+    }
+
     /// `buf[i] *= scale` over the first `len` elements. Gemma-family
     /// embedding scaling (×√hidden_size on residual-stream entry).
     /// Default round-trips through host memory — correct but slow;
