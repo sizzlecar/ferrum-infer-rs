@@ -1,0 +1,28 @@
+{
+  "status": "diagnostic_smoke_pass",
+  "source_sha": "2ab90fda518a85a317782abee300660598edab9f",
+  "binary_sha256": "4d141487f5c6ad98c1b11a85e01752b291b5750e5a6a6d434058c12245d030f6",
+  "version": "ferrum 0.7.7",
+  "instance_id": 40826362,
+  "gpu": "RTX 4090",
+  "run": {
+    "rc": 0,
+    "selected_graph_mode": "unified_decode_graph_layers_only"
+  },
+  "serve": {
+    "rc": 0,
+    "selected_graph_mode": "unified_decode_graph_layers_only",
+    "validation": {
+      "text": "The capital of France is Paris.",
+      "usage": {
+        "prompt_tokens": 23,
+        "completion_tokens": 8,
+        "total_tokens": 31
+      },
+      "errors": []
+    }
+  },
+  "release_grade": false,
+  "pass_line": null,
+  "cleanup": "vast_shutdown/stopped.json actual_status=exited"
+}

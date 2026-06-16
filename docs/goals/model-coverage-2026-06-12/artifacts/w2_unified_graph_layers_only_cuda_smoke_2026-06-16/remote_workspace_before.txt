@@ -1,0 +1,3 @@
+drwxr-xr-x 82 root root  8192 Jun 16 07:24 /workspace
+drwxr-xr-x 13  501 staff 4096 Jun 12 19:16 /workspace/ferrum-infer-rs
+drwxr-xr-x  3 root root    17 Jun 16 03:29 /workspace/hf-cache
