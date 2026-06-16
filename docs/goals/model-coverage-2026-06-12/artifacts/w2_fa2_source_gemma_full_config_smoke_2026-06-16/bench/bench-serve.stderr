@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=16 warmup=10 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (26 prompts including 10 warmup)
+    16 completed / 0 errored / 3.3s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=489.6  p95=847.6  p99=847.8
+      TPOT_ms  p50=43.2  p95=43.2  p99=43.3
+      ITL_ms   p50=38.6  p95=39.5  p99=40.4
+      throughput      313.5 tok/s
+      goodput         4.90 req/s
+
+→ wrote /workspace/w2_fa2_source_gemma_full_config_smoke_2026-06-16/bench/bench_fa2_source_sharegpt_c16_16x1.json

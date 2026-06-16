@@ -1,0 +1,24 @@
+{
+  "cwd": "/workspace/w2_fa2_source_gemma_full_config_smoke_2026-06-16",
+  "cmd": [
+    "/workspace/ferrum-infer-rs/target/release/ferrum",
+    "serve",
+    "--model",
+    "gemma3:27b-gptq",
+    "--backend",
+    "cuda",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18479",
+    "--kv-capacity",
+    "512",
+    "--max-num-seqs",
+    "16",
+    "--effective-config-json",
+    "/workspace/w2_fa2_source_gemma_full_config_smoke_2026-06-16/server/serve_effective_config.json",
+    "--decision-trace-jsonl",
+    "/workspace/w2_fa2_source_gemma_full_config_smoke_2026-06-16/server/serve_decision_trace.jsonl"
+  ],
+  "note": "artifact-local ferrum.toml selects runtime.fa2_source=true; diagnostic only"
+}
