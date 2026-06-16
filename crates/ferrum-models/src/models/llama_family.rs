@@ -4714,6 +4714,14 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
     ) -> std::result::Result<Vec<Option<Vec<f32>>>, ferrum_types::FerrumError> {
+        self.unified_forward_with_logits_policy(items, &[])
+    }
+
+    fn unified_forward_with_logits_policy(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        logits_policies: &[LogitsReturnPolicy],
+    ) -> std::result::Result<Vec<Option<Vec<f32>>>, ferrum_types::FerrumError> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -4765,7 +4773,8 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
                 )));
             }
         }
-        Ok(self.unified_forward_internal(items))
+        let logits_policies = (logits_policies.len() == items.len()).then_some(logits_policies);
+        Ok(self.unified_forward_internal(items, logits_policies))
     }
 
     fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {

@@ -91,6 +91,52 @@ enum ArgmaxMode<'a> {
     Masked(&'a TokenSelectionMask),
 }
 
+fn resolve_unified_logits_return<'a>(
+    policies: Option<&'a [LogitsReturnPolicy]>,
+    item_count: usize,
+    final_indices: &[(usize, usize)],
+) -> DecodeLogitsReturn<'a> {
+    let Some(policies) = policies else {
+        return DecodeLogitsReturn::Full;
+    };
+    if policies.len() != item_count {
+        return DecodeLogitsReturn::Full;
+    }
+
+    let mut selected_mask: Option<&'a TokenSelectionMask> = None;
+    let mut saw_unmasked = false;
+    for &(orig_idx, _) in final_indices {
+        match &policies[orig_idx] {
+            LogitsReturnPolicy::FullLogits => return DecodeLogitsReturn::Full,
+            LogitsReturnPolicy::GreedyArgmax { token_mask } => match token_mask.as_ref() {
+                Some(mask) => {
+                    if saw_unmasked {
+                        return DecodeLogitsReturn::Full;
+                    }
+                    if let Some(selected) = selected_mask {
+                        if selected.fingerprint != mask.fingerprint || selected.len() != mask.len()
+                        {
+                            return DecodeLogitsReturn::Full;
+                        }
+                    } else {
+                        selected_mask = Some(mask);
+                    }
+                }
+                None => {
+                    if selected_mask.is_some() {
+                        return DecodeLogitsReturn::Full;
+                    }
+                    saw_unmasked = true;
+                }
+            },
+        }
+    }
+
+    DecodeLogitsReturn::GreedyArgmax {
+        token_mask: selected_mask,
+    }
+}
+
 impl LlamaBatchedRuntimeConfig {
     pub(crate) fn decode_op_profile_enabled(&self) -> bool {
         self.decode_op_profile
@@ -1605,6 +1651,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
     pub(crate) fn unified_forward_internal(
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
+        logits_policies: Option<&[LogitsReturnPolicy]>,
     ) -> Vec<Option<Vec<f32>>> {
         if items.is_empty() {
             return Vec::new();
@@ -2281,22 +2328,83 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         debug_assert!(final_pack_ready);
         debug_assert!(lm_head_ready);
 
-        // Sync + readback. ALWAYS eager — to_vec needs the host result.
+        // Sync + readback. Keep full logits only for rows whose policy
+        // requires CPU-side sampling. Policy-compatible greedy rows use the
+        // existing GPU argmax kernels and return a one-element token sentinel.
         B::sync(&mut ctx);
         let mut out: Vec<Option<Vec<f32>>> = (0..items.len()).map(|_| None).collect();
         if num_sampled > 0 {
-            let packed_logits = self
-                .scratch
-                .unified_packed_logits
-                .as_ref()
-                .expect("unified_packed_logits missing");
             let readback_t0 = unified_op_profile.then(std::time::Instant::now);
-            let logits_flat = B::to_vec(packed_logits, num_sampled * vocab);
+            let logits_return =
+                resolve_unified_logits_return(logits_policies, items.len(), &final_indices);
+            let argmax_mode = match logits_return {
+                DecodeLogitsReturn::Full => None,
+                DecodeLogitsReturn::LegacyDefault if self.batched_cfg.greedy_argmax => {
+                    Some(ArgmaxMode::Raw)
+                }
+                DecodeLogitsReturn::LegacyDefault => None,
+                DecodeLogitsReturn::GreedyArgmax { token_mask } => {
+                    token_mask.map(ArgmaxMode::Masked).or(Some(ArgmaxMode::Raw))
+                }
+            };
+            let mut returned_argmax = false;
+            if let Some(argmax_mode) = argmax_mode {
+                let tokens = match argmax_mode {
+                    ArgmaxMode::Raw => {
+                        let packed_logits = self
+                            .scratch
+                            .unified_packed_logits
+                            .as_ref()
+                            .expect("unified_packed_logits missing");
+                        B::argmax_rows_f16(&mut ctx, packed_logits, num_sampled, vocab)
+                    }
+                    ArgmaxMode::Masked(mask) => {
+                        self.scratch.ensure_argmax_token_mask(&mut ctx, mask);
+                        let mask_len = self.scratch.argmax_token_mask_len;
+                        let device_mask = self
+                            .scratch
+                            .argmax_token_mask
+                            .as_ref()
+                            .expect("argmax token mask upload failed");
+                        let packed_logits = self
+                            .scratch
+                            .unified_packed_logits
+                            .as_ref()
+                            .expect("unified_packed_logits missing");
+                        B::argmax_rows_f16_masked(
+                            &mut ctx,
+                            packed_logits,
+                            device_mask,
+                            mask_len,
+                            num_sampled,
+                            vocab,
+                        )
+                    }
+                };
+                if let Ok(tokens) = tokens {
+                    if tokens.iter().all(|&token| token != u32::MAX) {
+                        for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                            out[orig_idx] = Some(vec![tokens[j] as f32]);
+                        }
+                        returned_argmax = true;
+                    }
+                }
+            }
+            let logits_flat = if returned_argmax {
+                Vec::new()
+            } else {
+                let packed_logits = self
+                    .scratch
+                    .unified_packed_logits
+                    .as_ref()
+                    .expect("unified_packed_logits missing");
+                B::to_vec(packed_logits, num_sampled * vocab)
+            };
             if let Some(t0) = readback_t0 {
                 let elapsed_us = t0.elapsed().as_micros() as u64;
                 add_profile_counter!(UNIFIED_READBACK_TIME_US, UNIFIED_READBACK_CALLS, elapsed_us);
             }
-            if self.batched_cfg.decode_op_profile {
+            if self.batched_cfg.decode_op_profile && !returned_argmax {
                 static UNIFIED_LOGITS_DIAG_CALLS: AtomicU64 = AtomicU64::new(0);
                 let call = UNIFIED_LOGITS_DIAG_CALLS.fetch_add(1, Ordering::Relaxed);
                 if should_log_unified_logits_diag(call) {
@@ -2318,9 +2426,11 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     }
                 }
             }
-            for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
-                let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
-                out[orig_idx] = Some(row);
+            if !returned_argmax {
+                for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
+                    let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
+                    out[orig_idx] = Some(row);
+                }
             }
         }
 

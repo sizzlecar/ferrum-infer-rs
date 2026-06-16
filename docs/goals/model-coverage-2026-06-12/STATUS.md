@@ -2,6 +2,47 @@
 
 进度日志,倒序。
 
+## 2026-06-17 YU — W2 source checkpoint: dense unified logits policy now avoids full readback for greedy rows
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_argmax_source_2026-06-17/`.
+- Scope:
+  - no GPU instance was started;
+  - no performance measurement was taken;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Bottleneck link:
+  - `w2_unified_op_profile_c16_rerun_2026-06-16` measured
+    `readback=22039us` in a mixed c16 dense unified frame;
+  - batched decode already had GPU argmax sentinel support, but dense
+    `unified_forward_internal` always downloaded `sampled * vocab` logits.
+- Source change:
+  - added `DecoderOnlyLLM::unified_forward_with_logits_policy(...)` with a
+    backwards-compatible default;
+  - `LlmExecutor::unified_decode` now forwards `UnifiedBatchItem.logits_policy`
+    to real unified model execution and treats policy-required full logits as a
+    full-logits condition;
+  - dense `LlamaFamilyModel` unified forward now uses existing GPU
+    `argmax_rows_f16` / `argmax_rows_f16_masked` when all sampled rows are
+    greedy-compatible and masks are uniform;
+  - any full-logits requirement, non-greedy sampling, structured output, or
+    incompatible mixed masks still falls back to full logits;
+  - default no-prefix-cache final prefill chunks now carry the same greedy
+    model-side policy as decode rows, while prefix-cache-enabled runs still
+    force full logits for cache storage.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - `cargo test -p ferrum-models unified_decode_ -- --nocapture` PASS;
+  - `cargo test -p ferrum-engine model_decode_logits_policy -- --nocapture`
+    PASS;
+  - `cargo check -q -p ferrum-models -p ferrum-engine` PASS.
+- Required next validation:
+  - one cached 1x4090 diagnostic with product `ferrum run`/`serve` smoke first;
+  - then c16 `bench-serve --fail-on-error` with decode op profile enabled;
+  - accept this branch only if correctness remains clean and unified
+    `readback`/endpoint throughput improve versus the current same-shape
+    diagnostic.
+
 ## 2026-06-16 YT — W2 c16 token-budget A/B: simple token cap is not the bottleneck fix
 
 - Artifact:

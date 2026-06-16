@@ -102,7 +102,9 @@ impl EngineInner {
     /// model lock — behavior-preserving but no perf gain. Llama already
     /// supports unified_forward, so M2 immediately co-batches prefill+decode.
     async fn process_batch_unified(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
-        use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
+        use ferrum_interfaces::model_executor::{
+            LogitsReturnPolicy, UnifiedBatch, UnifiedBatchItem,
+        };
         use ferrum_interfaces::KvCacheHandle;
 
         // ── 0. Materialize SequenceState for every request, classify ──
@@ -150,6 +152,7 @@ impl EngineInner {
             input_tokens: Vec<TokenId>,
             kv_handle: Arc<dyn KvCacheHandle>,
             metadata: std::collections::HashMap<String, serde_json::Value>,
+            logits_policy: LogitsReturnPolicy,
             fresh_kv: bool,
             chunk_start: usize,
             chunk_len: usize,
@@ -160,7 +163,7 @@ impl EngineInner {
         let has_decode_items = !decode_ids.is_empty();
         let mut unified_prefills: Vec<UnifiedPrefillWork> = Vec::new();
         for rid in &prefill_ids {
-            let (input_tokens, num_tokens, existing_kv, chunk_start, metadata) = {
+            let (input_tokens, num_tokens, existing_kv, chunk_start, metadata, logits_policy) = {
                 let sequences = self.sequences.read();
                 let Some(seq) = sequences.get(rid) else {
                     continue;
@@ -171,6 +174,11 @@ impl EngineInner {
                     seq.kv_cache.clone(),
                     seq.prefill_tokens_processed,
                     seq.model_decode_metadata(),
+                    if skip_prefix_cache {
+                        seq.model_decode_logits_policy()
+                    } else {
+                        LogitsReturnPolicy::FullLogits
+                    },
                 )
             };
             if chunk_start >= num_tokens {
@@ -262,6 +270,7 @@ impl EngineInner {
                 input_tokens,
                 kv_handle,
                 metadata,
+                logits_policy,
                 fresh_kv,
                 chunk_start,
                 chunk_len,
@@ -287,7 +296,7 @@ impl EngineInner {
                 pos_offset: work.chunk_start,
                 is_final_chunk: work.is_final_chunk,
                 metadata: work.metadata.clone(),
-                logits_policy: Default::default(),
+                logits_policy: work.logits_policy.clone(),
             });
             prefill_meta.push(work);
         }
