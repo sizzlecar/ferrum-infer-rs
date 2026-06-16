@@ -1,0 +1,12 @@
+[w2-c16-ab] start 2026-06-16T21:10:56Z
+[w2-c16-ab] root=/workspace/ferrum-infer-rs out=/workspace/w2_vllm_ferrum_same_hw_c16_ab_2026-06-17 model=gemma3:27b-gptq hf_home=/workspace/hf-cache dataset=/workspace/ascii_sharegpt_w2_100.jsonl
+[w2-c16-ab] installing rustup minimal toolchain
+[w2-c16-ab] starting Ferrum CUDA release build in background
+[w2-c16-ab] ensuring vLLM venv
+[w2-c16-ab] prefetching circulus/gemma-3-27b-it-gptq
+[w2-c16-ab] waiting for Ferrum build
+[w2-c16-ab] vLLM server + smoke + c16 bench
+[w2-c16-ab] Ferrum run correctness
+[w2-c16-ab] Ferrum serve correctness
+[w2-c16-ab] Ferrum serve + c16 bench
+[w2-c16-ab] done 2026-06-16T21:57:56Z
