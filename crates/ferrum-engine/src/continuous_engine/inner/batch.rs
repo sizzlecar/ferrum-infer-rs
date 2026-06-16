@@ -338,6 +338,24 @@ impl EngineInner {
 
         // ── 3. ONE unified forward call ──
         let unified_prof = self.runtime_config.unified_post_prof;
+        let first_token_prof = self.runtime_config.batch_decode_prof || unified_prof;
+        let prefill_model_start_wait_us: std::collections::HashMap<RequestId, u64> =
+            if first_token_prof {
+                let sequences = self.sequences.read();
+                prefill_meta
+                    .iter()
+                    .filter_map(|work| {
+                        sequences.get(&work.rid).map(|seq| {
+                            (
+                                work.rid.clone(),
+                                seq.start_time.elapsed().as_micros() as u64,
+                            )
+                        })
+                    })
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
         let t_unified_model = if unified_prof {
             Some(Instant::now())
         } else {
@@ -366,6 +384,9 @@ impl EngineInner {
         } else {
             None
         };
+        let unified_model_us = t_unified_model
+            .zip(t_unified_model_done)
+            .map(|(t0, t1)| t1.duration_since(t0).as_micros() as u64);
         if results.len() != unified.items.len() {
             return Err(FerrumError::internal(format!(
                 "unified_decode returned {} results for {} items",
@@ -422,7 +443,7 @@ impl EngineInner {
                     logits_vec.clone(),
                 );
             }
-            let first_token = {
+            let (first_token, queue_to_first_token_us) = {
                 let mut sequences = self.sequences.write();
                 let Some(seq) = sequences.get_mut(&work.rid) else {
                     continue;
@@ -445,13 +466,49 @@ impl EngineInner {
                 seq.prefill_tokens_processed = num_tokens;
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
-                token
+                (token, seq.start_time.elapsed().as_micros() as u64)
             };
             self.scheduler.mark_prefill_complete(&work.rid, num_tokens);
             self.total_prefill_tokens
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);
             counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
             counter!("ferrum.engine.prefills_total").increment(1);
+            if first_token_prof {
+                let queue_to_model_start_us = prefill_model_start_wait_us
+                    .get(&work.rid)
+                    .copied()
+                    .unwrap_or(0);
+                let model_batch_us = unified_model_us.unwrap_or(0);
+                eprintln!(
+                    "[first-token-prof] req={} source=unified_prefill prompt_tokens={} chunk_start={} chunk_len={} queue_to_model_start={}us model_batch={}us queue_to_first_token={}us",
+                    work.rid,
+                    num_tokens,
+                    work.chunk_start,
+                    work.chunk_len,
+                    queue_to_model_start_us,
+                    model_batch_us,
+                    queue_to_first_token_us,
+                );
+                let profile = global_profile();
+                if profile.is_enabled() {
+                    let _ = profile.push_event(
+                        "first_token_prof",
+                        profile_fields_from_json(serde_json::json!({
+                            "source": "unified_prefill",
+                            "request_id": work.rid.to_string(),
+                            "prompt_tokens": num_tokens,
+                            "chunk_start": work.chunk_start,
+                            "chunk_len": work.chunk_len,
+                        })),
+                        profile_fields_from_json(serde_json::json!({
+                            "queue_to_model_start": queue_to_model_start_us,
+                            "model_batch": model_batch_us,
+                            "queue_to_first_token": queue_to_first_token_us,
+                        })),
+                        false,
+                    );
+                }
+            }
             let stop_reason = self.stop_reason_for_request(&work.rid);
             if self.should_stream_generated_token(stop_reason) {
                 self.send_stream_update(&work.rid, first_token).await;
