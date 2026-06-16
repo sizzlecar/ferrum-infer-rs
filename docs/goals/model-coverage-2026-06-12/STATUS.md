@@ -2,6 +2,59 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XS — W2 native CUDA checkpoint: Marlin B-weight evict-first is a small positive lever
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_cache_policy_native_probe_2026-06-16/`.
+- Paid GPU lane:
+  `W2 Gemma3 Marlin cache-policy native probe` on the cached 1x RTX 4090
+  Vast instance.
+- Contract:
+  - expected runtime/cost: 10-20 minutes, about USD 0.07-0.15 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/compile first failure, probe non-zero or
+    timeout, or VERDICT plus artifact copyback;
+  - correctness gate: native probe exit 0 and
+    `VERDICT: gemma3 Marlin cache-policy native CUDA probe complete`;
+  - performance command:
+    `bash scripts/microbenches/build_and_run_gemma3_marlin_cache_policy_perf.sh`.
+- Evidence:
+  - remote HEAD `018ea7bce6494db5539ce32e22f104144fe87eba`;
+  - probe rc `0`;
+  - baseline binary SHA256
+    `50e4ad67f5d79293da1d524eedcae2cde7edb71d7e6d85387e94b5b37cb0ca41`;
+  - evict-first binary SHA256
+    `69655f683cc80daf98737e290946ca69bbcec87d69c818deff5cf2038e8c8e41`;
+  - stdout contains
+    `VERDICT: gemma3 Marlin cache-policy native CUDA probe complete`;
+  - Vast cleanup confirmed `stopped/exited`.
+- Key rows:
+  - m16 product chain event: baseline `215.580us`, evict-first `211.690us`
+    (`-1.8%`);
+  - m16 product down: baseline `70.549us`, evict-first `68.800us`;
+  - m32 product chain event: baseline `227.722us`, evict-first `225.173us`
+    (`-1.1%`);
+  - m32 product down: baseline `75.659us`, evict-first `75.339us`.
+- Interpretation:
+  - `FERRUM_MARLIN_CP_ASYNC_EVICT_FIRST=1` compiles on CUDA 12.4 / Ada and
+    produces a small positive tail-MLP segment gain;
+  - unlike explicit down prefetch, this improves segment wall time rather than
+    shifting cost into a warm kernel;
+  - the gain is too small by itself to close the W2 gap, so this is a useful
+    low-risk kernel lever but not the main missing performance breakthrough.
+- Next:
+  - either wire this as a typed/default CUDA build policy and validate
+    `ferrum run` / `ferrum serve` correctness before endpoint performance, or
+    keep searching for a higher-return dense MLP `gate_up` / work-reduction
+    lever.
+- Scope:
+  - this is diagnostic native CUDA evidence, not release performance evidence;
+  - the remote worktree had old tracked artifact-log modifications after
+    syncing `.git`; those are recorded in `remote/git_status_short.txt` and are
+    not used for release performance claims.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XR — W2 native CUDA checkpoint: overlap prefetch warms down but worsens wall time
 
 - Artifact:
