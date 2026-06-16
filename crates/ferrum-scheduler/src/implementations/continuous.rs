@@ -38,8 +38,6 @@ struct ContinuousBatchRuntimeConfig {
     scheduler_none_prof: bool,
 }
 
-const ACTIVE_DECODE_PREFILL_CHUNKS_PER_ITERATION: usize = 2;
-
 impl ContinuousBatchRuntimeConfig {
     fn from_scheduler_config(config: &SchedulerConfig) -> Self {
         Self {
@@ -431,6 +429,49 @@ impl ContinuousBatchScheduler {
         }
     }
 
+    fn active_decode_prefill_budget_tokens(
+        &self,
+        hint: &BatchHint,
+        scheduled_decode_count: usize,
+    ) -> Option<usize> {
+        let chunk = self.runtime_config.active_decode_prefill_chunk?;
+        if scheduled_decode_count == 0 {
+            return None;
+        }
+
+        let remaining_step_tokens = hint.max_tokens.saturating_sub(scheduled_decode_count);
+        let free_batch_slots = hint.max_batch_size.saturating_sub(scheduled_decode_count);
+        if remaining_step_tokens == 0 || free_batch_slots == 0 {
+            return Some(0);
+        }
+
+        let prefill_backlog = self.prefilling_count().saturating_add(self.waiting_count());
+        if prefill_backlog == 0 {
+            return Some(0);
+        }
+
+        // vLLM's scheduler uses the per-step token budget dynamically rather
+        // than a fixed "N prefill chunks while decoding" rule. Ferrum still
+        // needs a conservative mixed-prefill guard for Gemma3, so scale the
+        // guard by same-iteration batch headroom: fewer active decodes permit
+        // more partial prefills; near a full decode cohort admits fewer.
+        let max_mixed_prefill_chunks = self.cb_config.max_prefill_batch.div_ceil(2).max(1);
+        let scaled_chunks = free_batch_slots
+            .saturating_mul(max_mixed_prefill_chunks)
+            .div_ceil(hint.max_batch_size.max(1))
+            .max(1);
+        let target_chunks = scaled_chunks
+            .min(max_mixed_prefill_chunks)
+            .min(prefill_backlog)
+            .min(free_batch_slots);
+
+        Some(
+            chunk
+                .saturating_mul(target_chunks)
+                .min(remaining_step_tokens),
+        )
+    }
+
     fn add_prefill_requests_to_batch(
         &self,
         hint: &BatchHint,
@@ -525,11 +566,8 @@ impl ContinuousBatchScheduler {
             drop(decode_queue);
         }
         let scheduled_decode_count = batch_requests.len();
-        let mut active_decode_prefill_tokens_remaining = self
-            .runtime_config
-            .active_decode_prefill_chunk
-            .map(|chunk| chunk.saturating_mul(ACTIVE_DECODE_PREFILL_CHUNKS_PER_ITERATION))
-            .filter(|_| scheduled_decode_count > 0);
+        let mut active_decode_prefill_tokens_remaining =
+            self.active_decode_prefill_budget_tokens(&hint, scheduled_decode_count);
 
         // Then, add prefill requests up to the per-iter token budget.
         // Phase 3: `max_prefill_batch=8` no longer caps the count —
@@ -1442,15 +1480,58 @@ mod tests {
         let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(
             mixed_batch.requests.len(),
-            3,
-            "active decode should admit only two 64-token prefill chunks per iteration"
+            5,
+            "low decode pressure should admit more prefill chunks from batch headroom"
         );
-        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 128) * 16);
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 256) * 16);
         assert_eq!(
             scheduler.prefilling_count(),
             4,
             "waiting requests may be promoted, but scheduling must respect the mixed-prefill budget"
         );
+    }
+
+    #[test]
+    fn active_decode_prefill_budget_scales_down_with_decode_pressure() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            active_decode_prefill_chunk: Some(64),
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 2048,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let mut decode_ids = Vec::new();
+        for _ in 0..6 {
+            let request = create_test_request_with_prompt_tokens(Priority::Normal, 128);
+            decode_ids.push(request.id.clone());
+            enqueue_waiting(&scheduler, request);
+        }
+        let initial_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(initial_batch.requests.len(), 6);
+        for id in &decode_ids {
+            scheduler.mark_prefill_complete(id, 128);
+        }
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(
+            mixed_batch.requests.len(),
+            7,
+            "high decode pressure should admit only one prefill chunk"
+        );
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (6 + 64) * 16);
     }
 
     #[tokio::test]
