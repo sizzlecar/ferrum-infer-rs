@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XT — W2 source checkpoint: productize Marlin B-weight evict-first cache policy
+
+- Changed `crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu` so Marlin
+  B-weight `cp.async` uses `L2::evict_first` by default for CUDA `sm_80` through
+  pre-Blackwell architectures. Blackwell `sm_120` keeps the plain
+  `cp.async.cg` fallback because the fractional L2 cache-policy syntax is not
+  accepted there.
+- Updated `scripts/microbenches/build_and_run_gemma3_marlin_cache_policy_perf.sh`
+  to compare legacy plain `cp.async.cg` (`FERRUM_MARLIN_CP_ASYNC_PLAIN=1`)
+  against the product-default path.
+- Rationale:
+  - XS native CUDA evidence showed this cache policy is a small positive
+    product-shaped tail-MLP lever rather than a cost-shifting warmup trick;
+  - the behavior is now a default CUDA build path, not a hidden user env
+    combination.
+- Local validation:
+  - `bash -n scripts/microbenches/build_and_run_gemma3_marlin_cache_policy_perf.sh`;
+  - `git diff --check -- crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu scripts/microbenches/build_and_run_gemma3_marlin_cache_policy_perf.sh scripts/microbenches/README.md`.
+- Required next validation:
+  - run the native cache-policy probe on 1x RTX 4090 to confirm the product
+    default matches the previously measured evict-first path;
+  - before endpoint performance claims, validate `ferrum run` and
+    `ferrum serve` correctness on the product binary.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XS — W2 native CUDA checkpoint: Marlin B-weight evict-first is a small positive lever
 
 - Artifact:
