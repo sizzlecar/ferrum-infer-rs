@@ -7,6 +7,7 @@
 
 use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 use ferrum_kernels::Linear;
+use ferrum_kernels::LinearMetadata;
 use ferrum_types::Result;
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use std::sync::Arc;
 /// `forward()` delegates straight through.
 pub struct GptqLinear<B: Backend + BackendQuantMarlin> {
     inner: Box<dyn Linear<B> + Send + Sync>,
+    metadata: LinearMetadata,
 }
 
 impl<B: Backend + BackendQuantMarlin> GptqLinear<B> {
@@ -40,6 +42,33 @@ impl<B: Backend + BackendQuantMarlin> GptqLinear<B> {
         in_features: usize,
         out_features: usize,
     ) -> Result<Self> {
+        Self::from_raw_with_metadata(
+            qweight,
+            scales,
+            qzeros,
+            g_idx,
+            bias,
+            bits,
+            group_size,
+            in_features,
+            out_features,
+            LinearMetadata::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_raw_with_metadata(
+        qweight: &[i32],
+        scales: &[f32],
+        qzeros: &[i32],
+        g_idx: Option<&[i32]>,
+        bias: Option<&[f32]>,
+        bits: u32,
+        group_size: usize,
+        in_features: usize,
+        out_features: usize,
+        metadata: LinearMetadata,
+    ) -> Result<Self> {
         let inner = B::load_gptq(
             qweight,
             scales,
@@ -51,7 +80,7 @@ impl<B: Backend + BackendQuantMarlin> GptqLinear<B> {
             in_features,
             out_features,
         )?;
-        Ok(Self { inner })
+        Ok(Self { inner, metadata })
     }
 }
 
@@ -62,6 +91,14 @@ impl<B: Backend + BackendQuantMarlin> Linear<B> for GptqLinear<B> {
 
     fn out_features(&self) -> usize {
         self.inner.out_features()
+    }
+
+    fn metadata(&self) -> LinearMetadata {
+        if self.metadata.is_empty() {
+            self.inner.metadata()
+        } else {
+            self.metadata
+        }
     }
 
     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize) {
