@@ -19,6 +19,7 @@ use std::fs::File;
 use std::path::Path;
 
 use ferrum_kernels::backend::{Backend, BackendQuantMarlin, SrcDtype};
+use ferrum_kernels::LinearMetadata;
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
@@ -626,9 +627,10 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
                 )));
             }
             let weight = B::from_weight_bytes(raw, src_dtype);
-            return Ok(Box::new(DenseLinear::<B>::from_buffer(
-                weight, shape[0], shape[1],
-            )));
+            return Ok(Box::new(
+                DenseLinear::<B>::from_buffer(weight, shape[0], shape[1])
+                    .with_metadata(LinearMetadata::from_name(name)),
+            ));
         }
 
         // Llama-family fusion shims: synthesise qkv_proj / gate_up_proj from
@@ -644,7 +646,9 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
                 let weight = B::from_weight_bytes(&bytes, dtype);
-                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols);
+                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
+                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
+                );
                 if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
                     linear = linear.with_bias(B::from_slice(&bias));
                 }
@@ -659,7 +663,9 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
                 let weight = B::from_weight_bytes(&bytes, dtype);
-                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols);
+                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
+                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
+                );
                 if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
                     linear = linear.with_bias(B::from_slice(&bias));
                 }
@@ -739,7 +745,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                 out_features,
             );
             let mut linear =
-                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features);
+                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features)
+                    .with_metadata(LinearMetadata::from_name(name));
             let bias_key = format!("{name}.bias");
             if self.has(&bias_key) {
                 let (bias, _) = self.read_f32(&bias_key)?;
@@ -781,7 +788,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             None
         };
 
-        let linear = GptqLinear::<B>::from_raw(
+        let linear = GptqLinear::<B>::from_raw_with_metadata(
             &qweight,
             &scales_f32,
             &qzeros,
@@ -791,6 +798,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             qcfg.group_size,
             in_features,
             out_features,
+            LinearMetadata::from_name(name),
         )?;
         Ok(Box::new(linear))
     }
@@ -943,7 +951,10 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                 out_features,
             );
             let mut linear =
-                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features);
+                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features)
+                    .with_metadata(LinearMetadata::from_fused_names(
+                        parts.iter().map(String::as_str),
+                    ));
             let mut bias_acc: Vec<f32> = Vec::new();
             let mut any_bias = false;
             for p in parts {
@@ -1004,7 +1015,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             None
         };
 
-        let linear = GptqLinear::<B>::from_raw(
+        let linear = GptqLinear::<B>::from_raw_with_metadata(
             &qw_acc,
             &sc_acc,
             &qz_acc,
@@ -1014,6 +1025,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             qcfg.group_size,
             in_features,
             out_features,
+            LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
         )?;
 
         Ok(Box::new(linear))

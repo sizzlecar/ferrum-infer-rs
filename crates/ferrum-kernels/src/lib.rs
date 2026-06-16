@@ -17,7 +17,7 @@ pub fn configure_native_profile_sink(
 pub mod backend;
 
 pub mod linear;
-pub use linear::Linear;
+pub use linear::{Linear, LinearMetadata, LinearProjectionRole};
 
 pub mod stacked_expert;
 pub use stacked_expert::StackedExpertGgufLinear;

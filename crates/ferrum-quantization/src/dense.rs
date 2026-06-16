@@ -5,6 +5,7 @@
 //! dispatch on GPU backends, still part of the current command buffer).
 
 use ferrum_kernels::backend::Backend;
+use ferrum_kernels::LinearMetadata;
 
 use crate::traits::Linear;
 
@@ -17,6 +18,7 @@ pub struct DenseLinear<B: Backend> {
     bias: Option<B::Buffer>,
     in_features: usize,
     out_features: usize,
+    metadata: LinearMetadata,
 }
 
 impl<B: Backend> DenseLinear<B> {
@@ -33,6 +35,7 @@ impl<B: Backend> DenseLinear<B> {
             bias: None,
             in_features,
             out_features,
+            metadata: LinearMetadata::default(),
         }
     }
 
@@ -49,6 +52,7 @@ impl<B: Backend> DenseLinear<B> {
             bias: Some(B::from_slice(bias)),
             in_features,
             out_features,
+            metadata: LinearMetadata::default(),
         }
     }
 
@@ -59,11 +63,17 @@ impl<B: Backend> DenseLinear<B> {
             bias: None,
             in_features,
             out_features,
+            metadata: LinearMetadata::default(),
         }
     }
 
     pub fn with_bias(mut self, bias: B::Buffer) -> Self {
         self.bias = Some(bias);
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: LinearMetadata) -> Self {
+        self.metadata = metadata;
         self
     }
 
@@ -83,6 +93,10 @@ impl<B: Backend> Linear<B> for DenseLinear<B> {
 
     fn out_features(&self) -> usize {
         self.out_features
+    }
+
+    fn metadata(&self) -> LinearMetadata {
+        self.metadata
     }
 
     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize) {
