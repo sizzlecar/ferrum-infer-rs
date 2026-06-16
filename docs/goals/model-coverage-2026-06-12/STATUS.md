@@ -2,6 +2,61 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YT — W2 c16 token-budget A/B: simple token cap is not the bottleneck fix
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_token_budget_c16_ab_2026-06-16/`.
+- Source checkpoint before run:
+  `5f01af002d44ec58e2242f63ff085e54ba9a9e8c`
+  (`docs(cuda): record w2 unified op profile diagnostic`), clean remote
+  worktree.
+- GPU lifecycle:
+  - old stopped instance `41187356` could not be restarted
+    (`resources_unavailable`);
+  - new instance `41210668` stayed `actual=loading` with SSH refused and was
+    deleted;
+  - actual run used Vast `41212840`, 1x RTX 4090, driver `580.119.02`,
+    CUDA `12.4`, offer `36846332`, quoted USD `0.4044/h`;
+  - artifacts were copied back, then `41212840` was deleted; Vast DELETE
+    returned HTTP 200 success.
+- Binary evidence:
+  `649a73fc2ec46ab4272a14390422a1bfc565243a4b638c6f775e6cc5b15d8962`
+  for `/workspace/ferrum-target/release/ferrum`.
+- Product path and command shape:
+  - `ferrum serve --model gemma3:27b-gptq --backend cuda --kv-capacity 512
+    --max-num-seqs 16 --max-num-batched-tokens <1024|512>`;
+  - per cell: streaming `2+3` smoke, then `bench-serve --dataset random
+    --random-input-len 64 --random-output-len 16 --concurrency 16
+    --num-prompts 16 --warmup-requests 4 --n-repeats 1 --fail-on-error
+    --seed 9271`.
+- Correctness/resource result:
+  - `SMOKE_OK 1024 True`;
+  - `SMOKE_OK 512 True`;
+  - both bench cells completed `[16]`, errored `[0]`;
+  - both cells used `output_token_count_source=usage`;
+  - log scan found no panic, OOM, illegal address, or CUDA error.
+- Diagnostic performance:
+  - `max_num_batched_tokens=1024`: `12.722 req/s`,
+    `203.552 output tok/s`, TTFT p50/p95 `610.6/662.3 ms`, TPOT p50
+    `42.7 ms`, ITL p95 `60.8 ms`;
+  - `max_num_batched_tokens=512`: `12.226 req/s`,
+    `195.621 output tok/s`, TTFT p50/p95 `536.3/720.2 ms`, TPOT p50
+    `49.3 ms`, ITL p95 `159.2 ms`.
+- Profile interpretation:
+  - `1024` still formed a large mixed-prefill frame:
+    `items=16 prefill=11 decode=5 total_q=823`, model batch `334383us`;
+  - `512` split the prefill work, e.g.
+    `items=16 prefill=3 decode=13 total_q=235`, model batch `118779us`,
+    but throughput and tail latency worsened;
+  - conclusion: a simple typed token-budget reduction is not the W2
+    high-return lever. Next work should focus on Gemma3 GPTQ dense MLP
+    Marlin projection behavior, weight residency/permute overhead, or a more
+    targeted admission policy than globally reducing
+    `max_num_batched_tokens`.
+- Gate status:
+  - diagnostic only, `n_repeats=1`;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
 ## 2026-06-16 YS — W2 c16 unified op profile: bottleneck is GPTQ Marlin MLP, not attention
 
 - Artifact:

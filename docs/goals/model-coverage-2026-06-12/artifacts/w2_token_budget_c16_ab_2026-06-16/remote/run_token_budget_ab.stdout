@@ -1,0 +1,38 @@
+SMOKE_OK 1024 True
+SMOKE_OK 512 True
+{
+  "rows": [
+    {
+      "max_num_batched_tokens": 1024,
+      "completed_per_run": [
+        16
+      ],
+      "errored_per_run": [
+        0
+      ],
+      "request_throughput_rps": 12.722003240279912,
+      "output_throughput_tps": 203.5520518444786,
+      "ttft_p50_ms": 610.5607605,
+      "ttft_p95_ms": 662.2808367499999,
+      "tpot_p50_ms": 42.7161682,
+      "itl_p95_ms": 60.84655504999983,
+      "output_token_count_source": "usage"
+    },
+    {
+      "max_num_batched_tokens": 512,
+      "completed_per_run": [
+        16
+      ],
+      "errored_per_run": [
+        0
+      ],
+      "request_throughput_rps": 12.226307132472025,
+      "output_throughput_tps": 195.6209141195524,
+      "ttft_p50_ms": 536.343807,
+      "ttft_p95_ms": 720.1886529999999,
+      "tpot_p50_ms": 49.293474466666666,
+      "itl_p95_ms": 159.1559224999999,
+      "output_token_count_source": "usage"
+    }
+  ]
+}

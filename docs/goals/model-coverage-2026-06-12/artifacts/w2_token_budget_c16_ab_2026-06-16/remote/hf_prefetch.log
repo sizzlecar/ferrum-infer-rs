@@ -1,0 +1,4 @@
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 17 files:   6%|▌         | 1/17 [00:00<00:04,  3.59it/s]Fetching 17 files:  24%|██▎       | 4/17 [00:00<00:01, 11.76it/s]Fetching 17 files:  24%|██▎       | 4/17 [00:19<00:01, 11.76it/s]Fetching 17 files:  35%|███▌      | 6/17 [00:21<00:51,  4.69s/it]Fetching 17 files:  41%|████      | 7/17 [00:41<01:22,  8.23s/it]Fetching 17 files: 100%|██████████| 17/17 [00:41<00:00,  2.43s/it]
+SNAPSHOT /workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2
+PREFETCH_DONE

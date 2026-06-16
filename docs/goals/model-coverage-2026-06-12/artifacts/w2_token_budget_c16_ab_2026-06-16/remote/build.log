@@ -1,0 +1,1165 @@
+Get:1 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  InRelease [1581 B]
+Get:2 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  Packages [2750 kB]
+Hit:3 http://security.ubuntu.com/ubuntu jammy-security InRelease
+Hit:4 http://archive.ubuntu.com/ubuntu jammy InRelease
+Hit:5 http://archive.ubuntu.com/ubuntu jammy-updates InRelease
+Hit:6 http://archive.ubuntu.com/ubuntu jammy-backports InRelease
+Fetched 2751 kB in 1s (3430 kB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+The following additional packages will be installed:
+  binfmt-support clang-14 cpp-11 g++-11 gcc-11 gcc-11-base gcc-12-base
+  icu-devtools lib32gcc-s1 lib32stdc++6 libasan6 libatomic1 libc-dev-bin libc6
+  libc6-dev libc6-i386 libcc1-0 libclang-common-14-dev libclang-cpp14
+  libclang1-14 libffi-dev libgc1 libgcc-11-dev libgcc-s1 libgomp1 libicu-dev
+  libitm1 libllvm14 liblsan0 libncurses-dev libobjc-11-dev libobjc4 libpfm4
+  libpipeline1 libquadmath0 libstdc++-11-dev libstdc++6 libtinfo-dev libtsan0
+  libubsan1 libxml2-dev libz3-4 libz3-dev llvm-14 llvm-14-dev
+  llvm-14-linker-tools llvm-14-runtime llvm-14-tools python3-pygments
+  python3-yaml
+Suggested packages:
+  clang-14-doc gcc-11-locales g++-11-multilib gcc-11-doc gcc-11-multilib
+  glibc-doc manpages-dev icu-doc ncurses-doc libstdc++-11-doc llvm-14-doc
+  python-pygments-doc ttf-bitstream-vera
+Recommended packages:
+  manpages manpages-dev libc-devtools libnss-nis libnss-nisplus
+The following NEW packages will be installed:
+  binfmt-support clang clang-14 icu-devtools lib32gcc-s1 lib32stdc++6
+  libc6-i386 libclang-common-14-dev libclang-cpp14 libclang1-14 libffi-dev
+  libgc1 libicu-dev libllvm14 libncurses-dev libobjc-11-dev libobjc4 libpfm4
+  libpipeline1 libtinfo-dev libxml2-dev libz3-4 libz3-dev llvm-14 llvm-14-dev
+  llvm-14-linker-tools llvm-14-runtime llvm-14-tools ninja-build
+  python3-pygments python3-yaml
+The following packages will be upgraded:
+  cpp-11 g++-11 gcc-11 gcc-11-base gcc-12-base libasan6 libatomic1
+  libc-dev-bin libc6 libc6-dev libcc1-0 libgcc-11-dev libgcc-s1 libgomp1
+  libitm1 liblsan0 libquadmath0 libstdc++-11-dev libstdc++6 libtsan0 libubsan1
+21 upgraded, 31 newly installed, 0 to remove and 84 not upgraded.
+Need to get 186 MB of archives.
+After this operation, 706 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libc6-dev amd64 2.35-0ubuntu3.13 [2101 kB]
+Get:2 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libc-dev-bin amd64 2.35-0ubuntu3.13 [20.3 kB]
+Get:3 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libatomic1 amd64 12.3.0-1ubuntu1~22.04.3 [10.5 kB]
+Get:4 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libubsan1 amd64 12.3.0-1ubuntu1~22.04.3 [976 kB]
+Get:5 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 gcc-12-base amd64 12.3.0-1ubuntu1~22.04.3 [216 kB]
+Get:6 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libstdc++6 amd64 12.3.0-1ubuntu1~22.04.3 [699 kB]
+Get:7 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libquadmath0 amd64 12.3.0-1ubuntu1~22.04.3 [154 kB]
+Get:8 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 liblsan0 amd64 12.3.0-1ubuntu1~22.04.3 [1069 kB]
+Get:9 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libitm1 amd64 12.3.0-1ubuntu1~22.04.3 [30.2 kB]
+Get:10 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libgomp1 amd64 12.3.0-1ubuntu1~22.04.3 [127 kB]
+Get:11 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libcc1-0 amd64 12.3.0-1ubuntu1~22.04.3 [48.3 kB]
+Get:12 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libgcc-s1 amd64 12.3.0-1ubuntu1~22.04.3 [53.9 kB]
+Get:13 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libc6 amd64 2.35-0ubuntu3.13 [3235 kB]
+Get:14 http://archive.ubuntu.com/ubuntu jammy/main amd64 python3-yaml amd64 5.4.1-1ubuntu1 [129 kB]
+Get:15 http://archive.ubuntu.com/ubuntu jammy/main amd64 libpipeline1 amd64 1.5.5-1 [23.5 kB]
+Get:16 http://archive.ubuntu.com/ubuntu jammy/main amd64 binfmt-support amd64 2.2.1-2 [55.8 kB]
+Get:17 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libllvm14 amd64 1:14.0.0-1ubuntu1.1 [24.0 MB]
+Get:18 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 libclang-cpp14 amd64 1:14.0.0-1ubuntu1.1 [12.1 MB]
+Get:19 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libasan6 amd64 11.4.0-1ubuntu1~22.04.3 [2283 kB]
+Get:20 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 g++-11 amd64 11.4.0-1ubuntu1~22.04.3 [11.4 MB]
+Get:21 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 gcc-11 amd64 11.4.0-1ubuntu1~22.04.3 [20.1 MB]
+Get:22 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libstdc++-11-dev amd64 11.4.0-1ubuntu1~22.04.3 [2101 kB]
+Get:23 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libgcc-11-dev amd64 11.4.0-1ubuntu1~22.04.3 [2517 kB]
+Get:24 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libtsan0 amd64 11.4.0-1ubuntu1~22.04.3 [2260 kB]
+Get:25 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 cpp-11 amd64 11.4.0-1ubuntu1~22.04.3 [10.0 MB]
+Get:26 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 gcc-11-base amd64 11.4.0-1ubuntu1~22.04.3 [216 kB]
+Get:27 http://archive.ubuntu.com/ubuntu jammy/main amd64 libgc1 amd64 1:8.0.6-1.1build1 [96.8 kB]
+Get:28 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 libobjc4 amd64 12.3.0-1ubuntu1~22.04.3 [48.7 kB]
+Get:29 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 libobjc-11-dev amd64 11.4.0-1ubuntu1~22.04.3 [196 kB]
+Get:30 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libc6-i386 amd64 2.35-0ubuntu3.13 [2837 kB]
+Get:31 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 lib32gcc-s1 amd64 12.3.0-1ubuntu1~22.04.3 [63.9 kB]
+Get:32 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 lib32stdc++6 amd64 12.3.0-1ubuntu1~22.04.3 [739 kB]
+Get:33 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 libclang-common-14-dev amd64 1:14.0.0-1ubuntu1.1 [5975 kB]
+Get:34 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 llvm-14-linker-tools amd64 1:14.0.0-1ubuntu1.1 [1355 kB]
+Get:35 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 libclang1-14 amd64 1:14.0.0-1ubuntu1.1 [6792 kB]
+Get:36 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 clang-14 amd64 1:14.0.0-1ubuntu1.1 [81.2 kB]
+Get:37 http://archive.ubuntu.com/ubuntu jammy/universe amd64 clang amd64 1:14.0-55~exp2 [3558 B]
+Get:38 http://archive.ubuntu.com/ubuntu jammy/main amd64 icu-devtools amd64 70.1-2 [197 kB]
+Get:39 http://archive.ubuntu.com/ubuntu jammy/main amd64 libicu-dev amd64 70.1-2 [11.6 MB]
+Get:40 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libncurses-dev amd64 6.3-2ubuntu0.1 [381 kB]
+Get:41 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libtinfo-dev amd64 6.3-2ubuntu0.1 [780 B]
+Get:42 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libxml2-dev amd64 2.9.13+dfsg-1ubuntu0.11 [805 kB]
+Get:43 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 llvm-14-runtime amd64 1:14.0.0-1ubuntu1.1 [484 kB]
+Get:44 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libpfm4 amd64 4.11.1+git32-gd0b85fb-1ubuntu0.1 [345 kB]
+Get:45 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 llvm-14 amd64 1:14.0.0-1ubuntu1.1 [12.7 MB]
+Get:46 http://archive.ubuntu.com/ubuntu jammy/main amd64 libffi-dev amd64 3.4.2-4 [63.7 kB]
+Get:47 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 python3-pygments all 2.11.2+dfsg-2ubuntu0.1 [750 kB]
+Get:48 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 llvm-14-tools amd64 1:14.0.0-1ubuntu1.1 [404 kB]
+Get:49 http://archive.ubuntu.com/ubuntu jammy/universe amd64 libz3-4 amd64 4.8.12-1 [5766 kB]
+Get:50 http://archive.ubuntu.com/ubuntu jammy/universe amd64 libz3-dev amd64 4.8.12-1 [72.2 kB]
+Get:51 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 llvm-14-dev amd64 1:14.0.0-1ubuntu1.1 [37.8 MB]
+Get:52 http://archive.ubuntu.com/ubuntu jammy/universe amd64 ninja-build amd64 1.10.1-1 [111 kB]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 186 MB in 1s (147 MB/s)
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 25611 files and directories currently installed.)
+Preparing to unpack .../libc6-dev_2.35-0ubuntu3.13_amd64.deb ...
+Unpacking libc6-dev:amd64 (2.35-0ubuntu3.13) over (2.35-0ubuntu3.6) ...
+Preparing to unpack .../libc-dev-bin_2.35-0ubuntu3.13_amd64.deb ...
+Unpacking libc-dev-bin (2.35-0ubuntu3.13) over (2.35-0ubuntu3.6) ...
+Preparing to unpack .../libatomic1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libatomic1:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../libubsan1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libubsan1:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../gcc-12-base_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking gcc-12-base:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Setting up gcc-12-base:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 25611 files and directories currently installed.)
+Preparing to unpack .../libstdc++6_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libstdc++6:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Setting up libstdc++6:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 25611 files and directories currently installed.)
+Preparing to unpack .../0-libquadmath0_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libquadmath0:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../1-liblsan0_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking liblsan0:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../2-libitm1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libitm1:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../3-libgomp1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libgomp1:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../4-libcc1-0_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libcc1-0:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Preparing to unpack .../5-libgcc-s1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libgcc-s1:amd64 (12.3.0-1ubuntu1~22.04.3) over (12.3.0-1ubuntu1~22.04) ...
+Setting up libgcc-s1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 25611 files and directories currently installed.)
+Preparing to unpack .../libc6_2.35-0ubuntu3.13_amd64.deb ...
+Unpacking libc6:amd64 (2.35-0ubuntu3.13) over (2.35-0ubuntu3.6) ...
+Setting up libc6:amd64 (2.35-0ubuntu3.13) ...
+Selecting previously unselected package python3-yaml.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 25611 files and directories currently installed.)
+Preparing to unpack .../00-python3-yaml_5.4.1-1ubuntu1_amd64.deb ...
+Unpacking python3-yaml (5.4.1-1ubuntu1) ...
+Selecting previously unselected package libpipeline1:amd64.
+Preparing to unpack .../01-libpipeline1_1.5.5-1_amd64.deb ...
+Unpacking libpipeline1:amd64 (1.5.5-1) ...
+Selecting previously unselected package binfmt-support.
+Preparing to unpack .../02-binfmt-support_2.2.1-2_amd64.deb ...
+Unpacking binfmt-support (2.2.1-2) ...
+Selecting previously unselected package libllvm14:amd64.
+Preparing to unpack .../03-libllvm14_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking libllvm14:amd64 (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package libclang-cpp14.
+Preparing to unpack .../04-libclang-cpp14_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking libclang-cpp14 (1:14.0.0-1ubuntu1.1) ...
+Preparing to unpack .../05-libasan6_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libasan6:amd64 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../06-g++-11_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking g++-11 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../07-gcc-11_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking gcc-11 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../08-libstdc++-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libstdc++-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../09-libgcc-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libgcc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../10-libtsan0_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libtsan0:amd64 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../11-cpp-11_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking cpp-11 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Preparing to unpack .../12-gcc-11-base_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking gcc-11-base:amd64 (11.4.0-1ubuntu1~22.04.3) over (11.4.0-1ubuntu1~22.04) ...
+Selecting previously unselected package libgc1:amd64.
+Preparing to unpack .../13-libgc1_1%3a8.0.6-1.1build1_amd64.deb ...
+Unpacking libgc1:amd64 (1:8.0.6-1.1build1) ...
+Selecting previously unselected package libobjc4:amd64.
+Preparing to unpack .../14-libobjc4_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libobjc4:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libobjc-11-dev:amd64.
+Preparing to unpack .../15-libobjc-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking libobjc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libc6-i386.
+Preparing to unpack .../16-libc6-i386_2.35-0ubuntu3.13_amd64.deb ...
+Unpacking libc6-i386 (2.35-0ubuntu3.13) ...
+Selecting previously unselected package lib32gcc-s1.
+Preparing to unpack .../17-lib32gcc-s1_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking lib32gcc-s1 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package lib32stdc++6.
+Preparing to unpack .../18-lib32stdc++6_12.3.0-1ubuntu1~22.04.3_amd64.deb ...
+Unpacking lib32stdc++6 (12.3.0-1ubuntu1~22.04.3) ...
+Selecting previously unselected package libclang-common-14-dev.
+Preparing to unpack .../19-libclang-common-14-dev_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking libclang-common-14-dev (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package llvm-14-linker-tools.
+Preparing to unpack .../20-llvm-14-linker-tools_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking llvm-14-linker-tools (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package libclang1-14.
+Preparing to unpack .../21-libclang1-14_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking libclang1-14 (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package clang-14.
+Preparing to unpack .../22-clang-14_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking clang-14 (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package clang.
+Preparing to unpack .../23-clang_1%3a14.0-55~exp2_amd64.deb ...
+Unpacking clang (1:14.0-55~exp2) ...
+Selecting previously unselected package icu-devtools.
+Preparing to unpack .../24-icu-devtools_70.1-2_amd64.deb ...
+Unpacking icu-devtools (70.1-2) ...
+Selecting previously unselected package libicu-dev:amd64.
+Preparing to unpack .../25-libicu-dev_70.1-2_amd64.deb ...
+Unpacking libicu-dev:amd64 (70.1-2) ...
+Selecting previously unselected package libncurses-dev:amd64.
+Preparing to unpack .../26-libncurses-dev_6.3-2ubuntu0.1_amd64.deb ...
+Unpacking libncurses-dev:amd64 (6.3-2ubuntu0.1) ...
+Selecting previously unselected package libtinfo-dev:amd64.
+Preparing to unpack .../27-libtinfo-dev_6.3-2ubuntu0.1_amd64.deb ...
+Unpacking libtinfo-dev:amd64 (6.3-2ubuntu0.1) ...
+Selecting previously unselected package libxml2-dev:amd64.
+Preparing to unpack .../28-libxml2-dev_2.9.13+dfsg-1ubuntu0.11_amd64.deb ...
+Unpacking libxml2-dev:amd64 (2.9.13+dfsg-1ubuntu0.11) ...
+Selecting previously unselected package llvm-14-runtime.
+Preparing to unpack .../29-llvm-14-runtime_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking llvm-14-runtime (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package libpfm4:amd64.
+Preparing to unpack .../30-libpfm4_4.11.1+git32-gd0b85fb-1ubuntu0.1_amd64.deb ...
+Unpacking libpfm4:amd64 (4.11.1+git32-gd0b85fb-1ubuntu0.1) ...
+Selecting previously unselected package llvm-14.
+Preparing to unpack .../31-llvm-14_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking llvm-14 (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package libffi-dev:amd64.
+Preparing to unpack .../32-libffi-dev_3.4.2-4_amd64.deb ...
+Unpacking libffi-dev:amd64 (3.4.2-4) ...
+Selecting previously unselected package python3-pygments.
+Preparing to unpack .../33-python3-pygments_2.11.2+dfsg-2ubuntu0.1_all.deb ...
+Unpacking python3-pygments (2.11.2+dfsg-2ubuntu0.1) ...
+Selecting previously unselected package llvm-14-tools.
+Preparing to unpack .../34-llvm-14-tools_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking llvm-14-tools (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package libz3-4:amd64.
+Preparing to unpack .../35-libz3-4_4.8.12-1_amd64.deb ...
+Unpacking libz3-4:amd64 (4.8.12-1) ...
+Selecting previously unselected package libz3-dev:amd64.
+Preparing to unpack .../36-libz3-dev_4.8.12-1_amd64.deb ...
+Unpacking libz3-dev:amd64 (4.8.12-1) ...
+Selecting previously unselected package llvm-14-dev.
+Preparing to unpack .../37-llvm-14-dev_1%3a14.0.0-1ubuntu1.1_amd64.deb ...
+Unpacking llvm-14-dev (1:14.0.0-1ubuntu1.1) ...
+Selecting previously unselected package ninja-build.
+Preparing to unpack .../38-ninja-build_1.10.1-1_amd64.deb ...
+Unpacking ninja-build (1.10.1-1) ...
+Setting up libpipeline1:amd64 (1.5.5-1) ...
+Setting up gcc-11-base:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up python3-yaml (5.4.1-1ubuntu1) ...
+Setting up libgomp1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libffi-dev:amd64 (3.4.2-4) ...
+Setting up ninja-build (1.10.1-1) ...
+Setting up libasan6:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up python3-pygments (2.11.2+dfsg-2ubuntu0.1) ...
+Setting up libz3-4:amd64 (4.8.12-1) ...
+Setting up libpfm4:amd64 (4.11.1+git32-gd0b85fb-1ubuntu0.1) ...
+Setting up libquadmath0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libatomic1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up binfmt-support (2.2.1-2) ...
+invoke-rc.d: could not determine current runlevel
+invoke-rc.d: policy-rc.d denied execution of restart.
+Created symlink /etc/systemd/system/multi-user.target.wants/binfmt-support.service → /lib/systemd/system/binfmt-support.service.
+Setting up icu-devtools (70.1-2) ...
+Setting up libgc1:amd64 (1:8.0.6-1.1build1) ...
+Setting up libubsan1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libllvm14:amd64 (1:14.0.0-1ubuntu1.1) ...
+Setting up libc6-i386 (2.35-0ubuntu3.13) ...
+Setting up libc-dev-bin (2.35-0ubuntu3.13) ...
+Setting up llvm-14-linker-tools (1:14.0.0-1ubuntu1.1) ...
+Setting up libcc1-0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up liblsan0:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libitm1:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libtsan0:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up llvm-14-tools (1:14.0.0-1ubuntu1.1) ...
+Setting up cpp-11 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up libz3-dev:amd64 (4.8.12-1) ...
+Setting up libclang1-14 (1:14.0.0-1ubuntu1.1) ...
+Setting up libobjc4:amd64 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up llvm-14-runtime (1:14.0.0-1ubuntu1.1) ...
+Setting up lib32gcc-s1 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up lib32stdc++6 (12.3.0-1ubuntu1~22.04.3) ...
+Setting up libclang-common-14-dev (1:14.0.0-1ubuntu1.1) ...
+Setting up libclang-cpp14 (1:14.0.0-1ubuntu1.1) ...
+Setting up libgcc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up gcc-11 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up libc6-dev:amd64 (2.35-0ubuntu3.13) ...
+Setting up libicu-dev:amd64 (70.1-2) ...
+Setting up llvm-14 (1:14.0.0-1ubuntu1.1) ...
+Setting up libncurses-dev:amd64 (6.3-2ubuntu0.1) ...
+Setting up libobjc-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up libxml2-dev:amd64 (2.9.13+dfsg-1ubuntu0.11) ...
+Setting up libstdc++-11-dev:amd64 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up llvm-14-dev (1:14.0.0-1ubuntu1.1) ...
+Setting up libtinfo-dev:amd64 (6.3-2ubuntu0.1) ...
+Setting up clang-14 (1:14.0.0-1ubuntu1.1) ...
+Setting up g++-11 (11.4.0-1ubuntu1~22.04.3) ...
+Setting up clang (1:14.0-55~exp2) ...
+Processing triggers for libc-bin (2.35-0ubuntu3.6) ...
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded adler2 v2.0.1
+  Downloaded fastrand v2.3.0
+  Downloaded block-buffer v0.10.4
+  Downloaded bitflags v2.10.0
+  Downloaded indicatif v0.17.11
+  Downloaded foldhash v0.2.0
+  Downloaded gemm v0.19.0
+  Downloaded foreign-types-shared v0.1.1
+  Downloaded console v0.15.11
+  Downloaded ident_case v1.0.1
+  Downloaded itertools v0.14.0
+  Downloaded libloading v0.9.0
+  Downloaded metrics v0.22.4
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded plotters-svg v0.3.7
+  Downloaded pest_meta v2.8.3
+  Downloaded proc-macro2 v1.0.103
+  Downloaded quote v1.0.41
+  Downloaded quinn v0.11.9
+  Downloaded rustls-webpki v0.103.7
+  Downloaded slab v0.4.11
+  Downloaded thiserror v1.0.69
+  Downloaded strsim v0.11.1
+  Downloaded time-core v0.1.6
+  Downloaded tracing-subscriber v0.3.20
+  Downloaded version_check v0.9.5
+  Downloaded utf8_iter v1.0.4
+  Downloaded uuid v1.18.1
+  Downloaded zune-core v0.5.1
+  Downloaded unicode_categories v0.1.1
+  Downloaded zerocopy-derive v0.8.27
+  Downloaded toml_datetime v0.6.11
+  Downloaded winnow v0.7.13
+  Downloaded yoke v0.7.5
+  Downloaded zerovec v0.11.4
+  Downloaded webpki-roots v1.0.3
+  Downloaded tokio-util v0.7.16
+  Downloaded zip v7.2.0
+  Downloaded utf-8 v0.7.6
+  Downloaded zerotrie v0.2.2
+  Downloaded yoke-derive v0.8.0
+  Downloaded zune-jpeg v0.5.15
+  Downloaded zeroize v1.8.2
+  Downloaded tracing-attributes v0.1.30
+  Downloaded windowfunctions v0.1.1
+  Downloaded vcpkg v0.2.15
+  Downloaded unicode-segmentation v1.12.0
+  Downloaded syn v2.0.108
+  Downloaded regex-automata v0.4.13
+  Downloaded rustls v0.23.34
+  Downloaded zerofrom v0.1.6
+  Downloaded yoke-derive v0.7.5
+  Downloaded pxfm v0.1.28
+  Downloaded yaml-rust2 v0.8.1
+  Downloaded tower-http v0.6.6
+  Downloaded rustix v1.1.2
+  Downloaded symphonia-format-ogg v0.5.5
+  Downloaded webpki-roots v0.26.11
+  Downloaded onig_sys v69.9.1
+  Downloaded visibility v0.1.1
+  Downloaded url v2.5.7
+  Downloaded unicode-width v0.2.2
+  Downloaded tungstenite v0.24.0
+  Downloaded rustfft v6.4.1
+  Downloaded spm_precompiled v0.1.4
+  Downloaded png v0.18.1
+  Downloaded plotters v0.3.7
+  Downloaded utf8parse v0.2.2
+  Downloaded unicode-ident v1.0.20
+  Downloaded ug-cuda v0.5.0
+  Downloaded typenum v1.19.0
+  Downloaded tower-http v0.5.2
+  Downloaded tokio-stream v0.1.17
+  Downloaded sharded-slab v0.1.7
+  Downloaded rand_distr v0.5.1
+  Downloaded image v0.25.10
+  Downloaded want v0.3.1
+  Downloaded walkdir v2.5.0
+  Downloaded ucd-trie v0.1.7
+  Downloaded transpose v0.2.3
+  Downloaded tower v0.5.2
+  Downloaded toml_edit v0.22.27
+  Downloaded tinystr v0.8.1
+  Downloaded tempfile v3.23.0
+  Downloaded symphonia-codec-vorbis v0.5.5
+  Downloaded serde_path_to_error v0.1.20
+  Downloaded ryu v1.0.20
+  Downloaded ring v0.17.14
+  Downloaded reborrow v0.5.5
+  Downloaded plotters-backend v0.3.7
+  Downloaded linux-raw-sys v0.11.0
+  Downloaded try-lock v0.2.5
+  Downloaded tracing-serde v0.2.0
+  Downloaded tokenizers v0.21.4
+  Downloaded time v0.3.44
+  Downloaded thiserror v2.0.17
+  Downloaded symphonia-codec-aac v0.5.5
+  Downloaded static_assertions v1.1.0
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded tokio v1.48.0
+  Downloaded socket2 v0.6.1
+  Downloaded sketches-ddsketch v0.2.2
+  Downloaded serde_urlencoded v0.7.1
+  Downloaded scopeguard v1.2.0
+  Downloaded rustc-hash v2.1.1
+  Downloaded rayon-cond v0.4.0
+  Downloaded quick-error v2.0.1
+  Downloaded symphonia-bundle-mp3 v0.5.5
+  Downloaded simd-adler32 v0.3.7
+  Downloaded safetensors v0.4.5
+  Downloaded regex-syntax v0.8.8
+  Downloaded regex-lite v0.1.9
+  Downloaded rand v0.9.2
+  Downloaded ureq v2.12.1
+  Downloaded unicode-normalization-alignments v0.1.12
+  Downloaded tokio-macros v2.6.0
+  Downloaded thread_local v1.1.9
+  Downloaded thiserror-impl v2.0.17
+  Downloaded thiserror-impl v1.0.69
+  Downloaded symphonia-codec-pcm v0.5.5
+  Downloaded symphonia v0.5.5
+  Downloaded subtle v2.6.1
+  Downloaded smallvec v1.15.1
+  Downloaded serde_json v1.0.145
+  Downloaded seq-macro v0.3.6
+  Downloaded rustversion v1.0.22
+  Downloaded pin-project-lite v0.2.16
+  Downloaded hyper v0.14.32
+  Downloaded hashbrown v0.17.1
+  Downloaded getrandom v0.3.4
+  Downloaded tracing-core v0.1.34
+  Downloaded tracing v0.1.41
+  Downloaded symphonia-core v0.5.5
+  Downloaded serde_derive v1.0.228
+  Downloaded same-file v1.0.6
+  Downloaded reqwest v0.12.24
+  Downloaded rayon v1.11.0
+  Downloaded priority-queue v2.7.0
+  Downloaded potential_utf v0.1.3
+  Downloaded openssl-probe v0.2.1
+  Downloaded num-iter v0.1.45
+  Downloaded memchr v2.7.6
+  Downloaded icu_provider v2.0.0
+  Downloaded icu_properties v2.0.1
+  Downloaded icu_normalizer_data v2.0.0
+  Downloaded hyper-util v0.1.17
+  Downloaded hyper-tls v0.5.0
+  Downloaded zerovec-derive v0.11.1
+  Downloaded zerofrom-derive v0.1.6
+  Downloaded zerocopy v0.8.27
+  Downloaded yoke v0.8.1
+  Downloaded writeable v0.6.1
+  Downloaded unsafe-libyaml v0.2.11
+  Downloaded toml v0.8.23
+  Downloaded tokio-rustls v0.26.4
+  Downloaded tinyvec v1.10.0
+  Downloaded pest_generator v2.8.3
+  Downloaded num-complex v0.4.6
+  Downloaded libm v0.2.15
+  Downloaded untrusted v0.9.0
+  Downloaded tracing-log v0.2.0
+  Downloaded tokio-tungstenite v0.24.0
+  Downloaded symphonia-format-isomp4 v0.5.5
+  Downloaded ron v0.8.1
+  Downloaded rand_chacha v0.3.1
+  Downloaded pest_derive v2.8.3
+  Downloaded openssl v0.10.74
+  Downloaded tower-service v0.3.3
+  Downloaded tower-layer v0.3.3
+  Downloaded time-macros v0.2.24
+  Downloaded spin v0.9.8
+  Downloaded socket2 v0.5.10
+  Downloaded simple_asn1 v0.6.3
+  Downloaded serde_yaml v0.9.34+deprecated
+  Downloaded serde_core v1.0.228
+  Downloaded rand v0.8.5
+  Downloaded pulp v0.21.5
+  Downloaded paste v1.0.15
+  Downloaded option-ext v0.2.0
+  Downloaded num v0.4.3
+  Downloaded ipnet v2.11.0
+  Downloaded httpdate v1.0.3
+  Downloaded http v0.2.12
+  Downloaded gemm-f64 v0.19.0
+  Downloaded unicase v2.9.0
+  Downloaded ug v0.5.0
+  Downloaded typed-path v0.12.3
+  Downloaded tower v0.4.13
+  Downloaded toml_write v0.1.2
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded tinytemplate v1.2.1
+  Downloaded tiny-keccak v2.0.2
+  Downloaded symphonia-utils-xiph v0.5.5
+  Downloaded symphonia-format-riff v0.5.5
+  Downloaded socks v0.3.4
+  Downloaded shellexpand v3.1.1
+  Downloaded sha2 v0.10.9
+  Downloaded futures-sink v0.3.31
+  Downloaded futures-channel v0.3.31
+  Downloaded tokio-native-tls v0.3.1
+  Downloaded synstructure v0.13.2
+  Downloaded sync_wrapper v1.0.2
+  Downloaded symphonia-metadata v0.5.5
+  Downloaded serde_plain v1.0.2
+  Downloaded rustls-pki-types v1.12.0
+  Downloaded rustls-native-certs v0.8.3
+  Downloaded rubato v2.0.0
+  Downloaded rand_distr v0.4.3
+  Downloaded pest v2.8.3
+  Downloaded num-rational v0.4.2
+  Downloaded json5 v0.4.1
+  Downloaded symphonia-bundle-flac v0.5.5
+  Downloaded strength_reduce v0.2.4
+  Downloaded sha1 v0.10.6
+  Downloaded serde_spanned v0.6.9
+  Downloaded regex v1.12.2
+  Downloaded primal-check v0.3.4
+  Downloaded powerfmt v0.2.0
+  Downloaded pin-utils v0.1.0
+  Downloaded percent-encoding v2.3.2
+  Downloaded parking_lot v0.12.5
+  Downloaded multer v3.1.0
+  Downloaded minijinja v2.20.0
+  Downloaded mime_guess v2.0.5
+  Downloaded half v2.7.1
+  Downloaded dyn-stack v0.13.2
+  Downloaded dirs v6.0.0
+  Downloaded dialoguer v0.11.0
+  Downloaded cudarc v0.19.4
+  Downloaded cudarc v0.17.8
+  Downloaded shell-words v1.1.0
+  Downloaded realfft v3.5.0
+  Downloaded raw-cpuid v11.6.0
+  Downloaded pem v3.0.6
+  Downloaded num_cpus v1.17.0
+  Downloaded native-tls v0.2.14
+  Downloaded mio v1.1.0
+  Downloaded miniz_oxide v0.8.9
+  Downloaded data-encoding v2.9.0
+  Downloaded signal-hook-registry v1.4.6
+  Downloaded serde v1.0.228
+  Downloaded safetensors v0.7.0
+  Downloaded rust-ini v0.20.0
+  Downloaded rayon-core v1.13.0
+  Downloaded oorandom v11.1.5
+  Downloaded moxcms v0.8.1
+  Downloaded monostate-impl v0.1.18
+  Downloaded libc v0.2.186
+  Downloaded derive_builder_core v0.20.2
+  Downloaded config v0.14.1
+  Downloaded clap_lex v0.7.6
+  Downloaded clap_derive v4.5.49
+  Downloaded shlex v1.3.0
+  Downloaded rand_core v0.9.3
+  Downloaded rand_core v0.6.4
+  Downloaded quinn-proto v0.11.13
+  Downloaded quanta v0.12.6
+  Downloaded pulp-wasm-simd-flag v0.1.0
+  Downloaded mime v0.3.17
+  Downloaded metrics-util v0.16.3
+  Downloaded heck v0.5.0
+  Downloaded futures-core v0.3.31
+  Downloaded extended v0.1.0
+  Downloaded errno v0.3.14
+  Downloaded encoding_rs v0.8.35
+  Downloaded dlv-list v0.5.2
+  Downloaded chrono v0.4.42
+  Downloaded bit-vec v0.8.0
+  Downloaded base64 v0.22.1
+  Downloaded rand_chacha v0.9.0
+  Downloaded portable-atomic v1.11.1
+  Downloaded macro_rules_attribute v0.2.2
+  Downloaded log v0.4.28
+  Downloaded icu_locale_core v2.0.0
+  Downloaded futures-task v0.3.31
+  Downloaded foreign-types v0.3.2
+  Downloaded displaydoc v0.2.5
+  Downloaded const-random v0.1.18
+  Downloaded clap_builder v4.5.50
+  Downloaded cc v1.2.43
+  Downloaded bit-set v0.8.0
+  Downloaded bindgen_cuda v0.1.6
+  Downloaded pulp v0.22.2
+  Downloaded number_prefix v0.4.0
+  Downloaded h2 v0.4.12
+  Downloaded futures-io v0.3.31
+  Downloaded dirs-sys v0.4.1
+  Downloaded bytes v1.10.1
+  Downloaded quinn-udp v0.5.14
+  Downloaded openssl-sys v0.9.110
+  Downloaded onig v6.5.1
+  Downloaded num-bigint v0.4.6
+  Downloaded nom v7.1.3
+  Downloaded macro_rules_attribute-proc_macro v0.2.2
+  Downloaded idna v1.1.0
+  Downloaded gemm-f16 v0.19.0
+  Downloaded gemm-c64 v0.19.0
+  Downloaded derive_builder v0.20.2
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded crossbeam-channel v0.5.15
+  Downloaded criterion-plot v0.5.0
+  Downloaded cpufeatures v0.2.17
+  Downloaded castaway v0.2.4
+  Downloaded candle-nn v0.9.2
+  Downloaded base64 v0.21.7
+  Downloaded pin-project v1.1.10
+  Downloaded num-conv v0.1.0
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded itertools v0.10.5
+  Downloaded iri-string v0.7.8
+  Downloaded indexmap v2.14.0
+  Downloaded icu_properties_data v2.0.1
+  Downloaded hyper v1.7.0
+  Downloaded futures v0.3.31
+  Downloaded esaxx-rs v0.1.10
+  Downloaded darling_core v0.20.11
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded crc32fast v1.5.0
+  Downloaded ciborium v0.2.2
+  Downloaded cfg_aliases v0.2.1
+  Downloaded candle-ug v0.9.2
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded parking_lot_core v0.9.12
+  Downloaded once_cell v1.21.3
+  Downloaded metrics-exporter-prometheus v0.13.1
+  Downloaded memmap2 v0.9.9
+  Downloaded form_urlencoded v1.2.2
+  Downloaded either v1.15.0
+  Downloaded crunchy v0.2.4
+  Downloaded colorchoice v1.0.4
+  Downloaded ciborium-ll v0.2.2
+  Downloaded bytesize v1.3.3
+  Downloaded byteorder-lite v0.1.0
+  Downloaded pkg-config v0.3.32
+  Downloaded pin-project-internal v1.1.10
+  Downloaded pathdiff v0.2.3
+  Downloaded ordered-multimap v0.7.3
+  Downloaded openssl-probe v0.1.6
+  Downloaded openssl-macros v0.1.1
+  Downloaded num-traits v0.2.19
+  Downloaded num-integer v0.1.46
+  Downloaded matchit v0.7.3
+  Downloaded lock_api v0.4.14
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded icu_collections v2.0.0
+  Downloaded hashlink v0.8.4
+  Downloaded hashbrown v0.16.0
+  Downloaded getrandom v0.2.16
+  Downloaded futures-executor v0.3.31
+  Downloaded dashmap v6.1.0
+  Downloaded dary_heap v0.3.8
+  Downloaded convert_case v0.6.0
+  Downloaded candle-kernels v0.9.2
+  Downloaded candle-core v0.9.2
+  Downloaded monostate v0.1.18
+  Downloaded minimal-lexical v0.2.1
+  Downloaded minijinja-contrib v2.20.0
+  Downloaded lru-slab v0.1.2
+  Downloaded jsonwebtoken v9.3.1
+  Downloaded hyper-rustls v0.27.7
+  Downloaded hf-hub v0.4.3
+  Downloaded glob v0.3.3
+  Downloaded gemm-f64 v0.18.2
+  Downloaded gemm-f32 v0.19.0
+  Downloaded dirs v5.0.1
+  Downloaded anstream v0.6.21
+  Downloaded memo-map v0.3.3
+  Downloaded matchers v0.2.0
+  Downloaded litemap v0.8.0
+  Downloaded libloading v0.8.9
+  Downloaded itoa v1.0.15
+  Downloaded is-terminal v0.4.17
+  Downloaded image-webp v0.2.4
+  Downloaded idna_adapter v1.2.1
+  Downloaded httparse v1.10.1
+  Downloaded http-body-util v0.1.3
+  Downloaded http-body v1.0.1
+  Downloaded http v1.3.1
+  Downloaded generic-array v0.14.9
+  Downloaded fdeflate v0.3.7
+  Downloaded clap v4.5.50
+  Downloaded candle-transformers v0.9.2
+  Downloaded byteorder v1.5.0
+  Downloaded lazy_static v1.5.0
+  Downloaded icu_normalizer v2.0.0
+  Downloaded iana-time-zone v0.1.64
+  Downloaded hyper-tls v0.6.0
+  Downloaded http-body v0.4.6
+  Downloaded flate2 v1.1.5
+  Downloaded equivalent v1.0.2
+  Downloaded dirs-sys v0.5.0
+  Downloaded darling_macro v0.20.11
+  Downloaded ciborium-io v0.2.2
+  Downloaded colored v2.2.0
+  Downloaded audioadapter v3.0.0
+  Downloaded hashbrown v0.14.5
+  Downloaded gemm-f32 v0.18.2
+  Downloaded gemm-f16 v0.18.2
+  Downloaded gemm-common v0.19.0
+  Downloaded dyn-stack-macros v0.1.3
+  Downloaded digest v0.10.7
+  Downloaded derive_builder_macro v0.20.2
+  Downloaded deranged v0.5.4
+  Downloaded darling v0.20.11
+  Downloaded criterion v0.5.1
+  Downloaded const-random-macro v0.1.16
+  Downloaded compact_str v0.9.0
+  Downloaded cfg-if v1.0.4
+  Downloaded bitflags v1.3.2
+  Downloaded audioadapter-sample v3.0.0
+  Downloaded anstyle-parse v0.2.7
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded bytemuck v1.24.0
+  Downloaded async-trait v0.1.89
+  Downloaded gemm v0.18.2
+  Downloaded futures-macro v0.3.31
+  Downloaded crypto-common v0.1.6
+  Downloaded audio-core v0.2.1
+  Downloaded anstyle v1.0.13
+  Downloaded fnv v1.0.7
+  Downloaded float8 v0.7.0
+  Downloaded float8 v0.6.1
+  Downloaded cast v0.3.0
+  Downloaded axum v0.7.9
+  Downloaded anyhow v1.0.100
+  Downloaded gemm-common v0.18.2
+  Downloaded gemm-c64 v0.18.2
+  Downloaded gemm-c32 v0.19.0
+  Downloaded gemm-c32 v0.18.2
+  Downloaded futures-util v0.3.31
+  Downloaded find-msvc-tools v0.1.4
+  Downloaded fancy-regex v0.17.0
+  Downloaded autocfg v1.5.0
+  Downloaded axum-core v0.4.5
+  Downloaded audioadapter-buffers v3.0.0
+  Downloaded atomic-waker v1.1.2
+  Downloaded arrayvec v0.7.6
+  Downloaded arraydeque v0.5.1
+  Downloaded anstyle-query v1.1.4
+  Downloaded anes v0.1.6
+  Downloaded allocator-api2 v0.2.21
+  Downloaded aho-corasick v1.1.3
+  Downloaded ahash v0.8.12
+  Downloaded base64 v0.13.1
+   Compiling proc-macro2 v1.0.103
+   Compiling quote v1.0.41
+   Compiling unicode-ident v1.0.20
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling once_cell v1.21.3
+   Compiling itoa v1.0.15
+   Compiling memchr v2.7.6
+   Compiling zerocopy v0.8.27
+   Compiling autocfg v1.5.0
+   Compiling libm v0.2.15
+   Compiling version_check v0.9.5
+   Compiling getrandom v0.3.4
+   Compiling log v0.4.28
+   Compiling crossbeam-utils v0.8.21
+   Compiling equivalent v1.0.2
+   Compiling hashbrown v0.17.1
+   Compiling pin-project-lite v0.2.16
+   Compiling bytes v1.10.1
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.4
+   Compiling futures-core v0.3.31
+   Compiling parking_lot_core v0.9.12
+   Compiling ryu v1.0.20
+   Compiling scopeguard v1.2.0
+   Compiling futures-sink v0.3.31
+   Compiling rayon-core v1.13.0
+   Compiling serde_json v1.0.145
+   Compiling slab v0.4.11
+   Compiling pin-utils v0.1.0
+   Compiling lock_api v0.4.14
+   Compiling futures-io v0.3.31
+   Compiling futures-task v0.3.31
+   Compiling stable_deref_trait v1.2.1
+   Compiling futures-channel v0.3.31
+   Compiling fnv v1.0.7
+   Compiling pkg-config v0.3.32
+   Compiling cc v1.2.43
+   Compiling typenum v1.19.0
+   Compiling either v1.15.0
+   Compiling tracing-core v0.1.34
+   Compiling paste v1.0.15
+   Compiling allocator-api2 v0.2.21
+   Compiling encoding_rs v0.8.35
+   Compiling httparse v1.10.1
+   Compiling thiserror v1.0.69
+   Compiling tower-service v0.3.3
+   Compiling generic-array v0.14.9
+   Compiling ahash v0.8.12
+   Compiling lazy_static v1.5.0
+   Compiling vcpkg v0.2.15
+   Compiling pulp v0.22.2
+   Compiling crc32fast v1.5.0
+   Compiling num-traits v0.2.19
+   Compiling http v1.3.1
+   Compiling indexmap v2.14.0
+   Compiling cpufeatures v0.2.17
+   Compiling reborrow v0.5.5
+   Compiling dyn-stack-macros v0.1.3
+   Compiling pulp-wasm-simd-flag v0.1.0
+   Compiling try-lock v0.2.5
+   Compiling bitflags v1.3.2
+   Compiling seq-macro v0.3.6
+   Compiling thiserror v2.0.17
+   Compiling byteorder v1.5.0
+   Compiling arrayvec v0.7.6
+   Compiling zeroize v1.8.2
+   Compiling want v0.3.1
+   Compiling openssl v0.10.74
+   Compiling foreign-types-shared v0.1.1
+   Compiling litemap v0.8.0
+   Compiling percent-encoding v2.3.2
+   Compiling writeable v0.6.1
+   Compiling glob v0.3.3
+   Compiling httpdate v1.0.3
+   Compiling aho-corasick v1.1.3
+   Compiling rustls-pki-types v1.12.0
+   Compiling foreign-types v0.3.2
+   Compiling icu_normalizer_data v2.0.0
+   Compiling base64 v0.22.1
+   Compiling icu_properties_data v2.0.1
+   Compiling regex-syntax v0.8.8
+   Compiling iana-time-zone v0.1.64
+   Compiling native-tls v0.2.14
+   Compiling untrusted v0.9.0
+   Compiling atomic-waker v1.1.2
+   Compiling tower-layer v0.3.3
+   Compiling openssl-probe v0.1.6
+   Compiling strsim v0.11.1
+   Compiling cudarc v0.19.4
+   Compiling rustversion v1.0.22
+   Compiling http-body v1.0.1
+   Compiling ident_case v1.0.1
+   Compiling simd-adler32 v0.3.7
+   Compiling rustls v0.23.34
+   Compiling openssl-sys v0.9.110
+   Compiling ring v0.17.14
+   Compiling ipnet v2.11.0
+   Compiling form_urlencoded v1.2.2
+   Compiling crossbeam-epoch v0.9.18
+   Compiling sync_wrapper v1.0.2
+   Compiling libloading v0.9.0
+   Compiling subtle v2.6.1
+   Compiling http-body-util v0.1.3
+   Compiling foldhash v0.2.0
+   Compiling option-ext v0.2.0
+   Compiling crunchy v0.2.4
+   Compiling adler2 v2.0.1
+   Compiling webpki-roots v1.0.3
+   Compiling typed-path v0.12.3
+   Compiling mime v0.3.17
+   Compiling unicode-width v0.2.2
+   Compiling tiny-keccak v2.0.2
+   Compiling portable-atomic v1.11.1
+   Compiling miniz_oxide v0.8.9
+   Compiling syn v2.0.108
+   Compiling crossbeam-deque v0.8.6
+   Compiling anyhow v1.0.100
+   Compiling utf8_iter v1.0.4
+   Compiling onig_sys v69.9.1
+   Compiling minimal-lexical v0.2.1
+   Compiling unicode-segmentation v1.12.0
+   Compiling esaxx-rs v0.1.10
+   Compiling ucd-trie v0.1.7
+   Compiling num_cpus v1.17.0
+   Compiling getrandom v0.2.16
+   Compiling signal-hook-registry v1.4.6
+   Compiling mio v1.1.0
+   Compiling socket2 v0.6.1
+   Compiling console v0.15.11
+   Compiling memmap2 v0.9.9
+   Compiling nom v7.1.3
+   Compiling rand_core v0.9.3
+   Compiling dirs-sys v0.5.0
+   Compiling rand_core v0.6.4
+   Compiling crypto-common v0.1.6
+   Compiling block-buffer v0.10.4
+   Compiling flate2 v1.1.5
+   Compiling strength_reduce v0.2.4
+   Compiling rayon v1.11.0
+   Compiling number_prefix v0.4.0
+   Compiling digest v0.10.7
+   Compiling iri-string v0.7.8
+   Compiling audio-core v0.2.1
+   Compiling pest v2.8.3
+   Compiling dirs v6.0.0
+   Compiling castaway v0.2.4
+   Compiling const-random-macro v0.1.16
+   Compiling socks v0.3.4
+   Compiling webpki-roots v0.26.11
+   Compiling sha2 v0.10.9
+   Compiling itertools v0.14.0
+   Compiling base64 v0.13.1
+   Compiling bit-vec v0.8.0
+   Compiling winnow v0.7.13
+   Compiling static_assertions v1.1.0
+   Compiling indicatif v0.17.11
+   Compiling num-integer v0.1.46
+   Compiling macro_rules_attribute-proc_macro v0.2.2
+   Compiling toml_write v0.1.2
+   Compiling const-random v0.1.18
+   Compiling audioadapter-sample v3.0.0
+   Compiling audioadapter v3.0.0
+   Compiling bit-set v0.8.0
+   Compiling zip v7.2.0
+   Compiling dirs-sys v0.4.1
+   Compiling fdeflate v0.3.7
+   Compiling http v0.2.12
+   Compiling pxfm v0.1.28
+   Compiling primal-check v0.3.4
+   Compiling transpose v0.2.3
+   Compiling zune-core v0.5.1
+   Compiling macro_rules_attribute v0.2.2
+   Compiling extended v0.1.0
+   Compiling byteorder-lite v0.1.0
+   Compiling powerfmt v0.2.0
+   Compiling unicode_categories v0.1.1
+   Compiling num-conv v0.1.0
+   Compiling utf8parse v0.2.2
+   Compiling regex-automata v0.4.13
+   Compiling quick-error v2.0.1
+   Compiling time-core v0.1.6
+   Compiling zune-jpeg v0.5.15
+   Compiling anstyle-parse v0.2.7
+   Compiling deranged v0.5.4
+   Compiling bitflags v2.10.0
+   Compiling image-webp v0.2.4
+   Compiling dirs v5.0.1
+   Compiling time-macros v0.2.24
+   Compiling audioadapter-buffers v3.0.0
+   Compiling dlv-list v0.5.2
+   Compiling windowfunctions v0.1.1
+   Compiling raw-cpuid v11.6.0
+   Compiling png v0.18.1
+   Compiling sha1 v0.10.6
+   Compiling pest_meta v2.8.3
+   Compiling socket2 v0.5.10
+   Compiling http-body v0.4.6
+   Compiling multer v3.1.0
+   Compiling data-encoding v2.9.0
+   Compiling anstyle-query v1.1.4
+   Compiling base64 v0.21.7
+   Compiling colorchoice v1.0.4
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling utf-8 v0.7.6
+   Compiling anstyle v1.0.13
+   Compiling rustix v1.1.2
+   Compiling pathdiff v0.2.3
+   Compiling num-bigint v0.4.6
+   Compiling crossbeam-channel v0.5.15
+   Compiling priority-queue v2.7.0
+   Compiling linux-raw-sys v0.11.0
+   Compiling memo-map v0.3.3
+   Compiling anstream v0.6.21
+   Compiling ciborium-io v0.2.2
+   Compiling bindgen_cuda v0.1.6
+   Compiling spin v0.9.8
+   Compiling sketches-ddsketch v0.2.2
+   Compiling plotters-backend v0.3.7
+   Compiling time v0.3.44
+   Compiling clap_lex v0.7.6
+   Compiling heck v0.5.0
+   Compiling arraydeque v0.5.1
+   Compiling serde_path_to_error v0.1.20
+   Compiling convert_case v0.6.0
+   Compiling pem v3.0.6
+   Compiling plotters-svg v0.3.7
+   Compiling itertools v0.10.5
+   Compiling bytesize v1.3.3
+   Compiling fastrand v2.3.0
+   Compiling clap_builder v4.5.50
+   Compiling cast v0.3.0
+   Compiling same-file v1.0.6
+   Compiling candle-kernels v0.9.2
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-kernels)
+   Compiling rayon-cond v0.4.0
+   Compiling matchit v0.7.3
+   Compiling walkdir v2.5.0
+   Compiling plotters v0.3.7
+   Compiling is-terminal v0.4.17
+   Compiling tracing-log v0.2.0
+   Compiling sharded-slab v0.1.7
+   Compiling thread_local v1.1.9
+   Compiling regex-lite v0.1.9
+   Compiling quanta v0.12.6
+   Compiling nu-ansi-term v0.50.3
+   Compiling synstructure v0.13.2
+   Compiling darling_core v0.20.11
+   Compiling pest_generator v2.8.3
+   Compiling shell-words v1.1.0
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling unsafe-libyaml v0.2.11
+   Compiling shellexpand v3.1.1
+   Compiling colored v2.2.0
+   Compiling moxcms v0.8.1
+   Compiling criterion-plot v0.5.0
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.27
+   Compiling bytemuck_derive v1.10.2
+   Compiling tracing-attributes v0.1.30
+   Compiling tokio-macros v2.6.0
+   Compiling futures-macro v0.3.31
+   Compiling zerofrom-derive v0.1.6
+   Compiling yoke-derive v0.8.0
+   Compiling zerovec-derive v0.11.1
+   Compiling thiserror-impl v1.0.69
+   Compiling displaydoc v0.2.5
+   Compiling thiserror-impl v2.0.17
+   Compiling async-trait v0.1.89
+   Compiling openssl-macros v0.1.1
+   Compiling monostate-impl v0.1.18
+   Compiling regex v1.12.2
+   Compiling monostate v0.1.18
+   Compiling pin-project-internal v1.1.10
+   Compiling fancy-regex v0.17.0
+   Compiling visibility v0.1.1
+   Compiling futures-util v0.3.31
+   Compiling pest_derive v2.8.3
+   Compiling clap_derive v4.5.49
+   Compiling matchers v0.2.0
+   Compiling tempfile v3.23.0
+   Compiling dialoguer v0.11.0
+   Compiling darling_macro v0.20.11
+   Compiling tracing v0.1.41
+   Compiling bytemuck v1.24.0
+   Compiling zerofrom v0.1.6
+   Compiling pin-project v1.1.10
+   Compiling simple_asn1 v0.6.3
+   Compiling yoke v0.8.1
+   Compiling tower-http v0.5.2
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling num-complex v0.4.6
+   Compiling dyn-stack v0.13.2
+   Compiling symphonia-core v0.5.5
+   Compiling zerovec v0.11.4
+   Compiling zerotrie v0.2.2
+   Compiling rustfft v6.4.1
+   Compiling clap v4.5.50
+   Compiling derive_builder_macro v0.20.2
+   Compiling derive_builder v0.20.2
+   Compiling smallvec v1.15.1
+   Compiling chrono v0.4.42
+   Compiling uuid v1.18.1
+   Compiling hashbrown v0.16.0
+   Compiling serde_urlencoded v0.7.1
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling dary_heap v0.3.8
+   Compiling compact_str v0.9.0
+   Compiling spm_precompiled v0.1.4
+   Compiling safetensors v0.4.5
+   Compiling serde_plain v1.0.2
+   Compiling minijinja v2.20.0
+   Compiling json5 v0.4.1
+   Compiling symphonia-metadata v0.5.5
+   Compiling symphonia-codec-aac v0.5.5
+   Compiling tinystr v0.8.1
+   Compiling potential_utf v0.1.3
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling toml_edit v0.22.27
+   Compiling symphonia-codec-pcm v0.5.5
+   Compiling ron v0.8.1
+   Compiling icu_collections v2.0.0
+   Compiling icu_locale_core v2.0.0
+   Compiling parking_lot v0.12.5
+   Compiling tinytemplate v1.2.1
+   Compiling tracing-serde v0.2.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling symphonia-utils-xiph v0.5.5
+   Compiling tokio v1.48.0
+   Compiling hashbrown v0.14.5
+   Compiling safetensors v0.7.0
+   Compiling metrics v0.22.4
+   Compiling rand_chacha v0.9.0
+   Compiling rand_chacha v0.3.1
+   Compiling futures-executor v0.3.31
+   Compiling icu_provider v2.0.0
+   Compiling futures v0.3.31
+   Compiling rand v0.9.2
+   Compiling rand v0.8.5
+   Compiling symphonia-codec-vorbis v0.5.5
+   Compiling symphonia-format-ogg v0.5.5
+   Compiling symphonia-format-isomp4 v0.5.5
+   Compiling symphonia-bundle-flac v0.5.5
+   Compiling icu_properties v2.0.1
+   Compiling icu_normalizer v2.0.0
+   Compiling symphonia-format-riff v0.5.5
+   Compiling dashmap v6.1.0
+   Compiling symphonia-bundle-mp3 v0.5.5
+   Compiling ordered-multimap v0.7.3
+   Compiling hashlink v0.8.4
+   Compiling rand_distr v0.5.1
+   Compiling ferrum-types v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-types)
+   Compiling tungstenite v0.24.0
+   Compiling rand_distr v0.4.3
+   Compiling image v0.25.10
+   Compiling rust-ini v0.20.0
+   Compiling yaml-rust2 v0.8.1
+   Compiling toml v0.8.23
+   Compiling symphonia v0.5.5
+   Compiling half v2.7.1
+   Compiling idna_adapter v1.2.1
+   Compiling metrics-util v0.16.3
+   Compiling idna v1.1.0
+   Compiling axum-core v0.4.5
+   Compiling tower v0.4.13
+   Compiling tracing-subscriber v0.3.20
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling float8 v0.7.0
+   Compiling rustls-webpki v0.103.7
+   Compiling url v2.5.7
+   Compiling gemm-common v0.19.0
+   Compiling ciborium-ll v0.2.2
+   Compiling jsonwebtoken v9.3.1
+   Compiling config v0.14.1
+   Compiling ciborium v0.2.2
+   Compiling onig v6.5.1
+   Compiling gemm-f32 v0.19.0
+   Compiling gemm-c64 v0.19.0
+   Compiling gemm-c32 v0.19.0
+   Compiling gemm-f64 v0.19.0
+   Compiling minijinja-contrib v2.20.0
+   Compiling criterion v0.5.1
+   Compiling gemm-f16 v0.19.0
+   Compiling realfft v3.5.0
+   Compiling tokenizers v0.21.4
+   Compiling rubato v2.0.0
+   Compiling gemm v0.19.0
+   Compiling float8 v0.6.1
+   Compiling tokio-util v0.7.16
+   Compiling tokio-native-tls v0.3.1
+   Compiling tower v0.5.2
+   Compiling hyper v0.14.32
+   Compiling tokio-stream v0.1.17
+   Compiling tokio-tungstenite v0.24.0
+   Compiling tower-http v0.6.6
+   Compiling h2 v0.4.12
+   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-interfaces)
+   Compiling ferrum-bench-core v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-bench-core)
+   Compiling tokio-rustls v0.26.4
+   Compiling ureq v2.12.1
+   Compiling ferrum-kv v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-kv)
+   Compiling ferrum-sampler v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-sampler)
+   Compiling ferrum-scheduler v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-scheduler)
+   Compiling hyper-tls v0.5.0
+   Compiling metrics-exporter-prometheus v0.13.1
+   Compiling hyper v1.7.0
+   Compiling hyper-util v0.1.17
+   Compiling hyper-rustls v0.27.7
+   Compiling hyper-tls v0.6.0
+   Compiling axum v0.7.9
+   Compiling reqwest v0.12.24
+   Compiling hf-hub v0.4.3
+   Compiling ferrum-tokenizer v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-tokenizer)
+   Compiling candle-core v0.9.2
+   Compiling candle-nn v0.9.2
+   Compiling candle-transformers v0.9.2
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs-run/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 4m 06s
+BUILD_DONE
