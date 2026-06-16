@@ -2,6 +2,48 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YR — W2 c16 TTFT split: model prefill batch dominates queue wait
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_ttft_profile_c16_2026-06-16/`.
+- Source checkpoint:
+  `8eccd1c3 test(engine): add first token ttft profiling`.
+- GPU contract:
+  - reused Vast instance `41187356`, 1x RTX 4090;
+  - expected runtime/cost: 10-20 minutes, hard stop 30 minutes, about
+    USD `0.38/h`;
+  - correctness gate: `ferrum serve` streaming smoke before profiling;
+  - performance command: diagnostic-only c16 `bench-serve --fail-on-error
+    --seed 9271 --n-repeats 1`.
+- Evidence:
+  - remote clean worktree: `8eccd1c33c752937cf903f63638eaa6d51bd643e`;
+  - binary sha256:
+    `ae817f5b086275a9c8689c8c991d504bb79b73fa39eac8032cbb2368972d5cd1`;
+  - diagnostic profile toggles came from saved config-file runtime entries,
+    not hidden env-only behavior;
+  - cleanup confirmed `cur_state=stopped`, `actual_status=exited`.
+- Correctness/resource result:
+  - first attempt with `kv-capacity=2048` failed before smoke due CUDA OOM
+    on a 128 MiB F16 allocation with about 94 MiB free;
+  - retry with `kv-capacity=512`, `max-num-batched-tokens=1024` passed
+    streaming smoke and `bench-serve` completed 16/16 requests with 0 errors.
+- Diagnostic performance:
+  - c16 random 64/16, n=1, throughput `167.9 tok/s`;
+  - bench TTFT p50 `674.9 ms`, p95 `781.6 ms`;
+  - `first-token-prof`: p50 queue-to-model-start `87.6 ms`, p50 model batch
+    `421.6 ms`, p50 queue-to-first-token `559.4 ms`;
+  - heaviest observed unified call:
+    `items=15 prefill=13 decode=2 total_q=968 elapsed=421564us`.
+- Interpretation:
+  - this refines the bottleneck away from pure admission queueing: TTFT is
+    mainly the large mixed Gemma3 GPTQ prefill/unified model call;
+  - next W2 work should compare that same ~1k-token prefill shape against vLLM
+    and isolate attention vs dense MLP/Marlin vs packing/logits in the model
+    path.
+- Gate status:
+  - diagnostic only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
 ## 2026-06-16 YQ — W2 TTFT bottleneck direction: token-budget scheduling, not graph/kernel swapping
 
 - Scope:
