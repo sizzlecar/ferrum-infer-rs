@@ -173,6 +173,14 @@ pub struct ServeCommand {
     #[arg(long, conflicts_with = "unified_graph_layers_only")]
     pub disable_unified_graph_layers_only: bool,
 
+    /// Capture unified layers plus final packing; leave lm_head eager.
+    #[arg(long, conflicts_with = "disable_unified_graph_lm_head_eager")]
+    pub unified_graph_lm_head_eager: bool,
+
+    /// Disable lm-head-eager unified CUDA graph capture scope.
+    #[arg(long, conflicts_with = "unified_graph_lm_head_eager")]
+    pub disable_unified_graph_lm_head_eager: bool,
+
     /// Named startup/runtime preset, for example
     /// `m3_qwen3_30b_a3b_int4`.
     #[arg(long, value_name = "PRESET")]
@@ -254,6 +262,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         disable_unified_graph,
         unified_graph_layers_only,
         disable_unified_graph_layers_only,
+        unified_graph_lm_head_eager,
+        disable_unified_graph_lm_head_eager,
         runtime_preset,
         effective_config_json,
         decision_trace_jsonl,
@@ -634,6 +644,16 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     {
         startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
             "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) = batched_graph_cli_override(
+        unified_graph_lm_head_eager,
+        disable_unified_graph_lm_head_eager,
+    ) {
+        startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
             if enabled { "1" } else { "0" },
             RuntimeConfigSource::Cli,
         ));

@@ -318,6 +318,14 @@ pub struct RunCommand {
     #[arg(long, conflicts_with = "unified_graph_layers_only")]
     pub disable_unified_graph_layers_only: bool,
 
+    /// Capture unified layers plus final packing; leave lm_head eager.
+    #[arg(long, conflicts_with = "disable_unified_graph_lm_head_eager")]
+    pub unified_graph_lm_head_eager: bool,
+
+    /// Disable lm-head-eager unified CUDA graph capture scope.
+    #[arg(long, conflicts_with = "unified_graph_lm_head_eager")]
+    pub disable_unified_graph_lm_head_eager: bool,
+
     /// KV cache element dtype (Dim 5 polymorphism point). Accepts
     /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
     /// require model wire-up; today only the kernel + type layer ships.
@@ -1744,6 +1752,16 @@ fn run_startup_cli_runtime_entries(
             RuntimeConfigSource::Cli,
         ));
     }
+    if let Some(enabled) = bool_cli_override(
+        cmd.unified_graph_lm_head_eager,
+        cmd.disable_unified_graph_lm_head_eager,
+    ) {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
     crate::layer_split_pipeline::push_cli_runtime_entry(
         &mut entries,
         cmd.layer_split_pipeline_mode,
@@ -1875,6 +1893,8 @@ mod tests {
             disable_unified_graph: false,
             unified_graph_layers_only: false,
             disable_unified_graph_layers_only: false,
+            unified_graph_lm_head_eager: false,
+            disable_unified_graph_lm_head_eager: false,
             kv_dtype: None,
             kv_capacity: None,
             kv_max_blocks: None,
@@ -1936,6 +1956,7 @@ mod tests {
         cmd.batched_graph = true;
         cmd.unified_graph = true;
         cmd.unified_graph_layers_only = true;
+        cmd.unified_graph_lm_head_eager = true;
         let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
         let effective = run_effective_runtime_config(&snapshot, &cli_entries);
         let entry = |key: &str| {
@@ -1961,6 +1982,14 @@ mod tests {
         );
         assert_eq!(
             entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").source,
+            RuntimeConfigSource::Cli
+        );
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER").effective_value,
+            "1"
+        );
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER").source,
             RuntimeConfigSource::Cli
         );
     }

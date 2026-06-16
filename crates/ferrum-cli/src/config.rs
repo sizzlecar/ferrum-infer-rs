@@ -228,6 +228,11 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub unified_graph_layers_only: Option<bool>,
 
+    /// Diagnostic unified graph scope that leaves lm_head eager, equivalent to
+    /// `FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER`.
+    #[serde(default)]
+    pub unified_graph_lm_head_eager: Option<bool>,
+
     /// Emit engine batch iteration profile logs, equivalent to
     /// `FERRUM_BATCH_DECODE_PROF`.
     #[serde(default)]
@@ -366,6 +371,11 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
             self.unified_graph_layers_only,
+        );
+        push_bool_entry(
+            &mut entries,
+            "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+            self.unified_graph_lm_head_eager,
         );
         push_true_entry(
             &mut entries,
@@ -679,6 +689,7 @@ mod tests {
             batched_graph: Some(true),
             unified_graph: Some(true),
             unified_graph_layers_only: Some(true),
+            unified_graph_lm_head_eager: Some(true),
             batch_decode_prof: Some(true),
             batch_prefill_prof: Some(true),
             next_batch_prof: Some(true),
@@ -703,7 +714,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 34);
+        assert_eq!(entries.len(), 35);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -740,6 +751,10 @@ mod tests {
         assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
         assert_eq!(
             entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").effective_value,
+            "1"
+        );
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER").effective_value,
             "1"
         );
         assert_eq!(entry("FERRUM_BATCH_DECODE_PROF").effective_value, "1");

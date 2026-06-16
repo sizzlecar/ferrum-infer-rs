@@ -175,6 +175,23 @@ pub fn unified_layers_only_graph_key(
     )
 }
 
+/// Graph cache key for a diagnostic unified graph that captures transformer
+/// layers plus final norm / final-row packing, while leaving lm_head eager.
+pub fn unified_lm_head_eager_graph_key(
+    m_total: usize,
+    num_seqs: usize,
+    attention_launch_key: u64,
+    final_indices: &[(usize, usize)],
+) -> u64 {
+    scoped_unified_graph_key(
+        0x6c6d_6865_5f65_6772,
+        m_total,
+        num_seqs,
+        attention_launch_key,
+        final_indices,
+    )
+}
+
 fn scoped_unified_graph_key(
     scope_tag: u64,
     m_total: usize,
@@ -308,10 +325,17 @@ mod tests {
         let launch_long = unified_attention_launch_key(6, 2, 640, 512, None);
         let full_no_sample = unified_graph_key(6, 2, launch_short, &[]);
         let layers_only = unified_layers_only_graph_key(6, 2, launch_short);
+        let lm_head_eager = unified_lm_head_eager_graph_key(6, 2, launch_short, &[(0, 4), (1, 5)]);
         assert_ne!(full_no_sample, layers_only);
+        assert_ne!(full_no_sample, lm_head_eager);
+        assert_ne!(layers_only, lm_head_eager);
         assert_ne!(
             layers_only,
             unified_layers_only_graph_key(6, 2, launch_long)
+        );
+        assert_ne!(
+            lm_head_eager,
+            unified_lm_head_eager_graph_key(6, 2, launch_long, &[(0, 4), (1, 5)])
         );
     }
 
