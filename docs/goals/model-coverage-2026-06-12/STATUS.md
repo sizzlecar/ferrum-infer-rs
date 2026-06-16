@@ -2,6 +2,46 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YI — W2 source checkpoint: native gate_up split-vs-fused probe
+
+- No GPU instance was started in this checkpoint; no performance measurement
+  was taken and no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Added `scripts/microbenches/gemma3_gate_up_split_perf.cu` plus
+  `scripts/microbenches/build_and_run_gemma3_gate_up_split_perf.sh`.
+- Probe scope:
+  - directly targets the largest remaining dense tail-MLP hotspot:
+    Gemma3 GPTQ `gate_up_proj`;
+  - compares the current product-shaped fused Marlin projection
+    `hidden -> 2*intermediate` plus GeGLU against split `gate` and `up`
+    projections plus a separate GeGLU kernel;
+  - includes both serial split and two-stream split variants;
+  - cycles eight synthetic layer weight sets so a warm single-layer loop cannot
+    be mistaken for product-relevant evidence.
+- Why this is the next aligned CUDA check:
+  - same-shape c16 evidence now proves W2 is still below the 80% throughput and
+    p95 ITL release-grade gates;
+  - FA2 source, product batched graph, existing Triton W4A16, direct vLLM dense
+    Marlin swap, simple L2 persistence, external prefetch, and the first
+    producer-touch product prototype have all failed as safe W2 defaults;
+  - the next useful branch is therefore a dense MLP compute/layout question:
+    whether the fused `gate_up` Marlin shape itself should be changed before
+    touching product loader/runtime code.
+- Required next validation:
+  - run one cached 1x4090 native CUDA probe:
+    `bash scripts/microbenches/build_and_run_gemma3_gate_up_split_perf.sh`;
+  - accept this branch only if total `segment_host_us` improves, not merely if
+    one half projection looks faster;
+  - if split serial/overlap is not materially faster under eight-layer
+    rotation, reject split `gate`/`up` productization and move to another
+    tail-MLP work-reduction/fusion lever.
+- Local validation:
+  - `bash -n scripts/microbenches/build_and_run_gemma3_gate_up_split_perf.sh`
+    PASS;
+  - `git diff --check -- scripts/microbenches/gemma3_gate_up_split_perf.cu scripts/microbenches/build_and_run_gemma3_gate_up_split_perf.sh scripts/microbenches/README.md docs/goals/model-coverage-2026-06-12/STATUS.md`
+    PASS;
+  - local macOS host has no `nvcc`, so CUDA compile/run validation remains the
+    next cached-4090 native probe.
+
 ## 2026-06-16 YH — W2 CUDA c16 same-shape validation: correctness clean, performance still below 80%
 
 - Artifact:
