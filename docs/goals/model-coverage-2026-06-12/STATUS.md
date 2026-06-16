@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YD — W2 release-grade validator checkpoint: baseline evidence gate hardened
+
+- Source checkpoints:
+  - `d4d73197 test(release): enforce vllm release baselines`;
+  - `c881a953 test(release): tighten vllm baseline matching`.
+- Scope:
+  - no GPU instance was started;
+  - no performance measurement was taken;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Validator changes:
+  - CUDA HF/safetensors/GPTQ/AWQ release-grade lanes now require a vLLM
+    baseline by default;
+  - non-vLLM baseline selection is accepted only with explicit
+    `selection_exception` evidence proving vLLM is unsupported for that lane;
+  - baseline, Ferrum cell artifacts, clean dirty status, and zero bad-output /
+    malformed-stream / missing-DONE / duplicate-DONE / zero-output / HTTP-500 /
+    panic counts are required before the final gate can pass;
+  - misleading engine strings such as `not-vllm` are rejected by self-test.
+- Local validation:
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS;
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py`
+    PASS;
+  - `git diff --check` PASS;
+  - `python3 scripts/release/selftest_g0_validators.py` PASS.
+- Current W2 state:
+  - latest product-path smokes do not show a known correctness blocker;
+  - performance remains below the 80% mainstream baseline line, with current
+    ShareGPT diagnostics around 60-65% of vLLM;
+  - existing profile evidence still points to Gemma3 GPTQ dense tail MLP,
+    especially the `gate_up -> GeGLU -> down` sequence, as the main decode
+    bottleneck.
+- Next direction:
+  - avoid repeated full sweeps until a smaller source/native CUDA lever is
+    chosen;
+  - continue from the tail-MLP kernel/work-reduction path and keep c32
+    effective active concurrency comparable with the vLLM baseline.
+
 ## 2026-06-16 YC — W2 CUDA checkpoint: producer-touch product prototype is not safe as a default
 
 - Artifact:
