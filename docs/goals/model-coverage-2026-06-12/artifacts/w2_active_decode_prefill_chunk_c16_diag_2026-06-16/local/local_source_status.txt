@@ -1,0 +1,1 @@
+tracked clean at source sync; remote source was rsynced from git ls-files and has no .git metadata
