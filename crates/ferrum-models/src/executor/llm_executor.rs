@@ -859,10 +859,15 @@ impl ModelExecutor for LlmExecutor {
                 )
             })
             .collect();
-        let force_full_logits = batch
+        let force_full_logits = batch.items.iter().any(|item| {
+            metadata_requires_full_logits(&item.metadata)
+                || item.logits_policy.requires_full_logits()
+        });
+        let logits_policies: Vec<_> = batch
             .items
             .iter()
-            .any(|item| metadata_requires_full_logits(&item.metadata));
+            .map(|item| item.logits_policy.clone())
+            .collect();
         let mut attempted_unified = false;
         let mut fallback_reason = "none";
         {
@@ -884,7 +889,7 @@ impl ModelExecutor for LlmExecutor {
                     None
                 } else {
                     attempted_unified = true;
-                    Some(model.unified_forward(&unified_items))
+                    Some(model.unified_forward_with_logits_policy(&unified_items, &logits_policies))
                 }
             };
             if let Some(model_result) = model_result {
@@ -1069,6 +1074,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingCalls {
         unified_forward: usize,
+        unified_forward_policy_requires_full: Vec<Vec<bool>>,
         prefill: usize,
         decode: usize,
         decode_batch_force_full_logits: Vec<bool>,
@@ -1156,6 +1162,22 @@ mod tests {
                 .iter()
                 .map(|(_, _, _, is_final_chunk)| is_final_chunk.then_some(vec![0.0, 1.0, 2.0, 3.0]))
                 .collect())
+        }
+
+        fn unified_forward_with_logits_policy(
+            &mut self,
+            items: &[(String, Vec<u32>, usize, bool)],
+            policies: &[ferrum_interfaces::model_executor::LogitsReturnPolicy],
+        ) -> std::result::Result<Vec<Option<Vec<f32>>>, FerrumError> {
+            self.calls.lock().unified_forward_policy_requires_full.push(
+                policies
+                    .iter()
+                    .map(
+                        ferrum_interfaces::model_executor::LogitsReturnPolicy::requires_full_logits,
+                    )
+                    .collect(),
+            );
+            self.unified_forward(items)
         }
 
         fn unified_forward_can_return_full_logits(&self) -> bool {
@@ -1399,6 +1421,35 @@ mod tests {
         assert_eq!(output[0].as_ref().unwrap().len(), 4);
         let calls = calls.lock();
         assert_eq!(calls.unified_forward, 1);
+        assert!(calls.decode_batch_force_full_logits.is_empty());
+    }
+
+    #[test]
+    fn unified_decode_forwards_logits_policy_to_unified_model() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor(calls.clone());
+        let mut batch = UnifiedBatch::new();
+        batch.items.push(UnifiedBatchItem {
+            seq_id: "decode-cache".to_string(),
+            q_tokens: vec![7],
+            kv_cache: test_kv_handle("decode-cache", 3),
+            pos_offset: 3,
+            is_final_chunk: true,
+            metadata: HashMap::new(),
+            logits_policy: ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
+                token_mask: None,
+            },
+        });
+
+        let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
+
+        assert_eq!(output[0].as_ref().unwrap().len(), 4);
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 1);
+        assert_eq!(
+            calls.unified_forward_policy_requires_full,
+            vec![vec![false]]
+        );
         assert!(calls.decode_batch_force_full_logits.is_empty());
     }
 

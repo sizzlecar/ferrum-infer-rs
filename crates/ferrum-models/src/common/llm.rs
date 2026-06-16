@@ -215,6 +215,21 @@ pub trait DecoderOnlyLLM: Send + Sync {
         ))
     }
 
+    /// Unified mixed-batch forward with per-final-item logits return policies.
+    ///
+    /// The default preserves the historical trait behavior by returning full
+    /// logits from [`Self::unified_forward`]. Implementations may override this
+    /// to return model-side greedy-argmax sentinels (`vec![token_id]`) for
+    /// policy-compatible rows and avoid downloading full vocab logits.
+    #[allow(clippy::type_complexity)]
+    fn unified_forward_with_logits_policy(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        _policies: &[LogitsReturnPolicy],
+    ) -> std::result::Result<Vec<Option<Vec<f32>>>, ferrum_types::FerrumError> {
+        self.unified_forward(items)
+    }
+
     /// Whether `unified_forward` can satisfy requests that require full logits.
     ///
     /// The trait contract returns logits for every final chunk, so the default
