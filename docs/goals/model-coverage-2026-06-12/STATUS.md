@@ -2,6 +2,61 @@
 
 进度日志,倒序。
 
+## 2026-06-17 YV — W2 CUDA diagnostic: dense unified argmax removes readback bottleneck
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/`.
+- Source checkpoint:
+  `63b8565eb4f40b3bc94ac48729cd4cd0fd00b2b0`
+  (`perf(models): use logits policy in dense unified forward`).
+- GPU lifecycle:
+  - cached instances `41187356` / `41178475` could not restart
+    (`resources unavailable`);
+  - created `41218189`, but SSH/proxy never became usable; destroyed it;
+  - actual run used Vast `41218739`, 1x RTX 4090, driver `580.95.05`,
+    quoted USD `0.4696296296296296/h`;
+  - artifacts copied back, then `41218739` stopped; final status
+    `cur_state=stopped`, `actual_status=exited`.
+- Build/runtime evidence:
+  - binary sha256
+    `b0676434810f2824094a12a1ccd9bea666a9aaf4e72bfd404c00455888ef407f`;
+  - CUDA release build passed; first fresh build took `43m 52s`;
+  - product `ferrum run` smoke passed with stdout `5`, rc `0`;
+  - product `ferrum serve` streaming smoke passed with exactly one `[DONE]`
+    and usage present;
+  - c16 `bench-serve --fail-on-error` completed `[16]`, errored `[0]`,
+    `output_token_count_source=usage`.
+- Product-path diagnostic performance:
+  - non-profile c16 random 64/16: `17.0821 req/s`,
+    `273.3137 output tok/s`, TTFT p50/p95 `583.8/584.2 ms`,
+    ITL p95 `27.18 ms`;
+  - this is diagnostic `n=1` evidence only, not release evidence.
+- Profile rerun:
+  - reran from artifact CWD so `ferrum.toml` profile entries were actually
+    loaded;
+  - effective config showed `FERRUM_BATCH_DECODE_PROF=1`,
+    `FERRUM_NEXT_BATCH_PROF=1`, `FERRUM_UNIFIED_POST_PROF=1`,
+    `FERRUM_DECODE_OP_PROFILE=1`, `FERRUM_MARLIN_PROFILE=1`;
+  - profile c16 bench also completed `[16]`, errored `[0]`,
+    `output_token_count_source=usage`;
+  - profile throughput was `167.0513 tok/s` because sync-heavy profiling was
+    enabled.
+- Bottleneck result:
+  - previous same-shape mixed c16 frame had `readback=22039us`;
+  - target rerun frame:
+    `call#21 m_total=897 num_seqs=16 prefill=12 decode=4 total=383684us`;
+  - `readback=516us`, i.e. `0.0234x` of the previous readback time;
+  - remaining dominant buckets are MLP/Marlin:
+    `gate_up=174891us`, `down=110906us`, `marlin_kernel=312084us`;
+  - `lm_head=3167us` and `unwrapped=726us`, so the immediate bottleneck is
+    no longer logits readback/lm_head.
+- Status:
+  - no known correctness issue in this W2 c16 diagnostic;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced;
+  - next high-return work is vLLM source comparison plus native CUDA
+    minimal validation around Gemma3 GPTQ dense Marlin MLP
+    `gate_up/down` projection behavior.
+
 ## 2026-06-17 YU — W2 source checkpoint: dense unified logits policy now avoids full readback for greedy rows
 
 - Artifact:
