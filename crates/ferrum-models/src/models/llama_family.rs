@@ -417,7 +417,7 @@ impl LlamaFamilyRuntimeEnv {
         config
     }
 
-    fn kv_capacity_for_model(&self, model_max: usize) -> usize {
+    pub(crate) fn kv_capacity_for_model(&self, model_max: usize) -> usize {
         self.kv_capacity
             .map(|cap| cap.min(model_max))
             .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY))
