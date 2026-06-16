@@ -1,0 +1,26 @@
+[microbench] compiling scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu
+-rwxr-xr-x 1 root root 720512 Jun 16 01:44 /tmp/gemma3_down_prefetch_overlap_perf
+
+[microbench] running /tmp/gemma3_down_prefetch_overlap_perf
+gemma3_down_prefetch_overlap_perf device=NVIDIA GeForce RTX 4090 sm=8.9 h=5376 im=21504 layers=8 l2=75497472 persist_max=51904512 access_window_max=134213632
+mode,m,down_us,segment_host_us,useful_tflops,ret
+cycle8_no_prefetch,16,68.773,212.295,53.79,0
+cycle8_policy_only,16,69.316,212.490,53.37,0
+cycle8_overlap_qweight,16,34.150,235.799,108.33,0
+cycle8_overlap_qweight_scales,16,34.032,236.862,108.70,0
+cycle8_serial_qweight_scales,16,31.186,237.778,118.62,0
+cycle8_producer_touch_qweight_1x,16,62.787,202.341,58.92,0
+cycle8_producer_touch_qweight_4x,16,53.889,214.460,68.65,0
+cycle8_producer_touch_qweight_scales_4x,16,52.139,214.662,70.95,0
+cycle8_down_warm_upper,16,68.710,278.137,53.84,0
+cycle8_no_prefetch,32,74.286,224.566,99.60,0
+cycle8_policy_only,32,74.321,224.260,99.55,0
+cycle8_overlap_qweight,32,53.112,261.882,139.31,0
+cycle8_overlap_qweight_scales,32,52.954,263.005,139.72,0
+cycle8_serial_qweight_scales,32,52.943,266.736,139.75,0
+cycle8_producer_touch_qweight_1x,32,64.878,212.922,114.04,0
+cycle8_producer_touch_qweight_4x,32,53.474,240.533,138.36,0
+cycle8_producer_touch_qweight_scales_4x,32,53.362,242.477,138.65,0
+cycle8_down_warm_upper,32,74.290,295.986,99.59,0
+
+VERDICT: gemma3 down prefetch-overlap native CUDA probe complete
