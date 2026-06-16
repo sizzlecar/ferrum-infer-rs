@@ -1,0 +1,43 @@
+{
+  "bench_rc": 0,
+  "ok": true,
+  "reason": "diagnostic n_repeats=1; no --require-ci; final W2 validator not run",
+  "release_grade": false,
+  "rows": [
+    {
+      "bad_output": 0,
+      "completed": 16,
+      "concurrency": 16,
+      "delta_vs_old_ferrum_pct": -0.00021253605670058348,
+      "delta_vs_old_ferrum_tps": -0.07226287075656046,
+      "errored": 0,
+      "http_500": 0,
+      "n_repeats": 1,
+      "old_ferrum_tps": 340.0028770570583,
+      "output_throughput_tps_mean": 339.93061418630174,
+      "output_token_count_source": "usage",
+      "panic": 0,
+      "ratio_to_vllm": 0.6552298286538479,
+      "vllm_baseline_tps": 518.796,
+      "zero_output_tokens": 0
+    },
+    {
+      "bad_output": 0,
+      "completed": 16,
+      "concurrency": 32,
+      "delta_vs_old_ferrum_pct": -0.005050045025626909,
+      "delta_vs_old_ferrum_tps": -1.728549201843407,
+      "errored": 0,
+      "http_500": 0,
+      "n_repeats": 1,
+      "old_ferrum_tps": 342.2839188703721,
+      "output_throughput_tps_mean": 340.55536966852867,
+      "output_token_count_source": "usage",
+      "panic": 0,
+      "ratio_to_vllm": 0.6497561085622761,
+      "vllm_baseline_tps": 524.128,
+      "zero_output_tokens": 0
+    }
+  ],
+  "server_error_scan_lines": 0
+}

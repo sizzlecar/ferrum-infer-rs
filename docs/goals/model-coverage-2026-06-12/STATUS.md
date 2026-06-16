@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-16 XW — W2 CUDA checkpoint: Marlin evict-first does not move ShareGPT endpoint throughput
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_cache_policy_sharegpt_diag_2026-06-16/`.
+- Paid GPU lane:
+  `W2 current Ferrum ShareGPT same-dataset diagnostic after Marlin evict-first default`
+  on the cached 1x RTX 4090 Vast instance.
+- Contract:
+  - expected runtime/cost: 20-40 minutes, about USD 0.14-0.28 at
+    USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/sync/build/serve/bench first failure, or
+    diagnostic artifact collected, then stop the instance;
+  - correctness gate: prior product `ferrum run`/`ferrum serve` correctness
+    artifact plus this run's server readiness, chat smoke, bench rc 0,
+    completed requests, zero request errors, and clean server log scan;
+  - performance command:
+    `ferrum bench-serve --dataset sharegpt --sharegpt-path ascii_sharegpt.jsonl --random-output-len 64 --concurrency-sweep 16,32 --num-prompts 16 --n-repeats 1 --fail-on-error --seed 9271`.
+- Evidence:
+  - remote HEAD `7d93c2b481cc3a4d9ae794e2d6a66c3e05a55784`;
+  - clean remote worktree: `remote/git_status_short.txt` has `0` lines;
+  - binary SHA256
+    `d38caf704f252045c29bdfe02795606937f400ab00edef05647da74179b215d5`;
+  - server ready at `ready_at_poll=31`;
+  - chat smoke response content `"5"`, usage present;
+  - bench rc `0`, `output_token_count_source=usage`;
+  - server log scan has `0` lines;
+  - Vast cleanup confirmed `stopped/exited`.
+- Results against the existing clean vLLM ShareGPT baseline
+  `w2_vllm_sharegpt_baseline_probe_2026-06-15`:
+  - c16: `16 completed / 0 errored / 0 bad_output`,
+    `339.9306 tok/s`; ratio `339.9306 / 518.796 = 0.6552`;
+  - c32: `16 completed / 0 errored / 0 bad_output`,
+    `340.5554 tok/s`; ratio `340.5554 / 524.128 = 0.6498`;
+  - compared with the previous Ferrum same-dataset diagnostic, c16 changed by
+    `-0.02%` and c32 by `-0.51%`.
+- Interpretation:
+  - no new product `serve` correctness issue was found;
+  - the Marlin B-weight evict-first default is a real native tail-MLP segment
+    improvement, but it does not move full ShareGPT endpoint throughput;
+  - the W2 performance gap is still about 14-15 percentage points below the
+    80% same-hardware mainstream baseline target, so the next lever should move
+    to dense MLP `gate_up`, launch count, and batched decode graph/integration
+    behavior under product c16/c32.
+- Scope:
+  - this is diagnostic evidence only: `n_repeats=1`, no `--require-ci`, and no
+    final release-grade manifest.
+- W2 remains blocked on final performance and final validator:
+  `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has not been produced.
+
 ## 2026-06-16 XV — W2 CUDA checkpoint: Marlin evict-first product run/serve correctness passes
 
 - Artifact:
