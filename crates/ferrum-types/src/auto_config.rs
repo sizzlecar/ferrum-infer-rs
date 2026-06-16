@@ -1162,6 +1162,12 @@ impl FerrumConfigBuilder {
                 "unified decode graph does not apply to MoE models",
             );
         }
+        if self.model.architecture.eq_ignore_ascii_case("gemma3") {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH",
+                "unified decode graph is disabled for Gemma3 sandwich-norm models",
+            );
+        }
         if !self.is_cuda_backend() {
             return self.invalid(
                 "FERRUM_UNIFIED_GRAPH",
@@ -2695,31 +2701,20 @@ mod tests {
     }
 
     #[test]
-    fn unified_graph_allows_gemma3_sandwich_models_on_cuda_graph_hardware() {
+    fn unified_graph_rejects_gemma3_sandwich_models() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[(
-            "FERRUM_UNIFIED_GRAPH",
-            "1",
-            RuntimeConfigSource::Cli,
-        )]))
-        .with_model_capabilities(gemma3_gptq_model())
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .resolve()
-        .expect("Gemma3 unified graph should be allowed after CUDA graph reuse hardening");
-        let entry = resolved
-            .runtime_config
-            .entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_UNIFIED_GRAPH")
-            .expect("FERRUM_UNIFIED_GRAPH entry");
-        assert_eq!(entry.effective_value, "1");
-        assert_eq!(
-            resolved.effective_config_document()["selected_graph_mode"],
-            "unified_decode_graph"
-        );
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_UNIFIED_GRAPH", "1")]))
+            .with_model_capabilities(gemma3_gptq_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .expect_err("Gemma3 unified graph should stay disabled until graph instantiate fits");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_UNIFIED_GRAPH"
+        ));
     }
 
     #[test]
