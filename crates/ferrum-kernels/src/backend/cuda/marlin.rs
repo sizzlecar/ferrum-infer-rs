@@ -62,6 +62,10 @@ fn skip_ws_zero() -> bool {
     cuda_marlin_runtime_config().skip_ws_zero
 }
 
+fn should_zero_workspace(config: &CudaMarlinRuntimeConfig) -> bool {
+    !config.skip_ws_zero
+}
+
 /// Profile-only nested dense Marlin counters. They are intentionally not part
 /// of normal model timings because callers already time the full projection.
 pub static MARLIN_WS_ZERO_TIME_US: AtomicU64 = AtomicU64::new(0);
@@ -466,7 +470,7 @@ fn marlin_gemm_chunk(
 
     // Zero workspace on the runner's stream — Marlin uses it as mutex locks.
     // All operations (memset + kernel) on same stream → naturally ordered.
-    {
+    if should_zero_workspace(cuda_marlin_runtime_config()) {
         if profile {
             stream
                 .synchronize()
@@ -641,7 +645,7 @@ pub fn marlin_gemm_with_offset(
     const MAX_PAR: usize = 16;
     let ws_per_expert = (n_per / 128).max(1) * MAX_PAR;
     let ws_offset_bytes = expert_idx * ws_per_expert * std::mem::size_of::<i32>();
-    {
+    if should_zero_workspace(cuda_marlin_runtime_config()) {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(
@@ -1358,7 +1362,10 @@ fn build_marlin_perm() -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{marlin_profile_bucket_from_label, CudaMarlinRuntimeConfig, MarlinProfileBucket};
+    use super::{
+        marlin_profile_bucket_from_label, should_zero_workspace, CudaMarlinRuntimeConfig,
+        MarlinProfileBucket,
+    };
 
     #[test]
     fn cuda_marlin_runtime_config_parses_skip_ws_zero() {
@@ -1386,6 +1393,16 @@ mod tests {
         assert!(!config.skip_ws_zero);
         assert!(!config.trace_shapes);
         assert_eq!(config.trace_shapes_max, 256);
+    }
+
+    #[test]
+    fn marlin_workspace_zeroing_follows_runtime_config() {
+        let default_config = CudaMarlinRuntimeConfig::from_env_vars([]);
+        assert!(should_zero_workspace(&default_config));
+
+        let skip_config =
+            CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "1")]);
+        assert!(!should_zero_workspace(&skip_config));
     }
 
     #[test]
