@@ -44,6 +44,7 @@ pub(crate) struct LlamaBatchedRuntimeConfig {
     batched_graph: bool,
     batched_trace: bool,
     greedy_argmax: bool,
+    split_k_attn: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +101,7 @@ impl LlamaBatchedRuntimeConfig {
             batched_graph: false,
             batched_trace: false,
             greedy_argmax: false,
+            split_k_attn: None,
         };
         for (name, value) in vars {
             let value = value.as_ref();
@@ -113,6 +115,13 @@ impl LlamaBatchedRuntimeConfig {
                 "FERRUM_BATCHED_GRAPH" => config.batched_graph = value != "0",
                 "FERRUM_BATCHED_TRACE" => config.batched_trace = true,
                 "FERRUM_GREEDY_ARGMAX" => config.greedy_argmax = value == "1",
+                "FERRUM_SPLIT_K_ATTN" => {
+                    config.split_k_attn = match value {
+                        "1" => Some(true),
+                        "0" => Some(false),
+                        _ => None,
+                    }
+                }
                 _ => {}
             }
         }
@@ -179,6 +188,7 @@ fn record_unified_graph_replay(
     origin: &str,
     graph_key: u64,
     layers_only: bool,
+    attention_launch_key: u64,
     m_total: usize,
     num_seqs: usize,
     max_kv_len: usize,
@@ -188,7 +198,8 @@ fn record_unified_graph_replay(
         let scope = unified_graph_scope_label(layers_only);
         eprintln!(
             "[unified-graph-replay] origin={origin} count={count} scope={scope} key={graph_key} \
-             m_total={m_total} num_seqs={num_seqs} max_kv_len={max_kv_len}",
+             attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
+             max_kv_len={max_kv_len}",
         );
     }
 }
@@ -196,6 +207,7 @@ fn record_unified_graph_replay(
 fn record_unified_graph_capture(
     graph_key: u64,
     layers_only: bool,
+    attention_launch_key: u64,
     m_total: usize,
     num_seqs: usize,
     max_kv_len: usize,
@@ -205,7 +217,8 @@ fn record_unified_graph_capture(
         let scope = unified_graph_scope_label(layers_only);
         eprintln!(
             "[unified-graph-capture] count={count} scope={scope} key={graph_key} \
-             m_total={m_total} num_seqs={num_seqs} max_kv_len={max_kv_len}",
+             attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
+             max_kv_len={max_kv_len}",
         );
     }
 }
@@ -214,6 +227,7 @@ fn record_unified_graph_capture_skip(
     reason: &str,
     graph_key: u64,
     layers_only: bool,
+    attention_launch_key: u64,
     m_total: usize,
     num_seqs: usize,
     max_kv_len: usize,
@@ -224,7 +238,8 @@ fn record_unified_graph_capture_skip(
         let scope = unified_graph_scope_label(layers_only);
         eprintln!(
             "[unified-graph-skip] reason={reason} count={count} scope={scope} key={graph_key} \
-             m_total={m_total} num_seqs={num_seqs} max_kv_len={max_kv_len} cached_keys={cached_keys}",
+             attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
+             max_kv_len={max_kv_len} cached_keys={cached_keys}",
         );
     }
 }
@@ -246,6 +261,7 @@ fn unified_graph_capture_skip_reason(
 fn record_unified_graph_eager(
     graph_key: u64,
     layers_only: bool,
+    attention_launch_key: u64,
     m_total: usize,
     num_seqs: usize,
     max_kv_len: usize,
@@ -254,8 +270,9 @@ fn record_unified_graph_eager(
     if count.is_multiple_of(256) {
         let scope = unified_graph_scope_label(layers_only);
         eprintln!(
-            "[unified-graph-stats] scope={scope} key={graph_key} m_total={m_total} \
-             num_seqs={num_seqs} max_kv_len={max_kv_len} replays={} eagers={} captures={} skips={}",
+            "[unified-graph-stats] scope={scope} key={graph_key} \
+             attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
+             max_kv_len={max_kv_len} replays={} eagers={} captures={} skips={}",
             UNIFIED_GRAPH_REPLAY_COUNT.load(Ordering::Relaxed),
             UNIFIED_GRAPH_EAGER_COUNT.load(Ordering::Relaxed),
             UNIFIED_GRAPH_CAPTURE_COUNT.load(Ordering::Relaxed),
@@ -336,6 +353,7 @@ mod tests {
             ("FERRUM_BATCHED_GRAPH", "1"),
             ("FERRUM_BATCHED_TRACE", "0"),
             ("FERRUM_GREEDY_ARGMAX", "1"),
+            ("FERRUM_SPLIT_K_ATTN", "1"),
         ]);
 
         assert!(config.decode_op_profile);
@@ -345,6 +363,7 @@ mod tests {
         assert!(config.batched_graph);
         assert!(config.batched_trace);
         assert!(config.greedy_argmax);
+        assert_eq!(config.split_k_attn, Some(true));
         assert!(!config.graph_capture_allowed());
     }
 
@@ -355,6 +374,7 @@ mod tests {
             ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "true"),
             ("FERRUM_BATCHED_GRAPH", "0"),
             ("FERRUM_GREEDY_ARGMAX", "true"),
+            ("FERRUM_SPLIT_K_ATTN", "auto"),
         ]);
 
         assert!(!config.decode_op_profile);
@@ -364,6 +384,7 @@ mod tests {
         assert!(!config.batched_graph);
         assert!(!config.batched_trace);
         assert!(!config.greedy_argmax);
+        assert_eq!(config.split_k_attn, None);
         assert!(config.graph_capture_allowed());
     }
 
@@ -1629,15 +1650,24 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let graph_enabled =
             self.batched_cfg.unified_graph && self.batched_cfg.graph_capture_allowed();
         let graph_layers_only = self.batched_cfg.unified_graph_layers_only;
+        let attention_launch_key = crate::common::decoder_unified::unified_attention_launch_key(
+            m_total,
+            num_seqs,
+            max_kv_len,
+            self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len),
+            self.batched_cfg.split_k_attn,
+        );
         let graph_key = if graph_layers_only {
             crate::common::decoder_unified::unified_layers_only_graph_key(
-                m_total, num_seqs, max_kv_len,
+                m_total,
+                num_seqs,
+                attention_launch_key,
             )
         } else {
             crate::common::decoder_unified::unified_graph_key(
                 m_total,
                 num_seqs,
-                max_kv_len,
+                attention_launch_key,
                 &final_indices,
             )
         };
@@ -1709,6 +1739,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         "pure",
                         graph_key,
                         graph_layers_only,
+                        attention_launch_key,
                         m_total,
                         num_seqs,
                         max_kv_len,
@@ -1742,13 +1773,21 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             self.unified_graph_warmup += 1;
         }
         if graph_enabled && !did_pure_replay {
-            record_unified_graph_eager(graph_key, graph_layers_only, m_total, num_seqs, max_kv_len);
+            record_unified_graph_eager(
+                graph_key,
+                graph_layers_only,
+                attention_launch_key,
+                m_total,
+                num_seqs,
+                max_kv_len,
+            );
         }
         if let Some(reason) = capture_skip_reason {
             record_unified_graph_capture_skip(
                 reason,
                 graph_key,
                 graph_layers_only,
+                attention_launch_key,
                 m_total,
                 num_seqs,
                 max_kv_len,
@@ -1776,6 +1815,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     record_unified_graph_capture(
                         graph_key,
                         graph_layers_only,
+                        attention_launch_key,
                         m_total,
                         num_seqs,
                         max_kv_len,
@@ -1787,6 +1827,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                                 "post_capture",
                                 graph_key,
                                 graph_layers_only,
+                                attention_launch_key,
                                 m_total,
                                 num_seqs,
                                 max_kv_len,
@@ -1945,6 +1986,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 record_unified_graph_capture(
                     graph_key,
                     graph_layers_only,
+                    attention_launch_key,
                     m_total,
                     num_seqs,
                     max_kv_len,
@@ -1957,6 +1999,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                             "post_capture",
                             graph_key,
                             graph_layers_only,
+                            attention_launch_key,
                             m_total,
                             num_seqs,
                             max_kv_len,
