@@ -6,12 +6,14 @@
 | ~~40700477~~ | 2x RTX 4090 | 0.589 | | broken host (raw cuInit=999) | DESTROYED 2026-06-12 ~20:30 |
 | ~~40703915~~ | 2x RTX 4090 | 0.336 | | host never booted (18min None) | DESTROYED |
 | ~~40704262~~ | 2x RTX 4090, 160GB | 0.802 | 2026-06-12 ~21:50 | 70B dual lane (~5h) | DESTROYED 2026-06-13 ~02:50 |
-| ~~41241013~~ | 1x RTX 4090, 300GB, Netherlands host 51606 | 0.471 | 2026-06-17 | W2 same-pod vLLM/Ferrum c16 baseline, tail-profile diagnostic, and post-scheduler active-decode mixed-prefill c16 validation. Latest artifact `artifacts/w2_active_decode_prefill_budget_c16_cuda_2026-06-17/`: run/serve correctness passed, c16 completed 100x3 zero-error, p95 improved to 26.637ms but throughput LCB regressed to 333.110 tok/s, so no release-grade PASS. | STOPPED 2026-06-17, API verified `actual_status=exited` |
+| ~~41241013~~ | 1x RTX 4090, 300GB, Netherlands host 51606 | 0.471 | 2026-06-17 | W2 same-pod vLLM/Ferrum c16 baseline, tail-profile diagnostic, and post-scheduler active-decode mixed-prefill validation. Latest artifact `artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/`: run/serve correctness passed, c16 completed 100x3 zero-error, Ferrum LCB/vLLM LCB `0.9627`, Ferrum p95/vLLM p95 `0.8844`; still no release-grade PASS because only c16 was covered. | STOPPED 2026-06-17, API verified `actual_status=exited` |
 
 Destroy: `curl -X DELETE "https://console.vast.ai/api/v0/instances/{id}/?api_key=$VAST_API_KEY"`
 Verify zero: instances list must return 0 before declaring the goal done.
 
 **2026-06-17 — W2 41241013 stopped after post-scheduler c16 diagnostic. API verified `cur_state=stopped`,`actual_status=exited`; artifact copied locally before stop.**
+
+**2026-06-17 — W2 41241013 stopped again after two-chunk c16 diagnostic. API verified `cur_state=stopped`,`actual_status=exited`; artifact `w2_active_decode_prefill_budget2_c16_cuda_2026-06-17` copied locally before stop.**
 
 **2026-06-13 04:40 — API verified: 0 instances remaining.** Session GPU spend ~= $7.
 
