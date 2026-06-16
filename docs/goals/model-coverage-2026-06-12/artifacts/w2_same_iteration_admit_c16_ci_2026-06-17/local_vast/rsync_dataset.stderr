@@ -1,0 +1,7 @@
+Warning: Permanently added '[ssh7.vast.ai]:30498' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Transfer starting: 1 files
+
+sent 99 bytes  received 20 bytes  15 bytes/sec
+total size is 58600  speedup is 492.43

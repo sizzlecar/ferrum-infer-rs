@@ -1,0 +1,7 @@
+Warning: Permanently added '[ssh7.vast.ai]:30498' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+From /workspace/ferrum_b99_to_674.bundle
+ * branch              HEAD       -> FETCH_HEAD
+Previous HEAD position was b99afdea docs(cuda): record w2 active chunk diagnostic
+HEAD is now at 674c6678 perf(scheduler): admit prefills with remaining step budget

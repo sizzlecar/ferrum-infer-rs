@@ -2,6 +2,66 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZA — W2 CUDA diagnostic: same-iteration admission clears historical c16 throughput threshold
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_same_iteration_admit_c16_ci_2026-06-17/`.
+- Source checkpoint:
+  `674c66786f0cf654009c84070b65ec0174a95357`
+  (`perf(scheduler): admit prefills with remaining step budget`).
+- Scope:
+  - W2 Gemma3 CUDA GPTQ c16 ShareGPT CI diagnostic only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- GPU lifecycle:
+  - restarted cached Vast instance `41230499`, 1x RTX 4090, driver
+    `590.48.01`, quoted USD `0.5766666666666667/h`;
+  - reused existing model/build cache; CUDA release build completed in
+    `3m21.770s`;
+  - artifacts copied back, then instance stopped; final status
+    `cur_state=stopped`, `actual_status=exited`.
+- Source/runtime evidence:
+  - remote worktree was clean at
+    `674c66786f0cf654009c84070b65ec0174a95357`;
+  - binary sha256
+    `9c7def4de9568657798c3be5dacd3fb6a5b72ced87efa84552966f1bb8320fa6`;
+  - dataset sha256
+    `58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e`;
+  - effective config showed
+    `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK=16`.
+- Correctness result:
+  - product `ferrum run` smoke passed with stdout content `5`,
+    `n_tokens=3`;
+  - product `ferrum serve` streaming smoke passed with content `5\n`,
+    exactly one `[DONE]`, and usage present
+    (`prompt_tokens=23`, `completion_tokens=3`, `total_tokens=26`);
+  - no correctness issue observed in this diagnostic artifact.
+- Performance command:
+  - `ferrum bench-serve --dataset sharegpt --random-output-len 128
+    --concurrency-sweep 16 --num-prompts 100 --n-repeats 3
+    --fail-on-error --require-ci --seed 9271`;
+  - completed_per_run `[100, 100, 100]`, errored_per_run `[0, 0, 0]`;
+  - all quality/error counts were zero;
+  - `output_token_count_source=usage`.
+- c16 result:
+  - output throughput mean `402.71236961652994 tok/s`;
+  - CI half-width `4.727831673618258 tok/s`;
+  - LCB `397.9845379429117 tok/s`;
+  - previous active-chunk c16 LCB was `386.46217408059744 tok/s`, so this
+    checkpoint adds `11.52236386231426 tok/s` LCB;
+  - historical same-dataset vLLM c16 LCB from
+    `w2_ferrum_natural_c16_same_shape_2026-06-16` was `491.150 tok/s`;
+  - diagnostic LCB ratio vs that historical vLLM baseline is `81.03%`;
+  - historical 80% threshold is `392.920 tok/s`, so this run is above that
+    diagnostic threshold by `5.06453794291167 tok/s`;
+  - p95 ITL is `57.782 ms`, only slightly better than previous `58.728 ms`
+    and still about `2.05x` the historical vLLM p95 ITL `28.130 ms`.
+- Status:
+  - c16 throughput now has a credible diagnostic pass against the historical
+    same-dataset vLLM LCB threshold;
+  - W2 is still not release-grade because it lacks same-hardware vLLM baseline,
+    c=1/4/32 cells, full L0-L5 correctness, and final validator PASS;
+  - the remaining blocker is tail latency, not c16 throughput mean/LCB.
+
 ## 2026-06-17 YZ — W2 source checkpoint: same-iteration admission uses remaining decode-step budget
 
 - Artifact:
