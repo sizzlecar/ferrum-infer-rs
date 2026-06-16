@@ -1,0 +1,53 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Transfer starting: 46 files
+./
+build/
+remote/
+run/
+serve_smoke/
+server/
+correctness_check.json (251 B, 100.0% downloaded)
+correctness_check.rc (2 B, 100.0% downloaded)
+build/ferrum.sha256 (115 B, 100.0% downloaded)
+build/ferrum.version.txt (13 B, 100.0% downloaded)
+remote/finished_at_utc.txt (21 B, 100.0% downloaded)
+remote/git_head.txt (41 B, 100.0% downloaded)
+remote/git_status_short.txt (31.1 KB, 100.0% downloaded)
+remote/nvcc_version.txt (209 B, 100.0% downloaded)
+remote/nvidia_smi_before.txt (43 B, 100.0% downloaded)
+remote/source.diff (8.6 KB, 100.0% downloaded)
+remote/started_at_utc.txt (21 B, 100.0% downloaded)
+run/run.command.txt (456 B, 100.0% downloaded)
+run/run.rc (2 B, 100.0% downloaded)
+run/run.stderr (3.0 KB, 100.0% downloaded)
+run/run.stdout (111 B, 100.0% downloaded)
+run/run_decision_trace.jsonl (3.6 KB, 100.0% downloaded)
+run/run_effective_config.json (10.7 KB, 100.0% downloaded)
+serve_smoke/chat.rc (2 B, 100.0% downloaded)
+serve_smoke/chat_curl.err (0 B, 100.0% downloaded)
+serve_smoke/chat_request.json (157 B, 100.0% downloaded)
+serve_smoke/chat_response.json (282 B, 100.0% downloaded)
+server/error_scan.grep_rc (2 B, 100.0% downloaded)
+server/error_scan.txt (0 B, 100.0% downloaded)
+server/health_after_chat.err (0 B, 100.0% downloaded)
+server/health_after_chat.json (9.9 KB, 100.0% downloaded)
+server/kill_server.err (0 B, 100.0% downloaded)
+server/models.json (164 B, 100.0% downloaded)
+server/models_curl_last.err (0 B, 100.0% downloaded)
+server/nvidia_smi_after_server_stop.txt (1.7 KB, 100.0% downloaded)
+server/nvidia_smi_before_stop.txt (1.6 KB, 100.0% downloaded)
+server/ready (2 B, 100.0% downloaded)
+server/ready_poll_count.txt (3 B, 100.0% downloaded)
+server/serve.command.txt (443 B, 100.0% downloaded)
+server/serve_decision_trace.jsonl (3.6 KB, 100.0% downloaded)
+server/serve_effective_config.json (10.2 KB, 100.0% downloaded)
+server/server.log (2.7 KB, 100.0% downloaded)
+server/server.pid (4 B, 100.0% downloaded)
+server/server.stdout (910 B, 100.0% downloaded)
+server/stop_server.stderr (0 B, 100.0% downloaded)
+server/stop_server.stdout (0 B, 100.0% downloaded)
+
+sent 896 bytes  received 95052 bytes  191896 bytes/sec
+total size is 92219  speedup is 0.96

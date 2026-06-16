@@ -2074,9 +2074,14 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .as_mut()
                 .expect("unified_silu_out missing");
             match self.cfg.activation {
-                Activation::GeluTanh => {
-                    B::fused_gelu_tanh_mul_split(ctx, gate_up_out, silu_out, m_total, im)
-                }
+                Activation::GeluTanh => B::fused_gelu_tanh_mul_split_with_down_hint(
+                    ctx,
+                    gate_up_out,
+                    silu_out,
+                    m_total,
+                    im,
+                    Some(&*layer.down_proj),
+                ),
                 _ => B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im),
             }
         });

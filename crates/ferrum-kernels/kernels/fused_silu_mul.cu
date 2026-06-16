@@ -82,6 +82,36 @@ extern "C" __global__ void fused_gelu_tanh_mul_interleaved_f16(
     }
 }
 
+extern "C" __global__ void fused_gelu_tanh_mul_interleaved_f16_touch_down_qweight(
+    const __half* __restrict__ gate_up,  // [batch * 2 * inter]
+    __half* __restrict__ output,         // [batch * inter]
+    const int inter,
+    const int total,
+    const int* __restrict__ down_qweight,
+    const int down_qweight_words
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int acc = static_cast<unsigned int>(idx);
+    if (idx < total) {
+        int b = idx / inter;
+        int i = idx % inter;
+        float g = __half2float(gate_up[b * 2 * inter + i]);
+        float u = __half2float(gate_up[b * 2 * inter + inter + i]);
+        float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
+        inner = fminf(fmaxf(inner, -9.5f), 9.5f);
+        float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
+        output[idx] = __float2half(gelu_g * u);
+
+        if (down_qweight_words > 0) {
+            volatile const unsigned int* q =
+                reinterpret_cast<volatile const unsigned int*>(down_qweight);
+            const int pos = idx % down_qweight_words;
+            acc ^= q[pos];
+        }
+    }
+    asm volatile("" : : "r"(acc));
+}
+
 // In-place scalar scale (Gemma embedding x sqrt(hidden)). The trait's
 // host-roundtrip default would rebuild the buffer as F32 and flip the
 // CUDA lane's f16 dtype — this kernel keeps it on-device and typed.
