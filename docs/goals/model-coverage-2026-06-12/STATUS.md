@@ -2,6 +2,62 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YS — W2 c16 unified op profile: bottleneck is GPTQ Marlin MLP, not attention
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_op_profile_c16_rerun_2026-06-16/`.
+- Source checkpoints:
+  - `0d52b7b5 test(models): add unified forward op profiling`;
+  - `1707b001 test(models): sample large unified op profiles`.
+- GPU contract:
+  - reused Vast instance `41187356`, 1x RTX 4090, USD `0.38/h`;
+  - lane: W2 Gemma3 27B GPTQ c16 minimal diagnostic;
+  - correctness gate: product `ferrum serve` streaming smoke, then
+    `bench-serve --fail-on-error`;
+  - performance command: diagnostic-only c16 random 64/16, n=1, seed `9271`;
+  - stop condition: collect target `[unified-op-profile]` frame or failure
+    logs, then stop instance.
+- Evidence:
+  - remote clean worktree:
+    `1707b001da835f99484f09dec252a9f3c66823e4`;
+  - binary sha256:
+    `e2117a1df9613b15a2df470c3f7fa6b50a873b16b6dff61925ce9a9d33d4239f`;
+  - GPU: NVIDIA GeForce RTX 4090, driver `580.95.05`;
+  - cleanup confirmed `cur_state=stopped`, `actual_status=exited`.
+- Correctness/resource result:
+  - serve smoke passed: `SMOKE_OK True`;
+  - `bench-serve` rc `0`, completed `[16]`, errored `[0]`;
+  - output token count source was `usage`;
+  - log scan found no panic, OOM, illegal address, or CUDA error.
+- Diagnostic performance:
+  - request throughput `9.9298 req/s`;
+  - output throughput `158.877 tok/s`;
+  - TTFT p50/p95 `737.5 ms` / `825.0 ms`;
+  - TPOT p50/p95 `57.7 ms` / `86.6 ms`.
+- Bottleneck evidence:
+  - target frame:
+    `call#23 m_total=822 num_seqs=16 prefill=11 decode=5 total=339796us`;
+  - major components:
+    `gate_up=143991us`, `down=82787us`, `attn=18567us`,
+    `readback=22039us`, `qkv=30569us`;
+  - Marlin kernels:
+    `marlin_gate_up_kernel=141474us`,
+    `marlin_down_kernel=71062us`,
+    `marlin_qkv_kernel=28120us`,
+    `marlin_o_kernel=14974us`.
+- Interpretation:
+  - the current high-value W2 performance lever is Gemma3 GPTQ dense MLP
+    Marlin (`gate_up/down`), not FA2/attention or another broad graph sweep;
+  - next work should compare Ferrum and vLLM Marlin projection behavior at the
+    same `m_total` shapes (`1`, `4`, `150`, `373`, `822`) using source review
+    plus native CUDA/Rust CUDA microbench;
+  - if single-op Marlin is already comparable, the lever moves back to
+    scheduler/admission token budgeting to avoid TTFT-heavy mixed-prefill
+    frames.
+- Gate status:
+  - diagnostic only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
 ## 2026-06-16 YR — W2 c16 TTFT split: model prefill batch dominates queue wait
 
 - Artifact:
