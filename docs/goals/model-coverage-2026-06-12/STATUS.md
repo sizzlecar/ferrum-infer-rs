@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YG — W2 release-grade validator checkpoint: prompt dataset evidence must match
+
+- Source checkpoint:
+  - `90c48504 test(release): require matching prompt dataset evidence`.
+- Scope:
+  - no GPU instance was started;
+  - no performance measurement was taken;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Validator changes:
+  - release-grade `bench-serve` commands must now include `--num-prompts`
+    matching the cell `requests_per_run`;
+  - each performance cell must include `prompt_dataset_id` and
+    `baseline_prompt_dataset_id`, and they must match;
+  - each performance cell must include `prompt_dataset_sha256` and
+    `baseline_prompt_dataset_sha256`, and they must match;
+  - self-tests now reject mismatched `--num-prompts`, prompt dataset id, and
+    prompt dataset sha256.
+- Local validation:
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS;
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py`
+    PASS;
+  - `git diff --check` PASS;
+  - `python3 scripts/release/selftest_g0_validators.py` PASS.
+- Current W2 state:
+  - no new product correctness blocker is known;
+  - W2 remains not release-grade because there is no final PASS line and the
+    c16/c32 performance gap remains below the 80% mainstream-engine target;
+  - the next GPU validation should be a minimal c16 same-dataset,
+    same-shape run before any broader release sweep.
+
 ## 2026-06-16 YF — W2 release-grade validator checkpoint: baseline cell shape must match Ferrum
 
 - Source checkpoint:
