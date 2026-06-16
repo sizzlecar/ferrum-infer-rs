@@ -1,0 +1,192 @@
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 3.9 GB → max_blocks=512
+[auto-size] requested runtime floor requires KV_MAX_BLOCKS=512 above estimated budget 338; honoring explicit runtime limits
+[auto-size] KV_MAX_BLOCKS=512 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+[2m2026-06-16T16:55:25.362740Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-16T16:55:25.362765Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-16T16:55:25.362821Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-16T16:55:26.343196Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-16T16:55:26.343242Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-16T16:55:26.343248Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-16T16:55:26.343255Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=512
+[2m2026-06-16T16:55:26.343511Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-16T16:55:26.343942Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-16T16:55:26.495440Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-16T16:55:26.495537Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-16T16:55:26.495557Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-16T16:55:26.495567Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-16T16:56:32.355397Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+[2m2026-06-16T16:56:38.673491Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m Gemma3 family: legacy batched_decode=true varlen_unified=true
+[unified-decode] call#0 items=1 prefill=1 decode=0 total_q=23 attempted_unified=true fallback=false fallback_reason=none elapsed=181272us
+[first-token-prof] req=79e6368d-011a-4660-9770-7b55bf45c607 source=unified_prefill prompt_tokens=23 chunk_start=0 chunk_len=23 queue_to_model_start=901us model_batch=181344us queue_to_first_token=182554us
+[stream-ttft-prof] req=79e6368d-011a-4660-9770-7b55bf45c607 prompt_tokens=23 generated_tokens=1 ttft=186388us
+[unified-prof] iter#0 items=1 prefill=1 decode=0 total=189317us model=181344us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[iter-prof] iter#0 total=193924us sched=14us process=193909us batch_size=1
+[unified-decode] call#1 items=1 prefill=0 decode=1 total_q=1 attempted_unified=true fallback=false fallback_reason=none elapsed=21146us
+[unified-prof] iter#1 items=1 prefill=0 decode=1 total=21544us model=21186us decode_post=356us | sample=297 sched=1 stream=58 stop=0 complete=0 (us)
+[iter-prof] iter#1 total=25395us sched=13us process=25382us batch_size=1
+[unified-decode] call#2 items=1 prefill=0 decode=1 total_q=1 attempted_unified=true fallback=false fallback_reason=none elapsed=20967us
+[unified-prof] iter#2 items=1 prefill=0 decode=1 total=21325us model=21003us decode_post=320us | sample=296 sched=0 stream=0 stop=0 complete=24 (us)
+[iter-prof] iter#2 total=25169us sched=11us process=25157us batch_size=1
+[bg-loop-gap] call#8 inter_iter=5us
+[bg-loop-gap] call#16 inter_iter=5us
+[bg-loop-gap] call#24 inter_iter=4us
+[bg-loop-gap] call#32 inter_iter=5us
+[bg-loop-gap] call#40 inter_iter=5us
+[bg-loop-gap] call#48 inter_iter=5us
+[bg-loop-gap] call#56 inter_iter=4us
+[bg-loop-gap] call#64 inter_iter=4us
+[bg-loop-gap] call#72 inter_iter=4us
+[bg-loop-gap] call#80 inter_iter=5us
+[bg-loop-gap] call#88 inter_iter=5us
+[bg-loop-gap] call#96 inter_iter=5us
+[bg-loop-gap] call#104 inter_iter=5us
+[bg-loop-gap] call#112 inter_iter=4us
+[bg-loop-gap] call#120 inter_iter=4us
+[bg-loop-gap] call#128 inter_iter=4us
+[bg-loop-gap] call#136 inter_iter=5us
+[bg-loop-gap] call#144 inter_iter=5us
+[bg-loop-gap] call#152 inter_iter=4us
+[bg-loop-gap] call#160 inter_iter=5us
+[bg-loop-gap] call#168 inter_iter=4us
+[bg-loop-gap] call#176 inter_iter=5us
+[bg-loop-gap] call#184 inter_iter=5us
+[bg-loop-gap] call#192 inter_iter=5us
+[bg-loop-gap] call#200 inter_iter=5us
+[bg-loop-gap] call#208 inter_iter=4us
+[bg-loop-gap] call#216 inter_iter=5us
+[bg-loop-gap] call#224 inter_iter=5us
+[bg-loop-gap] call#232 inter_iter=5us
+[bg-loop-gap] call#240 inter_iter=5us
+[bg-loop-gap] call#248 inter_iter=4us
+[bg-loop-gap] call#256 inter_iter=5us
+[bg-loop-gap] call#264 inter_iter=6us
+[bg-loop-gap] call#272 inter_iter=5us
+[bg-loop-gap] call#280 inter_iter=5us
+[bg-loop-gap] call#288 inter_iter=5us
+[bg-loop-gap] call#296 inter_iter=4us
+[bg-loop-gap] call#304 inter_iter=5us
+[bg-loop-gap] call#312 inter_iter=6us
+[bg-loop-gap] call#320 inter_iter=5us
+[bg-loop-gap] call#328 inter_iter=4us
+[bg-loop-gap] call#336 inter_iter=4us
+[bg-loop-gap] call#344 inter_iter=5us
+[bg-loop-gap] call#352 inter_iter=5us
+[bg-loop-gap] call#360 inter_iter=5us
+[bg-loop-gap] call#368 inter_iter=5us
+[bg-loop-gap] call#376 inter_iter=5us
+[bg-loop-gap] call#384 inter_iter=5us
+[bg-loop-gap] call#392 inter_iter=5us
+[bg-loop-gap] call#400 inter_iter=5us
+[bg-loop-gap] call#408 inter_iter=5us
+[bg-loop-gap] call#416 inter_iter=5us
+[bg-loop-gap] call#424 inter_iter=5us
+[bg-loop-gap] call#432 inter_iter=4us
+[bg-loop-gap] call#440 inter_iter=5us
+[bg-loop-gap] call#448 inter_iter=5us
+[unified-decode] call#3 items=4 prefill=4 decode=0 total_q=299 attempted_unified=true fallback=false fallback_reason=none elapsed=136715us
+[first-token-prof] req=6d1e1b3a-e555-4579-80e7-9f89a3f8b376 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=7826us model_batch=136769us queue_to_first_token=144903us
+[stream-ttft-prof] req=6d1e1b3a-e555-4579-80e7-9f89a3f8b376 prompt_tokens=75 generated_tokens=1 ttft=148628us
+[first-token-prof] req=0f62bd38-aa8c-46c9-8a5f-2cc605af6ba1 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=7406us model_batch=136769us queue_to_first_token=152247us
+[stream-ttft-prof] req=0f62bd38-aa8c-46c9-8a5f-2cc605af6ba1 prompt_tokens=74 generated_tokens=1 ttft=155914us
+[first-token-prof] req=0542176b-f84f-46fd-a517-123dbc62f7ad source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=7385us model_batch=136769us queue_to_first_token=159874us
+[stream-ttft-prof] req=0542176b-f84f-46fd-a517-123dbc62f7ad prompt_tokens=75 generated_tokens=1 ttft=163566us
+[first-token-prof] req=aafc3327-749f-4a46-b5d9-fd633b3e6fd9 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=7164us model_batch=136769us queue_to_first_token=167320us
+[stream-ttft-prof] req=aafc3327-749f-4a46-b5d9-fd633b3e6fd9 prompt_tokens=75 generated_tokens=1 ttft=171015us
+[unified-prof] iter#3 items=4 prefill=4 decode=0 total=167527us model=136769us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[unified-decode] call#4 items=4 prefill=0 decode=4 total_q=4 attempted_unified=true fallback=false fallback_reason=none elapsed=23255us
+[unified-prof] iter#4 items=4 prefill=0 decode=4 total=24653us model=23297us decode_post=1351us | sample=1208 sched=1 stream=142 stop=0 complete=0 (us)
+[unified-decode] call#5 items=4 prefill=0 decode=4 total_q=4 attempted_unified=true fallback=false fallback_reason=none elapsed=23198us
+[unified-prof] iter#5 items=4 prefill=0 decode=4 total=24577us model=23247us decode_post=1324us | sample=1182 sched=0 stream=142 stop=0 complete=0 (us)
+[bg-loop-gap] call#456 inter_iter=5us
+[unified-decode] call#6 items=4 prefill=0 decode=4 total_q=4 attempted_unified=true fallback=false fallback_reason=none elapsed=22838us
+[unified-prof] iter#6 items=4 prefill=0 decode=4 total=24207us model=22875us decode_post=1326us | sample=1187 sched=0 stream=139 stop=0 complete=0 (us)
+[unified-decode] call#7 items=4 prefill=0 decode=4 total_q=4 attempted_unified=true fallback=false fallback_reason=none elapsed=22839us
+[unified-prof] iter#7 items=4 prefill=0 decode=4 total=24216us model=22879us decode_post=1330us | sample=1193 sched=0 stream=137 stop=0 complete=0 (us)
+[unified-prof] iter#8 items=4 prefill=0 decode=4 total=24176us model=22825us decode_post=1343us | sample=1194 sched=0 stream=149 stop=0 complete=0 (us)
+[unified-prof] iter#9 items=4 prefill=0 decode=4 total=24205us model=22857us decode_post=1340us | sample=1195 sched=0 stream=145 stop=0 complete=0 (us)
+[unified-prof] iter#10 items=4 prefill=0 decode=4 total=24243us model=22888us decode_post=1348us | sample=1194 sched=0 stream=154 stop=0 complete=0 (us)
+[unified-prof] iter#11 items=4 prefill=0 decode=4 total=24257us model=22897us decode_post=1353us | sample=1205 sched=0 stream=148 stop=0 complete=0 (us)
+[unified-prof] iter#12 items=4 prefill=0 decode=4 total=24317us model=22924us decode_post=1384us | sample=1222 sched=0 stream=162 stop=0 complete=0 (us)
+[unified-prof] iter#13 items=4 prefill=0 decode=4 total=24340us model=22952us decode_post=1382us | sample=1221 sched=0 stream=161 stop=0 complete=0 (us)
+[bg-loop-gap] call#464 inter_iter=6us
+[unified-prof] iter#14 items=4 prefill=0 decode=4 total=24287us model=22923us decode_post=1356us | sample=1202 sched=1 stream=153 stop=0 complete=0 (us)
+[unified-prof] iter#15 items=4 prefill=0 decode=4 total=24264us model=22881us decode_post=1376us | sample=1208 sched=0 stream=168 stop=0 complete=0 (us)
+[unified-prof] iter#16 items=4 prefill=0 decode=4 total=24269us model=22883us decode_post=1379us | sample=1212 sched=0 stream=167 stop=0 complete=0 (us)
+[unified-prof] iter#17 items=4 prefill=0 decode=4 total=24293us model=22907us decode_post=1379us | sample=1224 sched=0 stream=155 stop=0 complete=0 (us)
+[unified-prof] iter#18 items=4 prefill=0 decode=4 total=24428us model=22893us decode_post=1528us | sample=1213 sched=0 stream=177 stop=0 complete=138 (us)
+[unified-decode] call#19 items=6 prefill=6 decode=0 total_q=446 attempted_unified=true fallback=false fallback_reason=none elapsed=177159us
+[first-token-prof] req=6e58d4b4-0bf1-4620-b41f-96472c69b7c1 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=7067us model_batch=177217us queue_to_first_token=184633us
+[stream-ttft-prof] req=6e58d4b4-0bf1-4620-b41f-96472c69b7c1 prompt_tokens=74 generated_tokens=1 ttft=188396us
+[first-token-prof] req=6135f68d-f4a9-45e3-8912-e8c975a9e6d8 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=6272us model_batch=177217us queue_to_first_token=191740us
+[stream-ttft-prof] req=6135f68d-f4a9-45e3-8912-e8c975a9e6d8 prompt_tokens=75 generated_tokens=1 ttft=195472us
+[first-token-prof] req=d00435dc-bf7f-4c43-9f55-b47164fc6322 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=6344us model_batch=177217us queue_to_first_token=199650us
+[stream-ttft-prof] req=d00435dc-bf7f-4c43-9f55-b47164fc6322 prompt_tokens=75 generated_tokens=1 ttft=203496us
+[first-token-prof] req=032713f3-989a-4d8e-84fc-03352c6c34cb source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=6194us model_batch=177217us queue_to_first_token=207477us
+[stream-ttft-prof] req=032713f3-989a-4d8e-84fc-03352c6c34cb prompt_tokens=74 generated_tokens=1 ttft=211268us
+[first-token-prof] req=ae69db08-4ab5-41bf-b954-be9d7d0bbd3f source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=5880us model_batch=177217us queue_to_first_token=215047us
+[stream-ttft-prof] req=ae69db08-4ab5-41bf-b954-be9d7d0bbd3f prompt_tokens=74 generated_tokens=1 ttft=218832us
+[first-token-prof] req=cdd70afb-5453-4e5c-b177-cbebaea4ec07 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=5930us model_batch=177217us queue_to_first_token=222980us
+[stream-ttft-prof] req=cdd70afb-5453-4e5c-b177-cbebaea4ec07 prompt_tokens=74 generated_tokens=1 ttft=226732us
+[unified-prof] iter#19 items=6 prefill=6 decode=0 total=224541us model=177217us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[unified-decode] call#20 items=7 prefill=1 decode=6 total_q=80 attempted_unified=true fallback=false fallback_reason=none elapsed=57871us
+[first-token-prof] req=38355f33-7eb1-4d1e-8f98-ca0867cdf604 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=235828us model_batch=57922us queue_to_first_token=294060us
+[stream-ttft-prof] req=38355f33-7eb1-4d1e-8f98-ca0867cdf604 prompt_tokens=74 generated_tokens=1 ttft=297897us
+[unified-prof] iter#20 items=7 prefill=1 decode=6 total=67896us model=57922us decode_post=1972us | sample=1806 sched=0 stream=166 stop=0 complete=0 (us)
+[bg-loop-gap] call#472 inter_iter=7us
+[unified-decode] call#21 items=13 prefill=6 decode=7 total_q=455 attempted_unified=true fallback=false fallback_reason=none elapsed=203058us
+[first-token-prof] req=4e0c6cbd-59a4-4ea0-98aa-66c36765e138 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=318023us model_batch=203111us queue_to_first_token=521451us
+[stream-ttft-prof] req=4e0c6cbd-59a4-4ea0-98aa-66c36765e138 prompt_tokens=74 generated_tokens=1 ttft=525266us
+[first-token-prof] req=482b1a73-8055-48cd-b13e-c87c13d92010 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=317720us model_batch=203111us queue_to_first_token=529110us
+[stream-ttft-prof] req=482b1a73-8055-48cd-b13e-c87c13d92010 prompt_tokens=74 generated_tokens=1 ttft=532869us
+[first-token-prof] req=ff97fce5-967b-4d20-8fa1-7048945b7418 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=317784us model_batch=203111us queue_to_first_token=537003us
+[stream-ttft-prof] req=ff97fce5-967b-4d20-8fa1-7048945b7418 prompt_tokens=75 generated_tokens=1 ttft=540769us
+[first-token-prof] req=1a109987-de78-47f0-ad89-a2f97f419c24 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=318833us model_batch=203111us queue_to_first_token=545903us
+[stream-ttft-prof] req=1a109987-de78-47f0-ad89-a2f97f419c24 prompt_tokens=75 generated_tokens=1 ttft=549670us
+[first-token-prof] req=21771aa3-7f76-432c-a65b-20dcee68c36d source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=317467us model_batch=203111us queue_to_first_token=552359us
+[stream-ttft-prof] req=21771aa3-7f76-432c-a65b-20dcee68c36d prompt_tokens=75 generated_tokens=1 ttft=556118us
+[first-token-prof] req=6e8f58c4-7847-4c80-bed5-f981a3c132e7 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=317136us model_batch=203111us queue_to_first_token=559877us
+[stream-ttft-prof] req=6e8f58c4-7847-4c80-bed5-f981a3c132e7 prompt_tokens=75 generated_tokens=1 ttft=563671us
+[unified-prof] iter#21 items=13 prefill=6 decode=7 total=252615us model=203111us decode_post=2291us | sample=2092 sched=0 stream=199 stop=0 complete=0 (us)
+[unified-decode] call#22 items=16 prefill=3 decode=13 total_q=235 attempted_unified=true fallback=false fallback_reason=none elapsed=118725us
+[first-token-prof] req=0c32876b-9bb6-40de-8a4f-3d39bf213cbf source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=579299us model_batch=118779us queue_to_first_token=698394us
+[stream-ttft-prof] req=0c32876b-9bb6-40de-8a4f-3d39bf213cbf prompt_tokens=74 generated_tokens=1 ttft=702222us
+[first-token-prof] req=60981a9f-cf76-4a35-8803-a3eb5bf91dbc source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=579289us model_batch=118779us queue_to_first_token=706376us
+[stream-ttft-prof] req=60981a9f-cf76-4a35-8803-a3eb5bf91dbc prompt_tokens=74 generated_tokens=1 ttft=710195us
+[first-token-prof] req=0c48dc69-8472-4aa7-a96c-0a30cc74f92f source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=579160us model_batch=118779us queue_to_first_token=714162us
+[stream-ttft-prof] req=0c48dc69-8472-4aa7-a96c-0a30cc74f92f prompt_tokens=74 generated_tokens=1 ttft=717970us
+[unified-prof] iter#22 items=16 prefill=3 decode=13 total=146871us model=118779us decode_post=4276us | sample=3907 sched=0 stream=369 stop=0 complete=0 (us)
+[unified-prof] iter#23 items=16 prefill=0 decode=16 total=35485us model=30213us decode_post=5245us | sample=4770 sched=0 stream=475 stop=0 complete=0 (us)
+[unified-prof] iter#24 items=16 prefill=0 decode=16 total=35472us model=30163us decode_post=5283us | sample=4800 sched=1 stream=482 stop=0 complete=0 (us)
+[unified-prof] iter#25 items=16 prefill=0 decode=16 total=35371us model=30055us decode_post=5291us | sample=4795 sched=0 stream=496 stop=0 complete=0 (us)
+[unified-prof] iter#26 items=16 prefill=0 decode=16 total=35464us model=30165us decode_post=5277us | sample=4784 sched=1 stream=492 stop=0 complete=0 (us)
+[unified-prof] iter#27 items=16 prefill=0 decode=16 total=35430us model=30162us decode_post=5244us | sample=4759 sched=0 stream=485 stop=0 complete=0 (us)
+[iter-prof] iter#479 total=39393us sched=51us process=39342us batch_size=16
+[unified-prof] iter#28 items=16 prefill=0 decode=16 total=35542us model=30240us decode_post=5279us | sample=4777 sched=1 stream=501 stop=0 complete=0 (us)
+[bg-loop-gap] call#480 inter_iter=10us
+[unified-prof] iter#29 items=16 prefill=0 decode=16 total=35621us model=30222us decode_post=5374us | sample=4845 sched=0 stream=529 stop=0 complete=0 (us)
+[unified-prof] iter#30 items=16 prefill=0 decode=16 total=35674us model=30269us decode_post=5382us | sample=4814 sched=0 stream=568 stop=0 complete=0 (us)
+[unified-prof] iter#31 items=16 prefill=0 decode=16 total=35651us model=30259us decode_post=5369us | sample=4822 sched=0 stream=547 stop=0 complete=0 (us)
+[unified-decode] call#32 items=16 prefill=0 decode=16 total_q=16 attempted_unified=true fallback=false fallback_reason=none elapsed=30247us
+[unified-prof] iter#32 items=16 prefill=0 decode=16 total=35679us model=30297us decode_post=5360us | sample=4792 sched=1 stream=567 stop=0 complete=0 (us)
+[unified-prof] iter#33 items=16 prefill=0 decode=16 total=35692us model=30257us decode_post=5411us | sample=4835 sched=0 stream=576 stop=0 complete=0 (us)
+[unified-prof] iter#34 items=16 prefill=0 decode=16 total=35821us model=30296us decode_post=5496us | sample=4825 sched=1 stream=534 stop=0 complete=136 (us)
+[unified-prof] iter#35 items=10 prefill=0 decode=10 total=30291us model=26846us decode_post=3430us | sample=3041 sched=0 stream=357 stop=0 complete=32 (us)
+[unified-prof] iter#36 items=9 prefill=0 decode=9 total=29535us model=26275us decode_post=3245us | sample=2703 sched=1 stream=371 stop=0 complete=170 (us)
+[bg-loop-gap] call#488 inter_iter=7us
+[unified-prof] iter#37 items=3 prefill=0 decode=3 total=23498us model=22351us decode_post=1139us | sample=914 sched=0 stream=133 stop=0 complete=92 (us)
+[bg-loop-gap] call#496 inter_iter=4us
+[bg-loop-gap] call#504 inter_iter=4us
+[bg-loop-gap] call#512 inter_iter=5us
+[bg-loop-gap] call#520 inter_iter=5us
+[bg-loop-gap] call#528 inter_iter=5us
+[bg-loop-gap] call#536 inter_iter=5us
+[bg-loop-gap] call#544 inter_iter=4us
+[bg-loop-gap] call#552 inter_iter=5us
+[bg-loop-gap] call#560 inter_iter=5us
+[bg-loop-gap] call#568 inter_iter=4us
+[bg-loop-gap] call#576 inter_iter=5us
+[bg-loop-gap] call#584 inter_iter=5us
+[bg-loop-gap] call#592 inter_iter=5us
+[bg-loop-gap] call#600 inter_iter=4us
+[bg-loop-gap] call#608 inter_iter=5us
+[bg-loop-gap] call#616 inter_iter=4us
