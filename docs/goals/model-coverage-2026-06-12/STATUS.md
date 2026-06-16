@@ -2,6 +2,73 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YP — Release-grade validator W3 self-test hardening
+
+- Scope:
+  - no GPU instance was started;
+  - strengthened `scripts/release/model_release_grade_goal_gate.py --self-test`
+    so it now validates a passing W3 manifest as well as the existing W2
+    manifest path;
+  - added a negative W3 self-test that deletes `w3_s0_microbench` and confirms
+    the validator rejects the manifest.
+- Why this matters:
+  - `RELEASE_GRADE_GOAL.md` defines both W2 and W3 PASS lines through this
+    validator;
+  - before this checkpoint, the code path for W3 required correctness entries
+    existed, but the self-test did not prove the W3-specific S0/S1/S2 fields.
+- Local validation:
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS: `MODEL RELEASE GRADE GOAL SELFTEST PASS`;
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py`
+    PASS;
+  - `python3 scripts/release/selftest_g0_validators.py`
+    PASS: `G0 VALIDATOR SELFTEST PASS`.
+- Gate status:
+  - validator hardening only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+
+## 2026-06-16 YO — W2 lm-head-eager graph diagnostic: correctness boundary found, not a perf lever
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_lm_head_eager_graph_cuda_smoke_2026-06-16/`.
+- Source checkpoint:
+  `dded3b7d test(cuda): add lm-head-eager graph scope`.
+- GPU contract:
+  - lane: `W2 Gemma3 CUDA unified graph lm-head-eager minimal diagnostic`;
+  - expected runtime/cost: 15-30 minutes, hard cap 45 minutes, about
+    USD `0.38/h` on the selected 1x RTX 4090 instance;
+  - stop condition: start/SSH/CUDA/source sync/build failure, product smoke
+    failure, graph illegal-address/OOM, or one small c16 diagnostic collected;
+  - correctness gate: typed `ferrum run` and `ferrum serve` smoke;
+  - performance command: diagnostic-only `bench-serve --fail-on-error --seed
+    9271 --n-repeats 1`.
+- Evidence:
+  - Vast instance `41187356`, 1x RTX 4090, driver `580.95.05`, CUDA `12.4`;
+  - model prefetch rc `0`;
+  - dense CUDA diagnostic build rc `0`;
+  - cleanup confirmed `cur_state=stopped`, `actual_status=exited`.
+- Correctness result:
+  - `ferrum run` rc `0`, content `5`, `n_tokens=3`;
+  - `ferrum serve` chat response content `5`, usage present;
+  - repeated same-shape serve requests logged `scope=lm_head_eager` capture and
+    replay entries, with no illegal address.
+- Diagnostic performance:
+  - tiny c16 default: `246.621 tok/s`, completed `[16]`, errored `[0]`;
+  - tiny c16 lm-head-eager: `233.070 tok/s`, completed `[16]`, errored `[0]`;
+  - this was `n_repeats=1`, random 16/8, and is not release evidence.
+- Interpretation:
+  - `lm-head-eager` narrows the full unified graph crash suspect to the
+    excluded `lm_head` / dense Marlin graph-capture or workspace-aliasing
+    region;
+  - graph capture is not the current W2 throughput lever, because the clean
+    `lm-head-eager` scope did not improve endpoint throughput;
+  - next W2 performance work should remain on Gemma3 GPTQ dense tail MLP /
+    Marlin path and vLLM comparison, not another broad graph knob sweep.
+- Gate status:
+  - diagnostic only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
 ## 2026-06-16 YN — W2 native CUDA graph segment probe: launch count alone does not explain unified-graph OOM
 
 - Artifact:
