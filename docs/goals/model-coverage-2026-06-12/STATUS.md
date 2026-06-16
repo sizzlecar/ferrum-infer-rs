@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YH — W2 CUDA c16 same-shape validation: correctness clean, performance still below 80%
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_ferrum_natural_c16_same_shape_2026-06-16/`.
+- Paid GPU lane:
+  `W2 Gemma3 CUDA c16 same-dataset same-shape minimal validation` on cached
+  Vast instance `40826362`, 1x RTX 4090.
+- Contract:
+  - expected runtime/cost: 20-45 minutes, hard cap 60 minutes, about
+    USD 0.14-0.32 at USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/build/`ferrum run`/smoke first failure,
+    c16 `num_prompts=100,n_repeats=3,--require-ci` artifact copied, or
+    60-minute cap;
+  - correctness gate: `ferrum run` plus
+    `scripts/model_coverage_smoke.sh gemma3:27b-gptq`;
+  - performance command:
+    `ferrum bench-serve --dataset sharegpt --sharegpt-path ascii_sharegpt.jsonl --random-output-len 128 --concurrency-sweep 16 --num-prompts 100 --n-repeats 3 --fail-on-error --require-ci --seed 9271`.
+- Evidence hygiene:
+  - local source head `a45e3caaeb94af5451c64f7542014e580ea613e6`;
+  - local tracked dirty count `0`;
+  - binary SHA256
+    `79379516dc90c958ae03f65aeaa36b706156b5ec1f6e15e14092815f4d62a110`;
+  - dataset SHA256
+    `58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e`;
+  - Vast cleanup confirmed `actual_status=exited`.
+- Correctness:
+  - `ferrum run` returned assistant content `5`, finish_reason `stop`,
+    `n_tokens=3`;
+  - smoke PASS line:
+    `FERRUM W1 SMOKE PASS: gemma3:27b-gptq`.
+- Performance result:
+  - c16 completed `[100,100,100]`, errored `[0,0,0]`;
+  - all quality/error counts are zero and `output_token_count_source=usage`;
+  - Ferrum c16 `332.005 +/- 6.821 tok/s`, LCB `325.184 tok/s`;
+  - vLLM c16 same-dataset baseline LCB `491.150 tok/s`;
+  - required 80% threshold `392.920 tok/s`;
+  - Ferrum LCB / vLLM LCB `66.21%`, gap to 80% threshold
+    `67.736 tok/s`;
+  - Ferrum p95 ITL `83.979 ms` vs vLLM `28.130 ms`, `2.99x`.
+- Interpretation:
+  - this closes the previous 32-prompt diagnostic vs 100-prompt baseline
+    ambiguity;
+  - correctness is clean, but c16 still fails both the throughput and p95 ITL
+    release-grade thresholds;
+  - W2 remains not release-grade: no
+    `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced;
+  - the next performance lever should stay on the model-side decode/tail-MLP
+    path, not on another full sweep.
+
 ## 2026-06-16 YG — W2 release-grade validator checkpoint: prompt dataset evidence must match
 
 - Source checkpoint:
