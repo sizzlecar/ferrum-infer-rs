@@ -44,6 +44,16 @@ W3_REQUIRED_CORRECTNESS = {
     "w3_s1_single_layer",
     "w3_s2_whole_model_product_path",
 }
+REQUIRED_ZERO_RUN_COUNT_FIELDS = [
+    "bad_output_per_run",
+    "malformed_stream_per_run",
+    "missing_done_per_run",
+    "duplicate_done_per_run",
+    "zero_output_tokens_per_run",
+    "stream_bulk_flush_per_run",
+    "http_500_per_run",
+    "panic_per_run",
+]
 MIN_RATIO = 0.8
 MAX_ITL_MULTIPLE = 1.25
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -430,6 +440,17 @@ def validate_performance_cell(
         problems.append(f"{label}.completed_per_run must be full for every repeat")
     if errored and any(value != 0 for value in errored):
         problems.append(f"{label}.errored_per_run must be all zero")
+    for field in REQUIRED_ZERO_RUN_COUNT_FIELDS:
+        values = as_list(cell.get(field), f"{label}.{field}", problems)
+        if n_repeats is not None and len(values) != n_repeats:
+            problems.append(f"{label}.{field} length must equal n_repeats")
+        non_zero = [
+            value
+            for value in values
+            if not isinstance(value, int) or isinstance(value, bool) or value != 0
+        ]
+        if non_zero:
+            problems.append(f"{label}.{field} must be all zero")
     if cell.get("output_token_count_source") != "usage":
         problems.append(f"{label}.output_token_count_source must be usage")
     require_true(cell.get("stream_options_include_usage"), f"{label}.stream_options_include_usage", problems)
@@ -593,6 +614,14 @@ def write_selftest_manifest(root: Path, *, ratio: float = 0.82) -> Path:
                 "n_repeats": 3,
                 "completed_per_run": [100, 100, 100],
                 "errored_per_run": [0, 0, 0],
+                "bad_output_per_run": [0, 0, 0],
+                "malformed_stream_per_run": [0, 0, 0],
+                "missing_done_per_run": [0, 0, 0],
+                "duplicate_done_per_run": [0, 0, 0],
+                "zero_output_tokens_per_run": [0, 0, 0],
+                "stream_bulk_flush_per_run": [0, 0, 0],
+                "http_500_per_run": [0, 0, 0],
+                "panic_per_run": [0, 0, 0],
                 "output_token_count_source": "usage",
                 "stream_options_include_usage": True,
                 "same_hardware": True,
@@ -730,6 +759,15 @@ def run_selftest() -> int:
             for problem in missing_cell_problems
         ):
             raise AssertionError("missing cell artifact selftest did not fail as expected")
+
+        bad_quality = tmp_root / "bad-quality-count"
+        bad_quality_manifest = write_selftest_manifest(bad_quality, ratio=0.82)
+        data = load_json(bad_quality_manifest)
+        data["performance"]["cells"][0]["bad_output_per_run"] = [0, 1, 0]
+        write_json(bad_quality_manifest, data)
+        bad_quality_problems = validate_manifest(data, "w2", bad_quality)
+        if not any("bad_output_per_run must be all zero" in problem for problem in bad_quality_problems):
+            raise AssertionError("bad quality count selftest did not fail as expected")
 
     print("MODEL RELEASE GRADE GOAL SELFTEST PASS")
     return 0
