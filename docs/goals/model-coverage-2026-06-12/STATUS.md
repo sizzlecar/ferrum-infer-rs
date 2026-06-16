@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YF — W2 release-grade validator checkpoint: baseline cell shape must match Ferrum
+
+- Source checkpoint:
+  - `d549c6ed test(release): require matching baseline cell shape`.
+- Scope:
+  - no GPU instance was started;
+  - no performance measurement was taken;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Validator changes:
+  - each release-grade performance cell now rejects baseline/Ferrum shape
+    mismatches for `n_repeats`;
+  - each cell also rejects baseline/Ferrum mismatches for `requests_per_run`;
+  - self-tests now cover both mismatches.
+- Local validation:
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS;
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py`
+    PASS;
+  - `git diff --check` PASS;
+  - `python3 scripts/release/selftest_g0_validators.py` PASS.
+- Current W2 state:
+  - no current evidence shows a new product correctness blocker in
+    `ferrum run` or `ferrum serve`;
+  - W2 remains not release-grade because there is no final PASS line and
+    c16/c32 performance remains below the 80% mainstream-engine line;
+  - the latest natural ShareGPT Ferrum/vLLM comparison is still diagnostic:
+    Ferrum used `num_prompts=32,n_repeats=1`, while release evidence requires
+    `num_prompts=100,n_repeats=3,--require-ci` with matching baseline shape.
+- Next direction:
+  - before another expensive sweep, run only a minimal same-dataset,
+    same-shape c16 validation if GPU is started;
+  - continue bottleneck work from the decode tail MLP path, where current
+    profiling points to `gate_up -> GeGLU -> down` kernel time rather than
+    scheduler/postprocess overhead.
+
 ## 2026-06-16 YE — W2 release-grade validator checkpoint: baseline bench cells must be clean
 
 - Source checkpoint:
