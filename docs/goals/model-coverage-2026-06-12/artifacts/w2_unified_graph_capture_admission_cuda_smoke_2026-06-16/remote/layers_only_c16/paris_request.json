@@ -1,0 +1,1 @@
+{"model":"gemma3:27b-gptq","messages":[{"role":"user","content":"What is the capital of France? Answer in one short sentence."}],"temperature":0,"max_tokens":8}
