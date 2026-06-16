@@ -29,21 +29,6 @@ pub struct CudaMarlinLinear {
     pub out_features: usize,
 }
 
-impl CudaMarlinLinear {
-    #[cfg(feature = "triton-kernels")]
-    pub fn marlin_weight(&self) -> Option<&crate::marlin::MarlinWeight> {
-        match &self.store {
-            GptqStoreCuda::Marlin(weight) => Some(weight),
-            GptqStoreCuda::Triton(_) => None,
-        }
-    }
-
-    #[cfg(not(feature = "triton-kernels"))]
-    pub fn marlin_weight(&self) -> Option<&crate::marlin::MarlinWeight> {
-        Some(&self.store)
-    }
-}
-
 impl Linear<CudaBackend> for CudaMarlinLinear {
     fn in_features(&self) -> usize {
         self.in_features
@@ -51,10 +36,6 @@ impl Linear<CudaBackend> for CudaMarlinLinear {
 
     fn out_features(&self) -> usize {
         self.out_features
-    }
-
-    fn as_cuda_marlin_linear(&self) -> Option<&CudaMarlinLinear> {
-        Some(self)
     }
 
     #[allow(clippy::needless_return)]

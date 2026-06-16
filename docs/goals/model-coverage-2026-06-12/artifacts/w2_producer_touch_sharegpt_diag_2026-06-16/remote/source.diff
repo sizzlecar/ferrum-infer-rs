@@ -1,0 +1,215 @@
+diff --git a/crates/ferrum-kernels/kernels/fused_silu_mul.cu b/crates/ferrum-kernels/kernels/fused_silu_mul.cu
+index 8fd43a38..3148c095 100644
+--- a/crates/ferrum-kernels/kernels/fused_silu_mul.cu
++++ b/crates/ferrum-kernels/kernels/fused_silu_mul.cu
+@@ -82,6 +82,36 @@ extern "C" __global__ void fused_gelu_tanh_mul_interleaved_f16(
+     }
+ }
+
++extern "C" __global__ void fused_gelu_tanh_mul_interleaved_f16_touch_down_qweight(
++    const __half* __restrict__ gate_up,  // [batch * 2 * inter]
++    __half* __restrict__ output,         // [batch * inter]
++    const int inter,
++    const int total,
++    const int* __restrict__ down_qweight,
++    const int down_qweight_words
++) {
++    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    unsigned int acc = static_cast<unsigned int>(idx);
++    if (idx < total) {
++        int b = idx / inter;
++        int i = idx % inter;
++        float g = __half2float(gate_up[b * 2 * inter + i]);
++        float u = __half2float(gate_up[b * 2 * inter + inter + i]);
++        float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
++        inner = fminf(fmaxf(inner, -9.5f), 9.5f);
++        float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
++        output[idx] = __float2half(gelu_g * u);
++
++        if (down_qweight_words > 0) {
++            volatile const unsigned int* q =
++                reinterpret_cast<volatile const unsigned int*>(down_qweight);
++            const int pos = idx % down_qweight_words;
++            acc ^= q[pos];
++        }
++    }
++    asm volatile("" : : "r"(acc));
++}
++
+ // In-place scalar scale (Gemma embedding x sqrt(hidden)). The trait's
+ // host-roundtrip default would rebuild the buffer as F32 and flip the
+ // CUDA lane's f16 dtype — this kernel keeps it on-device and typed.
+diff --git a/crates/ferrum-kernels/src/backend/cuda/mod.rs b/crates/ferrum-kernels/src/backend/cuda/mod.rs
+index 5b25cb97..9404b9ed 100644
+--- a/crates/ferrum-kernels/src/backend/cuda/mod.rs
++++ b/crates/ferrum-kernels/src/backend/cuda/mod.rs
+@@ -1779,6 +1779,50 @@ impl Backend for CudaBackend {
+         .expect("fused_gelu_tanh_mul_split launch");
+     }
+
++    fn fused_gelu_tanh_mul_split_with_down_hint(
++        ctx: &mut Self::Context,
++        gate_up: &Self::Buffer,
++        out: &mut Self::Buffer,
++        tokens: usize,
++        im: usize,
++        down_proj: Option<&dyn crate::Linear<Self>>,
++    ) {
++        let Some(down_weight) = down_proj
++            .and_then(|linear| linear.as_cuda_marlin_linear())
++            .and_then(|linear| linear.marlin_weight())
++        else {
++            return Self::fused_gelu_tanh_mul_split(ctx, gate_up, out, tokens, im);
++        };
++
++        let func = ctx.func(
++            "fused_silu_mul",
++            ptx::FUSED_SILU_MUL,
++            "fused_gelu_tanh_mul_interleaved_f16_touch_down_qweight",
++        );
++        let im_i32 = im as i32;
++        let total = tokens * im;
++        let total_i32 = total as i32;
++        let qweight_words = down_weight.qweight.len() as i32;
++        let block = 256u32;
++        let grid = ((total as u32) + block - 1) / block;
++        let stream = ctx.stream.clone();
++        let mut b = stream.launch_builder(&func);
++        b.arg(gate_up);
++        b.arg(out);
++        b.arg(&im_i32);
++        b.arg(&total_i32);
++        b.arg(&down_weight.qweight);
++        b.arg(&qweight_words);
++        unsafe {
++            b.launch(LaunchConfig {
++                grid_dim: (grid, 1, 1),
++                block_dim: (block, 1, 1),
++                shared_mem_bytes: 0,
++            })
++        }
++        .expect("fused_gelu_tanh_mul_split_with_down_hint launch");
++    }
++
+     fn kv_cache_append_batched_per_cache(
+         ctx: &mut Self::Context,
+         caches: &[&Self::Buffer],
+diff --git a/crates/ferrum-kernels/src/backend/traits.rs b/crates/ferrum-kernels/src/backend/traits.rs
+index fa0ec383..594dfd9e 100644
+--- a/crates/ferrum-kernels/src/backend/traits.rs
++++ b/crates/ferrum-kernels/src/backend/traits.rs
+@@ -344,6 +344,20 @@ pub trait Backend: Send + Sync + Sized + 'static {
+         panic!("fused_gelu_tanh_mul_split not implemented for this backend");
+     }
+
++    /// GeGLU with an optional projection hint for backends that can use the
++    /// next down-projection metadata to preserve cache residency. The default
++    /// keeps existing behavior.
++    fn fused_gelu_tanh_mul_split_with_down_hint(
++        ctx: &mut Self::Context,
++        gate_up: &Self::Buffer,
++        out: &mut Self::Buffer,
++        tokens: usize,
++        im: usize,
++        _down_proj: Option<&dyn crate::Linear<Self>>,
++    ) {
++        Self::fused_gelu_tanh_mul_split(ctx, gate_up, out, tokens, im);
++    }
++
+     /// `buf[i] *= scale` over the first `len` elements. Gemma-family
+     /// embedding scaling (×√hidden_size on residual-stream entry).
+     /// Default round-trips through host memory — correct but slow;
+diff --git a/crates/ferrum-kernels/src/linear.rs b/crates/ferrum-kernels/src/linear.rs
+index c8366313..a1002aeb 100644
+--- a/crates/ferrum-kernels/src/linear.rs
++++ b/crates/ferrum-kernels/src/linear.rs
+@@ -23,6 +23,11 @@ pub trait Linear<B: Backend>: Send + Sync {
+     fn in_features(&self) -> usize;
+     fn out_features(&self) -> usize;
+
++    #[cfg(feature = "cuda")]
++    fn as_cuda_marlin_linear(&self) -> Option<&crate::quant_linear::cuda_marlin::CudaMarlinLinear> {
++        None
++    }
++
+     /// Append GEMM work onto `ctx`. Caller flushes the context when results
+     /// must be materialised.
+     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize);
+diff --git a/crates/ferrum-kernels/src/quant_linear/cuda_marlin.rs b/crates/ferrum-kernels/src/quant_linear/cuda_marlin.rs
+index 1c275300..eb58baa8 100644
+--- a/crates/ferrum-kernels/src/quant_linear/cuda_marlin.rs
++++ b/crates/ferrum-kernels/src/quant_linear/cuda_marlin.rs
+@@ -29,6 +29,21 @@ pub struct CudaMarlinLinear {
+     pub out_features: usize,
+ }
+
++impl CudaMarlinLinear {
++    #[cfg(feature = "triton-kernels")]
++    pub fn marlin_weight(&self) -> Option<&crate::marlin::MarlinWeight> {
++        match &self.store {
++            GptqStoreCuda::Marlin(weight) => Some(weight),
++            GptqStoreCuda::Triton(_) => None,
++        }
++    }
++
++    #[cfg(not(feature = "triton-kernels"))]
++    pub fn marlin_weight(&self) -> Option<&crate::marlin::MarlinWeight> {
++        Some(&self.store)
++    }
++}
++
+ impl Linear<CudaBackend> for CudaMarlinLinear {
+     fn in_features(&self) -> usize {
+         self.in_features
+@@ -38,6 +53,10 @@ impl Linear<CudaBackend> for CudaMarlinLinear {
+         self.out_features
+     }
+
++    fn as_cuda_marlin_linear(&self) -> Option<&CudaMarlinLinear> {
++        Some(self)
++    }
++
+     #[allow(clippy::needless_return)]
+     fn forward(
+         &self,
+diff --git a/crates/ferrum-models/src/models/llama_family.rs b/crates/ferrum-models/src/models/llama_family.rs
+index 9880dc79..1413e2a6 100644
+--- a/crates/ferrum-models/src/models/llama_family.rs
++++ b/crates/ferrum-models/src/models/llama_family.rs
+@@ -3289,12 +3289,13 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
+         // 11. Gated activation: SwiGLU (silu) or GeGLU (gelu_tanh, Gemma).
+         time_tail!(TAIL_ACT_TIME_US, TAIL_ACT_CALLS, {
+             match cfg.activation {
+-                Activation::GeluTanh => B::fused_gelu_tanh_mul_split(
++                Activation::GeluTanh => B::fused_gelu_tanh_mul_split_with_down_hint(
+                     ctx,
+                     &self.scratch.gate_up_out,
+                     &mut self.scratch.silu_out,
+                     tokens,
+                     im,
++                    Some(&*layer.down_proj),
+                 ),
+                 _ => B::fused_silu_mul_split(
+                     ctx,
+diff --git a/crates/ferrum-models/src/models/llama_family_forward_batched.rs b/crates/ferrum-models/src/models/llama_family_forward_batched.rs
+index a91d8db0..cc1bc20b 100644
+--- a/crates/ferrum-models/src/models/llama_family_forward_batched.rs
++++ b/crates/ferrum-models/src/models/llama_family_forward_batched.rs
+@@ -2074,9 +2074,14 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
+                 .as_mut()
+                 .expect("unified_silu_out missing");
+             match self.cfg.activation {
+-                Activation::GeluTanh => {
+-                    B::fused_gelu_tanh_mul_split(ctx, gate_up_out, silu_out, m_total, im)
+-                }
++                Activation::GeluTanh => B::fused_gelu_tanh_mul_split_with_down_hint(
++                    ctx,
++                    gate_up_out,
++                    silu_out,
++                    m_total,
++                    im,
++                    Some(&*layer.down_proj),
++                ),
+                 _ => B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im),
+             }
+         });
