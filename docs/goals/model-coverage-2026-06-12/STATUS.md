@@ -2,6 +2,109 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YA — W2 native CUDA checkpoint: producer-integrated qweight touch has a real segment-time signal
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_producer_touch_native_probe_2026-06-16/`.
+- Source change:
+  - extended `scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu`
+    with producer-integrated GeGLU touch modes;
+  - the probe keeps product-shaped eight-layer rotation and reports both
+    isolated `down_us` and total `segment_host_us`.
+- Paid GPU lane:
+  `W2 native CUDA producer-integrated tail-MLP cache probe` on the cached
+  1x RTX 4090 Vast instance.
+- Contract:
+  - expected runtime/cost: 10-20 minutes, about USD 0.07-0.15 at
+    USD 0.42488888888888887/h;
+  - stop condition: SSH/CUDA/sync/compile first failure or probe artifact
+    collected, then stop the instance;
+  - correctness gate: native probe exit 0 plus
+    `VERDICT: gemma3 down prefetch-overlap native CUDA probe complete`;
+  - performance command:
+    `bash scripts/microbenches/build_and_run_gemma3_down_prefetch_overlap_perf.sh`.
+- Evidence:
+  - GPU: NVIDIA GeForce RTX 4090, 24564 MiB, driver 565.77;
+  - remote base HEAD `017300426514d62e8e50ac1546ff77d4d54fd6ce`, with the
+    local dirty probe source synced over it;
+  - local HEAD `f096e96395b11f712a3660999d6b999a0970bc23`;
+  - binary SHA256
+    `994f828373477f5d9a34f8bd06c42921b1b13cfeb8b28679fd2400fb6f968801`;
+  - first compile attempt failed on `volatile uint4` copies and was preserved;
+  - retry rc `0`, PASS line present;
+  - Vast cleanup confirmed `stopped/exited`.
+- Key rows:
+  - m16 no prefetch: down `68.773us`, segment `212.295us`;
+  - m16 external overlap qweight: down `34.150us`, segment `235.799us`
+    (`+11.07%` segment, rejected);
+  - m16 producer touch qweight 1x: down `62.787us`, segment `202.341us`
+    (`-4.69%` segment);
+  - m16 producer touch qweight 4x: down `53.889us`, segment `214.460us`
+    (`+1.02%` segment, rejected);
+  - m32 no prefetch: down `74.286us`, segment `224.566us`;
+  - m32 external overlap qweight: down `53.112us`, segment `261.882us`
+    (`+16.62%` segment, rejected);
+  - m32 producer touch qweight 1x: down `64.878us`, segment `212.922us`
+    (`-5.19%` segment);
+  - m32 producer touch qweight 4x: down `53.474us`, segment `240.533us`
+    (`+7.11%` segment, rejected).
+- Interpretation:
+  - this is the first cache-residency branch signal that improves total
+    product-shaped tail-MLP segment time rather than only improving isolated
+    `down_us`;
+  - the viable branch is a small, producer-adjacent qweight touch/prefetch, not
+    a full external qweight warm and not simple stream access-policy alone;
+  - productization still needs typed projection/layer context and full
+    `ferrum run`/`ferrum serve` correctness before endpoint performance
+    diagnostics.
+- Scope:
+  - this is native CUDA diagnostic evidence only, not release-grade evidence;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
+## 2026-06-16 XZ — W2 CUDA checkpoint: next bottleneck lever narrowed to producer-integrated tail-MLP cache test
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_next_bottleneck_lever_2026-06-16/`.
+- This checkpoint adds no new GPU run. It consolidates the current bottleneck
+  evidence and fixes the next minimal validation target before another paid
+  benchmark or product patch.
+- Current W2 state:
+  - no final `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` has been produced;
+  - latest product correctness smokes did not expose a new run/serve blocker;
+  - performance remains below the 80% same-hardware mainstream baseline line,
+    with current ShareGPT diagnostics around 60-65% of vLLM depending on the
+    variant.
+- Evidence now included in the decision:
+  - `tail_mlp` is still the largest profiled decode block;
+  - native tail-MLP chain timing matches product timing, so the issue is not
+    just endpoint overhead;
+  - single-layer down-projection L2 persistence works, but the win disappears
+    under product-like eight-layer weight rotation;
+  - explicit down-weight warm/prefetch restores the isolated down kernel but
+    increases total segment wall time;
+  - FA2 source product path is correct but slower on the current Gemma3
+    ShareGPT c16 diagnostic;
+  - product `--batched-graph` selects the graph path but does not improve
+    endpoint throughput.
+- Source audit:
+  - Gemma3 tail MLP is the direct sequence
+    `gate_up_proj.forward -> fused_gelu_tanh_mul_split -> down_proj.forward`
+    in both unified and non-unified paths;
+  - `CudaMarlinLinear::forward` is currently generic, so a product fix that is
+    specific to Gemma3 `down_proj` needs a typed projection/layer context rather
+    than relying on diagnostic labels or hidden env.
+- Next minimal validation:
+  - extend the native CUDA prefetch-overlap probe to test a
+    producer-integrated GeGLU variant that touches a configurable slice of
+    `down_proj` qweight/scales while preserving eight-layer rotation;
+  - accept the branch only if total segment wall time improves, not merely the
+    isolated `down_us`;
+  - if this fails, abandon the simple cache-warm branch and move to tail-MLP
+    work reduction/fusion.
+- Scope:
+  - this is diagnostic planning/source-audit evidence only, not release-grade
+    evidence.
+
 ## 2026-06-16 XY — W2 CUDA checkpoint: FA2 source product path is correct but slower on Gemma3 ShareGPT c16
 
 - Artifacts:
