@@ -1,0 +1,10 @@
+{
+  "lane": "W2 unified graph attention-key CUDA smoke",
+  "instance_id": 40826362,
+  "hardware": "1x RTX 4090",
+  "expected_runtime": "20-40 minutes if remote cache is intact; hard stop under 1 instance-hour",
+  "expected_cost_usd": "about 0.15-0.43 at dph_total=0.4248888889",
+  "stop_condition": "build failure, run/serve correctness failure, graph OOM/illegal-address/error scan hit, or one c16 diagnostic completed and artifacts copied",
+  "correctness_gate": "ferrum run smoke and ferrum serve smoke before benchmark interpretation",
+  "performance_command": "ferrum bench-serve c16 ShareGPT --fail-on-error --seed 9271 --n-repeats 1 (diagnostic only)"
+}

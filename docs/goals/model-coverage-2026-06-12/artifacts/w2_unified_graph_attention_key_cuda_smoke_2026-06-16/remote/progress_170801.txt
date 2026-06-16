@@ -1,0 +1,31 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Tue Jun 16 09:08:06 UTC 2026
+w2-attention-key-smoke: 1 windows (created Tue Jun 16 09:03:50 2026)
+    PID     ELAPSED %CPU %MEM CMD
+    946       00:00  0.0  0.0 bash -c set -e; date -u; tmux ls || true; ps -o pid,etime,pcpu,pmem,cmd -p $(pgrep -f "rustc --crate-name ferrum" | head -1) 2>/dev/null || true; pgrep -af "w2_unified_graph_attention_key|cargo|rustc|ferrum run|ferrum serve|bench-serve" | head -80 || true; find /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16 -maxdepth 2 -type f | sort | sed -n "1,260p"; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_validation.txt 2>/dev/null || true; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/serve_chat_validation.txt 2>/dev/null || true; tail -160 /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/server.log 2>/dev/null || true; tail -120 /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/bench/bench_sharegpt_c16.stderr 2>/dev/null || true; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/run_remote.rc 2>/dev/null || true
+540 tmux new-session -d -s w2-attention-key-smoke bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh > /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stdout 2> /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stderr
+541 bash -c bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh > /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stdout 2> /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stderr
+544 bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh
+913 timeout 1200 /workspace/ferrum-infer-rs/target/release/ferrum run gemma3:27b-gptq --backend cuda --prompt What is 2+3? Answer with just the number. --max-tokens 64 --temperature 0 --kv-capacity 512 --max-num-seqs 2 --unified-graph --unified-graph-layers-only --output-format jsonl --effective-config-json /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_effective_config.json --decision-trace-jsonl /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_decision_trace.jsonl
+914 /workspace/ferrum-infer-rs/target/release/ferrum run gemma3:27b-gptq --backend cuda --prompt What is 2+3? Answer with just the number. --max-tokens 64 --temperature 0 --kv-capacity 512 --max-num-seqs 2 --unified-graph --unified-graph-layers-only --output-format jsonl --effective-config-json /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_effective_config.json --decision-trace-jsonl /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_decision_trace.jsonl
+946 bash -c set -e; date -u; tmux ls || true; ps -o pid,etime,pcpu,pmem,cmd -p $(pgrep -f "rustc --crate-name ferrum" | head -1) 2>/dev/null || true; pgrep -af "w2_unified_graph_attention_key|cargo|rustc|ferrum run|ferrum serve|bench-serve" | head -80 || true; find /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16 -maxdepth 2 -type f | sort | sed -n "1,260p"; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_validation.txt 2>/dev/null || true; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/serve_chat_validation.txt 2>/dev/null || true; tail -160 /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/server.log 2>/dev/null || true; tail -120 /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/bench/bench_sharegpt_c16.stderr 2>/dev/null || true; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/run_remote.rc 2>/dev/null || true
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/ferrum.sha256
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/ferrum_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/release_build.command.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/release_build.stderr
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/release_build.stdout
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run.command.json
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run.stderr
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run.stdout
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_decision_trace.jsonl
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_effective_config.json
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/cargo_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/git_head.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/git_status_short.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/git_status_source_short.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/nvcc_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/nvidia_smi_before.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/rustc_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/start_utc.txt

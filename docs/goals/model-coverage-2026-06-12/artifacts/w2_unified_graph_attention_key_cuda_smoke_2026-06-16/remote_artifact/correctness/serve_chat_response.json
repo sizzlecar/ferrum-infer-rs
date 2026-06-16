@@ -1,0 +1,1 @@
+{"id":"b69c051b-3374-491e-9c53-c4effec296a4","object":"chat.completion","created":1781600978,"model":"gemma3:27b-gptq","choices":[{"index":0,"message":{"role":"assistant","content":"Paris"},"finish_reason":"stop"}],"usage":{"prompt_tokens":23,"completion_tokens":2,"total_tokens":25}}

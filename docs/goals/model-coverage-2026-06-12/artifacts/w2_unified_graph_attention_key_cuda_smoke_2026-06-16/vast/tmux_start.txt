@@ -1,0 +1,8 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+w2-attention-key-smoke: 1 windows (created Tue Jun 16 09:03:50 2026)
+535 bash -c set -euo pipefail rm -rf /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16 tmux kill-session -t w2-attention-key-smoke 2>/dev/null || true tmux new-session -d -s w2-attention-key-smoke "bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh > /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stdout 2> /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stderr" tmux ls pgrep -af "w2_unified_graph_attention_key|cargo|rustc|ferrum" | head -80 || true
+540 tmux new-session -d -s w2-attention-key-smoke bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh > /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stdout 2> /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stderr
+541 bash -c bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh > /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stdout 2> /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stderr
+544 bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh
