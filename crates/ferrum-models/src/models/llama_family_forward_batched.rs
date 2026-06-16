@@ -240,6 +240,10 @@ fn should_log_unified_op_profile_call(call: u64) -> bool {
     call < 16 || call.is_multiple_of(64)
 }
 
+fn should_log_unified_op_profile_sample(call: u64, m_total: usize, prefill_items: usize) -> bool {
+    should_log_unified_op_profile_call(call) || m_total >= 128 || prefill_items > 1
+}
+
 #[cfg(feature = "cuda")]
 fn format_marlin_projection_bucket(label: &str, stats: MarlinProfileBucketStats) -> String {
     format!(
@@ -442,9 +446,10 @@ mod tests {
         batched_decode_graph_key, format_logit_top, logit_row_diagnostics,
         should_log_batched_graph_replay_count, should_log_unified_graph_count,
         should_log_unified_logits_diag, should_log_unified_op_profile_call,
-        should_use_batched_decode_graph, unified_graph_capture_skip_reason,
-        unified_graph_scope_label, LlamaBatchedRuntimeConfig, UnifiedGraphCaptureScope,
-        BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT, UNIFIED_GRAPH_MAX_CACHED_KEYS,
+        should_log_unified_op_profile_sample, should_use_batched_decode_graph,
+        unified_graph_capture_skip_reason, unified_graph_scope_label, LlamaBatchedRuntimeConfig,
+        UnifiedGraphCaptureScope, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
+        UNIFIED_GRAPH_MAX_CACHED_KEYS,
     };
 
     #[test]
@@ -627,6 +632,14 @@ mod tests {
         assert!(!should_log_unified_op_profile_call(16));
         assert!(!should_log_unified_op_profile_call(63));
         assert!(should_log_unified_op_profile_call(64));
+    }
+
+    #[test]
+    fn unified_op_profile_samples_large_or_mixed_prefill_calls() {
+        assert!(should_log_unified_op_profile_sample(23, 823, 11));
+        assert!(should_log_unified_op_profile_sample(23, 128, 0));
+        assert!(should_log_unified_op_profile_sample(23, 4, 2));
+        assert!(!should_log_unified_op_profile_sample(23, 4, 0));
     }
 }
 
@@ -2384,9 +2397,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 + lm_head_us
                 + readback_us;
             let unwrapped_us = total_us.saturating_sub(wrapped_us);
-            if should_log_unified_op_profile_call(call) {
-                let prefill_items = items.iter().filter(|(_, q, _, _)| q.len() > 1).count();
-                let decode_items = items.len().saturating_sub(prefill_items);
+            let prefill_items = items.iter().filter(|(_, q, _, _)| q.len() > 1).count();
+            let decode_items = items.len().saturating_sub(prefill_items);
+            if should_log_unified_op_profile_sample(call, m_total, prefill_items) {
                 eprintln!(
                     "[unified-op-profile] call#{} m_total={} num_seqs={} prefill={} decode={} max_kv={} sampled={} total={}us qkv={}us({}) qkr={}us({}) attn={}us({}) o_proj={}us({}) norm={}us({}) gate_up={}us({}) act={}us({}) down={}us({}) resid={}us({}) final_norm={}us({}) final_copy={}us({}) lm_head={}us({}) readback={}us({}) generic_matmul={}us({}) generic_attn={}us({}) generic_qkr={}us({}) generic_norm={}us({}) generic_other={}us({}) marlin_ws_zero={}us({}) marlin_gather={}us({}) marlin_kernel={}us({}) {} unwrapped={}us",
                     call,
