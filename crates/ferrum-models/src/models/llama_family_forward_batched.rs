@@ -159,6 +159,9 @@ fn record_batched_graph_replay(
 static UNIFIED_GRAPH_REPLAY_COUNT: AtomicU64 = AtomicU64::new(0);
 static UNIFIED_GRAPH_EAGER_COUNT: AtomicU64 = AtomicU64::new(0);
 static UNIFIED_GRAPH_CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
+static UNIFIED_GRAPH_CAPTURE_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+const UNIFIED_GRAPH_MAX_CACHED_KEYS: usize = 16;
 
 fn should_log_unified_graph_count(count: u64) -> bool {
     count.is_power_of_two()
@@ -207,6 +210,39 @@ fn record_unified_graph_capture(
     }
 }
 
+fn record_unified_graph_capture_skip(
+    reason: &str,
+    graph_key: u64,
+    layers_only: bool,
+    m_total: usize,
+    num_seqs: usize,
+    max_kv_len: usize,
+    cached_keys: usize,
+) {
+    let count = UNIFIED_GRAPH_CAPTURE_SKIP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if should_log_unified_graph_count(count) {
+        let scope = unified_graph_scope_label(layers_only);
+        eprintln!(
+            "[unified-graph-skip] reason={reason} count={count} scope={scope} key={graph_key} \
+             m_total={m_total} num_seqs={num_seqs} max_kv_len={max_kv_len} cached_keys={cached_keys}",
+        );
+    }
+}
+
+fn unified_graph_capture_skip_reason(
+    m_total: usize,
+    num_seqs: usize,
+    cached_keys: usize,
+) -> Option<&'static str> {
+    if num_seqs == 0 || m_total != num_seqs {
+        Some("mixed_or_prefill_batch")
+    } else if cached_keys >= UNIFIED_GRAPH_MAX_CACHED_KEYS {
+        Some("cache_full")
+    } else {
+        None
+    }
+}
+
 fn record_unified_graph_eager(
     graph_key: u64,
     layers_only: bool,
@@ -219,10 +255,11 @@ fn record_unified_graph_eager(
         let scope = unified_graph_scope_label(layers_only);
         eprintln!(
             "[unified-graph-stats] scope={scope} key={graph_key} m_total={m_total} \
-             num_seqs={num_seqs} max_kv_len={max_kv_len} replays={} eagers={} captures={}",
+             num_seqs={num_seqs} max_kv_len={max_kv_len} replays={} eagers={} captures={} skips={}",
             UNIFIED_GRAPH_REPLAY_COUNT.load(Ordering::Relaxed),
             UNIFIED_GRAPH_EAGER_COUNT.load(Ordering::Relaxed),
             UNIFIED_GRAPH_CAPTURE_COUNT.load(Ordering::Relaxed),
+            UNIFIED_GRAPH_CAPTURE_SKIP_COUNT.load(Ordering::Relaxed),
         );
     }
 }
@@ -284,8 +321,9 @@ mod tests {
     use super::{
         batched_decode_graph_key, format_logit_top, logit_row_diagnostics,
         should_log_batched_graph_replay_count, should_log_unified_graph_count,
-        should_log_unified_logits_diag, should_use_batched_decode_graph, unified_graph_scope_label,
-        LlamaBatchedRuntimeConfig, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
+        should_log_unified_logits_diag, should_use_batched_decode_graph,
+        unified_graph_capture_skip_reason, unified_graph_scope_label, LlamaBatchedRuntimeConfig,
+        BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT, UNIFIED_GRAPH_MAX_CACHED_KEYS,
     };
 
     #[test]
@@ -379,6 +417,31 @@ mod tests {
         assert!(should_log_unified_graph_count(4));
         assert_eq!(unified_graph_scope_label(true), "layers_only");
         assert_eq!(unified_graph_scope_label(false), "full");
+    }
+
+    #[test]
+    fn unified_graph_capture_admission_rejects_mixed_prefill_batches() {
+        assert_eq!(
+            unified_graph_capture_skip_reason(17, 16, 0),
+            Some("mixed_or_prefill_batch")
+        );
+        assert_eq!(
+            unified_graph_capture_skip_reason(0, 0, 0),
+            Some("mixed_or_prefill_batch")
+        );
+        assert_eq!(unified_graph_capture_skip_reason(16, 16, 0), None);
+    }
+
+    #[test]
+    fn unified_graph_capture_admission_caps_cached_shape_count() {
+        assert_eq!(
+            unified_graph_capture_skip_reason(16, 16, UNIFIED_GRAPH_MAX_CACHED_KEYS - 1),
+            None
+        );
+        assert_eq!(
+            unified_graph_capture_skip_reason(16, 16, UNIFIED_GRAPH_MAX_CACHED_KEYS),
+            Some("cache_full")
+        );
     }
 
     #[test]
@@ -1660,16 +1723,37 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
 
         const UNIFIED_GRAPH_WARMUP: usize = 3;
-        let should_capture = graph_enabled
+        let should_consider_capture = graph_enabled
             && !self.unified_graph_failed
             && !cache_has_key
             && self.unified_graph_warmup >= UNIFIED_GRAPH_WARMUP
             && !did_pure_replay;
+        let capture_skip_reason = should_consider_capture
+            .then(|| {
+                unified_graph_capture_skip_reason(
+                    m_total,
+                    num_seqs,
+                    self.unified_graph_keys_seen.len(),
+                )
+            })
+            .flatten();
+        let should_capture = should_consider_capture && capture_skip_reason.is_none();
         if !did_pure_replay {
             self.unified_graph_warmup += 1;
         }
         if graph_enabled && !did_pure_replay {
             record_unified_graph_eager(graph_key, graph_layers_only, m_total, num_seqs, max_kv_len);
+        }
+        if let Some(reason) = capture_skip_reason {
+            record_unified_graph_capture_skip(
+                reason,
+                graph_key,
+                graph_layers_only,
+                m_total,
+                num_seqs,
+                max_kv_len,
+                self.unified_graph_keys_seen.len(),
+            );
         }
 
         if should_capture {
