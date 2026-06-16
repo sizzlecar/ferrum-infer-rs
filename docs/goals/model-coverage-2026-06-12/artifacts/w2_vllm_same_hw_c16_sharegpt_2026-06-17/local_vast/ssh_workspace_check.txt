@@ -1,0 +1,10 @@
+Filesystem      Size  Used Avail Use% Mounted on
+overlay         300G  118M  300G   1% /
+overlay         300G  118M  300G   1% /
+/usr/bin/git
+/usr/bin/curl
+/usr/bin/rsync
+/usr/bin/tmux
+/usr/bin/python3
+git version 2.34.1
+tmux 3.2a

@@ -2,6 +2,80 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZB — W2 CUDA diagnostic: same-pod vLLM/Ferrum c16 throughput passes, p95 remains blocker
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_same_hw_c16_sharegpt_2026-06-17/`.
+- Scope:
+  - W2 Gemma3 CUDA GPTQ same-pod c16 ShareGPT diagnostic only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- GPU lifecycle:
+  - cached instance `41230499` could not be restarted because Vast returned
+    `resources_unavailable`, so no more time was spent on that host;
+  - created instance `41241013`, 1x RTX 4090, Netherlands, driver
+    `580.95.05`, CUDA devel image `nvidia/cuda:12.4.0-devel-ubuntu22.04`,
+    quoted total rate `0.47111111111111115 USD/h`;
+  - synced clean source by git bundle, prefetched the model into
+    `/workspace/hf-cache`, built Ferrum CUDA release with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - copied artifacts back, then stopped the instance; final sanitized Vast
+    state recorded `cur_state=stopped`, `actual_status=exited`.
+- Source/runtime evidence:
+  - remote worktree was clean at
+    `96d2df73e82ab4c0d643ced32d1f424b29dc5353`;
+  - Ferrum binary SHA256
+    `ca11f78f9e1be27a26bd12f50e377f3def602f14220cb10e1099eadb4f35ca93`;
+  - dataset SHA256
+    `58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e`;
+  - vLLM baseline used `vllm=0.10.1.1`, `torch=2.7.1+cu126`,
+    `transformers=4.55.4`, `fastapi=0.116.1`, `starlette=0.47.2`;
+  - Ferrum effective config selected
+    `scheduler_admission_policy=active_decode_prefill_chunk:16`;
+  - Ferrum still selected `legacy_paged_varlen`, `legacy_paged_decode`,
+    `legacy_moe`, and `graph_disabled` for Gemma3 in the product default path.
+- Correctness result:
+  - vLLM `/v1/models` and streaming smoke passed with content `5\n`, exactly
+    one `[DONE]`, and usage present;
+  - product `ferrum run` smoke passed with stdout content `5`,
+    `n_tokens=3`;
+  - product `ferrum serve` streaming smoke passed with content `5\n`, exactly
+    one `[DONE]`, and usage present
+    (`prompt_tokens=23`, `completion_tokens=3`, `total_tokens=26`);
+  - no correctness issue was observed in this diagnostic artifact.
+- Performance command:
+  - both vLLM and Ferrum used `ferrum bench-serve --dataset sharegpt
+    --random-output-len 128 --concurrency-sweep 16 --num-prompts 100
+    --n-repeats 3 --fail-on-error --require-ci --seed 9271`;
+  - both used the same model snapshot and same ASCII ShareGPT 100 dataset;
+  - both had `completed_per_run=[100,100,100]`,
+    `errored_per_run=[0,0,0]`, all quality/error counts zero, and
+    `output_token_count_source=usage`.
+- Same-pod c16 result:
+  - vLLM output throughput mean/LCB:
+    `500.67038762731977 / 478.39462812583776 tok/s`;
+  - Ferrum output throughput mean/LCB:
+    `422.34520497237537 / 414.59153186899397 tok/s`;
+  - Ferrum LCB / vLLM LCB = `0.8666308262975292`, so the c16 throughput
+    diagnostic clears the 80% line on same hardware;
+  - vLLM p95 ITL mean `33.06958213333332 ms`;
+  - Ferrum p95 ITL mean `52.81935383333333 ms`;
+  - Ferrum p95 ITL / vLLM p95 ITL = `1.597218665188174`, so the p95 tail
+    diagnostic still fails.
+- Interpretation:
+  - there is real progress: c16 throughput is no longer below the vLLM 80%
+    threshold when measured on the same pod;
+  - the remaining c16 blocker is tail latency, not mean/LCB throughput;
+  - prior diagnostics already showed typed VPA/FA2 product toggles do not
+    materially improve Gemma3 c16 and that decode-step time is dominated by
+    Gemma3 tail MLP/GPTQ dense projection, so the next optimization should
+    target Gemma3 decode/tail dense path and graph/fast-path integration rather
+    than more unscoped env sweeps.
+- Required next validation:
+  - add a focused tail-latency diagnostic for Gemma3 decode dense buckets
+    against this same-pod baseline;
+  - once p95 improves, expand the same-hardware matrix to c=1/4/32 before any
+    W2 release-grade claim.
+
 ## 2026-06-17 ZA — W2 CUDA diagnostic: same-iteration admission clears historical c16 throughput threshold
 
 - Artifact:
