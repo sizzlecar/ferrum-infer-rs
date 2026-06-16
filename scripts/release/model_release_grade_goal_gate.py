@@ -536,6 +536,18 @@ def validate_performance_cell(
     )
     if baseline_n_repeats is not None and baseline_n_repeats < 3:
         problems.append(f"{label}.baseline_n_repeats must be >= 3")
+    if (
+        n_repeats is not None
+        and baseline_n_repeats is not None
+        and baseline_n_repeats != n_repeats
+    ):
+        problems.append(f"{label}.baseline_n_repeats must match n_repeats")
+    if (
+        requests is not None
+        and baseline_requests is not None
+        and baseline_requests != requests
+    ):
+        problems.append(f"{label}.baseline_requests_per_run must match requests_per_run")
     validate_run_quality_counts(
         cell,
         label,
@@ -959,6 +971,45 @@ def run_selftest() -> int:
             for problem in bad_baseline_quality_problems
         ):
             raise AssertionError("bad baseline quality count selftest did not fail as expected")
+
+        bad_baseline_repeats = tmp_root / "bad-baseline-repeat-count"
+        bad_baseline_repeats_manifest = write_selftest_manifest(bad_baseline_repeats, ratio=0.82)
+        data = load_json(bad_baseline_repeats_manifest)
+        data["performance"]["cells"][0]["baseline_n_repeats"] = 4
+        data["performance"]["cells"][0]["baseline_completed_per_run"] = [100, 100, 100, 100]
+        data["performance"]["cells"][0]["baseline_errored_per_run"] = [0, 0, 0, 0]
+        for field in REQUIRED_ZERO_RUN_COUNT_FIELDS:
+            data["performance"]["cells"][0][f"baseline_{field}"] = [0, 0, 0, 0]
+        data["performance"]["cells"][0]["baseline_bench_command_line"] = [
+            "ferrum",
+            "bench-serve",
+            "--fail-on-error",
+            "--require-ci",
+            "--seed",
+            "9271",
+            "--n-repeats",
+            "4",
+        ]
+        write_json(bad_baseline_repeats_manifest, data)
+        bad_baseline_repeats_problems = validate_manifest(data, "w2", bad_baseline_repeats)
+        if not any(
+            "baseline_n_repeats must match n_repeats" in problem
+            for problem in bad_baseline_repeats_problems
+        ):
+            raise AssertionError("bad baseline repeat-count selftest did not fail as expected")
+
+        bad_baseline_requests = tmp_root / "bad-baseline-request-count"
+        bad_baseline_requests_manifest = write_selftest_manifest(bad_baseline_requests, ratio=0.82)
+        data = load_json(bad_baseline_requests_manifest)
+        data["performance"]["cells"][0]["baseline_requests_per_run"] = 32
+        data["performance"]["cells"][0]["baseline_completed_per_run"] = [32, 32, 32]
+        write_json(bad_baseline_requests_manifest, data)
+        bad_baseline_requests_problems = validate_manifest(data, "w2", bad_baseline_requests)
+        if not any(
+            "baseline_requests_per_run must match requests_per_run" in problem
+            for problem in bad_baseline_requests_problems
+        ):
+            raise AssertionError("bad baseline request-count selftest did not fail as expected")
 
     print("MODEL RELEASE GRADE GOAL SELFTEST PASS")
     return 0
