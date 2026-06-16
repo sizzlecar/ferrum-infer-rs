@@ -1,0 +1,12 @@
+{
+  "matches": [
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "16",
+      "key": "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+      "source": "default"
+    }
+  ]
+}
