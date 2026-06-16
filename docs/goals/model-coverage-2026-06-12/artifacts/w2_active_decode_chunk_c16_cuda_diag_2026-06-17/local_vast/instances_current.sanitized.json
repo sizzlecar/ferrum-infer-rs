@@ -1,0 +1,56 @@
+{
+  "instances_found": 3,
+  "rtx4090_instances": [
+    {
+      "actual_status": "offline",
+      "country_code": "KR",
+      "cur_state": "stopped",
+      "disk_space": 180.0,
+      "disk_usage": 18.0,
+      "dph_total": 0.3833333333333333,
+      "gpu_name": "RTX 4090",
+      "gpu_ram": 24564,
+      "id": 41178475,
+      "image_uuid": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+      "label": "ferrum-w2-graph-shape-20260616",
+      "num_gpus": 1,
+      "reliability2": 0.9977297,
+      "ssh_host": "ssh9.vast.ai",
+      "ssh_port": 18474
+    },
+    {
+      "actual_status": "exited",
+      "country_code": "NL",
+      "cur_state": "stopped",
+      "disk_space": 120.0,
+      "disk_usage": 19.0,
+      "dph_total": 0.38,
+      "gpu_name": "RTX 4090",
+      "gpu_ram": 24564,
+      "id": 41187356,
+      "image_uuid": "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel",
+      "label": "ferrum-w2-lm-head-eager-20260616-d",
+      "num_gpus": 1,
+      "reliability2": 0.9892278,
+      "ssh_host": "ssh6.vast.ai",
+      "ssh_port": 27356
+    },
+    {
+      "actual_status": "exited",
+      "country_code": "NL",
+      "cur_state": "stopped",
+      "disk_space": 260.0,
+      "disk_usage": -1,
+      "dph_total": 0.4696296296296296,
+      "gpu_name": "RTX 4090",
+      "gpu_ram": 24564,
+      "id": 41218739,
+      "image_uuid": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+      "label": "ferrum-w2-unified-argmax-c16-20260617b",
+      "num_gpus": 1,
+      "reliability2": 0.9905357,
+      "ssh_host": "ssh8.vast.ai",
+      "ssh_port": 18738
+    }
+  ]
+}
