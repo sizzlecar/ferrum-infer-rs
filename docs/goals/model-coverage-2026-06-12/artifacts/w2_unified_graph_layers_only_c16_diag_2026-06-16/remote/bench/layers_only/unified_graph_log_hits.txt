@@ -1,0 +1,17 @@
+[unified-graph-capture] count=1 scope=layers_only key=17028338829453157560 m_total=10 num_seqs=10 max_kv_len=125
+[unified-graph-replay] origin=post_capture count=1 scope=layers_only key=17028338829453157560 m_total=10 num_seqs=10 max_kv_len=125
+[unified-graph-capture] count=2 scope=layers_only key=17031208554802220595 m_total=10 num_seqs=10 max_kv_len=126
+[unified-graph-replay] origin=post_capture count=2 scope=layers_only key=17031208554802220595 m_total=10 num_seqs=10 max_kv_len=126
+[unified-graph-capture] count=4 scope=layers_only key=16795891076179051725 m_total=10 num_seqs=10 max_kv_len=128
+[unified-graph-replay] origin=post_capture count=4 scope=layers_only key=16795891076179051725 m_total=10 num_seqs=10 max_kv_len=128
+[unified-graph-capture] count=8 scope=layers_only key=16792064775713634345 m_total=10 num_seqs=10 max_kv_len=132
+[unified-graph-replay] origin=post_capture count=8 scope=layers_only key=16792064775713634345 m_total=10 num_seqs=10 max_kv_len=132
+[unified-graph-capture] count=16 scope=layers_only key=16799717376644469105 m_total=10 num_seqs=10 max_kv_len=140
+[unified-graph-replay] origin=post_capture count=16 scope=layers_only key=16799717376644469105 m_total=10 num_seqs=10 max_kv_len=140
+[unified-graph-capture] count=32 scope=layers_only key=16815022578506138625 m_total=10 num_seqs=10 max_kv_len=156
+[unified-graph-replay] origin=post_capture count=32 scope=layers_only key=16815022578506138625 m_total=10 num_seqs=10 max_kv_len=156
+[unified-graph-capture] count=64 scope=layers_only key=11644751597344750441 m_total=8 num_seqs=8 max_kv_len=188
+[unified-graph-replay] origin=post_capture count=64 scope=layers_only key=11644751597344750441 m_total=8 num_seqs=8 max_kv_len=188
+[unified-graph-capture] count=128 scope=layers_only key=15468931342328533913 m_total=16 num_seqs=16 max_kv_len=172
+[unified-graph-replay] origin=post_capture count=128 scope=layers_only key=15468931342328533913 m_total=16 num_seqs=16 max_kv_len=172
+[unified-graph-stats] scope=layers_only key=13114892978788168881 m_total=137 num_seqs=16 max_kv_len=197 replays=226 eagers=256 captures=171
