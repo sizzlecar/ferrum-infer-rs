@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YJ — W2 native gate_up split probe: branch rejected, not a material lever
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_gate_up_split_native_probe_2026-06-16/`.
+- Paid GPU lane:
+  `W2 Gemma3 gate_up split-vs-fused native probe` on cached Vast instance
+  `40826362`, 1x RTX 4090.
+- Contract:
+  - expected runtime/cost: 10-20 minutes, hard cap 30 minutes, about
+    USD 0.07-0.15 at USD 0.42488888888888887/h;
+  - stop condition: startup/SSH/CUDA/compile first failure, or probe prints
+    `VERDICT: gemma3 gate_up split native CUDA probe complete` and the artifact
+    is copied back;
+  - correctness gate: probe exit `0` plus the native CUDA VERDICT line;
+  - performance command:
+    `bash scripts/microbenches/build_and_run_gemma3_gate_up_split_perf.sh`.
+- Evidence hygiene:
+  - source head `50abea26c005c3115a7deb931434f53d0803de51`;
+  - source status before remote sync `clean-tracked-before-remote-sync`;
+  - binary SHA256
+    `f0939e6164e17e6d24b18dc127ff567f5a464913bbcd36b6cfea925caf1140e5`;
+  - GPU `NVIDIA GeForce RTX 4090`, driver `565.77`, `nvidia-smi` CUDA
+    `12.7`, `nvcc` `12.4.131`;
+  - Vast cleanup confirmed
+    `poll=00 cur_state=stopped actual_status=exited intended_status=stopped`.
+    Final Vast API status is also saved in
+    `vast_instance_40826362.final.json`.
+- Native CUDA result:
+  - probe rc `0`;
+  - VERDICT line:
+    `VERDICT: gemma3 gate_up split native CUDA probe complete`;
+  - serial split `gate`/`up` is slower for every tested `m`;
+  - two-stream split is neutral/slightly faster only around `m=10` and `m=16`,
+    with maximum isolated segment speedup `1.0136x`;
+  - two-stream split regresses at larger local shapes: `0.9828x` at `m=23`
+    and `0.9899x` at `m=32`.
+- Interpretation:
+  - the result rules out split `gate`/`up` productization as the next W2 fix;
+  - the branch would add loader, runtime, stream, and correctness risk for at
+    most about `1.4%` isolated segment gain near `m=16`, far short of the
+    current release-grade gap;
+  - next direction should move to another tail-MLP work-reduction/fusion or
+    prefill wall-time lever, not more env sweeps around this split branch.
+- Gate status:
+  - this is diagnostic native CUDA evidence only;
+  - no product `ferrum run`/`ferrum serve` release gate was run in this
+    checkpoint;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
 ## 2026-06-16 YI — W2 source checkpoint: native gate_up split-vs-fused probe
 
 - No GPU instance was started in this checkpoint; no performance measurement
