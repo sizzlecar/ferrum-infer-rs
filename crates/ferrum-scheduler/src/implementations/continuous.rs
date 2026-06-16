@@ -21,7 +21,7 @@ use ferrum_types::{
 };
 use parking_lot::RwLock;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -429,12 +429,51 @@ impl ContinuousBatchScheduler {
         }
     }
 
+    fn add_prefill_requests_to_batch(
+        &self,
+        hint: &BatchHint,
+        batch_requests: &mut Vec<ScheduledRequest>,
+        total_tokens: &mut usize,
+        scheduled_request_ids: &mut HashSet<RequestId>,
+    ) {
+        if batch_requests.len() >= hint.max_batch_size || *total_tokens >= hint.max_tokens {
+            return;
+        }
+
+        let prefill_queue = self.prefill_queue.read();
+        for req in prefill_queue.iter() {
+            if batch_requests.len() >= hint.max_batch_size {
+                break;
+            }
+            if scheduled_request_ids.contains(&req.inner.request.id) {
+                continue;
+            }
+
+            let prefill_chunk_tokens = self.prefill_budget_tokens(req);
+            // Skip fully-prefilled requests that are still in the queue
+            // (they'll be promoted by mark_prefill_chunk_processed on the
+            // next iteration boundary).
+            if prefill_chunk_tokens == 0 {
+                continue;
+            }
+
+            if *total_tokens + prefill_chunk_tokens <= hint.max_tokens {
+                let mut scheduled = req.inner.clone();
+                scheduled.tokens_processed = req.total_tokens();
+                scheduled_request_ids.insert(scheduled.request.id.clone());
+                batch_requests.push(scheduled);
+                *total_tokens += prefill_chunk_tokens;
+            }
+        }
+    }
+
     /// Create batch plan for current iteration
     fn create_iteration_batch(&self, hint: BatchHint) -> Option<BatchPlan> {
         let iteration = self.current_iteration.fetch_add(1, Ordering::Relaxed);
         self.metrics_tracker.record_iteration();
 
         let mut batch_requests = Vec::new();
+        let mut scheduled_request_ids = HashSet::new();
         let mut total_tokens = 0;
         let prefill_first_target = self
             .runtime_config
@@ -464,6 +503,7 @@ impl ContinuousBatchScheduler {
                 if total_tokens < hint.max_tokens {
                     let mut scheduled = req.inner.clone();
                     scheduled.tokens_processed = req.total_tokens();
+                    scheduled_request_ids.insert(scheduled.request.id.clone());
                     batch_requests.push(scheduled);
                     total_tokens += 1;
                 }
@@ -479,27 +519,12 @@ impl ContinuousBatchScheduler {
         // This is what lets the Qwen3MoE `unified_forward` path
         // activate for cohort prefills (m_total must stay ≤ scratch
         // max_tokens, which is pre-allocated to the same budget).
-        let prefill_remaining = hint.max_batch_size.saturating_sub(batch_requests.len());
-
-        if prefill_remaining > 0 {
-            let prefill_queue = self.prefill_queue.read();
-            for req in prefill_queue.iter().take(prefill_remaining) {
-                let prefill_chunk_tokens = self.prefill_budget_tokens(req);
-                // Skip fully-prefilled requests that are still in the queue
-                // (they'll be promoted by mark_prefill_chunk_processed on the
-                // next iteration boundary).
-                if prefill_chunk_tokens == 0 {
-                    continue;
-                }
-
-                if total_tokens + prefill_chunk_tokens <= hint.max_tokens {
-                    let mut scheduled = req.inner.clone();
-                    scheduled.tokens_processed = req.total_tokens();
-                    batch_requests.push(scheduled);
-                    total_tokens += prefill_chunk_tokens;
-                }
-            }
-        }
+        self.add_prefill_requests_to_batch(
+            &hint,
+            &mut batch_requests,
+            &mut total_tokens,
+            &mut scheduled_request_ids,
+        );
 
         // Check if we should admit new requests from waiting queue
         let waiting_queue = self.waiting_queue.read();
@@ -525,23 +550,16 @@ impl ContinuousBatchScheduler {
             self.promote_to_prefill(&req_id);
         }
 
-        // After promotion, add newly prefilling requests to batch
-        if batch_requests.is_empty() {
-            let prefill_queue = self.prefill_queue.read();
-            for req in prefill_queue.iter().take(hint.max_batch_size) {
-                let prefill_chunk_tokens = self.prefill_budget_tokens(req);
-                if prefill_chunk_tokens == 0 {
-                    continue;
-                }
-
-                if total_tokens + prefill_chunk_tokens <= hint.max_tokens {
-                    let mut scheduled = req.inner.clone();
-                    scheduled.tokens_processed = req.total_tokens();
-                    batch_requests.push(scheduled);
-                    total_tokens += prefill_chunk_tokens;
-                }
-            }
-        }
+        // vLLM's scheduler spends the remaining per-step token budget on
+        // waiting requests after running requests. Mirror that behavior so
+        // newly admitted prefills do not wait an extra iteration just because
+        // the current batch already contains decode work.
+        self.add_prefill_requests_to_batch(
+            &hint,
+            &mut batch_requests,
+            &mut total_tokens,
+            &mut scheduled_request_ids,
+        );
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
         if self.runtime_config.scheduler_none_prof && !batch_requests.is_empty() {
@@ -1221,6 +1239,49 @@ mod tests {
     }
 
     #[test]
+    fn newly_admitted_prefill_uses_remaining_budget_with_decode() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 4,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let first = create_test_request_with_prompt_tokens(Priority::Normal, 2);
+        let first_id = first.id.clone();
+        enqueue_waiting(&scheduler, first);
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 1);
+        scheduler.mark_prefill_complete(&first_id, 2);
+
+        let second = create_test_request_with_prompt_tokens(Priority::Normal, 2);
+        let second_id = second.id.clone();
+        enqueue_waiting(&scheduler, second);
+
+        let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
+        let ids: HashSet<RequestId> = mixed_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert_eq!(mixed_batch.requests.len(), 2);
+        assert!(
+            ids.contains(&first_id),
+            "decode request should remain scheduled"
+        );
+        assert!(
+            ids.contains(&second_id),
+            "newly admitted prefill should use remaining same-iteration budget"
+        );
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, 3 * 16);
+    }
+
+    #[test]
     fn max_batched_tokens_limits_prefill_admission_by_prompt_tokens() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
             prompt_token_estimate: true,
@@ -1322,10 +1383,6 @@ mod tests {
             &scheduler,
             create_test_request_with_prompt_tokens(Priority::Normal, 256),
         );
-        let decode_only_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
-        assert_eq!(decode_only_batch.requests.len(), 1);
-        assert_eq!(decode_only_batch.resource_requirements.gpu_memory, 16);
-
         let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(mixed_batch.requests.len(), 2);
         assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 64) * 16);
