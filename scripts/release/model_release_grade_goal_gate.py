@@ -436,6 +436,42 @@ def validate_tail_latency(
         )
 
 
+def validate_run_quality_counts(
+    cell: dict[str, Any],
+    label: str,
+    *,
+    field_prefix: str,
+    n_repeats: int | None,
+    requests: int | None,
+    problems: list[str],
+) -> None:
+    completed_key = f"{field_prefix}completed_per_run"
+    errored_key = f"{field_prefix}errored_per_run"
+    completed = as_list(cell.get(completed_key), f"{label}.{completed_key}", problems)
+    errored = as_list(cell.get(errored_key), f"{label}.{errored_key}", problems)
+    if n_repeats is not None:
+        if len(completed) != n_repeats:
+            problems.append(f"{label}.{completed_key} length must equal n_repeats")
+        if len(errored) != n_repeats:
+            problems.append(f"{label}.{errored_key} length must equal n_repeats")
+    if requests is not None and completed and completed != [requests] * len(completed):
+        problems.append(f"{label}.{completed_key} must be full for every repeat")
+    if errored and any(value != 0 for value in errored):
+        problems.append(f"{label}.{errored_key} must be all zero")
+    for field in REQUIRED_ZERO_RUN_COUNT_FIELDS:
+        key = f"{field_prefix}{field}"
+        values = as_list(cell.get(key), f"{label}.{key}", problems)
+        if n_repeats is not None and len(values) != n_repeats:
+            problems.append(f"{label}.{key} length must equal n_repeats")
+        non_zero = [
+            value
+            for value in values
+            if not isinstance(value, int) or isinstance(value, bool) or value != 0
+        ]
+        if non_zero:
+            problems.append(f"{label}.{key} must be all zero")
+
+
 def validate_performance_cell(
     cell: dict[str, Any],
     baseline: dict[str, Any],
@@ -476,31 +512,45 @@ def validate_performance_cell(
     requests = positive_int(cell.get("requests_per_run"), f"{label}.requests_per_run", problems)
     if n_repeats is not None and n_repeats < 3:
         problems.append(f"{label}.n_repeats must be >= 3")
-    completed = as_list(cell.get("completed_per_run"), f"{label}.completed_per_run", problems)
-    errored = as_list(cell.get("errored_per_run"), f"{label}.errored_per_run", problems)
-    if n_repeats is not None:
-        if len(completed) != n_repeats:
-            problems.append(f"{label}.completed_per_run length must equal n_repeats")
-        if len(errored) != n_repeats:
-            problems.append(f"{label}.errored_per_run length must equal n_repeats")
-    if requests is not None and completed and completed != [requests] * len(completed):
-        problems.append(f"{label}.completed_per_run must be full for every repeat")
-    if errored and any(value != 0 for value in errored):
-        problems.append(f"{label}.errored_per_run must be all zero")
-    for field in REQUIRED_ZERO_RUN_COUNT_FIELDS:
-        values = as_list(cell.get(field), f"{label}.{field}", problems)
-        if n_repeats is not None and len(values) != n_repeats:
-            problems.append(f"{label}.{field} length must equal n_repeats")
-        non_zero = [
-            value
-            for value in values
-            if not isinstance(value, int) or isinstance(value, bool) or value != 0
-        ]
-        if non_zero:
-            problems.append(f"{label}.{field} must be all zero")
+    validate_run_quality_counts(
+        cell,
+        label,
+        field_prefix="",
+        n_repeats=n_repeats,
+        requests=requests,
+        problems=problems,
+    )
     if cell.get("output_token_count_source") != "usage":
         problems.append(f"{label}.output_token_count_source must be usage")
     require_true(cell.get("stream_options_include_usage"), f"{label}.stream_options_include_usage", problems)
+
+    baseline_n_repeats = positive_int(
+        cell.get("baseline_n_repeats"),
+        f"{label}.baseline_n_repeats",
+        problems,
+    )
+    baseline_requests = positive_int(
+        cell.get("baseline_requests_per_run"),
+        f"{label}.baseline_requests_per_run",
+        problems,
+    )
+    if baseline_n_repeats is not None and baseline_n_repeats < 3:
+        problems.append(f"{label}.baseline_n_repeats must be >= 3")
+    validate_run_quality_counts(
+        cell,
+        label,
+        field_prefix="baseline_",
+        n_repeats=baseline_n_repeats,
+        requests=baseline_requests,
+        problems=problems,
+    )
+    if cell.get("baseline_output_token_count_source") != "usage":
+        problems.append(f"{label}.baseline_output_token_count_source must be usage")
+    require_true(
+        cell.get("baseline_stream_options_include_usage"),
+        f"{label}.baseline_stream_options_include_usage",
+        problems,
+    )
     for key in ["same_hardware", "same_model", "same_quantization", "same_prompt_or_dataset"]:
         require_true(cell.get(key, baseline.get(key)), f"{label}.{key}", problems)
 
@@ -511,6 +561,13 @@ def validate_performance_cell(
     )
     if command and n_repeats is not None:
         validate_bench_command(command, n_repeats, label, problems)
+    baseline_command = command_parts(
+        cell.get("baseline_bench_command_line", baseline.get("bench_command_line")),
+        f"{label}.baseline_bench_command_line",
+        problems,
+    )
+    if baseline_command and baseline_n_repeats is not None:
+        validate_bench_command(baseline_command, baseline_n_repeats, f"{label}.baseline", problems)
 
     ferrum_metric = metric_from_cell(cell, problems, label)
     baseline_metric = baseline_tps_from_cell(cell, baseline, problems, label)
@@ -662,6 +719,10 @@ def write_selftest_manifest(root: Path, *, ratio: float = 0.82) -> Path:
                 "n_repeats": 3,
                 "completed_per_run": [100, 100, 100],
                 "errored_per_run": [0, 0, 0],
+                "baseline_requests_per_run": 100,
+                "baseline_n_repeats": 3,
+                "baseline_completed_per_run": [100, 100, 100],
+                "baseline_errored_per_run": [0, 0, 0],
                 "bad_output_per_run": [0, 0, 0],
                 "malformed_stream_per_run": [0, 0, 0],
                 "missing_done_per_run": [0, 0, 0],
@@ -670,13 +731,33 @@ def write_selftest_manifest(root: Path, *, ratio: float = 0.82) -> Path:
                 "stream_bulk_flush_per_run": [0, 0, 0],
                 "http_500_per_run": [0, 0, 0],
                 "panic_per_run": [0, 0, 0],
+                "baseline_bad_output_per_run": [0, 0, 0],
+                "baseline_malformed_stream_per_run": [0, 0, 0],
+                "baseline_missing_done_per_run": [0, 0, 0],
+                "baseline_duplicate_done_per_run": [0, 0, 0],
+                "baseline_zero_output_tokens_per_run": [0, 0, 0],
+                "baseline_stream_bulk_flush_per_run": [0, 0, 0],
+                "baseline_http_500_per_run": [0, 0, 0],
+                "baseline_panic_per_run": [0, 0, 0],
                 "output_token_count_source": "usage",
                 "stream_options_include_usage": True,
+                "baseline_output_token_count_source": "usage",
+                "baseline_stream_options_include_usage": True,
                 "same_hardware": True,
                 "same_model": True,
                 "same_quantization": True,
                 "same_prompt_or_dataset": True,
                 "bench_command_line": [
+                    "ferrum",
+                    "bench-serve",
+                    "--fail-on-error",
+                    "--require-ci",
+                    "--seed",
+                    "9271",
+                    "--n-repeats",
+                    "3",
+                ],
+                "baseline_bench_command_line": [
                     "ferrum",
                     "bench-serve",
                     "--fail-on-error",
@@ -866,6 +947,18 @@ def run_selftest() -> int:
         bad_quality_problems = validate_manifest(data, "w2", bad_quality)
         if not any("bad_output_per_run must be all zero" in problem for problem in bad_quality_problems):
             raise AssertionError("bad quality count selftest did not fail as expected")
+
+        bad_baseline_quality = tmp_root / "bad-baseline-quality-count"
+        bad_baseline_quality_manifest = write_selftest_manifest(bad_baseline_quality, ratio=0.82)
+        data = load_json(bad_baseline_quality_manifest)
+        data["performance"]["cells"][0]["baseline_bad_output_per_run"] = [0, 1, 0]
+        write_json(bad_baseline_quality_manifest, data)
+        bad_baseline_quality_problems = validate_manifest(data, "w2", bad_baseline_quality)
+        if not any(
+            "baseline_bad_output_per_run must be all zero" in problem
+            for problem in bad_baseline_quality_problems
+        ):
+            raise AssertionError("bad baseline quality count selftest did not fail as expected")
 
     print("MODEL RELEASE GRADE GOAL SELFTEST PASS")
     return 0
