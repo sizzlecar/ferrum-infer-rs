@@ -2,6 +2,53 @@
 
 进度日志,倒序。
 
+## 2026-06-16 YM — W2 vLLM source diff checkpoint: dense Marlin ruled out, focus unified graph correctness
+
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_source_diff_2026-06-16/`.
+- Scope:
+  - compared local vLLM source at `/Users/chejinxuan/py_ws/vllm`
+    (`0b3ba88f1`) with Ferrum Gemma3/GPTQ decode paths;
+  - no new paid GPU run was started;
+  - local Mac cannot execute vLLM CUDA ops because `torch` is not installed, so
+    this checkpoint reuses existing same-4090 artifacts and local source
+    inspection.
+- Source comparison result:
+  - Gemma3 semantics line up: fused QKV, Q/K norm, per-layer sliding window,
+    query scale, Gemma sandwich norms, fused `gate_up`, GeGLU tanh, and final
+    logits softcap are all represented;
+  - dense GPTQ Marlin is not the main remaining gap: existing native
+    Ferrum-vs-vLLM Marlin probes show m16 `gate_up` and weight-cycle `down`
+    are effectively tied under product-relevant shapes;
+  - vLLM's remaining structural advantage is decode integration: persistent
+    GPU input buffers plus CUDA graph dispatch/replay for uniform decode;
+  - Ferrum's product-clean Gemma3 path is still eager; product
+    `--batched-graph` did not help, while `--unified-graph` is the closer match
+    to vLLM but is not correctness-clean yet.
+- Reused evidence:
+  - vLLM ShareGPT c16/c32 baseline: `518.796` / `524.128 tok/s`, zero errors;
+  - latest Ferrum default c16 diagnostic: `320.311 tok/s`, correctness clean;
+  - typed profile m16 decode: about `30.2 ms` per decode step, with
+    `tail_mlp` about `14.8 ms`, `marlin_kernel` about `16.6 ms`, and attention
+    about `2.5-2.7 ms`;
+  - unified graph c16 diagnostic previously failed under bench with
+    `CUDA_ERROR_ILLEGAL_ADDRESS`; a key-fix smoke later avoided that specific
+    crash but graph instantiation still hit `CUDA_ERROR_OUT_OF_MEMORY` and
+    fell back.
+- Correctness status:
+  - no new default-path correctness issue found;
+  - unified graph remains a correctness blocker and must not be used for
+    performance claims.
+- Next direction:
+  - stop broad runtime knob sweeps;
+  - run only a targeted minimal unified-graph correctness/memory validation on
+    one Gemma3 decode shape when using the cached 4090 again;
+  - collect the exact graph node/failing kernel evidence first, then only
+    compare eager vs graph replay after correctness is stable.
+- Gate status:
+  - diagnostic source-diff checkpoint only;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+
 ## 2026-06-16 YL — W2 active-decode prefill chunk c16 diagnostic: latency tradeoff, not throughput lever
 
 - Artifact:
