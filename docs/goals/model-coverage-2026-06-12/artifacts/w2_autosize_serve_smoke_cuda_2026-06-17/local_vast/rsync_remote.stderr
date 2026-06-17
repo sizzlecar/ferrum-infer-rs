@@ -1,0 +1,36 @@
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Transfer starting: 30 files
+./
+build/
+correctness/
+correctness/smoke/
+env/
+run.log (354 B, 100.0% downloaded)
+summary.json (1.2 KB, 100.0% downloaded)
+tmux_exit.txt (7 B, 100.0% downloaded)
+build/cargo_build_release.log (14.2 KB, 100.0% downloaded)
+correctness/effective_config_keys.json (711 B, 100.0% downloaded)
+correctness/log_blocker_scan.txt (0 B, 100.0% downloaded)
+correctness/models.json (164 B, 100.0% downloaded)
+correctness/serve.command.json (492 B, 100.0% downloaded)
+correctness/serve.log (3.7 KB, 100.0% downloaded)
+correctness/serve_decision_trace.jsonl (3.9 KB, 100.0% downloaded)
+correctness/serve_effective_config.json (11.2 KB, 100.0% downloaded)
+correctness/smoke/stream_request.json (260 B, 100.0% downloaded)
+correctness/smoke/stream_response.sse (847 B, 100.0% downloaded)
+correctness/smoke/stream_summary.json (136 B, 100.0% downloaded)
+env/cargo_version.txt (36 B, 100.0% downloaded)
+env/df_before.txt (129 B, 100.0% downloaded)
+env/end_utc.txt (21 B, 100.0% downloaded)
+env/ferrum.sha256 (121 B, 100.0% downloaded)
+env/git_head.txt (41 B, 100.0% downloaded)
+env/git_status_short.txt (0 B, 100.0% downloaded)
+env/nvcc_version.txt (209 B, 100.0% downloaded)
+env/nvidia_smi_after.txt (1.6 KB, 100.0% downloaded)
+env/nvidia_smi_before.txt (1.6 KB, 100.0% downloaded)
+env/rustc_version.txt (36 B, 100.0% downloaded)
+env/start_utc.txt (21 B, 100.0% downloaded)
+
+sent 566 bytes  received 43850 bytes  88832 bytes/sec
+total size is 41943  speedup is 0.94
