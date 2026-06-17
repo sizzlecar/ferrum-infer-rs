@@ -1,0 +1,23 @@
+Requirement already satisfied: pip in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (22.0.2)
+Collecting pip
+  Downloading pip-26.1.2-py3-none-any.whl (1.8 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.8/1.8 MB 15.8 MB/s eta 0:00:00
+Collecting wheel
+  Downloading wheel-0.47.0-py3-none-any.whl (32 kB)
+Requirement already satisfied: setuptools in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (59.6.0)
+Collecting setuptools
+  Downloading setuptools-82.0.1-py3-none-any.whl (1.0 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.0/1.0 MB 39.2 MB/s eta 0:00:00
+Collecting packaging>=24.0
+  Downloading packaging-26.2-py3-none-any.whl (100 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100.2/100.2 KB 39.3 MB/s eta 0:00:00
+Installing collected packages: setuptools, pip, packaging, wheel
+  Attempting uninstall: setuptools
+    Found existing installation: setuptools 59.6.0
+    Uninstalling setuptools-59.6.0:
+      Successfully uninstalled setuptools-59.6.0
+  Attempting uninstall: pip
+    Found existing installation: pip 22.0.2
+    Uninstalling pip-22.0.2:
+      Successfully uninstalled pip-22.0.2
+Successfully installed packaging-26.2 pip-26.1.2 setuptools-82.0.1 wheel-0.47.0
