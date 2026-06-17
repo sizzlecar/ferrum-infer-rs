@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZT — W3 DeltaNet recurrent CPU-reference checkpoint
+
+- Scope:
+  - W3-S2 DeltaNet state-update reference before backend kernel wiring;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Source comparison:
+  - checked local vLLM
+    `model_executor/layers/mamba/ops/cpu/recurrent_gated_delta_rule.py`;
+  - matched the recurrent update order:
+    decay state, compute `kv_mem`, compute beta-scaled delta, update state
+    with `delta outer k`, then produce output from updated state and scaled q;
+  - kept q/k head repeat semantics for Qwen3.6 value-head layouts.
+- Change:
+  - added `Qwen35DeltaRuleShape`;
+  - added `qwen35_recurrent_gated_delta_rule_cpu()`;
+  - function accepts Ferrum state layout `[value_heads, value_dim, key_dim]`
+    and returns output plus final state;
+  - supports optional q/k L2 normalization and explicit scale;
+  - validates all tensor lengths before compute.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `23 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is a CPU/reference path, not the CUDA/Metal product kernel;
+  - it is not wired into `prefill`/`decode` yet;
+  - no W3 product entrypoint or performance evidence exists.
+
 ## 2026-06-18 ZZS — W3 model-side recurrent-state cache checkpoint
 
 - Scope:

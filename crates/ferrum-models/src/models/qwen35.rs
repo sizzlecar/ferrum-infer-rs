@@ -98,6 +98,15 @@ pub struct Qwen35RecurrentStateTensor<B: Backend> {
     pub buffer: B::Buffer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35DeltaRuleShape {
+    pub tokens: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+}
+
 pub fn qwen35_runtime_config(
     config: &Qwen35TextConfig,
     vocab_size: usize,
@@ -196,6 +205,138 @@ impl<B: Backend> Qwen35RecurrentStateTensor<B> {
         let start = slot * self.elements_per_slot;
         Ok(start..start + self.elements_per_slot)
     }
+}
+
+pub fn qwen35_recurrent_gated_delta_rule_cpu(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    initial_state: &[f32],
+    shape: Qwen35DeltaRuleShape,
+    use_qk_l2norm: bool,
+    scale: Option<f32>,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    validate_delta_rule_shapes(query, key, value, g, beta, initial_state, shape)?;
+    if shape.value_heads % shape.key_heads != 0 {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 DeltaNet value_heads {} must be divisible by key_heads {}",
+            shape.value_heads, shape.key_heads
+        )));
+    }
+    let repeat_factor = shape.value_heads / shape.key_heads;
+    let scale = scale.unwrap_or_else(|| (shape.key_dim as f32).sqrt().recip());
+    let mut state = initial_state.to_vec();
+    let mut out = vec![0.0; shape.tokens * shape.value_heads * shape.value_dim];
+
+    for token in 0..shape.tokens {
+        for value_head in 0..shape.value_heads {
+            let key_head = value_head / repeat_factor;
+            let mut q = vec![0.0; shape.key_dim];
+            let mut k = vec![0.0; shape.key_dim];
+            for d in 0..shape.key_dim {
+                q[d] = query[delta_qk_idx(shape, token, key_head, d)];
+                k[d] = key[delta_qk_idx(shape, token, key_head, d)];
+            }
+            if use_qk_l2norm {
+                l2_normalize(&mut q);
+                l2_normalize(&mut k);
+            }
+            for value in &mut q {
+                *value *= scale;
+            }
+
+            let decay = g[token * shape.value_heads + value_head].exp();
+            let beta_t = beta[token * shape.value_heads + value_head];
+            for vd in 0..shape.value_dim {
+                let mut kv_mem = 0.0;
+                for kd in 0..shape.key_dim {
+                    let state_idx = delta_state_idx(shape, value_head, vd, kd);
+                    state[state_idx] *= decay;
+                    kv_mem += state[state_idx] * k[kd];
+                }
+                let v_t = value[delta_value_idx(shape, token, value_head, vd)];
+                let delta = (v_t - kv_mem) * beta_t;
+                for kd in 0..shape.key_dim {
+                    let state_idx = delta_state_idx(shape, value_head, vd, kd);
+                    state[state_idx] += delta * k[kd];
+                }
+                let mut acc = 0.0;
+                for kd in 0..shape.key_dim {
+                    acc += state[delta_state_idx(shape, value_head, vd, kd)] * q[kd];
+                }
+                out[delta_value_idx(shape, token, value_head, vd)] = acc;
+            }
+        }
+    }
+
+    Ok((out, state))
+}
+
+fn validate_delta_rule_shapes(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    initial_state: &[f32],
+    shape: Qwen35DeltaRuleShape,
+) -> Result<()> {
+    if shape.tokens == 0
+        || shape.key_heads == 0
+        || shape.value_heads == 0
+        || shape.key_dim == 0
+        || shape.value_dim == 0
+    {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 DeltaNet shape must be positive, got {shape:?}"
+        )));
+    }
+    let qk_len = shape.tokens * shape.key_heads * shape.key_dim;
+    let value_len = shape.tokens * shape.value_heads * shape.value_dim;
+    let gating_len = shape.tokens * shape.value_heads;
+    let state_len = shape.value_heads * shape.value_dim * shape.key_dim;
+    for (label, actual, expected) in [
+        ("query", query.len(), qk_len),
+        ("key", key.len(), qk_len),
+        ("value", value.len(), value_len),
+        ("g", g.len(), gating_len),
+        ("beta", beta.len(), gating_len),
+        ("initial_state", initial_state.len(), state_len),
+    ] {
+        if actual != expected {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 DeltaNet {label} length {actual} != expected {expected} for {shape:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn l2_normalize(values: &mut [f32]) {
+    let norm = values.iter().map(|value| value * value).sum::<f32>();
+    let inv = (norm + 1e-6).sqrt().recip();
+    for value in values {
+        *value *= inv;
+    }
+}
+
+fn delta_qk_idx(shape: Qwen35DeltaRuleShape, token: usize, head: usize, dim: usize) -> usize {
+    ((token * shape.key_heads + head) * shape.key_dim) + dim
+}
+
+fn delta_value_idx(shape: Qwen35DeltaRuleShape, token: usize, head: usize, dim: usize) -> usize {
+    ((token * shape.value_heads + head) * shape.value_dim) + dim
+}
+
+fn delta_state_idx(
+    shape: Qwen35DeltaRuleShape,
+    head: usize,
+    value_dim: usize,
+    key_dim: usize,
+) -> usize {
+    ((head * shape.value_dim + value_dim) * shape.key_dim) + key_dim
 }
 
 impl<B: Backend> Qwen35ModelWeights<B> {
@@ -631,5 +772,96 @@ mod tests {
             .expect_err("slot 1 should exceed one-slot recurrent state cache");
 
         assert!(err.to_string().contains("slot 1"), "{err}");
+    }
+
+    #[test]
+    fn recurrent_delta_rule_single_token_updates_state() {
+        let shape = Qwen35DeltaRuleShape {
+            tokens: 1,
+            key_heads: 1,
+            value_heads: 1,
+            key_dim: 2,
+            value_dim: 2,
+        };
+        let query = vec![1.0, 0.0];
+        let key = vec![1.0, 0.0];
+        let value = vec![2.0, 4.0];
+        let g = vec![0.0];
+        let beta = vec![0.5];
+        let initial_state = vec![0.0; 4];
+
+        let (out, state) = qwen35_recurrent_gated_delta_rule_cpu(
+            &query,
+            &key,
+            &value,
+            &g,
+            &beta,
+            &initial_state,
+            shape,
+            false,
+            Some(1.0),
+        )
+        .unwrap();
+
+        assert_eq!(state, vec![1.0, 0.0, 2.0, 0.0]);
+        assert_eq!(out, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn recurrent_delta_rule_repeats_qk_heads_over_value_heads() {
+        let shape = Qwen35DeltaRuleShape {
+            tokens: 1,
+            key_heads: 1,
+            value_heads: 2,
+            key_dim: 1,
+            value_dim: 1,
+        };
+        let query = vec![2.0];
+        let key = vec![3.0];
+        let value = vec![5.0, 7.0];
+        let g = vec![0.0, 0.0];
+        let beta = vec![1.0, 1.0];
+        let initial_state = vec![0.0, 0.0];
+
+        let (out, state) = qwen35_recurrent_gated_delta_rule_cpu(
+            &query,
+            &key,
+            &value,
+            &g,
+            &beta,
+            &initial_state,
+            shape,
+            false,
+            Some(1.0),
+        )
+        .unwrap();
+
+        assert_eq!(state, vec![15.0, 21.0]);
+        assert_eq!(out, vec![30.0, 42.0]);
+    }
+
+    #[test]
+    fn recurrent_delta_rule_rejects_shape_mismatch() {
+        let shape = Qwen35DeltaRuleShape {
+            tokens: 1,
+            key_heads: 2,
+            value_heads: 3,
+            key_dim: 1,
+            value_dim: 1,
+        };
+        let err = qwen35_recurrent_gated_delta_rule_cpu(
+            &[1.0, 2.0],
+            &[1.0, 2.0],
+            &[1.0, 2.0, 3.0],
+            &[0.0, 0.0, 0.0],
+            &[1.0, 1.0, 1.0],
+            &[0.0, 0.0, 0.0],
+            shape,
+            false,
+            Some(1.0),
+        )
+        .expect_err("value heads must divide key heads before update");
+
+        assert!(err.to_string().contains("value_heads 3"), "{err}");
     }
 }
