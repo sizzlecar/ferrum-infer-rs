@@ -1,9 +1,8 @@
 //! Qwen3.5 / Qwen3.6 W3 executor boundary.
 //!
-//! This skeleton is intentionally not registered as a product executor yet. It
-//! exposes the recurrent-state allocation contract that the real W3 executor
-//! will use. Product registration remains disabled until the full W3 run/serve
-//! path is wired and gated.
+//! This skeleton is intentionally limited to an explicit CPU/FP32 reference
+//! product path. It exposes the recurrent-state allocation contract that the
+//! real W3 executor will use, while CUDA/Metal release execution remains gated.
 
 use async_trait::async_trait;
 use candle_core::{Device as CandleDevice, Tensor};
@@ -12,11 +11,13 @@ use ferrum_interfaces::{
         DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage, ExecutorState,
         ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
     },
-    ModelExecutor, RecurrentStateSpec,
+    KvCacheHandle, ModelExecutor, RecurrentStateSpec,
 };
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_quantization::{NativeSafetensorsLoader, WeightLoader};
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, RequestId, Result, TokenId};
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -850,6 +851,7 @@ pub struct Qwen35W3Executor {
     weight_plan: Option<Qwen35ResolvedWeightPlan>,
     dense_reference_runtime: Option<Arc<Qwen35DenseReferenceRuntime>>,
     sparse_moe_reference_runtime: Option<Arc<Qwen35SparseMoeReferenceRuntime>>,
+    reference_sequences: Arc<Mutex<HashMap<String, Vec<usize>>>>,
 }
 
 impl Qwen35W3Executor {
@@ -873,6 +875,7 @@ impl Qwen35W3Executor {
             weight_plan: None,
             dense_reference_runtime: None,
             sparse_moe_reference_runtime: None,
+            reference_sequences: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -999,6 +1002,68 @@ impl Qwen35W3Executor {
         let id = QWEN35_REFERENCE_CACHE_COUNTER.fetch_add(1, Ordering::Relaxed);
         format!("qwen35-reference-prefill-{id}")
     }
+
+    fn reference_forward(&self, input_ids: &[usize]) -> Result<(usize, Vec<f32>)> {
+        if let Some(runtime) = &self.dense_reference_runtime {
+            let output = runtime.forward(input_ids)?;
+            Ok((runtime.vocab_size, output.logits))
+        } else if let Some(runtime) = &self.sparse_moe_reference_runtime {
+            let output = runtime.forward(input_ids)?;
+            Ok((runtime.vocab_size, output.logits))
+        } else {
+            Err(Self::unsupported_execution())
+        }
+    }
+
+    fn last_reference_logits(
+        token_count: usize,
+        vocab_size: usize,
+        logits: &[f32],
+    ) -> Result<Vec<f32>> {
+        if token_count == 0 {
+            return Err(FerrumError::model("Qwen3.5 reference input is empty"));
+        }
+        let required = token_count
+            .checked_mul(vocab_size)
+            .ok_or_else(|| FerrumError::model("Qwen3.5 reference logits shape overflow"))?;
+        if logits.len() < required {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 reference logits too short: got {}, need {required}",
+                logits.len()
+            )));
+        }
+        let last_token_start = (token_count - 1) * vocab_size;
+        Ok(logits[last_token_start..last_token_start + vocab_size].to_vec())
+    }
+
+    fn reference_prefill_cache_id_and_tokens(
+        &self,
+        input: &PrefillInput,
+        new_tokens: Vec<usize>,
+    ) -> Result<(String, Vec<usize>)> {
+        let Some(input_kv) = input.kv_cache.as_ref() else {
+            let cache_id = Self::next_reference_cache_id();
+            return Ok((cache_id, new_tokens));
+        };
+        let Some(input_handle) = input_kv.as_any().downcast_ref::<GenericKvCacheHandle>() else {
+            let cache_id = Self::next_reference_cache_id();
+            return Ok((cache_id, new_tokens));
+        };
+        let cache_id = input_handle.request_cache_id().to_string();
+        let existing_len = input_handle.block_table().sequence_length;
+        let mut full_tokens = {
+            let sequences = self.reference_sequences.lock();
+            sequences.get(&cache_id).cloned().unwrap_or_default()
+        };
+        if !full_tokens.is_empty() && full_tokens.len() != existing_len {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 reference prefill cache {cache_id} length mismatch: history={}, kv={existing_len}",
+                full_tokens.len()
+            )));
+        }
+        full_tokens.extend(new_tokens);
+        Ok((cache_id, full_tokens))
+    }
 }
 
 #[async_trait]
@@ -1020,41 +1085,85 @@ impl ModelExecutor for Qwen35W3Executor {
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         let tokens = common::tensor_to_tokens(&input.input_ids)?;
-        let input_ids = tokens
+        let new_input_ids = tokens
             .iter()
             .map(|token| *token as usize)
             .collect::<Vec<_>>();
-        let (vocab_size, logits) = if let Some(runtime) = &self.dense_reference_runtime {
-            let output = runtime.forward(&input_ids)?;
-            (runtime.vocab_size, output.logits)
-        } else if let Some(runtime) = &self.sparse_moe_reference_runtime {
-            let output = runtime.forward(&input_ids)?;
-            (runtime.vocab_size, output.logits)
-        } else {
-            return Err(Self::unsupported_execution());
-        };
-        let last_token_start = (input_ids.len() - 1) * vocab_size;
-        let last_logits = logits[last_token_start..last_token_start + vocab_size].to_vec();
+        let (cache_id, input_ids) =
+            self.reference_prefill_cache_id_and_tokens(input, new_input_ids)?;
+        let (vocab_size, logits) = self.reference_forward(&input_ids)?;
+        let last_logits = Self::last_reference_logits(input_ids.len(), vocab_size, &logits)?;
         let logits_tensor = Tensor::new(last_logits.as_slice(), &CandleDevice::Cpu)
             .map_err(|err| FerrumError::model(format!("Qwen3.5 logits tensor failed: {err}")))?
             .reshape((1, 1, vocab_size))
             .map_err(|err| FerrumError::model(format!("Qwen3.5 logits reshape failed: {err}")))?;
+        self.reference_sequences
+            .lock()
+            .insert(cache_id.clone(), input_ids.clone());
         let kv_cache = Arc::new(GenericKvCacheHandle::new(
             self.config.num_hidden_layers,
             self.config.num_key_value_heads,
             self.config.head_dim,
             CandleDevice::Cpu,
             input_ids.len(),
-            Self::next_reference_cache_id(),
+            cache_id,
         ));
-        Ok(PrefillOutput::new(
-            common::wrap_tensor(logits_tensor),
-            kv_cache,
-        ))
+        let output = PrefillOutput::new(common::wrap_tensor(logits_tensor), kv_cache);
+        Ok(if let Some(state) = input.recurrent_state.clone() {
+            output.with_recurrent_state(state)
+        } else {
+            output
+        })
     }
 
-    async fn decode(&self, _input: &DecodeInput) -> Result<DecodeOutput> {
-        Err(Self::unsupported_execution())
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        let input_handle = input
+            .kv_cache
+            .as_any()
+            .downcast_ref::<GenericKvCacheHandle>()
+            .ok_or_else(|| {
+                FerrumError::model("Qwen3.5 reference decode requires its own GenericKvCacheHandle")
+            })?;
+        let cache_id = input_handle.request_cache_id().to_string();
+        let seq_len = input_handle.block_table().sequence_length;
+        let tokens = common::tensor_to_tokens(&input.input_ids)?;
+        if tokens.len() != 1 {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 reference decode expects exactly one token, got {}",
+                tokens.len()
+            )));
+        }
+        let mut input_ids = {
+            let sequences = self.reference_sequences.lock();
+            sequences.get(&cache_id).cloned().ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Qwen3.5 reference decode has no token history for cache {cache_id}"
+                ))
+            })?
+        };
+        if input_ids.len() != seq_len {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 reference decode cache {cache_id} length mismatch: history={}, kv={seq_len}",
+                input_ids.len()
+            )));
+        }
+        input_ids.push(tokens[0] as usize);
+        let (vocab_size, logits) = self.reference_forward(&input_ids)?;
+        let last_logits = Self::last_reference_logits(input_ids.len(), vocab_size, &logits)?;
+        let logits_tensor = Tensor::new(last_logits.as_slice(), &CandleDevice::Cpu)
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 decode logits failed: {err}")))?
+            .reshape((1, vocab_size))
+            .map_err(|err| {
+                FerrumError::model(format!("Qwen3.5 decode logits reshape failed: {err}"))
+            })?;
+        self.reference_sequences.lock().insert(cache_id, input_ids);
+        let kv_cache = Arc::new(input_handle.with_sequence_length(seq_len + 1));
+        let output = DecodeOutput::new(common::wrap_tensor(logits_tensor), kv_cache);
+        Ok(if let Some(state) = input.recurrent_state.clone() {
+            output.with_recurrent_state(state)
+        } else {
+            output
+        })
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
@@ -1960,7 +2069,68 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_w3_reference_prefill_keeps_decode_unsupported_until_state_semantics_exist() {
+    fn qwen35_w3_reference_decode_replays_dense_history() {
+        let def = toy_dense_definition();
+        let runtime = toy_dense_runtime();
+        let expected = runtime.forward(&[0, 1, 2]).unwrap();
+        let executor = Qwen35W3Executor::from_definition(
+            "qwen35-reference",
+            &def,
+            DataType::FP32,
+            Device::CPU,
+        )
+        .unwrap()
+        .with_dense_reference_runtime(runtime)
+        .unwrap();
+        let prefill = tokio_test::block_on(executor.prefill(&PrefillInput::new(
+            MockTensor::from_u32(&[0, 1], &[2]).into_ref(),
+        )))
+        .unwrap();
+        let input = DecodeInput::new(
+            MockTensor::from_u32(&[2], &[1]).into_ref(),
+            prefill.kv_cache,
+        );
+
+        let output = tokio_test::block_on(executor.decode(&input)).unwrap();
+
+        assert_eq!(output.logits.shape(), &[1, 3]);
+        assert_close(&output.logits.to_vec_f32().unwrap(), &expected.logits[6..9]);
+        assert_eq!(output.kv_cache.block_table().sequence_length, 3);
+        assert!(output.recurrent_state.is_none());
+    }
+
+    #[test]
+    fn qwen35_w3_reference_decode_replays_sparse_moe_history() {
+        let def = toy_sparse_moe_definition();
+        let runtime = toy_sparse_moe_runtime();
+        let expected = runtime.forward(&[0, 1, 2]).unwrap();
+        let executor = Qwen35W3Executor::from_definition(
+            "qwen35-moe-reference",
+            &def,
+            DataType::FP32,
+            Device::CPU,
+        )
+        .unwrap()
+        .with_sparse_moe_reference_runtime(runtime)
+        .unwrap();
+        let prefill = tokio_test::block_on(executor.prefill(&PrefillInput::new(
+            MockTensor::from_u32(&[0, 1], &[2]).into_ref(),
+        )))
+        .unwrap();
+        let input = DecodeInput::new(
+            MockTensor::from_u32(&[2], &[1]).into_ref(),
+            prefill.kv_cache,
+        );
+
+        let output = tokio_test::block_on(executor.decode(&input)).unwrap();
+
+        assert_eq!(output.logits.shape(), &[1, 3]);
+        assert_close(&output.logits.to_vec_f32().unwrap(), &expected.logits[6..9]);
+        assert_eq!(output.kv_cache.block_table().sequence_length, 3);
+    }
+
+    #[test]
+    fn qwen35_w3_reference_decode_rejects_unknown_cache_history() {
         let def = toy_dense_definition();
         let executor = Qwen35W3Executor::from_definition(
             "qwen35-reference",
@@ -1977,13 +2147,13 @@ mod tests {
             2,
             CandleDevice::Cpu,
             2,
-            "qwen35-reference-test".to_string(),
+            "qwen35-reference-missing-history".to_string(),
         ));
         let input = DecodeInput::new(MockTensor::from_u32(&[1], &[1]).into_ref(), kv_cache);
 
         let err = tokio_test::block_on(executor.decode(&input))
-            .expect_err("decode should remain unsupported before recurrent/KV state semantics");
+            .expect_err("decode should reject cache handles with no reference history");
 
-        assert!(err.to_string().contains("not wired"), "{err}");
+        assert!(err.to_string().contains("no token history"), "{err}");
     }
 }
