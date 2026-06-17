@@ -107,7 +107,10 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         // instead.
         let displaced: Vec<u32> = caches
             .first()
-            .map(|c| c.paged_block_indices[..n_matched].to_vec())
+            .map(|c| {
+                let existing = &c.paged_block_indices;
+                existing[..n_matched.min(existing.len())].to_vec()
+            })
             .unwrap_or_default();
         alloc.free(&displaced);
         drop(alloc);
@@ -117,12 +120,15 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let caches_mut = self.kv_caches.get_mut(cache_id).expect("cache present");
         let max_blocks = caches_mut
             .first()
-            .map(|c| c.paged_block_indices.len())
+            .map(|c| c.capacity / c.block_size)
             .unwrap_or(0);
         let new_len = n_matched * block_size;
         let mut ctx_tmp = B::new_context();
         for c in caches_mut.iter_mut() {
             // Replace first n_matched entries with cached IDs.
+            if c.paged_block_indices.len() < matched.len() {
+                c.paged_block_indices.resize(matched.len(), 0);
+            }
             for (i, &b) in matched.iter().enumerate() {
                 c.paged_block_indices[i] = b;
             }

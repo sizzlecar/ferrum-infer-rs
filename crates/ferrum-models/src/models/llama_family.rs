@@ -340,6 +340,7 @@ impl LlamaStageHiddenBridgeTiming {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LlamaFamilyRuntimeEnv {
     pub(crate) kv_capacity: Option<usize>,
+    pub(crate) kv_max_blocks: Option<usize>,
     pub(crate) metal_paged_kv: Option<bool>,
     pub(crate) paged_max_seqs: usize,
     pub(crate) decode_op_profile: bool,
@@ -382,6 +383,7 @@ impl LlamaFamilyRuntimeEnv {
     {
         let mut config = Self {
             kv_capacity: None,
+            kv_max_blocks: None,
             metal_paged_kv: None,
             paged_max_seqs: 32,
             decode_op_profile: false,
@@ -397,6 +399,9 @@ impl LlamaFamilyRuntimeEnv {
             let value = value.as_ref();
             match name.as_ref() {
                 "FERRUM_KV_CAPACITY" => config.kv_capacity = value.parse::<usize>().ok(),
+                "FERRUM_KV_MAX_BLOCKS" => {
+                    config.kv_max_blocks = value.parse::<usize>().ok().filter(|v| *v > 0)
+                }
                 "FERRUM_METAL_PAGED_KV" => config.metal_paged_kv = Some(value != "0"),
                 "FERRUM_PAGED_MAX_SEQS" => {
                     if let Ok(max_seqs) = value.parse::<usize>() {
@@ -421,6 +426,12 @@ impl LlamaFamilyRuntimeEnv {
         self.kv_capacity
             .map(|cap| cap.min(model_max))
             .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY))
+    }
+
+    fn paged_total_blocks(&self, max_blocks_per_seq: usize) -> usize {
+        self.kv_max_blocks
+            .unwrap_or_else(|| self.paged_max_seqs * max_blocks_per_seq)
+            .max(1)
     }
 
     fn paged_kv_enabled<B: BackendPagedKv>(&self) -> bool {
@@ -2058,23 +2069,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         );
         const PAGED_BLOCK_SIZE: usize = 16;
 
-        // Phase 4 shared-pool sizing. The pool sees ALL concurrent
-        // sequences; per-cache_id state just owns indices into it.
-        // Default 32: covers c=16 burst with 2× headroom for the
-        // fresh-cache-id-per-request pattern that bench/server harnesses
-        // use. Pool memory is `max_seqs × max_blocks_per_seq` total
-        // blocks — we lowered DEFAULT_KV_CAPACITY to 2048 so this 2× max_seqs
-        // bump keeps the pool footprint identical to the pre-0.7.2 default.
+        // Paged KV uses a vLLM-style global physical block pool. `kv_capacity`
+        // defines the per-sequence logical table stride; `kv_max_blocks`
+        // defines how many physical blocks the model allocates up front.
+        // Sequences draw blocks on demand as their target length grows.
         let max_seqs = runtime_env.paged_max_seqs;
         let max_blocks_per_seq = max.div_ceil(PAGED_BLOCK_SIZE);
-        let total_pool_blocks = max_seqs * max_blocks_per_seq;
+        let total_pool_blocks = runtime_env.paged_total_blocks(max_blocks_per_seq);
 
         // Lazy-allocate the shared paged pools on the FIRST paged
-        // ensure_kv call. Pools are big — for Llama-8B (8 kv_heads,
-        // head_dim=128) at 16 seqs × 256 blocks × 16 slots = 65536 KV
-        // slots: 65536 * 8 * 128 * 4 = 256 MB per layer × 32 layers
-        // = 8 GB total. Sized this large only because `max_seqs=16`
-        // is the default; lower it via env to shrink.
+        // ensure_kv call. Pool size follows the global block budget, not
+        // `max_seqs * max_blocks_per_seq`, so high concurrency no longer
+        // implies every request reserves its full context window.
         if paged && self.paged_pools.is_none() {
             let mut pools = Vec::with_capacity(self.local_layer_count());
             for _ in self.local_layer_indices() {
@@ -2143,52 +2149,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             None => allocate_caches(),
         };
 
-        // Allocate physical blocks for THIS cache_id from the shared
-        // pool. We allocate all `max_blocks_per_seq` upfront for
-        // simplicity (matches contig's "pre-alloc to capacity"
-        // semantics); a smarter Phase 4b can grow on demand to save
-        // pool occupancy.
+        // Physical blocks are allocated on demand before each forward writes
+        // KV. At creation time the cache owns no blocks; block_table is all
+        // zeroes and context_lens is zero.
         if paged {
-            let alloc_arc = self
-                .paged_block_alloc
-                .as_ref()
-                .expect("paged_block_alloc must be initialised when paged=true");
-            // Recover from a previously-poisoned mutex instead of panicking
-            // (poison just means a prior holder panicked; the BlockAllocator
-            // state is still intact since allocate_n is fail-safe).
-            let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-            let block_indices = match alloc.allocate_n(max_blocks_per_seq) {
-                Ok(idx) => idx,
-                Err(e) => {
-                    // Pool exhaustion is a back-pressure signal, not a crash.
-                    // Drop the lock, return the cache to the free pool, and
-                    // bail before inserting it into kv_caches. The downstream
-                    // call will then fail with a clean per-request error
-                    // ("ensure_kv must be called before ...") instead of
-                    // dragging every other in-flight request down with it.
-                    drop(alloc);
-                    self.kv_free_pool.push(caches);
-                    eprintln!(
-                        "[ferrum] paged KV pool exhausted on ensure_kv for \
-                         cache_id={cache_id:?}: {e}. Increase \
-                         FERRUM_PAGED_MAX_SEQS (currently {max_seqs}) or \
-                         throttle concurrent requests.",
-                    );
-                    return;
-                }
-            };
-            // Write the block table to each layer's cache. All layers
-            // share the same logical→physical mapping for this seq.
-            // Also stash the host-side index list so release_kv can
-            // return them to the allocator without a device readback.
-            let mut padded = block_indices.clone();
-            padded.resize(max_blocks_per_seq, 0);
+            let padded = vec![0u32; max_blocks_per_seq];
             let mut ctx_tmp = B::new_context();
             for c in caches.iter_mut() {
                 if let Some(bt) = K::block_table_mut(c) {
                     B::write_typed::<u32>(&mut ctx_tmp, bt, &padded);
                 }
-                *K::paged_block_indices_mut(c) = block_indices.clone();
+                K::paged_block_indices_mut(c).clear();
             }
             B::sync(&mut ctx_tmp);
         }
@@ -2205,6 +2176,78 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             }
         }
         self.kv_caches.insert(cache_id.to_string(), caches);
+    }
+
+    pub(crate) fn ensure_paged_kv_capacity_for_cache_id(
+        &mut self,
+        ctx: &mut B::Context,
+        cache_id: &str,
+        target_len: usize,
+    ) -> Result<()> {
+        if self.paged_pools.is_none() {
+            return Ok(());
+        }
+
+        let (block_size, max_blocks_per_seq, mut block_indices) = {
+            let caches = self.kv_caches.get(cache_id).ok_or_else(|| {
+                ferrum_types::FerrumError::model(format!(
+                    "paged KV grow called before ensure_kv for cache_id={cache_id:?}"
+                ))
+            })?;
+            let cache = caches.first().ok_or_else(|| {
+                ferrum_types::FerrumError::model(format!(
+                    "paged KV grow found empty layer cache for cache_id={cache_id:?}"
+                ))
+            })?;
+            let block_size = K::block_size(cache);
+            if block_size == 0 {
+                return Ok(());
+            }
+            let capacity = K::capacity(cache);
+            (
+                block_size,
+                capacity / block_size,
+                K::paged_block_indices(cache).to_vec(),
+            )
+        };
+
+        let needed_blocks = target_len.div_ceil(block_size);
+        if needed_blocks > max_blocks_per_seq {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "paged KV: target_len={target_len} needs {needed_blocks} blocks, exceeds per-seq table capacity {max_blocks_per_seq} for cache_id={cache_id:?}"
+            )));
+        }
+        if block_indices.len() >= needed_blocks {
+            return Ok(());
+        }
+
+        let extra_blocks = needed_blocks - block_indices.len();
+        let new_blocks = {
+            let alloc_arc = self.paged_block_alloc.as_ref().ok_or_else(|| {
+                ferrum_types::FerrumError::model(
+                    "paged KV grow missing block allocator while paged_pools is set",
+                )
+            })?;
+            let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+            alloc.allocate_n(extra_blocks)?
+        };
+        block_indices.extend(new_blocks);
+
+        let mut padded = block_indices.clone();
+        padded.resize(max_blocks_per_seq, 0);
+        let caches = self.kv_caches.get_mut(cache_id).ok_or_else(|| {
+            ferrum_types::FerrumError::model(format!(
+                "paged KV grow lost cache after allocation for cache_id={cache_id:?}"
+            ))
+        })?;
+        for cache in caches.iter_mut() {
+            *K::paged_block_indices_mut(cache) = block_indices.clone();
+            if let Some(block_table) = K::block_table_mut(cache) {
+                B::write_typed::<u32>(ctx, block_table, &padded);
+            }
+        }
+
+        Ok(())
     }
 
     fn record_prefix_cache_probe(&mut self, saved_tokens: usize) {
@@ -2253,7 +2296,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         let displaced = caches
             .first()
-            .map(|cache| K::paged_block_indices(cache)[..n_matched].to_vec())
+            .map(|cache| {
+                let existing = K::paged_block_indices(cache);
+                existing[..n_matched.min(existing.len())].to_vec()
+            })
             .unwrap_or_default();
         alloc.free(&displaced);
         drop(alloc);
@@ -2268,6 +2314,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         for cache in caches_mut.iter_mut() {
             {
                 let indices = K::paged_block_indices_mut(cache);
+                if indices.len() < matched.len() {
+                    indices.resize(matched.len(), 0);
+                }
                 for (idx, &block) in matched.iter().enumerate() {
                     indices[idx] = block;
                 }
@@ -3433,6 +3482,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .unwrap_or(0);
 
         let mut ctx = B::new_context();
+        self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, pos_offset + seq_len)
+            .expect("paged KV dynamic grow");
         let mut residual = self
             .scratch
             .residual
@@ -3628,6 +3679,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
         let mut ctx = B::new_context();
+        self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, pos_offset + seq_len)
+            .expect("paged KV dynamic grow");
 
         // Move `residual` out of `scratch` to work around the borrow checker:
         // `forward_layer` re-borrows `&mut self` to reach `self.layers` /
@@ -3908,6 +3961,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // Context creation is cheap (CUDA reuses the process-global stream).
         // The captured graph lives in a process-global slot, not on ctx.
         let mut ctx = B::new_context();
+        let target_len = self.cache_len(cache_id).saturating_add(1);
+        self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, target_len)
+            .expect("paged KV dynamic grow");
 
         // Graph capture is opt-in via FERRUM_CUDA_GRAPH=1. Replay is currently
         // single-request-only on Blackwell + CUDA 12.8 (see
@@ -4195,6 +4251,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         let h = self.cfg.hidden_size;
         let mut ctx = B::new_context();
+        let target_len = self.cache_len(cache_id).saturating_add(seq_len);
+        self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, target_len)
+            .expect("paged KV dynamic grow");
         let mut residual = self
             .scratch
             .residual
@@ -4322,6 +4381,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.ensure_kv(cache_id);
 
         let mut ctx = B::new_context();
+        let target_len = self.cache_len(cache_id).saturating_add(seq_len);
+        self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, target_len)
+            .expect("paged KV dynamic grow");
         let mut residual = self
             .scratch
             .residual
@@ -4829,6 +4891,9 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         self.batched_graph_failed = false;
         self.kv_caches.clear();
         self.kv_free_pool.clear();
+        self.paged_pools = None;
+        self.paged_block_alloc = None;
+        self.paged_dims = None;
         self.lora_cache_adapters.clear();
     }
 }
@@ -4953,6 +5018,9 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         self.graph_capture_failed = false;
         self.kv_caches.clear();
         self.kv_free_pool.clear();
+        self.paged_pools = None;
+        self.paged_block_alloc = None;
+        self.paged_dims = None;
         self.lora_cache_adapters.clear();
     }
 }
@@ -5025,7 +5093,7 @@ fn scale_llama3_rope_freq(
 mod tests {
     use std::sync::Mutex;
 
-    use ferrum_kernels::backend::cpu::CpuBackend;
+    use ferrum_kernels::backend::{cpu::CpuBackend, Backend};
     use ferrum_quantization::{DenseLinear, QuantConfig, WeightLoader};
     use ferrum_types::{Activation, Result};
 
@@ -5238,6 +5306,75 @@ mod tests {
     }
 
     #[test]
+    fn paged_kv_blocks_grow_on_demand_and_release_to_pool() {
+        let mut cfg = test_llama_config(2, false);
+        cfg.max_seq_len = 64;
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
+        model.runtime_env = LlamaFamilyRuntimeEnv::from_env_vars([
+            ("FERRUM_METAL_PAGED_KV", "1"),
+            ("FERRUM_KV_CAPACITY", "64"),
+            ("FERRUM_KV_MAX_BLOCKS", "4"),
+            ("FERRUM_PAGED_MAX_SEQS", "32"),
+        ]);
+
+        model.ensure_kv("seq-a");
+        let caches = model.kv_caches.get("seq-a").unwrap();
+        assert!(caches
+            .iter()
+            .all(|cache| cache.paged_block_indices.is_empty()));
+        assert_eq!(
+            model
+                .paged_block_alloc
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .free_count(),
+            4
+        );
+
+        let mut ctx = CpuBackend::new_context();
+        model
+            .ensure_paged_kv_capacity_for_cache_id(&mut ctx, "seq-a", 17)
+            .unwrap();
+        let caches = model.kv_caches.get("seq-a").unwrap();
+        assert!(caches
+            .iter()
+            .all(|cache| cache.paged_block_indices == vec![0, 1]));
+        assert_eq!(
+            model
+                .paged_block_alloc
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .free_count(),
+            2
+        );
+
+        model
+            .ensure_paged_kv_capacity_for_cache_id(&mut ctx, "seq-a", 33)
+            .unwrap();
+        let caches = model.kv_caches.get("seq-a").unwrap();
+        assert!(caches
+            .iter()
+            .all(|cache| cache.paged_block_indices == vec![0, 1, 2]));
+
+        crate::common::DecoderOnlyLLM::release(&mut model, "seq-a");
+        assert_eq!(
+            model
+                .paged_block_alloc
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .free_count(),
+            4
+        );
+    }
+
+    #[test]
     fn llama_family_layer_loader_uses_source_layer_range() {
         let cfg = test_llama_config(5, true);
         let loader = RecordingLoader::default();
@@ -5418,6 +5555,7 @@ mod tests {
     fn llama_family_runtime_env_parses_startup_knobs() {
         let env = LlamaFamilyRuntimeEnv::from_env_vars([
             ("FERRUM_KV_CAPACITY", "4096"),
+            ("FERRUM_KV_MAX_BLOCKS", "1234"),
             ("FERRUM_METAL_PAGED_KV", "0"),
             ("FERRUM_PAGED_MAX_SEQS", "64"),
             ("FERRUM_DECODE_OP_PROFILE", "0"),
@@ -5429,6 +5567,7 @@ mod tests {
         ]);
 
         assert_eq!(env.kv_capacity, Some(4096));
+        assert_eq!(env.kv_max_blocks, Some(1234));
         assert_eq!(env.metal_paged_kv, Some(false));
         assert_eq!(env.paged_max_seqs, 64);
         assert!(env.decode_op_profile);
@@ -5445,11 +5584,13 @@ mod tests {
     fn llama_family_runtime_env_uses_defaults_for_invalid_values() {
         let env = LlamaFamilyRuntimeEnv::from_env_vars([
             ("FERRUM_KV_CAPACITY", "bad"),
+            ("FERRUM_KV_MAX_BLOCKS", "0"),
             ("FERRUM_PAGED_MAX_SEQS", "bad"),
             ("FERRUM_METAL_PAGED_KV", "1"),
         ]);
 
         assert_eq!(env.kv_capacity, None);
+        assert_eq!(env.kv_max_blocks, None);
         assert_eq!(env.metal_paged_kv, Some(true));
         assert_eq!(env.paged_max_seqs, 32);
         assert_eq!(

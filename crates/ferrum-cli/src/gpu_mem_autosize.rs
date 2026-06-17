@@ -219,13 +219,11 @@ pub enum AutoSizeProfile {
 }
 
 /// Apply auto-sizing: read CLI flag, query nvidia-smi, set env vars.
-/// Sets BOTH `FERRUM_KV_MAX_BLOCKS` (engine-side BlockPool) and
-/// `FERRUM_PAGED_MAX_SEQS` (model-side paged_pools — sizes the GPU
-/// KV pool as `max_seqs × max_blocks_per_seq`). Without bounding
-/// max_seqs the GPU pool can grow far past the engine pool budget
-/// — e.g. on Llama-3.1-8B FP16 with PAGED_MAX_SEQS=64 +
-/// KV_CAPACITY=2048 the pool is 16 GB by itself, OOMing weight load
-/// on a 24 GB card.
+/// Sets `FERRUM_KV_MAX_BLOCKS` (global physical paged-KV block budget),
+/// `FERRUM_PAGED_MAX_SEQS` (scheduler/model concurrency shape), and
+/// `FERRUM_KV_CAPACITY` (per-sequence logical table stride). The model
+/// allocates the GPU KV pool from `KV_MAX_BLOCKS`; `PAGED_MAX_SEQS *
+/// KV_CAPACITY` no longer reserves physical KV blocks up front.
 ///
 /// Idempotent — caller invokes once per CLI invocation before engine
 /// init. Respects user overrides (no clobber if env already set).
@@ -315,36 +313,15 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         AutoSizeProfile::Server => SERVER_PRESETS,
         AutoSizeProfile::Chat => CHAT_PRESETS,
     };
-    // Pool sizing: pool_blocks = max_seqs x ceil(KV_CAPACITY / 16).
-    // Picks the largest (max_seqs, KV_CAP) tuple from a fixed ladder whose
-    // pool fits the budget.
+    // Dynamic paged-KV sizing: the physical pool is `KV_MAX_BLOCKS`.
+    // Picks the largest (max_seqs, KV_CAP) tuple whose per-sequence table
+    // can fit in the global block budget. Multiple sequences share that pool
+    // on demand; they do not each reserve KV_CAPACITY at startup.
     //   Server: prioritise wide batch (c=16/32) over context.
     //   Chat:   single user, multi-turn -- pile budget into context.
     let (max_seqs_clamped, kv_capacity) = select_paged_pool_preset(presets, result.max_blocks);
 
     let kv_capacity_overridden = snapshot_value(&current, "FERRUM_KV_CAPACITY").is_some();
-    let mut forced_entries = Vec::new();
-    if let Some((requested_seqs, requested_cap, requested_blocks)) =
-        requested_paged_pool_blocks_from_snapshot(&current)
-    {
-        if requested_blocks > result.max_blocks {
-            let (safe_seqs, safe_cap) = select_paged_pool_preset(presets, result.max_blocks);
-            eprintln!(
-                "[auto-size] requested paged KV pool requires {} blocks (max_seqs={} kv_capacity={}) above memory budget {}; clamping to max_seqs={} kv_capacity={}",
-                requested_blocks, requested_seqs, requested_cap, result.max_blocks, safe_seqs, safe_cap
-            );
-            forced_entries.push(RuntimeConfigEntry::new(
-                "FERRUM_PAGED_MAX_SEQS",
-                safe_seqs.to_string(),
-                RuntimeConfigSource::MemoryProfile,
-            ));
-            forced_entries.push(RuntimeConfigEntry::new(
-                "FERRUM_KV_CAPACITY",
-                safe_cap.to_string(),
-                RuntimeConfigSource::MemoryProfile,
-            ));
-        }
-    }
     // MAX_BATCHED_TOKENS already set above (it's independent of the KV pool
     // sizing logic, runs even when the user overrode KV_MAX_BLOCKS + SEQS).
     // FERRUM_MOE_GRAPH is resolved as a typed CLI startup default and
@@ -371,11 +348,7 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
             RuntimeConfigSource::MemoryProfile,
         ));
     }
-    entries.extend(forced_entries.iter().cloned());
     crate::runtime_env::materialize_runtime_env_defaults(&entries);
-    for entry in &forced_entries {
-        std::env::set_var(&entry.key, &entry.effective_value);
-    }
     eprintln!(
         "[auto-size] KV_MAX_BLOCKS={} PAGED_MAX_SEQS={} KV_CAPACITY={}",
         if kv_overridden {
@@ -413,16 +386,17 @@ fn ceil_div_usize(value: usize, divisor: usize) -> usize {
 }
 
 fn select_paged_pool_preset(presets: &[(usize, usize)], max_blocks: usize) -> (usize, usize) {
-    if let Some((seqs, cap)) = presets.iter().copied().find(|(seqs, cap_tokens)| {
+    if let Some((seqs, cap)) = presets.iter().copied().find(|(_, cap_tokens)| {
         let bps = ceil_div_usize(*cap_tokens, PAGED_BLOCK_SIZE as usize).max(1);
-        seqs.saturating_mul(bps) <= max_blocks
+        bps <= max_blocks
     }) {
         return (seqs, cap);
     }
 
-    // Budget too tight for any preset -- try min server-like config.
-    let bps = (max_blocks / 8).max(8);
-    (8, bps * PAGED_BLOCK_SIZE as usize)
+    // Budget too tight for any preset's per-seq table. Keep the narrowest
+    // preset's concurrency shape and cap a single sequence to the pool.
+    let seqs = presets.last().map(|(seqs, _)| *seqs).unwrap_or(1);
+    (seqs, max_blocks.max(1) * PAGED_BLOCK_SIZE as usize)
 }
 
 fn weight_budget_shard_count(snapshot: &RuntimeConfigSnapshot) -> u64 {
@@ -471,22 +445,6 @@ fn requested_min_kv_blocks_from_snapshot(snapshot: &RuntimeConfigSnapshot) -> us
         .unwrap_or(0);
 
     max_model_len_blocks.max(max_batched_token_blocks)
-}
-
-fn requested_paged_pool_blocks_from_snapshot(
-    snapshot: &RuntimeConfigSnapshot,
-) -> Option<(usize, usize, usize)> {
-    match (
-        snapshot_usize(snapshot, "FERRUM_PAGED_MAX_SEQS"),
-        snapshot_usize(snapshot, "FERRUM_KV_CAPACITY"),
-    ) {
-        (Some(max_seqs), Some(kv_capacity)) => {
-            let blocks =
-                max_seqs.saturating_mul(ceil_div_usize(kv_capacity, PAGED_BLOCK_SIZE as usize));
-            Some((max_seqs, kv_capacity, blocks))
-        }
-        _ => None,
-    }
 }
 
 fn snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
@@ -589,21 +547,21 @@ mod tests {
         ]);
 
         assert_eq!(requested_min_kv_blocks_from_snapshot(&snapshot), 512);
-        assert_eq!(
-            requested_paged_pool_blocks_from_snapshot(&snapshot),
-            Some((8, 2048, 1024))
-        );
     }
 
     #[test]
-    fn paged_pool_preset_fits_block_budget() {
+    fn paged_pool_preset_keeps_concurrency_with_dynamic_block_pool() {
         assert_eq!(
             select_paged_pool_preset(&[(32, 512), (8, 512)], 338),
-            (8, 512)
+            (32, 512)
         );
         assert_eq!(
             select_paged_pool_preset(&[(32, 512), (16, 512)], 2048),
             (32, 512)
+        );
+        assert_eq!(
+            select_paged_pool_preset(&[(32, 2048), (8, 1024)], 64),
+            (8, 1024)
         );
     }
 }
