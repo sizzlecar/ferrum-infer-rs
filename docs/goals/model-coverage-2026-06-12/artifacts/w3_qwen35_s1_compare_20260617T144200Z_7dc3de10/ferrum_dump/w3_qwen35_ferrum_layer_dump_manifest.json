@@ -1,0 +1,234 @@
+{
+  "command_line": [
+    "target/debug/examples/w3_qwen35_s1_dump",
+    "--model-dir",
+    "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17",
+    "--hf-dump",
+    "/workspace/w3_hf_dump_artifacts/qwen35_08b_hf_layer_dump_20260617T141100Z_2d3092ba/dump",
+    "--out",
+    "/workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump"
+  ],
+  "git": {
+    "is_dirty": false,
+    "sha": "a98ef736728b1b88637c8751e00f8c25bc5f323d",
+    "tracked_status_short": [],
+    "untracked_count": 0,
+    "untracked_sample": []
+  },
+  "hf_reference_dump": "/workspace/w3_hf_dump_artifacts/qwen35_08b_hf_layer_dump_20260617T141100Z_2d3092ba/dump",
+  "mode": "ferrum-qwen35-s1-replay",
+  "model_dir": "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17",
+  "model_id": "Qwen/Qwen3.5-0.8B",
+  "note": "Ferrum-owned CPU replay of Qwen3.5 first linear-attention layer from HF safetensors weights",
+  "pass_line": "W3 QWEN35 FERRUM LAYER DUMP PASS: /workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump",
+  "producer": "ferrum-models-w3-qwen35-s1",
+  "prompt_input_ids": [
+    [
+      57590,
+      369,
+      279,
+      6511,
+      314
+    ]
+  ],
+  "schema_version": 1,
+  "selected_layer_idx": 0,
+  "selected_layer_type": "linear_attention",
+  "status": "pass",
+  "tensor_dir": "/workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump/tensors",
+  "tensors": {
+    "a_raw": {
+      "dtype": "float32",
+      "file": "a_raw.bin",
+      "numel": 80,
+      "shape": [
+        1,
+        5,
+        16
+      ]
+    },
+    "b_raw": {
+      "dtype": "float32",
+      "file": "b_raw.bin",
+      "numel": 80,
+      "shape": [
+        1,
+        5,
+        16
+      ]
+    },
+    "delta_beta": {
+      "dtype": "float32",
+      "file": "delta_beta.bin",
+      "numel": 80,
+      "shape": [
+        1,
+        5,
+        16
+      ]
+    },
+    "delta_core": {
+      "dtype": "float32",
+      "file": "delta_core.bin",
+      "numel": 10240,
+      "shape": [
+        1,
+        5,
+        16,
+        128
+      ]
+    },
+    "delta_g": {
+      "dtype": "float32",
+      "file": "delta_g.bin",
+      "numel": 80,
+      "shape": [
+        1,
+        5,
+        16
+      ]
+    },
+    "delta_k": {
+      "dtype": "float32",
+      "file": "delta_k.bin",
+      "numel": 10240,
+      "shape": [
+        1,
+        5,
+        16,
+        128
+      ]
+    },
+    "delta_norm": {
+      "dtype": "float32",
+      "file": "delta_norm.bin",
+      "numel": 10240,
+      "shape": [
+        80,
+        128
+      ]
+    },
+    "delta_output": {
+      "dtype": "float32",
+      "file": "delta_output.bin",
+      "numel": 5120,
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "delta_q": {
+      "dtype": "float32",
+      "file": "delta_q.bin",
+      "numel": 10240,
+      "shape": [
+        1,
+        5,
+        16,
+        128
+      ]
+    },
+    "delta_v": {
+      "dtype": "float32",
+      "file": "delta_v.bin",
+      "numel": 10240,
+      "shape": [
+        1,
+        5,
+        16,
+        128
+      ]
+    },
+    "input_norm": {
+      "dtype": "float32",
+      "file": "input_norm.bin",
+      "numel": 5120,
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "layer_input": {
+      "dtype": "float32",
+      "file": "layer_input.bin",
+      "numel": 5120,
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "layer_output": {
+      "dtype": "float32",
+      "file": "layer_output.bin",
+      "numel": 5120,
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "mixed_qkv_conv": {
+      "dtype": "float32",
+      "file": "mixed_qkv_conv.bin",
+      "numel": 30720,
+      "shape": [
+        1,
+        5,
+        6144
+      ]
+    },
+    "mixed_qkv_raw": {
+      "dtype": "float32",
+      "file": "mixed_qkv_raw.bin",
+      "numel": 30720,
+      "shape": [
+        1,
+        5,
+        6144
+      ]
+    },
+    "mlp_output": {
+      "dtype": "float32",
+      "file": "mlp_output.bin",
+      "numel": 5120,
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "post_attention_norm": {
+      "dtype": "float32",
+      "file": "post_attention_norm.bin",
+      "numel": 5120,
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "residual_after_mixer": {
+      "dtype": "float32",
+      "file": "residual_after_mixer.bin",
+      "numel": 5120,
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "z_raw": {
+      "dtype": "float32",
+      "file": "z_raw.bin",
+      "numel": 10240,
+      "shape": [
+        1,
+        5,
+        2048
+      ]
+    }
+  }
+}

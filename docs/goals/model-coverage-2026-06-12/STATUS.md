@@ -2,6 +2,53 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZZE — W3 Qwen3.5 S1 Ferrum-vs-HF layer compare PASS
+
+- Scope:
+  - W3-S1 correctness evidence for the dense Qwen3.5 first `linear_attention`
+    layer;
+  - model: `Qwen/Qwen3.5-0.8B`;
+  - prompt/layer match the committed HF reference layer dump from checkpoint
+    `ZZC`;
+  - Ferrum replay reads the real HF safetensors and dumps the same 19 tensor
+    checkpoints as the HF reference;
+  - no product-path `ferrum run` / `ferrum serve` was run in this checkpoint;
+  - no performance benchmark was run;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Evidence:
+  - artifact directory:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/`;
+  - Ferrum dump PASS:
+    `W3 QWEN35 FERRUM LAYER DUMP PASS:
+    /workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump`;
+  - comparator PASS:
+    `W3 QWEN35 LAYER COMPARE PASS:
+    /workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/compare`;
+  - remote git status recorded in both manifests:
+    `sha=a98ef736728b1b88637c8751e00f8c25bc5f323d`,
+    `is_dirty=false`, empty tracked status, `untracked_count=0`;
+  - compared tensors: 19/19 `pass`;
+  - largest recorded absolute delta:
+    `mixed_qkv_raw max_abs=2.765655517578125e-05,
+    mean_abs=9.50081827492492e-07`;
+  - final layer output delta:
+    `layer_output max_abs=8.642673492431641e-07,
+    mean_abs=5.998470555823588e-08`.
+- Remote state:
+  - retained 1x RTX 4090 host was left usable;
+  - no GPU compute process was present after the run;
+  - GPU memory check showed 1 MiB used.
+- Limitation:
+  - this proves the dense Qwen3.5 first layer replay path only;
+  - W3 still needs product loader/entrypoint work, `ferrum run` and
+    `ferrum serve` correctness, and the W3 performance gate;
+  - Qwen3.6 MoE/shared-expert coverage remains open.
+- Next required validation:
+  - extend this from diagnostic first-layer replay toward the product loader
+    path;
+  - add Qwen3.6 MoE/shared-expert evidence before any W3 release-grade claim;
+  - run W3-S2 product correctness before W3-S3 performance.
+
 ## 2026-06-17 ZZD — W3 Qwen3.5 Ferrum S1 replay source checkpoint
 
 - Scope:
