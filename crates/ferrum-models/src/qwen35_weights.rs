@@ -8,6 +8,9 @@ use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use ferrum_kernels::backend::Backend;
+use ferrum_quantization::{Linear, WeightLoader};
+use ferrum_types::{FerrumError, Result as FerrumResult};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
@@ -52,6 +55,84 @@ pub struct Qwen35ResolvedWeightPlan {
     pub prefix: String,
     pub global_tensors: Vec<Qwen35ResolvedWeightSpec>,
     pub layers: Vec<Qwen35ResolvedLayerWeights>,
+}
+
+pub struct Qwen35WeightPlanLoader<'a, B: Backend> {
+    plan: &'a Qwen35ResolvedWeightPlan,
+    inner: &'a dyn WeightLoader<B>,
+}
+
+impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
+    pub fn new(plan: &'a Qwen35ResolvedWeightPlan, inner: &'a dyn WeightLoader<B>) -> Self {
+        Self { plan, inner }
+    }
+
+    pub fn plan(&self) -> &'a Qwen35ResolvedWeightPlan {
+        self.plan
+    }
+
+    pub fn has_global_tensor(&self, role: &str) -> bool {
+        self.plan
+            .global_tensor(role)
+            .is_some_and(|tensor| tensor.present && self.inner.has_tensor(&tensor.name))
+    }
+
+    pub fn has_layer_tensor(&self, layer_index: usize, role: &str) -> bool {
+        self.plan
+            .layer_tensor(layer_index, role)
+            .is_some_and(|tensor| self.inner.has_tensor(&tensor.name))
+    }
+
+    pub fn load_global_tensor(&self, role: &str) -> FerrumResult<B::Buffer> {
+        let tensor = self.required_global_tensor(role)?;
+        self.inner.load_tensor(&tensor.name)
+    }
+
+    pub fn load_layer_tensor(&self, layer_index: usize, role: &str) -> FerrumResult<B::Buffer> {
+        let tensor = self.required_layer_tensor(layer_index, role)?;
+        self.inner.load_tensor(&tensor.name)
+    }
+
+    pub fn load_global_linear(&self, role: &str) -> FerrumResult<Box<dyn Linear<B>>> {
+        let tensor = self.required_global_tensor(role)?;
+        self.inner.load_linear(&linear_module_name(&tensor.name))
+    }
+
+    pub fn load_layer_linear(
+        &self,
+        layer_index: usize,
+        role: &str,
+    ) -> FerrumResult<Box<dyn Linear<B>>> {
+        let tensor = self.required_layer_tensor(layer_index, role)?;
+        self.inner.load_linear(&linear_module_name(&tensor.name))
+    }
+
+    fn required_global_tensor(&self, role: &str) -> FerrumResult<&Qwen35ResolvedWeightSpec> {
+        let tensor = self.plan.global_tensor(role).ok_or_else(|| {
+            FerrumError::model(format!(
+                "Qwen3.5 resolved weight plan has no global tensor role {role:?}"
+            ))
+        })?;
+        if !tensor.present {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 global tensor role {role:?} is absent: {}",
+                tensor.name
+            )));
+        }
+        Ok(tensor)
+    }
+
+    fn required_layer_tensor(
+        &self,
+        layer_index: usize,
+        role: &str,
+    ) -> FerrumResult<&Qwen35ResolvedWeightSpec> {
+        self.plan.layer_tensor(layer_index, role).ok_or_else(|| {
+            FerrumError::model(format!(
+                "Qwen3.5 resolved weight plan has no present layer tensor role {role:?} at layer {layer_index}"
+            ))
+        })
+    }
 }
 
 impl Qwen35WeightInventory {
@@ -356,12 +437,29 @@ impl Qwen35ResolvedWeightPlan {
                     .find(|tensor| tensor.role == role && tensor.present)
             })
     }
+
+    pub fn global_tensor(&self, role: &str) -> Option<&Qwen35ResolvedWeightSpec> {
+        self.global_tensors
+            .iter()
+            .find(|tensor| tensor.role == role)
+    }
+}
+
+fn linear_module_name(tensor_name: &str) -> String {
+    tensor_name
+        .strip_suffix(".weight")
+        .unwrap_or(tensor_name)
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
+    use ferrum_kernels::backend::cpu::CpuBackend;
+    use ferrum_quantization::{DenseLinear, QuantConfig, WeightLoader};
+    use ferrum_types::{FerrumError, Result as FerrumResult};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use tempfile::TempDir;
 
@@ -438,6 +536,56 @@ mod tests {
             &dir.join("model.safetensors"),
         )
         .unwrap();
+    }
+
+    struct RecordingLoader {
+        tensors: HashMap<String, Vec<f32>>,
+        linear_names: Mutex<Vec<String>>,
+    }
+
+    impl RecordingLoader {
+        fn from_names(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+            Self {
+                tensors: names
+                    .into_iter()
+                    .map(|name| (name.into(), vec![1.0]))
+                    .collect(),
+                linear_names: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn linear_names(&self) -> Vec<String> {
+            self.linear_names.lock().unwrap().clone()
+        }
+    }
+
+    impl WeightLoader<CpuBackend> for RecordingLoader {
+        fn load_tensor(&self, name: &str) -> FerrumResult<Vec<f32>> {
+            self.tensors
+                .get(name)
+                .cloned()
+                .ok_or_else(|| FerrumError::model(format!("missing tensor {name}")))
+        }
+
+        fn load_linear(
+            &self,
+            name: &str,
+        ) -> FerrumResult<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+            self.linear_names.lock().unwrap().push(name.to_string());
+            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(
+                &[0.0, 0.0],
+                1,
+                2,
+            )))
+        }
+
+        fn has_tensor(&self, name: &str) -> bool {
+            self.tensors.contains_key(name)
+        }
+
+        fn quant_config(&self) -> Option<&QuantConfig> {
+            None
+        }
     }
 
     #[test]
@@ -565,6 +713,47 @@ mod tests {
             .validation()
             .present_optional
             .contains(&"model.layers.0.mlp.experts.0.gate_proj.weight".to_string()));
+    }
+
+    #[test]
+    fn planned_loader_loads_by_role_and_strips_linear_weight_suffix() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        let inventory = Qwen35WeightInventory::from_names(names.clone());
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+        let loader = RecordingLoader::from_names(names);
+        let planned = Qwen35WeightPlanLoader::<CpuBackend>::new(&plan, &loader);
+
+        assert_eq!(planned.plan().prefix, "model");
+        assert!(planned.has_global_tensor("embed_tokens"));
+        assert_eq!(
+            planned.load_global_tensor("embed_tokens").unwrap(),
+            vec![1.0]
+        );
+        assert!(planned.has_layer_tensor(0, "linear_attn_qkv"));
+        let linear = planned.load_layer_linear(0, "linear_attn_qkv").unwrap();
+
+        assert_eq!(linear.in_features(), 2);
+        assert_eq!(
+            loader.linear_names(),
+            vec!["model.layers.0.linear_attn.in_proj_qkv".to_string()]
+        );
+        let err = planned
+            .load_global_tensor("lm_head")
+            .expect_err("tied lm_head is optional and absent");
+        assert!(err.to_string().contains("lm_head"), "{err}");
     }
 
     #[test]
