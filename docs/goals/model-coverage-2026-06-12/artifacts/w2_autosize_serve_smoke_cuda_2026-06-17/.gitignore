@@ -1,0 +1,6 @@
+local_vast/*.bundle
+local_vast/remote_monitor_00[1-6].*
+local_vast/remote_target_probe.*
+local_vast/scp_*
+local_vast/*_poll_tmp.raw.json
+local_vast/tmux_start.*

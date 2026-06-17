@@ -1,0 +1,52 @@
+{
+  "binary_sha256": "33a1999b0805c1daca1dd5b102eb9e5d91065951343d11e966a1816f3b418dc1  /workspace/ferrum-smoke-99859ce6/target/release/ferrum",
+  "effective_config_keys": {
+    "matches": [
+      {
+        "affects": [
+          "performance"
+        ],
+        "effective_value": "16",
+        "key": "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+        "source": "default"
+      },
+      {
+        "affects": [
+          "memory"
+        ],
+        "effective_value": "512",
+        "key": "FERRUM_KV_CAPACITY",
+        "source": "cli"
+      },
+      {
+        "affects": [
+          "performance",
+          "memory"
+        ],
+        "effective_value": "2048",
+        "key": "FERRUM_MAX_BATCHED_TOKENS",
+        "source": "memory_profile"
+      },
+      {
+        "affects": [
+          "performance",
+          "memory"
+        ],
+        "effective_value": "8",
+        "key": "FERRUM_PAGED_MAX_SEQS",
+        "source": "memory_profile"
+      }
+    ]
+  },
+  "git_head": "99859ce6e9e0c315ebf614f02a0ccec661a6c215",
+  "status": "pass",
+  "stream_summary": {
+    "content": "5\n",
+    "done_count": 1,
+    "usage": {
+      "completion_tokens": 3,
+      "prompt_tokens": 23,
+      "total_tokens": 26
+    }
+  }
+}
