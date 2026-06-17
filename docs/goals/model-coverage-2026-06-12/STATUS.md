@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZN — W3 executor weight-preflight boundary checkpoint
+
+- Scope:
+  - W3-S2 executor construction boundary after safetensors inventory support;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35W3Executor::from_definition_with_weight_preflight()`;
+  - the constructor reads a model directory via `Qwen35WeightInventory`;
+  - it validates the typed `Qwen35WeightManifest` before returning an executor;
+  - successful validation is retained on the executor as
+    `weight_validation()`;
+  - missing required tensors now fail during executor construction with a
+    specific missing tensor name;
+  - `Qwen35W3Executor::from_definition()` remains available for metadata-only
+    tests and performs no filesystem IO.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `12 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - registry still rejects Qwen3.5/Qwen3.6 product execution;
+  - this does not materialize tensor data into backend weights;
+  - this does not run prefill/decode.
+
 ## 2026-06-18 ZZM — W3 Qwen3.5/Qwen3.6 safetensors inventory checkpoint
 
 - Scope:
