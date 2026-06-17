@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="${ROOT:-/workspace/ferrum-infer-rs}"
-OUT="${OUT:-/workspace/w2_dynamic_prefill_full_matrix_samehw_cuda_2026-06-17}"
+OUT="${OUT:-/workspace/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17}"
 MODEL="${MODEL:-gemma3:27b-gptq}"
 HF_REPO="${HF_REPO:-circulus/gemma-3-27b-it-gptq}"
 HF_HOME="${HF_HOME:-/workspace/hf-cache}"
@@ -374,9 +374,9 @@ for c in cells:
 
 status = "diagnostic_pass" if all_pass and ferrum_rc == 0 and vllm_rc == 0 else "diagnostic_fail"
 summary = {
-    "lane": "w2_dynamic_prefill_full_matrix_samehw_cuda",
+    "lane": "w2_dynamic_kv_full_matrix_samehw_cuda",
     "status": status,
-    "release_gate": False,
+    "release_gate": "pending_final_validator",
     "required_validator_pass_line": "MODEL_RELEASE_GRADE_W2 PASS: <out_dir>",
     "remote_git_sha": read("env/git_sha.txt"),
     "remote_git_status_short": read("env/git_status_short.txt"),
@@ -398,9 +398,10 @@ summary = {
 (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
 lines = [
-    "# W2 dynamic-prefill same-hardware full matrix diagnostic",
+    "# W2 dynamic-KV same-hardware full matrix pre-gate summary",
     "",
-    "This is diagnostic evidence only and did not produce `MODEL_RELEASE_GRADE_W2 PASS`.",
+    "This summary is pre-gate evidence. Final release status is determined by ",
+    "`model_release_grade_goal_gate.manifest.json` when present.",
     "",
     f"- Status: `{status}`",
     f"- Remote git SHA: `{summary['remote_git_sha']}`",
@@ -595,6 +596,19 @@ date -u +%FT%TZ > "$OUT/env/end_utc.txt"
 if [ "$FERRUM_RC" -ne 0 ]; then
   echo "[w2-full-matrix] Ferrum bench failed with rc=$FERRUM_RC"
   exit "$FERRUM_RC"
+fi
+
+echo "[w2-full-matrix] generating W2 release-grade manifest"
+set +e
+python3 "$ROOT/scripts/release/model_release_grade_manifest.py" w2 \
+  --source "$OUT" \
+  --out "$OUT" \
+  2>&1 | tee "$OUT/model_release_grade_manifest.log"
+GATE_RC=${PIPESTATUS[0]}
+set -e
+if [ "$GATE_RC" -ne 0 ]; then
+  echo "[w2-full-matrix] release-grade manifest/gate failed with rc=$GATE_RC"
+  exit "$GATE_RC"
 fi
 
 echo "[w2-full-matrix] done $(date -u +%FT%TZ)"
