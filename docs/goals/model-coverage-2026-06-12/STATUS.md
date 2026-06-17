@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZO — W3-S0 source checkpoint: engine recurrent-state lifecycle carrier
+
+- Scope:
+  - source-only W3-S0 engine lifecycle checkpoint;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `SequenceState::recurrent_state` as an optional handle carried next
+    to KV state;
+  - threaded recurrent-state handles through continuous-engine prefill,
+    chunked-prefill, decode, and unified mixed-batch inputs/outputs;
+  - cleared recurrent state on preemption reset so resumed requests cannot
+    silently reuse stale state;
+  - kept current attention-only product paths behaviorally unchanged because no
+    recurrent manager allocation path is introduced yet.
+- Validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-engine --all-targets` PASS;
+  - `cargo test -p ferrum-engine test_sequence_state -- --nocapture` PASS:
+    `1 passed`.
+- Next required validation:
+  - W3 still needs real recurrent-state manager injection/allocation and S0
+    native CUDA/PTX delta-rule microbench before product DeltaNet integration;
+  - W2 release-grade full matrix still requires restored Vast credit.
+
 ## 2026-06-17 ZN — W3-S0 source checkpoint: scheduler recurrent-state resources
 
 - Scope:

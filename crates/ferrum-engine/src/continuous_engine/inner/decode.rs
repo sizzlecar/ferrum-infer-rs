@@ -55,7 +55,7 @@ impl EngineInner {
                     seq_id,
                     q_tokens: vec![last_token.get()],
                     kv_cache,
-                    recurrent_state: None,
+                    recurrent_state: seq.recurrent_state.clone(),
                     pos_offset,
                     is_final_chunk: true,
                     metadata: seq.model_decode_metadata(),
@@ -206,14 +206,20 @@ impl EngineInner {
                 .as_ref()
                 .ok_or_else(|| FerrumError::internal("No KV cache"))?
                 .clone();
+            let recurrent_state = seq.recurrent_state.clone();
             let last_token = seq
                 .generated_tokens
                 .last()
                 .copied()
                 .unwrap_or(TokenId::new(0));
             let tensor = self.tokens_to_tensor(&[last_token.get()])?;
-            ferrum_interfaces::model_executor::DecodeInput::new(tensor, kv_cache)
-                .with_metadata(seq.model_decode_metadata())
+            let input = ferrum_interfaces::model_executor::DecodeInput::new(tensor, kv_cache)
+                .with_metadata(seq.model_decode_metadata());
+            if let Some(state) = recurrent_state {
+                input.with_recurrent_state(state)
+            } else {
+                input
+            }
         };
 
         let decode_output = self.model_executor.decode(&decode_input).await?;
@@ -231,6 +237,7 @@ impl EngineInner {
             )?;
             seq.generated_tokens.push(token);
             seq.kv_cache = Some(decode_output.kv_cache.clone());
+            seq.recurrent_state = decode_output.recurrent_state.clone();
             seq.tokens_this_iteration += 1;
             token
         };

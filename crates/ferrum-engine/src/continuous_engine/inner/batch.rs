@@ -151,6 +151,7 @@ impl EngineInner {
             rid: RequestId,
             input_tokens: Vec<TokenId>,
             kv_handle: Arc<dyn KvCacheHandle>,
+            recurrent_state: Option<Arc<dyn ferrum_interfaces::RecurrentStateHandle>>,
             metadata: std::collections::HashMap<String, serde_json::Value>,
             logits_policy: LogitsReturnPolicy,
             fresh_kv: bool,
@@ -163,7 +164,15 @@ impl EngineInner {
         let has_decode_items = !decode_ids.is_empty();
         let mut unified_prefills: Vec<UnifiedPrefillWork> = Vec::new();
         for rid in &prefill_ids {
-            let (input_tokens, num_tokens, existing_kv, chunk_start, metadata, logits_policy) = {
+            let (
+                input_tokens,
+                num_tokens,
+                existing_kv,
+                existing_recurrent_state,
+                chunk_start,
+                metadata,
+                logits_policy,
+            ) = {
                 let sequences = self.sequences.read();
                 let Some(seq) = sequences.get(rid) else {
                     continue;
@@ -172,6 +181,7 @@ impl EngineInner {
                     seq.input_tokens.clone(),
                     seq.input_tokens.len(),
                     seq.kv_cache.clone(),
+                    seq.recurrent_state.clone(),
                     seq.prefill_tokens_processed,
                     seq.model_decode_metadata(),
                     if skip_prefix_cache {
@@ -269,6 +279,7 @@ impl EngineInner {
                 rid: rid.clone(),
                 input_tokens,
                 kv_handle,
+                recurrent_state: existing_recurrent_state,
                 metadata,
                 logits_policy,
                 fresh_kv,
@@ -293,7 +304,7 @@ impl EngineInner {
                 seq_id,
                 q_tokens,
                 kv_cache: work.kv_handle.clone(),
-                recurrent_state: None,
+                recurrent_state: work.recurrent_state.clone(),
                 pos_offset: work.chunk_start,
                 is_final_chunk: work.is_final_chunk,
                 metadata: work.metadata.clone(),
@@ -333,7 +344,7 @@ impl EngineInner {
                     seq_id,
                     q_tokens: vec![last_token.get()],
                     kv_cache: kv,
-                    recurrent_state: None,
+                    recurrent_state: seq.recurrent_state.clone(),
                     pos_offset,
                     is_final_chunk: true,
                     metadata: seq.model_decode_metadata(),
@@ -426,6 +437,7 @@ impl EngineInner {
                         if let Some(seq) = sequences.get_mut(&work.rid) {
                             seq.model_cache_id = Some(kv_handle.cache_id());
                             seq.kv_cache = Some(kv_handle);
+                            seq.recurrent_state = unified.items[i].recurrent_state.clone();
                             seq.prefill_tokens_processed =
                                 work.chunk_start.saturating_add(work.chunk_len);
                             seq.phase = RequestPhase::Prefilling;
@@ -474,6 +486,7 @@ impl EngineInner {
                 seq.generated_tokens.push(token);
                 seq.model_cache_id = Some(kv_handle.cache_id());
                 seq.kv_cache = Some(kv_handle);
+                seq.recurrent_state = unified.items[i].recurrent_state.clone();
                 seq.prefill_tokens_processed = num_tokens;
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
@@ -728,6 +741,7 @@ impl EngineInner {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(&victim_id) {
                 seq.kv_cache = None;
+                seq.recurrent_state = None;
                 seq.model_cache_id = None;
                 seq.generated_tokens.clear();
                 seq.prefill_complete = false;

@@ -155,9 +155,16 @@ impl EngineInner {
                 .map(|seq| seq.model_decode_metadata())
                 .unwrap_or_default()
         };
+        let initial_recurrent_state = {
+            let sequences = self.sequences.read();
+            sequences
+                .get(request_id)
+                .and_then(|seq| seq.recurrent_state.clone())
+        };
 
         let prefill_output = if let Some(csz) = chunk_size {
             let mut current_kv = kv_handle;
+            let mut current_recurrent_state = initial_recurrent_state;
             let mut final_output: Option<ferrum_interfaces::model_executor::PrefillOutput> = None;
             let mut processed = 0usize;
             while processed < num_tokens {
@@ -167,11 +174,15 @@ impl EngineInner {
                     .map(|t| t.get())
                     .collect();
                 let chunk_tensor = self.tokens_to_tensor(&chunk_ids)?;
-                let input = ferrum_interfaces::model_executor::PrefillInput::new(chunk_tensor)
+                let mut input = ferrum_interfaces::model_executor::PrefillInput::new(chunk_tensor)
                     .with_kv_cache(current_kv.clone())
                     .with_metadata(request_metadata.clone());
+                if let Some(state) = current_recurrent_state.clone() {
+                    input = input.with_recurrent_state(state);
+                }
                 let out = self.model_executor.prefill(&input).await?;
                 current_kv = out.kv_cache.clone();
+                current_recurrent_state = out.recurrent_state.clone();
 
                 self.scheduler.mark_prefill_chunk_processed(
                     request_id,
@@ -193,6 +204,11 @@ impl EngineInner {
             let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor)
                 .with_kv_cache(kv_handle)
                 .with_metadata(request_metadata);
+            let prefill_input = if let Some(state) = initial_recurrent_state {
+                prefill_input.with_recurrent_state(state)
+            } else {
+                prefill_input
+            };
             self.model_executor.prefill(&prefill_input).await?
         };
 
@@ -220,6 +236,7 @@ impl EngineInner {
             seq.generated_tokens.push(token);
             seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
             seq.kv_cache = Some(prefill_output.kv_cache.clone());
+            seq.recurrent_state = prefill_output.recurrent_state.clone();
             seq.prefill_complete = true;
             seq.phase = RequestPhase::Decoding;
             token
@@ -437,6 +454,7 @@ impl EngineInner {
                 seq.generated_tokens.push(token);
                 seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
                 seq.kv_cache = Some(prefill_output.kv_cache.clone());
+                seq.recurrent_state = prefill_output.recurrent_state.clone();
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
                 token
