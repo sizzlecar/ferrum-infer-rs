@@ -134,21 +134,21 @@ def require_artifact(raw: Any, label: str, out_dir: Path, problems: list[str]) -
         problems.append(f"{label} artifact missing: {raw} (checked {candidates})")
 
 
-def validate_evidence_entry(
-    entry: Any,
-    label: str,
-    out_dir: Path,
-    problems: list[str],
-) -> None:
+def existing_artifact_path(raw: Any, out_dir: Path) -> Path | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    for candidate in artifact_candidates(raw, out_dir):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def evidence_artifact_values(entry: Any, label: str, problems: list[str]) -> list[Any]:
     if isinstance(entry, str):
-        require_artifact(entry, label, out_dir, problems)
-        return
+        return [entry]
     obj = as_object(entry, label, problems)
     if not obj:
-        return
-    status = obj.get("status", "pass")
-    if status != "pass":
-        problems.append(f"{label} status must be pass, got {status!r}")
+        return []
     paths: list[Any] = []
     if "artifact" in obj:
         paths.append(obj["artifact"])
@@ -160,6 +160,21 @@ def validate_evidence_entry(
             paths.extend(artifacts)
         else:
             problems.append(f"{label}.artifacts must be a list")
+    return paths
+
+
+def validate_evidence_entry(
+    entry: Any,
+    label: str,
+    out_dir: Path,
+    problems: list[str],
+) -> None:
+    obj = entry if isinstance(entry, dict) else None
+    if obj is not None:
+        status = obj.get("status", "pass")
+        if status != "pass":
+            problems.append(f"{label} status must be pass, got {status!r}")
+    paths = evidence_artifact_values(entry, label, problems)
     if not paths:
         problems.append(f"{label} must reference at least one artifact")
     for idx, raw in enumerate(paths):
@@ -408,12 +423,151 @@ def validate_correctness(
             problems.append(f"correctness missing {key}")
             continue
         validate_evidence_entry(correctness[key], f"correctness.{key}", out_dir, problems)
+    if lane == "w3" and "w3_s2_whole_model_product_path" in correctness:
+        validate_w3_s2_product_artifact(
+            correctness["w3_s2_whole_model_product_path"],
+            out_dir,
+            problems,
+        )
     product = as_object(manifest.get("product_entrypoints"), "product_entrypoints", problems)
     for key in sorted(REQUIRED_PRODUCT_ENTRYPOINTS):
         if key not in product:
             problems.append(f"product_entrypoints missing {key}")
             continue
         validate_evidence_entry(product[key], f"product_entrypoints.{key}", out_dir, problems)
+
+
+def validate_product_command(
+    parts: list[str],
+    label: str,
+    subcommand: str,
+    problems: list[str],
+) -> None:
+    if subcommand not in parts:
+        problems.append(f"{label} command must invoke ferrum {subcommand}")
+    for part in parts:
+        if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
+            problems.append(f"{label} command uses hidden env override: {part.split('=', 1)[0]}")
+
+
+def validate_w3_s2_product_artifact(entry: Any, out_dir: Path, problems: list[str]) -> None:
+    artifacts = evidence_artifact_values(
+        entry,
+        "correctness.w3_s2_whole_model_product_path",
+        problems,
+    )
+    if not artifacts:
+        return
+    artifact_path = existing_artifact_path(artifacts[0], out_dir)
+    if artifact_path is None:
+        return
+    try:
+        data = as_object(
+            load_json(artifact_path),
+            "correctness.w3_s2_whole_model_product_path.artifact",
+            problems,
+        )
+    except ValidationError as exc:
+        problems.append(f"correctness.w3_s2_whole_model_product_path invalid JSON: {exc}")
+        return
+    if not data:
+        return
+
+    label = "correctness.w3_s2_whole_model_product_path"
+    if data.get("status") != "pass":
+        problems.append(f"{label}.status must be pass")
+    if data.get("lane") != "w3_s2_whole_model_product_path":
+        problems.append(f"{label}.lane must be w3_s2_whole_model_product_path")
+    if data.get("runtime_surface") not in {
+        "typed_cli",
+        "typed_config",
+        "typed_defaults",
+        "model_defaults",
+    }:
+        problems.append(f"{label}.runtime_surface must be typed product behavior")
+    if data.get("hidden_env", []) != []:
+        problems.append(f"{label}.hidden_env must be empty")
+
+    product = as_object(data.get("product_entrypoints"), f"{label}.product_entrypoints", problems)
+    run_entry = as_object(product.get("ferrum_run"), f"{label}.product_entrypoints.ferrum_run", problems)
+    if run_entry:
+        if run_entry.get("status") != "pass":
+            problems.append(f"{label}.ferrum_run.status must be pass")
+        run_command = command_parts(
+            run_entry.get("command_line"),
+            f"{label}.ferrum_run.command_line",
+            problems,
+        )
+        if run_command:
+            validate_product_command(run_command, f"{label}.ferrum_run", "run", problems)
+        assistant = as_object(
+            run_entry.get("assistant_event"),
+            f"{label}.ferrum_run.assistant_event",
+            problems,
+        )
+        if assistant:
+            if assistant.get("finish_reason") not in {"stop", "length"}:
+                problems.append(f"{label}.ferrum_run finish_reason must be stop or length")
+            positive_int(assistant.get("n_tokens"), f"{label}.ferrum_run.n_tokens", problems)
+            content = assistant.get("content")
+            if not isinstance(content, str) or not content.strip():
+                problems.append(f"{label}.ferrum_run.content must be non-empty")
+        if "stdout" in run_entry:
+            validate_evidence_entry(run_entry["stdout"], f"{label}.ferrum_run.stdout", out_dir, problems)
+        if "stderr" in run_entry:
+            validate_evidence_entry(run_entry["stderr"], f"{label}.ferrum_run.stderr", out_dir, problems)
+
+    serve_entry = as_object(
+        product.get("ferrum_serve"),
+        f"{label}.product_entrypoints.ferrum_serve",
+        problems,
+    )
+    if serve_entry:
+        if serve_entry.get("status") != "pass":
+            problems.append(f"{label}.ferrum_serve.status must be pass")
+        serve_command = command_parts(
+            serve_entry.get("command_line"),
+            f"{label}.ferrum_serve.command_line",
+            problems,
+        )
+        if serve_command:
+            validate_product_command(serve_command, f"{label}.ferrum_serve", "serve", problems)
+        if "log" in serve_entry:
+            validate_evidence_entry(serve_entry["log"], f"{label}.ferrum_serve.log", out_dir, problems)
+        nonstream = as_object(
+            serve_entry.get("nonstream"),
+            f"{label}.ferrum_serve.nonstream",
+            problems,
+        )
+        if nonstream:
+            if nonstream.get("finish_reason") not in {"stop", "length"}:
+                problems.append(f"{label}.ferrum_serve.nonstream finish_reason must be stop or length")
+            positive_int(nonstream.get("content_len"), f"{label}.ferrum_serve.nonstream.content_len", problems)
+            if "artifact" in nonstream:
+                validate_evidence_entry(
+                    nonstream["artifact"],
+                    f"{label}.ferrum_serve.nonstream.artifact",
+                    out_dir,
+                    problems,
+                )
+        stream = as_object(serve_entry.get("stream"), f"{label}.ferrum_serve.stream", problems)
+        if stream:
+            positive_int(stream.get("chunk_count"), f"{label}.ferrum_serve.stream.chunk_count", problems)
+            done_count = positive_int(
+                stream.get("done_count"),
+                f"{label}.ferrum_serve.stream.done_count",
+                problems,
+            )
+            if done_count is not None and done_count != 1:
+                problems.append(f"{label}.ferrum_serve.stream.done_count must be exactly 1")
+            require_true(stream.get("has_usage"), f"{label}.ferrum_serve.stream.has_usage", problems)
+            if "artifact" in stream:
+                validate_evidence_entry(
+                    stream["artifact"],
+                    f"{label}.ferrum_serve.stream.artifact",
+                    out_dir,
+                    problems,
+                )
 
 
 def metric_from_cell(cell: dict[str, Any], problems: list[str], label: str) -> float | None:
@@ -931,13 +1085,71 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
         "l5_concurrency": {"status": "pass", "artifact": "l5.json"},
     }
     if lane == "w3":
-        for rel in [
-            "w3_s0_design.json",
-            "w3_s0_microbench.json",
-            "w3_s1_single_layer.json",
-            "w3_s2_whole_model_product_path.json",
-        ]:
+        for rel in ["w3_s0_design.json", "w3_s0_microbench.json", "w3_s1_single_layer.json"]:
             write_json(root / rel, {"status": "pass", "name": rel})
+        write_json(root / "w3_run_stdout.jsonl", {"role": "assistant", "content": "ok ok"})
+        write_json(root / "w3_serve_nonstream.json", {"choices": [{"message": {"content": "ok"}}]})
+        (root / "w3_run_stderr.txt").write_text("", encoding="utf-8")
+        (root / "w3_serve.log").write_text("selftest serve log\n", encoding="utf-8")
+        (root / "w3_serve_stream.sse").write_text(
+            'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+            'data: {"usage":{"completion_tokens":1}}\n\n'
+            "data: [DONE]\n\n",
+            encoding="utf-8",
+        )
+        write_json(
+            root / "w3_s2_whole_model_product_path.json",
+            {
+                "schema_version": 1,
+                "status": "pass",
+                "lane": "w3_s2_whole_model_product_path",
+                "runtime_surface": "typed_cli",
+                "hidden_env": [],
+                "product_entrypoints": {
+                    "ferrum_run": {
+                        "status": "pass",
+                        "command_line": [
+                            "ferrum",
+                            "run",
+                            "selftest-qwen35",
+                            "--backend",
+                            "cpu",
+                            "--qwen35-reference",
+                        ],
+                        "stdout": "w3_run_stdout.jsonl",
+                        "stderr": "w3_run_stderr.txt",
+                        "assistant_event": {
+                            "finish_reason": "length",
+                            "n_tokens": 2,
+                            "content": "ok ok",
+                        },
+                    },
+                    "ferrum_serve": {
+                        "status": "pass",
+                        "command_line": [
+                            "ferrum",
+                            "serve",
+                            "selftest-qwen35",
+                            "--backend",
+                            "cpu",
+                            "--qwen35-reference",
+                        ],
+                        "log": "w3_serve.log",
+                        "nonstream": {
+                            "artifact": "w3_serve_nonstream.json",
+                            "finish_reason": "length",
+                            "content_len": 2,
+                        },
+                        "stream": {
+                            "artifact": "w3_serve_stream.sse",
+                            "chunk_count": 2,
+                            "done_count": 1,
+                            "has_usage": True,
+                        },
+                    },
+                },
+            },
+        )
         correctness.update(
             {
                 "w3_s0_design": {"status": "pass", "artifact": "w3_s0_design.json"},
@@ -1028,6 +1240,19 @@ def run_selftest() -> int:
             "correctness missing w3_s0_microbench" in problem for problem in bad_w3_problems
         ):
             raise AssertionError("bad W3 missing-S0 selftest did not fail as expected")
+
+        bad_w3_product = tmp_root / "bad-w3-product-no-usage"
+        bad_w3_product_manifest = write_selftest_manifest(bad_w3_product, lane="w3", ratio=0.82)
+        product = load_json(bad_w3_product / "w3_s2_whole_model_product_path.json")
+        product["product_entrypoints"]["ferrum_serve"]["stream"]["has_usage"] = False
+        write_json(bad_w3_product / "w3_s2_whole_model_product_path.json", product)
+        bad_w3_product_problems = validate_manifest(
+            load_json(bad_w3_product_manifest),
+            "w3",
+            bad_w3_product,
+        )
+        if not any("ferrum_serve.stream.has_usage" in problem for problem in bad_w3_product_problems):
+            raise AssertionError("bad W3 product no-usage selftest did not fail as expected")
 
         bad = tmp_root / "bad-ratio"
         bad_manifest = write_selftest_manifest(bad, ratio=0.79)
