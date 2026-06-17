@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZK — W3-S0 design checkpoint: recurrent-state boundary
+
+- Scope:
+  - source/docs-only W3-S0 design checkpoint;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `W3_S0_RECURRENT_STATE_DESIGN.md`;
+  - defined recurrent state as a separate cache abstraction rather than folding
+    it into `KvCacheHandle`;
+  - captured the interface boundary for paged KV, ContinuousBatch,
+    preemption/resume, prefix cache, scheduler resource accounting, and
+    model-executor inputs;
+  - documented the native CUDA/PTX S0 microbench contract for chunked
+    delta-rule before any W3 product-path integration.
+- Current external blocker:
+  - Vast still reports `credit=0`, no running instances, and only stopped
+    49GB RTX 4090 instance `41276321`;
+  - higher-priced replacement offers cannot be rented until the external
+    account credit state changes.
+- Next required validation:
+  - after credit is restored, resume W2 full-matrix same-hardware CUDA evidence
+    first;
+  - for W3, implement the recurrent-state interfaces and S0 microbench before
+    touching product `run`/`serve` paths.
+
 ## 2026-06-17 ZJ — W2-P0 docs checkpoint: coverage PASS is not release-grade PASS
 
 - Scope:
