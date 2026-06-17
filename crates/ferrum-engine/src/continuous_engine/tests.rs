@@ -408,6 +408,31 @@ fn model_decode_metadata_marks_structured_requests_for_full_logits() {
 }
 
 #[test]
+fn sequence_state_prefill_context_preserves_generated_tokens_for_kv_recompute() {
+    let mut state = SequenceState::new(policy_request(), vec![TokenId::new(10), TokenId::new(11)]);
+    state.generated_tokens = vec![TokenId::new(12), TokenId::new(13)];
+
+    assert_eq!(
+        state.prefill_context_tokens(),
+        vec![
+            TokenId::new(10),
+            TokenId::new(11),
+            TokenId::new(12),
+            TokenId::new(13)
+        ]
+    );
+    assert_eq!(state.prefill_context_len(), 4);
+    assert!(
+        state
+            .model_decode_metadata()
+            .get("ferrum_kv_capacity_hint")
+            .and_then(|value| value.as_u64())
+            .unwrap()
+            >= state.prefill_context_len() as u64
+    );
+}
+
+#[test]
 fn model_decode_metadata_marks_sampling_masks_for_full_logits() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         4,

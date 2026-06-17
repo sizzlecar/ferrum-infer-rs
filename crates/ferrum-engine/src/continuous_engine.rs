@@ -721,6 +721,20 @@ impl SequenceState {
         self.input_tokens.len() + self.generated_tokens.len()
     }
 
+    pub fn prefill_context_tokens(&self) -> Vec<TokenId> {
+        if self.generated_tokens.is_empty() {
+            return self.input_tokens.clone();
+        }
+        let mut tokens = Vec::with_capacity(self.input_tokens.len() + self.generated_tokens.len());
+        tokens.extend_from_slice(&self.input_tokens);
+        tokens.extend_from_slice(&self.generated_tokens);
+        tokens
+    }
+
+    pub fn prefill_context_len(&self) -> usize {
+        self.input_tokens.len() + self.generated_tokens.len()
+    }
+
     pub fn model_decode_metadata(&self) -> HashMap<String, serde_json::Value> {
         let mut metadata = self.original_request.metadata.clone();
         if self.requires_full_logits_for_sampling() {
@@ -731,9 +745,9 @@ impl SequenceState {
         }
         metadata.insert(
             "ferrum_kv_capacity_hint".to_string(),
-            serde_json::json!(
-                self.input_tokens.len() + self.sampling_params.max_tokens.saturating_sub(1)
-            ),
+            serde_json::json!(self
+                .prefill_context_len()
+                .max(self.input_tokens.len() + self.sampling_params.max_tokens.saturating_sub(1))),
         );
         metadata
     }

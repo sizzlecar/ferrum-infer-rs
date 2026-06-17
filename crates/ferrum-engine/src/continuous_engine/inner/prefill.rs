@@ -28,12 +28,16 @@ impl EngineInner {
     }
 
     async fn run_prefill_inner(&self, request_id: &RequestId) -> Result<()> {
-        let (input_tokens_clone, num_tokens) = {
+        let (context_tokens, num_tokens, can_use_prefix_cache) = {
             let sequences = self.sequences.read();
             let seq = sequences
                 .get(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-            (seq.input_tokens.clone(), seq.input_tokens.len())
+            (
+                seq.prefill_context_tokens(),
+                seq.prefill_context_len(),
+                seq.generated_tokens.is_empty(),
+            )
         };
 
         // ── Check prefix cache ──────────────────────────────────────────
@@ -59,14 +63,14 @@ impl EngineInner {
         // Opt in via `FERRUM_PREFIX_CACHE=1` once the CoW fix lands.
         let recurrent_state_spec = self
             .model_executor
-            .recurrent_state_spec(request_id, &input_tokens_clone)?;
+            .recurrent_state_spec(request_id, &context_tokens)?;
         let skip_prefix_cache =
             !self.runtime_config.prefix_cache_enabled || recurrent_state_spec.is_some();
-        if !skip_prefix_cache {
+        if !skip_prefix_cache && can_use_prefix_cache {
             let hit = self
                 .prefix_cache
-                .find_prefix(&input_tokens_clone)
-                .filter(|(prefix_id, _, _)| prefix_id.len() == input_tokens_clone.len());
+                .find_prefix(&context_tokens)
+                .filter(|(prefix_id, _, _)| prefix_id.len() == context_tokens.len());
             if let Some((_prefix_id, cached_kv, cached_logits)) = hit {
                 debug!(
                     "Prefix cache hit for {}: reusing {} cached tokens",
@@ -169,7 +173,7 @@ impl EngineInner {
             let mut processed = 0usize;
             while processed < num_tokens {
                 let end = (processed + csz).min(num_tokens);
-                let chunk_ids: Vec<u32> = input_tokens_clone[processed..end]
+                let chunk_ids: Vec<u32> = context_tokens[processed..end]
                     .iter()
                     .map(|t| t.get())
                     .collect();
@@ -198,7 +202,7 @@ impl EngineInner {
             final_output.expect("at least one chunk must run")
         } else {
             let input_tensor = {
-                let token_u32s: Vec<u32> = input_tokens_clone.iter().map(|t| t.get()).collect();
+                let token_u32s: Vec<u32> = context_tokens.iter().map(|t| t.get()).collect();
                 self.tokens_to_tensor(&token_u32s)?
             };
             let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor)
@@ -215,12 +219,15 @@ impl EngineInner {
         let last_logits = prefill_output.last_token_logits()?;
         let logits_vec = last_logits.to_vec_f32()?;
 
-        // Store in prefix cache for future reuse
-        let _ = self.prefix_cache.store_prefix(
-            &input_tokens_clone,
-            prefill_output.kv_cache.clone(),
-            logits_vec.clone(),
-        );
+        // Store only prompt-only prefills. Replay prefills include already
+        // generated output and would be low-value, request-specific entries.
+        if can_use_prefix_cache {
+            let _ = self.prefix_cache.store_prefix(
+                &context_tokens,
+                prefill_output.kv_cache.clone(),
+                logits_vec.clone(),
+            );
+        }
 
         let first_token = {
             let mut sequences = self.sequences.write();
@@ -309,6 +316,7 @@ impl EngineInner {
             Arc<dyn ferrum_interfaces::KvCacheHandle>,
             Option<Arc<dyn ferrum_interfaces::RecurrentStateHandle>>,
             std::collections::HashMap<String, serde_json::Value>,
+            bool,
         )> = Vec::new();
 
         let model_info = self.model_executor.info();
@@ -323,15 +331,16 @@ impl EngineInner {
         let skip_prefix_cache = !self.runtime_config.prefix_cache_enabled;
 
         for rid in request_ids {
-            let (input_tokens, num_tokens, metadata) = {
+            let (input_tokens, num_tokens, metadata, can_use_prefix_cache) = {
                 let sequences = self.sequences.read();
                 let Some(seq) = sequences.get(rid) else {
                     continue; // request gone (cancelled mid-batch)
                 };
                 (
-                    seq.input_tokens.clone(),
-                    seq.input_tokens.len(),
+                    seq.prefill_context_tokens(),
+                    seq.prefill_context_len(),
                     seq.model_decode_metadata(),
+                    seq.generated_tokens.is_empty(),
                 )
             };
             let recurrent_state_spec = self
@@ -339,7 +348,7 @@ impl EngineInner {
                 .recurrent_state_spec(rid, &input_tokens)?;
 
             // Prefix cache hit short-circuit (mirrors run_prefill_inner).
-            if !skip_prefix_cache && recurrent_state_spec.is_none() {
+            if !skip_prefix_cache && can_use_prefix_cache && recurrent_state_spec.is_none() {
                 let hit = self
                     .prefix_cache
                     .find_prefix(&input_tokens)
@@ -424,6 +433,7 @@ impl EngineInner {
                 kv_handle,
                 recurrent_state,
                 metadata,
+                can_use_prefix_cache,
             ));
         }
 
@@ -434,7 +444,7 @@ impl EngineInner {
         // ── Phase 1b: ONE batched model_executor.batch_prefill call ──
         let inputs: Vec<PrefillInput> = to_prefill
             .iter()
-            .map(|(_, tokens, kv, recurrent_state, metadata)| {
+            .map(|(_, tokens, kv, recurrent_state, metadata, _)| {
                 let token_u32s: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
                 let tensor = self.tokens_to_tensor(&token_u32s)?;
                 let input = PrefillInput::new(tensor)
@@ -458,18 +468,20 @@ impl EngineInner {
         }
 
         // ── Phase 1c: per-item post-process (sample, update seq, stream, stop) ──
-        for ((rid, input_tokens, _, recurrent_state, _), prefill_output) in
+        for ((rid, input_tokens, _, recurrent_state, _, can_use_prefix_cache), prefill_output) in
             to_prefill.iter().zip(outputs.iter())
         {
             let num_tokens = input_tokens.len();
             let last_logits = prefill_output.last_token_logits()?;
             let logits_vec = last_logits.to_vec_f32()?;
-            let _ = self.prefix_cache.store_prefix(
-                input_tokens,
-                prefill_output.kv_cache.clone(),
-                logits_vec.clone(),
-            );
-            let first_token = {
+            if *can_use_prefix_cache {
+                let _ = self.prefix_cache.store_prefix(
+                    input_tokens,
+                    prefill_output.kv_cache.clone(),
+                    logits_vec.clone(),
+                );
+            }
+            let first_token_result = {
                 let mut sequences = self.sequences.write();
                 let Some(seq) = sequences.get_mut(rid) else {
                     continue;
@@ -489,7 +501,15 @@ impl EngineInner {
                     .or_else(|| recurrent_state.clone());
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
-                token
+                Ok::<TokenId, FerrumError>(token)
+            };
+            let first_token = match first_token_result {
+                Ok(token) => token,
+                Err(e) => {
+                    warn!("Batch prefill post-process failed for {}: {}", rid, e);
+                    self.complete_request(rid, FinishReason::Error).await?;
+                    continue;
+                }
             };
             self.scheduler.mark_prefill_complete(rid, num_tokens);
             self.total_prefill_tokens
