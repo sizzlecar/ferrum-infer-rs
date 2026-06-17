@@ -215,6 +215,67 @@ pub struct Qwen35SparseMoeReference {
     pub moe_output: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35DenseReferenceModel<'a> {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub eps: f32,
+    pub embed_tokens: &'a [f32],
+    pub final_norm_weight: &'a [f32],
+    pub lm_head_weight: &'a [f32],
+    pub layers: &'a [Qwen35DenseReferenceLayer<'a>],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Qwen35DenseReferenceLayer<'a> {
+    Linear(Qwen35DenseReferenceLinearLayer<'a>),
+    Full(Qwen35DenseReferenceFullLayer<'a>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35DenseReferenceLinearLayer<'a> {
+    pub shape: Qwen35DenseLinearAttentionLayerShape,
+    pub input_norm_weight: &'a [f32],
+    pub qkv_weight: &'a [f32],
+    pub z_weight: &'a [f32],
+    pub b_weight: &'a [f32],
+    pub a_weight: &'a [f32],
+    pub conv1d_weight: &'a [f32],
+    pub a_log: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub norm_weight: &'a [f32],
+    pub out_proj_weight: &'a [f32],
+    pub post_attention_norm_weight: &'a [f32],
+    pub gate_proj_weight: &'a [f32],
+    pub up_proj_weight: &'a [f32],
+    pub down_proj_weight: &'a [f32],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35DenseReferenceFullLayer<'a> {
+    pub shape: Qwen35DenseFullAttentionLayerShape,
+    pub input_norm_weight: &'a [f32],
+    pub q_weight: &'a [f32],
+    pub k_weight: &'a [f32],
+    pub v_weight: &'a [f32],
+    pub q_norm_weight: &'a [f32],
+    pub k_norm_weight: &'a [f32],
+    pub o_weight: &'a [f32],
+    pub post_attention_norm_weight: &'a [f32],
+    pub gate_proj_weight: &'a [f32],
+    pub up_proj_weight: &'a [f32],
+    pub down_proj_weight: &'a [f32],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen35DenseReferenceModelOutput {
+    pub hidden: Vec<f32>,
+    pub final_hidden: Vec<f32>,
+    pub logits: Vec<f32>,
+    pub layer_hidden_states: Vec<Vec<f32>>,
+    pub linear_recurrent_states: Vec<Vec<f32>>,
+}
+
 pub fn qwen35_runtime_config(
     config: &Qwen35TextConfig,
     vocab_size: usize,
@@ -238,6 +299,113 @@ pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<Ll
         def.vocab_size,
         def.max_position_embeddings,
     ))
+}
+
+pub fn qwen35_dense_reference_model_forward_cpu(
+    model: Qwen35DenseReferenceModel<'_>,
+    input_ids: &[usize],
+) -> Result<Qwen35DenseReferenceModelOutput> {
+    model.validate(input_ids.len())?;
+    if input_ids.is_empty() {
+        return Err(FerrumError::model(
+            "Qwen3.5 dense reference forward requires at least one input token",
+        ));
+    }
+    let tokens = input_ids.len();
+    let mut hidden = gather_embedding_rows(
+        model.embed_tokens,
+        input_ids,
+        model.vocab_size,
+        model.hidden_size,
+    )?;
+    let mut layer_hidden_states = Vec::with_capacity(model.layers.len());
+    let mut linear_recurrent_states = Vec::new();
+
+    for layer in model.layers {
+        match layer {
+            Qwen35DenseReferenceLayer::Linear(layer) => {
+                if layer.shape.tokens != tokens || layer.shape.hidden_size != model.hidden_size {
+                    return Err(FerrumError::model(format!(
+                        "Qwen3.5 dense reference linear layer shape {:?} does not match tokens={tokens} hidden={}",
+                        layer.shape, model.hidden_size
+                    )));
+                }
+                let state_len = layer.shape.attention.state_len();
+                let initial_state = vec![0.0; state_len];
+                let out = qwen35_dense_linear_attention_layer_cpu(
+                    &hidden,
+                    layer.input_norm_weight,
+                    layer.qkv_weight,
+                    layer.z_weight,
+                    layer.b_weight,
+                    layer.a_weight,
+                    layer.conv1d_weight,
+                    layer.a_log,
+                    layer.dt_bias,
+                    layer.norm_weight,
+                    layer.out_proj_weight,
+                    layer.post_attention_norm_weight,
+                    layer.gate_proj_weight,
+                    layer.up_proj_weight,
+                    layer.down_proj_weight,
+                    &initial_state,
+                    layer.shape,
+                    model.eps,
+                )?;
+                linear_recurrent_states.push(out.attention.final_state);
+                hidden = out.layer_output;
+            }
+            Qwen35DenseReferenceLayer::Full(layer) => {
+                if layer.shape.tokens != tokens || layer.shape.hidden_size != model.hidden_size {
+                    return Err(FerrumError::model(format!(
+                        "Qwen3.5 dense reference full layer shape {:?} does not match tokens={tokens} hidden={}",
+                        layer.shape, model.hidden_size
+                    )));
+                }
+                let out = qwen35_dense_full_attention_layer_cpu(
+                    &hidden,
+                    layer.input_norm_weight,
+                    layer.q_weight,
+                    layer.k_weight,
+                    layer.v_weight,
+                    layer.q_norm_weight,
+                    layer.k_norm_weight,
+                    layer.o_weight,
+                    layer.post_attention_norm_weight,
+                    layer.gate_proj_weight,
+                    layer.up_proj_weight,
+                    layer.down_proj_weight,
+                    layer.shape,
+                    model.eps,
+                )?;
+                hidden = out.layer_output;
+            }
+        }
+        layer_hidden_states.push(hidden.clone());
+    }
+
+    let final_hidden = qwen35_rms_norm_plus_one_cpu(
+        &hidden,
+        model.final_norm_weight,
+        tokens,
+        model.hidden_size,
+        model.eps,
+    )?;
+    let logits = qwen35_linear_cpu(
+        &final_hidden,
+        model.lm_head_weight,
+        tokens,
+        model.hidden_size,
+        model.vocab_size,
+    )?;
+
+    Ok(Qwen35DenseReferenceModelOutput {
+        hidden,
+        final_hidden,
+        logits,
+        layer_hidden_states,
+        linear_recurrent_states,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1538,6 +1706,57 @@ impl Qwen35SparseMoeShape {
     }
 }
 
+impl Qwen35DenseReferenceModel<'_> {
+    fn validate(self, tokens: usize) -> Result<()> {
+        if self.vocab_size == 0 || self.hidden_size == 0 || self.layers.is_empty() {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 dense reference model shape must be positive, got vocab={} hidden={} layers={}",
+                self.vocab_size,
+                self.hidden_size,
+                self.layers.len()
+            )));
+        }
+        validate_len(
+            "dense reference embed_tokens",
+            self.embed_tokens.len(),
+            self.vocab_size * self.hidden_size,
+        )?;
+        validate_len(
+            "dense reference final_norm_weight",
+            self.final_norm_weight.len(),
+            self.hidden_size,
+        )?;
+        validate_len(
+            "dense reference lm_head_weight",
+            self.lm_head_weight.len(),
+            self.vocab_size * self.hidden_size,
+        )?;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            match layer {
+                Qwen35DenseReferenceLayer::Linear(layer) => {
+                    if layer.shape.tokens != tokens || layer.shape.hidden_size != self.hidden_size {
+                        return Err(FerrumError::model(format!(
+                            "Qwen3.5 dense reference layer {idx} linear shape {:?} does not match tokens={tokens} hidden={}",
+                            layer.shape, self.hidden_size
+                        )));
+                    }
+                    layer.shape.validate()?;
+                }
+                Qwen35DenseReferenceLayer::Full(layer) => {
+                    if layer.shape.tokens != tokens || layer.shape.hidden_size != self.hidden_size {
+                        return Err(FerrumError::model(format!(
+                            "Qwen3.5 dense reference layer {idx} full shape {:?} does not match tokens={tokens} hidden={}",
+                            layer.shape, self.hidden_size
+                        )));
+                    }
+                    layer.shape.validate()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn validate_delta_rule_shapes(
     query: &[f32],
     key: &[f32],
@@ -1591,6 +1810,30 @@ fn add_same_len(lhs: &[f32], rhs: &[f32], label: &str) -> Result<Vec<f32>> {
         .zip(rhs)
         .map(|(left, right)| left + right)
         .collect())
+}
+
+fn gather_embedding_rows(
+    embed_tokens: &[f32],
+    input_ids: &[usize],
+    vocab_size: usize,
+    hidden_size: usize,
+) -> Result<Vec<f32>> {
+    validate_len(
+        "embedding table",
+        embed_tokens.len(),
+        vocab_size * hidden_size,
+    )?;
+    let mut out = Vec::with_capacity(input_ids.len() * hidden_size);
+    for (position, token_id) in input_ids.iter().copied().enumerate() {
+        if token_id >= vocab_size {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 input token id {token_id} at position {position} exceeds vocab_size {vocab_size}"
+            )));
+        }
+        let start = token_id * hidden_size;
+        out.extend_from_slice(&embed_tokens[start..start + hidden_size]);
+    }
+    Ok(out)
 }
 
 fn qwen35_apply_rope_cpu(
@@ -2848,6 +3091,261 @@ mod tests {
             err.to_string().contains("fused_gate_up_proj length"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn dense_reference_model_forward_composes_layers_norm_and_lm_head() {
+        let input_ids = vec![0, 1];
+        let embed_tokens = vec![
+            1.0, 0.0, //
+            0.0, 1.0, //
+            1.0, 1.0,
+        ];
+        let linear_shape = Qwen35DenseLinearAttentionLayerShape {
+            tokens: 2,
+            hidden_size: 2,
+            intermediate_size: 2,
+            attention: Qwen35LinearAttentionShape {
+                tokens: 2,
+                key_heads: 1,
+                value_heads: 1,
+                key_dim: 1,
+                value_dim: 1,
+                conv_kernel: 1,
+            },
+        };
+        let linear_input_norm = vec![0.0, 0.0];
+        let linear_qkv = vec![
+            1.0, 0.0, //
+            0.0, 1.0, //
+            1.0, 1.0,
+        ];
+        let linear_z = vec![1.0, -1.0];
+        let linear_b = vec![0.5, 0.25];
+        let linear_a = vec![-0.25, 0.75];
+        let linear_conv = vec![1.0, 1.0, 1.0];
+        let linear_a_log = vec![0.0];
+        let linear_dt_bias = vec![0.0];
+        let linear_norm = vec![1.0];
+        let linear_out = vec![1.0, -0.5];
+        let linear_post_norm = vec![0.0, 0.0];
+        let linear_gate = vec![
+            0.2, 0.1, //
+            -0.1, 0.3,
+        ];
+        let linear_up = vec![
+            0.4, -0.2, //
+            0.3, 0.5,
+        ];
+        let linear_down = vec![
+            1.0, 0.0, //
+            0.0, 1.0,
+        ];
+
+        let full_shape = Qwen35DenseFullAttentionLayerShape {
+            tokens: 2,
+            hidden_size: 2,
+            intermediate_size: 2,
+            attention: Qwen35FullAttentionShape {
+                tokens: 2,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 2,
+                position_offset: 0,
+                rope_theta: 10_000.0,
+            },
+        };
+        let full_input_norm = vec![0.0, 0.0];
+        let full_q = vec![
+            1.0, 0.0, //
+            0.0, 1.0,
+        ];
+        let full_k = vec![
+            0.5, 0.0, //
+            0.0, 0.5,
+        ];
+        let full_v = vec![
+            1.0, 1.0, //
+            -0.5, 0.5,
+        ];
+        let full_q_norm = vec![1.0, 1.0];
+        let full_k_norm = vec![1.0, 1.0];
+        let full_o = vec![
+            1.0, 0.0, //
+            0.0, 1.0,
+        ];
+        let full_post_norm = vec![0.0, 0.0];
+        let full_gate = vec![
+            -0.2, 0.2, //
+            0.1, 0.3,
+        ];
+        let full_up = vec![
+            0.25, 0.5, //
+            -0.3, 0.4,
+        ];
+        let full_down = vec![
+            0.5, 0.25, //
+            -0.2, 0.75,
+        ];
+        let final_norm = vec![0.0, 0.0];
+        let lm_head = vec![
+            1.0, 0.0, //
+            0.0, 1.0, //
+            1.0, 1.0,
+        ];
+
+        let hidden0 = gather_embedding_rows(&embed_tokens, &input_ids, 3, 2).unwrap();
+        let linear_ref = qwen35_dense_linear_attention_layer_cpu(
+            &hidden0,
+            &linear_input_norm,
+            &linear_qkv,
+            &linear_z,
+            &linear_b,
+            &linear_a,
+            &linear_conv,
+            &linear_a_log,
+            &linear_dt_bias,
+            &linear_norm,
+            &linear_out,
+            &linear_post_norm,
+            &linear_gate,
+            &linear_up,
+            &linear_down,
+            &[0.0; 1],
+            linear_shape,
+            1e-6,
+        )
+        .unwrap();
+        let full_ref = qwen35_dense_full_attention_layer_cpu(
+            &linear_ref.layer_output,
+            &full_input_norm,
+            &full_q,
+            &full_k,
+            &full_v,
+            &full_q_norm,
+            &full_k_norm,
+            &full_o,
+            &full_post_norm,
+            &full_gate,
+            &full_up,
+            &full_down,
+            full_shape,
+            1e-6,
+        )
+        .unwrap();
+        let expected_final =
+            qwen35_rms_norm_plus_one_cpu(&full_ref.layer_output, &final_norm, 2, 2, 1e-6).unwrap();
+        let expected_logits = qwen35_linear_cpu(&expected_final, &lm_head, 2, 2, 3).unwrap();
+        let layers = vec![
+            Qwen35DenseReferenceLayer::Linear(Qwen35DenseReferenceLinearLayer {
+                shape: linear_shape,
+                input_norm_weight: &linear_input_norm,
+                qkv_weight: &linear_qkv,
+                z_weight: &linear_z,
+                b_weight: &linear_b,
+                a_weight: &linear_a,
+                conv1d_weight: &linear_conv,
+                a_log: &linear_a_log,
+                dt_bias: &linear_dt_bias,
+                norm_weight: &linear_norm,
+                out_proj_weight: &linear_out,
+                post_attention_norm_weight: &linear_post_norm,
+                gate_proj_weight: &linear_gate,
+                up_proj_weight: &linear_up,
+                down_proj_weight: &linear_down,
+            }),
+            Qwen35DenseReferenceLayer::Full(Qwen35DenseReferenceFullLayer {
+                shape: full_shape,
+                input_norm_weight: &full_input_norm,
+                q_weight: &full_q,
+                k_weight: &full_k,
+                v_weight: &full_v,
+                q_norm_weight: &full_q_norm,
+                k_norm_weight: &full_k_norm,
+                o_weight: &full_o,
+                post_attention_norm_weight: &full_post_norm,
+                gate_proj_weight: &full_gate,
+                up_proj_weight: &full_up,
+                down_proj_weight: &full_down,
+            }),
+        ];
+        let output = qwen35_dense_reference_model_forward_cpu(
+            Qwen35DenseReferenceModel {
+                vocab_size: 3,
+                hidden_size: 2,
+                eps: 1e-6,
+                embed_tokens: &embed_tokens,
+                final_norm_weight: &final_norm,
+                lm_head_weight: &lm_head,
+                layers: &layers,
+            },
+            &input_ids,
+        )
+        .unwrap();
+
+        assert_eq!(output.layer_hidden_states.len(), 2);
+        assert_eq!(output.linear_recurrent_states.len(), 1);
+        assert_close_slice(
+            &output.layer_hidden_states[0],
+            &linear_ref.layer_output,
+            1e-6,
+        );
+        assert_close_slice(&output.hidden, &full_ref.layer_output, 1e-6);
+        assert_close_slice(&output.final_hidden, &expected_final, 1e-6);
+        assert_close_slice(&output.logits, &expected_logits, 1e-6);
+        assert_close_slice(
+            &output.linear_recurrent_states[0],
+            &linear_ref.attention.final_state,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn dense_reference_model_forward_rejects_oov_token() {
+        let embed_tokens = vec![1.0, 0.0, 0.0, 1.0];
+        let layers = vec![Qwen35DenseReferenceLayer::Full(
+            Qwen35DenseReferenceFullLayer {
+                shape: Qwen35DenseFullAttentionLayerShape {
+                    tokens: 1,
+                    hidden_size: 2,
+                    intermediate_size: 1,
+                    attention: Qwen35FullAttentionShape {
+                        tokens: 1,
+                        num_heads: 1,
+                        num_kv_heads: 1,
+                        head_dim: 2,
+                        position_offset: 0,
+                        rope_theta: 10_000.0,
+                    },
+                },
+                input_norm_weight: &[0.0, 0.0],
+                q_weight: &[1.0, 0.0, 0.0, 1.0],
+                k_weight: &[1.0, 0.0, 0.0, 1.0],
+                v_weight: &[1.0, 0.0, 0.0, 1.0],
+                q_norm_weight: &[1.0, 1.0],
+                k_norm_weight: &[1.0, 1.0],
+                o_weight: &[1.0, 0.0, 0.0, 1.0],
+                post_attention_norm_weight: &[0.0, 0.0],
+                gate_proj_weight: &[1.0, 1.0],
+                up_proj_weight: &[1.0, 1.0],
+                down_proj_weight: &[1.0, 1.0],
+            },
+        )];
+        let err = qwen35_dense_reference_model_forward_cpu(
+            Qwen35DenseReferenceModel {
+                vocab_size: 2,
+                hidden_size: 2,
+                eps: 1e-6,
+                embed_tokens: &embed_tokens,
+                final_norm_weight: &[0.0, 0.0],
+                lm_head_weight: &[1.0, 0.0, 0.0, 1.0],
+                layers: &layers,
+            },
+            &[2],
+        )
+        .expect_err("token id 2 should exceed vocab size 2");
+
+        assert!(err.to_string().contains("token id 2"), "{err}");
     }
 
     #[test]
