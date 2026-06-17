@@ -211,13 +211,15 @@ pub fn write_qwen35_s1_dump(
     producer: &str,
 ) -> Result<(), String> {
     fs::create_dir_all(out_dir).map_err(|err| format!("create {out_dir:?}: {err}"))?;
+    let tensors_dir = out_dir.join("tensors");
+    fs::create_dir_all(&tensors_dir).map_err(|err| format!("create {tensors_dir:?}: {err}"))?;
     let dump = compute_qwen35_s1_dump(model_dir, hf_dump_dir)?;
     for name in QWEN35_LAYER_TENSORS {
         let values = dump
             .tensors
             .get(*name)
             .ok_or_else(|| format!("computed dump missing tensor {name}"))?;
-        write_f32(&out_dir.join(format!("{name}.bin")), values)?;
+        write_f32(&tensors_dir.join(format!("{name}.bin")), values)?;
     }
     let tensor_manifest = QWEN35_LAYER_TENSORS
         .iter()
@@ -255,6 +257,7 @@ pub fn write_qwen35_s1_dump(
             "prompt_input_ids": [dump.input_ids],
             "hf_reference_dump": hf_dump_dir.display().to_string(),
             "model_dir": model_dir.display().to_string(),
+            "tensor_dir": tensors_dir.display().to_string(),
             "tensors": tensor_manifest,
             "note": "Ferrum-owned CPU replay of Qwen3.5 first linear-attention layer from HF safetensors weights",
         }),
