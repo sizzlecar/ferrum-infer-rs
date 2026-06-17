@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ17 — W3 L0 template artifact generator checkpoint
+
+- Scope:
+  - W3 L0 chat-template/tokenizer golden artifact generation path;
+  - local CPU/Rust test execution only, no GPU/CUDA/Metal execution;
+  - no real Qwen3.5/Qwen3.6 L0 PASS and no real `MODEL_RELEASE_GRADE_W3
+    PASS: <out_dir>` was produced.
+- Change:
+  - added `scripts/release/w3_l0_template_gate.py`;
+  - the script validates a checked-in HF `apply_chat_template` golden fixture
+    with the existing Rust `ferrum-server` chat-template golden test;
+  - it also runs the no-silent-fallback unit test
+    `model_template_render_failure_is_an_error_not_a_silent_fallback`;
+  - it records a structured `w3_l0_template.json` accepted by the W3 final
+    validator, including the five required L0 cases, byte-equality status,
+    no hidden env, explicit render-failure behavior, and special-token
+    provenance from `generation_config.json`.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_l0_template_gate.py` PASS;
+  - `python3 scripts/release/w3_l0_template_gate.py --self-test` PASS:
+    `W3 L0 TEMPLATE SELFTEST PASS`;
+  - `git diff --check -- scripts/release/w3_l0_template_gate.py` PASS;
+  - real-mode smoke with existing `Qwen/Qwen3-0.6B` fixture PASS:
+    `W3 L0 TEMPLATE PASS: /tmp/ferrum-w3-l0-smoke-fMxTvX/out`;
+  - final-gate L0 structure probe on that artifact PASS:
+    `W3 L0 FINAL-GATE STRUCTURE PASS:
+    /tmp/ferrum-w3-l0-smoke-fMxTvX/out`.
+- Limitation:
+  - the real-mode smoke used an existing Qwen3 fixture plus temporary
+    `generation_config.json`; W3 still needs actual Qwen3.5/Qwen3.6 HF
+    golden fixtures and L0 artifact collection before release-grade evidence
+    can claim Qwen3.5/Qwen3.6 correctness.
+
 ## 2026-06-18 ZZZ16 — W3 L0-L5 correctness artifact gate hardening
 
 - Scope:
