@@ -163,6 +163,8 @@ impl FifoScheduler {
                 gpu_memory: (total_tokens * 16) as u64, // Rough estimate: 16 bytes per token
                 cpu_memory: (total_tokens * 4) as u64,  // Rough estimate: 4 bytes per token
                 kv_cache_blocks: total_tokens / 16,     // Assume 16 tokens per block
+                recurrent_state_bytes: 0,
+                recurrent_state_slots: 0,
                 compute_units: 1,
             },
             created_at: chrono::Utc::now(),

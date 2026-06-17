@@ -688,6 +688,8 @@ impl ContinuousBatchScheduler {
                 gpu_memory: (total_tokens * 16) as u64,
                 cpu_memory: (total_tokens * 4) as u64,
                 kv_cache_blocks: total_tokens / 16,
+                recurrent_state_bytes: 0,
+                recurrent_state_slots: 0,
                 compute_units: 1,
             },
             created_at: chrono::Utc::now(),
