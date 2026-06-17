@@ -4,9 +4,12 @@
 //! weight plan into backend-native buffers and linears, but intentionally does
 //! not implement product forward execution yet.
 
+use std::ops::Range;
+
+use ferrum_interfaces::RecurrentStateSpec;
 use ferrum_kernels::backend::Backend;
 use ferrum_quantization::Linear;
-use ferrum_types::Result;
+use ferrum_types::{DataType, Device, FerrumError, RequestId, Result};
 
 use crate::{
     common::LlmRuntimeConfig,
@@ -79,6 +82,22 @@ pub struct Qwen35SparseMoeSharedExpertWeights<B: Backend> {
     pub fused_down_proj: B::Buffer,
 }
 
+pub struct Qwen35RecurrentStateCache<B: Backend> {
+    pub request_id: RequestId,
+    pub dtype: DataType,
+    pub device: Device,
+    pub max_batch_slots: usize,
+    pub tensors: Vec<Qwen35RecurrentStateTensor<B>>,
+}
+
+pub struct Qwen35RecurrentStateTensor<B: Backend> {
+    pub layer_index: usize,
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub elements_per_slot: usize,
+    pub buffer: B::Buffer,
+}
+
 pub fn qwen35_runtime_config(
     config: &Qwen35TextConfig,
     vocab_size: usize,
@@ -102,6 +121,81 @@ pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<Ll
         def.vocab_size,
         def.max_position_embeddings,
     ))
+}
+
+impl<B: Backend> Qwen35RecurrentStateCache<B> {
+    pub fn from_spec(spec: &RecurrentStateSpec) -> Result<Self> {
+        if spec.max_batch_slots == 0 {
+            return Err(FerrumError::model(
+                "Qwen3.5 recurrent state requires at least one batch slot",
+            ));
+        }
+        let mut tensors = Vec::with_capacity(spec.tensors.len());
+        for tensor in &spec.tensors {
+            if tensor.shape.is_empty() {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 recurrent tensor layer={} name={} has empty shape",
+                    tensor.layer_index, tensor.name
+                )));
+            }
+            let elements_per_slot = tensor.num_elements();
+            let total_elements = elements_per_slot.saturating_mul(spec.max_batch_slots);
+            let zeros = vec![0.0f32; total_elements];
+            tensors.push(Qwen35RecurrentStateTensor {
+                layer_index: tensor.layer_index,
+                name: tensor.name.clone(),
+                shape: tensor.shape.clone(),
+                elements_per_slot,
+                buffer: B::from_slice(&zeros),
+            });
+        }
+        Ok(Self {
+            request_id: spec.request_id.clone(),
+            dtype: spec.dtype,
+            device: spec.device.clone(),
+            max_batch_slots: spec.max_batch_slots,
+            tensors,
+        })
+    }
+
+    pub fn total_elements(&self) -> usize {
+        self.tensors
+            .iter()
+            .map(|tensor| tensor.elements_per_slot * self.max_batch_slots)
+            .sum()
+    }
+
+    pub fn estimated_memory_bytes(&self) -> usize {
+        self.total_elements() * self.dtype.size_bytes()
+    }
+
+    pub fn tensor(&self, layer_index: usize, name: &str) -> Option<&Qwen35RecurrentStateTensor<B>> {
+        self.tensors
+            .iter()
+            .find(|tensor| tensor.layer_index == layer_index && tensor.name == name)
+    }
+
+    pub fn tensor_mut(
+        &mut self,
+        layer_index: usize,
+        name: &str,
+    ) -> Option<&mut Qwen35RecurrentStateTensor<B>> {
+        self.tensors
+            .iter_mut()
+            .find(|tensor| tensor.layer_index == layer_index && tensor.name == name)
+    }
+}
+
+impl<B: Backend> Qwen35RecurrentStateTensor<B> {
+    pub fn slot_range(&self, slot: usize, max_batch_slots: usize) -> Result<Range<usize>> {
+        if slot >= max_batch_slots {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 recurrent state slot {slot} exceeds max_batch_slots {max_batch_slots}"
+            )));
+        }
+        let start = slot * self.elements_per_slot;
+        Ok(start..start + self.elements_per_slot)
+    }
 }
 
 impl<B: Backend> Qwen35ModelWeights<B> {
@@ -494,5 +588,48 @@ mod tests {
         assert_eq!(runtime.head_dim, 4);
         assert_eq!(runtime.vocab_size, 32000);
         assert_eq!(runtime.max_seq_len, 4096);
+    }
+
+    #[test]
+    fn allocates_recurrent_state_cache_from_spec() {
+        let config = dense_config();
+        let request_id = RequestId::new();
+        let spec = config
+            .to_recurrent_state_spec(request_id.clone(), DataType::BF16, Device::CPU, 2)
+            .unwrap();
+
+        let cache = Qwen35RecurrentStateCache::<CpuBackend>::from_spec(&spec).unwrap();
+        let first = cache
+            .tensor(0, crate::qwen35_config::QWEN35_DELTA_STATE_NAME)
+            .unwrap();
+        let second_slot = first.slot_range(1, cache.max_batch_slots).unwrap();
+
+        assert_eq!(cache.request_id, request_id);
+        assert_eq!(cache.dtype, DataType::BF16);
+        assert_eq!(cache.device, Device::CPU);
+        assert_eq!(cache.max_batch_slots, 2);
+        assert_eq!(cache.tensors.len(), 3);
+        assert_eq!(first.shape, vec![2, 4, 4]);
+        assert_eq!(first.elements_per_slot, 32);
+        assert_eq!(second_slot, 32..64);
+        assert_eq!(cache.total_elements(), 3 * 2 * 32);
+        assert_eq!(cache.estimated_memory_bytes(), 3 * 2 * 32 * 2);
+    }
+
+    #[test]
+    fn rejects_recurrent_state_slot_overflow() {
+        let config = dense_config();
+        let spec = config
+            .to_recurrent_state_spec(RequestId::new(), DataType::FP16, Device::CPU, 1)
+            .unwrap();
+        let cache = Qwen35RecurrentStateCache::<CpuBackend>::from_spec(&spec).unwrap();
+        let first = cache
+            .tensor(0, crate::qwen35_config::QWEN35_DELTA_STATE_NAME)
+            .unwrap();
+        let err = first
+            .slot_range(1, cache.max_batch_slots)
+            .expect_err("slot 1 should exceed one-slot recurrent state cache");
+
+        assert!(err.to_string().contains("slot 1"), "{err}");
     }
 }

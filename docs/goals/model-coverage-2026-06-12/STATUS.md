@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZS — W3 model-side recurrent-state cache checkpoint
+
+- Scope:
+  - W3-S2 recurrent-state runtime storage prerequisite;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35RecurrentStateCache`;
+  - added `Qwen35RecurrentStateTensor`;
+  - model-side recurrent state can now be allocated from
+    `RecurrentStateSpec`;
+  - each recurrent tensor records layer index, state name, shape,
+    elements-per-slot, and backend buffer;
+  - added slot-range calculation so future DeltaNet updates can write only
+    the active request slot;
+  - cache accounting reports total elements and dtype-based estimated memory.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `20 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this still does not implement DeltaNet state update kernels;
+  - this does not implement Qwen3.5/Qwen3.6 prefill/decode;
+  - this does not register W3 product execution.
+
 ## 2026-06-18 ZZR — W3 runtime-config contract checkpoint
 
 - Scope:
