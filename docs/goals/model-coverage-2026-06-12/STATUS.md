@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ5 — W3 sparse-MoE layer composition checkpoint
+
+- Scope:
+  - W3-S1/S2 Qwen3.5 sparse-MoE layer composition before full MoE model
+    forward/product wiring;
+  - no product registry wiring was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35SparseMoeLinearAttentionLayerShape` and reference output;
+  - added `Qwen35SparseMoeFullAttentionLayerShape` and reference output;
+  - added `qwen35_sparse_moe_linear_attention_layer_cpu()`;
+  - added `qwen35_sparse_moe_full_attention_layer_cpu()`;
+  - both paths compose Qwen3.5 RMSNorm+1, linear/full attention, residual,
+    post-attention RMSNorm+1, shared-expert sparse MoE, and final residual.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `51 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still CPU/reference layer composition only;
+  - MoE full-model reference forward, safetensors materialization into the MoE
+    runtime, product `ferrum run`/`ferrum serve`, W3 correctness gates, and W3
+    80% performance gates remain incomplete.
+
 ## 2026-06-18 ZZZ4 — W3 dense reference safetensors prefill checkpoint
 
 - Scope:
