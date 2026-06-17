@@ -1,5 +1,15 @@
 use super::*;
+use crate::recurrent_state::{InMemoryRecurrentStateConfig, InMemoryRecurrentStateManager};
 use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
+use ferrum_interfaces::{
+    model_executor::{
+        DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PrefillInput,
+        PrefillOutput,
+    },
+    ModelExecutor, RecurrentStateManager, RecurrentStateSpec, RecurrentStateTensorSpec,
+};
+use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensorFactory};
+use std::time::Duration;
 
 struct PolicyTokenizer {
     vocab_size: usize,
@@ -120,6 +130,48 @@ fn policy_request() -> InferenceRequest {
         created_at: chrono::Utc::now(),
         api_request: None,
         metadata: HashMap::new(),
+    }
+}
+
+struct RecurrentSpecExecutor {
+    inner: MockModelExecutor,
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for RecurrentSpecExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+
+    fn recurrent_state_spec(
+        &self,
+        request_id: &RequestId,
+        _input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        Ok(Some(RecurrentStateSpec {
+            request_id: request_id.clone(),
+            num_layers: 1,
+            tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
+            dtype: DataType::BF16,
+            device: Device::CPU,
+            max_batch_slots: 1,
+        }))
+    }
+
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        self.inner.prefill(input).await
+    }
+
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.inner.decode(input).await
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
     }
 }
 
@@ -251,6 +303,49 @@ fn test_sequence_state() {
     assert_eq!(state.total_tokens(), 2);
     assert!(!state.prefill_complete);
     assert!(state.recurrent_state.is_none());
+}
+
+#[tokio::test]
+async fn engine_allocates_and_deallocates_model_declared_recurrent_state() {
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(
+        ferrum_types::SchedulerConfig::default(),
+    ));
+    let tokenizer = Arc::new(PolicyTokenizer::new(64, &[]));
+    let sampler = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    let executor = Arc::new(RecurrentSpecExecutor {
+        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+    });
+    let tensor_factory = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 1024,
+            total_batch_slots: 4,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        EngineConfig::default(),
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager.clone()),
+    );
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+
+    let response = engine.infer(request).await.unwrap();
+
+    assert_eq!(response.finish_reason, FinishReason::Length);
+    let stats = recurrent_manager.stats();
+    assert_eq!(stats.allocation_count, 1);
+    assert_eq!(stats.allocation_failures, 0);
+    assert_eq!(stats.active_states, 0);
+    assert_eq!(stats.used_memory_bytes, 0);
 }
 
 #[test]

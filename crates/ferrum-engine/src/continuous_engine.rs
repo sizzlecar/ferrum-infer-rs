@@ -1256,6 +1256,41 @@ impl EngineInner {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    async fn ensure_recurrent_state(
+        &self,
+        request_id: &RequestId,
+        spec: Option<ferrum_interfaces::RecurrentStateSpec>,
+    ) -> Result<Option<Arc<dyn RecurrentStateHandle>>> {
+        if let Some(existing) = self
+            .sequences
+            .read()
+            .get(request_id)
+            .and_then(|seq| seq.recurrent_state.clone())
+        {
+            return Ok(Some(existing));
+        }
+
+        let Some(spec) = spec else {
+            return Ok(None);
+        };
+
+        debug_assert_eq!(&spec.request_id, request_id);
+        let Some(manager) = &self.recurrent_state_manager else {
+            return Err(FerrumError::config(format!(
+                "model '{}' requires recurrent state for request {}, but no recurrent-state manager is configured",
+                self.model_executor.info().model_id, request_id
+            )));
+        };
+
+        let handle = manager.allocate(&spec).await?;
+
+        if let Some(seq) = self.sequences.write().get_mut(request_id) {
+            seq.recurrent_state = Some(handle.clone());
+        }
+
+        Ok(Some(handle))
+    }
+
     fn performance_breakdown(&self) -> ferrum_types::PerformanceBreakdown {
         ferrum_types::PerformanceBreakdown {
             scheduling_time_ms: avg_duration_ms(

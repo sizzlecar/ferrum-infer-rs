@@ -222,6 +222,7 @@ impl EngineInner {
             }
         };
 
+        let input_recurrent_state = decode_input.recurrent_state.clone();
         let decode_output = self.model_executor.decode(&decode_input).await?;
         let logits_vec = decode_output.logits.to_vec_f32()?;
 
@@ -237,7 +238,10 @@ impl EngineInner {
             )?;
             seq.generated_tokens.push(token);
             seq.kv_cache = Some(decode_output.kv_cache.clone());
-            seq.recurrent_state = decode_output.recurrent_state.clone();
+            seq.recurrent_state = decode_output
+                .recurrent_state
+                .clone()
+                .or(input_recurrent_state);
             seq.tokens_this_iteration += 1;
             token
         };
