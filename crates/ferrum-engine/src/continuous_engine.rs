@@ -11,8 +11,8 @@ use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
     model_executor::{LogitsReturnPolicy, TokenSelectionMask},
-    KvCacheHandle, KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler,
-    TensorFactory, TensorRef, Tokenizer,
+    KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, Sampler,
+    SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
 use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::json_mode::JsonModeProcessor;
@@ -506,6 +506,7 @@ pub struct SequenceState {
     pub input_tokens: Vec<TokenId>,
     pub generated_tokens: Vec<TokenId>,
     pub kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     pub sampling_params: SamplingParams,
     pub phase: RequestPhase,
     pub rng: StdRng,
@@ -685,6 +686,7 @@ impl SequenceState {
             input_tokens,
             generated_tokens: Vec::new(),
             kv_cache: None,
+            recurrent_state: None,
             sampling_params: request.sampling_params,
             phase: RequestPhase::Waiting,
             rng,

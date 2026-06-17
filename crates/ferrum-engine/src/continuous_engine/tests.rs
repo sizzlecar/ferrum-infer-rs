@@ -250,6 +250,7 @@ fn test_sequence_state() {
     assert_eq!(state.phase, RequestPhase::Waiting);
     assert_eq!(state.total_tokens(), 2);
     assert!(!state.prefill_complete);
+    assert!(state.recurrent_state.is_none());
 }
 
 #[test]
