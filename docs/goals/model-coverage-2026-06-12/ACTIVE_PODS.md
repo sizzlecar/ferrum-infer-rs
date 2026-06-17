@@ -6,10 +6,18 @@
 | ~~40700477~~ | 2x RTX 4090 | 0.589 | | broken host (raw cuInit=999) | DESTROYED 2026-06-12 ~20:30 |
 | ~~40703915~~ | 2x RTX 4090 | 0.336 | | host never booted (18min None) | DESTROYED |
 | ~~40704262~~ | 2x RTX 4090, 160GB | 0.802 | 2026-06-12 ~21:50 | 70B dual lane (~5h) | DESTROYED 2026-06-13 ~02:50 |
-| ~~41241013~~ | 1x RTX 4090, 300GB, Netherlands host 51606 | 0.471 | 2026-06-17 | W2 same-pod vLLM/Ferrum c16 baseline, tail-profile diagnostic, and post-scheduler active-decode mixed-prefill validation. Latest artifact `artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/`: run/serve correctness passed, c16 completed 100x3 zero-error, Ferrum LCB/vLLM LCB `0.9627`, Ferrum p95/vLLM p95 `0.8844`; still no release-grade PASS because only c16 was covered. | STOPPED 2026-06-17, API verified `actual_status=exited` |
+| 41241013 | 1x RTX 4090, 300GB, Netherlands host 51606 | 0.471 running / 0.111 stopped disk | 2026-06-17 | Retained as the single reusable CUDA dev instance for W2 same-hardware follow-up. It previously ran same-pod vLLM/Ferrum c16 baseline, tail-profile diagnostic, and post-scheduler active-decode mixed-prefill validation. Latest artifact `artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/`: run/serve correctness passed, c16 completed 100x3 zero-error, Ferrum LCB/vLLM LCB `0.9627`, Ferrum p95/vLLM p95 `0.8844`; still no release-grade PASS because only c16 was covered. | RETAINED STOPPED 2026-06-17; API verified `cur_state=stopped`, `actual_status=exited`, `gpuCostPerHour=0`; keep-one cleanup artifact `artifacts/vast_cleanup_keep_one_20260617T055651Z/` |
 
 Destroy: `curl -X DELETE "https://console.vast.ai/api/v0/instances/{id}/?api_key=$VAST_API_KEY"`
-Verify zero: instances list must return 0 before declaring the goal done.
+Goal completion cleanup: destroy any retained instance, or record explicit
+approval to keep it, before declaring the goal done.
+
+**2026-06-17 05:56Z — Vast keep-one cleanup.** User requested keeping one
+usable instance and destroying the rest after recharge. Kept `41241013`.
+Destroyed `41178475`, `41187356`, `41218739`, `41230499`, `41256521`, and
+`41276321`; all DELETE responses returned `success=true`. Three final API
+polls showed only `41241013` remains, with `cur_state=stopped`,
+`actual_status=exited`, and `gpuCostPerHour=0`.
 
 **2026-06-17 — W2 41241013 stopped after post-scheduler c16 diagnostic. API verified `cur_state=stopped`,`actual_status=exited`; artifact copied locally before stop.**
 
