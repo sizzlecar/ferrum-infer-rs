@@ -2,6 +2,47 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZZG — W3 Qwen3.5 recurrent-state shape contract checkpoint
+
+- Scope:
+  - W3-S0/S2 bridge work for the Gated-DeltaNet recurrent state contract;
+  - derives recurrent-state tensor specs directly from official Qwen3.5 /
+    Qwen3.6 HF `text_config`;
+  - no product execution was run;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `QWEN35_DELTA_STATE_NAME`;
+  - added `Qwen35TextConfig::linear_qk_total_dim()`;
+  - added `Qwen35TextConfig::linear_value_total_dim()`;
+  - added `Qwen35TextConfig::recurrent_delta_state_shape()`;
+  - added `Qwen35TextConfig::recurrent_state_tensor_specs()`;
+  - added `Qwen35TextConfig::recurrent_state_elements_per_slot()`.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models --test qwen35_config_test -- --nocapture`
+    PASS: `4 passed`.
+- Evidence from official configs:
+  - dense `Qwen/Qwen3.5-0.8B`:
+    18 linear-attention layers, `delta_state` shape `[16, 128, 128]`,
+    `18 * 16 * 128 * 128` state elements per request slot;
+  - MoE/shared-expert `Qwen/Qwen3.6-35B-A3B`:
+    30 linear-attention layers, `delta_state` shape `[16, 128, 256]`,
+    `30 * 16 * 128 * 256` state elements per request slot;
+  - the MoE shape explicitly captures the unequal head topology:
+    q/k total dim `2048`, value total dim `4096`, value state grouped across
+    16 key heads.
+- Limitation:
+  - this is a config-derived allocation contract only;
+  - it does not update recurrent state during prefill/decode yet;
+  - it does not prove Qwen3.6 MoE router/expert/shared-expert numerical
+    correctness.
+- Next required validation:
+  - have the eventual Qwen3.5/Qwen3.6 executor return these specs through
+    `ModelExecutor::recurrent_state_spec()`;
+  - add S1 tensor evidence for Qwen3.6 MoE router, expert layout, and shared
+    expert merge semantics.
+
 ## 2026-06-17 ZZF — W3 Qwen3.5/Qwen3.6 product config recognition checkpoint
 
 - Scope:

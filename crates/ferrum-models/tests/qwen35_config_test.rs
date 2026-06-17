@@ -1,4 +1,4 @@
-use ferrum_models::qwen35_config::{Qwen35LayerType, Qwen35TextConfig};
+use ferrum_models::qwen35_config::{Qwen35LayerType, Qwen35TextConfig, QWEN35_DELTA_STATE_NAME};
 
 const ARTIFACT_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -29,6 +29,24 @@ fn parses_official_qwen35_dense_min_config() {
     assert_eq!(cfg.linear_attention.value_head_dim, 128);
     assert_eq!(cfg.linear_attention.conv_kernel_dim, 4);
     assert_eq!(cfg.dense_intermediate_size, Some(3584));
+    assert_eq!(cfg.linear_qk_total_dim(), 2048);
+    assert_eq!(cfg.linear_value_total_dim(), 2048);
+    assert_eq!(
+        cfg.recurrent_delta_state_shape().unwrap(),
+        vec![16, 128, 128]
+    );
+    let specs = cfg.recurrent_state_tensor_specs().unwrap();
+    assert_eq!(specs.len(), 18);
+    assert_eq!(specs[0].layer_index, 0);
+    assert_eq!(specs[1].layer_index, 1);
+    assert_eq!(specs[2].layer_index, 2);
+    assert_eq!(specs[3].layer_index, 4);
+    assert_eq!(specs[0].name, QWEN35_DELTA_STATE_NAME);
+    assert_eq!(specs[0].shape, vec![16, 128, 128]);
+    assert_eq!(
+        cfg.recurrent_state_elements_per_slot().unwrap(),
+        18 * 16 * 128 * 128
+    );
 }
 
 #[test]
@@ -50,6 +68,24 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     assert_eq!(moe.num_experts_per_tok, 8);
     assert_eq!(moe.moe_intermediate_size, 512);
     assert_eq!(moe.shared_expert_intermediate_size, 512);
+    assert_eq!(cfg.linear_qk_total_dim(), 2048);
+    assert_eq!(cfg.linear_value_total_dim(), 4096);
+    assert_eq!(
+        cfg.recurrent_delta_state_shape().unwrap(),
+        vec![16, 128, 256]
+    );
+    let specs = cfg.recurrent_state_tensor_specs().unwrap();
+    assert_eq!(specs.len(), 30);
+    assert_eq!(specs[0].layer_index, 0);
+    assert_eq!(specs[1].layer_index, 1);
+    assert_eq!(specs[2].layer_index, 2);
+    assert_eq!(specs[3].layer_index, 4);
+    assert_eq!(specs[0].name, QWEN35_DELTA_STATE_NAME);
+    assert_eq!(specs[0].shape, vec![16, 128, 256]);
+    assert_eq!(
+        cfg.recurrent_state_elements_per_slot().unwrap(),
+        30 * 16 * 128 * 256
+    );
 }
 
 #[test]
