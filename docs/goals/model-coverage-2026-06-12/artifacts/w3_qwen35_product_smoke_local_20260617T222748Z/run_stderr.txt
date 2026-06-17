@@ -1,0 +1,17 @@
+Loading /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model...
+Using CPU backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-17T22:27:48.655484Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-17T22:27:48.655502Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-17T22:27:48.655571Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model/tokenizer.json"
+2026-06-17T22:27:48.656221Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-17T22:27:48.656234Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-17T22:27:48.656241Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-17T22:27:48.656252Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=CPU, block_size=16, max_blocks=2048
+2026-06-17T22:27:48.656272Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model (format: safetensors)
+2026-06-17T22:27:48.656411Z  INFO ferrum_engine::registry:   Architecture: Qwen35, Layers: 2, Vocab: 3
+2026-06-17T22:27:48.656417Z  INFO ferrum_engine::registry: Building model...
+2026-06-17T22:27:48.656423Z  INFO ferrum_engine::registry: Using Qwen3.5/Qwen3.6 explicit CPU/FP32 reference executor
+Model loaded in 0.0s.
+2026-06-17T22:27:48.664707Z  WARN ferrum_engine::continuous_engine::inner::batch: Unified forward failed: Unsupported operation: unified_decode not implemented for this executor; falling back to split
+2026-06-17T22:27:48.665023Z  WARN ferrum_engine::continuous_engine::inner::batch: Unified forward failed: Unsupported operation: unified_decode not implemented for this executor; falling back to split

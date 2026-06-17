@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ12 — W3-S2 product smoke artifact script checkpoint
+
+- Scope:
+  - W3-S2 artifact-producing product-path smoke for the explicit Qwen3.5 CPU/FP32
+    reference executor;
+  - no CUDA/Metal execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `scripts/release/w3_qwen35_product_smoke.py`;
+  - the script writes a local toy Qwen3.5 safetensors model without requiring
+    extra Python packages, runs real `ferrum run`, starts real `ferrum serve`,
+    exercises non-streaming and streaming `/v1/chat/completions`, and writes
+    `w3_s2_whole_model_product_path.json`;
+  - the generated W3-S2 manifest records typed CLI commands, `hidden_env=[]`,
+    run JSONL output, serve log, non-stream response, streaming SSE response,
+    usage-bearing stream chunk, and exactly one `[DONE]`.
+- Evidence:
+  - artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/`;
+  - script PASS line:
+    `W3 QWEN35 PRODUCT SMOKE PASS: /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z`;
+  - note: the artifact git summary reports dirty because the local worktree
+    already contains many pre-existing untracked historical artifacts, so this
+    remains a toy diagnostic W3-S2 artifact, not release-grade evidence.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_qwen35_product_smoke.py` PASS;
+  - `python3 scripts/release/w3_qwen35_product_smoke.py --out <out>` PASS;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS: `MODEL RELEASE GRADE GOAL SELFTEST PASS`.
+- Limitation:
+  - this does not satisfy real Qwen3.5/Qwen3.6 L0-L5 correctness;
+  - it does not provide CUDA/Metal execution, same-hardware baseline, or W3
+    80% performance evidence.
+
 ## 2026-06-18 ZZZ11 — W3 Qwen3.5 reference `ferrum serve` product smoke checkpoint
 
 - Scope:
