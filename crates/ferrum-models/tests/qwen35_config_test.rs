@@ -1,4 +1,6 @@
-use ferrum_models::qwen35_config::{Qwen35LayerType, Qwen35TextConfig, QWEN35_DELTA_STATE_NAME};
+use ferrum_models::qwen35_config::{
+    Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig, QWEN35_DELTA_STATE_NAME,
+};
 use ferrum_types::{DataType, Device, RequestId};
 
 const ARTIFACT_ROOT: &str = concat!(
@@ -30,6 +32,17 @@ fn parses_official_qwen35_dense_min_config() {
     assert_eq!(cfg.linear_attention.value_head_dim, 128);
     assert_eq!(cfg.linear_attention.conv_kernel_dim, 4);
     assert_eq!(cfg.dense_intermediate_size, Some(3584));
+    assert_eq!(cfg.dense_mlp_layers().len(), 24);
+    assert!(cfg.sparse_moe_layers().is_empty());
+    let plan = cfg.layer_plan().unwrap();
+    assert_eq!(plan.len(), 24);
+    assert_eq!(plan[0].layer_index, 0);
+    assert_eq!(plan[0].attention, Qwen35LayerType::LinearAttention);
+    assert_eq!(plan[0].mlp, Qwen35MlpKind::Dense);
+    assert!(plan[0].has_recurrent_state);
+    assert_eq!(plan[3].attention, Qwen35LayerType::FullAttention);
+    assert_eq!(plan[3].mlp, Qwen35MlpKind::Dense);
+    assert!(!plan[3].has_recurrent_state);
     assert_eq!(cfg.linear_qk_total_dim(), 2048);
     assert_eq!(cfg.linear_value_total_dim(), 2048);
     assert_eq!(
@@ -81,6 +94,18 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     assert_eq!(moe.num_experts_per_tok, 8);
     assert_eq!(moe.moe_intermediate_size, 512);
     assert_eq!(moe.shared_expert_intermediate_size, 512);
+    assert!(cfg.dense_mlp_layers().is_empty());
+    assert_eq!(cfg.sparse_moe_layers().len(), 40);
+    assert_eq!(cfg.sparse_moe_layers()[0], 0);
+    assert_eq!(cfg.sparse_moe_layers()[39], 39);
+    let plan = cfg.layer_plan().unwrap();
+    assert_eq!(plan.len(), 40);
+    assert_eq!(plan[0].attention, Qwen35LayerType::LinearAttention);
+    assert_eq!(plan[0].mlp, Qwen35MlpKind::SparseMoeSharedExpert);
+    assert!(plan[0].has_recurrent_state);
+    assert_eq!(plan[3].attention, Qwen35LayerType::FullAttention);
+    assert_eq!(plan[3].mlp, Qwen35MlpKind::SparseMoeSharedExpert);
+    assert!(!plan[3].has_recurrent_state);
     assert_eq!(cfg.linear_qk_total_dim(), 2048);
     assert_eq!(cfg.linear_value_total_dim(), 4096);
     assert_eq!(
@@ -169,4 +194,14 @@ fn rejects_zero_recurrent_state_batch_slots() {
         .to_recurrent_state_spec(RequestId::new(), DataType::FP16, Device::CPU, 0)
         .expect_err("zero batch slots should fail");
     assert!(err.contains("max_batch_slots"), "{err}");
+}
+
+#[test]
+fn rejects_out_of_range_layer_plan_lookup() {
+    let raw = read_artifact("dense_min_reference.config.json");
+    let cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
+    let err = cfg
+        .mlp_kind_for_layer(cfg.num_hidden_layers)
+        .expect_err("out-of-range layer lookup should fail");
+    assert!(err.contains("layer_index"), "{err}");
 }
