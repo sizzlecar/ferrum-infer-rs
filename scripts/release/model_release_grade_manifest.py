@@ -973,6 +973,130 @@ def write_selftest_w3_s0_s1_s2(root: Path) -> dict[str, Path]:
     }
 
 
+def write_selftest_w3_l0_l5(root: Path) -> None:
+    common = {
+        "status": "pass",
+        "model_id": "selftest-qwen35",
+        "product_surface": "typed_cli",
+        "hidden_env": [],
+    }
+    write_json(
+        root / "l0.json",
+        {
+            **common,
+            "level": "l0_template",
+            "chat_template_golden": {
+                "cases_total": 5,
+                "cases_passed": 5,
+                "hf_apply_chat_template_reference": True,
+                "byte_equal": True,
+                "eos_bos_from_generation_config": True,
+                "render_failure_is_error": True,
+                "silent_fallback": False,
+            },
+        },
+    )
+    write_json(
+        root / "l1.json",
+        {
+            **common,
+            "level": "l1_numeric",
+            "numeric": {
+                "comparisons_total": 6,
+                "comparisons_passed": 6,
+                "atol": 0.000001,
+                "max_abs": 0.0,
+                "deterministic": True,
+            },
+            "coverage": {
+                "linear_attention": True,
+                "full_attention": True,
+                "deltanet": True,
+                "moe_or_dense": True,
+                "lm_head": True,
+            },
+            "reference": {
+                "engine": "transformers",
+                "artifact": "selftest-reference-dump",
+            },
+        },
+    )
+    write_json(
+        root / "l2.json",
+        {
+            **common,
+            "level": "l2_quantized",
+            "quantized_semantics": {
+                "real_size_model": True,
+                "waived": False,
+                "semantic_pass": True,
+                "known_answer_total": 10,
+                "known_answer_passed": 10,
+                "format": "hf-gptq-int4",
+            },
+        },
+    )
+    write_json(
+        root / "l3.json",
+        {
+            **common,
+            "level": "l3_behavior",
+            "behavior": {
+                "cases_total": 7,
+                "cases_passed": 7,
+                "multi_turn": True,
+                "stream_nonstream_match": True,
+                "natural_eos": True,
+                "custom_stop": True,
+                "reasoning_extraction": True,
+                "stream_done_exactly_once": True,
+                "stream_usage_present": True,
+            },
+        },
+    )
+    write_json(
+        root / "l4.json",
+        {
+            **common,
+            "level": "l4_agent",
+            "agent": {
+                "real_model": True,
+                "required_tool_enforced": True,
+                "json_schema_strict": True,
+                "tool_calls_total": 10,
+                "tool_calls_passed": 10,
+                "strict_schema_total": 20,
+                "strict_schema_passed": 20,
+            },
+        },
+    )
+    cells = []
+    for concurrency in REQUIRED_CELLS:
+        cell: dict[str, Any] = {
+            "requested_concurrency": concurrency,
+            "requests_per_run": 100,
+            "n_repeats": 3,
+            "completed_per_run": [100, 100, 100],
+            "errored_per_run": [0, 0, 0],
+        }
+        for field in QUALITY_FIELDS:
+            cell[f"{field}_per_run"] = [0, 0, 0]
+        cells.append(cell)
+    write_json(
+        root / "l5.json",
+        {
+            **common,
+            "level": "l5_concurrency",
+            "concurrency": {
+                "closed_loop": True,
+                "stream_options_include_usage": True,
+                "output_token_count_source": "usage",
+                "cells": cells,
+            },
+        },
+    )
+
+
 def write_selftest_w3_args(root: Path) -> argparse.Namespace:
     root.mkdir(parents=True, exist_ok=True)
     artifacts = write_selftest_w3_s0_s1_s2(root / "w3")
@@ -990,6 +1114,7 @@ def write_selftest_w3_args(root: Path) -> argparse.Namespace:
         "serve.json",
     ]:
         write_json(root / rel, {"status": "pass", "name": rel})
+    write_selftest_w3_l0_l5(root)
     write_json(root / "dirty_status.json", {"dirty": False})
     ferrum_perf, baseline_perf = write_selftest_reports(root / "perf")
     (root / "ferrum_bench.command.txt").write_text(

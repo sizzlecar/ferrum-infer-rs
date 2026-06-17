@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ16 — W3 L0-L5 correctness artifact gate hardening
+
+- Scope:
+  - W3 release-grade correctness validator hardening;
+  - no GPU/CUDA/Metal execution was started;
+  - no real W3 performance claim and no real `MODEL_RELEASE_GRADE_W3 PASS:
+    <out_dir>` was produced.
+- Change:
+  - `scripts/release/model_release_grade_goal_gate.py` now deep-validates W3
+    L0-L5 artifacts instead of accepting shell `status=pass` JSON:
+    L0 chat-template golden, L1 numeric/reference coverage, L2 real-size
+    quantized semantics, L3 multi-turn/stream/stop behavior, L4 tools plus
+    strict JSON schema, and L5 c=1/4/16/32 zero-error concurrency cells;
+  - the stricter L0-L5 schema is scoped to W3 so existing W2 artifact formats
+    are not broken by this checkpoint;
+  - final-gate self-test now includes W3 negative cases for insufficient L4
+    strict-schema pass count and nonzero L5 errored requests;
+  - `scripts/release/model_release_grade_manifest.py` W3 self-test now emits
+    matching structured L0-L5 artifacts before invoking the final validator.
+- Validation:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py
+    scripts/release/model_release_grade_manifest.py` PASS;
+  - `git diff --check -- scripts/release/model_release_grade_goal_gate.py
+    scripts/release/model_release_grade_manifest.py` PASS;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS: `MODEL RELEASE GRADE GOAL SELFTEST PASS`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`
+    PASS, including synthetic `MODEL_RELEASE_GRADE_W2 PASS` and synthetic
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+- Limitation:
+  - synthetic PASS lines remain validator self-tests only; real W3 still needs
+    actual model L0-L5 correctness, same-hardware baseline, and c=1/4/16/32
+    >=80% performance evidence before release-grade PASS.
+
 ## 2026-06-18 ZZZ15 — W3 release-grade manifest builder checkpoint
 
 - Scope:
