@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ10 — W3 Qwen3.5 reference `ferrum run` product smoke checkpoint
+
+- Scope:
+  - W3-S2 Qwen3.5/Qwen3.6 explicit CPU/FP32 reference execution through the
+    real `ferrum run` product entrypoint;
+  - no CUDA/Metal execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added a CLI integration smoke that creates a local toy Qwen3.5 model
+    directory with `config.json`, `tokenizer.json`, and `model.safetensors`;
+  - the smoke runs the real `ferrum` binary with `run <model_dir> --backend
+    cpu --qwen35-reference --output-format jsonl --temperature 0
+    --max-tokens 2 --prompt hello`;
+  - the assertion checks a successful assistant JSONL event with
+    `finish_reason=length`, two generated tokens, and non-empty decoded text;
+  - product-path execution exposed a generic engine abstraction gap:
+    recurrent-state-capable executors could declare a recurrent-state spec,
+    but the default builder did not provide a recurrent-state manager;
+  - `EngineBuilder` now installs the default in-memory recurrent-state
+    manager for CPU/reference engines when no custom manager is supplied,
+    while keeping custom manager overrides intact and leaving GPU backends to
+    provide backend-native recurrent-state managers explicitly.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-cli --test qwen35_reference_product -- --nocapture`
+    PASS: `1 passed`;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `56 passed`, plus Qwen3.5 config integration coverage `1 passed`;
+  - `cargo test -p ferrum-engine qwen35_registry -- --nocapture` PASS:
+    `2 passed`;
+  - `cargo check -p ferrum-engine -p ferrum-cli` PASS.
+- Limitation:
+  - this is a toy CPU/FP32 reference product smoke only;
+  - real Qwen3.5/Qwen3.6 model L0-L5 correctness, `ferrum serve` product
+    smoke, CUDA/Metal execution, and W3 80% performance gates remain
+    incomplete.
+
 ## 2026-06-18 ZZZ9 — W3 Qwen3.5 reference decode replay checkpoint
 
 - Scope:
