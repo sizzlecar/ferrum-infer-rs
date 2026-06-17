@@ -27,22 +27,31 @@ release-grade artifact and did not produce `MODEL_RELEASE_GRADE_W2 PASS`.
 - Attempting to create a replacement 49GB RTX 4090 instance from offer
   `40813991` returned `insufficient_credit`.
 - A sanitized instance audit shows no Vast GPU instances currently running.
+- After checkpoint commit `995c703f`, a fresh sanitized Vast status probe still
+  showed no running instances and showed `credit=0` with the account balance
+  below the enabled threshold. Higher-priced offers cannot be rented until the
+  external credit state changes.
 
 ## Evidence
 
 - GPU contract: `gpu_contract.md`
+- W2 release-grade manifest generator checkpoint:
+  `995c703f test(release): build W2 release-grade manifest`
 - Sanitized restart response:
   `local_vast/restart_41276321_retry.sanitized.json`
 - Sanitized create response:
   `local_vast/new_instance_2/create_response_40813991.sanitized.json`
 - Sanitized instance audit:
   `local_vast/instances_audit_after_insufficient_credit.sanitized.json`
+- Fresh sanitized account/instance probe:
+  `local_vast/resume_probe_20260617T_after_checkpoint/vast_status.summary.json`
 
 ## Next step
 
-After Vast credit is available, create a new 49GB RTX 4090 instance and rerun
-the same full-matrix command. Correctness must pass before performance is used
-as evidence. The final W2 gate remains:
+After Vast credit is available, do not wait for the old stopped instance. Create
+a new high-availability 49GB RTX 4090 instance and rerun the same full-matrix
+command. Correctness must pass before performance is used as evidence. The final
+W2 gate remains:
 
 ```bash
 python3 scripts/release/model_release_grade_goal_gate.py w2 <out_dir>
