@@ -1,0 +1,3 @@
+3880af03
+/workspace/ferrum-infer-rs/target
+/workspace/hf-cache
