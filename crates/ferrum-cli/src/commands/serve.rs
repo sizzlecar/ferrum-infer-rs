@@ -49,6 +49,11 @@ pub struct ServeCommand {
     #[arg(long, default_value = "auto")]
     pub backend: String,
 
+    /// Enable the explicit CPU/FP32 Qwen3.5/Qwen3.6 reference executor for W3
+    /// correctness bring-up. This is not a release-performance path.
+    #[arg(long)]
+    pub qwen35_reference: bool,
+
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
     /// layer-split for supported Llama-family safetensors models.
     #[arg(long, value_name = "IDS")]
@@ -239,6 +244,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         port,
         tts_slots,
         backend,
+        qwen35_reference,
         gpu_devices,
         layer_split_pipeline_mode,
         spec_draft,
@@ -828,6 +834,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 "model_path".to_string(),
                 serde_json::Value::String(engine_model_path.clone()),
             );
+            if qwen35_reference {
+                engine_config.backend.backend_options.insert(
+                    "qwen35_reference".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
             if let Some(selection) = &gpu_selection {
                 selection.insert_backend_options(&mut engine_config.backend.backend_options);
             }
@@ -1840,6 +1852,21 @@ fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_parses_explicit_qwen35_reference_flag() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+
+        let parsed = TestCli::parse_from(["ferrum", "--model", "qwen3.5", "--qwen35-reference"]);
+
+        assert!(parsed.serve.qwen35_reference);
+    }
 
     #[test]
     fn serve_cli_runtime_entries_are_cli_sourced_and_classified() {

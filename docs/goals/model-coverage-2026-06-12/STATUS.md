@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ8 — W3 explicit Qwen3.5 reference product-entry checkpoint
+
+- Scope:
+  - W3-S2 controlled product-entry bridge for Qwen3.5/Qwen3.6 reference
+    execution through the existing `run`/`serve` -> `EngineConfig` ->
+    registry -> executor abstraction;
+  - no CUDA/Metal product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added user-visible `--qwen35-reference` to `ferrum run` and `ferrum
+    serve`;
+  - the flag lands as a typed backend option on `EngineConfig`, not as a
+    hidden environment-variable combination;
+  - `LlmExecutorFactory` now recognizes `Architecture::Qwen35` and
+    `Architecture::Qwen35Moe` behind that explicit flag;
+  - default Qwen3.5/Qwen3.6 product loading still rejects with a clear
+    unsupported message;
+  - the explicit path is restricted to CPU/FP32 reference execution and
+    materializes dense or sparse-MoE reference runtimes from the existing
+    safetensors inventory/weight-plan abstraction.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-cli qwen35_reference -- --nocapture` PASS:
+    `2 passed`;
+  - `cargo test -p ferrum-engine qwen35_registry -- --nocapture` PASS:
+    `2 passed`;
+  - `cargo check -p ferrum-engine -p ferrum-cli` PASS.
+- Limitation:
+  - this proves controlled reference loading and prefill at the registry
+    boundary only;
+  - decode/recurrent-state incremental semantics, full `ferrum run`/`ferrum
+    serve` W3 product scenarios, W3 L0-L5 correctness gates, and W3 80%
+    performance gates remain incomplete.
+
 ## 2026-06-18 ZZZ7 — W3 sparse-MoE reference runtime/materializer checkpoint
 
 - Scope:
