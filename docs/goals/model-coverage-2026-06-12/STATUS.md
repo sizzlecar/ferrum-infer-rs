@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ2 — W3 dense reference executor prefill checkpoint
+
+- Scope:
+  - W3-S2 executor-level dense Qwen3.5 reference prefill boundary;
+  - no product registry wiring was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added explicit `Qwen35DenseReferenceRuntime` owned reference weights;
+  - added `Qwen35W3Executor::with_dense_reference_runtime()`;
+  - default `Qwen35W3Executor::from_definition()` still keeps product
+    prefill/decode unsupported;
+  - reference-mode `prefill()` now extracts input tokens, runs the dense
+    CPU-reference model forward, returns last-token logits as `[1, 1, vocab]`,
+    and returns a `GenericKvCacheHandle` with the prompt sequence length;
+  - `decode()` remains unsupported until recurrent-state/KV semantics are
+    wired instead of faked.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `47 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still CPU/reference prefill only;
+  - sparse-MoE model-level executor path is not wired;
+  - product `ferrum run`, `ferrum serve`, W3 correctness gates, and W3 80%
+    performance gates remain incomplete.
+
 ## 2026-06-18 ZZZ1 — W3 dense model CPU-reference forward checkpoint
 
 - Scope:

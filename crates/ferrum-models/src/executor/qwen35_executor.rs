@@ -2,9 +2,11 @@
 //!
 //! This skeleton is intentionally not registered as a product executor yet. It
 //! exposes the recurrent-state allocation contract that the real W3 executor
-//! will use, while prefill/decode remain explicitly unsupported.
+//! will use. Product registration remains disabled until the full W3 run/serve
+//! path is wired and gated.
 
 use async_trait::async_trait;
+use candle_core::{Device as CandleDevice, Tensor};
 use ferrum_interfaces::{
     model_executor::{
         DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage, ExecutorState,
@@ -14,15 +16,223 @@ use ferrum_interfaces::{
 };
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, RequestId, Result, TokenId};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::{
     definition::ModelDefinition,
-    qwen35_config::Qwen35TextConfig,
+    executor::common::{self, GenericKvCacheHandle},
+    models::qwen35::{
+        qwen35_dense_reference_model_forward_cpu, Qwen35DenseFullAttentionLayerShape,
+        Qwen35DenseLinearAttentionLayerShape, Qwen35DenseReferenceFullLayer,
+        Qwen35DenseReferenceLayer, Qwen35DenseReferenceLinearLayer, Qwen35DenseReferenceModel,
+        Qwen35DenseReferenceModelOutput, Qwen35FullAttentionShape, Qwen35LinearAttentionShape,
+    },
+    qwen35_config::{Qwen35LayerType, Qwen35TextConfig},
     qwen35_weights::{Qwen35ResolvedWeightPlan, Qwen35WeightInventory, Qwen35WeightValidation},
 };
 
 const UNSUPPORTED_EXECUTION_MESSAGE: &str = "Qwen3.5/Qwen3.6 W3 executor exposes recurrent-state \
-spec only; prefill/decode are not wired yet";
+spec only; prefill/decode are not wired for product execution yet";
+
+static QWEN35_REFERENCE_CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone)]
+pub struct Qwen35DenseReferenceRuntime {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub eps: f32,
+    pub embed_tokens: Vec<f32>,
+    pub final_norm_weight: Vec<f32>,
+    pub lm_head_weight: Vec<f32>,
+    pub layers: Vec<Qwen35DenseReferenceRuntimeLayer>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Qwen35DenseReferenceRuntimeLayer {
+    Linear(Qwen35DenseReferenceRuntimeLinearLayer),
+    Full(Qwen35DenseReferenceRuntimeFullLayer),
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen35DenseReferenceRuntimeLinearLayer {
+    pub intermediate_size: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub conv_kernel: usize,
+    pub input_norm_weight: Vec<f32>,
+    pub qkv_weight: Vec<f32>,
+    pub z_weight: Vec<f32>,
+    pub b_weight: Vec<f32>,
+    pub a_weight: Vec<f32>,
+    pub conv1d_weight: Vec<f32>,
+    pub a_log: Vec<f32>,
+    pub dt_bias: Vec<f32>,
+    pub norm_weight: Vec<f32>,
+    pub out_proj_weight: Vec<f32>,
+    pub post_attention_norm_weight: Vec<f32>,
+    pub gate_proj_weight: Vec<f32>,
+    pub up_proj_weight: Vec<f32>,
+    pub down_proj_weight: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen35DenseReferenceRuntimeFullLayer {
+    pub intermediate_size: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub position_offset: usize,
+    pub rope_theta: f32,
+    pub input_norm_weight: Vec<f32>,
+    pub q_weight: Vec<f32>,
+    pub k_weight: Vec<f32>,
+    pub v_weight: Vec<f32>,
+    pub q_norm_weight: Vec<f32>,
+    pub k_norm_weight: Vec<f32>,
+    pub o_weight: Vec<f32>,
+    pub post_attention_norm_weight: Vec<f32>,
+    pub gate_proj_weight: Vec<f32>,
+    pub up_proj_weight: Vec<f32>,
+    pub down_proj_weight: Vec<f32>,
+}
+
+impl Qwen35DenseReferenceRuntime {
+    pub fn validate_for_config(&self, config: &Qwen35TextConfig, vocab_size: usize) -> Result<()> {
+        if config.is_moe() {
+            return Err(FerrumError::unsupported(
+                "Qwen3.5 dense reference runtime does not support sparse MoE layers",
+            ));
+        }
+        if self.vocab_size != vocab_size {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 dense reference vocab_size {} does not match model vocab_size {vocab_size}",
+                self.vocab_size
+            )));
+        }
+        if self.hidden_size != config.hidden_size {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 dense reference hidden_size {} does not match config hidden_size {}",
+                self.hidden_size, config.hidden_size
+            )));
+        }
+        if self.layers.len() != config.num_hidden_layers {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 dense reference layer count {} does not match config num_hidden_layers {}",
+                self.layers.len(),
+                config.num_hidden_layers
+            )));
+        }
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let expected = config.layer_types[idx];
+            let actual = layer.attention_kind();
+            if actual != expected {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 dense reference layer {idx} kind {actual:?} does not match config {expected:?}",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn forward(&self, input_ids: &[usize]) -> Result<Qwen35DenseReferenceModelOutput> {
+        let tokens = input_ids.len();
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| layer.as_reference_layer(tokens, self.hidden_size))
+            .collect::<Vec<_>>();
+        qwen35_dense_reference_model_forward_cpu(
+            Qwen35DenseReferenceModel {
+                vocab_size: self.vocab_size,
+                hidden_size: self.hidden_size,
+                eps: self.eps,
+                embed_tokens: &self.embed_tokens,
+                final_norm_weight: &self.final_norm_weight,
+                lm_head_weight: &self.lm_head_weight,
+                layers: &layers,
+            },
+            input_ids,
+        )
+    }
+}
+
+impl Qwen35DenseReferenceRuntimeLayer {
+    fn attention_kind(&self) -> Qwen35LayerType {
+        match self {
+            Self::Linear(_) => Qwen35LayerType::LinearAttention,
+            Self::Full(_) => Qwen35LayerType::FullAttention,
+        }
+    }
+
+    fn as_reference_layer(
+        &self,
+        tokens: usize,
+        hidden_size: usize,
+    ) -> Qwen35DenseReferenceLayer<'_> {
+        match self {
+            Self::Linear(layer) => {
+                Qwen35DenseReferenceLayer::Linear(Qwen35DenseReferenceLinearLayer {
+                    shape: Qwen35DenseLinearAttentionLayerShape {
+                        tokens,
+                        hidden_size,
+                        intermediate_size: layer.intermediate_size,
+                        attention: Qwen35LinearAttentionShape {
+                            tokens,
+                            key_heads: layer.key_heads,
+                            value_heads: layer.value_heads,
+                            key_dim: layer.key_dim,
+                            value_dim: layer.value_dim,
+                            conv_kernel: layer.conv_kernel,
+                        },
+                    },
+                    input_norm_weight: &layer.input_norm_weight,
+                    qkv_weight: &layer.qkv_weight,
+                    z_weight: &layer.z_weight,
+                    b_weight: &layer.b_weight,
+                    a_weight: &layer.a_weight,
+                    conv1d_weight: &layer.conv1d_weight,
+                    a_log: &layer.a_log,
+                    dt_bias: &layer.dt_bias,
+                    norm_weight: &layer.norm_weight,
+                    out_proj_weight: &layer.out_proj_weight,
+                    post_attention_norm_weight: &layer.post_attention_norm_weight,
+                    gate_proj_weight: &layer.gate_proj_weight,
+                    up_proj_weight: &layer.up_proj_weight,
+                    down_proj_weight: &layer.down_proj_weight,
+                })
+            }
+            Self::Full(layer) => Qwen35DenseReferenceLayer::Full(Qwen35DenseReferenceFullLayer {
+                shape: Qwen35DenseFullAttentionLayerShape {
+                    tokens,
+                    hidden_size,
+                    intermediate_size: layer.intermediate_size,
+                    attention: Qwen35FullAttentionShape {
+                        tokens,
+                        num_heads: layer.num_heads,
+                        num_kv_heads: layer.num_kv_heads,
+                        head_dim: layer.head_dim,
+                        position_offset: layer.position_offset,
+                        rope_theta: layer.rope_theta,
+                    },
+                },
+                input_norm_weight: &layer.input_norm_weight,
+                q_weight: &layer.q_weight,
+                k_weight: &layer.k_weight,
+                v_weight: &layer.v_weight,
+                q_norm_weight: &layer.q_norm_weight,
+                k_norm_weight: &layer.k_norm_weight,
+                o_weight: &layer.o_weight,
+                post_attention_norm_weight: &layer.post_attention_norm_weight,
+                gate_proj_weight: &layer.gate_proj_weight,
+                up_proj_weight: &layer.up_proj_weight,
+                down_proj_weight: &layer.down_proj_weight,
+            }),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Qwen35W3Executor {
@@ -32,6 +242,7 @@ pub struct Qwen35W3Executor {
     device: Device,
     weight_validation: Option<Qwen35WeightValidation>,
     weight_plan: Option<Qwen35ResolvedWeightPlan>,
+    dense_reference_runtime: Option<Arc<Qwen35DenseReferenceRuntime>>,
 }
 
 impl Qwen35W3Executor {
@@ -53,6 +264,7 @@ impl Qwen35W3Executor {
             device,
             weight_validation: None,
             weight_plan: None,
+            dense_reference_runtime: None,
         })
     }
 
@@ -87,8 +299,22 @@ impl Qwen35W3Executor {
         self.weight_plan.as_ref()
     }
 
+    pub fn with_dense_reference_runtime(
+        mut self,
+        runtime: Qwen35DenseReferenceRuntime,
+    ) -> Result<Self> {
+        runtime.validate_for_config(&self.config, self.info.vocab_size)?;
+        self.dense_reference_runtime = Some(Arc::new(runtime));
+        Ok(self)
+    }
+
     fn unsupported_execution() -> FerrumError {
         FerrumError::unsupported(UNSUPPORTED_EXECUTION_MESSAGE)
+    }
+
+    fn next_reference_cache_id() -> String {
+        let id = QWEN35_REFERENCE_CACHE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("qwen35-reference-prefill-{id}")
     }
 }
 
@@ -109,8 +335,36 @@ impl ModelExecutor for Qwen35W3Executor {
             .map_err(|err| FerrumError::model(format!("invalid Qwen3.5 recurrent spec: {err}")))
     }
 
-    async fn prefill(&self, _input: &PrefillInput) -> Result<PrefillOutput> {
-        Err(Self::unsupported_execution())
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        let runtime = self
+            .dense_reference_runtime
+            .as_ref()
+            .ok_or_else(Self::unsupported_execution)?;
+        let tokens = common::tensor_to_tokens(&input.input_ids)?;
+        let input_ids = tokens
+            .iter()
+            .map(|token| *token as usize)
+            .collect::<Vec<_>>();
+        let output = runtime.forward(&input_ids)?;
+        let vocab_size = runtime.vocab_size;
+        let last_token_start = (input_ids.len() - 1) * vocab_size;
+        let last_logits = output.logits[last_token_start..last_token_start + vocab_size].to_vec();
+        let logits_tensor = Tensor::new(last_logits.as_slice(), &CandleDevice::Cpu)
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 logits tensor failed: {err}")))?
+            .reshape((1, 1, vocab_size))
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 logits reshape failed: {err}")))?;
+        let kv_cache = Arc::new(GenericKvCacheHandle::new(
+            self.config.num_hidden_layers,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            CandleDevice::Cpu,
+            input_ids.len(),
+            Self::next_reference_cache_id(),
+        ));
+        Ok(PrefillOutput::new(
+            common::wrap_tensor(logits_tensor),
+            kv_cache,
+        ))
     }
 
     async fn decode(&self, _input: &DecodeInput) -> Result<DecodeOutput> {
@@ -144,9 +398,14 @@ impl ModelExecutor for Qwen35W3Executor {
     }
 
     fn status(&self) -> ExecutorStatus {
+        let ready = self.dense_reference_runtime.is_some();
         ExecutorStatus {
-            state: ExecutorState::Error,
-            is_ready: false,
+            state: if ready {
+                ExecutorState::Ready
+            } else {
+                ExecutorState::Error
+            },
+            is_ready: ready,
             current_batch_size: 0,
             prefill_operations: 0,
             decode_operations: 0,
@@ -160,5 +419,232 @@ impl ModelExecutor for Qwen35W3Executor {
             },
             last_operation: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{definition::ModelDefinition, registry::Architecture};
+    use ferrum_interfaces::{
+        model_executor::{DecodeInput, ExecutorState, PrefillInput},
+        ModelExecutor,
+    };
+    use ferrum_testkit::MockTensor;
+
+    fn toy_dense_definition() -> ModelDefinition {
+        let mut def = ModelDefinition::default();
+        def.architecture = Architecture::Qwen35;
+        def.hidden_size = 2;
+        def.intermediate_size = 2;
+        def.vocab_size = 3;
+        def.num_hidden_layers = 2;
+        def.num_attention_heads = 1;
+        def.num_key_value_heads = Some(1);
+        def.max_position_embeddings = 16;
+        def.rope_theta = Some(10_000.0);
+        def.norm_eps = 1e-6;
+        def.extra_params = serde_json::json!({
+            "model_type": "qwen3_5_text",
+            "hidden_size": 2,
+            "intermediate_size": 2,
+            "num_hidden_layers": 2,
+            "layer_types": ["linear_attention", "full_attention"],
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_key_head_dim": 1,
+            "linear_value_head_dim": 1,
+            "linear_conv_kernel_dim": 1,
+            "head_dim": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "tie_word_embeddings": false
+        });
+        def
+    }
+
+    fn toy_dense_runtime() -> Qwen35DenseReferenceRuntime {
+        Qwen35DenseReferenceRuntime {
+            vocab_size: 3,
+            hidden_size: 2,
+            eps: 1e-6,
+            embed_tokens: vec![
+                1.0, 0.0, //
+                0.0, 1.0, //
+                1.0, 1.0,
+            ],
+            final_norm_weight: vec![0.0, 0.0],
+            lm_head_weight: vec![
+                1.0, 0.0, //
+                0.0, 1.0, //
+                1.0, 1.0,
+            ],
+            layers: vec![
+                Qwen35DenseReferenceRuntimeLayer::Linear(Qwen35DenseReferenceRuntimeLinearLayer {
+                    intermediate_size: 2,
+                    key_heads: 1,
+                    value_heads: 1,
+                    key_dim: 1,
+                    value_dim: 1,
+                    conv_kernel: 1,
+                    input_norm_weight: vec![0.0, 0.0],
+                    qkv_weight: vec![
+                        1.0, 0.0, //
+                        0.0, 1.0, //
+                        1.0, 1.0,
+                    ],
+                    z_weight: vec![1.0, -1.0],
+                    b_weight: vec![0.5, 0.25],
+                    a_weight: vec![-0.25, 0.75],
+                    conv1d_weight: vec![1.0, 1.0, 1.0],
+                    a_log: vec![0.0],
+                    dt_bias: vec![0.0],
+                    norm_weight: vec![1.0],
+                    out_proj_weight: vec![1.0, -0.5],
+                    post_attention_norm_weight: vec![0.0, 0.0],
+                    gate_proj_weight: vec![
+                        0.2, 0.1, //
+                        -0.1, 0.3,
+                    ],
+                    up_proj_weight: vec![
+                        0.4, -0.2, //
+                        0.3, 0.5,
+                    ],
+                    down_proj_weight: vec![
+                        1.0, 0.0, //
+                        0.0, 1.0,
+                    ],
+                }),
+                Qwen35DenseReferenceRuntimeLayer::Full(Qwen35DenseReferenceRuntimeFullLayer {
+                    intermediate_size: 2,
+                    num_heads: 1,
+                    num_kv_heads: 1,
+                    head_dim: 2,
+                    position_offset: 0,
+                    rope_theta: 10_000.0,
+                    input_norm_weight: vec![0.0, 0.0],
+                    q_weight: vec![
+                        1.0, 0.0, //
+                        0.0, 1.0,
+                    ],
+                    k_weight: vec![
+                        0.5, 0.0, //
+                        0.0, 0.5,
+                    ],
+                    v_weight: vec![
+                        1.0, 1.0, //
+                        -0.5, 0.5,
+                    ],
+                    q_norm_weight: vec![1.0, 1.0],
+                    k_norm_weight: vec![1.0, 1.0],
+                    o_weight: vec![
+                        1.0, 0.0, //
+                        0.0, 1.0,
+                    ],
+                    post_attention_norm_weight: vec![0.0, 0.0],
+                    gate_proj_weight: vec![
+                        -0.2, 0.2, //
+                        0.1, 0.3,
+                    ],
+                    up_proj_weight: vec![
+                        0.25, 0.5, //
+                        -0.3, 0.4,
+                    ],
+                    down_proj_weight: vec![
+                        0.5, 0.25, //
+                        -0.2, 0.75,
+                    ],
+                }),
+            ],
+        }
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "mismatch at {idx}: actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen35_w3_executor_without_reference_runtime_keeps_prefill_unsupported() {
+        let def = toy_dense_definition();
+        let executor = Qwen35W3Executor::from_definition(
+            "qwen35-reference",
+            &def,
+            DataType::FP32,
+            Device::CPU,
+        )
+        .unwrap();
+        let input = PrefillInput::new(MockTensor::from_u32(&[0, 1], &[2]).into_ref());
+
+        let err = tokio_test::block_on(executor.prefill(&input))
+            .expect_err("default W3 executor must not pretend product execution is wired");
+
+        assert!(err.to_string().contains("not wired"), "{err}");
+        let status = executor.status();
+        assert_eq!(status.state, ExecutorState::Error);
+        assert!(!status.is_ready);
+    }
+
+    #[test]
+    fn qwen35_w3_reference_prefill_returns_last_token_logits_and_kv_handle() {
+        let def = toy_dense_definition();
+        let runtime = toy_dense_runtime();
+        let expected = runtime.forward(&[0, 1]).unwrap();
+        let executor = Qwen35W3Executor::from_definition(
+            "qwen35-reference",
+            &def,
+            DataType::FP32,
+            Device::CPU,
+        )
+        .unwrap()
+        .with_dense_reference_runtime(runtime)
+        .unwrap();
+        let input = PrefillInput::new(MockTensor::from_u32(&[0, 1], &[2]).into_ref());
+
+        let output = tokio_test::block_on(executor.prefill(&input)).unwrap();
+
+        assert_eq!(output.logits.shape(), &[1, 1, 3]);
+        assert_close(&output.logits.to_vec_f32().unwrap(), &expected.logits[3..6]);
+        assert_eq!(output.kv_cache.block_table().sequence_length, 2);
+        assert_eq!(output.kv_cache.num_layers(), 2);
+        assert_eq!(output.kv_cache.num_heads(), 1);
+        assert_eq!(output.kv_cache.head_dim(), 2);
+        assert!(output.recurrent_state.is_none());
+        let status = executor.status();
+        assert_eq!(status.state, ExecutorState::Ready);
+        assert!(status.is_ready);
+    }
+
+    #[test]
+    fn qwen35_w3_reference_prefill_keeps_decode_unsupported_until_state_semantics_exist() {
+        let def = toy_dense_definition();
+        let executor = Qwen35W3Executor::from_definition(
+            "qwen35-reference",
+            &def,
+            DataType::FP32,
+            Device::CPU,
+        )
+        .unwrap()
+        .with_dense_reference_runtime(toy_dense_runtime())
+        .unwrap();
+        let kv_cache = Arc::new(GenericKvCacheHandle::new(
+            2,
+            1,
+            2,
+            CandleDevice::Cpu,
+            2,
+            "qwen35-reference-test".to_string(),
+        ));
+        let input = DecodeInput::new(MockTensor::from_u32(&[1], &[1]).into_ref(), kv_cache);
+
+        let err = tokio_test::block_on(executor.decode(&input))
+            .expect_err("decode should remain unsupported before recurrent/KV state semantics");
+
+        assert!(err.to_string().contains("not wired"), "{err}");
     }
 }
