@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZV — W3-S1 source checkpoint: DeltaNet layer dump comparator
+
+- Scope:
+  - source-only W3-S1 correctness-gate checkpoint;
+  - no paid GPU compute was started during this checkpoint;
+  - no whole W3 model was loaded;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `scripts/release/w3_deltanet_s1_layer_compare.py`;
+  - defined the W3-S1 single-layer dump schema for DeltaNet q/k/v/beta,
+    delta-rule core, gated DeltaNet output, router logits/top-k, routed expert
+    output, shared expert output, MoE merge, and final layer output;
+  - implemented a deterministic CPU reference and comparator for reference dump
+    vs Ferrum dump;
+  - added self-test mode that writes a reference dump plus synthetic Ferrum dump
+    and compares all tensors.
+- Validation:
+  - `python3 -m py_compile
+    scripts/release/w3_deltanet_s1_layer_compare.py` PASS;
+  - `git diff --check -- scripts/release/w3_deltanet_s1_layer_compare.py`
+    PASS;
+  - `python3 scripts/release/w3_deltanet_s1_layer_compare.py --self-test --out
+    docs/goals/model-coverage-2026-06-12/artifacts/w3_deltanet_s1_layer_selftest_20260617T124000Z`
+    PASS line:
+    `W3 DELTANET S1 LAYER COMPARE SELFTEST PASS:
+    /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_deltanet_s1_layer_selftest_20260617T124000Z`;
+  - self-test comparisons record zero max_abs for `delta_output`,
+    `routed_expert_output`, `shared_expert_output`, `moe_output`, and
+    `layer_output`; router top-k indices have zero mismatches.
+- Limitation:
+  - this is a gate/schema self-test using a synthetic Ferrum dump, not real
+    Qwen3.5/Qwen3.6 or HF/reference-vs-Ferrum model evidence.
+- Next required validation:
+  - implement or expose the real Ferrum DeltaNet single-layer dump using this
+    schema;
+  - generate the official/HF reference dump for the selected W3 model;
+  - rerun this comparator in `--compare` mode and only then count W3-S1 as real
+    correctness evidence.
+
 ## 2026-06-17 ZU — W3-S0 native CUDA delta-rule microbench PASS
 
 - Scope:
