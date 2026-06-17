@@ -4,8 +4,9 @@ impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
 
     pub(super) async fn run_batch_decode_adaptive(&self, request_ids: &[RequestId]) -> Result<()> {
-        let mut stack = vec![request_ids.to_vec()];
+        let mut stack = vec![self.decode_ready_request_ids(request_ids)];
         while let Some(chunk) = stack.pop() {
+            let chunk = self.decode_ready_request_ids(&chunk);
             if chunk.is_empty() {
                 continue;
             }
@@ -43,21 +44,22 @@ impl EngineInner {
     pub(super) async fn run_batch_decode(&self, request_ids: &[RequestId]) -> Result<()> {
         use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
 
-        let rids: Vec<RequestId> = request_ids.to_vec();
+        let mut rids: Vec<RequestId> = Vec::new();
 
         // Build the unified batch from sequence state.
         let mut batch = UnifiedBatch::new();
         {
             let sequences = self.sequences.read();
-            for rid in &rids {
-                let seq = sequences
-                    .get(rid)
-                    .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                let kv_cache = seq
-                    .kv_cache
-                    .as_ref()
-                    .ok_or_else(|| FerrumError::internal("No KV cache"))?
-                    .clone();
+            for rid in request_ids {
+                let Some(seq) = sequences.get(rid) else {
+                    continue;
+                };
+                if !seq.prefill_complete || seq.generated_tokens.is_empty() {
+                    continue;
+                }
+                let Some(kv_cache) = seq.kv_cache.clone() else {
+                    continue;
+                };
                 let last_token = seq
                     .generated_tokens
                     .last()
@@ -89,7 +91,11 @@ impl EngineInner {
                     metadata: seq.model_decode_metadata(),
                     logits_policy: seq.model_decode_logits_policy(),
                 });
+                rids.push(rid.clone());
             }
+        }
+        if batch.items.is_empty() {
+            return Ok(());
         }
 
         let kv_requests = kv_slot_requests_for_unified_batch(&batch);
@@ -143,6 +149,16 @@ impl EngineInner {
                     )?
                 };
                 seq.generated_tokens.push(token);
+                let cache_id = seq
+                    .model_cache_id
+                    .clone()
+                    .unwrap_or_else(|| rid.to_string());
+                let kv_len = seq
+                    .input_tokens
+                    .len()
+                    .saturating_add(seq.generated_tokens.len())
+                    .saturating_sub(1);
+                seq.kv_cache = Some(self.make_model_kv_handle_with_seq(cache_id, kv_len));
                 seq.tokens_this_iteration += 1;
                 // pos_offset is sourced from SequenceState bookkeeping
                 // (see process_batch_unified). The engine-side KV handle's
