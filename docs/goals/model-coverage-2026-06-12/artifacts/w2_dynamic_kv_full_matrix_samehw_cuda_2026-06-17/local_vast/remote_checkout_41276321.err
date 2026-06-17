@@ -1,0 +1,23 @@
+Warning: Permanently added '[ssh8.vast.ai]:36320' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Cloning into 'ferrum-infer-rs'...
+Updating files:  94% (8496/8986)Updating files:  95% (8537/8986)Updating files:  96% (8627/8986)Updating files:  97% (8717/8986)Updating files:  98% (8807/8986)Updating files:  99% (8897/8986)Updating files: 100% (8986/8986)Updating files: 100% (8986/8986), done.
+Note: switching to '75c0f71175da2190c151678c17cb47b109766e9d'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 75c0f711 docs(cuda): record dynamic kv full matrix contract

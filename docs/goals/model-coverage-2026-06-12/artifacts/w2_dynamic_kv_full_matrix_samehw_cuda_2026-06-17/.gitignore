@@ -1,0 +1,10 @@
+local_vast/*.bundle
+local_vast/**/*.bundle
+local_vast/*.tgz
+local_vast/**/*.tgz
+local_vast/*.raw.json
+local_vast/**/*.raw.json
+local_vast/*raw*.json
+local_vast/**/*raw*.json
+local_vast/*_tmp.*
+local_vast/**/*_tmp.*

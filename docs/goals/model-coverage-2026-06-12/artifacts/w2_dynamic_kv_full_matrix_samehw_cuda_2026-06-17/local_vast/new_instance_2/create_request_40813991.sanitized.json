@@ -1,0 +1,11 @@
+{
+  "cancel_unavail": true,
+  "client_id": "me",
+  "disk": 300,
+  "image": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+  "label": "ferrum-w2-dynamic-kv-full-matrix-20260617b",
+  "offer": 40813991,
+  "onstart_present": true,
+  "runtype": "ssh",
+  "target_state": "running"
+}

@@ -1,0 +1,40 @@
+[
+  {
+    "ask_contract_id": 37848110,
+    "bundle_id": 1230644703,
+    "cpu_cores_effective": 10.0,
+    "cpu_name": "Xeon\u00ae w5-3425",
+    "cuda_max_good": 13.2,
+    "disk_space": 255.50000000000006,
+    "dph_total": 0.5355555555555556,
+    "geolocation": "South Carolina, US",
+    "gpu_name": "RTX 4090D",
+    "gpu_ram": 49140,
+    "host_id": 553047,
+    "id": 37848110,
+    "inet_down": 1146.4,
+    "inet_up": 1218.5,
+    "machine_id": 132117,
+    "num_gpus": 1,
+    "reliability2": 0.9909516
+  },
+  {
+    "ask_contract_id": 40219701,
+    "bundle_id": 1263549486,
+    "cpu_cores_effective": 25.6,
+    "cpu_name": "AMD EPYC 7B13 64-Core Processor",
+    "cuda_max_good": 13.0,
+    "disk_space": 810.2146470938433,
+    "dph_total": 0.5407407407407407,
+    "geolocation": "California, US",
+    "gpu_name": "RTX 4090",
+    "gpu_ram": 49140,
+    "host_id": 256524,
+    "id": 40219701,
+    "inet_down": 7263.8,
+    "inet_up": 5408.8,
+    "machine_id": 56458,
+    "num_gpus": 1,
+    "reliability2": 0.9935465
+  }
+]
