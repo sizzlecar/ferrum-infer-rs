@@ -18,7 +18,7 @@ use std::path::Path;
 use crate::{
     definition::ModelDefinition,
     qwen35_config::Qwen35TextConfig,
-    qwen35_weights::{Qwen35WeightInventory, Qwen35WeightValidation},
+    qwen35_weights::{Qwen35ResolvedWeightPlan, Qwen35WeightInventory, Qwen35WeightValidation},
 };
 
 const UNSUPPORTED_EXECUTION_MESSAGE: &str = "Qwen3.5/Qwen3.6 W3 executor exposes recurrent-state \
@@ -31,6 +31,7 @@ pub struct Qwen35W3Executor {
     dtype: DataType,
     device: Device,
     weight_validation: Option<Qwen35WeightValidation>,
+    weight_plan: Option<Qwen35ResolvedWeightPlan>,
 }
 
 impl Qwen35W3Executor {
@@ -51,6 +52,7 @@ impl Qwen35W3Executor {
             dtype,
             device,
             weight_validation: None,
+            weight_plan: None,
         })
     }
 
@@ -64,10 +66,12 @@ impl Qwen35W3Executor {
         let mut executor = Self::from_definition(model_id, def, dtype, device)?;
         let inventory = Qwen35WeightInventory::from_safetensors_dir(model_dir)
             .map_err(|err| FerrumError::model(format!("Qwen3.5 weight inventory failed: {err}")))?;
-        let validation = inventory
-            .detect_prefix_and_validate(&executor.config)
+        let weight_plan = inventory
+            .detect_prefix_and_resolve(&executor.config)
             .map_err(|err| FerrumError::model(format!("Qwen3.5 weight preflight failed: {err}")))?;
+        let validation = weight_plan.validation();
         executor.weight_validation = Some(validation);
+        executor.weight_plan = Some(weight_plan);
         Ok(executor)
     }
 
@@ -77,6 +81,10 @@ impl Qwen35W3Executor {
 
     pub fn weight_validation(&self) -> Option<&Qwen35WeightValidation> {
         self.weight_validation.as_ref()
+    }
+
+    pub fn weight_plan(&self) -> Option<&Qwen35ResolvedWeightPlan> {
+        self.weight_plan.as_ref()
     }
 
     fn unsupported_execution() -> FerrumError {

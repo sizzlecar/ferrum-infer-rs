@@ -619,6 +619,14 @@ mod tests {
         let validation = executor.weight_validation().unwrap();
         assert_eq!(validation.prefix, "model");
         assert!(validation.is_pass());
+        let weight_plan = executor.weight_plan().unwrap();
+        assert_eq!(weight_plan.prefix, "model");
+        assert_eq!(
+            weight_plan
+                .layer_tensor(0, "linear_attn_qkv")
+                .map(|tensor| tensor.name.as_str()),
+            Some("model.layers.0.linear_attn.in_proj_qkv.weight")
+        );
     }
 
     #[test]
