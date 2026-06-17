@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZH — W3 Qwen3.6 value-head DeltaNet topology correction checkpoint
+
+- Scope:
+  - W3-S1/S2 recurrent-state abstraction correction after checking current
+    vLLM Qwen3.5/Qwen3-Next Gated DeltaNet source;
+  - no product execution was run;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Correction:
+  - vLLM stores Gated DeltaNet temporal state as
+    `[value_heads, value_head_dim, key_head_dim]`;
+  - Qwen3.6 MoE/shared-expert therefore uses `delta_state` shape
+    `[32, 128, 128]`, not the earlier grouped-key-head shape
+    `[16, 128, 256]`;
+  - the total state elements are unchanged, but the layout semantics are
+    different and must be modeled before product prefill/decode wiring.
+- Change:
+  - updated `Qwen35TextConfig::recurrent_delta_state_shape()` to follow the
+    vLLM value-head temporal-state layout;
+  - updated the W3 DeltaNet S1 Rust harness and Python comparator with an
+    explicit `value_heads` axis;
+  - made `delta_beta`, `delta_v`, and `delta_core` value-head-major;
+  - added validation that `value_heads` is divisible by q/k `heads`;
+  - added a Qwen3.6 MoE topology unit test with `heads=16`,
+    `value_heads=32`, `key_dim=128`, and `value_dim=128`;
+  - kept expert counts small in the unit test so it stays a fast correctness
+    gate rather than a model-performance run.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models --test qwen35_config_test -- --nocapture`
+    PASS: `4 passed`;
+  - `cargo test -p ferrum-models deltanet_s1 -- --nocapture`
+    PASS: `5 passed`;
+  - `cargo run -p ferrum-models --example w3_deltanet_s1_dump -- --out target/w3_deltanet_s1_rust_qwen36 --tokens 2 --hidden-dim 16 --heads 16 --value-heads 32 --key-dim 128 --value-dim 128 --experts 8 --top-k 2 --expert-hidden-dim 4 --seed 9271`
+    PASS line:
+    `W3 DELTANET S1 FERRUM DUMP PASS: target/w3_deltanet_s1_rust_qwen36`;
+  - `python3 scripts/release/w3_deltanet_s1_layer_compare.py --self-test --out target/w3_deltanet_s1_python_qwen36 --tokens 2 --hidden-dim 16 --heads 16 --value-heads 32 --key-dim 128 --value-dim 128 --experts 8 --top-k 2 --expert-hidden-dim 4 --seed 9271`
+    PASS line:
+    `W3 DELTANET S1 LAYER COMPARE SELFTEST PASS: /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/w3_deltanet_s1_python_qwen36`;
+  - `python3 scripts/release/w3_deltanet_s1_layer_compare.py --compare --reference-dump target/w3_deltanet_s1_python_qwen36/reference_dump --ferrum-dump target/w3_deltanet_s1_rust_qwen36 --out target/w3_deltanet_s1_compare_qwen36 --atol 1e-6`
+    PASS line:
+    `W3 DELTANET S1 LAYER COMPARE PASS: /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/w3_deltanet_s1_compare_qwen36`;
+  - the cross-language compare reported `max_abs = 0.0` for all float tensors
+    and `0` mismatches for `router_topk_indices`.
+- Limitation:
+  - this is still S1 synthetic topology evidence;
+  - it does not yet wire the Qwen3.6 product executor, recurrent state update,
+    `ferrum run`, or `ferrum serve`.
+
 ## 2026-06-17 ZZG — W3 Qwen3.5 recurrent-state shape contract checkpoint
 
 - Scope:

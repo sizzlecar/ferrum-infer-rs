@@ -154,22 +154,21 @@ impl Qwen35TextConfig {
 
     /// Per-layer DeltaNet recurrent state shape, excluding the request slot.
     ///
-    /// Delta-rule state is a per-key-head memory matrix. Dense Qwen3.5 has
-    /// matching q/k and v totals: `[key_heads, key_dim, value_dim]`.
-    /// Qwen3.6 MoE expands value heads, so values are grouped back onto the
-    /// key heads: `[key_heads, key_dim, value_total / key_heads]`.
+    /// vLLM stores Gated DeltaNet temporal state as
+    /// `[value_heads, value_head_dim, key_head_dim]`. When value heads exceed
+    /// q/k heads, q/k are repeated onto the value-head axis.
     pub fn recurrent_delta_state_shape(&self) -> Result<Vec<usize>, String> {
         let key_heads = self.linear_attention.num_key_heads;
-        let value_total = self.linear_value_total_dim();
-        if value_total % key_heads != 0 {
+        let value_heads = self.linear_attention.num_value_heads;
+        if value_heads % key_heads != 0 {
             return Err(format!(
-                "linear value total dim {value_total} is not divisible by key heads {key_heads}"
+                "linear value heads {value_heads} is not divisible by key heads {key_heads}"
             ));
         }
         Ok(vec![
-            key_heads,
+            value_heads,
+            self.linear_attention.value_head_dim,
             self.linear_attention.key_head_dim,
-            value_total / key_heads,
         ])
     }
 
