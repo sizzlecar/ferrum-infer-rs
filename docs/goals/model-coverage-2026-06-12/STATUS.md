@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZT — W3-S0 source checkpoint: delta-rule microbench harness
+
+- Scope:
+  - source-only W3-S0 microbench harness checkpoint;
+  - no paid GPU compute was started during this checkpoint;
+  - local self-test is not W3-S0 native CUDA evidence;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `scripts/release/w3_delta_rule_s0_microbench.py`;
+  - implemented deterministic Python delta-rule reference and chunked-reference
+    comparison;
+  - added `--cuda` mode that writes a minimal native CUDA source, builds it
+    with `nvcc`, runs it, and compares CUDA output against the same reference;
+  - records command line, git state, shapes, seed, tolerance, CUDA metadata,
+    build/run commands, process logs, and binary SHA256 when CUDA mode is used.
+- Validation:
+  - `python3 -m py_compile
+    scripts/release/w3_delta_rule_s0_microbench.py` PASS;
+  - `python3 scripts/release/w3_delta_rule_s0_microbench.py --self-test --out
+    docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_selftest_20260617T060439Z`
+    PASS line:
+    `W3 DELTA RULE S0 SELFTEST PASS:
+    /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_selftest_20260617T060439Z`;
+  - self-test manifest records chunked-reference `max_abs=0.0`,
+    `max_rel=0.0`, `rmse=0.0`.
+- Next required validation:
+  - start retained Vast instance `41241013` only under a stated W3-S0 native
+    CUDA lane, run this script with `--cuda`, copy back the artifact, and stop
+    the instance immediately after the result.
+
 ## 2026-06-17 ZS — Vast cleanup checkpoint: keep one reusable CUDA instance
 
 - Scope:
