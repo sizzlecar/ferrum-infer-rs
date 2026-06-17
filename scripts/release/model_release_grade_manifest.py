@@ -340,17 +340,22 @@ def source_status(source: Path) -> dict[str, Any]:
 def build_manifest(
     *,
     source: Path,
+    baseline_source: Path | None,
     out_dir: Path,
     matrix_path: Path,
     effective_concurrency: dict[int, int],
     dataset_id: str,
 ) -> Path:
     source = require_dir(source, "source artifact dir").resolve()
+    baseline_source = require_dir(
+        baseline_source or source,
+        "baseline artifact dir",
+    ).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     source_status(source)
 
     ferrum_perf = source / "perf/bench_ferrum_sharegpt_sweep_100x3.json"
-    baseline_perf = source / "perf/bench_vllm_sharegpt_sweep_100x3.json"
+    baseline_perf = baseline_source / "perf/bench_vllm_sharegpt_sweep_100x3.json"
     ferrum_reports = reports_by_concurrency(ferrum_perf, "Ferrum bench report")
     baseline_reports = reports_by_concurrency(baseline_perf, "vLLM bench report")
     missing = [c for c in REQUIRED_CELLS if c not in ferrum_reports or c not in baseline_reports]
@@ -358,12 +363,21 @@ def build_manifest(
         raise BuildError(f"missing required performance cells: {missing}")
 
     dataset_sha = read_first_token(source / "env/dataset.sha256", "dataset sha")
+    baseline_dataset_sha = read_first_token(
+        baseline_source / "env/dataset.sha256",
+        "baseline dataset sha",
+    )
+    if dataset_sha.lower() != baseline_dataset_sha.lower():
+        raise BuildError(
+            "baseline dataset sha does not match Ferrum dataset sha: "
+            f"{baseline_dataset_sha} != {dataset_sha}"
+        )
     binary_sha = read_first_token(source / "env/ferrum.sha256", "Ferrum binary sha")
     git_sha = read_first_token(source / "env/git_sha.txt", "remote git sha")
     git_status = require_file(source / "env/git_status_short.txt", "remote git status").read_text(
         encoding="utf-8"
     ).strip()
-    vllm_versions = load_json(source / "env/vllm_versions.json")
+    vllm_versions = load_json(baseline_source / "env/vllm_versions.json")
     vllm_version = str(vllm_versions.get("vllm", "unknown"))
     baseline_build_command = [
         "python",
@@ -373,9 +387,14 @@ def build_manifest(
         f"vllm=={vllm_version}",
     ]
     ferrum_command = read_command(source / "perf/bench-ferrum.command.txt", "Ferrum bench command")
-    baseline_command = read_command(source / "perf/bench-vllm.command.txt", "vLLM bench command")
+    baseline_command = read_command(
+        baseline_source / "perf/bench-vllm.command.txt",
+        "vLLM bench command",
+    )
 
-    vllm_server = load_json(require_file(source / "vllm/vllm_server.command.json", "vLLM command"))
+    vllm_server = load_json(
+        require_file(baseline_source / "vllm/vllm_server.command.json", "vLLM command")
+    )
     vllm_server_command = vllm_server.get("cmd")
     if not isinstance(vllm_server_command, list) or not all(
         isinstance(part, str) for part in vllm_server_command
@@ -442,6 +461,7 @@ def build_manifest(
             "baseline": {
                 "engine": "vLLM",
                 "version": vllm_version,
+                "evidence_mode": "historical" if baseline_source != source else "live",
                 "build_command_line": baseline_build_command,
                 "command_line": vllm_server_command,
                 "bench_command_line": baseline_command,
@@ -537,9 +557,11 @@ def run_selftest() -> int:
     with tempfile.TemporaryDirectory(prefix="ferrum-w2-release-grade-manifest-") as tmp:
         root = Path(tmp)
         source = write_selftest_source(root)
+        baseline_source = write_selftest_source(root / "historical-baseline")
         out_dir = root / "out"
         manifest = build_manifest(
             source=source,
+            baseline_source=baseline_source,
             out_dir=out_dir,
             matrix_path=W2_MATRIX,
             effective_concurrency={32: 16},
@@ -558,6 +580,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("lane", choices=["w2"], nargs="?", help="release-grade lane")
     parser.add_argument("--source", type=Path, help="full-matrix artifact source dir")
+    parser.add_argument(
+        "--baseline-source",
+        type=Path,
+        help="artifact dir containing the vLLM baseline reports; defaults to --source",
+    )
     parser.add_argument("--out", type=Path, help="output dir for model_release_grade_manifest.json")
     parser.add_argument("--matrix", type=Path, default=W2_MATRIX, help="W2 coverage matrix")
     parser.add_argument(
@@ -592,6 +619,7 @@ def main() -> int:
     effective = parse_effective_concurrency(args.effective_concurrency)
     manifest = build_manifest(
         source=args.source,
+        baseline_source=args.baseline_source,
         out_dir=args.out,
         matrix_path=args.matrix,
         effective_concurrency=effective,
