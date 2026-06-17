@@ -5,7 +5,8 @@
 //! variants add routed experts plus a shared expert. This module keeps that
 //! shape explicit before the product loader/model path is wired.
 
-use ferrum_interfaces::RecurrentStateTensorSpec;
+use ferrum_interfaces::{RecurrentStateSpec, RecurrentStateTensorSpec};
+use ferrum_types::{DataType, Device, RequestId};
 use serde_json::Value;
 
 pub const QWEN35_DELTA_STATE_NAME: &str = "delta_state";
@@ -49,6 +50,32 @@ pub struct Qwen35TextConfig {
 }
 
 impl Qwen35TextConfig {
+    pub fn from_model_definition(def: &crate::definition::ModelDefinition) -> Result<Self, String> {
+        if !matches!(
+            def.architecture,
+            crate::registry::Architecture::Qwen35 | crate::registry::Architecture::Qwen35Moe
+        ) {
+            return Err(format!(
+                "model definition architecture {:?} is not Qwen3.5/Qwen3.6",
+                def.architecture
+            ));
+        }
+        let parsed = Self::from_hf_config_value(&def.extra_params)?;
+        if parsed.hidden_size != def.hidden_size {
+            return Err(format!(
+                "Qwen3.5 text hidden_size {} does not match ModelDefinition hidden_size {}",
+                parsed.hidden_size, def.hidden_size
+            ));
+        }
+        if parsed.num_hidden_layers != def.num_hidden_layers {
+            return Err(format!(
+                "Qwen3.5 text num_hidden_layers {} does not match ModelDefinition num_hidden_layers {}",
+                parsed.num_hidden_layers, def.num_hidden_layers
+            ));
+        }
+        Ok(parsed)
+    }
+
     pub fn from_hf_config_str(raw: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(raw).map_err(|err| err.to_string())?;
         Self::from_hf_config_value(&value)
@@ -196,6 +223,26 @@ impl Qwen35TextConfig {
             .iter()
             .map(RecurrentStateTensorSpec::num_elements)
             .sum())
+    }
+
+    pub fn to_recurrent_state_spec(
+        &self,
+        request_id: RequestId,
+        dtype: DataType,
+        device: Device,
+        max_batch_slots: usize,
+    ) -> Result<RecurrentStateSpec, String> {
+        if max_batch_slots == 0 {
+            return Err("max_batch_slots must be positive".to_string());
+        }
+        Ok(RecurrentStateSpec {
+            request_id,
+            num_layers: self.num_hidden_layers,
+            tensors: self.recurrent_state_tensor_specs()?,
+            dtype,
+            device,
+            max_batch_slots,
+        })
     }
 
     fn validate(&self) -> Result<(), String> {
