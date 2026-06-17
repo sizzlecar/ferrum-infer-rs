@@ -2,6 +2,36 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ1 — W3 dense model CPU-reference forward checkpoint
+
+- Scope:
+  - W3-S2 dense Qwen3.5 model-level CPU reference before product executor
+    wiring;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35DenseReferenceModel`;
+  - added reference layer descriptors for dense linear-attention and
+    full-attention layers;
+  - added `qwen35_dense_reference_model_forward_cpu()`;
+  - the reference forward gathers embeddings, runs linear/full attention
+    reference layers in order, applies final RMSNorm+1, and emits lm-head
+    logits;
+  - captures per-layer hidden states and final recurrent state for each
+    linear-attention layer so future executor wiring can compare layer
+    boundaries, not only final logits.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `44 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still CPU/reference math only;
+  - MoE model-level forward is not implemented in this checkpoint;
+  - product `prefill`/`decode`, `ferrum run`, and `ferrum serve` remain
+    unwired for W3.
+
 ## 2026-06-18 ZZZ — W3 sparse-MoE shared-expert CPU-reference checkpoint
 
 - Scope:
