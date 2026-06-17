@@ -7,6 +7,23 @@ mod completion;
 mod decode;
 mod prefill;
 
+pub(super) fn is_resource_exhausted_error(error: &FerrumError) -> bool {
+    matches!(error, FerrumError::ResourceExhausted { .. })
+}
+
+pub(super) fn kv_slot_requests_for_unified_batch(
+    batch: &ferrum_interfaces::model_executor::UnifiedBatch,
+) -> Vec<KvSlotRequest> {
+    batch
+        .items
+        .iter()
+        .map(|item| KvSlotRequest {
+            cache_id: item.seq_id.clone(),
+            target_len: item.pos_offset.saturating_add(item.q_tokens.len()),
+        })
+        .collect()
+}
+
 impl EngineInner {
     // ── tensor helper ──────────────────────────────────────────────────
 

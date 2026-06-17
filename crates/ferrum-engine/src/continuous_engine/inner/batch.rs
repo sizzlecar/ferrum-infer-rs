@@ -71,7 +71,7 @@ impl EngineInner {
             }
         }
         if decode_ids.len() > 1 {
-            if let Err(e) = self.run_batch_decode(&decode_ids).await {
+            if let Err(e) = self.run_batch_decode_adaptive(&decode_ids).await {
                 warn!("Batch decode failed, falling back to per-request: {}", e);
                 for rid in &decode_ids {
                     if let Err(e) = self.run_decode_step(rid).await {
@@ -400,6 +400,20 @@ impl EngineInner {
         } else {
             None
         };
+        let kv_requests = kv_slot_requests_for_unified_batch(&unified);
+        if let Err(e) = self.model_executor.reserve_kv_slots(&kv_requests) {
+            warn!("Unified KV admission failed: {}", e);
+            for work in &prefill_meta {
+                if work.fresh_kv {
+                    let _ = self.kv_cache.deallocate(work.rid.clone()).await;
+                }
+            }
+            if is_resource_exhausted_error(&e) && prefill_meta.is_empty() && !decode_meta.is_empty()
+            {
+                return self.run_batch_decode_adaptive(&decode_meta).await;
+            }
+            return self.process_batch_legacy_split(batch).await;
+        }
         let results = match self.model_executor.unified_decode(&unified).await {
             Ok(r) => r,
             Err(e) => {
@@ -717,12 +731,23 @@ impl EngineInner {
     ///
     /// Returns `true` if a victim was preempted.
     pub(super) async fn preempt_victim(&self, exclude_id: &RequestId) -> bool {
+        let exclude = std::collections::HashSet::from([exclude_id.clone()]);
+        self.preempt_victim_excluding(&exclude).await
+    }
+
+    /// Try to preempt a decoding request outside `exclude_ids`.
+    pub(super) async fn preempt_victim_excluding(
+        &self,
+        exclude_ids: &std::collections::HashSet<RequestId>,
+    ) -> bool {
         // Select victim: any decoding sequence except the requester
         let victim_id = {
             let sequences = self.sequences.read();
             sequences
                 .iter()
-                .filter(|(id, s)| *id != exclude_id && s.prefill_complete && s.kv_cache.is_some())
+                .filter(|(id, s)| {
+                    !exclude_ids.contains(*id) && s.prefill_complete && s.kv_cache.is_some()
+                })
                 .min_by(|(_, a), (_, b)| {
                     // Lowest priority first, then fewest generated tokens
                     a.sampling_params

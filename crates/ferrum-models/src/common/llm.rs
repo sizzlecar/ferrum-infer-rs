@@ -5,7 +5,7 @@
 //! `LlmExecutor` (living in `ferrum-engine`) holds a `Box<dyn DecoderOnlyLLM>`
 //! and adapts it to the `ModelExecutor` trait that the scheduler calls.
 
-use ferrum_interfaces::model_executor::LogitsReturnPolicy;
+use ferrum_interfaces::model_executor::{KvSlotRequest, KvSlotReservation, LogitsReturnPolicy};
 
 /// Runtime configuration every decoder-only LLM must expose.
 ///
@@ -118,6 +118,17 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// budget.
     fn kv_capacity(&self) -> usize {
         self.config().max_seq_len
+    }
+
+    /// Reserve model-owned KV slots before dispatching a prefill/decode forward.
+    ///
+    /// Paged-KV models override this to allocate physical blocks and update block
+    /// tables at the admission boundary. Non-paged models return `None`.
+    fn reserve_kv_slots(
+        &mut self,
+        _requests: &[KvSlotRequest],
+    ) -> std::result::Result<Option<KvSlotReservation>, ferrum_types::FerrumError> {
+        Ok(None)
     }
 
     /// Prefill the model with a prompt. Returns `[vocab_size]` logits for

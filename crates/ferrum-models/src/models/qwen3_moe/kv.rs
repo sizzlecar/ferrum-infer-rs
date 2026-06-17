@@ -237,4 +237,143 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
 
         Ok(())
     }
+
+    pub(crate) fn reserve_paged_kv_slots(
+        &mut self,
+        requests: &[KvSlotRequest],
+    ) -> Result<Option<KvSlotReservation>> {
+        if requests.is_empty() {
+            return Ok(None);
+        }
+
+        let mut targets: Vec<(String, usize)> = Vec::new();
+        for request in requests {
+            if let Some((_, target)) = targets
+                .iter_mut()
+                .find(|(cache_id, _)| cache_id == &request.cache_id)
+            {
+                *target = (*target).max(request.target_len);
+            } else {
+                targets.push((request.cache_id.clone(), request.target_len));
+            }
+        }
+
+        for (cache_id, _) in &targets {
+            self.ensure_kv(cache_id);
+        }
+        if self.paged_pools.is_none() {
+            return Ok(None);
+        }
+
+        let mut plans = Vec::with_capacity(targets.len());
+        let mut block_size = 0usize;
+        let mut total_new_blocks = 0usize;
+        for (cache_id, target_len) in &targets {
+            let caches = self.kv_caches.get(cache_id).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "paged KV reservation missing cache for cache_id={cache_id:?}"
+                ))
+            })?;
+            let cache = caches.first().ok_or_else(|| {
+                FerrumError::model(format!(
+                    "paged KV reservation found empty layer cache for cache_id={cache_id:?}"
+                ))
+            })?;
+            if cache.block_size == 0 {
+                return Ok(None);
+            }
+            if block_size == 0 {
+                block_size = cache.block_size;
+            } else if block_size != cache.block_size {
+                return Err(FerrumError::model(format!(
+                    "paged KV reservation saw mixed block sizes: {block_size} and {}",
+                    cache.block_size
+                )));
+            }
+
+            let max_blocks_per_seq = cache.capacity / cache.block_size;
+            let blocks_before = cache.paged_block_indices.len();
+            let blocks_after = target_len.div_ceil(cache.block_size);
+            if blocks_after > max_blocks_per_seq {
+                return Err(FerrumError::model(format!(
+                    "paged KV reservation: target_len={target_len} needs {blocks_after} blocks, exceeds per-seq table capacity {max_blocks_per_seq} for cache_id={cache_id:?}"
+                )));
+            }
+            let new_blocks = blocks_after.saturating_sub(blocks_before);
+            total_new_blocks += new_blocks;
+            plans.push(KvSlotAllocation {
+                cache_id: cache_id.clone(),
+                blocks_before,
+                blocks_after,
+                new_blocks,
+            });
+        }
+
+        let alloc_arc = self.paged_block_alloc.as_ref().ok_or_else(|| {
+            FerrumError::model(
+                "paged KV reservation missing block allocator while paged_pools is set",
+            )
+        })?;
+        let free_blocks_before = {
+            let alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+            alloc.free_count()
+        };
+        if total_new_blocks > free_blocks_before {
+            return Err(FerrumError::resource_exhausted(format!(
+                "paged KV admission: need {total_new_blocks} new blocks but only {free_blocks_before} free"
+            )));
+        }
+
+        let mut ctx = B::new_context();
+        for plan in &plans {
+            if plan.new_blocks == 0 {
+                continue;
+            }
+            let new_blocks = {
+                let alloc_arc = self.paged_block_alloc.as_ref().ok_or_else(|| {
+                    FerrumError::model(
+                        "paged KV reservation lost block allocator while paged_pools is set",
+                    )
+                })?;
+                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+                alloc.allocate_n(plan.new_blocks)?
+            };
+            let caches = self.kv_caches.get_mut(&plan.cache_id).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "paged KV reservation lost cache for cache_id={:?}",
+                    plan.cache_id
+                ))
+            })?;
+            let max_blocks_per_seq = caches
+                .first()
+                .map(|cache| cache.capacity / block_size)
+                .unwrap_or(0);
+            let mut block_indices = caches
+                .first()
+                .map(|cache| cache.paged_block_indices.clone())
+                .unwrap_or_default();
+            block_indices.extend(new_blocks);
+            let mut padded = block_indices.clone();
+            padded.resize(max_blocks_per_seq, 0);
+            for cache in caches.iter_mut() {
+                cache.paged_block_indices = block_indices.clone();
+                if let Some(block_table) = cache.block_table.as_mut() {
+                    B::write_typed::<u32>(&mut ctx, block_table, &padded);
+                }
+            }
+        }
+        B::sync(&mut ctx);
+
+        let (total_blocks, free_blocks_after) = {
+            let alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+            (alloc.capacity() as usize, alloc.free_count())
+        };
+        Ok(Some(KvSlotReservation {
+            block_size,
+            total_blocks,
+            free_blocks_before,
+            free_blocks_after,
+            allocations: plans,
+        }))
+    }
 }
