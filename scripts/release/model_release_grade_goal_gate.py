@@ -187,6 +187,25 @@ def flag_value(parts: list[str], flag: str) -> str | None:
     return None
 
 
+def parse_positive_int_list(value: str, label: str, problems: list[str]) -> set[int]:
+    out: set[int] = set()
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item:
+            problems.append(f"{label} contains an empty concurrency cell")
+            continue
+        try:
+            parsed = int(item)
+        except ValueError:
+            problems.append(f"{label} contains non-integer concurrency cell {item!r}")
+            continue
+        if parsed <= 0:
+            problems.append(f"{label} contains non-positive concurrency cell {parsed}")
+            continue
+        out.add(parsed)
+    return out
+
+
 def validate_bench_command(
     parts: list[str],
     n_repeats: int,
@@ -194,9 +213,12 @@ def validate_bench_command(
     problems: list[str],
     *,
     requests_per_run: int | None,
+    expected_concurrency: int | None,
 ) -> None:
     if not any(part == "bench-serve" or part.endswith("/bench-serve") for part in parts):
         problems.append(f"{label} command must invoke ferrum bench-serve")
+    if flag_value(parts, "--request-rate") is not None:
+        problems.append(f"{label} command must use closed-loop concurrency, not --request-rate")
     for flag in ["--fail-on-error", "--require-ci"]:
         if not has_flag(parts, flag):
             problems.append(f"{label} command missing {flag}")
@@ -217,6 +239,39 @@ def validate_bench_command(
             f"{label} command --num-prompts={prompt_value}, "
             f"expected manifest requests_per_run={requests_per_run}"
         )
+    if expected_concurrency is not None:
+        sweep_value = flag_value(parts, "--concurrency-sweep")
+        concurrency_value = flag_value(parts, "--concurrency")
+        if concurrency_value is None:
+            concurrency_value = flag_value(parts, "--max-concurrency")
+        if sweep_value is not None:
+            cells = parse_positive_int_list(
+                sweep_value,
+                f"{label} command --concurrency-sweep",
+                problems,
+            )
+            if expected_concurrency not in cells:
+                problems.append(
+                    f"{label} command --concurrency-sweep must include c={expected_concurrency}"
+                )
+        elif concurrency_value is not None:
+            try:
+                parsed = int(concurrency_value)
+            except ValueError:
+                problems.append(
+                    f"{label} command --concurrency must be integer, got {concurrency_value!r}"
+                )
+            else:
+                if parsed != expected_concurrency:
+                    problems.append(
+                        f"{label} command --concurrency={parsed}, "
+                        f"expected c={expected_concurrency}"
+                    )
+        else:
+            problems.append(
+                f"{label} command must include --concurrency-sweep or --concurrency "
+                f"for c={expected_concurrency}"
+            )
     for part in parts:
         if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
             problems.append(f"{label} command uses hidden env override: {part.split('=', 1)[0]}")
@@ -632,6 +687,7 @@ def validate_performance_cell(
             label,
             problems,
             requests_per_run=requests,
+            expected_concurrency=concurrency,
         )
     baseline_command = command_parts(
         cell.get("baseline_bench_command_line", baseline.get("bench_command_line")),
@@ -645,6 +701,7 @@ def validate_performance_cell(
             f"{label}.baseline",
             problems,
             requests_per_run=baseline_requests,
+            expected_concurrency=concurrency,
         )
 
     ferrum_metric = metric_from_cell(cell, problems, label)
@@ -832,6 +889,8 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
                 "bench_command_line": [
                     "ferrum",
                     "bench-serve",
+                    "--concurrency-sweep",
+                    "1,4,16,32",
                     "--fail-on-error",
                     "--require-ci",
                     "--seed",
@@ -844,6 +903,8 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
                 "baseline_bench_command_line": [
                     "ferrum",
                     "bench-serve",
+                    "--concurrency-sweep",
+                    "1,4,16,32",
                     "--fail-on-error",
                     "--require-ci",
                     "--seed",
@@ -1139,6 +1200,24 @@ def run_selftest() -> int:
             "command --num-prompts=32" in problem for problem in bad_num_prompts_problems
         ):
             raise AssertionError("bad num-prompts command selftest did not fail as expected")
+
+        bad_concurrency_sweep = tmp_root / "bad-concurrency-sweep-command"
+        bad_concurrency_sweep_manifest = write_selftest_manifest(
+            bad_concurrency_sweep,
+            ratio=0.82,
+        )
+        data = load_json(bad_concurrency_sweep_manifest)
+        command = data["performance"]["cells"][3]["bench_command_line"]
+        command[command.index("--concurrency-sweep") + 1] = "1,4,16"
+        baseline_command = data["performance"]["cells"][3]["baseline_bench_command_line"]
+        baseline_command[baseline_command.index("--concurrency-sweep") + 1] = "1,4,16"
+        write_json(bad_concurrency_sweep_manifest, data)
+        bad_concurrency_sweep_problems = validate_manifest(data, "w2", bad_concurrency_sweep)
+        if not any(
+            "command --concurrency-sweep must include c=32" in problem
+            for problem in bad_concurrency_sweep_problems
+        ):
+            raise AssertionError("bad concurrency-sweep command selftest did not fail as expected")
 
         bad_prompt_dataset_id = tmp_root / "bad-prompt-dataset-id"
         bad_prompt_dataset_id_manifest = write_selftest_manifest(bad_prompt_dataset_id, ratio=0.82)

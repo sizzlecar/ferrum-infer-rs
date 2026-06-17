@@ -493,11 +493,11 @@ def write_selftest_source(root: Path) -> Path:
     write_json(source / "vllm/vllm_server.command.json", {"cmd": ["python", "-m", "vllm"]})
     (source / "perf/bench-ferrum.command.txt").write_text(
         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
-        "--num-prompts 100 --n-repeats 3\n"
+        "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3\n"
     )
     (source / "perf/bench-vllm.command.txt").write_text(
         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
-        "--num-prompts 100 --n-repeats 3\n"
+        "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3\n"
     )
     ferrum_reports = []
     baseline_reports = []
