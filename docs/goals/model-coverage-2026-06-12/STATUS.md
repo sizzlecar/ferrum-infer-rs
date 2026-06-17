@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZH — W2 release-grade validator checkpoint: bench commands must cover cell concurrency
+
+- Scope:
+  - source-only release-grade validator hardening;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Change:
+  - `scripts/release/model_release_grade_goal_gate.py` now rejects
+    release-grade `bench-serve` evidence when a performance cell's command
+    cannot actually produce that closed-loop concurrency;
+  - accepted command shapes are either `--concurrency-sweep` containing the
+    cell, or a matching single-cell `--concurrency`/`--max-concurrency`;
+  - open-loop `--request-rate` is rejected for this release-grade lane because
+    it overrides closed-loop concurrency;
+  - the W2 manifest generator self-test now records the same
+    `--concurrency-sweep 1,4,16,32` command shape as the intended full matrix.
+- Validation:
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`
+    PASS, including the synthetic final validator
+    `MODEL_RELEASE_GRADE_W2 PASS: <tmp>/out`;
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py
+    scripts/release/model_release_grade_manifest.py
+    scripts/release/selftest_g0_validators.py` PASS;
+  - `git diff --check -- scripts/release/model_release_grade_goal_gate.py
+    scripts/release/model_release_grade_manifest.py` PASS;
+  - `python3 scripts/release/selftest_g0_validators.py` PASS.
+- Current external blocker:
+  - Vast still reports `credit=0`, no running instances, and only stopped
+    49GB RTX 4090 instance `41276321`;
+  - higher-priced replacement offers cannot be rented until the external
+    account credit state changes.
+- Next required validation:
+  - after Vast credit is available, create a new high-availability 49GB RTX
+    4090 instance, run W2 correctness first, then the c=1/4/16/32
+    same-hardware Ferrum/vLLM full matrix, then generate the manifest and run
+    the final W2 validator.
+
 ## 2026-06-17 ZG — W2 CUDA diagnostic: two mixed-prefill chunks pass c16 throughput and p95
 
 - Artifact:
