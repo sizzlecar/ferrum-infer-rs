@@ -107,6 +107,29 @@ pub struct Qwen35DeltaRuleShape {
     pub value_dim: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35LinearAttentionShape {
+    pub tokens: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub conv_kernel: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen35LinearAttentionReference {
+    pub mixed_qkv_conv: Vec<f32>,
+    pub query: Vec<f32>,
+    pub key: Vec<f32>,
+    pub value: Vec<f32>,
+    pub g: Vec<f32>,
+    pub beta: Vec<f32>,
+    pub delta_core: Vec<f32>,
+    pub delta_norm: Vec<f32>,
+    pub final_state: Vec<f32>,
+}
+
 pub fn qwen35_runtime_config(
     config: &Qwen35TextConfig,
     vocab_size: usize,
@@ -130,6 +153,174 @@ pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<Ll
         def.vocab_size,
         def.max_position_embeddings,
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_linear_attention_core_cpu(
+    mixed_qkv_raw: &[f32],
+    z_raw: &[f32],
+    a_raw: &[f32],
+    b_raw: &[f32],
+    conv1d_weight: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    norm_weight: &[f32],
+    initial_state: &[f32],
+    shape: Qwen35LinearAttentionShape,
+    eps: f32,
+) -> Result<Qwen35LinearAttentionReference> {
+    shape.validate()?;
+    validate_len("mixed_qkv_raw", mixed_qkv_raw.len(), shape.mixed_qkv_len())?;
+    validate_len("z_raw", z_raw.len(), shape.value_len())?;
+    let gating_len = shape.gating_len();
+    validate_len("a_raw", a_raw.len(), gating_len)?;
+    validate_len("b_raw", b_raw.len(), gating_len)?;
+    validate_len(
+        "conv1d_weight",
+        conv1d_weight.len(),
+        shape.conv_channels() * shape.conv_kernel,
+    )?;
+    validate_len("a_log", a_log.len(), shape.value_heads)?;
+    validate_len("dt_bias", dt_bias.len(), shape.value_heads)?;
+    validate_len("norm_weight", norm_weight.len(), shape.value_dim)?;
+    validate_len("initial_state", initial_state.len(), shape.state_len())?;
+
+    let mixed_qkv_conv = qwen35_depthwise_causal_conv_silu_cpu(
+        mixed_qkv_raw,
+        conv1d_weight,
+        shape.tokens,
+        shape.conv_channels(),
+        shape.conv_kernel,
+    )?;
+    let (query, key, value) = qwen35_split_linear_attention_qkv_cpu(&mixed_qkv_conv, shape)?;
+    let (g, beta) = qwen35_gdn_gating_cpu(
+        a_log,
+        a_raw,
+        b_raw,
+        dt_bias,
+        shape.tokens,
+        shape.value_heads,
+    )?;
+    let (delta_core, final_state) = qwen35_recurrent_gated_delta_rule_cpu(
+        &query,
+        &key,
+        &value,
+        &g,
+        &beta,
+        initial_state,
+        shape.delta_shape(),
+        true,
+        None,
+    )?;
+    let delta_norm = qwen35_gated_rms_norm_cpu(
+        &delta_core,
+        z_raw,
+        norm_weight,
+        shape.tokens,
+        shape.value_heads,
+        shape.value_dim,
+        eps,
+    )?;
+
+    Ok(Qwen35LinearAttentionReference {
+        mixed_qkv_conv,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        delta_core,
+        delta_norm,
+        final_state,
+    })
+}
+
+pub fn qwen35_depthwise_causal_conv_silu_cpu(
+    x: &[f32],
+    weight: &[f32],
+    tokens: usize,
+    channels: usize,
+    kernel: usize,
+) -> Result<Vec<f32>> {
+    if tokens == 0 || channels == 0 || kernel == 0 {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 depthwise conv shape must be positive, got tokens={tokens} channels={channels} kernel={kernel}"
+        )));
+    }
+    validate_len("depthwise conv input", x.len(), tokens * channels)?;
+    validate_len("depthwise conv weight", weight.len(), channels * kernel)?;
+
+    let pad = kernel - 1;
+    let mut out = vec![0.0; tokens * channels];
+    for token in 0..tokens {
+        for channel in 0..channels {
+            let mut acc = 0.0;
+            for kernel_idx in 0..kernel {
+                let padded_idx = token + kernel_idx;
+                if padded_idx >= pad {
+                    let src_token = padded_idx - pad;
+                    if src_token < tokens {
+                        acc += x[src_token * channels + channel]
+                            * weight[(channel * kernel) + kernel_idx];
+                    }
+                }
+            }
+            out[token * channels + channel] = silu(acc);
+        }
+    }
+    Ok(out)
+}
+
+pub fn qwen35_split_linear_attention_qkv_cpu(
+    mixed_qkv: &[f32],
+    shape: Qwen35LinearAttentionShape,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    shape.validate()?;
+    validate_len("mixed_qkv", mixed_qkv.len(), shape.mixed_qkv_len())?;
+    let qk_total = shape.qk_total();
+    let value_total = shape.value_total();
+    let width = shape.conv_channels();
+    Ok((
+        split_features(mixed_qkv, shape.tokens, width, 0, qk_total),
+        split_features(mixed_qkv, shape.tokens, width, qk_total, qk_total),
+        split_features(mixed_qkv, shape.tokens, width, qk_total * 2, value_total),
+    ))
+}
+
+pub fn qwen35_gated_rms_norm_cpu(
+    core: &[f32],
+    z: &[f32],
+    weight: &[f32],
+    tokens: usize,
+    heads: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<Vec<f32>> {
+    if tokens == 0 || heads == 0 || dim == 0 {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 gated RMSNorm shape must be positive, got tokens={tokens} heads={heads} dim={dim}"
+        )));
+    }
+    let len = tokens * heads * dim;
+    validate_len("gated RMSNorm core", core.len(), len)?;
+    validate_len("gated RMSNorm z", z.len(), len)?;
+    validate_len("gated RMSNorm weight", weight.len(), dim)?;
+
+    let rows = tokens * heads;
+    let mut out = vec![0.0; len];
+    for row in 0..rows {
+        let base = row * dim;
+        let mean = core[base..base + dim]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            / dim as f32;
+        let inv = (mean + eps).sqrt().recip();
+        for i in 0..dim {
+            out[base + i] = core[base + i] * inv * weight[i] * silu(z[base + i]);
+        }
+    }
+    Ok(out)
 }
 
 impl<B: Backend> Qwen35RecurrentStateCache<B> {
@@ -337,6 +528,67 @@ pub fn qwen35_gdn_gating_cpu(
     Ok((g, beta))
 }
 
+impl Qwen35LinearAttentionShape {
+    fn validate(self) -> Result<()> {
+        if self.tokens == 0
+            || self.key_heads == 0
+            || self.value_heads == 0
+            || self.key_dim == 0
+            || self.value_dim == 0
+            || self.conv_kernel == 0
+        {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 linear-attention shape must be positive, got {self:?}"
+            )));
+        }
+        if self.value_heads % self.key_heads != 0 {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 linear-attention value_heads {} must be divisible by key_heads {}",
+                self.value_heads, self.key_heads
+            )));
+        }
+        Ok(())
+    }
+
+    fn qk_total(self) -> usize {
+        self.key_heads * self.key_dim
+    }
+
+    fn value_total(self) -> usize {
+        self.value_heads * self.value_dim
+    }
+
+    fn conv_channels(self) -> usize {
+        self.qk_total() * 2 + self.value_total()
+    }
+
+    fn mixed_qkv_len(self) -> usize {
+        self.tokens * self.conv_channels()
+    }
+
+    fn value_len(self) -> usize {
+        self.tokens * self.value_total()
+    }
+
+    fn gating_len(self) -> usize {
+        self.tokens * self.value_heads
+    }
+
+    fn state_len(self) -> usize {
+        self.value_heads * self.value_dim * self.key_dim
+    }
+
+    fn delta_shape(self) -> Qwen35DeltaRuleShape {
+        Qwen35DeltaRuleShape {
+            tokens: self.tokens,
+            key_heads: self.key_heads,
+            value_heads: self.value_heads,
+            key_dim: self.key_dim,
+            value_dim: self.value_dim,
+        }
+    }
+}
+
 fn validate_delta_rule_shapes(
     query: &[f32],
     key: &[f32],
@@ -377,6 +629,15 @@ fn validate_delta_rule_shapes(
     Ok(())
 }
 
+fn validate_len(label: &str, actual: usize, expected: usize) -> Result<()> {
+    if actual != expected {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 {label} length {actual} != expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
 fn l2_normalize(values: &mut [f32]) {
     let norm = values.iter().map(|value| value * value).sum::<f32>();
     let inv = (norm + 1e-6).sqrt().recip();
@@ -393,6 +654,10 @@ fn sigmoid(x: f32) -> f32 {
         let z = x.exp();
         z / (1.0 + z)
     }
+}
+
+fn silu(x: f32) -> f32 {
+    x * sigmoid(x)
 }
 
 fn softplus(x: f32) -> f32 {
@@ -420,6 +685,14 @@ fn delta_state_idx(
     key_dim: usize,
 ) -> usize {
     ((head * shape.value_dim + value_dim) * shape.key_dim) + key_dim
+}
+
+fn split_features(x: &[f32], rows: usize, width: usize, start: usize, len: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows * len);
+    for row in 0..rows {
+        out.extend_from_slice(&x[row * width + start..row * width + start + len]);
+    }
+    out
 }
 
 impl<B: Backend> Qwen35ModelWeights<B> {
@@ -701,6 +974,22 @@ mod tests {
         qwen35_runtime_config(config, 128, 64)
     }
 
+    fn assert_close_slice(got: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "length mismatch: got {} expected {}",
+            got.len(),
+            expected.len()
+        );
+        for (idx, (got, expected)) in got.iter().zip(expected).enumerate() {
+            assert!(
+                (got - expected).abs() <= tolerance,
+                "idx {idx}: {got} != {expected}"
+            );
+        }
+    }
+
     #[test]
     fn materializes_dense_qwen35_weights_from_plan() {
         let config = dense_config();
@@ -855,6 +1144,159 @@ mod tests {
             .expect_err("slot 1 should exceed one-slot recurrent state cache");
 
         assert!(err.to_string().contains("slot 1"), "{err}");
+    }
+
+    #[test]
+    fn depthwise_causal_conv_uses_left_context_only() {
+        let out =
+            qwen35_depthwise_causal_conv_silu_cpu(&[1.0, 2.0, 3.0], &[10.0, 1.0], 3, 1, 2).unwrap();
+        let expected_raw = [1.0, 12.0, 23.0];
+        let expected = expected_raw.map(silu);
+
+        assert_close_slice(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    fn gated_rms_norm_matches_reference_formula() {
+        let out = qwen35_gated_rms_norm_cpu(
+            &[3.0, 4.0, 1.0, 2.0],
+            &[0.0, 1.0, -1.0, 2.0],
+            &[2.0, 3.0],
+            2,
+            1,
+            2,
+            0.0,
+        )
+        .unwrap();
+        let first_inv = ((3.0f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt().recip();
+        let second_inv = ((1.0f32 * 1.0 + 2.0 * 2.0) / 2.0).sqrt().recip();
+        let expected = vec![
+            3.0 * first_inv * 2.0 * silu(0.0),
+            4.0 * first_inv * 3.0 * silu(1.0),
+            1.0 * second_inv * 2.0 * silu(-1.0),
+            2.0 * second_inv * 3.0 * silu(2.0),
+        ];
+
+        assert_close_slice(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    fn linear_attention_core_composes_conv_gdn_delta_and_norm() {
+        let shape = Qwen35LinearAttentionShape {
+            tokens: 2,
+            key_heads: 1,
+            value_heads: 1,
+            key_dim: 2,
+            value_dim: 2,
+            conv_kernel: 1,
+        };
+        let mixed_qkv_raw = vec![
+            1.0, 0.0, 1.0, 0.0, 2.0, 4.0, //
+            0.0, 1.0, 0.0, 1.0, 3.0, 5.0,
+        ];
+        let conv1d_weight = vec![1.0; shape.conv_channels()];
+        let z_raw = vec![0.0, 1.0, 2.0, 3.0];
+        let a_raw = vec![0.0, 0.5];
+        let b_raw = vec![0.0, 1.0];
+        let a_log = vec![0.0];
+        let dt_bias = vec![0.0];
+        let norm_weight = vec![1.0, 2.0];
+        let initial_state = vec![0.0; shape.state_len()];
+
+        let mixed_qkv_conv = qwen35_depthwise_causal_conv_silu_cpu(
+            &mixed_qkv_raw,
+            &conv1d_weight,
+            shape.tokens,
+            shape.conv_channels(),
+            shape.conv_kernel,
+        )
+        .unwrap();
+        let (query, key, value) =
+            qwen35_split_linear_attention_qkv_cpu(&mixed_qkv_conv, shape).unwrap();
+        let (g, beta) = qwen35_gdn_gating_cpu(
+            &a_log,
+            &a_raw,
+            &b_raw,
+            &dt_bias,
+            shape.tokens,
+            shape.value_heads,
+        )
+        .unwrap();
+        let (delta_core, final_state) = qwen35_recurrent_gated_delta_rule_cpu(
+            &query,
+            &key,
+            &value,
+            &g,
+            &beta,
+            &initial_state,
+            shape.delta_shape(),
+            true,
+            None,
+        )
+        .unwrap();
+        let delta_norm = qwen35_gated_rms_norm_cpu(
+            &delta_core,
+            &z_raw,
+            &norm_weight,
+            shape.tokens,
+            shape.value_heads,
+            shape.value_dim,
+            1e-6,
+        )
+        .unwrap();
+
+        let reference = qwen35_linear_attention_core_cpu(
+            &mixed_qkv_raw,
+            &z_raw,
+            &a_raw,
+            &b_raw,
+            &conv1d_weight,
+            &a_log,
+            &dt_bias,
+            &norm_weight,
+            &initial_state,
+            shape,
+            1e-6,
+        )
+        .unwrap();
+
+        assert_close_slice(&reference.mixed_qkv_conv, &mixed_qkv_conv, 1e-6);
+        assert_close_slice(&reference.query, &query, 1e-6);
+        assert_close_slice(&reference.key, &key, 1e-6);
+        assert_close_slice(&reference.value, &value, 1e-6);
+        assert_close_slice(&reference.g, &g, 1e-6);
+        assert_close_slice(&reference.beta, &beta, 1e-6);
+        assert_close_slice(&reference.delta_core, &delta_core, 1e-6);
+        assert_close_slice(&reference.delta_norm, &delta_norm, 1e-6);
+        assert_close_slice(&reference.final_state, &final_state, 1e-6);
+    }
+
+    #[test]
+    fn linear_attention_core_rejects_shape_mismatch() {
+        let shape = Qwen35LinearAttentionShape {
+            tokens: 1,
+            key_heads: 1,
+            value_heads: 1,
+            key_dim: 1,
+            value_dim: 1,
+            conv_kernel: 1,
+        };
+        let err = qwen35_linear_attention_core_cpu(
+            &[0.0, 0.0],
+            &[0.0],
+            &[0.0],
+            &[0.0],
+            &[1.0, 1.0, 1.0],
+            &[0.0],
+            &[0.0],
+            &[1.0],
+            &[0.0],
+            shape,
+            1e-6,
+        )
+        .expect_err("mixed_qkv_raw should be too short");
+
+        assert!(err.to_string().contains("mixed_qkv_raw length"), "{err}");
     }
 
     #[test]
