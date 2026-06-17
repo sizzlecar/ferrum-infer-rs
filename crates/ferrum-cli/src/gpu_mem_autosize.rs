@@ -71,7 +71,7 @@ impl AutoSizeResult {
         }
         if self.requested_min_blocks > self.estimated_budget_blocks {
             eprintln!(
-                "[auto-size] requested runtime floor requires KV_MAX_BLOCKS={} above estimated budget {}; honoring explicit runtime limits",
+                "[auto-size] requested runtime token floor requires KV_MAX_BLOCKS={} above estimated budget {}; honoring explicit runtime limits",
                 self.requested_min_blocks, self.estimated_budget_blocks
             );
         }
@@ -288,11 +288,6 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     };
     result.print_summary();
 
-    // Pool sizing: pool_blocks = max_seqs × (KV_CAPACITY / 16).
-    // Picks the largest (max_seqs, KV_CAP) tuple from a fixed ladder
-    // whose pool fits the budget.
-    //   Server: prioritise wide batch (c=16/32) over context.
-    //   Chat:   single user, multi-turn — pile budget into context.
     const SERVER_PRESETS: &[(usize, usize)] = &[
         // (max_seqs, KV_CAPACITY tokens)
         (32, 2048), // best — INT4 8B on 24 GB usually lands here
@@ -320,23 +315,36 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         AutoSizeProfile::Server => SERVER_PRESETS,
         AutoSizeProfile::Chat => CHAT_PRESETS,
     };
-    let (max_seqs_clamped, kv_capacity) = {
-        let pick = presets.iter().copied().find(|(seqs, cap_tokens)| {
-            let bps = (*cap_tokens / 16).max(1);
-            seqs * bps <= result.max_blocks
-        });
-        if let Some((seqs, cap)) = pick {
-            // Always override KV_CAPACITY explicitly so behaviour is
-            // independent of the static default in llama_family.rs.
-            (seqs, cap)
-        } else {
-            // Budget too tight for any preset — try min config.
-            let bps = (result.max_blocks / 8).max(8);
-            (8, bps * 16)
-        }
-    };
+    // Pool sizing: pool_blocks = max_seqs x ceil(KV_CAPACITY / 16).
+    // Picks the largest (max_seqs, KV_CAP) tuple from a fixed ladder whose
+    // pool fits the budget.
+    //   Server: prioritise wide batch (c=16/32) over context.
+    //   Chat:   single user, multi-turn -- pile budget into context.
+    let (max_seqs_clamped, kv_capacity) = select_paged_pool_preset(presets, result.max_blocks);
 
     let kv_capacity_overridden = snapshot_value(&current, "FERRUM_KV_CAPACITY").is_some();
+    let mut forced_entries = Vec::new();
+    if let Some((requested_seqs, requested_cap, requested_blocks)) =
+        requested_paged_pool_blocks_from_snapshot(&current)
+    {
+        if requested_blocks > result.max_blocks {
+            let (safe_seqs, safe_cap) = select_paged_pool_preset(presets, result.max_blocks);
+            eprintln!(
+                "[auto-size] requested paged KV pool requires {} blocks (max_seqs={} kv_capacity={}) above memory budget {}; clamping to max_seqs={} kv_capacity={}",
+                requested_blocks, requested_seqs, requested_cap, result.max_blocks, safe_seqs, safe_cap
+            );
+            forced_entries.push(RuntimeConfigEntry::new(
+                "FERRUM_PAGED_MAX_SEQS",
+                safe_seqs.to_string(),
+                RuntimeConfigSource::MemoryProfile,
+            ));
+            forced_entries.push(RuntimeConfigEntry::new(
+                "FERRUM_KV_CAPACITY",
+                safe_cap.to_string(),
+                RuntimeConfigSource::MemoryProfile,
+            ));
+        }
+    }
     // MAX_BATCHED_TOKENS already set above (it's independent of the KV pool
     // sizing logic, runs even when the user overrode KV_MAX_BLOCKS + SEQS).
     // FERRUM_MOE_GRAPH is resolved as a typed CLI startup default and
@@ -363,7 +371,11 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
             RuntimeConfigSource::MemoryProfile,
         ));
     }
+    entries.extend(forced_entries.iter().cloned());
     crate::runtime_env::materialize_runtime_env_defaults(&entries);
+    for entry in &forced_entries {
+        std::env::set_var(&entry.key, &entry.effective_value);
+    }
     eprintln!(
         "[auto-size] KV_MAX_BLOCKS={} PAGED_MAX_SEQS={} KV_CAPACITY={}",
         if kv_overridden {
@@ -398,6 +410,19 @@ fn ceil_div_usize(value: usize, divisor: usize) -> usize {
         return value;
     }
     value.div_ceil(divisor)
+}
+
+fn select_paged_pool_preset(presets: &[(usize, usize)], max_blocks: usize) -> (usize, usize) {
+    if let Some((seqs, cap)) = presets.iter().copied().find(|(seqs, cap_tokens)| {
+        let bps = ceil_div_usize(*cap_tokens, PAGED_BLOCK_SIZE as usize).max(1);
+        seqs.saturating_mul(bps) <= max_blocks
+    }) {
+        return (seqs, cap);
+    }
+
+    // Budget too tight for any preset -- try min server-like config.
+    let bps = (max_blocks / 8).max(8);
+    (8, bps * PAGED_BLOCK_SIZE as usize)
 }
 
 fn weight_budget_shard_count(snapshot: &RuntimeConfigSnapshot) -> u64 {
@@ -444,19 +469,24 @@ fn requested_min_kv_blocks_from_snapshot(snapshot: &RuntimeConfigSnapshot) -> us
     let max_batched_token_blocks = snapshot_usize(snapshot, "FERRUM_MAX_BATCHED_TOKENS")
         .map(|value| ceil_div_usize(value, PAGED_BLOCK_SIZE as usize))
         .unwrap_or(0);
-    let paged_pool_blocks = match (
+
+    max_model_len_blocks.max(max_batched_token_blocks)
+}
+
+fn requested_paged_pool_blocks_from_snapshot(
+    snapshot: &RuntimeConfigSnapshot,
+) -> Option<(usize, usize, usize)> {
+    match (
         snapshot_usize(snapshot, "FERRUM_PAGED_MAX_SEQS"),
         snapshot_usize(snapshot, "FERRUM_KV_CAPACITY"),
     ) {
         (Some(max_seqs), Some(kv_capacity)) => {
-            max_seqs.saturating_mul(ceil_div_usize(kv_capacity, PAGED_BLOCK_SIZE as usize))
+            let blocks =
+                max_seqs.saturating_mul(ceil_div_usize(kv_capacity, PAGED_BLOCK_SIZE as usize));
+            Some((max_seqs, kv_capacity, blocks))
         }
-        _ => 0,
-    };
-
-    max_model_len_blocks
-        .max(max_batched_token_blocks)
-        .max(paged_pool_blocks)
+        _ => None,
+    }
 }
 
 fn snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
@@ -550,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_runtime_limits_define_kv_block_floor() {
+    fn requested_runtime_token_limits_define_kv_block_floor() {
         let snapshot = snapshot(&[
             ("FERRUM_MAX_MODEL_LEN", "8192"),
             ("FERRUM_MAX_BATCHED_TOKENS", "1024"),
@@ -558,6 +588,22 @@ mod tests {
             ("FERRUM_KV_CAPACITY", "2048"),
         ]);
 
-        assert_eq!(requested_min_kv_blocks_from_snapshot(&snapshot), 1024);
+        assert_eq!(requested_min_kv_blocks_from_snapshot(&snapshot), 512);
+        assert_eq!(
+            requested_paged_pool_blocks_from_snapshot(&snapshot),
+            Some((8, 2048, 1024))
+        );
+    }
+
+    #[test]
+    fn paged_pool_preset_fits_block_budget() {
+        assert_eq!(
+            select_paged_pool_preset(&[(32, 512), (8, 512)], 338),
+            (8, 512)
+        );
+        assert_eq!(
+            select_paged_pool_preset(&[(32, 512), (16, 512)], 2048),
+            (32, 512)
+        );
     }
 }
