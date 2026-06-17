@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ9 — W3 Qwen3.5 reference decode replay checkpoint
+
+- Scope:
+  - W3-S2 CPU/FP32 reference executor decode semantics after explicit product
+    entry wiring;
+  - no CUDA/Metal execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - `Qwen35W3Executor` now keeps per-reference-cache token history keyed by
+    the returned `GenericKvCacheHandle` cache id;
+  - reference `prefill()` records prompt/chunk history and preserves incoming
+    recurrent-state handles;
+  - reference `decode()` now accepts one token, validates the cache history and
+    KV sequence length, replays the dense or sparse-MoE CPU reference model on
+    the full sequence, returns `[1, vocab]` logits, and advances KV length;
+  - unknown/mismatched reference cache histories are rejected instead of
+    silently fabricating state.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `56 passed`, plus Qwen3.5 config integration coverage `1 passed`;
+  - `cargo test -p ferrum-engine qwen35_registry -- --nocapture` PASS:
+    `2 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine -p ferrum-cli` PASS.
+- Limitation:
+  - decode is still full-sequence CPU reference replay, not the final
+    incremental recurrent-state/KV implementation needed for performance;
+  - full `ferrum run` / `ferrum serve` W3 product scenarios, W3 L0-L5
+    correctness gates, and W3 80% performance gates remain incomplete.
+
 ## 2026-06-18 ZZZ8 — W3 explicit Qwen3.5 reference product-entry checkpoint
 
 - Scope:
