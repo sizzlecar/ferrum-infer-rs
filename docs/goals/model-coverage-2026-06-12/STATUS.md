@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ14 — W3-S0 design artifact gate checkpoint
+
+- Scope:
+  - W3-S0 design evidence generation for the release-grade goal;
+  - metadata-only local work, no GPU/CUDA/Metal execution;
+  - no performance claim and no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was
+    produced.
+- Change:
+  - added `scripts/release/w3_s0_design_gate.py`;
+  - the script validates that `RELEASE_GRADE_GOAL.md` and `W3_CHARTER.md`
+    contain the required W3 recurrent-state/paged-KV/ContinuousBatch
+    constraints;
+  - it writes `w3_s0_design.json` with the recurrent-state manager/spec/handle
+    contract, required operations, lifecycle ownership, and coexistence rules
+    for paged-KV, ContinuousBatch, preemption, and release;
+  - the manifest is shaped for the W3 final validator's
+    `w3_s0_design` correctness entry and records `hidden_env=[]`.
+- Evidence:
+  - artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_s0_design_local_20260617T230640Z/`;
+  - script PASS line:
+    `W3 S0 DESIGN PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_s0_design_local_20260617T230640Z`;
+  - note: the artifact git summary reports dirty because the local worktree
+    already contains many pre-existing untracked historical artifacts, so this
+    is S0 design artifact plumbing, not final release-grade evidence.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_s0_design_gate.py` PASS;
+  - `python3 scripts/release/w3_s0_design_gate.py --self-test` PASS:
+    `W3 S0 DESIGN SELFTEST PASS`;
+  - `git diff --check -- scripts/release/w3_s0_design_gate.py` PASS;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS: `MODEL RELEASE GRADE GOAL SELFTEST PASS`;
+  - generated artifact accepted by the final validator's S0 design structure
+    probe: `W3 S0 DESIGN ARTIFACT STRUCTURE PASS`.
+- Limitation:
+  - this closes the S0 design artifact generation gap only; W3 still needs
+    real L0-L5 correctness, same-hardware baseline, and c=1/4/16/32 80%
+    performance evidence before release-grade PASS.
+
 ## 2026-06-18 ZZZ13 — W3 S0/S1/S2 release-grade validator hardening
 
 - Scope:
