@@ -268,6 +268,81 @@ fn performance_breakdown_reports_engine_timing_counters() {
     assert_eq!(breakdown.other_overhead_time_ms, 0.5);
 }
 
+fn test_continuous_engine() -> ContinuousBatchEngine {
+    let config = EngineConfig::default();
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
+        Arc::new(ferrum_testkit::MockKvCacheManager::new(256));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
+    let model_executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(ferrum_testkit::MockModelExecutor::instant(128));
+
+    ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        model_executor,
+        tensor_factory,
+    )
+}
+
+#[test]
+fn model_kv_handle_with_seq_is_executor_decode_handle() {
+    let engine = test_continuous_engine();
+
+    let handle = engine
+        .inner
+        .make_model_kv_handle_with_seq("cache-a".to_string(), 17);
+    let generic = handle
+        .as_any()
+        .downcast_ref::<ferrum_models::executor::common::GenericKvCacheHandle>()
+        .expect("model KV handle must be GenericKvCacheHandle");
+
+    assert_eq!(generic.request_cache_id(), "cache-a");
+    assert_eq!(handle.block_table().sequence_length, 17);
+}
+
+#[test]
+fn decode_ready_request_ids_skip_preempted_sequences_without_kv() {
+    let engine = test_continuous_engine();
+    let ready_request = policy_request();
+    let ready_id = ready_request.id.clone();
+    let preempted_request = policy_request();
+    let preempted_id = preempted_request.id.clone();
+
+    let ready_kv = engine
+        .inner
+        .make_model_kv_handle_with_seq("ready-cache".to_string(), 2);
+    let mut ready_seq = SequenceState::new(ready_request, vec![TokenId::new(1)]);
+    ready_seq.generated_tokens.push(TokenId::new(2));
+    ready_seq.prefill_complete = true;
+    ready_seq.kv_cache = Some(ready_kv);
+    ready_seq.model_cache_id = Some("ready-cache".to_string());
+
+    let mut preempted_seq = SequenceState::new(preempted_request, vec![TokenId::new(1)]);
+    preempted_seq.generated_tokens.push(TokenId::new(2));
+    preempted_seq.prefill_complete = false;
+    preempted_seq.kv_cache = None;
+    preempted_seq.model_cache_id = None;
+
+    {
+        let mut sequences = engine.inner.sequences.write();
+        sequences.insert(ready_id.clone(), ready_seq);
+        sequences.insert(preempted_id.clone(), preempted_seq);
+    }
+
+    let ready = engine
+        .inner
+        .decode_ready_request_ids(&[ready_id.clone(), preempted_id]);
+
+    assert_eq!(ready, vec![ready_id]);
+}
+
 #[test]
 fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
     let mut config = EngineConfig::default();

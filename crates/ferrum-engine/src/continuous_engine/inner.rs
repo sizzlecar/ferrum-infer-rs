@@ -59,6 +59,59 @@ impl EngineInner {
         }
     }
 
+    /// Build the model-executor KV handle used by `LlmExecutor::decode`.
+    ///
+    /// The continuous engine has two KV identities:
+    /// - `KvCacheManager` allocations, keyed by request id, track resource
+    ///   lifetime and are deallocated on preemption/completion.
+    /// - model/executor cache ids track the actual model-side KV contents.
+    ///
+    /// `SequenceState.kv_cache` must carry the second identity because the
+    /// fallback single-request decode path downcasts it to
+    /// `GenericKvCacheHandle`. Unified CUDA paths don't read the handle body,
+    /// but keeping this invariant prevents resource-pressure fallbacks from
+    /// feeding a manager handle into `LlmExecutor::decode`.
+    pub(super) fn make_model_kv_handle_with_seq(
+        &self,
+        cache_id: String,
+        seq_len: usize,
+    ) -> std::sync::Arc<dyn ferrum_interfaces::KvCacheHandle> {
+        let info = self.model_executor.info();
+        let head_dim = if info.num_heads == 0 {
+            info.hidden_size.max(1)
+        } else {
+            (info.hidden_size / info.num_heads).max(1)
+        };
+        let num_kv_heads = if info.num_kv_heads == 0 {
+            info.num_heads.max(1)
+        } else {
+            info.num_kv_heads
+        };
+        std::sync::Arc::new(ferrum_models::executor::common::GenericKvCacheHandle::new(
+            info.num_layers,
+            num_kv_heads,
+            head_dim,
+            candle_core::Device::Cpu,
+            seq_len,
+            cache_id,
+        ))
+    }
+
+    pub(super) fn decode_ready_request_ids(&self, request_ids: &[RequestId]) -> Vec<RequestId> {
+        let sequences = self.sequences.read();
+        request_ids
+            .iter()
+            .filter(|rid| {
+                sequences.get(*rid).is_some_and(|seq| {
+                    seq.prefill_complete
+                        && seq.kv_cache.is_some()
+                        && !seq.generated_tokens.is_empty()
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     // ── iteration loop ─────────────────────────────────────────────────
 
     /// Run one iteration: ask the scheduler for a batch, then process it.

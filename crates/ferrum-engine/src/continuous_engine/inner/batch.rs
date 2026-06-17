@@ -70,21 +70,22 @@ impl EngineInner {
                 }
             }
         }
+        let decode_ids = self.decode_ready_request_ids(&decode_ids);
         if decode_ids.len() > 1 {
             if let Err(e) = self.run_batch_decode_adaptive(&decode_ids).await {
                 warn!("Batch decode failed, falling back to per-request: {}", e);
-                for rid in &decode_ids {
-                    if let Err(e) = self.run_decode_step(rid).await {
+                for rid in self.decode_ready_request_ids(&decode_ids) {
+                    if let Err(e) = self.run_decode_step(&rid).await {
                         warn!("Decode failed for {}: {}", rid, e);
-                        self.complete_request(rid, FinishReason::Error).await?;
+                        self.complete_request(&rid, FinishReason::Error).await?;
                     }
                 }
             }
         } else {
-            for rid in &decode_ids {
-                if let Err(e) = self.run_decode_step(rid).await {
+            for rid in self.decode_ready_request_ids(&decode_ids) {
+                if let Err(e) = self.run_decode_step(&rid).await {
                     warn!("Decode failed for {}: {}", rid, e);
-                    self.complete_request(rid, FinishReason::Error).await?;
+                    self.complete_request(&rid, FinishReason::Error).await?;
                 }
             }
         }
@@ -467,12 +468,14 @@ impl EngineInner {
             let logits_vec = match &results[i] {
                 Some(l) => l.clone(),
                 None if !work.is_final_chunk => {
-                    let kv_handle = unified.items[i].kv_cache.clone();
+                    let cache_id = unified.items[i].seq_id.clone();
+                    let kv_len = work.chunk_start.saturating_add(work.chunk_len);
+                    let model_kv = self.make_model_kv_handle_with_seq(cache_id.clone(), kv_len);
                     {
                         let mut sequences = self.sequences.write();
                         if let Some(seq) = sequences.get_mut(&work.rid) {
-                            seq.model_cache_id = Some(kv_handle.cache_id());
-                            seq.kv_cache = Some(kv_handle);
+                            seq.model_cache_id = Some(cache_id);
+                            seq.kv_cache = Some(model_kv);
                             seq.recurrent_state = unified.items[i].recurrent_state.clone();
                             seq.prefill_tokens_processed =
                                 work.chunk_start.saturating_add(work.chunk_len);
@@ -494,13 +497,14 @@ impl EngineInner {
                 }
             };
             let num_tokens = work.input_tokens.len();
-            let kv_handle = unified.items[i].kv_cache.clone();
+            let cache_id = unified.items[i].seq_id.clone();
+            let model_kv = self.make_model_kv_handle_with_seq(cache_id.clone(), num_tokens);
             if !skip_prefix_cache && work.can_use_prefix_cache && logits_vec.len() > 1 {
                 // Store in prefix cache (best-effort). Greedy-argmax results
                 // are single-token sentinels, not reusable full logits.
                 let _ = self.prefix_cache.store_prefix(
                     &work.input_tokens,
-                    kv_handle.clone(),
+                    model_kv.clone(),
                     logits_vec.clone(),
                 );
             }
@@ -522,8 +526,8 @@ impl EngineInner {
                     )?
                 };
                 seq.generated_tokens.push(token);
-                seq.model_cache_id = Some(kv_handle.cache_id());
-                seq.kv_cache = Some(kv_handle);
+                seq.model_cache_id = Some(cache_id.clone());
+                seq.kv_cache = Some(model_kv);
                 seq.recurrent_state = unified.items[i].recurrent_state.clone();
                 seq.prefill_tokens_processed = num_tokens;
                 seq.prefill_complete = true;
@@ -626,6 +630,16 @@ impl EngineInner {
                     )?
                 };
                 seq.generated_tokens.push(token);
+                let cache_id = seq
+                    .model_cache_id
+                    .clone()
+                    .unwrap_or_else(|| rid.to_string());
+                let kv_len = seq
+                    .input_tokens
+                    .len()
+                    .saturating_add(seq.generated_tokens.len())
+                    .saturating_sub(1);
+                seq.kv_cache = Some(self.make_model_kv_handle_with_seq(cache_id, kv_len));
                 seq.tokens_this_iteration += 1;
                 // pos_offset is sourced from SequenceState bookkeeping above
                 // (`input_tokens.len() + generated_tokens.len() - 1`); the
