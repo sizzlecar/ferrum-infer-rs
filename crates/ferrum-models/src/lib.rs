@@ -19,6 +19,7 @@
 pub mod audio_processor;
 pub mod common;
 pub mod definition;
+pub mod deltanet_s1;
 pub mod executor;
 pub mod gguf_config;
 pub mod gguf_engine_loader;

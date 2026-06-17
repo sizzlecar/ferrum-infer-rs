@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZW — W3-S1 source checkpoint: Ferrum Rust DeltaNet dump harness
+
+- Scope:
+  - source checkpoint for W3-S1 real Ferrum-side single-layer dump generation;
+  - no paid GPU compute was started during this checkpoint;
+  - no whole W3 model was loaded;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `crates/ferrum-models/src/deltanet_s1.rs`;
+  - added `crates/ferrum-models/examples/w3_deltanet_s1_dump.rs`;
+  - exported the module from `crates/ferrum-models/src/lib.rs`;
+  - implemented deterministic CPU Gated DeltaNet single-layer projection,
+    delta-rule core, Ferrum MoE top-k routing, routed expert output, shared
+    expert output, MoE merge, and final layer output;
+  - the example emits the same dump schema consumed by
+    `scripts/release/w3_deltanet_s1_layer_compare.py`.
+- Validation:
+  - `cargo test -p ferrum-models deltanet_s1 -- --nocapture` PASS
+    (`3 passed`);
+  - `cargo check -p ferrum-models --example w3_deltanet_s1_dump` PASS;
+  - `python3 -m py_compile
+    scripts/release/w3_deltanet_s1_layer_compare.py` PASS;
+  - local dry-run `W3 DELTANET S1 LAYER COMPARE PASS` was produced under
+    `target/w3_deltanet_s1_rust_compare/compare`.
+- Limitation:
+  - this proves a Ferrum-owned Rust single-layer dump path against the current
+    deterministic reference contract; it is not yet official/HF Qwen3.5 or
+    Qwen3.6 full model evidence.
+- Next required validation:
+  - regenerate the Rust-vs-reference compare artifact from a clean worktree and
+    commit it;
+  - then replace the deterministic reference with the selected official/HF W3
+    reference layer dump.
+
 ## 2026-06-17 ZV — W3-S1 source checkpoint: DeltaNet layer dump comparator
 
 - Scope:
