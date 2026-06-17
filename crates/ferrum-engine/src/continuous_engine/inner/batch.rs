@@ -194,7 +194,11 @@ impl EngineInner {
             if chunk_start >= num_tokens {
                 continue;
             }
-            if chunk_start == 0 && !skip_prefix_cache {
+            let recurrent_state_spec = self
+                .model_executor
+                .recurrent_state_spec(rid, &input_tokens)?;
+            let skip_request_prefix_cache = skip_prefix_cache || recurrent_state_spec.is_some();
+            if chunk_start == 0 && !skip_request_prefix_cache {
                 let hit = self
                     .prefix_cache
                     .find_prefix(&input_tokens)
@@ -269,6 +273,19 @@ impl EngineInner {
                 };
                 (allocated, true)
             };
+            let recurrent_state =
+                match self.ensure_recurrent_state(rid, recurrent_state_spec).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        warn!(
+                            "Unified prefill recurrent-state alloc failed for {}: {}",
+                            rid, e
+                        );
+                        self.complete_request(rid, FinishReason::Error).await?;
+                        continue;
+                    }
+                }
+                .or(existing_recurrent_state);
             let remaining = num_tokens - chunk_start;
             let chunk_len = match active_prefill_chunk_size {
                 Some(chunk) if has_decode_items || chunk_start > 0 => chunk.min(remaining),
@@ -279,7 +296,7 @@ impl EngineInner {
                 rid: rid.clone(),
                 input_tokens,
                 kv_handle,
-                recurrent_state: existing_recurrent_state,
+                recurrent_state,
                 metadata,
                 logits_policy,
                 fresh_kv,

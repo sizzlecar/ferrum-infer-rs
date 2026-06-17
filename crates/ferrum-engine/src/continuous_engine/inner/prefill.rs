@@ -57,7 +57,11 @@ impl EngineInner {
         // (request 1 ≠ request 2 == request 3). Reproduced 2026-05-19;
         // see `~/.claude/projects/*/memory/project_http_server_gaps_2026_05_19.md`.
         // Opt in via `FERRUM_PREFIX_CACHE=1` once the CoW fix lands.
-        let skip_prefix_cache = !self.runtime_config.prefix_cache_enabled;
+        let recurrent_state_spec = self
+            .model_executor
+            .recurrent_state_spec(request_id, &input_tokens_clone)?;
+        let skip_prefix_cache =
+            !self.runtime_config.prefix_cache_enabled || recurrent_state_spec.is_some();
         if !skip_prefix_cache {
             let hit = self
                 .prefix_cache
@@ -113,6 +117,9 @@ impl EngineInner {
         } // skip_prefix_cache
 
         // ── Cache miss (or prefix cache skipped) — full prefill ─────────
+        let initial_recurrent_state = self
+            .ensure_recurrent_state(request_id, recurrent_state_spec)
+            .await?;
         let model_info = self.model_executor.info();
         let alloc_request = AllocationRequest {
             request_id: request_id.clone(),
@@ -155,16 +162,9 @@ impl EngineInner {
                 .map(|seq| seq.model_decode_metadata())
                 .unwrap_or_default()
         };
-        let initial_recurrent_state = {
-            let sequences = self.sequences.read();
-            sequences
-                .get(request_id)
-                .and_then(|seq| seq.recurrent_state.clone())
-        };
-
         let prefill_output = if let Some(csz) = chunk_size {
             let mut current_kv = kv_handle;
-            let mut current_recurrent_state = initial_recurrent_state;
+            let mut current_recurrent_state = initial_recurrent_state.clone();
             let mut final_output: Option<ferrum_interfaces::model_executor::PrefillOutput> = None;
             let mut processed = 0usize;
             while processed < num_tokens {
@@ -204,7 +204,7 @@ impl EngineInner {
             let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor)
                 .with_kv_cache(kv_handle)
                 .with_metadata(request_metadata);
-            let prefill_input = if let Some(state) = initial_recurrent_state {
+            let prefill_input = if let Some(state) = initial_recurrent_state.clone() {
                 prefill_input.with_recurrent_state(state)
             } else {
                 prefill_input
@@ -236,7 +236,10 @@ impl EngineInner {
             seq.generated_tokens.push(token);
             seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
             seq.kv_cache = Some(prefill_output.kv_cache.clone());
-            seq.recurrent_state = prefill_output.recurrent_state.clone();
+            seq.recurrent_state = prefill_output
+                .recurrent_state
+                .clone()
+                .or_else(|| initial_recurrent_state.clone());
             seq.prefill_complete = true;
             seq.phase = RequestPhase::Decoding;
             token
@@ -304,6 +307,7 @@ impl EngineInner {
             RequestId,
             Vec<TokenId>,
             Arc<dyn ferrum_interfaces::KvCacheHandle>,
+            Option<Arc<dyn ferrum_interfaces::RecurrentStateHandle>>,
             std::collections::HashMap<String, serde_json::Value>,
         )> = Vec::new();
 
@@ -330,9 +334,12 @@ impl EngineInner {
                     seq.model_decode_metadata(),
                 )
             };
+            let recurrent_state_spec = self
+                .model_executor
+                .recurrent_state_spec(rid, &input_tokens)?;
 
             // Prefix cache hit short-circuit (mirrors run_prefill_inner).
-            if !skip_prefix_cache {
+            if !skip_prefix_cache && recurrent_state_spec.is_none() {
                 let hit = self
                     .prefix_cache
                     .find_prefix(&input_tokens)
@@ -402,7 +409,22 @@ impl EngineInner {
                     }
                 }
             };
-            to_prefill.push((rid.clone(), input_tokens, kv_handle, metadata));
+            let recurrent_state = match self.ensure_recurrent_state(rid, recurrent_state_spec).await
+            {
+                Ok(state) => state,
+                Err(e) => {
+                    warn!("Recurrent-state alloc failed for {}: {}", rid, e);
+                    self.complete_request(rid, FinishReason::Error).await?;
+                    continue;
+                }
+            };
+            to_prefill.push((
+                rid.clone(),
+                input_tokens,
+                kv_handle,
+                recurrent_state,
+                metadata,
+            ));
         }
 
         if to_prefill.is_empty() {
@@ -412,12 +434,17 @@ impl EngineInner {
         // ── Phase 1b: ONE batched model_executor.batch_prefill call ──
         let inputs: Vec<PrefillInput> = to_prefill
             .iter()
-            .map(|(_, tokens, kv, metadata)| {
+            .map(|(_, tokens, kv, recurrent_state, metadata)| {
                 let token_u32s: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
                 let tensor = self.tokens_to_tensor(&token_u32s)?;
-                Ok(PrefillInput::new(tensor)
+                let input = PrefillInput::new(tensor)
                     .with_kv_cache(kv.clone())
-                    .with_metadata(metadata.clone()))
+                    .with_metadata(metadata.clone());
+                Ok(if let Some(state) = recurrent_state.clone() {
+                    input.with_recurrent_state(state)
+                } else {
+                    input
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -431,7 +458,9 @@ impl EngineInner {
         }
 
         // ── Phase 1c: per-item post-process (sample, update seq, stream, stop) ──
-        for ((rid, input_tokens, _, _), prefill_output) in to_prefill.iter().zip(outputs.iter()) {
+        for ((rid, input_tokens, _, recurrent_state, _), prefill_output) in
+            to_prefill.iter().zip(outputs.iter())
+        {
             let num_tokens = input_tokens.len();
             let last_logits = prefill_output.last_token_logits()?;
             let logits_vec = last_logits.to_vec_f32()?;
@@ -454,7 +483,10 @@ impl EngineInner {
                 seq.generated_tokens.push(token);
                 seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
                 seq.kv_cache = Some(prefill_output.kv_cache.clone());
-                seq.recurrent_state = prefill_output.recurrent_state.clone();
+                seq.recurrent_state = prefill_output
+                    .recurrent_state
+                    .clone()
+                    .or_else(|| recurrent_state.clone());
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
                 token

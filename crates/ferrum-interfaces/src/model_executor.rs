@@ -3,9 +3,9 @@
 //! This module provides the ModelExecutor trait that replaces the "fat" Model
 //! interface, focusing purely on tensor operations without tokenization or sampling.
 
-use crate::{KvCacheHandle, RecurrentStateHandle, TensorRef};
+use crate::{KvCacheHandle, RecurrentStateHandle, RecurrentStateSpec, TensorRef};
 use async_trait::async_trait;
-use ferrum_types::{ModelInfo, Result};
+use ferrum_types::{ModelInfo, RequestId, Result, TokenId};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
@@ -398,6 +398,20 @@ pub trait ModelExecutor: Send + Sync {
     /// runtime cache window than the model's declared context length.
     fn kv_capacity(&self) -> Option<usize> {
         None
+    }
+
+    /// Recurrent-state allocation spec for this request, when the model has
+    /// state-space or hybrid layers that need per-request recurrent state.
+    ///
+    /// Attention-only models return `None`. If this returns `Some`, the engine
+    /// must allocate a recurrent-state handle before prefill and pass it through
+    /// prefill/decode inputs. The default keeps existing executors KV-only.
+    fn recurrent_state_spec(
+        &self,
+        _request_id: &RequestId,
+        _input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        Ok(None)
     }
 
     /// Execute prefill phase (process initial prompt)

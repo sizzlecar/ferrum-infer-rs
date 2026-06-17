@@ -2,6 +2,38 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZR — W3-S0 source checkpoint: model-declared recurrent-state allocation
+
+- Scope:
+  - source-only W3-S0 model-declared allocation checkpoint;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `ModelExecutor::recurrent_state_spec(...)` as the typed hook for
+    state-space/hybrid models to declare per-request recurrent-state needs;
+  - wired continuous-engine prefill, batched prefill, and unified mixed-batch
+    prefill to allocate recurrent state through the configured manager when a
+    model returns a spec;
+  - disabled current KV-only prefix-cache hits for requests whose model declares
+    recurrent state, because no recurrent-state snapshot is stored there yet;
+  - preserved in-place recurrent-state handles when model outputs do not return
+    a replacement handle;
+  - added an engine test proving model-declared recurrent state is allocated and
+    deallocated by the in-memory manager across a request lifecycle.
+- Validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-engine
+    engine_allocates_and_deallocates_model_declared_recurrent_state --
+    --nocapture` PASS: `1 passed`;
+  - `cargo check -p ferrum-engine --all-targets` PASS;
+  - `cargo test -p ferrum-interfaces` PASS: full crate test set `15 passed`;
+  - `cargo check -p ferrum-models --all-targets` PASS.
+- Next required validation:
+  - W3 still needs real DeltaNet model specs and S0 native CUDA/PTX delta-rule
+    microbench before product DeltaNet integration;
+  - W2 release-grade full matrix still requires restored Vast credit.
+
 ## 2026-06-17 ZQ — W3-S0 source checkpoint: in-memory recurrent-state manager
 
 - Scope:
