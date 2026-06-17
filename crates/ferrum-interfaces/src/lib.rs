@@ -13,6 +13,7 @@ pub mod engine;
 pub mod kv_cache;
 pub mod kv_dtype;
 pub mod model_executor;
+pub mod recurrent_state;
 pub mod sampler;
 pub mod scheduler;
 pub mod tensor;
@@ -25,6 +26,11 @@ pub use kv_cache::{
 };
 pub use kv_dtype::{KvBf16, KvDtypeKind, KvFp16, KvFp8, KvInt8};
 pub use model_executor::{DecodeInput, DecodeOutput, ModelExecutor, PrefillInput, PrefillOutput};
+pub use recurrent_state::{
+    RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
+    RecurrentStateManagerStats, RecurrentStateResumePolicy, RecurrentStateSpec,
+    RecurrentStateTensorSpec,
+};
 pub use sampler::{LogitsProcessor, Sampler, SamplingConfig, SamplingContext};
 pub use scheduler::{BatchHint, BatchPlan, Scheduler as SchedulerInterface};
 pub use tensor::{TensorFactory, TensorLike, TensorOps, TensorRef};

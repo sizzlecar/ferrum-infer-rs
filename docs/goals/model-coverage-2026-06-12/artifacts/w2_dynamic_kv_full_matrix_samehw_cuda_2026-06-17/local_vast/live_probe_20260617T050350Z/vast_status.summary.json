@@ -1,0 +1,78 @@
+{
+  "billing_state": {
+    "balance_below_enabled_threshold": null,
+    "balance_threshold_enabled": true,
+    "billing_creditonly": 1,
+    "credit": 0
+  },
+  "http_codes": {
+    "instances": 200,
+    "user_current": 200
+  },
+  "instances": [
+    {
+      "actual_status": "exited",
+      "cur_state": "stopped",
+      "gpu_name": "RTX 4090",
+      "gpu_ram": 24564,
+      "id": 41178475,
+      "label": "ferrum-w2-graph-shape-20260616",
+      "num_gpus": 1
+    },
+    {
+      "actual_status": "exited",
+      "cur_state": "stopped",
+      "gpu_name": "RTX 4090",
+      "gpu_ram": 24564,
+      "id": 41187356,
+      "label": "ferrum-w2-lm-head-eager-20260616-d",
+      "num_gpus": 1
+    },
+    {
+      "actual_status": "exited",
+      "cur_state": "stopped",
+      "gpu_name": "RTX 4090",
+      "gpu_ram": 24564,
+      "id": 41218739,
+      "label": "ferrum-w2-unified-argmax-c16-20260617b",
+      "num_gpus": 1
+    },
+    {
+      "actual_status": "exited",
+      "cur_state": "stopped",
+      "gpu_name": "RTX 4090",
+      "gpu_ram": 24564,
+      "id": 41230499,
+      "label": "ferrum-w2-active-chunk-c16-20260617",
+      "num_gpus": 1
+    },
+    {
+      "actual_status": "exited",
+      "cur_state": "stopped",
+      "gpu_name": "RTX 4090",
+      "gpu_ram": 24564,
+      "id": 41241013,
+      "label": "ferrum-w2-vllm-ferrum-c16-ab-20260617",
+      "num_gpus": 1
+    },
+    {
+      "actual_status": "exited",
+      "cur_state": "stopped",
+      "gpu_name": "RTX 4090",
+      "gpu_ram": 24564,
+      "id": 41256521,
+      "label": "ferrum-w2-dynamic-prefill-matrix-20260617",
+      "num_gpus": 1
+    },
+    {
+      "actual_status": "exited",
+      "cur_state": "stopped",
+      "gpu_name": "RTX 4090",
+      "gpu_ram": 49140,
+      "id": 41276321,
+      "label": "ferrum-w2-dynamic-kv-full-matrix-20260617",
+      "num_gpus": 1
+    }
+  ],
+  "running_count": 0
+}
