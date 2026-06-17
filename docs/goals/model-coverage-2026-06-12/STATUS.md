@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZQ — W3-S0 source checkpoint: in-memory recurrent-state manager
+
+- Scope:
+  - source-only W3-S0 concrete manager checkpoint;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `InMemoryRecurrentStateManager` in `ferrum-engine` for GPU-free
+    recurrent-state lifecycle/capacity management;
+  - implemented allocation, duplicate rejection, capacity rejection,
+    deallocation invalidation, reset invalidation, handle lookup/listing, and
+    aggregate stats;
+  - re-exported the manager/config/handle from `ferrum-engine` so integration
+    wiring can use a concrete manager before backend-specific CUDA/Metal
+    managers exist.
+- Validation:
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS:
+    `4 passed` under the filter, including 3 in-memory manager lifecycle tests
+    plus the builder injection test;
+  - `cargo check -p ferrum-engine --all-targets` PASS;
+  - `cargo fmt --all` PASS before final checks.
+- Next required validation:
+  - final local diff/format checks before commit;
+  - W3 still needs model-family allocation specs and S0 native CUDA/PTX
+    delta-rule microbench before product DeltaNet integration;
+  - W2 release-grade full matrix still requires restored Vast credit.
+
 ## 2026-06-17 ZP — W3-S0 source checkpoint: recurrent-state manager injection
 
 - Scope:

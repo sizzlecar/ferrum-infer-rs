@@ -53,6 +53,7 @@ pub(crate) mod layer_split;
 pub mod modality_stubs;
 pub mod parallel;
 pub mod pipeline;
+pub mod recurrent_state;
 pub mod registry;
 pub mod speculative;
 pub mod tensor_factory;
@@ -80,6 +81,10 @@ pub use continuous_engine::{ContinuousBatchEngine, SequenceState};
 // Re-exports of pipeline
 pub use pipeline::{
     ChunkedPrefillConfig, ChunkedPrefillExecutor, ExecutionPhase, PipelineConfig, PipelineExecutor,
+};
+
+pub use recurrent_state::{
+    InMemoryRecurrentStateConfig, InMemoryRecurrentStateHandle, InMemoryRecurrentStateManager,
 };
 
 // Re-exports of builder
