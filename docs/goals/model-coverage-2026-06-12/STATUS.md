@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZK — W3 Qwen3.5/Qwen3.6 typed layer-plan checkpoint
+
+- Scope:
+  - W3-S2 executor wiring prerequisite after the recurrent-state skeleton;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- vLLM source comparison:
+  - checked local `/Users/chejinxuan/py_ws/vllm/vllm/model_executor/models/qwen3_5.py`;
+  - `Qwen3_5DecoderLayer` uses `QwenGatedDeltaNetAttention` for
+    `linear_attention` layers and `Qwen3NextAttention` for `full_attention`;
+  - dense `qwen3_5_text` uses `Qwen3NextMLP` on every layer;
+  - `qwen3_5_moe_text` uses `Qwen3NextSparseMoeBlock` on every layer, including
+    full-attention layers, with the shared expert block.
+- Change:
+  - added `Qwen35MlpKind`;
+  - added `Qwen35LayerPlan`;
+  - added `Qwen35TextConfig::layer_plan()`;
+  - added `Qwen35TextConfig::mlp_kind_for_layer()`;
+  - added `dense_mlp_layers()` and `sparse_moe_layers()` helpers.
+- Evidence:
+  - dense `Qwen/Qwen3.5-0.8B` now resolves 24 dense-MLP layers and 0 sparse
+    MoE layers;
+  - MoE/shared-expert `Qwen/Qwen3.6-35B-A3B` now resolves 40 sparse
+    MoE/shared-expert MLP layers and 0 dense-MLP layers;
+  - full-attention layers keep `has_recurrent_state=false` but still use the
+    MoE MLP in the MoE model, matching vLLM.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models --test qwen35_config_test -- --nocapture`
+    PASS: `6 passed`;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `7 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still config/executor-planning evidence;
+  - no weights are loaded and no prefill/decode path is implemented yet.
+
 ## 2026-06-18 ZZJ — W3 executor skeleton recurrent-state boundary checkpoint
 
 - Scope:

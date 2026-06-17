@@ -17,6 +17,20 @@ pub enum Qwen35LayerType {
     FullAttention,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum Qwen35MlpKind {
+    Dense,
+    SparseMoeSharedExpert,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35LayerPlan {
+    pub layer_index: usize,
+    pub attention: Qwen35LayerType,
+    pub mlp: Qwen35MlpKind,
+    pub has_recurrent_state: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Qwen35LinearAttentionConfig {
     pub num_key_heads: usize,
@@ -169,6 +183,52 @@ impl Qwen35TextConfig {
         self.layer_types
             .iter()
             .position(|kind| *kind == Qwen35LayerType::FullAttention)
+    }
+
+    pub fn mlp_kind_for_layer(&self, layer_index: usize) -> Result<Qwen35MlpKind, String> {
+        if layer_index >= self.num_hidden_layers {
+            return Err(format!(
+                "layer_index {layer_index} exceeds num_hidden_layers {}",
+                self.num_hidden_layers
+            ));
+        }
+        if self.is_moe() {
+            Ok(Qwen35MlpKind::SparseMoeSharedExpert)
+        } else {
+            Ok(Qwen35MlpKind::Dense)
+        }
+    }
+
+    pub fn layer_plan(&self) -> Result<Vec<Qwen35LayerPlan>, String> {
+        self.layer_types
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(layer_index, attention)| {
+                Ok(Qwen35LayerPlan {
+                    layer_index,
+                    attention,
+                    mlp: self.mlp_kind_for_layer(layer_index)?,
+                    has_recurrent_state: attention == Qwen35LayerType::LinearAttention,
+                })
+            })
+            .collect()
+    }
+
+    pub fn sparse_moe_layers(&self) -> Vec<usize> {
+        if self.is_moe() {
+            (0..self.num_hidden_layers).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn dense_mlp_layers(&self) -> Vec<usize> {
+        if self.is_moe() {
+            Vec::new()
+        } else {
+            (0..self.num_hidden_layers).collect()
+        }
     }
 
     pub fn linear_qk_total_dim(&self) -> usize {
