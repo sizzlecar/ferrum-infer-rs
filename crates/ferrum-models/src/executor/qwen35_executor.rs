@@ -15,7 +15,7 @@ use ferrum_interfaces::{
     ModelExecutor, RecurrentStateSpec,
 };
 use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_quantization::WeightLoader;
+use ferrum_quantization::{NativeSafetensorsLoader, WeightLoader};
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, RequestId, Result, TokenId};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -496,6 +496,39 @@ impl Qwen35W3Executor {
         Ok(executor)
     }
 
+    pub fn from_definition_with_dense_reference_cpu_safetensors(
+        model_id: impl Into<String>,
+        def: &ModelDefinition,
+        model_dir: &Path,
+        dtype: DataType,
+        device: Device,
+    ) -> Result<Self> {
+        if dtype != DataType::FP32 || device != Device::CPU {
+            return Err(FerrumError::unsupported(
+                "Qwen3.5 dense reference safetensors executor requires FP32 CPU",
+            ));
+        }
+        let mut executor = Self::from_definition(model_id, def, dtype, device)?;
+        let inventory = Qwen35WeightInventory::from_safetensors_dir(model_dir)
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 weight inventory failed: {err}")))?;
+        let weight_plan = inventory
+            .detect_prefix_and_resolve(&executor.config)
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 weight preflight failed: {err}")))?;
+        let validation = weight_plan.validation();
+        let loader = NativeSafetensorsLoader::<CpuBackend>::open(model_dir)?;
+        let runtime = Qwen35DenseReferenceRuntime::from_cpu_weight_plan(
+            &executor.config,
+            def.vocab_size,
+            def.norm_eps as f32,
+            def.rope_theta.unwrap_or(10_000.0) as f32,
+            &weight_plan,
+            &loader,
+        )?;
+        executor.weight_validation = Some(validation);
+        executor.weight_plan = Some(weight_plan);
+        executor.with_dense_reference_runtime(runtime)
+    }
+
     pub fn qwen35_config(&self) -> &Qwen35TextConfig {
         &self.config
     }
@@ -642,6 +675,7 @@ mod tests {
     use ferrum_quantization::QuantConfig;
     use ferrum_testkit::MockTensor;
     use std::collections::HashMap;
+    use std::path::Path;
 
     fn toy_dense_definition() -> ModelDefinition {
         let mut def = ModelDefinition::default();
@@ -925,6 +959,32 @@ mod tests {
         }
     }
 
+    fn write_toy_safetensors(dir: &Path, tensors: HashMap<String, Vec<f32>>) {
+        use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+        let views = tensors
+            .into_iter()
+            .map(|(name, values)| {
+                let bytes = values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let bytes: &'static [u8] = Box::leak(bytes);
+                (
+                    name,
+                    TensorView::new(Dtype::F32, vec![values.len()], bytes).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            views,
+            &None::<HashMap<String, String>>,
+            &dir.join("model.safetensors"),
+        )
+        .unwrap();
+    }
+
     fn assert_close(actual: &[f32], expected: &[f32]) {
         assert_eq!(actual.len(), expected.len());
         for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
@@ -1014,6 +1074,31 @@ mod tests {
             &actual.linear_recurrent_states[0],
             &expected.linear_recurrent_states[0],
         );
+    }
+
+    #[test]
+    fn qwen35_w3_reference_executor_prefills_from_dense_safetensors() {
+        let def = toy_dense_definition();
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_toy_safetensors(tmp.path(), toy_dense_weight_map());
+
+        let executor = Qwen35W3Executor::from_definition_with_dense_reference_cpu_safetensors(
+            "qwen35-reference",
+            &def,
+            tmp.path(),
+            DataType::FP32,
+            Device::CPU,
+        )
+        .unwrap();
+        let expected = toy_dense_runtime().forward(&[0, 1]).unwrap();
+        let input = PrefillInput::new(MockTensor::from_u32(&[0, 1], &[2]).into_ref());
+
+        let output = tokio_test::block_on(executor.prefill(&input)).unwrap();
+
+        assert_close(&output.logits.to_vec_f32().unwrap(), &expected.logits[3..6]);
+        assert_eq!(output.kv_cache.block_table().sequence_length, 2);
+        assert!(executor.weight_validation().unwrap().is_pass());
+        assert_eq!(executor.weight_plan().unwrap().prefix, "model");
     }
 
     #[test]
