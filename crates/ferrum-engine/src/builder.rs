@@ -406,6 +406,14 @@ impl EngineBuilder {
             _ => (None, None),
         };
 
+        let recurrent_state_manager = custom_recurrent_state_manager.or_else(|| {
+            matches!(&config.backend.device, ferrum_types::Device::CPU).then(|| {
+                Arc::new(crate::recurrent_state::InMemoryRecurrentStateManager::new(
+                    crate::recurrent_state::InMemoryRecurrentStateConfig::default(),
+                )) as Arc<dyn RecurrentStateManager + Send + Sync>
+            })
+        });
+
         let engine = crate::ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
             config,
             cb_scheduler,
@@ -416,7 +424,7 @@ impl EngineBuilder {
             tensor_factory,
             draft_executor,
             spec_config,
-            custom_recurrent_state_manager,
+            recurrent_state_manager,
         );
         Ok(Box::new(engine))
     }
