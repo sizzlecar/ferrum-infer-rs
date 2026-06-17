@@ -2,6 +2,36 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZI — W2 full-matrix runner checkpoint: auto-generate final manifest
+
+- Scope:
+  - source-only paid-GPU workflow hardening for the tracked W2 dynamic-KV full
+    matrix runner;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Change:
+  - fixed the runner default output directory name from the old
+    `w2_dynamic_prefill...` label to
+    `w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17`;
+  - after Ferrum and vLLM c=1/4/16/32 sweeps finish, the runner now invokes
+    `scripts/release/model_release_grade_manifest.py w2 --source "$OUT"
+    --out "$OUT"` so the same artifact directory gets
+    `model_release_grade_manifest.json`,
+    `model_release_grade_goal_gate.manifest.json`, and the exact final PASS or
+    FAIL output;
+  - updated the tracked runner SHA256 file after the script change.
+- Validation:
+  - `bash -n
+    docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/run_remote_full_matrix.sh`
+    PASS, with only a local locale warning;
+  - `git diff --check --
+    docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/run_remote_full_matrix.sh`
+    PASS.
+- Next required validation:
+  - after Vast credit is available, use the updated runner on a new
+    high-availability 49GB RTX 4090 instance; correctness and full matrix must
+    still pass before the final W2 release-grade claim is valid.
+
 ## 2026-06-17 ZH — W2 release-grade validator checkpoint: bench commands must cover cell concurrency
 
 - Scope:
