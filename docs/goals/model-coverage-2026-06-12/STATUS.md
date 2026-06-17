@@ -24,17 +24,24 @@
     norm output, DeltaNet output, residual-after-mixer, post-attention norm,
     MLP output, and layer output.
 - Validation:
+  - clean-worktree artifact directory:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_hf_layer_harness_20260617T134658Z_d53683a6/`;
+  - artifact manifests were generated from clean detached worktree commit
+    `d53683a60029229ff0a60e928df6e88cd3e3e82e`, with
+    `is_dirty=false`, empty tracked status, and `untracked_count=0`;
   - `python3 -m py_compile scripts/release/w3_qwen35_hf_layer_dump.py` PASS;
   - `python3 scripts/release/w3_qwen35_hf_layer_dump.py --self-test --out
-    /tmp/w3_qwen35_hf_layer_dump_selftest` PASS:
+    /tmp/w3_qwen35_hf_layer_harness_20260617T134658Z_d53683a6/selftest`
+    PASS:
     `W3 QWEN35 HF LAYER DUMP SELFTEST PASS:
-    /private/tmp/w3_qwen35_hf_layer_dump_selftest`;
+    /private/tmp/w3_qwen35_hf_layer_harness_20260617T134658Z_d53683a6/selftest`;
   - `python3 scripts/release/w3_qwen35_hf_layer_dump.py --contract --model-id
     Qwen/Qwen3.5-0.8B --config
     docs/goals/model-coverage-2026-06-12/artifacts/w3_hf_config_probe_20260617T131209Z_f97c1d6f/dense_min_reference.config.json
-    --out /tmp/w3_qwen35_hf_layer_contract` PASS:
+    --out /tmp/w3_qwen35_hf_layer_harness_20260617T134658Z_d53683a6/contract`
+    PASS:
     `W3 QWEN35 HF LAYER CONTRACT PASS:
-    /private/tmp/w3_qwen35_hf_layer_contract`.
+    /private/tmp/w3_qwen35_hf_layer_harness_20260617T134658Z_d53683a6/contract`.
 - Limitation:
   - this is still not an official weight-based HF tensor dump and not a
     Ferrum-vs-HF compare artifact;
