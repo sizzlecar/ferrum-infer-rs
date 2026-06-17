@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZZC — W3 Qwen3.5 0.8B HF layer dump PASS
+
+- Scope:
+  - paid GPU host was reused, but the HF reference dump ran with CPU torch;
+  - real `Qwen/Qwen3.5-0.8B` weights were loaded through HF transformers;
+  - selected layer: first `linear_attention` layer, `layer_idx=0`;
+  - no Ferrum Qwen3.5 layer dump was generated in this checkpoint;
+  - no product-path `ferrum run` / `ferrum serve` was run;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Evidence:
+  - artifact directory:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_08b_hf_layer_dump_20260617T141100Z_2d3092ba/`;
+  - required PASS line:
+    `W3 QWEN35 HF LAYER DUMP PASS:
+    /workspace/w3_hf_dump_artifacts/qwen35_08b_hf_layer_dump_20260617T141100Z_2d3092ba/dump`;
+  - manifest git status from remote:
+    `sha=2d3092bab3cc4b22c08d97d0e6f0e205b723b9a1`,
+    `is_dirty=false`, empty tracked status, `untracked_count=0`;
+  - dependencies recorded in manifest:
+    `torch=2.12.0+cpu`, `transformers=5.12.1`;
+  - captured 19 tensors, including DeltaNet q/k/v/beta/g/core, conv output,
+    gated norm output, DeltaNet output, post-attention norm, MLP output, and
+    final layer output.
+- Remote state:
+  - retained 1x RTX 4090 host was left usable;
+  - no GPU compute process was present after the dump;
+  - GPU memory check showed 1 MiB used.
+- Limitation:
+  - this is HF reference evidence only; W3-S1 still requires the matching
+    Ferrum dump and an explicit Ferrum-vs-HF comparator PASS.
+- Next required validation:
+  - implement/route Ferrum Qwen3.5 first-layer dump for the same prompt and
+    layer;
+  - compare against this HF artifact before moving to W3-S2 product paths.
+
 ## 2026-06-17 ZZB — W3 Qwen3.5 HF layer dump harness checkpoint
 
 - Scope:
