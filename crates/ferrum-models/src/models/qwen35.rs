@@ -9,12 +9,15 @@ use ferrum_quantization::Linear;
 use ferrum_types::Result;
 
 use crate::{
+    common::LlmRuntimeConfig,
+    definition::ModelDefinition,
     qwen35_config::{Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig},
     qwen35_weights::{Qwen35ResolvedWeightPlan, Qwen35WeightPlanLoader},
 };
 
 pub struct Qwen35ModelWeights<B: Backend> {
     pub config: Qwen35TextConfig,
+    pub runtime_cfg: LlmRuntimeConfig,
     pub embed_tokens: B::Buffer,
     pub final_norm: B::Buffer,
     pub lm_head: Box<dyn Linear<B>>,
@@ -76,9 +79,35 @@ pub struct Qwen35SparseMoeSharedExpertWeights<B: Backend> {
     pub fused_down_proj: B::Buffer,
 }
 
+pub fn qwen35_runtime_config(
+    config: &Qwen35TextConfig,
+    vocab_size: usize,
+    max_seq_len: usize,
+) -> LlmRuntimeConfig {
+    LlmRuntimeConfig {
+        hidden_size: config.hidden_size,
+        num_layers: config.num_hidden_layers,
+        num_kv_heads: config.num_key_value_heads,
+        head_dim: config.head_dim,
+        vocab_size,
+        max_seq_len,
+    }
+}
+
+pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<LlmRuntimeConfig> {
+    let config =
+        Qwen35TextConfig::from_model_definition(def).map_err(ferrum_types::FerrumError::model)?;
+    Ok(qwen35_runtime_config(
+        &config,
+        def.vocab_size,
+        def.max_position_embeddings,
+    ))
+}
+
 impl<B: Backend> Qwen35ModelWeights<B> {
     pub fn load(
         config: Qwen35TextConfig,
+        runtime_cfg: LlmRuntimeConfig,
         plan: &Qwen35ResolvedWeightPlan,
         loader: &dyn ferrum_quantization::WeightLoader<B>,
     ) -> Result<Self> {
@@ -185,6 +214,7 @@ impl<B: Backend> Qwen35ModelWeights<B> {
 
         Ok(Self {
             config,
+            runtime_cfg,
             embed_tokens,
             final_norm,
             lm_head,
@@ -222,6 +252,7 @@ mod tests {
 
     use super::*;
     use crate::qwen35_weights::Qwen35WeightInventory;
+    use crate::{definition::ConfigManager, registry::Architecture};
 
     fn dense_config() -> Qwen35TextConfig {
         Qwen35TextConfig::from_hf_config_str(
@@ -348,15 +379,27 @@ mod tests {
         }
     }
 
+    fn runtime_config(config: &Qwen35TextConfig) -> LlmRuntimeConfig {
+        qwen35_runtime_config(config, 128, 64)
+    }
+
     #[test]
     fn materializes_dense_qwen35_weights_from_plan() {
         let config = dense_config();
         let loader = RecordingLoader::from_required_manifest(&config);
         let plan = loader.plan(&config);
 
-        let model = Qwen35ModelWeights::<CpuBackend>::load(config.clone(), &plan, &loader).unwrap();
+        let model = Qwen35ModelWeights::<CpuBackend>::load(
+            config.clone(),
+            runtime_config(&config),
+            &plan,
+            &loader,
+        )
+        .unwrap();
 
         assert_eq!(model.config.num_hidden_layers, 4);
+        assert_eq!(model.runtime_cfg.hidden_size, 16);
+        assert_eq!(model.runtime_cfg.vocab_size, 128);
         assert_eq!(model.layers.len(), 4);
         assert_eq!(
             model.layers[0].attention.kind(),
@@ -384,9 +427,16 @@ mod tests {
         let loader = RecordingLoader::from_required_manifest(&config);
         let plan = loader.plan(&config);
 
-        let model = Qwen35ModelWeights::<CpuBackend>::load(config.clone(), &plan, &loader).unwrap();
+        let model = Qwen35ModelWeights::<CpuBackend>::load(
+            config.clone(),
+            runtime_config(&config),
+            &plan,
+            &loader,
+        )
+        .unwrap();
 
         assert_eq!(model.layers.len(), 4);
+        assert_eq!(model.runtime_cfg.num_kv_heads, 1);
         assert_eq!(
             model.layers[0].mlp.kind(),
             Qwen35MlpKind::SparseMoeSharedExpert
@@ -407,5 +457,42 @@ mod tests {
             Qwen35MlpWeights::SparseMoeSharedExpert(weights)
                 if weights.fused_gate_up_proj == vec![1.0]
         ));
+    }
+
+    #[test]
+    fn derives_runtime_config_from_model_definition() {
+        let raw = serde_json::json!({
+          "model_type": "qwen3_5",
+          "architectures": ["Qwen3_5ForConditionalGeneration"],
+          "vocab_size": 32000,
+          "max_position_embeddings": 4096,
+          "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 16,
+            "num_hidden_layers": 4,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 2,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 4,
+            "head_dim": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "intermediate_size": 32,
+            "tie_word_embeddings": true
+          }
+        });
+        let mut manager = ConfigManager::new();
+        let def = manager.parse_config_for_tests(&raw).unwrap();
+        let runtime = qwen35_runtime_config_from_definition(&def).unwrap();
+
+        assert_eq!(def.architecture, Architecture::Qwen35);
+        assert_eq!(runtime.hidden_size, 16);
+        assert_eq!(runtime.num_layers, 4);
+        assert_eq!(runtime.num_kv_heads, 1);
+        assert_eq!(runtime.head_dim, 4);
+        assert_eq!(runtime.vocab_size, 32000);
+        assert_eq!(runtime.max_seq_len, 4096);
     }
 }

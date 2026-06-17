@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZR — W3 runtime-config contract checkpoint
+
+- Scope:
+  - W3-S2 runtime contract after typed weight materialization;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - `Qwen35ModelWeights` now carries an explicit `LlmRuntimeConfig`;
+  - added `qwen35_runtime_config()` for explicit text-config + vocab/max-seq
+    construction;
+  - added `qwen35_runtime_config_from_definition()` so product wiring can
+    derive scheduler-facing hidden size, layer count, KV heads, head dim,
+    vocab size, and max sequence length from `ModelDefinition`;
+  - kept `DecoderOnlyLLM` unimplemented because `prefill/decode` cannot
+    safely return an unsupported error through that trait today.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `18 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this still does not implement Qwen3.5/Qwen3.6 prefill/decode;
+  - this does not register W3 product execution;
+  - next W3-S2 work is recurrent-state/runtime storage plus DeltaNet/full
+    attention forward wiring.
+
 ## 2026-06-18 ZZQ — W3 typed model-weight materialization checkpoint
 
 - Scope:
