@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZU — W3-S0 native CUDA delta-rule microbench PASS
+
+- Scope:
+  - paid GPU lane: W3-S0 native CUDA delta-rule microbench on retained 1x RTX
+    4090 instance;
+  - no whole W3 model was loaded during this checkpoint;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Evidence:
+  - artifact directory:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/`;
+  - required PASS line:
+    `W3 DELTA RULE S0 MICROBENCH PASS:
+    /workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd`;
+  - remote git SHA: `da2802bdc67d223c8b94674880a5ca9f03fceb48`;
+  - remote git state: clean tracked status, zero untracked files;
+  - `ptx_arch=sm_89`;
+  - CUDA binary SHA256:
+    `6341b5bed1746468b4c15d1fa1acacc3d4700cf8ef325c187560c80dc2367ab1`;
+  - input distribution recorded as deterministic centered uniform ranges for
+    q/k/v/beta.
+- Validation:
+  - CUDA source compiled with:
+    `nvcc -O2 --generate-line-info -arch=sm_89 ...`;
+  - CUDA output compared against the internal Python delta-rule reference;
+  - error stats: `max_abs=3.011855029266819e-09`,
+    `max_rel=3.429708441964771e-06`,
+    `rmse=6.12241793241555e-10`;
+  - GPU compute process query after the run returned no active compute apps.
+- Next required validation:
+  - W3-S1 still needs DeltaNet single-layer CPU/reference vs Ferrum dump and
+    MoE variant layout/router/shared-merge coverage;
+  - W3-S2 still needs whole-model product-path `ferrum run` and `ferrum serve`;
+  - W3-S3 still needs the release-grade 80% performance gate or an explicitly
+    documented cap.
+
 ## 2026-06-17 ZT — W3-S0 source checkpoint: delta-rule microbench harness
 
 - Scope:

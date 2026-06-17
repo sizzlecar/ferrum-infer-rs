@@ -1,0 +1,150 @@
+{
+  "chunk_size": 3,
+  "chunked_reference_error": {
+    "max_abs": 0.0,
+    "max_rel": 0.0,
+    "rmse": 0.0
+  },
+  "command_line": [
+    "/usr/bin/python3",
+    "scripts/release/w3_delta_rule_s0_microbench.py",
+    "--cuda",
+    "--cuda-arch",
+    "auto",
+    "--out",
+    "/workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd"
+  ],
+  "created_at": "2026-06-17T12:31:41.004425+00:00",
+  "cuda": {
+    "binary_sha256": "6341b5bed1746468b4c15d1fa1acacc3d4700cf8ef325c187560c80dc2367ab1",
+    "compile_command": [
+      "/usr/local/cuda/bin/nvcc",
+      "-O2",
+      "--generate-line-info",
+      "-arch=sm_89",
+      "/workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/delta_rule_s0.cu",
+      "-o",
+      "/workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/delta_rule_s0"
+    ],
+    "compile_logs": {
+      "returncode": 0,
+      "stderr_path": "nvcc_compile.stderr.txt",
+      "stdout_path": "nvcc_compile.stdout.txt"
+    },
+    "input": "/workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/input.bin",
+    "metadata": {
+      "compute_cap": {
+        "available": true,
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=compute_cap",
+          "--format=csv,noheader,nounits"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "8.9\n"
+      },
+      "cuda_visible_devices": null,
+      "nvcc_path": "/usr/local/cuda/bin/nvcc",
+      "nvcc_version": {
+        "available": true,
+        "command": [
+          "/usr/local/cuda/bin/nvcc",
+          "--version"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2024 NVIDIA Corporation\nBuilt on Thu_Mar_28_02:18:24_PDT_2024\nCuda compilation tools, release 12.4, V12.4.131\nBuild cuda_12.4.r12.4/compiler.34097967_0\n"
+      },
+      "nvidia_smi": {
+        "available": true,
+        "command": [
+          "nvidia-smi",
+          "-q"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "\n==============NVSMI LOG==============\n\nTimestamp                                 : Wed Jun 17 12:31:40 2026\nDriver Version                            : 570.195.03\nCUDA Version                              : 12.8\n\nAttached GPUs                             : 1\nGPU 00000000:A1:00.0\n    Product Name                          : NVIDIA GeForce RTX 4090\n    Product Brand                         : GeForce\n    Product Architecture                  : Ada Lovelace\n    Display Mode                          : Disabled\n    Display Active                        : Disabled\n    Persistence Mode                      : Enabled\n    Addressing Mode                       : None\n    MIG Mode\n        Current                           : N/A\n        Pending                           : N/A\n    Accounting Mode                       : Disabled\n    Accounting Mode Buffer Size           : 4000\n    Driver Model\n        Current                           : N/A\n        Pending                           : N/A\n    Serial Number                         : N/A\n    GPU UUID                              : GPU-4128e307-0733-967b-e4ef-3b3171f241e3\n    Minor Number                          : 7\n    VBIOS Version                         : 95.02.18.C0.CF\n    MultiGPU Board                        : No\n    Board ID                              : 0xa100\n    Board Part Number                     : N/A\n    GPU Part Number                       : 2684-300-A1\n    FRU Part Number                       : N/A\n    Platform Info\n        Chassis Serial Number             : N/A\n        Slot Number                       : N/A\n        Tray Index                        : N/A\n        Host ID                           : N/A\n        Peer Type                         : N/A\n        Module Id                         : 1\n        GPU Fabric GUID                   : N/A\n    Inforom Version\n        Image Version                     : G002.0000.00.03\n        OEM Object                        : 2.0\n        ECC Object                        : 6.16\n        Power Management Object           : N/A\n    Inforom BBX Object Flush\n        Latest Timestamp                  : N/A\n        Latest Duration                   : N/A\n    GPU Operation Mode\n        Current                           : N/A\n        Pending                           : N/A\n    GPU C2C Mode                          : N/A\n    GPU Virtualization Mode\n        Virtualization Mode               : None\n        Host VGPU Mode                    : N/A\n        vGPU Heterogeneous Mode           : N/A\n    GPU Reset Status\n        Reset Required                    : Requested functionality has been deprecated\n        Drain and Reset Recommended       : Requested functionality has been deprecated\n    GPU Recovery Action                   : None\n    GSP Firmware Version                  : 570.195.03\n    IBMNPU\n        Relaxed Ordering Mode             : N/A\n    PCI\n        Bus                               : 0xA1\n        Device                            : 0x00\n        Domain                            : 0x0000\n        Base Classcode                    : 0x3\n        Sub Classcode                     : 0x0\n        Device Id                         : 0x268410DE\n        Bus Id                            : 00000000:A1:00.0\n        Sub System Id                     : 0x51031462\n        GPU Link Info\n            PCIe Generation\n                Max                       : 4\n                Current                   : 4\n                Device Current            : 4\n                Device Max                : 4\n                Host Max                  : 5\n            Link Width\n                Max                       : 16x\n                Current                   : 16x\n        Bridge Chip\n            Type                          : N/A\n            Firmware                      : N/A\n        Replays Since Reset               : 0\n        Replay Number Rollovers           : 0\n        Tx Throughput                     : 341 KB/s\n        Rx Throughput                     : 341 KB/s\n        Atomic Caps Outbound              : N/A\n        Atomic Caps Inbound               : N/A\n    Fan Speed                             : 0 %\n    Performance State                     : P0\n    Clocks Event Reasons\n        Idle                              : Not Active\n        Applications Clocks Setting       : Not Active\n        SW Power Cap                      : Not Active\n        HW Slowdown                       : Not Active\n            HW Thermal Slowdown           : Not Active\n            HW Power Brake Slowdown       : Not Active\n        Sync Boost                        : Not Active\n        SW Thermal Slowdown               : Not Active\n        Display Clock Setting             : Not Active\n    Sparse Operation Mode                 : N/A\n    FB Memory Usage\n        Total                             : 24564 MiB\n        Reserved                          : 474 MiB\n        Used                              : 1 MiB\n        Free                              : 24090 MiB\n    BAR1 Memory Usage\n        Total                             : 32768 MiB\n        Used                              : 2 MiB\n        Free                              : 32766 MiB\n    Conf Compute Protected Memory Usage\n        Total                             : 0 MiB\n        Used                              : 0 MiB\n        Free                              : 0 MiB\n    Compute Mode                          : Default\n    Utilization\n        GPU                               : 36 %\n        Memory                            : 3 %\n        Encoder                           : 0 %\n        Decoder                           : 0 %\n        JPEG                              : 0 %\n        OFA                               : 0 %\n    Encoder Stats\n        Active Sessions                   : 0\n        Average FPS                       : 0\n        Average Latency                   : 0\n    FBC Stats\n        Active Sessions                   : 0\n        Average FPS                       : 0\n        Average Latency                   : 0\n    DRAM Encryption Mode\n        Current                           : N/A\n        Pending                           : N/A\n    ECC Mode\n        Current                           : Disabled\n        Pending                           : Disabled\n    ECC Errors\n        Volatile\n            SRAM Correctable              : N/A\n            SRAM Uncorrectable Parity     : N/A\n            SRAM Uncorrectable SEC-DED    : N/A\n            DRAM Correctable              : N/A\n            DRAM Uncorrectable            : N/A\n        Aggregate\n            SRAM Correctable              : N/A\n            SRAM Uncorrectable Parity     : N/A\n            SRAM Uncorrectable SEC-DED    : N/A\n            DRAM Correctable              : N/A\n            DRAM Uncorrectable            : N/A\n            SRAM Threshold Exceeded       : N/A\n        Aggregate Uncorrectable SRAM Sources\n            SRAM L2                       : N/A\n            SRAM SM                       : N/A\n            SRAM Microcontroller          : N/A\n            SRAM PCIE                     : N/A\n            SRAM Other                    : N/A\n    Retired Pages\n        Single Bit ECC                    : N/A\n        Double Bit ECC                    : N/A\n        Pending Page Blacklist            : N/A\n    Remapped Rows\n        Correctable Error                 : 0\n        Uncorrectable Error               : 0\n        Pending                           : No\n        Remapping Failure Occurred        : No\n        Bank Remap Availability Histogram\n            Max                           : 192 bank(s)\n            High                          : 0 bank(s)\n            Partial                       : 0 bank(s)\n            Low                           : 0 bank(s)\n            None                          : 0 bank(s)\n    Temperature\n        GPU Current Temp                  : 52 C\n        GPU T.Limit Temp                  : 32 C\n        GPU Shutdown T.Limit Temp         : -7 C\n        GPU Slowdown T.Limit Temp         : -2 C\n        GPU Max Operating T.Limit Temp    : 0 C\n        GPU Target Temperature            : 84 C\n        Memory Current Temp               : N/A\n        Memory Max Operating T.Limit Temp : N/A\n    GPU Power Readings\n        Average Power Draw                : 45.97 W\n        Instantaneous Power Draw          : 86.02 W\n        Current Power Limit               : 450.00 W\n        Requested Power Limit             : 450.00 W\n        Default Power Limit               : 450.00 W\n        Min Power Limit                   : 150.00 W\n        Max Power Limit                   : 480.00 W\n    GPU Memory Power Readings \n        Average Power Draw                : N/A\n        Instantaneous Power Draw          : N/A\n    Module Power Readings\n        Average Power Draw                : N/A\n        Instantaneous Power Draw          : N/A\n        Current Power Limit               : N/A\n        Requested Power Limit             : N/A\n        Default Power Limit               : N/A\n        Min Power Limit                   : N/A\n        Max Power Limit                   : N/A\n    Power Smoothing                       : N/A\n    Workload Power Profiles\n        Requested Profiles                : N/A\n        Enforced Profiles                 : N/A\n    Clocks\n        Graphics                          : 2595 MHz\n        SM                                : 2595 MHz\n        Memory                            : 10501 MHz\n        Video                             : 1995 MHz\n    Applications Clocks\n        Graphics                          : N/A\n        Memory                            : N/A\n    Default Applications Clocks\n        Graphics                          : N/A\n        Memory                            : N/A\n    Deferred Clocks\n        Memory                            : N/A\n    Max Clocks\n        Graphics                          : 3135 MHz\n        SM                                : 3135 MHz\n        Memory                            : 10501 MHz\n        Video                             : 2415 MHz\n    Max Customer Boost Clocks\n        Graphics                          : N/A\n    Clock Policy\n        Auto Boost                        : N/A\n        Auto Boost Default                : N/A\n    Voltage\n        Graphics                          : N/A\n    Fabric\n        State                             : N/A\n        Status                            : N/A\n        CliqueId                          : N/A\n        ClusterUUID                       : N/A\n        Health\n            Bandwidth                     : N/A\n            Route Recovery in progress    : N/A\n            Route Unhealthy               : N/A\n            Access Timeout Recovery       : N/A\n    Processes                             : None\n    Capabilities\n        EGM                               : disabled\n\n"
+      }
+    },
+    "nvcc_path": "/usr/local/cuda/bin/nvcc",
+    "output": "/workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/output.bin",
+    "requested_arch": "auto",
+    "resolved_arch": "sm_89",
+    "run_command": [
+      "/workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/delta_rule_s0",
+      "/workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/input.bin",
+      "/workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/output.bin",
+      "2",
+      "2",
+      "8",
+      "4",
+      "4"
+    ],
+    "run_logs": {
+      "returncode": 0,
+      "stderr_path": "cuda_run.stderr.txt",
+      "stdout_path": "cuda_run.stdout.txt"
+    },
+    "source": "/workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/delta_rule_s0.cu"
+  },
+  "cuda_binary_sha256": "6341b5bed1746468b4c15d1fa1acacc3d4700cf8ef325c187560c80dc2367ab1",
+  "cuda_error": {
+    "max_abs": 3.011855029266819e-09,
+    "max_rel": 3.429708441964771e-06,
+    "rmse": 6.12241793241555e-10
+  },
+  "error_stats": {
+    "max_abs": 3.011855029266819e-09,
+    "max_rel": 3.429708441964771e-06,
+    "rmse": 6.12241793241555e-10
+  },
+  "git": {
+    "is_dirty": false,
+    "sha": "da2802bdc67d223c8b94674880a5ca9f03fceb48",
+    "tracked_status_short": [],
+    "untracked_count": 0,
+    "untracked_sample": []
+  },
+  "input_distribution": {
+    "beta_range": [
+      0.5,
+      0.75
+    ],
+    "generator": "lcg_u32_centered_uniform",
+    "k_range": [
+      -0.2,
+      0.2
+    ],
+    "q_range": [
+      -0.25,
+      0.25
+    ],
+    "v_range": [
+      -0.3,
+      0.3
+    ]
+  },
+  "mode": "cuda",
+  "note": "native CUDA/PTX minimal correctness evidence",
+  "pass_line": "W3 DELTA RULE S0 MICROBENCH PASS: /workspace/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd",
+  "ptx_arch": "sm_89",
+  "reference": {
+    "formula": "S_t = S_{t-1} + beta_t * k_t^T * (v_t - k_t @ S_{t-1}); o_t = q_t @ S_t",
+    "name": "internal-python-delta-rule-reference",
+    "revision": "self-test"
+  },
+  "schema_version": 1,
+  "seed": 9271,
+  "shape": {
+    "batch": 2,
+    "heads": 2,
+    "key_dim": 4,
+    "tokens": 8,
+    "value_dim": 4
+  },
+  "status": "pass",
+  "tolerance": {
+    "max_abs": 0.001
+  }
+}
