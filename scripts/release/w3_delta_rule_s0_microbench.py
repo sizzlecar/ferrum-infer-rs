@@ -27,6 +27,13 @@ from typing import Any
 PASS_SELFTEST = "W3 DELTA RULE S0 SELFTEST PASS"
 PASS_CUDA = "W3 DELTA RULE S0 MICROBENCH PASS"
 MANIFEST_NAME = "w3_delta_rule_s0_microbench_manifest.json"
+INPUT_DISTRIBUTION = {
+    "generator": "lcg_u32_centered_uniform",
+    "q_range": [-0.25, 0.25],
+    "k_range": [-0.20, 0.20],
+    "v_range": [-0.30, 0.30],
+    "beta_range": [0.50, 0.75],
+}
 
 
 class MicrobenchError(Exception):
@@ -372,14 +379,37 @@ def cuda_metadata(nvcc: str) -> dict[str, Any]:
         "nvcc_path": nvcc,
         "nvcc_version": best_effort_command([nvcc, "--version"]),
         "nvidia_smi": best_effort_command(["nvidia-smi", "-q"]),
+        "compute_cap": best_effort_command(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"]
+        ),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
 
 
-def run_cuda(shape: Shape, inputs: dict[str, list[float]], out_dir: Path) -> dict[str, Any]:
+def resolve_cuda_arch(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    proc = run_command(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"])
+    if proc.returncode == 0:
+        first = proc.stdout.splitlines()[0].strip() if proc.stdout.splitlines() else ""
+        digits = "".join(ch for ch in first if ch.isdigit())
+        if digits:
+            return f"sm_{digits}"
+    # RTX 4090 fallback. The manifest records the requested value and metadata.
+    return "sm_89"
+
+
+def run_cuda(
+    shape: Shape,
+    inputs: dict[str, list[float]],
+    out_dir: Path,
+    *,
+    cuda_arch: str,
+) -> dict[str, Any]:
     nvcc = shutil.which("nvcc")
     if not nvcc:
         raise MicrobenchError("nvcc not found; cannot run native CUDA microbench")
+    resolved_arch = resolve_cuda_arch(cuda_arch)
     build_dir = out_dir / "cuda_build"
     build_dir.mkdir(parents=True, exist_ok=True)
     source = build_dir / "delta_rule_s0.cu"
@@ -389,7 +419,15 @@ def run_cuda(shape: Shape, inputs: dict[str, list[float]], out_dir: Path) -> dic
     source.write_text(CUDA_SOURCE, encoding="utf-8")
     packed_inputs = inputs["q"] + inputs["k"] + inputs["v"] + inputs["beta"]
     write_float_file(input_bin, packed_inputs)
-    compile_cmd = [nvcc, "-O2", "--generate-line-info", str(source), "-o", str(binary)]
+    compile_cmd = [
+        nvcc,
+        "-O2",
+        "--generate-line-info",
+        f"-arch={resolved_arch}",
+        str(source),
+        "-o",
+        str(binary),
+    ]
     compile_proc = run_command(compile_cmd)
     compile_logs = write_process_logs(build_dir / "nvcc_compile", compile_proc)
     if compile_proc.returncode != 0:
@@ -410,6 +448,8 @@ def run_cuda(shape: Shape, inputs: dict[str, list[float]], out_dir: Path) -> dic
         raise MicrobenchError(f"cuda microbench failed rc={run_proc.returncode}\n{run_proc.stderr}")
     return {
         "nvcc": nvcc,
+        "requested_arch": cuda_arch,
+        "resolved_arch": resolved_arch,
         "cuda_metadata": cuda_metadata(nvcc),
         "compile_command": compile_cmd,
         "compile_logs": compile_logs,
@@ -441,22 +481,25 @@ def run(args: argparse.Namespace) -> int:
     cuda_stats = None
     cuda_meta = None
     if args.cuda:
-        cuda_meta = run_cuda(shape, inputs, out_dir)
+        cuda_meta = run_cuda(shape, inputs, out_dir, cuda_arch=args.cuda_arch)
         cuda_stats = error_stats(reference, cuda_meta["output"])
         if cuda_stats["max_abs"] > args.atol:
             raise MicrobenchError(f"CUDA max_abs {cuda_stats['max_abs']} exceeds {args.atol}")
     if chunk_stats["max_abs"] > 0.0:
         raise MicrobenchError(f"chunked reference mismatch: {chunk_stats}")
+    pass_line = f"{PASS_CUDA if args.cuda else PASS_SELFTEST}: {out_dir}"
     manifest = {
         "schema_version": 1,
         "status": "pass",
         "mode": "cuda" if args.cuda else "self-test",
+        "pass_line": pass_line,
         "created_at": iso_now(),
         "command_line": command_line(),
         "git": git_summary(),
         "shape": shape.__dict__,
         "seed": args.seed,
         "chunk_size": args.chunk_size,
+        "input_distribution": INPUT_DISTRIBUTION,
         "tolerance": {"max_abs": args.atol},
         "reference": {
             "name": args.reference_name,
@@ -465,8 +508,13 @@ def run(args: argparse.Namespace) -> int:
         },
         "chunked_reference_error": chunk_stats,
         "cuda_error": cuda_stats,
+        "error_stats": cuda_stats if args.cuda else chunk_stats,
+        "ptx_arch": cuda_meta["resolved_arch"] if cuda_meta else None,
+        "cuda_binary_sha256": cuda_meta["binary_sha256"] if cuda_meta else None,
         "cuda": {
             "nvcc_path": cuda_meta["nvcc"],
+            "requested_arch": cuda_meta["requested_arch"],
+            "resolved_arch": cuda_meta["resolved_arch"],
             "metadata": cuda_meta["cuda_metadata"],
             "compile_command": cuda_meta["compile_command"],
             "compile_logs": cuda_meta["compile_logs"],
@@ -486,8 +534,7 @@ def run(args: argparse.Namespace) -> int:
         ),
     }
     write_json(out_dir / MANIFEST_NAME, manifest)
-    pass_line = PASS_CUDA if args.cuda else PASS_SELFTEST
-    print(f"{pass_line}: {out_dir}")
+    print(pass_line)
     return 0
 
 
@@ -506,6 +553,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=1e-3)
     parser.add_argument("--reference-name", default="internal-python-delta-rule-reference")
     parser.add_argument("--reference-rev", default="self-test")
+    parser.add_argument(
+        "--cuda-arch",
+        default="auto",
+        help="nvcc -arch value, or auto to query nvidia-smi compute capability",
+    )
     return parser.parse_args(argv)
 
 
