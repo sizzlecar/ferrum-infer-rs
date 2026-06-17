@@ -2,6 +2,36 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZY — W3 dense full-attention layer CPU-reference checkpoint
+
+- Scope:
+  - W3-S2 Qwen3.5 dense full-attention decoder layer reference before
+    product forward;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35FullAttentionShape`;
+  - added `Qwen35FullAttentionReference`;
+  - added `Qwen35DenseFullAttentionLayerShape`;
+  - added `Qwen35DenseFullAttentionLayerReference`;
+  - added `qwen35_full_attention_core_cpu()` with q/k RMSNorm, non-interleaved
+    RoPE, GQA head repeat, causal softmax, and token-major context output;
+  - added `qwen35_dense_full_attention_layer_cpu()` to compose input
+    RMSNorm+1, q/k/v projections, full-attention core, `o_proj`, residual,
+    post-attention RMSNorm+1, dense SwiGLU MLP, and final residual;
+  - added shared CPU helpers for standard RMSNorm and dense SwiGLU MLP.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `40 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still CPU/reference math only;
+  - sparse MoE/shared-expert execution is not implemented here;
+  - product `prefill`/`decode` remains unwired;
+  - no W3 product correctness or performance gate was run.
+
 ## 2026-06-18 ZZX — W3 dense linear-attention layer CPU-reference checkpoint
 
 - Scope:
