@@ -2,6 +2,35 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZS — Vast cleanup checkpoint: keep one reusable CUDA instance
+
+- Scope:
+  - resource-governance checkpoint after user requested: keep one usable Vast
+    instance and destroy the rest;
+  - no paid GPU compute was started during this checkpoint;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Action:
+  - kept `41241013` (`ferrum-w2-vllm-ferrum-c16-ab-20260617`) because it is the
+    most useful retained CUDA devel 4090 for W2 same-hardware follow-up;
+  - destroyed stopped diagnostic instances `41178475`, `41187356`, `41218739`,
+    `41230499`, `41256521`, and `41276321`;
+  - did not retain the more expensive `41276321`.
+- Evidence:
+  - artifact directory:
+    `docs/goals/model-coverage-2026-06-12/artifacts/vast_cleanup_keep_one_20260617T055651Z/`;
+  - all six destroy summary responses record `success=true`;
+  - final API polls 1/2/3 each returned exactly one instance: `41241013`;
+  - retained instance final state: `cur_state=stopped`,
+    `actual_status=exited`, `gpuCostPerHour=0`, stopped disk `totalHour`
+    approximately `$0.111/hr`.
+- Next required validation:
+  - when using `41241013`, start it only for a stated lane with stop condition
+    and command;
+  - after each GPU checkpoint, stop it and verify `actual_status=exited`;
+  - before final goal completion, destroy it or record explicit approval to keep
+    it.
+
 ## 2026-06-17 ZR — W3-S0 source checkpoint: model-declared recurrent-state allocation
 
 - Scope:
