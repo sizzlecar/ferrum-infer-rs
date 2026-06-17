@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZW — W3 linear-attention CPU-reference core checkpoint
+
+- Scope:
+  - W3-S2 Qwen3.5 linear-attention core reference before product forward;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35LinearAttentionShape`;
+  - added `Qwen35LinearAttentionReference`;
+  - added `qwen35_linear_attention_core_cpu()`;
+  - the helper composes causal depthwise conv + SiLU, q/k/v split,
+    GDN gating, recurrent DeltaNet update, and gated RMSNorm;
+  - added public CPU reference helpers for Qwen3.5 depthwise conv, q/k/v
+    split, and gated RMSNorm;
+  - kept Ferrum recurrent state layout `[value_heads, value_dim, key_dim]`.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `30 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still CPU/reference math only;
+  - no `out_proj`, residual, MLP, or product `prefill`/`decode` path has
+    been wired here;
+  - no W3 product correctness or performance gate was run.
+
 ## 2026-06-18 ZZV — W3 GDN attention CPU-reference checkpoint
 
 - Scope:
