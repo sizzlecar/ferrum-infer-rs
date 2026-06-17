@@ -2,6 +2,42 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ6 — W3 S0 native CUDA microbench checkpoint
+
+- Scope:
+  - W3-S0 Qwen3.5 delta-rule native CUDA minimal validation on 1x RTX 4090;
+  - same SHA clean detached remote worktree:
+    `c8b8da1f41ff346809d7bdc88476c755846cdc83`;
+  - this does not enable product registry wiring and does not produce
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+- Evidence:
+  - artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/`;
+  - native CUDA/Python reference validator PASS:
+    `W3 DELTA RULE S0 MICROBENCH PASS: /workspace/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f`;
+  - remote GPU: `NVIDIA GeForce RTX 4090, 24564 MiB, 570.195.03`;
+  - remote CUDA compiler:
+    `Build cuda_12.4.r12.4/compiler.34097967_0`.
+- Validation:
+  - `python3 scripts/release/w3_delta_rule_s0_microbench.py --cuda --out <out>`
+    PASS;
+  - remote minimal Rust install was required because the CUDA devel container
+    had no `cargo`;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS on the same clean
+    worktree:
+    `51 passed; 0 failed`, plus `parses_official_qwen35_dense_min_config`
+    integration coverage `1 passed`.
+- GPU lifecycle:
+  - Vast instance `41287720` was stopped after artifact collection;
+  - final Vast API cleanup check is saved under
+    `local_vast/vast_cleanup_summary.json` and reports
+    `cur_state=stopped`, `actual_status=exited`.
+- Limitation:
+  - this is S0 CUDA kernel-level evidence plus reference executor tests only;
+  - Qwen3.5 MoE full-model reference forward, MoE safetensors materialization,
+    decode/recurrent-state semantics, product `ferrum run`/`ferrum serve`, W3
+    correctness gates, and W3 performance gates remain incomplete.
+
 ## 2026-06-18 ZZZ5 — W3 sparse-MoE layer composition checkpoint
 
 - Scope:
