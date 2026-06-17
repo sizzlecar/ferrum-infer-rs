@@ -8,3 +8,4 @@ local_vast/*raw*.json
 local_vast/**/*raw*.json
 local_vast/*_tmp.*
 local_vast/**/*_tmp.*
+local_vast/**/vast_status.sanitized.json
