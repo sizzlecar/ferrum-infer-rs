@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZZA — W3 Qwen3.5/Qwen3.6 HF config parser checkpoint
+
+- Scope:
+  - source checkpoint for W3 loader/config groundwork;
+  - parses official/HF nested `text_config` shape into Ferrum-owned typed
+    config structures;
+  - no model weights were downloaded;
+  - no paid GPU compute was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `crates/ferrum-models/src/qwen35_config.rs`;
+  - exported `qwen35_config` from `crates/ferrum-models/src/lib.rs`;
+  - added `crates/ferrum-models/tests/qwen35_config_test.rs`;
+  - parser now preserves linear/full attention layer kinds, linear-attention
+    q/k/v head dims, dense intermediate size, MoE expert count/top-k, and
+    shared-expert intermediate size.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models --test qwen35_config_test -- --nocapture`
+    PASS (`4 passed`);
+  - tests read the committed HF config probe artifact for
+    `Qwen/Qwen3.5-0.8B` and `Qwen/Qwen3.6-35B-A3B`;
+  - negative tests reject dense configs with MoE fields and MoE configs missing
+    `shared_expert_intermediate_size`.
+- Limitation:
+  - this is config/loader groundwork only; it does not load weights, emit an
+    official/HF hidden-state dump, or run product paths.
+- Next required validation:
+  - implement official/HF layer-dump extraction for `Qwen/Qwen3.5-0.8B`;
+  - map these parsed fields into the real Ferrum W3 model loader/config path.
+
 ## 2026-06-17 ZZ — W3 official/HF config probe PASS
 
 - Scope:
