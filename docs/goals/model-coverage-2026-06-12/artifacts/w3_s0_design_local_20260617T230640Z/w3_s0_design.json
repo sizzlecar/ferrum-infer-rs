@@ -1,0 +1,89 @@
+{
+  "acceptance": {
+    "design_covers_continuous_batch": true,
+    "design_covers_paged_kv": true,
+    "design_covers_preemption": true,
+    "design_covers_release": true,
+    "design_uses_typed_interfaces": true,
+    "hidden_env_required": false
+  },
+  "coexistence": {
+    "continuous_batch": "ContinuousBatch admission allocates recurrent state once per request and passes the handle through prefill/decode batch items.",
+    "paged_kv": "Recurrent state is a separate allocation domain from paged-KV; mixed-attention models may carry both a KV handle and recurrent handle.",
+    "preemption": "Preemption must preserve or clone the recurrent handle with the same request identity; dropped requests release both KV and recurrent state.",
+    "release": "Completion, cancellation, or admission failure must release recurrent state even when no paged-KV blocks were allocated."
+  },
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/w3_s0_design_gate.py",
+    "--out",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w3_s0_design_local_20260617T230640Z"
+  ],
+  "created_at": "2026-06-18T07:06:40.252506+08:00",
+  "git": {
+    "is_dirty": true,
+    "sha": "7532212ac588a4c500f0999f42336b5b03b5f890",
+    "tracked_status_short": [],
+    "untracked_count": 1853,
+    "untracked_sample": [
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/ferrum_699add71_to_a7444587.bundle",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/query_41241013.raw.json",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_001.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_001.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_002.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_002.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_003.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_003.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_004.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_004.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_005.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_005.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_006.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_006.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_007.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_007.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_008.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_008.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_009.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_009.txt"
+    ]
+  },
+  "hidden_env": [],
+  "lane": "w3_s0_design",
+  "pass_line": "W3 S0 DESIGN PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_s0_design_local_20260617T230640Z",
+  "recurrent_state_cache": {
+    "allocation_owner": "request admission",
+    "handle": "ferrum_interfaces::RecurrentStateHandle",
+    "lifetime_owner": "request lifecycle",
+    "required_operations": [
+      "allocate(request_id, spec)",
+      "can_allocate(spec)",
+      "get_handle(request_id)",
+      "release(request_id)",
+      "clone_handle_for_preemption(request_id)",
+      "stats()"
+    ],
+    "state_kind": "O(1) recurrent DeltaNet state, not sequence KV pages",
+    "state_spec": "ferrum_interfaces::RecurrentStateSpec",
+    "tensor_spec": "ferrum_interfaces::RecurrentStateTensorSpec",
+    "trait": "ferrum_interfaces::RecurrentStateManager"
+  },
+  "scheduler_contract": {
+    "decode": "decode reuses the request's recurrent handle and mutates state in token order",
+    "failure_mode": "missing recurrent state for a W3 model is a correctness failure, not a fallback",
+    "multi_turn": "chat continuations retain request-local history only through explicit handles",
+    "prefill": "prefill receives a freshly allocated recurrent handle when the model advertises a spec"
+  },
+  "schema_version": 1,
+  "source_docs": {
+    "release_grade_goal": {
+      "path": "docs/goals/model-coverage-2026-06-12/RELEASE_GRADE_GOAL.md",
+      "sha256": "289bf9bdbe0effdda567bed73150c6434f66a29a7beac27502d7a915122e7aed"
+    },
+    "w3_charter": {
+      "path": "docs/goals/model-coverage-2026-06-12/W3_CHARTER.md",
+      "sha256": "96ace47367460dd8e4d0915e21ddafdaa61457225d515a6d3d6bcb3b5d05ba0d"
+    }
+  },
+  "status": "pass"
+}
