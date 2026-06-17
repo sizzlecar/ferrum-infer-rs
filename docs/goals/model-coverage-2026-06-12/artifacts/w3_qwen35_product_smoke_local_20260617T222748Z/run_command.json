@@ -1,0 +1,19 @@
+{
+  "command_line": [
+    "/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/debug/ferrum",
+    "run",
+    "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model",
+    "--backend",
+    "cpu",
+    "--qwen35-reference",
+    "--output-format",
+    "jsonl",
+    "--temperature",
+    "0",
+    "--max-tokens",
+    "2",
+    "--prompt",
+    "hello"
+  ],
+  "returncode": 0
+}

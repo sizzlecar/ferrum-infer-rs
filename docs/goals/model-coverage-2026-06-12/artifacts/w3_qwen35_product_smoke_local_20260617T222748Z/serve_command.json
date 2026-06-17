@@ -1,0 +1,15 @@
+{
+  "command_line": [
+    "/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/debug/ferrum",
+    "serve",
+    "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "56121",
+    "--backend",
+    "cpu",
+    "--qwen35-reference"
+  ],
+  "port": 56121
+}

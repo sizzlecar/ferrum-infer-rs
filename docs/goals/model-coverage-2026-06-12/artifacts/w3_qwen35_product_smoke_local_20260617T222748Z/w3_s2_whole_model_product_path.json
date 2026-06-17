@@ -1,0 +1,113 @@
+{
+  "architecture": "qwen3_5",
+  "backend": "cpu",
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/w3_qwen35_product_smoke.py",
+    "--out",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z"
+  ],
+  "created_at": "2026-06-18T06:27:48.705326+08:00",
+  "git": {
+    "is_dirty": true,
+    "sha": "e3976153cd7baa46644206733230e47b0e42897a",
+    "tracked_status_short": [],
+    "untracked_count": 1863,
+    "untracked_sample": [
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/ferrum_699add71_to_a7444587.bundle",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/query_41241013.raw.json",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_001.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_001.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_002.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_002.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_003.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_003.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_004.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_004.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_005.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_005.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_006.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_006.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_007.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_007.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_008.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_008.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_009.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_009.txt"
+    ]
+  },
+  "goal_doc": "docs/goals/model-coverage-2026-06-12/RELEASE_GRADE_GOAL.md",
+  "hidden_env": [],
+  "lane": "w3_s2_whole_model_product_path",
+  "limitations": [
+    "toy CPU/FP32 reference product smoke only",
+    "not real-model L0-L5 correctness",
+    "not CUDA/Metal performance evidence"
+  ],
+  "model_dir": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model",
+  "model_id": "qwen35-reference-model",
+  "pass_line": "W3 QWEN35 PRODUCT SMOKE PASS: /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z",
+  "product_entrypoints": {
+    "ferrum_run": {
+      "assistant_event": {
+        "chunk_count": 1,
+        "content": "beta beta",
+        "event": "assistant",
+        "finish_reason": "length",
+        "ms": 1.518167,
+        "n_tokens": 2,
+        "turn": 0
+      },
+      "command_line": [
+        "/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/debug/ferrum",
+        "run",
+        "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model",
+        "--backend",
+        "cpu",
+        "--qwen35-reference",
+        "--output-format",
+        "jsonl",
+        "--temperature",
+        "0",
+        "--max-tokens",
+        "2",
+        "--prompt",
+        "hello"
+      ],
+      "status": "pass",
+      "stderr": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/run_stderr.txt",
+      "stdout": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/run_stdout.jsonl"
+    },
+    "ferrum_serve": {
+      "command_line": [
+        "/Users/chejinxuan/rust_ws/ferrum-infer-rs/target/debug/ferrum",
+        "serve",
+        "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "56121",
+        "--backend",
+        "cpu",
+        "--qwen35-reference"
+      ],
+      "log": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/serve.log",
+      "nonstream": {
+        "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/serve_nonstream.json",
+        "content_len": 9,
+        "finish_reason": "length"
+      },
+      "status": "pass",
+      "stream": {
+        "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/serve_stream.sse",
+        "chunk_count": 4,
+        "done_count": 1,
+        "has_usage": true
+      }
+    }
+  },
+  "quantization": "fp32-reference",
+  "runtime_surface": "typed_cli",
+  "schema_version": 1,
+  "status": "pass"
+}
