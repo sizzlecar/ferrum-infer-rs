@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZZ — W3 official/HF config probe PASS
+
+- Scope:
+  - metadata-only official/HF config probe for W3 reference selection;
+  - no model weights were downloaded;
+  - generated from clean local worktree at commit
+    `f97c1d6f3539ede18621bcb0e10eb7711d3e19bf`;
+  - no paid GPU compute was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Evidence:
+  - artifact directory:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_hf_config_probe_20260617T131209Z_f97c1d6f/`;
+  - required PASS line:
+    `W3 HF CONFIG PROBE PASS:
+    /private/tmp/w3_hf_config_probe_20260617T131209Z_f97c1d6f`;
+  - clean worktree status in manifest:
+    `is_dirty=false`, empty tracked status, `untracked_count=0`;
+  - raw `config.json` copies and SHA256s are saved for each model.
+- Validated official/HF configs:
+  - `Qwen/Qwen3.5-0.8B`: `qwen3_5_text`, 24 layers, 18
+    `linear_attention` + 6 `full_attention`, no MoE fields;
+  - `Qwen/Qwen3.5-4B`: `qwen3_5_text`, 32 layers, 24
+    `linear_attention` + 8 `full_attention`, no MoE fields;
+  - `Qwen/Qwen3.6-35B-A3B`: `qwen3_5_moe_text`, 40 layers, 30
+    `linear_attention` + 10 `full_attention`, `num_experts=256`,
+    `num_experts_per_tok=8`, `moe_intermediate_size=512`,
+    `shared_expert_intermediate_size=512`.
+- Limitation:
+  - this proves the official/HF metadata required to select W3 references; it
+    is not a layer dump, product path, or performance artifact.
+- Next required validation:
+  - use `Qwen/Qwen3.5-0.8B` as the first smallest official dense DeltaNet layer
+    reference target;
+  - use `Qwen/Qwen3.6-35B-A3B` for the shared-expert / 256-expert MoE variant
+    semantic target;
+  - implement official/HF layer-dump extraction and compare it against Ferrum
+    dumps before W3-S1 can be called real model evidence.
+
 ## 2026-06-17 ZY — W3 official/HF config probe source checkpoint
 
 - Scope:
