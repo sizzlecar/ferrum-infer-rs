@@ -2,6 +2,59 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZZF — W3 Qwen3.5/Qwen3.6 product config recognition checkpoint
+
+- Scope:
+  - W3-S2 product-path groundwork after the S1 dense first-layer PASS;
+  - recognizes official HF `qwen3_5` and `qwen3_5_moe` configs as distinct
+    architectures instead of falling through to `Unknown`, `Qwen3`, or
+    Llama-family defaults;
+  - flattens nested HF `text_config` into `ModelDefinition` for
+    Qwen3.5/Qwen3.6, the same way Gemma3 text configs are handled;
+  - preserves the typed W3 text shape under
+    `extra_params.ferrum_qwen35_text_config`, including layer types,
+    linear-attention dimensions, MoE router shape, and shared expert size;
+  - updates CLI source-family detection and serve capability snapshots so
+    Qwen3.5 dense and Qwen3.5/Qwen3.6 MoE are not silently treated as older
+    Qwen3;
+  - keeps product execution explicitly unsupported until the real W3 model
+    executor is wired, avoiding a false `ferrum run` / `ferrum serve` pass.
+- Change:
+  - added `Architecture::Qwen35` and `Architecture::Qwen35Moe`;
+  - mapped official names:
+    `qwen3_5`, `Qwen3_5ForConditionalGeneration`,
+    `qwen3_5_moe`, `Qwen3_5MoeForConditionalGeneration`;
+  - updated `ConfigManager` to parse `Qwen35TextConfig` for these
+    architectures and derive real dimensions from `text_config`;
+  - updated `ferrum-cli` source resolver defaults for `qwen3_5` /
+    `qwen3_5_moe`;
+  - updated `serve` model-capability snapshots to preserve Qwen3.5 MoE expert
+    fields.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `4 passed`;
+  - `cargo test -p ferrum-models test_architecture_from_str -- --nocapture`
+    PASS: `1 passed`;
+  - `cargo test -p ferrum-models --test qwen35_config_test -- --nocapture`
+    PASS: `4 passed`;
+  - `cargo test -p ferrum-cli qwen35 -- --nocapture` PASS: `3 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine -p ferrum-cli` PASS.
+- Limitation:
+  - this is not an execution-path PASS;
+  - `ferrum run` and `ferrum serve` still intentionally reject Qwen3.5/Qwen3.6
+    model execution with an explicit unsupported error;
+  - no W3 product correctness gate, concurrency gate, or performance gate was
+    run;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Next required validation:
+  - implement the product model loader/executor path using the preserved W3
+    text config rather than ad hoc config parsing;
+  - add Qwen3.6 MoE/shared-expert S1 tensor evidence before claiming W3-S1
+    complete across dense and MoE variants;
+  - only after product execution exists, run `ferrum run` and `ferrum serve`
+    correctness before W3-S3 performance.
+
 ## 2026-06-17 ZZE — W3 Qwen3.5 S1 Ferrum-vs-HF layer compare PASS
 
 - Scope:

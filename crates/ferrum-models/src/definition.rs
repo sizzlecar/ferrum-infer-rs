@@ -1,6 +1,6 @@
 //! Model definition and configuration parsing
 
-use crate::{registry::Architecture, source::ResolvedModelSource};
+use crate::{qwen35_config::Qwen35TextConfig, registry::Architecture, source::ResolvedModelSource};
 use ferrum_types::{
     Activation, AttentionConfig, FerrumError, ModelInfo, ModelType, NormType, Result, RopeScaling,
 };
@@ -179,27 +179,52 @@ impl ConfigManager {
         // Detect architecture
         let architecture = self.detect_architecture(raw)?;
 
+        let qwen35_config =
+            if matches!(architecture, Architecture::Qwen35 | Architecture::Qwen35Moe) {
+                Some(Qwen35TextConfig::from_hf_config_value(raw).map_err(|err| {
+                    FerrumError::model(format!("invalid Qwen3.5/Qwen3.6 config: {err}"))
+                })?)
+            } else {
+                None
+            };
+
         // Gemma 3 multimodal checkpoints (Gemma3ForConditionalGeneration)
         // nest the language model under `text_config`. Flatten it over the
         // root so field extraction and `extra_params` lookups (head_dim /
         // sliding_window / rope_local_base_freq / query_pre_attn_scalar /
         // rope_scaling) see the text-model values; vision_config is
         // ignored — text-only support.
-        let gemma3_merged: Option<serde_json::Map<String, serde_json::Value>> =
-            if architecture == Architecture::Gemma3 {
-                obj.get("text_config")
-                    .and_then(|v| v.as_object())
-                    .map(|tc| {
-                        let mut m = obj.clone();
-                        for (k, v) in tc {
-                            m.insert(k.clone(), v.clone());
-                        }
-                        m
-                    })
-            } else {
-                None
-            };
-        let obj = gemma3_merged.as_ref().unwrap_or(obj);
+        //
+        // Qwen3.5/Qwen3.6 use the same nested HF shape for the text model.
+        // Flatten them here too, then attach the typed W3 text config under
+        // `ferrum_qwen35_text_config` so the product loader can consume the
+        // exact layer/mixer/MoE shape without reparsing raw JSON or silently
+        // falling back to Llama-family defaults.
+        let text_merged: Option<serde_json::Map<String, serde_json::Value>> = if architecture
+            == Architecture::Gemma3
+            || matches!(architecture, Architecture::Qwen35 | Architecture::Qwen35Moe)
+        {
+            obj.get("text_config")
+                .and_then(|v| v.as_object())
+                .map(|tc| {
+                    let mut m = obj.clone();
+                    for (k, v) in tc {
+                        m.insert(k.clone(), v.clone());
+                    }
+                    if let Some(qwen35_config) = &qwen35_config {
+                        m.insert(
+                            "ferrum_qwen35_text_config".to_string(),
+                            serde_json::to_value(qwen35_config).unwrap_or_else(|_| {
+                                serde_json::Value::Object(serde_json::Map::new())
+                            }),
+                        );
+                    }
+                    m
+                })
+        } else {
+            None
+        };
+        let obj = text_merged.as_ref().unwrap_or(obj);
 
         // Parse common fields (CLIP stores these in text_config/vision_config)
         let text_cfg = obj.get("text_config");
@@ -213,11 +238,22 @@ impl ConfigManager {
             })
             .unwrap_or(4096) as usize;
 
-        let intermediate_size = obj
+        let mut intermediate_size = obj
             .get("intermediate_size")
             .and_then(|v| v.as_u64())
             .or_else(|| obj.get("ffn_dim").and_then(|v| v.as_u64()))
             .unwrap_or(11008) as usize;
+        if let Some(qwen35_config) = &qwen35_config {
+            intermediate_size = qwen35_config
+                .dense_intermediate_size
+                .or_else(|| {
+                    qwen35_config
+                        .moe
+                        .as_ref()
+                        .map(|moe| moe.moe_intermediate_size)
+                })
+                .unwrap_or(intermediate_size);
+        }
 
         // CLIP models store vocab_size in text_config, not at top level
         let vocab_size = obj
@@ -357,5 +393,121 @@ impl ConfigManager {
     /// Infer model type from definition
     pub fn infer_model_type(&self, definition: &ModelDefinition) -> ModelType {
         ModelType::Custom(format!("{:?}", definition.architecture))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const QWEN35_ARTIFACT_ROOT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/goals/model-coverage-2026-06-12/artifacts/",
+        "w3_hf_config_probe_20260617T131209Z_f97c1d6f"
+    );
+
+    fn parse_artifact_config(name: &str) -> ModelDefinition {
+        let raw = std::fs::read_to_string(format!("{QWEN35_ARTIFACT_ROOT}/{name}")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let mut manager = ConfigManager::new();
+        manager.parse_config_for_tests(&json).unwrap()
+    }
+
+    #[test]
+    fn qwen35_dense_config_flattens_text_config_without_llama_fallback() {
+        let def = parse_artifact_config("dense_min_reference.config.json");
+
+        assert_eq!(def.architecture, Architecture::Qwen35);
+        assert_eq!(def.hidden_size, 1024);
+        assert_eq!(def.intermediate_size, 3584);
+        assert_eq!(def.vocab_size, 248320);
+        assert_eq!(def.num_hidden_layers, 24);
+        assert_eq!(def.num_attention_heads, 8);
+        assert_eq!(def.num_key_value_heads, Some(2));
+        assert_eq!(def.max_position_embeddings, 262144);
+        assert_eq!(def.norm_type, NormType::RMSNorm);
+        assert_eq!(def.activation, Activation::SiLU);
+
+        let extra = def.extra_params.as_object().unwrap();
+        assert_eq!(
+            extra.get("model_type").and_then(|value| value.as_str()),
+            Some("qwen3_5_text")
+        );
+        assert_eq!(
+            extra
+                .get("linear_num_key_heads")
+                .and_then(|value| value.as_u64()),
+            Some(16)
+        );
+        let typed = extra
+            .get("ferrum_qwen35_text_config")
+            .and_then(|value| value.as_object())
+            .unwrap();
+        let linear_attention = typed
+            .get("linear_attention")
+            .and_then(|value| value.as_object())
+            .unwrap();
+        assert_eq!(
+            linear_attention
+                .get("num_key_heads")
+                .and_then(|value| value.as_u64()),
+            Some(16)
+        );
+        assert_eq!(
+            typed
+                .get("text_model_type")
+                .and_then(|value| value.as_str()),
+            Some("qwen3_5_text")
+        );
+        assert_eq!(
+            typed
+                .get("layer_types")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn qwen35_moe_config_preserves_shared_expert_shape() {
+        let def = parse_artifact_config("moe_shared_expert_reference.config.json");
+
+        assert_eq!(def.architecture, Architecture::Qwen35Moe);
+        assert_eq!(def.hidden_size, 2048);
+        assert_eq!(def.intermediate_size, 512);
+        assert_eq!(def.vocab_size, 248320);
+        assert_eq!(def.num_hidden_layers, 40);
+        assert_eq!(def.num_attention_heads, 16);
+        assert_eq!(def.num_key_value_heads, Some(2));
+
+        let typed = def
+            .extra_params
+            .get("ferrum_qwen35_text_config")
+            .and_then(|value| value.as_object())
+            .unwrap();
+        assert_eq!(
+            typed
+                .get("text_model_type")
+                .and_then(|value| value.as_str()),
+            Some("qwen3_5_moe_text")
+        );
+        let moe = typed
+            .get("moe")
+            .and_then(|value| value.as_object())
+            .unwrap();
+        assert_eq!(
+            moe.get("num_experts").and_then(|value| value.as_u64()),
+            Some(256)
+        );
+        assert_eq!(
+            moe.get("num_experts_per_tok")
+                .and_then(|value| value.as_u64()),
+            Some(8)
+        );
+        assert_eq!(
+            moe.get("shared_expert_intermediate_size")
+                .and_then(|value| value.as_u64()),
+            Some(512)
+        );
     }
 }

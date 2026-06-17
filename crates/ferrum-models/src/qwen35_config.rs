@@ -7,13 +7,13 @@
 
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Qwen35LayerType {
     LinearAttention,
     FullAttention,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Qwen35LinearAttentionConfig {
     pub num_key_heads: usize,
     pub num_value_heads: usize,
@@ -22,7 +22,7 @@ pub struct Qwen35LinearAttentionConfig {
     pub conv_kernel_dim: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Qwen35MoeTextConfig {
     pub num_experts: usize,
     pub num_experts_per_tok: usize,
@@ -30,7 +30,7 @@ pub struct Qwen35MoeTextConfig {
     pub shared_expert_intermediate_size: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Qwen35TextConfig {
     pub top_level_model_type: Option<String>,
     pub text_model_type: String,

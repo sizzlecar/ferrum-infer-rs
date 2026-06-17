@@ -134,7 +134,10 @@ fn chat_profile_runtime_entries_for_arch(
     // GGUF: contiguous path is the correctness baseline. For safetensors,
     // keep paged KV only on families with current product evidence.
     let need_paged = !is_gguf
-        && (is_moe || model_family.is_some_and(|family| family.eq_ignore_ascii_case("qwen3")));
+        && (is_moe
+            || model_family.is_some_and(|family| {
+                family.eq_ignore_ascii_case("qwen3") || family.eq_ignore_ascii_case("qwen3_5")
+            }));
     push_missing_entry(
         &mut entries,
         current,
@@ -254,7 +257,18 @@ pub fn detect_model_family(path: &Path) -> Option<String> {
 
 fn normalize_model_family(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("qwen3_moe") || lower.contains("qwen3moe") || lower.contains("qwen3_mo") {
+    if lower.contains("qwen3_5_moe")
+        || lower.contains("qwen3_5moe")
+        || lower.contains("qwen35_moe")
+        || lower.contains("qwen35moe")
+    {
+        "qwen3_5_moe".to_string()
+    } else if lower.contains("qwen3_5") || lower.contains("qwen35") {
+        "qwen3_5".to_string()
+    } else if lower.contains("qwen3_moe")
+        || lower.contains("qwen3moe")
+        || lower.contains("qwen3_mo")
+    {
         "qwen3_moe".to_string()
     } else if lower.contains("qwen3") {
         "qwen3".to_string()
@@ -843,6 +857,29 @@ mod tests {
     }
 
     #[test]
+    fn chat_profile_recognizes_qwen35_dense_without_qwen3_fallback() {
+        let dir = temp_model_dir(
+            "qwen35_dense",
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
+        );
+        assert_eq!(detect_model_family(&dir).as_deref(), Some("qwen3_5"));
+        assert!(!detect_moe_arch(&dir));
+
+        let entries = chat_profile_runtime_entries(
+            &dir,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("1")
+        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn chat_profile_disables_metal_paged_kv_for_llama_safetensors() {
         let dir = temp_model_dir(
             "llama",
@@ -913,6 +950,29 @@ mod tests {
             value(&entries, "FERRUM_MOE_BATCH_THRESHOLD").as_deref(),
             Some("2")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_profile_recognizes_qwen35_moe_as_distinct_moe_family() {
+        let dir = temp_model_dir(
+            "qwen35_moe",
+            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"model_type":"qwen3_5_moe"}"#,
+        );
+        assert_eq!(detect_model_family(&dir).as_deref(), Some("qwen3_5_moe"));
+        assert!(detect_moe_arch(&dir));
+
+        let entries = chat_profile_runtime_entries(
+            &dir,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
+            Some("4096")
+        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
