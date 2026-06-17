@@ -1441,6 +1441,12 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 )?;
                 Ok(Arc::new(executor))
             }
+            ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe => {
+                Err(FerrumError::unsupported(
+                    "Qwen3.5/Qwen3.6 W3 configs are recognized, but product model execution is \
+                     not wired yet. Continue through W3-S1/S2 before using ferrum run/serve.",
+                ))
+            }
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
                 model_def.architecture

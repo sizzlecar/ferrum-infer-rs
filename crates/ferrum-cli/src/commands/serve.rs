@@ -1380,7 +1380,9 @@ pub(crate) fn model_capabilities_from_definition(
 ) -> ModelCapabilities {
     let architecture = match definition.architecture {
         ferrum_models::Architecture::Qwen3Moe => "qwen3_moe",
+        ferrum_models::Architecture::Qwen35Moe => "qwen3_5_moe",
         ferrum_models::Architecture::Gemma3 => "gemma3",
+        ferrum_models::Architecture::Qwen35 => "qwen3_5",
         ferrum_models::Architecture::Qwen3 => "qwen3",
         ferrum_models::Architecture::Qwen2 => "qwen2",
         ferrum_models::Architecture::Llama => "llama",
@@ -1403,7 +1405,10 @@ pub(crate) fn model_capabilities_from_definition(
             (definition.num_attention_heads > 0)
                 .then_some(definition.hidden_size / definition.num_attention_heads)
         });
-    let moe = if definition.architecture == ferrum_models::Architecture::Qwen3Moe {
+    let moe = if matches!(
+        definition.architecture,
+        ferrum_models::Architecture::Qwen3Moe | ferrum_models::Architecture::Qwen35Moe
+    ) {
         let num_experts = definition
             .extra_params
             .get("num_experts")
@@ -2288,6 +2293,37 @@ mod tests {
             }
         });
         definition
+    }
+
+    #[test]
+    fn qwen35_moe_model_capabilities_preserve_moe_shape() {
+        let mut definition = ferrum_models::ModelDefinition {
+            architecture: ferrum_models::Architecture::Qwen35Moe,
+            hidden_size: 2048,
+            intermediate_size: 512,
+            num_hidden_layers: 40,
+            num_attention_heads: 16,
+            num_key_value_heads: Some(2),
+            max_position_embeddings: 262144,
+            ..Default::default()
+        };
+        definition.extra_params = serde_json::json!({
+            "head_dim": 256,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512
+        });
+
+        let capabilities = model_capabilities_from_definition(&definition);
+
+        assert_eq!(capabilities.architecture, "qwen3_5_moe");
+        assert_eq!(capabilities.head_dim, Some(256));
+        assert_eq!(capabilities.num_hidden_layers, Some(40));
+        let moe = capabilities.moe.expect("Qwen3.5 MoE should be marked MoE");
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.experts_per_token, 8);
+        assert_eq!(moe.moe_intermediate_size, Some(512));
     }
 
     fn two_gpu_layer_split_selection() -> crate::gpu_devices::GpuDeviceSelection {
