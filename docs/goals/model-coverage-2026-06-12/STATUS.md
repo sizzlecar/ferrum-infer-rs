@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ4 — W3 dense reference safetensors prefill checkpoint
+
+- Scope:
+  - W3-S2 dense Qwen3.5 reference executor construction from an actual
+    safetensors directory;
+  - no product registry wiring was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added
+    `Qwen35W3Executor::from_definition_with_dense_reference_cpu_safetensors()`;
+  - the constructor keeps the path explicitly FP32 CPU reference-only;
+  - it runs safetensors inventory/preflight, resolves the W3 weight plan,
+    opens `NativeSafetensorsLoader<CpuBackend>`, materializes the dense
+    reference runtime, stores validation/plan evidence on the executor, and
+    enables reference `prefill()`;
+  - added a temp-safetensors test that writes toy W3 weights, constructs the
+    executor from disk, runs `prefill()`, and checks last-token logits plus KV
+    sequence length.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `49 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still an explicit CPU-reference constructor, not default product
+    support;
+  - registry, tokenizer/template product scenarios, `ferrum run`, `ferrum
+    serve`, sparse-MoE runtime materialization, decode/recurrent-state
+    semantics, and W3 performance gates remain incomplete.
+
 ## 2026-06-18 ZZZ3 — W3 dense reference runtime materializer checkpoint
 
 - Scope:
