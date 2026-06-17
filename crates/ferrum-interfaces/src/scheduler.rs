@@ -93,6 +93,10 @@ pub struct ResourceConstraints {
     pub max_gpu_memory: Option<u64>,
     /// Maximum CPU memory usage
     pub max_cpu_memory: Option<u64>,
+    /// Maximum recurrent-state memory usage
+    pub max_recurrent_state_bytes: Option<u64>,
+    /// Maximum recurrent-state slots
+    pub max_recurrent_state_slots: Option<usize>,
     /// Maximum compute units
     pub max_compute_units: Option<usize>,
     /// Required device types
@@ -204,12 +208,16 @@ pub struct AllocatedResources {
     pub gpu_memory: u64,
     /// CPU memory allocated (bytes)
     pub cpu_memory: u64,
+    /// Recurrent-state memory allocated (bytes)
+    pub recurrent_state_bytes: u64,
+    /// Recurrent-state slots allocated
+    pub recurrent_state_slots: usize,
     /// Compute units reserved
     pub compute_units: usize,
 }
 
 /// Resource requirements for batch execution
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BatchResourceRequirements {
     /// Required GPU memory
     pub gpu_memory: u64,
@@ -217,6 +225,10 @@ pub struct BatchResourceRequirements {
     pub cpu_memory: u64,
     /// Required KV cache blocks
     pub kv_cache_blocks: usize,
+    /// Required recurrent-state memory
+    pub recurrent_state_bytes: u64,
+    /// Required recurrent-state slots
+    pub recurrent_state_slots: usize,
     /// Required compute units
     pub compute_units: usize,
 }
@@ -307,6 +319,10 @@ pub struct ResourceLimits {
     pub max_cpu_memory: Option<u64>,
     /// Maximum KV cache blocks
     pub max_kv_cache_blocks: Option<usize>,
+    /// Maximum recurrent-state memory
+    pub max_recurrent_state_bytes: Option<u64>,
+    /// Maximum recurrent-state slots
+    pub max_recurrent_state_slots: Option<usize>,
     /// Per-client resource limits
     pub per_client_limits: HashMap<String, ClientResourceLimits>,
 }
@@ -318,6 +334,8 @@ pub struct ClientResourceLimits {
     pub max_concurrent_requests: usize,
     /// Max GPU memory per client
     pub max_gpu_memory: Option<u64>,
+    /// Max recurrent-state memory per client
+    pub max_recurrent_state_bytes: Option<u64>,
     /// Max requests per minute
     pub max_requests_per_minute: Option<u32>,
 }

@@ -2,6 +2,30 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZN — W3-S0 source checkpoint: scheduler recurrent-state resources
+
+- Scope:
+  - source-only W3-S0 scheduler/resource-accounting checkpoint;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added recurrent-state memory/slot fields to scheduler resource constraints,
+    allocated resources, batch resource requirements, and resource limits;
+  - kept current FIFO/priority/continuous scheduler behavior unchanged by
+    setting recurrent-state requirements to zero in existing batch plans;
+  - added an interfaces contract test that verifies recurrent-state resource
+    fields default to empty/zero.
+- Validation:
+  - `cargo test -p ferrum-interfaces` PASS:
+    full crate test set `15 passed`;
+  - `cargo test -p ferrum-scheduler` PASS:
+    `53 passed`;
+  - `cargo check -p ferrum-engine --all-targets` PASS.
+- Next required validation:
+  - W3 next local step is engine lifecycle ownership for allocation/deallocation
+    of recurrent state handles.
+
 ## 2026-06-17 ZM — W3-S0 source checkpoint: model-executor recurrent-state carriers
 
 - Scope:
