@@ -301,6 +301,9 @@ impl EngineInner {
             for rid in request_ids {
                 if let Err(e) = self.run_prefill(rid).await {
                     warn!("Prefill failed for {}: {}", rid, e);
+                    if is_resource_exhausted_error(&e) {
+                        continue;
+                    }
                     self.complete_request(rid, FinishReason::Error).await?;
                 }
             }
@@ -406,14 +409,12 @@ impl EngineInner {
                         match self.kv_cache.allocate(&alloc_request).await {
                             Ok(h) => h,
                             Err(e) => {
-                                warn!("Prefill alloc failed for {} after preempt: {}", rid, e);
-                                self.complete_request(rid, FinishReason::Error).await?;
+                                warn!("Prefill alloc deferred for {} after preempt: {}", rid, e);
                                 continue;
                             }
                         }
                     } else {
-                        warn!("Prefill alloc failed for {}: no preempt victim", rid);
-                        self.complete_request(rid, FinishReason::Error).await?;
+                        warn!("Prefill alloc deferred for {}: no preempt victim", rid);
                         continue;
                     }
                 }
@@ -458,7 +459,15 @@ impl EngineInner {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let outputs = self.model_executor.batch_prefill(&inputs).await?;
+        let outputs = match self.model_executor.batch_prefill(&inputs).await {
+            Ok(outputs) => outputs,
+            Err(e) => {
+                for (rid, _, _, _, _, _) in &to_prefill {
+                    let _ = self.kv_cache.deallocate(rid.clone()).await;
+                }
+                return Err(e);
+            }
+        };
         if outputs.len() != to_prefill.len() {
             return Err(FerrumError::internal(format!(
                 "batch_prefill returned {} outputs for {} inputs",

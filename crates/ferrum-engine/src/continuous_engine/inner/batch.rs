@@ -65,6 +65,9 @@ impl EngineInner {
                 for rid in &prefill_ids {
                     if let Err(e) = self.run_prefill(rid).await {
                         warn!("Prefill failed for {}: {}", rid, e);
+                        if is_resource_exhausted_error(&e) {
+                            continue;
+                        }
                         self.complete_request(rid, FinishReason::Error).await?;
                     }
                 }
@@ -264,14 +267,15 @@ impl EngineInner {
                             match self.kv_cache.allocate(&alloc_request).await {
                                 Ok(h) => h,
                                 Err(e) => {
-                                    warn!("Unified prefill alloc failed for {}: {}", rid, e);
-                                    self.complete_request(rid, FinishReason::Error).await?;
+                                    warn!(
+                                        "Unified prefill alloc deferred for {} after preempt: {}",
+                                        rid, e
+                                    );
                                     continue;
                                 }
                             }
                         } else {
-                            warn!("Unified prefill alloc failed for {}: no victim", rid);
-                            self.complete_request(rid, FinishReason::Error).await?;
+                            warn!("Unified prefill alloc deferred for {}: no victim", rid);
                             continue;
                         }
                     }
