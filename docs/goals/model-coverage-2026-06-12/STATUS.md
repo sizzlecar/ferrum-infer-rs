@@ -2,6 +2,35 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ — W3 sparse-MoE shared-expert CPU-reference checkpoint
+
+- Scope:
+  - W3-S1/S2 Qwen3.5 sparse MoE/shared-expert reference before product
+    forward;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35SparseMoeShape`;
+  - added `Qwen35SparseMoeReference`;
+  - added `qwen35_sparse_moe_shared_expert_cpu()`;
+  - the helper uses Ferrum's stable MoE `route()` for top-k ids/weights;
+  - fixed CPU reference layout for fused routed experts as
+    `[experts, 2 * expert_intermediate, hidden]` for gate/up and
+    `[experts, hidden, expert_intermediate]` for down;
+  - materializes routed expert output, shared expert gate, shared expert
+    output, and final `routed + shared` MoE output.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `42 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still CPU/reference math only;
+  - sparse MoE is not yet wired into product `prefill`/`decode`;
+  - full W3 model execution, correctness gates, and performance gates remain
+    incomplete.
+
 ## 2026-06-18 ZZY — W3 dense full-attention layer CPU-reference checkpoint
 
 - Scope:

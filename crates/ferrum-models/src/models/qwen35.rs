@@ -193,6 +193,28 @@ pub struct Qwen35DenseFullAttentionLayerReference {
     pub layer_output: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35SparseMoeShape {
+    pub tokens: usize,
+    pub hidden_size: usize,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub expert_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
+    pub norm_topk_prob: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen35SparseMoeReference {
+    pub router_logits: Vec<f32>,
+    pub router_topk_indices: Vec<u32>,
+    pub router_topk_weights: Vec<f32>,
+    pub routed_expert_output: Vec<f32>,
+    pub shared_expert_gate: Vec<f32>,
+    pub shared_expert_output: Vec<f32>,
+    pub moe_output: Vec<f32>,
+}
+
 pub fn qwen35_runtime_config(
     config: &Qwen35TextConfig,
     vocab_size: usize,
@@ -475,6 +497,136 @@ pub fn qwen35_full_attention_core_cpu(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn qwen35_sparse_moe_shared_expert_cpu(
+    x: &[f32],
+    router_weight: &[f32],
+    fused_gate_up_proj: &[f32],
+    fused_down_proj: &[f32],
+    shared_expert_gate_weight: &[f32],
+    shared_expert_gate_proj_weight: &[f32],
+    shared_expert_up_proj_weight: &[f32],
+    shared_expert_down_proj_weight: &[f32],
+    shape: Qwen35SparseMoeShape,
+) -> Result<Qwen35SparseMoeReference> {
+    shape.validate()?;
+    validate_len(
+        "sparse MoE input",
+        x.len(),
+        shape.tokens * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE router_weight",
+        router_weight.len(),
+        shape.num_experts * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE fused_gate_up_proj",
+        fused_gate_up_proj.len(),
+        shape.num_experts * 2 * shape.expert_intermediate_size * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE fused_down_proj",
+        fused_down_proj.len(),
+        shape.num_experts * shape.hidden_size * shape.expert_intermediate_size,
+    )?;
+    validate_len(
+        "sparse MoE shared_expert_gate_weight",
+        shared_expert_gate_weight.len(),
+        shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE shared_expert_gate_proj_weight",
+        shared_expert_gate_proj_weight.len(),
+        shape.shared_expert_intermediate_size * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE shared_expert_up_proj_weight",
+        shared_expert_up_proj_weight.len(),
+        shape.shared_expert_intermediate_size * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE shared_expert_down_proj_weight",
+        shared_expert_down_proj_weight.len(),
+        shape.hidden_size * shape.shared_expert_intermediate_size,
+    )?;
+
+    let router_logits = qwen35_linear_cpu(
+        x,
+        router_weight,
+        shape.tokens,
+        shape.hidden_size,
+        shape.num_experts,
+    )?;
+    let routed = crate::moe::router::route(
+        &router_logits,
+        shape.tokens,
+        shape.num_experts,
+        shape.top_k,
+        shape.norm_topk_prob,
+    );
+    let mut routed_expert_output = vec![0.0; shape.tokens * shape.hidden_size];
+    for token_idx in 0..shape.tokens {
+        let token = &x[token_idx * shape.hidden_size..(token_idx + 1) * shape.hidden_size];
+        for slot in 0..shape.top_k {
+            let pair_idx = token_idx * shape.top_k + slot;
+            let expert_id = routed.expert_ids[pair_idx] as usize;
+            let weight = routed.expert_weights[pair_idx];
+            let expert_output = qwen35_fused_expert_mlp_cpu(
+                token,
+                fused_gate_up_proj,
+                fused_down_proj,
+                shape,
+                expert_id,
+            )?;
+            for hidden_idx in 0..shape.hidden_size {
+                routed_expert_output[token_idx * shape.hidden_size + hidden_idx] +=
+                    weight * expert_output[hidden_idx];
+            }
+        }
+    }
+
+    let shared_expert_gate_raw = qwen35_linear_cpu(
+        x,
+        shared_expert_gate_weight,
+        shape.tokens,
+        shape.hidden_size,
+        1,
+    )?;
+    let shared_expert_gate = shared_expert_gate_raw
+        .into_iter()
+        .map(sigmoid)
+        .collect::<Vec<_>>();
+    let shared_dense = qwen35_dense_mlp_cpu(
+        x,
+        shared_expert_gate_proj_weight,
+        shared_expert_up_proj_weight,
+        shared_expert_down_proj_weight,
+        shape.tokens,
+        shape.hidden_size,
+        shape.shared_expert_intermediate_size,
+    )?;
+    let mut shared_expert_output = vec![0.0; shape.tokens * shape.hidden_size];
+    for token_idx in 0..shape.tokens {
+        let gate = shared_expert_gate[token_idx];
+        for hidden_idx in 0..shape.hidden_size {
+            let idx = token_idx * shape.hidden_size + hidden_idx;
+            shared_expert_output[idx] = gate * shared_dense[idx];
+        }
+    }
+    let moe_output = add_same_len(&routed_expert_output, &shared_expert_output, "moe_output")?;
+
+    Ok(Qwen35SparseMoeReference {
+        router_logits,
+        router_topk_indices: routed.expert_ids,
+        router_topk_weights: routed.expert_weights,
+        routed_expert_output,
+        shared_expert_gate,
+        shared_expert_output,
+        moe_output,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn qwen35_dense_linear_attention_layer_cpu(
     layer_input: &[f32],
     input_norm_weight: &[f32],
@@ -729,6 +881,54 @@ pub fn qwen35_dense_mlp_cpu(
         tokens,
         intermediate_size,
         hidden_size,
+    )
+}
+
+fn qwen35_fused_expert_mlp_cpu(
+    token: &[f32],
+    fused_gate_up_proj: &[f32],
+    fused_down_proj: &[f32],
+    shape: Qwen35SparseMoeShape,
+    expert_id: usize,
+) -> Result<Vec<f32>> {
+    if expert_id >= shape.num_experts {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 sparse MoE expert_id {expert_id} exceeds num_experts {}",
+            shape.num_experts
+        )));
+    }
+    validate_len("sparse MoE expert input", token.len(), shape.hidden_size)?;
+    let gate_up_per_expert = 2 * shape.expert_intermediate_size * shape.hidden_size;
+    let down_per_expert = shape.hidden_size * shape.expert_intermediate_size;
+    let gate_up_start = expert_id * gate_up_per_expert;
+    let gate_start = gate_up_start;
+    let up_start = gate_start + shape.expert_intermediate_size * shape.hidden_size;
+    let down_start = expert_id * down_per_expert;
+    let gate = qwen35_linear_cpu(
+        token,
+        &fused_gate_up_proj[gate_start..up_start],
+        1,
+        shape.hidden_size,
+        shape.expert_intermediate_size,
+    )?;
+    let up = qwen35_linear_cpu(
+        token,
+        &fused_gate_up_proj[up_start..gate_up_start + gate_up_per_expert],
+        1,
+        shape.hidden_size,
+        shape.expert_intermediate_size,
+    )?;
+    let fused = gate
+        .iter()
+        .zip(&up)
+        .map(|(gate, up)| silu(*gate) * up)
+        .collect::<Vec<_>>();
+    qwen35_linear_cpu(
+        &fused,
+        &fused_down_proj[down_start..down_start + down_per_expert],
+        1,
+        shape.expert_intermediate_size,
+        shape.hidden_size,
     )
 }
 
@@ -1309,6 +1509,29 @@ impl Qwen35DenseFullAttentionLayerShape {
                 "Qwen3.5 dense full layer hidden_size {} must match attention q_total {}",
                 self.hidden_size,
                 self.attention.q_total()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Qwen35SparseMoeShape {
+    fn validate(self) -> Result<()> {
+        if self.tokens == 0
+            || self.hidden_size == 0
+            || self.num_experts == 0
+            || self.top_k == 0
+            || self.expert_intermediate_size == 0
+            || self.shared_expert_intermediate_size == 0
+        {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse MoE shape must be positive, got {self:?}"
+            )));
+        }
+        if self.top_k > self.num_experts {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse MoE top_k {} exceeds num_experts {}",
+                self.top_k, self.num_experts
             )));
         }
         Ok(())
@@ -2466,6 +2689,165 @@ mod tests {
         .expect_err("hidden size must match attention q_total");
 
         assert!(err.to_string().contains("hidden_size 3"), "{err}");
+    }
+
+    #[test]
+    fn sparse_moe_shared_expert_composes_router_fused_experts_and_shared_gate() {
+        let shape = Qwen35SparseMoeShape {
+            tokens: 2,
+            hidden_size: 2,
+            num_experts: 3,
+            top_k: 2,
+            expert_intermediate_size: 2,
+            shared_expert_intermediate_size: 2,
+            norm_topk_prob: true,
+        };
+        let x = vec![
+            1.0, 0.0, //
+            0.0, 1.0,
+        ];
+        let router_weight = vec![
+            2.0, 0.0, //
+            0.0, 2.0, //
+            1.0, 1.0,
+        ];
+        let mut fused_gate_up_proj = Vec::new();
+        let mut fused_down_proj = Vec::new();
+        for expert in 0..shape.num_experts {
+            let scale = expert as f32 + 1.0;
+            fused_gate_up_proj.extend_from_slice(&[
+                scale, 0.0, //
+                0.0, scale,
+            ]);
+            fused_gate_up_proj.extend_from_slice(&[
+                1.0, 0.5, //
+                -0.25, 0.75,
+            ]);
+            fused_down_proj.extend_from_slice(&[
+                0.5 * scale,
+                0.0, //
+                0.0,
+                -0.25 * scale,
+            ]);
+        }
+        let shared_expert_gate_weight = vec![0.0, 0.0];
+        let shared_expert_gate_proj_weight = vec![
+            0.2, -0.1, //
+            0.3, 0.4,
+        ];
+        let shared_expert_up_proj_weight = vec![
+            0.5, 0.1, //
+            -0.2, 0.6,
+        ];
+        let shared_expert_down_proj_weight = vec![
+            1.0, 0.0, //
+            0.0, 1.0,
+        ];
+
+        let router_logits = qwen35_linear_cpu(
+            &x,
+            &router_weight,
+            shape.tokens,
+            shape.hidden_size,
+            shape.num_experts,
+        )
+        .unwrap();
+        let routed = crate::moe::router::route(
+            &router_logits,
+            shape.tokens,
+            shape.num_experts,
+            shape.top_k,
+            shape.norm_topk_prob,
+        );
+        assert_eq!(routed.expert_ids, vec![0, 2, 1, 2]);
+
+        let mut routed_expert_output = vec![0.0; shape.tokens * shape.hidden_size];
+        for token_idx in 0..shape.tokens {
+            let token = &x[token_idx * shape.hidden_size..(token_idx + 1) * shape.hidden_size];
+            for slot in 0..shape.top_k {
+                let pair_idx = token_idx * shape.top_k + slot;
+                let expert_id = routed.expert_ids[pair_idx] as usize;
+                let expert_output = qwen35_fused_expert_mlp_cpu(
+                    token,
+                    &fused_gate_up_proj,
+                    &fused_down_proj,
+                    shape,
+                    expert_id,
+                )
+                .unwrap();
+                for hidden_idx in 0..shape.hidden_size {
+                    routed_expert_output[token_idx * shape.hidden_size + hidden_idx] +=
+                        routed.expert_weights[pair_idx] * expert_output[hidden_idx];
+                }
+            }
+        }
+        let shared_dense = qwen35_dense_mlp_cpu(
+            &x,
+            &shared_expert_gate_proj_weight,
+            &shared_expert_up_proj_weight,
+            &shared_expert_down_proj_weight,
+            shape.tokens,
+            shape.hidden_size,
+            shape.shared_expert_intermediate_size,
+        )
+        .unwrap();
+        let shared_expert_output = shared_dense
+            .iter()
+            .map(|value| 0.5 * value)
+            .collect::<Vec<_>>();
+        let moe_output =
+            add_same_len(&routed_expert_output, &shared_expert_output, "moe_output").unwrap();
+
+        let reference = qwen35_sparse_moe_shared_expert_cpu(
+            &x,
+            &router_weight,
+            &fused_gate_up_proj,
+            &fused_down_proj,
+            &shared_expert_gate_weight,
+            &shared_expert_gate_proj_weight,
+            &shared_expert_up_proj_weight,
+            &shared_expert_down_proj_weight,
+            shape,
+        )
+        .unwrap();
+
+        assert_close_slice(&reference.router_logits, &router_logits, 1e-6);
+        assert_eq!(reference.router_topk_indices, routed.expert_ids);
+        assert_close_slice(&reference.router_topk_weights, &routed.expert_weights, 1e-6);
+        assert_close_slice(&reference.routed_expert_output, &routed_expert_output, 1e-6);
+        assert_close_slice(&reference.shared_expert_gate, &[0.5, 0.5], 1e-6);
+        assert_close_slice(&reference.shared_expert_output, &shared_expert_output, 1e-6);
+        assert_close_slice(&reference.moe_output, &moe_output, 1e-6);
+    }
+
+    #[test]
+    fn sparse_moe_rejects_invalid_fused_expert_layout() {
+        let shape = Qwen35SparseMoeShape {
+            tokens: 1,
+            hidden_size: 2,
+            num_experts: 2,
+            top_k: 1,
+            expert_intermediate_size: 2,
+            shared_expert_intermediate_size: 2,
+            norm_topk_prob: true,
+        };
+        let err = qwen35_sparse_moe_shared_expert_cpu(
+            &[1.0, 0.0],
+            &[1.0, 0.0, 0.0, 1.0],
+            &[0.0; 7],
+            &[0.0; 8],
+            &[0.0, 0.0],
+            &[0.0; 4],
+            &[0.0; 4],
+            &[0.0; 4],
+            shape,
+        )
+        .expect_err("fused gate/up tensor should be too short");
+
+        assert!(
+            err.to_string().contains("fused_gate_up_proj length"),
+            "{err}"
+        );
     }
 
     #[test]
