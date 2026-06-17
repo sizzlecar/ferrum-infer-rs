@@ -34,6 +34,7 @@ candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
 safetensors = { workspace = true }
+memmap2 = "0.9"
 
 # Unified compute kernels (CUDA/Metal/CPU) — Backend<B> trait stack +
 # the fused-transformer module used by Qwen3-TTS (formerly ferrum-attention).

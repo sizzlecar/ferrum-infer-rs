@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZZD — W3 Qwen3.5 Ferrum S1 replay source checkpoint
+
+- Scope:
+  - source checkpoint for Ferrum-owned Qwen3.5 first-layer CPU replay;
+  - reads real HF safetensors weights and a matching HF layer dump manifest;
+  - targets the same `Qwen/Qwen3.5-0.8B` prompt/layer as the HF reference
+    artifact;
+  - no remote real-weight Ferrum dump was generated in this checkpoint;
+  - no product-path `ferrum run` / `ferrum serve` was run;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `crates/ferrum-models/src/qwen35_s1.rs`;
+  - added `crates/ferrum-models/examples/w3_qwen35_s1_dump.rs`;
+  - added `scripts/release/w3_qwen35_layer_compare.py`;
+  - exported `qwen35_s1` from `crates/ferrum-models/src/lib.rs`;
+  - added `memmap2` to `ferrum-models` for diagnostic safetensors mmap.
+- Implemented replay pieces:
+  - HF safetensors BF16/F16/F32 to f32 materialization;
+  - Qwen3.5 `RMSNorm` with `1.0 + weight` semantics;
+  - depthwise causal conv + SiLU;
+  - first-layer q/k/v/beta/g projection path;
+  - single-chunk `torch_chunk_gated_delta_rule` replay for the 5-token
+    reference prompt, including q/k L2 normalization and decay mask semantics;
+  - gated RMS norm, DeltaNet out projection, post-attention norm, and dense
+    gated MLP.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `python3 -m py_compile scripts/release/w3_qwen35_layer_compare.py` PASS;
+  - `cargo check -p ferrum-models --example w3_qwen35_s1_dump` PASS;
+  - `cargo test -p ferrum-models qwen35_s1 -- --nocapture` PASS:
+    `2 passed`;
+  - `python3 scripts/release/w3_qwen35_layer_compare.py --self-test --out
+    /tmp/w3_qwen35_layer_compare_selftest` PASS:
+    `W3 QWEN35 LAYER COMPARE SELFTEST PASS:
+    /private/tmp/w3_qwen35_layer_compare_selftest`.
+- Limitation:
+  - this checkpoint proves source/schema only; real W3-S1 remains open until
+    the example is run against cached `Qwen/Qwen3.5-0.8B` safetensors and the
+    comparator prints `W3 QWEN35 LAYER COMPARE PASS`.
+- Next required validation:
+  - sync this source checkpoint to the retained remote host;
+  - run `w3_qwen35_s1_dump` against the cached HF snapshot and compare it with
+    the existing HF reference layer dump.
+
 ## 2026-06-17 ZZC — W3 Qwen3.5 0.8B HF layer dump PASS
 
 - Scope:
