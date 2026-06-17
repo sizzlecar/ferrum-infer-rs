@@ -1,0 +1,164 @@
+{
+  "checks": {
+    "delta_rule": "pass",
+    "deltanet_layer": "pass",
+    "expert_layout": "pass",
+    "router_topk": "pass",
+    "shared_expert_merge": "pass"
+  },
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/w3_deltanet_s1_layer_compare.py",
+    "--self-test",
+    "--out",
+    "/tmp/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/reference_bundle"
+  ],
+  "comparisons": {
+    "delta_beta": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_core": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_gate": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_k": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_q": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_v": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "input": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "layer_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "moe_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "routed_expert_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "router_logits": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "router_topk_indices": {
+      "first_mismatch": null,
+      "mismatches": 0,
+      "status": "pass"
+    },
+    "router_topk_weights": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "shared_expert_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    }
+  },
+  "created_at": "2026-06-17T21:02:34.757464+08:00",
+  "ferrum_dump": "/private/tmp/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/reference_bundle/synthetic_ferrum_dump",
+  "git": {
+    "is_dirty": false,
+    "sha": "1b480a31091fb890d753f1e85e008c28db3b1d39",
+    "tracked_status_short": [],
+    "untracked_count": 0,
+    "untracked_sample": []
+  },
+  "mode": "self-test",
+  "note": "self-test validates the S1 dump contract only; it is not real-model W3-S1 evidence",
+  "pass_line": "W3 DELTANET S1 LAYER COMPARE SELFTEST PASS: /private/tmp/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/reference_bundle",
+  "reference_dump": "/private/tmp/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/reference_bundle/reference_dump",
+  "schema_version": 1,
+  "seed": 9271,
+  "shape": {
+    "expert_hidden_dim": 6,
+    "experts": 5,
+    "heads": 2,
+    "hidden_dim": 8,
+    "key_dim": 3,
+    "tokens": 6,
+    "top_k": 2,
+    "value_dim": 4
+  },
+  "status": "pass",
+  "tolerance": {
+    "max_abs": 1e-06
+  }
+}

@@ -1,0 +1,110 @@
+{
+  "created_at": "2026-06-17T21:02:34.756477+08:00",
+  "float_tensors": {
+    "delta_beta": "delta_beta.bin",
+    "delta_core": "delta_core.bin",
+    "delta_gate": "delta_gate.bin",
+    "delta_k": "delta_k.bin",
+    "delta_output": "delta_output.bin",
+    "delta_q": "delta_q.bin",
+    "delta_v": "delta_v.bin",
+    "input": "input.bin",
+    "layer_output": "layer_output.bin",
+    "moe_output": "moe_output.bin",
+    "routed_expert_output": "routed_expert_output.bin",
+    "router_logits": "router_logits.bin",
+    "router_topk_weights": "router_topk_weights.bin",
+    "shared_expert_output": "shared_expert_output.bin"
+  },
+  "int_tensors": {
+    "router_topk_indices": "router_topk_indices.json"
+  },
+  "layout": "token-major contiguous float32 unless noted",
+  "producer": "synthetic-ferrum-selftest",
+  "schema_version": 1,
+  "seed": 9271,
+  "semantics": {
+    "delta_output": "matmul(delta_core * sigmoid(x @ w_delta_gate), w_o)",
+    "delta_rule": "S_t = S_{t-1} + beta_t * k_t^T * (v_t - k_t @ S_{t-1}); core_t = q_t @ S_t",
+    "expert": "down(silu(x @ gate) * (x @ up))",
+    "layer_output": "input + delta_output + moe_output",
+    "moe_merge": "routed_topk_expert_sum + shared_expert_output",
+    "router": "stable top-k by descending logit then ascending expert id; weights are softmax over selected logits"
+  },
+  "shape": {
+    "expert_hidden_dim": 6,
+    "experts": 5,
+    "heads": 2,
+    "hidden_dim": 8,
+    "key_dim": 3,
+    "tokens": 6,
+    "top_k": 2,
+    "value_dim": 4
+  },
+  "tensor_shapes": {
+    "delta_beta": [
+      6,
+      2
+    ],
+    "delta_core": [
+      6,
+      2,
+      4
+    ],
+    "delta_gate": [
+      6,
+      8
+    ],
+    "delta_k": [
+      6,
+      2,
+      3
+    ],
+    "delta_output": [
+      6,
+      8
+    ],
+    "delta_q": [
+      6,
+      2,
+      3
+    ],
+    "delta_v": [
+      6,
+      2,
+      4
+    ],
+    "input": [
+      6,
+      8
+    ],
+    "layer_output": [
+      6,
+      8
+    ],
+    "moe_output": [
+      6,
+      8
+    ],
+    "routed_expert_output": [
+      6,
+      8
+    ],
+    "router_logits": [
+      6,
+      5
+    ],
+    "router_topk_indices": [
+      6,
+      2
+    ],
+    "router_topk_weights": [
+      6,
+      2
+    ],
+    "shared_expert_output": [
+      6,
+      8
+    ]
+  }
+}
