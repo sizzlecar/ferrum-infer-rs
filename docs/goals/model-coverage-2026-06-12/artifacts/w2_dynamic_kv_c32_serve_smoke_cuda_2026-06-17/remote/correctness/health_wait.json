@@ -1,0 +1,120 @@
+{
+  "ok": true,
+  "rows": [
+    {
+      "ts": 1781667735.3756394,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667740.3813217,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667745.3870783,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667750.3928633,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667755.3984747,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667760.4042199,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667765.410017,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667770.41588,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667775.4217076,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667780.4272223,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667785.43301,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667790.4388163,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667795.4444866,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667800.4501407,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667805.4558043,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667810.4614565,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667815.466292,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667820.4733357,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667825.4782596,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667830.4840093,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667835.4897804,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667840.4953854,
+      "status": "wait",
+      "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+    },
+    {
+      "ts": 1781667845.5021808,
+      "status": "ok",
+      "body": "{\"object\":\"list\",\"data\":[{\"id\":\"circulus/gemma-3-27b-it-gptq\",\"object\":\"model\",\"created\":1781667845,\"owned_by\":\"ferrum\",\"permission\":[],\"root\":null,\"parent\":null}]}"
+    }
+  ]
+}
