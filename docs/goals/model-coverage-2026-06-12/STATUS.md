@@ -2,6 +2,24 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZJ — W2-P0 docs checkpoint: coverage PASS is not release-grade PASS
+
+- Scope:
+  - README/support-matrix wording audit for W2-P0 release posture;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` was produced.
+- Change:
+  - `README.md` and `README_zh.md` already described Gemma 3 27B GPTQ as
+    functional/known-gap rather than release-grade;
+  - tightened the Gemma 3 footnote to say the existing
+    `MODEL_COVERAGE_W2 GOAL PASS` is a coverage validator line, not the
+    release-grade `MODEL_RELEASE_GRADE_W2 PASS` line.
+- Current external blocker:
+  - Vast still reports `credit=0`, no running instances, and only stopped
+    49GB RTX 4090 instance `41276321`;
+  - higher-priced replacement offers cannot be rented until the external
+    account credit state changes.
+
 ## 2026-06-17 ZI — W2 full-matrix runner checkpoint: auto-generate final manifest
 
 - Scope:
