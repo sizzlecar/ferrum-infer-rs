@@ -1,0 +1,12 @@
+worktree=/workspace/ferrum-w3-s0-20260617T203149Z-c8b8da1f
+artifact=/workspace/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f
+head=c8b8da1f41ff346809d7bdc88476c755846cdc83
+status_begin
+status_end
+cargo_test_begin=2026-06-17T20:32:44Z
+cargo_test_rc=127
+cargo_test_end=2026-06-17T20:32:44Z
+rustup_install_rc=0
+cargo_test_retry_begin=2026-06-17T20:33:58Z
+cargo_test_retry_rc=0
+cargo_test_retry_end=2026-06-17T20:34:30Z

@@ -1,0 +1,162 @@
+
+running 51 tests
+test definition::tests::qwen35_model_definition_rejects_non_w3_architecture ... ok
+test definition::tests::qwen35_dense_config_flattens_text_config_without_llama_fallback ... ok
+test definition::tests::qwen35_w3_executor_skeleton_exposes_recurrent_state_spec_only ... ok
+test definition::tests::qwen35_model_definition_builds_recurrent_state_spec ... ok
+test definition::tests::qwen35_moe_config_preserves_shared_expert_shape ... ok
+test models::qwen35::tests::allocates_recurrent_state_cache_from_spec ... ok
+test models::qwen35::tests::dense_full_attention_layer_composes_attention_residual_and_dense_mlp ... ok
+test executor::qwen35_executor::tests::qwen35_dense_reference_runtime_materializes_from_cpu_weight_plan ... ok
+test models::qwen35::tests::dense_full_attention_layer_rejects_hidden_size_mismatch ... ok
+test models::qwen35::tests::dense_linear_attention_layer_rejects_token_shape_mismatch ... ok
+test models::qwen35::tests::dense_linear_attention_layer_composes_attention_residual_and_dense_mlp ... ok
+test executor::qwen35_executor::tests::qwen35_w3_reference_prefill_keeps_decode_unsupported_until_state_semantics_exist ... ok
+test executor::qwen35_executor::tests::qwen35_w3_executor_without_reference_runtime_keeps_prefill_unsupported ... ok
+test models::qwen35::tests::dense_reference_model_forward_composes_layers_norm_and_lm_head ... ok
+test models::qwen35::tests::dense_reference_model_forward_rejects_oov_token ... ok
+test models::qwen35::tests::depthwise_causal_conv_uses_left_context_only ... ok
+test executor::qwen35_executor::tests::qwen35_w3_reference_prefill_returns_last_token_logits_and_kv_handle ... ok
+test models::qwen35::tests::full_attention_core_applies_causal_softmax ... ok
+test models::qwen35::tests::full_attention_core_rejects_invalid_gqa_shape ... ok
+test models::qwen35::tests::gated_delta_attention_matches_gating_plus_recurrent_reference ... ok
+test models::qwen35::tests::derives_runtime_config_from_model_definition ... ok
+test models::qwen35::tests::gated_rms_norm_matches_reference_formula ... ok
+test models::qwen35::tests::gdn_gating_matches_reference_formula ... ok
+test models::qwen35::tests::gdn_gating_rejects_shape_mismatch ... ok
+test models::qwen35::tests::linear_attention_core_composes_conv_gdn_delta_and_norm ... ok
+test models::qwen35::tests::linear_attention_core_rejects_shape_mismatch ... ok
+test models::qwen35::tests::linear_cpu_uses_row_major_out_in_weights ... ok
+test models::qwen35::tests::recurrent_delta_rule_rejects_shape_mismatch ... ok
+test executor::qwen35_executor::tests::qwen35_w3_reference_executor_prefills_from_dense_safetensors ... ok
+test models::qwen35::tests::recurrent_delta_rule_repeats_qk_heads_over_value_heads ... ok
+test models::qwen35::tests::rms_norm_plus_one_matches_qwen35_semantics ... ok
+test models::qwen35::tests::recurrent_delta_rule_single_token_updates_state ... ok
+test models::qwen35::tests::rms_norm_matches_qk_norm_semantics ... ok
+test models::qwen35::tests::rope_uses_non_interleaved_half_rotation ... ok
+test models::qwen35::tests::sparse_moe_rejects_invalid_fused_expert_layout ... ok
+test models::qwen35::tests::rejects_recurrent_state_slot_overflow ... ok
+test models::qwen35::tests::sparse_moe_shared_expert_composes_router_fused_experts_and_shared_gate ... ok
+test models::qwen35::tests::sparse_moe_linear_attention_layer_composes_attention_residual_and_moe ... ok
+test models::qwen35::tests::sparse_moe_full_attention_layer_composes_attention_residual_and_moe ... ok
+test qwen35_s1::tests::depthwise_causal_conv_uses_left_context_only ... ok
+test qwen35_s1::tests::rms_norm_plus_one_matches_qwen35_semantics ... ok
+test qwen35_weights::tests::reports_missing_required_tensor ... ok
+test models::qwen35::tests::materializes_dense_qwen35_weights_from_plan ... ok
+test qwen35_weights::tests::reads_sharded_index_weight_map_without_loading_tensor_data ... ok
+test qwen35_weights::tests::resolves_manifest_to_executor_tensor_plan ... ok
+test models::qwen35::tests::materializes_moe_qwen35_weights_from_plan ... ok
+test qwen35_weights::tests::planned_loader_loads_by_role_and_strips_linear_weight_suffix ... ok
+test qwen35_weights::tests::resolves_optional_wildcard_expert_aliases_when_present ... ok
+test qwen35_weights::tests::validates_single_file_safetensors_against_manifest ... ok
+test definition::tests::qwen35_w3_executor_weight_preflight_accepts_complete_inventory ... ok
+test definition::tests::qwen35_w3_executor_weight_preflight_rejects_missing_required_tensor ... ok
+
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 155 filtered out; finished in 0.01s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+
+running 1 test
+test parses_official_qwen35_dense_min_config ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
