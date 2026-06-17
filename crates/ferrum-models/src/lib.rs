@@ -46,8 +46,8 @@ pub mod weight_format;
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
-    BertModelExecutor, ClipModelExecutor, LlmExecutor, StubModelExecutor, TtsModelExecutor,
-    WhisperModelExecutor,
+    BertModelExecutor, ClipModelExecutor, LlmExecutor, Qwen35W3Executor, StubModelExecutor,
+    TtsModelExecutor, WhisperModelExecutor,
 };
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;
