@@ -1,0 +1,114 @@
+{
+  "active_decode_prefill_chunk_check": {
+    "matches": [
+      {
+        "affects": [
+          "performance"
+        ],
+        "effective_value": "16",
+        "key": "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+        "source": "default"
+      }
+    ]
+  },
+  "concurrency_cells": [
+    {
+      "clean": true,
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "concurrency": 1,
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "output_token_count_source": "usage",
+      "output_tps_lcb": 46.06618455965938,
+      "output_tps_mean": 46.0757125680106,
+      "p95_itl_ms": 21.346890716666667
+    },
+    {
+      "clean": true,
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "concurrency": 4,
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "output_token_count_source": "usage",
+      "output_tps_lcb": 157.0913193074107,
+      "output_tps_mean": 157.74416405828245,
+      "p95_itl_ms": 24.204866666666664
+    },
+    {
+      "clean": true,
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "concurrency": 16,
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "output_token_count_source": "usage",
+      "output_tps_lcb": 434.30817751202113,
+      "output_tps_mean": 448.5040626539317,
+      "p95_itl_ms": 35.74488671666668
+    },
+    {
+      "clean": true,
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "concurrency": 32,
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "output_token_count_source": "usage",
+      "output_tps_lcb": 512.7603506672946,
+      "output_tps_mean": 515.057941541576,
+      "p95_itl_ms": 35.90188203333334
+    }
+  ],
+  "dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e  /workspace/ascii_sharegpt_w2_100_58d5721d.jsonl",
+  "ferrum_bench_exit_code": 0,
+  "ferrum_binary_sha256": "d65b109291a964517c8d51f2639094e5d67f1d80aae37c6da081a37b2bef9606  target/release/ferrum",
+  "ferrum_run_smoke": {
+    "assistant_events": 1,
+    "content": "5",
+    "n_tokens": 3
+  },
+  "ferrum_serve_smoke": {
+    "content": "5\n",
+    "done_count": 1,
+    "usage": {
+      "completion_tokens": 3,
+      "prompt_tokens": 23,
+      "total_tokens": 26
+    }
+  },
+  "kv_capacity": 512,
+  "lane": "w2_ferrum_first_diagnostic",
+  "max_num_seqs": 32,
+  "model_path": "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+  "release_gate": "not_a_release_gate",
+  "remote_git_sha": "8181a99d7d6f9167f31dccd4767b31304a3c4e50",
+  "remote_git_status_short": "",
+  "required_release_pass_line": "MODEL_RELEASE_GRADE_W2 PASS: <out_dir>",
+  "status": "diagnostic_pass"
+}
