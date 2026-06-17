@@ -671,12 +671,17 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // HF-cache models are not `local_dir_path`, but they still need the same
     // KV block sizing as direct local safetensors directories.
     crate::gpu_mem_autosize::apply_auto_size(&source.local_path, gpu_memory_utilization);
-    let autosize_runtime_entries = runtime_entries_added_by_snapshot(
+    let autosize_runtime_entries = runtime_entries_changed_by_snapshot(
         &autosize_env_before,
         &RuntimeConfigSnapshot::capture_current(),
         SERVE_AUTOSIZE_RUNTIME_KEYS,
         RuntimeConfigSource::MemoryProfile,
     );
+    let autosize_runtime_keys: Vec<String> = autosize_runtime_entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect();
+    startup_cli_runtime_entries.retain(|entry| !autosize_runtime_keys.contains(&entry.key));
     materialized_runtime_keys.extend(
         autosize_runtime_entries
             .iter()
@@ -1029,7 +1034,7 @@ pub(crate) const SERVE_AUTOSIZE_RUNTIME_KEYS: &[&str] = &[
     "FERRUM_KV_CAPACITY",
 ];
 
-pub(crate) fn runtime_entries_added_by_snapshot(
+pub(crate) fn runtime_entries_changed_by_snapshot(
     before: &RuntimeConfigSnapshot,
     after: &RuntimeConfigSnapshot,
     keys: &[&str],
@@ -1041,6 +1046,9 @@ pub(crate) fn runtime_entries_added_by_snapshot(
             let after_value = runtime_snapshot_value(after, key);
             match (before_value, after_value) {
                 (None, Some(value)) => Some(RuntimeConfigEntry::new(*key, value, source)),
+                (Some(before), Some(after)) if before != after => {
+                    Some(RuntimeConfigEntry::new(*key, after, source))
+                }
                 _ => None,
             }
         })
@@ -2055,14 +2063,16 @@ mod tests {
     }
 
     #[test]
-    fn autosize_snapshot_diff_marks_only_new_values_as_memory_profile() {
+    fn autosize_snapshot_diff_marks_new_and_changed_values_as_memory_profile() {
         let before = RuntimeConfigSnapshot::from_entries([
             RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "2048", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "512", RuntimeConfigSource::Cli),
         ]);
         let after = RuntimeConfigSnapshot::from_entries([
             RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "2048", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "256", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new(
                 "FERRUM_MAX_BATCHED_TOKENS",
                 "2048",
@@ -2071,7 +2081,7 @@ mod tests {
             RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "32", RuntimeConfigSource::Env),
         ]);
 
-        let entries = runtime_entries_added_by_snapshot(
+        let entries = runtime_entries_changed_by_snapshot(
             &before,
             &after,
             SERVE_AUTOSIZE_RUNTIME_KEYS,
@@ -2086,12 +2096,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {key}"))
         };
 
-        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.entries.len(), 3);
         assert_eq!(
             entry("FERRUM_MAX_BATCHED_TOKENS").source,
             RuntimeConfigSource::MemoryProfile
         );
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "32");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "256");
+        assert_eq!(
+            entry("FERRUM_KV_CAPACITY").source,
+            RuntimeConfigSource::MemoryProfile
+        );
         assert!(snapshot
             .entries
             .iter()
