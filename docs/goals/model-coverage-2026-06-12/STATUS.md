@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZM — W3 Qwen3.5/Qwen3.6 safetensors inventory checkpoint
+
+- Scope:
+  - W3-S2 loader preflight after the typed weight manifest;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `qwen35_weights`;
+  - added `Qwen35WeightInventory`;
+  - added `Qwen35WeightValidation`;
+  - inventory reads `model.safetensors` headers via mmap without loading tensor
+    data;
+  - inventory reads `model.safetensors.index.json` `weight_map` and checks that
+    referenced shard files exist;
+  - validation compares available tensor names against the typed
+    `Qwen35WeightManifest`;
+  - prefix detection tries `model.language_model` and `model`, returning the
+    first prefix with no missing required tensors;
+  - missing required tensors now produce an explicit error listing the missing
+    Qwen3.5/Qwen3.6 weight names.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35_weights -- --nocapture` PASS:
+    `3 passed`;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `10 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this still does not materialize tensors into backend weights;
+  - this does not run prefill/decode;
+  - it is a fast loader preflight for the real W3 safetensors loader.
+
 ## 2026-06-18 ZZL — W3 Qwen3.5/Qwen3.6 weight-manifest checkpoint
 
 - Scope:

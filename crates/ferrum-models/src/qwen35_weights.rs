@@ -1,0 +1,313 @@
+//! Qwen3.5 / Qwen3.6 safetensors inventory and manifest validation.
+//!
+//! This module only inspects safetensors metadata. It does not materialize
+//! tensor data, so it can run before the W3 executor allocates model weights.
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use memmap2::Mmap;
+use safetensors::SafeTensors;
+
+use crate::qwen35_config::{Qwen35TextConfig, Qwen35WeightManifest, Qwen35WeightSpec};
+
+const PREFIX_CANDIDATES: &[&str] = &["model.language_model", "model"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen35WeightInventory {
+    names: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen35WeightValidation {
+    pub prefix: String,
+    pub missing_required: Vec<String>,
+    pub present_required: Vec<String>,
+    pub present_optional: Vec<String>,
+    pub missing_optional: Vec<String>,
+}
+
+impl Qwen35WeightInventory {
+    pub fn from_names(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            names: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn from_safetensors_dir(model_dir: &Path) -> Result<Self, String> {
+        let single = model_dir.join("model.safetensors");
+        if single.exists() {
+            return Self::from_safetensors_files([single]);
+        }
+
+        let index = model_dir.join("model.safetensors.index.json");
+        if index.exists() {
+            return Self::from_safetensors_index(model_dir, &index);
+        }
+
+        let mut files = fs::read_dir(model_dir)
+            .map_err(|err| format!("read_dir {model_dir:?}: {err}"))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+            .collect::<Vec<_>>();
+        files.sort();
+        if files.is_empty() {
+            Err(format!("no safetensors files found in {model_dir:?}"))
+        } else {
+            Self::from_safetensors_files(files)
+        }
+    }
+
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.names.iter().map(String::as_str)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    pub fn validate_manifest(&self, manifest: &Qwen35WeightManifest) -> Qwen35WeightValidation {
+        let mut missing_required = Vec::new();
+        let mut present_required = Vec::new();
+        let mut present_optional = Vec::new();
+        let mut missing_optional = Vec::new();
+
+        for tensor in manifest.global_tensors.iter().chain(
+            manifest
+                .layers
+                .iter()
+                .flat_map(|layer| layer.tensors.iter()),
+        ) {
+            let present = self.contains_weight_spec(tensor);
+            match (tensor.required, present) {
+                (true, true) => present_required.push(tensor.name.clone()),
+                (true, false) => missing_required.push(tensor.name.clone()),
+                (false, true) => present_optional.push(tensor.name.clone()),
+                (false, false) => missing_optional.push(tensor.name.clone()),
+            }
+        }
+
+        Qwen35WeightValidation {
+            prefix: manifest.prefix.clone(),
+            missing_required,
+            present_required,
+            present_optional,
+            missing_optional,
+        }
+    }
+
+    pub fn detect_prefix_and_validate(
+        &self,
+        config: &Qwen35TextConfig,
+    ) -> Result<Qwen35WeightValidation, String> {
+        let mut best: Option<Qwen35WeightValidation> = None;
+        for prefix in PREFIX_CANDIDATES {
+            let manifest = config.weight_manifest(*prefix)?;
+            let validation = self.validate_manifest(&manifest);
+            if validation.missing_required.is_empty() {
+                return Ok(validation);
+            }
+            if best.as_ref().is_none_or(|current| {
+                validation.missing_required.len() < current.missing_required.len()
+            }) {
+                best = Some(validation);
+            }
+        }
+        let best = best.expect("PREFIX_CANDIDATES is non-empty");
+        Err(format!(
+            "missing {} required Qwen3.5/Qwen3.6 tensors for prefix {}: {}",
+            best.missing_required.len(),
+            best.prefix,
+            best.missing_required
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
+    fn from_safetensors_files(files: impl IntoIterator<Item = PathBuf>) -> Result<Self, String> {
+        let mut names = BTreeSet::new();
+        for path in files {
+            let file = File::open(&path).map_err(|err| format!("open {path:?}: {err}"))?;
+            let mmap = unsafe { Mmap::map(&file).map_err(|err| format!("mmap {path:?}: {err}"))? };
+            let safetensors =
+                SafeTensors::deserialize(&mmap).map_err(|err| format!("parse {path:?}: {err}"))?;
+            names.extend(safetensors.names().into_iter().map(|name| name.to_string()));
+        }
+        Ok(Self { names })
+    }
+
+    fn from_safetensors_index(model_dir: &Path, index: &Path) -> Result<Self, String> {
+        let raw = fs::read_to_string(index).map_err(|err| format!("read {index:?}: {err}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|err| format!("parse {index:?}: {err}"))?;
+        let weight_map = value
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| format!("{index:?} missing weight_map"))?;
+        let shard_files = weight_map
+            .values()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<BTreeSet<_>>();
+        for shard in shard_files {
+            let path = model_dir.join(shard);
+            if !path.exists() {
+                return Err(format!("missing safetensors shard {path:?}"));
+            }
+        }
+        Ok(Self {
+            names: weight_map.keys().cloned().collect(),
+        })
+    }
+
+    fn contains_weight_spec(&self, tensor: &Qwen35WeightSpec) -> bool {
+        if !tensor.name.contains('*') {
+            return self.contains(&tensor.name);
+        }
+        let mut pieces = tensor.name.splitn(2, '*');
+        let prefix = pieces.next().unwrap_or("");
+        let suffix = pieces.next().unwrap_or("");
+        self.names
+            .iter()
+            .any(|name| name.starts_with(prefix) && name.ends_with(suffix))
+    }
+}
+
+impl Qwen35WeightValidation {
+    pub fn is_pass(&self) -> bool {
+        self.missing_required.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn dense_config() -> Qwen35TextConfig {
+        Qwen35TextConfig::from_hf_config_str(
+            r#"{
+              "model_type": "qwen3_5",
+              "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 16,
+                "num_hidden_layers": 4,
+                "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2,
+                "linear_key_head_dim": 4,
+                "linear_value_head_dim": 4,
+                "linear_conv_kernel_dim": 4,
+                "head_dim": 4,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "intermediate_size": 32,
+                "tie_word_embeddings": true
+              }
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn write_safetensors(dir: &Path, names: &[String]) {
+        let tensors = names
+            .iter()
+            .map(|name| {
+                let bytes: &'static [u8] =
+                    Box::leak(0.0f32.to_le_bytes().to_vec().into_boxed_slice());
+                (
+                    name.clone(),
+                    TensorView::new(Dtype::F32, vec![1], bytes).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            tensors,
+            &None::<HashMap<String, String>>,
+            &dir.join("model.safetensors"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validates_single_file_safetensors_against_manifest() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        let tmp = TempDir::new().unwrap();
+        write_safetensors(tmp.path(), &names);
+
+        let inventory = Qwen35WeightInventory::from_safetensors_dir(tmp.path()).unwrap();
+        let validation = inventory.detect_prefix_and_validate(&config).unwrap();
+        assert_eq!(validation.prefix, "model");
+        assert!(validation.is_pass());
+        assert!(validation
+            .missing_optional
+            .contains(&"model.lm_head.weight".to_string()));
+    }
+
+    #[test]
+    fn reports_missing_required_tensor() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let mut names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        names.retain(|name| name != "model.layers.3.self_attn.q_proj.weight");
+        let inventory = Qwen35WeightInventory::from_names(names);
+        let err = inventory
+            .detect_prefix_and_validate(&config)
+            .expect_err("missing full-attention q_proj should fail");
+        assert!(err.contains("self_attn.q_proj.weight"), "{err}");
+    }
+
+    #[test]
+    fn reads_sharded_index_weight_map_without_loading_tensor_data() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("shard-00001.safetensors"), []).unwrap();
+        fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            serde_json::json!({
+                "metadata": {},
+                "weight_map": {
+                    "model.embed_tokens.weight": "shard-00001.safetensors",
+                    "model.norm.weight": "shard-00001.safetensors"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let inventory = Qwen35WeightInventory::from_safetensors_dir(tmp.path()).unwrap();
+        assert!(inventory.contains("model.embed_tokens.weight"));
+        assert!(inventory.contains("model.norm.weight"));
+    }
+}
