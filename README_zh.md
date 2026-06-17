@@ -188,8 +188,8 @@ lane 划分：**GGUF 走 Metal lane；CUDA 走 GPTQ/safetensors**。
 ² 32B dense 在 32 GB Mac 上会逐 token 从 SSD 重读被驱逐权重（约 0.14 tok/s），不适合作为实际部署；使用 CUDA lane。
 ³ strict `json_schema` 在 32B-GPTQ 上偶发 500（开放问题）；required tool-calls 是 10/10。
 ⁴ R1-distill template 会强制 `<think>`，70B 会把 tool-call JSON 写进 think block；适合 chat/reasoning，不适合作为 tool-calling 认证。
-⁵ Gemma 3 W2 最终 validator 行是
-`MODEL_COVERAGE_W2 GOAL PASS: docs/goals/model-coverage-2026-06-12`。CUDA L5 覆盖 random `256/128`、c=1/4/16/32、每个 cell 100 prompts × 3 repeats、零错误、usage token 计数。24 GB RTX 4090 的 c=32 客户端 lane 使用产品 CLI admission `--max-num-seqs 16` 与 `--kv-capacity 400`。同卡 llama.cpp 对比为 `0.500260x`，刚过 coverage floor，但低于 release-grade 的 `0.8x` 目标；因此这是 functional 正确性/并发证据并带 known performance gap，不是 release-grade 支持或性能优化完成声明。27B GGUF Metal 在降级的 32 GB Mac 上 waived；Gemma 3 GGUF 架构覆盖由 1B Q4_K_M Metal smoke artifact 固定。
+⁵ Gemma 3 W2 已有 coverage validator 行
+`MODEL_COVERAGE_W2 GOAL PASS: docs/goals/model-coverage-2026-06-12`；它还没有 release-grade 行 `MODEL_RELEASE_GRADE_W2 PASS`。CUDA L5 覆盖 random `256/128`、c=1/4/16/32、每个 cell 100 prompts × 3 repeats、零错误、usage token 计数。24 GB RTX 4090 的 c=32 客户端 lane 使用产品 CLI admission `--max-num-seqs 16` 与 `--kv-capacity 400`。同卡 llama.cpp 对比为 `0.500260x`，刚过 coverage floor，但低于 release-grade 的 `0.8x` 目标；因此这是 functional 正确性/并发证据并带 known performance gap，不是 release-grade 支持或性能优化完成声明。27B GGUF Metal 在降级的 32 GB Mac 上 waived；Gemma 3 GGUF 架构覆盖由 1B Q4_K_M Metal smoke artifact 固定。
 
 可使用任意 HuggingFace 模型 ID:
 

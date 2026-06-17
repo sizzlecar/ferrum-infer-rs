@@ -286,8 +286,9 @@ required tool-calls are 10/10.
 inside the think block — reliable for chat/reasoning, not tool calling.
 DeepSeek-R1-Distill-Qwen-14B shares the 32B's template/config byte-for-byte
 and rides the same lanes.
-⁵ Gemma 3 W2 evidence has final validator line
-`MODEL_COVERAGE_W2 GOAL PASS: docs/goals/model-coverage-2026-06-12`.
+⁵ Gemma 3 W2 evidence has the coverage validator line
+`MODEL_COVERAGE_W2 GOAL PASS: docs/goals/model-coverage-2026-06-12`;
+it does not have the release-grade line `MODEL_RELEASE_GRADE_W2 PASS`.
 CUDA L5 covers random `256/128` at c=1/4/16/32, 100 prompts × 3 repeats per
 cell, zero errors, and usage-counted output tokens. On a 24 GB RTX 4090, the
 c=32 client lane uses product CLI admission `--max-num-seqs 16` with
