@@ -31,6 +31,7 @@ fn parses_official_qwen35_dense_min_config() {
     assert_eq!(cfg.linear_attention.key_head_dim, 128);
     assert_eq!(cfg.linear_attention.value_head_dim, 128);
     assert_eq!(cfg.linear_attention.conv_kernel_dim, 4);
+    assert!(cfg.tie_word_embeddings);
     assert_eq!(cfg.dense_intermediate_size, Some(3584));
     assert_eq!(cfg.dense_mlp_layers().len(), 24);
     assert!(cfg.sparse_moe_layers().is_empty());
@@ -45,6 +46,28 @@ fn parses_official_qwen35_dense_min_config() {
     assert!(!plan[3].has_recurrent_state);
     assert_eq!(cfg.linear_qk_total_dim(), 2048);
     assert_eq!(cfg.linear_value_total_dim(), 2048);
+    let manifest = cfg.weight_manifest("model").unwrap();
+    assert_eq!(
+        manifest
+            .global_tensors
+            .iter()
+            .find(|tensor| tensor.role == "lm_head")
+            .unwrap()
+            .required,
+        false
+    );
+    assert!(manifest.layers[0]
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name == "model.layers.0.linear_attn.in_proj_qkv.weight"));
+    assert!(manifest.layers[0]
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name == "model.layers.0.mlp.gate_proj.weight"));
+    assert!(manifest.layers[3]
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name == "model.layers.3.self_attn.q_proj.weight"));
     assert_eq!(
         cfg.recurrent_delta_state_shape().unwrap(),
         vec![16, 128, 128]
@@ -89,6 +112,7 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     assert_eq!(cfg.layer_types[3], Qwen35LayerType::FullAttention);
     assert_eq!(cfg.linear_attention.num_key_heads, 16);
     assert_eq!(cfg.linear_attention.num_value_heads, 32);
+    assert!(!cfg.tie_word_embeddings);
     let moe = cfg.moe.as_ref().unwrap();
     assert_eq!(moe.num_experts, 256);
     assert_eq!(moe.num_experts_per_tok, 8);
@@ -108,6 +132,32 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     assert!(!plan[3].has_recurrent_state);
     assert_eq!(cfg.linear_qk_total_dim(), 2048);
     assert_eq!(cfg.linear_value_total_dim(), 4096);
+    let manifest = cfg.weight_manifest("model.language_model").unwrap();
+    assert_eq!(
+        manifest
+            .global_tensors
+            .iter()
+            .find(|tensor| tensor.role == "lm_head")
+            .unwrap()
+            .required,
+        true
+    );
+    assert!(manifest.layers[0].tensors.iter().any(
+        |tensor| tensor.name == "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+    ));
+    assert!(manifest.layers[0]
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name == "model.language_model.layers.0.mlp.experts.gate_up_proj"));
+    assert!(manifest.layers[3]
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name == "model.language_model.layers.3.self_attn.q_proj.weight"));
+    assert!(manifest.layers[3]
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name
+            == "model.language_model.layers.3.mlp.shared_expert.down_proj.weight"));
     assert_eq!(
         cfg.recurrent_delta_state_shape().unwrap(),
         vec![32, 128, 128]

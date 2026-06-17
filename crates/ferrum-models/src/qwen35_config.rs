@@ -32,6 +32,28 @@ pub struct Qwen35LayerPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35WeightSpec {
+    pub role: String,
+    pub name: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35LayerWeightManifest {
+    pub layer_index: usize,
+    pub attention: Qwen35LayerType,
+    pub mlp: Qwen35MlpKind,
+    pub tensors: Vec<Qwen35WeightSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35WeightManifest {
+    pub prefix: String,
+    pub global_tensors: Vec<Qwen35WeightSpec>,
+    pub layers: Vec<Qwen35LayerWeightManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Qwen35LinearAttentionConfig {
     pub num_key_heads: usize,
     pub num_value_heads: usize,
@@ -59,6 +81,7 @@ pub struct Qwen35TextConfig {
     pub head_dim: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    pub tie_word_embeddings: bool,
     pub dense_intermediate_size: Option<usize>,
     pub moe: Option<Qwen35MoeTextConfig>,
 }
@@ -138,6 +161,10 @@ impl Qwen35TextConfig {
             reject_dense_moe_fields(text_config)?;
             None
         };
+        let tie_word_embeddings = match optional_bool(text_config, "tie_word_embeddings")? {
+            Some(value) => value,
+            None => optional_bool(obj, "tie_word_embeddings")?.unwrap_or(false),
+        };
         let parsed = Self {
             top_level_model_type,
             text_model_type,
@@ -148,6 +175,7 @@ impl Qwen35TextConfig {
             head_dim: required_usize(text_config, "head_dim")?,
             num_attention_heads: required_usize(text_config, "num_attention_heads")?,
             num_key_value_heads: required_usize(text_config, "num_key_value_heads")?,
+            tie_word_embeddings,
             dense_intermediate_size: optional_usize(text_config, "intermediate_size")?,
             moe,
         };
@@ -229,6 +257,74 @@ impl Qwen35TextConfig {
         } else {
             (0..self.num_hidden_layers).collect()
         }
+    }
+
+    pub fn weight_manifest(
+        &self,
+        prefix: impl Into<String>,
+    ) -> Result<Qwen35WeightManifest, String> {
+        let prefix = prefix.into();
+        let mut global_tensors = vec![
+            weight_spec(
+                "embed_tokens",
+                format!("{prefix}.embed_tokens.weight"),
+                true,
+            ),
+            weight_spec("final_norm", format!("{prefix}.norm.weight"), true),
+        ];
+        global_tensors.push(weight_spec(
+            "lm_head",
+            format!("{prefix}.lm_head.weight"),
+            !self.tie_word_embeddings,
+        ));
+
+        let layers = self
+            .layer_plan()?
+            .into_iter()
+            .map(|plan| {
+                let layer_prefix = format!("{prefix}.layers.{}", plan.layer_index);
+                let mut tensors = vec![
+                    weight_spec(
+                        "input_layernorm",
+                        format!("{layer_prefix}.input_layernorm.weight"),
+                        true,
+                    ),
+                    weight_spec(
+                        "post_attention_layernorm",
+                        format!("{layer_prefix}.post_attention_layernorm.weight"),
+                        true,
+                    ),
+                ];
+                match plan.attention {
+                    Qwen35LayerType::LinearAttention => {
+                        tensors.extend(linear_attention_weight_specs(&layer_prefix));
+                    }
+                    Qwen35LayerType::FullAttention => {
+                        tensors.extend(full_attention_weight_specs(&layer_prefix));
+                    }
+                }
+                match plan.mlp {
+                    Qwen35MlpKind::Dense => {
+                        tensors.extend(dense_mlp_weight_specs(&layer_prefix));
+                    }
+                    Qwen35MlpKind::SparseMoeSharedExpert => {
+                        tensors.extend(sparse_moe_weight_specs(&layer_prefix));
+                    }
+                }
+                Qwen35LayerWeightManifest {
+                    layer_index: plan.layer_index,
+                    attention: plan.attention,
+                    mlp: plan.mlp,
+                    tensors,
+                }
+            })
+            .collect();
+
+        Ok(Qwen35WeightManifest {
+            prefix,
+            global_tensors,
+            layers,
+        })
     }
 
     pub fn linear_qk_total_dim(&self) -> usize {
@@ -373,6 +469,119 @@ fn optional_usize(
     Ok(Some(
         usize::try_from(parsed).map_err(|_| format!("{key} is too large"))?,
     ))
+}
+
+fn optional_bool(map: &serde_json::Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
+    let Some(value) = map.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("{key} must be a boolean when present"))
+}
+
+fn weight_spec(
+    role: impl Into<String>,
+    name: impl Into<String>,
+    required: bool,
+) -> Qwen35WeightSpec {
+    Qwen35WeightSpec {
+        role: role.into(),
+        name: name.into(),
+        required,
+    }
+}
+
+fn linear_attention_weight_specs(layer_prefix: &str) -> Vec<Qwen35WeightSpec> {
+    [
+        ("linear_attn_qkv", "linear_attn.in_proj_qkv.weight"),
+        ("linear_attn_z", "linear_attn.in_proj_z.weight"),
+        ("linear_attn_b", "linear_attn.in_proj_b.weight"),
+        ("linear_attn_a", "linear_attn.in_proj_a.weight"),
+        ("linear_attn_conv", "linear_attn.conv1d.weight"),
+        ("linear_attn_a_log", "linear_attn.A_log"),
+        ("linear_attn_dt_bias", "linear_attn.dt_bias"),
+        ("linear_attn_norm", "linear_attn.norm.weight"),
+        ("linear_attn_out", "linear_attn.out_proj.weight"),
+    ]
+    .into_iter()
+    .map(|(role, suffix)| weight_spec(role, format!("{layer_prefix}.{suffix}"), true))
+    .collect()
+}
+
+fn full_attention_weight_specs(layer_prefix: &str) -> Vec<Qwen35WeightSpec> {
+    [
+        ("self_attn_q", "self_attn.q_proj.weight"),
+        ("self_attn_k", "self_attn.k_proj.weight"),
+        ("self_attn_v", "self_attn.v_proj.weight"),
+        ("self_attn_o", "self_attn.o_proj.weight"),
+        ("self_attn_q_norm", "self_attn.q_norm.weight"),
+        ("self_attn_k_norm", "self_attn.k_norm.weight"),
+    ]
+    .into_iter()
+    .map(|(role, suffix)| weight_spec(role, format!("{layer_prefix}.{suffix}"), true))
+    .collect()
+}
+
+fn dense_mlp_weight_specs(layer_prefix: &str) -> Vec<Qwen35WeightSpec> {
+    [
+        ("mlp_gate", "mlp.gate_proj.weight"),
+        ("mlp_up", "mlp.up_proj.weight"),
+        ("mlp_down", "mlp.down_proj.weight"),
+    ]
+    .into_iter()
+    .map(|(role, suffix)| weight_spec(role, format!("{layer_prefix}.{suffix}"), true))
+    .collect()
+}
+
+fn sparse_moe_weight_specs(layer_prefix: &str) -> Vec<Qwen35WeightSpec> {
+    [
+        ("moe_router", "mlp.gate.weight", true),
+        (
+            "moe_shared_expert_gate",
+            "mlp.shared_expert_gate.weight",
+            true,
+        ),
+        (
+            "moe_shared_expert_gate_proj",
+            "mlp.shared_expert.gate_proj.weight",
+            true,
+        ),
+        (
+            "moe_shared_expert_up_proj",
+            "mlp.shared_expert.up_proj.weight",
+            true,
+        ),
+        (
+            "moe_shared_expert_down_proj",
+            "mlp.shared_expert.down_proj.weight",
+            true,
+        ),
+        ("moe_fused_gate_up_proj", "mlp.experts.gate_up_proj", true),
+        ("moe_fused_down_proj", "mlp.experts.down_proj", true),
+        (
+            "moe_per_expert_gate_proj",
+            "mlp.experts.*.gate_proj.weight",
+            false,
+        ),
+        (
+            "moe_per_expert_up_proj",
+            "mlp.experts.*.up_proj.weight",
+            false,
+        ),
+        (
+            "moe_per_expert_down_proj",
+            "mlp.experts.*.down_proj.weight",
+            false,
+        ),
+    ]
+    .into_iter()
+    .map(|(role, suffix, required)| weight_spec(role, format!("{layer_prefix}.{suffix}"), required))
+    .collect()
 }
 
 fn parse_layer_types(
