@@ -55,13 +55,13 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             .metal_paged_kv_enabled(B::supports_paged_kv());
         const PAGED_BLOCK_SIZE: usize = 16;
 
-        // Default 32: covers c=16 burst with 2× headroom for the
-        // fresh-cache-id-per-request pattern that bench/server harnesses
-        // use. Pool memory unchanged from pre-0.7.2 default because
-        // DEFAULT_KV_CAPACITY dropped 4096 → 2048 in lockstep.
+        // Paged KV uses a vLLM-style global physical block pool. `max`
+        // defines the per-sequence logical table stride; `kv_max_blocks`
+        // defines the physical pool size. Sequences grow their block lists
+        // on demand before each KV write.
         let max_seqs = self.runtime_env.paged_max_seqs;
         let max_blocks_per_seq = max.div_ceil(PAGED_BLOCK_SIZE);
-        let total_pool_blocks = max_seqs * max_blocks_per_seq;
+        let total_pool_blocks = self.runtime_env.paged_total_blocks(max_blocks_per_seq);
 
         // Lazy-allocate the shared paged pools on the first paged
         // ensure_kv call.
@@ -145,35 +145,16 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                 .collect()
         });
 
-        // Allocate physical blocks for THIS cache_id from the shared pool.
+        // Physical blocks are allocated on demand before each forward writes
+        // KV. At creation time the cache owns no blocks.
         if paged {
-            let alloc_arc = self
-                .paged_block_alloc
-                .as_ref()
-                .expect("paged_block_alloc must be initialised when paged=true");
-            let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-            let block_indices = match alloc.allocate_n(max_blocks_per_seq) {
-                Ok(idx) => idx,
-                Err(e) => {
-                    drop(alloc);
-                    self.kv_free_pool.push(caches);
-                    eprintln!(
-                        "[ferrum] paged KV pool exhausted on ensure_kv for \
-                         cache_id={cache_id:?}: {e}. Increase \
-                         FERRUM_PAGED_MAX_SEQS (currently {max_seqs}) or \
-                         throttle concurrent requests.",
-                    );
-                    return;
-                }
-            };
-            let mut padded = block_indices.clone();
-            padded.resize(max_blocks_per_seq, 0);
+            let padded = vec![0u32; max_blocks_per_seq];
             let mut ctx_tmp = B::new_context();
             for c in caches.iter_mut() {
                 if let Some(bt) = c.block_table.as_mut() {
                     B::write_typed::<u32>(&mut ctx_tmp, bt, &padded);
                 }
-                c.paged_block_indices = block_indices.clone();
+                c.paged_block_indices.clear();
             }
             B::sync(&mut ctx_tmp);
         }
@@ -187,5 +168,73 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             }
         }
         self.kv_caches.insert(cache_id.to_string(), caches);
+    }
+
+    pub(crate) fn ensure_paged_kv_capacity_for_cache_id(
+        &mut self,
+        ctx: &mut B::Context,
+        cache_id: &str,
+        target_len: usize,
+    ) -> Result<()> {
+        if self.paged_pools.is_none() {
+            return Ok(());
+        }
+
+        let (block_size, max_blocks_per_seq, mut block_indices) = {
+            let caches = self.kv_caches.get(cache_id).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "paged KV grow called before ensure_kv for cache_id={cache_id:?}"
+                ))
+            })?;
+            let cache = caches.first().ok_or_else(|| {
+                FerrumError::model(format!(
+                    "paged KV grow found empty layer cache for cache_id={cache_id:?}"
+                ))
+            })?;
+            if cache.block_size == 0 {
+                return Ok(());
+            }
+            (
+                cache.block_size,
+                cache.capacity / cache.block_size,
+                cache.paged_block_indices.clone(),
+            )
+        };
+
+        let needed_blocks = target_len.div_ceil(block_size);
+        if needed_blocks > max_blocks_per_seq {
+            return Err(FerrumError::model(format!(
+                "paged KV: target_len={target_len} needs {needed_blocks} blocks, exceeds per-seq table capacity {max_blocks_per_seq} for cache_id={cache_id:?}"
+            )));
+        }
+        if block_indices.len() >= needed_blocks {
+            return Ok(());
+        }
+
+        let extra_blocks = needed_blocks - block_indices.len();
+        let new_blocks = {
+            let alloc_arc = self.paged_block_alloc.as_ref().ok_or_else(|| {
+                FerrumError::model("paged KV grow missing block allocator while paged_pools is set")
+            })?;
+            let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
+            alloc.allocate_n(extra_blocks)?
+        };
+        block_indices.extend(new_blocks);
+
+        let mut padded = block_indices.clone();
+        padded.resize(max_blocks_per_seq, 0);
+        let caches = self.kv_caches.get_mut(cache_id).ok_or_else(|| {
+            FerrumError::model(format!(
+                "paged KV grow lost cache after allocation for cache_id={cache_id:?}"
+            ))
+        })?;
+        for cache in caches.iter_mut() {
+            cache.paged_block_indices = block_indices.clone();
+            if let Some(block_table) = cache.block_table.as_mut() {
+                B::write_typed::<u32>(ctx, block_table, &padded);
+            }
+        }
+
+        Ok(())
     }
 }

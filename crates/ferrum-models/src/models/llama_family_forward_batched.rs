@@ -1701,6 +1701,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let max_blocks_per_seq = self.scratch.paged_max_blocks_per_seq;
         let block_size = 16usize; // matches PAGED_BLOCK_SIZE in ensure_kv
 
+        let mut ctx = B::new_context();
+        for (cid, tokens, pos_offset, _) in items {
+            self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cid, *pos_offset + tokens.len())
+                .expect("paged KV dynamic grow");
+        }
+
         // Make sure scratch fits this batch. Use the engine-side
         // `paged_max_seqs` cap (set in `enable_paged_batch` from
         // `FERRUM_PAGED_MAX_SEQS`, default 32) so the index buffers
@@ -1739,8 +1745,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             self.unified_graph_warmup = 0;
             self.unified_graph_failed = false;
         }
-
-        let mut ctx = B::new_context();
 
         // Embed all q-tokens into the unified residual buffer.
         let mut residual = self
@@ -3180,6 +3184,11 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let vocab = self.cfg.vocab_size;
         let num_layers = self.cfg.num_layers;
         let mut ctx = B::new_context();
+        for (cid, _, _) in batch {
+            let target_len = self.cache_len(cid).saturating_add(1);
+            self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cid, target_len)
+                .expect("paged KV dynamic grow");
+        }
 
         // Pre-step state (positions, kv_lens_pre, kv_lens_post). All
         // 32 layers' batched kernels read these from scratch device
