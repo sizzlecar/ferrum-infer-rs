@@ -19,7 +19,8 @@ use tracing::debug;
 use ferrum_interfaces::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
-        MemoryRequirements, PrefillInput, PrefillOutput, UnifiedBatch,
+        KvSlotRequest, KvSlotReservation, MemoryRequirements, PrefillInput, PrefillOutput,
+        UnifiedBatch,
     },
     ModelExecutor,
 };
@@ -266,6 +267,10 @@ impl ModelExecutor for LlmExecutor {
         Some(self.lock_model().kv_capacity())
     }
 
+    fn reserve_kv_slots(&self, requests: &[KvSlotRequest]) -> Result<Option<KvSlotReservation>> {
+        self.lock_model().reserve_kv_slots(requests)
+    }
+
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         let tokens = common::tensor_to_tokens(&input.input_ids)?;
 
@@ -308,6 +313,10 @@ impl ModelExecutor for LlmExecutor {
             if let Some(capacity_hint) = metadata_kv_capacity_hint(&input.metadata) {
                 model.prepare_kv_capacity(&cache_id, capacity_hint);
             }
+            model.reserve_kv_slots(&[KvSlotRequest {
+                cache_id: cache_id.clone(),
+                target_len: prior_seq_len + tokens.len(),
+            }])?;
             if force_full_logits {
                 model.prefill(&cache_id, &tokens)
             } else {
@@ -436,6 +445,16 @@ impl ModelExecutor for LlmExecutor {
                     model.prepare_kv_capacity(cache_id, capacity_hint);
                 }
             }
+            let kv_requests: Vec<KvSlotRequest> = cache_ids
+                .iter()
+                .zip(prior_seq_lens.iter())
+                .zip(tokens_per_input.iter())
+                .map(|((cache_id, prior_seq_len), tokens)| KvSlotRequest {
+                    cache_id: cache_id.clone(),
+                    target_len: prior_seq_len.saturating_add(tokens.len()),
+                })
+                .collect();
+            model.reserve_kv_slots(&kv_requests)?;
             if force_full_logits {
                 took_fallback = true;
                 fallback_reason = "requires_full_logits";
@@ -629,6 +648,10 @@ impl ModelExecutor for LlmExecutor {
                 &cache_id,
                 active_lora_from_metadata(&input.metadata)?,
             )?;
+            model.reserve_kv_slots(&[KvSlotRequest {
+                cache_id: cache_id.clone(),
+                target_len: seq_len.saturating_add(1),
+            }])?;
             if force_full_logits {
                 model.decode(&cache_id, token, seq_len as u32)
             } else {
@@ -729,6 +752,14 @@ impl ModelExecutor for LlmExecutor {
             for p in &prepped {
                 model.set_lora_adapter_for_cache(&p.cache_id, p.lora.clone())?;
             }
+            let kv_requests: Vec<KvSlotRequest> = prepped
+                .iter()
+                .map(|p| KvSlotRequest {
+                    cache_id: p.cache_id.clone(),
+                    target_len: (p.seq_len as usize).saturating_add(1),
+                })
+                .collect();
+            model.reserve_kv_slots(&kv_requests)?;
             let unified_items: Vec<(String, Vec<u32>, usize, bool)> = prepped
                 .iter()
                 .map(|p| (p.cache_id.clone(), vec![p.token], p.seq_len as usize, true))
@@ -884,6 +915,15 @@ impl ModelExecutor for LlmExecutor {
                         }
                     }
                 }
+                let kv_requests: Vec<KvSlotRequest> = batch
+                    .items
+                    .iter()
+                    .map(|item| KvSlotRequest {
+                        cache_id: item.seq_id.clone(),
+                        target_len: item.pos_offset.saturating_add(item.q_tokens.len()),
+                    })
+                    .collect();
+                model.reserve_kv_slots(&kv_requests)?;
                 if force_full_logits && !model.unified_forward_can_return_full_logits() {
                     fallback_reason = "requires_full_logits_unavailable";
                     None

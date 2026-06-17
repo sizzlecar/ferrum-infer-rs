@@ -10,7 +10,7 @@ use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
-    model_executor::{LogitsReturnPolicy, TokenSelectionMask},
+    model_executor::{KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask},
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
     Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };

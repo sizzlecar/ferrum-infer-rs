@@ -3,6 +3,34 @@ use super::*;
 impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
 
+    pub(super) async fn run_batch_decode_adaptive(&self, request_ids: &[RequestId]) -> Result<()> {
+        let mut stack = vec![request_ids.to_vec()];
+        while let Some(chunk) = stack.pop() {
+            if chunk.is_empty() {
+                continue;
+            }
+            match self.run_batch_decode(&chunk).await {
+                Ok(()) => {}
+                Err(e) if is_resource_exhausted_error(&e) && chunk.len() > 1 => {
+                    let mid = chunk.len() / 2;
+                    stack.push(chunk[mid..].to_vec());
+                    stack.push(chunk[..mid].to_vec());
+                }
+                Err(e) if is_resource_exhausted_error(&e) => {
+                    let exclude: std::collections::HashSet<RequestId> =
+                        chunk.iter().cloned().collect();
+                    if self.preempt_victim_excluding(&exclude).await {
+                        stack.push(chunk);
+                    } else {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Run batch decode for multiple requests in a single forward pass.
     ///
     /// Dispatches via the unified-batch API: we build a `UnifiedBatch`
@@ -63,6 +91,9 @@ impl EngineInner {
                 });
             }
         }
+
+        let kv_requests = kv_slot_requests_for_unified_batch(&batch);
+        self.model_executor.reserve_kv_slots(&kv_requests)?;
 
         let prof = self.runtime_config.rbd_prof;
         let t_decode = if prof { Some(Instant::now()) } else { None };

@@ -1652,9 +1652,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
         logits_policies: Option<&[LogitsReturnPolicy]>,
-    ) -> Vec<Option<Vec<f32>>> {
+    ) -> Result<Vec<Option<Vec<f32>>>> {
         if items.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         // Snapshot cfg fields into Copy locals so we can take &mut self later
         // without a long-lived `&self.cfg` borrow conflicting.
@@ -1703,8 +1703,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         let mut ctx = B::new_context();
         for (cid, tokens, pos_offset, _) in items {
-            self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cid, *pos_offset + tokens.len())
-                .expect("paged KV dynamic grow");
+            self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cid, *pos_offset + tokens.len())?;
         }
 
         // Make sure scratch fits this batch. Use the engine-side
@@ -2591,7 +2590,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         self.scratch.unified_residual = Some(residual);
         self.scratch.unified_norm_out = Some(norm_out);
 
-        out
+        Ok(out)
     }
 
     /// One transformer layer for the unified mixed-batch forward.

@@ -13,6 +13,39 @@ use std::{
     sync::Arc,
 };
 
+/// One model-owned KV slot reservation request.
+///
+/// `cache_id` is the executor/model cache key attached to a sequence. `target_len`
+/// is the sequence length that must be writable before the next forward runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSlotRequest {
+    pub cache_id: String,
+    pub target_len: usize,
+}
+
+/// Per-cache outcome from a KV slot reservation attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSlotAllocation {
+    pub cache_id: String,
+    pub blocks_before: usize,
+    pub blocks_after: usize,
+    pub new_blocks: usize,
+}
+
+/// Model-owned paged-KV reservation evidence.
+///
+/// Executors that own a vLLM-style physical KV block pool return this after
+/// reserving all requested slots. Executors without model-owned paged KV return
+/// `None` from `reserve_kv_slots`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSlotReservation {
+    pub block_size: usize,
+    pub total_blocks: usize,
+    pub free_blocks_before: usize,
+    pub free_blocks_after: usize,
+    pub allocations: Vec<KvSlotAllocation>,
+}
+
 /// Token-validity mask for model-side greedy argmax.
 ///
 /// `valid_token_mask[id] != 0` means token `id` may be selected. Tokens at or
@@ -398,6 +431,16 @@ pub trait ModelExecutor: Send + Sync {
     /// runtime cache window than the model's declared context length.
     fn kv_capacity(&self) -> Option<usize> {
         None
+    }
+
+    /// Reserve model-owned KV slots before a forward is dispatched.
+    ///
+    /// This is the executor-level admission hook for vLLM-style paged KV. The
+    /// engine calls it at the batch boundary so a request that cannot grow its
+    /// KV cache is delayed or preempted before kernel launch instead of
+    /// panicking inside attention.
+    fn reserve_kv_slots(&self, _requests: &[KvSlotRequest]) -> Result<Option<KvSlotReservation>> {
+        Ok(None)
     }
 
     /// Recurrent-state allocation spec for this request, when the model has
