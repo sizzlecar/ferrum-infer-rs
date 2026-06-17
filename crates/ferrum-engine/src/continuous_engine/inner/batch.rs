@@ -736,6 +736,10 @@ impl EngineInner {
         // Free KV cache manager blocks
         let _ = self.kv_cache.deallocate(victim_id.clone()).await;
 
+        if let Some(manager) = &self.recurrent_state_manager {
+            let _ = manager.deallocate(victim_id.clone()).await;
+        }
+
         // Reset sequence state — keep response/stream channels intact
         {
             let mut sequences = self.sequences.write();

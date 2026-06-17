@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZP — W3-S0 source checkpoint: recurrent-state manager injection
+
+- Scope:
+  - source-only W3-S0 manager-injection checkpoint;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added optional `RecurrentStateManager` ownership to `ContinuousBatchEngine`
+    construction and `EngineInner`;
+  - added `EngineBuilder::with_custom_recurrent_state_manager(...)` so tests or
+    future model-family wiring can inject a concrete manager without hidden
+    environment variables;
+  - wired completion and preemption cleanup to call recurrent-state manager
+    `deallocate` when a sequence actually owns recurrent state;
+  - kept the default product path unchanged: no recurrent manager is installed
+    unless typed construction supplies one.
+- Validation:
+  - `cargo check -p ferrum-engine --all-targets` PASS;
+  - `cargo test -p ferrum-engine builder -- --nocapture` PASS:
+    builder-filtered test set `10 passed`;
+  - `cargo fmt --all` PASS before final checks.
+- Next required validation:
+  - final local diff/format checks before commit;
+  - W3 still needs real recurrent-state manager allocation and S0 native
+    CUDA/PTX delta-rule microbench before product DeltaNet integration;
+  - W2 release-grade full matrix still requires restored Vast credit.
+
 ## 2026-06-17 ZO — W3-S0 source checkpoint: engine recurrent-state lifecycle carrier
 
 - Scope:
