@@ -194,6 +194,51 @@ pub struct Qwen35DenseFullAttentionLayerReference {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35SparseMoeLinearAttentionLayerShape {
+    pub tokens: usize,
+    pub hidden_size: usize,
+    pub attention: Qwen35LinearAttentionShape,
+    pub moe: Qwen35SparseMoeShape,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen35SparseMoeLinearAttentionLayerReference {
+    pub input_norm: Vec<f32>,
+    pub mixed_qkv_raw: Vec<f32>,
+    pub z_raw: Vec<f32>,
+    pub b_raw: Vec<f32>,
+    pub a_raw: Vec<f32>,
+    pub attention: Qwen35LinearAttentionReference,
+    pub delta_output: Vec<f32>,
+    pub residual_after_mixer: Vec<f32>,
+    pub post_attention_norm: Vec<f32>,
+    pub moe: Qwen35SparseMoeReference,
+    pub layer_output: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Qwen35SparseMoeFullAttentionLayerShape {
+    pub tokens: usize,
+    pub hidden_size: usize,
+    pub attention: Qwen35FullAttentionShape,
+    pub moe: Qwen35SparseMoeShape,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen35SparseMoeFullAttentionLayerReference {
+    pub input_norm: Vec<f32>,
+    pub query_raw: Vec<f32>,
+    pub key_raw: Vec<f32>,
+    pub value_raw: Vec<f32>,
+    pub attention: Qwen35FullAttentionReference,
+    pub attn_output: Vec<f32>,
+    pub residual_after_attention: Vec<f32>,
+    pub post_attention_norm: Vec<f32>,
+    pub moe: Qwen35SparseMoeReference,
+    pub layer_output: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Qwen35SparseMoeShape {
     pub tokens: usize,
     pub hidden_size: usize,
@@ -561,6 +606,315 @@ pub fn qwen35_dense_full_attention_layer_cpu(
         residual_after_attention,
         post_attention_norm,
         mlp_output,
+        layer_output,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_sparse_moe_linear_attention_layer_cpu(
+    layer_input: &[f32],
+    input_norm_weight: &[f32],
+    qkv_weight: &[f32],
+    z_weight: &[f32],
+    b_weight: &[f32],
+    a_weight: &[f32],
+    conv1d_weight: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    norm_weight: &[f32],
+    out_proj_weight: &[f32],
+    post_attention_norm_weight: &[f32],
+    router_weight: &[f32],
+    fused_gate_up_proj: &[f32],
+    fused_down_proj: &[f32],
+    shared_expert_gate_weight: &[f32],
+    shared_expert_gate_proj_weight: &[f32],
+    shared_expert_up_proj_weight: &[f32],
+    shared_expert_down_proj_weight: &[f32],
+    initial_state: &[f32],
+    shape: Qwen35SparseMoeLinearAttentionLayerShape,
+    eps: f32,
+) -> Result<Qwen35SparseMoeLinearAttentionLayerReference> {
+    shape.validate()?;
+    let attention_shape = shape.attention;
+    let hidden_len = shape.tokens * shape.hidden_size;
+    let value_total = attention_shape.value_total();
+    validate_len(
+        "sparse MoE linear layer input",
+        layer_input.len(),
+        hidden_len,
+    )?;
+    validate_len(
+        "sparse MoE linear layer input_norm_weight",
+        input_norm_weight.len(),
+        shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE linear layer qkv_weight",
+        qkv_weight.len(),
+        attention_shape.conv_channels() * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE linear layer z_weight",
+        z_weight.len(),
+        value_total * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE linear layer b_weight",
+        b_weight.len(),
+        attention_shape.value_heads * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE linear layer a_weight",
+        a_weight.len(),
+        attention_shape.value_heads * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE linear layer out_proj_weight",
+        out_proj_weight.len(),
+        shape.hidden_size * value_total,
+    )?;
+    validate_len(
+        "sparse MoE linear layer post_attention_norm_weight",
+        post_attention_norm_weight.len(),
+        shape.hidden_size,
+    )?;
+
+    let input_norm = qwen35_rms_norm_plus_one_cpu(
+        layer_input,
+        input_norm_weight,
+        shape.tokens,
+        shape.hidden_size,
+        eps,
+    )?;
+    let mixed_qkv_raw = qwen35_linear_cpu(
+        &input_norm,
+        qkv_weight,
+        shape.tokens,
+        shape.hidden_size,
+        attention_shape.conv_channels(),
+    )?;
+    let z_raw = qwen35_linear_cpu(
+        &input_norm,
+        z_weight,
+        shape.tokens,
+        shape.hidden_size,
+        value_total,
+    )?;
+    let b_raw = qwen35_linear_cpu(
+        &input_norm,
+        b_weight,
+        shape.tokens,
+        shape.hidden_size,
+        attention_shape.value_heads,
+    )?;
+    let a_raw = qwen35_linear_cpu(
+        &input_norm,
+        a_weight,
+        shape.tokens,
+        shape.hidden_size,
+        attention_shape.value_heads,
+    )?;
+    let attention = qwen35_linear_attention_core_cpu(
+        &mixed_qkv_raw,
+        &z_raw,
+        &a_raw,
+        &b_raw,
+        conv1d_weight,
+        a_log,
+        dt_bias,
+        norm_weight,
+        initial_state,
+        attention_shape,
+        eps,
+    )?;
+    let delta_output = qwen35_linear_cpu(
+        &attention.delta_norm,
+        out_proj_weight,
+        shape.tokens,
+        value_total,
+        shape.hidden_size,
+    )?;
+    let residual_after_mixer = add_same_len(layer_input, &delta_output, "residual_after_mixer")?;
+    let post_attention_norm = qwen35_rms_norm_plus_one_cpu(
+        &residual_after_mixer,
+        post_attention_norm_weight,
+        shape.tokens,
+        shape.hidden_size,
+        eps,
+    )?;
+    let moe = qwen35_sparse_moe_shared_expert_cpu(
+        &post_attention_norm,
+        router_weight,
+        fused_gate_up_proj,
+        fused_down_proj,
+        shared_expert_gate_weight,
+        shared_expert_gate_proj_weight,
+        shared_expert_up_proj_weight,
+        shared_expert_down_proj_weight,
+        shape.moe,
+    )?;
+    let layer_output = add_same_len(&residual_after_mixer, &moe.moe_output, "layer_output")?;
+
+    Ok(Qwen35SparseMoeLinearAttentionLayerReference {
+        input_norm,
+        mixed_qkv_raw,
+        z_raw,
+        b_raw,
+        a_raw,
+        attention,
+        delta_output,
+        residual_after_mixer,
+        post_attention_norm,
+        moe,
+        layer_output,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_sparse_moe_full_attention_layer_cpu(
+    layer_input: &[f32],
+    input_norm_weight: &[f32],
+    q_weight: &[f32],
+    k_weight: &[f32],
+    v_weight: &[f32],
+    q_norm_weight: &[f32],
+    k_norm_weight: &[f32],
+    o_weight: &[f32],
+    post_attention_norm_weight: &[f32],
+    router_weight: &[f32],
+    fused_gate_up_proj: &[f32],
+    fused_down_proj: &[f32],
+    shared_expert_gate_weight: &[f32],
+    shared_expert_gate_proj_weight: &[f32],
+    shared_expert_up_proj_weight: &[f32],
+    shared_expert_down_proj_weight: &[f32],
+    shape: Qwen35SparseMoeFullAttentionLayerShape,
+    eps: f32,
+) -> Result<Qwen35SparseMoeFullAttentionLayerReference> {
+    shape.validate()?;
+    let attention_shape = shape.attention;
+    let hidden_len = shape.tokens * shape.hidden_size;
+    let q_total = attention_shape.q_total();
+    let kv_total = attention_shape.kv_total();
+    validate_len("sparse MoE full layer input", layer_input.len(), hidden_len)?;
+    validate_len(
+        "sparse MoE full layer input_norm_weight",
+        input_norm_weight.len(),
+        shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE full layer q_weight",
+        q_weight.len(),
+        q_total * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE full layer k_weight",
+        k_weight.len(),
+        kv_total * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE full layer v_weight",
+        v_weight.len(),
+        kv_total * shape.hidden_size,
+    )?;
+    validate_len(
+        "sparse MoE full layer q_norm_weight",
+        q_norm_weight.len(),
+        attention_shape.head_dim,
+    )?;
+    validate_len(
+        "sparse MoE full layer k_norm_weight",
+        k_norm_weight.len(),
+        attention_shape.head_dim,
+    )?;
+    validate_len(
+        "sparse MoE full layer o_weight",
+        o_weight.len(),
+        shape.hidden_size * q_total,
+    )?;
+    validate_len(
+        "sparse MoE full layer post_attention_norm_weight",
+        post_attention_norm_weight.len(),
+        shape.hidden_size,
+    )?;
+
+    let input_norm = qwen35_rms_norm_plus_one_cpu(
+        layer_input,
+        input_norm_weight,
+        shape.tokens,
+        shape.hidden_size,
+        eps,
+    )?;
+    let query_raw = qwen35_linear_cpu(
+        &input_norm,
+        q_weight,
+        shape.tokens,
+        shape.hidden_size,
+        q_total,
+    )?;
+    let key_raw = qwen35_linear_cpu(
+        &input_norm,
+        k_weight,
+        shape.tokens,
+        shape.hidden_size,
+        kv_total,
+    )?;
+    let value_raw = qwen35_linear_cpu(
+        &input_norm,
+        v_weight,
+        shape.tokens,
+        shape.hidden_size,
+        kv_total,
+    )?;
+    let attention = qwen35_full_attention_core_cpu(
+        &query_raw,
+        &key_raw,
+        &value_raw,
+        q_norm_weight,
+        k_norm_weight,
+        attention_shape,
+        eps,
+    )?;
+    let attn_output = qwen35_linear_cpu(
+        &attention.context,
+        o_weight,
+        shape.tokens,
+        q_total,
+        shape.hidden_size,
+    )?;
+    let residual_after_attention =
+        add_same_len(layer_input, &attn_output, "residual_after_attention")?;
+    let post_attention_norm = qwen35_rms_norm_plus_one_cpu(
+        &residual_after_attention,
+        post_attention_norm_weight,
+        shape.tokens,
+        shape.hidden_size,
+        eps,
+    )?;
+    let moe = qwen35_sparse_moe_shared_expert_cpu(
+        &post_attention_norm,
+        router_weight,
+        fused_gate_up_proj,
+        fused_down_proj,
+        shared_expert_gate_weight,
+        shared_expert_gate_proj_weight,
+        shared_expert_up_proj_weight,
+        shared_expert_down_proj_weight,
+        shape.moe,
+    )?;
+    let layer_output = add_same_len(&residual_after_attention, &moe.moe_output, "layer_output")?;
+
+    Ok(Qwen35SparseMoeFullAttentionLayerReference {
+        input_norm,
+        query_raw,
+        key_raw,
+        value_raw,
+        attention,
+        attn_output,
+        residual_after_attention,
+        post_attention_norm,
+        moe,
         layer_output,
     })
 }
@@ -1683,6 +2037,63 @@ impl Qwen35DenseFullAttentionLayerShape {
     }
 }
 
+impl Qwen35SparseMoeLinearAttentionLayerShape {
+    fn validate(self) -> Result<()> {
+        if self.tokens == 0 || self.hidden_size == 0 {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse-MoE linear-attention layer shape must be positive, got {self:?}"
+            )));
+        }
+        self.attention.validate()?;
+        self.moe.validate()?;
+        if self.attention.tokens != self.tokens {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse-MoE linear layer tokens {} must match attention tokens {}",
+                self.tokens, self.attention.tokens
+            )));
+        }
+        if self.moe.tokens != self.tokens || self.moe.hidden_size != self.hidden_size {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse-MoE linear layer shape tokens={} hidden={} must match MoE {:?}",
+                self.tokens, self.hidden_size, self.moe
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Qwen35SparseMoeFullAttentionLayerShape {
+    fn validate(self) -> Result<()> {
+        if self.tokens == 0 || self.hidden_size == 0 {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse-MoE full-attention layer shape must be positive, got {self:?}"
+            )));
+        }
+        self.attention.validate()?;
+        self.moe.validate()?;
+        if self.attention.tokens != self.tokens {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse-MoE full layer tokens {} must match attention tokens {}",
+                self.tokens, self.attention.tokens
+            )));
+        }
+        if self.attention.q_total() != self.hidden_size {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse-MoE full layer hidden_size {} must match attention q_total {}",
+                self.hidden_size,
+                self.attention.q_total()
+            )));
+        }
+        if self.moe.tokens != self.tokens || self.moe.hidden_size != self.hidden_size {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse-MoE full layer shape tokens={} hidden={} must match MoE {:?}",
+                self.tokens, self.hidden_size, self.moe
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Qwen35SparseMoeShape {
     fn validate(self) -> Result<()> {
         if self.tokens == 0
@@ -2241,6 +2652,57 @@ mod tests {
                 (got - expected).abs() <= tolerance,
                 "idx {idx}: {got} != {expected}"
             );
+        }
+    }
+
+    struct SmallMoeWeights {
+        router_weight: Vec<f32>,
+        fused_gate_up_proj: Vec<f32>,
+        fused_down_proj: Vec<f32>,
+        shared_expert_gate_weight: Vec<f32>,
+        shared_expert_gate_proj_weight: Vec<f32>,
+        shared_expert_up_proj_weight: Vec<f32>,
+        shared_expert_down_proj_weight: Vec<f32>,
+    }
+
+    fn single_expert_moe_shape(tokens: usize, hidden_size: usize) -> Qwen35SparseMoeShape {
+        Qwen35SparseMoeShape {
+            tokens,
+            hidden_size,
+            num_experts: 1,
+            top_k: 1,
+            expert_intermediate_size: 2,
+            shared_expert_intermediate_size: 2,
+            norm_topk_prob: false,
+        }
+    }
+
+    fn small_moe_weights() -> SmallMoeWeights {
+        SmallMoeWeights {
+            router_weight: vec![0.1, -0.2],
+            fused_gate_up_proj: vec![
+                0.2, 0.1, //
+                -0.1, 0.3, //
+                0.4, -0.2, //
+                0.3, 0.5,
+            ],
+            fused_down_proj: vec![
+                0.5, 0.25, //
+                -0.2, 0.75,
+            ],
+            shared_expert_gate_weight: vec![0.25, -0.1],
+            shared_expert_gate_proj_weight: vec![
+                -0.2, 0.2, //
+                0.1, 0.3,
+            ],
+            shared_expert_up_proj_weight: vec![
+                0.25, 0.5, //
+                -0.3, 0.4,
+            ],
+            shared_expert_down_proj_weight: vec![
+                0.5, 0.25, //
+                -0.2, 0.75,
+            ],
         }
     }
 
@@ -2908,6 +3370,244 @@ mod tests {
         assert_close_slice(&reference.post_attention_norm, &post_attention_norm, 1e-6);
         assert_close_slice(&reference.mlp_output, &mlp_output, 1e-6);
         assert_close_slice(&reference.layer_output, &layer_output, 1e-6);
+    }
+
+    #[test]
+    fn sparse_moe_linear_attention_layer_composes_attention_residual_and_moe() {
+        let attention_shape = Qwen35LinearAttentionShape {
+            tokens: 2,
+            key_heads: 1,
+            value_heads: 1,
+            key_dim: 1,
+            value_dim: 1,
+            conv_kernel: 1,
+        };
+        let moe_shape = single_expert_moe_shape(2, 2);
+        let shape = Qwen35SparseMoeLinearAttentionLayerShape {
+            tokens: 2,
+            hidden_size: 2,
+            attention: attention_shape,
+            moe: moe_shape,
+        };
+        let layer_input = vec![1.0, 2.0, 3.0, 4.0];
+        let input_norm_weight = vec![0.0, 0.0];
+        let qkv_weight = vec![
+            1.0, 0.0, //
+            0.0, 1.0, //
+            1.0, 1.0,
+        ];
+        let z_weight = vec![1.0, -1.0];
+        let b_weight = vec![0.5, 0.25];
+        let a_weight = vec![-0.25, 0.75];
+        let conv1d_weight = vec![1.0, 1.0, 1.0];
+        let a_log = vec![0.0];
+        let dt_bias = vec![0.0];
+        let norm_weight = vec![1.0];
+        let out_proj_weight = vec![1.0, -0.5];
+        let post_attention_norm_weight = vec![0.0, 0.0];
+        let initial_state = vec![0.0; attention_shape.state_len()];
+        let moe_weights = small_moe_weights();
+
+        let dense_attention_only = qwen35_dense_linear_attention_layer_cpu(
+            &layer_input,
+            &input_norm_weight,
+            &qkv_weight,
+            &z_weight,
+            &b_weight,
+            &a_weight,
+            &conv1d_weight,
+            &a_log,
+            &dt_bias,
+            &norm_weight,
+            &out_proj_weight,
+            &post_attention_norm_weight,
+            &[0.0; 4],
+            &[0.0; 4],
+            &[0.0; 4],
+            &initial_state,
+            Qwen35DenseLinearAttentionLayerShape {
+                tokens: 2,
+                hidden_size: 2,
+                intermediate_size: 2,
+                attention: attention_shape,
+            },
+            1e-6,
+        )
+        .unwrap();
+        let moe = qwen35_sparse_moe_shared_expert_cpu(
+            &dense_attention_only.post_attention_norm,
+            &moe_weights.router_weight,
+            &moe_weights.fused_gate_up_proj,
+            &moe_weights.fused_down_proj,
+            &moe_weights.shared_expert_gate_weight,
+            &moe_weights.shared_expert_gate_proj_weight,
+            &moe_weights.shared_expert_up_proj_weight,
+            &moe_weights.shared_expert_down_proj_weight,
+            moe_shape,
+        )
+        .unwrap();
+        let expected_layer_output = add_same_len(
+            &dense_attention_only.residual_after_mixer,
+            &moe.moe_output,
+            "layer_output",
+        )
+        .unwrap();
+
+        let reference = qwen35_sparse_moe_linear_attention_layer_cpu(
+            &layer_input,
+            &input_norm_weight,
+            &qkv_weight,
+            &z_weight,
+            &b_weight,
+            &a_weight,
+            &conv1d_weight,
+            &a_log,
+            &dt_bias,
+            &norm_weight,
+            &out_proj_weight,
+            &post_attention_norm_weight,
+            &moe_weights.router_weight,
+            &moe_weights.fused_gate_up_proj,
+            &moe_weights.fused_down_proj,
+            &moe_weights.shared_expert_gate_weight,
+            &moe_weights.shared_expert_gate_proj_weight,
+            &moe_weights.shared_expert_up_proj_weight,
+            &moe_weights.shared_expert_down_proj_weight,
+            &initial_state,
+            shape,
+            1e-6,
+        )
+        .unwrap();
+
+        assert_close_slice(
+            &reference.residual_after_mixer,
+            &dense_attention_only.residual_after_mixer,
+            1e-6,
+        );
+        assert_close_slice(
+            &reference.post_attention_norm,
+            &dense_attention_only.post_attention_norm,
+            1e-6,
+        );
+        assert_eq!(reference.moe, moe);
+        assert_close_slice(&reference.layer_output, &expected_layer_output, 1e-6);
+    }
+
+    #[test]
+    fn sparse_moe_full_attention_layer_composes_attention_residual_and_moe() {
+        let attention_shape = Qwen35FullAttentionShape {
+            tokens: 2,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            position_offset: 0,
+            rope_theta: 10_000.0,
+        };
+        let moe_shape = single_expert_moe_shape(2, 2);
+        let shape = Qwen35SparseMoeFullAttentionLayerShape {
+            tokens: 2,
+            hidden_size: 2,
+            attention: attention_shape,
+            moe: moe_shape,
+        };
+        let layer_input = vec![1.0, 2.0, 3.0, 4.0];
+        let input_norm_weight = vec![0.0, 0.0];
+        let q_weight = vec![
+            1.0, 0.0, //
+            0.0, 1.0,
+        ];
+        let k_weight = vec![
+            0.5, 0.0, //
+            0.0, 0.5,
+        ];
+        let v_weight = vec![
+            1.0, 1.0, //
+            -0.5, 0.5,
+        ];
+        let q_norm_weight = vec![1.0, 1.0];
+        let k_norm_weight = vec![1.0, 1.0];
+        let o_weight = vec![
+            1.0, 0.0, //
+            0.0, 1.0,
+        ];
+        let post_attention_norm_weight = vec![0.0, 0.0];
+        let moe_weights = small_moe_weights();
+
+        let dense_attention_only = qwen35_dense_full_attention_layer_cpu(
+            &layer_input,
+            &input_norm_weight,
+            &q_weight,
+            &k_weight,
+            &v_weight,
+            &q_norm_weight,
+            &k_norm_weight,
+            &o_weight,
+            &post_attention_norm_weight,
+            &[0.0; 4],
+            &[0.0; 4],
+            &[0.0; 4],
+            Qwen35DenseFullAttentionLayerShape {
+                tokens: 2,
+                hidden_size: 2,
+                intermediate_size: 2,
+                attention: attention_shape,
+            },
+            1e-6,
+        )
+        .unwrap();
+        let moe = qwen35_sparse_moe_shared_expert_cpu(
+            &dense_attention_only.post_attention_norm,
+            &moe_weights.router_weight,
+            &moe_weights.fused_gate_up_proj,
+            &moe_weights.fused_down_proj,
+            &moe_weights.shared_expert_gate_weight,
+            &moe_weights.shared_expert_gate_proj_weight,
+            &moe_weights.shared_expert_up_proj_weight,
+            &moe_weights.shared_expert_down_proj_weight,
+            moe_shape,
+        )
+        .unwrap();
+        let expected_layer_output = add_same_len(
+            &dense_attention_only.residual_after_attention,
+            &moe.moe_output,
+            "layer_output",
+        )
+        .unwrap();
+
+        let reference = qwen35_sparse_moe_full_attention_layer_cpu(
+            &layer_input,
+            &input_norm_weight,
+            &q_weight,
+            &k_weight,
+            &v_weight,
+            &q_norm_weight,
+            &k_norm_weight,
+            &o_weight,
+            &post_attention_norm_weight,
+            &moe_weights.router_weight,
+            &moe_weights.fused_gate_up_proj,
+            &moe_weights.fused_down_proj,
+            &moe_weights.shared_expert_gate_weight,
+            &moe_weights.shared_expert_gate_proj_weight,
+            &moe_weights.shared_expert_up_proj_weight,
+            &moe_weights.shared_expert_down_proj_weight,
+            shape,
+            1e-6,
+        )
+        .unwrap();
+
+        assert_close_slice(
+            &reference.residual_after_attention,
+            &dense_attention_only.residual_after_attention,
+            1e-6,
+        );
+        assert_close_slice(
+            &reference.post_attention_norm,
+            &dense_attention_only.post_attention_norm,
+            1e-6,
+        );
+        assert_eq!(reference.moe, moe);
+        assert_close_slice(&reference.layer_output, &expected_layer_output, 1e-6);
     }
 
     #[test]
