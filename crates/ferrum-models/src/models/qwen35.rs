@@ -274,6 +274,41 @@ pub fn qwen35_recurrent_gated_delta_rule_cpu(
     Ok((out, state))
 }
 
+pub fn qwen35_gdn_gating_cpu(
+    a_log: &[f32],
+    a: &[f32],
+    b: &[f32],
+    dt_bias: &[f32],
+    tokens: usize,
+    value_heads: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let gating_len = tokens
+        .checked_mul(value_heads)
+        .ok_or_else(|| FerrumError::model("Qwen3.5 GDN gating shape overflow".to_string()))?;
+    for (label, actual, expected) in [
+        ("A_log", a_log.len(), value_heads),
+        ("dt_bias", dt_bias.len(), value_heads),
+        ("a", a.len(), gating_len),
+        ("b", b.len(), gating_len),
+    ] {
+        if actual != expected {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 GDN gating {label} length {actual} != expected {expected}"
+            )));
+        }
+    }
+    let mut g = vec![0.0; gating_len];
+    let mut beta = vec![0.0; gating_len];
+    for token in 0..tokens {
+        for head in 0..value_heads {
+            let idx = token * value_heads + head;
+            g[idx] = -a_log[head].exp() * softplus(a[idx] + dt_bias[head]);
+            beta[idx] = sigmoid(b[idx]);
+        }
+    }
+    Ok((g, beta))
+}
+
 fn validate_delta_rule_shapes(
     query: &[f32],
     key: &[f32],
@@ -319,6 +354,26 @@ fn l2_normalize(values: &mut [f32]) {
     let inv = (norm + 1e-6).sqrt().recip();
     for value in values {
         *value *= inv;
+    }
+}
+
+fn sigmoid(x: f32) -> f32 {
+    if x >= 0.0 {
+        let z = (-x).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = x.exp();
+        z / (1.0 + z)
+    }
+}
+
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else if x < -20.0 {
+        x.exp()
+    } else {
+        (1.0 + x.exp()).ln()
     }
 }
 
@@ -863,5 +918,40 @@ mod tests {
         .expect_err("value heads must divide key heads before update");
 
         assert!(err.to_string().contains("value_heads 3"), "{err}");
+    }
+
+    #[test]
+    fn gdn_gating_matches_reference_formula() {
+        let (g, beta) = qwen35_gdn_gating_cpu(
+            &[0.0, (2.0f32).ln()],
+            &[0.0, 1.0, -1.0, 2.0],
+            &[0.0, 1.0, -1.0, 2.0],
+            &[0.0, 0.5],
+            2,
+            2,
+        )
+        .unwrap();
+        let expected_g = [
+            -softplus(0.0),
+            -2.0 * softplus(1.5),
+            -softplus(-1.0),
+            -2.0 * softplus(2.5),
+        ];
+        let expected_beta = [sigmoid(0.0), sigmoid(1.0), sigmoid(-1.0), sigmoid(2.0)];
+
+        for (got, expected) in g.iter().zip(expected_g) {
+            assert!((got - expected).abs() < 1e-6, "{got} != {expected}");
+        }
+        for (got, expected) in beta.iter().zip(expected_beta) {
+            assert!((got - expected).abs() < 1e-6, "{got} != {expected}");
+        }
+    }
+
+    #[test]
+    fn gdn_gating_rejects_shape_mismatch() {
+        let err = qwen35_gdn_gating_cpu(&[0.0], &[0.0, 1.0], &[0.0], &[0.0], 2, 1)
+            .expect_err("b length should fail");
+
+        assert!(err.to_string().contains("b length"), "{err}");
     }
 }

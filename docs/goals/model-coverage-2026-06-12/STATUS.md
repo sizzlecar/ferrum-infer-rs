@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZU — W3 GDN gating CPU-reference checkpoint
+
+- Scope:
+  - W3-S2 Qwen Gated DeltaNet reference math before backend kernel wiring;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Source comparison:
+  - checked vLLM CPU/reference GDN path:
+    `g = -exp(A_log) * softplus(a + dt_bias)`;
+  - checked `beta = sigmoid(b)` from the same path.
+- Change:
+  - added `qwen35_gdn_gating_cpu()`;
+  - validates `A_log`, `dt_bias`, `a`, and `b` lengths;
+  - returns `g` and `beta` in `[tokens, value_heads]` layout;
+  - shares the reference with the recurrent DeltaNet CPU path added in the
+    previous checkpoint.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `25 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still CPU/reference math only;
+  - it is not wired into product `prefill`/`decode`;
+  - no CUDA/Metal kernel or product correctness gate was run.
+
 ## 2026-06-18 ZZT — W3 DeltaNet recurrent CPU-reference checkpoint
 
 - Scope:
