@@ -2,6 +2,35 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ3 — W3 dense reference runtime materializer checkpoint
+
+- Scope:
+  - W3-S2 dense Qwen3.5 reference runtime construction from the real weight
+    planning abstraction;
+  - no product registry wiring was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35DenseReferenceRuntime::from_cpu_weight_plan()`;
+  - materializes dense W3 reference weights from `Qwen35ResolvedWeightPlan`
+    plus `WeightLoader<CpuBackend>`;
+  - uses plan roles for embeddings, final norm, optional tied/untied lm head,
+    linear-attention projections/state parameters, full-attention projections,
+    q/k norms, and dense MLP projections;
+  - preserves `norm_eps` and RoPE theta as explicit constructor inputs instead
+    of hard-coded product behavior.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `48 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - dense safetensors CPU-reference materialization is now test-covered, but
+    product `ferrum run`/`ferrum serve` are still not enabled;
+  - sparse-MoE runtime materialization and decode/recurrent-state semantics are
+    still incomplete;
+  - W3 correctness gates and W3 80% performance gates remain incomplete.
+
 ## 2026-06-18 ZZZ2 — W3 dense reference executor prefill checkpoint
 
 - Scope:
