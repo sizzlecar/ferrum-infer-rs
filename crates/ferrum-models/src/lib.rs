@@ -33,6 +33,7 @@ pub mod models;
 pub mod moe;
 pub mod moe_config;
 pub mod multimodal;
+pub mod qwen35_config;
 pub mod registry;
 pub mod source;
 pub mod tensor_wrapper;

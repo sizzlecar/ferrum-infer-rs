@@ -1,0 +1,106 @@
+use ferrum_models::qwen35_config::{Qwen35LayerType, Qwen35TextConfig};
+
+const ARTIFACT_ROOT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/goals/model-coverage-2026-06-12/artifacts/",
+    "w3_hf_config_probe_20260617T131209Z_f97c1d6f"
+);
+
+fn read_artifact(name: &str) -> String {
+    std::fs::read_to_string(format!("{ARTIFACT_ROOT}/{name}")).unwrap()
+}
+
+#[test]
+fn parses_official_qwen35_dense_min_config() {
+    let raw = read_artifact("dense_min_reference.config.json");
+    let cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
+    assert!(!cfg.is_moe());
+    assert_eq!(cfg.top_level_model_type.as_deref(), Some("qwen3_5"));
+    assert_eq!(cfg.text_model_type, "qwen3_5_text");
+    assert_eq!(cfg.hidden_size, 1024);
+    assert_eq!(cfg.num_hidden_layers, 24);
+    assert_eq!(cfg.linear_attention_layers(), 18);
+    assert_eq!(cfg.full_attention_layers(), 6);
+    assert_eq!(cfg.first_linear_attention_layer(), Some(0));
+    assert_eq!(cfg.first_full_attention_layer(), Some(3));
+    assert_eq!(cfg.linear_attention.num_key_heads, 16);
+    assert_eq!(cfg.linear_attention.num_value_heads, 16);
+    assert_eq!(cfg.linear_attention.key_head_dim, 128);
+    assert_eq!(cfg.linear_attention.value_head_dim, 128);
+    assert_eq!(cfg.linear_attention.conv_kernel_dim, 4);
+    assert_eq!(cfg.dense_intermediate_size, Some(3584));
+}
+
+#[test]
+fn parses_official_qwen36_shared_expert_moe_config() {
+    let raw = read_artifact("moe_shared_expert_reference.config.json");
+    let cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
+    assert!(cfg.is_moe());
+    assert_eq!(cfg.top_level_model_type.as_deref(), Some("qwen3_5_moe"));
+    assert_eq!(cfg.text_model_type, "qwen3_5_moe_text");
+    assert_eq!(cfg.hidden_size, 2048);
+    assert_eq!(cfg.num_hidden_layers, 40);
+    assert_eq!(cfg.linear_attention_layers(), 30);
+    assert_eq!(cfg.full_attention_layers(), 10);
+    assert_eq!(cfg.layer_types[3], Qwen35LayerType::FullAttention);
+    assert_eq!(cfg.linear_attention.num_key_heads, 16);
+    assert_eq!(cfg.linear_attention.num_value_heads, 32);
+    let moe = cfg.moe.as_ref().unwrap();
+    assert_eq!(moe.num_experts, 256);
+    assert_eq!(moe.num_experts_per_tok, 8);
+    assert_eq!(moe.moe_intermediate_size, 512);
+    assert_eq!(moe.shared_expert_intermediate_size, 512);
+}
+
+#[test]
+fn rejects_dense_config_with_moe_fields() {
+    let raw = r#"{
+      "model_type": "qwen3_5",
+      "text_config": {
+        "model_type": "qwen3_5_text",
+        "hidden_size": 16,
+        "num_hidden_layers": 4,
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 2,
+        "linear_key_head_dim": 4,
+        "linear_value_head_dim": 4,
+        "linear_conv_kernel_dim": 4,
+        "head_dim": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "intermediate_size": 32,
+        "num_experts": 8
+      }
+    }"#;
+    let err = Qwen35TextConfig::from_hf_config_str(raw)
+        .expect_err("dense config with MoE fields should fail");
+    assert!(err.contains("num_experts"), "{err}");
+}
+
+#[test]
+fn rejects_moe_config_without_shared_expert() {
+    let raw = r#"{
+      "model_type": "qwen3_5_moe",
+      "text_config": {
+        "model_type": "qwen3_5_moe_text",
+        "hidden_size": 16,
+        "num_hidden_layers": 4,
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 2,
+        "linear_key_head_dim": 4,
+        "linear_value_head_dim": 4,
+        "linear_conv_kernel_dim": 4,
+        "head_dim": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 4
+      }
+    }"#;
+    let err = Qwen35TextConfig::from_hf_config_str(raw)
+        .expect_err("MoE config without shared expert should fail");
+    assert!(err.contains("shared_expert_intermediate_size"), "{err}");
+}
