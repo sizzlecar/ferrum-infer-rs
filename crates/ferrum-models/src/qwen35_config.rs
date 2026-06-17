@@ -68,6 +68,7 @@ pub struct Qwen35MoeTextConfig {
     pub num_experts_per_tok: usize,
     pub moe_intermediate_size: usize,
     pub shared_expert_intermediate_size: usize,
+    pub norm_topk_prob: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -156,6 +157,9 @@ impl Qwen35TextConfig {
                     text_config,
                     "shared_expert_intermediate_size",
                 )?,
+                norm_topk_prob: optional_bool(text_config, "norm_topk_prob")?
+                    .or(optional_bool(obj, "norm_topk_prob")?)
+                    .unwrap_or(true),
             })
         } else {
             reject_dense_moe_fields(text_config)?;
@@ -615,6 +619,7 @@ fn reject_dense_moe_fields(map: &serde_json::Map<String, Value>) -> Result<(), S
         "num_experts_per_tok",
         "moe_intermediate_size",
         "shared_expert_intermediate_size",
+        "norm_topk_prob",
     ] {
         if map.get(key).is_some_and(|value| !value.is_null()) {
             return Err(format!("dense Qwen3.5 config unexpectedly defines {key}"));
