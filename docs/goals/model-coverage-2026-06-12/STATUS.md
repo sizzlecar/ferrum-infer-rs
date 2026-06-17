@@ -2,6 +2,35 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZQ — W3 typed model-weight materialization checkpoint
+
+- Scope:
+  - W3-S2 materialization boundary after role-aware weight loading;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `models::qwen35`;
+  - added `Qwen35ModelWeights`;
+  - added typed layer weights for linear-attention layers, full-attention
+    layers, dense MLP layers, and sparse MoE/shared-expert layers;
+  - materialization now uses `Qwen35WeightPlanLoader` plus the existing
+    backend `WeightLoader<B>` abstraction;
+  - dense tied `lm_head` falls back to the embedding linear path, matching the
+    existing Qwen3/Qwen3-MoE loader convention;
+  - sparse MoE fused expert tensors are loaded as raw backend buffers instead
+    of pretending they are rank-2 linears.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `17 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this still does not implement Qwen3.5/Qwen3.6 prefill/decode;
+  - this does not register W3 product execution;
+  - recurrent-state update and DeltaNet/full-attention forward wiring remain
+    the next W3-S2 blockers.
+
 ## 2026-06-18 ZZP — W3 role-aware weight-loader adapter checkpoint
 
 - Scope:
