@@ -1,0 +1,896 @@
+{
+  "backend": "cuda",
+  "binary_sha256": "d65b109291a964517c8d51f2639094e5d67f1d80aae37c6da081a37b2bef9606",
+  "correctness": {
+    "l0_template": {
+      "artifact": "crates/ferrum-server/tests/fixtures/chat_template/unsloth__gemma-3-1b-it",
+      "source_cell": "l0_template",
+      "status": "pass"
+    },
+    "l1_numeric": {
+      "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/gemma3_l1",
+      "source_cell": "l1_bf16",
+      "status": "pass"
+    },
+    "l2_quantized": {
+      "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log",
+      "source_cell": "l2_gptq_cuda",
+      "status": "pass"
+    },
+    "l3_behavior": {
+      "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log",
+      "source_cell": "l3_behavior",
+      "status": "pass"
+    },
+    "l4_agent": {
+      "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log",
+      "source_cell": "l4_agent",
+      "status": "pass"
+    },
+    "l5_concurrency": {
+      "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_c32_admission16_l5_pass_2026-06-14/l5_gemma3-27b-gptq_cuda.json",
+      "source_cell": "l5_concurrency",
+      "status": "pass"
+    }
+  },
+  "dirty_status": {
+    "dirty": false,
+    "status_short": ""
+  },
+  "git_sha": "8181a99d7d6f9167f31dccd4767b31304a3c4e50",
+  "goal_doc": "docs/goals/model-coverage-2026-06-12/RELEASE_GRADE_GOAL.md",
+  "hardware": {
+    "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/env/nvidia_smi_before.txt",
+    "status": "pass"
+  },
+  "lane": "w2",
+  "model_id": "gemma3:27b-gptq",
+  "performance": {
+    "baseline": {
+      "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_prefill_full_matrix_samehw_cuda_2026-06-17/remote_retry2_failure/perf/bench_vllm_sharegpt_sweep_100x3.json",
+      "bench_command_line": [
+        "timeout",
+        "14400",
+        "/workspace/ferrum-infer-rs/target/release/ferrum",
+        "bench-serve",
+        "--base-url",
+        "http://127.0.0.1:18245",
+        "--model",
+        "gemma3:27b-gptq",
+        "--tokenizer",
+        "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+        "--dataset",
+        "sharegpt",
+        "--sharegpt-path",
+        "/workspace/ascii_sharegpt_w2_100.jsonl",
+        "--random-output-len",
+        "128",
+        "--concurrency-sweep",
+        "1,4,16,32",
+        "--num-prompts",
+        "100",
+        "--n-repeats",
+        "3",
+        "--fail-on-error",
+        "--require-ci",
+        "--seed",
+        "9271",
+        "--out",
+        "/workspace/w2_dynamic_prefill_full_matrix_samehw_cuda_2026-06-17_retry2/perf/bench_vllm_sharegpt_sweep_100x3.json"
+      ],
+      "build_command_line": [
+        "python",
+        "-m",
+        "pip",
+        "install",
+        "vllm==0.10.1.1"
+      ],
+      "command_line": [
+        "/workspace/vllm-venv-0101-cu126/bin/python",
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18245",
+        "--model",
+        "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+        "--served-model-name",
+        "gemma3:27b-gptq",
+        "--max-model-len",
+        "512",
+        "--max-num-seqs",
+        "32",
+        "--gpu-memory-utilization",
+        "0.92"
+      ],
+      "engine": "vLLM",
+      "evidence_mode": "historical",
+      "same_hardware": true,
+      "same_model": true,
+      "same_quantization": true,
+      "version": "0.10.1.1"
+    },
+    "cells": [
+      {
+        "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/perf/bench_ferrum_sharegpt_sweep_100x3.json",
+        "bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_bench_command_line": [
+          "timeout",
+          "14400",
+          "/workspace/ferrum-infer-rs/target/release/ferrum",
+          "bench-serve",
+          "--base-url",
+          "http://127.0.0.1:18245",
+          "--model",
+          "gemma3:27b-gptq",
+          "--tokenizer",
+          "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+          "--dataset",
+          "sharegpt",
+          "--sharegpt-path",
+          "/workspace/ascii_sharegpt_w2_100.jsonl",
+          "--random-output-len",
+          "128",
+          "--concurrency-sweep",
+          "1,4,16,32",
+          "--num-prompts",
+          "100",
+          "--n-repeats",
+          "3",
+          "--fail-on-error",
+          "--require-ci",
+          "--seed",
+          "9271",
+          "--out",
+          "/workspace/w2_dynamic_prefill_full_matrix_samehw_cuda_2026-06-17_retry2/perf/bench_vllm_sharegpt_sweep_100x3.json"
+        ],
+        "baseline_completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "baseline_duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_effective_active_concurrency": 1,
+        "baseline_errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_n_repeats": 3,
+        "baseline_output_token_count_source": "usage",
+        "baseline_output_tps": 43.218729299743835,
+        "baseline_p95_itl_ms": 22.955233583333328,
+        "baseline_panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_prompt_dataset_id": "w2/ascii-sharegpt-100-seed9271",
+        "baseline_prompt_dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+        "baseline_requests_per_run": 100,
+        "baseline_stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_stream_options_include_usage": true,
+        "baseline_zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ],
+        "bench_command_line": [
+          "timeout",
+          "14400",
+          "/workspace/ferrum-infer-rs/target/release/ferrum",
+          "bench-serve",
+          "--base-url",
+          "http://127.0.0.1:18247",
+          "--model",
+          "gemma3:27b-gptq",
+          "--tokenizer",
+          "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+          "--dataset",
+          "sharegpt",
+          "--sharegpt-path",
+          "/workspace/ascii_sharegpt_w2_100_58d5721d.jsonl",
+          "--random-output-len",
+          "128",
+          "--concurrency-sweep",
+          "1,4,16,32",
+          "--num-prompts",
+          "100",
+          "--n-repeats",
+          "3",
+          "--fail-on-error",
+          "--require-ci",
+          "--seed",
+          "9271",
+          "--out",
+          "/workspace/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/perf/bench_ferrum_sharegpt_sweep_100x3.json"
+        ],
+        "completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "effective_active_concurrency": 1,
+        "errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "ferrum_output_tps_lcb": 46.06618455965938,
+        "ferrum_p95_itl_ms": 21.346890716666667,
+        "http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "n_repeats": 3,
+        "output_token_count_source": "usage",
+        "panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "prompt_dataset_id": "w2/ascii-sharegpt-100-seed9271",
+        "prompt_dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+        "ratio": 1.065884751959434,
+        "requested_concurrency": 1,
+        "requests_per_run": 100,
+        "same_hardware": true,
+        "same_model": true,
+        "same_prompt_or_dataset": true,
+        "same_quantization": true,
+        "stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "stream_options_include_usage": true,
+        "zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/perf/bench_ferrum_sharegpt_sweep_100x3.json",
+        "bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_bench_command_line": [
+          "timeout",
+          "14400",
+          "/workspace/ferrum-infer-rs/target/release/ferrum",
+          "bench-serve",
+          "--base-url",
+          "http://127.0.0.1:18245",
+          "--model",
+          "gemma3:27b-gptq",
+          "--tokenizer",
+          "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+          "--dataset",
+          "sharegpt",
+          "--sharegpt-path",
+          "/workspace/ascii_sharegpt_w2_100.jsonl",
+          "--random-output-len",
+          "128",
+          "--concurrency-sweep",
+          "1,4,16,32",
+          "--num-prompts",
+          "100",
+          "--n-repeats",
+          "3",
+          "--fail-on-error",
+          "--require-ci",
+          "--seed",
+          "9271",
+          "--out",
+          "/workspace/w2_dynamic_prefill_full_matrix_samehw_cuda_2026-06-17_retry2/perf/bench_vllm_sharegpt_sweep_100x3.json"
+        ],
+        "baseline_completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "baseline_duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_effective_active_concurrency": 4,
+        "baseline_errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_n_repeats": 3,
+        "baseline_output_token_count_source": "usage",
+        "baseline_output_tps": 162.8373227316501,
+        "baseline_p95_itl_ms": 23.58017641666667,
+        "baseline_panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_prompt_dataset_id": "w2/ascii-sharegpt-100-seed9271",
+        "baseline_prompt_dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+        "baseline_requests_per_run": 100,
+        "baseline_stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_stream_options_include_usage": true,
+        "baseline_zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ],
+        "bench_command_line": [
+          "timeout",
+          "14400",
+          "/workspace/ferrum-infer-rs/target/release/ferrum",
+          "bench-serve",
+          "--base-url",
+          "http://127.0.0.1:18247",
+          "--model",
+          "gemma3:27b-gptq",
+          "--tokenizer",
+          "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+          "--dataset",
+          "sharegpt",
+          "--sharegpt-path",
+          "/workspace/ascii_sharegpt_w2_100_58d5721d.jsonl",
+          "--random-output-len",
+          "128",
+          "--concurrency-sweep",
+          "1,4,16,32",
+          "--num-prompts",
+          "100",
+          "--n-repeats",
+          "3",
+          "--fail-on-error",
+          "--require-ci",
+          "--seed",
+          "9271",
+          "--out",
+          "/workspace/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/perf/bench_ferrum_sharegpt_sweep_100x3.json"
+        ],
+        "completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "effective_active_concurrency": 4,
+        "errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "ferrum_output_tps_lcb": 157.0913193074107,
+        "ferrum_p95_itl_ms": 24.204866666666664,
+        "http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "n_repeats": 3,
+        "output_token_count_source": "usage",
+        "panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "prompt_dataset_id": "w2/ascii-sharegpt-100-seed9271",
+        "prompt_dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+        "ratio": 0.9647132283444099,
+        "requested_concurrency": 4,
+        "requests_per_run": 100,
+        "same_hardware": true,
+        "same_model": true,
+        "same_prompt_or_dataset": true,
+        "same_quantization": true,
+        "stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "stream_options_include_usage": true,
+        "zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/perf/bench_ferrum_sharegpt_sweep_100x3.json",
+        "bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_bench_command_line": [
+          "timeout",
+          "14400",
+          "/workspace/ferrum-infer-rs/target/release/ferrum",
+          "bench-serve",
+          "--base-url",
+          "http://127.0.0.1:18245",
+          "--model",
+          "gemma3:27b-gptq",
+          "--tokenizer",
+          "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+          "--dataset",
+          "sharegpt",
+          "--sharegpt-path",
+          "/workspace/ascii_sharegpt_w2_100.jsonl",
+          "--random-output-len",
+          "128",
+          "--concurrency-sweep",
+          "1,4,16,32",
+          "--num-prompts",
+          "100",
+          "--n-repeats",
+          "3",
+          "--fail-on-error",
+          "--require-ci",
+          "--seed",
+          "9271",
+          "--out",
+          "/workspace/w2_dynamic_prefill_full_matrix_samehw_cuda_2026-06-17_retry2/perf/bench_vllm_sharegpt_sweep_100x3.json"
+        ],
+        "baseline_completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "baseline_duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_effective_active_concurrency": 16,
+        "baseline_errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_n_repeats": 3,
+        "baseline_output_token_count_source": "usage",
+        "baseline_output_tps": 431.01168442039665,
+        "baseline_p95_itl_ms": 34.994875266666654,
+        "baseline_panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_prompt_dataset_id": "w2/ascii-sharegpt-100-seed9271",
+        "baseline_prompt_dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+        "baseline_requests_per_run": 100,
+        "baseline_stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_stream_options_include_usage": true,
+        "baseline_zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ],
+        "bench_command_line": [
+          "timeout",
+          "14400",
+          "/workspace/ferrum-infer-rs/target/release/ferrum",
+          "bench-serve",
+          "--base-url",
+          "http://127.0.0.1:18247",
+          "--model",
+          "gemma3:27b-gptq",
+          "--tokenizer",
+          "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+          "--dataset",
+          "sharegpt",
+          "--sharegpt-path",
+          "/workspace/ascii_sharegpt_w2_100_58d5721d.jsonl",
+          "--random-output-len",
+          "128",
+          "--concurrency-sweep",
+          "1,4,16,32",
+          "--num-prompts",
+          "100",
+          "--n-repeats",
+          "3",
+          "--fail-on-error",
+          "--require-ci",
+          "--seed",
+          "9271",
+          "--out",
+          "/workspace/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/perf/bench_ferrum_sharegpt_sweep_100x3.json"
+        ],
+        "completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "effective_active_concurrency": 16,
+        "errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "ferrum_output_tps_lcb": 434.30817751202113,
+        "ferrum_p95_itl_ms": 35.74488671666668,
+        "http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "n_repeats": 3,
+        "output_token_count_source": "usage",
+        "panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "prompt_dataset_id": "w2/ascii-sharegpt-100-seed9271",
+        "prompt_dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+        "ratio": 1.0076482685058932,
+        "requested_concurrency": 16,
+        "requests_per_run": 100,
+        "same_hardware": true,
+        "same_model": true,
+        "same_prompt_or_dataset": true,
+        "same_quantization": true,
+        "stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "stream_options_include_usage": true,
+        "zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/perf/bench_ferrum_sharegpt_sweep_100x3.json",
+        "bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_bench_command_line": [
+          "timeout",
+          "14400",
+          "/workspace/ferrum-infer-rs/target/release/ferrum",
+          "bench-serve",
+          "--base-url",
+          "http://127.0.0.1:18245",
+          "--model",
+          "gemma3:27b-gptq",
+          "--tokenizer",
+          "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+          "--dataset",
+          "sharegpt",
+          "--sharegpt-path",
+          "/workspace/ascii_sharegpt_w2_100.jsonl",
+          "--random-output-len",
+          "128",
+          "--concurrency-sweep",
+          "1,4,16,32",
+          "--num-prompts",
+          "100",
+          "--n-repeats",
+          "3",
+          "--fail-on-error",
+          "--require-ci",
+          "--seed",
+          "9271",
+          "--out",
+          "/workspace/w2_dynamic_prefill_full_matrix_samehw_cuda_2026-06-17_retry2/perf/bench_vllm_sharegpt_sweep_100x3.json"
+        ],
+        "baseline_completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "baseline_duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_effective_active_concurrency": 32,
+        "baseline_errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_n_repeats": 3,
+        "baseline_output_token_count_source": "usage",
+        "baseline_output_tps": 588.0019610727007,
+        "baseline_p95_itl_ms": 42.19981498333333,
+        "baseline_panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_prompt_dataset_id": "w2/ascii-sharegpt-100-seed9271",
+        "baseline_prompt_dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+        "baseline_requests_per_run": 100,
+        "baseline_stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "baseline_stream_options_include_usage": true,
+        "baseline_zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ],
+        "bench_command_line": [
+          "timeout",
+          "14400",
+          "/workspace/ferrum-infer-rs/target/release/ferrum",
+          "bench-serve",
+          "--base-url",
+          "http://127.0.0.1:18247",
+          "--model",
+          "gemma3:27b-gptq",
+          "--tokenizer",
+          "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+          "--dataset",
+          "sharegpt",
+          "--sharegpt-path",
+          "/workspace/ascii_sharegpt_w2_100_58d5721d.jsonl",
+          "--random-output-len",
+          "128",
+          "--concurrency-sweep",
+          "1,4,16,32",
+          "--num-prompts",
+          "100",
+          "--n-repeats",
+          "3",
+          "--fail-on-error",
+          "--require-ci",
+          "--seed",
+          "9271",
+          "--out",
+          "/workspace/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/perf/bench_ferrum_sharegpt_sweep_100x3.json"
+        ],
+        "completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "effective_active_concurrency": 32,
+        "errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "ferrum_output_tps_lcb": 512.7603506672946,
+        "ferrum_p95_itl_ms": 35.90188203333334,
+        "http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "n_repeats": 3,
+        "output_token_count_source": "usage",
+        "panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "prompt_dataset_id": "w2/ascii-sharegpt-100-seed9271",
+        "prompt_dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+        "ratio": 0.8720385043135881,
+        "requested_concurrency": 32,
+        "requests_per_run": 100,
+        "same_hardware": true,
+        "same_model": true,
+        "same_prompt_or_dataset": true,
+        "same_quantization": true,
+        "stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "stream_options_include_usage": true,
+        "zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ]
+      }
+    ]
+  },
+  "product_entrypoints": {
+    "ferrum_run": {
+      "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/correctness/run_summary.json",
+      "status": "pass"
+    },
+    "ferrum_serve": {
+      "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/correctness/smoke/stream_summary.json",
+      "status": "pass"
+    }
+  },
+  "quantization": "hf-gptq-int4",
+  "release_scope": {
+    "backends": [
+      "cuda"
+    ],
+    "excluded_lanes": {
+      "gguf_metal": {
+        "reason": "GGUF/Metal is not in this W2 CUDA GPTQ release-grade scope"
+      }
+    },
+    "formats": [
+      "hf-gptq-int4"
+    ]
+  },
+  "runtime_config": {
+    "hidden_env": [],
+    "product_surface": "typed_cli",
+    "snapshot": "docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/server/serve_effective_config.json"
+  },
+  "schema_version": 1,
+  "status": "pass"
+}
