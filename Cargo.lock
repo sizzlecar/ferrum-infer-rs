@@ -1492,6 +1492,7 @@ dependencies = [
  "hf-hub",
  "image",
  "indicatif",
+ "memmap2",
  "once_cell",
  "parking_lot",
  "pathdiff",
