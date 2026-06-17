@@ -72,7 +72,7 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     assert_eq!(cfg.linear_value_total_dim(), 4096);
     assert_eq!(
         cfg.recurrent_delta_state_shape().unwrap(),
-        vec![16, 128, 256]
+        vec![32, 128, 128]
     );
     let specs = cfg.recurrent_state_tensor_specs().unwrap();
     assert_eq!(specs.len(), 30);
@@ -81,10 +81,10 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     assert_eq!(specs[2].layer_index, 2);
     assert_eq!(specs[3].layer_index, 4);
     assert_eq!(specs[0].name, QWEN35_DELTA_STATE_NAME);
-    assert_eq!(specs[0].shape, vec![16, 128, 256]);
+    assert_eq!(specs[0].shape, vec![32, 128, 128]);
     assert_eq!(
         cfg.recurrent_state_elements_per_slot().unwrap(),
-        30 * 16 * 128 * 256
+        30 * 32 * 128 * 128
     );
 }
 

@@ -63,6 +63,7 @@ class Shape:
     tokens: int
     hidden_dim: int
     heads: int
+    value_heads: int
     key_dim: int
     value_dim: int
     experts: int
@@ -75,6 +76,8 @@ class Shape:
                 raise CompareError(f"{name} must be positive, got {value}")
         if self.top_k > self.experts:
             raise CompareError("top_k cannot exceed experts")
+        if self.value_heads % self.heads != 0:
+            raise CompareError("value_heads must be divisible by heads")
 
     @property
     def qk_dim(self) -> int:
@@ -82,7 +85,14 @@ class Shape:
 
     @property
     def value_total_dim(self) -> int:
-        return self.heads * self.value_dim
+        return self.value_heads * self.value_dim
+
+    @property
+    def qk_repeat_factor(self) -> int:
+        return self.value_heads // self.heads
+
+    def key_head_for_value_head(self, value_head: int) -> int:
+        return value_head // self.qk_repeat_factor
 
 
 def iso_now() -> str:
@@ -175,9 +185,9 @@ def tensor_shapes(shape: Shape) -> dict[str, list[int]]:
         "input": [shape.tokens, shape.hidden_dim],
         "delta_q": [shape.tokens, shape.heads, shape.key_dim],
         "delta_k": [shape.tokens, shape.heads, shape.key_dim],
-        "delta_v": [shape.tokens, shape.heads, shape.value_dim],
-        "delta_beta": [shape.tokens, shape.heads],
-        "delta_core": [shape.tokens, shape.heads, shape.value_dim],
+        "delta_v": [shape.tokens, shape.value_heads, shape.value_dim],
+        "delta_beta": [shape.tokens, shape.value_heads],
+        "delta_core": [shape.tokens, shape.value_heads, shape.value_dim],
         "delta_gate": [shape.tokens, shape.value_total_dim],
         "delta_output": [shape.tokens, shape.hidden_dim],
         "router_logits": [shape.tokens, shape.experts],
@@ -217,7 +227,7 @@ def make_weights(shape: Shape, seed: int) -> dict[str, Any]:
         "w_q": floats(shape.hidden_dim * shape.qk_dim, 0.12),
         "w_k": floats(shape.hidden_dim * shape.qk_dim, 0.12),
         "w_v": floats(shape.hidden_dim * shape.value_total_dim, 0.12),
-        "w_beta": floats(shape.hidden_dim * shape.heads, 0.10),
+        "w_beta": floats(shape.hidden_dim * shape.value_heads, 0.10),
         "w_delta_gate": floats(shape.hidden_dim * shape.value_total_dim, 0.10),
         "w_o": floats(shape.value_total_dim * shape.hidden_dim, 0.10),
         "w_router": floats(shape.hidden_dim * shape.experts, 0.10),
@@ -232,28 +242,29 @@ def qk_index(shape: Shape, t: int, h: int, kk: int) -> int:
     return (t * shape.heads + h) * shape.key_dim + kk
 
 
-def value_index(shape: Shape, t: int, h: int, vv: int) -> int:
-    return (t * shape.heads + h) * shape.value_dim + vv
+def value_index(shape: Shape, t: int, value_head: int, vv: int) -> int:
+    return (t * shape.value_heads + value_head) * shape.value_dim + vv
 
 
 def delta_rule(shape: Shape, q: list[float], k: list[float], v: list[float], beta: list[float]) -> list[float]:
     out = [0.0] * (shape.tokens * shape.value_total_dim)
-    for h in range(shape.heads):
+    for value_head in range(shape.value_heads):
+        key_head = shape.key_head_for_value_head(value_head)
         state = [0.0] * (shape.key_dim * shape.value_dim)
         for t in range(shape.tokens):
-            bt = beta[t * shape.heads + h]
+            bt = beta[t * shape.value_heads + value_head]
             for vv in range(shape.value_dim):
                 pred = 0.0
                 for kk in range(shape.key_dim):
-                    pred += k[qk_index(shape, t, h, kk)] * state[kk * shape.value_dim + vv]
-                delta = bt * (v[value_index(shape, t, h, vv)] - pred)
+                    pred += k[qk_index(shape, t, key_head, kk)] * state[kk * shape.value_dim + vv]
+                delta = bt * (v[value_index(shape, t, value_head, vv)] - pred)
                 for kk in range(shape.key_dim):
-                    state[kk * shape.value_dim + vv] += k[qk_index(shape, t, h, kk)] * delta
+                    state[kk * shape.value_dim + vv] += k[qk_index(shape, t, key_head, kk)] * delta
             for vv in range(shape.value_dim):
                 acc = 0.0
                 for kk in range(shape.key_dim):
-                    acc += q[qk_index(shape, t, h, kk)] * state[kk * shape.value_dim + vv]
-                out[value_index(shape, t, h, vv)] = acc
+                    acc += q[qk_index(shape, t, key_head, kk)] * state[kk * shape.value_dim + vv]
+                out[value_index(shape, t, value_head, vv)] = acc
     return out
 
 
@@ -297,7 +308,13 @@ def compute_reference(shape: Shape, seed: int) -> dict[str, Any]:
         shape.hidden_dim,
         shape.value_total_dim,
     )
-    beta_raw = matmul_token_major(x, weights["w_beta"], shape.tokens, shape.hidden_dim, shape.heads)
+    beta_raw = matmul_token_major(
+        x,
+        weights["w_beta"],
+        shape.tokens,
+        shape.hidden_dim,
+        shape.value_heads,
+    )
     beta = [sigmoid(value) for value in beta_raw]
     delta_core = delta_rule(shape, q, k, v, beta)
     delta_gate_raw = matmul_token_major(
@@ -443,7 +460,8 @@ def write_dump(path: Path, shape: Shape, seed: int, tensors: dict[str, Any], *, 
             "tensor_shapes": shapes,
             "layout": "token-major contiguous float32 unless noted",
             "semantics": {
-                "delta_rule": "S_t = S_{t-1} + beta_t * k_t^T * (v_t - k_t @ S_{t-1}); core_t = q_t @ S_t",
+                "delta_rule": "S_t = S_{t-1} + beta_t * k_t^T * (v_t - k_t @ S_{t-1}); core_t = q_t @ S_t; q/k heads repeat onto value heads when value_heads > heads",
+                "delta_state_layout": "[value_heads, value_dim, key_dim]",
                 "delta_output": "matmul(delta_core * sigmoid(x @ w_delta_gate), w_o)",
                 "router": "stable top-k by descending logit then ascending expert id; weights are softmax over selected logits",
                 "expert": "down(silu(x @ gate) * (x @ up))",
@@ -557,10 +575,12 @@ def compare_dumps(reference_dir: Path, ferrum_dir: Path, *, atol: float) -> dict
 
 
 def shape_from_args(args: argparse.Namespace) -> Shape:
+    value_heads = args.value_heads if args.value_heads is not None else args.heads
     shape = Shape(
         tokens=args.tokens,
         hidden_dim=args.hidden_dim,
         heads=args.heads,
+        value_heads=value_heads,
         key_dim=args.key_dim,
         value_dim=args.value_dim,
         experts=args.experts,
@@ -662,6 +682,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--tokens", type=int, default=6)
     parser.add_argument("--hidden-dim", type=int, default=8)
     parser.add_argument("--heads", type=int, default=2)
+    parser.add_argument("--value-heads", type=int)
     parser.add_argument("--key-dim", type=int, default=3)
     parser.add_argument("--value-dim", type=int, default=4)
     parser.add_argument("--experts", type=int, default=5)

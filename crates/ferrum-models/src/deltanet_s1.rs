@@ -39,6 +39,7 @@ pub struct W3DeltaNetS1Shape {
     pub tokens: usize,
     pub hidden_dim: usize,
     pub heads: usize,
+    pub value_heads: usize,
     pub key_dim: usize,
     pub value_dim: usize,
     pub experts: usize,
@@ -52,6 +53,7 @@ impl Default for W3DeltaNetS1Shape {
             tokens: 6,
             hidden_dim: 8,
             heads: 2,
+            value_heads: 2,
             key_dim: 3,
             value_dim: 4,
             experts: 5,
@@ -67,6 +69,7 @@ impl W3DeltaNetS1Shape {
             ("tokens", self.tokens),
             ("hidden_dim", self.hidden_dim),
             ("heads", self.heads),
+            ("value_heads", self.value_heads),
             ("key_dim", self.key_dim),
             ("value_dim", self.value_dim),
             ("experts", self.experts),
@@ -83,6 +86,12 @@ impl W3DeltaNetS1Shape {
                 self.top_k, self.experts
             ));
         }
+        if self.value_heads % self.heads != 0 {
+            return Err(format!(
+                "value_heads {} must be divisible by heads {}",
+                self.value_heads, self.heads
+            ));
+        }
         Ok(())
     }
 
@@ -91,7 +100,15 @@ impl W3DeltaNetS1Shape {
     }
 
     fn value_total_dim(self) -> usize {
-        self.heads * self.value_dim
+        self.value_heads * self.value_dim
+    }
+
+    fn qk_repeat_factor(self) -> usize {
+        self.value_heads / self.heads
+    }
+
+    fn key_head_for_value_head(self, value_head: usize) -> usize {
+        value_head / self.qk_repeat_factor()
     }
 }
 
@@ -202,7 +219,7 @@ fn make_weights(shape: W3DeltaNetS1Shape, seed: u32) -> Weights {
         w_q: floats(shape.hidden_dim * shape.qk_dim(), 0.12),
         w_k: floats(shape.hidden_dim * shape.qk_dim(), 0.12),
         w_v: floats(shape.hidden_dim * shape.value_total_dim(), 0.12),
-        w_beta: floats(shape.hidden_dim * shape.heads, 0.10),
+        w_beta: floats(shape.hidden_dim * shape.value_heads, 0.10),
         w_delta_gate: floats(shape.hidden_dim * shape.value_total_dim(), 0.10),
         w_o: floats(shape.value_total_dim() * shape.hidden_dim, 0.10),
         w_router: floats(shape.hidden_dim * shape.experts, 0.10),
@@ -237,32 +254,33 @@ fn qk_index(shape: W3DeltaNetS1Shape, t: usize, h: usize, kk: usize) -> usize {
     (t * shape.heads + h) * shape.key_dim + kk
 }
 
-fn value_index(shape: W3DeltaNetS1Shape, t: usize, h: usize, vv: usize) -> usize {
-    (t * shape.heads + h) * shape.value_dim + vv
+fn value_index(shape: W3DeltaNetS1Shape, t: usize, value_head: usize, vv: usize) -> usize {
+    (t * shape.value_heads + value_head) * shape.value_dim + vv
 }
 
 fn delta_rule(shape: W3DeltaNetS1Shape, q: &[f64], k: &[f64], v: &[f64], beta: &[f64]) -> Vec<f64> {
     let mut out = vec![0.0; shape.tokens * shape.value_total_dim()];
-    for h in 0..shape.heads {
+    for value_head in 0..shape.value_heads {
+        let key_head = shape.key_head_for_value_head(value_head);
         let mut state = vec![0.0; shape.key_dim * shape.value_dim];
         for t in 0..shape.tokens {
-            let bt = beta[t * shape.heads + h];
+            let bt = beta[t * shape.value_heads + value_head];
             for vv in 0..shape.value_dim {
                 let mut pred = 0.0;
                 for kk in 0..shape.key_dim {
-                    pred += k[qk_index(shape, t, h, kk)] * state[kk * shape.value_dim + vv];
+                    pred += k[qk_index(shape, t, key_head, kk)] * state[kk * shape.value_dim + vv];
                 }
-                let delta = bt * (v[value_index(shape, t, h, vv)] - pred);
+                let delta = bt * (v[value_index(shape, t, value_head, vv)] - pred);
                 for kk in 0..shape.key_dim {
-                    state[kk * shape.value_dim + vv] += k[qk_index(shape, t, h, kk)] * delta;
+                    state[kk * shape.value_dim + vv] += k[qk_index(shape, t, key_head, kk)] * delta;
                 }
             }
             for vv in 0..shape.value_dim {
                 let mut acc = 0.0;
                 for kk in 0..shape.key_dim {
-                    acc += q[qk_index(shape, t, h, kk)] * state[kk * shape.value_dim + vv];
+                    acc += q[qk_index(shape, t, key_head, kk)] * state[kk * shape.value_dim + vv];
                 }
-                out[value_index(shape, t, h, vv)] = acc;
+                out[value_index(shape, t, value_head, vv)] = acc;
             }
         }
     }
@@ -335,7 +353,7 @@ pub fn compute_w3_deltanet_s1_dump(
         &weights.w_beta,
         shape.tokens,
         shape.hidden_dim,
-        shape.heads,
+        shape.value_heads,
     );
     let beta: Vec<f64> = beta_raw.into_iter().map(sigmoid).collect();
     let delta_core = delta_rule(shape, &q, &k, &v, &beta);
@@ -457,9 +475,9 @@ fn tensor_shapes(shape: W3DeltaNetS1Shape) -> serde_json::Value {
         "input": [shape.tokens, shape.hidden_dim],
         "delta_q": [shape.tokens, shape.heads, shape.key_dim],
         "delta_k": [shape.tokens, shape.heads, shape.key_dim],
-        "delta_v": [shape.tokens, shape.heads, shape.value_dim],
-        "delta_beta": [shape.tokens, shape.heads],
-        "delta_core": [shape.tokens, shape.heads, shape.value_dim],
+        "delta_v": [shape.tokens, shape.value_heads, shape.value_dim],
+        "delta_beta": [shape.tokens, shape.value_heads],
+        "delta_core": [shape.tokens, shape.value_heads, shape.value_dim],
         "delta_gate": [shape.tokens, shape.value_total_dim()],
         "delta_output": [shape.tokens, shape.hidden_dim],
         "router_logits": [shape.tokens, shape.experts],
@@ -539,6 +557,7 @@ pub fn write_w3_deltanet_s1_dump(
                 "tokens": shape.tokens,
                 "hidden_dim": shape.hidden_dim,
                 "heads": shape.heads,
+                "value_heads": shape.value_heads,
                 "key_dim": shape.key_dim,
                 "value_dim": shape.value_dim,
                 "experts": shape.experts,
@@ -551,7 +570,8 @@ pub fn write_w3_deltanet_s1_dump(
             "tensor_shapes": tensor_shapes(shape),
             "layout": "token-major contiguous float32 unless noted",
             "semantics": {
-                "delta_rule": "S_t = S_{t-1} + beta_t * k_t^T * (v_t - k_t @ S_{t-1}); core_t = q_t @ S_t",
+                "delta_rule": "S_t = S_{t-1} + beta_t * k_t^T * (v_t - k_t @ S_{t-1}); core_t = q_t @ S_t; q/k heads repeat onto value heads when value_heads > heads",
+                "delta_state_layout": "[value_heads, value_dim, key_dim]",
                 "delta_output": "matmul(delta_core * sigmoid(x @ w_delta_gate), w_o)",
                 "router": "Ferrum MoE route() stable top-k ids; dump weights are selected-logit softmax for reference alignment",
                 "expert": "down(silu(x @ gate) * (x @ up))",
@@ -577,7 +597,7 @@ mod tests {
         );
         assert_eq!(
             dump.delta_core.len(),
-            shape.tokens * shape.heads * shape.value_dim
+            shape.tokens * shape.value_heads * shape.value_dim
         );
         assert_eq!(dump.router_topk_indices.len(), shape.tokens * shape.top_k);
         assert_eq!(dump.layer_output.len(), shape.tokens * shape.hidden_dim);
@@ -604,5 +624,54 @@ mod tests {
             assert!(expert_id >= 0);
             assert!((expert_id as usize) < shape.experts);
         }
+    }
+
+    #[test]
+    fn qwen36_moe_topology_repeats_qk_heads_onto_value_heads() {
+        let shape = W3DeltaNetS1Shape {
+            tokens: 2,
+            hidden_dim: 16,
+            heads: 16,
+            value_heads: 32,
+            key_dim: 128,
+            value_dim: 128,
+            experts: 8,
+            top_k: 2,
+            expert_hidden_dim: 4,
+        };
+        let dump = compute_w3_deltanet_s1_dump(shape, 9271).unwrap();
+        assert_eq!(
+            dump.delta_q.len(),
+            shape.tokens * shape.heads * shape.key_dim
+        );
+        assert_eq!(
+            dump.delta_v.len(),
+            shape.tokens * shape.value_heads * shape.value_dim
+        );
+        assert_eq!(dump.delta_beta.len(), shape.tokens * shape.value_heads);
+        assert_eq!(
+            dump.delta_core.len(),
+            shape.tokens * shape.value_heads * shape.value_dim
+        );
+        assert_eq!(dump.layer_output.len(), shape.tokens * shape.hidden_dim);
+        for i in 0..dump.moe_output.len() {
+            let expected = dump.routed_expert_output[i] + dump.shared_expert_output[i];
+            assert!(
+                (dump.moe_output[i] - expected).abs() < 1e-7,
+                "moe_output[{i}] mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn value_heads_must_be_divisible_by_key_heads() {
+        let shape = W3DeltaNetS1Shape {
+            heads: 3,
+            value_heads: 4,
+            ..W3DeltaNetS1Shape::default()
+        };
+        let err = compute_w3_deltanet_s1_dump(shape, 9271)
+            .expect_err("non-divisible q/k to value-head topology should fail");
+        assert!(err.contains("value_heads"), "{err}");
     }
 }

@@ -45,6 +45,7 @@ fn main() {
             tokens: parse_value(&args, "--tokens", default_shape.tokens)?,
             hidden_dim: parse_value(&args, "--hidden-dim", default_shape.hidden_dim)?,
             heads: parse_value(&args, "--heads", default_shape.heads)?,
+            value_heads: parse_value(&args, "--value-heads", default_shape.value_heads)?,
             key_dim: parse_value(&args, "--key-dim", default_shape.key_dim)?,
             value_dim: parse_value(&args, "--value-dim", default_shape.value_dim)?,
             experts: parse_value(&args, "--experts", default_shape.experts)?,
