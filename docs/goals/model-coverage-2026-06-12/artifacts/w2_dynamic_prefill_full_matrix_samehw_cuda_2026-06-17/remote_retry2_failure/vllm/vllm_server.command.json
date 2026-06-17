@@ -1,0 +1,28 @@
+{
+  "cmd": [
+    "/workspace/vllm-venv-0101-cu126/bin/python",
+    "-m",
+    "vllm.entrypoints.openai.api_server",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18245",
+    "--model",
+    "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+    "--served-model-name",
+    "gemma3:27b-gptq",
+    "--max-model-len",
+    "512",
+    "--max-num-seqs",
+    "32",
+    "--gpu-memory-utilization",
+    "0.92"
+  ],
+  "dependency_pins": {
+    "fastapi": "0.116.1",
+    "prometheus-fastapi-instrumentator": "7.1.0",
+    "starlette": "0.47.2",
+    "transformers": "4.55.4",
+    "vllm": "0.10.1.1"
+  }
+}
