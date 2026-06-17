@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ13 — W3 S0/S1/S2 release-grade validator hardening
+
+- Scope:
+  - release-grade validator hardening for W3 correctness artifacts;
+  - no CUDA/Metal execution was started;
+  - no performance claim and no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was
+    produced.
+- Change:
+  - `scripts/release/model_release_grade_goal_gate.py` now deep-validates W3
+    S0 design evidence, S0 CUDA delta-rule microbench evidence, S1 single-layer
+    compare evidence, and the existing S2 product-path evidence;
+  - S0 design evidence must record recurrent-state cache trait/spec semantics
+    and coexistence with paged-KV, ContinuousBatch, preemption, and release;
+  - S0 microbench evidence must be CUDA mode, include PTX arch, clean git
+    summary, deterministic input distribution, reference formula, compile/run
+    commands, binary SHA256, and error stats within tolerance;
+  - S1 evidence must be real compare mode, not self-test-only evidence, with
+    passing delta-rule/layer/expert/router/shared-expert checks and per-tensor
+    comparison tolerances;
+  - self-test fixtures now include structured W3 S0/S1/S2 artifacts and negative
+    cases for S0 tolerance failure, S1 self-test pass-line misuse, and S2 missing
+    stream usage.
+- Validation:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py`
+    PASS;
+  - `git diff --check -- scripts/release/model_release_grade_goal_gate.py`
+    PASS;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS: `MODEL RELEASE GRADE GOAL SELFTEST PASS`;
+  - current W3 S0 artifact structure probe PASS:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/w3_delta_rule_s0_microbench_manifest.json`;
+  - current W3 S1 artifact structure probe PASS:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/compare/w3_deltanet_s1_layer_compare_manifest.json`.
+- Limitation:
+  - this improves the final gate's ability to reject weak W3 evidence; real
+    W3 L0-L5 correctness, same-hardware baseline, and c=1/4/16/32 80%
+    performance evidence remain incomplete.
+
 ## 2026-06-18 ZZZ12 — W3-S2 product smoke artifact script checkpoint
 
 - Scope:

@@ -118,6 +118,13 @@ def require_true(value: Any, label: str, problems: list[str]) -> None:
         problems.append(f"{label} must be true")
 
 
+def non_empty_string(value: Any, label: str, problems: list[str]) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        problems.append(f"{label} must be a non-empty string")
+        return None
+    return value
+
+
 def artifact_candidates(raw: str, out_dir: Path) -> list[Path]:
     path = Path(raw)
     if path.is_absolute():
@@ -423,12 +430,27 @@ def validate_correctness(
             problems.append(f"correctness missing {key}")
             continue
         validate_evidence_entry(correctness[key], f"correctness.{key}", out_dir, problems)
-    if lane == "w3" and "w3_s2_whole_model_product_path" in correctness:
-        validate_w3_s2_product_artifact(
-            correctness["w3_s2_whole_model_product_path"],
-            out_dir,
-            problems,
-        )
+    if lane == "w3":
+        if "w3_s0_design" in correctness:
+            validate_w3_s0_design_artifact(correctness["w3_s0_design"], out_dir, problems)
+        if "w3_s0_microbench" in correctness:
+            validate_w3_s0_microbench_artifact(
+                correctness["w3_s0_microbench"],
+                out_dir,
+                problems,
+            )
+        if "w3_s1_single_layer" in correctness:
+            validate_w3_s1_single_layer_artifact(
+                correctness["w3_s1_single_layer"],
+                out_dir,
+                problems,
+            )
+        if "w3_s2_whole_model_product_path" in correctness:
+            validate_w3_s2_product_artifact(
+                correctness["w3_s2_whole_model_product_path"],
+                out_dir,
+                problems,
+            )
     product = as_object(manifest.get("product_entrypoints"), "product_entrypoints", problems)
     for key in sorted(REQUIRED_PRODUCT_ENTRYPOINTS):
         if key not in product:
@@ -450,26 +472,248 @@ def validate_product_command(
             problems.append(f"{label} command uses hidden env override: {part.split('=', 1)[0]}")
 
 
-def validate_w3_s2_product_artifact(entry: Any, out_dir: Path, problems: list[str]) -> None:
+def load_first_artifact_object(
+    entry: Any,
+    label: str,
+    out_dir: Path,
+    problems: list[str],
+) -> dict[str, Any]:
     artifacts = evidence_artifact_values(
         entry,
-        "correctness.w3_s2_whole_model_product_path",
+        label,
         problems,
     )
     if not artifacts:
-        return
+        return {}
     artifact_path = existing_artifact_path(artifacts[0], out_dir)
     if artifact_path is None:
-        return
+        return {}
     try:
-        data = as_object(
+        return as_object(
             load_json(artifact_path),
-            "correctness.w3_s2_whole_model_product_path.artifact",
+            f"{label}.artifact",
             problems,
         )
     except ValidationError as exc:
-        problems.append(f"correctness.w3_s2_whole_model_product_path invalid JSON: {exc}")
+        problems.append(f"{label} invalid JSON: {exc}")
+        return {}
+
+
+def require_pass_line_prefix(
+    data: dict[str, Any],
+    label: str,
+    prefix: str,
+    problems: list[str],
+) -> None:
+    pass_line = non_empty_string(data.get("pass_line"), f"{label}.pass_line", problems)
+    if pass_line is not None and not pass_line.startswith(prefix):
+        problems.append(f"{label}.pass_line must start with {prefix!r}")
+
+
+def validate_clean_git_fragment(data: dict[str, Any], label: str, problems: list[str]) -> None:
+    git = as_object(data.get("git"), f"{label}.git", problems)
+    if not git:
         return
+    if git.get("is_dirty") is not False:
+        problems.append(f"{label}.git.is_dirty must be false")
+    if git.get("tracked_status_short", []) != []:
+        problems.append(f"{label}.git.tracked_status_short must be empty")
+    sha = git.get("sha")
+    if not isinstance(sha, str) or not re.match(r"^[0-9a-fA-F]{7,40}$", sha):
+        problems.append(f"{label}.git.sha must be a 7-40 character hex string")
+
+
+def validate_positive_shape(
+    shape: dict[str, Any],
+    required_keys: list[str],
+    label: str,
+    problems: list[str],
+) -> None:
+    for key in required_keys:
+        positive_int(shape.get(key), f"{label}.{key}", problems)
+
+
+def numeric_within_tolerance(
+    data: dict[str, Any],
+    value_key: str,
+    tolerance: float,
+    label: str,
+    problems: list[str],
+) -> None:
+    value = number(data.get(value_key), f"{label}.{value_key}", problems)
+    if value is not None and value > tolerance:
+        problems.append(f"{label}.{value_key} {value:.6g} exceeds tolerance {tolerance:.6g}")
+
+
+def validate_w3_s0_design_artifact(entry: Any, out_dir: Path, problems: list[str]) -> None:
+    label = "correctness.w3_s0_design"
+    data = load_first_artifact_object(entry, label, out_dir, problems)
+    if not data:
+        return
+
+    if data.get("status") != "pass":
+        problems.append(f"{label}.status must be pass")
+    if data.get("lane") != "w3_s0_design":
+        problems.append(f"{label}.lane must be w3_s0_design")
+    require_pass_line_prefix(data, label, "W3 S0 DESIGN PASS:", problems)
+    recurrent = as_object(data.get("recurrent_state_cache"), f"{label}.recurrent_state_cache", problems)
+    if recurrent:
+        non_empty_string(recurrent.get("trait"), f"{label}.recurrent_state_cache.trait", problems)
+        non_empty_string(
+            recurrent.get("state_spec"),
+            f"{label}.recurrent_state_cache.state_spec",
+            problems,
+        )
+    coexistence = as_object(data.get("coexistence"), f"{label}.coexistence", problems)
+    for key in ["paged_kv", "continuous_batch", "preemption", "release"]:
+        non_empty_string(coexistence.get(key), f"{label}.coexistence.{key}", problems)
+    if data.get("hidden_env", []) != []:
+        problems.append(f"{label}.hidden_env must be empty")
+
+
+def validate_range_pair(value: Any, label: str, problems: list[str]) -> None:
+    items = as_list(value, label, problems)
+    if len(items) != 2:
+        problems.append(f"{label} must contain exactly two numbers")
+        return
+    lo = number(items[0], f"{label}[0]", problems)
+    hi = number(items[1], f"{label}[1]", problems)
+    if lo is not None and hi is not None and lo >= hi:
+        problems.append(f"{label}[0] must be less than {label}[1]")
+
+
+def validate_w3_s0_microbench_artifact(entry: Any, out_dir: Path, problems: list[str]) -> None:
+    label = "correctness.w3_s0_microbench"
+    data = load_first_artifact_object(entry, label, out_dir, problems)
+    if not data:
+        return
+
+    if data.get("status") != "pass":
+        problems.append(f"{label}.status must be pass")
+    if data.get("mode") != "cuda":
+        problems.append(f"{label}.mode must be cuda, not self-test or dry-run")
+    require_pass_line_prefix(data, label, "W3 DELTA RULE S0 MICROBENCH PASS:", problems)
+    non_empty_string(data.get("ptx_arch"), f"{label}.ptx_arch", problems)
+    digest = data.get("cuda_binary_sha256")
+    if not isinstance(digest, str) or not HEX64.match(digest):
+        problems.append(f"{label}.cuda_binary_sha256 must be a 64-character hex digest")
+    positive_int(data.get("seed"), f"{label}.seed", problems)
+    validate_clean_git_fragment(data, label, problems)
+
+    shape = as_object(data.get("shape"), f"{label}.shape", problems)
+    validate_positive_shape(shape, ["batch", "heads", "tokens", "key_dim", "value_dim"], f"{label}.shape", problems)
+
+    reference = as_object(data.get("reference"), f"{label}.reference", problems)
+    if reference:
+        non_empty_string(reference.get("name"), f"{label}.reference.name", problems)
+        non_empty_string(reference.get("formula"), f"{label}.reference.formula", problems)
+
+    distribution = as_object(data.get("input_distribution"), f"{label}.input_distribution", problems)
+    if distribution:
+        non_empty_string(distribution.get("generator"), f"{label}.input_distribution.generator", problems)
+        for key in ["q_range", "k_range", "v_range", "beta_range"]:
+            validate_range_pair(distribution.get(key), f"{label}.input_distribution.{key}", problems)
+
+    tolerance = as_object(data.get("tolerance"), f"{label}.tolerance", problems)
+    max_abs_tolerance = number(tolerance.get("max_abs"), f"{label}.tolerance.max_abs", problems)
+    if max_abs_tolerance is None or max_abs_tolerance <= 0:
+        problems.append(f"{label}.tolerance.max_abs must be > 0")
+        max_abs_tolerance = 0.0
+    for key in ["error_stats", "chunked_reference_error", "cuda_error"]:
+        stats = as_object(data.get(key), f"{label}.{key}", problems)
+        if stats and max_abs_tolerance > 0:
+            numeric_within_tolerance(stats, "max_abs", max_abs_tolerance, f"{label}.{key}", problems)
+
+    cuda = as_object(data.get("cuda"), f"{label}.cuda", problems)
+    if cuda:
+        command_parts(cuda.get("compile_command"), f"{label}.cuda.compile_command", problems)
+        command_parts(cuda.get("run_command"), f"{label}.cuda.run_command", problems)
+        compile_logs = as_object(cuda.get("compile_logs"), f"{label}.cuda.compile_logs", problems)
+        run_logs = as_object(cuda.get("run_logs"), f"{label}.cuda.run_logs", problems)
+        if compile_logs.get("returncode") != 0:
+            problems.append(f"{label}.cuda.compile_logs.returncode must be 0")
+        if run_logs.get("returncode") != 0:
+            problems.append(f"{label}.cuda.run_logs.returncode must be 0")
+
+
+def validate_numeric_comparison(
+    comparison: dict[str, Any],
+    label: str,
+    problems: list[str],
+) -> None:
+    if comparison.get("status") != "pass":
+        problems.append(f"{label}.status must be pass")
+    tolerance = number(comparison.get("atol"), f"{label}.atol", problems)
+    if tolerance is None or tolerance <= 0:
+        problems.append(f"{label}.atol must be > 0")
+        return
+    numeric_within_tolerance(comparison, "max_abs", tolerance, label, problems)
+
+
+def validate_w3_s1_single_layer_artifact(entry: Any, out_dir: Path, problems: list[str]) -> None:
+    label = "correctness.w3_s1_single_layer"
+    data = load_first_artifact_object(entry, label, out_dir, problems)
+    if not data:
+        return
+
+    if data.get("status") != "pass":
+        problems.append(f"{label}.status must be pass")
+    if data.get("mode") != "compare":
+        problems.append(f"{label}.mode must be compare")
+    require_pass_line_prefix(data, label, "W3 DELTANET S1 LAYER COMPARE PASS:", problems)
+    pass_line = str(data.get("pass_line", ""))
+    if "SELFTEST" in pass_line:
+        problems.append(f"{label}.pass_line must not be self-test evidence")
+    validate_clean_git_fragment(data, label, problems)
+
+    reference_dump = non_empty_string(data.get("reference_dump"), f"{label}.reference_dump", problems)
+    ferrum_dump = non_empty_string(data.get("ferrum_dump"), f"{label}.ferrum_dump", problems)
+    if reference_dump is not None and existing_artifact_path(reference_dump, out_dir) is None:
+        problems.append(f"{label}.reference_dump artifact missing: {reference_dump}")
+    if ferrum_dump is not None and existing_artifact_path(ferrum_dump, out_dir) is None:
+        problems.append(f"{label}.ferrum_dump artifact missing: {ferrum_dump}")
+
+    checks = as_object(data.get("checks"), f"{label}.checks", problems)
+    for key in ["delta_rule", "deltanet_layer", "expert_layout", "router_topk", "shared_expert_merge"]:
+        if checks.get(key) != "pass":
+            problems.append(f"{label}.checks.{key} must be pass")
+
+    comparisons = as_object(data.get("comparisons"), f"{label}.comparisons", problems)
+    numeric_keys = [
+        "input",
+        "delta_q",
+        "delta_k",
+        "delta_v",
+        "delta_gate",
+        "delta_beta",
+        "delta_core",
+        "delta_output",
+        "router_logits",
+        "router_topk_weights",
+        "routed_expert_output",
+        "shared_expert_output",
+        "moe_output",
+        "layer_output",
+    ]
+    for key in numeric_keys:
+        comparison = as_object(comparisons.get(key), f"{label}.comparisons.{key}", problems)
+        if comparison:
+            validate_numeric_comparison(comparison, f"{label}.comparisons.{key}", problems)
+    topk_indices = as_object(
+        comparisons.get("router_topk_indices"),
+        f"{label}.comparisons.router_topk_indices",
+        problems,
+    )
+    if topk_indices:
+        if topk_indices.get("status") != "pass":
+            problems.append(f"{label}.comparisons.router_topk_indices.status must be pass")
+        if topk_indices.get("mismatches") != 0:
+            problems.append(f"{label}.comparisons.router_topk_indices.mismatches must be 0")
+
+
+def validate_w3_s2_product_artifact(entry: Any, out_dir: Path, problems: list[str]) -> None:
+    label = "correctness.w3_s2_whole_model_product_path"
+    data = load_first_artifact_object(entry, label, out_dir, problems)
     if not data:
         return
 
@@ -1085,8 +1329,120 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
         "l5_concurrency": {"status": "pass", "artifact": "l5.json"},
     }
     if lane == "w3":
-        for rel in ["w3_s0_design.json", "w3_s0_microbench.json", "w3_s1_single_layer.json"]:
-            write_json(root / rel, {"status": "pass", "name": rel})
+        write_json(
+            root / "w3_s0_design.json",
+            {
+                "schema_version": 1,
+                "status": "pass",
+                "lane": "w3_s0_design",
+                "pass_line": "W3 S0 DESIGN PASS: selftest",
+                "hidden_env": [],
+                "recurrent_state_cache": {
+                    "trait": "RecurrentStateManager",
+                    "state_spec": "RecurrentStateSpec",
+                },
+                "coexistence": {
+                    "paged_kv": "separate allocation domain from attention KV pages",
+                    "continuous_batch": "allocated during request admission and passed through batch items",
+                    "preemption": "state handle can be cloned or released with request lifecycle",
+                    "release": "state is removed when request completes or is aborted",
+                },
+            },
+        )
+        write_json(
+            root / "w3_s0_microbench.json",
+            {
+                "schema_version": 1,
+                "status": "pass",
+                "mode": "cuda",
+                "pass_line": "W3 DELTA RULE S0 MICROBENCH PASS: selftest",
+                "ptx_arch": "sm_89",
+                "cuda_binary_sha256": "c" * 64,
+                "seed": 9271,
+                "git": {
+                    "sha": "0123456789abcdef",
+                    "is_dirty": False,
+                    "tracked_status_short": [],
+                },
+                "shape": {
+                    "batch": 2,
+                    "heads": 2,
+                    "tokens": 8,
+                    "key_dim": 4,
+                    "value_dim": 4,
+                },
+                "reference": {
+                    "name": "internal-python-delta-rule-reference",
+                    "formula": "S_t = S_{t-1} + beta_t * k_t^T * (v_t - k_t @ S_{t-1})",
+                },
+                "input_distribution": {
+                    "generator": "lcg_u32_centered_uniform",
+                    "q_range": [-0.25, 0.25],
+                    "k_range": [-0.20, 0.20],
+                    "v_range": [-0.30, 0.30],
+                    "beta_range": [0.50, 0.75],
+                },
+                "tolerance": {"max_abs": 0.001},
+                "error_stats": {"max_abs": 0.00001},
+                "chunked_reference_error": {"max_abs": 0.0},
+                "cuda_error": {"max_abs": 0.00001},
+                "cuda": {
+                    "compile_command": ["nvcc", "-arch=sm_89", "delta_rule_s0.cu"],
+                    "run_command": ["delta_rule_s0", "input.bin", "output.bin"],
+                    "compile_logs": {"returncode": 0},
+                    "run_logs": {"returncode": 0},
+                },
+            },
+        )
+        (root / "w3_s1_reference_dump").mkdir(exist_ok=True)
+        (root / "w3_s1_ferrum_dump").mkdir(exist_ok=True)
+        s1_comparisons = {
+            key: {"status": "pass", "atol": 0.000001, "max_abs": 0.0}
+            for key in [
+                "input",
+                "delta_q",
+                "delta_k",
+                "delta_v",
+                "delta_gate",
+                "delta_beta",
+                "delta_core",
+                "delta_output",
+                "router_logits",
+                "router_topk_weights",
+                "routed_expert_output",
+                "shared_expert_output",
+                "moe_output",
+                "layer_output",
+            ]
+        }
+        s1_comparisons["router_topk_indices"] = {
+            "status": "pass",
+            "mismatches": 0,
+        }
+        write_json(
+            root / "w3_s1_single_layer.json",
+            {
+                "schema_version": 1,
+                "status": "pass",
+                "mode": "compare",
+                "pass_line": "W3 DELTANET S1 LAYER COMPARE PASS: selftest",
+                "reference_dump": "w3_s1_reference_dump",
+                "ferrum_dump": "w3_s1_ferrum_dump",
+                "git": {
+                    "sha": "0123456789abcdef",
+                    "is_dirty": False,
+                    "tracked_status_short": [],
+                },
+                "checks": {
+                    "delta_rule": "pass",
+                    "deltanet_layer": "pass",
+                    "expert_layout": "pass",
+                    "router_topk": "pass",
+                    "shared_expert_merge": "pass",
+                },
+                "comparisons": s1_comparisons,
+            },
+        )
         write_json(root / "w3_run_stdout.jsonl", {"role": "assistant", "content": "ok ok"})
         write_json(root / "w3_serve_nonstream.json", {"choices": [{"message": {"content": "ok"}}]})
         (root / "w3_run_stderr.txt").write_text("", encoding="utf-8")
@@ -1240,6 +1596,40 @@ def run_selftest() -> int:
             "correctness missing w3_s0_microbench" in problem for problem in bad_w3_problems
         ):
             raise AssertionError("bad W3 missing-S0 selftest did not fail as expected")
+
+        bad_w3_s0_microbench = tmp_root / "bad-w3-s0-microbench-tolerance"
+        bad_w3_s0_microbench_manifest = write_selftest_manifest(
+            bad_w3_s0_microbench,
+            lane="w3",
+            ratio=0.82,
+        )
+        s0_microbench = load_json(bad_w3_s0_microbench / "w3_s0_microbench.json")
+        s0_microbench["cuda_error"]["max_abs"] = 0.01
+        write_json(bad_w3_s0_microbench / "w3_s0_microbench.json", s0_microbench)
+        bad_w3_s0_microbench_problems = validate_manifest(
+            load_json(bad_w3_s0_microbench_manifest),
+            "w3",
+            bad_w3_s0_microbench,
+        )
+        if not any("correctness.w3_s0_microbench.cuda_error.max_abs" in problem for problem in bad_w3_s0_microbench_problems):
+            raise AssertionError("bad W3 S0 tolerance selftest did not fail as expected")
+
+        bad_w3_s1_selftest = tmp_root / "bad-w3-s1-selftest-pass-line"
+        bad_w3_s1_selftest_manifest = write_selftest_manifest(
+            bad_w3_s1_selftest,
+            lane="w3",
+            ratio=0.82,
+        )
+        s1_single_layer = load_json(bad_w3_s1_selftest / "w3_s1_single_layer.json")
+        s1_single_layer["pass_line"] = "W3 DELTANET S1 LAYER COMPARE SELFTEST PASS: selftest"
+        write_json(bad_w3_s1_selftest / "w3_s1_single_layer.json", s1_single_layer)
+        bad_w3_s1_selftest_problems = validate_manifest(
+            load_json(bad_w3_s1_selftest_manifest),
+            "w3",
+            bad_w3_s1_selftest,
+        )
+        if not any("self-test evidence" in problem for problem in bad_w3_s1_selftest_problems):
+            raise AssertionError("bad W3 S1 selftest pass-line did not fail as expected")
 
         bad_w3_product = tmp_root / "bad-w3-product-no-usage"
         bad_w3_product_manifest = write_selftest_manifest(bad_w3_product, lane="w3", ratio=0.82)
