@@ -150,7 +150,14 @@ impl EngineInner {
         request_id: &RequestId,
         finish_reason: FinishReason,
     ) -> Result<()> {
-        let (response, stream_sender, response_sender, has_kv_cache, model_cache_id) = {
+        let (
+            response,
+            stream_sender,
+            response_sender,
+            has_kv_cache,
+            has_recurrent_state,
+            model_cache_id,
+        ) = {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.remove(request_id) {
                 let text = self
@@ -186,12 +193,14 @@ impl EngineInner {
                 };
 
                 let has_kv = seq.kv_cache.is_some();
+                let has_recurrent_state = seq.recurrent_state.is_some();
                 let cache_id = seq.model_cache_id.clone();
                 (
                     response,
                     seq.stream_sender,
                     seq.response_sender,
                     has_kv,
+                    has_recurrent_state,
                     cache_id,
                 )
             } else {
@@ -206,6 +215,12 @@ impl EngineInner {
 
         if has_kv_cache {
             let _ = self.kv_cache.deallocate(request_id.clone()).await;
+        }
+
+        if has_recurrent_state {
+            if let Some(manager) = &self.recurrent_state_manager {
+                let _ = manager.deallocate(request_id.clone()).await;
+            }
         }
 
         self.scheduler

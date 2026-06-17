@@ -11,8 +11,8 @@ use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
     model_executor::{LogitsReturnPolicy, TokenSelectionMask},
-    KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, Sampler,
-    SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
+    KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
+    Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
 use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::json_mode::JsonModeProcessor;
@@ -1198,6 +1198,7 @@ struct EngineInner {
     // Retained for constructor API; sampling now uses per-request SamplingConfig
     sampler: Arc<dyn Sampler + Send + Sync>,
     kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+    recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
     /// Optional draft executor for speculative decoding. When set alongside
     /// `spec_config`, `run_single_decode` routes through `SpeculativeRunner`.
@@ -1339,9 +1340,39 @@ impl ContinuousBatchEngine {
         draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
         spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
     ) -> Self {
+        Self::new_with_speculation_and_recurrent_state_manager(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            kv_cache,
+            model_executor,
+            tensor_factory,
+            draft_executor,
+            spec_config,
+            None,
+        )
+    }
+
+    /// Build an engine with optional speculative decoding and an optional
+    /// recurrent-state manager for state-space / hybrid models.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_speculation_and_recurrent_state_manager(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        tensor_factory: Arc<dyn TensorFactory>,
+        draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
+        spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
+        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
+    ) -> Self {
         info!(
-            "Creating ContinuousBatchEngine (speculative_decoding={})",
-            draft_executor.is_some() && spec_config.is_some()
+            "Creating ContinuousBatchEngine (speculative_decoding={}, recurrent_state_manager={})",
+            draft_executor.is_some() && spec_config.is_some(),
+            recurrent_state_manager.is_some()
         );
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
 
@@ -1352,6 +1383,7 @@ impl ContinuousBatchEngine {
                 tokenizer,
                 sampler,
                 kv_cache,
+                recurrent_state_manager,
                 model_executor,
                 draft_executor,
                 spec_config,

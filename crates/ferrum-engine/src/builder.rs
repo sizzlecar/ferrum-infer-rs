@@ -11,8 +11,8 @@
 use crate::registry::{ComponentConfig, ComponentRegistry};
 use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_interfaces::{
-    KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, TensorFactory,
-    Tokenizer,
+    KvCacheManager, ModelExecutor, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler,
+    TensorFactory, Tokenizer,
 };
 use ferrum_types::{EngineConfig, FerrumError, Result, SchedulingPolicy};
 use std::sync::Arc;
@@ -48,6 +48,8 @@ pub struct EngineBuilder {
     custom_scheduler: Option<Arc<dyn Scheduler + Send + Sync>>,
     /// Pre-created KV cache (skip factory)
     custom_kv_cache: Option<Arc<dyn KvCacheManager + Send + Sync>>,
+    /// Pre-created recurrent-state manager (skip factory)
+    custom_recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
     /// Pre-created executor (skip factory)
     custom_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
 }
@@ -72,6 +74,7 @@ impl EngineBuilder {
             custom_sampler: None,
             custom_scheduler: None,
             custom_kv_cache: None,
+            custom_recurrent_state_manager: None,
             custom_executor: None,
         }
     }
@@ -121,6 +124,15 @@ impl EngineBuilder {
     /// Set a pre-created KV cache manager
     pub fn with_custom_kv_cache(mut self, kv_cache: Arc<dyn KvCacheManager + Send + Sync>) -> Self {
         self.custom_kv_cache = Some(kv_cache);
+        self
+    }
+
+    /// Set a pre-created recurrent-state manager.
+    pub fn with_custom_recurrent_state_manager(
+        mut self,
+        manager: Arc<dyn RecurrentStateManager + Send + Sync>,
+    ) -> Self {
+        self.custom_recurrent_state_manager = Some(manager);
         self
     }
 
@@ -242,6 +254,7 @@ impl EngineBuilder {
         let custom_sampler = self.custom_sampler;
         let custom_scheduler = self.custom_scheduler;
         let custom_kv_cache = self.custom_kv_cache;
+        let custom_recurrent_state_manager = self.custom_recurrent_state_manager;
         let custom_executor = self.custom_executor;
 
         // 2. Create or use provided tokenizer
@@ -393,7 +406,7 @@ impl EngineBuilder {
             _ => (None, None),
         };
 
-        let engine = crate::ContinuousBatchEngine::new_with_speculation(
+        let engine = crate::ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
             config,
             cb_scheduler,
             tokenizer,
@@ -403,6 +416,7 @@ impl EngineBuilder {
             tensor_factory,
             draft_executor,
             spec_config,
+            custom_recurrent_state_manager,
         );
         Ok(Box::new(engine))
     }
@@ -469,6 +483,59 @@ pub async fn create_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_interfaces::{
+        RecurrentStateHandle, RecurrentStateManager, RecurrentStateManagerStats, RecurrentStateSpec,
+    };
+    use ferrum_types::RequestId;
+
+    #[derive(Debug)]
+    struct NoopRecurrentStateManager;
+
+    #[async_trait::async_trait]
+    impl RecurrentStateManager for NoopRecurrentStateManager {
+        async fn allocate(
+            &self,
+            _spec: &RecurrentStateSpec,
+        ) -> Result<Arc<dyn RecurrentStateHandle>> {
+            Err(FerrumError::unsupported(
+                "noop recurrent-state manager does not allocate",
+            ))
+        }
+
+        async fn deallocate(&self, _request_id: RequestId) -> Result<()> {
+            Ok(())
+        }
+
+        fn can_allocate(&self, _spec: &RecurrentStateSpec) -> bool {
+            false
+        }
+
+        fn get_handle(&self, _request_id: RequestId) -> Option<Arc<dyn RecurrentStateHandle>> {
+            None
+        }
+
+        fn list_handles(&self) -> Vec<(RequestId, Arc<dyn RecurrentStateHandle>)> {
+            Vec::new()
+        }
+
+        fn stats(&self) -> RecurrentStateManagerStats {
+            RecurrentStateManagerStats {
+                total_memory_bytes: 0,
+                used_memory_bytes: 0,
+                active_states: 0,
+                active_state_tensors: 0,
+                total_batch_slots: 0,
+                used_batch_slots: 0,
+                allocation_count: 0,
+                allocation_failures: 0,
+                eviction_count: 0,
+            }
+        }
+
+        async fn reset(&self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_builder_creation() {
@@ -476,6 +543,7 @@ mod tests {
         let builder = EngineBuilder::new(config);
 
         assert!(builder.tokenizer_name.is_none());
+        assert!(builder.custom_recurrent_state_manager.is_none());
     }
 
     #[test]
@@ -493,6 +561,15 @@ mod tests {
         assert_eq!(builder.scheduler_name, Some("priority".to_string()));
         assert_eq!(builder.kv_cache_name, Some("paged".to_string()));
         assert_eq!(builder.executor_name, Some("custom_executor".to_string()));
+    }
+
+    #[test]
+    fn test_builder_with_custom_recurrent_state_manager() {
+        let config = EngineConfig::default();
+        let manager = Arc::new(NoopRecurrentStateManager);
+        let builder = EngineBuilder::new(config).with_custom_recurrent_state_manager(manager);
+
+        assert!(builder.custom_recurrent_state_manager.is_some());
     }
 
     #[test]
