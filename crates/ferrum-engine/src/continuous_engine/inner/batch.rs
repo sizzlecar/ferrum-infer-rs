@@ -154,6 +154,7 @@ impl EngineInner {
             recurrent_state: Option<Arc<dyn ferrum_interfaces::RecurrentStateHandle>>,
             metadata: std::collections::HashMap<String, serde_json::Value>,
             logits_policy: LogitsReturnPolicy,
+            can_use_prefix_cache: bool,
             fresh_kv: bool,
             chunk_start: usize,
             chunk_len: usize,
@@ -172,14 +173,15 @@ impl EngineInner {
                 chunk_start,
                 metadata,
                 logits_policy,
+                can_use_prefix_cache,
             ) = {
                 let sequences = self.sequences.read();
                 let Some(seq) = sequences.get(rid) else {
                     continue;
                 };
                 (
-                    seq.input_tokens.clone(),
-                    seq.input_tokens.len(),
+                    seq.prefill_context_tokens(),
+                    seq.prefill_context_len(),
                     seq.kv_cache.clone(),
                     seq.recurrent_state.clone(),
                     seq.prefill_tokens_processed,
@@ -189,6 +191,7 @@ impl EngineInner {
                     } else {
                         LogitsReturnPolicy::FullLogits
                     },
+                    seq.generated_tokens.is_empty(),
                 )
             };
             if chunk_start >= num_tokens {
@@ -197,7 +200,8 @@ impl EngineInner {
             let recurrent_state_spec = self
                 .model_executor
                 .recurrent_state_spec(rid, &input_tokens)?;
-            let skip_request_prefix_cache = skip_prefix_cache || recurrent_state_spec.is_some();
+            let skip_request_prefix_cache =
+                skip_prefix_cache || !can_use_prefix_cache || recurrent_state_spec.is_some();
             if chunk_start == 0 && !skip_request_prefix_cache {
                 let hit = self
                     .prefix_cache
@@ -299,6 +303,7 @@ impl EngineInner {
                 recurrent_state,
                 metadata,
                 logits_policy,
+                can_use_prefix_cache,
                 fresh_kv,
                 chunk_start,
                 chunk_len,
@@ -483,12 +488,14 @@ impl EngineInner {
                 }
                 None => {
                     warn!("Unified prefill result missing for {}", work.rid);
+                    self.complete_request(&work.rid, FinishReason::Error)
+                        .await?;
                     continue;
                 }
             };
             let num_tokens = work.input_tokens.len();
             let kv_handle = unified.items[i].kv_cache.clone();
-            if !skip_prefix_cache && logits_vec.len() > 1 {
+            if !skip_prefix_cache && work.can_use_prefix_cache && logits_vec.len() > 1 {
                 // Store in prefix cache (best-effort). Greedy-argmax results
                 // are single-token sentinels, not reusable full logits.
                 let _ = self.prefix_cache.store_prefix(
@@ -497,7 +504,7 @@ impl EngineInner {
                     logits_vec.clone(),
                 );
             }
-            let (first_token, queue_to_first_token_us) = {
+            let first_token_result = {
                 let mut sequences = self.sequences.write();
                 let Some(seq) = sequences.get_mut(&work.rid) else {
                     continue;
@@ -521,7 +528,22 @@ impl EngineInner {
                 seq.prefill_tokens_processed = num_tokens;
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
-                (token, seq.start_time.elapsed().as_micros() as u64)
+                Ok::<(TokenId, u64), FerrumError>((
+                    token,
+                    seq.start_time.elapsed().as_micros() as u64,
+                ))
+            };
+            let (first_token, queue_to_first_token_us) = match first_token_result {
+                Ok(value) => value,
+                Err(e) => {
+                    warn!(
+                        "Unified prefill post-process failed for {}: {}",
+                        work.rid, e
+                    );
+                    self.complete_request(&work.rid, FinishReason::Error)
+                        .await?;
+                    continue;
+                }
             };
             self.scheduler.mark_prefill_complete(&work.rid, num_tokens);
             self.total_prefill_tokens
@@ -581,9 +603,13 @@ impl EngineInner {
             };
             let logits_vec = match &results[i] {
                 Some(l) => l.clone(),
-                None => continue,
+                None => {
+                    warn!("Unified decode result missing for {}", rid);
+                    self.complete_request(&rid, FinishReason::Error).await?;
+                    continue;
+                }
             };
-            let next_token = {
+            let next_token_result = {
                 let mut sequences = self.sequences.write();
                 let Some(seq) = sequences.get_mut(&rid) else {
                     continue;
@@ -609,7 +635,15 @@ impl EngineInner {
                 // model's internal paged_pool is what actually grows), so
                 // the previous `make_kv_handle_with_seq` write was a
                 // silent no-op for production handles.
-                token
+                Ok::<TokenId, FerrumError>(token)
+            };
+            let next_token = match next_token_result {
+                Ok(token) => token,
+                Err(e) => {
+                    warn!("Unified decode post-process failed for {}: {}", rid, e);
+                    self.complete_request(&rid, FinishReason::Error).await?;
+                    continue;
+                }
             };
             if let Some(t0) = t0_sample {
                 t_decode_sample_us += t0.elapsed().as_micros() as u64;
@@ -725,9 +759,11 @@ impl EngineInner {
     /// Try to preempt a decoding request to free KV cache blocks.
     ///
     /// Picks the lowest-priority victim (ties broken by fewest generated
-    /// tokens — least work lost).  Frees the victim's KV cache, resets
-    /// its sequence state, and re-submits it to the scheduler so it will
-    /// be re-prefilled in a later iteration.
+    /// tokens — least work lost). Frees the victim's physical KV cache and
+    /// re-submits it to the scheduler. The logical output state is preserved:
+    /// the next prefill rebuilds KV from prompt + already-generated tokens,
+    /// mirroring vLLM-style recompute preemption instead of duplicating or
+    /// dropping streamed output.
     ///
     /// Returns `true` if a victim was preempted.
     pub(super) async fn preempt_victim(&self, exclude_id: &RequestId) -> bool {
@@ -782,22 +818,21 @@ impl EngineInner {
             let _ = manager.deallocate(victim_id.clone()).await;
         }
 
-        // Reset sequence state — keep response/stream channels intact
+        // Reset only physical model state. Keep generated_tokens, RNG,
+        // token-frequency, and stream offsets intact; those are logical
+        // request state and are needed to continue without replaying output
+        // to the client after KV recompute.
         {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(&victim_id) {
                 seq.kv_cache = None;
                 seq.recurrent_state = None;
                 seq.model_cache_id = None;
-                seq.generated_tokens.clear();
                 seq.prefill_complete = false;
                 seq.prefill_tokens_processed = 0;
                 seq.phase = RequestPhase::Waiting;
                 seq.tokens_this_iteration = 0;
                 seq.preemption_count += 1;
-                // Reset RNG to original seed for deterministic re-generation
-                let seed = seq.sampling_params.seed.unwrap_or(42);
-                seq.rng = StdRng::seed_from_u64(seed);
             }
         }
 

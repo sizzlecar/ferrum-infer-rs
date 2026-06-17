@@ -123,7 +123,7 @@ impl EngineInner {
             })?;
 
             let t0_sample = if prof { Some(Instant::now()) } else { None };
-            let next_token = {
+            let next_token_result = {
                 let mut sequences = self.sequences.write();
                 let seq = sequences
                     .get_mut(rid)
@@ -149,7 +149,15 @@ impl EngineInner {
                 // sequence_length is not used for position tracking
                 // anymore — production handles (Paged/Default) don't
                 // update it across iterations.
-                token
+                Ok::<TokenId, FerrumError>(token)
+            };
+            let next_token = match next_token_result {
+                Ok(token) => token,
+                Err(e) => {
+                    warn!("Batch decode post-process failed for {}: {}", rid, e);
+                    self.complete_request(rid, FinishReason::Error).await?;
+                    continue;
+                }
             };
 
             if let Some(t0) = t0_sample {

@@ -846,7 +846,20 @@ impl Scheduler for ContinuousBatchScheduler {
             {
                 prefill_queue.remove(pos);
                 self.request_index.write().remove(&request_id);
-                self.completed_counter.fetch_add(1, Ordering::Relaxed);
+                match response.finish_reason {
+                    ferrum_types::FinishReason::EOS
+                    | ferrum_types::FinishReason::Stop
+                    | ferrum_types::FinishReason::Length => {
+                        self.completed_counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        self.failed_counter.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "Request {} completed with error during prefill: {:?}",
+                            request_id, response.finish_reason
+                        );
+                    }
+                }
                 return Ok(());
             }
 
