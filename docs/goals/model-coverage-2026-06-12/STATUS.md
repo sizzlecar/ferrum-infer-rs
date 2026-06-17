@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZY — W3 official/HF config probe source checkpoint
+
+- Scope:
+  - source checkpoint for selecting official/HF W3 reference-layer targets;
+  - metadata-only, no model weights downloaded;
+  - no paid GPU compute was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `scripts/release/w3_hf_config_probe.py`;
+  - validates nested `text_config` for selected Qwen3.5 dense and Qwen3.6
+    MoE references;
+  - checks `layer_types` include both `linear_attention` and `full_attention`;
+  - checks linear-attention head/key/value/conv fields;
+  - checks MoE fields including `num_experts`, `num_experts_per_tok`,
+    `moe_intermediate_size`, and `shared_expert_intermediate_size`.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_hf_config_probe.py` PASS;
+  - `python3 scripts/release/w3_hf_config_probe.py --self-test --out
+    target/w3_hf_config_probe_selftest` PASS line:
+    `W3 HF CONFIG PROBE SELFTEST PASS:
+    /Users/chejinxuan/rust_ws/ferrum-infer-rs/target/w3_hf_config_probe_selftest`;
+  - `git diff --check -- scripts/release/w3_hf_config_probe.py` PASS.
+- Next required validation:
+  - run the probe from a clean worktree against Hugging Face config URLs and
+    commit the artifact;
+  - use that artifact to choose the first official/HF W3 layer-dump reference.
+
 ## 2026-06-17 ZX — W3-S1 Ferrum Rust single-layer compare PASS
 
 - Scope:
