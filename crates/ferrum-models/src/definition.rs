@@ -510,4 +510,35 @@ mod tests {
             Some(512)
         );
     }
+
+    #[test]
+    fn qwen35_model_definition_builds_recurrent_state_spec() {
+        let def = parse_artifact_config("moe_shared_expert_reference.config.json");
+        let cfg = Qwen35TextConfig::from_model_definition(&def).unwrap();
+        let request_id = ferrum_types::RequestId::new();
+        let spec = cfg
+            .to_recurrent_state_spec(
+                request_id.clone(),
+                ferrum_types::DataType::FP16,
+                ferrum_types::Device::CPU,
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(spec.request_id, request_id);
+        assert_eq!(spec.num_layers, 40);
+        assert_eq!(spec.tensors.len(), 30);
+        assert_eq!(spec.tensors[0].layer_index, 0);
+        assert_eq!(spec.tensors[3].layer_index, 4);
+        assert_eq!(spec.tensors[0].shape, vec![32, 128, 128]);
+        assert_eq!(spec.estimated_memory_bytes(), 30 * 32 * 128 * 128 * 2);
+    }
+
+    #[test]
+    fn qwen35_model_definition_rejects_non_w3_architecture() {
+        let def = ModelDefinition::default();
+        let err = Qwen35TextConfig::from_model_definition(&def)
+            .expect_err("Llama definition must not parse as Qwen3.5");
+        assert!(err.contains("not Qwen3.5/Qwen3.6"), "{err}");
+    }
 }

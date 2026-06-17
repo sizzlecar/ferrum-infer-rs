@@ -1,4 +1,5 @@
 use ferrum_models::qwen35_config::{Qwen35LayerType, Qwen35TextConfig, QWEN35_DELTA_STATE_NAME};
+use ferrum_types::{DataType, Device, RequestId};
 
 const ARTIFACT_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -47,6 +48,18 @@ fn parses_official_qwen35_dense_min_config() {
         cfg.recurrent_state_elements_per_slot().unwrap(),
         18 * 16 * 128 * 128
     );
+    let request_id = RequestId::new();
+    let spec = cfg
+        .to_recurrent_state_spec(request_id.clone(), DataType::BF16, Device::CPU, 1)
+        .unwrap();
+    assert_eq!(spec.request_id, request_id);
+    assert_eq!(spec.num_layers, 24);
+    assert_eq!(spec.tensors.len(), 18);
+    assert_eq!(spec.tensors[0].shape, vec![16, 128, 128]);
+    assert_eq!(spec.dtype, DataType::BF16);
+    assert_eq!(spec.device, Device::CPU);
+    assert_eq!(spec.max_batch_slots, 1);
+    assert_eq!(spec.estimated_memory_bytes(), 18 * 16 * 128 * 128 * 2);
 }
 
 #[test]
@@ -86,6 +99,13 @@ fn parses_official_qwen36_shared_expert_moe_config() {
         cfg.recurrent_state_elements_per_slot().unwrap(),
         30 * 32 * 128 * 128
     );
+    let spec = cfg
+        .to_recurrent_state_spec(RequestId::new(), DataType::FP16, Device::CPU, 1)
+        .unwrap();
+    assert_eq!(spec.num_layers, 40);
+    assert_eq!(spec.tensors.len(), 30);
+    assert_eq!(spec.tensors[0].shape, vec![32, 128, 128]);
+    assert_eq!(spec.estimated_memory_bytes(), 30 * 32 * 128 * 128 * 2);
 }
 
 #[test]
@@ -139,4 +159,14 @@ fn rejects_moe_config_without_shared_expert() {
     let err = Qwen35TextConfig::from_hf_config_str(raw)
         .expect_err("MoE config without shared expert should fail");
     assert!(err.contains("shared_expert_intermediate_size"), "{err}");
+}
+
+#[test]
+fn rejects_zero_recurrent_state_batch_slots() {
+    let raw = read_artifact("dense_min_reference.config.json");
+    let cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
+    let err = cfg
+        .to_recurrent_state_spec(RequestId::new(), DataType::FP16, Device::CPU, 0)
+        .expect_err("zero batch slots should fail");
+    assert!(err.contains("max_batch_slots"), "{err}");
 }

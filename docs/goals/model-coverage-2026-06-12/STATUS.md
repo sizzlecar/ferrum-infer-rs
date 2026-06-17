@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZI — W3 recurrent-state spec product-boundary checkpoint
+
+- Scope:
+  - W3-S2 bridge work from parsed Qwen3.5/Qwen3.6 product configs to the
+    `ModelExecutor::recurrent_state_spec()` allocation contract;
+  - no product execution was run;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35TextConfig::from_model_definition()` so executor/loader code
+    can rebuild the typed W3 config from `ModelDefinition.extra_params`
+    without re-reading raw HF JSON or duplicating shape parsing;
+  - added `Qwen35TextConfig::to_recurrent_state_spec()` to produce the exact
+    `RecurrentStateSpec` needed by ContinuousBatch recurrent-state allocation;
+  - validated `max_batch_slots > 0`;
+  - kept the registry execution path explicitly unsupported for
+    Qwen3.5/Qwen3.6 until the real executor is wired, avoiding a misleading
+    `ferrum run` / `ferrum serve` partial path.
+- Evidence:
+  - dense `Qwen/Qwen3.5-0.8B` produces 18 `delta_state` tensors with shape
+    `[16, 128, 128]` and BF16 slot memory `18 * 16 * 128 * 128 * 2`;
+  - MoE/shared-expert `Qwen/Qwen3.6-35B-A3B` produces 30 `delta_state` tensors
+    with shape `[32, 128, 128]` and FP16 slot memory
+    `30 * 32 * 128 * 128 * 2`;
+  - the crate-local config chain now covers
+    `ConfigManager -> ModelDefinition -> Qwen35TextConfig -> RecurrentStateSpec`.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `6 passed`;
+  - `cargo test -p ferrum-models --test qwen35_config_test -- --nocapture`
+    PASS: `5 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this does not allocate/update the recurrent state at runtime yet;
+  - Qwen3.5/Qwen3.6 product execution remains intentionally unsupported until
+    the W3 executor path calls this spec and implements prefill/decode.
+
 ## 2026-06-18 ZZH — W3 Qwen3.6 value-head DeltaNet topology correction checkpoint
 
 - Scope:
