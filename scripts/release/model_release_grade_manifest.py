@@ -365,6 +365,13 @@ def build_manifest(
     ).strip()
     vllm_versions = load_json(source / "env/vllm_versions.json")
     vllm_version = str(vllm_versions.get("vllm", "unknown"))
+    baseline_build_command = [
+        "python",
+        "-m",
+        "pip",
+        "install",
+        f"vllm=={vllm_version}",
+    ]
     ferrum_command = read_command(source / "perf/bench-ferrum.command.txt", "Ferrum bench command")
     baseline_command = read_command(source / "perf/bench-vllm.command.txt", "vLLM bench command")
 
@@ -435,17 +442,7 @@ def build_manifest(
             "baseline": {
                 "engine": "vLLM",
                 "version": vllm_version,
-                "build_command_line": [
-                    "python",
-                    "-m",
-                    "pip",
-                    "install",
-                    "vllm==0.10.1.1",
-                    "transformers==4.55.4",
-                    "fastapi==0.116.1",
-                    "starlette==0.47.2",
-                    "prometheus-fastapi-instrumentator==7.1.0",
-                ],
+                "build_command_line": baseline_build_command,
                 "command_line": vllm_server_command,
                 "bench_command_line": baseline_command,
                 "same_hardware": True,
@@ -486,7 +483,7 @@ def write_selftest_source(root: Path) -> Path:
     (source / "env/git_sha.txt").write_text("0123456789abcdef\n")
     (source / "env/git_status_short.txt").write_text("")
     (source / "env/nvidia_smi_before.txt").write_text("NVIDIA GeForce RTX 4090\n")
-    write_json(source / "env/vllm_versions.json", {"vllm": "0.10.1.1"})
+    write_json(source / "env/vllm_versions.json", {"vllm": "0.23.0"})
     write_json(source / "server/serve_effective_config.json", {"status": "pass"})
     write_json(source / "correctness/run_summary.json", {"status": "pass", "content": "5"})
     write_json(source / "correctness/smoke/stream_summary.json", {"done_count": 1, "content": "5"})

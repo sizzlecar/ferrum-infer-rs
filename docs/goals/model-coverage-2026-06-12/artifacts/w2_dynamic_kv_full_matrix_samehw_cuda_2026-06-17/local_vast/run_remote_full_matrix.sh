@@ -7,7 +7,8 @@ MODEL="${MODEL:-gemma3:27b-gptq}"
 HF_REPO="${HF_REPO:-circulus/gemma-3-27b-it-gptq}"
 HF_HOME="${HF_HOME:-/workspace/hf-cache}"
 DATASET="${DATASET:-/workspace/ascii_sharegpt_w2_100.jsonl}"
-VLLM_VENV="${VLLM_VENV:-/workspace/vllm-venv-0101-cu126}"
+VLLM_VERSION="${VLLM_VERSION:-0.23.0}"
+VLLM_VENV="${VLLM_VENV:-/workspace/vllm-venv-${VLLM_VERSION//./_}}"
 VLLM_PORT="${VLLM_PORT:-18245}"
 FERRUM_CORRECTNESS_PORT="${FERRUM_CORRECTNESS_PORT:-18246}"
 FERRUM_BENCH_PORT="${FERRUM_BENCH_PORT:-18247}"
@@ -163,7 +164,7 @@ PY
 
 ensure_vllm() {
   echo "[w2-full-matrix] ensuring vLLM venv"
-  if [ -x "$VLLM_VENV/bin/python" ] && "$VLLM_VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  if [ -x "$VLLM_VENV/bin/python" ] && "$VLLM_VENV/bin/python" -m pip show vllm 2>/dev/null | grep -q "Version: $VLLM_VERSION"; then
     echo "[w2-full-matrix] reusing existing vLLM venv"
   else
     rm -rf "$VLLM_VENV"
@@ -176,13 +177,9 @@ ensure_vllm() {
     fi
     "$VLLM_VENV/bin/python" -m pip install --upgrade pip wheel setuptools \
       > "$OUT/install/pip_upgrade.log" 2>&1
-    "$VLLM_VENV/bin/python" -m pip install vllm==0.10.1.1 \
-      > "$OUT/install/vllm0101_install.log" 2>&1
+    "$VLLM_VENV/bin/python" -m pip install "vllm==$VLLM_VERSION" \
+      > "$OUT/install/vllm_install.log" 2>&1
   fi
-  "$VLLM_VENV/bin/python" -m pip install transformers==4.55.4 \
-    > "$OUT/install/pin_transformers_4554.log" 2>&1
-  "$VLLM_VENV/bin/python" -m pip install fastapi==0.116.1 starlette==0.47.2 prometheus-fastapi-instrumentator==7.1.0 \
-    > "$OUT/install/pin_api_stack.log" 2>&1
   "$VLLM_VENV/bin/python" -m pip freeze > "$OUT/env/vllm_pip_freeze.txt"
   "$VLLM_VENV/bin/python" - <<'PY' > "$OUT/env/vllm_versions.json"
 import importlib.metadata as md
@@ -460,16 +457,14 @@ SERVER_CMD=(
 )
 python3 - "$OUT/vllm/vllm_server.command.json" "${SERVER_CMD[@]}" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 Path(sys.argv[1]).write_text(json.dumps({
     "cmd": sys.argv[2:],
     "dependency_pins": {
-        "vllm": "0.10.1.1",
-        "transformers": "4.55.4",
-        "fastapi": "0.116.1",
-        "starlette": "0.47.2",
-        "prometheus-fastapi-instrumentator": "7.1.0",
+        "vllm": os.environ.get("VLLM_VERSION", "unknown"),
+        "dependency_policy": "vLLM release resolver; no manual transformers/api downgrades",
     },
 }, indent=2, sort_keys=True) + "\n")
 PY
