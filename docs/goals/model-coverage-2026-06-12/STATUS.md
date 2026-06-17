@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZP — W3 role-aware weight-loader adapter checkpoint
+
+- Scope:
+  - W3-S2 bridge from resolved weight plan to the existing backend
+    `WeightLoader` abstraction;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35WeightPlanLoader`;
+  - the adapter loads global and layer tensors by semantic role instead of
+    repeating full safetensors names at each call site;
+  - the adapter delegates tensor and linear materialization to the existing
+    backend `WeightLoader<B>` path;
+  - `load_*_linear()` strips the `.weight` suffix before calling
+    `WeightLoader::load_linear()`, matching the existing Qwen3/Qwen3-MoE
+    loader contract;
+  - absent optional tied weights, such as dense `lm_head`, now fail with a
+    role-specific error when accidentally loaded directly.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35_weights -- --nocapture` PASS:
+    `6 passed`;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `15 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this still does not implement Qwen3.5/Qwen3.6 prefill/decode;
+  - this does not register W3 product execution;
+  - it is the loader abstraction needed before materializing W3 model weights.
+
 ## 2026-06-18 ZZO — W3 resolved weight-plan checkpoint
 
 - Scope:
