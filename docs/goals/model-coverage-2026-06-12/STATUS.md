@@ -2,6 +2,51 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZL — W3 Qwen3.5/Qwen3.6 weight-manifest checkpoint
+
+- Scope:
+  - W3-S2 loader/forward prerequisite after typed layer planning;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Source comparison:
+  - reused the existing Ferrum Qwen3.5 S1 replay tensor names for dense
+    linear-attention and dense MLP layers;
+  - checked local vLLM `qwen3_5.py` / `qwen3_next.py` loader mappings for
+    full attention, sparse MoE, fused routed experts, and shared expert names.
+- Change:
+  - added `tie_word_embeddings` to the typed Qwen3.5 config;
+  - added `Qwen35WeightSpec`;
+  - added `Qwen35LayerWeightManifest`;
+  - added `Qwen35WeightManifest`;
+  - added `Qwen35TextConfig::weight_manifest(prefix)`;
+  - manifest now emits canonical HF tensor names for:
+    - global embedding/final norm/lm head;
+    - linear-attention QKV/Z/B/A/conv/A_log/dt_bias/norm/out projection;
+    - full-attention q/k/v/o projections and q/k norms;
+    - dense MLP gate/up/down;
+    - MoE router, shared expert gate, shared expert MLP, fused expert gate-up
+      and down weights, plus optional per-expert aliases.
+- Evidence:
+  - dense Qwen3.5 marks `lm_head` optional because the official artifact ties
+    embeddings;
+  - Qwen3.6 MoE marks `lm_head` required because the official artifact does
+    not tie embeddings;
+  - Qwen3.6 layer 0 manifest includes linear-attention and MoE fused expert
+    weights;
+  - Qwen3.6 layer 3 manifest includes full-attention and shared-expert weights.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models --test qwen35_config_test -- --nocapture`
+    PASS: `6 passed`;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `7 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this still does not load tensors into the W3 executor;
+  - this does not run prefill/decode;
+  - it fixes the loader contract before the loader implementation.
+
 ## 2026-06-18 ZZK — W3 Qwen3.5/Qwen3.6 typed layer-plan checkpoint
 
 - Scope:
