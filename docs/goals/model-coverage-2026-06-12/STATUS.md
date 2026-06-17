@@ -2,6 +2,31 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZL — W3-S0 source checkpoint: recurrent-state interface contract
+
+- Scope:
+  - source-only W3-S0 interface checkpoint;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `crates/ferrum-interfaces/src/recurrent_state.rs`;
+  - exported GPU-free `RecurrentStateSpec`, `RecurrentStateTensorSpec`,
+    `RecurrentStateHandle`, `RecurrentStateManager`, stats, and resume policy;
+  - added crate-local mock lifecycle tests for allocate/get/list/deallocate,
+    reset, capacity rejection, and memory estimation.
+- Validation:
+  - `cargo test -p ferrum-interfaces` PASS:
+    recurrent-state tests `4 passed`, full crate test set `13 passed`;
+  - live Vast probe still reports `credit=0`, `running_count=0`, and all known
+    instances stopped/exited; saved summary under
+    `artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/live_probe_20260617T050350Z/`.
+- Next required validation:
+  - after credit is restored, resume W2 full-matrix same-hardware CUDA evidence
+    first;
+  - W3 next local step is to thread optional recurrent-state handles through
+    model executor inputs without breaking KV-only models.
+
 ## 2026-06-17 ZK — W3-S0 design checkpoint: recurrent-state boundary
 
 - Scope:
