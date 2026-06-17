@@ -1,9 +1,13 @@
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use std::collections::HashMap;
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct TempDirGuard {
     path: PathBuf,
@@ -53,6 +57,11 @@ fn ferrum_bin() -> PathBuf {
 
 fn run(cmd: &mut Command) -> Output {
     cmd.output().expect("failed to run ferrum command")
+}
+
+fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    listener.local_addr().expect("local_addr").port()
 }
 
 fn write_qwen35_reference_config(dir: &Path) {
@@ -253,6 +262,109 @@ fn write_qwen35_reference_model_dir(root: &Path) -> PathBuf {
     model_dir
 }
 
+struct ServerFixture {
+    base_url: String,
+    model_id: String,
+    child: Child,
+    log_path: PathBuf,
+}
+
+impl ServerFixture {
+    async fn spawn(workspace: &Path, model_dir: &Path) -> Self {
+        let port = free_port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let model_id = model_dir
+            .file_name()
+            .expect("model dir file name")
+            .to_string_lossy()
+            .to_string();
+        let log_path = workspace.join("qwen35-reference-serve.log");
+        let log = fs::File::create(&log_path).expect("create server log");
+        let mut child = Command::new(ferrum_bin())
+            .current_dir(workspace)
+            .arg("serve")
+            .arg(model_dir)
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--backend")
+            .arg("cpu")
+            .arg("--qwen35-reference")
+            .env("NO_COLOR", "1")
+            .env("HF_HOME", workspace.join("hf-cache"))
+            .stdout(Stdio::from(log.try_clone().expect("clone server log")))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("spawn ferrum serve");
+
+        let client = reqwest::Client::new();
+        let healthz = format!("{base_url}/health");
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > SERVER_STARTUP_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                let log = fs::read_to_string(&log_path).unwrap_or_default();
+                panic!(
+                    "server did not become healthy within {SERVER_STARTUP_TIMEOUT:?}\nlog={log}"
+                );
+            }
+            let ok = client
+                .get(&healthz)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .map(|response| response.status().is_success())
+                .unwrap_or(false);
+            if ok {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        Self {
+            base_url,
+            model_id,
+            child,
+            log_path,
+        }
+    }
+
+    fn chat_url(&self) -> String {
+        format!("{}/v1/chat/completions", self.base_url)
+    }
+}
+
+impl Drop for ServerFixture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Ok(log) = fs::read_to_string(&self.log_path) {
+            for bad in ["panicked", "KV cache overflow", "stream error"] {
+                assert!(!log.contains(bad), "server log contains {bad}: {log}");
+            }
+        }
+    }
+}
+
+fn parse_sse(body: &str) -> (Vec<serde_json::Value>, usize) {
+    let mut chunks = Vec::new();
+    let mut done_count = 0usize;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            done_count += 1;
+        } else if !data.is_empty() {
+            chunks.push(serde_json::from_str(data).expect("valid SSE JSON"));
+        }
+    }
+    (chunks, done_count)
+}
+
 #[test]
 fn ferrum_run_qwen35_reference_oneshot_uses_product_path() {
     let workspace = TempDirGuard::new("run-reference");
@@ -304,5 +416,83 @@ fn ferrum_run_qwen35_reference_oneshot_uses_product_path() {
             .as_str()
             .is_some_and(|content| !content.trim().is_empty()),
         "assistant content should be non-empty: {assistant}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ferrum_serve_qwen35_reference_chat_uses_product_path() {
+    let workspace = TempDirGuard::new("serve-reference");
+    let model_dir = write_qwen35_reference_model_dir(workspace.path());
+    let server = ServerFixture::spawn(workspace.path(), &model_dir).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(server.chat_url())
+        .timeout(SERVER_REQUEST_TIMEOUT)
+        .json(&serde_json::json!({
+            "model": server.model_id,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("post non-stream chat completion");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("non-stream json");
+    assert!(status.is_success(), "HTTP {status}: {body}");
+    assert_eq!(body["model"].as_str(), Some(server.model_id.as_str()));
+    assert_eq!(
+        body["choices"][0]["finish_reason"].as_str(),
+        Some("length"),
+        "unexpected non-stream body: {body}"
+    );
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("message.content");
+    assert!(
+        !content.trim().is_empty(),
+        "non-stream content should be non-empty: {body}"
+    );
+
+    let stream_response = client
+        .post(server.chat_url())
+        .timeout(SERVER_REQUEST_TIMEOUT)
+        .json(&serde_json::json!({
+            "model": server.model_id,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .send()
+        .await
+        .expect("post stream chat completion");
+    let stream_status = stream_response.status();
+    let stream_body = stream_response.text().await.expect("stream text");
+    assert!(
+        stream_status.is_success(),
+        "HTTP {stream_status}: {stream_body}"
+    );
+    let (chunks, done_count) = parse_sse(&stream_body);
+    assert_eq!(
+        done_count, 1,
+        "stream should emit one [DONE]: {stream_body}"
+    );
+    assert!(
+        chunks.iter().any(|chunk| {
+            chunk["choices"][0]["delta"]["content"]
+                .as_str()
+                .is_some_and(|delta| !delta.is_empty())
+        }),
+        "stream should emit at least one content delta: {stream_body}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk.get("usage").is_some_and(|usage| !usage.is_null())),
+        "stream include_usage should emit usage: {stream_body}"
     );
 }

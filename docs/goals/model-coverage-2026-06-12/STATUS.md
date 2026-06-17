@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ11 — W3 Qwen3.5 reference `ferrum serve` product smoke checkpoint
+
+- Scope:
+  - W3-S2 Qwen3.5/Qwen3.6 explicit CPU/FP32 reference execution through both
+    real product entrypoints now covered by toy smoke: `ferrum run` and
+    `ferrum serve`;
+  - no CUDA/Metal execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - extended the Qwen3.5 reference product integration test to spawn a real
+    `ferrum serve <model_dir> --host 127.0.0.1 --port <ephemeral>
+    --backend cpu --qwen35-reference` subprocess;
+  - the test reuses the local toy Qwen3.5 `config.json`, `tokenizer.json`,
+    and `model.safetensors` fixture used by the `ferrum run` smoke;
+  - non-streaming `/v1/chat/completions` now asserts HTTP success,
+    returned model id, `finish_reason=length`, and non-empty content;
+  - streaming `/v1/chat/completions` now sends
+    `stream_options.include_usage=true` and asserts at least one content delta,
+    one usage-bearing chunk, and exactly one `data: [DONE]`.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-cli --test qwen35_reference_product -- --nocapture`
+    PASS: `2 passed`;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `56 passed`, plus Qwen3.5 config integration coverage `1 passed`;
+  - `cargo test -p ferrum-engine qwen35_registry -- --nocapture` PASS:
+    `2 passed`;
+  - `cargo check -p ferrum-engine -p ferrum-cli` PASS.
+- Limitation:
+  - this is still a toy CPU/FP32 reference product smoke only;
+  - real Qwen3.5/Qwen3.6 model L0-L5 correctness, CUDA/Metal execution,
+    release-grade baseline comparison, and W3 80% performance gates remain
+    incomplete.
+
 ## 2026-06-18 ZZZ10 — W3 Qwen3.5 reference `ferrum run` product smoke checkpoint
 
 - Scope:
