@@ -587,4 +587,93 @@ mod tests {
             30 * 32 * 128 * 128 * 2
         );
     }
+
+    #[test]
+    fn qwen35_w3_executor_weight_preflight_accepts_complete_inventory() {
+        let def = parse_artifact_config("dense_min_reference.config.json");
+        let cfg = Qwen35TextConfig::from_model_definition(&def).unwrap();
+        let manifest = cfg.weight_manifest("model").unwrap();
+        let names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_safetensors_inventory(tmp.path(), &names);
+
+        let executor = crate::executor::Qwen35W3Executor::from_definition_with_weight_preflight(
+            "qwen35-preflight",
+            &def,
+            tmp.path(),
+            ferrum_types::DataType::FP16,
+            ferrum_types::Device::CPU,
+        )
+        .unwrap();
+        let validation = executor.weight_validation().unwrap();
+        assert_eq!(validation.prefix, "model");
+        assert!(validation.is_pass());
+    }
+
+    #[test]
+    fn qwen35_w3_executor_weight_preflight_rejects_missing_required_tensor() {
+        let def = parse_artifact_config("dense_min_reference.config.json");
+        let cfg = Qwen35TextConfig::from_model_definition(&def).unwrap();
+        let manifest = cfg.weight_manifest("model").unwrap();
+        let mut names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        names.retain(|name| name != "model.layers.3.self_attn.q_proj.weight");
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_safetensors_inventory(tmp.path(), &names);
+
+        let err = crate::executor::Qwen35W3Executor::from_definition_with_weight_preflight(
+            "qwen35-preflight",
+            &def,
+            tmp.path(),
+            ferrum_types::DataType::FP16,
+            ferrum_types::Device::CPU,
+        )
+        .expect_err("missing required W3 tensor should fail preflight");
+        assert!(err.to_string().contains("self_attn.q_proj.weight"), "{err}");
+    }
+
+    fn write_safetensors_inventory(dir: &std::path::Path, names: &[String]) {
+        use std::collections::HashMap;
+
+        use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+        let tensors = names
+            .iter()
+            .map(|name| {
+                let bytes: &'static [u8] =
+                    Box::leak(0.0f32.to_le_bytes().to_vec().into_boxed_slice());
+                (
+                    name.clone(),
+                    TensorView::new(Dtype::F32, vec![1], bytes).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            tensors,
+            &None::<HashMap<String, String>>,
+            &dir.join("model.safetensors"),
+        )
+        .unwrap();
+    }
 }

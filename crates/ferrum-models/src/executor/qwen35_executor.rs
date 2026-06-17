@@ -13,8 +13,13 @@ use ferrum_interfaces::{
     ModelExecutor, RecurrentStateSpec,
 };
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, RequestId, Result, TokenId};
+use std::path::Path;
 
-use crate::{definition::ModelDefinition, qwen35_config::Qwen35TextConfig};
+use crate::{
+    definition::ModelDefinition,
+    qwen35_config::Qwen35TextConfig,
+    qwen35_weights::{Qwen35WeightInventory, Qwen35WeightValidation},
+};
 
 const UNSUPPORTED_EXECUTION_MESSAGE: &str = "Qwen3.5/Qwen3.6 W3 executor exposes recurrent-state \
 spec only; prefill/decode are not wired yet";
@@ -25,6 +30,7 @@ pub struct Qwen35W3Executor {
     config: Qwen35TextConfig,
     dtype: DataType,
     device: Device,
+    weight_validation: Option<Qwen35WeightValidation>,
 }
 
 impl Qwen35W3Executor {
@@ -44,11 +50,33 @@ impl Qwen35W3Executor {
             config,
             dtype,
             device,
+            weight_validation: None,
         })
+    }
+
+    pub fn from_definition_with_weight_preflight(
+        model_id: impl Into<String>,
+        def: &ModelDefinition,
+        model_dir: &Path,
+        dtype: DataType,
+        device: Device,
+    ) -> Result<Self> {
+        let mut executor = Self::from_definition(model_id, def, dtype, device)?;
+        let inventory = Qwen35WeightInventory::from_safetensors_dir(model_dir)
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 weight inventory failed: {err}")))?;
+        let validation = inventory
+            .detect_prefix_and_validate(&executor.config)
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 weight preflight failed: {err}")))?;
+        executor.weight_validation = Some(validation);
+        Ok(executor)
     }
 
     pub fn qwen35_config(&self) -> &Qwen35TextConfig {
         &self.config
+    }
+
+    pub fn weight_validation(&self) -> Option<&Qwen35WeightValidation> {
+        self.weight_validation.as_ref()
     }
 
     fn unsupported_execution() -> FerrumError {
