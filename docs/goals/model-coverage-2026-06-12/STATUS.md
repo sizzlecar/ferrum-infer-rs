@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ7 — W3 sparse-MoE reference runtime/materializer checkpoint
+
+- Scope:
+  - W3-S2 Qwen3.5/Qwen3.6 sparse-MoE reference full-model forward and
+    safetensors materialization;
+  - no product registry wiring was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added typed `norm_topk_prob` parsing to `Qwen35MoeTextConfig`, with
+    model config override and Qwen3-MoE compatible default;
+  - added `Qwen35SparseMoeReferenceModel` and
+    `qwen35_sparse_moe_reference_model_forward_cpu()`;
+  - the sparse-MoE reference model composes embeddings, linear/full attention
+    layers, router/fused experts/shared expert, final RMSNorm+1, and lm_head;
+  - added `Qwen35SparseMoeReferenceRuntime::from_cpu_weight_plan()`;
+  - added explicit CPU/FP32
+    `Qwen35W3Executor::from_definition_with_sparse_moe_reference_cpu_safetensors()`;
+  - `Qwen35W3Executor::prefill()` can now use either dense or sparse-MoE
+    reference runtime while default product execution remains disabled.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `54 passed`;
+  - `cargo test -p ferrum-models --test qwen35_config_test -- --nocapture`
+    PASS: `6 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still CPU/reference materialization only;
+  - decode/recurrent-state runtime semantics, product `ferrum run`/`ferrum
+    serve`, W3 L0-L5 correctness gates, and W3 80% performance gates remain
+    incomplete.
+
 ## 2026-06-18 ZZZ6 — W3 S0 native CUDA microbench checkpoint
 
 - Scope:

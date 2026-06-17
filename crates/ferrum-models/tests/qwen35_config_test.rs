@@ -118,6 +118,7 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     assert_eq!(moe.num_experts_per_tok, 8);
     assert_eq!(moe.moe_intermediate_size, 512);
     assert_eq!(moe.shared_expert_intermediate_size, 512);
+    assert!(moe.norm_topk_prob);
     assert!(cfg.dense_mlp_layers().is_empty());
     assert_eq!(cfg.sparse_moe_layers().len(), 40);
     assert_eq!(cfg.sparse_moe_layers()[0], 0);

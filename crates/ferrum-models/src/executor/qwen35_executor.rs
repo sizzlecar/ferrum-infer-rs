@@ -25,12 +25,16 @@ use crate::{
     definition::ModelDefinition,
     executor::common::{self, GenericKvCacheHandle},
     models::qwen35::{
-        qwen35_dense_reference_model_forward_cpu, Qwen35DenseFullAttentionLayerShape,
-        Qwen35DenseLinearAttentionLayerShape, Qwen35DenseReferenceFullLayer,
-        Qwen35DenseReferenceLayer, Qwen35DenseReferenceLinearLayer, Qwen35DenseReferenceModel,
-        Qwen35DenseReferenceModelOutput, Qwen35FullAttentionShape, Qwen35LinearAttentionShape,
+        qwen35_dense_reference_model_forward_cpu, qwen35_sparse_moe_reference_model_forward_cpu,
+        Qwen35DenseFullAttentionLayerShape, Qwen35DenseLinearAttentionLayerShape,
+        Qwen35DenseReferenceFullLayer, Qwen35DenseReferenceLayer, Qwen35DenseReferenceLinearLayer,
+        Qwen35DenseReferenceModel, Qwen35DenseReferenceModelOutput, Qwen35FullAttentionShape,
+        Qwen35LinearAttentionShape, Qwen35SparseMoeFullAttentionLayerShape,
+        Qwen35SparseMoeLinearAttentionLayerShape, Qwen35SparseMoeReferenceFullLayer,
+        Qwen35SparseMoeReferenceLayer, Qwen35SparseMoeReferenceLinearLayer,
+        Qwen35SparseMoeReferenceModel, Qwen35SparseMoeReferenceModelOutput, Qwen35SparseMoeShape,
     },
-    qwen35_config::{Qwen35LayerType, Qwen35TextConfig},
+    qwen35_config::{Qwen35LayerType, Qwen35MoeTextConfig, Qwen35TextConfig},
     qwen35_weights::{
         Qwen35ResolvedWeightPlan, Qwen35ResolvedWeightSpec, Qwen35WeightInventory,
         Qwen35WeightValidation,
@@ -102,6 +106,76 @@ pub struct Qwen35DenseReferenceRuntimeFullLayer {
     pub gate_proj_weight: Vec<f32>,
     pub up_proj_weight: Vec<f32>,
     pub down_proj_weight: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen35SparseMoeReferenceRuntime {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub eps: f32,
+    pub embed_tokens: Vec<f32>,
+    pub final_norm_weight: Vec<f32>,
+    pub lm_head_weight: Vec<f32>,
+    pub moe: Qwen35MoeTextConfig,
+    pub norm_topk_prob: bool,
+    pub layers: Vec<Qwen35SparseMoeReferenceRuntimeLayer>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Qwen35SparseMoeReferenceRuntimeLayer {
+    Linear(Qwen35SparseMoeReferenceRuntimeLinearLayer),
+    Full(Qwen35SparseMoeReferenceRuntimeFullLayer),
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen35SparseMoeReferenceRuntimeLinearLayer {
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub conv_kernel: usize,
+    pub input_norm_weight: Vec<f32>,
+    pub qkv_weight: Vec<f32>,
+    pub z_weight: Vec<f32>,
+    pub b_weight: Vec<f32>,
+    pub a_weight: Vec<f32>,
+    pub conv1d_weight: Vec<f32>,
+    pub a_log: Vec<f32>,
+    pub dt_bias: Vec<f32>,
+    pub norm_weight: Vec<f32>,
+    pub out_proj_weight: Vec<f32>,
+    pub post_attention_norm_weight: Vec<f32>,
+    pub router_weight: Vec<f32>,
+    pub fused_gate_up_proj: Vec<f32>,
+    pub fused_down_proj: Vec<f32>,
+    pub shared_expert_gate_weight: Vec<f32>,
+    pub shared_expert_gate_proj_weight: Vec<f32>,
+    pub shared_expert_up_proj_weight: Vec<f32>,
+    pub shared_expert_down_proj_weight: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen35SparseMoeReferenceRuntimeFullLayer {
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub position_offset: usize,
+    pub rope_theta: f32,
+    pub input_norm_weight: Vec<f32>,
+    pub q_weight: Vec<f32>,
+    pub k_weight: Vec<f32>,
+    pub v_weight: Vec<f32>,
+    pub q_norm_weight: Vec<f32>,
+    pub k_norm_weight: Vec<f32>,
+    pub o_weight: Vec<f32>,
+    pub post_attention_norm_weight: Vec<f32>,
+    pub router_weight: Vec<f32>,
+    pub fused_gate_up_proj: Vec<f32>,
+    pub fused_down_proj: Vec<f32>,
+    pub shared_expert_gate_weight: Vec<f32>,
+    pub shared_expert_gate_proj_weight: Vec<f32>,
+    pub shared_expert_up_proj_weight: Vec<f32>,
+    pub shared_expert_down_proj_weight: Vec<f32>,
 }
 
 impl Qwen35DenseReferenceRuntime {
@@ -313,6 +387,243 @@ impl Qwen35DenseReferenceRuntime {
     }
 }
 
+impl Qwen35SparseMoeReferenceRuntime {
+    pub fn from_cpu_weight_plan(
+        config: &Qwen35TextConfig,
+        vocab_size: usize,
+        eps: f32,
+        rope_theta: f32,
+        plan: &Qwen35ResolvedWeightPlan,
+        loader: &dyn WeightLoader<CpuBackend>,
+    ) -> Result<Self> {
+        let moe = config.moe.clone().ok_or_else(|| {
+            FerrumError::model("Qwen3.5 sparse-MoE reference runtime requires MoE config")
+        })?;
+        let embed_tokens = load_global_cpu_tensor(plan, loader, "embed_tokens")?;
+        let final_norm_weight = load_global_cpu_tensor(plan, loader, "final_norm")?;
+        let lm_head_weight = match optional_global_cpu_tensor(plan, loader, "lm_head")? {
+            Some(weight) => weight,
+            None => embed_tokens.clone(),
+        };
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for (layer_index, kind) in config.layer_types.iter().copied().enumerate() {
+            let input_norm_weight =
+                load_layer_cpu_tensor(plan, loader, layer_index, "input_layernorm")?;
+            let post_attention_norm_weight =
+                load_layer_cpu_tensor(plan, loader, layer_index, "post_attention_layernorm")?;
+            let router_weight = load_layer_cpu_tensor(plan, loader, layer_index, "moe_router")?;
+            let fused_gate_up_proj =
+                load_layer_cpu_tensor(plan, loader, layer_index, "moe_fused_gate_up_proj")?;
+            let fused_down_proj =
+                load_layer_cpu_tensor(plan, loader, layer_index, "moe_fused_down_proj")?;
+            let shared_expert_gate_weight =
+                load_layer_cpu_tensor(plan, loader, layer_index, "moe_shared_expert_gate")?;
+            let shared_expert_gate_proj_weight =
+                load_layer_cpu_tensor(plan, loader, layer_index, "moe_shared_expert_gate_proj")?;
+            let shared_expert_up_proj_weight =
+                load_layer_cpu_tensor(plan, loader, layer_index, "moe_shared_expert_up_proj")?;
+            let shared_expert_down_proj_weight =
+                load_layer_cpu_tensor(plan, loader, layer_index, "moe_shared_expert_down_proj")?;
+
+            let layer = match kind {
+                Qwen35LayerType::LinearAttention => Qwen35SparseMoeReferenceRuntimeLayer::Linear(
+                    Qwen35SparseMoeReferenceRuntimeLinearLayer {
+                        key_heads: config.linear_attention.num_key_heads,
+                        value_heads: config.linear_attention.num_value_heads,
+                        key_dim: config.linear_attention.key_head_dim,
+                        value_dim: config.linear_attention.value_head_dim,
+                        conv_kernel: config.linear_attention.conv_kernel_dim,
+                        input_norm_weight,
+                        qkv_weight: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "linear_attn_qkv",
+                        )?,
+                        z_weight: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "linear_attn_z",
+                        )?,
+                        b_weight: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "linear_attn_b",
+                        )?,
+                        a_weight: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "linear_attn_a",
+                        )?,
+                        conv1d_weight: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "linear_attn_conv",
+                        )?,
+                        a_log: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "linear_attn_a_log",
+                        )?,
+                        dt_bias: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "linear_attn_dt_bias",
+                        )?,
+                        norm_weight: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "linear_attn_norm",
+                        )?,
+                        out_proj_weight: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "linear_attn_out",
+                        )?,
+                        post_attention_norm_weight,
+                        router_weight,
+                        fused_gate_up_proj,
+                        fused_down_proj,
+                        shared_expert_gate_weight,
+                        shared_expert_gate_proj_weight,
+                        shared_expert_up_proj_weight,
+                        shared_expert_down_proj_weight,
+                    },
+                ),
+                Qwen35LayerType::FullAttention => Qwen35SparseMoeReferenceRuntimeLayer::Full(
+                    Qwen35SparseMoeReferenceRuntimeFullLayer {
+                        num_heads: config.num_attention_heads,
+                        num_kv_heads: config.num_key_value_heads,
+                        head_dim: config.head_dim,
+                        position_offset: 0,
+                        rope_theta,
+                        input_norm_weight,
+                        q_weight: load_layer_cpu_tensor(plan, loader, layer_index, "self_attn_q")?,
+                        k_weight: load_layer_cpu_tensor(plan, loader, layer_index, "self_attn_k")?,
+                        v_weight: load_layer_cpu_tensor(plan, loader, layer_index, "self_attn_v")?,
+                        q_norm_weight: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "self_attn_q_norm",
+                        )?,
+                        k_norm_weight: load_layer_cpu_tensor(
+                            plan,
+                            loader,
+                            layer_index,
+                            "self_attn_k_norm",
+                        )?,
+                        o_weight: load_layer_cpu_tensor(plan, loader, layer_index, "self_attn_o")?,
+                        post_attention_norm_weight,
+                        router_weight,
+                        fused_gate_up_proj,
+                        fused_down_proj,
+                        shared_expert_gate_weight,
+                        shared_expert_gate_proj_weight,
+                        shared_expert_up_proj_weight,
+                        shared_expert_down_proj_weight,
+                    },
+                ),
+            };
+            layers.push(layer);
+        }
+        let runtime = Self {
+            vocab_size,
+            hidden_size: config.hidden_size,
+            eps,
+            embed_tokens,
+            final_norm_weight,
+            lm_head_weight,
+            norm_topk_prob: moe.norm_topk_prob,
+            moe,
+            layers,
+        };
+        runtime.validate_for_config(config, vocab_size)?;
+        Ok(runtime)
+    }
+
+    pub fn validate_for_config(&self, config: &Qwen35TextConfig, vocab_size: usize) -> Result<()> {
+        let moe = config.moe.as_ref().ok_or_else(|| {
+            FerrumError::model("Qwen3.5 sparse-MoE reference runtime requires MoE config")
+        })?;
+        if self.vocab_size != vocab_size {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse-MoE reference vocab_size {} does not match model vocab_size {vocab_size}",
+                self.vocab_size
+            )));
+        }
+        if self.hidden_size != config.hidden_size {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse-MoE reference hidden_size {} does not match config hidden_size {}",
+                self.hidden_size, config.hidden_size
+            )));
+        }
+        if &self.moe != moe {
+            return Err(FerrumError::model(
+                "Qwen3.5 sparse-MoE reference MoE config does not match model config",
+            ));
+        }
+        if self.layers.len() != config.num_hidden_layers {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sparse-MoE reference layer count {} does not match config num_hidden_layers {}",
+                self.layers.len(),
+                config.num_hidden_layers
+            )));
+        }
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let expected = config.layer_types[idx];
+            let actual = layer.attention_kind();
+            if actual != expected {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 sparse-MoE reference layer {idx} kind {actual:?} does not match config {expected:?}",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn forward(&self, input_ids: &[usize]) -> Result<Qwen35SparseMoeReferenceModelOutput> {
+        let tokens = input_ids.len();
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| layer.as_reference_layer(tokens, self.hidden_size, self.moe_shape(tokens)))
+            .collect::<Vec<_>>();
+        qwen35_sparse_moe_reference_model_forward_cpu(
+            Qwen35SparseMoeReferenceModel {
+                vocab_size: self.vocab_size,
+                hidden_size: self.hidden_size,
+                eps: self.eps,
+                embed_tokens: &self.embed_tokens,
+                final_norm_weight: &self.final_norm_weight,
+                lm_head_weight: &self.lm_head_weight,
+                layers: &layers,
+            },
+            input_ids,
+        )
+    }
+
+    fn moe_shape(&self, tokens: usize) -> Qwen35SparseMoeShape {
+        Qwen35SparseMoeShape {
+            tokens,
+            hidden_size: self.hidden_size,
+            num_experts: self.moe.num_experts,
+            top_k: self.moe.num_experts_per_tok,
+            expert_intermediate_size: self.moe.moe_intermediate_size,
+            shared_expert_intermediate_size: self.moe.shared_expert_intermediate_size,
+            norm_topk_prob: self.norm_topk_prob,
+        }
+    }
+}
+
 fn load_global_cpu_tensor(
     plan: &Qwen35ResolvedWeightPlan,
     loader: &dyn WeightLoader<CpuBackend>,
@@ -443,6 +754,92 @@ impl Qwen35DenseReferenceRuntimeLayer {
     }
 }
 
+impl Qwen35SparseMoeReferenceRuntimeLayer {
+    fn attention_kind(&self) -> Qwen35LayerType {
+        match self {
+            Self::Linear(_) => Qwen35LayerType::LinearAttention,
+            Self::Full(_) => Qwen35LayerType::FullAttention,
+        }
+    }
+
+    fn as_reference_layer(
+        &self,
+        tokens: usize,
+        hidden_size: usize,
+        moe: Qwen35SparseMoeShape,
+    ) -> Qwen35SparseMoeReferenceLayer<'_> {
+        match self {
+            Self::Linear(layer) => {
+                Qwen35SparseMoeReferenceLayer::Linear(Qwen35SparseMoeReferenceLinearLayer {
+                    shape: Qwen35SparseMoeLinearAttentionLayerShape {
+                        tokens,
+                        hidden_size,
+                        attention: Qwen35LinearAttentionShape {
+                            tokens,
+                            key_heads: layer.key_heads,
+                            value_heads: layer.value_heads,
+                            key_dim: layer.key_dim,
+                            value_dim: layer.value_dim,
+                            conv_kernel: layer.conv_kernel,
+                        },
+                        moe,
+                    },
+                    input_norm_weight: &layer.input_norm_weight,
+                    qkv_weight: &layer.qkv_weight,
+                    z_weight: &layer.z_weight,
+                    b_weight: &layer.b_weight,
+                    a_weight: &layer.a_weight,
+                    conv1d_weight: &layer.conv1d_weight,
+                    a_log: &layer.a_log,
+                    dt_bias: &layer.dt_bias,
+                    norm_weight: &layer.norm_weight,
+                    out_proj_weight: &layer.out_proj_weight,
+                    post_attention_norm_weight: &layer.post_attention_norm_weight,
+                    router_weight: &layer.router_weight,
+                    fused_gate_up_proj: &layer.fused_gate_up_proj,
+                    fused_down_proj: &layer.fused_down_proj,
+                    shared_expert_gate_weight: &layer.shared_expert_gate_weight,
+                    shared_expert_gate_proj_weight: &layer.shared_expert_gate_proj_weight,
+                    shared_expert_up_proj_weight: &layer.shared_expert_up_proj_weight,
+                    shared_expert_down_proj_weight: &layer.shared_expert_down_proj_weight,
+                })
+            }
+            Self::Full(layer) => {
+                Qwen35SparseMoeReferenceLayer::Full(Qwen35SparseMoeReferenceFullLayer {
+                    shape: Qwen35SparseMoeFullAttentionLayerShape {
+                        tokens,
+                        hidden_size,
+                        attention: Qwen35FullAttentionShape {
+                            tokens,
+                            num_heads: layer.num_heads,
+                            num_kv_heads: layer.num_kv_heads,
+                            head_dim: layer.head_dim,
+                            position_offset: layer.position_offset,
+                            rope_theta: layer.rope_theta,
+                        },
+                        moe,
+                    },
+                    input_norm_weight: &layer.input_norm_weight,
+                    q_weight: &layer.q_weight,
+                    k_weight: &layer.k_weight,
+                    v_weight: &layer.v_weight,
+                    q_norm_weight: &layer.q_norm_weight,
+                    k_norm_weight: &layer.k_norm_weight,
+                    o_weight: &layer.o_weight,
+                    post_attention_norm_weight: &layer.post_attention_norm_weight,
+                    router_weight: &layer.router_weight,
+                    fused_gate_up_proj: &layer.fused_gate_up_proj,
+                    fused_down_proj: &layer.fused_down_proj,
+                    shared_expert_gate_weight: &layer.shared_expert_gate_weight,
+                    shared_expert_gate_proj_weight: &layer.shared_expert_gate_proj_weight,
+                    shared_expert_up_proj_weight: &layer.shared_expert_up_proj_weight,
+                    shared_expert_down_proj_weight: &layer.shared_expert_down_proj_weight,
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Qwen35W3Executor {
     info: ModelInfo,
@@ -452,6 +849,7 @@ pub struct Qwen35W3Executor {
     weight_validation: Option<Qwen35WeightValidation>,
     weight_plan: Option<Qwen35ResolvedWeightPlan>,
     dense_reference_runtime: Option<Arc<Qwen35DenseReferenceRuntime>>,
+    sparse_moe_reference_runtime: Option<Arc<Qwen35SparseMoeReferenceRuntime>>,
 }
 
 impl Qwen35W3Executor {
@@ -474,6 +872,7 @@ impl Qwen35W3Executor {
             weight_validation: None,
             weight_plan: None,
             dense_reference_runtime: None,
+            sparse_moe_reference_runtime: None,
         })
     }
 
@@ -529,6 +928,39 @@ impl Qwen35W3Executor {
         executor.with_dense_reference_runtime(runtime)
     }
 
+    pub fn from_definition_with_sparse_moe_reference_cpu_safetensors(
+        model_id: impl Into<String>,
+        def: &ModelDefinition,
+        model_dir: &Path,
+        dtype: DataType,
+        device: Device,
+    ) -> Result<Self> {
+        if dtype != DataType::FP32 || device != Device::CPU {
+            return Err(FerrumError::unsupported(
+                "Qwen3.5 sparse-MoE reference safetensors executor requires FP32 CPU",
+            ));
+        }
+        let mut executor = Self::from_definition(model_id, def, dtype, device)?;
+        let inventory = Qwen35WeightInventory::from_safetensors_dir(model_dir)
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 weight inventory failed: {err}")))?;
+        let weight_plan = inventory
+            .detect_prefix_and_resolve(&executor.config)
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 weight preflight failed: {err}")))?;
+        let validation = weight_plan.validation();
+        let loader = NativeSafetensorsLoader::<CpuBackend>::open(model_dir)?;
+        let runtime = Qwen35SparseMoeReferenceRuntime::from_cpu_weight_plan(
+            &executor.config,
+            def.vocab_size,
+            def.norm_eps as f32,
+            def.rope_theta.unwrap_or(10_000.0) as f32,
+            &weight_plan,
+            &loader,
+        )?;
+        executor.weight_validation = Some(validation);
+        executor.weight_plan = Some(weight_plan);
+        executor.with_sparse_moe_reference_runtime(runtime)
+    }
+
     pub fn qwen35_config(&self) -> &Qwen35TextConfig {
         &self.config
     }
@@ -547,6 +979,15 @@ impl Qwen35W3Executor {
     ) -> Result<Self> {
         runtime.validate_for_config(&self.config, self.info.vocab_size)?;
         self.dense_reference_runtime = Some(Arc::new(runtime));
+        Ok(self)
+    }
+
+    pub fn with_sparse_moe_reference_runtime(
+        mut self,
+        runtime: Qwen35SparseMoeReferenceRuntime,
+    ) -> Result<Self> {
+        runtime.validate_for_config(&self.config, self.info.vocab_size)?;
+        self.sparse_moe_reference_runtime = Some(Arc::new(runtime));
         Ok(self)
     }
 
@@ -578,19 +1019,22 @@ impl ModelExecutor for Qwen35W3Executor {
     }
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        let runtime = self
-            .dense_reference_runtime
-            .as_ref()
-            .ok_or_else(Self::unsupported_execution)?;
         let tokens = common::tensor_to_tokens(&input.input_ids)?;
         let input_ids = tokens
             .iter()
             .map(|token| *token as usize)
             .collect::<Vec<_>>();
-        let output = runtime.forward(&input_ids)?;
-        let vocab_size = runtime.vocab_size;
+        let (vocab_size, logits) = if let Some(runtime) = &self.dense_reference_runtime {
+            let output = runtime.forward(&input_ids)?;
+            (runtime.vocab_size, output.logits)
+        } else if let Some(runtime) = &self.sparse_moe_reference_runtime {
+            let output = runtime.forward(&input_ids)?;
+            (runtime.vocab_size, output.logits)
+        } else {
+            return Err(Self::unsupported_execution());
+        };
         let last_token_start = (input_ids.len() - 1) * vocab_size;
-        let last_logits = output.logits[last_token_start..last_token_start + vocab_size].to_vec();
+        let last_logits = logits[last_token_start..last_token_start + vocab_size].to_vec();
         let logits_tensor = Tensor::new(last_logits.as_slice(), &CandleDevice::Cpu)
             .map_err(|err| FerrumError::model(format!("Qwen3.5 logits tensor failed: {err}")))?
             .reshape((1, 1, vocab_size))
@@ -640,7 +1084,8 @@ impl ModelExecutor for Qwen35W3Executor {
     }
 
     fn status(&self) -> ExecutorStatus {
-        let ready = self.dense_reference_runtime.is_some();
+        let ready =
+            self.dense_reference_runtime.is_some() || self.sparse_moe_reference_runtime.is_some();
         ExecutorStatus {
             state: if ready {
                 ExecutorState::Ready
@@ -704,6 +1149,60 @@ mod tests {
             "num_attention_heads": 1,
             "num_key_value_heads": 1,
             "tie_word_embeddings": false
+        });
+        def
+    }
+
+    fn toy_sparse_moe_definition() -> ModelDefinition {
+        let mut def = ModelDefinition::default();
+        def.architecture = Architecture::Qwen35Moe;
+        def.hidden_size = 2;
+        def.vocab_size = 3;
+        def.num_hidden_layers = 2;
+        def.num_attention_heads = 1;
+        def.num_key_value_heads = Some(1);
+        def.max_position_embeddings = 16;
+        def.rope_theta = Some(10_000.0);
+        def.norm_eps = 1e-6;
+        def.extra_params = serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "hidden_size": 2,
+            "num_hidden_layers": 2,
+            "layer_types": ["linear_attention", "full_attention"],
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_key_head_dim": 1,
+            "linear_value_head_dim": 1,
+            "linear_conv_kernel_dim": 1,
+            "head_dim": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "num_experts": 1,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 2,
+            "shared_expert_intermediate_size": 2,
+            "norm_topk_prob": false,
+            "tie_word_embeddings": false,
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 2,
+                "num_hidden_layers": 2,
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 1,
+                "linear_key_head_dim": 1,
+                "linear_value_head_dim": 1,
+                "linear_conv_kernel_dim": 1,
+                "head_dim": 2,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "num_experts": 1,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 2,
+                "shared_expert_intermediate_size": 2,
+                "norm_topk_prob": false,
+                "tie_word_embeddings": false
+            }
         });
         def
     }
@@ -800,6 +1299,144 @@ mod tests {
                         -0.2, 0.75,
                     ],
                 }),
+            ],
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ToySparseMoeWeights {
+        router_weight: Vec<f32>,
+        fused_gate_up_proj: Vec<f32>,
+        fused_down_proj: Vec<f32>,
+        shared_expert_gate_weight: Vec<f32>,
+        shared_expert_gate_proj_weight: Vec<f32>,
+        shared_expert_up_proj_weight: Vec<f32>,
+        shared_expert_down_proj_weight: Vec<f32>,
+    }
+
+    fn toy_sparse_moe_weights() -> ToySparseMoeWeights {
+        ToySparseMoeWeights {
+            router_weight: vec![0.1, -0.2],
+            fused_gate_up_proj: vec![
+                0.2, 0.1, //
+                -0.1, 0.3, //
+                0.4, -0.2, //
+                0.3, 0.5,
+            ],
+            fused_down_proj: vec![
+                0.5, 0.25, //
+                -0.2, 0.75,
+            ],
+            shared_expert_gate_weight: vec![0.25, -0.1],
+            shared_expert_gate_proj_weight: vec![
+                -0.2, 0.2, //
+                0.1, 0.3,
+            ],
+            shared_expert_up_proj_weight: vec![
+                0.25, 0.5, //
+                -0.3, 0.4,
+            ],
+            shared_expert_down_proj_weight: vec![
+                0.5, 0.25, //
+                -0.2, 0.75,
+            ],
+        }
+    }
+
+    fn toy_sparse_moe_runtime() -> Qwen35SparseMoeReferenceRuntime {
+        let linear_moe = toy_sparse_moe_weights();
+        let full_moe = toy_sparse_moe_weights();
+        Qwen35SparseMoeReferenceRuntime {
+            vocab_size: 3,
+            hidden_size: 2,
+            eps: 1e-6,
+            embed_tokens: vec![
+                1.0, 0.0, //
+                0.0, 1.0, //
+                1.0, 1.0,
+            ],
+            final_norm_weight: vec![0.0, 0.0],
+            lm_head_weight: vec![
+                1.0, 0.0, //
+                0.0, 1.0, //
+                1.0, 1.0,
+            ],
+            moe: Qwen35MoeTextConfig {
+                num_experts: 1,
+                num_experts_per_tok: 1,
+                moe_intermediate_size: 2,
+                shared_expert_intermediate_size: 2,
+                norm_topk_prob: false,
+            },
+            norm_topk_prob: false,
+            layers: vec![
+                Qwen35SparseMoeReferenceRuntimeLayer::Linear(
+                    Qwen35SparseMoeReferenceRuntimeLinearLayer {
+                        key_heads: 1,
+                        value_heads: 1,
+                        key_dim: 1,
+                        value_dim: 1,
+                        conv_kernel: 1,
+                        input_norm_weight: vec![0.0, 0.0],
+                        qkv_weight: vec![
+                            1.0, 0.0, //
+                            0.0, 1.0, //
+                            1.0, 1.0,
+                        ],
+                        z_weight: vec![1.0, -1.0],
+                        b_weight: vec![0.5, 0.25],
+                        a_weight: vec![-0.25, 0.75],
+                        conv1d_weight: vec![1.0, 1.0, 1.0],
+                        a_log: vec![0.0],
+                        dt_bias: vec![0.0],
+                        norm_weight: vec![1.0],
+                        out_proj_weight: vec![1.0, -0.5],
+                        post_attention_norm_weight: vec![0.0, 0.0],
+                        router_weight: linear_moe.router_weight,
+                        fused_gate_up_proj: linear_moe.fused_gate_up_proj,
+                        fused_down_proj: linear_moe.fused_down_proj,
+                        shared_expert_gate_weight: linear_moe.shared_expert_gate_weight,
+                        shared_expert_gate_proj_weight: linear_moe.shared_expert_gate_proj_weight,
+                        shared_expert_up_proj_weight: linear_moe.shared_expert_up_proj_weight,
+                        shared_expert_down_proj_weight: linear_moe.shared_expert_down_proj_weight,
+                    },
+                ),
+                Qwen35SparseMoeReferenceRuntimeLayer::Full(
+                    Qwen35SparseMoeReferenceRuntimeFullLayer {
+                        num_heads: 1,
+                        num_kv_heads: 1,
+                        head_dim: 2,
+                        position_offset: 0,
+                        rope_theta: 10_000.0,
+                        input_norm_weight: vec![0.0, 0.0],
+                        q_weight: vec![
+                            1.0, 0.0, //
+                            0.0, 1.0,
+                        ],
+                        k_weight: vec![
+                            0.5, 0.0, //
+                            0.0, 0.5,
+                        ],
+                        v_weight: vec![
+                            1.0, 1.0, //
+                            -0.5, 0.5,
+                        ],
+                        q_norm_weight: vec![1.0, 1.0],
+                        k_norm_weight: vec![1.0, 1.0],
+                        o_weight: vec![
+                            1.0, 0.0, //
+                            0.0, 1.0,
+                        ],
+                        post_attention_norm_weight: vec![0.0, 0.0],
+                        router_weight: full_moe.router_weight,
+                        fused_gate_up_proj: full_moe.fused_gate_up_proj,
+                        fused_down_proj: full_moe.fused_down_proj,
+                        shared_expert_gate_weight: full_moe.shared_expert_gate_weight,
+                        shared_expert_gate_proj_weight: full_moe.shared_expert_gate_proj_weight,
+                        shared_expert_up_proj_weight: full_moe.shared_expert_up_proj_weight,
+                        shared_expert_down_proj_weight: full_moe.shared_expert_down_proj_weight,
+                    },
+                ),
             ],
         }
     }
@@ -926,6 +1563,170 @@ mod tests {
             "model.layers.1.mlp.down_proj.weight".to_string(),
             full.down_proj_weight.clone(),
         );
+        tensors
+    }
+
+    fn insert_sparse_moe_tensors(
+        tensors: &mut HashMap<String, Vec<f32>>,
+        layer_index: usize,
+        weights: &ToySparseMoeWeights,
+    ) {
+        tensors.insert(
+            format!("model.layers.{layer_index}.mlp.gate.weight"),
+            weights.router_weight.clone(),
+        );
+        tensors.insert(
+            format!("model.layers.{layer_index}.mlp.experts.gate_up_proj"),
+            weights.fused_gate_up_proj.clone(),
+        );
+        tensors.insert(
+            format!("model.layers.{layer_index}.mlp.experts.down_proj"),
+            weights.fused_down_proj.clone(),
+        );
+        tensors.insert(
+            format!("model.layers.{layer_index}.mlp.shared_expert_gate.weight"),
+            weights.shared_expert_gate_weight.clone(),
+        );
+        tensors.insert(
+            format!("model.layers.{layer_index}.mlp.shared_expert.gate_proj.weight"),
+            weights.shared_expert_gate_proj_weight.clone(),
+        );
+        tensors.insert(
+            format!("model.layers.{layer_index}.mlp.shared_expert.up_proj.weight"),
+            weights.shared_expert_up_proj_weight.clone(),
+        );
+        tensors.insert(
+            format!("model.layers.{layer_index}.mlp.shared_expert.down_proj.weight"),
+            weights.shared_expert_down_proj_weight.clone(),
+        );
+    }
+
+    fn toy_sparse_moe_weight_map() -> HashMap<String, Vec<f32>> {
+        let runtime = toy_sparse_moe_runtime();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.embed_tokens.weight".to_string(),
+            runtime.embed_tokens.clone(),
+        );
+        tensors.insert(
+            "model.norm.weight".to_string(),
+            runtime.final_norm_weight.clone(),
+        );
+        tensors.insert(
+            "model.lm_head.weight".to_string(),
+            runtime.lm_head_weight.clone(),
+        );
+
+        let Qwen35SparseMoeReferenceRuntimeLayer::Linear(linear) = &runtime.layers[0] else {
+            panic!("toy sparse MoE layer 0 must be linear attention");
+        };
+        tensors.insert(
+            "model.layers.0.input_layernorm.weight".to_string(),
+            linear.input_norm_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.0.post_attention_layernorm.weight".to_string(),
+            linear.post_attention_norm_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.0.linear_attn.in_proj_qkv.weight".to_string(),
+            linear.qkv_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.0.linear_attn.in_proj_z.weight".to_string(),
+            linear.z_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.0.linear_attn.in_proj_b.weight".to_string(),
+            linear.b_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.0.linear_attn.in_proj_a.weight".to_string(),
+            linear.a_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.0.linear_attn.conv1d.weight".to_string(),
+            linear.conv1d_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.0.linear_attn.A_log".to_string(),
+            linear.a_log.clone(),
+        );
+        tensors.insert(
+            "model.layers.0.linear_attn.dt_bias".to_string(),
+            linear.dt_bias.clone(),
+        );
+        tensors.insert(
+            "model.layers.0.linear_attn.norm.weight".to_string(),
+            linear.norm_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.0.linear_attn.out_proj.weight".to_string(),
+            linear.out_proj_weight.clone(),
+        );
+        insert_sparse_moe_tensors(
+            &mut tensors,
+            0,
+            &ToySparseMoeWeights {
+                router_weight: linear.router_weight.clone(),
+                fused_gate_up_proj: linear.fused_gate_up_proj.clone(),
+                fused_down_proj: linear.fused_down_proj.clone(),
+                shared_expert_gate_weight: linear.shared_expert_gate_weight.clone(),
+                shared_expert_gate_proj_weight: linear.shared_expert_gate_proj_weight.clone(),
+                shared_expert_up_proj_weight: linear.shared_expert_up_proj_weight.clone(),
+                shared_expert_down_proj_weight: linear.shared_expert_down_proj_weight.clone(),
+            },
+        );
+
+        let Qwen35SparseMoeReferenceRuntimeLayer::Full(full) = &runtime.layers[1] else {
+            panic!("toy sparse MoE layer 1 must be full attention");
+        };
+        tensors.insert(
+            "model.layers.1.input_layernorm.weight".to_string(),
+            full.input_norm_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.1.post_attention_layernorm.weight".to_string(),
+            full.post_attention_norm_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.1.self_attn.q_proj.weight".to_string(),
+            full.q_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.1.self_attn.k_proj.weight".to_string(),
+            full.k_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.1.self_attn.v_proj.weight".to_string(),
+            full.v_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.1.self_attn.o_proj.weight".to_string(),
+            full.o_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.1.self_attn.q_norm.weight".to_string(),
+            full.q_norm_weight.clone(),
+        );
+        tensors.insert(
+            "model.layers.1.self_attn.k_norm.weight".to_string(),
+            full.k_norm_weight.clone(),
+        );
+        insert_sparse_moe_tensors(
+            &mut tensors,
+            1,
+            &ToySparseMoeWeights {
+                router_weight: full.router_weight.clone(),
+                fused_gate_up_proj: full.fused_gate_up_proj.clone(),
+                fused_down_proj: full.fused_down_proj.clone(),
+                shared_expert_gate_weight: full.shared_expert_gate_weight.clone(),
+                shared_expert_gate_proj_weight: full.shared_expert_gate_proj_weight.clone(),
+                shared_expert_up_proj_weight: full.shared_expert_up_proj_weight.clone(),
+                shared_expert_down_proj_weight: full.shared_expert_down_proj_weight.clone(),
+            },
+        );
+
         tensors
     }
 
@@ -1077,6 +1878,37 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_sparse_moe_reference_runtime_materializes_from_cpu_weight_plan() {
+        let def = toy_sparse_moe_definition();
+        let config = Qwen35TextConfig::from_model_definition(&def).unwrap();
+        let loader = MapWeightLoader {
+            tensors: toy_sparse_moe_weight_map(),
+        };
+        let plan = Qwen35WeightInventory::from_names(loader.tensors.keys().cloned())
+            .detect_prefix_and_resolve(&config)
+            .unwrap();
+
+        let runtime = Qwen35SparseMoeReferenceRuntime::from_cpu_weight_plan(
+            &config,
+            def.vocab_size,
+            def.norm_eps as f32,
+            def.rope_theta.unwrap() as f32,
+            &plan,
+            &loader,
+        )
+        .unwrap();
+        let expected = toy_sparse_moe_runtime().forward(&[0, 1]).unwrap();
+        let actual = runtime.forward(&[0, 1]).unwrap();
+
+        assert_close(&actual.logits, &expected.logits);
+        assert_close(
+            &actual.linear_recurrent_states[0],
+            &expected.linear_recurrent_states[0],
+        );
+        assert_eq!(actual.sparse_moe_outputs, expected.sparse_moe_outputs);
+    }
+
+    #[test]
     fn qwen35_w3_reference_executor_prefills_from_dense_safetensors() {
         let def = toy_dense_definition();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1099,6 +1931,32 @@ mod tests {
         assert_eq!(output.kv_cache.block_table().sequence_length, 2);
         assert!(executor.weight_validation().unwrap().is_pass());
         assert_eq!(executor.weight_plan().unwrap().prefix, "model");
+    }
+
+    #[test]
+    fn qwen35_w3_reference_executor_prefills_from_sparse_moe_safetensors() {
+        let def = toy_sparse_moe_definition();
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_toy_safetensors(tmp.path(), toy_sparse_moe_weight_map());
+
+        let executor = Qwen35W3Executor::from_definition_with_sparse_moe_reference_cpu_safetensors(
+            "qwen35-moe-reference",
+            &def,
+            tmp.path(),
+            DataType::FP32,
+            Device::CPU,
+        )
+        .unwrap();
+        let expected = toy_sparse_moe_runtime().forward(&[0, 1]).unwrap();
+        let input = PrefillInput::new(MockTensor::from_u32(&[0, 1], &[2]).into_ref());
+
+        let output = tokio_test::block_on(executor.prefill(&input)).unwrap();
+
+        assert_close(&output.logits.to_vec_f32().unwrap(), &expected.logits[3..6]);
+        assert_eq!(output.kv_cache.block_table().sequence_length, 2);
+        assert!(executor.weight_validation().unwrap().is_pass());
+        assert_eq!(executor.weight_plan().unwrap().prefix, "model");
+        assert_eq!(executor.status().state, ExecutorState::Ready);
     }
 
     #[test]
