@@ -35,6 +35,7 @@ pub mod moe_config;
 pub mod multimodal;
 pub mod qwen35_config;
 pub mod qwen35_s1;
+pub mod qwen35_weights;
 pub mod registry;
 pub mod source;
 pub mod tensor_wrapper;
