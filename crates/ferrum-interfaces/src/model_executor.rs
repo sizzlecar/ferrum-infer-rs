@@ -3,7 +3,7 @@
 //! This module provides the ModelExecutor trait that replaces the "fat" Model
 //! interface, focusing purely on tensor operations without tokenization or sampling.
 
-use crate::{KvCacheHandle, TensorRef};
+use crate::{KvCacheHandle, RecurrentStateHandle, TensorRef};
 use async_trait::async_trait;
 use ferrum_types::{ModelInfo, Result};
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,8 @@ pub struct PrefillInput {
     pub position_ids: Option<TensorRef>,
     /// Pre-allocated KV cache handle (optional, for paged attention)
     pub kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    /// Pre-allocated recurrent-state handle (optional, for state-space layers)
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     /// Request metadata that can affect model execution.
     pub metadata: HashMap<String, serde_json::Value>,
 }
@@ -98,6 +100,7 @@ impl PrefillInput {
             attention_mask: None,
             position_ids: None,
             kv_cache: None,
+            recurrent_state: None,
             metadata: HashMap::new(),
         }
     }
@@ -105,6 +108,12 @@ impl PrefillInput {
     /// Create prefill input with a pre-allocated KV cache handle.
     pub fn with_kv_cache(mut self, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
         self.kv_cache = Some(kv_cache);
+        self
+    }
+
+    /// Create prefill input with a pre-allocated recurrent-state handle.
+    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
+        self.recurrent_state = Some(recurrent_state);
         self
     }
 
@@ -148,6 +157,8 @@ pub struct PrefillOutput {
     pub logits: TensorRef,
     /// KV cache handle populated with prompt states
     pub kv_cache: Arc<dyn KvCacheHandle>,
+    /// Recurrent-state handle populated with prompt state, when used.
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     /// Hidden states at each layer (optional, for analysis)
     pub hidden_states: Option<Vec<TensorRef>>,
     /// Attention weights (optional, for analysis)
@@ -160,9 +171,16 @@ impl PrefillOutput {
         Self {
             logits,
             kv_cache,
+            recurrent_state: None,
             hidden_states: None,
             attention_weights: None,
         }
+    }
+
+    /// Attach updated recurrent state to the prefill output.
+    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
+        self.recurrent_state = Some(recurrent_state);
+        self
     }
 
     /// Get logits for last position (for next token generation)
@@ -192,6 +210,8 @@ pub struct DecodeInput {
     pub input_ids: TensorRef,
     /// Existing KV cache from previous steps
     pub kv_cache: Arc<dyn KvCacheHandle>,
+    /// Existing recurrent state from previous steps, when used.
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     /// Position IDs for current step [batch_size, 1] (optional)
     pub position_ids: Option<TensorRef>,
     /// Request metadata that can affect model execution.
@@ -206,6 +226,7 @@ impl DecodeInput {
         Self {
             input_ids,
             kv_cache,
+            recurrent_state: None,
             position_ids: None,
             metadata: HashMap::new(),
             logits_policy: LogitsReturnPolicy::FullLogits,
@@ -215,6 +236,12 @@ impl DecodeInput {
     /// Add position IDs
     pub fn with_position_ids(mut self, positions: TensorRef) -> Self {
         self.position_ids = Some(positions);
+        self
+    }
+
+    /// Attach recurrent state for state-space or hybrid layers.
+    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
+        self.recurrent_state = Some(recurrent_state);
         self
     }
 
@@ -257,6 +284,8 @@ pub struct UnifiedBatchItem {
     pub q_tokens: Vec<u32>,
     /// KV cache handle for this sequence.
     pub kv_cache: Arc<dyn KvCacheHandle>,
+    /// Recurrent-state handle for this sequence, when used.
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     /// Starting absolute position for the FIRST token in `q_tokens`.
     /// 0 for a fresh prefill, `kv_len` for a decode step or a continuing
     /// chunked-prefill slice.
@@ -277,6 +306,7 @@ impl std::fmt::Debug for UnifiedBatchItem {
         f.debug_struct("UnifiedBatchItem")
             .field("seq_id", &self.seq_id)
             .field("q_len", &self.q_tokens.len())
+            .field("has_recurrent_state", &self.recurrent_state.is_some())
             .field("pos_offset", &self.pos_offset)
             .field("is_final_chunk", &self.is_final_chunk)
             .finish()
@@ -319,6 +349,8 @@ pub struct DecodeOutput {
     pub logits: TensorRef,
     /// Updated KV cache with new token state
     pub kv_cache: Arc<dyn KvCacheHandle>,
+    /// Updated recurrent state, when used.
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     /// Hidden state for current token (optional)
     pub hidden_state: Option<TensorRef>,
     /// Attention weights for current token (optional)
@@ -331,9 +363,16 @@ impl DecodeOutput {
         Self {
             logits,
             kv_cache,
+            recurrent_state: None,
             hidden_state: None,
             attention_weights: None,
         }
+    }
+
+    /// Attach updated recurrent state to the decode output.
+    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
+        self.recurrent_state = Some(recurrent_state);
+        self
     }
 }
 

@@ -55,6 +55,7 @@ impl EngineInner {
                     seq_id,
                     q_tokens: vec![last_token.get()],
                     kv_cache,
+                    recurrent_state: None,
                     pos_offset,
                     is_final_chunk: true,
                     metadata: seq.model_decode_metadata(),

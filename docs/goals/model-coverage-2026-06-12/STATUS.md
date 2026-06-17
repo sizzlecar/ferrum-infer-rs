@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZM — W3-S0 source checkpoint: model-executor recurrent-state carriers
+
+- Scope:
+  - source-only W3-S0 interface integration checkpoint;
+  - no paid GPU instance was started;
+  - no `MODEL_RELEASE_GRADE_W2 PASS: <out_dir>` or
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - threaded optional recurrent-state handles through `PrefillInput`,
+    `PrefillOutput`, `DecodeInput`, `DecodeOutput`, and `UnifiedBatchItem`;
+  - kept existing KV-required decode and unified-batch constructors/fields
+    compatible for current KV-only product paths;
+  - updated current engine/model unified-batch call sites to set
+    `recurrent_state: None`;
+  - added a contract test proving model executor inputs and outputs can carry
+    recurrent-state handles alongside KV handles.
+- Validation:
+  - `cargo test -p ferrum-interfaces` PASS:
+    recurrent-state tests `5 passed`, full crate test set `14 passed`;
+  - `cargo check -p ferrum-engine --all-targets` PASS;
+  - `cargo check -p ferrum-models --all-targets` PASS.
+- Next required validation:
+  - W2 remains blocked on Vast `credit=0` for release-grade full-matrix CUDA;
+  - W3 next local step is scheduler/engine lifecycle ownership for recurrent
+    state allocation and cleanup, still before product DeltaNet integration.
+
 ## 2026-06-17 ZL — W3-S0 source checkpoint: recurrent-state interface contract
 
 - Scope:
