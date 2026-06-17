@@ -37,6 +37,14 @@ REQUIRED_CORRECTNESS = {
     "l4_agent",
     "l5_concurrency",
 }
+W3_L0_L5_LEVELS = {
+    "l0_template": "l0_template",
+    "l1_numeric": "l1_numeric",
+    "l2_quantized": "l2_quantized",
+    "l3_behavior": "l3_behavior",
+    "l4_agent": "l4_agent",
+    "l5_concurrency": "l5_concurrency",
+}
 REQUIRED_PRODUCT_ENTRYPOINTS = {"ferrum_run", "ferrum_serve"}
 W3_REQUIRED_CORRECTNESS = {
     "w3_s0_design",
@@ -430,6 +438,8 @@ def validate_correctness(
             problems.append(f"correctness missing {key}")
             continue
         validate_evidence_entry(correctness[key], f"correctness.{key}", out_dir, problems)
+        if lane == "w3" and key in W3_L0_L5_LEVELS:
+            validate_w3_l0_l5_artifact(key, correctness[key], out_dir, problems)
     if lane == "w3":
         if "w3_s0_design" in correctness:
             validate_w3_s0_design_artifact(correctness["w3_s0_design"], out_dir, problems)
@@ -521,6 +531,214 @@ def validate_clean_git_fragment(data: dict[str, Any], label: str, problems: list
     sha = git.get("sha")
     if not isinstance(sha, str) or not re.match(r"^[0-9a-fA-F]{7,40}$", sha):
         problems.append(f"{label}.git.sha must be a 7-40 character hex string")
+
+
+def require_false(value: Any, label: str, problems: list[str]) -> None:
+    if value is not False:
+        problems.append(f"{label} must be false")
+
+
+def require_empty_list(value: Any, label: str, problems: list[str]) -> None:
+    if value != []:
+        problems.append(f"{label} must be an empty list")
+
+
+def require_level(data: dict[str, Any], expected: str, label: str, problems: list[str]) -> None:
+    actual = data.get("level", data.get("lane"))
+    if actual != expected:
+        problems.append(f"{label}.level or .lane must be {expected!r}")
+
+
+def require_passed_total(
+    data: dict[str, Any],
+    total_key: str,
+    passed_key: str,
+    min_total: int,
+    label: str,
+    problems: list[str],
+) -> None:
+    total = positive_int(data.get(total_key), f"{label}.{total_key}", problems)
+    passed = positive_int(data.get(passed_key), f"{label}.{passed_key}", problems)
+    if total is not None and total < min_total:
+        problems.append(f"{label}.{total_key} must be >= {min_total}")
+    if total is not None and passed is not None and passed != total:
+        problems.append(f"{label}.{passed_key} must equal {label}.{total_key}")
+
+
+def validate_w3_l0_l5_common(
+    data: dict[str, Any],
+    key: str,
+    label: str,
+    problems: list[str],
+) -> None:
+    if data.get("status") != "pass":
+        problems.append(f"{label}.status must be pass")
+    require_level(data, W3_L0_L5_LEVELS[key], label, problems)
+    non_empty_string(data.get("model_id"), f"{label}.model_id", problems)
+    surface = data.get("product_surface", data.get("runtime_surface"))
+    if surface not in {"typed_cli", "typed_config", "typed_defaults", "model_defaults"}:
+        problems.append(f"{label}.product_surface must be typed product behavior")
+    require_empty_list(data.get("hidden_env", []), f"{label}.hidden_env", problems)
+
+
+def validate_w3_l0_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
+    golden = as_object(data.get("chat_template_golden"), f"{label}.chat_template_golden", problems)
+    if not golden:
+        return
+    require_passed_total(golden, "cases_total", "cases_passed", 5, f"{label}.chat_template_golden", problems)
+    require_true(
+        golden.get("hf_apply_chat_template_reference"),
+        f"{label}.chat_template_golden.hf_apply_chat_template_reference",
+        problems,
+    )
+    require_true(golden.get("byte_equal"), f"{label}.chat_template_golden.byte_equal", problems)
+    require_true(
+        golden.get("eos_bos_from_generation_config"),
+        f"{label}.chat_template_golden.eos_bos_from_generation_config",
+        problems,
+    )
+    require_true(
+        golden.get("render_failure_is_error"),
+        f"{label}.chat_template_golden.render_failure_is_error",
+        problems,
+    )
+    require_false(
+        golden.get("silent_fallback"),
+        f"{label}.chat_template_golden.silent_fallback",
+        problems,
+    )
+
+
+def validate_w3_l1_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
+    numeric = as_object(data.get("numeric"), f"{label}.numeric", problems)
+    if numeric:
+        require_passed_total(numeric, "comparisons_total", "comparisons_passed", 1, f"{label}.numeric", problems)
+        atol = number(numeric.get("atol"), f"{label}.numeric.atol", problems)
+        if atol is None or atol <= 0:
+            problems.append(f"{label}.numeric.atol must be > 0")
+        elif "max_abs" in numeric:
+            numeric_within_tolerance(numeric, "max_abs", atol, f"{label}.numeric", problems)
+        require_true(numeric.get("deterministic"), f"{label}.numeric.deterministic", problems)
+    coverage = as_object(data.get("coverage"), f"{label}.coverage", problems)
+    for key in ["linear_attention", "full_attention", "deltanet", "moe_or_dense", "lm_head"]:
+        require_true(coverage.get(key), f"{label}.coverage.{key}", problems)
+    reference = as_object(data.get("reference"), f"{label}.reference", problems)
+    if reference:
+        non_empty_string(reference.get("engine"), f"{label}.reference.engine", problems)
+        non_empty_string(reference.get("artifact"), f"{label}.reference.artifact", problems)
+
+
+def validate_w3_l2_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
+    quantized = as_object(data.get("quantized_semantics"), f"{label}.quantized_semantics", problems)
+    if not quantized:
+        return
+    require_true(quantized.get("real_size_model"), f"{label}.quantized_semantics.real_size_model", problems)
+    require_false(quantized.get("waived"), f"{label}.quantized_semantics.waived", problems)
+    require_true(quantized.get("semantic_pass"), f"{label}.quantized_semantics.semantic_pass", problems)
+    require_passed_total(
+        quantized,
+        "known_answer_total",
+        "known_answer_passed",
+        10,
+        f"{label}.quantized_semantics",
+        problems,
+    )
+    non_empty_string(quantized.get("format"), f"{label}.quantized_semantics.format", problems)
+
+
+def validate_w3_l3_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
+    behavior = as_object(data.get("behavior"), f"{label}.behavior", problems)
+    for key in [
+        "multi_turn",
+        "stream_nonstream_match",
+        "natural_eos",
+        "custom_stop",
+        "reasoning_extraction",
+        "stream_done_exactly_once",
+        "stream_usage_present",
+    ]:
+        require_true(behavior.get(key), f"{label}.behavior.{key}", problems)
+    require_passed_total(behavior, "cases_total", "cases_passed", 5, f"{label}.behavior", problems)
+
+
+def validate_w3_l4_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
+    agent = as_object(data.get("agent"), f"{label}.agent", problems)
+    if not agent:
+        return
+    require_true(agent.get("real_model"), f"{label}.agent.real_model", problems)
+    require_true(agent.get("required_tool_enforced"), f"{label}.agent.required_tool_enforced", problems)
+    require_true(agent.get("json_schema_strict"), f"{label}.agent.json_schema_strict", problems)
+    require_passed_total(agent, "tool_calls_total", "tool_calls_passed", 10, f"{label}.agent", problems)
+    require_passed_total(
+        agent,
+        "strict_schema_total",
+        "strict_schema_passed",
+        20,
+        f"{label}.agent",
+        problems,
+    )
+
+
+def validate_w3_l5_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
+    concurrency = as_object(data.get("concurrency"), f"{label}.concurrency", problems)
+    if not concurrency:
+        return
+    require_true(concurrency.get("closed_loop"), f"{label}.concurrency.closed_loop", problems)
+    require_true(
+        concurrency.get("stream_options_include_usage"),
+        f"{label}.concurrency.stream_options_include_usage",
+        problems,
+    )
+    if concurrency.get("output_token_count_source") != "usage":
+        problems.append(f"{label}.concurrency.output_token_count_source must be usage")
+    cells = as_list(concurrency.get("cells"), f"{label}.concurrency.cells", problems)
+    seen: set[int] = set()
+    for idx, raw_cell in enumerate(cells):
+        cell_label = f"{label}.concurrency.cells[{idx}]"
+        cell = as_object(raw_cell, cell_label, problems)
+        requested = positive_int(cell.get("requested_concurrency"), f"{cell_label}.requested_concurrency", problems)
+        if requested is not None:
+            seen.add(requested)
+        n_repeats = positive_int(cell.get("n_repeats"), f"{cell_label}.n_repeats", problems)
+        requests = positive_int(cell.get("requests_per_run"), f"{cell_label}.requests_per_run", problems)
+        if n_repeats is not None and n_repeats < 3:
+            problems.append(f"{cell_label}.n_repeats must be >= 3")
+        validate_run_quality_counts(
+            cell,
+            cell_label,
+            field_prefix="",
+            n_repeats=n_repeats,
+            requests=requests,
+            problems=problems,
+        )
+    missing = sorted(REQUIRED_CONCURRENCY - seen)
+    if missing:
+        problems.append(f"{label}.concurrency.cells missing concurrency cells: {missing}")
+
+
+def validate_w3_l0_l5_artifact(
+    key: str,
+    entry: Any,
+    out_dir: Path,
+    problems: list[str],
+) -> None:
+    label = f"correctness.{key}"
+    data = load_first_artifact_object(entry, label, out_dir, problems)
+    if not data:
+        return
+    validate_w3_l0_l5_common(data, key, label, problems)
+    if key == "l0_template":
+        validate_w3_l0_artifact(data, label, problems)
+    elif key == "l1_numeric":
+        validate_w3_l1_artifact(data, label, problems)
+    elif key == "l2_quantized":
+        validate_w3_l2_artifact(data, label, problems)
+    elif key == "l3_behavior":
+        validate_w3_l3_artifact(data, label, problems)
+    elif key == "l4_agent":
+        validate_w3_l4_artifact(data, label, problems)
+    elif key == "l5_concurrency":
+        validate_w3_l5_artifact(data, label, problems)
 
 
 def validate_positive_shape(
@@ -1219,6 +1437,130 @@ def run_gate(lane: str, out_dir: Path, manifest_path: Path) -> int:
     return 0
 
 
+def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
+    common = {
+        "status": "pass",
+        "model_id": "selftest-qwen35",
+        "product_surface": "typed_cli",
+        "hidden_env": [],
+    }
+    write_json(
+        root / "l0.json",
+        {
+            **common,
+            "level": "l0_template",
+            "chat_template_golden": {
+                "cases_total": 5,
+                "cases_passed": 5,
+                "hf_apply_chat_template_reference": True,
+                "byte_equal": True,
+                "eos_bos_from_generation_config": True,
+                "render_failure_is_error": True,
+                "silent_fallback": False,
+            },
+        },
+    )
+    write_json(
+        root / "l1.json",
+        {
+            **common,
+            "level": "l1_numeric",
+            "numeric": {
+                "comparisons_total": 6,
+                "comparisons_passed": 6,
+                "atol": 0.000001,
+                "max_abs": 0.0,
+                "deterministic": True,
+            },
+            "coverage": {
+                "linear_attention": True,
+                "full_attention": True,
+                "deltanet": True,
+                "moe_or_dense": True,
+                "lm_head": True,
+            },
+            "reference": {
+                "engine": "transformers",
+                "artifact": "selftest-reference-dump",
+            },
+        },
+    )
+    write_json(
+        root / "l2.json",
+        {
+            **common,
+            "level": "l2_quantized",
+            "quantized_semantics": {
+                "real_size_model": True,
+                "waived": False,
+                "semantic_pass": True,
+                "known_answer_total": 10,
+                "known_answer_passed": 10,
+                "format": "hf-gptq-int4",
+            },
+        },
+    )
+    write_json(
+        root / "l3.json",
+        {
+            **common,
+            "level": "l3_behavior",
+            "behavior": {
+                "cases_total": 7,
+                "cases_passed": 7,
+                "multi_turn": True,
+                "stream_nonstream_match": True,
+                "natural_eos": True,
+                "custom_stop": True,
+                "reasoning_extraction": True,
+                "stream_done_exactly_once": True,
+                "stream_usage_present": True,
+            },
+        },
+    )
+    write_json(
+        root / "l4.json",
+        {
+            **common,
+            "level": "l4_agent",
+            "agent": {
+                "real_model": True,
+                "required_tool_enforced": True,
+                "json_schema_strict": True,
+                "tool_calls_total": 10,
+                "tool_calls_passed": 10,
+                "strict_schema_total": 20,
+                "strict_schema_passed": 20,
+            },
+        },
+    )
+    cells = []
+    for concurrency in sorted(REQUIRED_CONCURRENCY):
+        cell: dict[str, Any] = {
+            "requested_concurrency": concurrency,
+            "requests_per_run": 100,
+            "n_repeats": 3,
+            "completed_per_run": [100, 100, 100],
+            "errored_per_run": [0, 0, 0],
+        }
+        for field in REQUIRED_ZERO_RUN_COUNT_FIELDS:
+            cell[field] = [0, 0, 0]
+        cells.append(cell)
+    write_json(
+        root / "l5.json",
+        {
+            **common,
+            "level": "l5_concurrency",
+            "concurrency": {
+                "closed_loop": True,
+                "stream_options_include_usage": True,
+                "output_token_count_source": "usage",
+                "cells": cells,
+            },
+        },
+    )
+
+
 def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     for rel in [
@@ -1329,6 +1671,7 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
         "l5_concurrency": {"status": "pass", "artifact": "l5.json"},
     }
     if lane == "w3":
+        write_selftest_w3_l0_l5_artifacts(root)
         write_json(
             root / "w3_s0_design.json",
             {
@@ -1585,6 +1928,24 @@ def run_selftest() -> int:
         good_w3_problems = validate_manifest(load_json(good_w3_manifest), "w3", good_w3)
         if good_w3_problems:
             raise AssertionError("good W3 selftest manifest failed: " + "; ".join(good_w3_problems))
+
+        bad_w3_l4 = tmp_root / "bad-w3-l4-schema-count"
+        bad_w3_l4_manifest = write_selftest_manifest(bad_w3_l4, lane="w3", ratio=0.82)
+        l4_agent = load_json(bad_w3_l4 / "l4.json")
+        l4_agent["agent"]["strict_schema_passed"] = 19
+        write_json(bad_w3_l4 / "l4.json", l4_agent)
+        bad_w3_l4_problems = validate_manifest(load_json(bad_w3_l4_manifest), "w3", bad_w3_l4)
+        if not any("correctness.l4_agent.agent.strict_schema_passed" in problem for problem in bad_w3_l4_problems):
+            raise AssertionError("bad W3 L4 strict-schema selftest did not fail as expected")
+
+        bad_w3_l5 = tmp_root / "bad-w3-l5-error-count"
+        bad_w3_l5_manifest = write_selftest_manifest(bad_w3_l5, lane="w3", ratio=0.82)
+        l5_concurrency = load_json(bad_w3_l5 / "l5.json")
+        l5_concurrency["concurrency"]["cells"][2]["errored_per_run"] = [0, 1, 0]
+        write_json(bad_w3_l5 / "l5.json", l5_concurrency)
+        bad_w3_l5_problems = validate_manifest(load_json(bad_w3_l5_manifest), "w3", bad_w3_l5)
+        if not any("correctness.l5_concurrency.concurrency.cells[2].errored_per_run" in problem for problem in bad_w3_l5_problems):
+            raise AssertionError("bad W3 L5 error-count selftest did not fail as expected")
 
         bad_w3 = tmp_root / "bad-w3-missing-s0"
         bad_w3_manifest = write_selftest_manifest(bad_w3, lane="w3", ratio=0.82)
