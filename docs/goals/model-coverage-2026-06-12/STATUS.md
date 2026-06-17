@@ -2,6 +2,31 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZV — W3 GDN attention CPU-reference checkpoint
+
+- Scope:
+  - W3-S2 combined Gated DeltaNet attention reference before product forward;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `qwen35_gated_delta_attention_cpu()`;
+  - the helper composes `qwen35_gdn_gating_cpu()` with
+    `qwen35_recurrent_gated_delta_rule_cpu()`;
+  - inputs use projected q/k/v plus a/b/A_log/dt_bias and the Ferrum
+    recurrent state layout `[value_heads, value_dim, key_dim]`;
+  - returns both attention output and final recurrent state.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `26 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still CPU/reference math only;
+  - no depthwise conv/projection wrapper or product `prefill`/`decode` has
+    been wired yet;
+  - no W3 product correctness or performance gate was run.
+
 ## 2026-06-18 ZZU — W3 GDN gating CPU-reference checkpoint
 
 - Scope:
