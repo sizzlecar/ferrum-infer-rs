@@ -541,4 +541,50 @@ mod tests {
             .expect_err("Llama definition must not parse as Qwen3.5");
         assert!(err.contains("not Qwen3.5/Qwen3.6"), "{err}");
     }
+
+    #[test]
+    fn qwen35_w3_executor_skeleton_exposes_recurrent_state_spec_only() {
+        use ferrum_interfaces::ModelExecutor;
+
+        let def = parse_artifact_config("moe_shared_expert_reference.config.json");
+        let executor = crate::executor::Qwen35W3Executor::from_definition(
+            "qwen36-skeleton",
+            &def,
+            ferrum_types::DataType::FP16,
+            ferrum_types::Device::CPU,
+        )
+        .unwrap();
+        let request_id = ferrum_types::RequestId::new();
+        let input_tokens = [
+            ferrum_types::TokenId(1),
+            ferrum_types::TokenId(2),
+            ferrum_types::TokenId(3),
+        ];
+        let spec = executor
+            .recurrent_state_spec(&request_id, &input_tokens)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(executor.info().num_layers, 40);
+        assert_eq!(executor.qwen35_config().linear_attention_layers(), 30);
+        assert_eq!(spec.request_id, request_id);
+        assert_eq!(spec.tensors.len(), 30);
+        assert_eq!(spec.tensors[0].shape, vec![32, 128, 128]);
+        assert_eq!(spec.dtype, ferrum_types::DataType::FP16);
+        assert_eq!(spec.device, ferrum_types::Device::CPU);
+        assert_eq!(spec.max_batch_slots, 1);
+
+        let status = executor.status();
+        assert_eq!(
+            status.state,
+            ferrum_interfaces::model_executor::ExecutorState::Error
+        );
+        assert!(!status.is_ready);
+        let capabilities = executor.capabilities();
+        assert!(!capabilities.supports_continuous_batching);
+        assert_eq!(
+            capabilities.memory_requirements.overhead_memory,
+            30 * 32 * 128 * 128 * 2
+        );
+    }
 }

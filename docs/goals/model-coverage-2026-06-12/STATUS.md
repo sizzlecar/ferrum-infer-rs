@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZJ — W3 executor skeleton recurrent-state boundary checkpoint
+
+- Scope:
+  - W3-S2 executor boundary work for Qwen3.5/Qwen3.6;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added an unregistered `Qwen35W3Executor` skeleton;
+  - the skeleton is constructible from `ModelDefinition`, dtype, and device;
+  - it implements `ModelExecutor::recurrent_state_spec()` using the shared
+    Qwen3.5/Qwen3.6 recurrent-state spec helper;
+  - it keeps `prefill` and `decode` explicitly unsupported;
+  - `status()` reports `ExecutorState::Error` and `is_ready=false`, so this
+    cannot be mistaken for a runnable product executor;
+  - it is exported for the future registry/runtime wiring step, but the
+    registry still rejects Qwen3.5/Qwen3.6 product execution.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `7 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this does not yet load Qwen3.5/Qwen3.6 weights;
+  - this does not update recurrent state during prefill/decode;
+  - `ferrum run` and `ferrum serve` remain intentionally unsupported for W3.
+
 ## 2026-06-18 ZZI — W3 recurrent-state spec product-boundary checkpoint
 
 - Scope:
