@@ -274,6 +274,34 @@ pub fn qwen35_recurrent_gated_delta_rule_cpu(
     Ok((out, state))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_gated_delta_attention_cpu(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    a: &[f32],
+    b: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    initial_state: &[f32],
+    shape: Qwen35DeltaRuleShape,
+    use_qk_l2norm: bool,
+    scale: Option<f32>,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let (g, beta) = qwen35_gdn_gating_cpu(a_log, a, b, dt_bias, shape.tokens, shape.value_heads)?;
+    qwen35_recurrent_gated_delta_rule_cpu(
+        query,
+        key,
+        value,
+        &g,
+        &beta,
+        initial_state,
+        shape,
+        use_qk_l2norm,
+        scale,
+    )
+}
+
 pub fn qwen35_gdn_gating_cpu(
     a_log: &[f32],
     a: &[f32],
@@ -953,5 +981,55 @@ mod tests {
             .expect_err("b length should fail");
 
         assert!(err.to_string().contains("b length"), "{err}");
+    }
+
+    #[test]
+    fn gated_delta_attention_matches_gating_plus_recurrent_reference() {
+        let shape = Qwen35DeltaRuleShape {
+            tokens: 2,
+            key_heads: 1,
+            value_heads: 1,
+            key_dim: 2,
+            value_dim: 1,
+        };
+        let query = vec![1.0, 0.0, 0.0, 1.0];
+        let key = vec![1.0, 0.0, 0.0, 1.0];
+        let value = vec![2.0, 4.0];
+        let a = vec![0.0, 0.5];
+        let b = vec![0.0, 1.0];
+        let a_log = vec![0.0];
+        let dt_bias = vec![0.0];
+        let initial_state = vec![0.0; 2];
+        let (g, beta) = qwen35_gdn_gating_cpu(&a_log, &a, &b, &dt_bias, 2, 1).unwrap();
+        let (expected_out, expected_state) = qwen35_recurrent_gated_delta_rule_cpu(
+            &query,
+            &key,
+            &value,
+            &g,
+            &beta,
+            &initial_state,
+            shape,
+            false,
+            Some(1.0),
+        )
+        .unwrap();
+
+        let (out, state) = qwen35_gated_delta_attention_cpu(
+            &query,
+            &key,
+            &value,
+            &a,
+            &b,
+            &a_log,
+            &dt_bias,
+            &initial_state,
+            shape,
+            false,
+            Some(1.0),
+        )
+        .unwrap();
+
+        assert_eq!(out, expected_out);
+        assert_eq!(state, expected_state);
     }
 }
