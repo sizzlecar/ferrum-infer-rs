@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZO — W3 resolved weight-plan checkpoint
+
+- Scope:
+  - W3-S2 loader/executor bridge after safetensors preflight;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35ResolvedWeightPlan`;
+  - added resolved global/layer tensor specs with `role`, concrete tensor
+    name, required flag, and present flag;
+  - wildcard optional expert aliases now resolve to concrete names when a
+    safetensors inventory contains them;
+  - missing optional tied `lm_head` remains represented as absent instead of
+    failing preflight;
+  - `Qwen35W3Executor::from_definition_with_weight_preflight()` now stores the
+    resolved weight plan alongside the validation summary;
+  - added `weight_plan()` and `layer_tensor()` lookup helpers for the next
+    tensor materialization step.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35_weights -- --nocapture` PASS:
+    `5 passed`;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `14 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this still does not materialize tensor data into backend weights;
+  - this does not run prefill/decode;
+  - registry still rejects Qwen3.5/Qwen3.6 product execution.
+
 ## 2026-06-18 ZZN — W3 executor weight-preflight boundary checkpoint
 
 - Scope:

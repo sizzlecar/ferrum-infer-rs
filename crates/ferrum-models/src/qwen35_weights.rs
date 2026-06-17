@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use crate::qwen35_config::{Qwen35TextConfig, Qwen35WeightManifest, Qwen35WeightSpec};
+use crate::qwen35_config::{
+    Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig, Qwen35WeightManifest, Qwen35WeightSpec,
+};
 
 const PREFIX_CANDIDATES: &[&str] = &["model.language_model", "model"];
 
@@ -27,6 +29,29 @@ pub struct Qwen35WeightValidation {
     pub present_required: Vec<String>,
     pub present_optional: Vec<String>,
     pub missing_optional: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen35ResolvedWeightSpec {
+    pub role: String,
+    pub name: String,
+    pub required: bool,
+    pub present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen35ResolvedLayerWeights {
+    pub layer_index: usize,
+    pub attention: Qwen35LayerType,
+    pub mlp: Qwen35MlpKind,
+    pub tensors: Vec<Qwen35ResolvedWeightSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen35ResolvedWeightPlan {
+    pub prefix: String,
+    pub global_tensors: Vec<Qwen35ResolvedWeightSpec>,
+    pub layers: Vec<Qwen35ResolvedLayerWeights>,
 }
 
 impl Qwen35WeightInventory {
@@ -98,6 +123,42 @@ impl Qwen35WeightInventory {
         }
     }
 
+    pub fn resolve_manifest(
+        &self,
+        manifest: &Qwen35WeightManifest,
+    ) -> Result<Qwen35ResolvedWeightPlan, String> {
+        let validation = self.validate_manifest(manifest);
+        if !validation.missing_required.is_empty() {
+            return Err(format!(
+                "missing {} required Qwen3.5/Qwen3.6 tensors for prefix {}: {}",
+                validation.missing_required.len(),
+                validation.prefix,
+                validation
+                    .missing_required
+                    .iter()
+                    .take(12)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        Ok(Qwen35ResolvedWeightPlan {
+            prefix: manifest.prefix.clone(),
+            global_tensors: self.resolve_weight_specs(&manifest.global_tensors),
+            layers: manifest
+                .layers
+                .iter()
+                .map(|layer| Qwen35ResolvedLayerWeights {
+                    layer_index: layer.layer_index,
+                    attention: layer.attention,
+                    mlp: layer.mlp,
+                    tensors: self.resolve_weight_specs(&layer.tensors),
+                })
+                .collect(),
+        })
+    }
+
     pub fn detect_prefix_and_validate(
         &self,
         config: &Qwen35TextConfig,
@@ -108,6 +169,37 @@ impl Qwen35WeightInventory {
             let validation = self.validate_manifest(&manifest);
             if validation.missing_required.is_empty() {
                 return Ok(validation);
+            }
+            if best.as_ref().is_none_or(|current| {
+                validation.missing_required.len() < current.missing_required.len()
+            }) {
+                best = Some(validation);
+            }
+        }
+        let best = best.expect("PREFIX_CANDIDATES is non-empty");
+        Err(format!(
+            "missing {} required Qwen3.5/Qwen3.6 tensors for prefix {}: {}",
+            best.missing_required.len(),
+            best.prefix,
+            best.missing_required
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
+    pub fn detect_prefix_and_resolve(
+        &self,
+        config: &Qwen35TextConfig,
+    ) -> Result<Qwen35ResolvedWeightPlan, String> {
+        let mut best: Option<Qwen35WeightValidation> = None;
+        for prefix in PREFIX_CANDIDATES {
+            let manifest = config.weight_manifest(*prefix)?;
+            let validation = self.validate_manifest(&manifest);
+            if validation.missing_required.is_empty() {
+                return self.resolve_manifest(&manifest);
             }
             if best.as_ref().is_none_or(|current| {
                 validation.missing_required.len() < current.missing_required.len()
@@ -165,21 +257,104 @@ impl Qwen35WeightInventory {
     }
 
     fn contains_weight_spec(&self, tensor: &Qwen35WeightSpec) -> bool {
+        !self.matching_names(tensor).is_empty()
+    }
+
+    fn matching_names(&self, tensor: &Qwen35WeightSpec) -> Vec<String> {
         if !tensor.name.contains('*') {
-            return self.contains(&tensor.name);
+            return self
+                .contains(&tensor.name)
+                .then(|| tensor.name.clone())
+                .into_iter()
+                .collect();
         }
         let mut pieces = tensor.name.splitn(2, '*');
         let prefix = pieces.next().unwrap_or("");
         let suffix = pieces.next().unwrap_or("");
         self.names
             .iter()
-            .any(|name| name.starts_with(prefix) && name.ends_with(suffix))
+            .filter(|name| name.starts_with(prefix) && name.ends_with(suffix))
+            .cloned()
+            .collect()
+    }
+
+    fn resolve_weight_specs(&self, specs: &[Qwen35WeightSpec]) -> Vec<Qwen35ResolvedWeightSpec> {
+        specs
+            .iter()
+            .flat_map(|spec| {
+                let matches = self.matching_names(spec);
+                if matches.is_empty() {
+                    vec![Qwen35ResolvedWeightSpec {
+                        role: spec.role.clone(),
+                        name: spec.name.clone(),
+                        required: spec.required,
+                        present: false,
+                    }]
+                } else {
+                    matches
+                        .into_iter()
+                        .map(|name| Qwen35ResolvedWeightSpec {
+                            role: spec.role.clone(),
+                            name,
+                            required: spec.required,
+                            present: true,
+                        })
+                        .collect()
+                }
+            })
+            .collect()
     }
 }
 
 impl Qwen35WeightValidation {
     pub fn is_pass(&self) -> bool {
         self.missing_required.is_empty()
+    }
+}
+
+impl Qwen35ResolvedWeightPlan {
+    pub fn validation(&self) -> Qwen35WeightValidation {
+        let mut missing_required = Vec::new();
+        let mut present_required = Vec::new();
+        let mut present_optional = Vec::new();
+        let mut missing_optional = Vec::new();
+
+        for tensor in self
+            .global_tensors
+            .iter()
+            .chain(self.layers.iter().flat_map(|layer| layer.tensors.iter()))
+        {
+            match (tensor.required, tensor.present) {
+                (true, true) => present_required.push(tensor.name.clone()),
+                (true, false) => missing_required.push(tensor.name.clone()),
+                (false, true) => present_optional.push(tensor.name.clone()),
+                (false, false) => missing_optional.push(tensor.name.clone()),
+            }
+        }
+
+        Qwen35WeightValidation {
+            prefix: self.prefix.clone(),
+            missing_required,
+            present_required,
+            present_optional,
+            missing_optional,
+        }
+    }
+
+    pub fn layer_tensor(
+        &self,
+        layer_index: usize,
+        role: &str,
+    ) -> Option<&Qwen35ResolvedWeightSpec> {
+        self.layers
+            .iter()
+            .find(|layer| layer.layer_index == layer_index)
+            .and_then(|layer| {
+                layer
+                    .tensors
+                    .iter()
+                    .find(|tensor| tensor.role == role && tensor.present)
+            })
     }
 }
 
@@ -211,6 +386,34 @@ mod tests {
                 "num_key_value_heads": 1,
                 "intermediate_size": 32,
                 "tie_word_embeddings": true
+              }
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn moe_config() -> Qwen35TextConfig {
+        Qwen35TextConfig::from_hf_config_str(
+            r#"{
+              "model_type": "qwen3_5_moe",
+              "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 16,
+                "num_hidden_layers": 4,
+                "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 4,
+                "linear_value_head_dim": 4,
+                "linear_conv_kernel_dim": 4,
+                "head_dim": 4,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 8,
+                "shared_expert_intermediate_size": 8,
+                "tie_word_embeddings": false
               }
             }"#,
         )
@@ -287,6 +490,81 @@ mod tests {
             .detect_prefix_and_validate(&config)
             .expect_err("missing full-attention q_proj should fail");
         assert!(err.contains("self_attn.q_proj.weight"), "{err}");
+    }
+
+    #[test]
+    fn resolves_manifest_to_executor_tensor_plan() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        let inventory = Qwen35WeightInventory::from_names(names);
+
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+        let validation = plan.validation();
+
+        assert_eq!(plan.prefix, "model");
+        assert!(validation.is_pass());
+        assert!(plan
+            .global_tensors
+            .iter()
+            .any(|tensor| tensor.role == "embed_tokens"
+                && tensor.name == "model.embed_tokens.weight"
+                && tensor.present));
+        assert!(plan
+            .global_tensors
+            .iter()
+            .any(|tensor| tensor.role == "lm_head"
+                && tensor.name == "model.lm_head.weight"
+                && !tensor.present
+                && !tensor.required));
+        assert_eq!(
+            plan.layer_tensor(0, "linear_attn_qkv")
+                .map(|tensor| tensor.name.as_str()),
+            Some("model.layers.0.linear_attn.in_proj_qkv.weight")
+        );
+    }
+
+    #[test]
+    fn resolves_optional_wildcard_expert_aliases_when_present() {
+        let config = moe_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let mut names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        names.push("model.layers.0.mlp.experts.0.gate_proj.weight".to_string());
+        let inventory = Qwen35WeightInventory::from_names(names);
+
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+
+        assert_eq!(
+            plan.layer_tensor(0, "moe_per_expert_gate_proj")
+                .map(|tensor| tensor.name.as_str()),
+            Some("model.layers.0.mlp.experts.0.gate_proj.weight")
+        );
+        assert!(plan
+            .validation()
+            .present_optional
+            .contains(&"model.layers.0.mlp.experts.0.gate_proj.weight".to_string()));
     }
 
     #[test]
