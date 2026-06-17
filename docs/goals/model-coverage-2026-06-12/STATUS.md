@@ -2,6 +2,43 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ15 — W3 release-grade manifest builder checkpoint
+
+- Scope:
+  - W3 release-grade manifest assembly path;
+  - no GPU/CUDA/Metal execution was started;
+  - no real W3 performance claim and no real `MODEL_RELEASE_GRADE_W3 PASS:
+    <out_dir>` was produced.
+- Change:
+  - extended `scripts/release/model_release_grade_manifest.py` from W2-only to
+    lane-aware `w2`/`w3`;
+  - W3 mode requires explicit paths for S0 design, S0 microbench, S1
+    single-layer, S2 product path, L0-L5 correctness artifacts, `ferrum run`,
+    `ferrum serve`, hardware/runtime/git/binary evidence, Ferrum bench report,
+    baseline bench report, and all command-line evidence;
+  - W3 perf assembly reuses the release bench schema and requires c=1/4/16/32,
+    usage-counted outputs, full completed counts, zero error/quality counts,
+    same prompt dataset SHA, same effective concurrency, and bench commands
+    suitable for the final validator;
+  - builder self-test now creates synthetic W2 and W3 manifests and invokes the
+    final validator for both lanes.
+- Validation:
+  - `python3 -m py_compile scripts/release/model_release_grade_manifest.py`
+    PASS;
+  - `git diff --check -- scripts/release/model_release_grade_manifest.py`
+    PASS;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`
+    PASS, including synthetic `MODEL_RELEASE_GRADE_W2 PASS` and synthetic
+    `MODEL_RELEASE_GRADE_W3 PASS`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`
+    PASS: `MODEL RELEASE GRADE GOAL SELFTEST PASS`;
+  - W3 missing-args CLI negative test fails as intended and lists all required
+    evidence paths.
+- Limitation:
+  - synthetic manifest PASS lines are validator self-tests only; real W3 still
+    needs actual L0-L5 correctness, same-hardware baseline, and c=1/4/16/32
+    80% performance evidence before any release-grade claim.
+
 ## 2026-06-18 ZZZ14 — W3-S0 design artifact gate checkpoint
 
 - Scope:
