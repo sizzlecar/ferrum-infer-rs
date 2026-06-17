@@ -5,7 +5,10 @@
 //! variants add routed experts plus a shared expert. This module keeps that
 //! shape explicit before the product loader/model path is wired.
 
+use ferrum_interfaces::RecurrentStateTensorSpec;
 use serde_json::Value;
+
+pub const QWEN35_DELTA_STATE_NAME: &str = "delta_state";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Qwen35LayerType {
@@ -139,6 +142,61 @@ impl Qwen35TextConfig {
         self.layer_types
             .iter()
             .position(|kind| *kind == Qwen35LayerType::FullAttention)
+    }
+
+    pub fn linear_qk_total_dim(&self) -> usize {
+        self.linear_attention.num_key_heads * self.linear_attention.key_head_dim
+    }
+
+    pub fn linear_value_total_dim(&self) -> usize {
+        self.linear_attention.num_value_heads * self.linear_attention.value_head_dim
+    }
+
+    /// Per-layer DeltaNet recurrent state shape, excluding the request slot.
+    ///
+    /// Delta-rule state is a per-key-head memory matrix. Dense Qwen3.5 has
+    /// matching q/k and v totals: `[key_heads, key_dim, value_dim]`.
+    /// Qwen3.6 MoE expands value heads, so values are grouped back onto the
+    /// key heads: `[key_heads, key_dim, value_total / key_heads]`.
+    pub fn recurrent_delta_state_shape(&self) -> Result<Vec<usize>, String> {
+        let key_heads = self.linear_attention.num_key_heads;
+        let value_total = self.linear_value_total_dim();
+        if value_total % key_heads != 0 {
+            return Err(format!(
+                "linear value total dim {value_total} is not divisible by key heads {key_heads}"
+            ));
+        }
+        Ok(vec![
+            key_heads,
+            self.linear_attention.key_head_dim,
+            value_total / key_heads,
+        ])
+    }
+
+    pub fn recurrent_state_tensor_specs(&self) -> Result<Vec<RecurrentStateTensorSpec>, String> {
+        let shape = self.recurrent_delta_state_shape()?;
+        Ok(self
+            .layer_types
+            .iter()
+            .enumerate()
+            .filter_map(|(layer_index, kind)| {
+                (*kind == Qwen35LayerType::LinearAttention).then(|| {
+                    RecurrentStateTensorSpec::new(
+                        layer_index,
+                        QWEN35_DELTA_STATE_NAME,
+                        shape.clone(),
+                    )
+                })
+            })
+            .collect())
+    }
+
+    pub fn recurrent_state_elements_per_slot(&self) -> Result<usize, String> {
+        Ok(self
+            .recurrent_state_tensor_specs()?
+            .iter()
+            .map(RecurrentStateTensorSpec::num_elements)
+            .sum())
     }
 
     fn validate(&self) -> Result<(), String> {
