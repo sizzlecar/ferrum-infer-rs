@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-17 ZZB — W3 Qwen3.5 HF layer dump harness checkpoint
+
+- Scope:
+  - source checkpoint for official/HF W3-S1 layer dump extraction;
+  - validates the selected Qwen3.5 first `linear_attention` layer contract
+    against saved HF config metadata and current Transformers source hooks;
+  - no model weights were downloaded;
+  - no paid GPU compute was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `scripts/release/w3_qwen35_hf_layer_dump.py`;
+  - script modes:
+    - `--self-test` validates the dump schema and source-hook contract without
+      torch/transformers;
+    - `--contract` validates saved HF `config.json` plus Transformers source
+      hooks without weights;
+    - `--dump` is the real HF/torch path for dumping the selected layer tensors.
+  - dump schema captures the first dense Qwen3.5 DeltaNet layer inputs,
+    QKV/z/b/a projections, conv output, delta-rule q/k/v/beta/g/core, gated
+    norm output, DeltaNet output, residual-after-mixer, post-attention norm,
+    MLP output, and layer output.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_qwen35_hf_layer_dump.py` PASS;
+  - `python3 scripts/release/w3_qwen35_hf_layer_dump.py --self-test --out
+    /tmp/w3_qwen35_hf_layer_dump_selftest` PASS:
+    `W3 QWEN35 HF LAYER DUMP SELFTEST PASS:
+    /private/tmp/w3_qwen35_hf_layer_dump_selftest`;
+  - `python3 scripts/release/w3_qwen35_hf_layer_dump.py --contract --model-id
+    Qwen/Qwen3.5-0.8B --config
+    docs/goals/model-coverage-2026-06-12/artifacts/w3_hf_config_probe_20260617T131209Z_f97c1d6f/dense_min_reference.config.json
+    --out /tmp/w3_qwen35_hf_layer_contract` PASS:
+    `W3 QWEN35 HF LAYER CONTRACT PASS:
+    /private/tmp/w3_qwen35_hf_layer_contract`.
+- Limitation:
+  - this is still not an official weight-based HF tensor dump and not a
+    Ferrum-vs-HF compare artifact;
+  - W3-S1 remains open until the real HF dump is compared against a real Ferrum
+    dump for the same prompt/layer.
+- Next required validation:
+  - run `--dump` for `Qwen/Qwen3.5-0.8B` on the retained environment with
+    torch/transformers and cached weights;
+  - implement/route the matching Ferrum Qwen3.5 layer dump and compare both
+    artifacts.
+
 ## 2026-06-17 ZZA — W3 Qwen3.5/Qwen3.6 HF config parser checkpoint
 
 - Scope:
