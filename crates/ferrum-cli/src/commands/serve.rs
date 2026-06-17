@@ -141,6 +141,10 @@ pub struct ServeCommand {
     #[arg(long, value_name = "N")]
     pub kv_capacity: Option<usize>,
 
+    /// Global KV block budget (`FERRUM_KV_MAX_BLOCKS`).
+    #[arg(long, value_name = "N")]
+    pub kv_max_blocks: Option<usize>,
+
     /// Use GPU argmax for greedy decoding (`FERRUM_GREEDY_ARGMAX=1`).
     #[arg(long, conflicts_with = "disable_greedy_argmax")]
     pub greedy_argmax: bool,
@@ -254,6 +258,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         session_cache_max_tokens,
         kv_dtype,
         kv_capacity,
+        kv_max_blocks,
         greedy_argmax,
         disable_greedy_argmax,
         batched_graph,
@@ -602,6 +607,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let mut startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
         kv_capacity,
+        kv_max_blocks,
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
@@ -1099,6 +1105,7 @@ pub(crate) fn runtime_preset_entries(
 fn serve_cli_runtime_entries(
     kv_dtype: Option<&str>,
     kv_capacity: Option<usize>,
+    kv_max_blocks: Option<usize>,
     max_model_len: Option<usize>,
     max_num_seqs: Option<usize>,
     max_num_batched_tokens: Option<usize>,
@@ -1120,6 +1127,7 @@ fn serve_cli_runtime_entries(
     let mut entries = Vec::new();
     push_cli_runtime_entry(&mut entries, "FERRUM_KV_DTYPE", kv_dtype);
     push_cli_runtime_usize(&mut entries, "FERRUM_KV_CAPACITY", kv_capacity);
+    push_cli_runtime_usize(&mut entries, "FERRUM_KV_MAX_BLOCKS", kv_max_blocks);
     push_cli_runtime_usize(&mut entries, "FERRUM_MAX_MODEL_LEN", max_model_len);
     push_cli_runtime_usize(&mut entries, "FERRUM_PAGED_MAX_SEQS", max_num_seqs);
     push_cli_runtime_usize(
@@ -1834,6 +1842,7 @@ mod tests {
             Some("int8"),
             Some(1024),
             Some(4096),
+            Some(4096),
             Some(64),
             Some(2048),
             Some(8),
@@ -1867,6 +1876,11 @@ mod tests {
             .contains(&ferrum_types::RuntimeConfigEffect::Correctness));
         assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "1024");
+        assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
+        assert_eq!(
+            entry("FERRUM_KV_MAX_BLOCKS").source,
+            RuntimeConfigSource::Cli
+        );
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
         assert_eq!(
@@ -1959,6 +1973,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(
@@ -2013,6 +2028,7 @@ mod tests {
         let cli_entries = serve_cli_runtime_entries(
             None,
             Some(1024),
+            None,
             Some(4096),
             Some(8),
             Some(512),
@@ -2588,6 +2604,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -2628,6 +2645,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(true, false, false, false),
             None,
             None,
@@ -2641,6 +2659,7 @@ mod tests {
             None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,
@@ -2670,6 +2689,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(false, true, false, false),
             None,
             None,
@@ -2683,6 +2703,7 @@ mod tests {
             None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,
