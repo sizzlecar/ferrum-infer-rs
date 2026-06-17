@@ -130,6 +130,29 @@ pub struct Qwen35LinearAttentionReference {
     pub final_state: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35DenseLinearAttentionLayerShape {
+    pub tokens: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub attention: Qwen35LinearAttentionShape,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen35DenseLinearAttentionLayerReference {
+    pub input_norm: Vec<f32>,
+    pub mixed_qkv_raw: Vec<f32>,
+    pub z_raw: Vec<f32>,
+    pub b_raw: Vec<f32>,
+    pub a_raw: Vec<f32>,
+    pub attention: Qwen35LinearAttentionReference,
+    pub delta_output: Vec<f32>,
+    pub residual_after_mixer: Vec<f32>,
+    pub post_attention_norm: Vec<f32>,
+    pub mlp_output: Vec<f32>,
+    pub layer_output: Vec<f32>,
+}
+
 pub fn qwen35_runtime_config(
     config: &Qwen35TextConfig,
     vocab_size: usize,
@@ -153,6 +176,248 @@ pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<Ll
         def.vocab_size,
         def.max_position_embeddings,
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_dense_linear_attention_layer_cpu(
+    layer_input: &[f32],
+    input_norm_weight: &[f32],
+    qkv_weight: &[f32],
+    z_weight: &[f32],
+    b_weight: &[f32],
+    a_weight: &[f32],
+    conv1d_weight: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    norm_weight: &[f32],
+    out_proj_weight: &[f32],
+    post_attention_norm_weight: &[f32],
+    gate_proj_weight: &[f32],
+    up_proj_weight: &[f32],
+    down_proj_weight: &[f32],
+    initial_state: &[f32],
+    shape: Qwen35DenseLinearAttentionLayerShape,
+    eps: f32,
+) -> Result<Qwen35DenseLinearAttentionLayerReference> {
+    shape.validate()?;
+    let attention_shape = shape.attention;
+    let hidden_len = shape.tokens * shape.hidden_size;
+    let value_total = attention_shape.value_total();
+    validate_len("dense layer input", layer_input.len(), hidden_len)?;
+    validate_len(
+        "dense layer input_norm_weight",
+        input_norm_weight.len(),
+        shape.hidden_size,
+    )?;
+    validate_len(
+        "dense layer qkv_weight",
+        qkv_weight.len(),
+        attention_shape.conv_channels() * shape.hidden_size,
+    )?;
+    validate_len(
+        "dense layer z_weight",
+        z_weight.len(),
+        value_total * shape.hidden_size,
+    )?;
+    validate_len(
+        "dense layer b_weight",
+        b_weight.len(),
+        attention_shape.value_heads * shape.hidden_size,
+    )?;
+    validate_len(
+        "dense layer a_weight",
+        a_weight.len(),
+        attention_shape.value_heads * shape.hidden_size,
+    )?;
+    validate_len(
+        "dense layer out_proj_weight",
+        out_proj_weight.len(),
+        shape.hidden_size * value_total,
+    )?;
+    validate_len(
+        "dense layer post_attention_norm_weight",
+        post_attention_norm_weight.len(),
+        shape.hidden_size,
+    )?;
+    validate_len(
+        "dense layer gate_proj_weight",
+        gate_proj_weight.len(),
+        shape.intermediate_size * shape.hidden_size,
+    )?;
+    validate_len(
+        "dense layer up_proj_weight",
+        up_proj_weight.len(),
+        shape.intermediate_size * shape.hidden_size,
+    )?;
+    validate_len(
+        "dense layer down_proj_weight",
+        down_proj_weight.len(),
+        shape.hidden_size * shape.intermediate_size,
+    )?;
+
+    let input_norm = qwen35_rms_norm_plus_one_cpu(
+        layer_input,
+        input_norm_weight,
+        shape.tokens,
+        shape.hidden_size,
+        eps,
+    )?;
+    let mixed_qkv_raw = qwen35_linear_cpu(
+        &input_norm,
+        qkv_weight,
+        shape.tokens,
+        shape.hidden_size,
+        attention_shape.conv_channels(),
+    )?;
+    let z_raw = qwen35_linear_cpu(
+        &input_norm,
+        z_weight,
+        shape.tokens,
+        shape.hidden_size,
+        value_total,
+    )?;
+    let b_raw = qwen35_linear_cpu(
+        &input_norm,
+        b_weight,
+        shape.tokens,
+        shape.hidden_size,
+        attention_shape.value_heads,
+    )?;
+    let a_raw = qwen35_linear_cpu(
+        &input_norm,
+        a_weight,
+        shape.tokens,
+        shape.hidden_size,
+        attention_shape.value_heads,
+    )?;
+    let attention = qwen35_linear_attention_core_cpu(
+        &mixed_qkv_raw,
+        &z_raw,
+        &a_raw,
+        &b_raw,
+        conv1d_weight,
+        a_log,
+        dt_bias,
+        norm_weight,
+        initial_state,
+        attention_shape,
+        eps,
+    )?;
+    let delta_output = qwen35_linear_cpu(
+        &attention.delta_norm,
+        out_proj_weight,
+        shape.tokens,
+        value_total,
+        shape.hidden_size,
+    )?;
+    let residual_after_mixer = add_same_len(layer_input, &delta_output, "residual_after_mixer")?;
+    let post_attention_norm = qwen35_rms_norm_plus_one_cpu(
+        &residual_after_mixer,
+        post_attention_norm_weight,
+        shape.tokens,
+        shape.hidden_size,
+        eps,
+    )?;
+    let gate = qwen35_linear_cpu(
+        &post_attention_norm,
+        gate_proj_weight,
+        shape.tokens,
+        shape.hidden_size,
+        shape.intermediate_size,
+    )?;
+    let up = qwen35_linear_cpu(
+        &post_attention_norm,
+        up_proj_weight,
+        shape.tokens,
+        shape.hidden_size,
+        shape.intermediate_size,
+    )?;
+    let fused = gate
+        .iter()
+        .zip(&up)
+        .map(|(gate, up)| silu(*gate) * up)
+        .collect::<Vec<_>>();
+    let mlp_output = qwen35_linear_cpu(
+        &fused,
+        down_proj_weight,
+        shape.tokens,
+        shape.intermediate_size,
+        shape.hidden_size,
+    )?;
+    let layer_output = add_same_len(&residual_after_mixer, &mlp_output, "layer_output")?;
+
+    Ok(Qwen35DenseLinearAttentionLayerReference {
+        input_norm,
+        mixed_qkv_raw,
+        z_raw,
+        b_raw,
+        a_raw,
+        attention,
+        delta_output,
+        residual_after_mixer,
+        post_attention_norm,
+        mlp_output,
+        layer_output,
+    })
+}
+
+pub fn qwen35_linear_cpu(
+    x: &[f32],
+    weight: &[f32],
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<Vec<f32>> {
+    if rows == 0 || in_dim == 0 || out_dim == 0 {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 linear shape must be positive, got rows={rows} in_dim={in_dim} out_dim={out_dim}"
+        )));
+    }
+    validate_len("linear input", x.len(), rows * in_dim)?;
+    validate_len("linear weight", weight.len(), out_dim * in_dim)?;
+
+    let mut out = vec![0.0; rows * out_dim];
+    for row in 0..rows {
+        for out_col in 0..out_dim {
+            let mut acc = 0.0;
+            for in_col in 0..in_dim {
+                acc += x[row * in_dim + in_col] * weight[out_col * in_dim + in_col];
+            }
+            out[row * out_dim + out_col] = acc;
+        }
+    }
+    Ok(out)
+}
+
+pub fn qwen35_rms_norm_plus_one_cpu(
+    x: &[f32],
+    weight: &[f32],
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<Vec<f32>> {
+    if rows == 0 || dim == 0 {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 RMSNorm shape must be positive, got rows={rows} dim={dim}"
+        )));
+    }
+    validate_len("RMSNorm input", x.len(), rows * dim)?;
+    validate_len("RMSNorm weight", weight.len(), dim)?;
+
+    let mut out = vec![0.0; rows * dim];
+    for row in 0..rows {
+        let base = row * dim;
+        let mean = x[base..base + dim]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            / dim as f32;
+        let inv = (mean + eps).sqrt().recip();
+        for i in 0..dim {
+            out[base + i] = x[base + i] * inv * (1.0 + weight[i]);
+        }
+    }
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -589,6 +854,24 @@ impl Qwen35LinearAttentionShape {
     }
 }
 
+impl Qwen35DenseLinearAttentionLayerShape {
+    fn validate(self) -> Result<()> {
+        if self.tokens == 0 || self.hidden_size == 0 || self.intermediate_size == 0 {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 dense linear-attention layer shape must be positive, got {self:?}"
+            )));
+        }
+        self.attention.validate()?;
+        if self.attention.tokens != self.tokens {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 dense layer tokens {} must match attention tokens {}",
+                self.tokens, self.attention.tokens
+            )));
+        }
+        Ok(())
+    }
+}
+
 fn validate_delta_rule_shapes(
     query: &[f32],
     key: &[f32],
@@ -627,6 +910,21 @@ fn validate_delta_rule_shapes(
         }
     }
     Ok(())
+}
+
+fn add_same_len(lhs: &[f32], rhs: &[f32], label: &str) -> Result<Vec<f32>> {
+    if lhs.len() != rhs.len() {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 {label} add length mismatch: lhs {} != rhs {}",
+            lhs.len(),
+            rhs.len()
+        )));
+    }
+    Ok(lhs
+        .iter()
+        .zip(rhs)
+        .map(|(left, right)| left + right)
+        .collect())
 }
 
 fn validate_len(label: &str, actual: usize, expected: usize) -> Result<()> {
@@ -1147,6 +1445,32 @@ mod tests {
     }
 
     #[test]
+    fn linear_cpu_uses_row_major_out_in_weights() {
+        let out = qwen35_linear_cpu(
+            &[1.0, 2.0, 3.0, 4.0],
+            &[
+                1.0, 0.0, //
+                0.0, 1.0, //
+                1.0, 1.0,
+            ],
+            2,
+            2,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 3.0, 4.0, 7.0]);
+    }
+
+    #[test]
+    fn rms_norm_plus_one_matches_qwen35_semantics() {
+        let out = qwen35_rms_norm_plus_one_cpu(&[3.0, 4.0], &[0.0, 1.0], 1, 2, 0.0).unwrap();
+        let inv = ((3.0f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt().recip();
+
+        assert_close_slice(&out, &[3.0 * inv, 4.0 * inv * 2.0], 1e-6);
+    }
+
+    #[test]
     fn depthwise_causal_conv_uses_left_context_only() {
         let out =
             qwen35_depthwise_causal_conv_silu_cpu(&[1.0, 2.0, 3.0], &[10.0, 1.0], 3, 1, 2).unwrap();
@@ -1178,6 +1502,234 @@ mod tests {
         ];
 
         assert_close_slice(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    fn dense_linear_attention_layer_composes_attention_residual_and_dense_mlp() {
+        let attention_shape = Qwen35LinearAttentionShape {
+            tokens: 2,
+            key_heads: 1,
+            value_heads: 1,
+            key_dim: 1,
+            value_dim: 1,
+            conv_kernel: 1,
+        };
+        let shape = Qwen35DenseLinearAttentionLayerShape {
+            tokens: 2,
+            hidden_size: 2,
+            intermediate_size: 2,
+            attention: attention_shape,
+        };
+        let layer_input = vec![1.0, 2.0, 3.0, 4.0];
+        let input_norm_weight = vec![0.0, 0.0];
+        let qkv_weight = vec![
+            1.0, 0.0, //
+            0.0, 1.0, //
+            1.0, 1.0,
+        ];
+        let z_weight = vec![1.0, -1.0];
+        let b_weight = vec![0.5, 0.25];
+        let a_weight = vec![-0.25, 0.75];
+        let conv1d_weight = vec![1.0, 1.0, 1.0];
+        let a_log = vec![0.0];
+        let dt_bias = vec![0.0];
+        let norm_weight = vec![1.0];
+        let out_proj_weight = vec![1.0, -0.5];
+        let post_attention_norm_weight = vec![0.0, 0.0];
+        let gate_proj_weight = vec![
+            0.2, 0.1, //
+            -0.1, 0.3,
+        ];
+        let up_proj_weight = vec![
+            0.4, -0.2, //
+            0.3, 0.5,
+        ];
+        let down_proj_weight = vec![
+            1.0, 0.0, //
+            0.0, 1.0,
+        ];
+        let initial_state = vec![0.0; attention_shape.state_len()];
+
+        let input_norm = qwen35_rms_norm_plus_one_cpu(
+            &layer_input,
+            &input_norm_weight,
+            shape.tokens,
+            shape.hidden_size,
+            1e-6,
+        )
+        .unwrap();
+        let mixed_qkv_raw = qwen35_linear_cpu(
+            &input_norm,
+            &qkv_weight,
+            shape.tokens,
+            shape.hidden_size,
+            attention_shape.conv_channels(),
+        )
+        .unwrap();
+        let z_raw = qwen35_linear_cpu(
+            &input_norm,
+            &z_weight,
+            shape.tokens,
+            shape.hidden_size,
+            attention_shape.value_total(),
+        )
+        .unwrap();
+        let b_raw = qwen35_linear_cpu(
+            &input_norm,
+            &b_weight,
+            shape.tokens,
+            shape.hidden_size,
+            attention_shape.value_heads,
+        )
+        .unwrap();
+        let a_raw = qwen35_linear_cpu(
+            &input_norm,
+            &a_weight,
+            shape.tokens,
+            shape.hidden_size,
+            attention_shape.value_heads,
+        )
+        .unwrap();
+        let attention = qwen35_linear_attention_core_cpu(
+            &mixed_qkv_raw,
+            &z_raw,
+            &a_raw,
+            &b_raw,
+            &conv1d_weight,
+            &a_log,
+            &dt_bias,
+            &norm_weight,
+            &initial_state,
+            attention_shape,
+            1e-6,
+        )
+        .unwrap();
+        let delta_output = qwen35_linear_cpu(
+            &attention.delta_norm,
+            &out_proj_weight,
+            shape.tokens,
+            attention_shape.value_total(),
+            shape.hidden_size,
+        )
+        .unwrap();
+        let residual_after_mixer =
+            add_same_len(&layer_input, &delta_output, "residual_after_mixer").unwrap();
+        let post_attention_norm = qwen35_rms_norm_plus_one_cpu(
+            &residual_after_mixer,
+            &post_attention_norm_weight,
+            shape.tokens,
+            shape.hidden_size,
+            1e-6,
+        )
+        .unwrap();
+        let gate = qwen35_linear_cpu(
+            &post_attention_norm,
+            &gate_proj_weight,
+            shape.tokens,
+            shape.hidden_size,
+            shape.intermediate_size,
+        )
+        .unwrap();
+        let up = qwen35_linear_cpu(
+            &post_attention_norm,
+            &up_proj_weight,
+            shape.tokens,
+            shape.hidden_size,
+            shape.intermediate_size,
+        )
+        .unwrap();
+        let fused = gate
+            .iter()
+            .zip(&up)
+            .map(|(gate, up)| silu(*gate) * up)
+            .collect::<Vec<_>>();
+        let mlp_output = qwen35_linear_cpu(
+            &fused,
+            &down_proj_weight,
+            shape.tokens,
+            shape.intermediate_size,
+            shape.hidden_size,
+        )
+        .unwrap();
+        let layer_output =
+            add_same_len(&residual_after_mixer, &mlp_output, "layer_output").unwrap();
+
+        let reference = qwen35_dense_linear_attention_layer_cpu(
+            &layer_input,
+            &input_norm_weight,
+            &qkv_weight,
+            &z_weight,
+            &b_weight,
+            &a_weight,
+            &conv1d_weight,
+            &a_log,
+            &dt_bias,
+            &norm_weight,
+            &out_proj_weight,
+            &post_attention_norm_weight,
+            &gate_proj_weight,
+            &up_proj_weight,
+            &down_proj_weight,
+            &initial_state,
+            shape,
+            1e-6,
+        )
+        .unwrap();
+
+        assert_close_slice(&reference.input_norm, &input_norm, 1e-6);
+        assert_close_slice(&reference.mixed_qkv_raw, &mixed_qkv_raw, 1e-6);
+        assert_close_slice(&reference.z_raw, &z_raw, 1e-6);
+        assert_close_slice(&reference.b_raw, &b_raw, 1e-6);
+        assert_close_slice(&reference.a_raw, &a_raw, 1e-6);
+        assert_eq!(reference.attention, attention);
+        assert_close_slice(&reference.delta_output, &delta_output, 1e-6);
+        assert_close_slice(&reference.residual_after_mixer, &residual_after_mixer, 1e-6);
+        assert_close_slice(&reference.post_attention_norm, &post_attention_norm, 1e-6);
+        assert_close_slice(&reference.mlp_output, &mlp_output, 1e-6);
+        assert_close_slice(&reference.layer_output, &layer_output, 1e-6);
+    }
+
+    #[test]
+    fn dense_linear_attention_layer_rejects_token_shape_mismatch() {
+        let shape = Qwen35DenseLinearAttentionLayerShape {
+            tokens: 2,
+            hidden_size: 2,
+            intermediate_size: 2,
+            attention: Qwen35LinearAttentionShape {
+                tokens: 1,
+                key_heads: 1,
+                value_heads: 1,
+                key_dim: 1,
+                value_dim: 1,
+                conv_kernel: 1,
+            },
+        };
+        let err = qwen35_dense_linear_attention_layer_cpu(
+            &[0.0; 4],
+            &[0.0; 2],
+            &[0.0; 6],
+            &[0.0; 2],
+            &[0.0; 2],
+            &[0.0; 2],
+            &[1.0; 3],
+            &[0.0],
+            &[0.0],
+            &[1.0],
+            &[0.0; 2],
+            &[0.0; 2],
+            &[0.0; 4],
+            &[0.0; 4],
+            &[0.0; 4],
+            &[0.0],
+            shape,
+            1e-6,
+        )
+        .expect_err("layer tokens should reject mismatched attention tokens");
+
+        assert!(
+            err.to_string().contains("must match attention tokens"),
+            "{err}"
+        );
     }
 
     #[test]

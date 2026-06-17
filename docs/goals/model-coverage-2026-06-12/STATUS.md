@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZX — W3 dense linear-attention layer CPU-reference checkpoint
+
+- Scope:
+  - W3-S2 Qwen3.5 dense decoder layer reference before product forward;
+  - no product execution was enabled;
+  - no GPU work was started;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `Qwen35DenseLinearAttentionLayerShape`;
+  - added `Qwen35DenseLinearAttentionLayerReference`;
+  - added `qwen35_dense_linear_attention_layer_cpu()`;
+  - the layer reference composes input RMSNorm+1, qkv/z/a/b projections,
+    linear-attention core, attention `out_proj`, residual, post-attention
+    RMSNorm+1, dense SwiGLU MLP, and final residual;
+  - added CPU helpers for row-major linear projection and Qwen3.5 RMSNorm+1.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    `34 passed`;
+  - `cargo check -p ferrum-models -p ferrum-engine` PASS.
+- Limitation:
+  - this is still CPU/reference math only;
+  - sparse MoE layer execution and full-attention layer execution are not
+    implemented here;
+  - product `prefill`/`decode` remains unwired;
+  - no W3 product correctness or performance gate was run.
+
 ## 2026-06-18 ZZW — W3 linear-attention CPU-reference core checkpoint
 
 - Scope:
