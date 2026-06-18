@@ -218,6 +218,19 @@ pub struct Qwen35BackendDenseMlpOutput<B: Backend> {
     pub output: B::Buffer,
 }
 
+pub struct Qwen35BackendDenseFullAttentionLayerOutput<B: Backend> {
+    pub input_norm: B::Buffer,
+    pub query_raw: B::Buffer,
+    pub key_raw: B::Buffer,
+    pub value_raw: B::Buffer,
+    pub attention: Qwen35BackendFullAttentionOutput<B>,
+    pub attn_output: B::Buffer,
+    pub residual_after_attention: B::Buffer,
+    pub post_attention_norm: B::Buffer,
+    pub mlp: Qwen35BackendDenseMlpOutput<B>,
+    pub layer_output: B::Buffer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Qwen35DenseLinearAttentionLayerShape {
     pub tokens: usize,
@@ -955,6 +968,133 @@ pub fn qwen35_dense_full_attention_layer_cpu(
         residual_after_attention,
         post_attention_norm,
         mlp_output,
+        layer_output,
+    })
+}
+
+pub fn qwen35_dense_full_attention_layer_backend<B: Backend>(
+    ctx: &mut B::Context,
+    layer_input: &B::Buffer,
+    layer: &Qwen35LayerWeights<B>,
+    rope: &Qwen35BackendRopeCache<B>,
+    shape: Qwen35DenseFullAttentionLayerShape,
+    eps: f32,
+) -> Result<Qwen35BackendDenseFullAttentionLayerOutput<B>> {
+    shape.validate()?;
+    let attention_shape = shape.attention;
+    let hidden_len = shape.tokens * shape.hidden_size;
+    let q_total = attention_shape.q_total();
+    let kv_total = attention_shape.kv_total();
+    let attention = match &layer.attention {
+        Qwen35AttentionWeights::Full(attention) => attention,
+        Qwen35AttentionWeights::Linear(_) => {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 backend dense full layer expected full attention at layer {}",
+                layer.layer_index
+            )));
+        }
+    };
+    let mlp = match &layer.mlp {
+        Qwen35MlpWeights::Dense(mlp) => mlp,
+        Qwen35MlpWeights::SparseMoeSharedExpert(_) => {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 backend dense full layer expected dense MLP at layer {}",
+                layer.layer_index
+            )));
+        }
+    };
+
+    let mut input_norm = B::alloc(hidden_len);
+    B::rms_norm(
+        ctx,
+        layer_input,
+        &layer.input_layernorm,
+        eps,
+        &mut input_norm,
+        shape.tokens,
+        shape.hidden_size,
+    );
+    let mut query_raw = B::alloc(shape.tokens * q_total);
+    let mut key_raw = B::alloc(shape.tokens * kv_total);
+    let mut value_raw = B::alloc(shape.tokens * kv_total);
+    attention
+        .q_proj
+        .forward(ctx, &input_norm, &mut query_raw, shape.tokens);
+    attention
+        .k_proj
+        .forward(ctx, &input_norm, &mut key_raw, shape.tokens);
+    attention
+        .v_proj
+        .forward(ctx, &input_norm, &mut value_raw, shape.tokens);
+
+    let attention_out = qwen35_full_attention_core_backend::<B>(
+        ctx,
+        &query_raw,
+        &key_raw,
+        &value_raw,
+        &attention.q_norm_weight,
+        &attention.k_norm_weight,
+        &rope.cos,
+        &rope.sin,
+        attention_shape,
+        eps,
+    )?;
+    let mut attn_output = B::alloc(hidden_len);
+    attention
+        .o_proj
+        .forward(ctx, &attention_out.context, &mut attn_output, shape.tokens);
+
+    let mut residual_after_attention = B::alloc(hidden_len);
+    B::copy_slice(
+        ctx,
+        layer_input,
+        0,
+        &mut residual_after_attention,
+        0,
+        hidden_len,
+    );
+    B::add_inplace(ctx, &mut residual_after_attention, &attn_output, hidden_len);
+
+    let mut post_attention_norm = B::alloc(hidden_len);
+    B::rms_norm(
+        ctx,
+        &residual_after_attention,
+        &layer.post_attention_layernorm,
+        eps,
+        &mut post_attention_norm,
+        shape.tokens,
+        shape.hidden_size,
+    );
+    let mlp_out = qwen35_dense_mlp_backend::<B>(
+        ctx,
+        &post_attention_norm,
+        &*mlp.gate_up_proj,
+        &*mlp.down_proj,
+        shape.tokens,
+        shape.hidden_size,
+        shape.intermediate_size,
+    )?;
+    let mut layer_output = B::alloc(hidden_len);
+    B::copy_slice(
+        ctx,
+        &residual_after_attention,
+        0,
+        &mut layer_output,
+        0,
+        hidden_len,
+    );
+    B::add_inplace(ctx, &mut layer_output, &mlp_out.output, hidden_len);
+
+    Ok(Qwen35BackendDenseFullAttentionLayerOutput {
+        input_norm,
+        query_raw,
+        key_raw,
+        value_raw,
+        attention: attention_out,
+        attn_output,
+        residual_after_attention,
+        post_attention_norm,
+        mlp: mlp_out,
         layer_output,
     })
 }
@@ -4981,6 +5121,136 @@ mod tests {
         assert_close_slice(&reference.post_attention_norm, &post_attention_norm, 1e-6);
         assert_close_slice(&reference.mlp_output, &mlp_output, 1e-6);
         assert_close_slice(&reference.layer_output, &layer_output, 1e-6);
+
+        let input_norm_folded = input_norm_weight
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let q_norm_folded = q_norm_weight
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let k_norm_folded = k_norm_weight
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let post_norm_folded = post_attention_norm_weight
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let mut gate_up_weight = gate_proj_weight.clone();
+        gate_up_weight.extend_from_slice(&up_proj_weight);
+        let layer = Qwen35LayerWeights {
+            layer_index: 0,
+            input_layernorm: CpuBackend::from_slice(&input_norm_folded),
+            post_attention_layernorm: CpuBackend::from_slice(&post_norm_folded),
+            attention: Qwen35AttentionWeights::Full(Qwen35FullAttentionWeights {
+                q_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &q_weight,
+                    attention_shape.q_total(),
+                    shape.hidden_size,
+                )),
+                k_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &k_weight,
+                    attention_shape.kv_total(),
+                    shape.hidden_size,
+                )),
+                v_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &v_weight,
+                    attention_shape.kv_total(),
+                    shape.hidden_size,
+                )),
+                o_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &o_weight,
+                    shape.hidden_size,
+                    attention_shape.q_total(),
+                )),
+                q_norm_weight: CpuBackend::from_slice(&q_norm_folded),
+                k_norm_weight: CpuBackend::from_slice(&k_norm_folded),
+            }),
+            mlp: Qwen35MlpWeights::Dense(Qwen35DenseMlpWeights {
+                gate_up_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &gate_up_weight,
+                    2 * shape.intermediate_size,
+                    shape.hidden_size,
+                )),
+                down_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &down_proj_weight,
+                    shape.hidden_size,
+                    shape.intermediate_size,
+                )),
+            }),
+        };
+        let rope = qwen35_build_rope_cache_backend::<CpuBackend>(
+            attention_shape.position_offset + attention_shape.tokens,
+            attention_shape.head_dim,
+            attention_shape.rope_theta,
+        )
+        .unwrap();
+        let mut ctx = CpuBackend::new_context();
+        let backend = qwen35_dense_full_attention_layer_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice(&layer_input),
+            &layer,
+            &rope,
+            shape,
+            1e-6,
+        )
+        .unwrap();
+
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.input_norm, input_norm.len()),
+            &input_norm,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.query_raw, query_raw.len()),
+            &query_raw,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.key_raw, key_raw.len()),
+            &key_raw,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.value_raw, value_raw.len()),
+            &value_raw,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attention.context, attention.context.len()),
+            &attention.context,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attn_output, attn_output.len()),
+            &attn_output,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(
+                &backend.residual_after_attention,
+                residual_after_attention.len(),
+            ),
+            &residual_after_attention,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.post_attention_norm, post_attention_norm.len()),
+            &post_attention_norm,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.mlp.output, mlp_output.len()),
+            &mlp_output,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.layer_output, layer_output.len()),
+            &layer_output,
+            1e-6,
+        );
     }
 
     #[test]
