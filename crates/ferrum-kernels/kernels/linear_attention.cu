@@ -1,4 +1,15 @@
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+static __device__ __forceinline__ float ferrum_load_value(const float* ptr,
+                                                          int idx) {
+  return ptr[idx];
+}
+
+static __device__ __forceinline__ float ferrum_load_value(const __half* ptr,
+                                                          int idx) {
+  return __half2float(ptr[idx]);
+}
 
 static __device__ __forceinline__ float ferrum_sigmoid(float x) {
   if (x >= 0.0f) {
@@ -19,13 +30,14 @@ static __device__ __forceinline__ float ferrum_softplus(float x) {
   return log1pf(expf(x));
 }
 
-extern "C" __global__ void linear_attention_prepare_f32(
-    const float* __restrict__ mixed_qkv_raw,
-    const float* __restrict__ conv_weight,
-    const float* __restrict__ a_raw,
-    const float* __restrict__ b_raw,
-    const float* __restrict__ a_log,
-    const float* __restrict__ dt_bias,
+template <typename InputT>
+static __device__ void linear_attention_prepare_impl(
+    const InputT* __restrict__ mixed_qkv_raw,
+    const InputT* __restrict__ conv_weight,
+    const InputT* __restrict__ a_raw,
+    const InputT* __restrict__ b_raw,
+    const InputT* __restrict__ a_log,
+    const InputT* __restrict__ dt_bias,
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
@@ -56,8 +68,10 @@ extern "C" __global__ void linear_attention_prepare_f32(
       if (padded >= pad) {
         const int src_token = padded - pad;
         if (src_token < tokens) {
-          acc += mixed_qkv_raw[src_token * conv_channels + channel] *
-                 conv_weight[channel * conv_kernel + kernel_idx];
+          acc += ferrum_load_value(mixed_qkv_raw,
+                                   src_token * conv_channels + channel) *
+                 ferrum_load_value(conv_weight,
+                                   channel * conv_kernel + kernel_idx);
         }
       }
     }
@@ -74,20 +88,70 @@ extern "C" __global__ void linear_attention_prepare_f32(
   if (idx < gate_total) {
     const int token = idx / value_heads;
     const int head = idx - token * value_heads;
-    const float a = a_raw[idx] + dt_bias[head];
-    g[idx] = -expf(a_log[head]) * ferrum_softplus(a);
-    beta[idx] = ferrum_sigmoid(b_raw[idx]);
+    const float a = ferrum_load_value(a_raw, idx) +
+                    ferrum_load_value(dt_bias, head);
+    g[idx] = -expf(ferrum_load_value(a_log, head)) * ferrum_softplus(a);
+    beta[idx] = ferrum_sigmoid(ferrum_load_value(b_raw, idx));
   }
 }
 
-extern "C" __global__ void linear_attention_decode_prepare_f32(
+extern "C" __global__ void linear_attention_prepare_f32(
     const float* __restrict__ mixed_qkv_raw,
     const float* __restrict__ conv_weight,
-    const float* __restrict__ conv_state,
     const float* __restrict__ a_raw,
     const float* __restrict__ b_raw,
     const float* __restrict__ a_log,
     const float* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    const int tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_prepare_impl<float>(
+      mixed_qkv_raw, conv_weight, a_raw, b_raw, a_log, dt_bias, query, key,
+      value, g, beta, tokens, key_heads, value_heads, key_dim, value_dim,
+      conv_kernel);
+}
+
+extern "C" __global__ void linear_attention_prepare_f16_to_f32(
+    const __half* __restrict__ mixed_qkv_raw,
+    const __half* __restrict__ conv_weight,
+    const __half* __restrict__ a_raw,
+    const __half* __restrict__ b_raw,
+    const __half* __restrict__ a_log,
+    const __half* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    const int tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_prepare_impl<__half>(
+      mixed_qkv_raw, conv_weight, a_raw, b_raw, a_log, dt_bias, query, key,
+      value, g, beta, tokens, key_heads, value_heads, key_dim, value_dim,
+      conv_kernel);
+}
+
+template <typename InputT>
+static __device__ void linear_attention_decode_prepare_impl(
+    const InputT* __restrict__ mixed_qkv_raw,
+    const InputT* __restrict__ conv_weight,
+    const float* __restrict__ conv_state,
+    const InputT* __restrict__ a_raw,
+    const InputT* __restrict__ b_raw,
+    const InputT* __restrict__ a_log,
+    const InputT* __restrict__ dt_bias,
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
@@ -114,15 +178,17 @@ extern "C" __global__ void linear_attention_decode_prepare_f32(
     for (int kernel_idx = 0; kernel_idx < conv_kernel; ++kernel_idx) {
       const float x = kernel_idx < state_len
                           ? conv_state[state_base + kernel_idx]
-                          : mixed_qkv_raw[channel];
-      acc += x * conv_weight[channel * conv_kernel + kernel_idx];
+                          : ferrum_load_value(mixed_qkv_raw, channel);
+      acc += x *
+             ferrum_load_value(conv_weight,
+                               channel * conv_kernel + kernel_idx);
     }
 
     if (state_len > 0) {
       for (int pos = 0; pos < state_len; ++pos) {
         next_conv_state[state_base + pos] =
             (pos + 1 < state_len) ? conv_state[state_base + pos + 1]
-                                  : mixed_qkv_raw[channel];
+                                  : ferrum_load_value(mixed_qkv_raw, channel);
       }
     }
 
@@ -137,10 +203,61 @@ extern "C" __global__ void linear_attention_decode_prepare_f32(
   }
 
   if (idx < value_heads) {
-    const float a = a_raw[idx] + dt_bias[idx];
-    g[idx] = -expf(a_log[idx]) * ferrum_softplus(a);
-    beta[idx] = ferrum_sigmoid(b_raw[idx]);
+    const float a = ferrum_load_value(a_raw, idx) +
+                    ferrum_load_value(dt_bias, idx);
+    g[idx] = -expf(ferrum_load_value(a_log, idx)) * ferrum_softplus(a);
+    beta[idx] = ferrum_sigmoid(ferrum_load_value(b_raw, idx));
   }
+}
+
+extern "C" __global__ void linear_attention_decode_prepare_f32(
+    const float* __restrict__ mixed_qkv_raw,
+    const float* __restrict__ conv_weight,
+    const float* __restrict__ conv_state,
+    const float* __restrict__ a_raw,
+    const float* __restrict__ b_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    float* __restrict__ next_conv_state,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_decode_prepare_impl<float>(
+      mixed_qkv_raw, conv_weight, conv_state, a_raw, b_raw, a_log, dt_bias,
+      query, key, value, g, beta, next_conv_state, key_heads, value_heads,
+      key_dim, value_dim, conv_kernel);
+}
+
+extern "C" __global__ void linear_attention_decode_prepare_f16_to_f32(
+    const __half* __restrict__ mixed_qkv_raw,
+    const __half* __restrict__ conv_weight,
+    const float* __restrict__ conv_state,
+    const __half* __restrict__ a_raw,
+    const __half* __restrict__ b_raw,
+    const __half* __restrict__ a_log,
+    const __half* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    float* __restrict__ next_conv_state,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_decode_prepare_impl<__half>(
+      mixed_qkv_raw, conv_weight, conv_state, a_raw, b_raw, a_log, dt_bias,
+      query, key, value, g, beta, next_conv_state, key_heads, value_heads,
+      key_dim, value_dim, conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_qk_l2norm_f32(

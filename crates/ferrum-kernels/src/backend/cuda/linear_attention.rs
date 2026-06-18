@@ -4,12 +4,14 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use ferrum_types::{FerrumError, Result};
 
 use super::CudaState;
-use crate::backend::CudaBuf;
+use crate::backend::{CudaBuf, Dtype};
 use crate::ptx;
 
 const MODULE_NAME: &str = "linear_attention";
 const PREPARE_FUNC: &str = "linear_attention_prepare_f32";
+const PREPARE_F16_TO_F32_FUNC: &str = "linear_attention_prepare_f16_to_f32";
 const DECODE_PREPARE_FUNC: &str = "linear_attention_decode_prepare_f32";
+const DECODE_PREPARE_F16_TO_F32_FUNC: &str = "linear_attention_decode_prepare_f16_to_f32";
 const QK_L2NORM_FUNC: &str = "linear_attention_qk_l2norm_f32";
 const GATED_RMS_NORM_FUNC: &str = "gated_rms_norm_f32";
 
@@ -55,13 +57,32 @@ pub fn linear_attention_prepare_f32(
         conv_kernel,
     )?;
 
+    let input_dtype = validate_prepare_dtype(
+        mixed_qkv_raw,
+        conv_weight,
+        a_raw,
+        b_raw,
+        a_log,
+        dt_bias,
+        query,
+        key,
+        value,
+        g,
+        beta,
+    )?;
+
     let qk_total = key_heads * key_dim;
     let value_total = value_heads * value_dim;
     let conv_channels = 2 * qk_total + value_total;
     let conv_total = tokens * conv_channels;
     let gate_total = tokens * value_heads;
     let total = conv_total.max(gate_total);
-    let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, PREPARE_FUNC);
+    let func_name = match input_dtype {
+        Dtype::F32 => PREPARE_FUNC,
+        Dtype::F16 => PREPARE_F16_TO_F32_FUNC,
+        _ => unreachable!("validate_prepare_dtype filters unsupported inputs"),
+    };
+    let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
     let stream = ctx.stream.clone();
     let tokens_i32 = tokens as i32;
     let key_heads_i32 = key_heads as i32;
@@ -70,12 +91,25 @@ pub fn linear_attention_prepare_f32(
     let value_dim_i32 = value_dim as i32;
     let conv_kernel_i32 = conv_kernel as i32;
     let mut builder = stream.launch_builder(&func);
-    builder.arg(mixed_qkv_raw.as_f32());
-    builder.arg(conv_weight.as_f32());
-    builder.arg(a_raw.as_f32());
-    builder.arg(b_raw.as_f32());
-    builder.arg(a_log.as_f32());
-    builder.arg(dt_bias.as_f32());
+    match input_dtype {
+        Dtype::F32 => {
+            builder.arg(mixed_qkv_raw.as_f32());
+            builder.arg(conv_weight.as_f32());
+            builder.arg(a_raw.as_f32());
+            builder.arg(b_raw.as_f32());
+            builder.arg(a_log.as_f32());
+            builder.arg(dt_bias.as_f32());
+        }
+        Dtype::F16 => {
+            builder.arg(mixed_qkv_raw.as_f16());
+            builder.arg(conv_weight.as_f16());
+            builder.arg(a_raw.as_f16());
+            builder.arg(b_raw.as_f16());
+            builder.arg(a_log.as_f16());
+            builder.arg(dt_bias.as_f16());
+        }
+        _ => unreachable!("validate_prepare_dtype filters unsupported inputs"),
+    }
     builder.arg(query.as_f32_mut());
     builder.arg(key.as_f32_mut());
     builder.arg(value.as_f32_mut());
@@ -171,11 +205,32 @@ pub fn linear_attention_decode_prepare_f32(
         conv_kernel,
     )?;
 
+    let input_dtype = validate_decode_prepare_dtype(
+        mixed_qkv_raw,
+        conv_weight,
+        conv_state,
+        a_raw,
+        b_raw,
+        a_log,
+        dt_bias,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        next_conv_state,
+    )?;
+
     let qk_total = key_heads * key_dim;
     let value_total = value_heads * value_dim;
     let conv_channels = 2 * qk_total + value_total;
     let total = conv_channels.max(value_heads);
-    let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, DECODE_PREPARE_FUNC);
+    let func_name = match input_dtype {
+        Dtype::F32 => DECODE_PREPARE_FUNC,
+        Dtype::F16 => DECODE_PREPARE_F16_TO_F32_FUNC,
+        _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
+    };
+    let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
     let stream = ctx.stream.clone();
     let key_heads_i32 = key_heads as i32;
     let value_heads_i32 = value_heads as i32;
@@ -183,13 +238,33 @@ pub fn linear_attention_decode_prepare_f32(
     let value_dim_i32 = value_dim as i32;
     let conv_kernel_i32 = conv_kernel as i32;
     let mut builder = stream.launch_builder(&func);
-    builder.arg(mixed_qkv_raw.as_f32());
-    builder.arg(conv_weight.as_f32());
+    match input_dtype {
+        Dtype::F32 => {
+            builder.arg(mixed_qkv_raw.as_f32());
+            builder.arg(conv_weight.as_f32());
+        }
+        Dtype::F16 => {
+            builder.arg(mixed_qkv_raw.as_f16());
+            builder.arg(conv_weight.as_f16());
+        }
+        _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
+    }
     builder.arg(conv_state.as_f32());
-    builder.arg(a_raw.as_f32());
-    builder.arg(b_raw.as_f32());
-    builder.arg(a_log.as_f32());
-    builder.arg(dt_bias.as_f32());
+    match input_dtype {
+        Dtype::F32 => {
+            builder.arg(a_raw.as_f32());
+            builder.arg(b_raw.as_f32());
+            builder.arg(a_log.as_f32());
+            builder.arg(dt_bias.as_f32());
+        }
+        Dtype::F16 => {
+            builder.arg(a_raw.as_f16());
+            builder.arg(b_raw.as_f16());
+            builder.arg(a_log.as_f16());
+            builder.arg(dt_bias.as_f16());
+        }
+        _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
+    }
     builder.arg(query.as_f32_mut());
     builder.arg(key.as_f32_mut());
     builder.arg(value.as_f32_mut());
@@ -279,6 +354,107 @@ pub fn gated_rms_norm_f32(
             .map_err(|err| FerrumError::backend(format!("gated_rms_norm launch: {err}")))?;
     }
     Ok(())
+}
+
+fn require_dtype(op: &str, label: &str, actual: Dtype, expected: Dtype) -> Result<()> {
+    if actual != expected {
+        return Err(FerrumError::model(format!(
+            "{op} {label} dtype {} != expected {}",
+            actual.name(),
+            expected.name()
+        )));
+    }
+    Ok(())
+}
+
+fn require_supported_input_dtype(op: &str, label: &str, dtype: Dtype) -> Result<()> {
+    match dtype {
+        Dtype::F32 | Dtype::F16 => Ok(()),
+        other => Err(FerrumError::model(format!(
+            "{op} {label} dtype {} is unsupported; expected f32 or f16",
+            other.name()
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_prepare_dtype(
+    mixed_qkv_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    a_raw: &CudaBuf,
+    b_raw: &CudaBuf,
+    a_log: &CudaBuf,
+    dt_bias: &CudaBuf,
+    query: &CudaBuf,
+    key: &CudaBuf,
+    value: &CudaBuf,
+    g: &CudaBuf,
+    beta: &CudaBuf,
+) -> Result<Dtype> {
+    let op = "linear_attention_prepare";
+    let input_dtype = mixed_qkv_raw.dtype();
+    require_supported_input_dtype(op, "mixed_qkv_raw", input_dtype)?;
+    for (label, actual) in [
+        ("conv_weight", conv_weight.dtype()),
+        ("a_raw", a_raw.dtype()),
+        ("b_raw", b_raw.dtype()),
+        ("a_log", a_log.dtype()),
+        ("dt_bias", dt_bias.dtype()),
+    ] {
+        require_dtype(op, label, actual, input_dtype)?;
+    }
+    for (label, actual) in [
+        ("query", query.dtype()),
+        ("key", key.dtype()),
+        ("value", value.dtype()),
+        ("g", g.dtype()),
+        ("beta", beta.dtype()),
+    ] {
+        require_dtype(op, label, actual, Dtype::F32)?;
+    }
+    Ok(input_dtype)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_decode_prepare_dtype(
+    mixed_qkv_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    conv_state: &CudaBuf,
+    a_raw: &CudaBuf,
+    b_raw: &CudaBuf,
+    a_log: &CudaBuf,
+    dt_bias: &CudaBuf,
+    query: &CudaBuf,
+    key: &CudaBuf,
+    value: &CudaBuf,
+    g: &CudaBuf,
+    beta: &CudaBuf,
+    next_conv_state: &CudaBuf,
+) -> Result<Dtype> {
+    let op = "linear_attention_decode_prepare";
+    let input_dtype = mixed_qkv_raw.dtype();
+    require_supported_input_dtype(op, "mixed_qkv_raw", input_dtype)?;
+    for (label, actual) in [
+        ("conv_weight", conv_weight.dtype()),
+        ("a_raw", a_raw.dtype()),
+        ("b_raw", b_raw.dtype()),
+        ("a_log", a_log.dtype()),
+        ("dt_bias", dt_bias.dtype()),
+    ] {
+        require_dtype(op, label, actual, input_dtype)?;
+    }
+    for (label, actual) in [
+        ("conv_state", conv_state.dtype()),
+        ("query", query.dtype()),
+        ("key", key.dtype()),
+        ("value", value.dtype()),
+        ("g", g.dtype()),
+        ("beta", beta.dtype()),
+        ("next_conv_state", next_conv_state.dtype()),
+    ] {
+        require_dtype(op, label, actual, Dtype::F32)?;
+    }
+    Ok(input_dtype)
 }
 
 #[allow(clippy::too_many_arguments)]
