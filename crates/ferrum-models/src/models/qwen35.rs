@@ -87,8 +87,7 @@ pub enum Qwen35MlpWeights<B: Backend> {
 }
 
 pub struct Qwen35DenseMlpWeights<B: Backend> {
-    pub gate_proj: Box<dyn Linear<B>>,
-    pub up_proj: Box<dyn Linear<B>>,
+    pub gate_up_proj: Box<dyn Linear<B>>,
     pub down_proj: Box<dyn Linear<B>>,
 }
 
@@ -211,6 +210,12 @@ pub struct Qwen35BackendFullAttentionOutput<B: Backend> {
     pub value_head_major: B::Buffer,
     pub context_head_major: B::Buffer,
     pub context: B::Buffer,
+}
+
+pub struct Qwen35BackendDenseMlpOutput<B: Backend> {
+    pub gate_up: B::Buffer,
+    pub fused: B::Buffer,
+    pub output: B::Buffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1419,11 +1424,11 @@ pub fn qwen35_full_attention_core_backend<B: Backend>(
 
     let q_len = shape.q_len();
     let kv_len = shape.kv_len();
-    let mut query_head_major = B::alloc_typed(Dtype::F32, q_len);
-    let mut key_head_major = B::alloc_typed(Dtype::F32, kv_len);
-    let mut value_head_major = B::alloc_typed(Dtype::F32, kv_len);
-    let mut context_head_major = B::alloc_typed(Dtype::F32, q_len);
-    let mut context = B::alloc_typed(Dtype::F32, q_len);
+    let mut query_head_major = B::alloc(q_len);
+    let mut key_head_major = B::alloc(kv_len);
+    let mut value_head_major = B::alloc(kv_len);
+    let mut context_head_major = B::alloc(q_len);
+    let mut context = B::alloc(q_len);
 
     B::qk_norm_rope(
         ctx,
@@ -1893,6 +1898,55 @@ pub fn qwen35_dense_mlp_cpu(
         intermediate_size,
         hidden_size,
     )
+}
+
+pub fn qwen35_dense_mlp_backend<B: Backend>(
+    ctx: &mut B::Context,
+    x: &B::Buffer,
+    gate_up_proj: &dyn Linear<B>,
+    down_proj: &dyn Linear<B>,
+    tokens: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+) -> Result<Qwen35BackendDenseMlpOutput<B>> {
+    if tokens == 0 || hidden_size == 0 || intermediate_size == 0 {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 backend dense MLP shape must be positive, got tokens={tokens} \
+             hidden_size={hidden_size} intermediate_size={intermediate_size}"
+        )));
+    }
+    if gate_up_proj.in_features() != hidden_size
+        || gate_up_proj.out_features() != 2 * intermediate_size
+    {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 backend dense MLP gate_up projection shape {}x{} does not match \
+             hidden={hidden_size} intermediate={intermediate_size}",
+            gate_up_proj.out_features(),
+            gate_up_proj.in_features()
+        )));
+    }
+    if down_proj.in_features() != intermediate_size || down_proj.out_features() != hidden_size {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 backend dense MLP down projection shape {}x{} does not match hidden={} \
+             intermediate={}",
+            down_proj.out_features(),
+            down_proj.in_features(),
+            hidden_size,
+            intermediate_size
+        )));
+    }
+
+    let mut gate_up = B::alloc(tokens * 2 * intermediate_size);
+    let mut fused = B::alloc(tokens * intermediate_size);
+    let mut output = B::alloc(tokens * hidden_size);
+    gate_up_proj.forward(ctx, x, &mut gate_up, tokens);
+    B::fused_silu_mul_split(ctx, &gate_up, &mut fused, tokens, intermediate_size);
+    down_proj.forward(ctx, &fused, &mut output, tokens);
+    Ok(Qwen35BackendDenseMlpOutput {
+        gate_up,
+        fused,
+        output,
+    })
 }
 
 fn qwen35_fused_expert_mlp_cpu(
@@ -3523,8 +3577,8 @@ impl<B: Backend> Qwen35ModelWeights<B> {
                 },
                 mlp: match layer_plan.mlp {
                     Qwen35MlpKind::Dense => Qwen35MlpWeights::Dense(Qwen35DenseMlpWeights {
-                        gate_proj: planned.load_layer_linear(layer_plan.layer_index, "mlp_gate")?,
-                        up_proj: planned.load_layer_linear(layer_plan.layer_index, "mlp_up")?,
+                        gate_up_proj: planned
+                            .load_layer_dense_gate_up_linear(layer_plan.layer_index)?,
                         down_proj: planned.load_layer_linear(layer_plan.layer_index, "mlp_down")?,
                     }),
                     Qwen35MlpKind::SparseMoeSharedExpert => {
@@ -3724,6 +3778,18 @@ mod tests {
             &self,
             name: &str,
         ) -> FerrumResult<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+            if let Some(prefix) = name.strip_suffix("gate_up_proj") {
+                let gate = format!("{prefix}gate_proj.weight");
+                let up = format!("{prefix}up_proj.weight");
+                if self.tensors.contains_key(&gate) && self.tensors.contains_key(&up) {
+                    self.linears.lock().unwrap().push(name.to_string());
+                    return Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(
+                        &[0.0, 0.0, 0.0, 0.0],
+                        2,
+                        2,
+                    )));
+                }
+            }
             let tensor_name = format!("{name}.weight");
             if !self.tensors.contains_key(&tensor_name) {
                 return Err(FerrumError::model(format!(
@@ -4441,6 +4507,92 @@ mod tests {
         ];
 
         assert_close_slice(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    fn dense_mlp_backend_matches_reference_with_fused_gate_up() {
+        let tokens = 2;
+        let hidden_size = 2;
+        let intermediate_size = 2;
+        let x = vec![
+            1.0, 2.0, //
+            -1.0, 0.5,
+        ];
+        let gate_weight = vec![
+            0.2, 0.1, //
+            -0.1, 0.3,
+        ];
+        let up_weight = vec![
+            0.4, -0.2, //
+            0.3, 0.5,
+        ];
+        let down_weight = vec![
+            1.0, -0.25, //
+            0.5, 0.75,
+        ];
+        let mut gate_up_weight = gate_weight.clone();
+        gate_up_weight.extend_from_slice(&up_weight);
+        let expected = qwen35_dense_mlp_cpu(
+            &x,
+            &gate_weight,
+            &up_weight,
+            &down_weight,
+            tokens,
+            hidden_size,
+            intermediate_size,
+        )
+        .unwrap();
+        let gate =
+            qwen35_linear_cpu(&x, &gate_weight, tokens, hidden_size, intermediate_size).unwrap();
+        let up = qwen35_linear_cpu(&x, &up_weight, tokens, hidden_size, intermediate_size).unwrap();
+        let mut expected_gate_up = Vec::with_capacity(tokens * 2 * intermediate_size);
+        for token in 0..tokens {
+            expected_gate_up.extend_from_slice(
+                &gate[token * intermediate_size..(token + 1) * intermediate_size],
+            );
+            expected_gate_up
+                .extend_from_slice(&up[token * intermediate_size..(token + 1) * intermediate_size]);
+        }
+        let expected_fused = gate
+            .iter()
+            .zip(&up)
+            .map(|(gate, up)| silu(*gate) * up)
+            .collect::<Vec<_>>();
+        let gate_up_proj = DenseLinear::<CpuBackend>::from_rows(
+            &gate_up_weight,
+            2 * intermediate_size,
+            hidden_size,
+        );
+        let down_proj =
+            DenseLinear::<CpuBackend>::from_rows(&down_weight, hidden_size, intermediate_size);
+
+        let mut ctx = CpuBackend::new_context();
+        let output = qwen35_dense_mlp_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice(&x),
+            &gate_up_proj,
+            &down_proj,
+            tokens,
+            hidden_size,
+            intermediate_size,
+        )
+        .unwrap();
+
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.gate_up, expected_gate_up.len()),
+            &expected_gate_up,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.fused, expected_fused.len()),
+            &expected_fused,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.output, expected.len()),
+            &expected,
+            1e-6,
+        );
     }
 
     #[test]
