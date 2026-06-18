@@ -5,17 +5,21 @@
 //! not implement product forward execution yet.
 
 use std::ops::Range;
+use std::path::Path;
 
 use ferrum_interfaces::RecurrentStateSpec;
-use ferrum_kernels::backend::Backend;
-use ferrum_quantization::Linear;
+use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
+use ferrum_quantization::{Linear, NativeSafetensorsLoader, WeightLoader};
 use ferrum_types::{DataType, Device, FerrumError, RequestId, Result};
 
 use crate::{
     common::LlmRuntimeConfig,
     definition::ModelDefinition,
     qwen35_config::{Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig},
-    qwen35_weights::{Qwen35ResolvedWeightPlan, Qwen35WeightPlanLoader},
+    qwen35_weights::{
+        Qwen35ResolvedWeightPlan, Qwen35WeightInventory, Qwen35WeightPlanLoader,
+        Qwen35WeightValidation,
+    },
 };
 
 pub struct Qwen35ModelWeights<B: Backend> {
@@ -25,6 +29,12 @@ pub struct Qwen35ModelWeights<B: Backend> {
     pub final_norm: B::Buffer,
     pub lm_head: Box<dyn Linear<B>>,
     pub layers: Vec<Qwen35LayerWeights<B>>,
+}
+
+pub struct Qwen35BackendModel<B: Backend> {
+    pub weights: Qwen35ModelWeights<B>,
+    pub weight_plan: Qwen35ResolvedWeightPlan,
+    pub weight_validation: Qwen35WeightValidation,
 }
 
 pub struct Qwen35LayerWeights<B: Backend> {
@@ -414,6 +424,70 @@ pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<Ll
         def.vocab_size,
         def.max_position_embeddings,
     ))
+}
+
+impl<B: Backend> Qwen35BackendModel<B> {
+    pub fn from_weight_plan(
+        config: Qwen35TextConfig,
+        runtime_cfg: LlmRuntimeConfig,
+        weight_plan: Qwen35ResolvedWeightPlan,
+        loader: &dyn WeightLoader<B>,
+    ) -> Result<Self> {
+        let weight_validation = weight_plan.validation();
+        if !weight_validation.is_pass() {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 backend model weight plan is incomplete for prefix {}: {} missing \
+                 required tensors",
+                weight_validation.prefix,
+                weight_validation.missing_required.len()
+            )));
+        }
+        let weights = Qwen35ModelWeights::<B>::load(config, runtime_cfg, &weight_plan, loader)?;
+        Ok(Self {
+            weights,
+            weight_plan,
+            weight_validation,
+        })
+    }
+
+    pub fn from_definition_with_loader(
+        def: &ModelDefinition,
+        weight_plan: Qwen35ResolvedWeightPlan,
+        loader: &dyn WeightLoader<B>,
+    ) -> Result<Self> {
+        let config = Qwen35TextConfig::from_model_definition(def)
+            .map_err(|err| FerrumError::model(format!("invalid Qwen3.5/Qwen3.6 config: {err}")))?;
+        let runtime_cfg =
+            qwen35_runtime_config(&config, def.vocab_size, def.max_position_embeddings);
+        Self::from_weight_plan(config, runtime_cfg, weight_plan, loader)
+    }
+
+    pub fn qwen35_config(&self) -> &Qwen35TextConfig {
+        &self.weights.config
+    }
+
+    pub fn runtime_config(&self) -> &LlmRuntimeConfig {
+        &self.weights.runtime_cfg
+    }
+}
+
+impl<B: Backend + BackendQuantMarlin> Qwen35BackendModel<B> {
+    pub fn from_definition_with_native_safetensors(
+        def: &ModelDefinition,
+        model_dir: &Path,
+    ) -> Result<Self> {
+        let config = Qwen35TextConfig::from_model_definition(def)
+            .map_err(|err| FerrumError::model(format!("invalid Qwen3.5/Qwen3.6 config: {err}")))?;
+        let inventory = Qwen35WeightInventory::from_safetensors_dir(model_dir)
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 weight inventory failed: {err}")))?;
+        let weight_plan = inventory
+            .detect_prefix_and_resolve(&config)
+            .map_err(|err| FerrumError::model(format!("Qwen3.5 weight preflight failed: {err}")))?;
+        let runtime_cfg =
+            qwen35_runtime_config(&config, def.vocab_size, def.max_position_embeddings);
+        let loader = NativeSafetensorsLoader::<B>::open(model_dir)?;
+        Self::from_weight_plan(config, runtime_cfg, weight_plan, &loader)
+    }
 }
 
 pub fn qwen35_dense_reference_model_forward_cpu(
@@ -3020,6 +3094,74 @@ mod tests {
             Qwen35MlpWeights::SparseMoeSharedExpert(weights)
                 if weights.fused_gate_up_proj == vec![1.0]
         ));
+    }
+
+    #[test]
+    fn qwen35_backend_model_materializes_from_definition_and_weight_plan() {
+        let raw = serde_json::json!({
+          "model_type": "qwen3_5",
+          "architectures": ["Qwen3_5ForConditionalGeneration"],
+          "vocab_size": 32000,
+          "max_position_embeddings": 4096,
+          "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 16,
+            "num_hidden_layers": 4,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 2,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 4,
+            "head_dim": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "intermediate_size": 32,
+            "tie_word_embeddings": true
+          }
+        });
+        let mut manager = ConfigManager::new();
+        let def = manager.parse_config_for_tests(&raw).unwrap();
+        let config = Qwen35TextConfig::from_model_definition(&def).unwrap();
+        let loader = RecordingLoader::from_required_manifest(&config);
+        let plan = loader.plan(&config);
+
+        let model =
+            Qwen35BackendModel::<CpuBackend>::from_definition_with_loader(&def, plan, &loader)
+                .unwrap();
+
+        assert_eq!(model.qwen35_config().num_hidden_layers, 4);
+        assert_eq!(model.runtime_config().hidden_size, 16);
+        assert_eq!(model.runtime_config().vocab_size, 32000);
+        assert!(model.weight_validation.is_pass());
+        assert_eq!(model.weight_plan.prefix, "model");
+        assert!(loader
+            .linears()
+            .contains(&"model.layers.0.linear_attn.in_proj_qkv".to_string()));
+    }
+
+    #[test]
+    fn qwen35_backend_model_rejects_incomplete_weight_plan() {
+        let config = dense_config();
+        let loader = RecordingLoader::from_required_manifest(&config);
+        let mut plan = loader.plan(&config);
+        plan.layers[0].tensors[0].present = false;
+
+        let err = match Qwen35BackendModel::<CpuBackend>::from_weight_plan(
+            config.clone(),
+            runtime_config(&config),
+            plan,
+            &loader,
+        ) {
+            Ok(_) => panic!("incomplete backend weight plan must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("weight plan is incomplete for prefix model"),
+            "{err}"
+        );
     }
 
     #[test]
