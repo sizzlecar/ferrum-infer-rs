@@ -188,6 +188,18 @@ pub struct Qwen35BackendLinearAttentionPrefillOutput<B: Backend> {
     pub final_state: B::Buffer,
 }
 
+pub struct Qwen35BackendLinearAttentionDecodeOutput<B: Backend> {
+    pub query: B::Buffer,
+    pub key: B::Buffer,
+    pub value: B::Buffer,
+    pub g: B::Buffer,
+    pub beta: B::Buffer,
+    pub next_conv_state: B::Buffer,
+    pub delta_core: B::Buffer,
+    pub delta_norm: B::Buffer,
+    pub final_state: B::Buffer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Qwen35DenseLinearAttentionLayerShape {
     pub tokens: usize,
@@ -2589,6 +2601,108 @@ pub fn qwen35_linear_attention_prefill_core_backend<B: Backend>(
         value,
         g,
         beta,
+        delta_core: delta.output,
+        delta_norm,
+        final_state: delta.final_state,
+    })
+}
+
+/// Backend-native Qwen3.5 linear-attention core for one decode token.
+///
+/// This mirrors vLLM's decode ordering: update the dim-first causal-conv state,
+/// emit L2-normalized Q/K for the current token, then update the temporal
+/// DeltaNet state and apply gated RMSNorm.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_linear_attention_decode_core_backend<B: Backend>(
+    ctx: &mut B::Context,
+    mixed_qkv_raw: &B::Buffer,
+    z_raw: &B::Buffer,
+    a_raw: &B::Buffer,
+    b_raw: &B::Buffer,
+    conv1d_weight: &B::Buffer,
+    conv_state: &B::Buffer,
+    a_log: &B::Buffer,
+    dt_bias: &B::Buffer,
+    norm_weight: &B::Buffer,
+    initial_delta_state: &B::Buffer,
+    shape: Qwen35LinearAttentionShape,
+    eps: f32,
+) -> Result<Qwen35BackendLinearAttentionDecodeOutput<B>> {
+    shape.validate()?;
+    if shape.tokens != 1 {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 decode linear-attention core expects one token, got {}",
+            shape.tokens
+        )));
+    }
+
+    let qk_total = shape.qk_total();
+    let value_total = shape.value_total();
+    let value_len = shape.value_len();
+    let gating_len = shape.gating_len();
+    let conv_state_len = shape.conv_channels() * shape.conv_kernel.saturating_sub(1);
+
+    let mut query = B::alloc_typed(Dtype::F32, qk_total);
+    let mut key = B::alloc_typed(Dtype::F32, qk_total);
+    let mut value = B::alloc_typed(Dtype::F32, value_total);
+    let mut g = B::alloc_typed(Dtype::F32, gating_len);
+    let mut beta = B::alloc_typed(Dtype::F32, gating_len);
+    let mut next_conv_state = B::alloc_typed(Dtype::F32, conv_state_len);
+    B::linear_attention_decode_prepare_f32(
+        ctx,
+        mixed_qkv_raw,
+        conv1d_weight,
+        conv_state,
+        a_raw,
+        b_raw,
+        a_log,
+        dt_bias,
+        &mut query,
+        &mut key,
+        &mut value,
+        &mut g,
+        &mut beta,
+        &mut next_conv_state,
+        shape.key_heads,
+        shape.value_heads,
+        shape.key_dim,
+        shape.value_dim,
+        shape.conv_kernel,
+        true,
+    )?;
+
+    let delta = qwen35_recurrent_gated_delta_rule_backend::<B>(
+        ctx,
+        &query,
+        &key,
+        &value,
+        &g,
+        &beta,
+        initial_delta_state,
+        shape.delta_shape(),
+        false,
+        Some((shape.key_dim as f32).sqrt().recip()),
+    )?;
+    let mut delta_norm = B::alloc_typed(Dtype::F32, value_len);
+    B::gated_rms_norm_f32(
+        ctx,
+        &delta.output,
+        z_raw,
+        norm_weight,
+        &mut delta_norm,
+        shape.tokens,
+        shape.value_heads,
+        shape.value_dim,
+        eps,
+    )?;
+
+    Ok(Qwen35BackendLinearAttentionDecodeOutput {
+        query,
+        key,
+        value,
+        g,
+        beta,
+        next_conv_state,
         delta_core: delta.output,
         delta_norm,
         final_state: delta.final_state,
@@ -5487,6 +5601,168 @@ mod tests {
         assert_close_slice(
             &CpuBackend::to_vec(&output.final_state, shape.state_len()),
             &reference.final_state,
+            1e-5,
+        );
+    }
+
+    #[test]
+    fn linear_attention_decode_backend_matches_full_reference_last_token() {
+        let full_shape = Qwen35LinearAttentionShape {
+            tokens: 3,
+            key_heads: 1,
+            value_heads: 2,
+            key_dim: 2,
+            value_dim: 2,
+            conv_kernel: 3,
+        };
+        let prefix_shape = Qwen35LinearAttentionShape {
+            tokens: 2,
+            ..full_shape
+        };
+        let decode_shape = Qwen35LinearAttentionShape {
+            tokens: 1,
+            ..full_shape
+        };
+        let mixed_qkv_raw: Vec<f32> = (0..full_shape.mixed_qkv_len())
+            .map(|i| ((i as f32 % 11.0) - 5.0) * 0.125)
+            .collect();
+        let conv1d_weight: Vec<f32> = (0..full_shape.conv_channels() * full_shape.conv_kernel)
+            .map(|i| match i % 3 {
+                0 => -0.25,
+                1 => 0.5,
+                _ => 0.75,
+            })
+            .collect();
+        let z_raw: Vec<f32> = (0..full_shape.value_len())
+            .map(|i| ((i as f32 % 7.0) - 3.0) * 0.15)
+            .collect();
+        let a_raw: Vec<f32> = (0..full_shape.gating_len())
+            .map(|i| ((i as f32 % 5.0) - 2.0) * 0.25)
+            .collect();
+        let b_raw: Vec<f32> = (0..full_shape.gating_len())
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.1)
+            .collect();
+        let a_log = vec![0.5f32.ln(), 1.25f32.ln()];
+        let dt_bias = vec![-0.1, 0.2];
+        let norm_weight = vec![0.75, 1.5];
+        let initial_state = vec![0.0; full_shape.state_len()];
+        let eps = 1e-6;
+
+        let prefix_mixed_len = prefix_shape.mixed_qkv_len();
+        let prefix_value_len = prefix_shape.value_len();
+        let prefix_gating_len = prefix_shape.gating_len();
+        let prefix = qwen35_linear_attention_core_cpu(
+            &mixed_qkv_raw[..prefix_mixed_len],
+            &z_raw[..prefix_value_len],
+            &a_raw[..prefix_gating_len],
+            &b_raw[..prefix_gating_len],
+            &conv1d_weight,
+            &a_log,
+            &dt_bias,
+            &norm_weight,
+            &initial_state,
+            prefix_shape,
+            eps,
+        )
+        .unwrap();
+        let full = qwen35_linear_attention_core_cpu(
+            &mixed_qkv_raw,
+            &z_raw,
+            &a_raw,
+            &b_raw,
+            &conv1d_weight,
+            &a_log,
+            &dt_bias,
+            &norm_weight,
+            &initial_state,
+            full_shape,
+            eps,
+        )
+        .unwrap();
+
+        let decode_mixed_start = prefix_mixed_len;
+        let decode_value_start = prefix_value_len;
+        let decode_gating_start = prefix_gating_len;
+        let mut ctx = CpuBackend::new_context();
+        let output = qwen35_linear_attention_decode_core_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice_typed(&mixed_qkv_raw[decode_mixed_start..]),
+            &CpuBackend::from_slice_typed(&z_raw[decode_value_start..]),
+            &CpuBackend::from_slice_typed(&a_raw[decode_gating_start..]),
+            &CpuBackend::from_slice_typed(&b_raw[decode_gating_start..]),
+            &CpuBackend::from_slice_typed(&conv1d_weight),
+            &CpuBackend::from_slice_typed(&prefix.final_conv_state),
+            &CpuBackend::from_slice_typed(&a_log),
+            &CpuBackend::from_slice_typed(&dt_bias),
+            &CpuBackend::from_slice_typed(&norm_weight),
+            &CpuBackend::from_slice_typed(&prefix.final_state),
+            decode_shape,
+            eps,
+        )
+        .unwrap();
+
+        let last_token = prefix_shape.tokens;
+        let last_qk_start = last_token * full_shape.qk_total();
+        let mut expected_query = full.query[last_qk_start..].to_vec();
+        let mut expected_key = full.key[last_qk_start..].to_vec();
+        for head in 0..full_shape.key_heads {
+            let base = head * full_shape.key_dim;
+            let mut q_sum = 0.0;
+            let mut k_sum = 0.0;
+            for d in 0..full_shape.key_dim {
+                q_sum += expected_query[base + d] * expected_query[base + d];
+                k_sum += expected_key[base + d] * expected_key[base + d];
+            }
+            let q_inv = (q_sum + 1e-6).sqrt().recip();
+            let k_inv = (k_sum + 1e-6).sqrt().recip();
+            for d in 0..full_shape.key_dim {
+                expected_query[base + d] *= q_inv;
+                expected_key[base + d] *= k_inv;
+            }
+        }
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.query, decode_shape.qk_total()),
+            &expected_query,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.key, decode_shape.qk_total()),
+            &expected_key,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.value, decode_shape.value_len()),
+            &full.value[decode_value_start..],
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.g, decode_shape.gating_len()),
+            &full.g[decode_gating_start..],
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.beta, decode_shape.gating_len()),
+            &full.beta[decode_gating_start..],
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.next_conv_state, full.final_conv_state.len()),
+            &full.final_conv_state,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.delta_core, decode_shape.value_len()),
+            &full.delta_core[decode_value_start..],
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.delta_norm, decode_shape.value_len()),
+            &full.delta_norm[decode_value_start..],
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.final_state, decode_shape.state_len()),
+            &full.final_state,
             1e-5,
         );
     }
