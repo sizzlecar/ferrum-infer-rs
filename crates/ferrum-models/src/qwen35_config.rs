@@ -72,7 +72,14 @@ pub struct Qwen35MoeTextConfig {
     pub norm_topk_prob: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Qwen35RopeParameters {
+    pub rope_theta: f64,
+    pub partial_rotary_factor: f32,
+    pub mrope_interleaved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Qwen35TextConfig {
     pub top_level_model_type: Option<String>,
     pub text_model_type: String,
@@ -83,6 +90,8 @@ pub struct Qwen35TextConfig {
     pub head_dim: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    pub attn_output_gate: bool,
+    pub rope_parameters: Qwen35RopeParameters,
     pub tie_word_embeddings: bool,
     pub dense_intermediate_size: Option<usize>,
     pub moe: Option<Qwen35MoeTextConfig>,
@@ -180,6 +189,10 @@ impl Qwen35TextConfig {
             head_dim: required_usize(text_config, "head_dim")?,
             num_attention_heads: required_usize(text_config, "num_attention_heads")?,
             num_key_value_heads: required_usize(text_config, "num_key_value_heads")?,
+            attn_output_gate: optional_bool(text_config, "attn_output_gate")?
+                .or(optional_bool(obj, "attn_output_gate")?)
+                .unwrap_or(false),
+            rope_parameters: parse_rope_parameters(text_config, obj)?,
             tie_word_embeddings,
             dense_intermediate_size: optional_usize(text_config, "intermediate_size")?,
             moe,
@@ -340,6 +353,27 @@ impl Qwen35TextConfig {
         self.linear_attention.num_value_heads * self.linear_attention.value_head_dim
     }
 
+    pub fn full_attention_query_total_dim(&self) -> usize {
+        self.num_attention_heads * self.head_dim
+    }
+
+    pub fn full_attention_kv_total_dim(&self) -> usize {
+        self.num_key_value_heads * self.head_dim
+    }
+
+    pub fn full_attention_q_proj_total_dim(&self) -> usize {
+        let base = self.full_attention_query_total_dim();
+        if self.attn_output_gate {
+            2 * base
+        } else {
+            base
+        }
+    }
+
+    pub fn full_attention_rope_dim(&self) -> usize {
+        ((self.head_dim as f32) * self.rope_parameters.partial_rotary_factor).round() as usize
+    }
+
     /// Per-layer causal-convolution recurrent state shape, excluding the request slot.
     ///
     /// vLLM stores Qwen GDN convolution state before the temporal DeltaNet state.
@@ -436,6 +470,27 @@ impl Qwen35TextConfig {
         if self.full_attention_layers() == 0 {
             return Err("Qwen3.5 W3 config must include full_attention layers".to_string());
         }
+        if self.rope_parameters.rope_theta <= 0.0 {
+            return Err(format!(
+                "rope_theta must be positive, got {}",
+                self.rope_parameters.rope_theta
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.rope_parameters.partial_rotary_factor)
+            || self.rope_parameters.partial_rotary_factor == 0.0
+        {
+            return Err(format!(
+                "partial_rotary_factor must be in (0, 1], got {}",
+                self.rope_parameters.partial_rotary_factor
+            ));
+        }
+        let rope_dim = self.full_attention_rope_dim();
+        if rope_dim == 0 || rope_dim > self.head_dim || rope_dim % 2 != 0 {
+            return Err(format!(
+                "full attention rope dim {rope_dim} must be positive, even, and <= head_dim {}",
+                self.head_dim
+            ));
+        }
         if let Some(moe) = &self.moe {
             if moe.num_experts_per_tok > moe.num_experts {
                 return Err(format!(
@@ -451,6 +506,47 @@ impl Qwen35TextConfig {
         }
         Ok(())
     }
+}
+
+fn parse_rope_parameters(
+    text_config: &serde_json::Map<String, Value>,
+    root: &serde_json::Map<String, Value>,
+) -> Result<Qwen35RopeParameters, String> {
+    let rope_obj = text_config
+        .get("rope_parameters")
+        .or_else(|| root.get("rope_parameters"))
+        .and_then(Value::as_object);
+    let rope_theta = rope_obj
+        .and_then(|obj| obj.get("rope_theta"))
+        .and_then(Value::as_f64)
+        .or_else(|| text_config.get("rope_theta").and_then(Value::as_f64))
+        .or_else(|| root.get("rope_theta").and_then(Value::as_f64))
+        .unwrap_or(10_000.0);
+    let partial_rotary_factor = rope_obj
+        .and_then(|obj| obj.get("partial_rotary_factor"))
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            text_config
+                .get("partial_rotary_factor")
+                .and_then(Value::as_f64)
+        })
+        .or_else(|| root.get("partial_rotary_factor").and_then(Value::as_f64))
+        .unwrap_or(1.0) as f32;
+    let mrope_interleaved = rope_obj
+        .and_then(|obj| obj.get("mrope_interleaved"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            text_config
+                .get("mrope_interleaved")
+                .and_then(Value::as_bool)
+        })
+        .or_else(|| root.get("mrope_interleaved").and_then(Value::as_bool))
+        .unwrap_or(false);
+    Ok(Qwen35RopeParameters {
+        rope_theta,
+        partial_rotary_factor,
+        mrope_interleaved,
+    })
 }
 
 fn required_string(map: &serde_json::Map<String, Value>, key: &str) -> Result<String, String> {
