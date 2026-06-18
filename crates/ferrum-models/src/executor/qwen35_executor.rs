@@ -37,7 +37,8 @@ use crate::{
         Qwen35SparseMoeReferenceModelOutput, Qwen35SparseMoeShape,
     },
     qwen35_config::{
-        Qwen35LayerType, Qwen35MoeTextConfig, Qwen35TextConfig, QWEN35_DELTA_STATE_NAME,
+        Qwen35LayerType, Qwen35MoeTextConfig, Qwen35TextConfig, QWEN35_CONV_STATE_NAME,
+        QWEN35_DELTA_STATE_NAME,
     },
     qwen35_weights::{
         Qwen35ResolvedWeightPlan, Qwen35ResolvedWeightSpec, Qwen35WeightInventory,
@@ -185,6 +186,7 @@ pub struct Qwen35SparseMoeReferenceRuntimeFullLayer {
 struct Qwen35ReferenceForwardOutput {
     vocab_size: usize,
     logits: Vec<f32>,
+    linear_conv_states: Vec<Vec<f32>>,
     linear_recurrent_states: Vec<Vec<f32>>,
 }
 
@@ -1018,6 +1020,7 @@ impl Qwen35W3Executor {
             Ok(Qwen35ReferenceForwardOutput {
                 vocab_size: runtime.vocab_size,
                 logits: output.logits,
+                linear_conv_states: output.linear_conv_states,
                 linear_recurrent_states: output.linear_recurrent_states,
             })
         } else if let Some(runtime) = &self.sparse_moe_reference_runtime {
@@ -1025,6 +1028,7 @@ impl Qwen35W3Executor {
             Ok(Qwen35ReferenceForwardOutput {
                 vocab_size: runtime.vocab_size,
                 logits: output.logits,
+                linear_conv_states: output.linear_conv_states,
                 linear_recurrent_states: output.linear_recurrent_states,
             })
         } else {
@@ -1085,6 +1089,7 @@ impl Qwen35W3Executor {
     fn write_reference_recurrent_state(
         &self,
         recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+        linear_conv_states: &[Vec<f32>],
         linear_recurrent_states: &[Vec<f32>],
     ) -> Result<Option<Arc<dyn RecurrentStateHandle>>> {
         let Some(recurrent_state) = recurrent_state else {
@@ -1097,6 +1102,12 @@ impl Qwen35W3Executor {
             return Ok(Some(recurrent_state));
         };
         let expected_states = self.config.linear_attention_layers();
+        if linear_conv_states.len() != expected_states {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 reference produced {} conv states, expected {expected_states}",
+                linear_conv_states.len()
+            )));
+        }
         if linear_recurrent_states.len() != expected_states {
             return Err(FerrumError::model(format!(
                 "Qwen3.5 reference produced {} recurrent states, expected {expected_states}",
@@ -1117,7 +1128,34 @@ impl Qwen35W3Executor {
             if layer_type != Qwen35LayerType::LinearAttention {
                 continue;
             }
-            let source = &linear_recurrent_states[state_index];
+            let conv_source = &linear_conv_states[state_index];
+            {
+                let tensor = cache
+                    .tensor_mut(layer_index, QWEN35_CONV_STATE_NAME)
+                    .ok_or_else(|| {
+                        FerrumError::model(format!(
+                            "Qwen3.5 recurrent state missing layer={layer_index} {QWEN35_CONV_STATE_NAME}"
+                        ))
+                    })?;
+                if conv_source.len() != tensor.elements_per_slot {
+                    return Err(FerrumError::model(format!(
+                        "Qwen3.5 conv state layer={layer_index} shape mismatch: got {}, expected {}",
+                        conv_source.len(),
+                        tensor.elements_per_slot
+                    )));
+                }
+                let range = tensor.slot_range(0, max_batch_slots)?;
+                if range.end > tensor.buffer.len() {
+                    return Err(FerrumError::model(format!(
+                        "Qwen3.5 conv state layer={layer_index} buffer too short: range_end={}, buffer_len={}",
+                        range.end,
+                        tensor.buffer.len()
+                    )));
+                }
+                tensor.buffer[range].copy_from_slice(conv_source);
+            }
+
+            let delta_source = &linear_recurrent_states[state_index];
             let tensor = cache
                 .tensor_mut(layer_index, QWEN35_DELTA_STATE_NAME)
                 .ok_or_else(|| {
@@ -1125,10 +1163,10 @@ impl Qwen35W3Executor {
                         "Qwen3.5 recurrent state missing layer={layer_index} {QWEN35_DELTA_STATE_NAME}"
                     ))
                 })?;
-            if source.len() != tensor.elements_per_slot {
+            if delta_source.len() != tensor.elements_per_slot {
                 return Err(FerrumError::model(format!(
-                    "Qwen3.5 recurrent state layer={layer_index} shape mismatch: got {}, expected {}",
-                    source.len(),
+                    "Qwen3.5 delta state layer={layer_index} shape mismatch: got {}, expected {}",
+                    delta_source.len(),
                     tensor.elements_per_slot
                 )));
             }
@@ -1140,7 +1178,7 @@ impl Qwen35W3Executor {
                     tensor.buffer.len()
                 )));
             }
-            tensor.buffer[range].copy_from_slice(source);
+            tensor.buffer[range].copy_from_slice(delta_source);
             state_index += 1;
         }
         drop(cache);
@@ -1182,6 +1220,7 @@ impl ModelExecutor for Qwen35W3Executor {
             .map_err(|err| FerrumError::model(format!("Qwen3.5 logits reshape failed: {err}")))?;
         let recurrent_state = self.write_reference_recurrent_state(
             input.recurrent_state.clone(),
+            &forward.linear_conv_states,
             &forward.linear_recurrent_states,
         )?;
         self.reference_sequences
@@ -1246,6 +1285,7 @@ impl ModelExecutor for Qwen35W3Executor {
             })?;
         let recurrent_state = self.write_reference_recurrent_state(
             input.recurrent_state.clone(),
+            &forward.linear_conv_states,
             &forward.linear_recurrent_states,
         )?;
         self.reference_sequences.lock().insert(cache_id, input_ids);
@@ -2013,18 +2053,33 @@ mod tests {
         Arc::new(Qwen35RecurrentStateHandle::<CpuBackend>::from_spec(&spec).unwrap())
     }
 
-    fn recurrent_delta_state(
+    fn recurrent_state_tensor(
         recurrent_state: &Arc<dyn RecurrentStateHandle>,
         layer_index: usize,
+        name: &str,
     ) -> Vec<f32> {
         let typed = recurrent_state
             .as_any()
             .downcast_ref::<Qwen35RecurrentStateHandle<CpuBackend>>()
             .unwrap();
         let cache = typed.cache();
-        let tensor = cache.tensor(layer_index, QWEN35_DELTA_STATE_NAME).unwrap();
+        let tensor = cache.tensor(layer_index, name).unwrap();
         let range = tensor.slot_range(0, cache.max_batch_slots).unwrap();
         tensor.buffer[range].to_vec()
+    }
+
+    fn recurrent_conv_state(
+        recurrent_state: &Arc<dyn RecurrentStateHandle>,
+        layer_index: usize,
+    ) -> Vec<f32> {
+        recurrent_state_tensor(recurrent_state, layer_index, QWEN35_CONV_STATE_NAME)
+    }
+
+    fn recurrent_delta_state(
+        recurrent_state: &Arc<dyn RecurrentStateHandle>,
+        layer_index: usize,
+    ) -> Vec<f32> {
+        recurrent_state_tensor(recurrent_state, layer_index, QWEN35_DELTA_STATE_NAME)
     }
 
     #[test]
@@ -2100,6 +2155,10 @@ mod tests {
 
         let output_state = output.recurrent_state.unwrap();
         assert_close(
+            &recurrent_conv_state(&output_state, 0),
+            &expected.linear_conv_states[0],
+        );
+        assert_close(
             &recurrent_delta_state(&output_state, 0),
             &expected.linear_recurrent_states[0],
         );
@@ -2130,6 +2189,10 @@ mod tests {
 
         assert_close(&actual.logits, &expected.logits);
         assert_close(
+            &actual.linear_conv_states[0],
+            &expected.linear_conv_states[0],
+        );
+        assert_close(
             &actual.linear_recurrent_states[0],
             &expected.linear_recurrent_states[0],
         );
@@ -2159,6 +2222,10 @@ mod tests {
         let actual = runtime.forward(&[0, 1]).unwrap();
 
         assert_close(&actual.logits, &expected.logits);
+        assert_close(
+            &actual.linear_conv_states[0],
+            &expected.linear_conv_states[0],
+        );
         assert_close(
             &actual.linear_recurrent_states[0],
             &expected.linear_recurrent_states[0],
@@ -2276,6 +2343,10 @@ mod tests {
         let output = tokio_test::block_on(executor.decode(&input)).unwrap();
 
         let output_state = output.recurrent_state.unwrap();
+        assert_close(
+            &recurrent_conv_state(&output_state, 0),
+            &expected.linear_conv_states[0],
+        );
         assert_close(
             &recurrent_delta_state(&output_state, 0),
             &expected.linear_recurrent_states[0],

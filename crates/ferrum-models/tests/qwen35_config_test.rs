@@ -1,5 +1,6 @@
 use ferrum_models::qwen35_config::{
-    Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig, QWEN35_DELTA_STATE_NAME,
+    Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig, QWEN35_CONV_STATE_NAME,
+    QWEN35_DELTA_STATE_NAME,
 };
 use ferrum_types::{DataType, Device, RequestId};
 
@@ -72,17 +73,21 @@ fn parses_official_qwen35_dense_min_config() {
         cfg.recurrent_delta_state_shape().unwrap(),
         vec![16, 128, 128]
     );
+    assert_eq!(cfg.recurrent_conv_state_shape().unwrap(), vec![6144, 3]);
     let specs = cfg.recurrent_state_tensor_specs().unwrap();
-    assert_eq!(specs.len(), 18);
+    assert_eq!(specs.len(), 36);
     assert_eq!(specs[0].layer_index, 0);
-    assert_eq!(specs[1].layer_index, 1);
-    assert_eq!(specs[2].layer_index, 2);
-    assert_eq!(specs[3].layer_index, 4);
-    assert_eq!(specs[0].name, QWEN35_DELTA_STATE_NAME);
-    assert_eq!(specs[0].shape, vec![16, 128, 128]);
+    assert_eq!(specs[1].layer_index, 0);
+    assert_eq!(specs[2].layer_index, 1);
+    assert_eq!(specs[4].layer_index, 2);
+    assert_eq!(specs[6].layer_index, 4);
+    assert_eq!(specs[0].name, QWEN35_CONV_STATE_NAME);
+    assert_eq!(specs[0].shape, vec![6144, 3]);
+    assert_eq!(specs[1].name, QWEN35_DELTA_STATE_NAME);
+    assert_eq!(specs[1].shape, vec![16, 128, 128]);
     assert_eq!(
         cfg.recurrent_state_elements_per_slot().unwrap(),
-        18 * 16 * 128 * 128
+        18 * (6144 * 3 + 16 * 128 * 128)
     );
     let request_id = RequestId::new();
     let spec = cfg
@@ -90,12 +95,16 @@ fn parses_official_qwen35_dense_min_config() {
         .unwrap();
     assert_eq!(spec.request_id, request_id);
     assert_eq!(spec.num_layers, 24);
-    assert_eq!(spec.tensors.len(), 18);
-    assert_eq!(spec.tensors[0].shape, vec![16, 128, 128]);
+    assert_eq!(spec.tensors.len(), 36);
+    assert_eq!(spec.tensors[0].shape, vec![6144, 3]);
+    assert_eq!(spec.tensors[1].shape, vec![16, 128, 128]);
     assert_eq!(spec.dtype, DataType::BF16);
     assert_eq!(spec.device, Device::CPU);
     assert_eq!(spec.max_batch_slots, 1);
-    assert_eq!(spec.estimated_memory_bytes(), 18 * 16 * 128 * 128 * 2);
+    assert_eq!(
+        spec.estimated_memory_bytes(),
+        18 * (6144 * 3 + 16 * 128 * 128) * 2
+    );
 }
 
 #[test]
@@ -163,25 +172,33 @@ fn parses_official_qwen36_shared_expert_moe_config() {
         cfg.recurrent_delta_state_shape().unwrap(),
         vec![32, 128, 128]
     );
+    assert_eq!(cfg.recurrent_conv_state_shape().unwrap(), vec![8192, 3]);
     let specs = cfg.recurrent_state_tensor_specs().unwrap();
-    assert_eq!(specs.len(), 30);
+    assert_eq!(specs.len(), 60);
     assert_eq!(specs[0].layer_index, 0);
-    assert_eq!(specs[1].layer_index, 1);
-    assert_eq!(specs[2].layer_index, 2);
-    assert_eq!(specs[3].layer_index, 4);
-    assert_eq!(specs[0].name, QWEN35_DELTA_STATE_NAME);
-    assert_eq!(specs[0].shape, vec![32, 128, 128]);
+    assert_eq!(specs[1].layer_index, 0);
+    assert_eq!(specs[2].layer_index, 1);
+    assert_eq!(specs[4].layer_index, 2);
+    assert_eq!(specs[6].layer_index, 4);
+    assert_eq!(specs[0].name, QWEN35_CONV_STATE_NAME);
+    assert_eq!(specs[0].shape, vec![8192, 3]);
+    assert_eq!(specs[1].name, QWEN35_DELTA_STATE_NAME);
+    assert_eq!(specs[1].shape, vec![32, 128, 128]);
     assert_eq!(
         cfg.recurrent_state_elements_per_slot().unwrap(),
-        30 * 32 * 128 * 128
+        30 * (8192 * 3 + 32 * 128 * 128)
     );
     let spec = cfg
         .to_recurrent_state_spec(RequestId::new(), DataType::FP16, Device::CPU, 1)
         .unwrap();
     assert_eq!(spec.num_layers, 40);
-    assert_eq!(spec.tensors.len(), 30);
-    assert_eq!(spec.tensors[0].shape, vec![32, 128, 128]);
-    assert_eq!(spec.estimated_memory_bytes(), 30 * 32 * 128 * 128 * 2);
+    assert_eq!(spec.tensors.len(), 60);
+    assert_eq!(spec.tensors[0].shape, vec![8192, 3]);
+    assert_eq!(spec.tensors[1].shape, vec![32, 128, 128]);
+    assert_eq!(
+        spec.estimated_memory_bytes(),
+        30 * (8192 * 3 + 32 * 128 * 128) * 2
+    );
 }
 
 #[test]
