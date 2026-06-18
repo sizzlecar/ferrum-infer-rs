@@ -4,13 +4,23 @@
 //! weight plan into backend-native buffers and linears, but intentionally does
 //! not implement product forward execution yet.
 
+use std::any::Any;
+use std::collections::HashMap;
+use std::fmt;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
-use ferrum_interfaces::RecurrentStateSpec;
-use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
+use ferrum_interfaces::{
+    RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
+    RecurrentStateManagerStats, RecurrentStateSpec,
+};
+use ferrum_kernels::backend::{Backend, BackendQuantMarlin, Dtype};
 use ferrum_quantization::{Linear, NativeSafetensorsLoader, WeightLoader};
 use ferrum_types::{DataType, Device, FerrumError, RequestId, Result};
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
     common::LlmRuntimeConfig,
@@ -94,6 +104,7 @@ pub struct Qwen35SparseMoeSharedExpertWeights<B: Backend> {
 
 pub struct Qwen35RecurrentStateCache<B: Backend> {
     pub request_id: RequestId,
+    pub num_layers: usize,
     pub dtype: DataType,
     pub device: Device,
     pub max_batch_slots: usize,
@@ -106,6 +117,26 @@ pub struct Qwen35RecurrentStateTensor<B: Backend> {
     pub shape: Vec<usize>,
     pub elements_per_slot: usize,
     pub buffer: B::Buffer,
+}
+
+pub struct Qwen35RecurrentStateHandle<B: Backend> {
+    cache: Arc<Mutex<Qwen35RecurrentStateCache<B>>>,
+    cache_id: String,
+    valid: Arc<AtomicBool>,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen35RecurrentStateManagerConfig {
+    pub total_memory_bytes: usize,
+    pub total_batch_slots: usize,
+}
+
+pub struct Qwen35RecurrentStateManager<B: Backend> {
+    config: Qwen35RecurrentStateManagerConfig,
+    handles: Mutex<HashMap<RequestId, Arc<Qwen35RecurrentStateHandle<B>>>>,
+    allocation_count: AtomicU64,
+    allocation_failures: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1954,6 +1985,7 @@ impl<B: Backend> Qwen35RecurrentStateCache<B> {
                 "Qwen3.5 recurrent state requires at least one batch slot",
             ));
         }
+        let storage_dtype = qwen35_recurrent_backend_dtype(spec.dtype)?;
         let mut tensors = Vec::with_capacity(spec.tensors.len());
         for tensor in &spec.tensors {
             if tensor.shape.is_empty() {
@@ -1964,17 +1996,17 @@ impl<B: Backend> Qwen35RecurrentStateCache<B> {
             }
             let elements_per_slot = tensor.num_elements();
             let total_elements = elements_per_slot.saturating_mul(spec.max_batch_slots);
-            let zeros = vec![0.0f32; total_elements];
             tensors.push(Qwen35RecurrentStateTensor {
                 layer_index: tensor.layer_index,
                 name: tensor.name.clone(),
                 shape: tensor.shape.clone(),
                 elements_per_slot,
-                buffer: B::from_slice(&zeros),
+                buffer: B::alloc_typed(storage_dtype, total_elements),
             });
         }
         Ok(Self {
             request_id: spec.request_id.clone(),
+            num_layers: spec.num_layers,
             dtype: spec.dtype,
             device: spec.device.clone(),
             max_batch_slots: spec.max_batch_slots,
@@ -2010,6 +2042,251 @@ impl<B: Backend> Qwen35RecurrentStateCache<B> {
     }
 }
 
+impl<B: Backend> Qwen35RecurrentStateHandle<B> {
+    pub fn from_spec(spec: &RecurrentStateSpec) -> Result<Self> {
+        Self::from_cache(Qwen35RecurrentStateCache::<B>::from_spec(spec)?)
+    }
+
+    pub fn from_cache(cache: Qwen35RecurrentStateCache<B>) -> Result<Self> {
+        let request_id = cache.request_id.clone();
+        Ok(Self {
+            cache: Arc::new(Mutex::new(cache)),
+            cache_id: format!("qwen35-recurrent-state-{request_id}"),
+            valid: Arc::new(AtomicBool::new(true)),
+            created_at: Instant::now(),
+        })
+    }
+
+    pub fn cache(&self) -> MutexGuard<'_, Qwen35RecurrentStateCache<B>> {
+        self.cache.lock()
+    }
+
+    fn invalidate(&self) {
+        self.valid.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Default for Qwen35RecurrentStateManagerConfig {
+    fn default() -> Self {
+        Self {
+            total_memory_bytes: usize::MAX,
+            total_batch_slots: usize::MAX,
+        }
+    }
+}
+
+impl<B: Backend> Qwen35RecurrentStateManager<B> {
+    pub fn new(config: Qwen35RecurrentStateManagerConfig) -> Self {
+        Self {
+            config,
+            handles: Mutex::new(HashMap::new()),
+            allocation_count: AtomicU64::new(0),
+            allocation_failures: AtomicU64::new(0),
+        }
+    }
+
+    fn used_memory_bytes_locked(
+        handles: &HashMap<RequestId, Arc<Qwen35RecurrentStateHandle<B>>>,
+    ) -> usize {
+        handles
+            .values()
+            .map(|handle| handle.cache.lock().estimated_memory_bytes())
+            .sum()
+    }
+
+    fn used_batch_slots_locked(
+        handles: &HashMap<RequestId, Arc<Qwen35RecurrentStateHandle<B>>>,
+    ) -> usize {
+        handles
+            .values()
+            .map(|handle| handle.cache.lock().max_batch_slots)
+            .sum()
+    }
+
+    fn active_state_tensors_locked(
+        handles: &HashMap<RequestId, Arc<Qwen35RecurrentStateHandle<B>>>,
+    ) -> usize {
+        handles
+            .values()
+            .map(|handle| handle.cache.lock().tensors.len())
+            .sum()
+    }
+}
+
+impl<B: Backend> fmt::Debug for Qwen35RecurrentStateHandle<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cache = self.cache.lock();
+        f.debug_struct("Qwen35RecurrentStateHandle")
+            .field("request_id", &cache.request_id)
+            .field("dtype", &cache.dtype)
+            .field("device", &cache.device)
+            .field("max_batch_slots", &cache.max_batch_slots)
+            .field("state_tensors", &cache.tensors.len())
+            .field("cache_id", &self.cache_id)
+            .field("valid", &self.valid.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl<B: Backend> fmt::Debug for Qwen35RecurrentStateManager<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Qwen35RecurrentStateManager")
+            .field("config", &self.config)
+            .field("active_states", &self.handles.lock().len())
+            .finish()
+    }
+}
+
+impl<B: Backend> RecurrentStateHandle for Qwen35RecurrentStateHandle<B> {
+    fn request_id(&self) -> RequestId {
+        self.cache.lock().request_id.clone()
+    }
+
+    fn device(&self) -> Device {
+        self.cache.lock().device.clone()
+    }
+
+    fn num_layers(&self) -> usize {
+        self.cache.lock().num_layers
+    }
+
+    fn state_bytes(&self) -> usize {
+        self.cache.lock().estimated_memory_bytes()
+    }
+
+    fn clone_handle(&self) -> Result<Arc<dyn RecurrentStateHandle>> {
+        Ok(Arc::new(Self {
+            cache: Arc::clone(&self.cache),
+            cache_id: self.cache_id.clone(),
+            valid: Arc::clone(&self.valid),
+            created_at: self.created_at,
+        }))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn stats(&self) -> RecurrentStateHandleStats {
+        let cache = self.cache.lock();
+        RecurrentStateHandleStats {
+            memory_bytes: cache.estimated_memory_bytes(),
+            state_tensors: cache.tensors.len(),
+            batch_slots: cache.max_batch_slots,
+            last_access: self.created_at,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::Relaxed)
+    }
+
+    fn cache_id(&self) -> String {
+        self.cache_id.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl<B: Backend> RecurrentStateManager for Qwen35RecurrentStateManager<B> {
+    async fn allocate(&self, spec: &RecurrentStateSpec) -> Result<Arc<dyn RecurrentStateHandle>> {
+        let mut handles = self.handles.lock();
+        if handles.contains_key(&spec.request_id) {
+            self.allocation_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(FerrumError::already_exists(format!(
+                "Qwen3.5 recurrent state already allocated for {}",
+                spec.request_id
+            )));
+        }
+
+        let requested_bytes = spec.estimated_memory_bytes();
+        let projected_memory =
+            Self::used_memory_bytes_locked(&handles).saturating_add(requested_bytes);
+        let projected_slots =
+            Self::used_batch_slots_locked(&handles).saturating_add(spec.max_batch_slots);
+        if projected_memory > self.config.total_memory_bytes
+            || projected_slots > self.config.total_batch_slots
+        {
+            self.allocation_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(FerrumError::resource_exhausted(
+                "insufficient Qwen3.5 recurrent-state capacity",
+            ));
+        }
+
+        let handle = match Qwen35RecurrentStateHandle::<B>::from_spec(spec) {
+            Ok(handle) => Arc::new(handle),
+            Err(err) => {
+                self.allocation_failures.fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+        };
+        handles.insert(spec.request_id.clone(), Arc::clone(&handle));
+        self.allocation_count.fetch_add(1, Ordering::Relaxed);
+        Ok(handle)
+    }
+
+    async fn deallocate(&self, request_id: RequestId) -> Result<()> {
+        if let Some(handle) = self.handles.lock().remove(&request_id) {
+            handle.invalidate();
+        }
+        Ok(())
+    }
+
+    fn can_allocate(&self, spec: &RecurrentStateSpec) -> bool {
+        let handles = self.handles.lock();
+        if handles.contains_key(&spec.request_id) {
+            return false;
+        }
+        Self::used_memory_bytes_locked(&handles).saturating_add(spec.estimated_memory_bytes())
+            <= self.config.total_memory_bytes
+            && Self::used_batch_slots_locked(&handles).saturating_add(spec.max_batch_slots)
+                <= self.config.total_batch_slots
+    }
+
+    fn get_handle(&self, request_id: RequestId) -> Option<Arc<dyn RecurrentStateHandle>> {
+        self.handles
+            .lock()
+            .get(&request_id)
+            .map(|handle| handle.clone() as Arc<dyn RecurrentStateHandle>)
+    }
+
+    fn list_handles(&self) -> Vec<(RequestId, Arc<dyn RecurrentStateHandle>)> {
+        self.handles
+            .lock()
+            .iter()
+            .map(|(request_id, handle)| {
+                (
+                    request_id.clone(),
+                    handle.clone() as Arc<dyn RecurrentStateHandle>,
+                )
+            })
+            .collect()
+    }
+
+    fn stats(&self) -> RecurrentStateManagerStats {
+        let handles = self.handles.lock();
+        RecurrentStateManagerStats {
+            total_memory_bytes: self.config.total_memory_bytes,
+            used_memory_bytes: Self::used_memory_bytes_locked(&handles),
+            active_states: handles.len(),
+            active_state_tensors: Self::active_state_tensors_locked(&handles),
+            total_batch_slots: self.config.total_batch_slots,
+            used_batch_slots: Self::used_batch_slots_locked(&handles),
+            allocation_count: self.allocation_count.load(Ordering::Relaxed),
+            allocation_failures: self.allocation_failures.load(Ordering::Relaxed),
+            eviction_count: 0,
+        }
+    }
+
+    async fn reset(&self) -> Result<()> {
+        let mut handles = self.handles.lock();
+        for handle in handles.values() {
+            handle.invalidate();
+        }
+        handles.clear();
+        Ok(())
+    }
+}
+
 impl<B: Backend> Qwen35RecurrentStateTensor<B> {
     pub fn slot_range(&self, slot: usize, max_batch_slots: usize) -> Result<Range<usize>> {
         if slot >= max_batch_slots {
@@ -2019,6 +2296,16 @@ impl<B: Backend> Qwen35RecurrentStateTensor<B> {
         }
         let start = slot * self.elements_per_slot;
         Ok(start..start + self.elements_per_slot)
+    }
+}
+
+fn qwen35_recurrent_backend_dtype(dtype: DataType) -> Result<Dtype> {
+    match dtype {
+        DataType::FP32 => Ok(Dtype::F32),
+        DataType::FP16 | DataType::BF16 => Ok(Dtype::F16),
+        other => Err(FerrumError::unsupported(format!(
+            "Qwen3.5 recurrent state dtype {other:?} is not supported"
+        ))),
     }
 }
 
@@ -3216,6 +3503,7 @@ mod tests {
         let second_slot = first.slot_range(1, cache.max_batch_slots).unwrap();
 
         assert_eq!(cache.request_id, request_id);
+        assert_eq!(cache.num_layers, 4);
         assert_eq!(cache.dtype, DataType::BF16);
         assert_eq!(cache.device, Device::CPU);
         assert_eq!(cache.max_batch_slots, 2);
@@ -3242,6 +3530,105 @@ mod tests {
             .expect_err("slot 1 should exceed one-slot recurrent state cache");
 
         assert!(err.to_string().contains("slot 1"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unsupported_recurrent_state_dtype() {
+        let config = dense_config();
+        let spec = config
+            .to_recurrent_state_spec(RequestId::new(), DataType::FP8, Device::CPU, 1)
+            .unwrap();
+
+        let err = match Qwen35RecurrentStateCache::<CpuBackend>::from_spec(&spec) {
+            Ok(_) => panic!("FP8 recurrent state storage is not implemented"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("dtype FP8"), "{err}");
+    }
+
+    #[test]
+    fn recurrent_state_handle_downcasts_and_clones_shared_cache() {
+        let config = dense_config();
+        let request_id = RequestId::new();
+        let spec = config
+            .to_recurrent_state_spec(request_id.clone(), DataType::FP16, Device::CPU, 1)
+            .unwrap();
+        let handle = Qwen35RecurrentStateHandle::<CpuBackend>::from_spec(&spec).unwrap();
+
+        let cloned = handle.clone_handle().unwrap();
+        let typed = cloned
+            .as_any()
+            .downcast_ref::<Qwen35RecurrentStateHandle<CpuBackend>>()
+            .expect("clone_handle should preserve the Qwen35 typed handle");
+        let stats = typed.stats();
+
+        assert_eq!(typed.request_id(), request_id);
+        assert_eq!(typed.num_layers(), 4);
+        assert_eq!(typed.device(), Device::CPU);
+        assert_eq!(typed.cache_id(), handle.cache_id());
+        assert_eq!(stats.state_tensors, 3);
+        assert_eq!(stats.batch_slots, 1);
+        assert_eq!(stats.memory_bytes, 3 * 32 * 2);
+        let cache = typed.cache();
+        assert_eq!(cache.tensors.len(), 3);
+        assert!(typed.is_valid());
+    }
+
+    #[test]
+    fn recurrent_state_manager_allocates_rejects_capacity_and_invalidates() {
+        let config = dense_config();
+        let manager =
+            Qwen35RecurrentStateManager::<CpuBackend>::new(Qwen35RecurrentStateManagerConfig {
+                total_memory_bytes: 3 * 32 * 2,
+                total_batch_slots: 1,
+            });
+        let request_id = RequestId::new();
+        let spec = config
+            .to_recurrent_state_spec(request_id.clone(), DataType::FP16, Device::CPU, 1)
+            .unwrap();
+        let second_spec = config
+            .to_recurrent_state_spec(RequestId::new(), DataType::FP16, Device::CPU, 1)
+            .unwrap();
+
+        assert!(manager.can_allocate(&spec));
+        let handle = tokio_test::block_on(manager.allocate(&spec)).unwrap();
+        let typed = handle
+            .as_any()
+            .downcast_ref::<Qwen35RecurrentStateHandle<CpuBackend>>()
+            .expect("manager should allocate a Qwen35 typed recurrent-state handle");
+
+        assert_eq!(typed.cache().tensors.len(), 3);
+        assert_eq!(manager.stats().active_states, 1);
+        assert_eq!(manager.stats().active_state_tensors, 3);
+        assert_eq!(manager.stats().used_memory_bytes, 3 * 32 * 2);
+        assert!(!manager.can_allocate(&spec));
+        assert!(!manager.can_allocate(&second_spec));
+
+        let duplicate = tokio_test::block_on(manager.allocate(&spec)).unwrap_err();
+        assert!(
+            duplicate.to_string().contains("already allocated"),
+            "{duplicate}"
+        );
+        let overcommit = tokio_test::block_on(manager.allocate(&second_spec)).unwrap_err();
+        assert!(
+            overcommit
+                .to_string()
+                .contains("insufficient Qwen3.5 recurrent-state capacity"),
+            "{overcommit}"
+        );
+        assert_eq!(manager.stats().allocation_failures, 2);
+
+        tokio_test::block_on(manager.deallocate(request_id.clone())).unwrap();
+        assert!(!handle.is_valid());
+        assert!(manager.get_handle(request_id).is_none());
+        assert_eq!(manager.stats().active_states, 0);
+
+        let replacement = tokio_test::block_on(manager.allocate(&second_spec)).unwrap();
+        assert!(replacement.is_valid());
+        tokio_test::block_on(manager.reset()).unwrap();
+        assert!(!replacement.is_valid());
+        assert_eq!(manager.stats().active_states, 0);
     }
 
     #[test]
