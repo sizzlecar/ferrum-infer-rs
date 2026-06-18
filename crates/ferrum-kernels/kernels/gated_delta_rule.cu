@@ -1,0 +1,78 @@
+#include <cuda_runtime.h>
+
+extern "C" __global__ void recurrent_gated_delta_rule_f32(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const float* __restrict__ initial_state,
+    float* __restrict__ out,
+    float* __restrict__ final_state,
+    const int tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int use_qk_l2norm,
+    const float scale) {
+  const int value_head = blockIdx.x;
+  if (value_head >= value_heads) return;
+
+  const int repeat_factor = value_heads / key_heads;
+  const int key_head = value_head / repeat_factor;
+
+  for (int value_offset = threadIdx.x; value_offset < value_dim; value_offset += blockDim.x) {
+    const int state_base = (value_head * value_dim + value_offset) * key_dim;
+
+    for (int kd = 0; kd < key_dim; ++kd) {
+      final_state[state_base + kd] = initial_state[state_base + kd];
+    }
+
+    for (int token = 0; token < tokens; ++token) {
+      float q_inv = 1.0f;
+      float k_inv = 1.0f;
+      if (use_qk_l2norm != 0) {
+        float q_norm = 0.0f;
+        float k_norm = 0.0f;
+        for (int kd = 0; kd < key_dim; ++kd) {
+          const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+          const float qv = query[qk_idx];
+          const float kv = key[qk_idx];
+          q_norm += qv * qv;
+          k_norm += kv * kv;
+        }
+        q_inv = rsqrtf(q_norm + 1.0e-6f);
+        k_inv = rsqrtf(k_norm + 1.0e-6f);
+      }
+
+      const int gate_idx = token * value_heads + value_head;
+      const float decay = expf(g[gate_idx]);
+      const float beta_t = beta[gate_idx];
+
+      float kv_mem = 0.0f;
+      for (int kd = 0; kd < key_dim; ++kd) {
+        const int state_idx = state_base + kd;
+        const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+        final_state[state_idx] *= decay;
+        kv_mem += final_state[state_idx] * (key[qk_idx] * k_inv);
+      }
+
+      const int value_idx = ((token * value_heads + value_head) * value_dim) + value_offset;
+      const float delta = (value[value_idx] - kv_mem) * beta_t;
+      for (int kd = 0; kd < key_dim; ++kd) {
+        const int state_idx = state_base + kd;
+        const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+        final_state[state_idx] += delta * (key[qk_idx] * k_inv);
+      }
+
+      float acc = 0.0f;
+      for (int kd = 0; kd < key_dim; ++kd) {
+        const int state_idx = state_base + kd;
+        const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+        acc += final_state[state_idx] * (query[qk_idx] * q_inv * scale);
+      }
+      out[value_idx] = acc;
+    }
+  }
+}

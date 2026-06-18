@@ -244,6 +244,41 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Recurrent gated DeltaNet update used by linear-attention layers.
+    ///
+    /// Layouts are token-major:
+    /// - `query` / `key`: `[tokens, key_heads, key_dim]`
+    /// - `value` / `out`: `[tokens, value_heads, value_dim]`
+    /// - `g` / `beta`: `[tokens, value_heads]`
+    /// - `initial_state` / `final_state`: `[value_heads, value_dim, key_dim]`
+    ///
+    /// Backends may require these buffers to be F32. CUDA currently provides
+    /// the native W3 path; unsupported backends should use the model-level
+    /// reference path instead of silently round-tripping through the host.
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_f32(
+        _ctx: &mut Self::Context,
+        _query: &Self::Buffer,
+        _key: &Self::Buffer,
+        _value: &Self::Buffer,
+        _g: &Self::Buffer,
+        _beta: &Self::Buffer,
+        _initial_state: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _final_state: &mut Self::Buffer,
+        _tokens: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _use_qk_l2norm: bool,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "recurrent_gated_delta_rule_f32 not implemented for this backend",
+        ))
+    }
+
     // ── Element-wise ────────────────────────────────────────────────────
     //
     // Models use `add_inplace` for residual updates and `copy_slice` for the
