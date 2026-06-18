@@ -11,7 +11,7 @@ use ferrum_interfaces::{
         DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage, ExecutorState,
         ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
     },
-    KvCacheHandle, ModelExecutor, RecurrentStateSpec,
+    KvCacheHandle, ModelExecutor, RecurrentStateHandle, RecurrentStateSpec,
 };
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_quantization::{NativeSafetensorsLoader, WeightLoader};
@@ -30,12 +30,15 @@ use crate::{
         Qwen35DenseFullAttentionLayerShape, Qwen35DenseLinearAttentionLayerShape,
         Qwen35DenseReferenceFullLayer, Qwen35DenseReferenceLayer, Qwen35DenseReferenceLinearLayer,
         Qwen35DenseReferenceModel, Qwen35DenseReferenceModelOutput, Qwen35FullAttentionShape,
-        Qwen35LinearAttentionShape, Qwen35SparseMoeFullAttentionLayerShape,
-        Qwen35SparseMoeLinearAttentionLayerShape, Qwen35SparseMoeReferenceFullLayer,
-        Qwen35SparseMoeReferenceLayer, Qwen35SparseMoeReferenceLinearLayer,
-        Qwen35SparseMoeReferenceModel, Qwen35SparseMoeReferenceModelOutput, Qwen35SparseMoeShape,
+        Qwen35LinearAttentionShape, Qwen35RecurrentStateHandle,
+        Qwen35SparseMoeFullAttentionLayerShape, Qwen35SparseMoeLinearAttentionLayerShape,
+        Qwen35SparseMoeReferenceFullLayer, Qwen35SparseMoeReferenceLayer,
+        Qwen35SparseMoeReferenceLinearLayer, Qwen35SparseMoeReferenceModel,
+        Qwen35SparseMoeReferenceModelOutput, Qwen35SparseMoeShape,
     },
-    qwen35_config::{Qwen35LayerType, Qwen35MoeTextConfig, Qwen35TextConfig},
+    qwen35_config::{
+        Qwen35LayerType, Qwen35MoeTextConfig, Qwen35TextConfig, QWEN35_DELTA_STATE_NAME,
+    },
     qwen35_weights::{
         Qwen35ResolvedWeightPlan, Qwen35ResolvedWeightSpec, Qwen35WeightInventory,
         Qwen35WeightValidation,
@@ -177,6 +180,12 @@ pub struct Qwen35SparseMoeReferenceRuntimeFullLayer {
     pub shared_expert_gate_proj_weight: Vec<f32>,
     pub shared_expert_up_proj_weight: Vec<f32>,
     pub shared_expert_down_proj_weight: Vec<f32>,
+}
+
+struct Qwen35ReferenceForwardOutput {
+    vocab_size: usize,
+    logits: Vec<f32>,
+    linear_recurrent_states: Vec<Vec<f32>>,
 }
 
 impl Qwen35DenseReferenceRuntime {
@@ -1003,13 +1012,21 @@ impl Qwen35W3Executor {
         format!("qwen35-reference-prefill-{id}")
     }
 
-    fn reference_forward(&self, input_ids: &[usize]) -> Result<(usize, Vec<f32>)> {
+    fn reference_forward(&self, input_ids: &[usize]) -> Result<Qwen35ReferenceForwardOutput> {
         if let Some(runtime) = &self.dense_reference_runtime {
             let output = runtime.forward(input_ids)?;
-            Ok((runtime.vocab_size, output.logits))
+            Ok(Qwen35ReferenceForwardOutput {
+                vocab_size: runtime.vocab_size,
+                logits: output.logits,
+                linear_recurrent_states: output.linear_recurrent_states,
+            })
         } else if let Some(runtime) = &self.sparse_moe_reference_runtime {
             let output = runtime.forward(input_ids)?;
-            Ok((runtime.vocab_size, output.logits))
+            Ok(Qwen35ReferenceForwardOutput {
+                vocab_size: runtime.vocab_size,
+                logits: output.logits,
+                linear_recurrent_states: output.linear_recurrent_states,
+            })
         } else {
             Err(Self::unsupported_execution())
         }
@@ -1064,6 +1081,71 @@ impl Qwen35W3Executor {
         full_tokens.extend(new_tokens);
         Ok((cache_id, full_tokens))
     }
+
+    fn write_reference_recurrent_state(
+        &self,
+        recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+        linear_recurrent_states: &[Vec<f32>],
+    ) -> Result<Option<Arc<dyn RecurrentStateHandle>>> {
+        let Some(recurrent_state) = recurrent_state else {
+            return Ok(None);
+        };
+        let Some(qwen35_state) = recurrent_state
+            .as_any()
+            .downcast_ref::<Qwen35RecurrentStateHandle<CpuBackend>>()
+        else {
+            return Ok(Some(recurrent_state));
+        };
+        let expected_states = self.config.linear_attention_layers();
+        if linear_recurrent_states.len() != expected_states {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 reference produced {} recurrent states, expected {expected_states}",
+                linear_recurrent_states.len()
+            )));
+        }
+
+        let mut cache = qwen35_state.cache();
+        if cache.dtype != DataType::FP32 || cache.device != Device::CPU {
+            return Err(FerrumError::unsupported(format!(
+                "Qwen3.5 reference recurrent write requires FP32 CPU state, got {:?} {:?}",
+                cache.dtype, cache.device
+            )));
+        }
+        let max_batch_slots = cache.max_batch_slots;
+        let mut state_index = 0usize;
+        for (layer_index, layer_type) in self.config.layer_types.iter().copied().enumerate() {
+            if layer_type != Qwen35LayerType::LinearAttention {
+                continue;
+            }
+            let source = &linear_recurrent_states[state_index];
+            let tensor = cache
+                .tensor_mut(layer_index, QWEN35_DELTA_STATE_NAME)
+                .ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 recurrent state missing layer={layer_index} {QWEN35_DELTA_STATE_NAME}"
+                    ))
+                })?;
+            if source.len() != tensor.elements_per_slot {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 recurrent state layer={layer_index} shape mismatch: got {}, expected {}",
+                    source.len(),
+                    tensor.elements_per_slot
+                )));
+            }
+            let range = tensor.slot_range(0, max_batch_slots)?;
+            if range.end > tensor.buffer.len() {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 recurrent state layer={layer_index} buffer too short: range_end={}, buffer_len={}",
+                    range.end,
+                    tensor.buffer.len()
+                )));
+            }
+            tensor.buffer[range].copy_from_slice(source);
+            state_index += 1;
+        }
+        drop(cache);
+        Ok(Some(recurrent_state))
+    }
 }
 
 #[async_trait]
@@ -1091,12 +1173,17 @@ impl ModelExecutor for Qwen35W3Executor {
             .collect::<Vec<_>>();
         let (cache_id, input_ids) =
             self.reference_prefill_cache_id_and_tokens(input, new_input_ids)?;
-        let (vocab_size, logits) = self.reference_forward(&input_ids)?;
-        let last_logits = Self::last_reference_logits(input_ids.len(), vocab_size, &logits)?;
+        let forward = self.reference_forward(&input_ids)?;
+        let last_logits =
+            Self::last_reference_logits(input_ids.len(), forward.vocab_size, &forward.logits)?;
         let logits_tensor = Tensor::new(last_logits.as_slice(), &CandleDevice::Cpu)
             .map_err(|err| FerrumError::model(format!("Qwen3.5 logits tensor failed: {err}")))?
-            .reshape((1, 1, vocab_size))
+            .reshape((1, 1, forward.vocab_size))
             .map_err(|err| FerrumError::model(format!("Qwen3.5 logits reshape failed: {err}")))?;
+        let recurrent_state = self.write_reference_recurrent_state(
+            input.recurrent_state.clone(),
+            &forward.linear_recurrent_states,
+        )?;
         self.reference_sequences
             .lock()
             .insert(cache_id.clone(), input_ids.clone());
@@ -1109,7 +1196,7 @@ impl ModelExecutor for Qwen35W3Executor {
             cache_id,
         ));
         let output = PrefillOutput::new(common::wrap_tensor(logits_tensor), kv_cache);
-        Ok(if let Some(state) = input.recurrent_state.clone() {
+        Ok(if let Some(state) = recurrent_state {
             output.with_recurrent_state(state)
         } else {
             output
@@ -1148,18 +1235,23 @@ impl ModelExecutor for Qwen35W3Executor {
             )));
         }
         input_ids.push(tokens[0] as usize);
-        let (vocab_size, logits) = self.reference_forward(&input_ids)?;
-        let last_logits = Self::last_reference_logits(input_ids.len(), vocab_size, &logits)?;
+        let forward = self.reference_forward(&input_ids)?;
+        let last_logits =
+            Self::last_reference_logits(input_ids.len(), forward.vocab_size, &forward.logits)?;
         let logits_tensor = Tensor::new(last_logits.as_slice(), &CandleDevice::Cpu)
             .map_err(|err| FerrumError::model(format!("Qwen3.5 decode logits failed: {err}")))?
-            .reshape((1, vocab_size))
+            .reshape((1, forward.vocab_size))
             .map_err(|err| {
                 FerrumError::model(format!("Qwen3.5 decode logits reshape failed: {err}"))
             })?;
+        let recurrent_state = self.write_reference_recurrent_state(
+            input.recurrent_state.clone(),
+            &forward.linear_recurrent_states,
+        )?;
         self.reference_sequences.lock().insert(cache_id, input_ids);
         let kv_cache = Arc::new(input_handle.with_sequence_length(seq_len + 1));
         let output = DecodeOutput::new(common::wrap_tensor(logits_tensor), kv_cache);
-        Ok(if let Some(state) = input.recurrent_state.clone() {
+        Ok(if let Some(state) = recurrent_state {
             output.with_recurrent_state(state)
         } else {
             output
@@ -1905,6 +1997,36 @@ mod tests {
         }
     }
 
+    fn typed_recurrent_state_handle(
+        executor: &Qwen35W3Executor,
+        input_tokens: &[u32],
+    ) -> Arc<Qwen35RecurrentStateHandle<CpuBackend>> {
+        let token_ids = input_tokens
+            .iter()
+            .copied()
+            .map(TokenId::new)
+            .collect::<Vec<_>>();
+        let spec = executor
+            .recurrent_state_spec(&RequestId::new(), &token_ids)
+            .unwrap()
+            .unwrap();
+        Arc::new(Qwen35RecurrentStateHandle::<CpuBackend>::from_spec(&spec).unwrap())
+    }
+
+    fn recurrent_delta_state(
+        recurrent_state: &Arc<dyn RecurrentStateHandle>,
+        layer_index: usize,
+    ) -> Vec<f32> {
+        let typed = recurrent_state
+            .as_any()
+            .downcast_ref::<Qwen35RecurrentStateHandle<CpuBackend>>()
+            .unwrap();
+        let cache = typed.cache();
+        let tensor = cache.tensor(layer_index, QWEN35_DELTA_STATE_NAME).unwrap();
+        let range = tensor.slot_range(0, cache.max_batch_slots).unwrap();
+        tensor.buffer[range].to_vec()
+    }
+
     #[test]
     fn qwen35_w3_executor_without_reference_runtime_keeps_prefill_unsupported() {
         let def = toy_dense_definition();
@@ -1954,6 +2076,33 @@ mod tests {
         let status = executor.status();
         assert_eq!(status.state, ExecutorState::Ready);
         assert!(status.is_ready);
+    }
+
+    #[test]
+    fn qwen35_w3_reference_prefill_writes_typed_recurrent_state() {
+        let def = toy_dense_definition();
+        let runtime = toy_dense_runtime();
+        let expected = runtime.forward(&[0, 1]).unwrap();
+        let executor = Qwen35W3Executor::from_definition(
+            "qwen35-reference",
+            &def,
+            DataType::FP32,
+            Device::CPU,
+        )
+        .unwrap()
+        .with_dense_reference_runtime(runtime)
+        .unwrap();
+        let recurrent_state = typed_recurrent_state_handle(&executor, &[0, 1]);
+        let input = PrefillInput::new(MockTensor::from_u32(&[0, 1], &[2]).into_ref())
+            .with_recurrent_state(recurrent_state);
+
+        let output = tokio_test::block_on(executor.prefill(&input)).unwrap();
+
+        let output_state = output.recurrent_state.unwrap();
+        assert_close(
+            &recurrent_delta_state(&output_state, 0),
+            &expected.linear_recurrent_states[0],
+        );
     }
 
     #[test]
@@ -2097,6 +2246,40 @@ mod tests {
         assert_close(&output.logits.to_vec_f32().unwrap(), &expected.logits[6..9]);
         assert_eq!(output.kv_cache.block_table().sequence_length, 3);
         assert!(output.recurrent_state.is_none());
+    }
+
+    #[test]
+    fn qwen35_w3_reference_decode_updates_typed_recurrent_state() {
+        let def = toy_dense_definition();
+        let runtime = toy_dense_runtime();
+        let expected = runtime.forward(&[0, 1, 2]).unwrap();
+        let executor = Qwen35W3Executor::from_definition(
+            "qwen35-reference",
+            &def,
+            DataType::FP32,
+            Device::CPU,
+        )
+        .unwrap()
+        .with_dense_reference_runtime(runtime)
+        .unwrap();
+        let recurrent_state = typed_recurrent_state_handle(&executor, &[0, 1]);
+        let prefill_input = PrefillInput::new(MockTensor::from_u32(&[0, 1], &[2]).into_ref())
+            .with_recurrent_state(recurrent_state);
+        let prefill = tokio_test::block_on(executor.prefill(&prefill_input)).unwrap();
+        let decode_state = prefill.recurrent_state.unwrap();
+        let input = DecodeInput::new(
+            MockTensor::from_u32(&[2], &[1]).into_ref(),
+            prefill.kv_cache,
+        )
+        .with_recurrent_state(decode_state);
+
+        let output = tokio_test::block_on(executor.decode(&input)).unwrap();
+
+        let output_state = output.recurrent_state.unwrap();
+        assert_close(
+            &recurrent_delta_state(&output_state, 0),
+            &expected.linear_recurrent_states[0],
+        );
     }
 
     #[test]
