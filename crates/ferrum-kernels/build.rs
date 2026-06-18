@@ -40,6 +40,7 @@ const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/int8_paged_decode_attention.cu",
     "kernels/argmax_rows.cu",
     "kernels/split_qkv_norm_rope_into_paged_cache_vllm.cu",
+    "kernels/gated_delta_rule.cu",
 ];
 
 const CORE_PTX_HEADERS: &[&str] = &["kernels/common.cuh"];

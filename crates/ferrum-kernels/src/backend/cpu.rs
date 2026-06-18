@@ -60,6 +60,60 @@ fn dequant_q4_k_cpu(bytes: &[u8], n_blocks: usize) -> Vec<f32> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_gated_delta_rule_shape(
+    query_len: usize,
+    key_len: usize,
+    value_len_actual: usize,
+    g_len: usize,
+    beta_len: usize,
+    initial_state_len: usize,
+    out_len: usize,
+    final_state_len: usize,
+    tokens: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> Result<()> {
+    if tokens == 0 || key_heads == 0 || value_heads == 0 || key_dim == 0 || value_dim == 0 {
+        return Err(FerrumError::model(format!(
+            "gated_delta_rule shape must be positive, got tokens={tokens} key_heads={key_heads} value_heads={value_heads} key_dim={key_dim} value_dim={value_dim}"
+        )));
+    }
+    if value_heads % key_heads != 0 {
+        return Err(FerrumError::model(format!(
+            "gated_delta_rule value_heads {value_heads} must be divisible by key_heads {key_heads}"
+        )));
+    }
+
+    for (label, actual, expected) in [
+        ("query", query_len, tokens * key_heads * key_dim),
+        ("key", key_len, tokens * key_heads * key_dim),
+        ("value", value_len_actual, tokens * value_heads * value_dim),
+        ("g", g_len, tokens * value_heads),
+        ("beta", beta_len, tokens * value_heads),
+        (
+            "initial_state",
+            initial_state_len,
+            value_heads * value_dim * key_dim,
+        ),
+        ("out", out_len, tokens * value_heads * value_dim),
+        (
+            "final_state",
+            final_state_len,
+            value_heads * value_dim * key_dim,
+        ),
+    ] {
+        if actual < expected {
+            return Err(FerrumError::model(format!(
+                "gated_delta_rule {label} length {actual} < expected {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub struct CpuBackend;
 
 #[cfg(target_os = "macos")]
@@ -319,6 +373,91 @@ impl Backend for CpuBackend {
         cpu_attention(
             q, k, v, out, batch, q_len, kv_len, cfg.causal, pos_offset, cfg,
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_f32(
+        _ctx: &mut Self::Context,
+        query: &Self::Buffer,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        g: &Self::Buffer,
+        beta: &Self::Buffer,
+        initial_state: &Self::Buffer,
+        out: &mut Self::Buffer,
+        final_state: &mut Self::Buffer,
+        tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        use_qk_l2norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        validate_gated_delta_rule_shape(
+            query.len(),
+            key.len(),
+            value.len(),
+            g.len(),
+            beta.len(),
+            initial_state.len(),
+            out.len(),
+            final_state.len(),
+            tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+        )?;
+
+        let repeat_factor = value_heads / key_heads;
+        let state_len = value_heads * value_dim * key_dim;
+        final_state[..state_len].copy_from_slice(&initial_state[..state_len]);
+
+        for token in 0..tokens {
+            for value_head in 0..value_heads {
+                let key_head = value_head / repeat_factor;
+                let mut q_inv = 1.0;
+                let mut k_inv = 1.0;
+                if use_qk_l2norm {
+                    let mut q_norm = 0.0;
+                    let mut k_norm = 0.0;
+                    for kd in 0..key_dim {
+                        let qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+                        q_norm += query[qk_idx] * query[qk_idx];
+                        k_norm += key[qk_idx] * key[qk_idx];
+                    }
+                    q_inv = (q_norm + 1e-6).sqrt().recip();
+                    k_inv = (k_norm + 1e-6).sqrt().recip();
+                }
+                let gate_idx = token * value_heads + value_head;
+                let decay = g[gate_idx].exp();
+                let beta_t = beta[gate_idx];
+                for vd in 0..value_dim {
+                    let state_base = (value_head * value_dim + vd) * key_dim;
+                    let mut kv_mem = 0.0;
+                    for kd in 0..key_dim {
+                        let qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+                        let state_idx = state_base + kd;
+                        final_state[state_idx] *= decay;
+                        kv_mem += final_state[state_idx] * (key[qk_idx] * k_inv);
+                    }
+                    let value_idx = ((token * value_heads + value_head) * value_dim) + vd;
+                    let delta = (value[value_idx] - kv_mem) * beta_t;
+                    for kd in 0..key_dim {
+                        let qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+                        final_state[state_base + kd] += delta * (key[qk_idx] * k_inv);
+                    }
+                    let mut acc = 0.0;
+                    for kd in 0..key_dim {
+                        let qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+                        acc += final_state[state_base + kd] * (query[qk_idx] * q_inv * scale);
+                    }
+                    out[value_idx] = acc;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn copy_slice(

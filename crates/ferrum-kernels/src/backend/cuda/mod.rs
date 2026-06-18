@@ -46,6 +46,7 @@ pub mod collective;
 pub mod fa2_ffi;
 #[cfg(feature = "fa2-source")]
 pub mod fa2_source;
+pub mod gated_delta_rule;
 pub mod graph;
 pub mod int8_kv;
 pub mod moe;
@@ -1507,6 +1508,45 @@ impl Backend for CudaBackend {
             })
         }
         .expect("flash_attn_full launch");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_f32(
+        ctx: &mut Self::Context,
+        query: &Self::Buffer,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        g: &Self::Buffer,
+        beta: &Self::Buffer,
+        initial_state: &Self::Buffer,
+        out: &mut Self::Buffer,
+        final_state: &mut Self::Buffer,
+        tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        use_qk_l2norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        gated_delta_rule::recurrent_gated_delta_rule_f32(
+            ctx,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state,
+            out,
+            final_state,
+            tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            use_qk_l2norm,
+            scale,
+        )
     }
 
     // ── Buffer utilities ────────────────────────────────────────────────
