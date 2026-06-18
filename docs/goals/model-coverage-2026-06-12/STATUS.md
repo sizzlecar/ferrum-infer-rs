@@ -2,6 +2,35 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ20 — W3 L2 quantized artifact gate checkpoint
+
+- Scope:
+  - W3 L2 real-size quantized semantic correctness artifact packaging;
+  - local gate/schema work only, no GPU/CUDA/Metal execution was started;
+  - no real Qwen3.5 GPTQ known-answer report was produced, and no
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `scripts/release/w3_l2_quantized_gate.py`;
+  - the gate consumes a real known-answer report and writes
+    `w3_l2_quantized.json` in the shape accepted by
+    `model_release_grade_goal_gate.py`;
+  - the gate rejects toy/fixture reports, waived lanes, hidden env, fewer than
+    10 known-answer cases, partial semantic pass, and reports missing either
+    `ferrum run` or `ferrum serve` product commands;
+  - HF/model metadata alone cannot be converted into an L2 PASS artifact.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_l2_quantized_gate.py` PASS;
+  - `python3 scripts/release/w3_l2_quantized_gate.py --self-test` PASS:
+    `W3 L2 QUANTIZED SELFTEST PASS`;
+  - synthetic CLI-mode artifact probe PASS:
+    `W3 L2 QUANTIZED PASS: /tmp/ferrum-w3-l2-probe-oKme52/out`;
+  - final-gate L2 structure probe PASS:
+    `W3 L2 FINAL-GATE STRUCTURE PASS: /tmp/ferrum-w3-l2-probe-oKme52/out`.
+- Limitation:
+  - this closes only the L2 artifact gate gap; W3 still needs a real
+    full-size Qwen3.5/Qwen3.6 quantized product run with known-answer
+    semantics, plus L3/L4/L5, same-hardware baseline, and 80% performance.
+
 ## 2026-06-18 ZZZ19 — W3 L1 numeric artifact gate checkpoint
 
 - Scope:
