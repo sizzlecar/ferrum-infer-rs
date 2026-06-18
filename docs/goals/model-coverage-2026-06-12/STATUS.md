@@ -2,6 +2,24 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ23 — W3 Qwen35 release-grade goal doc checkpoint
+
+- Scope:
+  - W3/Qwen3.5-Qwen3.6 release-grade execution contract and handoff context;
+  - documentation-only checkpoint, no code/kernel changes and no GPU execution;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `W3_QWEN35_RELEASE_GRADE_GOAL.md`;
+  - records the current official Qwen3.5/Qwen3.6 model facts, current
+    checkpoint `3b2b55cf`, completed gates, missing real-model gates, and the
+    concrete L0-L5 plus 80% performance acceptance criteria;
+  - explicitly names `Qwen/Qwen3.5-35B-A3B-GPTQ-Int4` as the practical 1x4090
+    real validation lane for the Qwen3.5 family.
+- Limitation:
+  - this is a planning/handoff artifact only; W3 still needs real backend
+    full-attention repair, sparse-MoE backend wiring, real Qwen3.5 GPTQ
+    `ferrum run`/`ferrum serve` correctness, L3-L5, and performance evidence.
+
 ## 2026-06-18 ZZZ22 — W3 Qwen35 product-path typed recurrent manager checkpoint
 
 - Scope:
