@@ -52,6 +52,12 @@ pub fn recurrent_gated_delta_rule_f32(
     let func = ctx.func(MODULE_NAME, ptx::GATED_DELTA_RULE, FUNC_NAME);
     let block = value_dim.min(256).max(1) as u32;
     let stream = ctx.stream.clone();
+    let tokens_i32 = tokens as i32;
+    let key_heads_i32 = key_heads as i32;
+    let value_heads_i32 = value_heads as i32;
+    let key_dim_i32 = key_dim as i32;
+    let value_dim_i32 = value_dim as i32;
+    let use_qk_l2norm_i32 = i32::from(use_qk_l2norm);
     let mut builder = stream.launch_builder(&func);
     builder.arg(query.as_f32());
     builder.arg(key.as_f32());
@@ -61,12 +67,12 @@ pub fn recurrent_gated_delta_rule_f32(
     builder.arg(initial_state.as_f32());
     builder.arg(out.as_f32_mut());
     builder.arg(final_state.as_f32_mut());
-    builder.arg(&(tokens as i32));
-    builder.arg(&(key_heads as i32));
-    builder.arg(&(value_heads as i32));
-    builder.arg(&(key_dim as i32));
-    builder.arg(&(value_dim as i32));
-    builder.arg(&(i32::from(use_qk_l2norm)));
+    builder.arg(&tokens_i32);
+    builder.arg(&key_heads_i32);
+    builder.arg(&value_heads_i32);
+    builder.arg(&key_dim_i32);
+    builder.arg(&value_dim_i32);
+    builder.arg(&use_qk_l2norm_i32);
     builder.arg(&scale);
     unsafe {
         builder
