@@ -171,6 +171,11 @@ pub struct Qwen35LinearAttentionReference {
     pub final_state: Vec<f32>,
 }
 
+pub struct Qwen35BackendDeltaRuleOutput<B: Backend> {
+    pub output: B::Buffer,
+    pub final_state: B::Buffer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Qwen35DenseLinearAttentionLayerShape {
     pub tokens: usize,
@@ -2404,6 +2409,53 @@ pub fn qwen35_gated_delta_attention_cpu(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_recurrent_gated_delta_rule_backend<B: Backend>(
+    ctx: &mut B::Context,
+    query: &B::Buffer,
+    key: &B::Buffer,
+    value: &B::Buffer,
+    g: &B::Buffer,
+    beta: &B::Buffer,
+    initial_state: &B::Buffer,
+    shape: Qwen35DeltaRuleShape,
+    use_qk_l2norm: bool,
+    scale: Option<f32>,
+) -> Result<Qwen35BackendDeltaRuleOutput<B>> {
+    validate_delta_rule_shape_values(shape)?;
+    let scale = scale.unwrap_or_else(|| (shape.key_dim as f32).sqrt().recip());
+    let mut output = B::alloc_typed(
+        Dtype::F32,
+        shape.tokens * shape.value_heads * shape.value_dim,
+    );
+    let mut final_state = B::alloc_typed(
+        Dtype::F32,
+        shape.value_heads * shape.value_dim * shape.key_dim,
+    );
+    B::recurrent_gated_delta_rule_f32(
+        ctx,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state,
+        &mut output,
+        &mut final_state,
+        shape.tokens,
+        shape.key_heads,
+        shape.value_heads,
+        shape.key_dim,
+        shape.value_dim,
+        use_qk_l2norm,
+        scale,
+    )?;
+    Ok(Qwen35BackendDeltaRuleOutput {
+        output,
+        final_state,
+    })
+}
+
 pub fn qwen35_gdn_gating_cpu(
     a_log: &[f32],
     a: &[f32],
@@ -2778,16 +2830,7 @@ fn validate_delta_rule_shapes(
     initial_state: &[f32],
     shape: Qwen35DeltaRuleShape,
 ) -> Result<()> {
-    if shape.tokens == 0
-        || shape.key_heads == 0
-        || shape.value_heads == 0
-        || shape.key_dim == 0
-        || shape.value_dim == 0
-    {
-        return Err(FerrumError::model(format!(
-            "Qwen3.5 DeltaNet shape must be positive, got {shape:?}"
-        )));
-    }
+    validate_delta_rule_shape_values(shape)?;
     let qk_len = shape.tokens * shape.key_heads * shape.key_dim;
     let value_len = shape.tokens * shape.value_heads * shape.value_dim;
     let gating_len = shape.tokens * shape.value_heads;
@@ -2805,6 +2848,26 @@ fn validate_delta_rule_shapes(
                 "Qwen3.5 DeltaNet {label} length {actual} != expected {expected} for {shape:?}"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_delta_rule_shape_values(shape: Qwen35DeltaRuleShape) -> Result<()> {
+    if shape.tokens == 0
+        || shape.key_heads == 0
+        || shape.value_heads == 0
+        || shape.key_dim == 0
+        || shape.value_dim == 0
+    {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 DeltaNet shape must be positive, got {shape:?}"
+        )));
+    }
+    if shape.value_heads % shape.key_heads != 0 {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 DeltaNet value_heads {} must be divisible by key_heads {}",
+            shape.value_heads, shape.key_heads
+        )));
     }
     Ok(())
 }
@@ -3103,7 +3166,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use ferrum_kernels::backend::cpu::CpuBackend;
+    use ferrum_kernels::backend::{cpu::CpuBackend, Backend};
     use ferrum_quantization::{DenseLinear, QuantConfig, WeightLoader};
     use ferrum_types::{FerrumError, Result as FerrumResult};
 
@@ -5206,6 +5269,62 @@ mod tests {
 
         assert_eq!(state, vec![15.0, 21.0]);
         assert_eq!(out, vec![30.0, 42.0]);
+    }
+
+    #[test]
+    fn recurrent_delta_rule_backend_matches_reference() {
+        let shape = Qwen35DeltaRuleShape {
+            tokens: 2,
+            key_heads: 1,
+            value_heads: 2,
+            key_dim: 2,
+            value_dim: 1,
+        };
+        let query = vec![1.0, 0.5, -0.25, 0.75];
+        let key = vec![0.5, -0.5, 1.0, 0.25];
+        let value = vec![2.0, -1.0, 0.5, 3.0];
+        let g = vec![0.0, -0.25, -0.5, 0.0];
+        let beta = vec![0.5, 0.75, 0.25, 1.0];
+        let initial_state = vec![0.1, -0.2, 0.0, 0.3];
+        let scale = (shape.key_dim as f32).sqrt().recip();
+        let (expected_out, expected_state) = qwen35_recurrent_gated_delta_rule_cpu(
+            &query,
+            &key,
+            &value,
+            &g,
+            &beta,
+            &initial_state,
+            shape,
+            true,
+            Some(scale),
+        )
+        .unwrap();
+
+        let mut ctx = CpuBackend::new_context();
+        let output = qwen35_recurrent_gated_delta_rule_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice_typed(&query),
+            &CpuBackend::from_slice_typed(&key),
+            &CpuBackend::from_slice_typed(&value),
+            &CpuBackend::from_slice_typed(&g),
+            &CpuBackend::from_slice_typed(&beta),
+            &CpuBackend::from_slice_typed(&initial_state),
+            shape,
+            true,
+            Some(scale),
+        )
+        .unwrap();
+
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.output, expected_out.len()),
+            &expected_out,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.final_state, expected_state.len()),
+            &expected_state,
+            1e-6,
+        );
     }
 
     #[test]
