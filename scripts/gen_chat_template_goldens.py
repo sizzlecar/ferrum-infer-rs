@@ -11,9 +11,15 @@ renders a fixed set of conversation cases with
   cases.json       the exact messages/tools per case (single source of truth
                    shared with the Rust test)
   golden_<case>.txt  the transformers-rendered prompt (byte ground truth)
+  generation_config.json / tokenizer_config.json / tokenizer.json
+                  HF sidecars useful for release-grade L0 token provenance
+  tokenizer_special_tokens.json
+                  compact AutoTokenizer special-token ids for checked-in gates
 
 Run (network required; no torch needed):
-  uv run --with transformers --with jinja2 python scripts/gen_chat_template_goldens.py [model_id ...]
+  uv run --with transformers --with jinja2 --with huggingface-hub \
+    python scripts/gen_chat_template_goldens.py [model_id ...]
+  # Add `--with socksio` as well when HF traffic goes through a SOCKS proxy.
 
 The Rust side (`crates/ferrum-server/tests/chat_template_golden.rs`) renders
 the same cases through ferrum's renderer and asserts byte equality.
@@ -21,10 +27,13 @@ the same cases through ferrum's renderer and asserts byte equality.
 
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
 DEFAULT_MODELS = [
+    "Qwen/Qwen3.5-35B-A3B",
+    "Qwen/Qwen3.6-35B-A3B",
     "Qwen/Qwen3-0.6B",
     "Qwen/Qwen3-Coder-30B-A3B-Instruct",
     "Qwen/Qwen2.5-Coder-32B-Instruct",
@@ -35,6 +44,8 @@ DEFAULT_MODELS = [
 FIXTURE_ROOT = Path(__file__).resolve().parent.parent / (
     "crates/ferrum-server/tests/fixtures/chat_template"
 )
+
+HF_SIDECARS = ["generation_config.json", "tokenizer_config.json"]
 
 WEATHER_TOOL = {
     "type": "function",
@@ -83,6 +94,57 @@ CASES = {
 
 def template_supports_tools(template: str) -> bool:
     return re.search(r"(?<![A-Za-z0-9_])tools(?![A-Za-z0-9_])", template) is not None
+
+
+def copy_hf_sidecars(model_id: str, out_dir: Path) -> dict[str, dict[str, object]]:
+    from huggingface_hub import hf_hub_download
+
+    sidecars: dict[str, dict[str, object]] = {}
+    for filename in HF_SIDECARS:
+        target = out_dir / filename
+        try:
+            cached = Path(hf_hub_download(repo_id=model_id, filename=filename))
+            shutil.copyfile(cached, target)
+            sidecars[filename] = {
+                "status": "copied",
+                "path": str(target),
+                "size_bytes": target.stat().st_size,
+            }
+            print(f"   sidecar {filename} ({target.stat().st_size} bytes)")
+        except Exception as exc:  # noqa: BLE001 - record missing/remote errors in meta
+            sidecars[filename] = {
+                "status": "missing_or_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            print(f"   !! sidecar {filename} failed: {exc}")
+    return sidecars
+
+
+def write_tokenizer_special_tokens(tok, out_dir: Path) -> dict[str, object]:
+    target = out_dir / "tokenizer_special_tokens.json"
+    data = {
+        "source": "AutoTokenizer",
+        "bos_token": tok.bos_token,
+        "bos_token_id": tok.bos_token_id,
+        "eos_token": tok.eos_token,
+        "eos_token_id": tok.eos_token_id,
+        "pad_token": tok.pad_token,
+        "pad_token_id": tok.pad_token_id,
+        "unk_token": tok.unk_token,
+        "unk_token_id": tok.unk_token_id,
+        "additional_special_tokens": getattr(tok, "additional_special_tokens", []),
+        "additional_special_tokens_ids": getattr(tok, "additional_special_tokens_ids", []),
+        "all_special_tokens": getattr(tok, "all_special_tokens", []),
+        "all_special_ids": getattr(tok, "all_special_ids", []),
+        "special_tokens_map": getattr(tok, "special_tokens_map", {}),
+    }
+    target.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"   sidecar {target.name} ({target.stat().st_size} bytes)")
+    return {
+        "status": "generated",
+        "path": str(target),
+        "size_bytes": target.stat().st_size,
+    }
 
 
 def pin_strftime_now() -> str:
@@ -141,6 +203,8 @@ def main() -> None:
 
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "template.jinja").write_text(template, encoding="utf-8")
+        sidecars = copy_hf_sidecars(model_id, out_dir)
+        sidecars["tokenizer_special_tokens.json"] = write_tokenizer_special_tokens(tok, out_dir)
 
         cases_out = {}
         for name, case in CASES.items():
@@ -172,6 +236,7 @@ def main() -> None:
             "render_kwargs": kwargs,
             "now": pinned_now,
             "transformers_version": __import__("transformers").__version__,
+            "sidecars": sidecars,
         }
         (out_dir / "meta.json").write_text(
             json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"

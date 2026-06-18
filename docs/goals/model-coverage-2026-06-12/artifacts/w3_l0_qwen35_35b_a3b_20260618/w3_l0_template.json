@@ -1,0 +1,93 @@
+{
+  "chat_template_golden": {
+    "byte_equal": true,
+    "cargo_tests": [
+      {
+        "command_line": [
+          "cargo",
+          "test",
+          "-p",
+          "ferrum-server",
+          "--test",
+          "chat_template_golden",
+          "--",
+          "--nocapture"
+        ],
+        "returncode": 0,
+        "stderr": "docs/goals/model-coverage-2026-06-12/artifacts/w3_l0_qwen35_35b_a3b_20260618/cargo_chat_template_golden.stderr.txt",
+        "stdout": "docs/goals/model-coverage-2026-06-12/artifacts/w3_l0_qwen35_35b_a3b_20260618/cargo_chat_template_golden.stdout.txt"
+      },
+      {
+        "command_line": [
+          "cargo",
+          "test",
+          "-p",
+          "ferrum-server",
+          "model_template_render_failure_is_an_error_not_a_silent_fallback",
+          "--",
+          "--nocapture"
+        ],
+        "returncode": 0,
+        "stderr": "docs/goals/model-coverage-2026-06-12/artifacts/w3_l0_qwen35_35b_a3b_20260618/cargo_chat_template_no_fallback.stderr.txt",
+        "stdout": "docs/goals/model-coverage-2026-06-12/artifacts/w3_l0_qwen35_35b_a3b_20260618/cargo_chat_template_no_fallback.stdout.txt"
+      }
+    ],
+    "case_names": [
+      "single",
+      "system",
+      "multi_turn",
+      "tools",
+      "think_history"
+    ],
+    "cases_passed": 5,
+    "cases_total": 5,
+    "eos_bos_from_generation_config": true,
+    "hf_apply_chat_template_reference": true,
+    "render_failure_is_error": true,
+    "silent_fallback": false
+  },
+  "fixture_dir": "crates/ferrum-server/tests/fixtures/chat_template/Qwen__Qwen3.5-35B-A3B",
+  "generated_at": "2026-06-18T08:20:40.787632+08:00",
+  "hidden_env": [],
+  "level": "l0_template",
+  "model_id": "Qwen/Qwen3.5-35B-A3B",
+  "pass_line": "W3 L0 TEMPLATE PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_l0_qwen35_35b_a3b_20260618",
+  "product_surface": "typed_cli",
+  "schema_version": 1,
+  "special_tokens": {
+    "bos_token": null,
+    "bos_token_id": 248044,
+    "eos_token": "<|im_end|>",
+    "eos_token_id": [
+      248046,
+      248044
+    ],
+    "generation_config": "crates/ferrum-server/tests/fixtures/chat_template/Qwen__Qwen3.5-35B-A3B/generation_config.json",
+    "mappings": {
+      "bos_token": {
+        "checked": false,
+        "ids_from_generation_config": [
+          248044
+        ],
+        "token": null,
+        "tokenizer_id": null,
+        "tokenizer_id_source": null
+      },
+      "eos_token": {
+        "checked": true,
+        "ids_from_generation_config": [
+          248046,
+          248044
+        ],
+        "token": "<|im_end|>",
+        "tokenizer_id": 248046,
+        "tokenizer_id_source": "tokenizer_special_tokens"
+      }
+    },
+    "source": "generation_config",
+    "tokenizer_config": "crates/ferrum-server/tests/fixtures/chat_template/Qwen__Qwen3.5-35B-A3B/tokenizer_config.json",
+    "tokenizer_json": null,
+    "tokenizer_special_tokens": "crates/ferrum-server/tests/fixtures/chat_template/Qwen__Qwen3.5-35B-A3B/tokenizer_special_tokens.json"
+  },
+  "status": "pass"
+}

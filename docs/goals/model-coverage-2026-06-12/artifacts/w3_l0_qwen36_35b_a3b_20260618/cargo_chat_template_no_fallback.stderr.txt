@@ -1,0 +1,10 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running unittests src/lib.rs (target/debug/deps/ferrum_server-30efb5519f52c420)
+     Running tests/cache_metrics_contract.rs (target/debug/deps/cache_metrics_contract-d53bc8d356ddc5ea)
+     Running tests/chat_template_golden.rs (target/debug/deps/chat_template_golden-1ae9562390d519d6)
+     Running tests/structured_output_contract.rs (target/debug/deps/structured_output_contract-2389f44df28dba19)
+     Running tests/tiny_stack_wire.rs (target/debug/deps/tiny_stack_wire-8178d82d8790560f)

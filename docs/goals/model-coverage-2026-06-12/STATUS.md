@@ -2,6 +2,53 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ18 — W3 real Qwen3.5/Qwen3.6 L0 template checkpoint
+
+- Scope:
+  - real W3 L0 chat-template/tokenizer golden evidence for
+    `Qwen/Qwen3.5-35B-A3B` and `Qwen/Qwen3.6-35B-A3B`;
+  - local CPU/Rust test execution only, no GPU/CUDA/Metal execution;
+  - no W3 L1-L5 correctness evidence, no real model `ferrum run`/`ferrum
+    serve` release-grade evidence, and no `MODEL_RELEASE_GRADE_W3 PASS:
+    <out_dir>` was produced.
+- Change:
+  - extended `scripts/gen_chat_template_goldens.py` so W3 target fixtures
+    include official HF `generation_config.json`, `tokenizer_config.json`,
+    and a compact generated `tokenizer_special_tokens.json` sidecar;
+  - avoided checking in full 12 MB `tokenizer.json` files while still recording
+    EOS/BOS token-id provenance from `generation_config.json` plus tokenizer
+    special-token ids;
+  - changed the default generated W3 models to `Qwen/Qwen3.5-35B-A3B` and
+    `Qwen/Qwen3.6-35B-A3B`;
+  - extended `scripts/release/w3_l0_template_gate.py` to auto-discover fixture
+    sidecars and record the token-id source explicitly;
+  - added checked-in HF `apply_chat_template` golden fixtures for both W3
+    target models, each with `single`, `system`, `multi_turn`, `tools`, and
+    `think_history` cases.
+- Validation:
+  - fixture generation PASS:
+    `uv run --with transformers --with jinja2 --with huggingface-hub --with
+    socksio python scripts/gen_chat_template_goldens.py
+    Qwen/Qwen3.5-35B-A3B Qwen/Qwen3.6-35B-A3B`;
+  - `python3 -m py_compile scripts/gen_chat_template_goldens.py
+    scripts/release/w3_l0_template_gate.py` PASS;
+  - `python3 scripts/release/w3_l0_template_gate.py --self-test` PASS:
+    `W3 L0 TEMPLATE SELFTEST PASS`;
+  - `git diff --check -- scripts/gen_chat_template_goldens.py
+    scripts/release/w3_l0_template_gate.py` PASS;
+  - real Qwen3.5 L0 gate PASS:
+    `W3 L0 TEMPLATE PASS:
+    docs/goals/model-coverage-2026-06-12/artifacts/w3_l0_qwen35_35b_a3b_20260618`;
+  - real Qwen3.6 L0 gate PASS:
+    `W3 L0 TEMPLATE PASS:
+    docs/goals/model-coverage-2026-06-12/artifacts/w3_l0_qwen36_35b_a3b_20260618`;
+  - final-gate L0 structure probes PASS for both artifact directories.
+- Limitation:
+  - this proves only W3 L0 for the two target model families;
+  - W3 L1 single-layer/model numeric evidence, L2 quantized semantics, L3/L4
+    behavior/tool/schema gates, L5 concurrency, same-hardware baseline, and
+    80% performance evidence remain incomplete.
+
 ## 2026-06-18 ZZZ17 — W3 L0 template artifact generator checkpoint
 
 - Scope:
