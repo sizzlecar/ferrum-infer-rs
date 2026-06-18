@@ -62,6 +62,12 @@ pub fn linear_attention_prepare_f32(
     let total = conv_total.max(gate_total);
     let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, PREPARE_FUNC);
     let stream = ctx.stream.clone();
+    let tokens_i32 = tokens as i32;
+    let key_heads_i32 = key_heads as i32;
+    let value_heads_i32 = value_heads as i32;
+    let key_dim_i32 = key_dim as i32;
+    let value_dim_i32 = value_dim as i32;
+    let conv_kernel_i32 = conv_kernel as i32;
     let mut builder = stream.launch_builder(&func);
     builder.arg(mixed_qkv_raw.as_f32());
     builder.arg(conv_weight.as_f32());
@@ -74,12 +80,12 @@ pub fn linear_attention_prepare_f32(
     builder.arg(value.as_f32_mut());
     builder.arg(g.as_f32_mut());
     builder.arg(beta.as_f32_mut());
-    builder.arg(&(tokens as i32));
-    builder.arg(&(key_heads as i32));
-    builder.arg(&(value_heads as i32));
-    builder.arg(&(key_dim as i32));
-    builder.arg(&(value_dim as i32));
-    builder.arg(&(conv_kernel as i32));
+    builder.arg(&tokens_i32);
+    builder.arg(&key_heads_i32);
+    builder.arg(&value_heads_i32);
+    builder.arg(&key_dim_i32);
+    builder.arg(&value_dim_i32);
+    builder.arg(&conv_kernel_i32);
     unsafe {
         builder
             .launch(LaunchConfig {
@@ -96,13 +102,14 @@ pub fn linear_attention_prepare_f32(
         let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, QK_L2NORM_FUNC);
         let block = key_dim.next_power_of_two().min(256).max(1) as u32;
         let stream = ctx.stream.clone();
+        let eps = 1e-6f32;
         let mut builder = stream.launch_builder(&func);
         builder.arg(query.as_f32_mut());
         builder.arg(key.as_f32_mut());
-        builder.arg(&(tokens as i32));
-        builder.arg(&(key_heads as i32));
-        builder.arg(&(key_dim as i32));
-        builder.arg(&1e-6f32);
+        builder.arg(&tokens_i32);
+        builder.arg(&key_heads_i32);
+        builder.arg(&key_dim_i32);
+        builder.arg(&eps);
         unsafe {
             builder
                 .launch(LaunchConfig {
@@ -136,13 +143,15 @@ pub fn gated_rms_norm_f32(
     let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, GATED_RMS_NORM_FUNC);
     let block = dim.next_power_of_two().min(256).max(1) as u32;
     let stream = ctx.stream.clone();
+    let rows_i32 = (tokens * heads) as i32;
+    let dim_i32 = dim as i32;
     let mut builder = stream.launch_builder(&func);
     builder.arg(core.as_f32());
     builder.arg(z.as_f32());
     builder.arg(weight.as_f32());
     builder.arg(out.as_f32_mut());
-    builder.arg(&((tokens * heads) as i32));
-    builder.arg(&(dim as i32));
+    builder.arg(&rows_i32);
+    builder.arg(&dim_i32);
     builder.arg(&eps);
     unsafe {
         builder
