@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ21 — W3 Qwen35 reference recurrent-state writeback checkpoint
+
+- Scope:
+  - W3/Qwen35 executor-local recurrent-state correctness plumbing;
+  - local CPU/Rust tests only, no GPU/CUDA/Metal execution was started;
+  - no real Qwen3.5/Qwen3.6 product gate, no performance evidence, and no
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - `Qwen35W3Executor` reference forward now preserves
+    `linear_recurrent_states` alongside logits;
+  - reference `prefill` and `decode` write DeltaNet final state into
+    `Qwen35RecurrentStateHandle<CpuBackend>` when a typed handle is supplied;
+  - non-Qwen35 recurrent handles remain pass-through so current product smoke
+    paths are not broken before the engine default manager is switched;
+  - added tests proving typed recurrent state is populated after prefill and
+    updated after decode.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-models qwen35_w3_reference -- --nocapture` PASS:
+    8 matched tests passed;
+  - `cargo test -p ferrum-models recurrent_state -- --nocapture` PASS:
+    9 matched tests passed.
+- Limitation:
+  - this removes the executor-level "handle only" gap for the CPU reference
+    path; W3 still needs product-path typed manager wiring, real full-model
+    backend prefill/decode, L2-L5 correctness artifacts, and 80% performance
+    evidence.
+
 ## 2026-06-18 ZZZ20 — W3 L2 quantized artifact gate checkpoint
 
 - Scope:
