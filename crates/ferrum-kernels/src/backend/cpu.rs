@@ -114,6 +114,117 @@ fn validate_gated_delta_rule_shape(
     Ok(())
 }
 
+fn sigmoid(x: f32) -> f32 {
+    if x >= 0.0 {
+        let z = (-x).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = x.exp();
+        z / (1.0 + z)
+    }
+}
+
+fn silu(x: f32) -> f32 {
+    x * sigmoid(x)
+}
+
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else if x < -20.0 {
+        x.exp()
+    } else {
+        (1.0 + x.exp()).ln()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_linear_attention_prepare_shape(
+    mixed_qkv_raw_len: usize,
+    conv_weight_len: usize,
+    a_raw_len: usize,
+    b_raw_len: usize,
+    a_log_len: usize,
+    dt_bias_len: usize,
+    query_len: usize,
+    key_len: usize,
+    value_len_actual: usize,
+    g_len: usize,
+    beta_len: usize,
+    tokens: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+) -> Result<()> {
+    if tokens == 0
+        || key_heads == 0
+        || value_heads == 0
+        || key_dim == 0
+        || value_dim == 0
+        || conv_kernel == 0
+    {
+        return Err(FerrumError::model(format!(
+            "linear_attention_prepare shape must be positive, got tokens={tokens} key_heads={key_heads} value_heads={value_heads} key_dim={key_dim} value_dim={value_dim} conv_kernel={conv_kernel}"
+        )));
+    }
+
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    for (label, actual, expected) in [
+        ("mixed_qkv_raw", mixed_qkv_raw_len, tokens * conv_channels),
+        ("conv_weight", conv_weight_len, conv_channels * conv_kernel),
+        ("a_raw", a_raw_len, tokens * value_heads),
+        ("b_raw", b_raw_len, tokens * value_heads),
+        ("a_log", a_log_len, value_heads),
+        ("dt_bias", dt_bias_len, value_heads),
+        ("query", query_len, tokens * qk_total),
+        ("key", key_len, tokens * qk_total),
+        ("value", value_len_actual, tokens * value_total),
+        ("g", g_len, tokens * value_heads),
+        ("beta", beta_len, tokens * value_heads),
+    ] {
+        if actual < expected {
+            return Err(FerrumError::model(format!(
+                "linear_attention_prepare {label} length {actual} < expected {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_gated_rms_norm_shape(
+    core_len: usize,
+    z_len: usize,
+    weight_len: usize,
+    out_len: usize,
+    tokens: usize,
+    heads: usize,
+    dim: usize,
+) -> Result<()> {
+    if tokens == 0 || heads == 0 || dim == 0 {
+        return Err(FerrumError::model(format!(
+            "gated_rms_norm shape must be positive, got tokens={tokens} heads={heads} dim={dim}"
+        )));
+    }
+    let expected = tokens * heads * dim;
+    for (label, actual, expected) in [
+        ("core", core_len, expected),
+        ("z", z_len, expected),
+        ("weight", weight_len, dim),
+        ("out", out_len, expected),
+    ] {
+        if actual < expected {
+            return Err(FerrumError::model(format!(
+                "gated_rms_norm {label} length {actual} < expected {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub struct CpuBackend;
 
 #[cfg(target_os = "macos")]
@@ -455,6 +566,140 @@ impl Backend for CpuBackend {
                     }
                     out[value_idx] = acc;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_f32(
+        _ctx: &mut Self::Context,
+        mixed_qkv_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        a_raw: &Self::Buffer,
+        b_raw: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        validate_linear_attention_prepare_shape(
+            mixed_qkv_raw.len(),
+            conv_weight.len(),
+            a_raw.len(),
+            b_raw.len(),
+            a_log.len(),
+            dt_bias.len(),
+            query.len(),
+            key.len(),
+            value.len(),
+            g.len(),
+            beta.len(),
+            tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+        )?;
+
+        let qk_total = key_heads * key_dim;
+        let value_total = value_heads * value_dim;
+        let conv_channels = 2 * qk_total + value_total;
+        let pad = conv_kernel - 1;
+        for token in 0..tokens {
+            for channel in 0..conv_channels {
+                let mut acc = 0.0;
+                for kernel_idx in 0..conv_kernel {
+                    let padded = token + kernel_idx;
+                    if padded >= pad {
+                        let src_token = padded - pad;
+                        if src_token < tokens {
+                            acc += mixed_qkv_raw[src_token * conv_channels + channel]
+                                * conv_weight[channel * conv_kernel + kernel_idx];
+                        }
+                    }
+                }
+                let conv = silu(acc);
+                if channel < qk_total {
+                    query[token * qk_total + channel] = conv;
+                } else if channel < 2 * qk_total {
+                    key[token * qk_total + (channel - qk_total)] = conv;
+                } else {
+                    value[token * value_total + (channel - 2 * qk_total)] = conv;
+                }
+            }
+
+            for value_head in 0..value_heads {
+                let gate_idx = token * value_heads + value_head;
+                g[gate_idx] =
+                    -a_log[value_head].exp() * softplus(a_raw[gate_idx] + dt_bias[value_head]);
+                beta[gate_idx] = sigmoid(b_raw[gate_idx]);
+            }
+        }
+
+        if apply_qk_l2norm {
+            for row in 0..tokens * key_heads {
+                let base = row * key_dim;
+                let mut q_sum = 0.0;
+                let mut k_sum = 0.0;
+                for d in 0..key_dim {
+                    q_sum += query[base + d] * query[base + d];
+                    k_sum += key[base + d] * key[base + d];
+                }
+                let q_inv = (q_sum + 1e-6).sqrt().recip();
+                let k_inv = (k_sum + 1e-6).sqrt().recip();
+                for d in 0..key_dim {
+                    query[base + d] *= q_inv;
+                    key[base + d] *= k_inv;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gated_rms_norm_f32(
+        _ctx: &mut Self::Context,
+        core: &Self::Buffer,
+        z: &Self::Buffer,
+        weight: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        validate_gated_rms_norm_shape(
+            core.len(),
+            z.len(),
+            weight.len(),
+            out.len(),
+            tokens,
+            heads,
+            dim,
+        )?;
+
+        for row in 0..tokens * heads {
+            let base = row * dim;
+            let mut sum_sq = 0.0;
+            for d in 0..dim {
+                let x = core[base + d];
+                sum_sq += x * x;
+            }
+            let inv = (sum_sq / dim as f32 + eps).sqrt().recip();
+            for d in 0..dim {
+                out[base + d] = core[base + d] * inv * weight[d] * silu(z[base + d]);
             }
         }
         Ok(())
