@@ -231,6 +231,21 @@ pub struct Qwen35BackendDenseFullAttentionLayerOutput<B: Backend> {
     pub layer_output: B::Buffer,
 }
 
+pub struct Qwen35BackendDenseLinearAttentionLayerOutput<B: Backend> {
+    pub input_norm: B::Buffer,
+    pub mixed_qkv_raw: B::Buffer,
+    pub z_raw: B::Buffer,
+    pub b_raw: B::Buffer,
+    pub a_raw: B::Buffer,
+    pub attention: Qwen35BackendLinearAttentionPrefillOutput<B>,
+    pub final_conv_state: B::Buffer,
+    pub delta_output: B::Buffer,
+    pub residual_after_mixer: B::Buffer,
+    pub post_attention_norm: B::Buffer,
+    pub mlp: Qwen35BackendDenseMlpOutput<B>,
+    pub layer_output: B::Buffer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Qwen35DenseLinearAttentionLayerShape {
     pub tokens: usize,
@@ -1256,6 +1271,145 @@ pub fn qwen35_sparse_moe_linear_attention_layer_cpu(
         residual_after_mixer,
         post_attention_norm,
         moe,
+        layer_output,
+    })
+}
+
+pub fn qwen35_dense_linear_attention_layer_backend<B: Backend>(
+    ctx: &mut B::Context,
+    layer_input: &B::Buffer,
+    initial_state: &B::Buffer,
+    layer: &Qwen35LayerWeights<B>,
+    shape: Qwen35DenseLinearAttentionLayerShape,
+    eps: f32,
+) -> Result<Qwen35BackendDenseLinearAttentionLayerOutput<B>> {
+    shape.validate()?;
+    let attention_shape = shape.attention;
+    let hidden_len = shape.tokens * shape.hidden_size;
+    let value_total = attention_shape.value_total();
+    let attention = match &layer.attention {
+        Qwen35AttentionWeights::Linear(attention) => attention,
+        Qwen35AttentionWeights::Full(_) => {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 backend dense linear layer expected linear attention at layer {}",
+                layer.layer_index
+            )));
+        }
+    };
+    let mlp = match &layer.mlp {
+        Qwen35MlpWeights::Dense(mlp) => mlp,
+        Qwen35MlpWeights::SparseMoeSharedExpert(_) => {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 backend dense linear layer expected dense MLP at layer {}",
+                layer.layer_index
+            )));
+        }
+    };
+
+    let mut input_norm = B::alloc(hidden_len);
+    B::rms_norm(
+        ctx,
+        layer_input,
+        &layer.input_layernorm,
+        eps,
+        &mut input_norm,
+        shape.tokens,
+        shape.hidden_size,
+    );
+    let mut mixed_qkv_raw = B::alloc(attention_shape.mixed_qkv_len());
+    let mut z_raw = B::alloc(attention_shape.value_len());
+    let mut b_raw = B::alloc(attention_shape.gating_len());
+    let mut a_raw = B::alloc(attention_shape.gating_len());
+    attention
+        .qkv_proj
+        .forward(ctx, &input_norm, &mut mixed_qkv_raw, shape.tokens);
+    attention
+        .z_proj
+        .forward(ctx, &input_norm, &mut z_raw, shape.tokens);
+    attention
+        .b_proj
+        .forward(ctx, &input_norm, &mut b_raw, shape.tokens);
+    attention
+        .a_proj
+        .forward(ctx, &input_norm, &mut a_raw, shape.tokens);
+
+    let final_conv_state =
+        qwen35_final_conv_state_backend::<B>(ctx, &mixed_qkv_raw, attention_shape)?;
+    let attention_out = qwen35_linear_attention_prefill_core_backend::<B>(
+        ctx,
+        &mixed_qkv_raw,
+        &z_raw,
+        &a_raw,
+        &b_raw,
+        &attention.conv1d_weight,
+        &attention.a_log,
+        &attention.dt_bias,
+        &attention.norm_weight,
+        initial_state,
+        attention_shape,
+        eps,
+    )?;
+    let mut delta_output = B::alloc(hidden_len);
+    attention.out_proj.forward(
+        ctx,
+        &attention_out.delta_norm,
+        &mut delta_output,
+        shape.tokens,
+    );
+
+    let mut residual_after_mixer = B::alloc(hidden_len);
+    B::copy_slice(
+        ctx,
+        layer_input,
+        0,
+        &mut residual_after_mixer,
+        0,
+        hidden_len,
+    );
+    B::add_inplace(ctx, &mut residual_after_mixer, &delta_output, hidden_len);
+
+    let mut post_attention_norm = B::alloc(hidden_len);
+    B::rms_norm(
+        ctx,
+        &residual_after_mixer,
+        &layer.post_attention_layernorm,
+        eps,
+        &mut post_attention_norm,
+        shape.tokens,
+        shape.hidden_size,
+    );
+    let mlp_out = qwen35_dense_mlp_backend::<B>(
+        ctx,
+        &post_attention_norm,
+        &*mlp.gate_up_proj,
+        &*mlp.down_proj,
+        shape.tokens,
+        shape.hidden_size,
+        shape.intermediate_size,
+    )?;
+    let mut layer_output = B::alloc(hidden_len);
+    B::copy_slice(
+        ctx,
+        &residual_after_mixer,
+        0,
+        &mut layer_output,
+        0,
+        hidden_len,
+    );
+    B::add_inplace(ctx, &mut layer_output, &mlp_out.output, hidden_len);
+
+    Ok(Qwen35BackendDenseLinearAttentionLayerOutput {
+        input_norm,
+        mixed_qkv_raw,
+        z_raw,
+        b_raw,
+        a_raw,
+        attention: attention_out,
+        final_conv_state,
+        delta_output,
+        residual_after_mixer,
+        post_attention_norm,
+        mlp: mlp_out,
         layer_output,
     })
 }
@@ -2304,6 +2458,35 @@ pub fn qwen35_final_conv_state_cpu(
                 mixed_qkv_raw[source_token * channels + channel];
         }
     }
+    Ok(state)
+}
+
+pub fn qwen35_final_conv_state_backend<B: Backend>(
+    ctx: &mut B::Context,
+    mixed_qkv_raw: &B::Buffer,
+    shape: Qwen35LinearAttentionShape,
+) -> Result<B::Buffer> {
+    shape.validate()?;
+    let channels = shape.conv_channels();
+    let state_tokens = shape.conv_kernel.saturating_sub(1);
+    let state_len = channels * state_tokens;
+    let mut state = B::from_slice(&vec![0.0; state_len]);
+    if state_tokens == 0 {
+        return Ok(state);
+    }
+
+    let copied_tokens = state_tokens.min(shape.tokens);
+    let source_token_start = shape.tokens - copied_tokens;
+    let state_token_start = state_tokens - copied_tokens;
+    for channel in 0..channels {
+        for state_token in 0..copied_tokens {
+            let source_token = source_token_start + state_token;
+            let src_offset = source_token * channels + channel;
+            let dst_offset = channel * state_tokens + state_token_start + state_token;
+            B::copy_slice(ctx, mixed_qkv_raw, src_offset, &mut state, dst_offset, 1);
+        }
+    }
+
     Ok(state)
 }
 
@@ -4918,6 +5101,161 @@ mod tests {
         assert_close_slice(&reference.post_attention_norm, &post_attention_norm, 1e-6);
         assert_close_slice(&reference.mlp_output, &mlp_output, 1e-6);
         assert_close_slice(&reference.layer_output, &layer_output, 1e-6);
+
+        let input_norm_folded = input_norm_weight
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let post_norm_folded = post_attention_norm_weight
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let mut gate_up_weight = gate_proj_weight.clone();
+        gate_up_weight.extend_from_slice(&up_proj_weight);
+        let layer = Qwen35LayerWeights {
+            layer_index: 0,
+            input_layernorm: CpuBackend::from_slice(&input_norm_folded),
+            post_attention_layernorm: CpuBackend::from_slice(&post_norm_folded),
+            attention: Qwen35AttentionWeights::Linear(Qwen35LinearAttentionWeights {
+                qkv_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &qkv_weight,
+                    attention_shape.conv_channels(),
+                    shape.hidden_size,
+                )),
+                z_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &z_weight,
+                    attention_shape.value_total(),
+                    shape.hidden_size,
+                )),
+                b_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &b_weight,
+                    attention_shape.value_heads,
+                    shape.hidden_size,
+                )),
+                a_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &a_weight,
+                    attention_shape.value_heads,
+                    shape.hidden_size,
+                )),
+                conv1d_weight: CpuBackend::from_slice(&conv1d_weight),
+                a_log: CpuBackend::from_slice(&a_log),
+                dt_bias: CpuBackend::from_slice(&dt_bias),
+                norm_weight: CpuBackend::from_slice(&norm_weight),
+                out_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &out_proj_weight,
+                    shape.hidden_size,
+                    attention_shape.value_total(),
+                )),
+            }),
+            mlp: Qwen35MlpWeights::Dense(Qwen35DenseMlpWeights {
+                gate_up_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &gate_up_weight,
+                    2 * shape.intermediate_size,
+                    shape.hidden_size,
+                )),
+                down_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &down_proj_weight,
+                    shape.hidden_size,
+                    shape.intermediate_size,
+                )),
+            }),
+        };
+        let mut ctx = CpuBackend::new_context();
+        let backend = qwen35_dense_linear_attention_layer_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice(&layer_input),
+            &CpuBackend::from_slice(&initial_state),
+            &layer,
+            shape,
+            1e-6,
+        )
+        .unwrap();
+
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.input_norm, input_norm.len()),
+            &input_norm,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.mixed_qkv_raw, mixed_qkv_raw.len()),
+            &mixed_qkv_raw,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.z_raw, z_raw.len()),
+            &z_raw,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.b_raw, b_raw.len()),
+            &b_raw,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.a_raw, a_raw.len()),
+            &a_raw,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attention.value, attention.value.len()),
+            &attention.value,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attention.g, attention.g.len()),
+            &attention.g,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attention.beta, attention.beta.len()),
+            &attention.beta,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attention.delta_core, attention.delta_core.len()),
+            &attention.delta_core,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attention.delta_norm, attention.delta_norm.len()),
+            &attention.delta_norm,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attention.final_state, attention.final_state.len()),
+            &attention.final_state,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.final_conv_state, attention.final_conv_state.len()),
+            &attention.final_conv_state,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.delta_output, delta_output.len()),
+            &delta_output,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.residual_after_mixer, residual_after_mixer.len()),
+            &residual_after_mixer,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.post_attention_norm, post_attention_norm.len()),
+            &post_attention_norm,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.mlp.output, mlp_output.len()),
+            &mlp_output,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.layer_output, layer_output.len()),
+            &layer_output,
+            1e-5,
+        );
     }
 
     #[test]
