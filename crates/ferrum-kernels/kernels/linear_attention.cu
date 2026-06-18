@@ -80,6 +80,69 @@ extern "C" __global__ void linear_attention_prepare_f32(
   }
 }
 
+extern "C" __global__ void linear_attention_decode_prepare_f32(
+    const float* __restrict__ mixed_qkv_raw,
+    const float* __restrict__ conv_weight,
+    const float* __restrict__ conv_state,
+    const float* __restrict__ a_raw,
+    const float* __restrict__ b_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    float* __restrict__ next_conv_state,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  const int qk_total = key_heads * key_dim;
+  const int value_total = value_heads * value_dim;
+  const int conv_channels = 2 * qk_total + value_total;
+  const int state_len = conv_kernel - 1;
+  const int total = max(conv_channels, value_heads);
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+
+  if (idx < conv_channels) {
+    const int channel = idx;
+    const int state_base = channel * state_len;
+    float acc = 0.0f;
+    for (int kernel_idx = 0; kernel_idx < conv_kernel; ++kernel_idx) {
+      const float x = kernel_idx < state_len
+                          ? conv_state[state_base + kernel_idx]
+                          : mixed_qkv_raw[channel];
+      acc += x * conv_weight[channel * conv_kernel + kernel_idx];
+    }
+
+    if (state_len > 0) {
+      for (int pos = 0; pos < state_len; ++pos) {
+        next_conv_state[state_base + pos] =
+            (pos + 1 < state_len) ? conv_state[state_base + pos + 1]
+                                  : mixed_qkv_raw[channel];
+      }
+    }
+
+    const float conv = ferrum_silu(acc);
+    if (channel < qk_total) {
+      query[channel] = conv;
+    } else if (channel < 2 * qk_total) {
+      key[channel - qk_total] = conv;
+    } else {
+      value[channel - 2 * qk_total] = conv;
+    }
+  }
+
+  if (idx < value_heads) {
+    const float a = a_raw[idx] + dt_bias[idx];
+    g[idx] = -expf(a_log[idx]) * ferrum_softplus(a);
+    beta[idx] = ferrum_sigmoid(b_raw[idx]);
+  }
+}
+
 extern "C" __global__ void linear_attention_qk_l2norm_f32(
     float* __restrict__ query,
     float* __restrict__ key,

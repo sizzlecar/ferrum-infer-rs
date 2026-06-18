@@ -9,6 +9,7 @@ use crate::ptx;
 
 const MODULE_NAME: &str = "linear_attention";
 const PREPARE_FUNC: &str = "linear_attention_prepare_f32";
+const DECODE_PREPARE_FUNC: &str = "linear_attention_decode_prepare_f32";
 const QK_L2NORM_FUNC: &str = "linear_attention_qk_l2norm_f32";
 const GATED_RMS_NORM_FUNC: &str = "gated_rms_norm_f32";
 
@@ -127,6 +128,121 @@ pub fn linear_attention_prepare_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn linear_attention_decode_prepare_f32(
+    ctx: &mut CudaState,
+    mixed_qkv_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    conv_state: &CudaBuf,
+    a_raw: &CudaBuf,
+    b_raw: &CudaBuf,
+    a_log: &CudaBuf,
+    dt_bias: &CudaBuf,
+    query: &mut CudaBuf,
+    key: &mut CudaBuf,
+    value: &mut CudaBuf,
+    g: &mut CudaBuf,
+    beta: &mut CudaBuf,
+    next_conv_state: &mut CudaBuf,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+    apply_qk_l2norm: bool,
+) -> Result<()> {
+    validate_decode_prepare_shape(
+        mixed_qkv_raw,
+        conv_weight,
+        conv_state,
+        a_raw,
+        b_raw,
+        a_log,
+        dt_bias,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        next_conv_state,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+    )?;
+
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let total = conv_channels.max(value_heads);
+    let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, DECODE_PREPARE_FUNC);
+    let stream = ctx.stream.clone();
+    let key_heads_i32 = key_heads as i32;
+    let value_heads_i32 = value_heads as i32;
+    let key_dim_i32 = key_dim as i32;
+    let value_dim_i32 = value_dim as i32;
+    let conv_kernel_i32 = conv_kernel as i32;
+    let mut builder = stream.launch_builder(&func);
+    builder.arg(mixed_qkv_raw.as_f32());
+    builder.arg(conv_weight.as_f32());
+    builder.arg(conv_state.as_f32());
+    builder.arg(a_raw.as_f32());
+    builder.arg(b_raw.as_f32());
+    builder.arg(a_log.as_f32());
+    builder.arg(dt_bias.as_f32());
+    builder.arg(query.as_f32_mut());
+    builder.arg(key.as_f32_mut());
+    builder.arg(value.as_f32_mut());
+    builder.arg(g.as_f32_mut());
+    builder.arg(beta.as_f32_mut());
+    builder.arg(next_conv_state.as_f32_mut());
+    builder.arg(&key_heads_i32);
+    builder.arg(&value_heads_i32);
+    builder.arg(&key_dim_i32);
+    builder.arg(&value_dim_i32);
+    builder.arg(&conv_kernel_i32);
+    unsafe {
+        builder
+            .launch(LaunchConfig {
+                grid_dim: (total.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .map_err(|err| {
+                FerrumError::backend(format!("linear_attention_decode_prepare launch: {err}"))
+            })?;
+    }
+
+    if apply_qk_l2norm {
+        let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, QK_L2NORM_FUNC);
+        let block = key_dim.next_power_of_two().min(256).max(1) as u32;
+        let stream = ctx.stream.clone();
+        let tokens_i32 = 1i32;
+        let eps = 1e-6f32;
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(query.as_f32_mut());
+        builder.arg(key.as_f32_mut());
+        builder.arg(&tokens_i32);
+        builder.arg(&key_heads_i32);
+        builder.arg(&key_dim_i32);
+        builder.arg(&eps);
+        unsafe {
+            builder
+                .launch(LaunchConfig {
+                    grid_dim: (key_heads as u32, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|err| {
+                    FerrumError::backend(format!("linear_attention_qk_l2norm launch: {err}"))
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn gated_rms_norm_f32(
     ctx: &mut CudaState,
     core: &CudaBuf,
@@ -219,6 +335,68 @@ fn validate_prepare_shape(
         if actual < expected {
             return Err(FerrumError::model(format!(
                 "linear_attention_prepare {label} length {actual} < expected {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_decode_prepare_shape(
+    mixed_qkv_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    conv_state: &CudaBuf,
+    a_raw: &CudaBuf,
+    b_raw: &CudaBuf,
+    a_log: &CudaBuf,
+    dt_bias: &CudaBuf,
+    query: &CudaBuf,
+    key: &CudaBuf,
+    value: &CudaBuf,
+    g: &CudaBuf,
+    beta: &CudaBuf,
+    next_conv_state: &CudaBuf,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+) -> Result<()> {
+    if key_heads == 0 || value_heads == 0 || key_dim == 0 || value_dim == 0 || conv_kernel == 0 {
+        return Err(FerrumError::model(format!(
+            "linear_attention_decode_prepare shape must be positive, got key_heads={key_heads} value_heads={value_heads} key_dim={key_dim} value_dim={value_dim} conv_kernel={conv_kernel}"
+        )));
+    }
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let conv_state_elements = conv_channels * conv_kernel.saturating_sub(1);
+    for (label, actual, expected) in [
+        ("mixed_qkv_raw", mixed_qkv_raw.len(), conv_channels),
+        (
+            "conv_weight",
+            conv_weight.len(),
+            conv_channels * conv_kernel,
+        ),
+        ("conv_state", conv_state.len(), conv_state_elements),
+        ("a_raw", a_raw.len(), value_heads),
+        ("b_raw", b_raw.len(), value_heads),
+        ("a_log", a_log.len(), value_heads),
+        ("dt_bias", dt_bias.len(), value_heads),
+        ("query", query.len(), qk_total),
+        ("key", key.len(), qk_total),
+        ("value", value.len(), value_total),
+        ("g", g.len(), value_heads),
+        ("beta", beta.len(), value_heads),
+        (
+            "next_conv_state",
+            next_conv_state.len(),
+            conv_state_elements,
+        ),
+    ] {
+        if actual < expected {
+            return Err(FerrumError::model(format!(
+                "linear_attention_decode_prepare {label} length {actual} < expected {expected}"
             )));
         }
     }

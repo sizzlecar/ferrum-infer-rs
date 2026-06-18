@@ -309,6 +309,41 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Decode-time gated-Delta linear-attention preparation for one token.
+    ///
+    /// This is the stateful counterpart of [`Self::linear_attention_prepare_f32`]:
+    /// it reads `[conv_channels, conv_kernel - 1]` causal-conv state, appends the
+    /// current raw QKV token, writes the next conv state, then emits Q/K/V and
+    /// GDN gates for the current token. The layout mirrors vLLM's Qwen GDN
+    /// `conv_state` + temporal-state split.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _conv_state: &Self::Buffer,
+        _a_raw: &Self::Buffer,
+        _b_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _next_conv_state: &mut Self::Buffer,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_decode_prepare_f32 not implemented for this backend",
+        ))
+    }
+
     /// Gated RMSNorm used after recurrent DeltaNet core:
     /// `out = rms_norm(core) * weight * silu(z)`.
     #[allow(clippy::too_many_arguments)]

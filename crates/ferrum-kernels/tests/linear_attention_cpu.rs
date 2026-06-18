@@ -125,6 +125,95 @@ fn linear_attention_prepare_cpu_splits_gates_and_l2_normalizes_qk() {
 }
 
 #[test]
+fn linear_attention_decode_prepare_cpu_updates_conv_state_and_splits_current_token() {
+    let key_heads = 1;
+    let value_heads = 2;
+    let key_dim = 2;
+    let value_dim = 1;
+    let conv_kernel = 3;
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let state_len = conv_kernel - 1;
+
+    let mixed_qkv_raw = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+    let conv_state = vec![
+        1.0, 2.0, //
+        3.0, 4.0, //
+        5.0, 6.0, //
+        7.0, 8.0, //
+        9.0, 10.0, //
+        11.0, 12.0,
+    ];
+    let mut conv_weight = Vec::new();
+    for channel in 0..conv_channels {
+        conv_weight.extend([
+            0.1 + channel as f32 * 0.01,
+            0.2 + channel as f32 * 0.01,
+            0.3 + channel as f32 * 0.01,
+        ]);
+    }
+    let a_raw = vec![0.25, -0.5];
+    let b_raw = vec![-1.0, 1.5];
+    let a_log = vec![2.0f32.ln(), 0.5f32.ln()];
+    let dt_bias = vec![0.1, -0.2];
+
+    let mut ctx = CpuBackend::new_context();
+    let mut query = vec![0.0; qk_total];
+    let mut key = vec![0.0; qk_total];
+    let mut value = vec![0.0; value_total];
+    let mut g = vec![0.0; value_heads];
+    let mut beta = vec![0.0; value_heads];
+    let mut next_conv_state = vec![0.0; conv_channels * state_len];
+
+    CpuBackend::linear_attention_decode_prepare_f32(
+        &mut ctx,
+        &mixed_qkv_raw,
+        &conv_weight,
+        &conv_state,
+        &a_raw,
+        &b_raw,
+        &a_log,
+        &dt_bias,
+        &mut query,
+        &mut key,
+        &mut value,
+        &mut g,
+        &mut beta,
+        &mut next_conv_state,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+        false,
+    )
+    .unwrap();
+
+    let mut conv = vec![0.0; conv_channels];
+    let mut expected_next_state = vec![0.0; conv_channels * state_len];
+    for channel in 0..conv_channels {
+        let state_base = channel * state_len;
+        let weight_base = channel * conv_kernel;
+        let acc = conv_state[state_base] * conv_weight[weight_base]
+            + conv_state[state_base + 1] * conv_weight[weight_base + 1]
+            + mixed_qkv_raw[channel] * conv_weight[weight_base + 2];
+        conv[channel] = silu(acc);
+        expected_next_state[state_base] = conv_state[state_base + 1];
+        expected_next_state[state_base + 1] = mixed_qkv_raw[channel];
+    }
+    let expected_g = vec![-2.0 * softplus(0.25 + 0.1), -0.5 * softplus(-0.5 - 0.2)];
+    let expected_beta = vec![sigmoid(-1.0), sigmoid(1.5)];
+
+    assert_close(&query, &conv[0..qk_total], 1e-6);
+    assert_close(&key, &conv[qk_total..2 * qk_total], 1e-6);
+    assert_close(&value, &conv[2 * qk_total..], 1e-6);
+    assert_close(&g, &expected_g, 1e-6);
+    assert_close(&beta, &expected_beta, 1e-6);
+    assert_close(&next_conv_state, &expected_next_state, 1e-6);
+}
+
+#[test]
 fn gated_rms_norm_cpu_matches_norm_before_gate() {
     let tokens = 2;
     let heads = 1;
