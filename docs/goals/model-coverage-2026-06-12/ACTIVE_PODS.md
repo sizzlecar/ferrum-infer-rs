@@ -6,7 +6,8 @@
 | ~~40700477~~ | 2x RTX 4090 | 0.589 | | broken host (raw cuInit=999) | DESTROYED 2026-06-12 ~20:30 |
 | ~~40703915~~ | 2x RTX 4090 | 0.336 | | host never booted (18min None) | DESTROYED |
 | ~~40704262~~ | 2x RTX 4090, 160GB | 0.802 | 2026-06-12 ~21:50 | 70B dual lane (~5h) | DESTROYED 2026-06-13 ~02:50 |
-| 41241013 | 1x RTX 4090, 300GB, Netherlands host 51606 | 0.471 running / 0.111 stopped disk | 2026-06-17 | Retained as the single reusable CUDA dev instance for W2 same-hardware follow-up. It previously ran same-pod vLLM/Ferrum c16 baseline, tail-profile diagnostic, and post-scheduler active-decode mixed-prefill validation. Latest artifact `artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/`: run/serve correctness passed, c16 completed 100x3 zero-error, Ferrum LCB/vLLM LCB `0.9627`, Ferrum p95/vLLM p95 `0.8844`; still no release-grade PASS because only c16 was covered. | RETAINED STOPPED 2026-06-17; API verified `cur_state=stopped`, `actual_status=exited`, `gpuCostPerHour=0`; keep-one cleanup artifact `artifacts/vast_cleanup_keep_one_20260617T055651Z/` |
+| ~~41241013~~ | 1x RTX 4090, 300GB, Netherlands host 51606 | 0.471 running / 0.111 stopped disk | 2026-06-17 | Retained as the single reusable CUDA dev instance for W2 same-hardware follow-up. It previously ran same-pod vLLM/Ferrum c16 baseline, tail-profile diagnostic, and post-scheduler active-decode mixed-prefill validation. Latest artifact `artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/`: run/serve correctness passed, c16 completed 100x3 zero-error, Ferrum LCB/vLLM LCB `0.9627`, Ferrum p95/vLLM p95 `0.8844`; still no release-grade PASS because only c16 was covered. | NO LONGER LISTED by Vast API on 2026-06-18; active instance inventory zero-verified |
+| ~~41287720~~ | 1x RTX 4090, W3 Delta S0 CUDA microbench instance | 0.4556 | 2026-06-17 | W3 S0 native CUDA/PTX delta-rule microbench. Artifact `artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/`: `W3 DELTA RULE S0 MICROBENCH PASS`, `ptx_arch=sm_89`, CUDA max_abs error about `3.0e-9`; this is S0 kernel correctness evidence, not W3 whole-model product execution. | STOPPED/EXITED after artifact copy; DESTROYED 2026-06-18, DELETE returned `success=true`, follow-up API list did not include the instance |
 
 Destroy: `curl -X DELETE "https://console.vast.ai/api/v0/instances/{id}/?api_key=$VAST_API_KEY"`
 Goal completion cleanup: destroy any retained instance, or record explicit
@@ -22,6 +23,13 @@ polls showed only `41241013` remains, with `cur_state=stopped`,
 **2026-06-17 — W2 41241013 stopped after post-scheduler c16 diagnostic. API verified `cur_state=stopped`,`actual_status=exited`; artifact copied locally before stop.**
 
 **2026-06-17 — W2 41241013 stopped again after two-chunk c16 diagnostic. API verified `cur_state=stopped`,`actual_status=exited`; artifact `w2_active_decode_prefill_budget2_c16_cuda_2026-06-17` copied locally before stop.**
+
+**2026-06-18 — Vast inventory zero-verified.** User asked why a GPU machine
+was still visible. API check showed only `41287720`, already
+`cur_state=stopped`/`actual_status=exited`; artifacts had been copied locally.
+The stopped instance was destroyed by `DELETE /api/v0/instances/41287720/`,
+which returned `success=true`. A follow-up `GET /api/v0/instances/` returned
+`INSTANCE_COUNT 0`.
 
 **2026-06-13 04:40 — API verified: 0 instances remaining.** Session GPU spend ~= $7.
 
