@@ -292,7 +292,13 @@ impl ConfigManager {
         let rope_theta = obj
             .get("rope_theta")
             .and_then(|v| v.as_f64())
-            .or_else(|| obj.get("rotary_emb_base").and_then(|v| v.as_f64()));
+            .or_else(|| obj.get("rotary_emb_base").and_then(|v| v.as_f64()))
+            .or_else(|| {
+                obj.get("rope_parameters")
+                    .and_then(|v| v.as_object())
+                    .and_then(|rope| rope.get("rope_theta"))
+                    .and_then(|v| v.as_f64())
+            });
 
         // Parse RoPE scaling
         let rope_scaling = obj
@@ -425,6 +431,7 @@ mod tests {
         assert_eq!(def.num_attention_heads, 8);
         assert_eq!(def.num_key_value_heads, Some(2));
         assert_eq!(def.max_position_embeddings, 262144);
+        assert_eq!(def.rope_theta, Some(10_000_000.0));
         assert_eq!(def.norm_type, NormType::RMSNorm);
         assert_eq!(def.activation, Activation::SiLU);
 
@@ -479,6 +486,7 @@ mod tests {
         assert_eq!(def.num_hidden_layers, 40);
         assert_eq!(def.num_attention_heads, 16);
         assert_eq!(def.num_key_value_heads, Some(2));
+        assert_eq!(def.rope_theta, Some(10_000_000.0));
 
         let typed = def
             .extra_params
