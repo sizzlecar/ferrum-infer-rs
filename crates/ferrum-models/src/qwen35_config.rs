@@ -9,6 +9,7 @@ use ferrum_interfaces::{RecurrentStateSpec, RecurrentStateTensorSpec};
 use ferrum_types::{DataType, Device, RequestId};
 use serde_json::Value;
 
+pub const QWEN35_CONV_STATE_NAME: &str = "conv_state";
 pub const QWEN35_DELTA_STATE_NAME: &str = "delta_state";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -339,6 +340,18 @@ impl Qwen35TextConfig {
         self.linear_attention.num_value_heads * self.linear_attention.value_head_dim
     }
 
+    /// Per-layer causal-convolution recurrent state shape, excluding the request slot.
+    ///
+    /// vLLM stores Qwen GDN convolution state before the temporal DeltaNet state.
+    /// The dim-first layout is `[conv_channels, conv_kernel - 1]`, where
+    /// `conv_channels = q_total + k_total + v_total`.
+    pub fn recurrent_conv_state_shape(&self) -> Result<Vec<usize>, String> {
+        Ok(vec![
+            self.linear_qk_total_dim() * 2 + self.linear_value_total_dim(),
+            self.linear_attention.conv_kernel_dim.saturating_sub(1),
+        ])
+    }
+
     /// Per-layer DeltaNet recurrent state shape, excluding the request slot.
     ///
     /// vLLM stores Gated DeltaNet temporal state as
@@ -360,21 +373,25 @@ impl Qwen35TextConfig {
     }
 
     pub fn recurrent_state_tensor_specs(&self) -> Result<Vec<RecurrentStateTensorSpec>, String> {
-        let shape = self.recurrent_delta_state_shape()?;
-        Ok(self
-            .layer_types
-            .iter()
-            .enumerate()
-            .filter_map(|(layer_index, kind)| {
-                (*kind == Qwen35LayerType::LinearAttention).then(|| {
-                    RecurrentStateTensorSpec::new(
-                        layer_index,
-                        QWEN35_DELTA_STATE_NAME,
-                        shape.clone(),
-                    )
-                })
-            })
-            .collect())
+        let conv_shape = self.recurrent_conv_state_shape()?;
+        let delta_shape = self.recurrent_delta_state_shape()?;
+        let mut specs = Vec::with_capacity(self.linear_attention_layers() * 2);
+        for (layer_index, kind) in self.layer_types.iter().copied().enumerate() {
+            if kind != Qwen35LayerType::LinearAttention {
+                continue;
+            }
+            specs.push(RecurrentStateTensorSpec::new(
+                layer_index,
+                QWEN35_CONV_STATE_NAME,
+                conv_shape.clone(),
+            ));
+            specs.push(RecurrentStateTensorSpec::new(
+                layer_index,
+                QWEN35_DELTA_STATE_NAME,
+                delta_shape.clone(),
+            ));
+        }
+        Ok(specs)
     }
 
     pub fn recurrent_state_elements_per_slot(&self) -> Result<usize, String> {

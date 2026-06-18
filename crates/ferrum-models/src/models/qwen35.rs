@@ -161,6 +161,7 @@ pub struct Qwen35LinearAttentionShape {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen35LinearAttentionReference {
     pub mixed_qkv_conv: Vec<f32>,
+    pub final_conv_state: Vec<f32>,
     pub query: Vec<f32>,
     pub key: Vec<f32>,
     pub value: Vec<f32>,
@@ -435,6 +436,7 @@ pub struct Qwen35DenseReferenceModelOutput {
     pub final_hidden: Vec<f32>,
     pub logits: Vec<f32>,
     pub layer_hidden_states: Vec<Vec<f32>>,
+    pub linear_conv_states: Vec<Vec<f32>>,
     pub linear_recurrent_states: Vec<Vec<f32>>,
 }
 
@@ -444,6 +446,7 @@ pub struct Qwen35SparseMoeReferenceModelOutput {
     pub final_hidden: Vec<f32>,
     pub logits: Vec<f32>,
     pub layer_hidden_states: Vec<Vec<f32>>,
+    pub linear_conv_states: Vec<Vec<f32>>,
     pub linear_recurrent_states: Vec<Vec<f32>>,
     pub sparse_moe_outputs: Vec<Qwen35SparseMoeReference>,
 }
@@ -555,6 +558,7 @@ pub fn qwen35_dense_reference_model_forward_cpu(
         model.hidden_size,
     )?;
     let mut layer_hidden_states = Vec::with_capacity(model.layers.len());
+    let mut linear_conv_states = Vec::new();
     let mut linear_recurrent_states = Vec::new();
 
     for layer in model.layers {
@@ -588,6 +592,7 @@ pub fn qwen35_dense_reference_model_forward_cpu(
                     layer.shape,
                     model.eps,
                 )?;
+                linear_conv_states.push(out.attention.final_conv_state.clone());
                 linear_recurrent_states.push(out.attention.final_state);
                 hidden = out.layer_output;
             }
@@ -640,6 +645,7 @@ pub fn qwen35_dense_reference_model_forward_cpu(
         final_hidden,
         logits,
         layer_hidden_states,
+        linear_conv_states,
         linear_recurrent_states,
     })
 }
@@ -662,6 +668,7 @@ pub fn qwen35_sparse_moe_reference_model_forward_cpu(
         model.hidden_size,
     )?;
     let mut layer_hidden_states = Vec::with_capacity(model.layers.len());
+    let mut linear_conv_states = Vec::new();
     let mut linear_recurrent_states = Vec::new();
     let mut sparse_moe_outputs = Vec::with_capacity(model.layers.len());
 
@@ -700,6 +707,7 @@ pub fn qwen35_sparse_moe_reference_model_forward_cpu(
                     layer.shape,
                     model.eps,
                 )?;
+                linear_conv_states.push(out.attention.final_conv_state.clone());
                 linear_recurrent_states.push(out.attention.final_state);
                 sparse_moe_outputs.push(out.moe);
                 hidden = out.layer_output;
@@ -758,6 +766,7 @@ pub fn qwen35_sparse_moe_reference_model_forward_cpu(
         final_hidden,
         logits,
         layer_hidden_states,
+        linear_conv_states,
         linear_recurrent_states,
         sparse_moe_outputs,
     })
@@ -1856,6 +1865,7 @@ pub fn qwen35_linear_attention_core_cpu(
     validate_len("norm_weight", norm_weight.len(), shape.value_dim)?;
     validate_len("initial_state", initial_state.len(), shape.state_len())?;
 
+    let final_conv_state = qwen35_final_conv_state_cpu(mixed_qkv_raw, shape)?;
     let mixed_qkv_conv = qwen35_depthwise_causal_conv_silu_cpu(
         mixed_qkv_raw,
         conv1d_weight,
@@ -1895,6 +1905,7 @@ pub fn qwen35_linear_attention_core_cpu(
 
     Ok(Qwen35LinearAttentionReference {
         mixed_qkv_conv,
+        final_conv_state,
         query,
         key,
         value,
@@ -1904,6 +1915,32 @@ pub fn qwen35_linear_attention_core_cpu(
         delta_norm,
         final_state,
     })
+}
+
+pub fn qwen35_final_conv_state_cpu(
+    mixed_qkv_raw: &[f32],
+    shape: Qwen35LinearAttentionShape,
+) -> Result<Vec<f32>> {
+    shape.validate()?;
+    validate_len("mixed_qkv_raw", mixed_qkv_raw.len(), shape.mixed_qkv_len())?;
+    let channels = shape.conv_channels();
+    let state_len = shape.conv_kernel.saturating_sub(1);
+    let mut state = vec![0.0; channels * state_len];
+    if state_len == 0 {
+        return Ok(state);
+    }
+
+    let copied_tokens = state_len.min(shape.tokens);
+    let source_token_start = shape.tokens - copied_tokens;
+    let state_token_start = state_len - copied_tokens;
+    for channel in 0..channels {
+        for state_token in 0..copied_tokens {
+            let source_token = source_token_start + state_token;
+            state[channel * state_len + state_token_start + state_token] =
+                mixed_qkv_raw[source_token * channels + channel];
+        }
+    }
+    Ok(state)
 }
 
 pub fn qwen35_depthwise_causal_conv_silu_cpu(
@@ -3662,22 +3699,29 @@ mod tests {
             .unwrap();
 
         let cache = Qwen35RecurrentStateCache::<CpuBackend>::from_spec(&spec).unwrap();
-        let first = cache
+        let first_conv = cache
+            .tensor(0, crate::qwen35_config::QWEN35_CONV_STATE_NAME)
+            .unwrap();
+        let first_delta = cache
             .tensor(0, crate::qwen35_config::QWEN35_DELTA_STATE_NAME)
             .unwrap();
-        let second_slot = first.slot_range(1, cache.max_batch_slots).unwrap();
+        let second_conv_slot = first_conv.slot_range(1, cache.max_batch_slots).unwrap();
+        let second_delta_slot = first_delta.slot_range(1, cache.max_batch_slots).unwrap();
 
         assert_eq!(cache.request_id, request_id);
         assert_eq!(cache.num_layers, 4);
         assert_eq!(cache.dtype, DataType::BF16);
         assert_eq!(cache.device, Device::CPU);
         assert_eq!(cache.max_batch_slots, 2);
-        assert_eq!(cache.tensors.len(), 3);
-        assert_eq!(first.shape, vec![2, 4, 4]);
-        assert_eq!(first.elements_per_slot, 32);
-        assert_eq!(second_slot, 32..64);
-        assert_eq!(cache.total_elements(), 3 * 2 * 32);
-        assert_eq!(cache.estimated_memory_bytes(), 3 * 2 * 32 * 2);
+        assert_eq!(cache.tensors.len(), 6);
+        assert_eq!(first_conv.shape, vec![24, 3]);
+        assert_eq!(first_conv.elements_per_slot, 72);
+        assert_eq!(first_delta.shape, vec![2, 4, 4]);
+        assert_eq!(first_delta.elements_per_slot, 32);
+        assert_eq!(second_conv_slot, 72..144);
+        assert_eq!(second_delta_slot, 32..64);
+        assert_eq!(cache.total_elements(), 3 * 2 * (72 + 32));
+        assert_eq!(cache.estimated_memory_bytes(), 3 * 2 * (72 + 32) * 2);
     }
 
     #[test]
@@ -3732,11 +3776,11 @@ mod tests {
         assert_eq!(typed.num_layers(), 4);
         assert_eq!(typed.device(), Device::CPU);
         assert_eq!(typed.cache_id(), handle.cache_id());
-        assert_eq!(stats.state_tensors, 3);
+        assert_eq!(stats.state_tensors, 6);
         assert_eq!(stats.batch_slots, 1);
-        assert_eq!(stats.memory_bytes, 3 * 32 * 2);
+        assert_eq!(stats.memory_bytes, 3 * (72 + 32) * 2);
         let cache = typed.cache();
-        assert_eq!(cache.tensors.len(), 3);
+        assert_eq!(cache.tensors.len(), 6);
         assert!(typed.is_valid());
     }
 
@@ -3745,7 +3789,7 @@ mod tests {
         let config = dense_config();
         let manager =
             Qwen35RecurrentStateManager::<CpuBackend>::new(Qwen35RecurrentStateManagerConfig {
-                total_memory_bytes: 3 * 32 * 2,
+                total_memory_bytes: 3 * (72 + 32) * 2,
                 total_batch_slots: 1,
             });
         let request_id = RequestId::new();
@@ -3763,10 +3807,10 @@ mod tests {
             .downcast_ref::<Qwen35RecurrentStateHandle<CpuBackend>>()
             .expect("manager should allocate a Qwen35 typed recurrent-state handle");
 
-        assert_eq!(typed.cache().tensors.len(), 3);
+        assert_eq!(typed.cache().tensors.len(), 6);
         assert_eq!(manager.stats().active_states, 1);
-        assert_eq!(manager.stats().active_state_tensors, 3);
-        assert_eq!(manager.stats().used_memory_bytes, 3 * 32 * 2);
+        assert_eq!(manager.stats().active_state_tensors, 6);
+        assert_eq!(manager.stats().used_memory_bytes, 3 * (72 + 32) * 2);
         assert!(!manager.can_allocate(&spec));
         assert!(!manager.can_allocate(&second_spec));
 
@@ -4918,6 +4962,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.layer_hidden_states.len(), 2);
+        assert_eq!(output.linear_conv_states.len(), 1);
         assert_eq!(output.linear_recurrent_states.len(), 1);
         assert_close_slice(
             &output.layer_hidden_states[0],
@@ -4927,6 +4972,11 @@ mod tests {
         assert_close_slice(&output.hidden, &full_ref.layer_output, 1e-6);
         assert_close_slice(&output.final_hidden, &expected_final, 1e-6);
         assert_close_slice(&output.logits, &expected_logits, 1e-6);
+        assert_close_slice(
+            &output.linear_conv_states[0],
+            &linear_ref.attention.final_conv_state,
+            1e-6,
+        );
         assert_close_slice(
             &output.linear_recurrent_states[0],
             &linear_ref.attention.final_state,
@@ -5121,6 +5171,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.layer_hidden_states.len(), 2);
+        assert_eq!(output.linear_conv_states.len(), 1);
         assert_eq!(output.linear_recurrent_states.len(), 1);
         assert_eq!(output.sparse_moe_outputs.len(), 2);
         assert_close_slice(
@@ -5131,6 +5182,11 @@ mod tests {
         assert_close_slice(&output.hidden, &full_ref.layer_output, 1e-6);
         assert_close_slice(&output.final_hidden, &expected_final, 1e-6);
         assert_close_slice(&output.logits, &expected_logits, 1e-6);
+        assert_close_slice(
+            &output.linear_conv_states[0],
+            &linear_ref.attention.final_conv_state,
+            1e-6,
+        );
         assert_close_slice(
             &output.linear_recurrent_states[0],
             &linear_ref.attention.final_state,
@@ -5276,7 +5332,38 @@ mod tests {
         assert_close_slice(&reference.beta, &beta, 1e-6);
         assert_close_slice(&reference.delta_core, &delta_core, 1e-6);
         assert_close_slice(&reference.delta_norm, &delta_norm, 1e-6);
+        assert!(reference.final_conv_state.is_empty());
         assert_close_slice(&reference.final_state, &final_state, 1e-6);
+    }
+
+    #[test]
+    fn final_conv_state_uses_dim_first_left_padded_layout() {
+        let shape = Qwen35LinearAttentionShape {
+            tokens: 2,
+            key_heads: 1,
+            value_heads: 1,
+            key_dim: 2,
+            value_dim: 2,
+            conv_kernel: 4,
+        };
+        let mixed_qkv_raw = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+
+        let state = qwen35_final_conv_state_cpu(&mixed_qkv_raw, shape).unwrap();
+
+        assert_eq!(
+            state,
+            vec![
+                0.0, 1.0, 7.0, //
+                0.0, 2.0, 8.0, //
+                0.0, 3.0, 9.0, //
+                0.0, 4.0, 10.0, //
+                0.0, 5.0, 11.0, //
+                0.0, 6.0, 12.0,
+            ]
+        );
     }
 
     #[test]
