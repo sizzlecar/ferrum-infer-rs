@@ -406,13 +406,8 @@ impl EngineBuilder {
             _ => (None, None),
         };
 
-        let recurrent_state_manager = custom_recurrent_state_manager.or_else(|| {
-            matches!(&config.backend.device, ferrum_types::Device::CPU).then(|| {
-                Arc::new(crate::recurrent_state::InMemoryRecurrentStateManager::new(
-                    crate::recurrent_state::InMemoryRecurrentStateConfig::default(),
-                )) as Arc<dyn RecurrentStateManager + Send + Sync>
-            })
-        });
+        let recurrent_state_manager = custom_recurrent_state_manager
+            .or_else(|| default_recurrent_state_manager(&config, &component_config));
 
         let engine = crate::ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
             config,
@@ -428,6 +423,32 @@ impl EngineBuilder {
         );
         Ok(Box::new(engine))
     }
+}
+
+fn default_recurrent_state_manager(
+    config: &EngineConfig,
+    component_config: &ComponentConfig,
+) -> Option<Arc<dyn RecurrentStateManager + Send + Sync>> {
+    if !matches!(&config.backend.device, ferrum_types::Device::CPU) {
+        return None;
+    }
+    if component_config
+        .get_option::<bool>("qwen35_reference")
+        .unwrap_or(false)
+    {
+        return Some(
+            Arc::new(ferrum_models::models::Qwen35RecurrentStateManager::<
+                ferrum_kernels::backend::cpu::CpuBackend,
+            >::new(
+                ferrum_models::models::Qwen35RecurrentStateManagerConfig::default(),
+            )) as Arc<dyn RecurrentStateManager + Send + Sync>,
+        );
+    }
+    Some(
+        Arc::new(crate::recurrent_state::InMemoryRecurrentStateManager::new(
+            crate::recurrent_state::InMemoryRecurrentStateConfig::default(),
+        )) as Arc<dyn RecurrentStateManager + Send + Sync>,
+    )
 }
 
 fn validate_layer_split_plan(component_config: &ComponentConfig) -> Result<()> {
@@ -492,9 +513,10 @@ pub async fn create_engine(
 mod tests {
     use super::*;
     use ferrum_interfaces::{
-        RecurrentStateHandle, RecurrentStateManager, RecurrentStateManagerStats, RecurrentStateSpec,
+        RecurrentStateHandle, RecurrentStateManager, RecurrentStateManagerStats,
+        RecurrentStateSpec, RecurrentStateTensorSpec,
     };
-    use ferrum_types::RequestId;
+    use ferrum_types::{DataType, Device, RequestId};
 
     #[derive(Debug)]
     struct NoopRecurrentStateManager;
@@ -616,6 +638,42 @@ mod tests {
             Some("/models/draft")
         );
         assert_eq!(component_config.get_option::<usize>("spec_n"), Some(6));
+    }
+
+    #[test]
+    fn test_builder_qwen35_reference_uses_typed_recurrent_state_manager() {
+        let mut config = EngineConfig::default();
+        config.backend.device = Device::CPU;
+        config.backend.backend_options.insert(
+            "qwen35_reference".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let component_config = ComponentConfig::from_engine_config(&config);
+        let manager = default_recurrent_state_manager(&config, &component_config)
+            .expect("qwen35 reference CPU path should install a recurrent-state manager");
+        let spec = RecurrentStateSpec {
+            request_id: RequestId::new(),
+            num_layers: 2,
+            tensors: vec![RecurrentStateTensorSpec::new(
+                0,
+                "delta_state",
+                vec![1, 1, 1],
+            )],
+            dtype: DataType::FP32,
+            device: Device::CPU,
+            max_batch_slots: 1,
+        };
+
+        let handle = tokio_test::block_on(manager.allocate(&spec)).unwrap();
+
+        assert!(
+            handle
+                .as_any()
+                .is::<ferrum_models::models::Qwen35RecurrentStateHandle<
+                    ferrum_kernels::backend::cpu::CpuBackend,
+                >>(),
+            "qwen35 reference should allocate typed Qwen35 recurrent-state handles"
+        );
     }
 
     #[test]

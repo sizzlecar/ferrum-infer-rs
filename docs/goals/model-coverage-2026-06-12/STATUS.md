@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ22 — W3 Qwen35 product-path typed recurrent manager checkpoint
+
+- Scope:
+  - W3/Qwen35 product-path recurrent-state manager selection;
+  - local CPU/Rust tests only, no GPU/CUDA/Metal execution was started;
+  - no real Qwen3.5/Qwen3.6 product gate, no performance evidence, and no
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - `EngineBuilder` now installs
+    `Qwen35RecurrentStateManager<CpuBackend>` as the default recurrent-state
+    manager when the typed product config has `qwen35_reference=true` on CPU;
+  - existing CPU non-Qwen35 paths still use `InMemoryRecurrentStateManager`;
+  - added a builder test that allocates through the default manager and verifies
+    the returned handle is a typed `Qwen35RecurrentStateHandle<CpuBackend>`.
+- Validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-engine builder -- --nocapture` PASS:
+    11 matched tests passed;
+  - `cargo test -p ferrum-cli --test qwen35_reference_product -- --nocapture`
+    PASS: `ferrum run` and `ferrum serve --qwen35-reference` toy product-path
+    tests passed.
+- Limitation:
+  - this wires the CPU reference product path to typed recurrent state; W3 still
+    needs real full-model backend prefill/decode, L2-L5 correctness artifacts,
+    concurrency evidence, and 80% performance evidence.
+
 ## 2026-06-18 ZZZ21 — W3 Qwen35 reference recurrent-state writeback checkpoint
 
 - Scope:
