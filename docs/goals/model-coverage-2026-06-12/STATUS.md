@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-18 ZZZ19 — W3 L1 numeric artifact gate checkpoint
+
+- Scope:
+  - W3 L1 numeric/reference artifact packaging for the Qwen3.5/Qwen3.6 W3
+    architecture family;
+  - local CPU/Rust test execution only, no GPU/CUDA/Metal execution;
+  - no W3 L2-L5 correctness evidence, no real model performance evidence, and
+    no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced.
+- Change:
+  - added `scripts/release/w3_l1_numeric_gate.py`;
+  - the gate runs `cargo test -p ferrum-models qwen35 -- --nocapture`;
+  - it verifies that the Rust test log covers the final-gate-required W3 L1
+    component categories: linear attention, full attention, DeltaNet, MoE/dense
+    path, and LM head;
+  - it writes `w3_l1_numeric.json` in the shape accepted by
+    `model_release_grade_goal_gate.py`.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_l1_numeric_gate.py` PASS;
+  - `python3 scripts/release/w3_l1_numeric_gate.py --self-test` PASS:
+    `W3 L1 NUMERIC SELFTEST PASS`;
+  - `git diff --check -- scripts/release/w3_l1_numeric_gate.py` PASS;
+  - real L1 gate PASS:
+    `W3 L1 NUMERIC PASS:
+    docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260618`;
+  - final-gate L1 structure probe PASS:
+    `W3 L1 FINAL-GATE STRUCTURE PASS:
+    docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260618`;
+  - artifact records `comparisons_total=14`, `comparisons_passed=14`, and all
+    required L1 coverage booleans true.
+- Limitation:
+  - this is a packaged Rust CPU reference numeric gate; it does not prove W3
+    quantized semantics, real-model behavior/tool/schema correctness,
+    concurrency, CUDA/Metal execution, or 80% performance.
+
 ## 2026-06-18 ZZZ18 — W3 real Qwen3.5/Qwen3.6 L0 template checkpoint
 
 - Scope:
