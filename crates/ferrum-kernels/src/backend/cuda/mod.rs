@@ -49,6 +49,7 @@ pub mod fa2_source;
 pub mod gated_delta_rule;
 pub mod graph;
 pub mod int8_kv;
+pub mod linear_attention;
 pub mod moe;
 pub mod paged;
 pub mod quant;
@@ -1547,6 +1548,66 @@ impl Backend for CudaBackend {
             use_qk_l2norm,
             scale,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_f32(
+        ctx: &mut Self::Context,
+        mixed_qkv_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        a_raw: &Self::Buffer,
+        b_raw: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        linear_attention::linear_attention_prepare_f32(
+            ctx,
+            mixed_qkv_raw,
+            conv_weight,
+            a_raw,
+            b_raw,
+            a_log,
+            dt_bias,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+            apply_qk_l2norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gated_rms_norm_f32(
+        ctx: &mut Self::Context,
+        core: &Self::Buffer,
+        z: &Self::Buffer,
+        weight: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        linear_attention::gated_rms_norm_f32(ctx, core, z, weight, out, tokens, heads, dim, eps)
     }
 
     // ── Buffer utilities ────────────────────────────────────────────────

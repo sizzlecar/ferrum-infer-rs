@@ -279,6 +279,55 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Prepare a gated-Delta linear-attention block:
+    /// depthwise causal conv + SiLU over `mixed_qkv_raw`, split into Q/K/V,
+    /// and compute GDN gates `g` and `beta`.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _a_raw: &Self::Buffer,
+        _b_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _tokens: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_prepare_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Gated RMSNorm used after recurrent DeltaNet core:
+    /// `out = rms_norm(core) * weight * silu(z)`.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_rms_norm_f32(
+        _ctx: &mut Self::Context,
+        _core: &Self::Buffer,
+        _z: &Self::Buffer,
+        _weight: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _tokens: usize,
+        _heads: usize,
+        _dim: usize,
+        _eps: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gated_rms_norm_f32 not implemented for this backend",
+        ))
+    }
+
     // ── Element-wise ────────────────────────────────────────────────────
     //
     // Models use `add_inplace` for residual updates and `copy_slice` for the
