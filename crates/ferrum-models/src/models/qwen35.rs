@@ -1274,14 +1274,14 @@ pub fn qwen35_full_attention_core_cpu(
         shape.head_dim,
     )?;
 
-    let mut query = qwen35_rms_norm_cpu(
+    let mut query = qwen35_rms_norm_plus_one_cpu(
         query_raw,
         q_norm_weight,
         shape.tokens * shape.num_heads,
         shape.head_dim,
         eps,
     )?;
-    let mut key = qwen35_rms_norm_cpu(
+    let mut key = qwen35_rms_norm_plus_one_cpu(
         key_raw,
         k_norm_weight,
         shape.tokens * shape.num_kv_heads,
@@ -3285,8 +3285,13 @@ impl<B: Backend> Qwen35ModelWeights<B> {
         loader: &dyn ferrum_quantization::WeightLoader<B>,
     ) -> Result<Self> {
         let planned = Qwen35WeightPlanLoader::<B>::new(plan, loader);
+        let hidden_size = config.hidden_size;
+        let head_dim = config.head_dim;
         let embed_tokens = planned.load_global_tensor("embed_tokens")?;
-        let final_norm = planned.load_global_tensor("final_norm")?;
+        let final_norm = qwen35_fold_gemma_norm_weight::<B>(
+            planned.load_global_tensor("final_norm")?,
+            hidden_size,
+        );
         let lm_head = if planned.has_global_tensor("lm_head") {
             planned.load_global_linear("lm_head")?
         } else {
@@ -3299,10 +3304,15 @@ impl<B: Backend> Qwen35ModelWeights<B> {
         {
             layers.push(Qwen35LayerWeights {
                 layer_index: layer_plan.layer_index,
-                input_layernorm: planned
-                    .load_layer_tensor(layer_plan.layer_index, "input_layernorm")?,
-                post_attention_layernorm: planned
-                    .load_layer_tensor(layer_plan.layer_index, "post_attention_layernorm")?,
+                input_layernorm: qwen35_fold_gemma_norm_weight::<B>(
+                    planned.load_layer_tensor(layer_plan.layer_index, "input_layernorm")?,
+                    hidden_size,
+                ),
+                post_attention_layernorm: qwen35_fold_gemma_norm_weight::<B>(
+                    planned
+                        .load_layer_tensor(layer_plan.layer_index, "post_attention_layernorm")?,
+                    hidden_size,
+                ),
                 attention: match layer_plan.attention {
                     Qwen35LayerType::LinearAttention => {
                         Qwen35AttentionWeights::Linear(Qwen35LinearAttentionWeights {
@@ -3336,10 +3346,20 @@ impl<B: Backend> Qwen35ModelWeights<B> {
                                 .load_layer_linear(layer_plan.layer_index, "self_attn_v")?,
                             o_proj: planned
                                 .load_layer_linear(layer_plan.layer_index, "self_attn_o")?,
-                            q_norm_weight: planned
-                                .load_layer_tensor(layer_plan.layer_index, "self_attn_q_norm")?,
-                            k_norm_weight: planned
-                                .load_layer_tensor(layer_plan.layer_index, "self_attn_k_norm")?,
+                            q_norm_weight: qwen35_fold_gemma_norm_weight::<B>(
+                                planned.load_layer_tensor(
+                                    layer_plan.layer_index,
+                                    "self_attn_q_norm",
+                                )?,
+                                head_dim,
+                            ),
+                            k_norm_weight: qwen35_fold_gemma_norm_weight::<B>(
+                                planned.load_layer_tensor(
+                                    layer_plan.layer_index,
+                                    "self_attn_k_norm",
+                                )?,
+                                head_dim,
+                            ),
                         })
                     }
                 },
@@ -3394,6 +3414,14 @@ impl<B: Backend> Qwen35ModelWeights<B> {
             layers,
         })
     }
+}
+
+fn qwen35_fold_gemma_norm_weight<B: Backend>(buf: B::Buffer, len: usize) -> B::Buffer {
+    let mut values = B::to_vec(&buf, len);
+    for value in &mut values {
+        *value += 1.0;
+    }
+    B::from_slice(&values)
 }
 
 impl<B: Backend> Qwen35AttentionWeights<B> {
@@ -3498,7 +3526,16 @@ mod tests {
                         .flat_map(|layer| layer.tensors.iter()),
                 )
                 .filter(|tensor| tensor.required)
-                .map(|tensor| (tensor.name.clone(), vec![1.0]))
+                .map(|tensor| {
+                    let len = match tensor.role.as_str() {
+                        "final_norm" | "input_layernorm" | "post_attention_layernorm" => {
+                            config.hidden_size
+                        }
+                        "self_attn_q_norm" | "self_attn_k_norm" => config.head_dim,
+                        _ => 1,
+                    };
+                    (tensor.name.clone(), vec![1.0; len])
+                })
                 .collect();
             Self {
                 tensors,
@@ -3640,7 +3677,16 @@ mod tests {
         assert_eq!(model.config.num_hidden_layers, 4);
         assert_eq!(model.runtime_cfg.hidden_size, 16);
         assert_eq!(model.runtime_cfg.vocab_size, 128);
+        assert_eq!(model.final_norm, vec![2.0; config.hidden_size]);
         assert_eq!(model.layers.len(), 4);
+        assert_eq!(
+            model.layers[0].input_layernorm,
+            vec![2.0; config.hidden_size]
+        );
+        assert_eq!(
+            model.layers[0].post_attention_layernorm,
+            vec![2.0; config.hidden_size]
+        );
         assert_eq!(
             model.layers[0].attention.kind(),
             Qwen35LayerType::LinearAttention
@@ -3649,6 +3695,11 @@ mod tests {
         assert_eq!(
             model.layers[3].attention.kind(),
             Qwen35LayerType::FullAttention
+        );
+        assert!(
+            matches!(&model.layers[3].attention, Qwen35AttentionWeights::Full(weights)
+                if weights.q_norm_weight == vec![2.0; config.head_dim]
+                    && weights.k_norm_weight == vec![2.0; config.head_dim])
         );
         assert_eq!(model.layers[3].mlp.kind(), Qwen35MlpKind::Dense);
         assert!(loader.linears().contains(&"model.embed_tokens".to_string()));
@@ -3986,6 +4037,38 @@ mod tests {
         let inv = ((3.0f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt().recip();
 
         assert_close_slice(&out, &[3.0 * inv * 2.0, 4.0 * inv * 3.0], 1e-6);
+    }
+
+    #[test]
+    fn full_attention_qk_norm_uses_vllm_gemma_plus_one_semantics() {
+        let shape = Qwen35FullAttentionShape {
+            tokens: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            position_offset: 0,
+            rope_theta: 10_000.0,
+        };
+        let reference = qwen35_full_attention_core_cpu(
+            &[3.0, 4.0],
+            &[5.0, 12.0],
+            &[7.0, 11.0],
+            &[0.0, 1.0],
+            &[0.5, 1.5],
+            shape,
+            0.0,
+        )
+        .unwrap();
+        let q_inv = ((3.0f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt().recip();
+        let k_inv = ((5.0f32 * 5.0 + 12.0 * 12.0) / 2.0).sqrt().recip();
+
+        assert_close_slice(&reference.query, &[3.0 * q_inv, 4.0 * q_inv * 2.0], 1e-6);
+        assert_close_slice(
+            &reference.key,
+            &[5.0 * k_inv * 1.5, 12.0 * k_inv * 2.5],
+            1e-6,
+        );
+        assert_close_slice(&reference.value, &[7.0, 11.0], 1e-6);
     }
 
     #[test]
