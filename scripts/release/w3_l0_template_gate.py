@@ -5,6 +5,9 @@ The gate consumes HF-generated golden fixtures and verifies that Ferrum's
 renderer still matches them byte-for-byte through the existing Rust golden
 test. It also records model special-token provenance from generation_config so
 the final W3 release-grade gate can reject shell "status=pass" evidence.
+When explicit sidecar paths are omitted, the gate resolves
+generation_config.json, tokenizer_config.json, tokenizer_special_tokens.json,
+and tokenizer.json from the fixture directory.
 """
 
 from __future__ import annotations
@@ -56,6 +59,58 @@ def require_dir(path: Path, label: str) -> Path:
     if not path.is_dir():
         raise GateError(f"{label} missing: {path}")
     return path
+
+
+def optional_file(path: Path, label: str) -> Path | None:
+    return path if path.is_file() else None
+
+
+def resolve_fixture_sidecars(
+    *,
+    fixture_dir: Path,
+    generation_config: Path | None,
+    tokenizer_config: Path | None,
+    tokenizer_special_tokens: Path | None,
+    tokenizer_json: Path | None,
+) -> tuple[Path, Path | None, Path | None, Path | None]:
+    fixture_dir = require_dir(fixture_dir, "fixture dir")
+    resolved_generation = generation_config or optional_file(
+        fixture_dir / "generation_config.json",
+        "fixture generation_config.json",
+    )
+    if resolved_generation is None:
+        raise GateError(
+            "generation_config.json missing: pass --generation-config or generate it into the fixture dir"
+        )
+    require_file(resolved_generation, "generation_config.json")
+
+    resolved_tokenizer_config = tokenizer_config or optional_file(
+        fixture_dir / "tokenizer_config.json",
+        "fixture tokenizer_config.json",
+    )
+    if resolved_tokenizer_config is not None:
+        require_file(resolved_tokenizer_config, "tokenizer_config.json")
+
+    resolved_tokenizer_special_tokens = tokenizer_special_tokens or optional_file(
+        fixture_dir / "tokenizer_special_tokens.json",
+        "fixture tokenizer_special_tokens.json",
+    )
+    if resolved_tokenizer_special_tokens is not None:
+        require_file(resolved_tokenizer_special_tokens, "tokenizer_special_tokens.json")
+
+    resolved_tokenizer_json = tokenizer_json or optional_file(
+        fixture_dir / "tokenizer.json",
+        "fixture tokenizer.json",
+    )
+    if resolved_tokenizer_json is not None:
+        require_file(resolved_tokenizer_json, "tokenizer.json")
+
+    return (
+        resolved_generation,
+        resolved_tokenizer_config,
+        resolved_tokenizer_special_tokens,
+        resolved_tokenizer_json,
+    )
 
 
 def as_object(value: Any, label: str) -> dict[str, Any]:
@@ -113,6 +168,35 @@ def tokenizer_vocab(tokenizer_json: Path | None) -> dict[str, int]:
     return vocab
 
 
+def merge_tokenizer_vocab(
+    tokenizer_special_tokens: Path | None,
+    tokenizer_json: Path | None,
+) -> tuple[dict[str, int], dict[str, str]]:
+    vocab = tokenizer_special_token_vocab(tokenizer_special_tokens)
+    sources = {token: "tokenizer_special_tokens" for token in vocab}
+    json_vocab = tokenizer_vocab(tokenizer_json)
+    for token, token_id in json_vocab.items():
+        vocab[token] = token_id
+        sources[token] = "tokenizer_json"
+    return vocab, sources
+
+
+def tokenizer_special_token_vocab(tokenizer_special_tokens: Path | None) -> dict[str, int]:
+    if tokenizer_special_tokens is None:
+        return {}
+    value = as_object(
+        load_json(require_file(tokenizer_special_tokens, "tokenizer_special_tokens.json")),
+        "tokenizer_special_tokens.json",
+    )
+    vocab: dict[str, int] = {}
+    for token_key, id_key in [("bos_token", "bos_token_id"), ("eos_token", "eos_token_id")]:
+        token = parse_token_value(value.get(token_key))
+        raw_id = value.get(id_key)
+        if token is not None and isinstance(raw_id, int) and not isinstance(raw_id, bool):
+            vocab[token] = raw_id
+    return vocab
+
+
 def load_special_token_strings(
     *,
     meta: dict[str, Any],
@@ -136,13 +220,14 @@ def validate_special_tokens(
     generation_config: Path,
     meta: dict[str, Any],
     tokenizer_config: Path | None,
+    tokenizer_special_tokens: Path | None,
     tokenizer_json: Path | None,
 ) -> dict[str, Any]:
     generation = as_object(load_json(require_file(generation_config, "generation_config.json")), "generation_config.json")
     eos_ids = normalize_id_list(generation.get("eos_token_id"), "eos_token_id", required=True)
     bos_ids = normalize_id_list(generation.get("bos_token_id"), "bos_token_id", required=False)
     tokens = load_special_token_strings(meta=meta, tokenizer_config=tokenizer_config)
-    vocab = tokenizer_vocab(tokenizer_json)
+    vocab, token_id_sources = merge_tokenizer_vocab(tokenizer_special_tokens, tokenizer_json)
 
     mappings: dict[str, Any] = {}
     for key, ids in [("eos_token", eos_ids), ("bos_token", bos_ids)]:
@@ -151,7 +236,8 @@ def validate_special_tokens(
             mappings[key] = {
                 "token": token,
                 "ids_from_generation_config": ids,
-                "tokenizer_json_id": None,
+                "tokenizer_id": None,
+                "tokenizer_id_source": None,
                 "checked": False,
             }
             continue
@@ -159,7 +245,8 @@ def validate_special_tokens(
         mappings[key] = {
             "token": token,
             "ids_from_generation_config": ids,
-            "tokenizer_json_id": tokenizer_id,
+            "tokenizer_id": tokenizer_id,
+            "tokenizer_id_source": token_id_sources.get(token),
             "checked": True,
         }
         if ids and tokenizer_id not in ids:
@@ -171,6 +258,7 @@ def validate_special_tokens(
     return {
         "generation_config": str(generation_config),
         "tokenizer_config": str(tokenizer_config) if tokenizer_config else None,
+        "tokenizer_special_tokens": str(tokenizer_special_tokens) if tokenizer_special_tokens else None,
         "tokenizer_json": str(tokenizer_json) if tokenizer_json else None,
         "eos_token_id": eos_ids if len(eos_ids) != 1 else eos_ids[0],
         "bos_token_id": None if not bos_ids else (bos_ids[0] if len(bos_ids) == 1 else bos_ids),
@@ -243,6 +331,7 @@ def build_artifact(
     fixture_dir: Path,
     generation_config: Path,
     tokenizer_config: Path | None,
+    tokenizer_special_tokens: Path | None,
     tokenizer_json: Path | None,
     required_cases: list[str],
     run_cargo: bool,
@@ -257,6 +346,7 @@ def build_artifact(
         generation_config=generation_config,
         meta=fixture["meta"],
         tokenizer_config=tokenizer_config,
+        tokenizer_special_tokens=tokenizer_special_tokens,
         tokenizer_json=tokenizer_json,
     )
 
@@ -317,9 +407,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, help="artifact output directory")
     parser.add_argument("--model-id", help="HF model id expected by the fixture")
     parser.add_argument("--fixture-dir", type=Path, help="chat-template fixture directory")
-    parser.add_argument("--generation-config", type=Path, help="generation_config.json path")
-    parser.add_argument("--tokenizer-config", type=Path, help="tokenizer_config.json path")
-    parser.add_argument("--tokenizer-json", type=Path, help="tokenizer.json path")
+    parser.add_argument(
+        "--generation-config",
+        type=Path,
+        help="generation_config.json path; defaults to <fixture-dir>/generation_config.json",
+    )
+    parser.add_argument(
+        "--tokenizer-config",
+        type=Path,
+        help="tokenizer_config.json path; defaults to <fixture-dir>/tokenizer_config.json when present",
+    )
+    parser.add_argument(
+        "--tokenizer-special-tokens",
+        type=Path,
+        help=(
+            "compact tokenizer_special_tokens.json path; defaults to "
+            "<fixture-dir>/tokenizer_special_tokens.json when present"
+        ),
+    )
+    parser.add_argument(
+        "--tokenizer-json",
+        type=Path,
+        help="tokenizer.json path; defaults to <fixture-dir>/tokenizer.json when present",
+    )
     parser.add_argument(
         "--required-case",
         action="append",
@@ -333,7 +443,7 @@ def parse_args() -> argparse.Namespace:
 def require_args(args: argparse.Namespace) -> None:
     missing = [
         name
-        for name in ["out", "model_id", "fixture_dir", "generation_config"]
+        for name in ["out", "model_id", "fixture_dir"]
         if getattr(args, name) is None
     ]
     if missing:
@@ -362,22 +472,38 @@ def run_selftest() -> int:
         (fixture / "template.jinja").write_text("{{ messages[0].content }}", encoding="utf-8")
         for case in DEFAULT_REQUIRED_CASES:
             (fixture / f"golden_{case}.txt").write_text(case, encoding="utf-8")
-        write_json(root / "generation_config.json", {"bos_token_id": 1, "eos_token_id": 2})
-        write_json(root / "tokenizer_config.json", {"bos_token": "<s>", "eos_token": "</s>"})
+        write_json(fixture / "generation_config.json", {"bos_token_id": 1, "eos_token_id": 2})
+        write_json(fixture / "tokenizer_config.json", {"bos_token": "<s>", "eos_token": "</s>"})
         write_json(
-            root / "tokenizer.json",
+            fixture / "tokenizer_special_tokens.json",
             {
-                "model": {"vocab": {"<s>": 1, "</s>": 2}},
-                "added_tokens": [],
+                "source": "selftest",
+                "bos_token": "<s>",
+                "bos_token_id": 1,
+                "eos_token": "</s>",
+                "eos_token_id": 2,
             },
+        )
+        (
+            generation_config,
+            tokenizer_config,
+            tokenizer_special_tokens,
+            tokenizer_json,
+        ) = resolve_fixture_sidecars(
+            fixture_dir=fixture,
+            generation_config=None,
+            tokenizer_config=None,
+            tokenizer_special_tokens=None,
+            tokenizer_json=None,
         )
         artifact = build_artifact(
             out_dir=root / "out",
             model_id="selftest/qwen35",
             fixture_dir=fixture,
-            generation_config=root / "generation_config.json",
-            tokenizer_config=root / "tokenizer_config.json",
-            tokenizer_json=root / "tokenizer.json",
+            generation_config=generation_config,
+            tokenizer_config=tokenizer_config,
+            tokenizer_special_tokens=tokenizer_special_tokens,
+            tokenizer_json=tokenizer_json,
             required_cases=DEFAULT_REQUIRED_CASES,
             run_cargo=False,
         )
@@ -406,8 +532,9 @@ def run_selftest() -> int:
             validate_special_tokens(
                 generation_config=root / "bad_generation_config.json",
                 meta={"bos_token": "<s>", "eos_token": "</s>"},
-                tokenizer_config=root / "tokenizer_config.json",
-                tokenizer_json=root / "tokenizer.json",
+                tokenizer_config=tokenizer_config,
+                tokenizer_special_tokens=tokenizer_special_tokens,
+                tokenizer_json=tokenizer_json,
             )
         except GateError as exc:
             if "not in generation_config ids" not in str(exc):
@@ -426,13 +553,26 @@ def main() -> int:
             return run_selftest()
         require_args(args)
         required_cases = args.required_cases or DEFAULT_REQUIRED_CASES
+        (
+            generation_config,
+            tokenizer_config,
+            tokenizer_special_tokens,
+            tokenizer_json,
+        ) = resolve_fixture_sidecars(
+            fixture_dir=args.fixture_dir,
+            generation_config=args.generation_config,
+            tokenizer_config=args.tokenizer_config,
+            tokenizer_special_tokens=args.tokenizer_special_tokens,
+            tokenizer_json=args.tokenizer_json,
+        )
         artifact = build_artifact(
             out_dir=args.out,
             model_id=args.model_id,
             fixture_dir=args.fixture_dir,
-            generation_config=args.generation_config,
-            tokenizer_config=args.tokenizer_config,
-            tokenizer_json=args.tokenizer_json,
+            generation_config=generation_config,
+            tokenizer_config=tokenizer_config,
+            tokenizer_special_tokens=tokenizer_special_tokens,
+            tokenizer_json=tokenizer_json,
             required_cases=required_cases,
             run_cargo=True,
         )
