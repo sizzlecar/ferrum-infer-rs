@@ -17,7 +17,7 @@ use ferrum_interfaces::{
     RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
     RecurrentStateManagerStats, RecurrentStateSpec,
 };
-use ferrum_kernels::backend::{Backend, BackendQuantMarlin, Dtype};
+use ferrum_kernels::backend::{AttnConfig, Backend, BackendQuantMarlin, Dtype};
 use ferrum_quantization::{Linear, NativeSafetensorsLoader, WeightLoader};
 use ferrum_types::{DataType, Device, FerrumError, RequestId, Result};
 use parking_lot::{Mutex, MutexGuard};
@@ -198,6 +198,19 @@ pub struct Qwen35BackendLinearAttentionDecodeOutput<B: Backend> {
     pub delta_core: B::Buffer,
     pub delta_norm: B::Buffer,
     pub final_state: B::Buffer,
+}
+
+pub struct Qwen35BackendRopeCache<B: Backend> {
+    pub cos: B::Buffer,
+    pub sin: B::Buffer,
+}
+
+pub struct Qwen35BackendFullAttentionOutput<B: Backend> {
+    pub query_head_major: B::Buffer,
+    pub key_head_major: B::Buffer,
+    pub value_head_major: B::Buffer,
+    pub context_head_major: B::Buffer,
+    pub context: B::Buffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1345,6 +1358,151 @@ pub fn qwen35_full_attention_core_cpu(
         query,
         key,
         value: value_raw.to_vec(),
+        context,
+    })
+}
+
+pub fn qwen35_build_rope_cache_backend<B: Backend>(
+    max_seq_len: usize,
+    head_dim: usize,
+    rope_theta: f32,
+) -> Result<Qwen35BackendRopeCache<B>> {
+    if max_seq_len == 0 || head_dim == 0 || rope_theta <= 0.0 {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 RoPE cache shape must be positive, got max_seq_len={max_seq_len} \
+             head_dim={head_dim} rope_theta={rope_theta}"
+        )));
+    }
+    if head_dim % 2 != 0 {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 RoPE cache head_dim {head_dim} must be even"
+        )));
+    }
+
+    let half = head_dim / 2;
+    let mut cos = vec![0.0; max_seq_len * half];
+    let mut sin = vec![0.0; max_seq_len * half];
+    for position in 0..max_seq_len {
+        for pair in 0..half {
+            let inv_freq = rope_theta.powf(-(2.0 * pair as f32) / head_dim as f32);
+            let angle = position as f32 * inv_freq;
+            let (sin_value, cos_value) = angle.sin_cos();
+            cos[position * half + pair] = cos_value;
+            sin[position * half + pair] = sin_value;
+        }
+    }
+
+    Ok(Qwen35BackendRopeCache {
+        cos: B::from_slice(&cos),
+        sin: B::from_slice(&sin),
+    })
+}
+
+/// Backend-native Qwen3.5 full-attention core.
+///
+/// `q_norm_weight` and `k_norm_weight` are expected to be already folded with
+/// the Gemma/Qwen `1 + weight` convention, matching `Qwen35ModelWeights::load`.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_full_attention_core_backend<B: Backend>(
+    ctx: &mut B::Context,
+    query_raw: &B::Buffer,
+    key_raw: &B::Buffer,
+    value_raw: &B::Buffer,
+    q_norm_weight: &B::Buffer,
+    k_norm_weight: &B::Buffer,
+    rope_cos: &B::Buffer,
+    rope_sin: &B::Buffer,
+    shape: Qwen35FullAttentionShape,
+    eps: f32,
+) -> Result<Qwen35BackendFullAttentionOutput<B>> {
+    shape.validate()?;
+
+    let q_len = shape.q_len();
+    let kv_len = shape.kv_len();
+    let mut query_head_major = B::alloc_typed(Dtype::F32, q_len);
+    let mut key_head_major = B::alloc_typed(Dtype::F32, kv_len);
+    let mut value_head_major = B::alloc_typed(Dtype::F32, kv_len);
+    let mut context_head_major = B::alloc_typed(Dtype::F32, q_len);
+    let mut context = B::alloc_typed(Dtype::F32, q_len);
+
+    B::qk_norm_rope(
+        ctx,
+        query_raw,
+        q_norm_weight,
+        rope_cos,
+        rope_sin,
+        &mut query_head_major,
+        shape.tokens,
+        shape.num_heads,
+        shape.head_dim,
+        shape.position_offset,
+        eps,
+        1,
+    );
+    B::qk_norm_rope(
+        ctx,
+        key_raw,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        &mut key_head_major,
+        shape.tokens,
+        shape.num_kv_heads,
+        shape.head_dim,
+        shape.position_offset,
+        eps,
+        1,
+    );
+    B::qk_norm_rope(
+        ctx,
+        value_raw,
+        q_norm_weight,
+        rope_cos,
+        rope_sin,
+        &mut value_head_major,
+        shape.tokens,
+        shape.num_kv_heads,
+        shape.head_dim,
+        0,
+        eps,
+        0,
+    );
+
+    let attn_cfg = AttnConfig {
+        num_heads: shape.num_heads,
+        num_kv_heads: shape.num_kv_heads,
+        head_dim: shape.head_dim,
+        causal: true,
+        scale: (shape.head_dim as f32).sqrt().recip(),
+        kv_seq_stride: 0,
+        sliding_window: 0,
+    };
+    B::flash_attention(
+        ctx,
+        &query_head_major,
+        &key_head_major,
+        &value_head_major,
+        &mut context_head_major,
+        1,
+        shape.tokens,
+        shape.tokens,
+        0,
+        &attn_cfg,
+    );
+    B::transpose_head_to_token(
+        ctx,
+        &context_head_major,
+        &mut context,
+        shape.tokens,
+        shape.num_heads,
+        shape.head_dim,
+    );
+
+    Ok(Qwen35BackendFullAttentionOutput {
+        query_head_major,
+        key_head_major,
+        value_head_major,
+        context_head_major,
         context,
     })
 }
@@ -3609,6 +3767,23 @@ mod tests {
         }
     }
 
+    fn token_major_to_head_major(
+        values: &[f32],
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0; values.len()];
+        for token in 0..tokens {
+            for head in 0..heads {
+                let src = (token * heads + head) * head_dim;
+                let dst = (head * tokens + token) * head_dim;
+                out[dst..dst + head_dim].copy_from_slice(&values[src..src + head_dim]);
+            }
+        }
+        out
+    }
+
     struct SmallMoeWeights {
         router_weight: Vec<f32>,
         fused_gate_up_proj: Vec<f32>,
@@ -4105,6 +4280,115 @@ mod tests {
         assert_close_slice(&reference.key, &[0.0, 0.0, 0.0, 0.0], 1e-6);
         assert_close_slice(&reference.value, &[2.0, 4.0, 6.0, 8.0], 1e-6);
         assert_close_slice(&reference.context, &[2.0, 4.0, 4.0, 6.0], 1e-6);
+    }
+
+    #[test]
+    fn full_attention_backend_core_matches_reference() {
+        let raw_shape = Qwen35FullAttentionShape {
+            tokens: 3,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            position_offset: 1,
+            rope_theta: 10_000.0,
+        };
+        let q_raw: Vec<f32> = (0..raw_shape.q_len())
+            .map(|i| ((i as f32 % 7.0) - 3.0) * 0.2)
+            .collect();
+        let k_raw: Vec<f32> = (0..raw_shape.kv_len())
+            .map(|i| ((i as f32 % 5.0) - 2.0) * 0.15)
+            .collect();
+        let v_raw: Vec<f32> = (0..raw_shape.kv_len())
+            .map(|i| ((i as f32 % 11.0) - 5.0) * 0.1)
+            .collect();
+        let q_norm_raw = vec![0.0, 0.5];
+        let k_norm_raw = vec![0.25, -0.5];
+        let q_norm_folded = q_norm_raw
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let k_norm_folded = k_norm_raw
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let eps = 1e-6;
+        let reference = qwen35_full_attention_core_cpu(
+            &q_raw,
+            &k_raw,
+            &v_raw,
+            &q_norm_raw,
+            &k_norm_raw,
+            raw_shape,
+            eps,
+        )
+        .unwrap();
+
+        let rope = qwen35_build_rope_cache_backend::<CpuBackend>(
+            raw_shape.position_offset + raw_shape.tokens,
+            raw_shape.head_dim,
+            raw_shape.rope_theta,
+        )
+        .unwrap();
+        let mut ctx = CpuBackend::new_context();
+        let output = qwen35_full_attention_core_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice_typed(&q_raw),
+            &CpuBackend::from_slice_typed(&k_raw),
+            &CpuBackend::from_slice_typed(&v_raw),
+            &CpuBackend::from_slice_typed(&q_norm_folded),
+            &CpuBackend::from_slice_typed(&k_norm_folded),
+            &rope.cos,
+            &rope.sin,
+            raw_shape,
+            eps,
+        )
+        .unwrap();
+
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.query_head_major, raw_shape.q_len()),
+            &token_major_to_head_major(
+                &reference.query,
+                raw_shape.tokens,
+                raw_shape.num_heads,
+                raw_shape.head_dim,
+            ),
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.key_head_major, raw_shape.kv_len()),
+            &token_major_to_head_major(
+                &reference.key,
+                raw_shape.tokens,
+                raw_shape.num_kv_heads,
+                raw_shape.head_dim,
+            ),
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.value_head_major, raw_shape.kv_len()),
+            &token_major_to_head_major(
+                &reference.value,
+                raw_shape.tokens,
+                raw_shape.num_kv_heads,
+                raw_shape.head_dim,
+            ),
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.context_head_major, raw_shape.q_len()),
+            &token_major_to_head_major(
+                &reference.context,
+                raw_shape.tokens,
+                raw_shape.num_heads,
+                raw_shape.head_dim,
+            ),
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&output.context, raw_shape.q_len()),
+            &reference.context,
+            1e-6,
+        );
     }
 
     #[test]
