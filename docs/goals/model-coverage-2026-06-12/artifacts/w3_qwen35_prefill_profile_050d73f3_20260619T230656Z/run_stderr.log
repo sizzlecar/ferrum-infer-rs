@@ -1,0 +1,16 @@
+Loading /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b...
+Using CUDA(0) backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-19T23:14:26.309229Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-19T23:14:26.309292Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-19T23:14:26.309409Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b/tokenizer.json"
+2026-06-19T23:14:27.060274Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-19T23:14:27.060344Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-19T23:14:27.060352Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-19T23:14:27.060387Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=2048
+2026-06-19T23:14:27.060473Z  INFO ferrum_engine::registry: Loading model from /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b (format: safetensors)
+2026-06-19T23:14:27.060842Z  INFO ferrum_engine::registry:   Architecture: Qwen35Moe, Layers: 40, Vocab: 248320
+2026-06-19T23:14:27.323029Z  INFO ferrum_engine::registry: Building model...
+2026-06-19T23:14:27.323072Z  INFO ferrum_engine::registry: Using Qwen3.5/Qwen3.6 CUDA backend executor
+Model loaded in 35.7s.
+[qwen35-prefill-prof] call#1 cache_id="paged-080cc23b-3a8c-4c10-a78d-338b816a5ae8" prior_len=0 tokens=24 layers=40 linear_layers=30 full_layers=10 embedding=542us layer_sum=2653731us linear_layer_sum=2647617us full_layer_sum=6114us final_sum=2652us final_norm=5us final_gather=7us lm_head=1307us readback=1333us slow_layers=[(0, "linear", 283080), (32, "linear", 101307), (38, "linear", 100810), (2, "linear", 83741), (17, "linear", 83706), (34, "linear", 83679), (1, "linear", 82760), (8, "linear", 82617)]
