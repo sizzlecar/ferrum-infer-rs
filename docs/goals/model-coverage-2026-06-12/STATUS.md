@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ29 — W3 Qwen35 greedy repetition stays on GPU source checkpoint
+
+- Scope:
+  - Qwen35 decode hot-path architecture fix after the strict-schema smoke showed
+    correctness PASS but throughput far below the vLLM 80% targets;
+  - source-level validation only at this checkpoint;
+  - no CUDA performance artifact, no W3 final PASS, and no release-grade
+    performance claim.
+- vLLM comparison used:
+  - local vLLM source applies repetition penalties on GPU before sampling rather
+    than forcing a full `[batch, vocab]` logits download;
+  - Ferrum's product default chat path used `repetition_penalty=1.1`, but the
+    engine previously treated that as ineligible for model-side greedy argmax.
+- Change:
+  - `LogitsReturnPolicy::GreedyArgmax` now carries optional sparse
+    repetition-penalty metadata;
+  - ordinary greedy text decode with token masks and repetition penalty remains
+    on the model-side argmax path instead of setting
+    `ferrum_require_full_logits`;
+  - Qwen35 uploads per-row sparse repeated-token lists and applies the penalty in
+    a CUDA logits kernel before the existing masked/unmasked row argmax;
+  - the shared CPU/full-logits `RepetitionPenaltyProcessor` now matches the same
+    vLLM-style "token appeared" semantics instead of over-penalizing duplicate
+    generated tokens by frequency exponent;
+  - structured JSON/schema/regex guided requests still request full logits for
+    engine-side constrained sampling;
+  - non-Qwen35 Llama-family decode conservatively falls back to full logits when
+    sparse repetition penalty is requested, until that backend gets the same
+    model-side implementation.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - `cargo test -p ferrum-interfaces repetition_penalty_applies -- --nocapture`
+    PASS: 1 matched test;
+  - `cargo check -p ferrum-interfaces -p ferrum-kernels -p ferrum-engine -p ferrum-models --all-targets`
+    PASS;
+  - `cargo test -p ferrum-engine model_decode -- --nocapture` PASS: 4 matched
+    tests;
+  - `cargo test -p ferrum-models qwen35_decode_logits_policy_uses_greedy_only_for_consistent_masks -- --nocapture`
+    PASS: 1 matched test;
+  - `cargo test -p ferrum-models unified_decode_forwards_logits_policy_to_unified_model -- --nocapture`
+    PASS: 1 matched test.
+- Limitation / next work:
+  - CUDA kernel build/runtime behavior still needs same-pod validation on the
+    4090 instance;
+  - next GPU lane should run the Qwen35 `ferrum run`/`ferrum serve` correctness
+    smoke first, then a diagnostic `bench-serve` c=1/32 sweep to measure whether
+    this removes the CPU sampling/logits-readback bottleneck.
+
 ## 2026-06-20 ZZZ28 — W3 Qwen35 strict-schema product smoke PASS, perf still far below target
 
 - Scope:

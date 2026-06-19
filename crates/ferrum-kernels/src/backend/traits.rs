@@ -1077,6 +1077,29 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Greedy-decode fast path with sparse repetition penalty.
+    ///
+    /// `row_offsets` has length `m + 1` and indexes into `token_ids`; row `r`
+    /// owns `token_ids[row_offsets[r]..row_offsets[r + 1]]`. Backends should
+    /// apply each row's `repetition_penalties[r]` to those logits in-place,
+    /// then run raw or masked argmax and return one token id per row.
+    #[allow(clippy::too_many_arguments)]
+    fn argmax_rows_f16_sparse_repetition_penalty(
+        _ctx: &mut Self::Context,
+        _logits: &mut Self::Buffer,
+        _valid_token_mask: Option<(&Self::Buffer, usize)>,
+        _row_offsets: &Self::Buffer,
+        _token_ids: &Self::Buffer,
+        _repetition_penalties: &Self::Buffer,
+        _total_token_ids: usize,
+        _m: usize,
+        _n: usize,
+    ) -> Result<Vec<u32>> {
+        Err(FerrumError::unsupported(
+            "sparse repetition-penalty GPU argmax is not implemented for this backend",
+        ))
+    }
+
     /// Load a weight tensor straight from its on-disk byte representation,
     /// letting the backend pick its preferred storage dtype.
     ///

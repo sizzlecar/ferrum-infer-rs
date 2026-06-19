@@ -1235,6 +1235,52 @@ impl Backend for CudaBackend {
         Ok(host.into_iter().map(|x| x as u32).collect())
     }
 
+    fn argmax_rows_f16_sparse_repetition_penalty(
+        ctx: &mut Self::Context,
+        logits: &mut Self::Buffer,
+        valid_token_mask: Option<(&Self::Buffer, usize)>,
+        row_offsets: &Self::Buffer,
+        token_ids: &Self::Buffer,
+        repetition_penalties: &Self::Buffer,
+        total_token_ids: usize,
+        m: usize,
+        n: usize,
+    ) -> Result<Vec<u32>> {
+        if total_token_ids > 0 {
+            let func = ctx.func(
+                "argmax_rows",
+                ptx::ARGMAX_ROWS,
+                "apply_repetition_penalties_sparse_f16",
+            );
+            let n_i32 = n as i32;
+            let total_i32 = total_token_ids as i32;
+            let mut b = ctx.stream.launch_builder(&func);
+            b.arg(logits);
+            b.arg(&n_i32);
+            b.arg(row_offsets);
+            b.arg(token_ids);
+            b.arg(repetition_penalties);
+            b.arg(&total_i32);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (m as u32, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| {
+                FerrumError::internal(format!("apply_repetition_penalties_sparse_f16 launch: {e}"))
+            })?;
+        }
+
+        match valid_token_mask {
+            Some((mask, mask_len)) => {
+                Self::argmax_rows_f16_masked(ctx, logits, mask, mask_len, m, n)
+            }
+            None => Self::argmax_rows_f16(ctx, logits, m, n),
+        }
+    }
+
     // ── Norms ────────────────────────────────────────────────────────────
 
     fn rms_norm(

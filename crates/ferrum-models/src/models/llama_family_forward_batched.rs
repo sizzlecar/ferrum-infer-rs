@@ -108,27 +108,36 @@ fn resolve_unified_logits_return<'a>(
     for &(orig_idx, _) in final_indices {
         match &policies[orig_idx] {
             LogitsReturnPolicy::FullLogits => return DecodeLogitsReturn::Full,
-            LogitsReturnPolicy::GreedyArgmax { token_mask } => match token_mask.as_ref() {
-                Some(mask) => {
-                    if saw_unmasked {
-                        return DecodeLogitsReturn::Full;
-                    }
-                    if let Some(selected) = selected_mask {
-                        if selected.fingerprint != mask.fingerprint || selected.len() != mask.len()
-                        {
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask,
+                repetition_penalty,
+            } => {
+                if repetition_penalty.is_some() {
+                    return DecodeLogitsReturn::Full;
+                }
+                match token_mask.as_ref() {
+                    Some(mask) => {
+                        if saw_unmasked {
                             return DecodeLogitsReturn::Full;
                         }
-                    } else {
-                        selected_mask = Some(mask);
+                        if let Some(selected) = selected_mask {
+                            if selected.fingerprint != mask.fingerprint
+                                || selected.len() != mask.len()
+                            {
+                                return DecodeLogitsReturn::Full;
+                            }
+                        } else {
+                            selected_mask = Some(mask);
+                        }
+                    }
+                    None => {
+                        if selected_mask.is_some() {
+                            return DecodeLogitsReturn::Full;
+                        }
+                        saw_unmasked = true;
                     }
                 }
-                None => {
-                    if selected_mask.is_some() {
-                        return DecodeLogitsReturn::Full;
-                    }
-                    saw_unmasked = true;
-                }
-            },
+            }
         }
     }
 
@@ -3096,28 +3105,37 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 LogitsReturnPolicy::FullLogits => {
                     return self.decode_batch_internal_with_full_logits(batch, true);
                 }
-                LogitsReturnPolicy::GreedyArgmax { token_mask } => match token_mask.as_ref() {
-                    Some(mask) => {
-                        if saw_unmasked {
-                            return self.decode_batch_internal_with_full_logits(batch, true);
-                        }
-                        if let Some(selected) = selected_mask {
-                            if selected.fingerprint != mask.fingerprint
-                                || selected.len() != mask.len()
-                            {
+                LogitsReturnPolicy::GreedyArgmax {
+                    token_mask,
+                    repetition_penalty,
+                } => {
+                    if repetition_penalty.is_some() {
+                        return self.decode_batch_internal_with_full_logits(batch, true);
+                    }
+                    match token_mask.as_ref() {
+                        Some(mask) => {
+                            if saw_unmasked {
                                 return self.decode_batch_internal_with_full_logits(batch, true);
                             }
-                        } else {
-                            selected_mask = Some(mask);
+                            if let Some(selected) = selected_mask {
+                                if selected.fingerprint != mask.fingerprint
+                                    || selected.len() != mask.len()
+                                {
+                                    return self
+                                        .decode_batch_internal_with_full_logits(batch, true);
+                                }
+                            } else {
+                                selected_mask = Some(mask);
+                            }
+                        }
+                        None => {
+                            if selected_mask.is_some() {
+                                return self.decode_batch_internal_with_full_logits(batch, true);
+                            }
+                            saw_unmasked = true;
                         }
                     }
-                    None => {
-                        if selected_mask.is_some() {
-                            return self.decode_batch_internal_with_full_logits(batch, true);
-                        }
-                        saw_unmasked = true;
-                    }
-                },
+                }
             }
         }
 

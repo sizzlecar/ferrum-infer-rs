@@ -7,7 +7,7 @@
 use ferrum_types::{Result, SamplingParams, TokenId};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Sampling context passed to logits processors and samplers
 #[derive(Debug)]
@@ -327,19 +327,17 @@ impl RepetitionPenaltyProcessor {
 impl LogitsProcessor for RepetitionPenaltyProcessor {
     fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         if self.penalty != 1.0 {
+            let mut seen = HashSet::new();
             for &token_id in ctx.previous_tokens {
-                if let Some(freq) = ctx.token_frequencies.get(&token_id) {
-                    if usize::from(token_id) < ctx.logits.len() {
-                        let idx = usize::from(token_id);
-                        let current_logit = ctx.logits[idx];
-                        let penalty_factor = self.penalty.powi(*freq as i32);
-
-                        if current_logit > 0.0 {
-                            ctx.logits[idx] = current_logit / penalty_factor;
-                        } else {
-                            ctx.logits[idx] = current_logit * penalty_factor;
-                        }
-                    }
+                if !seen.insert(token_id) || usize::from(token_id) >= ctx.logits.len() {
+                    continue;
+                }
+                let idx = usize::from(token_id);
+                let current_logit = ctx.logits[idx];
+                if current_logit > 0.0 {
+                    ctx.logits[idx] = current_logit / self.penalty;
+                } else {
+                    ctx.logits[idx] = current_logit * self.penalty;
                 }
             }
         }

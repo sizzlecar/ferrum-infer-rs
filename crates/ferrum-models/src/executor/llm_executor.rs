@@ -1481,6 +1481,7 @@ mod tests {
             metadata: HashMap::new(),
             logits_policy: ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
                 token_mask: None,
+                repetition_penalty: None,
             },
         });
 
