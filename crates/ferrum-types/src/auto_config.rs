@@ -594,12 +594,12 @@ impl FerrumConfigBuilder {
                 let q = q.to_ascii_lowercase();
                 q.contains("gptq") || q.contains("int4")
             });
-        let cuda_qwen3_moe = cuda_backend
+        let cuda_qwen_moe = cuda_backend
             && self.model.moe.is_some()
-            && self.model.architecture.eq_ignore_ascii_case("qwen3_moe");
+            && qwen_moe_architecture_uses_vllm_paged_attn(&self.model.architecture);
         let use_vllm_paged_attn = self.bool_value(
             "FERRUM_USE_VLLM_PAGED_ATTN",
-            (self.workload.is_m3_preset() || cuda_qwen3_moe)
+            (self.workload.is_m3_preset() || cuda_qwen_moe)
                 && cuda_backend
                 && self.hardware.compiled_features.vllm_paged_attn,
             AutoConfigSource::WorkloadPreset,
@@ -619,7 +619,7 @@ impl FerrumConfigBuilder {
         )?;
         let vllm_v1_short = self.bool_value(
             "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
-            use_vllm_paged_attn.value,
+            use_vllm_paged_attn.value && self.model.head_dim.unwrap_or(128) <= 128,
             AutoConfigSource::Default,
         )?;
         let vllm_moe = self.bool_value(
@@ -1839,6 +1839,11 @@ fn kv_cache_bytes_per_token_for_model(model: &ModelCapabilities) -> Option<u64> 
         .checked_mul(2)
 }
 
+fn qwen_moe_architecture_uses_vllm_paged_attn(architecture: &str) -> bool {
+    architecture.eq_ignore_ascii_case("qwen3_moe")
+        || architecture.eq_ignore_ascii_case("qwen3_5_moe")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedValue<T> {
     value: T,
@@ -2116,6 +2121,49 @@ mod tests {
         assert_eq!(
             entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
             "1"
+        );
+    }
+
+    #[test]
+    fn cuda_qwen35_moe_enables_vllm_paged_attn_v2_without_m3_preset() {
+        // Qwen3.5-MoE shares the Qwen MoE CUDA fast-path requirements, but its
+        // full-attention head_dim is 256. The H256 path uses the v2 paged
+        // attention launcher, so the default decision trace must not report
+        // the H128-oriented v1-short path.
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let mut model = ModelCapabilities::qwen3_30b_a3b_gptq_int4();
+        model.architecture = "qwen3_5_moe".to_string();
+        model.head_dim = Some(256);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(model)
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(
+            decisions["attention_prefill_mixed_backend"],
+            "vllm_paged_varlen"
+        );
+        assert_eq!(decisions["attention_decode_backend"], "vllm_paged_attn_v2");
+        let entry = |key: &str| {
+            resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing runtime config entry {key}"))
+        };
+        assert_eq!(entry("FERRUM_USE_VLLM_PAGED_ATTN").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
+            "0"
         );
     }
 
