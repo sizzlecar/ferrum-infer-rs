@@ -19,13 +19,13 @@ use ferrum_interfaces::{
     RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
     RecurrentStateManagerStats, RecurrentStateSpec,
 };
-use ferrum_kernels::backend::{AttnConfig, Backend, Dtype, KvCache, MoeLlmBackend};
+use ferrum_kernels::backend::{AttnConfig, Backend, BackendPagedKv, Dtype, KvCache, MoeLlmBackend};
 use ferrum_quantization::{Linear, NativeSafetensorsLoader, StackedExpertLinear, WeightLoader};
 use ferrum_types::{DataType, Device, FerrumError, RequestId, Result};
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
-    common::{DecoderOnlyLLM, LlmRuntimeConfig},
+    common::{paged_pool::BlockAllocator, DecoderOnlyLLM, LlmRuntimeConfig},
     definition::ModelDefinition,
     moe::{moe_forward_bucketed, ExpertStack, MoeForwardBucketedParams, MoeRouteScratch},
     qwen35_config::{Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig},
@@ -51,6 +51,12 @@ pub struct Qwen35BackendModel<B: MoeLlmBackend> {
     pub rope: Qwen35BackendRopeCache<B>,
     pub sequences: HashMap<String, Qwen35SequenceState<B>>,
     pub kv_capacity: usize,
+    pub use_paged_kv: bool,
+    pub paged_pools: Option<Vec<(B::Buffer, B::Buffer)>>,
+    pub paged_block_alloc: Option<std::sync::Mutex<BlockAllocator>>,
+    pub paged_max_seqs: usize,
+    pub paged_max_blocks_per_seq: usize,
+    paged_scratch: Qwen35PagedScratch<B>,
     pub greedy_argmax: bool,
     argmax_token_mask: Option<B::Buffer>,
     argmax_token_mask_fingerprint: Option<u64>,
@@ -228,6 +234,18 @@ pub struct Qwen35BackendLinearAttentionDecodeOutput<B: Backend> {
 pub struct Qwen35BackendRopeCache<B: Backend> {
     pub cos: B::Buffer,
     pub sin: B::Buffer,
+}
+
+pub struct Qwen35PagedScratch<B: MoeLlmBackend> {
+    cu_seqlens_q: Option<B::Buffer>,
+    pos_offsets: Option<B::Buffer>,
+    block_tables: Option<B::Buffer>,
+    context_lens: Option<B::Buffer>,
+    q: Option<B::Buffer>,
+    out: Option<B::Buffer>,
+    max_seqs: usize,
+    max_tokens: usize,
+    max_blocks_per_seq: usize,
 }
 
 pub struct Qwen35BackendFullAttentionOutput<B: Backend> {
@@ -581,6 +599,49 @@ pub fn qwen35_runtime_config(
 }
 
 const QWEN35_DEFAULT_KV_CAPACITY: usize = 512;
+const QWEN35_PAGED_BLOCK_SIZE: usize = 16;
+
+impl<B: MoeLlmBackend> Qwen35PagedScratch<B> {
+    fn new() -> Self {
+        Self {
+            cu_seqlens_q: None,
+            pos_offsets: None,
+            block_tables: None,
+            context_lens: None,
+            q: None,
+            out: None,
+            max_seqs: 0,
+            max_tokens: 0,
+            max_blocks_per_seq: 0,
+        }
+    }
+
+    fn ensure(
+        &mut self,
+        total_tokens: usize,
+        num_seqs: usize,
+        max_blocks_per_seq: usize,
+        q_total: usize,
+    ) {
+        let grow_tables = self.cu_seqlens_q.is_none()
+            || self.max_seqs < num_seqs
+            || self.max_blocks_per_seq < max_blocks_per_seq;
+        let grow_tokens = self.q.is_none() || self.max_tokens < total_tokens;
+        if grow_tables {
+            self.cu_seqlens_q = Some(B::alloc_typed(Dtype::U32, num_seqs + 1));
+            self.pos_offsets = Some(B::alloc_typed(Dtype::U32, num_seqs));
+            self.context_lens = Some(B::alloc_typed(Dtype::U32, num_seqs));
+            self.block_tables = Some(B::alloc_typed(Dtype::U32, num_seqs * max_blocks_per_seq));
+            self.max_seqs = num_seqs;
+            self.max_blocks_per_seq = max_blocks_per_seq;
+        }
+        if grow_tokens {
+            self.q = Some(B::alloc(total_tokens * q_total));
+            self.out = Some(B::alloc(total_tokens * q_total));
+            self.max_tokens = total_tokens;
+        }
+    }
+}
 
 fn qwen35_effective_max_seq_len_from_snapshot(
     snapshot: &ferrum_types::RuntimeConfigSnapshot,
@@ -622,6 +683,32 @@ fn qwen35_runtime_bool(snapshot: &ferrum_types::RuntimeConfigSnapshot, key: &str
             "1" | "true" | "TRUE" | "True" => Some(true),
             "0" | "false" | "FALSE" | "False" => Some(false),
             _ => None,
+        })
+}
+
+fn qwen35_paged_max_seqs(snapshot: &ferrum_types::RuntimeConfigSnapshot) -> usize {
+    qwen35_runtime_positive_usize(snapshot, "FERRUM_PAGED_MAX_SEQS").unwrap_or(32)
+}
+
+fn qwen35_paged_total_blocks(
+    snapshot: &ferrum_types::RuntimeConfigSnapshot,
+    max_blocks_per_seq: usize,
+    max_seqs: usize,
+) -> usize {
+    qwen35_runtime_positive_usize(snapshot, "FERRUM_KV_MAX_BLOCKS")
+        .unwrap_or_else(|| max_seqs * max_blocks_per_seq)
+        .max(1)
+}
+
+fn qwen35_first_full_kv<B: MoeLlmBackend>(
+    state: &Qwen35SequenceState<B>,
+) -> Option<&KvCache<B, KvFp16>> {
+    state
+        .layers
+        .iter()
+        .find_map(|layer_state| match layer_state {
+            Qwen35LayerRuntimeState::Full { kv } => Some(kv),
+            Qwen35LayerRuntimeState::Linear { .. } => None,
         })
 }
 
@@ -677,7 +764,7 @@ pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<Ll
     ))
 }
 
-impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
+impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
     pub fn from_weight_plan(
         config: Qwen35TextConfig,
         runtime_cfg: LlmRuntimeConfig,
@@ -702,6 +789,12 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
         let weights = Qwen35ModelWeights::<B>::load(config, runtime_cfg, &weight_plan, loader)?;
         let snapshot = ferrum_types::active_runtime_snapshot();
         let greedy_argmax = qwen35_runtime_bool(&snapshot, "FERRUM_GREEDY_ARGMAX").unwrap_or(false);
+        let use_paged_kv = B::supports_paged_kv()
+            && B::supports_varlen_qkv()
+            && B::supports_qwen35_paged_qkv()
+            && qwen35_runtime_bool(&snapshot, "FERRUM_METAL_PAGED_KV").unwrap_or(true);
+        let paged_max_seqs = qwen35_paged_max_seqs(&snapshot);
+        let paged_max_blocks_per_seq = kv_capacity.div_ceil(QWEN35_PAGED_BLOCK_SIZE);
         Ok(Self {
             weights,
             weight_plan,
@@ -709,6 +802,12 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
             rope,
             sequences: HashMap::new(),
             kv_capacity,
+            use_paged_kv,
+            paged_pools: None,
+            paged_block_alloc: None,
+            paged_max_seqs,
+            paged_max_blocks_per_seq,
+            paged_scratch: Qwen35PagedScratch::new(),
             greedy_argmax,
             argmax_token_mask: None,
             argmax_token_mask_fingerprint: None,
@@ -739,7 +838,113 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
         &self.weights.runtime_cfg
     }
 
-    fn allocate_sequence_state(&self) -> Result<Qwen35SequenceState<B>> {
+    fn ensure_paged_pools(&mut self) {
+        if !self.use_paged_kv || self.paged_pools.is_some() {
+            return;
+        }
+        let snapshot = ferrum_types::active_runtime_snapshot();
+        let total_blocks = qwen35_paged_total_blocks(
+            &snapshot,
+            self.paged_max_blocks_per_seq,
+            self.paged_max_seqs,
+        );
+        let pool_len = total_blocks
+            * self.weights.config.num_key_value_heads
+            * QWEN35_PAGED_BLOCK_SIZE
+            * self.weights.config.head_dim;
+        let mut pools = Vec::with_capacity(self.weights.config.num_hidden_layers);
+        for _ in 0..self.weights.config.num_hidden_layers {
+            pools.push((B::alloc(pool_len), B::alloc(pool_len)));
+        }
+        self.paged_pools = Some(pools);
+        self.paged_block_alloc = Some(std::sync::Mutex::new(BlockAllocator::new(
+            total_blocks as u32,
+        )));
+    }
+
+    fn ensure_paged_kv_capacity_for_state(
+        &mut self,
+        ctx: &mut B::Context,
+        cache_id: &str,
+        state: &mut Qwen35SequenceState<B>,
+        target_len: usize,
+    ) -> Result<()> {
+        if !self.use_paged_kv {
+            return Ok(());
+        }
+        let Some((block_size, max_blocks_per_seq, mut block_indices)) = qwen35_first_full_kv(state)
+            .map(|kv| {
+                (
+                    kv.block_size,
+                    kv.capacity / kv.block_size.max(1),
+                    kv.paged_block_indices.clone(),
+                )
+            })
+        else {
+            return Ok(());
+        };
+        if block_size == 0 {
+            return Ok(());
+        }
+        let needed_blocks = target_len.div_ceil(block_size);
+        if needed_blocks > max_blocks_per_seq {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 paged KV: target_len={target_len} needs {needed_blocks} blocks, \
+                 exceeds per-seq table capacity {max_blocks_per_seq} for cache_id={cache_id:?}"
+            )));
+        }
+        if block_indices.len() < needed_blocks {
+            let extra = needed_blocks - block_indices.len();
+            let new_blocks = {
+                let alloc = self.paged_block_alloc.as_ref().ok_or_else(|| {
+                    FerrumError::model(
+                        "Qwen3.5 paged KV grow missing allocator while paged pools are set",
+                    )
+                })?;
+                let mut alloc = alloc.lock().unwrap_or_else(|p| p.into_inner());
+                alloc.allocate_n(extra)?
+            };
+            block_indices.extend(new_blocks);
+        }
+        let mut padded = block_indices.clone();
+        padded.resize(max_blocks_per_seq, 0);
+        for layer_state in &mut state.layers {
+            if let Qwen35LayerRuntimeState::Full { kv } = layer_state {
+                kv.paged_block_indices = block_indices.clone();
+                if let Some(block_table) = kv.block_table.as_mut() {
+                    B::write_typed::<u32>(ctx, block_table, &padded);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn release_sequence_state_blocks(&mut self, state: &mut Qwen35SequenceState<B>) {
+        if !self.use_paged_kv {
+            return;
+        }
+        let Some(blocks) = qwen35_first_full_kv(state)
+            .map(|kv| kv.paged_block_indices.clone())
+            .filter(|blocks| !blocks.is_empty())
+        else {
+            return;
+        };
+        if let Some(alloc) = self.paged_block_alloc.as_ref() {
+            let mut alloc = alloc.lock().unwrap_or_else(|p| p.into_inner());
+            alloc.free(&blocks);
+        }
+        for layer_state in &mut state.layers {
+            if let Qwen35LayerRuntimeState::Full { kv } = layer_state {
+                kv.paged_block_indices.clear();
+                kv.len = 0;
+            }
+        }
+    }
+
+    fn allocate_sequence_state(&mut self) -> Result<Qwen35SequenceState<B>> {
+        if self.use_paged_kv {
+            self.ensure_paged_pools();
+        }
         let mut layers = Vec::with_capacity(self.weights.config.num_hidden_layers);
         for layer_plan in self
             .weights
@@ -766,8 +971,30 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
                     });
                 }
                 Qwen35LayerType::FullAttention => {
-                    layers.push(Qwen35LayerRuntimeState::Full {
-                        kv: KvCache {
+                    let kv = if self.use_paged_kv {
+                        let mut context_lens = B::alloc_typed(Dtype::U32, 1);
+                        let mut block_table =
+                            B::alloc_typed(Dtype::U32, self.paged_max_blocks_per_seq);
+                        let mut ctx = B::new_context();
+                        let padded = vec![0u32; self.paged_max_blocks_per_seq];
+                        B::write_typed::<u32>(&mut ctx, &mut context_lens, &[0u32]);
+                        B::write_typed::<u32>(&mut ctx, &mut block_table, &padded);
+                        B::sync(&mut ctx);
+                        KvCache {
+                            k: B::alloc(1),
+                            v: B::alloc(1),
+                            len: 0,
+                            capacity: self.paged_max_blocks_per_seq * QWEN35_PAGED_BLOCK_SIZE,
+                            num_kv_heads: self.weights.config.num_key_value_heads,
+                            head_dim: self.weights.config.head_dim,
+                            block_size: QWEN35_PAGED_BLOCK_SIZE,
+                            block_table: Some(block_table),
+                            context_lens: Some(context_lens),
+                            paged_block_indices: Vec::new(),
+                            _kv_dtype: std::marker::PhantomData,
+                        }
+                    } else {
+                        KvCache {
                             k: B::alloc(
                                 self.weights.config.num_key_value_heads
                                     * self.kv_capacity
@@ -787,8 +1014,9 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
                             context_lens: None,
                             paged_block_indices: Vec::new(),
                             _kv_dtype: std::marker::PhantomData,
-                        },
-                    });
+                        }
+                    };
+                    layers.push(Qwen35LayerRuntimeState::Full { kv });
                 }
             }
         }
@@ -830,16 +1058,28 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
     }
 
     fn forward_stateful_chunk(&mut self, cache_id: &str, tokens: &[u32]) -> Result<Vec<f32>> {
-        let weights = &self.weights;
-        let rope = &self.rope;
-        let state = self.sequences.get_mut(cache_id).ok_or_else(|| {
+        let mut state = self.sequences.remove(cache_id).ok_or_else(|| {
             FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
         })?;
-        if state.layers.len() != weights.layers.len() {
+        let result = self.forward_stateful_chunk_taken(cache_id, tokens, &mut state);
+        if result.is_ok() {
+            state.tokens.extend_from_slice(tokens);
+        }
+        self.sequences.insert(cache_id.to_string(), state);
+        result
+    }
+
+    fn forward_stateful_chunk_taken(
+        &mut self,
+        cache_id: &str,
+        tokens: &[u32],
+        state: &mut Qwen35SequenceState<B>,
+    ) -> Result<Vec<f32>> {
+        if state.layers.len() != self.weights.layers.len() {
             return Err(FerrumError::model(format!(
                 "Qwen3.5 sequence state layer count {} != model layers {}",
                 state.layers.len(),
-                weights.layers.len()
+                self.weights.layers.len()
             )));
         }
         let tokens_len = tokens.len();
@@ -852,6 +1092,14 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
         }
 
         let mut ctx = B::new_context();
+        self.ensure_paged_kv_capacity_for_state(
+            &mut ctx,
+            cache_id,
+            state,
+            state.tokens.len() + tokens_len,
+        )?;
+        let weights = &self.weights;
+        let rope = &self.rope;
         let mut hidden = B::alloc(tokens_len * weights.config.hidden_size);
         B::embedding_lookup(
             &mut ctx,
@@ -901,10 +1149,18 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
                     branch_f32.as_mut(),
                 )?,
                 Qwen35LayerRuntimeState::Full { kv } => {
+                    let paged = if self.use_paged_kv {
+                        self.paged_pools
+                            .as_mut()
+                            .map(|pools| (&mut pools[layer_index], &mut self.paged_scratch))
+                    } else {
+                        None
+                    };
                     qwen35_full_attention_stateful_layer_backend::<B>(
                         &mut ctx,
                         &hidden,
                         kv,
+                        paged,
                         layer,
                         rope,
                         &weights.config,
@@ -996,7 +1252,6 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
                 out.len().saturating_sub(finite),
             );
         }
-        state.tokens.extend_from_slice(tokens);
         Ok(out)
     }
 
@@ -1081,14 +1336,22 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
         states: &mut [(String, Qwen35SequenceState<B>)],
         logits_return: Qwen35DecodeLogitsReturn<'_>,
     ) -> Result<Vec<Vec<f32>>> {
-        let weights = &self.weights;
-        let rope = &self.rope;
         let batch_len = tokens.len();
         if batch_len == 0 {
             return Ok(Vec::new());
         }
-        let hidden_len = batch_len * weights.config.hidden_size;
         let mut ctx = B::new_context();
+        for (cache_id, state) in states.iter_mut() {
+            self.ensure_paged_kv_capacity_for_state(
+                &mut ctx,
+                cache_id,
+                state,
+                state.tokens.len() + 1,
+            )?;
+        }
+        let weights = &self.weights;
+        let rope = &self.rope;
+        let hidden_len = batch_len * weights.config.hidden_size;
         let mut hidden = B::alloc(hidden_len);
         B::embedding_lookup(
             &mut ctx,
@@ -1124,10 +1387,18 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
                     )?
                 }
                 Qwen35AttentionWeights::Full(_) => {
+                    let paged = if self.use_paged_kv {
+                        self.paged_pools
+                            .as_mut()
+                            .map(|pools| (&mut pools[layer_index], &mut self.paged_scratch))
+                    } else {
+                        None
+                    };
                     qwen35_full_attention_decode_batch_layer_backend::<B>(
                         &mut ctx,
                         &hidden,
                         states,
+                        paged,
                         layer_index,
                         layer,
                         rope,
@@ -1347,7 +1618,7 @@ fn qwen35_trace_layer_moe_route(
     );
 }
 
-impl<B: MoeLlmBackend> DecoderOnlyLLM for Qwen35BackendModel<B> {
+impl<B: MoeLlmBackend + BackendPagedKv> DecoderOnlyLLM for Qwen35BackendModel<B> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.weights.runtime_cfg
     }
@@ -1413,15 +1684,20 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for Qwen35BackendModel<B> {
     }
 
     fn release(&mut self, cache_id: &str) {
-        self.sequences.remove(cache_id);
+        if let Some(mut state) = self.sequences.remove(cache_id) {
+            self.release_sequence_state_blocks(&mut state);
+        }
     }
 
     fn reset(&mut self) {
-        self.sequences.clear();
+        let mut states = std::mem::take(&mut self.sequences);
+        for state in states.values_mut() {
+            self.release_sequence_state_blocks(state);
+        }
     }
 }
 
-impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
+impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
     pub fn from_definition_with_native_safetensors(
         def: &ModelDefinition,
         model_dir: &Path,
@@ -3761,10 +4037,11 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
+fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPagedKv>(
     ctx: &mut B::Context,
     layer_input: &B::Buffer,
     states: &mut [(String, Qwen35SequenceState<B>)],
+    paged: Option<(&mut (B::Buffer, B::Buffer), &mut Qwen35PagedScratch<B>)>,
     layer_index: usize,
     layer: &Qwen35LayerWeights<B>,
     rope: &Qwen35BackendRopeCache<B>,
@@ -3827,6 +4104,198 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
     attention
         .v_proj
         .forward(ctx, &input_norm, &mut value_raw, batch_len);
+
+    if let Some((pool, scratch)) = paged {
+        let mut pos_offsets = Vec::with_capacity(batch_len);
+        let mut context_lens = Vec::with_capacity(batch_len);
+        let mut stacked = Vec::new();
+        let mut block_size = 0usize;
+        let mut max_blocks_per_seq = 0usize;
+        for (_, state) in states.iter() {
+            let Qwen35LayerRuntimeState::Full { kv } =
+                state.layers.get(layer_index).ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing layer {layer_index} state during paged decode"
+                    ))
+                })?
+            else {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 paged decode expected full layer state at layer {layer_index}"
+                )));
+            };
+            if kv.block_size == 0 {
+                return Err(FerrumError::model(
+                    "Qwen3.5 paged decode received non-paged KV metadata",
+                ));
+            }
+            if block_size == 0 {
+                block_size = kv.block_size;
+                max_blocks_per_seq = kv.capacity / kv.block_size;
+            }
+            pos_offsets.push(kv.len as u32);
+            context_lens.push((kv.len + 1) as u32);
+            let mut blocks = kv.paged_block_indices.clone();
+            blocks.resize(max_blocks_per_seq, 0);
+            stacked.extend(blocks);
+        }
+        let cu: Vec<u32> = (0..=batch_len as u32).collect();
+        scratch.ensure(batch_len, batch_len, max_blocks_per_seq, q_total);
+        let cu_buf = scratch
+            .cu_seqlens_q
+            .as_mut()
+            .expect("qwen35 paged cu missing");
+        let pos_buf = scratch
+            .pos_offsets
+            .as_mut()
+            .expect("qwen35 paged pos missing");
+        let bt_buf = scratch
+            .block_tables
+            .as_mut()
+            .expect("qwen35 paged block_tables missing");
+        let lens_buf = scratch
+            .context_lens
+            .as_mut()
+            .expect("qwen35 paged context_lens missing");
+        B::write_typed::<u32>(ctx, cu_buf, &cu);
+        B::write_typed::<u32>(ctx, pos_buf, &pos_offsets);
+        B::write_typed::<u32>(ctx, bt_buf, &stacked);
+        B::write_typed::<u32>(ctx, lens_buf, &context_lens);
+        let q_buf = scratch.q.as_mut().expect("qwen35 paged q missing");
+        let out_buf = scratch.out.as_mut().expect("qwen35 paged out missing");
+        let attention_shape = Qwen35FullAttentionShape {
+            tokens: 1,
+            num_heads: config.num_attention_heads,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            rope_dim: config.full_attention_rope_dim(),
+            position_offset: 0,
+            rope_theta: config.rope_parameters.rope_theta as f32,
+            rope_interleaved: config.full_attention_text_rope_interleaved(),
+            attn_output_gate: config.attn_output_gate,
+        };
+        attention_shape.validate()?;
+        B::qwen35_split_qkv_norm_rope_into_paged_cache_varlen(
+            ctx,
+            &query_raw,
+            &key_raw,
+            &value_raw,
+            &attention.q_norm_weight,
+            &attention.k_norm_weight,
+            &rope.cos,
+            &rope.sin,
+            q_buf,
+            &mut pool.0,
+            &mut pool.1,
+            cu_buf,
+            pos_buf,
+            bt_buf,
+            batch_len,
+            batch_len,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            attention_shape.rope_dim,
+            q_proj_total,
+            if attention_shape.attn_output_gate {
+                2 * config.head_dim
+            } else {
+                config.head_dim
+            },
+            kv_total,
+            eps,
+            if attention_shape.rope_interleaved {
+                3
+            } else {
+                1
+            },
+            block_size,
+            max_blocks_per_seq,
+        )?;
+        for (_, state) in states.iter_mut() {
+            let Qwen35LayerRuntimeState::Full { kv } =
+                state.layers.get_mut(layer_index).ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing layer {layer_index} state during paged decode len update"
+                    ))
+                })?
+            else {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 paged decode expected full layer state at layer {layer_index}"
+                )));
+            };
+            kv.len += 1;
+            if let Some(cl) = kv.context_lens.as_mut() {
+                B::write_typed::<u32>(ctx, cl, &[kv.len as u32]);
+            }
+        }
+        let max_kv_len = context_lens.iter().copied().max().unwrap_or(1) as usize;
+        B::paged_batched_decode_attention(
+            ctx,
+            q_buf,
+            &pool.0,
+            &pool.1,
+            out_buf,
+            bt_buf,
+            lens_buf,
+            batch_len,
+            max_kv_len,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            block_size,
+            max_blocks_per_seq,
+        )?;
+        let mut context = B::alloc(batch_len * q_total);
+        B::copy_slice(ctx, out_buf, 0, &mut context, 0, batch_len * q_total);
+        if attention_shape.attn_output_gate {
+            B::qwen35_apply_attention_gate(
+                ctx,
+                &mut context,
+                &query_raw,
+                batch_len,
+                q_total,
+                q_proj_total,
+                config.head_dim,
+            )?;
+        }
+        let mut attn_output = B::alloc(hidden_len);
+        attention
+            .o_proj
+            .forward(ctx, &context, &mut attn_output, batch_len);
+        if let (Some(residual_f32), Some(branch_f32)) =
+            (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
+        {
+            B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
+            B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+            return qwen35_finish_layer_with_mlp_f32_residual::<B>(
+                ctx,
+                residual_f32,
+                branch_f32,
+                layer,
+                config,
+                batch_len,
+                eps,
+            );
+        }
+        let mut residual_after_attention = B::alloc(hidden_len);
+        B::copy_slice(
+            ctx,
+            layer_input,
+            0,
+            &mut residual_after_attention,
+            0,
+            hidden_len,
+        );
+        B::add_inplace(ctx, &mut residual_after_attention, &attn_output, hidden_len);
+        return qwen35_finish_layer_with_mlp::<B>(
+            ctx,
+            &residual_after_attention,
+            layer,
+            config,
+            batch_len,
+            eps,
+        );
+    }
 
     let mut context = B::alloc(batch_len * q_total);
     for (row, (cache_id, state)) in states.iter_mut().enumerate() {
@@ -4361,10 +4830,11 @@ fn qwen35_linear_attention_stateful_layer_backend<B: MoeLlmBackend>(
     }
 }
 
-fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend>(
+fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend + BackendPagedKv>(
     ctx: &mut B::Context,
     layer_input: &B::Buffer,
     kv: &mut KvCache<B, KvFp16>,
+    paged: Option<(&mut (B::Buffer, B::Buffer), &mut Qwen35PagedScratch<B>)>,
     layer: &Qwen35LayerWeights<B>,
     rope: &Qwen35BackendRopeCache<B>,
     config: &Qwen35TextConfig,
@@ -4470,6 +4940,154 @@ fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend>(
         &value_raw,
         tokens * kv_total,
     );
+
+    if let Some((pool, scratch)) = paged {
+        let block_size = kv.block_size;
+        let max_blocks_per_seq = kv.capacity / block_size.max(1);
+        if block_size == 0 || max_blocks_per_seq == 0 {
+            return Err(FerrumError::model(
+                "Qwen3.5 paged full attention received non-paged KV metadata",
+            ));
+        }
+        let mut padded = kv.paged_block_indices.clone();
+        padded.resize(max_blocks_per_seq, 0);
+        let cu = vec![0u32, tokens as u32];
+        let pos_offsets = vec![position_offset as u32];
+        let context_lens = vec![(position_offset + tokens) as u32];
+        scratch.ensure(tokens, 1, max_blocks_per_seq, q_total);
+        let cu_buf = scratch
+            .cu_seqlens_q
+            .as_mut()
+            .expect("qwen35 paged cu missing");
+        let pos_buf = scratch
+            .pos_offsets
+            .as_mut()
+            .expect("qwen35 paged pos missing");
+        let bt_buf = scratch
+            .block_tables
+            .as_mut()
+            .expect("qwen35 paged block_tables missing");
+        let lens_buf = scratch
+            .context_lens
+            .as_mut()
+            .expect("qwen35 paged context_lens missing");
+        B::write_typed::<u32>(ctx, cu_buf, &cu);
+        B::write_typed::<u32>(ctx, pos_buf, &pos_offsets);
+        B::write_typed::<u32>(ctx, bt_buf, &padded);
+        B::write_typed::<u32>(ctx, lens_buf, &context_lens);
+        if let Some(cl) = kv.context_lens.as_mut() {
+            B::write_typed::<u32>(ctx, cl, &context_lens);
+        }
+        let q_buf = scratch.q.as_mut().expect("qwen35 paged q missing");
+        let out_buf = scratch.out.as_mut().expect("qwen35 paged out missing");
+        B::qwen35_split_qkv_norm_rope_into_paged_cache_varlen(
+            ctx,
+            &query_raw,
+            &key_raw,
+            &value_raw,
+            &attention.q_norm_weight,
+            &attention.k_norm_weight,
+            &rope.cos,
+            &rope.sin,
+            q_buf,
+            &mut pool.0,
+            &mut pool.1,
+            cu_buf,
+            pos_buf,
+            bt_buf,
+            1,
+            tokens,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            attention_shape.rope_dim,
+            q_proj_total,
+            if attention_shape.attn_output_gate {
+                2 * config.head_dim
+            } else {
+                config.head_dim
+            },
+            kv_total,
+            eps,
+            if attention_shape.rope_interleaved {
+                3
+            } else {
+                1
+            },
+            block_size,
+            max_blocks_per_seq,
+        )?;
+        kv.len += tokens;
+        B::paged_varlen_attention(
+            ctx,
+            q_buf,
+            &pool.0,
+            &pool.1,
+            out_buf,
+            cu_buf,
+            pos_buf,
+            bt_buf,
+            1,
+            tokens,
+            kv.len,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            0,
+            block_size,
+            max_blocks_per_seq,
+        )?;
+        let mut context = B::alloc(tokens * q_total);
+        B::copy_slice(ctx, out_buf, 0, &mut context, 0, tokens * q_total);
+        if attention_shape.attn_output_gate {
+            B::qwen35_apply_attention_gate(
+                ctx,
+                &mut context,
+                &query_raw,
+                tokens,
+                q_total,
+                q_proj_total,
+                config.head_dim,
+            )?;
+        }
+        let mut attn_output = B::alloc(hidden_len);
+        attention
+            .o_proj
+            .forward(ctx, &context, &mut attn_output, tokens);
+        if let (Some(residual_f32), Some(branch_f32)) =
+            (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
+        {
+            B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
+            B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+            return qwen35_finish_layer_with_mlp_f32_residual::<B>(
+                ctx,
+                residual_f32,
+                branch_f32,
+                layer,
+                config,
+                tokens,
+                eps,
+            );
+        }
+        let mut residual_after_attention = B::alloc(hidden_len);
+        B::copy_slice(
+            ctx,
+            layer_input,
+            0,
+            &mut residual_after_attention,
+            0,
+            hidden_len,
+        );
+        B::add_inplace(ctx, &mut residual_after_attention, &attn_output, hidden_len);
+        return qwen35_finish_layer_with_mlp::<B>(
+            ctx,
+            &residual_after_attention,
+            layer,
+            config,
+            tokens,
+            eps,
+        );
+    }
 
     let mut query_head_major = B::alloc(tokens * q_total);
     let mut key_head_major = B::alloc(tokens * kv_total);

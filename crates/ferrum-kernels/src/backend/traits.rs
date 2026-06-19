@@ -1399,6 +1399,50 @@ pub trait BackendPagedKv: Backend {
         false
     }
 
+    /// Qwen3.5 full-attention uses separate q/k/v projections and partial
+    /// RoPE/gated-Q layout, so it cannot use the fused-QKV paged writer
+    /// directly. Backends that implement this method can write those
+    /// separate projections into the same vLLM-style paged pool consumed by
+    /// [`Self::paged_batched_decode_attention`].
+    fn supports_qwen35_paged_qkv() -> bool {
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_split_qkv_norm_rope_into_paged_cache_varlen(
+        _ctx: &mut Self::Context,
+        _query_raw: &Self::Buffer,
+        _key_raw: &Self::Buffer,
+        _value_raw: &Self::Buffer,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _total_q_tokens: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _rope_dim: usize,
+        _q_proj_stride: usize,
+        _q_head_stride: usize,
+        _kv_proj_stride: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _block_size: usize,
+        _max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "qwen35_split_qkv_norm_rope_into_paged_cache_varlen not implemented for this backend",
+        ))
+    }
+
     /// vLLM-layout variant of
     /// [`Self::split_qkv_norm_rope_into_paged_cache`]. K/V are written in
     /// vLLM's `paged_attention_v2` layout: K is
