@@ -622,6 +622,12 @@ impl BackendPagedKv for CudaBackend {
     fn supports_qwen35_paged_qkv() -> bool {
         true
     }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    fn supports_qwen35_paged_qkv_vllm() -> bool {
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn qwen35_split_qkv_norm_rope_into_paged_cache_varlen(
         ctx: &mut Self::Context,
@@ -714,6 +720,101 @@ impl BackendPagedKv for CudaBackend {
             ))
         })
     }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_split_qkv_norm_rope_into_paged_cache_varlen_vllm(
+        ctx: &mut Self::Context,
+        query_raw: &Self::Buffer,
+        key_raw: &Self::Buffer,
+        value_raw: &Self::Buffer,
+        q_norm_w: &Self::Buffer,
+        k_norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        q_out: &mut Self::Buffer,
+        cache_k: &mut Self::Buffer,
+        cache_v: &mut Self::Buffer,
+        cu_seqlens_q: &Self::Buffer,
+        pos_offsets: &Self::Buffer,
+        block_tables: &Self::Buffer,
+        num_seqs: usize,
+        total_q_tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        q_proj_stride: usize,
+        q_head_stride: usize,
+        kv_proj_stride: usize,
+        eps: f32,
+        qk_mode: i32,
+        block_size: usize,
+        max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        if num_seqs == 0 || total_q_tokens == 0 {
+            return Ok(());
+        }
+        let func = ctx.func(
+            "qwen35_paged_qkv",
+            ptx::QWEN35_PAGED_QKV,
+            "qwen35_split_qkv_norm_rope_into_paged_cache_varlen_vllm_f16",
+        );
+        let stream = ctx.stream.clone();
+        let num_seqs_i32 = num_seqs as i32;
+        let total_q_tokens_i32 = total_q_tokens as i32;
+        let q_heads_i32 = q_heads as i32;
+        let kv_heads_i32 = kv_heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let rope_dim_i32 = rope_dim as i32;
+        let q_proj_stride_i32 = q_proj_stride as i32;
+        let q_head_stride_i32 = q_head_stride as i32;
+        let kv_proj_stride_i32 = kv_proj_stride as i32;
+        let block_size_i32 = block_size as i32;
+        let max_blocks_per_seq_i32 = max_blocks_per_seq as i32;
+        let qk_mode_i32 = qk_mode;
+        let mut b = stream.launch_builder(&func);
+        b.arg(query_raw);
+        b.arg(key_raw);
+        b.arg(value_raw);
+        b.arg(q_norm_w);
+        b.arg(k_norm_w);
+        b.arg(cos);
+        b.arg(sin);
+        b.arg(q_out);
+        b.arg(cache_k);
+        b.arg(cache_v);
+        b.arg(cu_seqlens_q);
+        b.arg(pos_offsets);
+        b.arg(block_tables);
+        b.arg(&num_seqs_i32);
+        b.arg(&total_q_tokens_i32);
+        b.arg(&q_heads_i32);
+        b.arg(&kv_heads_i32);
+        b.arg(&head_dim_i32);
+        b.arg(&rope_dim_i32);
+        b.arg(&q_proj_stride_i32);
+        b.arg(&q_head_stride_i32);
+        b.arg(&kv_proj_stride_i32);
+        b.arg(&eps);
+        b.arg(&qk_mode_i32);
+        b.arg(&block_size_i32);
+        b.arg(&max_blocks_per_seq_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (total_q_tokens as u32, (q_heads + 2 * kv_heads) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|e| {
+            FerrumError::model(format!(
+                "qwen35_split_qkv_norm_rope_into_paged_cache_varlen_vllm: {e}"
+            ))
+        })
+    }
+
     fn populate_batched_pointers(
         ctx: &mut Self::Context,
         k_caches: &[&Self::Buffer],
