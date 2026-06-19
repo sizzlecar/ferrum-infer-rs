@@ -227,17 +227,24 @@ impl Linear<CudaBackend> for CudaMarlinStackedExpertLinear {
                 };
                 #[cfg(not(feature = "triton-kernels"))]
                 let mw: &crate::marlin::MarlinWeight = self.store.as_ref();
-                let stream = ctx.stream.clone();
-                crate::marlin::marlin_gemm_with_offset(
-                    &stream,
-                    input.as_f16(),
-                    mw,
-                    out.as_f16_mut(),
-                    m as i32,
-                    self.expert_offset as i32,
-                    self.expert_n as i32,
-                )
-                .map_err(|e| FerrumError::model(format!("marlin offset gemm: {e}")))
+                if mw.vllm_moe {
+                    Err(FerrumError::unsupported(
+                        "vLLM Marlin-MoE packed weight cannot be dispatched through \
+                         single-expert offset Marlin GEMM",
+                    ))
+                } else {
+                    let stream = ctx.stream.clone();
+                    crate::marlin::marlin_gemm_with_offset(
+                        &stream,
+                        input.as_f16(),
+                        mw,
+                        out.as_f16_mut(),
+                        m as i32,
+                        self.expert_offset as i32,
+                        self.expert_n as i32,
+                    )
+                    .map_err(|e| FerrumError::model(format!("marlin offset gemm: {e}")))
+                }
             }
             #[cfg(not(feature = "marlin"))]
             {

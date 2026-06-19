@@ -5,7 +5,7 @@
 //! not implement product forward execution yet.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
 use std::path::Path;
@@ -14,17 +14,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ferrum_interfaces::{
-    RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
+    kv_dtype::KvFp16, RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
     RecurrentStateManagerStats, RecurrentStateSpec,
 };
-use ferrum_kernels::backend::{AttnConfig, Backend, BackendQuantMarlin, Dtype};
-use ferrum_quantization::{Linear, NativeSafetensorsLoader, WeightLoader};
+use ferrum_kernels::backend::{AttnConfig, Backend, Dtype, KvCache, MoeLlmBackend};
+use ferrum_quantization::{Linear, NativeSafetensorsLoader, StackedExpertLinear, WeightLoader};
 use ferrum_types::{DataType, Device, FerrumError, RequestId, Result};
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
-    common::LlmRuntimeConfig,
+    common::{DecoderOnlyLLM, LlmRuntimeConfig},
     definition::ModelDefinition,
+    moe::{moe_forward_bucketed, ExpertStack, MoeForwardBucketedParams, MoeRouteScratch},
     qwen35_config::{Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig},
     qwen35_weights::{
         Qwen35ResolvedWeightPlan, Qwen35WeightInventory, Qwen35WeightPlanLoader,
@@ -32,7 +33,7 @@ use crate::{
     },
 };
 
-pub struct Qwen35ModelWeights<B: Backend> {
+pub struct Qwen35ModelWeights<B: MoeLlmBackend> {
     pub config: Qwen35TextConfig,
     pub runtime_cfg: LlmRuntimeConfig,
     pub embed_tokens: B::Buffer,
@@ -41,13 +42,16 @@ pub struct Qwen35ModelWeights<B: Backend> {
     pub layers: Vec<Qwen35LayerWeights<B>>,
 }
 
-pub struct Qwen35BackendModel<B: Backend> {
+pub struct Qwen35BackendModel<B: MoeLlmBackend> {
     pub weights: Qwen35ModelWeights<B>,
     pub weight_plan: Qwen35ResolvedWeightPlan,
     pub weight_validation: Qwen35WeightValidation,
+    pub rope: Qwen35BackendRopeCache<B>,
+    pub sequences: HashMap<String, Qwen35SequenceState<B>>,
+    pub kv_capacity: usize,
 }
 
-pub struct Qwen35LayerWeights<B: Backend> {
+pub struct Qwen35LayerWeights<B: MoeLlmBackend> {
     pub layer_index: usize,
     pub input_layernorm: B::Buffer,
     pub post_attention_layernorm: B::Buffer,
@@ -55,12 +59,12 @@ pub struct Qwen35LayerWeights<B: Backend> {
     pub mlp: Qwen35MlpWeights<B>,
 }
 
-pub enum Qwen35AttentionWeights<B: Backend> {
+pub enum Qwen35AttentionWeights<B: MoeLlmBackend> {
     Linear(Qwen35LinearAttentionWeights<B>),
     Full(Qwen35FullAttentionWeights<B>),
 }
 
-pub struct Qwen35LinearAttentionWeights<B: Backend> {
+pub struct Qwen35LinearAttentionWeights<B: MoeLlmBackend> {
     pub qkv_proj: Box<dyn Linear<B>>,
     pub z_proj: Box<dyn Linear<B>>,
     pub b_proj: Box<dyn Linear<B>>,
@@ -72,7 +76,7 @@ pub struct Qwen35LinearAttentionWeights<B: Backend> {
     pub out_proj: Box<dyn Linear<B>>,
 }
 
-pub struct Qwen35FullAttentionWeights<B: Backend> {
+pub struct Qwen35FullAttentionWeights<B: MoeLlmBackend> {
     pub q_proj: Box<dyn Linear<B>>,
     pub k_proj: Box<dyn Linear<B>>,
     pub v_proj: Box<dyn Linear<B>>,
@@ -81,24 +85,40 @@ pub struct Qwen35FullAttentionWeights<B: Backend> {
     pub k_norm_weight: B::Buffer,
 }
 
-pub enum Qwen35MlpWeights<B: Backend> {
+pub enum Qwen35MlpWeights<B: MoeLlmBackend> {
     Dense(Qwen35DenseMlpWeights<B>),
     SparseMoeSharedExpert(Qwen35SparseMoeSharedExpertWeights<B>),
 }
 
-pub struct Qwen35DenseMlpWeights<B: Backend> {
+pub struct Qwen35DenseMlpWeights<B: MoeLlmBackend> {
     pub gate_up_proj: Box<dyn Linear<B>>,
     pub down_proj: Box<dyn Linear<B>>,
 }
 
-pub struct Qwen35SparseMoeSharedExpertWeights<B: Backend> {
+pub struct Qwen35SparseMoeSharedExpertWeights<B: MoeLlmBackend> {
     pub router: Box<dyn Linear<B>>,
+    pub experts: ExpertStack<B>,
     pub shared_expert_gate: B::Buffer,
     pub shared_expert_gate_proj: Box<dyn Linear<B>>,
     pub shared_expert_up_proj: Box<dyn Linear<B>>,
     pub shared_expert_down_proj: Box<dyn Linear<B>>,
     pub fused_gate_up_proj: B::Buffer,
     pub fused_down_proj: B::Buffer,
+}
+
+pub struct Qwen35SequenceState<B: MoeLlmBackend> {
+    pub tokens: Vec<u32>,
+    pub layers: Vec<Qwen35LayerRuntimeState<B>>,
+}
+
+pub enum Qwen35LayerRuntimeState<B: MoeLlmBackend> {
+    Linear {
+        conv_state: B::Buffer,
+        delta_state: B::Buffer,
+    },
+    Full {
+        kv: KvCache<B, KvFp16>,
+    },
 }
 
 pub struct Qwen35RecurrentStateCache<B: Backend> {
@@ -218,6 +238,16 @@ pub struct Qwen35BackendDenseMlpOutput<B: Backend> {
     pub output: B::Buffer,
 }
 
+pub struct Qwen35BackendSparseMoeOutput<B: MoeLlmBackend> {
+    pub router_logits: B::Buffer,
+    pub routed_output: B::Buffer,
+    pub shared_gate: B::Buffer,
+    pub shared_gate_up: B::Buffer,
+    pub shared_fused: B::Buffer,
+    pub shared_output: B::Buffer,
+    pub output: B::Buffer,
+}
+
 pub struct Qwen35BackendDenseFullAttentionLayerOutput<B: Backend> {
     pub input_norm: B::Buffer,
     pub query_raw: B::Buffer,
@@ -275,8 +305,11 @@ pub struct Qwen35FullAttentionShape {
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
+    pub rope_dim: usize,
     pub position_offset: usize,
     pub rope_theta: f32,
+    pub rope_interleaved: bool,
+    pub attn_output_gate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -284,6 +317,8 @@ pub struct Qwen35FullAttentionReference {
     pub query: Vec<f32>,
     pub key: Vec<f32>,
     pub value: Vec<f32>,
+    pub attention_gate: Option<Vec<f32>>,
+    pub context_ungated: Vec<f32>,
     pub context: Vec<f32>,
 }
 
@@ -534,7 +569,7 @@ pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<Ll
     ))
 }
 
-impl<B: Backend> Qwen35BackendModel<B> {
+impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
     pub fn from_weight_plan(
         config: Qwen35TextConfig,
         runtime_cfg: LlmRuntimeConfig,
@@ -550,11 +585,20 @@ impl<B: Backend> Qwen35BackendModel<B> {
                 weight_validation.missing_required.len()
             )));
         }
+        let rope = qwen35_build_rope_cache_backend::<B>(
+            runtime_cfg.max_seq_len,
+            config.full_attention_rope_dim(),
+            config.rope_parameters.rope_theta as f32,
+        )?;
+        let kv_capacity = runtime_cfg.max_seq_len;
         let weights = Qwen35ModelWeights::<B>::load(config, runtime_cfg, &weight_plan, loader)?;
         Ok(Self {
             weights,
             weight_plan,
             weight_validation,
+            rope,
+            sequences: HashMap::new(),
+            kv_capacity,
         })
     }
 
@@ -577,9 +621,603 @@ impl<B: Backend> Qwen35BackendModel<B> {
     pub fn runtime_config(&self) -> &LlmRuntimeConfig {
         &self.weights.runtime_cfg
     }
+
+    fn allocate_sequence_state(&self) -> Result<Qwen35SequenceState<B>> {
+        let mut layers = Vec::with_capacity(self.weights.config.num_hidden_layers);
+        for layer_plan in self
+            .weights
+            .config
+            .layer_plan()
+            .map_err(FerrumError::model)?
+        {
+            match layer_plan.attention {
+                Qwen35LayerType::LinearAttention => {
+                    let shape = Qwen35LinearAttentionShape {
+                        tokens: 1,
+                        key_heads: self.weights.config.linear_attention.num_key_heads,
+                        value_heads: self.weights.config.linear_attention.num_value_heads,
+                        key_dim: self.weights.config.linear_attention.key_head_dim,
+                        value_dim: self.weights.config.linear_attention.value_head_dim,
+                        conv_kernel: self.weights.config.linear_attention.conv_kernel_dim,
+                    };
+                    layers.push(Qwen35LayerRuntimeState::Linear {
+                        conv_state: B::alloc_typed(
+                            Dtype::F32,
+                            shape.conv_channels() * shape.conv_kernel.saturating_sub(1),
+                        ),
+                        delta_state: B::alloc_typed(Dtype::F32, shape.state_len()),
+                    });
+                }
+                Qwen35LayerType::FullAttention => {
+                    layers.push(Qwen35LayerRuntimeState::Full {
+                        kv: KvCache {
+                            k: B::alloc(
+                                self.weights.config.num_key_value_heads
+                                    * self.kv_capacity
+                                    * self.weights.config.head_dim,
+                            ),
+                            v: B::alloc(
+                                self.weights.config.num_key_value_heads
+                                    * self.kv_capacity
+                                    * self.weights.config.head_dim,
+                            ),
+                            len: 0,
+                            capacity: self.kv_capacity,
+                            num_kv_heads: self.weights.config.num_key_value_heads,
+                            head_dim: self.weights.config.head_dim,
+                            block_size: 0,
+                            block_table: None,
+                            context_lens: None,
+                            paged_block_indices: Vec::new(),
+                            _kv_dtype: std::marker::PhantomData,
+                        },
+                    });
+                }
+            }
+        }
+        Ok(Qwen35SequenceState {
+            tokens: Vec::new(),
+            layers,
+        })
+    }
+
+    fn ensure_sequence_state(&mut self, cache_id: &str) -> Result<()> {
+        if self.sequences.contains_key(cache_id) {
+            return Ok(());
+        }
+        let state = self.allocate_sequence_state()?;
+        self.sequences.insert(cache_id.to_string(), state);
+        Ok(())
+    }
+
+    fn forward_stateful(&mut self, cache_id: &str, tokens: &[u32]) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(FerrumError::model(
+                "Qwen3.5 stateful forward requires at least one token",
+            ));
+        }
+        self.ensure_sequence_state(cache_id)?;
+        if tokens.len() > 1
+            && self
+                .sequences
+                .get(cache_id)
+                .is_some_and(|state| !state.tokens.is_empty())
+        {
+            let mut last = Vec::new();
+            for token in tokens {
+                last = self.forward_stateful_chunk(cache_id, &[*token])?;
+            }
+            return Ok(last);
+        }
+        self.forward_stateful_chunk(cache_id, tokens)
+    }
+
+    fn forward_stateful_chunk(&mut self, cache_id: &str, tokens: &[u32]) -> Result<Vec<f32>> {
+        let weights = &self.weights;
+        let rope = &self.rope;
+        let state = self.sequences.get_mut(cache_id).ok_or_else(|| {
+            FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
+        })?;
+        if state.layers.len() != weights.layers.len() {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sequence state layer count {} != model layers {}",
+                state.layers.len(),
+                weights.layers.len()
+            )));
+        }
+        let tokens_len = tokens.len();
+        if state.tokens.len() + tokens_len > self.kv_capacity {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 sequence length {} exceeds KV capacity {}",
+                state.tokens.len() + tokens_len,
+                self.kv_capacity
+            )));
+        }
+
+        let mut ctx = B::new_context();
+        let mut hidden = B::alloc(tokens_len * weights.config.hidden_size);
+        B::embedding_lookup(
+            &mut ctx,
+            &weights.embed_tokens,
+            tokens,
+            &mut hidden,
+            weights.config.hidden_size,
+        );
+        qwen35_trace_buffer_stats::<B>(
+            &mut ctx,
+            "embedding",
+            &hidden,
+            tokens_len * weights.config.hidden_size,
+        );
+        let eps = 1e-6f32;
+        let hidden_len = tokens_len * weights.config.hidden_size;
+        let mut residual_f32 = if B::supports_device_f32_residual_shadow() {
+            let mut shadow = B::alloc_typed(Dtype::F32, hidden_len);
+            B::activation_to_f32_shadow(&mut ctx, &hidden, &mut shadow, hidden_len);
+            Some(shadow)
+        } else {
+            None
+        };
+        let mut branch_f32 = residual_f32
+            .as_ref()
+            .map(|_| B::alloc_typed(Dtype::F32, hidden_len));
+        for (layer_index, (layer, layer_state)) in weights
+            .layers
+            .iter()
+            .zip(state.layers.iter_mut())
+            .enumerate()
+        {
+            hidden = match layer_state {
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state,
+                    delta_state,
+                } => qwen35_linear_attention_stateful_layer_backend::<B>(
+                    &mut ctx,
+                    &hidden,
+                    conv_state,
+                    delta_state,
+                    layer,
+                    &weights.config,
+                    tokens_len,
+                    eps,
+                    residual_f32.as_mut(),
+                    branch_f32.as_mut(),
+                )?,
+                Qwen35LayerRuntimeState::Full { kv } => {
+                    qwen35_full_attention_stateful_layer_backend::<B>(
+                        &mut ctx,
+                        &hidden,
+                        kv,
+                        layer,
+                        rope,
+                        &weights.config,
+                        tokens_len,
+                        eps,
+                        residual_f32.as_mut(),
+                        branch_f32.as_mut(),
+                    )?
+                }
+            };
+            if std::env::var_os("FERRUM_QWEN35_BUFFER_TRACE").is_some() {
+                let label = format!("layer{layer_index}.output");
+                qwen35_trace_buffer_stats::<B>(
+                    &mut ctx,
+                    &label,
+                    &hidden,
+                    tokens_len * weights.config.hidden_size,
+                );
+            }
+        }
+
+        let mut final_hidden = B::alloc(tokens_len * weights.config.hidden_size);
+        if let Some(residual_f32) = residual_f32.as_ref() {
+            B::rms_norm_f32_to_activation(
+                &mut ctx,
+                residual_f32,
+                &weights.final_norm,
+                eps,
+                &mut final_hidden,
+                tokens_len,
+                weights.config.hidden_size,
+            );
+        } else {
+            B::rms_norm(
+                &mut ctx,
+                &hidden,
+                &weights.final_norm,
+                eps,
+                &mut final_hidden,
+                tokens_len,
+                weights.config.hidden_size,
+            );
+        }
+        qwen35_trace_buffer_stats::<B>(
+            &mut ctx,
+            "final_norm",
+            &final_hidden,
+            tokens_len * weights.config.hidden_size,
+        );
+        let mut logits = B::alloc(tokens_len * weights.runtime_cfg.vocab_size);
+        weights
+            .lm_head
+            .forward(&mut ctx, &final_hidden, &mut logits, tokens_len);
+        let mut last_logits = B::alloc(weights.runtime_cfg.vocab_size);
+        B::copy_slice(
+            &mut ctx,
+            &logits,
+            (tokens_len - 1) * weights.runtime_cfg.vocab_size,
+            &mut last_logits,
+            0,
+            weights.runtime_cfg.vocab_size,
+        );
+        B::sync_before_host_readback(&mut ctx);
+        B::sync(&mut ctx);
+        let out = B::to_vec(&last_logits, weights.runtime_cfg.vocab_size);
+        if std::env::var_os("FERRUM_QWEN35_LOGITS_TRACE").is_some() {
+            let mut finite = 0usize;
+            let mut top: Vec<(usize, f32)> = Vec::new();
+            for (token_id, &logit) in out.iter().enumerate() {
+                if !logit.is_finite() {
+                    continue;
+                }
+                finite += 1;
+                let insert_at = top
+                    .iter()
+                    .position(|&(_, value)| logit > value)
+                    .unwrap_or(top.len());
+                if insert_at < 8 {
+                    top.insert(insert_at, (token_id, logit));
+                    top.truncate(8);
+                }
+            }
+            eprintln!(
+                "[qwen35-logits-trace] cache_id={cache_id:?} tokens_len={} vocab={} finite={} \
+                 nonfinite={} top={top:?}",
+                tokens_len,
+                weights.runtime_cfg.vocab_size,
+                finite,
+                out.len().saturating_sub(finite),
+            );
+        }
+        state.tokens.extend_from_slice(tokens);
+        Ok(out)
+    }
+
+    fn forward_stateful_decode_batch(
+        &mut self,
+        batch: &[(String, u32, u32)],
+    ) -> Result<Vec<Vec<f32>>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut seen = HashSet::with_capacity(batch.len());
+        for (cache_id, _, _) in batch {
+            if !seen.insert(cache_id.as_str()) {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 decode_batch requires unique cache ids",
+                ));
+            }
+        }
+        for (cache_id, _, _) in batch {
+            self.ensure_sequence_state(cache_id)?;
+        }
+        for (cache_id, _, pos) in batch {
+            let state = self.sequences.get(cache_id).ok_or_else(|| {
+                FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
+            })?;
+            if state.layers.len() != self.weights.layers.len() {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 sequence state layer count {} != model layers {}",
+                    state.layers.len(),
+                    self.weights.layers.len()
+                )));
+            }
+            if state.tokens.len() != *pos as usize {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 decode_batch position mismatch for {cache_id:?}: state len {} != pos {}",
+                    state.tokens.len(),
+                    pos
+                )));
+            }
+            if state.tokens.len() + 1 > self.kv_capacity {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 sequence length {} exceeds KV capacity {}",
+                    state.tokens.len() + 1,
+                    self.kv_capacity
+                )));
+            }
+        }
+
+        let mut states = Vec::with_capacity(batch.len());
+        for (cache_id, _, _) in batch {
+            let state = self.sequences.remove(cache_id).ok_or_else(|| {
+                FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
+            })?;
+            states.push((cache_id.clone(), state));
+        }
+        let tokens: Vec<u32> = batch.iter().map(|(_, token, _)| *token).collect();
+        let result = self.forward_stateful_decode_batch_taken(&tokens, &mut states);
+        let success = result.is_ok();
+        for ((cache_id, mut state), token) in states.into_iter().zip(tokens.iter().copied()) {
+            if success {
+                state.tokens.push(token);
+            }
+            self.sequences.insert(cache_id, state);
+        }
+        result
+    }
+
+    fn forward_stateful_decode_batch_taken(
+        &self,
+        tokens: &[u32],
+        states: &mut [(String, Qwen35SequenceState<B>)],
+    ) -> Result<Vec<Vec<f32>>> {
+        let weights = &self.weights;
+        let rope = &self.rope;
+        let batch_len = tokens.len();
+        if batch_len == 0 {
+            return Ok(Vec::new());
+        }
+        let hidden_len = batch_len * weights.config.hidden_size;
+        let mut ctx = B::new_context();
+        let mut hidden = B::alloc(hidden_len);
+        B::embedding_lookup(
+            &mut ctx,
+            &weights.embed_tokens,
+            tokens,
+            &mut hidden,
+            weights.config.hidden_size,
+        );
+        let eps = 1e-6f32;
+        let mut residual_f32 = if B::supports_device_f32_residual_shadow() {
+            let mut shadow = B::alloc_typed(Dtype::F32, hidden_len);
+            B::activation_to_f32_shadow(&mut ctx, &hidden, &mut shadow, hidden_len);
+            Some(shadow)
+        } else {
+            None
+        };
+        let mut branch_f32 = residual_f32
+            .as_ref()
+            .map(|_| B::alloc_typed(Dtype::F32, hidden_len));
+        for (layer_index, layer) in weights.layers.iter().enumerate() {
+            hidden = match &layer.attention {
+                Qwen35AttentionWeights::Linear(_) => {
+                    qwen35_linear_attention_decode_batch_layer_backend::<B>(
+                        &mut ctx,
+                        &hidden,
+                        states,
+                        layer_index,
+                        layer,
+                        &weights.config,
+                        eps,
+                        residual_f32.as_mut(),
+                        branch_f32.as_mut(),
+                    )?
+                }
+                Qwen35AttentionWeights::Full(_) => {
+                    qwen35_full_attention_decode_batch_layer_backend::<B>(
+                        &mut ctx,
+                        &hidden,
+                        states,
+                        layer_index,
+                        layer,
+                        rope,
+                        &weights.config,
+                        eps,
+                        residual_f32.as_mut(),
+                        branch_f32.as_mut(),
+                    )?
+                }
+            };
+        }
+
+        let mut final_hidden = B::alloc(hidden_len);
+        if let Some(residual_f32) = residual_f32.as_ref() {
+            B::rms_norm_f32_to_activation(
+                &mut ctx,
+                residual_f32,
+                &weights.final_norm,
+                eps,
+                &mut final_hidden,
+                batch_len,
+                weights.config.hidden_size,
+            );
+        } else {
+            B::rms_norm(
+                &mut ctx,
+                &hidden,
+                &weights.final_norm,
+                eps,
+                &mut final_hidden,
+                batch_len,
+                weights.config.hidden_size,
+            );
+        }
+        let vocab = weights.runtime_cfg.vocab_size;
+        let mut logits = B::alloc(batch_len * vocab);
+        weights
+            .lm_head
+            .forward(&mut ctx, &final_hidden, &mut logits, batch_len);
+        B::sync_before_host_readback(&mut ctx);
+        B::sync(&mut ctx);
+        let flat = B::to_vec(&logits, batch_len * vocab);
+        Ok(flat.chunks_exact(vocab).map(|row| row.to_vec()).collect())
+    }
 }
 
-impl<B: Backend + BackendQuantMarlin> Qwen35BackendModel<B> {
+fn qwen35_trace_buffer_stats<B: Backend>(
+    ctx: &mut B::Context,
+    label: &str,
+    buffer: &B::Buffer,
+    len: usize,
+) {
+    if std::env::var_os("FERRUM_QWEN35_BUFFER_TRACE").is_none() {
+        return;
+    }
+    B::sync_before_host_readback(ctx);
+    B::sync(ctx);
+    let values = B::to_vec(buffer, len);
+    let mut finite = 0usize;
+    let mut nan = 0usize;
+    let mut infinite = 0usize;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut first_nonfinite = None;
+    for (idx, value) in values.iter().copied().enumerate() {
+        if value.is_finite() {
+            finite += 1;
+            min = min.min(value);
+            max = max.max(value);
+        } else {
+            if value.is_nan() {
+                nan += 1;
+            } else {
+                infinite += 1;
+            }
+            first_nonfinite.get_or_insert((idx, value));
+        }
+    }
+    if finite == 0 {
+        min = f32::NAN;
+        max = f32::NAN;
+    }
+    eprintln!(
+        "[qwen35-buffer-trace] label={label} len={len} finite={finite} nan={nan} inf={infinite} \
+         min={min:?} max={max:?} first_nonfinite={first_nonfinite:?}"
+    );
+}
+
+fn qwen35_trace_layer_buffer_stats<B: Backend>(
+    ctx: &mut B::Context,
+    layer_index: usize,
+    name: &str,
+    buffer: &B::Buffer,
+    len: usize,
+) {
+    let Some(filter) = std::env::var_os("FERRUM_QWEN35_LAYER_TRACE") else {
+        return;
+    };
+    let filter = filter.to_string_lossy();
+    let matches = filter
+        .split(',')
+        .map(str::trim)
+        .any(|value| value == "all" || value.parse::<usize>().ok() == Some(layer_index));
+    if !matches {
+        return;
+    }
+    let label = format!("layer{layer_index}.{name}");
+    qwen35_trace_buffer_stats::<B>(ctx, &label, buffer, len);
+}
+
+fn qwen35_trace_layer_moe_route(
+    layer_index: usize,
+    tokens: usize,
+    num_experts: usize,
+    top_k: usize,
+    expert_ids: &[u32],
+    expert_weights: &[f32],
+) {
+    let Some(filter) = std::env::var_os("FERRUM_QWEN35_LAYER_TRACE") else {
+        return;
+    };
+    let filter = filter.to_string_lossy();
+    let matches = filter
+        .split(',')
+        .map(str::trim)
+        .any(|value| value == "all" || value.parse::<usize>().ok() == Some(layer_index));
+    if !matches {
+        return;
+    }
+
+    let rows = tokens.min(4);
+    let mut first_rows = Vec::with_capacity(rows);
+    for token in 0..rows {
+        let mut row = Vec::with_capacity(top_k);
+        for slot in 0..top_k {
+            let pair = token * top_k + slot;
+            if pair < expert_ids.len() && pair < expert_weights.len() {
+                row.push((expert_ids[pair], expert_weights[pair]));
+            }
+        }
+        first_rows.push(row);
+    }
+
+    let mut counts = vec![0usize; num_experts];
+    for expert_id in expert_ids {
+        let expert = *expert_id as usize;
+        if expert < counts.len() {
+            counts[expert] += 1;
+        }
+    }
+    let mut top_counts = counts
+        .into_iter()
+        .enumerate()
+        .filter(|(_, count)| *count > 0)
+        .collect::<Vec<_>>();
+    top_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top_counts.truncate(16);
+
+    eprintln!(
+        "[qwen35-moe-route-trace] layer={layer_index} tokens={tokens} top_k={top_k} \
+         first_rows={first_rows:?} top_expert_counts={top_counts:?}"
+    );
+}
+
+impl<B: MoeLlmBackend> DecoderOnlyLLM for Qwen35BackendModel<B> {
+    fn config(&self) -> &LlmRuntimeConfig {
+        &self.weights.runtime_cfg
+    }
+
+    fn kv_capacity(&self) -> usize {
+        self.kv_capacity
+    }
+
+    fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        self.forward_stateful(cache_id, tokens)
+            .unwrap_or_else(|err| panic!("Qwen3.5 prefill failed: {err}"))
+    }
+
+    fn decode(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
+        if let Some(state) = self.sequences.get(cache_id) {
+            debug_assert_eq!(
+                state.tokens.len(),
+                pos as usize,
+                "Qwen3.5 decode position mismatch"
+            );
+        }
+        self.forward_stateful(cache_id, &[token])
+            .unwrap_or_else(|err| panic!("Qwen3.5 decode failed: {err}"))
+    }
+
+    fn decode_batch(&mut self, batch: &[(String, u32, u32)]) -> Vec<Vec<f32>> {
+        self.decode_batch_with_full_logits(batch, false)
+    }
+
+    fn decode_batch_with_full_logits(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        _force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
+        if batch.len() <= 1 {
+            return batch
+                .iter()
+                .map(|(cache_id, token, pos)| self.decode(cache_id, *token, *pos))
+                .collect();
+        }
+        self.forward_stateful_decode_batch(batch)
+            .unwrap_or_else(|err| panic!("Qwen3.5 decode_batch failed: {err}"))
+    }
+
+    fn release(&mut self, cache_id: &str) {
+        self.sequences.remove(cache_id);
+    }
+
+    fn reset(&mut self) {
+        self.sequences.clear();
+    }
+}
+
+impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
     pub fn from_definition_with_native_safetensors(
         def: &ModelDefinition,
         model_dir: &Path,
@@ -851,6 +1489,7 @@ pub fn qwen35_dense_full_attention_layer_cpu(
     let attention_shape = shape.attention;
     let hidden_len = shape.tokens * shape.hidden_size;
     let q_total = attention_shape.q_total();
+    let q_proj_total = attention_shape.q_proj_total();
     let kv_total = attention_shape.kv_total();
     validate_len("dense full layer input", layer_input.len(), hidden_len)?;
     validate_len(
@@ -861,7 +1500,7 @@ pub fn qwen35_dense_full_attention_layer_cpu(
     validate_len(
         "dense full layer q_weight",
         q_weight.len(),
-        q_total * shape.hidden_size,
+        q_proj_total * shape.hidden_size,
     )?;
     validate_len(
         "dense full layer k_weight",
@@ -921,7 +1560,7 @@ pub fn qwen35_dense_full_attention_layer_cpu(
         q_weight,
         shape.tokens,
         shape.hidden_size,
-        q_total,
+        q_proj_total,
     )?;
     let key_raw = qwen35_linear_cpu(
         &input_norm,
@@ -987,7 +1626,7 @@ pub fn qwen35_dense_full_attention_layer_cpu(
     })
 }
 
-pub fn qwen35_dense_full_attention_layer_backend<B: Backend>(
+pub fn qwen35_dense_full_attention_layer_backend<B: MoeLlmBackend>(
     ctx: &mut B::Context,
     layer_input: &B::Buffer,
     layer: &Qwen35LayerWeights<B>,
@@ -999,6 +1638,7 @@ pub fn qwen35_dense_full_attention_layer_backend<B: Backend>(
     let attention_shape = shape.attention;
     let hidden_len = shape.tokens * shape.hidden_size;
     let q_total = attention_shape.q_total();
+    let q_proj_total = attention_shape.q_proj_total();
     let kv_total = attention_shape.kv_total();
     let attention = match &layer.attention {
         Qwen35AttentionWeights::Full(attention) => attention,
@@ -1029,7 +1669,7 @@ pub fn qwen35_dense_full_attention_layer_backend<B: Backend>(
         shape.tokens,
         shape.hidden_size,
     );
-    let mut query_raw = B::alloc(shape.tokens * q_total);
+    let mut query_raw = B::alloc(shape.tokens * q_proj_total);
     let mut key_raw = B::alloc(shape.tokens * kv_total);
     let mut value_raw = B::alloc(shape.tokens * kv_total);
     attention
@@ -1275,7 +1915,7 @@ pub fn qwen35_sparse_moe_linear_attention_layer_cpu(
     })
 }
 
-pub fn qwen35_dense_linear_attention_layer_backend<B: Backend>(
+pub fn qwen35_dense_linear_attention_layer_backend<B: MoeLlmBackend>(
     ctx: &mut B::Context,
     layer_input: &B::Buffer,
     initial_state: &B::Buffer,
@@ -1349,13 +1989,17 @@ pub fn qwen35_dense_linear_attention_layer_backend<B: Backend>(
         attention_shape,
         eps,
     )?;
-    let mut delta_output = B::alloc(hidden_len);
-    attention.out_proj.forward(
+    let mut delta_activation = B::alloc(attention_shape.value_len());
+    B::f32_to_activation(
         ctx,
         &attention_out.delta_norm,
-        &mut delta_output,
-        shape.tokens,
+        &mut delta_activation,
+        attention_shape.value_len(),
     );
+    let mut delta_output = B::alloc(hidden_len);
+    attention
+        .out_proj
+        .forward(ctx, &delta_activation, &mut delta_output, shape.tokens);
 
     let mut residual_after_mixer = B::alloc(hidden_len);
     B::copy_slice(
@@ -1439,6 +2083,7 @@ pub fn qwen35_sparse_moe_full_attention_layer_cpu(
     let attention_shape = shape.attention;
     let hidden_len = shape.tokens * shape.hidden_size;
     let q_total = attention_shape.q_total();
+    let q_proj_total = attention_shape.q_proj_total();
     let kv_total = attention_shape.kv_total();
     validate_len("sparse MoE full layer input", layer_input.len(), hidden_len)?;
     validate_len(
@@ -1449,7 +2094,7 @@ pub fn qwen35_sparse_moe_full_attention_layer_cpu(
     validate_len(
         "sparse MoE full layer q_weight",
         q_weight.len(),
-        q_total * shape.hidden_size,
+        q_proj_total * shape.hidden_size,
     )?;
     validate_len(
         "sparse MoE full layer k_weight",
@@ -1494,7 +2139,7 @@ pub fn qwen35_sparse_moe_full_attention_layer_cpu(
         q_weight,
         shape.tokens,
         shape.hidden_size,
-        q_total,
+        q_proj_total,
     )?;
     let key_raw = qwen35_linear_cpu(
         &input_norm,
@@ -1571,8 +2216,35 @@ pub fn qwen35_full_attention_core_cpu(
     shape: Qwen35FullAttentionShape,
     eps: f32,
 ) -> Result<Qwen35FullAttentionReference> {
+    qwen35_full_attention_core_cpu_impl(
+        query_raw,
+        key_raw,
+        value_raw,
+        q_norm_weight,
+        k_norm_weight,
+        shape,
+        eps,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen35_full_attention_core_cpu_impl(
+    query_raw: &[f32],
+    key_raw: &[f32],
+    value_raw: &[f32],
+    q_norm_weight: &[f32],
+    k_norm_weight: &[f32],
+    shape: Qwen35FullAttentionShape,
+    eps: f32,
+    norm_weight_folded: bool,
+) -> Result<Qwen35FullAttentionReference> {
     shape.validate()?;
-    validate_len("full attention query_raw", query_raw.len(), shape.q_len())?;
+    validate_len(
+        "full attention query_raw",
+        query_raw.len(),
+        shape.q_proj_len(),
+    )?;
     validate_len("full attention key_raw", key_raw.len(), shape.kv_len())?;
     validate_len("full attention value_raw", value_raw.len(), shape.kv_len())?;
     validate_len(
@@ -1586,40 +2258,73 @@ pub fn qwen35_full_attention_core_cpu(
         shape.head_dim,
     )?;
 
-    let mut query = qwen35_rms_norm_plus_one_cpu(
+    let (query_source, attention_gate) = split_qwen35_full_attention_query_gate(
         query_raw,
-        q_norm_weight,
-        shape.tokens * shape.num_heads,
+        shape.tokens,
+        shape.num_heads,
         shape.head_dim,
-        eps,
+        shape.q_proj_total(),
+        shape.attn_output_gate,
     )?;
-    let mut key = qwen35_rms_norm_plus_one_cpu(
-        key_raw,
-        k_norm_weight,
-        shape.tokens * shape.num_kv_heads,
-        shape.head_dim,
-        eps,
-    )?;
+
+    let mut query = if norm_weight_folded {
+        qwen35_rms_norm_cpu(
+            &query_source,
+            q_norm_weight,
+            shape.tokens * shape.num_heads,
+            shape.head_dim,
+            eps,
+        )?
+    } else {
+        qwen35_rms_norm_plus_one_cpu(
+            &query_source,
+            q_norm_weight,
+            shape.tokens * shape.num_heads,
+            shape.head_dim,
+            eps,
+        )?
+    };
+    let mut key = if norm_weight_folded {
+        qwen35_rms_norm_cpu(
+            key_raw,
+            k_norm_weight,
+            shape.tokens * shape.num_kv_heads,
+            shape.head_dim,
+            eps,
+        )?
+    } else {
+        qwen35_rms_norm_plus_one_cpu(
+            key_raw,
+            k_norm_weight,
+            shape.tokens * shape.num_kv_heads,
+            shape.head_dim,
+            eps,
+        )?
+    };
     qwen35_apply_rope_cpu(
         &mut query,
         shape.tokens,
         shape.num_heads,
         shape.head_dim,
+        shape.rope_dim,
         shape.position_offset,
         shape.rope_theta,
+        shape.rope_interleaved,
     )?;
     qwen35_apply_rope_cpu(
         &mut key,
         shape.tokens,
         shape.num_kv_heads,
         shape.head_dim,
+        shape.rope_dim,
         shape.position_offset,
         shape.rope_theta,
+        shape.rope_interleaved,
     )?;
 
     let repeat = shape.num_heads / shape.num_kv_heads;
     let scale = (shape.head_dim as f32).sqrt().recip();
-    let mut context = vec![0.0; shape.q_len()];
+    let mut context_ungated = vec![0.0; shape.q_len()];
     let mut scores = vec![0.0; shape.tokens];
     for token in 0..shape.tokens {
         for query_head in 0..shape.num_heads {
@@ -1648,8 +2353,14 @@ pub fn qwen35_full_attention_core_cpu(
                     let prob = scores[key_token] / denom;
                     acc += prob * value_raw[full_kv_idx(shape, key_token, kv_head, dim)];
                 }
-                context[full_q_idx(shape, token, query_head, dim)] = acc;
+                context_ungated[full_q_idx(shape, token, query_head, dim)] = acc;
             }
+        }
+    }
+    let mut context = context_ungated.clone();
+    if let Some(gate) = &attention_gate {
+        for (value, gate) in context.iter_mut().zip(gate) {
+            *value *= sigmoid(*gate);
         }
     }
 
@@ -1657,33 +2368,35 @@ pub fn qwen35_full_attention_core_cpu(
         query,
         key,
         value: value_raw.to_vec(),
+        attention_gate,
+        context_ungated,
         context,
     })
 }
 
 pub fn qwen35_build_rope_cache_backend<B: Backend>(
     max_seq_len: usize,
-    head_dim: usize,
+    rope_dim: usize,
     rope_theta: f32,
 ) -> Result<Qwen35BackendRopeCache<B>> {
-    if max_seq_len == 0 || head_dim == 0 || rope_theta <= 0.0 {
+    if max_seq_len == 0 || rope_dim == 0 || rope_theta <= 0.0 {
         return Err(FerrumError::model(format!(
             "Qwen3.5 RoPE cache shape must be positive, got max_seq_len={max_seq_len} \
-             head_dim={head_dim} rope_theta={rope_theta}"
+             rope_dim={rope_dim} rope_theta={rope_theta}"
         )));
     }
-    if head_dim % 2 != 0 {
+    if rope_dim % 2 != 0 {
         return Err(FerrumError::model(format!(
-            "Qwen3.5 RoPE cache head_dim {head_dim} must be even"
+            "Qwen3.5 RoPE cache rope_dim {rope_dim} must be even"
         )));
     }
 
-    let half = head_dim / 2;
+    let half = rope_dim / 2;
     let mut cos = vec![0.0; max_seq_len * half];
     let mut sin = vec![0.0; max_seq_len * half];
     for position in 0..max_seq_len {
         for pair in 0..half {
-            let inv_freq = rope_theta.powf(-(2.0 * pair as f32) / head_dim as f32);
+            let inv_freq = rope_theta.powf(-(2.0 * pair as f32) / rope_dim as f32);
             let angle = position as f32 * inv_freq;
             let (sin_value, cos_value) = angle.sin_cos();
             cos[position * half + pair] = cos_value;
@@ -1715,7 +2428,6 @@ pub fn qwen35_full_attention_core_backend<B: Backend>(
     eps: f32,
 ) -> Result<Qwen35BackendFullAttentionOutput<B>> {
     shape.validate()?;
-
     let q_len = shape.q_len();
     let kv_len = shape.kv_len();
     let mut query_head_major = B::alloc(q_len);
@@ -1724,7 +2436,7 @@ pub fn qwen35_full_attention_core_backend<B: Backend>(
     let mut context_head_major = B::alloc(q_len);
     let mut context = B::alloc(q_len);
 
-    B::qk_norm_rope(
+    B::qk_norm_rope_partial(
         ctx,
         query_raw,
         q_norm_weight,
@@ -1734,11 +2446,19 @@ pub fn qwen35_full_attention_core_backend<B: Backend>(
         shape.tokens,
         shape.num_heads,
         shape.head_dim,
+        shape.rope_dim,
+        shape.q_proj_total(),
+        0,
+        if shape.attn_output_gate {
+            2 * shape.head_dim
+        } else {
+            shape.head_dim
+        },
         shape.position_offset,
         eps,
-        1,
-    );
-    B::qk_norm_rope(
+        if shape.rope_interleaved { 3 } else { 1 },
+    )?;
+    B::qk_norm_rope_partial(
         ctx,
         key_raw,
         k_norm_weight,
@@ -1748,11 +2468,15 @@ pub fn qwen35_full_attention_core_backend<B: Backend>(
         shape.tokens,
         shape.num_kv_heads,
         shape.head_dim,
+        shape.rope_dim,
+        shape.kv_total(),
+        0,
+        shape.head_dim,
         shape.position_offset,
         eps,
-        1,
-    );
-    B::qk_norm_rope(
+        if shape.rope_interleaved { 3 } else { 1 },
+    )?;
+    B::qk_norm_rope_partial(
         ctx,
         value_raw,
         q_norm_weight,
@@ -1762,10 +2486,14 @@ pub fn qwen35_full_attention_core_backend<B: Backend>(
         shape.tokens,
         shape.num_kv_heads,
         shape.head_dim,
+        shape.head_dim,
+        shape.kv_total(),
+        0,
+        shape.head_dim,
         0,
         eps,
         0,
-    );
+    )?;
 
     let attn_cfg = AttnConfig {
         num_heads: shape.num_heads,
@@ -1796,6 +2524,17 @@ pub fn qwen35_full_attention_core_backend<B: Backend>(
         shape.num_heads,
         shape.head_dim,
     );
+    if shape.attn_output_gate {
+        B::qwen35_apply_attention_gate(
+            ctx,
+            &mut context,
+            query_raw,
+            shape.tokens,
+            shape.q_total(),
+            shape.q_proj_total(),
+            shape.head_dim,
+        )?;
+    }
 
     Ok(Qwen35BackendFullAttentionOutput {
         query_head_major,
@@ -2243,6 +2982,1517 @@ pub fn qwen35_dense_mlp_backend<B: Backend>(
     })
 }
 
+pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    x: &B::Buffer,
+    moe: &Qwen35SparseMoeSharedExpertWeights<B>,
+    shape: Qwen35SparseMoeShape,
+    layer_index: usize,
+) -> Result<Qwen35BackendSparseMoeOutput<B>> {
+    shape.validate()?;
+    if moe.router.in_features() != shape.hidden_size
+        || moe.router.out_features() != shape.num_experts
+    {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 sparse MoE router shape {}x{} does not match hidden={} experts={}",
+            moe.router.out_features(),
+            moe.router.in_features(),
+            shape.hidden_size,
+            shape.num_experts
+        )));
+    }
+    if moe.shared_expert_gate_proj.in_features() != shape.hidden_size
+        || moe.shared_expert_gate_proj.out_features() != shape.shared_expert_intermediate_size
+        || moe.shared_expert_up_proj.in_features() != shape.hidden_size
+        || moe.shared_expert_up_proj.out_features() != shape.shared_expert_intermediate_size
+        || moe.shared_expert_down_proj.in_features() != shape.shared_expert_intermediate_size
+        || moe.shared_expert_down_proj.out_features() != shape.hidden_size
+    {
+        return Err(FerrumError::model(
+            "Qwen3.5 sparse MoE shared expert projection shapes do not match config",
+        ));
+    }
+
+    let mut router_logits = B::alloc(shape.tokens * shape.num_experts);
+    moe.router.forward(ctx, x, &mut router_logits, shape.tokens);
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.router_logits",
+        &router_logits,
+        shape.tokens * shape.num_experts,
+    );
+
+    let mut routed_output = B::alloc(shape.tokens * shape.hidden_size);
+    B::zero_buffer(ctx, &mut routed_output, shape.tokens * shape.hidden_size)?;
+    let total_pairs = shape.tokens * shape.top_k;
+    let mut x_packed = B::alloc(total_pairs * shape.hidden_size);
+    let mut gate_up_packed = B::alloc(total_pairs * 2 * shape.expert_intermediate_size);
+    let mut silu_packed = B::alloc(total_pairs * shape.expert_intermediate_size);
+    let mut down_packed = B::alloc(total_pairs * shape.hidden_size);
+    let mut route_scratch = MoeRouteScratch::new();
+    moe_forward_bucketed(MoeForwardBucketedParams {
+        ctx,
+        x,
+        router_logits: &router_logits,
+        out: &mut routed_output,
+        batch: shape.tokens,
+        hidden_size: shape.hidden_size,
+        expert_intermediate: shape.expert_intermediate_size,
+        num_experts: shape.num_experts,
+        top_k: shape.top_k,
+        norm_topk_prob: shape.norm_topk_prob,
+        experts: &moe.experts,
+        x_packed: &mut x_packed,
+        gate_up_packed: &mut gate_up_packed,
+        silu_packed: &mut silu_packed,
+        down_packed: &mut down_packed,
+        route_scratch: &mut route_scratch,
+        device_route: None,
+    })?;
+    qwen35_trace_layer_moe_route(
+        layer_index,
+        shape.tokens,
+        shape.num_experts,
+        shape.top_k,
+        &route_scratch.output.expert_ids,
+        &route_scratch.output.expert_weights,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.x_packed",
+        &x_packed,
+        total_pairs * shape.hidden_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.gate_up_packed",
+        &gate_up_packed,
+        total_pairs * 2 * shape.expert_intermediate_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.silu_packed",
+        &silu_packed,
+        total_pairs * shape.expert_intermediate_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.down_packed",
+        &down_packed,
+        total_pairs * shape.hidden_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.routed_output",
+        &routed_output,
+        shape.tokens * shape.hidden_size,
+    );
+
+    let mut shared_gate = B::alloc(shape.tokens);
+    B::gemm(
+        ctx,
+        x,
+        &moe.shared_expert_gate,
+        &mut shared_gate,
+        shape.tokens,
+        1,
+        shape.hidden_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_gate",
+        &shared_gate,
+        shape.tokens,
+    );
+    let shared_inter = shape.shared_expert_intermediate_size;
+    let mut shared_gate_up = B::alloc(shape.tokens * 2 * shared_inter);
+    let mut shared_gate_proj = B::alloc(shape.tokens * shared_inter);
+    let mut shared_up_proj = B::alloc(shape.tokens * shared_inter);
+    moe.shared_expert_gate_proj
+        .forward(ctx, x, &mut shared_gate_proj, shape.tokens);
+    moe.shared_expert_up_proj
+        .forward(ctx, x, &mut shared_up_proj, shape.tokens);
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_gate_proj",
+        &shared_gate_proj,
+        shape.tokens * shared_inter,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_up_proj",
+        &shared_up_proj,
+        shape.tokens * shared_inter,
+    );
+    for token in 0..shape.tokens {
+        B::copy_slice(
+            ctx,
+            &shared_gate_proj,
+            token * shared_inter,
+            &mut shared_gate_up,
+            token * 2 * shared_inter,
+            shared_inter,
+        );
+        B::copy_slice(
+            ctx,
+            &shared_up_proj,
+            token * shared_inter,
+            &mut shared_gate_up,
+            token * 2 * shared_inter + shared_inter,
+            shared_inter,
+        );
+    }
+    let mut shared_fused = B::alloc(shape.tokens * shared_inter);
+    B::fused_silu_mul_split(
+        ctx,
+        &shared_gate_up,
+        &mut shared_fused,
+        shape.tokens,
+        shared_inter,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_fused",
+        &shared_fused,
+        shape.tokens * shared_inter,
+    );
+    let mut shared_output = B::alloc(shape.tokens * shape.hidden_size);
+    moe.shared_expert_down_proj
+        .forward(ctx, &shared_fused, &mut shared_output, shape.tokens);
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_down_output",
+        &shared_output,
+        shape.tokens * shape.hidden_size,
+    );
+    B::qwen35_apply_token_gate(
+        ctx,
+        &mut shared_output,
+        &shared_gate,
+        shape.tokens,
+        shape.hidden_size,
+    )?;
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_output",
+        &shared_output,
+        shape.tokens * shape.hidden_size,
+    );
+
+    let mut output = B::alloc(shape.tokens * shape.hidden_size);
+    B::copy_slice(
+        ctx,
+        &routed_output,
+        0,
+        &mut output,
+        0,
+        shape.tokens * shape.hidden_size,
+    );
+    B::add_inplace(
+        ctx,
+        &mut output,
+        &shared_output,
+        shape.tokens * shape.hidden_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.output",
+        &output,
+        shape.tokens * shape.hidden_size,
+    );
+
+    Ok(Qwen35BackendSparseMoeOutput {
+        router_logits,
+        routed_output,
+        shared_gate,
+        shared_gate_up,
+        shared_fused,
+        shared_output,
+        output,
+    })
+}
+
+fn qwen35_mlp_backend<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    x: &B::Buffer,
+    mlp: &Qwen35MlpWeights<B>,
+    config: &Qwen35TextConfig,
+    tokens: usize,
+    layer_index: usize,
+) -> Result<B::Buffer> {
+    match mlp {
+        Qwen35MlpWeights::Dense(mlp) => {
+            let intermediate = config.dense_intermediate_size.ok_or_else(|| {
+                FerrumError::model("Qwen3.5 dense MLP config missing intermediate_size")
+            })?;
+            Ok(qwen35_dense_mlp_backend::<B>(
+                ctx,
+                x,
+                &*mlp.gate_up_proj,
+                &*mlp.down_proj,
+                tokens,
+                config.hidden_size,
+                intermediate,
+            )?
+            .output)
+        }
+        Qwen35MlpWeights::SparseMoeSharedExpert(moe) => {
+            let moe_config = config
+                .moe
+                .as_ref()
+                .ok_or_else(|| FerrumError::model("Qwen3.5 sparse MoE config missing"))?;
+            Ok(qwen35_sparse_moe_shared_expert_backend::<B>(
+                ctx,
+                x,
+                moe,
+                Qwen35SparseMoeShape {
+                    tokens,
+                    hidden_size: config.hidden_size,
+                    num_experts: moe_config.num_experts,
+                    top_k: moe_config.num_experts_per_tok,
+                    expert_intermediate_size: moe_config.moe_intermediate_size,
+                    shared_expert_intermediate_size: moe_config.shared_expert_intermediate_size,
+                    norm_topk_prob: moe_config.norm_topk_prob,
+                },
+                layer_index,
+            )?
+            .output)
+        }
+    }
+}
+
+fn qwen35_finish_layer_with_mlp<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    residual_after_attention: &B::Buffer,
+    layer: &Qwen35LayerWeights<B>,
+    config: &Qwen35TextConfig,
+    tokens: usize,
+    eps: f32,
+) -> Result<B::Buffer> {
+    let hidden_len = tokens * config.hidden_size;
+    let mut post_attention_norm = B::alloc(hidden_len);
+    B::rms_norm(
+        ctx,
+        residual_after_attention,
+        &layer.post_attention_layernorm,
+        eps,
+        &mut post_attention_norm,
+        tokens,
+        config.hidden_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "post_attention_norm",
+        &post_attention_norm,
+        hidden_len,
+    );
+    let mlp_out = qwen35_mlp_backend::<B>(
+        ctx,
+        &post_attention_norm,
+        &layer.mlp,
+        config,
+        tokens,
+        layer.layer_index,
+    )?;
+    qwen35_trace_layer_buffer_stats::<B>(ctx, layer.layer_index, "mlp_out", &mlp_out, hidden_len);
+    let mut layer_output = B::alloc(hidden_len);
+    B::copy_slice(
+        ctx,
+        residual_after_attention,
+        0,
+        &mut layer_output,
+        0,
+        hidden_len,
+    );
+    B::add_inplace(ctx, &mut layer_output, &mlp_out, hidden_len);
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "layer_output_after_mlp",
+        &layer_output,
+        hidden_len,
+    );
+    Ok(layer_output)
+}
+
+fn qwen35_finish_layer_with_mlp_f32_residual<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    residual_f32: &mut B::Buffer,
+    branch_f32: &mut B::Buffer,
+    layer: &Qwen35LayerWeights<B>,
+    config: &Qwen35TextConfig,
+    tokens: usize,
+    eps: f32,
+) -> Result<B::Buffer> {
+    let hidden_len = tokens * config.hidden_size;
+    let mut post_attention_norm = B::alloc(hidden_len);
+    B::rms_norm_f32_to_activation(
+        ctx,
+        residual_f32,
+        &layer.post_attention_layernorm,
+        eps,
+        &mut post_attention_norm,
+        tokens,
+        config.hidden_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "post_attention_norm",
+        &post_attention_norm,
+        hidden_len,
+    );
+    let mlp_out = qwen35_mlp_backend::<B>(
+        ctx,
+        &post_attention_norm,
+        &layer.mlp,
+        config,
+        tokens,
+        layer.layer_index,
+    )?;
+    qwen35_trace_layer_buffer_stats::<B>(ctx, layer.layer_index, "mlp_out", &mlp_out, hidden_len);
+    B::activation_to_f32_shadow(ctx, &mlp_out, branch_f32, hidden_len);
+    B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "layer_output_after_mlp",
+        residual_f32,
+        hidden_len,
+    );
+    let mut layer_output = B::alloc(hidden_len);
+    B::f32_to_activation(ctx, residual_f32, &mut layer_output, hidden_len);
+    Ok(layer_output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    layer_input: &B::Buffer,
+    states: &mut [(String, Qwen35SequenceState<B>)],
+    layer_index: usize,
+    layer: &Qwen35LayerWeights<B>,
+    config: &Qwen35TextConfig,
+    eps: f32,
+    mut residual_f32: Option<&mut B::Buffer>,
+    mut branch_f32: Option<&mut B::Buffer>,
+) -> Result<B::Buffer> {
+    let batch_len = states.len();
+    let attention_shape = Qwen35LinearAttentionShape {
+        tokens: 1,
+        key_heads: config.linear_attention.num_key_heads,
+        value_heads: config.linear_attention.num_value_heads,
+        key_dim: config.linear_attention.key_head_dim,
+        value_dim: config.linear_attention.value_head_dim,
+        conv_kernel: config.linear_attention.conv_kernel_dim,
+    };
+    let hidden_len = batch_len * config.hidden_size;
+    let qkv_width = attention_shape.conv_channels();
+    let value_total = attention_shape.value_total();
+    let gating_width = attention_shape.value_heads;
+    let attention = match &layer.attention {
+        Qwen35AttentionWeights::Linear(attention) => attention,
+        Qwen35AttentionWeights::Full(_) => {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch decode expected linear attention at layer {}",
+                layer.layer_index
+            )));
+        }
+    };
+
+    let mut input_norm = B::alloc(hidden_len);
+    if let Some(residual_f32) = residual_f32.as_ref() {
+        B::rms_norm_f32_to_activation(
+            ctx,
+            residual_f32,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            batch_len,
+            config.hidden_size,
+        );
+    } else {
+        B::rms_norm(
+            ctx,
+            layer_input,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            batch_len,
+            config.hidden_size,
+        );
+    }
+
+    let mut mixed_qkv_raw = B::alloc(batch_len * qkv_width);
+    let mut z_raw = B::alloc(batch_len * value_total);
+    let mut b_raw = B::alloc(batch_len * gating_width);
+    let mut a_raw = B::alloc(batch_len * gating_width);
+    attention
+        .qkv_proj
+        .forward(ctx, &input_norm, &mut mixed_qkv_raw, batch_len);
+    attention
+        .z_proj
+        .forward(ctx, &input_norm, &mut z_raw, batch_len);
+    attention
+        .b_proj
+        .forward(ctx, &input_norm, &mut b_raw, batch_len);
+    attention
+        .a_proj
+        .forward(ctx, &input_norm, &mut a_raw, batch_len);
+
+    let mut delta_norm = B::alloc_typed(Dtype::F32, batch_len * value_total);
+    for (row, (cache_id, state)) in states.iter_mut().enumerate() {
+        let Qwen35LayerRuntimeState::Linear {
+            conv_state,
+            delta_state,
+        } = state.layers.get_mut(layer_index).ok_or_else(|| {
+            FerrumError::model(format!(
+                "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+            ))
+        })?
+        else {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch decode expected linear layer state at layer {layer_index} for {cache_id:?}"
+            )));
+        };
+
+        let mut row_qkv = B::alloc(qkv_width);
+        let mut row_z = B::alloc(value_total);
+        let mut row_a = B::alloc(gating_width);
+        let mut row_b = B::alloc(gating_width);
+        B::copy_slice(
+            ctx,
+            &mixed_qkv_raw,
+            row * qkv_width,
+            &mut row_qkv,
+            0,
+            qkv_width,
+        );
+        B::copy_slice(ctx, &z_raw, row * value_total, &mut row_z, 0, value_total);
+        B::copy_slice(ctx, &a_raw, row * gating_width, &mut row_a, 0, gating_width);
+        B::copy_slice(ctx, &b_raw, row * gating_width, &mut row_b, 0, gating_width);
+        let attention_out = qwen35_linear_attention_decode_core_backend::<B>(
+            ctx,
+            &row_qkv,
+            &row_z,
+            &row_a,
+            &row_b,
+            &attention.conv1d_weight,
+            conv_state,
+            &attention.a_log,
+            &attention.dt_bias,
+            &attention.norm_weight,
+            delta_state,
+            attention_shape,
+            eps,
+        )?;
+        *conv_state = attention_out.next_conv_state;
+        *delta_state = attention_out.final_state;
+        B::copy_slice(
+            ctx,
+            &attention_out.delta_norm,
+            0,
+            &mut delta_norm,
+            row * value_total,
+            value_total,
+        );
+    }
+
+    let mut delta_activation = B::alloc(batch_len * value_total);
+    B::f32_to_activation(
+        ctx,
+        &delta_norm,
+        &mut delta_activation,
+        batch_len * value_total,
+    );
+    let mut delta_output = B::alloc(hidden_len);
+    attention
+        .out_proj
+        .forward(ctx, &delta_activation, &mut delta_output, batch_len);
+
+    if let (Some(residual_f32), Some(branch_f32)) =
+        (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
+    {
+        B::activation_to_f32_shadow(ctx, &delta_output, branch_f32, hidden_len);
+        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        qwen35_finish_layer_with_mlp_f32_residual::<B>(
+            ctx,
+            residual_f32,
+            branch_f32,
+            layer,
+            config,
+            batch_len,
+            eps,
+        )
+    } else {
+        let mut residual_after_mixer = B::alloc(hidden_len);
+        B::copy_slice(
+            ctx,
+            layer_input,
+            0,
+            &mut residual_after_mixer,
+            0,
+            hidden_len,
+        );
+        B::add_inplace(ctx, &mut residual_after_mixer, &delta_output, hidden_len);
+        qwen35_finish_layer_with_mlp::<B>(ctx, &residual_after_mixer, layer, config, batch_len, eps)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    layer_input: &B::Buffer,
+    states: &mut [(String, Qwen35SequenceState<B>)],
+    layer_index: usize,
+    layer: &Qwen35LayerWeights<B>,
+    rope: &Qwen35BackendRopeCache<B>,
+    config: &Qwen35TextConfig,
+    eps: f32,
+    mut residual_f32: Option<&mut B::Buffer>,
+    mut branch_f32: Option<&mut B::Buffer>,
+) -> Result<B::Buffer> {
+    let batch_len = states.len();
+    let hidden_len = batch_len * config.hidden_size;
+    let attention = match &layer.attention {
+        Qwen35AttentionWeights::Full(attention) => attention,
+        Qwen35AttentionWeights::Linear(_) => {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch decode expected full attention at layer {}",
+                layer.layer_index
+            )));
+        }
+    };
+    let q_total = config.num_attention_heads * config.head_dim;
+    let q_proj_total = if config.attn_output_gate {
+        2 * q_total
+    } else {
+        q_total
+    };
+    let kv_total = config.num_key_value_heads * config.head_dim;
+
+    let mut input_norm = B::alloc(hidden_len);
+    if let Some(residual_f32) = residual_f32.as_ref() {
+        B::rms_norm_f32_to_activation(
+            ctx,
+            residual_f32,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            batch_len,
+            config.hidden_size,
+        );
+    } else {
+        B::rms_norm(
+            ctx,
+            layer_input,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            batch_len,
+            config.hidden_size,
+        );
+    }
+
+    let mut query_raw = B::alloc(batch_len * q_proj_total);
+    let mut key_raw = B::alloc(batch_len * kv_total);
+    let mut value_raw = B::alloc(batch_len * kv_total);
+    attention
+        .q_proj
+        .forward(ctx, &input_norm, &mut query_raw, batch_len);
+    attention
+        .k_proj
+        .forward(ctx, &input_norm, &mut key_raw, batch_len);
+    attention
+        .v_proj
+        .forward(ctx, &input_norm, &mut value_raw, batch_len);
+
+    let mut context = B::alloc(batch_len * q_total);
+    for (row, (cache_id, state)) in states.iter_mut().enumerate() {
+        let Qwen35LayerRuntimeState::Full { kv } =
+            state.layers.get_mut(layer_index).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+                ))
+            })?
+        else {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch decode expected full layer state at layer {layer_index} for {cache_id:?}"
+            )));
+        };
+        let position_offset = kv.len;
+        if position_offset + 1 > kv.capacity {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 full-attention KV overflow at layer {} for {cache_id:?}: target={} capacity={}",
+                layer.layer_index,
+                position_offset + 1,
+                kv.capacity
+            )));
+        }
+        let attention_shape = Qwen35FullAttentionShape {
+            tokens: 1,
+            num_heads: config.num_attention_heads,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            rope_dim: config.full_attention_rope_dim(),
+            position_offset,
+            rope_theta: config.rope_parameters.rope_theta as f32,
+            rope_interleaved: config.full_attention_text_rope_interleaved(),
+            attn_output_gate: config.attn_output_gate,
+        };
+        attention_shape.validate()?;
+
+        let mut query_head_major = B::alloc(q_total);
+        let mut key_head_major = B::alloc(kv_total);
+        let mut value_head_major = B::alloc(kv_total);
+        B::qk_norm_rope_partial(
+            ctx,
+            &query_raw,
+            &attention.q_norm_weight,
+            &rope.cos,
+            &rope.sin,
+            &mut query_head_major,
+            1,
+            config.num_attention_heads,
+            config.head_dim,
+            attention_shape.rope_dim,
+            batch_len * q_proj_total,
+            row * q_proj_total,
+            if attention_shape.attn_output_gate {
+                2 * config.head_dim
+            } else {
+                config.head_dim
+            },
+            position_offset,
+            eps,
+            if attention_shape.rope_interleaved {
+                3
+            } else {
+                1
+            },
+        )?;
+        B::qk_norm_rope_partial(
+            ctx,
+            &key_raw,
+            &attention.k_norm_weight,
+            &rope.cos,
+            &rope.sin,
+            &mut key_head_major,
+            1,
+            config.num_key_value_heads,
+            config.head_dim,
+            attention_shape.rope_dim,
+            batch_len * kv_total,
+            row * kv_total,
+            config.head_dim,
+            position_offset,
+            eps,
+            if attention_shape.rope_interleaved {
+                3
+            } else {
+                1
+            },
+        )?;
+        B::qk_norm_rope_partial(
+            ctx,
+            &value_raw,
+            &attention.q_norm_weight,
+            &rope.cos,
+            &rope.sin,
+            &mut value_head_major,
+            1,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.head_dim,
+            batch_len * kv_total,
+            row * kv_total,
+            config.head_dim,
+            0,
+            eps,
+            0,
+        )?;
+        B::kv_cache_append_head_major(
+            ctx,
+            &mut kv.k,
+            &mut kv.v,
+            position_offset,
+            kv.capacity,
+            &key_head_major,
+            &value_head_major,
+            1,
+            config.num_key_value_heads,
+            config.head_dim,
+        );
+        kv.len += 1;
+
+        let mut context_head_major = B::alloc(q_total);
+        let attn_cfg = AttnConfig {
+            num_heads: config.num_attention_heads,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            causal: true,
+            scale: (config.head_dim as f32).sqrt().recip(),
+            kv_seq_stride: kv.capacity,
+            sliding_window: 0,
+        };
+        B::flash_attention(
+            ctx,
+            &query_head_major,
+            &kv.k,
+            &kv.v,
+            &mut context_head_major,
+            1,
+            1,
+            kv.len,
+            position_offset,
+            &attn_cfg,
+        );
+        let mut row_context = B::alloc(q_total);
+        B::transpose_head_to_token(
+            ctx,
+            &context_head_major,
+            &mut row_context,
+            1,
+            config.num_attention_heads,
+            config.head_dim,
+        );
+        if attention_shape.attn_output_gate {
+            let mut row_query_raw = B::alloc(q_proj_total);
+            B::copy_slice(
+                ctx,
+                &query_raw,
+                row * q_proj_total,
+                &mut row_query_raw,
+                0,
+                q_proj_total,
+            );
+            B::qwen35_apply_attention_gate(
+                ctx,
+                &mut row_context,
+                &row_query_raw,
+                1,
+                q_total,
+                q_proj_total,
+                config.head_dim,
+            )?;
+        }
+        B::copy_slice(ctx, &row_context, 0, &mut context, row * q_total, q_total);
+    }
+
+    let mut attn_output = B::alloc(hidden_len);
+    attention
+        .o_proj
+        .forward(ctx, &context, &mut attn_output, batch_len);
+
+    if let (Some(residual_f32), Some(branch_f32)) =
+        (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
+    {
+        B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
+        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        qwen35_finish_layer_with_mlp_f32_residual::<B>(
+            ctx,
+            residual_f32,
+            branch_f32,
+            layer,
+            config,
+            batch_len,
+            eps,
+        )
+    } else {
+        let mut residual_after_attention = B::alloc(hidden_len);
+        B::copy_slice(
+            ctx,
+            layer_input,
+            0,
+            &mut residual_after_attention,
+            0,
+            hidden_len,
+        );
+        B::add_inplace(ctx, &mut residual_after_attention, &attn_output, hidden_len);
+        qwen35_finish_layer_with_mlp::<B>(
+            ctx,
+            &residual_after_attention,
+            layer,
+            config,
+            batch_len,
+            eps,
+        )
+    }
+}
+
+fn qwen35_linear_attention_stateful_layer_backend<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    layer_input: &B::Buffer,
+    conv_state: &mut B::Buffer,
+    delta_state: &mut B::Buffer,
+    layer: &Qwen35LayerWeights<B>,
+    config: &Qwen35TextConfig,
+    tokens: usize,
+    eps: f32,
+    mut residual_f32: Option<&mut B::Buffer>,
+    mut branch_f32: Option<&mut B::Buffer>,
+) -> Result<B::Buffer> {
+    let attention_shape = Qwen35LinearAttentionShape {
+        tokens,
+        key_heads: config.linear_attention.num_key_heads,
+        value_heads: config.linear_attention.num_value_heads,
+        key_dim: config.linear_attention.key_head_dim,
+        value_dim: config.linear_attention.value_head_dim,
+        conv_kernel: config.linear_attention.conv_kernel_dim,
+    };
+    let hidden_len = tokens * config.hidden_size;
+    let attention = match &layer.attention {
+        Qwen35AttentionWeights::Linear(attention) => attention,
+        Qwen35AttentionWeights::Full(_) => {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 stateful linear layer expected linear attention at layer {}",
+                layer.layer_index
+            )));
+        }
+    };
+
+    let mut input_norm = B::alloc(hidden_len);
+    if let Some(residual_f32) = residual_f32.as_ref() {
+        B::rms_norm_f32_to_activation(
+            ctx,
+            residual_f32,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            tokens,
+            config.hidden_size,
+        );
+    } else {
+        B::rms_norm(
+            ctx,
+            layer_input,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            tokens,
+            config.hidden_size,
+        );
+    }
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "linear.input_norm",
+        &input_norm,
+        hidden_len,
+    );
+    let mut mixed_qkv_raw = B::alloc(attention_shape.mixed_qkv_len());
+    let mut z_raw = B::alloc(attention_shape.value_len());
+    let mut b_raw = B::alloc(attention_shape.gating_len());
+    let mut a_raw = B::alloc(attention_shape.gating_len());
+    attention
+        .qkv_proj
+        .forward(ctx, &input_norm, &mut mixed_qkv_raw, tokens);
+    attention
+        .z_proj
+        .forward(ctx, &input_norm, &mut z_raw, tokens);
+    attention
+        .b_proj
+        .forward(ctx, &input_norm, &mut b_raw, tokens);
+    attention
+        .a_proj
+        .forward(ctx, &input_norm, &mut a_raw, tokens);
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "linear.mixed_qkv_raw",
+        &mixed_qkv_raw,
+        attention_shape.mixed_qkv_len(),
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "linear.z_raw",
+        &z_raw,
+        attention_shape.value_len(),
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "linear.b_raw",
+        &b_raw,
+        attention_shape.gating_len(),
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "linear.a_raw",
+        &a_raw,
+        attention_shape.gating_len(),
+    );
+
+    let delta_norm = if tokens == 1 {
+        let attention_out = qwen35_linear_attention_decode_core_backend::<B>(
+            ctx,
+            &mixed_qkv_raw,
+            &z_raw,
+            &a_raw,
+            &b_raw,
+            &attention.conv1d_weight,
+            conv_state,
+            &attention.a_log,
+            &attention.dt_bias,
+            &attention.norm_weight,
+            delta_state,
+            attention_shape,
+            eps,
+        )?;
+        *conv_state = attention_out.next_conv_state;
+        *delta_state = attention_out.final_state;
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.query",
+            &attention_out.query,
+            attention_shape.qk_total(),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.key",
+            &attention_out.key,
+            attention_shape.qk_total(),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.value",
+            &attention_out.value,
+            attention_shape.value_total(),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.g",
+            &attention_out.g,
+            attention_shape.value_heads,
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.beta",
+            &attention_out.beta,
+            attention_shape.value_heads,
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.delta_core",
+            &attention_out.delta_core,
+            attention_shape.value_len(),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.delta_norm",
+            &attention_out.delta_norm,
+            attention_shape.value_len(),
+        );
+        attention_out.delta_norm
+    } else {
+        let final_conv_state =
+            qwen35_final_conv_state_backend::<B>(ctx, &mixed_qkv_raw, attention_shape)?;
+        let attention_out = qwen35_linear_attention_prefill_core_backend::<B>(
+            ctx,
+            &mixed_qkv_raw,
+            &z_raw,
+            &a_raw,
+            &b_raw,
+            &attention.conv1d_weight,
+            &attention.a_log,
+            &attention.dt_bias,
+            &attention.norm_weight,
+            delta_state,
+            attention_shape,
+            eps,
+        )?;
+        *conv_state = final_conv_state;
+        *delta_state = attention_out.final_state;
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.final_conv_state",
+            conv_state,
+            attention_shape.conv_channels() * attention_shape.conv_kernel.saturating_sub(1),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.query",
+            &attention_out.query,
+            tokens * attention_shape.qk_total(),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.key",
+            &attention_out.key,
+            tokens * attention_shape.qk_total(),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.value",
+            &attention_out.value,
+            attention_shape.value_len(),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.g",
+            &attention_out.g,
+            attention_shape.gating_len(),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.beta",
+            &attention_out.beta,
+            attention_shape.gating_len(),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.delta_core",
+            &attention_out.delta_core,
+            attention_shape.value_len(),
+        );
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.delta_norm",
+            &attention_out.delta_norm,
+            attention_shape.value_len(),
+        );
+        attention_out.delta_norm
+    };
+
+    let mut delta_activation = B::alloc(attention_shape.value_len());
+    B::f32_to_activation(
+        ctx,
+        &delta_norm,
+        &mut delta_activation,
+        attention_shape.value_len(),
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "linear.delta_activation",
+        &delta_activation,
+        attention_shape.value_len(),
+    );
+    let mut delta_output = B::alloc(hidden_len);
+    attention
+        .out_proj
+        .forward(ctx, &delta_activation, &mut delta_output, tokens);
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "linear.delta_output",
+        &delta_output,
+        hidden_len,
+    );
+
+    if let (Some(residual_f32), Some(branch_f32)) =
+        (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
+    {
+        B::activation_to_f32_shadow(ctx, &delta_output, branch_f32, hidden_len);
+        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.residual_after_mixer",
+            residual_f32,
+            hidden_len,
+        );
+        qwen35_finish_layer_with_mlp_f32_residual::<B>(
+            ctx,
+            residual_f32,
+            branch_f32,
+            layer,
+            config,
+            tokens,
+            eps,
+        )
+    } else {
+        let mut residual_after_mixer = B::alloc(hidden_len);
+        B::copy_slice(
+            ctx,
+            layer_input,
+            0,
+            &mut residual_after_mixer,
+            0,
+            hidden_len,
+        );
+        B::add_inplace(ctx, &mut residual_after_mixer, &delta_output, hidden_len);
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "linear.residual_after_mixer",
+            &residual_after_mixer,
+            hidden_len,
+        );
+        qwen35_finish_layer_with_mlp::<B>(ctx, &residual_after_mixer, layer, config, tokens, eps)
+    }
+}
+
+fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    layer_input: &B::Buffer,
+    kv: &mut KvCache<B, KvFp16>,
+    layer: &Qwen35LayerWeights<B>,
+    rope: &Qwen35BackendRopeCache<B>,
+    config: &Qwen35TextConfig,
+    tokens: usize,
+    eps: f32,
+    mut residual_f32: Option<&mut B::Buffer>,
+    mut branch_f32: Option<&mut B::Buffer>,
+) -> Result<B::Buffer> {
+    let attention = match &layer.attention {
+        Qwen35AttentionWeights::Full(attention) => attention,
+        Qwen35AttentionWeights::Linear(_) => {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 stateful full layer expected full attention at layer {}",
+                layer.layer_index
+            )));
+        }
+    };
+    let position_offset = kv.len;
+    if position_offset + tokens > kv.capacity {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 full-attention KV overflow at layer {}: target={} capacity={}",
+            layer.layer_index,
+            position_offset + tokens,
+            kv.capacity
+        )));
+    }
+    let attention_shape = Qwen35FullAttentionShape {
+        tokens,
+        num_heads: config.num_attention_heads,
+        num_kv_heads: config.num_key_value_heads,
+        head_dim: config.head_dim,
+        rope_dim: config.full_attention_rope_dim(),
+        position_offset,
+        rope_theta: config.rope_parameters.rope_theta as f32,
+        rope_interleaved: config.full_attention_text_rope_interleaved(),
+        attn_output_gate: config.attn_output_gate,
+    };
+    attention_shape.validate()?;
+    let hidden_len = tokens * config.hidden_size;
+    let q_total = attention_shape.q_total();
+    let q_proj_total = attention_shape.q_proj_total();
+    let kv_total = attention_shape.kv_total();
+
+    let mut input_norm = B::alloc(hidden_len);
+    if let Some(residual_f32) = residual_f32.as_ref() {
+        B::rms_norm_f32_to_activation(
+            ctx,
+            residual_f32,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            tokens,
+            config.hidden_size,
+        );
+    } else {
+        B::rms_norm(
+            ctx,
+            layer_input,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            tokens,
+            config.hidden_size,
+        );
+    }
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "full.input_norm",
+        &input_norm,
+        hidden_len,
+    );
+    let mut query_raw = B::alloc(tokens * q_proj_total);
+    let mut key_raw = B::alloc(tokens * kv_total);
+    let mut value_raw = B::alloc(tokens * kv_total);
+    attention
+        .q_proj
+        .forward(ctx, &input_norm, &mut query_raw, tokens);
+    attention
+        .k_proj
+        .forward(ctx, &input_norm, &mut key_raw, tokens);
+    attention
+        .v_proj
+        .forward(ctx, &input_norm, &mut value_raw, tokens);
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "full.query_raw",
+        &query_raw,
+        tokens * q_proj_total,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "full.key_raw",
+        &key_raw,
+        tokens * kv_total,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "full.value_raw",
+        &value_raw,
+        tokens * kv_total,
+    );
+
+    let mut query_head_major = B::alloc(tokens * q_total);
+    let mut key_head_major = B::alloc(tokens * kv_total);
+    let mut value_head_major = B::alloc(tokens * kv_total);
+    B::qk_norm_rope_partial(
+        ctx,
+        &query_raw,
+        &attention.q_norm_weight,
+        &rope.cos,
+        &rope.sin,
+        &mut query_head_major,
+        tokens,
+        config.num_attention_heads,
+        config.head_dim,
+        attention_shape.rope_dim,
+        q_proj_total,
+        0,
+        if attention_shape.attn_output_gate {
+            2 * config.head_dim
+        } else {
+            config.head_dim
+        },
+        position_offset,
+        eps,
+        if attention_shape.rope_interleaved {
+            3
+        } else {
+            1
+        },
+    )?;
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "full.query_head_major",
+        &query_head_major,
+        tokens * q_total,
+    );
+    B::qk_norm_rope_partial(
+        ctx,
+        &key_raw,
+        &attention.k_norm_weight,
+        &rope.cos,
+        &rope.sin,
+        &mut key_head_major,
+        tokens,
+        config.num_key_value_heads,
+        config.head_dim,
+        attention_shape.rope_dim,
+        kv_total,
+        0,
+        config.head_dim,
+        position_offset,
+        eps,
+        if attention_shape.rope_interleaved {
+            3
+        } else {
+            1
+        },
+    )?;
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "full.key_head_major",
+        &key_head_major,
+        tokens * kv_total,
+    );
+    B::qk_norm_rope_partial(
+        ctx,
+        &value_raw,
+        &attention.q_norm_weight,
+        &rope.cos,
+        &rope.sin,
+        &mut value_head_major,
+        tokens,
+        config.num_key_value_heads,
+        config.head_dim,
+        config.head_dim,
+        kv_total,
+        0,
+        config.head_dim,
+        0,
+        eps,
+        0,
+    )?;
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "full.value_head_major",
+        &value_head_major,
+        tokens * kv_total,
+    );
+    B::kv_cache_append_head_major(
+        ctx,
+        &mut kv.k,
+        &mut kv.v,
+        position_offset,
+        kv.capacity,
+        &key_head_major,
+        &value_head_major,
+        tokens,
+        config.num_key_value_heads,
+        config.head_dim,
+    );
+    kv.len += tokens;
+
+    let mut context_head_major = B::alloc(tokens * q_total);
+    let attn_cfg = AttnConfig {
+        num_heads: config.num_attention_heads,
+        num_kv_heads: config.num_key_value_heads,
+        head_dim: config.head_dim,
+        causal: true,
+        scale: (config.head_dim as f32).sqrt().recip(),
+        kv_seq_stride: kv.capacity,
+        sliding_window: 0,
+    };
+    B::flash_attention(
+        ctx,
+        &query_head_major,
+        &kv.k,
+        &kv.v,
+        &mut context_head_major,
+        1,
+        tokens,
+        kv.len,
+        position_offset,
+        &attn_cfg,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "full.context_head_major",
+        &context_head_major,
+        tokens * q_total,
+    );
+    let mut context = B::alloc(tokens * q_total);
+    B::transpose_head_to_token(
+        ctx,
+        &context_head_major,
+        &mut context,
+        tokens,
+        config.num_attention_heads,
+        config.head_dim,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "full.context",
+        &context,
+        tokens * q_total,
+    );
+    if attention_shape.attn_output_gate {
+        B::qwen35_apply_attention_gate(
+            ctx,
+            &mut context,
+            &query_raw,
+            tokens,
+            q_total,
+            q_proj_total,
+            config.head_dim,
+        )?;
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "full.context_after_gate",
+            &context,
+            tokens * q_total,
+        );
+    }
+
+    let mut attn_output = B::alloc(hidden_len);
+    attention
+        .o_proj
+        .forward(ctx, &context, &mut attn_output, tokens);
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "full.attn_output",
+        &attn_output,
+        hidden_len,
+    );
+    if let (Some(residual_f32), Some(branch_f32)) =
+        (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
+    {
+        B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
+        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "full.residual_after_attention",
+            residual_f32,
+            hidden_len,
+        );
+        qwen35_finish_layer_with_mlp_f32_residual::<B>(
+            ctx,
+            residual_f32,
+            branch_f32,
+            layer,
+            config,
+            tokens,
+            eps,
+        )
+    } else {
+        let mut residual_after_attention = B::alloc(hidden_len);
+        B::copy_slice(
+            ctx,
+            layer_input,
+            0,
+            &mut residual_after_attention,
+            0,
+            hidden_len,
+        );
+        B::add_inplace(ctx, &mut residual_after_attention, &attn_output, hidden_len);
+        qwen35_trace_layer_buffer_stats::<B>(
+            ctx,
+            layer.layer_index,
+            "full.residual_after_attention",
+            &residual_after_attention,
+            hidden_len,
+        );
+        qwen35_finish_layer_with_mlp::<B>(
+            ctx,
+            &residual_after_attention,
+            layer,
+            config,
+            tokens,
+            eps,
+        )
+    }
+}
+
 fn qwen35_fused_expert_mlp_cpu(
     token: &[f32],
     fused_gate_up_proj: &[f32],
@@ -2470,10 +4720,18 @@ pub fn qwen35_final_conv_state_backend<B: Backend>(
     let channels = shape.conv_channels();
     let state_tokens = shape.conv_kernel.saturating_sub(1);
     let state_len = channels * state_tokens;
-    let mut state = B::from_slice(&vec![0.0; state_len]);
+    let mut state = B::from_slice_typed::<f32>(&vec![0.0; state_len]);
     if state_tokens == 0 {
         return Ok(state);
     }
+
+    let mut mixed_qkv_f32 = B::alloc_typed(Dtype::F32, shape.mixed_qkv_len());
+    B::activation_to_f32_shadow(
+        ctx,
+        mixed_qkv_raw,
+        &mut mixed_qkv_f32,
+        shape.mixed_qkv_len(),
+    );
 
     let copied_tokens = state_tokens.min(shape.tokens);
     let source_token_start = shape.tokens - copied_tokens;
@@ -2483,7 +4741,7 @@ pub fn qwen35_final_conv_state_backend<B: Backend>(
             let source_token = source_token_start + state_token;
             let src_offset = source_token * channels + channel;
             let dst_offset = channel * state_tokens + state_token_start + state_token;
-            B::copy_slice(ctx, mixed_qkv_raw, src_offset, &mut state, dst_offset, 1);
+            B::copy_slice(ctx, &mixed_qkv_f32, src_offset, &mut state, dst_offset, 1);
         }
     }
 
@@ -3364,6 +5622,7 @@ impl Qwen35FullAttentionShape {
             || self.num_heads == 0
             || self.num_kv_heads == 0
             || self.head_dim == 0
+            || self.rope_dim == 0
             || self.rope_theta <= 0.0
         {
             return Err(FerrumError::model(format!(
@@ -3376,10 +5635,10 @@ impl Qwen35FullAttentionShape {
                 self.num_heads, self.num_kv_heads
             )));
         }
-        if self.head_dim % 2 != 0 {
+        if self.rope_dim > self.head_dim || self.rope_dim % 2 != 0 {
             return Err(FerrumError::model(format!(
-                "Qwen3.5 full-attention head_dim {} must be even for RoPE",
-                self.head_dim
+                "Qwen3.5 full-attention rope_dim {} must be even and <= head_dim {}",
+                self.rope_dim, self.head_dim
             )));
         }
         Ok(())
@@ -3389,12 +5648,25 @@ impl Qwen35FullAttentionShape {
         self.num_heads * self.head_dim
     }
 
+    fn q_proj_total(self) -> usize {
+        let base = self.q_total();
+        if self.attn_output_gate {
+            base * 2
+        } else {
+            base
+        }
+    }
+
     fn kv_total(self) -> usize {
         self.num_kv_heads * self.head_dim
     }
 
     fn q_len(self) -> usize {
         self.tokens * self.q_total()
+    }
+
+    fn q_proj_len(self) -> usize {
+        self.tokens * self.q_proj_total()
     }
 
     fn kv_len(self) -> usize {
@@ -3414,13 +5686,6 @@ impl Qwen35DenseFullAttentionLayerShape {
             return Err(FerrumError::model(format!(
                 "Qwen3.5 dense full layer tokens {} must match attention tokens {}",
                 self.tokens, self.attention.tokens
-            )));
-        }
-        if self.attention.q_total() != self.hidden_size {
-            return Err(FerrumError::model(format!(
-                "Qwen3.5 dense full layer hidden_size {} must match attention q_total {}",
-                self.hidden_size,
-                self.attention.q_total()
             )));
         }
         Ok(())
@@ -3465,13 +5730,6 @@ impl Qwen35SparseMoeFullAttentionLayerShape {
             return Err(FerrumError::model(format!(
                 "Qwen3.5 sparse-MoE full layer tokens {} must match attention tokens {}",
                 self.tokens, self.attention.tokens
-            )));
-        }
-        if self.attention.q_total() != self.hidden_size {
-            return Err(FerrumError::model(format!(
-                "Qwen3.5 sparse-MoE full layer hidden_size {} must match attention q_total {}",
-                self.hidden_size,
-                self.attention.q_total()
             )));
         }
         if self.moe.tokens != self.tokens || self.moe.hidden_size != self.hidden_size {
@@ -3704,34 +5962,45 @@ fn qwen35_apply_rope_cpu(
     tokens: usize,
     heads: usize,
     head_dim: usize,
+    rope_dim: usize,
     position_offset: usize,
     rope_theta: f32,
+    interleaved: bool,
 ) -> Result<()> {
-    if tokens == 0 || heads == 0 || head_dim == 0 || rope_theta <= 0.0 {
+    if tokens == 0 || heads == 0 || head_dim == 0 || rope_dim == 0 || rope_theta <= 0.0 {
         return Err(FerrumError::model(format!(
-            "Qwen3.5 RoPE shape must be positive, got tokens={tokens} heads={heads} head_dim={head_dim} rope_theta={rope_theta}"
+            "Qwen3.5 RoPE shape must be positive, got tokens={tokens} heads={heads} head_dim={head_dim} rope_dim={rope_dim} rope_theta={rope_theta}"
         )));
     }
-    if head_dim % 2 != 0 {
+    if rope_dim > head_dim || rope_dim % 2 != 0 {
         return Err(FerrumError::model(format!(
-            "Qwen3.5 RoPE head_dim {head_dim} must be even"
+            "Qwen3.5 RoPE rope_dim {rope_dim} must be even and <= head_dim {head_dim}"
         )));
     }
     validate_len("RoPE input", x.len(), tokens * heads * head_dim)?;
 
-    let half = head_dim / 2;
+    let half = rope_dim / 2;
     for token in 0..tokens {
         let position = (position_offset + token) as f32;
         for pair in 0..half {
-            let inv_freq = rope_theta.powf(-(2.0 * pair as f32) / head_dim as f32);
+            let inv_freq = rope_theta.powf(-(2.0 * pair as f32) / rope_dim as f32);
             let angle = position * inv_freq;
             let (sin, cos) = angle.sin_cos();
             for head in 0..heads {
-                let base = ((token * heads + head) * head_dim) + pair;
-                let x0 = x[base];
-                let x1 = x[base + half];
-                x[base] = x0 * cos - x1 * sin;
-                x[base + half] = x0 * sin + x1 * cos;
+                let head_base = (token * heads + head) * head_dim;
+                if interleaved {
+                    let base = head_base + 2 * pair;
+                    let x0 = x[base];
+                    let x1 = x[base + 1];
+                    x[base] = x0 * cos - x1 * sin;
+                    x[base + 1] = x1 * cos + x0 * sin;
+                } else {
+                    let base = head_base + pair;
+                    let x0 = x[base];
+                    let x1 = x[base + half];
+                    x[base] = x0 * cos - x1 * sin;
+                    x[base + half] = x0 * sin + x1 * cos;
+                }
             }
         }
     }
@@ -3812,7 +6081,153 @@ fn split_features(x: &[f32], rows: usize, width: usize, start: usize, len: usize
     out
 }
 
-impl<B: Backend> Qwen35ModelWeights<B> {
+fn split_qwen35_full_attention_query_gate(
+    query_raw: &[f32],
+    tokens: usize,
+    num_heads: usize,
+    head_dim: usize,
+    q_proj_total: usize,
+    attn_output_gate: bool,
+) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+    let q_total = num_heads * head_dim;
+    if !attn_output_gate {
+        return Ok((
+            split_features(query_raw, tokens, q_proj_total, 0, q_total),
+            None,
+        ));
+    }
+    if q_proj_total < num_heads * 2 * head_dim {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 gated q_proj width {q_proj_total} is too small for num_heads={num_heads} head_dim={head_dim}"
+        )));
+    }
+    validate_len(
+        "full attention query_raw",
+        query_raw.len(),
+        tokens * q_proj_total,
+    )?;
+
+    let mut query = vec![0.0; tokens * q_total];
+    let mut gate = vec![0.0; tokens * q_total];
+    for token in 0..tokens {
+        let row_base = token * q_proj_total;
+        let out_base = token * q_total;
+        for head in 0..num_heads {
+            let src_head = row_base + head * 2 * head_dim;
+            let dst_head = out_base + head * head_dim;
+            query[dst_head..dst_head + head_dim]
+                .copy_from_slice(&query_raw[src_head..src_head + head_dim]);
+            gate[dst_head..dst_head + head_dim]
+                .copy_from_slice(&query_raw[src_head + head_dim..src_head + 2 * head_dim]);
+        }
+    }
+    Ok((query, Some(gate)))
+}
+
+fn token_major_to_head_major_f32(
+    values: &[f32],
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0; tokens * heads * head_dim];
+    for token in 0..tokens {
+        for head in 0..heads {
+            let src = (token * heads + head) * head_dim;
+            let dst = (head * tokens + token) * head_dim;
+            out[dst..dst + head_dim].copy_from_slice(&values[src..src + head_dim]);
+        }
+    }
+    out
+}
+
+fn qwen35_load_sparse_moe_experts<B: MoeLlmBackend>(
+    planned: &Qwen35WeightPlanLoader<'_, B>,
+    layer_index: usize,
+    config: &Qwen35TextConfig,
+) -> Result<(ExpertStack<B>, B::Buffer, B::Buffer)> {
+    let moe_config = config
+        .moe
+        .as_ref()
+        .ok_or_else(|| FerrumError::model("Qwen3.5 sparse MoE config missing"))?;
+    let num_experts = moe_config.num_experts;
+    let hidden = config.hidden_size;
+    let expert_intermediate = moe_config.moe_intermediate_size;
+
+    if planned.has_layer_tensor(layer_index, "moe_per_expert_gate_proj_qweight") {
+        let (gate_up_marlin, gate_up_n_per_expert, _) = planned.load_layer_stacked_gptq_experts(
+            layer_index,
+            num_experts,
+            &["gate_proj", "up_proj"],
+        )?;
+        let (down_marlin, down_n_per_expert, _) =
+            planned.load_layer_stacked_gptq_experts(layer_index, num_experts, &["down_proj"])?;
+
+        let mut gate_up: Vec<Box<dyn Linear<B>>> = Vec::with_capacity(num_experts);
+        let mut down: Vec<Box<dyn Linear<B>>> = Vec::with_capacity(num_experts);
+        for expert in 0..num_experts {
+            gate_up.push(Box::new(StackedExpertLinear::<B>::new(
+                gate_up_marlin.clone(),
+                expert * gate_up_n_per_expert,
+                gate_up_n_per_expert,
+            )?));
+            down.push(Box::new(StackedExpertLinear::<B>::new(
+                down_marlin.clone(),
+                expert * down_n_per_expert,
+                down_n_per_expert,
+            )?));
+        }
+        let experts = ExpertStack {
+            gate_up,
+            down,
+            gate_stacked: None,
+            up_stacked: None,
+            down_stacked: None,
+            gate_up_marlin_stack: Some(gate_up_marlin),
+            down_marlin_stack: Some(down_marlin),
+        };
+        return Ok((experts, B::from_slice(&[0.0]), B::from_slice(&[0.0])));
+    }
+
+    if planned.has_layer_tensor(layer_index, "moe_fused_gate_up_proj")
+        && planned.has_layer_tensor(layer_index, "moe_fused_down_proj")
+    {
+        let fused_gate_up_proj =
+            planned.load_layer_tensor(layer_index, "moe_fused_gate_up_proj")?;
+        let fused_down_proj = planned.load_layer_tensor(layer_index, "moe_fused_down_proj")?;
+        let fused_gate_up_host = B::to_vec(
+            &fused_gate_up_proj,
+            num_experts * 2 * expert_intermediate * hidden,
+        );
+        let fused_down_host =
+            B::to_vec(&fused_down_proj, num_experts * hidden * expert_intermediate);
+        let per_gate = expert_intermediate * hidden;
+        let per_fused = 2 * per_gate;
+        let mut gate_stack = Vec::with_capacity(num_experts * per_gate);
+        let mut up_stack = Vec::with_capacity(num_experts * per_gate);
+        for expert in 0..num_experts {
+            let base = expert * per_fused;
+            gate_stack.extend_from_slice(&fused_gate_up_host[base..base + per_gate]);
+            up_stack.extend_from_slice(&fused_gate_up_host[base + per_gate..base + per_fused]);
+        }
+        let experts = ExpertStack::from_dense_stacks(
+            &gate_stack,
+            &up_stack,
+            &fused_down_host,
+            num_experts,
+            hidden,
+            expert_intermediate,
+        )?;
+        return Ok((experts, fused_gate_up_proj, fused_down_proj));
+    }
+
+    Err(FerrumError::model(format!(
+        "Qwen3.5 sparse MoE layer {layer_index} has neither official per-expert GPTQ qweight \
+         tensors nor fused dense expert tensors"
+    )))
+}
+
+impl<B: MoeLlmBackend> Qwen35ModelWeights<B> {
     pub fn load(
         config: Qwen35TextConfig,
         runtime_cfg: LlmRuntimeConfig,
@@ -3861,12 +6276,27 @@ impl<B: Backend> Qwen35ModelWeights<B> {
                                 .load_layer_linear(layer_plan.layer_index, "linear_attn_a")?,
                             conv1d_weight: planned
                                 .load_layer_tensor(layer_plan.layer_index, "linear_attn_conv")?,
-                            a_log: planned
-                                .load_layer_tensor(layer_plan.layer_index, "linear_attn_a_log")?,
-                            dt_bias: planned
-                                .load_layer_tensor(layer_plan.layer_index, "linear_attn_dt_bias")?,
-                            norm_weight: planned
-                                .load_layer_tensor(layer_plan.layer_index, "linear_attn_norm")?,
+                            a_log: qwen35_promote_to_f32_buffer::<B>(
+                                planned.load_layer_tensor(
+                                    layer_plan.layer_index,
+                                    "linear_attn_a_log",
+                                )?,
+                                config.linear_attention.num_value_heads,
+                            ),
+                            dt_bias: qwen35_promote_to_f32_buffer::<B>(
+                                planned.load_layer_tensor(
+                                    layer_plan.layer_index,
+                                    "linear_attn_dt_bias",
+                                )?,
+                                config.linear_attention.num_value_heads,
+                            ),
+                            norm_weight: qwen35_promote_to_f32_buffer::<B>(
+                                planned.load_layer_tensor(
+                                    layer_plan.layer_index,
+                                    "linear_attn_norm",
+                                )?,
+                                config.linear_attention.value_head_dim,
+                            ),
                             out_proj: planned
                                 .load_layer_linear(layer_plan.layer_index, "linear_attn_out")?,
                         })
@@ -3905,10 +6335,17 @@ impl<B: Backend> Qwen35ModelWeights<B> {
                         down_proj: planned.load_layer_linear(layer_plan.layer_index, "mlp_down")?,
                     }),
                     Qwen35MlpKind::SparseMoeSharedExpert => {
+                        let (experts, fused_gate_up_proj, fused_down_proj) =
+                            qwen35_load_sparse_moe_experts::<B>(
+                                &planned,
+                                layer_plan.layer_index,
+                                &config,
+                            )?;
                         Qwen35MlpWeights::SparseMoeSharedExpert(
                             Qwen35SparseMoeSharedExpertWeights {
                                 router: planned
                                     .load_layer_linear(layer_plan.layer_index, "moe_router")?,
+                                experts,
                                 shared_expert_gate: planned.load_layer_tensor(
                                     layer_plan.layer_index,
                                     "moe_shared_expert_gate",
@@ -3925,14 +6362,8 @@ impl<B: Backend> Qwen35ModelWeights<B> {
                                     layer_plan.layer_index,
                                     "moe_shared_expert_down_proj",
                                 )?,
-                                fused_gate_up_proj: planned.load_layer_tensor(
-                                    layer_plan.layer_index,
-                                    "moe_fused_gate_up_proj",
-                                )?,
-                                fused_down_proj: planned.load_layer_tensor(
-                                    layer_plan.layer_index,
-                                    "moe_fused_down_proj",
-                                )?,
+                                fused_gate_up_proj,
+                                fused_down_proj,
                             },
                         )
                     }
@@ -3959,7 +6390,12 @@ fn qwen35_fold_gemma_norm_weight<B: Backend>(buf: B::Buffer, len: usize) -> B::B
     B::from_slice(&values)
 }
 
-impl<B: Backend> Qwen35AttentionWeights<B> {
+fn qwen35_promote_to_f32_buffer<B: Backend>(buf: B::Buffer, len: usize) -> B::Buffer {
+    let values = B::to_vec(&buf, len);
+    B::from_slice_typed::<f32>(&values)
+}
+
+impl<B: MoeLlmBackend> Qwen35AttentionWeights<B> {
     pub fn kind(&self) -> Qwen35LayerType {
         match self {
             Self::Linear(_) => Qwen35LayerType::LinearAttention,
@@ -3968,7 +6404,7 @@ impl<B: Backend> Qwen35AttentionWeights<B> {
     }
 }
 
-impl<B: Backend> Qwen35MlpWeights<B> {
+impl<B: MoeLlmBackend> Qwen35MlpWeights<B> {
     pub fn kind(&self) -> Qwen35MlpKind {
         match self {
             Self::Dense(_) => Qwen35MlpKind::Dense,
@@ -4043,6 +6479,44 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn qwen35_text_rope_uses_neox_when_mrope_section_is_present() {
+        let cfg = Qwen35TextConfig::from_hf_config_str(
+            r#"{
+              "model_type": "qwen3_5_moe",
+              "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 16,
+                "num_hidden_layers": 4,
+                "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 4,
+                "linear_value_head_dim": 4,
+                "linear_conv_kernel_dim": 4,
+                "head_dim": 4,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 8,
+                "shared_expert_intermediate_size": 8,
+                "tie_word_embeddings": false,
+                "rope_parameters": {
+                  "rope_theta": 10000000,
+                  "partial_rotary_factor": 1.0,
+                  "mrope_interleaved": true,
+                  "mrope_section": [1, 1]
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.rope_parameters.mrope_section, Some(vec![1, 1]));
+        assert!(!cfg.full_attention_text_rope_interleaved());
+    }
+
     struct RecordingLoader {
         tensors: HashMap<String, Vec<f32>>,
         linears: Mutex<Vec<String>>,
@@ -4051,7 +6525,7 @@ mod tests {
     impl RecordingLoader {
         fn from_required_manifest(config: &Qwen35TextConfig) -> Self {
             let manifest = config.weight_manifest("model").unwrap();
-            let tensors = manifest
+            let mut tensors: HashMap<String, Vec<f32>> = manifest
                 .global_tensors
                 .iter()
                 .chain(
@@ -4066,12 +6540,31 @@ mod tests {
                         "final_norm" | "input_layernorm" | "post_attention_layernorm" => {
                             config.hidden_size
                         }
+                        "linear_attn_a_log" | "linear_attn_dt_bias" => {
+                            config.linear_attention.num_value_heads
+                        }
+                        "linear_attn_norm" => config.linear_attention.value_head_dim,
                         "self_attn_q_norm" | "self_attn_k_norm" => config.head_dim,
                         _ => 1,
                     };
                     (tensor.name.clone(), vec![1.0; len])
                 })
                 .collect();
+            if let Some(moe) = &config.moe {
+                let gate_up_len =
+                    moe.num_experts * 2 * moe.moe_intermediate_size * config.hidden_size;
+                let down_len = moe.num_experts * config.hidden_size * moe.moe_intermediate_size;
+                for layer in config.sparse_moe_layers() {
+                    tensors.insert(
+                        format!("model.layers.{layer}.mlp.experts.gate_up_proj"),
+                        vec![1.0; gate_up_len],
+                    );
+                    tensors.insert(
+                        format!("model.layers.{layer}.mlp.experts.down_proj"),
+                        vec![1.0; down_len],
+                    );
+                }
+            }
             Self {
                 tensors,
                 linears: Mutex::new(Vec::new()),
@@ -4310,7 +6803,8 @@ mod tests {
         assert!(matches!(
             &model.layers[0].mlp,
             Qwen35MlpWeights::SparseMoeSharedExpert(weights)
-                if weights.fused_gate_up_proj == vec![1.0]
+                if weights.fused_gate_up_proj.len() == 8 * 2 * 8 * 16
+                    && weights.fused_gate_up_proj.iter().all(|value| *value == 1.0)
         ));
     }
 
@@ -4610,8 +7104,11 @@ mod tests {
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: 2,
+            rope_dim: 2,
             position_offset: 0,
             rope_theta: 10_000.0,
+            rope_interleaved: false,
+            attn_output_gate: false,
         };
         let reference = qwen35_full_attention_core_cpu(
             &[3.0, 4.0],
@@ -4638,10 +7135,19 @@ mod tests {
     #[test]
     fn rope_uses_non_interleaved_half_rotation() {
         let mut values = vec![1.0, 0.0];
-        qwen35_apply_rope_cpu(&mut values, 1, 1, 2, 1, 10_000.0).unwrap();
+        qwen35_apply_rope_cpu(&mut values, 1, 1, 2, 2, 1, 10_000.0, false).unwrap();
         let (sin, cos) = 1.0f32.sin_cos();
 
         assert_close_slice(&values, &[cos, sin], 1e-6);
+    }
+
+    #[test]
+    fn rope_uses_partial_interleaved_rotation() {
+        let mut values = vec![1.0, 0.0, 3.0, 4.0];
+        qwen35_apply_rope_cpu(&mut values, 1, 1, 4, 2, 1, 10_000.0, true).unwrap();
+        let (sin, cos) = 1.0f32.sin_cos();
+
+        assert_close_slice(&values, &[cos, sin, 3.0, 4.0], 1e-6);
     }
 
     #[test]
@@ -4651,8 +7157,11 @@ mod tests {
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: 2,
+            rope_dim: 2,
             position_offset: 0,
             rope_theta: 10_000.0,
+            rope_interleaved: false,
+            attn_output_gate: false,
         };
         let reference = qwen35_full_attention_core_cpu(
             &[0.0, 0.0, 0.0, 0.0],
@@ -4672,14 +7181,55 @@ mod tests {
     }
 
     #[test]
+    fn full_attention_core_applies_qwen35_output_gate() {
+        let gates = vec![0.0, 1.0, -1.0, 2.0];
+        let query_raw = vec![0.0, 0.0, gates[0], gates[1], 0.0, 0.0, gates[2], gates[3]];
+        let shape = Qwen35FullAttentionShape {
+            tokens: 1,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            rope_dim: 2,
+            position_offset: 0,
+            rope_theta: 10_000.0,
+            rope_interleaved: true,
+            attn_output_gate: true,
+        };
+        let reference = qwen35_full_attention_core_cpu(
+            &query_raw,
+            &[0.0; 2],
+            &[2.0, 4.0],
+            &[0.0; 2],
+            &[0.0; 2],
+            shape,
+            1e-6,
+        )
+        .unwrap();
+        let expected = vec![
+            2.0 * sigmoid(gates[0]),
+            4.0 * sigmoid(gates[1]),
+            2.0 * sigmoid(gates[2]),
+            4.0 * sigmoid(gates[3]),
+        ];
+
+        assert_close_slice(&reference.query, &[0.0, 0.0, 0.0, 0.0], 1e-6);
+        assert_close_slice(&reference.context_ungated, &[2.0, 4.0, 2.0, 4.0], 1e-6);
+        assert_close_slice(&reference.context, &expected, 1e-6);
+        assert_eq!(reference.attention_gate.as_deref(), Some(gates.as_slice()));
+    }
+
+    #[test]
     fn full_attention_backend_core_matches_reference() {
         let raw_shape = Qwen35FullAttentionShape {
             tokens: 3,
             num_heads: 2,
             num_kv_heads: 1,
             head_dim: 2,
+            rope_dim: 2,
             position_offset: 1,
             rope_theta: 10_000.0,
+            rope_interleaved: false,
+            attn_output_gate: false,
         };
         let q_raw: Vec<f32> = (0..raw_shape.q_len())
             .map(|i| ((i as f32 % 7.0) - 3.0) * 0.2)
@@ -4714,7 +7264,7 @@ mod tests {
 
         let rope = qwen35_build_rope_cache_backend::<CpuBackend>(
             raw_shape.position_offset + raw_shape.tokens,
-            raw_shape.head_dim,
+            raw_shape.rope_dim,
             raw_shape.rope_theta,
         )
         .unwrap();
@@ -4787,8 +7337,11 @@ mod tests {
             num_heads: 3,
             num_kv_heads: 2,
             head_dim: 2,
+            rope_dim: 2,
             position_offset: 0,
             rope_theta: 10_000.0,
+            rope_interleaved: false,
+            attn_output_gate: false,
         };
         let err = qwen35_full_attention_core_cpu(
             &[0.0; 6], &[0.0; 4], &[0.0; 4], &[1.0; 2], &[1.0; 2], shape, 1e-6,
@@ -5308,8 +7861,11 @@ mod tests {
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: 2,
+            rope_dim: 2,
             position_offset: 0,
             rope_theta: 10_000.0,
+            rope_interleaved: false,
+            attn_output_gate: false,
         };
         let shape = Qwen35DenseFullAttentionLayerShape {
             tokens: 2,
@@ -5521,7 +8077,7 @@ mod tests {
         };
         let rope = qwen35_build_rope_cache_backend::<CpuBackend>(
             attention_shape.position_offset + attention_shape.tokens,
-            attention_shape.head_dim,
+            attention_shape.rope_dim,
             attention_shape.rope_theta,
         )
         .unwrap();
@@ -5719,8 +8275,11 @@ mod tests {
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: 2,
+            rope_dim: 2,
             position_offset: 0,
             rope_theta: 10_000.0,
+            rope_interleaved: false,
+            attn_output_gate: false,
         };
         let moe_shape = single_expert_moe_shape(2, 2);
         let shape = Qwen35SparseMoeFullAttentionLayerShape {
@@ -5830,27 +8389,39 @@ mod tests {
     }
 
     #[test]
-    fn dense_full_attention_layer_rejects_hidden_size_mismatch() {
+    fn dense_full_attention_layer_accepts_qwen35_gate_shape_with_hidden_not_q_total() {
         let shape = Qwen35DenseFullAttentionLayerShape {
             tokens: 1,
-            hidden_size: 3,
-            intermediate_size: 2,
+            hidden_size: 2,
+            intermediate_size: 1,
             attention: Qwen35FullAttentionShape {
                 tokens: 1,
-                num_heads: 1,
+                num_heads: 2,
                 num_kv_heads: 1,
-                head_dim: 2,
+                head_dim: 4,
+                rope_dim: 2,
                 position_offset: 0,
                 rope_theta: 10_000.0,
+                rope_interleaved: true,
+                attn_output_gate: true,
             },
         };
-        let err = qwen35_dense_full_attention_layer_cpu(
-            &[0.0; 3], &[0.0; 3], &[0.0; 6], &[0.0; 6], &[0.0; 6], &[1.0; 2], &[1.0; 2], &[0.0; 6],
-            &[0.0; 3], &[0.0; 6], &[0.0; 6], &[0.0; 6], shape, 1e-6,
+        let reference = qwen35_dense_full_attention_layer_cpu(
+            &[0.0; 2], &[0.0; 2], &[0.0; 32], &[0.0; 8], &[0.0; 8], &[0.0; 4], &[0.0; 4],
+            &[0.0; 16], &[0.0; 2], &[0.0; 2], &[0.0; 2], &[0.0; 2], shape, 1e-6,
         )
-        .expect_err("hidden size must match attention q_total");
+        .expect("Qwen3.5 full attention permits hidden_size != q_total with gated q_proj");
 
-        assert!(err.to_string().contains("hidden_size 3"), "{err}");
+        assert_eq!(shape.hidden_size, 2);
+        assert_eq!(shape.attention.q_total(), 8);
+        assert_eq!(shape.attention.q_proj_total(), 16);
+        assert_eq!(reference.query_raw.len(), shape.attention.q_proj_len());
+        assert_eq!(reference.attention.context.len(), shape.attention.q_len());
+        assert_eq!(
+            reference.attention.attention_gate.as_ref().unwrap().len(),
+            8
+        );
+        assert_eq!(reference.attn_output.len(), shape.hidden_size);
     }
 
     #[test]
@@ -6070,8 +8641,11 @@ mod tests {
                 num_heads: 1,
                 num_kv_heads: 1,
                 head_dim: 2,
+                rope_dim: 2,
                 position_offset: 0,
                 rope_theta: 10_000.0,
+                rope_interleaved: false,
+                attn_output_gate: false,
             },
         };
         let full_input_norm = vec![0.0, 0.0];
@@ -6269,8 +8843,11 @@ mod tests {
             num_heads: 1,
             num_kv_heads: 1,
             head_dim: 2,
+            rope_dim: 2,
             position_offset: 0,
             rope_theta: 10_000.0,
+            rope_interleaved: false,
+            attn_output_gate: false,
         };
         let full_shape = Qwen35SparseMoeFullAttentionLayerShape {
             tokens: 2,
@@ -6451,8 +9028,11 @@ mod tests {
                         num_heads: 1,
                         num_kv_heads: 1,
                         head_dim: 2,
+                        rope_dim: 2,
                         position_offset: 0,
                         rope_theta: 10_000.0,
+                        rope_interleaved: false,
+                        attn_output_gate: false,
                     },
                 },
                 input_norm_weight: &[0.0, 0.0],

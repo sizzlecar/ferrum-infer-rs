@@ -620,7 +620,14 @@ def validate_w3_l1_artifact(data: dict[str, Any], label: str, problems: list[str
             numeric_within_tolerance(numeric, "max_abs", atol, f"{label}.numeric", problems)
         require_true(numeric.get("deterministic"), f"{label}.numeric.deterministic", problems)
     coverage = as_object(data.get("coverage"), f"{label}.coverage", problems)
-    for key in ["linear_attention", "full_attention", "deltanet", "moe_or_dense", "lm_head"]:
+    for key in [
+        "linear_attention",
+        "full_attention",
+        "full_attention_official_shape",
+        "deltanet",
+        "moe_or_dense",
+        "lm_head",
+    ]:
         require_true(coverage.get(key), f"{label}.coverage.{key}", problems)
     reference = as_object(data.get("reference"), f"{label}.reference", problems)
     if reference:
@@ -1475,6 +1482,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
             "coverage": {
                 "linear_attention": True,
                 "full_attention": True,
+                "full_attention_official_shape": True,
                 "deltanet": True,
                 "moe_or_dense": True,
                 "lm_head": True,

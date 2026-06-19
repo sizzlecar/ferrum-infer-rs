@@ -440,6 +440,11 @@ pub fn marlin_gemm_with_perm(
 ) -> Result<()> {
     let runtime_config = cuda_quant_runtime_config();
     let use_vllm = runtime_config.vllm_marlin;
+    if weight.vllm_moe {
+        return Err(FerrumError::unsupported(
+            "vLLM Marlin-MoE packed weight cannot be dispatched through dense Marlin GEMM",
+        ));
+    }
 
     if let Some(perm) = weight.perm.as_ref() {
         let k = weight.k;
@@ -733,10 +738,12 @@ impl BackendQuantMarlin for CudaBackend {
         let marlin_weight = crate::marlin::MarlinWeight {
             qweight: qweight_dev,
             scales: scales_dev,
+            qzeros: None,
             workspace: workspace_dev,
             k,
             n,
             group_size: group_size as i32,
+            vllm_moe: false,
             perm: perm_dev_opt,
         };
 
@@ -785,25 +792,25 @@ impl BackendQuantMarlin for CudaBackend {
                 qzeros.len()
             )));
         }
-        for (idx, qz) in qzeros.iter().enumerate() {
-            reject_unsupported_marlin_qzeros(
-                &format!("CUDA GPTQ stacked Marlin expert {idx}"),
-                qz,
-            )?;
-        }
+        let needs_vllm_qzeros = qzeros
+            .iter()
+            .any(|qz| !marlin_qzeros_are_symmetric_code7(qz));
 
         // vLLM marlin_moe_wna16 path: stacked weight in vLLM Marlin tile
         // format (NOT IST-DASLab). Run gptq_marlin_repack per expert,
         // permute scales with the same _scale_perm IST-DASLab uses.
-        // Opt-in via FERRUM_VLLM_MOE=1 — paired with the dispatch-side
-        // switch in moe_forward_bucketed.
+        // Non-symmetric GPTQ qzeros require this path because the standard
+        // IST-DASLab Marlin wrapper only handles the symmetric uint4b8
+        // zero-point bias. FERRUM_VLLM_MOE=1 remains an opt-in for
+        // symmetric models; asymmetric stacks select vLLM automatically.
         #[cfg(feature = "vllm-moe-marlin")]
-        if use_vllm_moe() {
+        if use_vllm_moe() || needs_vllm_qzeros {
             let stream = default_stream();
             let mw = crate::vllm_marlin::load_stacked_gptq_vllm_marlin(
                 &stream,
                 qweights,
                 scales,
+                qzeros,
                 bits,
                 group_size,
                 k,
@@ -826,6 +833,22 @@ impl BackendQuantMarlin for CudaBackend {
                     k,
                 ),
             ));
+        }
+
+        #[cfg(not(feature = "vllm-moe-marlin"))]
+        if needs_vllm_qzeros {
+            return Err(FerrumError::unsupported(
+                "CUDA GPTQ stacked Marlin found non-symmetric qzeros; rebuild with \
+                 --features vllm-moe-marlin so Ferrum can use the vLLM MoE \
+                 Marlin zero-point path",
+            ));
+        }
+
+        for (idx, qz) in qzeros.iter().enumerate() {
+            reject_unsupported_marlin_qzeros(
+                &format!("CUDA GPTQ stacked Marlin expert {idx}"),
+                qz,
+            )?;
         }
 
         // Triton path: would need a stacked variant — not implemented.
@@ -925,10 +948,12 @@ impl BackendQuantMarlin for CudaBackend {
         let marlin_weight = crate::marlin::MarlinWeight {
             qweight: qweight_dev,
             scales: scales_dev,
+            qzeros: None,
             workspace: workspace_dev,
             k,
             n: total_n,
             group_size: group_size as i32,
+            vllm_moe: false,
             perm: perm_dev_opt,
         };
 
@@ -984,6 +1009,12 @@ pub(crate) fn moe_gemm_phase_batched_impl(
     };
     #[cfg(not(feature = "triton-kernels"))]
     let mw: &crate::marlin::MarlinWeight = weight;
+    if mw.vllm_moe {
+        return Err(FerrumError::unsupported(
+            "vLLM Marlin-MoE packed weight cannot be dispatched through bucketed Marlin; \
+             use gemm_phase_vllm",
+        ));
+    }
 
     // ── Stage 12.1: fused MoE Marlin path (default ON) ──────────────
     // Dispatches all experts in this phase as a small number of

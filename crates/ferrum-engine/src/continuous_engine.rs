@@ -351,6 +351,9 @@ fn cached_forbidden_generation_tokens(
     }
 
     let mut forbidden = HashSet::new();
+    let scan_limit = tok.vocab_size().min(GENERATION_POLICY_SCAN_LIMIT);
+    let has_reverse_vocab =
+        (0..scan_limit).any(|token_id| tok.token_text(TokenId::new(token_id as u32)).is_some());
     let special = tok.special_tokens();
     for token in [
         special.bos_token,
@@ -385,21 +388,20 @@ fn cached_forbidden_generation_tokens(
             }
         }
     }
-    let scan_limit = tok.vocab_size().min(GENERATION_POLICY_SCAN_LIMIT);
     for token_id in 0..scan_limit {
         let id = token_id as u32;
         if allowed_generated_controls.contains(&id) {
             continue;
         }
         let token = TokenId::new(id);
-        let raw_text_forbidden = tok
-            .token_text(token)
-            .is_some_and(is_forbidden_generation_token_text);
+        let raw_text = tok.token_text(token);
+        let missing_token_text = has_reverse_vocab && raw_text.is_none();
+        let raw_text_forbidden = raw_text.is_some_and(is_forbidden_generation_token_text);
         let decoded_text_forbidden = tok
             .decode(&[token], true)
             .map(|text| is_forbidden_generation_token_text(&text))
             .unwrap_or(true);
-        if raw_text_forbidden || decoded_text_forbidden {
+        if missing_token_text || raw_text_forbidden || decoded_text_forbidden {
             forbidden.insert(id);
         }
     }
@@ -414,6 +416,49 @@ fn cached_forbidden_generation_tokens(
 fn tokenizer_cache_key(tok: &(dyn Tokenizer + Send + Sync)) -> usize {
     let ptr = tok as *const (dyn Tokenizer + Send + Sync);
     ptr.cast::<()>() as usize
+}
+
+fn maybe_trace_prompt_tokens(
+    tok: &(dyn Tokenizer + Send + Sync),
+    request_id: &RequestId,
+    prompt: &str,
+) {
+    if std::env::var_os("FERRUM_TRACE_PROMPT_TOKENS").is_none() {
+        return;
+    }
+
+    let prompt_json = serde_json::to_string(prompt).unwrap_or_else(|_| "<json-error>".to_string());
+    eprintln!("[prompt-tokens] request_id={request_id} prompt={prompt_json}");
+    for add_special in [true, false] {
+        match tok.encode(prompt, add_special) {
+            Ok(tokens) => {
+                let ids: Vec<u32> = tokens.iter().map(|token| token.get()).collect();
+                let head_ids: Vec<u32> = ids.iter().copied().take(96).collect();
+                let mut tail_ids: Vec<u32> = ids.iter().rev().copied().take(32).collect();
+                tail_ids.reverse();
+                let head_texts: Vec<String> = tokens
+                    .iter()
+                    .take(24)
+                    .map(|token| {
+                        tok.decode(&[*token], false)
+                            .unwrap_or_else(|_| "<decode-error>".to_string())
+                    })
+                    .collect();
+                eprintln!(
+                    "[prompt-tokens] request_id={request_id} add_special={add_special} len={} head_ids={:?} tail_ids={:?} head_texts={:?}",
+                    tokens.len(),
+                    head_ids,
+                    tail_ids,
+                    head_texts,
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "[prompt-tokens] request_id={request_id} add_special={add_special} error={err}"
+                );
+            }
+        }
+    }
 }
 
 fn is_forbidden_generation_token_text(text: &str) -> bool {
@@ -1536,6 +1581,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         counter!("ferrum.engine.requests_total").increment(1);
         gauge!("ferrum.engine.active_requests").increment(1.0);
 
+        maybe_trace_prompt_tokens(&*self.inner.tokenizer, &request_id, &request.prompt);
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
             &mut request,
@@ -1607,6 +1653,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let (tx, rx) = mpsc::channel(100);
         let request_id = request.id.clone();
 
+        maybe_trace_prompt_tokens(&*self.inner.tokenizer, &request_id, &request.prompt);
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
             &mut request,

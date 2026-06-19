@@ -1446,11 +1446,37 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                     .get_option::<bool>("qwen35_reference")
                     .unwrap_or(false);
                 if !reference_enabled {
-                    return Err(FerrumError::unsupported(
-                        "Qwen3.5/Qwen3.6 W3 configs are recognized, but product model execution \
-                         is not wired yet. Use the explicit --qwen35-reference CPU/FP32 path only \
-                         for W3 correctness bring-up until release-grade run/serve support is gated.",
-                    ));
+                    if !matches!(config.device, Device::CUDA(_)) {
+                        return Err(FerrumError::unsupported(
+                            "Qwen3.5/Qwen3.6 product execution is CUDA-only in the W3 path. \
+                             CPU is available only through explicit --qwen35-reference for \
+                             correctness bring-up.",
+                        ));
+                    }
+                    #[cfg(feature = "cuda")]
+                    {
+                        info!("Using Qwen3.5/Qwen3.6 CUDA backend executor");
+                        let model_dir = std::path::Path::new(&model_path);
+                        let llm = ferrum_models::models::Qwen35BackendModel::<
+                            ferrum_kernels::backend::cuda::CudaBackend,
+                        >::from_definition_with_native_safetensors(
+                            &model_def, model_dir
+                        )?;
+                        let mut model_info = model_def
+                            .to_model_info(config.engine_config.model.model_id.to_string());
+                        model_info.dtype = DataType::FP16;
+                        model_info.device = config.device.clone();
+                        return Ok(Arc::new(ferrum_models::LlmExecutor::new(
+                            Box::new(llm),
+                            model_info,
+                        )));
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        return Err(FerrumError::device(
+                            "CUDA requested but 'cuda' feature not enabled",
+                        ));
+                    }
                 }
                 if config.device != Device::CPU || dtype != DType::F32 {
                     return Err(FerrumError::unsupported(

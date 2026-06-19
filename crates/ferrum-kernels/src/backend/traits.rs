@@ -509,6 +509,89 @@ pub trait Backend: Send + Sync + Sized + 'static {
         mode: i32,
     );
 
+    /// Q/K preparation variant for Qwen3.5 full attention.
+    ///
+    /// `input_stride` is the per-token feature width in `input`, and
+    /// `input_offset` is the first feature for this projection inside each
+    /// token row. This lets Q read the first `num_heads * head_dim` slice from
+    /// Qwen3.5's gated `q_proj` output while leaving the attention gate slice
+    /// in place for a later device-side post-op.
+    ///
+    /// `rope_dim` may be smaller than `head_dim`; dimensions outside
+    /// `rope_dim` are normalized and copied but not rotated. `mode` follows
+    /// [`Backend::qk_norm_rope`]: 0 transpose only, 1 RMSNorm+RoPE, 2 RoPE
+    /// only, 3 RMSNorm+interleaved RoPE for Qwen3.5's mrope layout.
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_partial(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        output: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        input_stride: usize,
+        input_offset: usize,
+        input_head_stride: usize,
+        pos_offset: usize,
+        eps: f32,
+        mode: i32,
+    ) -> Result<()> {
+        if rope_dim == head_dim
+            && input_stride == heads * head_dim
+            && input_offset == 0
+            && input_head_stride == head_dim
+            && mode != 3
+        {
+            Self::qk_norm_rope(
+                ctx, input, norm_w, cos, sin, output, tokens, heads, head_dim, pos_offset, eps,
+                mode,
+            );
+            return Ok(());
+        }
+        Err(FerrumError::unsupported(
+            "qk_norm_rope_partial not implemented for this backend",
+        ))
+    }
+
+    /// Apply Qwen3.5 attention output gate in place. Gated Qwen3.5 full
+    /// attention stores q_proj rows as per-head `[query, gate]` slices, so
+    /// `context[token, head, dim] *= sigmoid(q_proj[token, head, head_dim + dim])`.
+    ///
+    /// The CUDA implementation is a single device kernel. Backends that do not
+    /// implement it must fail rather than silently copying data through host
+    /// memory on product paths.
+    fn qwen35_apply_attention_gate(
+        _ctx: &mut Self::Context,
+        _context: &mut Self::Buffer,
+        _query_raw: &Self::Buffer,
+        _tokens: usize,
+        _q_total: usize,
+        _q_proj_total: usize,
+        _head_dim: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "qwen35_apply_attention_gate not implemented for this backend",
+        ))
+    }
+
+    /// Apply one scalar gate per token to a token-major hidden buffer:
+    /// `values[token, dim] *= sigmoid(gate[token])`.
+    fn qwen35_apply_token_gate(
+        _ctx: &mut Self::Context,
+        _values: &mut Self::Buffer,
+        _gate: &Self::Buffer,
+        _tokens: usize,
+        _hidden_size: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "qwen35_apply_token_gate not implemented for this backend",
+        ))
+    }
+
     /// Batched kv_cache_append across M caches in one launch. Each item
     /// writes its (head-major) K-or-V row into its own cache at offset
     /// read from `cache_lens[i]`. Replaces M sequential
@@ -837,6 +920,22 @@ pub trait Backend: Send + Sync + Sized + 'static {
         }
         let src = Self::from_slice(data);
         Self::copy_slice(ctx, &src, 0, dst, 0, data.len());
+    }
+
+    /// Convert a typed F32 device buffer into the backend activation dtype.
+    ///
+    /// CUDA activations are FP16 for tensor-core/Marlin kernels, while the
+    /// Qwen3.5 gated-Delta core keeps recurrent math in F32. Backends with
+    /// non-F32 activations should override this with a device-side conversion.
+    fn f32_to_activation(
+        ctx: &mut Self::Context,
+        input_f32: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    ) {
+        Self::sync(ctx);
+        let values = Self::to_vec(input_f32, len);
+        Self::write_f32_to_activation(ctx, out, &values);
     }
 
     /// Whether this backend can keep Gemma-style sandwich residuals in a

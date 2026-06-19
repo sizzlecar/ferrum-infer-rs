@@ -897,6 +897,43 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn f32_to_activation(
+        ctx: &mut Self::Context,
+        input_f32: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    ) {
+        match (input_f32.dtype(), out.dtype()) {
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F16) => {
+                let func = ctx.func("sandwich_norm", ptx::SANDWICH_NORM, "f32_to_activation_f16");
+                let n = len as i32;
+                let block = 256u32;
+                let grid = ((len as u32) + block - 1) / block;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(input_f32);
+                b.arg(out);
+                b.arg(&n);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("f32_to_activation_f16 launch");
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F32) => {
+                Self::copy_slice(ctx, input_f32, 0, out, 0, len);
+            }
+            (src, dst) => panic!(
+                "CudaBackend::f32_to_activation unsupported dtypes input={} out={}",
+                src.name(),
+                dst.name()
+            ),
+        }
+    }
+
     fn supports_device_f32_residual_shadow() -> bool {
         true
     }
@@ -1472,6 +1509,12 @@ impl Backend for CudaBackend {
             ptx::FLASH_ATTN_FULL,
             "flash_attn_full_f16",
         );
+        if cfg.head_dim > 256 {
+            panic!(
+                "flash_attn_full_f16 supports head_dim <= 256, got {}",
+                cfg.head_dim
+            );
+        }
         let params = FlashAttnParams {
             batch: batch as i32,
             num_heads: cfg.num_heads as i32,
@@ -2239,6 +2282,193 @@ impl Backend for CudaBackend {
         }
         .expect("qk_norm_rope launch");
         drop(dec_guard);
+    }
+
+    fn qk_norm_rope_partial(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        output: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        input_stride: usize,
+        input_offset: usize,
+        input_head_stride: usize,
+        pos_offset: usize,
+        eps: f32,
+        mode: i32,
+    ) -> Result<()> {
+        if rope_dim == head_dim
+            && input_stride == heads * head_dim
+            && input_offset == 0
+            && input_head_stride == head_dim
+            && mode != 3
+        {
+            Self::qk_norm_rope(
+                ctx, input, norm_w, cos, sin, output, tokens, heads, head_dim, pos_offset, eps,
+                mode,
+            );
+            return Ok(());
+        }
+
+        if tokens == 0 || heads == 0 || head_dim == 0 || rope_dim == 0 {
+            return Err(FerrumError::model(format!(
+                "qk_norm_rope_partial shape must be positive, got tokens={tokens} heads={heads} head_dim={head_dim} rope_dim={rope_dim}"
+            )));
+        }
+        if rope_dim > head_dim || rope_dim % 2 != 0 {
+            return Err(FerrumError::model(format!(
+                "qk_norm_rope_partial rope_dim {rope_dim} must be even and <= head_dim {head_dim}"
+            )));
+        }
+        if input_head_stride == 0 {
+            return Err(FerrumError::model(
+                "qk_norm_rope_partial input_head_stride must be positive",
+            ));
+        }
+        let required_width = input_offset + (heads - 1) * input_head_stride + head_dim;
+        if input_stride < required_width {
+            return Err(FerrumError::model(format!(
+                "qk_norm_rope_partial input_stride {input_stride} is too small for offset {input_offset}, heads {heads}, head_dim {head_dim}, input_head_stride {input_head_stride}"
+            )));
+        }
+
+        let func = ctx.func(
+            "qk_norm_rope_partial",
+            ptx::QK_NORM_ROPE,
+            "qk_norm_rope_partial_transpose_f16",
+        );
+        let tokens_i32 = tokens as i32;
+        let heads_i32 = heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let rope_dim_i32 = rope_dim as i32;
+        let input_stride_i32 = input_stride as i32;
+        let input_offset_i32 = input_offset as i32;
+        let input_head_stride_i32 = input_head_stride as i32;
+        let pos_offset_i32 = pos_offset as i32;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(input);
+        b.arg(norm_w);
+        b.arg(cos);
+        b.arg(sin);
+        b.arg(output);
+        b.arg(&tokens_i32);
+        b.arg(&heads_i32);
+        b.arg(&head_dim_i32);
+        b.arg(&rope_dim_i32);
+        b.arg(&input_stride_i32);
+        b.arg(&input_offset_i32);
+        b.arg(&input_head_stride_i32);
+        b.arg(&pos_offset_i32);
+        b.arg(&eps);
+        b.arg(&mode);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (tokens as u32, heads as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qk_norm_rope_partial: {e}")))?;
+        Ok(())
+    }
+
+    fn qwen35_apply_attention_gate(
+        ctx: &mut Self::Context,
+        context: &mut Self::Buffer,
+        query_raw: &Self::Buffer,
+        tokens: usize,
+        q_total: usize,
+        q_proj_total: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        if head_dim == 0 || q_total % head_dim != 0 {
+            return Err(FerrumError::model(format!(
+                "qwen35_apply_attention_gate q_total {q_total} must be divisible by head_dim {head_dim}"
+            )));
+        }
+        let heads = q_total / head_dim;
+        if q_proj_total < heads * 2 * head_dim {
+            return Err(FerrumError::model(format!(
+                "qwen35_apply_attention_gate q_proj_total {q_proj_total} must include per-head query and gate slices for q_total {q_total}, head_dim {head_dim}"
+            )));
+        }
+        if tokens == 0 || q_total == 0 {
+            return Ok(());
+        }
+
+        let func = ctx.func(
+            "qk_norm_rope_gate",
+            ptx::QK_NORM_ROPE,
+            "qwen35_apply_attention_gate_f16",
+        );
+        let tokens_i32 = tokens as i32;
+        let q_total_i32 = q_total as i32;
+        let q_proj_total_i32 = q_proj_total as i32;
+        let head_dim_i32 = head_dim as i32;
+        let total = tokens * q_total;
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(context);
+        b.arg(query_raw);
+        b.arg(&tokens_i32);
+        b.arg(&q_total_i32);
+        b.arg(&q_proj_total_i32);
+        b.arg(&head_dim_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qwen35_apply_attention_gate: {e}")))?;
+        Ok(())
+    }
+
+    fn qwen35_apply_token_gate(
+        ctx: &mut Self::Context,
+        values: &mut Self::Buffer,
+        gate: &Self::Buffer,
+        tokens: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        if tokens == 0 || hidden_size == 0 {
+            return Ok(());
+        }
+
+        let func = ctx.func(
+            "qk_norm_rope_gate",
+            ptx::QK_NORM_ROPE,
+            "qwen35_apply_token_gate_f16",
+        );
+        let tokens_i32 = tokens as i32;
+        let hidden_i32 = hidden_size as i32;
+        let total = tokens * hidden_size;
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(values);
+        b.arg(gate);
+        b.arg(&tokens_i32);
+        b.arg(&hidden_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qwen35_apply_token_gate: {e}")))?;
+        Ok(())
     }
 
     /// Split QKV + qk-norm + RoPE into FP16 head-major scratch buffers.

@@ -34,6 +34,11 @@ COVERAGE_TESTS = {
         "dense_full_attention_layer_composes_attention_residual_and_dense_mlp",
         "sparse_moe_full_attention_layer_composes_attention_residual_and_moe",
     ],
+    "full_attention_official_shape": [
+        "rope_uses_partial_interleaved_rotation",
+        "full_attention_core_applies_qwen35_output_gate",
+        "dense_full_attention_layer_accepts_qwen35_gate_shape_with_hidden_not_q_total",
+    ],
     "deltanet": [
         "gated_delta_attention_matches_gating_plus_recurrent_reference",
         "recurrent_delta_rule_single_token_updates_state",

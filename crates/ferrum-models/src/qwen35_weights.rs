@@ -132,6 +132,24 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
         self.inner.load_linear(&format!("{prefix}gate_up_proj"))
     }
 
+    pub fn load_layer_stacked_gptq_experts(
+        &self,
+        layer_index: usize,
+        num_experts: usize,
+        proj_names: &[&str],
+    ) -> FerrumResult<(
+        std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>,
+        usize,
+        usize,
+    )> {
+        let expert_prefix = format!(
+            "{}.layers.{layer_index}.mlp.experts.{{e}}.",
+            self.plan.prefix
+        );
+        self.inner
+            .load_stacked_gptq_experts(&expert_prefix, num_experts, proj_names)
+    }
+
     fn required_global_tensor(&self, role: &str) -> FerrumResult<&Qwen35ResolvedWeightSpec> {
         let tensor = self.plan.global_tensor(role).ok_or_else(|| {
             FerrumError::model(format!(
@@ -368,6 +386,9 @@ impl Qwen35WeightInventory {
 
     fn matching_names(&self, tensor: &Qwen35WeightSpec) -> Vec<String> {
         if !tensor.name.contains('*') {
+            if tensor.name.ends_with(".lm_head.weight") && self.contains("lm_head.weight") {
+                return vec!["lm_head.weight".to_string()];
+            }
             return self
                 .contains(&tensor.name)
                 .then(|| tensor.name.clone())
@@ -738,6 +759,37 @@ mod tests {
             .validation()
             .present_optional
             .contains(&"model.layers.0.mlp.experts.0.gate_proj.weight".to_string()));
+    }
+
+    #[test]
+    fn resolves_top_level_lm_head_alias_for_language_model_prefix() {
+        let config = moe_config();
+        let manifest = config.weight_manifest("model.language_model").unwrap();
+        let mut names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        names.retain(|name| name != "model.language_model.lm_head.weight");
+        names.push("lm_head.weight".to_string());
+        let inventory = Qwen35WeightInventory::from_names(names);
+
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+
+        assert_eq!(plan.prefix, "model.language_model");
+        assert_eq!(
+            plan.global_tensor("lm_head")
+                .map(|tensor| (tensor.name.as_str(), tensor.present)),
+            Some(("lm_head.weight", true))
+        );
+        assert!(plan.validation().is_pass());
     }
 
     #[test]

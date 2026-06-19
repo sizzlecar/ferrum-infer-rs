@@ -345,7 +345,10 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
     ) -> Result<(Vec<i32>, Vec<f32>, Vec<i32>, Option<Vec<i32>>, usize, usize)> {
         let (qweight, qw_shape) = self.read_i32(&format!("{name}.qweight"))?;
         let (scales, _) = self.read_f32(&format!("{name}.scales"))?;
-        let (qzeros, _) = self.read_i32(&format!("{name}.qzeros"))?;
+        let (mut qzeros, _) = self.read_i32(&format!("{name}.qzeros"))?;
+        if let Some(qcfg) = self.quant_config.as_ref() {
+            canonicalize_gptq_qzeros_for_sym(qcfg, &mut qzeros);
+        }
         let g_idx = if self.has(&format!("{name}.g_idx")) {
             Some(self.read_i32(&format!("{name}.g_idx"))?.0)
         } else {
@@ -428,7 +431,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                 let name = format!("{prefix}{proj}");
                 let (qw, qw_sh) = self.read_i32(&format!("{name}.qweight"))?;
                 let (sc, sc_sh) = self.read_f32(&format!("{name}.scales"))?;
-                let (qz, qz_sh) = self.read_i32(&format!("{name}.qzeros"))?;
+                let (mut qz, qz_sh) = self.read_i32(&format!("{name}.qzeros"))?;
+                canonicalize_gptq_qzeros_for_sym(qcfg, &mut qz);
                 if qw_sh.len() != 2 || sc_sh.len() != 2 || qz_sh.len() != 2 {
                     return Err(FerrumError::model(format!(
                         "stacked GPTQ '{name}': expected 2D, got qw {qw_sh:?} sc {sc_sh:?} qz {qz_sh:?}"
@@ -685,6 +689,24 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
     fn quant_config(&self) -> Option<&QuantConfig> {
         self.quant_config.as_ref()
     }
+
+    fn load_stacked_gptq_experts(
+        &self,
+        expert_prefix_fmt: &str,
+        num_experts: usize,
+        proj_names: &[&str],
+    ) -> Result<(
+        std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>,
+        usize,
+        usize,
+    )> {
+        NativeSafetensorsLoader::load_stacked_gptq_experts(
+            self,
+            expert_prefix_fmt,
+            num_experts,
+            proj_names,
+        )
+    }
 }
 
 impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
@@ -708,7 +730,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
 
         let (qweight, qw_shape) = self.read_i32(&format!("{name}.qweight"))?;
         let (scales_f32, sc_shape) = self.read_f32(&format!("{name}.scales"))?;
-        let (qzeros, _qz_shape) = self.read_i32(&format!("{name}.qzeros"))?;
+        let (mut qzeros, _qz_shape) = self.read_i32(&format!("{name}.qzeros"))?;
+        canonicalize_gptq_qzeros_for_sym(qcfg, &mut qzeros);
         let g_idx = if self.has(&format!("{name}.g_idx")) {
             Some(self.read_i32(&format!("{name}.g_idx"))?.0)
         } else {
@@ -845,7 +868,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         for p in parts {
             let (qw, qw_sh) = self.read_i32(&format!("{p}.qweight"))?;
             let (sc, sc_sh) = self.read_f32(&format!("{p}.scales"))?;
-            let (qz, qz_sh) = self.read_i32(&format!("{p}.qzeros"))?;
+            let (mut qz, qz_sh) = self.read_i32(&format!("{p}.qzeros"))?;
+            canonicalize_gptq_qzeros_for_sym(qcfg, &mut qz);
             if qw_sh.len() != 2 || sc_sh.len() != 2 || qz_sh.len() != 2 {
                 return Err(FerrumError::model(format!(
                     "GPTQ fusion '{p}': expected 2D tensors, got qw {qw_sh:?} sc {sc_sh:?} qz {qz_sh:?}"
@@ -1169,6 +1193,12 @@ fn gptq_qzero_stats(qzeros: &[i32]) -> GptqQzeroStats {
     }
 }
 
+fn canonicalize_gptq_qzeros_for_sym(qcfg: &QuantConfig, qzeros: &mut [i32]) {
+    if qcfg.method == QuantMethod::Gptq && qcfg.sym && qcfg.bits == 4 {
+        qzeros.fill(0x7777_7777);
+    }
+}
+
 fn trace_gptq_qzeros_if_requested(
     name: &str,
     qcfg: &QuantConfig,
@@ -1456,12 +1486,16 @@ mod tests {
     use super::*;
 
     fn gptq_config(desc_act: bool) -> QuantConfig {
+        gptq_config_with_sym(desc_act, true)
+    }
+
+    fn gptq_config_with_sym(desc_act: bool, sym: bool) -> QuantConfig {
         QuantConfig {
             method: QuantMethod::Gptq,
             bits: 4,
             group_size: 2,
             desc_act,
-            sym: true,
+            sym,
         }
     }
 
@@ -1550,5 +1584,24 @@ mod tests {
         assert_eq!(stats.max_code, 7);
         assert_eq!(stats.code7_count, 1);
         assert!(!stats.all_code7());
+    }
+
+    #[test]
+    fn symmetric_gptq_qzeros_are_canonicalized_to_code7() {
+        let mut qzeros = vec![0x8888_8888u32 as i32, 0x0123_4567];
+
+        canonicalize_gptq_qzeros_for_sym(&gptq_config(true), &mut qzeros);
+
+        assert_eq!(qzeros, vec![0x7777_7777, 0x7777_7777]);
+        assert!(gptq_qzero_stats(&qzeros).all_code7());
+    }
+
+    #[test]
+    fn asymmetric_gptq_qzeros_are_preserved() {
+        let mut qzeros = vec![0x8888_8888u32 as i32, 0x0123_4567];
+
+        canonicalize_gptq_qzeros_for_sym(&gptq_config_with_sym(false, false), &mut qzeros);
+
+        assert_eq!(qzeros, vec![0x8888_8888u32 as i32, 0x0123_4567]);
     }
 }

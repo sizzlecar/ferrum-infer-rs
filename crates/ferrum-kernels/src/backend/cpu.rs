@@ -350,6 +350,19 @@ impl Backend for CpuBackend {
         std::mem::size_of::<f32>()
     }
 
+    fn zero_buffer(_ctx: &mut Self::Context, buf: &mut Self::Buffer, len: usize) -> Result<()> {
+        if buf.len() < len {
+            return Err(FerrumError::model(format!(
+                "zero_buffer length {len} exceeds CPU buffer length {}",
+                buf.len()
+            )));
+        }
+        for value in &mut buf[..len] {
+            *value = 0.0;
+        }
+        Ok(())
+    }
+
     /// Phase D step 2+3: typed alloc. CPU Buffer is Vec<f32> — bytes
     /// are dtype-erased, so we size the underlying Vec to hold `n`
     /// elements of `dtype` (bit-cast at read/write time).
@@ -1028,6 +1041,186 @@ impl Backend for CpuBackend {
                 }
             }
         }
+    }
+
+    fn qk_norm_rope_partial(
+        _ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        output: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        input_stride: usize,
+        input_offset: usize,
+        input_head_stride: usize,
+        pos_offset: usize,
+        eps: f32,
+        mode: i32,
+    ) -> Result<()> {
+        if tokens == 0 || heads == 0 || head_dim == 0 || rope_dim == 0 {
+            return Err(FerrumError::model(format!(
+                "qk_norm_rope_partial shape must be positive, got tokens={tokens} heads={heads} head_dim={head_dim} rope_dim={rope_dim}"
+            )));
+        }
+        if rope_dim > head_dim || rope_dim % 2 != 0 {
+            return Err(FerrumError::model(format!(
+                "qk_norm_rope_partial rope_dim {rope_dim} must be even and <= head_dim {head_dim}"
+            )));
+        }
+        if input_head_stride == 0 {
+            return Err(FerrumError::model(
+                "qk_norm_rope_partial input_head_stride must be positive",
+            ));
+        }
+        let required_width = input_offset + (heads - 1) * input_head_stride + head_dim;
+        if input_stride < required_width {
+            return Err(FerrumError::model(format!(
+                "qk_norm_rope_partial input_stride {input_stride} is too small for offset {input_offset}, heads {heads}, head_dim {head_dim}, input_head_stride {input_head_stride}"
+            )));
+        }
+        let required_input = tokens * input_stride;
+        let required_output = tokens * heads * head_dim;
+        if input.len() < required_input || output.len() < required_output {
+            return Err(FerrumError::model(format!(
+                "qk_norm_rope_partial buffer too short: input {} need {required_input}, output {} need {required_output}",
+                input.len(),
+                output.len()
+            )));
+        }
+        if mode != 0
+            && (cos.len() < (pos_offset + tokens) * (rope_dim / 2)
+                || sin.len() < (pos_offset + tokens) * (rope_dim / 2))
+        {
+            return Err(FerrumError::model(
+                "qk_norm_rope_partial RoPE cache is too short",
+            ));
+        }
+        if (mode == 1 || mode == 3) && norm_w.len() < head_dim {
+            return Err(FerrumError::model(
+                "qk_norm_rope_partial norm weight is too short",
+            ));
+        }
+
+        let rope_half = rope_dim / 2;
+        for t in 0..tokens {
+            let pos = pos_offset + t;
+            for h in 0..heads {
+                let src_off = t * input_stride + input_offset + h * input_head_stride;
+                let dst_off = (h * tokens + t) * head_dim;
+                let mut row = vec![0.0f32; head_dim];
+
+                let scale = if mode == 1 || mode == 3 {
+                    let mut sum_sq = 0.0f32;
+                    for i in 0..head_dim {
+                        let value = input[src_off + i];
+                        sum_sq += value * value;
+                    }
+                    (sum_sq / head_dim as f32 + eps).sqrt().recip()
+                } else {
+                    1.0
+                };
+                for i in 0..head_dim {
+                    let mut value = input[src_off + i];
+                    if mode == 1 || mode == 3 {
+                        value *= scale * norm_w[i];
+                    }
+                    row[i] = value;
+                }
+
+                if mode == 1 || mode == 2 {
+                    for i in 0..rope_half {
+                        let left = i;
+                        let right = i + rope_half;
+                        let x0 = row[left];
+                        let x1 = row[right];
+                        let c = cos[pos * rope_half + i];
+                        let s = sin[pos * rope_half + i];
+                        row[left] = x0 * c - x1 * s;
+                        row[right] = x1 * c + x0 * s;
+                    }
+                } else if mode == 3 {
+                    for i in 0..rope_half {
+                        let left = 2 * i;
+                        let right = left + 1;
+                        let x0 = row[left];
+                        let x1 = row[right];
+                        let c = cos[pos * rope_half + i];
+                        let s = sin[pos * rope_half + i];
+                        row[left] = x0 * c - x1 * s;
+                        row[right] = x1 * c + x0 * s;
+                    }
+                } else if mode != 0 {
+                    return Err(FerrumError::model(format!(
+                        "qk_norm_rope_partial unsupported mode {mode}"
+                    )));
+                }
+
+                output[dst_off..dst_off + head_dim].copy_from_slice(&row);
+            }
+        }
+        Ok(())
+    }
+
+    fn qwen35_apply_attention_gate(
+        _ctx: &mut Self::Context,
+        context: &mut Self::Buffer,
+        query_raw: &Self::Buffer,
+        tokens: usize,
+        q_total: usize,
+        q_proj_total: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        if head_dim == 0 || q_total % head_dim != 0 {
+            return Err(FerrumError::model(format!(
+                "qwen35 attention gate requires q_total {q_total} to be divisible by head_dim {head_dim}"
+            )));
+        }
+        let heads = q_total / head_dim;
+        if q_proj_total < heads * 2 * head_dim {
+            return Err(FerrumError::model(format!(
+                "qwen35 attention gate requires q_proj_total >= heads*2*head_dim, got q_total={q_total} q_proj_total={q_proj_total} head_dim={head_dim}"
+            )));
+        }
+        if context.len() < tokens * q_total || query_raw.len() < tokens * q_proj_total {
+            return Err(FerrumError::model(
+                "qwen35 attention gate buffer is too short",
+            ));
+        }
+        for token in 0..tokens {
+            let ctx_base = token * q_total;
+            for dim in 0..q_total {
+                let head = dim / head_dim;
+                let head_dim_offset = dim % head_dim;
+                let gate_idx =
+                    token * q_proj_total + head * (2 * head_dim) + head_dim + head_dim_offset;
+                context[ctx_base + dim] *= sigmoid(query_raw[gate_idx]);
+            }
+        }
+        Ok(())
+    }
+
+    fn qwen35_apply_token_gate(
+        _ctx: &mut Self::Context,
+        values: &mut Self::Buffer,
+        gate: &Self::Buffer,
+        tokens: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        if values.len() < tokens * hidden_size || gate.len() < tokens {
+            return Err(FerrumError::model("qwen35 token gate buffer is too short"));
+        }
+        for token in 0..tokens {
+            let scale = sigmoid(gate[token]);
+            let base = token * hidden_size;
+            for dim in 0..hidden_size {
+                values[base + dim] *= scale;
+            }
+        }
+        Ok(())
     }
 
     fn kv_cache_append_head_major(
