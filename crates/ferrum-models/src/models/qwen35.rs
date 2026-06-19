@@ -1250,19 +1250,24 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             &final_hidden,
             tokens_len * weights.config.hidden_size,
         );
-        let mut logits = B::alloc(tokens_len * weights.runtime_cfg.vocab_size);
+        let last_hidden = if tokens_len == 1 {
+            final_hidden
+        } else {
+            let mut last_hidden = B::alloc(weights.config.hidden_size);
+            B::copy_slice(
+                &mut ctx,
+                &final_hidden,
+                (tokens_len - 1) * weights.config.hidden_size,
+                &mut last_hidden,
+                0,
+                weights.config.hidden_size,
+            );
+            last_hidden
+        };
+        let mut last_logits = B::alloc(weights.runtime_cfg.vocab_size);
         weights
             .lm_head
-            .forward(&mut ctx, &final_hidden, &mut logits, tokens_len);
-        let mut last_logits = B::alloc(weights.runtime_cfg.vocab_size);
-        B::copy_slice(
-            &mut ctx,
-            &logits,
-            (tokens_len - 1) * weights.runtime_cfg.vocab_size,
-            &mut last_logits,
-            0,
-            weights.runtime_cfg.vocab_size,
-        );
+            .forward(&mut ctx, &last_hidden, &mut last_logits, 1);
         B::sync_before_host_readback(&mut ctx);
         B::sync(&mut ctx);
         let out = B::to_vec(&last_logits, weights.runtime_cfg.vocab_size);
