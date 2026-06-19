@@ -739,6 +739,136 @@ impl Backend for CpuBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_varlen_f32(
+        _ctx: &mut Self::Context,
+        query: &Self::Buffer,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        g: &Self::Buffer,
+        beta: &Self::Buffer,
+        initial_states: &Self::Buffer,
+        cu_seqlens: &Self::Buffer,
+        out: &mut Self::Buffer,
+        final_states: &mut Self::Buffer,
+        batch: usize,
+        total_tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        use_qk_l2norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        if batch == 0
+            || total_tokens == 0
+            || key_heads == 0
+            || value_heads == 0
+            || key_dim == 0
+            || value_dim == 0
+        {
+            return Err(FerrumError::model(format!(
+                "gated_delta_rule_varlen shape must be positive, got batch={batch} total_tokens={total_tokens} key_heads={key_heads} value_heads={value_heads} key_dim={key_dim} value_dim={value_dim}"
+            )));
+        }
+        let cu = cpu_read_u32_buffer(cu_seqlens, batch + 1, "gated_delta_rule_varlen cu_seqlens")?;
+        if cu.first().copied() != Some(0) || cu.last().copied() != Some(total_tokens as u32) {
+            return Err(FerrumError::model(format!(
+                "gated_delta_rule_varlen cu_seqlens must start at 0 and end at total_tokens {total_tokens}, got first={:?} last={:?}",
+                cu.first(),
+                cu.last()
+            )));
+        }
+        for seq in 0..batch {
+            if cu[seq + 1] <= cu[seq] {
+                return Err(FerrumError::model(format!(
+                    "gated_delta_rule_varlen sequence {seq} has empty or non-monotonic range {}..{}",
+                    cu[seq],
+                    cu[seq + 1]
+                )));
+            }
+        }
+
+        let state_len = value_heads * value_dim * key_dim;
+        validate_gated_delta_rule_shape(
+            query.len(),
+            key.len(),
+            value.len(),
+            g.len(),
+            beta.len(),
+            state_len,
+            out.len(),
+            state_len,
+            total_tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+        )?;
+        if initial_states.len() < batch * state_len || final_states.len() < batch * state_len {
+            return Err(FerrumError::model(format!(
+                "gated_delta_rule_varlen state length too small: initial={} final={} expected={}",
+                initial_states.len(),
+                final_states.len(),
+                batch * state_len
+            )));
+        }
+
+        let repeat_factor = value_heads / key_heads;
+        for seq in 0..batch {
+            let token_start = cu[seq] as usize;
+            let token_end = cu[seq + 1] as usize;
+            let row_state_base = seq * state_len;
+            final_states[row_state_base..row_state_base + state_len]
+                .copy_from_slice(&initial_states[row_state_base..row_state_base + state_len]);
+
+            for token in token_start..token_end {
+                for value_head in 0..value_heads {
+                    let key_head = value_head / repeat_factor;
+                    let mut q_inv = 1.0;
+                    let mut k_inv = 1.0;
+                    if use_qk_l2norm {
+                        let mut q_norm = 0.0;
+                        let mut k_norm = 0.0;
+                        for kd in 0..key_dim {
+                            let qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+                            q_norm += query[qk_idx] * query[qk_idx];
+                            k_norm += key[qk_idx] * key[qk_idx];
+                        }
+                        q_inv = (q_norm + 1e-6).sqrt().recip();
+                        k_inv = (k_norm + 1e-6).sqrt().recip();
+                    }
+                    let gate_idx = token * value_heads + value_head;
+                    let decay = g[gate_idx].exp();
+                    let beta_t = beta[gate_idx];
+                    for vd in 0..value_dim {
+                        let state_base = row_state_base + (value_head * value_dim + vd) * key_dim;
+                        let mut kv_mem = 0.0;
+                        for kd in 0..key_dim {
+                            let qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+                            let state_idx = state_base + kd;
+                            final_states[state_idx] *= decay;
+                            kv_mem += final_states[state_idx] * (key[qk_idx] * k_inv);
+                        }
+                        let value_idx = ((token * value_heads + value_head) * value_dim) + vd;
+                        let delta = (value[value_idx] - kv_mem) * beta_t;
+                        for kd in 0..key_dim {
+                            let qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+                            final_states[state_base + kd] += delta * (key[qk_idx] * k_inv);
+                        }
+                        let mut acc = 0.0;
+                        for kd in 0..key_dim {
+                            let qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+                            acc += final_states[state_base + kd] * (query[qk_idx] * q_inv * scale);
+                        }
+                        out[value_idx] = acc;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn linear_attention_prepare_f32(
         _ctx: &mut Self::Context,
         mixed_qkv_raw: &Self::Buffer,
@@ -1846,6 +1976,27 @@ impl crate::backend::BackendQuantMarlin for CpuBackend {
     // gemm_gptq_with_offset_strided body moved to free function
     // cpu_gemm_gptq_with_offset_strided below — called by
     // CpuMarlinExpertStack::gemm_phase_batched.
+}
+
+fn cpu_read_u32_buffer(buf: &[f32], n: usize, label: &str) -> Result<Vec<u32>> {
+    let bytes = n
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| FerrumError::model(format!("{label}: byte length overflow")))?;
+    if bytes > buf.len() * std::mem::size_of::<f32>() {
+        return Err(FerrumError::model(format!(
+            "{label}: buffer byte length {} < expected {bytes}",
+            buf.len() * std::mem::size_of::<f32>()
+        )));
+    }
+    let mut out = vec![0u32; n];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            buf.as_ptr() as *const u8,
+            out.as_mut_ptr() as *mut u8,
+            bytes,
+        );
+    }
+    Ok(out)
 }
 
 /// Free-function form of the deleted

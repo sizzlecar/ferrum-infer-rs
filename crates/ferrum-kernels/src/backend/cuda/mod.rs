@@ -1679,6 +1679,49 @@ impl Backend for CudaBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_varlen_f32(
+        ctx: &mut Self::Context,
+        query: &Self::Buffer,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        g: &Self::Buffer,
+        beta: &Self::Buffer,
+        initial_states: &Self::Buffer,
+        cu_seqlens: &Self::Buffer,
+        out: &mut Self::Buffer,
+        final_states: &mut Self::Buffer,
+        batch: usize,
+        total_tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        use_qk_l2norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        gated_delta_rule::recurrent_gated_delta_rule_varlen_f32(
+            ctx,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_states,
+            cu_seqlens,
+            out,
+            final_states,
+            batch,
+            total_tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            use_qk_l2norm,
+            scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn linear_attention_prepare_f32(
         ctx: &mut Self::Context,
         mixed_qkv_raw: &Self::Buffer,

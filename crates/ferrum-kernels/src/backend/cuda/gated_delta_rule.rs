@@ -14,6 +14,7 @@ use crate::ptx;
 const MODULE_NAME: &str = "gated_delta_rule";
 const FUNC_NAME: &str = "recurrent_gated_delta_rule_f32";
 const BATCH_FUNC_NAME: &str = "recurrent_gated_delta_rule_batch_f32";
+const VARLEN_FUNC_NAME: &str = "recurrent_gated_delta_rule_varlen_f32";
 
 #[allow(clippy::too_many_arguments)]
 pub fn recurrent_gated_delta_rule_f32(
@@ -160,6 +161,87 @@ pub fn recurrent_gated_delta_rule_batch_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn recurrent_gated_delta_rule_varlen_f32(
+    ctx: &mut CudaState,
+    query: &CudaBuf,
+    key: &CudaBuf,
+    value: &CudaBuf,
+    g: &CudaBuf,
+    beta: &CudaBuf,
+    initial_states: &CudaBuf,
+    cu_seqlens: &CudaBuf,
+    out: &mut CudaBuf,
+    final_states: &mut CudaBuf,
+    batch: usize,
+    total_tokens: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    use_qk_l2norm: bool,
+    scale: f32,
+) -> Result<()> {
+    validate_varlen_shape(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_states,
+        cu_seqlens,
+        out,
+        final_states,
+        batch,
+        total_tokens,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+    )?;
+
+    let func = ctx.func(MODULE_NAME, ptx::GATED_DELTA_RULE, VARLEN_FUNC_NAME);
+    let block = value_dim.min(256).max(1) as u32;
+    let stream = ctx.stream.clone();
+    let batch_i32 = batch as i32;
+    let total_tokens_i32 = total_tokens as i32;
+    let key_heads_i32 = key_heads as i32;
+    let value_heads_i32 = value_heads as i32;
+    let key_dim_i32 = key_dim as i32;
+    let value_dim_i32 = value_dim as i32;
+    let use_qk_l2norm_i32 = i32::from(use_qk_l2norm);
+    let mut builder = stream.launch_builder(&func);
+    builder.arg(query.as_f32());
+    builder.arg(key.as_f32());
+    builder.arg(value.as_f32());
+    builder.arg(g.as_f32());
+    builder.arg(beta.as_f32());
+    builder.arg(initial_states.as_f32());
+    builder.arg(cu_seqlens.as_u32());
+    builder.arg(out.as_f32_mut());
+    builder.arg(final_states.as_f32_mut());
+    builder.arg(&batch_i32);
+    builder.arg(&total_tokens_i32);
+    builder.arg(&key_heads_i32);
+    builder.arg(&value_heads_i32);
+    builder.arg(&key_dim_i32);
+    builder.arg(&value_dim_i32);
+    builder.arg(&use_qk_l2norm_i32);
+    builder.arg(&scale);
+    unsafe {
+        builder
+            .launch(LaunchConfig {
+                grid_dim: (value_heads as u32, batch as u32, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .map_err(|err| {
+                FerrumError::backend(format!("gated_delta_rule_varlen launch: {err}"))
+            })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_shape(
     query: &CudaBuf,
     key: &CudaBuf,
@@ -261,6 +343,62 @@ fn validate_batch_shape(
         if actual < expected {
             return Err(FerrumError::model(format!(
                 "gated_delta_rule_batch {label} length {actual} < expected {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_varlen_shape(
+    query: &CudaBuf,
+    key: &CudaBuf,
+    value: &CudaBuf,
+    g: &CudaBuf,
+    beta: &CudaBuf,
+    initial_states: &CudaBuf,
+    cu_seqlens: &CudaBuf,
+    out: &CudaBuf,
+    final_states: &CudaBuf,
+    batch: usize,
+    total_tokens: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> Result<()> {
+    if batch == 0
+        || total_tokens == 0
+        || key_heads == 0
+        || value_heads == 0
+        || key_dim == 0
+        || value_dim == 0
+    {
+        return Err(FerrumError::model(format!(
+            "gated_delta_rule_varlen shape must be positive, got batch={batch} total_tokens={total_tokens} key_heads={key_heads} value_heads={value_heads} key_dim={key_dim} value_dim={value_dim}"
+        )));
+    }
+    if value_heads % key_heads != 0 {
+        return Err(FerrumError::model(format!(
+            "gated_delta_rule_varlen value_heads {value_heads} must be divisible by key_heads {key_heads}"
+        )));
+    }
+
+    let state_len = value_heads * value_dim * key_dim;
+    for (label, actual, expected) in [
+        ("query", query.len(), total_tokens * key_heads * key_dim),
+        ("key", key.len(), total_tokens * key_heads * key_dim),
+        ("value", value.len(), total_tokens * value_heads * value_dim),
+        ("g", g.len(), total_tokens * value_heads),
+        ("beta", beta.len(), total_tokens * value_heads),
+        ("initial_states", initial_states.len(), batch * state_len),
+        ("cu_seqlens", cu_seqlens.len(), batch + 1),
+        ("out", out.len(), total_tokens * value_heads * value_dim),
+        ("final_states", final_states.len(), batch * state_len),
+    ] {
+        if actual < expected {
+            return Err(FerrumError::model(format!(
+                "gated_delta_rule_varlen {label} length {actual} < expected {expected}"
             )));
         }
     }
