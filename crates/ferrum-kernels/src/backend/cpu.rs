@@ -640,6 +640,105 @@ impl Backend for CpuBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_f32(
+        _ctx: &mut Self::Context,
+        query: &Self::Buffer,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        g: &Self::Buffer,
+        beta: &Self::Buffer,
+        initial_states: &Self::Buffer,
+        out: &mut Self::Buffer,
+        final_states: &mut Self::Buffer,
+        batch: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        use_qk_l2norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        if batch == 0 {
+            return Err(FerrumError::model(
+                "gated_delta_rule_batch batch must be positive",
+            ));
+        }
+        let state_len = value_heads * value_dim * key_dim;
+        validate_gated_delta_rule_shape(
+            query.len(),
+            key.len(),
+            value.len(),
+            g.len(),
+            beta.len(),
+            initial_states.len(),
+            out.len(),
+            final_states.len(),
+            batch,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+        )?;
+        if initial_states.len() < batch * state_len || final_states.len() < batch * state_len {
+            return Err(FerrumError::model(format!(
+                "gated_delta_rule_batch state length too small: initial={} final={} expected={}",
+                initial_states.len(),
+                final_states.len(),
+                batch * state_len
+            )));
+        }
+
+        let repeat_factor = value_heads / key_heads;
+        for row in 0..batch {
+            let row_state_base = row * state_len;
+            final_states[row_state_base..row_state_base + state_len]
+                .copy_from_slice(&initial_states[row_state_base..row_state_base + state_len]);
+            for value_head in 0..value_heads {
+                let key_head = value_head / repeat_factor;
+                let mut q_inv = 1.0;
+                let mut k_inv = 1.0;
+                if use_qk_l2norm {
+                    let mut q_norm = 0.0;
+                    let mut k_norm = 0.0;
+                    for kd in 0..key_dim {
+                        let qk_idx = ((row * key_heads + key_head) * key_dim) + kd;
+                        q_norm += query[qk_idx] * query[qk_idx];
+                        k_norm += key[qk_idx] * key[qk_idx];
+                    }
+                    q_inv = (q_norm + 1e-6).sqrt().recip();
+                    k_inv = (k_norm + 1e-6).sqrt().recip();
+                }
+                let gate_idx = row * value_heads + value_head;
+                let decay = g[gate_idx].exp();
+                let beta_t = beta[gate_idx];
+                for vd in 0..value_dim {
+                    let state_base = row_state_base + (value_head * value_dim + vd) * key_dim;
+                    let mut kv_mem = 0.0;
+                    for kd in 0..key_dim {
+                        let qk_idx = ((row * key_heads + key_head) * key_dim) + kd;
+                        let state_idx = state_base + kd;
+                        final_states[state_idx] *= decay;
+                        kv_mem += final_states[state_idx] * (key[qk_idx] * k_inv);
+                    }
+                    let value_idx = ((row * value_heads + value_head) * value_dim) + vd;
+                    let delta = (value[value_idx] - kv_mem) * beta_t;
+                    for kd in 0..key_dim {
+                        let qk_idx = ((row * key_heads + key_head) * key_dim) + kd;
+                        final_states[state_base + kd] += delta * (key[qk_idx] * k_inv);
+                    }
+                    let mut acc = 0.0;
+                    for kd in 0..key_dim {
+                        let qk_idx = ((row * key_heads + key_head) * key_dim) + kd;
+                        acc += final_states[state_base + kd] * (query[qk_idx] * q_inv * scale);
+                    }
+                    out[value_idx] = acc;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn linear_attention_prepare_f32(
         _ctx: &mut Self::Context,
         mixed_qkv_raw: &Self::Buffer,
@@ -824,6 +923,137 @@ impl Backend for CpuBackend {
 
         if apply_qk_l2norm {
             for row in 0..key_heads {
+                let base = row * key_dim;
+                let mut q_sum = 0.0;
+                let mut k_sum = 0.0;
+                for d in 0..key_dim {
+                    q_sum += query[base + d] * query[base + d];
+                    k_sum += key[base + d] * key[base + d];
+                }
+                let q_inv = (q_sum + 1e-6).sqrt().recip();
+                let k_inv = (k_sum + 1e-6).sqrt().recip();
+                for d in 0..key_dim {
+                    query[base + d] *= q_inv;
+                    key[base + d] *= k_inv;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_f32(
+        _ctx: &mut Self::Context,
+        mixed_qkv_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        conv_states: &Self::Buffer,
+        a_raw: &Self::Buffer,
+        b_raw: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        next_conv_states: &mut Self::Buffer,
+        batch: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        if batch == 0 {
+            return Err(FerrumError::model(
+                "linear_attention_decode_prepare_batch batch must be positive",
+            ));
+        }
+        let qk_total = key_heads * key_dim;
+        let value_total = value_heads * value_dim;
+        let conv_channels = 2 * qk_total + value_total;
+        let state_len = conv_kernel.saturating_sub(1);
+        let conv_state_len = conv_channels * state_len;
+        validate_linear_attention_prepare_shape(
+            mixed_qkv_raw.len(),
+            conv_weight.len(),
+            a_raw.len(),
+            b_raw.len(),
+            a_log.len(),
+            dt_bias.len(),
+            query.len(),
+            key.len(),
+            value.len(),
+            g.len(),
+            beta.len(),
+            batch,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+        )?;
+        for (label, actual, expected) in [
+            ("conv_states", conv_states.len(), batch * conv_state_len),
+            (
+                "next_conv_states",
+                next_conv_states.len(),
+                batch * conv_state_len,
+            ),
+        ] {
+            if actual < expected {
+                return Err(FerrumError::model(format!(
+                    "linear_attention_decode_prepare_batch {label} length {actual} < expected {expected}"
+                )));
+            }
+        }
+
+        for row in 0..batch {
+            let conv_row_base = row * conv_channels;
+            let state_row_base = row * conv_state_len;
+            for channel in 0..conv_channels {
+                let state_base = state_row_base + channel * state_len;
+                let mut acc = 0.0;
+                for kernel_idx in 0..conv_kernel {
+                    let x = if kernel_idx < state_len {
+                        conv_states[state_base + kernel_idx]
+                    } else {
+                        mixed_qkv_raw[conv_row_base + channel]
+                    };
+                    acc += x * conv_weight[channel * conv_kernel + kernel_idx];
+                }
+
+                if state_len > 0 {
+                    for pos in 0..state_len {
+                        next_conv_states[state_base + pos] = if pos + 1 < state_len {
+                            conv_states[state_base + pos + 1]
+                        } else {
+                            mixed_qkv_raw[conv_row_base + channel]
+                        };
+                    }
+                }
+
+                let conv = silu(acc);
+                if channel < qk_total {
+                    query[row * qk_total + channel] = conv;
+                } else if channel < 2 * qk_total {
+                    key[row * qk_total + (channel - qk_total)] = conv;
+                } else {
+                    value[row * value_total + (channel - 2 * qk_total)] = conv;
+                }
+            }
+
+            for value_head in 0..value_heads {
+                let gate_idx = row * value_heads + value_head;
+                g[gate_idx] =
+                    -a_log[value_head].exp() * softplus(a_raw[gate_idx] + dt_bias[value_head]);
+                beta[gate_idx] = sigmoid(b_raw[gate_idx]);
+            }
+        }
+
+        if apply_qk_l2norm {
+            for row in 0..batch * key_heads {
                 let base = row * key_dim;
                 let mut q_sum = 0.0;
                 let mut k_sum = 0.0;

@@ -309,6 +309,162 @@ extern "C" __global__ void linear_attention_decode_prepare_f16_params_f32(
       key_dim, value_dim, conv_kernel);
 }
 
+template <typename InputT, typename ParamT>
+static __device__ void linear_attention_decode_prepare_batch_impl(
+    const InputT* __restrict__ mixed_qkv_raw,
+    const InputT* __restrict__ conv_weight,
+    const float* __restrict__ conv_states,
+    const InputT* __restrict__ a_raw,
+    const InputT* __restrict__ b_raw,
+    const ParamT* __restrict__ a_log,
+    const ParamT* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    float* __restrict__ next_conv_states,
+    const int batch,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  const int qk_total = key_heads * key_dim;
+  const int value_total = value_heads * value_dim;
+  const int conv_channels = 2 * qk_total + value_total;
+  const int state_len = conv_kernel - 1;
+  const int conv_state_len = conv_channels * state_len;
+  const int row_total = max(conv_channels, value_heads);
+  const int global = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch * row_total;
+  if (global >= total) return;
+
+  const int row = global / row_total;
+  const int idx = global - row * row_total;
+
+  if (idx < conv_channels) {
+    const int channel = idx;
+    const int state_base = row * conv_state_len + channel * state_len;
+    const int input_base = row * conv_channels;
+    float acc = 0.0f;
+    for (int kernel_idx = 0; kernel_idx < conv_kernel; ++kernel_idx) {
+      const float x = kernel_idx < state_len
+                          ? conv_states[state_base + kernel_idx]
+                          : ferrum_load_value(mixed_qkv_raw,
+                                              input_base + channel);
+      acc += x *
+             ferrum_load_value(conv_weight,
+                               channel * conv_kernel + kernel_idx);
+    }
+
+    if (state_len > 0) {
+      for (int pos = 0; pos < state_len; ++pos) {
+        next_conv_states[state_base + pos] =
+            (pos + 1 < state_len)
+                ? conv_states[state_base + pos + 1]
+                : ferrum_load_value(mixed_qkv_raw, input_base + channel);
+      }
+    }
+
+    const float conv = ferrum_silu(acc);
+    if (channel < qk_total) {
+      query[row * qk_total + channel] = conv;
+    } else if (channel < 2 * qk_total) {
+      key[row * qk_total + (channel - qk_total)] = conv;
+    } else {
+      value[row * value_total + (channel - 2 * qk_total)] = conv;
+    }
+  }
+
+  if (idx < value_heads) {
+    const int gate_idx = row * value_heads + idx;
+    const float a = ferrum_load_value(a_raw, gate_idx) +
+                    ferrum_load_value(dt_bias, idx);
+    g[gate_idx] = -expf(ferrum_load_value(a_log, idx)) *
+                  ferrum_softplus(a);
+    beta[gate_idx] = ferrum_sigmoid(ferrum_load_value(b_raw, gate_idx));
+  }
+}
+
+extern "C" __global__ void linear_attention_decode_prepare_batch_f32(
+    const float* __restrict__ mixed_qkv_raw,
+    const float* __restrict__ conv_weight,
+    const float* __restrict__ conv_states,
+    const float* __restrict__ a_raw,
+    const float* __restrict__ b_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    float* __restrict__ next_conv_states,
+    const int batch,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_decode_prepare_batch_impl<float, float>(
+      mixed_qkv_raw, conv_weight, conv_states, a_raw, b_raw, a_log, dt_bias,
+      query, key, value, g, beta, next_conv_states, batch, key_heads,
+      value_heads, key_dim, value_dim, conv_kernel);
+}
+
+extern "C" __global__ void linear_attention_decode_prepare_batch_f16_to_f32(
+    const __half* __restrict__ mixed_qkv_raw,
+    const __half* __restrict__ conv_weight,
+    const float* __restrict__ conv_states,
+    const __half* __restrict__ a_raw,
+    const __half* __restrict__ b_raw,
+    const __half* __restrict__ a_log,
+    const __half* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    float* __restrict__ next_conv_states,
+    const int batch,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_decode_prepare_batch_impl<__half, __half>(
+      mixed_qkv_raw, conv_weight, conv_states, a_raw, b_raw, a_log, dt_bias,
+      query, key, value, g, beta, next_conv_states, batch, key_heads,
+      value_heads, key_dim, value_dim, conv_kernel);
+}
+
+extern "C" __global__ void linear_attention_decode_prepare_batch_f16_params_f32(
+    const __half* __restrict__ mixed_qkv_raw,
+    const __half* __restrict__ conv_weight,
+    const float* __restrict__ conv_states,
+    const __half* __restrict__ a_raw,
+    const __half* __restrict__ b_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    float* __restrict__ next_conv_states,
+    const int batch,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_decode_prepare_batch_impl<__half, float>(
+      mixed_qkv_raw, conv_weight, conv_states, a_raw, b_raw, a_log, dt_bias,
+      query, key, value, g, beta, next_conv_states, batch, key_heads,
+      value_heads, key_dim, value_dim, conv_kernel);
+}
+
 extern "C" __global__ void linear_attention_qk_l2norm_f32(
     float* __restrict__ query,
     float* __restrict__ key,

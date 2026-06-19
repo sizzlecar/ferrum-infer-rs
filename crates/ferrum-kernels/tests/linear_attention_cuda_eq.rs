@@ -535,6 +535,148 @@ fn linear_attention_decode_prepare_cuda_accepts_f16_projection_inputs() {
 }
 
 #[test]
+fn linear_attention_decode_prepare_batch_cuda_matches_cpu_reference() {
+    let batch = 3;
+    let key_heads = 2;
+    let value_heads = 4;
+    let key_dim = 3;
+    let value_dim = 2;
+    let conv_kernel = 4;
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let state_len = conv_kernel - 1;
+    let conv_state_len = conv_channels * state_len;
+    let mixed_qkv_raw: Vec<f32> = (0..batch * conv_channels)
+        .map(|i| ((i as f32 % 17.0) - 8.0) * 0.125)
+        .collect();
+    let conv_states: Vec<f32> = (0..batch * conv_state_len)
+        .map(|i| ((i as f32 % 19.0) - 9.0) * 0.05)
+        .collect();
+    let conv_weight: Vec<f32> = (0..conv_channels * conv_kernel)
+        .map(|i| match i % 4 {
+            0 => -0.125,
+            1 => 0.25,
+            2 => 0.5,
+            _ => 0.75,
+        })
+        .collect();
+    let a_raw: Vec<f32> = (0..batch * value_heads)
+        .map(|i| ((i as f32 % 7.0) - 3.0) * 0.2)
+        .collect();
+    let b_raw: Vec<f32> = (0..batch * value_heads)
+        .map(|i| ((i as f32 % 5.0) - 2.0) * 0.3)
+        .collect();
+    let a_log: Vec<f32> = (0..value_heads)
+        .map(|i| (0.5 + i as f32 * 0.25).ln())
+        .collect();
+    let dt_bias: Vec<f32> = (0..value_heads).map(|i| -0.2 + i as f32 * 0.1).collect();
+
+    let mut cpu_ctx = CpuBackend::new_context();
+    let mut expected_q = vec![0.0; batch * qk_total];
+    let mut expected_k = vec![0.0; batch * qk_total];
+    let mut expected_v = vec![0.0; batch * value_total];
+    let mut expected_g = vec![0.0; batch * value_heads];
+    let mut expected_beta = vec![0.0; batch * value_heads];
+    let mut expected_next = vec![0.0; batch * conv_state_len];
+    CpuBackend::linear_attention_decode_prepare_batch_f32(
+        &mut cpu_ctx,
+        &mixed_qkv_raw,
+        &conv_weight,
+        &conv_states,
+        &a_raw,
+        &b_raw,
+        &a_log,
+        &dt_bias,
+        &mut expected_q,
+        &mut expected_k,
+        &mut expected_v,
+        &mut expected_g,
+        &mut expected_beta,
+        &mut expected_next,
+        batch,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+        true,
+    )
+    .unwrap();
+
+    let mut cuda_ctx = CudaBackend::new_context();
+    let mixed_dev = CudaBackend::from_slice_typed(&mixed_qkv_raw);
+    let conv_dev = CudaBackend::from_slice_typed(&conv_weight);
+    let conv_states_dev = CudaBackend::from_slice_typed(&conv_states);
+    let a_dev = CudaBackend::from_slice_typed(&a_raw);
+    let b_dev = CudaBackend::from_slice_typed(&b_raw);
+    let a_log_dev = CudaBackend::from_slice_typed(&a_log);
+    let dt_bias_dev = CudaBackend::from_slice_typed(&dt_bias);
+    let mut q_dev = CudaBackend::alloc_typed(Dtype::F32, batch * qk_total);
+    let mut k_dev = CudaBackend::alloc_typed(Dtype::F32, batch * qk_total);
+    let mut v_dev = CudaBackend::alloc_typed(Dtype::F32, batch * value_total);
+    let mut g_dev = CudaBackend::alloc_typed(Dtype::F32, batch * value_heads);
+    let mut beta_dev = CudaBackend::alloc_typed(Dtype::F32, batch * value_heads);
+    let mut next_dev = CudaBackend::alloc_typed(Dtype::F32, batch * conv_state_len);
+    CudaBackend::linear_attention_decode_prepare_batch_f32(
+        &mut cuda_ctx,
+        &mixed_dev,
+        &conv_dev,
+        &conv_states_dev,
+        &a_dev,
+        &b_dev,
+        &a_log_dev,
+        &dt_bias_dev,
+        &mut q_dev,
+        &mut k_dev,
+        &mut v_dev,
+        &mut g_dev,
+        &mut beta_dev,
+        &mut next_dev,
+        batch,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+        true,
+    )
+    .unwrap();
+    CudaBackend::sync(&mut cuda_ctx);
+
+    assert_close(
+        &CudaBackend::to_vec(&q_dev, batch * qk_total),
+        &expected_q,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&k_dev, batch * qk_total),
+        &expected_k,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&v_dev, batch * value_total),
+        &expected_v,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&g_dev, batch * value_heads),
+        &expected_g,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&beta_dev, batch * value_heads),
+        &expected_beta,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&next_dev, batch * conv_state_len),
+        &expected_next,
+        2e-5,
+    );
+}
+
+#[test]
 fn gated_rms_norm_cuda_matches_cpu_reference() {
     let tokens = 4;
     let heads = 3;
