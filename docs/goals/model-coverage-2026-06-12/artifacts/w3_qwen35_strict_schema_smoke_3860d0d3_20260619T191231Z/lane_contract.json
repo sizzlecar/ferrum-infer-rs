@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "lane": "W3 Qwen35 CUDA vLLM-H256 smoke",
+  "commit": "3860d0d3da39092012b186c216e06ed49a3110c5",
+  "source_fix_commit": "3860d0d3",
+  "post_validation": "finish_reason length/repetition/tool/structured hard checks",
+  "expected_runtime_minutes": "25-45",
+  "hourly_cost_usd": 0.662962962962963,
+  "stop_condition": "CUDA build failure, product smoke failure, diagnostic bench failure, or PASS artifact copied back",
+  "correctness_gate": "release CUDA build plus ferrum run and ferrum serve smoke; effective config must select vllm_paged_attn_v2 with FERRUM_USE_VLLM_PAGED_ATTN=1",
+  "performance_command": "ferrum bench-serve --fail-on-error --seed 9271 --n-repeats 1 --concurrency-sweep 1,32 (diagnostic only)",
+  "model_path": "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+  "dataset": "/workspace/artifacts/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja/dataset/ascii_sharegpt_w3_100_58d5721d.jsonl"
+}

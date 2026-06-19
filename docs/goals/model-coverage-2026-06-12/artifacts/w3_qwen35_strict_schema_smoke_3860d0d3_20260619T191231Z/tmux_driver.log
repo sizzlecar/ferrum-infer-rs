@@ -1,0 +1,57 @@
+started_at_utc=2026-06-19T19:13:00Z
+repo=/workspace/ferrum-clean
+artifact=/workspace/artifacts/w3_qwen35_strict_schema_smoke_3860d0d3_20260619T191231Z
+git_head=3860d0d3da39092012b186c216e06ed49a3110c5
+git_status_short_begin
+## goal/w2-w3-release-grade...origin/goal/w2-w3-release-grade
+git_status_short_end
+nvidia_smi_query_begin
+0, NVIDIA GeForce RTX 4090, 49140 MiB, 580.126.09, 8.9
+nvidia_smi_query_end
+nvcc_begin
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2024 NVIDIA Corporation
+Built on Thu_Mar_28_02:18:24_PDT_2024
+Cuda compilation tools, release 12.4, V12.4.131
+Build cuda_12.4.r12.4/compiler.34097967_0
+nvcc_end
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+   Compiling ferrum-types v0.7.7 (/workspace/ferrum-clean/crates/ferrum-types)
+   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-clean/crates/ferrum-interfaces)
+   Compiling ferrum-bench-core v0.7.7 (/workspace/ferrum-clean/crates/ferrum-bench-core)
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-clean/crates/ferrum-kernels)
+   Compiling ferrum-tokenizer v0.7.7 (/workspace/ferrum-clean/crates/ferrum-tokenizer)
+   Compiling ferrum-kv v0.7.7 (/workspace/ferrum-clean/crates/ferrum-kv)
+   Compiling ferrum-scheduler v0.7.7 (/workspace/ferrum-clean/crates/ferrum-scheduler)
+   Compiling ferrum-sampler v0.7.7 (/workspace/ferrum-clean/crates/ferrum-sampler)
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-clean/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-clean/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-clean/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-clean/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-clean/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 4m 43s
+9fb863464d86358dde93674ebf3fdcb02d28f51118a9fa6e96b555b574ea9a55  /workspace/ferrum-w3-qwen35-ac98207/target/release/ferrum
+ferrum bench-serve — dataset=sharegpt num_prompts=8 warmup=1 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=1
+  cell closed_loop c=1 — repeat 1/1 (9 prompts including 1 warmup)
+    8 completed / 0 errored / 36.6s
+    summary c=1 (n_repeats=1, no CI)
+      TTFT_ms  p50=2659.5  p95=2752.7  p99=2766.4
+      TPOT_ms  p50=16.3  p95=16.4  p99=16.4
+      ITL_ms   p50=15.8  p95=18.2  p99=19.7
+      throughput      26.3 tok/s
+      goodput         0.22 req/s
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/1 (9 prompts including 1 warmup)
+    8 completed / 0 errored / 27.3s
+    summary c=32 (n_repeats=1, no CI)
+      TTFT_ms  p50=21739.9  p95=21740.5  p99=21740.6
+      TPOT_ms  p50=44.2  p95=142.1  p99=183.5
+      ITL_ms   p50=43.9  p95=49.5  p99=51.2
+      throughput      35.2 tok/s
+      goodput         0.29 req/s
+
+→ wrote /workspace/artifacts/w3_qwen35_strict_schema_smoke_3860d0d3_20260619T191231Z/bench_sharegpt_c1_c32.json
+W3 QWEN35 VLLM H256 SMOKE PASS: /workspace/artifacts/w3_qwen35_strict_schema_smoke_3860d0d3_20260619T191231Z

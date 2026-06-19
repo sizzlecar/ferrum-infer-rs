@@ -1,0 +1,23 @@
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":"Please"}}]}
+
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":" say"}}]}
+
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":" \""}}]}
+
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":"f"}}]}
+
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":"err"}}]}
+
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":"um"}}]}
+
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":"-stream"}}]}
+
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":"-ok"}}]}
+
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":"\"."}}]}
+
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]}
+
+data: {"id":"2e394af9-db6c-4797-aac6-f96603ea614c","object":"chat.completion.chunk","created":1781896743,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[],"usage":{"prompt_tokens":22,"completion_tokens":10,"total_tokens":32}}
+
+data: [DONE]
