@@ -24,7 +24,8 @@ use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngin
 use ferrum_types::{
     EngineMetrics, EngineStatus, FerrumConfigBuilder, FerrumError as Error, FinishReason,
     InferenceRequest, InferenceResponse, ModelId, Priority, RequestId, ResolvedFerrumConfig,
-    RuntimeConfigSnapshot, SamplingParams, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    RuntimeConfigSnapshot, SamplingParams, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
+    DEFAULT_MAX_TOKENS_METADATA_KEY,
 };
 use std::{
     collections::HashMap,
@@ -1386,6 +1387,7 @@ fn convert_chat_request_with_template_model(
         .or(default_tool_choice.as_ref());
     let functions = request.functions.as_deref().unwrap_or_default();
     let forced_response_format = forced_tool_choice_response_format(request);
+    let requested_response_format = requested_response_format_for_sampling(request)?;
     let render_messages =
         render_messages_with_response_format_instruction(request, forced_response_format.as_ref());
     let chat_template_options = chat_template_options_for_request(request, model_template)?;
@@ -1478,7 +1480,7 @@ fn convert_chat_request_with_template_model(
             temperature: request.temperature.unwrap_or(DEFAULT_SAMPLING_TEMPERATURE),
             top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
             top_k: None, // OpenAI doesn't use top-k
-            repetition_penalty: 1.0,
+            repetition_penalty: DEFAULT_CHAT_REPETITION_PENALTY,
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             stop_sequences: request.stop.clone().unwrap_or_default(),
@@ -1488,6 +1490,8 @@ fn convert_chat_request_with_template_model(
             typical_p: None,
             mirostat: None,
             response_format: forced_response_format
+                .clone()
+                .or(requested_response_format)
                 .or_else(|| inferred_auto_tool_response_format(request))
                 .unwrap_or(ferrum_types::ResponseFormat::Text),
         },
@@ -1605,6 +1609,35 @@ fn forced_tool_choice_response_format(
     serde_json::to_string(&schema)
         .ok()
         .map(ferrum_types::ResponseFormat::JsonSchema)
+}
+
+fn requested_response_format_for_sampling(
+    request: &ChatCompletionsRequest,
+) -> ferrum_types::Result<Option<ferrum_types::ResponseFormat>> {
+    let Some(format) = request.response_format.as_ref() else {
+        return Ok(None);
+    };
+    match format.format_type.as_str() {
+        "json_schema" => {
+            let Some(schema) = format.json_schema.as_ref() else {
+                return Err(Error::invalid_request(
+                    "response_format.json_schema.schema is required",
+                ));
+            };
+            if !schema.strict.unwrap_or(false) {
+                return Ok(None);
+            }
+            let Some(schema_value) = schema.schema.as_ref() else {
+                return Err(Error::invalid_request(
+                    "response_format.json_schema.schema is required",
+                ));
+            };
+            serde_json::to_string(schema_value)
+                .map(|schema| Some(ferrum_types::ResponseFormat::JsonSchema(schema)))
+                .map_err(|err| Error::invalid_request(err.to_string()))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn inferred_auto_tool_response_format(
@@ -5567,6 +5600,10 @@ mod tests {
             request.sampling_params.temperature,
             DEFAULT_SAMPLING_TEMPERATURE
         );
+        assert_eq!(
+            request.sampling_params.repetition_penalty,
+            DEFAULT_CHAT_REPETITION_PENALTY
+        );
         assert_eq!(request.sampling_params.stop_sequences, vec!["<END>"]);
     }
 
@@ -7457,7 +7494,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_json_schema_response_format_uses_text_sampling_mode() {
+    fn strict_json_schema_response_format_uses_guided_sampling_mode() {
         let request = chat_request(json!({
             "response_format": {
                 "type": "json_schema",
@@ -7481,11 +7518,18 @@ mod tests {
             "response_format instruction should reach the model prompt: {}",
             internal.prompt
         );
-        assert_eq!(
-            internal.sampling_params.response_format,
-            ferrum_types::ResponseFormat::Text,
-            "strict json_schema is validated after generation instead of applying JSON soft bias during Qwen3 thinking"
-        );
+        let ferrum_types::ResponseFormat::JsonSchema(schema) =
+            internal.sampling_params.response_format
+        else {
+            panic!(
+                "strict json_schema must reach guided decoding, got {:?}",
+                internal.sampling_params.response_format
+            );
+        };
+        let schema: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["answer"]["type"], "string");
+        assert_eq!(schema["required"], json!(["answer"]));
     }
 
     #[tokio::test]

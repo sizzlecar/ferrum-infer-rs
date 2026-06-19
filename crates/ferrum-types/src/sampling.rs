@@ -5,6 +5,13 @@ use std::collections::HashMap;
 
 use crate::{FerrumError, Result, TokenId};
 
+/// Default repetition penalty for product chat entrypoints.
+///
+/// Chat defaults are greedy, and unpenalized greedy decoding can lock into
+/// deterministic token loops on real models. Keep CLI `run` and OpenAI chat
+/// serving on the same default unless an endpoint exposes an explicit override.
+pub const DEFAULT_CHAT_REPETITION_PENALTY: f32 = 1.1;
+
 /// Sampling parameters for generation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingParams {
