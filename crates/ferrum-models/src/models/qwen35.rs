@@ -559,13 +559,46 @@ pub fn qwen35_runtime_config(
     }
 }
 
+const QWEN35_DEFAULT_KV_CAPACITY: usize = 512;
+
+fn qwen35_effective_max_seq_len_from_snapshot(
+    snapshot: &ferrum_types::RuntimeConfigSnapshot,
+    model_max_seq_len: usize,
+) -> usize {
+    let requested = qwen35_runtime_positive_usize(snapshot, "FERRUM_KV_CAPACITY")
+        .or_else(|| qwen35_runtime_positive_usize(snapshot, "FERRUM_MAX_MODEL_LEN"));
+    requested
+        .map(|cap| cap.min(model_max_seq_len))
+        .unwrap_or_else(|| model_max_seq_len.min(QWEN35_DEFAULT_KV_CAPACITY))
+        .max(1)
+}
+
+fn qwen35_effective_max_seq_len(model_max_seq_len: usize) -> usize {
+    qwen35_effective_max_seq_len_from_snapshot(
+        &ferrum_types::active_runtime_snapshot(),
+        model_max_seq_len,
+    )
+}
+
+fn qwen35_runtime_positive_usize(
+    snapshot: &ferrum_types::RuntimeConfigSnapshot,
+    key: &str,
+) -> Option<usize> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .and_then(|entry| entry.effective_value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
 pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<LlmRuntimeConfig> {
     let config =
         Qwen35TextConfig::from_model_definition(def).map_err(ferrum_types::FerrumError::model)?;
     Ok(qwen35_runtime_config(
         &config,
         def.vocab_size,
-        def.max_position_embeddings,
+        qwen35_effective_max_seq_len(def.max_position_embeddings),
     ))
 }
 
@@ -609,8 +642,11 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
     ) -> Result<Self> {
         let config = Qwen35TextConfig::from_model_definition(def)
             .map_err(|err| FerrumError::model(format!("invalid Qwen3.5/Qwen3.6 config: {err}")))?;
-        let runtime_cfg =
-            qwen35_runtime_config(&config, def.vocab_size, def.max_position_embeddings);
+        let runtime_cfg = qwen35_runtime_config(
+            &config,
+            def.vocab_size,
+            qwen35_effective_max_seq_len(def.max_position_embeddings),
+        );
         Self::from_weight_plan(config, runtime_cfg, weight_plan, loader)
     }
 
@@ -1229,8 +1265,11 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
         let weight_plan = inventory
             .detect_prefix_and_resolve(&config)
             .map_err(|err| FerrumError::model(format!("Qwen3.5 weight preflight failed: {err}")))?;
-        let runtime_cfg =
-            qwen35_runtime_config(&config, def.vocab_size, def.max_position_embeddings);
+        let runtime_cfg = qwen35_runtime_config(
+            &config,
+            def.vocab_size,
+            qwen35_effective_max_seq_len(def.max_position_embeddings),
+        );
         let loader = NativeSafetensorsLoader::<B>::open(model_dir)?;
         Self::from_weight_plan(config, runtime_cfg, weight_plan, &loader)
     }
@@ -6420,7 +6459,10 @@ mod tests {
 
     use ferrum_kernels::backend::{cpu::CpuBackend, Backend};
     use ferrum_quantization::{DenseLinear, QuantConfig, WeightLoader};
-    use ferrum_types::{FerrumError, Result as FerrumResult};
+    use ferrum_types::{
+        FerrumError, Result as FerrumResult, RuntimeConfigEntry, RuntimeConfigSnapshot,
+        RuntimeConfigSource,
+    };
 
     use super::*;
     use crate::qwen35_weights::Qwen35WeightInventory;
@@ -6631,6 +6673,14 @@ mod tests {
 
     fn runtime_config(config: &Qwen35TextConfig) -> LlmRuntimeConfig {
         qwen35_runtime_config(config, 128, 64)
+    }
+
+    fn runtime_snapshot(vars: &[(&str, &str)]) -> RuntimeConfigSnapshot {
+        RuntimeConfigSnapshot::from_entries(
+            vars.iter().map(|(key, value)| {
+                RuntimeConfigEntry::new(*key, *value, RuntimeConfigSource::Cli)
+            }),
+        )
     }
 
     fn assert_close_slice(got: &[f32], expected: &[f32], tolerance: f32) {
@@ -6910,7 +6960,54 @@ mod tests {
         assert_eq!(runtime.num_kv_heads, 1);
         assert_eq!(runtime.head_dim, 4);
         assert_eq!(runtime.vocab_size, 32000);
-        assert_eq!(runtime.max_seq_len, 4096);
+        assert_eq!(runtime.max_seq_len, QWEN35_DEFAULT_KV_CAPACITY);
+    }
+
+    #[test]
+    fn qwen35_effective_max_seq_len_honors_max_model_len_snapshot() {
+        let snapshot = runtime_snapshot(&[("FERRUM_MAX_MODEL_LEN", "4096")]);
+
+        assert_eq!(
+            qwen35_effective_max_seq_len_from_snapshot(&snapshot, 262_144),
+            4096
+        );
+    }
+
+    #[test]
+    fn qwen35_effective_max_seq_len_prefers_kv_capacity() {
+        let snapshot = runtime_snapshot(&[
+            ("FERRUM_KV_CAPACITY", "2048"),
+            ("FERRUM_MAX_MODEL_LEN", "4096"),
+        ]);
+
+        assert_eq!(
+            qwen35_effective_max_seq_len_from_snapshot(&snapshot, 262_144),
+            2048
+        );
+    }
+
+    #[test]
+    fn qwen35_effective_max_seq_len_clamps_to_model_context() {
+        let snapshot = runtime_snapshot(&[("FERRUM_MAX_MODEL_LEN", "8192")]);
+
+        assert_eq!(
+            qwen35_effective_max_seq_len_from_snapshot(&snapshot, 1024),
+            1024
+        );
+    }
+
+    #[test]
+    fn qwen35_effective_max_seq_len_uses_safe_default_for_invalid_or_absent_snapshot() {
+        let invalid = runtime_snapshot(&[("FERRUM_KV_CAPACITY", "bad")]);
+
+        assert_eq!(
+            qwen35_effective_max_seq_len_from_snapshot(&invalid, 262_144),
+            QWEN35_DEFAULT_KV_CAPACITY
+        );
+        assert_eq!(
+            qwen35_effective_max_seq_len_from_snapshot(&RuntimeConfigSnapshot::default(), 256),
+            256
+        );
     }
 
     #[test]
