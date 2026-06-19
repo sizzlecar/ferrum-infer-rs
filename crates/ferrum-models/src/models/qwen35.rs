@@ -1,8 +1,8 @@
 //! Qwen3.5 / Qwen3.6 typed model weights.
 //!
 //! This is the W3 materialization boundary: it turns the resolved semantic
-//! weight plan into backend-native buffers and linears, but intentionally does
-//! not implement product forward execution yet.
+//! weight plan into backend-native buffers, linears, and product forward
+//! execution for the Qwen3.5/Qwen3.6 gated-DeltaNet family.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -1131,6 +1131,9 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         }
 
         let mut ctx = B::new_context();
+        let prior_len = state.tokens.len();
+        let profile_enabled = qwen35_prefill_profile_enabled();
+        let mut prefill_profile = Qwen35PrefillProfile::default();
         self.ensure_paged_kv_capacity_for_state(
             &mut ctx,
             cache_id,
@@ -1140,6 +1143,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         let weights = &self.weights;
         let rope = &self.rope;
         let mut hidden = B::alloc(tokens_len * weights.config.hidden_size);
+        let t_embedding = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
         B::embedding_lookup(
             &mut ctx,
             &weights.embed_tokens,
@@ -1147,6 +1151,8 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             &mut hidden,
             weights.config.hidden_size,
         );
+        prefill_profile.embedding_us +=
+            qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_embedding, "qwen35_embedding");
         qwen35_trace_buffer_stats::<B>(
             &mut ctx,
             "embedding",
@@ -1171,6 +1177,11 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .zip(state.layers.iter_mut())
             .enumerate()
         {
+            let layer_kind = match layer_state {
+                Qwen35LayerRuntimeState::Linear { .. } => "linear",
+                Qwen35LayerRuntimeState::Full { .. } => "full",
+            };
+            let t_layer = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
             hidden = match layer_state {
                 Qwen35LayerRuntimeState::Linear {
                     conv_state,
@@ -1211,6 +1222,9 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                     )?
                 }
             };
+            let layer_elapsed =
+                qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_layer, "qwen35_prefill_layer");
+            prefill_profile.record_layer(layer_index, layer_kind, layer_elapsed);
             if std::env::var_os("FERRUM_QWEN35_BUFFER_TRACE").is_some() {
                 let label = format!("layer{layer_index}.output");
                 qwen35_trace_buffer_stats::<B>(
@@ -1223,6 +1237,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         }
 
         let mut final_hidden = B::alloc(tokens_len * weights.config.hidden_size);
+        let t_final_norm = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
         if let Some(residual_f32) = residual_f32.as_ref() {
             B::rms_norm_f32_to_activation(
                 &mut ctx,
@@ -1244,12 +1259,16 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 weights.config.hidden_size,
             );
         }
+        prefill_profile.final_norm_us +=
+            qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_final_norm, "qwen35_final_norm");
         qwen35_trace_buffer_stats::<B>(
             &mut ctx,
             "final_norm",
             &final_hidden,
             tokens_len * weights.config.hidden_size,
         );
+        let t_final_gather =
+            qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled && tokens_len > 1);
         let last_hidden = if tokens_len == 1 {
             final_hidden
         } else {
@@ -1264,13 +1283,32 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             );
             last_hidden
         };
+        prefill_profile.final_gather_us += qwen35_prefill_profile_stage_finish::<B>(
+            &mut ctx,
+            t_final_gather,
+            "qwen35_final_token_gather",
+        );
         let mut last_logits = B::alloc(weights.runtime_cfg.vocab_size);
+        let t_lm_head = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
         weights
             .lm_head
             .forward(&mut ctx, &last_hidden, &mut last_logits, 1);
+        prefill_profile.lm_head_us +=
+            qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_lm_head, "qwen35_lm_head");
+        let t_readback = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         B::sync_before_host_readback(&mut ctx);
         B::sync(&mut ctx);
         let out = B::to_vec(&last_logits, weights.runtime_cfg.vocab_size);
+        if let Some(start) = t_readback {
+            prefill_profile.readback_us += start.elapsed().as_micros() as u64;
+        }
+        if profile_enabled {
+            prefill_profile.log(cache_id, prior_len, tokens_len, weights.layers.len());
+        }
         if std::env::var_os("FERRUM_QWEN35_LOGITS_TRACE").is_some() {
             let mut finite = 0usize;
             let mut top: Vec<(usize, f32)> = Vec::new();
@@ -1676,6 +1714,159 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         );
 
         token_ids.len()
+    }
+}
+
+#[derive(Default)]
+struct Qwen35PrefillProfile {
+    embedding_us: u64,
+    linear_layer_us: u64,
+    full_layer_us: u64,
+    linear_layers: usize,
+    full_layers: usize,
+    final_norm_us: u64,
+    final_gather_us: u64,
+    lm_head_us: u64,
+    readback_us: u64,
+    slow_layers: Vec<(usize, &'static str, u64)>,
+}
+
+static QWEN35_PREFILL_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn qwen35_env_flag_enabled(name: &str) -> bool {
+    let Some(value) = std::env::var_os(name) else {
+        return false;
+    };
+    let value = value.to_string_lossy();
+    let value = value.trim();
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "off" | "no"
+    )
+}
+
+fn qwen35_prefill_profile_enabled() -> bool {
+    qwen35_env_flag_enabled("FERRUM_QWEN35_PREFILL_PROFILE")
+}
+
+fn qwen35_prefill_profile_stage_start<B: Backend>(
+    ctx: &mut B::Context,
+    enabled: bool,
+) -> Option<B::Timer> {
+    ferrum_kernels::backend::timer::start_probe_timer_if::<B>(enabled, ctx)
+}
+
+fn qwen35_prefill_profile_stage_finish<B: Backend>(
+    ctx: &mut B::Context,
+    timer: Option<B::Timer>,
+    name: &str,
+) -> u64 {
+    ferrum_kernels::backend::timer::finish_probe_timer_traced::<B>(
+        timer,
+        ctx,
+        name,
+        "qwen35_prefill",
+        0,
+    )
+    .unwrap_or(0)
+}
+
+impl Qwen35PrefillProfile {
+    fn record_layer(&mut self, layer_index: usize, kind: &'static str, elapsed_us: u64) {
+        match kind {
+            "linear" => {
+                self.linear_layers += 1;
+                self.linear_layer_us += elapsed_us;
+            }
+            "full" => {
+                self.full_layers += 1;
+                self.full_layer_us += elapsed_us;
+            }
+            _ => {}
+        }
+
+        let insert_at = self
+            .slow_layers
+            .iter()
+            .position(|&(_, _, value)| elapsed_us > value)
+            .unwrap_or(self.slow_layers.len());
+        if insert_at < 8 {
+            self.slow_layers
+                .insert(insert_at, (layer_index, kind, elapsed_us));
+            self.slow_layers.truncate(8);
+        }
+    }
+
+    fn log(&self, cache_id: &str, prior_len: usize, tokens_len: usize, total_layers: usize) {
+        let call = QWEN35_PREFILL_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if call > 16 && call % 64 != 0 {
+            return;
+        }
+
+        let layer_sum = self.linear_layer_us + self.full_layer_us;
+        let final_sum =
+            self.final_norm_us + self.final_gather_us + self.lm_head_us + self.readback_us;
+        eprintln!(
+            "[qwen35-prefill-prof] call#{} cache_id={cache_id:?} prior_len={} tokens={} \
+             layers={} linear_layers={} full_layers={} embedding={}us layer_sum={}us \
+             linear_layer_sum={}us full_layer_sum={}us final_sum={}us final_norm={}us \
+             final_gather={}us lm_head={}us readback={}us slow_layers={:?}",
+            call,
+            prior_len,
+            tokens_len,
+            total_layers,
+            self.linear_layers,
+            self.full_layers,
+            self.embedding_us,
+            layer_sum,
+            self.linear_layer_us,
+            self.full_layer_us,
+            final_sum,
+            self.final_norm_us,
+            self.final_gather_us,
+            self.lm_head_us,
+            self.readback_us,
+            self.slow_layers,
+        );
+
+        let profile = ferrum_bench_core::global_profile();
+        if profile.is_enabled() {
+            let slow_layers = self
+                .slow_layers
+                .iter()
+                .map(|(layer, kind, us)| {
+                    serde_json::json!({
+                        "layer": layer,
+                        "kind": kind,
+                        "us": us,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let _ = profile.push_event(
+                "qwen35_prefill_prof",
+                ferrum_bench_core::profile_fields_from_json(serde_json::json!({
+                    "call": call,
+                    "prior_len": prior_len,
+                    "tokens": tokens_len,
+                    "layers": total_layers,
+                    "linear_layers": self.linear_layers,
+                    "full_layers": self.full_layers,
+                })),
+                ferrum_bench_core::profile_fields_from_json(serde_json::json!({
+                    "embedding": self.embedding_us,
+                    "layer_sum": layer_sum,
+                    "linear_layer_sum": self.linear_layer_us,
+                    "full_layer_sum": self.full_layer_us,
+                    "final_sum": final_sum,
+                    "final_norm": self.final_norm_us,
+                    "final_gather": self.final_gather_us,
+                    "lm_head": self.lm_head_us,
+                    "readback": self.readback_us,
+                    "slow_layers": slow_layers,
+                })),
+                false,
+            );
+        }
     }
 }
 
