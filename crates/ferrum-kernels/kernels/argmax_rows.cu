@@ -13,6 +13,46 @@
 
 #include <cuda_fp16.h>
 
+extern "C" __global__ void apply_repetition_penalties_sparse_f16(
+    __half* __restrict__ logits,                 // [m, n] row-major
+    int n,                                       // vocab size
+    const unsigned int* __restrict__ row_offsets, // [m + 1]
+    const unsigned int* __restrict__ token_ids,   // [total_token_ids]
+    const float* __restrict__ repetition_penalties, // [m]
+    int total_token_ids
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    float penalty = repetition_penalties[row];
+    if (penalty == 1.0f) {
+        return;
+    }
+
+    unsigned int start = row_offsets[row];
+    unsigned int end = row_offsets[row + 1];
+    if (start > (unsigned int)total_token_ids) {
+        start = (unsigned int)total_token_ids;
+    }
+    if (end > (unsigned int)total_token_ids) {
+        end = (unsigned int)total_token_ids;
+    }
+
+    __half* row_ptr = logits + (size_t)row * (size_t)n;
+    for (unsigned int entry = start + tid; entry < end; entry += block_size) {
+        unsigned int token = token_ids[entry];
+        if (token >= (unsigned int)n) {
+            continue;
+        }
+        float v = __half2float(row_ptr[token]);
+        if (!isfinite(v)) {
+            continue;
+        }
+        v = (v > 0.0f) ? (v / penalty) : (v * penalty);
+        row_ptr[token] = __float2half_rn(v);
+    }
+}
+
 extern "C" __global__ void argmax_rows_f16(
     const __half* __restrict__ logits,  // [m, n] row-major
     int n,                              // vocab size

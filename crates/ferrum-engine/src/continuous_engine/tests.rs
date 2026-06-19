@@ -508,7 +508,7 @@ fn sequence_state_prefill_context_preserves_generated_tokens_for_kv_recompute() 
 }
 
 #[test]
-fn model_decode_metadata_marks_sampling_masks_for_full_logits() {
+fn model_decode_metadata_keeps_sampling_masks_on_model_argmax_path() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         4,
         &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
@@ -521,10 +521,11 @@ fn model_decode_metadata_marks_sampling_masks_for_full_logits() {
             .model_decode_metadata()
             .get("ferrum_require_full_logits")
             .and_then(|value| value.as_bool()),
-        Some(true)
+        None
     );
     let LogitsReturnPolicy::GreedyArgmax {
         token_mask: Some(mask),
+        repetition_penalty: None,
     } = state.model_decode_logits_policy()
     else {
         panic!("plain greedy decode should use a masked model-side argmax policy");
@@ -534,19 +535,27 @@ fn model_decode_metadata_marks_sampling_masks_for_full_logits() {
 }
 
 #[test]
-fn model_decode_logits_policy_requires_full_for_non_greedy_sampling() {
+fn model_decode_logits_policy_keeps_repetition_penalty_on_greedy_argmax_path() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         4,
         &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
     ));
     let mut request = policy_request();
     request.sampling_params.repetition_penalty = 1.1;
-    let state = SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+    let mut state =
+        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+    state.generated_tokens = vec![TokenId::new(3), TokenId::new(3), TokenId::new(0)];
 
-    assert!(matches!(
-        state.model_decode_logits_policy(),
-        LogitsReturnPolicy::FullLogits
-    ));
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+        repetition_penalty: Some(penalty),
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("greedy repetition penalty should use model-side argmax policy");
+    };
+    assert_eq!(mask.valid_token_mask[2], 0);
+    assert_eq!(penalty.penalty, 1.1);
+    assert_eq!(penalty.token_ids.as_ref(), &[3, 0]);
 }
 
 #[test]
@@ -992,6 +1001,7 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
         SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
     let LogitsReturnPolicy::GreedyArgmax {
         token_mask: Some(mask),
+        repetition_penalty: None,
     } = state.model_decode_logits_policy()
     else {
         panic!("first greedy decode should use the initial token mask");
@@ -1008,6 +1018,7 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
     state.generated_tokens.push(first);
     let LogitsReturnPolicy::GreedyArgmax {
         token_mask: Some(mask),
+        repetition_penalty: None,
     } = state.model_decode_logits_policy()
     else {
         panic!("subsequent greedy decode should use the regular token mask");

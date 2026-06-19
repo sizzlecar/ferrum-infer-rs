@@ -93,6 +93,7 @@ pub enum LogitsReturnPolicy {
     FullLogits,
     GreedyArgmax {
         token_mask: Option<TokenSelectionMask>,
+        repetition_penalty: Option<GreedyRepetitionPenalty>,
     },
 }
 
@@ -105,6 +106,30 @@ impl Default for LogitsReturnPolicy {
 impl LogitsReturnPolicy {
     pub fn requires_full_logits(&self) -> bool {
         matches!(self, Self::FullLogits)
+    }
+}
+
+/// Sparse repetition-penalty metadata for model-side greedy argmax.
+///
+/// The token list is request-local and de-duplicated. Applying the penalty
+/// before GPU argmax avoids downloading full `[batch, vocab]` logits for the
+/// common greedy chat path while preserving repeat avoidance.
+#[derive(Clone, Debug)]
+pub struct GreedyRepetitionPenalty {
+    pub penalty: f32,
+    pub token_ids: Arc<[u32]>,
+}
+
+impl GreedyRepetitionPenalty {
+    pub fn new(penalty: f32, token_ids: Vec<u32>) -> Self {
+        Self {
+            penalty,
+            token_ids: Arc::from(token_ids),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.token_ids.is_empty() || self.penalty == 1.0
     }
 }
 

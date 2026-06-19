@@ -10,7 +10,9 @@ use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
-    model_executor::{KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask},
+    model_executor::{
+        GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
+    },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
     Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
@@ -782,7 +784,7 @@ impl SequenceState {
 
     pub fn model_decode_metadata(&self) -> HashMap<String, serde_json::Value> {
         let mut metadata = self.original_request.metadata.clone();
-        if self.requires_full_logits_for_sampling() {
+        if self.requires_engine_full_logits_for_sampling() {
             metadata.insert(
                 "ferrum_require_full_logits".to_string(),
                 serde_json::json!(true),
@@ -807,7 +809,10 @@ impl SequenceState {
             } else {
                 self.argmax_token_mask.clone()
             };
-        LogitsReturnPolicy::GreedyArgmax { token_mask }
+        LogitsReturnPolicy::GreedyArgmax {
+            token_mask,
+            repetition_penalty: self.model_decode_repetition_penalty(),
+        }
     }
 
     fn can_use_model_greedy_argmax(&self) -> bool {
@@ -817,7 +822,7 @@ impl SequenceState {
         params.temperature == 0.0
             && params.top_p == 1.0
             && params.top_k.is_none()
-            && params.repetition_penalty == 1.0
+            && params.repetition_penalty > 0.0
             && params.presence_penalty == 0.0
             && params.frequency_penalty == 0.0
             && params.min_p.is_none()
@@ -827,6 +832,25 @@ impl SequenceState {
             && self.json_processor.is_none()
             && self.regex_processor.is_none()
             && matches!(params.response_format, ResponseFormat::Text)
+    }
+
+    fn model_decode_repetition_penalty(&self) -> Option<GreedyRepetitionPenalty> {
+        let penalty = self.sampling_params.repetition_penalty;
+        if penalty == 1.0 || self.generated_tokens.is_empty() {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        let mut token_ids = Vec::new();
+        for token in &self.generated_tokens {
+            if seen.insert(token.get()) {
+                token_ids.push(token.get());
+            }
+        }
+        if token_ids.is_empty() {
+            None
+        } else {
+            Some(GreedyRepetitionPenalty::new(penalty, token_ids))
+        }
     }
 
     pub fn accept_model_greedy_argmax_token(
@@ -933,24 +957,19 @@ impl SequenceState {
         }
     }
 
-    pub fn requires_full_logits_for_sampling(&self) -> bool {
+    pub fn requires_engine_full_logits_for_sampling(&self) -> bool {
         use ferrum_types::ResponseFormat;
 
-        let needs_sampling_masks = !self.forbidden_token_ids.is_empty()
-            || (self.generated_tokens.is_empty() && !self.initial_forbidden_token_ids.is_empty());
-        let needs_extended_vocab_mask = self.tokenizer_base_vocab_size.is_some_and(|base| {
-            self.allowed_extended_token_ids
-                .iter()
-                .any(|&token_id| token_id as usize >= base)
-        });
         self.json_processor.is_some()
             || self.regex_processor.is_some()
             || matches!(
                 self.sampling_params.response_format,
                 ResponseFormat::JsonSchema(_)
             )
-            || needs_sampling_masks
-            || needs_extended_vocab_mask
+    }
+
+    pub fn requires_full_logits_for_sampling(&self) -> bool {
+        self.requires_engine_full_logits_for_sampling()
     }
 
     pub fn reset_guided_processors(&self) -> Result<()> {

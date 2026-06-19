@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use ferrum_interfaces::{
     kv_dtype::KvFp16,
-    model_executor::{LogitsReturnPolicy, TokenSelectionMask},
+    model_executor::{GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask},
     RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
     RecurrentStateManagerStats, RecurrentStateSpec,
 };
@@ -62,6 +62,12 @@ pub struct Qwen35BackendModel<B: MoeLlmBackend> {
     argmax_token_mask: Option<B::Buffer>,
     argmax_token_mask_fingerprint: Option<u64>,
     argmax_token_mask_len: usize,
+    argmax_repetition_offsets: Option<B::Buffer>,
+    argmax_repetition_token_ids: Option<B::Buffer>,
+    argmax_repetition_penalties: Option<B::Buffer>,
+    argmax_repetition_offsets_capacity: usize,
+    argmax_repetition_token_ids_capacity: usize,
+    argmax_repetition_penalties_capacity: usize,
 }
 
 pub struct Qwen35LayerWeights<B: MoeLlmBackend> {
@@ -569,12 +575,13 @@ pub struct Qwen35SparseMoeReferenceModelOutput {
     pub sparse_moe_outputs: Vec<Qwen35SparseMoeReference>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Qwen35DecodeLogitsReturn<'a> {
     Full,
     LegacyDefault,
     GreedyArgmax {
         token_mask: Option<&'a TokenSelectionMask>,
+        repetition_penalties: Vec<Option<&'a GreedyRepetitionPenalty>>,
     },
 }
 
@@ -582,6 +589,10 @@ enum Qwen35DecodeLogitsReturn<'a> {
 enum Qwen35ArgmaxMode<'a> {
     Raw,
     Masked(&'a TokenSelectionMask),
+    SparseRepetition {
+        token_mask: Option<&'a TokenSelectionMask>,
+        repetition_penalties: &'a [Option<&'a GreedyRepetitionPenalty>],
+    },
 }
 
 pub fn qwen35_runtime_config(
@@ -723,36 +734,52 @@ fn qwen35_decode_logits_return_from_policies<'a>(
 
     let mut selected_mask: Option<&'a TokenSelectionMask> = None;
     let mut saw_unmasked = false;
+    let mut repetition_penalties = Vec::with_capacity(batch_len);
     for policy in policies {
         match policy {
             LogitsReturnPolicy::FullLogits => return Qwen35DecodeLogitsReturn::Full,
-            LogitsReturnPolicy::GreedyArgmax { token_mask } => match token_mask.as_ref() {
-                Some(mask) => {
-                    if saw_unmasked {
-                        return Qwen35DecodeLogitsReturn::Full;
-                    }
-                    if let Some(selected) = selected_mask {
-                        if selected.fingerprint != mask.fingerprint || selected.len() != mask.len()
-                        {
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask,
+                repetition_penalty,
+            } => {
+                repetition_penalties.push(repetition_penalty.as_ref());
+                match token_mask.as_ref() {
+                    Some(mask) => {
+                        if saw_unmasked {
                             return Qwen35DecodeLogitsReturn::Full;
                         }
-                    } else {
-                        selected_mask = Some(mask);
+                        if let Some(selected) = selected_mask {
+                            if selected.fingerprint != mask.fingerprint
+                                || selected.len() != mask.len()
+                            {
+                                return Qwen35DecodeLogitsReturn::Full;
+                            }
+                        } else {
+                            selected_mask = Some(mask);
+                        }
+                    }
+                    None => {
+                        if selected_mask.is_some() {
+                            return Qwen35DecodeLogitsReturn::Full;
+                        }
+                        saw_unmasked = true;
                     }
                 }
-                None => {
-                    if selected_mask.is_some() {
-                        return Qwen35DecodeLogitsReturn::Full;
-                    }
-                    saw_unmasked = true;
-                }
-            },
+            }
         }
     }
 
     Qwen35DecodeLogitsReturn::GreedyArgmax {
         token_mask: selected_mask,
+        repetition_penalties,
     }
+}
+
+fn qwen35_has_repetition_penalties(penalties: &[Option<&GreedyRepetitionPenalty>]) -> bool {
+    penalties
+        .iter()
+        .flatten()
+        .any(|penalty| !penalty.is_empty())
 }
 
 pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<LlmRuntimeConfig> {
@@ -818,6 +845,12 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             argmax_token_mask: None,
             argmax_token_mask_fingerprint: None,
             argmax_token_mask_len: 0,
+            argmax_repetition_offsets: None,
+            argmax_repetition_token_ids: None,
+            argmax_repetition_penalties: None,
+            argmax_repetition_offsets_capacity: 0,
+            argmax_repetition_token_ids_capacity: 0,
+            argmax_repetition_penalties_capacity: 0,
         })
     }
 
@@ -1448,15 +1481,27 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .forward(&mut ctx, &final_hidden, &mut logits, batch_len);
         B::sync_before_host_readback(&mut ctx);
         B::sync(&mut ctx);
-        let argmax_mode = match logits_return {
+        let argmax_mode = match &logits_return {
             Qwen35DecodeLogitsReturn::Full => None,
             Qwen35DecodeLogitsReturn::LegacyDefault if self.greedy_argmax => {
                 Some(Qwen35ArgmaxMode::Raw)
             }
             Qwen35DecodeLogitsReturn::LegacyDefault => None,
-            Qwen35DecodeLogitsReturn::GreedyArgmax { token_mask } => token_mask
-                .map(Qwen35ArgmaxMode::Masked)
-                .or(Some(Qwen35ArgmaxMode::Raw)),
+            Qwen35DecodeLogitsReturn::GreedyArgmax {
+                token_mask,
+                repetition_penalties,
+            } => {
+                if qwen35_has_repetition_penalties(repetition_penalties) {
+                    Some(Qwen35ArgmaxMode::SparseRepetition {
+                        token_mask: *token_mask,
+                        repetition_penalties,
+                    })
+                } else {
+                    token_mask
+                        .map(Qwen35ArgmaxMode::Masked)
+                        .or(Some(Qwen35ArgmaxMode::Raw))
+                }
+            }
         };
         if let Some(argmax_mode) = argmax_mode {
             let tokens = match argmax_mode {
@@ -1473,6 +1518,50 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                         &logits,
                         device_mask,
                         mask_len,
+                        batch_len,
+                        vocab,
+                    )
+                }
+                Qwen35ArgmaxMode::SparseRepetition {
+                    token_mask,
+                    repetition_penalties,
+                } => {
+                    if let Some(mask) = token_mask {
+                        self.ensure_argmax_token_mask(&mut ctx, mask);
+                    }
+                    let total_token_ids = self.upload_argmax_repetition_penalty(
+                        &mut ctx,
+                        repetition_penalties,
+                        batch_len,
+                    );
+                    let valid_token_mask = token_mask.map(|_| {
+                        (
+                            self.argmax_token_mask
+                                .as_ref()
+                                .expect("Qwen3.5 argmax token mask upload failed"),
+                            self.argmax_token_mask_len,
+                        )
+                    });
+                    let row_offsets = self
+                        .argmax_repetition_offsets
+                        .as_ref()
+                        .expect("Qwen3.5 repetition row offsets upload failed");
+                    let token_ids = self
+                        .argmax_repetition_token_ids
+                        .as_ref()
+                        .expect("Qwen3.5 repetition token ids upload failed");
+                    let penalties = self
+                        .argmax_repetition_penalties
+                        .as_ref()
+                        .expect("Qwen3.5 repetition penalties upload failed");
+                    B::argmax_rows_f16_sparse_repetition_penalty(
+                        &mut ctx,
+                        &mut logits,
+                        valid_token_mask,
+                        row_offsets,
+                        token_ids,
+                        penalties,
+                        total_token_ids,
                         batch_len,
                         vocab,
                     )
@@ -1505,6 +1594,83 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         self.argmax_token_mask
             .as_ref()
             .expect("Qwen3.5 argmax token mask upload failed")
+    }
+
+    fn upload_argmax_repetition_penalty(
+        &mut self,
+        ctx: &mut B::Context,
+        penalties: &[Option<&GreedyRepetitionPenalty>],
+        batch_len: usize,
+    ) -> usize {
+        let mut offsets = Vec::with_capacity(batch_len + 1);
+        let mut token_ids = Vec::new();
+        let mut row_penalties = Vec::with_capacity(batch_len);
+        offsets.push(0u32);
+        for row in 0..batch_len {
+            let penalty = penalties.get(row).and_then(|value| *value);
+            row_penalties.push(penalty.map(|value| value.penalty).unwrap_or(1.0));
+            let before = token_ids.len();
+            if let Some(penalty) = penalty {
+                let mut seen = HashSet::new();
+                for &token_id in penalty.token_ids.iter() {
+                    if seen.insert(token_id) {
+                        token_ids.push(token_id);
+                    }
+                }
+            }
+            debug_assert!(token_ids.len() >= before);
+            offsets.push(token_ids.len() as u32);
+        }
+
+        let offsets_len = offsets.len().max(1);
+        if self.argmax_repetition_offsets_capacity < offsets_len {
+            self.argmax_repetition_offsets = Some(B::alloc_typed(Dtype::U32, offsets_len));
+            self.argmax_repetition_offsets_capacity = offsets_len;
+        }
+        let token_ids_len = token_ids.len().max(1);
+        if self.argmax_repetition_token_ids_capacity < token_ids_len {
+            self.argmax_repetition_token_ids = Some(B::alloc_typed(Dtype::U32, token_ids_len));
+            self.argmax_repetition_token_ids_capacity = token_ids_len;
+        }
+        let penalties_len = row_penalties.len().max(1);
+        if self.argmax_repetition_penalties_capacity < penalties_len {
+            self.argmax_repetition_penalties = Some(B::alloc_typed(Dtype::F32, penalties_len));
+            self.argmax_repetition_penalties_capacity = penalties_len;
+        }
+
+        B::write_typed::<u32>(
+            ctx,
+            self.argmax_repetition_offsets
+                .as_mut()
+                .expect("Qwen3.5 repetition row offsets allocation failed"),
+            &offsets,
+        );
+        if token_ids.is_empty() {
+            B::write_typed::<u32>(
+                ctx,
+                self.argmax_repetition_token_ids
+                    .as_mut()
+                    .expect("Qwen3.5 repetition token ids allocation failed"),
+                &[0],
+            );
+        } else {
+            B::write_typed::<u32>(
+                ctx,
+                self.argmax_repetition_token_ids
+                    .as_mut()
+                    .expect("Qwen3.5 repetition token ids allocation failed"),
+                &token_ids,
+            );
+        }
+        B::write_typed::<f32>(
+            ctx,
+            self.argmax_repetition_penalties
+                .as_mut()
+                .expect("Qwen3.5 repetition penalties allocation failed"),
+            &row_penalties,
+        );
+
+        token_ids.len()
     }
 }
 
@@ -7952,23 +8118,30 @@ mod tests {
         let consistent = [
             LogitsReturnPolicy::GreedyArgmax {
                 token_mask: Some(mask_a.clone()),
+                repetition_penalty: None,
             },
             LogitsReturnPolicy::GreedyArgmax {
                 token_mask: Some(mask_a_same),
+                repetition_penalty: None,
             },
         ];
         assert!(matches!(
             qwen35_decode_logits_return_from_policies(&consistent, 2),
             Qwen35DecodeLogitsReturn::GreedyArgmax {
-                token_mask: Some(_)
+                token_mask: Some(_),
+                ..
             }
         ));
 
         let mixed_mask = [
             LogitsReturnPolicy::GreedyArgmax {
                 token_mask: Some(mask_a.clone()),
+                repetition_penalty: None,
             },
-            LogitsReturnPolicy::GreedyArgmax { token_mask: None },
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: None,
+                repetition_penalty: None,
+            },
         ];
         assert!(matches!(
             qwen35_decode_logits_return_from_policies(&mixed_mask, 2),
@@ -7978,15 +8151,38 @@ mod tests {
         let different_masks = [
             LogitsReturnPolicy::GreedyArgmax {
                 token_mask: Some(mask_a),
+                repetition_penalty: None,
             },
             LogitsReturnPolicy::GreedyArgmax {
                 token_mask: Some(mask_b),
+                repetition_penalty: None,
             },
         ];
         assert!(matches!(
             qwen35_decode_logits_return_from_policies(&different_masks, 2),
             Qwen35DecodeLogitsReturn::Full
         ));
+
+        let penalty = GreedyRepetitionPenalty::new(1.1, vec![10, 11]);
+        let repeated = [
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: None,
+                repetition_penalty: Some(penalty),
+            },
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: None,
+                repetition_penalty: None,
+            },
+        ];
+        let Qwen35DecodeLogitsReturn::GreedyArgmax {
+            repetition_penalties,
+            ..
+        } = qwen35_decode_logits_return_from_policies(&repeated, 2)
+        else {
+            panic!("Qwen3.5 should keep per-row repetition penalty on greedy argmax path");
+        };
+        assert!(repetition_penalties[0].is_some());
+        assert!(repetition_penalties[1].is_none());
     }
 
     #[test]
