@@ -2,6 +2,64 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ31 — W3 Qwen35 argmax mask model-vocab smoke PASS, performance still blocked
+
+- Scope:
+  - targeted 1x Vast CUDA validation for commit
+    `e4404604 fix(engine): size argmax masks to model vocab`;
+  - fixes the previous model-side argmax correctness regression by building the
+    GPU token-validity mask to the model/logits vocab size instead of the
+    tokenizer base vocab size;
+  - diagnostic bench ran only after correctness passed;
+  - no W3 final PASS and no release-grade performance claim.
+- Local source validation before GPU:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - `cargo test -p ferrum-engine model_decode -- --nocapture` PASS: 5 matched
+    tests;
+  - `cargo check -p ferrum-engine --all-targets` PASS.
+- GPU / lifecycle:
+  - Vast instance `41422823`, SSH `ssh7.vast.ai:22822`, was started for this
+    targeted lane and stopped after artifact copyback;
+  - final stop check: `cur_state=stopped`, `actual_status=exited`;
+  - GPU: 1x `NVIDIA GeForce RTX 4090`, `49140 MiB`, driver `580.126.09`,
+    compute capability `8.9`;
+  - CUDA toolkit `12.4`, Rust `1.96.0`.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_argmax_mask_model_vocab_e4404604_20260619T210406Z`;
+  - smoke PASS line:
+    `W3 QWEN35 VLLM H256 SMOKE PASS: /workspace/artifacts/w3_qwen35_argmax_mask_model_vocab_e4404604_20260619T210406Z`;
+  - CUDA release build PASS, binary SHA256:
+    `916e2eb5644a95f1df731aae2bd87fc8fddc6ee81799e269a09265a49dd23f0e`.
+- Correctness result:
+  - `ferrum run` PASS; output:
+    `The mysterious ferrum-ok appears only in rare scientific texts.`;
+  - `ferrum serve` effective config selected `vllm_paged_attn_v2`, with
+    `FERRUM_USE_VLLM_PAGED_ATTN=1` and `FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0`;
+  - non-stream chat HTTP 200, content `The capital of France is Paris.`,
+    `finish_reason=stop`;
+  - stream chat HTTP 200, exactly one `[DONE]`, usage present, final
+    `finish_reason=stop`;
+  - required tool call HTTP 200, parsed `get_weather({"city":"Paris"})`,
+    `finish_reason=tool_calls`;
+  - strict structured output HTTP 200, content exactly
+    `{"answer":"scenario-ok"}`, `finish_reason=stop`.
+- Diagnostic bench only:
+  - command used `bench-serve --dataset sharegpt --num-prompts 8
+    --n-repeats 1 --concurrency-sweep 1,32 --fail-on-error --seed 9271`;
+  - c=1: 8 completed / 0 errored / 24.4s, output throughput `14.5 tok/s`;
+  - c=32: 8 completed / 0 errored / 23.0s, output throughput `15.3 tok/s`;
+  - this is a bottleneck signal only (`n_repeats=1`, small prompt count), not
+    W3 performance evidence.
+- Interpretation / next work:
+  - correctness smoke is back to PASS with model-side argmax enabled;
+  - performance regressed from the previous strict-schema diagnostic
+    (`26.3`/`35.2` tok/s at c=1/c=32) and remains far below the vLLM 80%
+    targets (`107.5`/`1349.9` tok/s);
+  - next work should stop optimizing sampling and inspect Qwen35 scheduler/KV
+    integration and decode batching, especially why c=32 effective throughput
+    is nearly identical to c=1.
+
 ## 2026-06-20 ZZZ30 — W3 Qwen35 sparse-repetition CUDA smoke failed at non-stream length
 
 - Scope:
