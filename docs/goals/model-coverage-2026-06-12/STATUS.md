@@ -2,6 +2,58 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ28 — W3 Qwen35 strict-schema product smoke PASS, perf still far below target
+
+- Scope:
+  - targeted 1x Vast CUDA product smoke for commit
+    `3860d0d3 fix(server): guide strict schema chat sampling`;
+  - this validates the previous structured-output/repetition fixes on the real
+    Qwen35 GPTQ product path;
+  - no W3 final PASS and no release-grade performance claim.
+- GPU / lifecycle:
+  - Vast instance `41422823`, SSH `ssh7.vast.ai:22822`, stopped after artifact
+    copyback;
+  - stop check: `cur_state=stopped`, `actual_status=exited`;
+  - `nvidia-smi`: 1x `NVIDIA GeForce RTX 4090`, `49140 MiB`, driver
+    `580.126.09`, compute capability `8.9`;
+  - CUDA toolkit `12.4`, Rust `1.96.0`.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_strict_schema_smoke_3860d0d3_20260619T191231Z`;
+  - smoke PASS line:
+    `W3 QWEN35 VLLM H256 SMOKE PASS: /workspace/artifacts/w3_qwen35_strict_schema_smoke_3860d0d3_20260619T191231Z`;
+  - release CUDA build PASS, binary SHA256:
+    `9fb863464d86358dde93674ebf3fdcb02d28f51118a9fa6e96b555b574ea9a55`.
+- Correctness result:
+  - `ferrum run` PASS; output:
+    `The mysterious ferrum-ok appears only in rare scientific texts.`;
+  - effective config for both `run` and `serve` selected
+    `vllm_paged_attn_v2`, with `FERRUM_USE_VLLM_PAGED_ATTN=1` and
+    `FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0`;
+  - non-stream chat HTTP 200, `finish_reason=stop`;
+  - stream chat HTTP 200, exactly one `[DONE]`, usage present, final
+    `finish_reason=stop`;
+  - required tool call HTTP 200, parsed `get_weather({"city":"Paris"})`,
+    `finish_reason=tool_calls`;
+  - strict structured output HTTP 200, content exactly
+    `{"answer":"scenario-ok"}`, `finish_reason=stop`;
+  - post-validation additionally rejects `finish_reason=length` and obvious
+    repeated token chunks.
+- Diagnostic bench only:
+  - command used `bench-serve --dataset sharegpt --num-prompts 8
+    --n-repeats 1 --concurrency-sweep 1,32 --fail-on-error --seed 9271`;
+  - c=1: 8 completed / 0 errored / 36.6s, output throughput `26.3 tok/s`;
+  - c=32: 8 completed / 0 errored / 27.3s, output throughput `35.2 tok/s`;
+  - this is a bottleneck signal only (`n_repeats=1`, small prompt count), not
+    W3 performance evidence.
+- Limitation / next work:
+  - correctness smoke now passes on the intended vLLM H256/V2 attention route;
+  - performance remains orders of magnitude below the recorded vLLM 80%
+    targets (`107.5` tok/s at c=1 and `1349.9` tok/s at c=32);
+  - next work should focus on the decode throughput architecture: avoid
+    CPU-side repetition/sampling bottlenecks and verify Qwen35 uses the shared
+    paged KV scheduler/block-table path rather than model-local full-attention
+    state.
+
 ## 2026-06-20 ZZZ27 — W3 serve strict schema/repetition source fix
 
 - Scope:
