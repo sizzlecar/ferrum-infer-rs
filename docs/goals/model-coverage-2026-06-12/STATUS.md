@@ -2,6 +2,47 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ27 — W3 serve strict schema/repetition source fix
+
+- Scope:
+  - follow-up source fix for the failed Qwen35 vLLM H256 GPU smoke artifact
+    `w3_qwen35_vllm_h256_smoke_178d76fa_20260619T181820Z_hot_target`;
+  - no new GPU run yet, no release-grade PASS, no W3 final PASS, and no
+    performance claim.
+- Root causes addressed:
+  - OpenAI chat `response_format.json_schema.strict=true` previously only
+    added prompt text and final validation; it did not set engine
+    `ResponseFormat::JsonSchema`, so generation was unconstrained and could
+    emit trailing text after valid JSON;
+  - OpenAI chat serving used `repetition_penalty=1.0` while `ferrum run`
+    defaults to a repeat penalty, which matches the GPU smoke's repeated
+    `Paris` until `finish_reason=length`.
+- Change:
+  - strict JSON schema requests now route the schema into guided sampling
+    unless a forced tool call already owns the structured response format;
+  - non-strict `json_schema` remains prompt/final-validation behavior and is
+    not hard-masked;
+  - `DEFAULT_CHAT_REPETITION_PENALTY` now lives in `ferrum-types` and is used
+    by both `ferrum run` and OpenAI chat serving.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-server strict_json_schema -- --nocapture` PASS:
+    11 tests;
+  - `cargo test -p ferrum-server chat_accepts_stop_string_and_max_completion_tokens -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-cli chat_default_applies_repetition_penalty -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine --test regex_guided_test -- --nocapture`
+    PASS: 3 tests;
+  - `cargo test -p ferrum-server --test structured_output_contract -- --nocapture`
+    PASS: 3 tests;
+  - `git diff --check` PASS.
+- Limitation / next work:
+  - this is source-level product-path evidence only;
+  - restart the stopped Vast GPU lane only after this commit is pushed, then
+    rerun the Qwen35 product smoke for `run`, `serve`, streaming, required
+    tool, and strict schema before any bench/performance work.
+
 ## 2026-06-19 ZZZ26 — W3 Qwen35 vLLM H256 path GPU smoke failed at structured output
 
 - Scope:

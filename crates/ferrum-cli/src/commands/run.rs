@@ -10,7 +10,7 @@ use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, Promp
 use ferrum_types::{
     FerrumConfigBuilder, FerrumError, FinishReason, InferenceRequest, ModelCapabilities, Priority,
     RequestId, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
-    RuntimeConfigSource, SamplingParams, WorkloadProfile,
+    RuntimeConfigSource, SamplingParams, WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -267,7 +267,7 @@ pub struct RunCommand {
     /// with no penalty deterministically locks into token loops on some
     /// inputs (the "2D/3D 2D/3D..." degeneration). Pass `--repeat-penalty 1.0`
     /// for an unpenalized greedy baseline.
-    #[arg(long, default_value = "1.1")]
+    #[arg(long, default_value_t = DEFAULT_CHAT_REPETITION_PENALTY)]
     pub repeat_penalty: f32,
 
     /// Number of recent tokens that the repetition penalty considers.
