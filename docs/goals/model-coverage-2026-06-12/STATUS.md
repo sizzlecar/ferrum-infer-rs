@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ30 — W3 Qwen35 sparse-repetition CUDA smoke failed at non-stream length
+
+- Scope:
+  - targeted 1x Vast CUDA validation for the Qwen35 sparse repetition greedy
+    decode work;
+  - validates that the CUDA feature build compiles after the GPU-side sparse
+    repetition argmax changes;
+  - no diagnostic bench was run because correctness failed first;
+  - no W3 final PASS and no release-grade performance claim.
+- Code:
+  - pushed source/perf commit
+    `48db0eb5 perf(qwen35): keep repetition greedy decode on gpu`;
+  - pushed CUDA build fix commits `31817b49`, `103faeea`, and `6c3aad47`;
+  - remote validation head:
+    `6c3aad47a63c7e1030a60b00e7d437ec09ac0a79`.
+- GPU / lifecycle:
+  - Vast instance `41422823`, SSH `ssh7.vast.ai:22822`, was started only for
+    this targeted lane and stopped after artifact copyback;
+  - final stop check: `cur_state=stopped`, `actual_status=exited`;
+  - GPU: 1x `NVIDIA GeForce RTX 4090`, `49140 MiB`, driver `580.126.09`,
+    compute capability `8.9`;
+  - CUDA toolkit `12.4`, Rust `1.96.0`.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_sparse_repetition_gpu_6c3aad47_20260619T203155Z`;
+  - smoke FAIL line:
+    `W3 QWEN35 VLLM H256 SMOKE FAIL rc=1: /workspace/artifacts/w3_qwen35_sparse_repetition_gpu_6c3aad47_20260619T203155Z`;
+  - CUDA release build PASS, binary SHA256:
+    `ee04f09cee1dd91c16b6d6424ebf77a72cdb118b92562fb28d1da79418c2673e`;
+  - `ferrum run` validation PASS.
+- Correctness failure:
+  - `ferrum serve` started and effective config still selected
+    `vllm_paged_attn_v2`, with `FERRUM_USE_VLLM_PAGED_ATTN=1` and
+    `FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0`;
+  - non-stream chat returned HTTP 200 but failed post-validation because
+    `finish_reason=length`;
+  - body repeated `Paris` inside `<text>` blocks until the 64-token cap:
+    `The capital of France is Paris. <text> Paris </text> ...`;
+  - stream/tool/strict-schema request script summary was PASS, but the lane is
+    correctly marked FAIL because the non-stream product path is not correct;
+  - no `bench-serve` artifact exists for this run.
+- Interpretation / next work:
+  - the CUDA build part of the sparse repetition argmax fix is now past the
+    previous compile blockers;
+  - the vLLM-style single-application repetition penalty is not sufficient to
+    make the Qwen35 ordinary non-stream greedy chat path stop correctly;
+  - next work should inspect whether Qwen35 serve is actually taking the new
+    model-side sparse-repetition argmax path and then fix the decode-quality
+    architecture before rerunning paid CUDA.
+
 ## 2026-06-20 ZZZ29 — W3 Qwen35 greedy repetition stays on GPU source checkpoint
 
 - Scope:
