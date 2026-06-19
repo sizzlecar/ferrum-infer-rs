@@ -19,8 +19,8 @@ use tracing::debug;
 use ferrum_interfaces::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
-        KvSlotRequest, KvSlotReservation, MemoryRequirements, PrefillInput, PrefillOutput,
-        UnifiedBatch,
+        KvSlotRequest, KvSlotReservation, LogitsReturnPolicy, MemoryRequirements, PrefillInput,
+        PrefillOutput, UnifiedBatch,
     },
     ModelExecutor,
 };
@@ -652,20 +652,15 @@ impl ModelExecutor for LlmExecutor {
                 cache_id: cache_id.clone(),
                 target_len: seq_len.saturating_add(1),
             }])?;
-            if force_full_logits {
+            if force_full_logits || input.logits_policy.requires_full_logits() {
                 model.decode(&cache_id, token, seq_len as u32)
             } else {
-                let unified_item = vec![(cache_id.clone(), vec![token], seq_len, true)];
-                match model.unified_forward(&unified_item) {
-                    Ok(mut per_item) => per_item
-                        .pop()
-                        .flatten()
-                        .ok_or_else(|| FerrumError::model("unified_forward returned no logits"))?,
-                    Err(FerrumError::Unsupported { .. }) => {
-                        model.decode(&cache_id, token, seq_len as u32)
-                    }
-                    Err(e) => return Err(e),
-                }
+                let tuple = [(cache_id.clone(), token, seq_len as u32)];
+                let policy = std::slice::from_ref(&input.logits_policy);
+                model
+                    .decode_batch_with_logits_policy(&tuple, policy)
+                    .pop()
+                    .ok_or_else(|| FerrumError::model("decode_batch returned no logits"))?
             }
         };
 
@@ -701,6 +696,7 @@ impl ModelExecutor for LlmExecutor {
             seq_len: u32,
             lora: Option<ActiveLoraAdapter>,
             requires_full_logits: bool,
+            logits_policy: LogitsReturnPolicy,
             handle: Arc<GenericKvCacheHandle>,
         }
         let mut prepped: Vec<Prep> = Vec::with_capacity(inputs.len());
@@ -722,6 +718,7 @@ impl ModelExecutor for LlmExecutor {
                 seq_len,
                 lora: active_lora_from_metadata(&input.metadata)?,
                 requires_full_logits: metadata_requires_full_logits(&input.metadata),
+                logits_policy: input.logits_policy.clone(),
                 handle: Arc::new(input_handle.with_sequence_length((seq_len + 1) as usize)),
             });
         }
@@ -768,7 +765,9 @@ impl ModelExecutor for LlmExecutor {
                 .iter()
                 .map(|p| (p.cache_id.clone(), p.token, p.seq_len))
                 .collect();
-            let force_full_logits = prepped.iter().any(|p| p.requires_full_logits);
+            let force_full_logits = prepped
+                .iter()
+                .any(|p| p.requires_full_logits || p.logits_policy.requires_full_logits());
             let logits = if force_full_logits {
                 model.decode_batch_with_full_logits(&tuples, true)
             } else {
@@ -792,7 +791,9 @@ impl ModelExecutor for LlmExecutor {
                         out
                     }
                     Err(FerrumError::Unsupported { .. }) => {
-                        model.decode_batch_with_full_logits(&tuples, false)
+                        let policies: Vec<_> =
+                            prepped.iter().map(|p| p.logits_policy.clone()).collect();
+                        model.decode_batch_with_logits_policy(&tuples, &policies)
                     }
                     Err(e) => return Err(e),
                 }

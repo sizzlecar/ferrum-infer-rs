@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ferrum_interfaces::{
-    kv_dtype::KvFp16, RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
+    kv_dtype::KvFp16,
+    model_executor::{LogitsReturnPolicy, TokenSelectionMask},
+    RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
     RecurrentStateManagerStats, RecurrentStateSpec,
 };
 use ferrum_kernels::backend::{AttnConfig, Backend, Dtype, KvCache, MoeLlmBackend};
@@ -49,6 +51,10 @@ pub struct Qwen35BackendModel<B: MoeLlmBackend> {
     pub rope: Qwen35BackendRopeCache<B>,
     pub sequences: HashMap<String, Qwen35SequenceState<B>>,
     pub kv_capacity: usize,
+    pub greedy_argmax: bool,
+    argmax_token_mask: Option<B::Buffer>,
+    argmax_token_mask_fingerprint: Option<u64>,
+    argmax_token_mask_len: usize,
 }
 
 pub struct Qwen35LayerWeights<B: MoeLlmBackend> {
@@ -544,6 +550,21 @@ pub struct Qwen35SparseMoeReferenceModelOutput {
     pub sparse_moe_outputs: Vec<Qwen35SparseMoeReference>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Qwen35DecodeLogitsReturn<'a> {
+    Full,
+    LegacyDefault,
+    GreedyArgmax {
+        token_mask: Option<&'a TokenSelectionMask>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Qwen35ArgmaxMode<'a> {
+    Raw,
+    Masked(&'a TokenSelectionMask),
+}
+
 pub fn qwen35_runtime_config(
     config: &Qwen35TextConfig,
     vocab_size: usize,
@@ -592,6 +613,60 @@ fn qwen35_runtime_positive_usize(
         .filter(|value| *value > 0)
 }
 
+fn qwen35_runtime_bool(snapshot: &ferrum_types::RuntimeConfigSnapshot, key: &str) -> Option<bool> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .and_then(|entry| match entry.effective_value.as_str() {
+            "1" | "true" | "TRUE" | "True" => Some(true),
+            "0" | "false" | "FALSE" | "False" => Some(false),
+            _ => None,
+        })
+}
+
+fn qwen35_decode_logits_return_from_policies<'a>(
+    policies: &'a [LogitsReturnPolicy],
+    batch_len: usize,
+) -> Qwen35DecodeLogitsReturn<'a> {
+    if policies.len() != batch_len {
+        return Qwen35DecodeLogitsReturn::Full;
+    }
+
+    let mut selected_mask: Option<&'a TokenSelectionMask> = None;
+    let mut saw_unmasked = false;
+    for policy in policies {
+        match policy {
+            LogitsReturnPolicy::FullLogits => return Qwen35DecodeLogitsReturn::Full,
+            LogitsReturnPolicy::GreedyArgmax { token_mask } => match token_mask.as_ref() {
+                Some(mask) => {
+                    if saw_unmasked {
+                        return Qwen35DecodeLogitsReturn::Full;
+                    }
+                    if let Some(selected) = selected_mask {
+                        if selected.fingerprint != mask.fingerprint || selected.len() != mask.len()
+                        {
+                            return Qwen35DecodeLogitsReturn::Full;
+                        }
+                    } else {
+                        selected_mask = Some(mask);
+                    }
+                }
+                None => {
+                    if selected_mask.is_some() {
+                        return Qwen35DecodeLogitsReturn::Full;
+                    }
+                    saw_unmasked = true;
+                }
+            },
+        }
+    }
+
+    Qwen35DecodeLogitsReturn::GreedyArgmax {
+        token_mask: selected_mask,
+    }
+}
+
 pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<LlmRuntimeConfig> {
     let config =
         Qwen35TextConfig::from_model_definition(def).map_err(ferrum_types::FerrumError::model)?;
@@ -625,6 +700,8 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
         )?;
         let kv_capacity = runtime_cfg.max_seq_len;
         let weights = Qwen35ModelWeights::<B>::load(config, runtime_cfg, &weight_plan, loader)?;
+        let snapshot = ferrum_types::active_runtime_snapshot();
+        let greedy_argmax = qwen35_runtime_bool(&snapshot, "FERRUM_GREEDY_ARGMAX").unwrap_or(false);
         Ok(Self {
             weights,
             weight_plan,
@@ -632,6 +709,10 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
             rope,
             sequences: HashMap::new(),
             kv_capacity,
+            greedy_argmax,
+            argmax_token_mask: None,
+            argmax_token_mask_fingerprint: None,
+            argmax_token_mask_len: 0,
         })
     }
 
@@ -923,6 +1004,17 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
         &mut self,
         batch: &[(String, u32, u32)],
     ) -> Result<Vec<Vec<f32>>> {
+        self.forward_stateful_decode_batch_with_logits_return(
+            batch,
+            Qwen35DecodeLogitsReturn::LegacyDefault,
+        )
+    }
+
+    fn forward_stateful_decode_batch_with_logits_return(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        logits_return: Qwen35DecodeLogitsReturn<'_>,
+    ) -> Result<Vec<Vec<f32>>> {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
@@ -972,7 +1064,7 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
             states.push((cache_id.clone(), state));
         }
         let tokens: Vec<u32> = batch.iter().map(|(_, token, _)| *token).collect();
-        let result = self.forward_stateful_decode_batch_taken(&tokens, &mut states);
+        let result = self.forward_stateful_decode_batch_taken(&tokens, &mut states, logits_return);
         let success = result.is_ok();
         for ((cache_id, mut state), token) in states.into_iter().zip(tokens.iter().copied()) {
             if success {
@@ -984,9 +1076,10 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
     }
 
     fn forward_stateful_decode_batch_taken(
-        &self,
+        &mut self,
         tokens: &[u32],
         states: &mut [(String, Qwen35SequenceState<B>)],
+        logits_return: Qwen35DecodeLogitsReturn<'_>,
     ) -> Result<Vec<Vec<f32>>> {
         let weights = &self.weights;
         let rope = &self.rope;
@@ -1076,8 +1169,63 @@ impl<B: MoeLlmBackend> Qwen35BackendModel<B> {
             .forward(&mut ctx, &final_hidden, &mut logits, batch_len);
         B::sync_before_host_readback(&mut ctx);
         B::sync(&mut ctx);
+        let argmax_mode = match logits_return {
+            Qwen35DecodeLogitsReturn::Full => None,
+            Qwen35DecodeLogitsReturn::LegacyDefault if self.greedy_argmax => {
+                Some(Qwen35ArgmaxMode::Raw)
+            }
+            Qwen35DecodeLogitsReturn::LegacyDefault => None,
+            Qwen35DecodeLogitsReturn::GreedyArgmax { token_mask } => token_mask
+                .map(Qwen35ArgmaxMode::Masked)
+                .or(Some(Qwen35ArgmaxMode::Raw)),
+        };
+        if let Some(argmax_mode) = argmax_mode {
+            let tokens = match argmax_mode {
+                Qwen35ArgmaxMode::Raw => B::argmax_rows_f16(&mut ctx, &logits, batch_len, vocab),
+                Qwen35ArgmaxMode::Masked(mask) => {
+                    self.ensure_argmax_token_mask(&mut ctx, mask);
+                    let mask_len = self.argmax_token_mask_len;
+                    let device_mask = self
+                        .argmax_token_mask
+                        .as_ref()
+                        .expect("Qwen3.5 argmax token mask upload failed");
+                    B::argmax_rows_f16_masked(
+                        &mut ctx,
+                        &logits,
+                        device_mask,
+                        mask_len,
+                        batch_len,
+                        vocab,
+                    )
+                }
+            };
+            if let Ok(tokens) = tokens {
+                if tokens.iter().all(|&token| token != u32::MAX) {
+                    return Ok(tokens.into_iter().map(|token| vec![token as f32]).collect());
+                }
+            }
+        }
         let flat = B::to_vec(&logits, batch_len * vocab);
         Ok(flat.chunks_exact(vocab).map(|row| row.to_vec()).collect())
+    }
+
+    fn ensure_argmax_token_mask(
+        &mut self,
+        ctx: &mut B::Context,
+        mask: &TokenSelectionMask,
+    ) -> &B::Buffer {
+        let needs_upload = self.argmax_token_mask_fingerprint != Some(mask.fingerprint)
+            || self.argmax_token_mask_len != mask.len();
+        if needs_upload {
+            let mut device_mask = B::alloc_typed(Dtype::I8, mask.len().max(1));
+            B::write_typed::<i8>(ctx, &mut device_mask, &mask.valid_token_mask);
+            self.argmax_token_mask = Some(device_mask);
+            self.argmax_token_mask_fingerprint = Some(mask.fingerprint);
+            self.argmax_token_mask_len = mask.len();
+        }
+        self.argmax_token_mask
+            .as_ref()
+            .expect("Qwen3.5 argmax token mask upload failed")
     }
 }
 
@@ -1232,15 +1380,35 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for Qwen35BackendModel<B> {
     fn decode_batch_with_full_logits(
         &mut self,
         batch: &[(String, u32, u32)],
-        _force_full_logits: bool,
+        force_full_logits: bool,
     ) -> Vec<Vec<f32>> {
-        if batch.len() <= 1 {
+        if batch.len() <= 1 && force_full_logits {
             return batch
                 .iter()
                 .map(|(cache_id, token, pos)| self.decode(cache_id, *token, *pos))
                 .collect();
         }
-        self.forward_stateful_decode_batch(batch)
+        self.forward_stateful_decode_batch_with_logits_return(
+            batch,
+            if force_full_logits {
+                Qwen35DecodeLogitsReturn::Full
+            } else {
+                Qwen35DecodeLogitsReturn::LegacyDefault
+            },
+        )
+        .unwrap_or_else(|err| panic!("Qwen3.5 decode_batch failed: {err}"))
+    }
+
+    fn decode_batch_with_logits_policy(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        policies: &[LogitsReturnPolicy],
+    ) -> Vec<Vec<f32>> {
+        let logits_return = qwen35_decode_logits_return_from_policies(policies, batch.len());
+        if batch.len() <= 1 && matches!(logits_return, Qwen35DecodeLogitsReturn::Full) {
+            return self.decode_batch_with_full_logits(batch, true);
+        }
+        self.forward_stateful_decode_batch_with_logits_return(batch, logits_return)
             .unwrap_or_else(|err| panic!("Qwen3.5 decode_batch failed: {err}"))
     }
 
@@ -7008,6 +7176,69 @@ mod tests {
             qwen35_effective_max_seq_len_from_snapshot(&RuntimeConfigSnapshot::default(), 256),
             256
         );
+    }
+
+    #[test]
+    fn qwen35_runtime_bool_reads_typed_snapshot() {
+        let enabled = runtime_snapshot(&[("FERRUM_GREEDY_ARGMAX", "1")]);
+        let disabled = runtime_snapshot(&[("FERRUM_GREEDY_ARGMAX", "0")]);
+        let invalid = runtime_snapshot(&[("FERRUM_GREEDY_ARGMAX", "maybe")]);
+
+        assert_eq!(
+            qwen35_runtime_bool(&enabled, "FERRUM_GREEDY_ARGMAX"),
+            Some(true)
+        );
+        assert_eq!(
+            qwen35_runtime_bool(&disabled, "FERRUM_GREEDY_ARGMAX"),
+            Some(false)
+        );
+        assert_eq!(qwen35_runtime_bool(&invalid, "FERRUM_GREEDY_ARGMAX"), None);
+    }
+
+    #[test]
+    fn qwen35_decode_logits_policy_uses_greedy_only_for_consistent_masks() {
+        let mask_a = ferrum_interfaces::model_executor::TokenSelectionMask::new(vec![1, 0, 1]);
+        let mask_a_same = ferrum_interfaces::model_executor::TokenSelectionMask::new(vec![1, 0, 1]);
+        let mask_b = ferrum_interfaces::model_executor::TokenSelectionMask::new(vec![1, 1, 0]);
+
+        let consistent = [
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(mask_a.clone()),
+            },
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(mask_a_same),
+            },
+        ];
+        assert!(matches!(
+            qwen35_decode_logits_return_from_policies(&consistent, 2),
+            Qwen35DecodeLogitsReturn::GreedyArgmax {
+                token_mask: Some(_)
+            }
+        ));
+
+        let mixed_mask = [
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(mask_a.clone()),
+            },
+            LogitsReturnPolicy::GreedyArgmax { token_mask: None },
+        ];
+        assert!(matches!(
+            qwen35_decode_logits_return_from_policies(&mixed_mask, 2),
+            Qwen35DecodeLogitsReturn::Full
+        ));
+
+        let different_masks = [
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(mask_a),
+            },
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(mask_b),
+            },
+        ];
+        assert!(matches!(
+            qwen35_decode_logits_return_from_policies(&different_masks, 2),
+            Qwen35DecodeLogitsReturn::Full
+        ));
     }
 
     #[test]

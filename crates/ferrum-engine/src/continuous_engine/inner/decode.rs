@@ -269,7 +269,8 @@ impl EngineInner {
                 .unwrap_or(TokenId::new(0));
             let tensor = self.tokens_to_tensor(&[last_token.get()])?;
             let input = ferrum_interfaces::model_executor::DecodeInput::new(tensor, kv_cache)
-                .with_metadata(seq.model_decode_metadata());
+                .with_metadata(seq.model_decode_metadata())
+                .with_logits_policy(seq.model_decode_logits_policy());
             if let Some(state) = recurrent_state {
                 input.with_recurrent_state(state)
             } else {
@@ -287,10 +288,16 @@ impl EngineInner {
                 .get_mut(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
             let mut logits = logits_vec;
-            let token = seq.sample_with_processors_with_tokenizer(
-                &mut logits,
-                Some(self.tokenizer.as_ref()),
-            )?;
+            let token = if logits.len() == 1 {
+                let token = TokenId::new(logits[0] as u32);
+                seq.accept_model_greedy_argmax_token(Some(self.tokenizer.as_ref()), token)?;
+                token
+            } else {
+                seq.sample_with_processors_with_tokenizer(
+                    &mut logits,
+                    Some(self.tokenizer.as_ref()),
+                )?
+            };
             seq.generated_tokens.push(token);
             seq.kv_cache = Some(decode_output.kv_cache.clone());
             seq.recurrent_state = decode_output

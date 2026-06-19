@@ -2,6 +2,83 @@
 
 进度日志,倒序。
 
+## 2026-06-19 ZZZ25 — W3 Qwen35 GPU argmax/readback hot-path checkpoint
+
+- Scope:
+  - Qwen35 decode hot-path optimization toward the recorded vLLM 80% targets;
+  - local source changes and CPU/Rust validation only at this checkpoint;
+  - no new CUDA performance result and no `MODEL_RELEASE_GRADE_W3 PASS:
+    <out_dir>` was produced.
+- Change:
+  - Qwen35 backend model now reads typed runtime snapshot
+    `FERRUM_GREEDY_ARGMAX` and can return model-side greedy token sentinels
+    instead of downloading `[batch, vocab]` logits on eligible decode rows;
+  - Qwen35 `decode_batch_with_logits_policy` now supports consistent
+    `GreedyArgmax` token masks via backend masked argmax, and falls back to
+    full logits for full-logits requests, mixed masked/unmasked rows, or
+    inconsistent masks;
+  - `LlmExecutor::decode` now passes `LogitsReturnPolicy` through the single
+    decode path and uses the model policy decode path instead of always
+    falling back to full-logits `decode`;
+  - single-request continuous decode now accepts the same one-element greedy
+    sentinel as unified/batch decode and validates it with the existing token
+    quality checks before appending the token.
+- Validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS:
+    80 matched tests passed;
+  - `cargo test -p ferrum-engine continuous_engine -- --nocapture` PASS:
+    27 matched tests passed;
+  - `cargo check -p ferrum-interfaces -p ferrum-models -p ferrum-engine
+    --all-targets` PASS.
+- Limitation:
+  - this removes a known logits readback/CPU sampling bottleneck, but it is
+    not yet same-hardware performance evidence;
+  - the larger structural gap remains Qwen35 full-attention KV layout:
+    Qwen35 still uses model-private contiguous full-attention KV state instead
+    of the shared vLLM-style paged block table/slot mapping path used by
+    existing Llama/Qwen3 MoE model implementations.
+
+## 2026-06-19 ZZZ24 — W3 Qwen35 same-host vLLM ShareGPT baseline recorded
+
+- Scope:
+  - W3/Qwen35 same-host vLLM baseline capture for the 80% performance target;
+  - 1x Vast CUDA host, vLLM first, ASCII ShareGPT 100 prompts, output length
+    128, c=1/4/16/32, `--fail-on-error --require-ci --seed 9271
+    --n-repeats 3`;
+  - this is optimization input, not a Ferrum release-grade performance PASS.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_vllm_sharegpt_baseline_20260619`;
+  - source raw artifact copied from:
+    `/tmp/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja`;
+  - model snapshot:
+    `Qwen/Qwen3.5-35B-A3B-GPTQ-Int4@3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b`;
+  - dataset SHA256:
+    `58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e`.
+- vLLM baseline and Ferrum targets:
+  - c=1: vLLM LCB `134.3690` tok/s, Ferrum 80% target `107.4952`
+    tok/s;
+  - c=4: vLLM LCB `405.0572` tok/s, Ferrum 80% target `324.0457`
+    tok/s;
+  - c=16: vLLM LCB `1120.2993` tok/s, Ferrum 80% target `896.2394`
+    tok/s;
+  - c=32: vLLM LCB `1687.3965` tok/s, Ferrum 80% target `1349.9172`
+    tok/s.
+- Ferrum diagnostic:
+  - the matching Ferrum sweep was stopped early after c=1 repeat 1 because
+    `100 completed / 0 errored / 340.3s` implied only about `37.6` output
+    tok/s, far below the c=1 80% target;
+  - this partial result is a bottleneck signal only and is not used as a
+    release-grade performance result.
+- Cost/lifecycle:
+  - the Vast instance was stopped after artifact copyback and confirmed as
+    `cur_state=stopped actual_status=exited`.
+- Limitation:
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` was produced;
+  - next work is GPU-first optimization toward these 80% targets, followed by
+    a fresh full same-host Ferrum/vLLM A/B or a valid final manifest.
+
 ## 2026-06-18 ZZZ23 — W3 Qwen35 release-grade goal doc checkpoint
 
 - Scope:
