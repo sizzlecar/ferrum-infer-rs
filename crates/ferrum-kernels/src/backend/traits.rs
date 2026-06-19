@@ -315,6 +315,45 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Variable-length batched recurrent gated DeltaNet prefill update.
+    ///
+    /// Layouts are token-major over all concatenated prefill chunks:
+    /// - `query` / `key`: `[total_tokens, key_heads, key_dim]`
+    /// - `value` / `out`: `[total_tokens, value_heads, value_dim]`
+    /// - `g` / `beta`: `[total_tokens, value_heads]`
+    /// - `cu_seqlens`: `[batch + 1]` u32 prefix sum into the flat token axis
+    /// - `initial_states` / `final_states`: `[batch, value_heads, value_dim, key_dim]`
+    ///
+    /// Each sequence advances independently from its own initial recurrent
+    /// state and writes one final state. This is the prefill counterpart of
+    /// [`Self::recurrent_gated_delta_rule_batch_f32`] and matches the
+    /// `cu_seqlens` shape used by vLLM-style chunked GDN prefill.
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_varlen_f32(
+        _ctx: &mut Self::Context,
+        _query: &Self::Buffer,
+        _key: &Self::Buffer,
+        _value: &Self::Buffer,
+        _g: &Self::Buffer,
+        _beta: &Self::Buffer,
+        _initial_states: &Self::Buffer,
+        _cu_seqlens: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _final_states: &mut Self::Buffer,
+        _batch: usize,
+        _total_tokens: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _use_qk_l2norm: bool,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "recurrent_gated_delta_rule_varlen_f32 not implemented for this backend",
+        ))
+    }
+
     /// Prepare a gated-Delta linear-attention block:
     /// depthwise causal conv + SiLU over `mixed_qkv_raw`, split into Q/K/V,
     /// and compute GDN gates `g` and `beta`.
