@@ -279,6 +279,42 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Batched one-token recurrent gated DeltaNet update.
+    ///
+    /// Layouts are independent-sequence token-major:
+    /// - `query` / `key`: `[batch, key_heads, key_dim]`
+    /// - `value` / `out`: `[batch, value_heads, value_dim]`
+    /// - `g` / `beta`: `[batch, value_heads]`
+    /// - `initial_states` / `final_states`: `[batch, value_heads, value_dim, key_dim]`
+    ///
+    /// This is the decode-time counterpart of
+    /// [`Self::recurrent_gated_delta_rule_f32`] for continuous batching. Each
+    /// batch row has its own recurrent state; there is no temporal dependency
+    /// across rows.
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_f32(
+        _ctx: &mut Self::Context,
+        _query: &Self::Buffer,
+        _key: &Self::Buffer,
+        _value: &Self::Buffer,
+        _g: &Self::Buffer,
+        _beta: &Self::Buffer,
+        _initial_states: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _final_states: &mut Self::Buffer,
+        _batch: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _use_qk_l2norm: bool,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "recurrent_gated_delta_rule_batch_f32 not implemented for this backend",
+        ))
+    }
+
     /// Prepare a gated-Delta linear-attention block:
     /// depthwise causal conv + SiLU over `mixed_qkv_raw`, split into Q/K/V,
     /// and compute GDN gates `g` and `beta`.
@@ -341,6 +377,43 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "linear_attention_decode_prepare_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Batched stateful one-token linear-attention preparation.
+    ///
+    /// This processes `batch` independent decode rows:
+    /// - `mixed_qkv_raw`: `[batch, conv_channels]`
+    /// - `conv_states` / `next_conv_states`: `[batch, conv_channels, conv_kernel - 1]`
+    /// - `a_raw` / `b_raw` / `g` / `beta`: `[batch, value_heads]`
+    /// - `query` / `key`: `[batch, key_heads, key_dim]`
+    /// - `value`: `[batch, value_heads, value_dim]`
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _conv_states: &Self::Buffer,
+        _a_raw: &Self::Buffer,
+        _b_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _next_conv_states: &mut Self::Buffer,
+        _batch: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_decode_prepare_batch_f32 not implemented for this backend",
         ))
     }
 

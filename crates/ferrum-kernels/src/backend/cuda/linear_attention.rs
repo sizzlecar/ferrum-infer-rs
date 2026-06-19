@@ -14,6 +14,11 @@ const PREPARE_F16_PARAMS_F32_FUNC: &str = "linear_attention_prepare_f16_params_f
 const DECODE_PREPARE_FUNC: &str = "linear_attention_decode_prepare_f32";
 const DECODE_PREPARE_F16_TO_F32_FUNC: &str = "linear_attention_decode_prepare_f16_to_f32";
 const DECODE_PREPARE_F16_PARAMS_F32_FUNC: &str = "linear_attention_decode_prepare_f16_params_f32";
+const DECODE_PREPARE_BATCH_FUNC: &str = "linear_attention_decode_prepare_batch_f32";
+const DECODE_PREPARE_BATCH_F16_TO_F32_FUNC: &str =
+    "linear_attention_decode_prepare_batch_f16_to_f32";
+const DECODE_PREPARE_BATCH_F16_PARAMS_F32_FUNC: &str =
+    "linear_attention_decode_prepare_batch_f16_params_f32";
 const QK_L2NORM_FUNC: &str = "linear_attention_qk_l2norm_f32";
 const GATED_RMS_NORM_FUNC: &str = "gated_rms_norm_f32";
 const GATED_RMS_NORM_F16_TO_F32_FUNC: &str = "gated_rms_norm_f16_to_f32";
@@ -338,6 +343,177 @@ pub fn linear_attention_decode_prepare_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn linear_attention_decode_prepare_batch_f32(
+    ctx: &mut CudaState,
+    mixed_qkv_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    conv_states: &CudaBuf,
+    a_raw: &CudaBuf,
+    b_raw: &CudaBuf,
+    a_log: &CudaBuf,
+    dt_bias: &CudaBuf,
+    query: &mut CudaBuf,
+    key: &mut CudaBuf,
+    value: &mut CudaBuf,
+    g: &mut CudaBuf,
+    beta: &mut CudaBuf,
+    next_conv_states: &mut CudaBuf,
+    batch: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+    apply_qk_l2norm: bool,
+) -> Result<()> {
+    validate_decode_prepare_batch_shape(
+        mixed_qkv_raw,
+        conv_weight,
+        conv_states,
+        a_raw,
+        b_raw,
+        a_log,
+        dt_bias,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        next_conv_states,
+        batch,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+    )?;
+
+    let (input_dtype, param_dtype) = validate_decode_prepare_dtype(
+        mixed_qkv_raw,
+        conv_weight,
+        conv_states,
+        a_raw,
+        b_raw,
+        a_log,
+        dt_bias,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        next_conv_states,
+    )?;
+
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let row_total = conv_channels.max(value_heads);
+    let total = batch * row_total;
+    let func_name = match (input_dtype, param_dtype) {
+        (Dtype::F32, Dtype::F32) => DECODE_PREPARE_BATCH_FUNC,
+        (Dtype::F16, Dtype::F16) => DECODE_PREPARE_BATCH_F16_TO_F32_FUNC,
+        (Dtype::F16, Dtype::F32) => DECODE_PREPARE_BATCH_F16_PARAMS_F32_FUNC,
+        _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
+    };
+    let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
+    let stream = ctx.stream.clone();
+    let batch_i32 = batch as i32;
+    let key_heads_i32 = key_heads as i32;
+    let value_heads_i32 = value_heads as i32;
+    let key_dim_i32 = key_dim as i32;
+    let value_dim_i32 = value_dim as i32;
+    let conv_kernel_i32 = conv_kernel as i32;
+    let mut builder = stream.launch_builder(&func);
+    match input_dtype {
+        Dtype::F32 => {
+            builder.arg(mixed_qkv_raw.as_f32());
+            builder.arg(conv_weight.as_f32());
+        }
+        Dtype::F16 => {
+            builder.arg(mixed_qkv_raw.as_f16());
+            builder.arg(conv_weight.as_f16());
+        }
+        _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
+    }
+    builder.arg(conv_states.as_f32());
+    match input_dtype {
+        Dtype::F32 => {
+            builder.arg(a_raw.as_f32());
+            builder.arg(b_raw.as_f32());
+        }
+        Dtype::F16 => {
+            builder.arg(a_raw.as_f16());
+            builder.arg(b_raw.as_f16());
+        }
+        _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
+    }
+    match param_dtype {
+        Dtype::F32 => {
+            builder.arg(a_log.as_f32());
+            builder.arg(dt_bias.as_f32());
+        }
+        Dtype::F16 => {
+            builder.arg(a_log.as_f16());
+            builder.arg(dt_bias.as_f16());
+        }
+        _ => unreachable!("validate_decode_prepare_dtype filters unsupported params"),
+    }
+    builder.arg(query.as_f32_mut());
+    builder.arg(key.as_f32_mut());
+    builder.arg(value.as_f32_mut());
+    builder.arg(g.as_f32_mut());
+    builder.arg(beta.as_f32_mut());
+    builder.arg(next_conv_states.as_f32_mut());
+    builder.arg(&batch_i32);
+    builder.arg(&key_heads_i32);
+    builder.arg(&value_heads_i32);
+    builder.arg(&key_dim_i32);
+    builder.arg(&value_dim_i32);
+    builder.arg(&conv_kernel_i32);
+    unsafe {
+        builder
+            .launch(LaunchConfig {
+                grid_dim: (total.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .map_err(|err| {
+                FerrumError::backend(format!(
+                    "linear_attention_decode_prepare_batch launch: {err}"
+                ))
+            })?;
+    }
+
+    if apply_qk_l2norm {
+        let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, QK_L2NORM_FUNC);
+        let block = key_dim.next_power_of_two().min(256).max(1) as u32;
+        let stream = ctx.stream.clone();
+        let tokens_i32 = batch as i32;
+        let eps = 1e-6f32;
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(query.as_f32_mut());
+        builder.arg(key.as_f32_mut());
+        builder.arg(&tokens_i32);
+        builder.arg(&key_heads_i32);
+        builder.arg(&key_dim_i32);
+        builder.arg(&eps);
+        unsafe {
+            builder
+                .launch(LaunchConfig {
+                    grid_dim: ((batch * key_heads) as u32, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|err| {
+                    FerrumError::backend(format!("linear_attention_batch_qk_l2norm launch: {err}"))
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn gated_rms_norm_f32(
     ctx: &mut CudaState,
     core: &CudaBuf,
@@ -648,6 +824,79 @@ fn validate_decode_prepare_shape(
         if actual < expected {
             return Err(FerrumError::model(format!(
                 "linear_attention_decode_prepare {label} length {actual} < expected {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_decode_prepare_batch_shape(
+    mixed_qkv_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    conv_states: &CudaBuf,
+    a_raw: &CudaBuf,
+    b_raw: &CudaBuf,
+    a_log: &CudaBuf,
+    dt_bias: &CudaBuf,
+    query: &CudaBuf,
+    key: &CudaBuf,
+    value: &CudaBuf,
+    g: &CudaBuf,
+    beta: &CudaBuf,
+    next_conv_states: &CudaBuf,
+    batch: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+) -> Result<()> {
+    if batch == 0
+        || key_heads == 0
+        || value_heads == 0
+        || key_dim == 0
+        || value_dim == 0
+        || conv_kernel == 0
+    {
+        return Err(FerrumError::model(format!(
+            "linear_attention_decode_prepare_batch shape must be positive, got batch={batch} key_heads={key_heads} value_heads={value_heads} key_dim={key_dim} value_dim={value_dim} conv_kernel={conv_kernel}"
+        )));
+    }
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let conv_state_elements = conv_channels * conv_kernel.saturating_sub(1);
+    for (label, actual, expected) in [
+        ("mixed_qkv_raw", mixed_qkv_raw.len(), batch * conv_channels),
+        (
+            "conv_weight",
+            conv_weight.len(),
+            conv_channels * conv_kernel,
+        ),
+        (
+            "conv_states",
+            conv_states.len(),
+            batch * conv_state_elements,
+        ),
+        ("a_raw", a_raw.len(), batch * value_heads),
+        ("b_raw", b_raw.len(), batch * value_heads),
+        ("a_log", a_log.len(), value_heads),
+        ("dt_bias", dt_bias.len(), value_heads),
+        ("query", query.len(), batch * qk_total),
+        ("key", key.len(), batch * qk_total),
+        ("value", value.len(), batch * value_total),
+        ("g", g.len(), batch * value_heads),
+        ("beta", beta.len(), batch * value_heads),
+        (
+            "next_conv_states",
+            next_conv_states.len(),
+            batch * conv_state_elements,
+        ),
+    ] {
+        if actual < expected {
+            return Err(FerrumError::model(format!(
+                "linear_attention_decode_prepare_batch {label} length {actual} < expected {expected}"
             )));
         }
     }

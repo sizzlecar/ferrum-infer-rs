@@ -4111,7 +4111,12 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         .a_proj
         .forward(ctx, &input_norm, &mut a_raw, batch_len);
 
-    let mut delta_norm = B::alloc_typed(Dtype::F32, batch_len * value_total);
+    let conv_state_len = qkv_width * attention_shape.conv_kernel.saturating_sub(1);
+    let delta_state_len = attention_shape.state_len();
+    let mut conv_states = B::alloc_typed(Dtype::F32, batch_len * conv_state_len);
+    let mut next_conv_states = B::alloc_typed(Dtype::F32, batch_len * conv_state_len);
+    let mut initial_delta_states = B::alloc_typed(Dtype::F32, batch_len * delta_state_len);
+    let mut final_delta_states = B::alloc_typed(Dtype::F32, batch_len * delta_state_len);
     for (row, (cache_id, state)) in states.iter_mut().enumerate() {
         let Qwen35LayerRuntimeState::Linear {
             conv_state,
@@ -4126,46 +4131,113 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
                 "Qwen3.5 batch decode expected linear layer state at layer {layer_index} for {cache_id:?}"
             )));
         };
-
-        let mut row_qkv = B::alloc(qkv_width);
-        let mut row_z = B::alloc(value_total);
-        let mut row_a = B::alloc(gating_width);
-        let mut row_b = B::alloc(gating_width);
         B::copy_slice(
             ctx,
-            &mixed_qkv_raw,
-            row * qkv_width,
-            &mut row_qkv,
-            0,
-            qkv_width,
-        );
-        B::copy_slice(ctx, &z_raw, row * value_total, &mut row_z, 0, value_total);
-        B::copy_slice(ctx, &a_raw, row * gating_width, &mut row_a, 0, gating_width);
-        B::copy_slice(ctx, &b_raw, row * gating_width, &mut row_b, 0, gating_width);
-        let attention_out = qwen35_linear_attention_decode_core_backend::<B>(
-            ctx,
-            &row_qkv,
-            &row_z,
-            &row_a,
-            &row_b,
-            &attention.conv1d_weight,
             conv_state,
-            &attention.a_log,
-            &attention.dt_bias,
-            &attention.norm_weight,
-            delta_state,
-            attention_shape,
-            eps,
-        )?;
-        *conv_state = attention_out.next_conv_state;
-        *delta_state = attention_out.final_state;
+            0,
+            &mut conv_states,
+            row * conv_state_len,
+            conv_state_len,
+        );
         B::copy_slice(
             ctx,
-            &attention_out.delta_norm,
+            delta_state,
             0,
-            &mut delta_norm,
-            row * value_total,
-            value_total,
+            &mut initial_delta_states,
+            row * delta_state_len,
+            delta_state_len,
+        );
+    }
+
+    let mut query = B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
+    let mut key = B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
+    let mut value = B::alloc_typed(Dtype::F32, batch_len * value_total);
+    let mut g = B::alloc_typed(Dtype::F32, batch_len * gating_width);
+    let mut beta = B::alloc_typed(Dtype::F32, batch_len * gating_width);
+    B::linear_attention_decode_prepare_batch_f32(
+        ctx,
+        &mixed_qkv_raw,
+        &attention.conv1d_weight,
+        &conv_states,
+        &a_raw,
+        &b_raw,
+        &attention.a_log,
+        &attention.dt_bias,
+        &mut query,
+        &mut key,
+        &mut value,
+        &mut g,
+        &mut beta,
+        &mut next_conv_states,
+        batch_len,
+        attention_shape.key_heads,
+        attention_shape.value_heads,
+        attention_shape.key_dim,
+        attention_shape.value_dim,
+        attention_shape.conv_kernel,
+        true,
+    )?;
+
+    let mut delta_core = B::alloc_typed(Dtype::F32, batch_len * value_total);
+    B::recurrent_gated_delta_rule_batch_f32(
+        ctx,
+        &query,
+        &key,
+        &value,
+        &g,
+        &beta,
+        &initial_delta_states,
+        &mut delta_core,
+        &mut final_delta_states,
+        batch_len,
+        attention_shape.key_heads,
+        attention_shape.value_heads,
+        attention_shape.key_dim,
+        attention_shape.value_dim,
+        false,
+        (attention_shape.key_dim as f32).sqrt().recip(),
+    )?;
+    let mut delta_norm = B::alloc_typed(Dtype::F32, batch_len * value_total);
+    B::gated_rms_norm_f32(
+        ctx,
+        &delta_core,
+        &z_raw,
+        &attention.norm_weight,
+        &mut delta_norm,
+        batch_len,
+        attention_shape.value_heads,
+        attention_shape.value_dim,
+        eps,
+    )?;
+    for (row, (cache_id, state)) in states.iter_mut().enumerate() {
+        let Qwen35LayerRuntimeState::Linear {
+            conv_state,
+            delta_state,
+        } = state.layers.get_mut(layer_index).ok_or_else(|| {
+            FerrumError::model(format!(
+                "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+            ))
+        })?
+        else {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch decode expected linear layer state at layer {layer_index} for {cache_id:?}"
+            )));
+        };
+        B::copy_slice(
+            ctx,
+            &next_conv_states,
+            row * conv_state_len,
+            conv_state,
+            0,
+            conv_state_len,
+        );
+        B::copy_slice(
+            ctx,
+            &final_delta_states,
+            row * delta_state_len,
+            delta_state,
+            0,
+            delta_state_len,
         );
     }
 
