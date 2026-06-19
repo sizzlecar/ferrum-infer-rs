@@ -1,0 +1,6 @@
+artifact=/workspace/artifacts/w3_qwen35_pagedkv_smoke_9c892bb0_20260619T162017Z
+2026-06-19T16:20:17Z
+repo=/workspace/ferrum-w3-qwen35-8cfa422c
+target_dir=/workspace/ferrum-w3-qwen35-ac98207/target
+model=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+dataset=/workspace/artifacts/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja/dataset/ascii_sharegpt_w3_100_58d5721d.jsonl

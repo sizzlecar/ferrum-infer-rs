@@ -1,0 +1,4 @@
+artifact=/workspace/artifacts/ferrum_w3_qwen35_argmax_smoke_8cfa422c_20260619T144246Z
+2026-06-19T14:42:46Z
+repo=/workspace/ferrum-w3-qwen35-8cfa422c
+target_dir=/workspace/ferrum-w3-qwen35-ac98207/target
