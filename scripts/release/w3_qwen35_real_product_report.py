@@ -893,7 +893,7 @@ def behavior_reasoning_extraction(
     payload = chat_payload(
         request_model,
         [{"role": "user", "content": "Think briefly, then answer: what is 1+1?"}],
-        max_tokens=128,
+        max_tokens=256,
         stream=False,
         enable_thinking=True,
     )
@@ -911,13 +911,17 @@ def behavior_reasoning_extraction(
     assert_no_bad_text("reasoning_extraction_content", content)
     if reasoning:
         assert_no_bad_text("reasoning_extraction_reasoning", reasoning)
-    passed = bool(reasoning and reasoning.strip()) and contains_number("2")(content)
+    leaked_think = "<think>" in content or "</think>" in content
+    answer_seen = contains_number("2")(content) or contains_number("2")(reasoning or "")
+    passed = bool(reasoning and reasoning.strip()) and answer_seen and not leaked_think
     return BehaviorCase(
         "reasoning_extraction",
         passed,
         artifact,
         {
             "content": content,
+            "answer_seen": answer_seen,
+            "leaked_think": leaked_think,
             "reasoning_len": len(reasoning or ""),
             "finish_reason": finish_reason,
         },
