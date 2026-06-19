@@ -1,0 +1,10 @@
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-clean/crates/ferrum-kernels)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.73s
+     Running tests/gated_delta_rule_cuda_eq.rs (/workspace/ferrum-w3-qwen35-ac98207/target/debug/deps/gated_delta_rule_cuda_eq-bd3a08764da2d735)
+
+running 2 tests
+test recurrent_gated_delta_rule_batch_cuda_matches_cpu_reference ... ok
+test recurrent_gated_delta_rule_cuda_matches_cpu_reference ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+

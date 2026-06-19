@@ -1,0 +1,1 @@
+cargo test -p ferrum-kernels --features cuda --test gated_delta_rule_cuda_eq -- --nocapture 

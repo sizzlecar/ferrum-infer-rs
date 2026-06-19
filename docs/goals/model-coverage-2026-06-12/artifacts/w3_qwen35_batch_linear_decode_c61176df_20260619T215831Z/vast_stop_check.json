@@ -1,0 +1,11 @@
+{
+  "captured_at_utc": "2026-06-19T22:09:26Z",
+  "id": 41422823,
+  "cur_state": "stopped",
+  "actual_status": "exited",
+  "intended_status": "stopped",
+  "gpu_name": "RTX 4090",
+  "num_gpus": 1,
+  "gpu_totalram": 49140,
+  "dph_total": 0.662962962962963
+}

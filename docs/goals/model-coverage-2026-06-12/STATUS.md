@@ -2,6 +2,86 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ32 — W3 Qwen35 batched linear-attention decode smoke PASS, batch scaling still blocked
+
+- Scope:
+  - targeted 1x Vast CUDA validation for commit
+    `c61176df perf(qwen35): batch linear attention decode state kernels`;
+  - replaces the Qwen35 linear-attention decode per-row compute loop with
+    backend batch APIs and CUDA batch kernels for decode preparation and
+    recurrent gated delta rule state updates;
+  - follows the vLLM direction of batched stateful decode work instead of
+    launching one tiny recurrent/prepare kernel sequence per request row;
+  - diagnostic bench ran only after CUDA parity tests and product correctness
+    passed;
+  - no W3 final PASS and no release-grade performance claim.
+- Local source validation before GPU:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-kernels -p ferrum-models --all-targets` PASS;
+  - `cargo test -p ferrum-kernels --test linear_attention_cpu -- --nocapture`
+    PASS: 4 tests;
+  - `cargo test -p ferrum-kernels --test gated_delta_rule_cpu -- --nocapture`
+    PASS: 3 tests;
+  - `cargo test -p ferrum-models linear_attention_decode_backend_matches_full_reference_last_token -- --nocapture`
+    PASS: 1 matched test;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS: 81 tests;
+  - `git diff --check` PASS.
+- GPU / lifecycle:
+  - Vast instance `41422823`, SSH `ssh7.vast.ai:22822`, was started only for
+    this targeted lane and stopped after artifact copyback;
+  - final stop check: `cur_state=stopped`, `actual_status=exited`;
+  - GPU: 1x `NVIDIA GeForce RTX 4090`, `49140 MiB` reported by `nvidia-smi`,
+    driver `580.126.09`, compute capability `8.9`;
+  - CUDA toolkit `12.4`, Rust `1.96.0`.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_batch_linear_decode_c61176df_20260619T215831Z`;
+  - smoke PASS line:
+    `W3 QWEN35 VLLM H256 SMOKE PASS: /workspace/artifacts/w3_qwen35_batch_linear_decode_c61176df_20260619T215831Z`;
+  - CUDA release build PASS, binary SHA256:
+    `af47b9fe3573f567a0fe5c63b3300d2931ae05ee1b2e80dfadcc755ef2f8e0c4`.
+- CUDA parity result:
+  - `cargo test -p ferrum-kernels --features cuda --test linear_attention_cuda_eq -- --nocapture`
+    PASS: 6 tests, including
+    `linear_attention_decode_prepare_batch_cuda_matches_cpu_reference`;
+  - `cargo test -p ferrum-kernels --features cuda --test gated_delta_rule_cuda_eq -- --nocapture`
+    PASS: 2 tests, including
+    `recurrent_gated_delta_rule_batch_cuda_matches_cpu_reference`.
+- Correctness result:
+  - `ferrum run` PASS; output:
+    `The mysterious ferrum-ok appears only in rare scientific texts.`;
+  - `ferrum serve` effective config selected `vllm_paged_attn_v2`, with
+    `FERRUM_USE_VLLM_PAGED_ATTN=1` and `FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0`;
+  - non-stream chat HTTP 200, content `The capital of France is Paris.`,
+    `finish_reason=stop`;
+  - stream chat HTTP 200, exactly one `[DONE]`, usage present, final
+    `finish_reason=stop`;
+  - required tool call HTTP 200, parsed `get_weather({"city":"Paris"})`,
+    `finish_reason=tool_calls`;
+  - strict structured output HTTP 200, content exactly
+    `{"answer":"scenario-ok"}`, `finish_reason=stop`;
+  - post-validation rejects `finish_reason=length`, missing tool calls,
+    malformed streams, duplicate `[DONE]`, and obvious repetition.
+- Diagnostic bench only:
+  - command used `bench-serve --dataset sharegpt --num-prompts 8
+    --n-repeats 1 --concurrency-sweep 1,32 --fail-on-error --seed 9271`;
+  - c=1: 8 completed / 0 errored / 26.1s, output throughput
+    `13.57 tok/s`, `output_token_count_source=usage`;
+  - c=32: 8 completed / 0 errored / 22.0s, output throughput
+    `16.03 tok/s`, `output_token_count_source=usage`;
+  - this is a bottleneck signal only (`n_repeats=1`, small prompt count), not
+    W3 performance evidence.
+- Interpretation / next work:
+  - the batched CUDA linear-attention decode kernels are correct and the product
+    smoke remains PASS;
+  - performance did not materially improve versus the previous diagnostic
+    (`14.5`/`15.3 tok/s`) and remains far below the vLLM 80% targets
+    (`107.5`/`1349.9 tok/s`);
+  - removing per-row compute kernels was necessary but not sufficient: the next
+    investigation should use profiler evidence around the outer decode step to
+    separate remaining Qwen35 state pack/copy cost, scheduler admission/step
+    behavior, logits/sampling work, and any serialization that prevents true
+    c=32 token-step batching.
+
 ## 2026-06-20 ZZZ31 — W3 Qwen35 argmax mask model-vocab smoke PASS, performance still blocked
 
 - Scope:
