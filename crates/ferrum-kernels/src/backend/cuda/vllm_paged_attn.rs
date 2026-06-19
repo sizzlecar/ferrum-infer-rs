@@ -35,7 +35,48 @@ extern "C" {
         stream: *mut std::ffi::c_void,
     );
 
+    fn ferrum_vllm_paged_attention_v1_f16_h256_b16(
+        out: *mut std::ffi::c_void,     // __half*
+        query: *const std::ffi::c_void, // const __half*
+        key_cache: *const std::ffi::c_void,
+        value_cache: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        block_tables: *const std::ffi::c_void,
+        seq_lens: *const std::ffi::c_void,
+        num_seqs: i32,
+        num_heads: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        max_seq_len: i32,
+        stream: *mut std::ffi::c_void,
+    );
+
     fn ferrum_vllm_paged_attention_v2_f16_h128_b16(
+        out: *mut std::ffi::c_void,        // __half*
+        exp_sums: *mut std::ffi::c_void,   // float*
+        max_logits: *mut std::ffi::c_void, // float*
+        tmp_out: *mut std::ffi::c_void,    // __half*
+        query: *const std::ffi::c_void,    // const __half*
+        key_cache: *const std::ffi::c_void,
+        value_cache: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        block_tables: *const std::ffi::c_void, // const int*
+        seq_lens: *const std::ffi::c_void,
+        num_seqs: i32,
+        num_heads: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        max_seq_len: i32,
+        stream: *mut std::ffi::c_void,
+    );
+
+    fn ferrum_vllm_paged_attention_v2_f16_h256_b16(
         out: *mut std::ffi::c_void,        // __half*
         exp_sums: *mut std::ffi::c_void,   // float*
         max_logits: *mut std::ffi::c_void, // float*
@@ -169,7 +210,8 @@ fn ensure_pa_scratch(
     );
 }
 
-/// Dispatch vLLM paged attention for the FP16 / HEAD=128 / BLOCK=16 shape.
+/// Dispatch vLLM paged attention for the FP16 / HEAD={128,256} / BLOCK=16
+/// shapes used by the Qwen3/Qwen3.5 CUDA lanes.
 /// K/V cache must already be in vLLM layout (see
 /// `split_qkv_norm_rope_into_paged_cache_varlen_vllm_f16`).
 ///
@@ -195,9 +237,9 @@ pub fn dispatch_paged_attention_v2(
     max_seq_len: usize,
 ) -> Result<()> {
     const PARTITION_SIZE: usize = 512;
-    if head_dim != 128 {
+    if !matches!(head_dim, 128 | 256) {
         return Err(FerrumError::unsupported(format!(
-            "vllm paged_attn_v2: only head_dim=128 instantiated, got {head_dim}"
+            "vllm paged_attn_v2: only head_dim=128/256 instantiated, got {head_dim}"
         )));
     }
     if block_size != 16 {
@@ -223,24 +265,45 @@ pub fn dispatch_paged_attention_v2(
             let (v_dp, _v_recs) = v_cache.device_ptr(stream);
             let (bt_dp, _bt_recs) = block_tables.device_ptr(stream);
             let (sl_dp, _sl_recs) = seq_lens.device_ptr(stream);
-            ferrum_vllm_paged_attention_v1_f16_h128_b16(
-                out_dp as *mut std::ffi::c_void,
-                q_dp as *const std::ffi::c_void,
-                k_dp as *const std::ffi::c_void,
-                v_dp as *const std::ffi::c_void,
-                num_kv_heads as i32,
-                scale,
-                bt_dp as *const std::ffi::c_void,
-                sl_dp as *const std::ffi::c_void,
-                num_seqs as i32,
-                num_heads as i32,
-                max_num_blocks_per_seq as i32,
-                q_stride,
-                kv_block_stride,
-                kv_head_stride,
-                max_seq_len as i32,
-                raw_stream,
-            );
+            if head_dim == 128 {
+                ferrum_vllm_paged_attention_v1_f16_h128_b16(
+                    out_dp as *mut std::ffi::c_void,
+                    q_dp as *const std::ffi::c_void,
+                    k_dp as *const std::ffi::c_void,
+                    v_dp as *const std::ffi::c_void,
+                    num_kv_heads as i32,
+                    scale,
+                    bt_dp as *const std::ffi::c_void,
+                    sl_dp as *const std::ffi::c_void,
+                    num_seqs as i32,
+                    num_heads as i32,
+                    max_num_blocks_per_seq as i32,
+                    q_stride,
+                    kv_block_stride,
+                    kv_head_stride,
+                    max_seq_len as i32,
+                    raw_stream,
+                );
+            } else {
+                ferrum_vllm_paged_attention_v1_f16_h256_b16(
+                    out_dp as *mut std::ffi::c_void,
+                    q_dp as *const std::ffi::c_void,
+                    k_dp as *const std::ffi::c_void,
+                    v_dp as *const std::ffi::c_void,
+                    num_kv_heads as i32,
+                    scale,
+                    bt_dp as *const std::ffi::c_void,
+                    sl_dp as *const std::ffi::c_void,
+                    num_seqs as i32,
+                    num_heads as i32,
+                    max_num_blocks_per_seq as i32,
+                    q_stride,
+                    kv_block_stride,
+                    kv_head_stride,
+                    max_seq_len as i32,
+                    raw_stream,
+                );
+            }
         }
         return Ok(());
     }
@@ -277,27 +340,51 @@ pub fn dispatch_paged_attention_v2(
         // u64 is the raw device address. Cast u64 → typed pointer directly
         // (the intermediate `as *const _` form fails to infer the element
         // type when the destination is `*const c_void`).
-        ferrum_vllm_paged_attention_v2_f16_h128_b16(
-            out_dp as *mut std::ffi::c_void,
-            es_dp as *mut std::ffi::c_void,
-            ml_dp as *mut std::ffi::c_void,
-            to_dp as *mut std::ffi::c_void,
-            q_dp as *const std::ffi::c_void,
-            k_dp as *const std::ffi::c_void,
-            v_dp as *const std::ffi::c_void,
-            num_kv_heads as i32,
-            scale,
-            bt_dp as *const std::ffi::c_void,
-            sl_dp as *const std::ffi::c_void,
-            num_seqs as i32,
-            num_heads as i32,
-            max_num_blocks_per_seq as i32,
-            q_stride,
-            kv_block_stride,
-            kv_head_stride,
-            max_seq_len as i32,
-            raw_stream,
-        );
+        if head_dim == 128 {
+            ferrum_vllm_paged_attention_v2_f16_h128_b16(
+                out_dp as *mut std::ffi::c_void,
+                es_dp as *mut std::ffi::c_void,
+                ml_dp as *mut std::ffi::c_void,
+                to_dp as *mut std::ffi::c_void,
+                q_dp as *const std::ffi::c_void,
+                k_dp as *const std::ffi::c_void,
+                v_dp as *const std::ffi::c_void,
+                num_kv_heads as i32,
+                scale,
+                bt_dp as *const std::ffi::c_void,
+                sl_dp as *const std::ffi::c_void,
+                num_seqs as i32,
+                num_heads as i32,
+                max_num_blocks_per_seq as i32,
+                q_stride,
+                kv_block_stride,
+                kv_head_stride,
+                max_seq_len as i32,
+                raw_stream,
+            );
+        } else {
+            ferrum_vllm_paged_attention_v2_f16_h256_b16(
+                out_dp as *mut std::ffi::c_void,
+                es_dp as *mut std::ffi::c_void,
+                ml_dp as *mut std::ffi::c_void,
+                to_dp as *mut std::ffi::c_void,
+                q_dp as *const std::ffi::c_void,
+                k_dp as *const std::ffi::c_void,
+                v_dp as *const std::ffi::c_void,
+                num_kv_heads as i32,
+                scale,
+                bt_dp as *const std::ffi::c_void,
+                sl_dp as *const std::ffi::c_void,
+                num_seqs as i32,
+                num_heads as i32,
+                max_num_blocks_per_seq as i32,
+                q_stride,
+                kv_block_stride,
+                kv_head_stride,
+                max_seq_len as i32,
+                raw_stream,
+            );
+        }
     }
     Ok(())
 }

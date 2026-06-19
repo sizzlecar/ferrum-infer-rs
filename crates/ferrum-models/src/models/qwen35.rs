@@ -52,6 +52,7 @@ pub struct Qwen35BackendModel<B: MoeLlmBackend> {
     pub sequences: HashMap<String, Qwen35SequenceState<B>>,
     pub kv_capacity: usize,
     pub use_paged_kv: bool,
+    pub use_vllm_paged_attn: bool,
     pub paged_pools: Option<Vec<(B::Buffer, B::Buffer)>>,
     pub paged_block_alloc: Option<std::sync::Mutex<BlockAllocator>>,
     pub paged_max_seqs: usize,
@@ -793,6 +794,10 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             && B::supports_varlen_qkv()
             && B::supports_qwen35_paged_qkv()
             && qwen35_runtime_bool(&snapshot, "FERRUM_METAL_PAGED_KV").unwrap_or(true);
+        let use_vllm_paged_attn = use_paged_kv
+            && qwen35_runtime_bool(&snapshot, "FERRUM_USE_VLLM_PAGED_ATTN").unwrap_or(false)
+            && B::supports_vllm_paged_attn()
+            && B::supports_qwen35_paged_qkv_vllm();
         let paged_max_seqs = qwen35_paged_max_seqs(&snapshot);
         let paged_max_blocks_per_seq = kv_capacity.div_ceil(QWEN35_PAGED_BLOCK_SIZE);
         Ok(Self {
@@ -803,6 +808,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             sequences: HashMap::new(),
             kv_capacity,
             use_paged_kv,
+            use_vllm_paged_attn,
             paged_pools: None,
             paged_block_alloc: None,
             paged_max_seqs,
@@ -1164,6 +1170,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                         layer,
                         rope,
                         &weights.config,
+                        self.use_vllm_paged_attn,
                         tokens_len,
                         eps,
                         residual_f32.as_mut(),
@@ -1403,6 +1410,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                         layer,
                         rope,
                         &weights.config,
+                        self.use_vllm_paged_attn,
                         eps,
                         residual_f32.as_mut(),
                         branch_f32.as_mut(),
@@ -4046,6 +4054,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
     layer: &Qwen35LayerWeights<B>,
     rope: &Qwen35BackendRopeCache<B>,
     config: &Qwen35TextConfig,
+    use_vllm_paged_attn: bool,
     eps: f32,
     mut residual_f32: Option<&mut B::Buffer>,
     mut branch_f32: Option<&mut B::Buffer>,
@@ -4174,43 +4183,83 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
             attn_output_gate: config.attn_output_gate,
         };
         attention_shape.validate()?;
-        B::qwen35_split_qkv_norm_rope_into_paged_cache_varlen(
-            ctx,
-            &query_raw,
-            &key_raw,
-            &value_raw,
-            &attention.q_norm_weight,
-            &attention.k_norm_weight,
-            &rope.cos,
-            &rope.sin,
-            q_buf,
-            &mut pool.0,
-            &mut pool.1,
-            cu_buf,
-            pos_buf,
-            bt_buf,
-            batch_len,
-            batch_len,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
-            attention_shape.rope_dim,
-            q_proj_total,
-            if attention_shape.attn_output_gate {
-                2 * config.head_dim
-            } else {
-                config.head_dim
-            },
-            kv_total,
-            eps,
-            if attention_shape.rope_interleaved {
-                3
-            } else {
-                1
-            },
-            block_size,
-            max_blocks_per_seq,
-        )?;
+        if use_vllm_paged_attn {
+            B::qwen35_split_qkv_norm_rope_into_paged_cache_varlen_vllm(
+                ctx,
+                &query_raw,
+                &key_raw,
+                &value_raw,
+                &attention.q_norm_weight,
+                &attention.k_norm_weight,
+                &rope.cos,
+                &rope.sin,
+                q_buf,
+                &mut pool.0,
+                &mut pool.1,
+                cu_buf,
+                pos_buf,
+                bt_buf,
+                batch_len,
+                batch_len,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                attention_shape.rope_dim,
+                q_proj_total,
+                if attention_shape.attn_output_gate {
+                    2 * config.head_dim
+                } else {
+                    config.head_dim
+                },
+                kv_total,
+                eps,
+                if attention_shape.rope_interleaved {
+                    3
+                } else {
+                    1
+                },
+                block_size,
+                max_blocks_per_seq,
+            )?;
+        } else {
+            B::qwen35_split_qkv_norm_rope_into_paged_cache_varlen(
+                ctx,
+                &query_raw,
+                &key_raw,
+                &value_raw,
+                &attention.q_norm_weight,
+                &attention.k_norm_weight,
+                &rope.cos,
+                &rope.sin,
+                q_buf,
+                &mut pool.0,
+                &mut pool.1,
+                cu_buf,
+                pos_buf,
+                bt_buf,
+                batch_len,
+                batch_len,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                attention_shape.rope_dim,
+                q_proj_total,
+                if attention_shape.attn_output_gate {
+                    2 * config.head_dim
+                } else {
+                    config.head_dim
+                },
+                kv_total,
+                eps,
+                if attention_shape.rope_interleaved {
+                    3
+                } else {
+                    1
+                },
+                block_size,
+                max_blocks_per_seq,
+            )?;
+        }
         for (_, state) in states.iter_mut() {
             let Qwen35LayerRuntimeState::Full { kv } =
                 state.layers.get_mut(layer_index).ok_or_else(|| {
@@ -4229,22 +4278,41 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
             }
         }
         let max_kv_len = context_lens.iter().copied().max().unwrap_or(1) as usize;
-        B::paged_batched_decode_attention(
-            ctx,
-            q_buf,
-            &pool.0,
-            &pool.1,
-            out_buf,
-            bt_buf,
-            lens_buf,
-            batch_len,
-            max_kv_len,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
-            block_size,
-            max_blocks_per_seq,
-        )?;
+        if use_vllm_paged_attn {
+            B::paged_decode_attention_v2(
+                ctx,
+                q_buf,
+                &pool.0,
+                &pool.1,
+                out_buf,
+                bt_buf,
+                lens_buf,
+                batch_len,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                block_size,
+                max_blocks_per_seq,
+                max_kv_len,
+            )?;
+        } else {
+            B::paged_batched_decode_attention(
+                ctx,
+                q_buf,
+                &pool.0,
+                &pool.1,
+                out_buf,
+                bt_buf,
+                lens_buf,
+                batch_len,
+                max_kv_len,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                block_size,
+                max_blocks_per_seq,
+            )?;
+        }
         let mut context = B::alloc(batch_len * q_total);
         B::copy_slice(ctx, out_buf, 0, &mut context, 0, batch_len * q_total);
         if attention_shape.attn_output_gate {
@@ -4838,6 +4906,7 @@ fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend + BackendPagedK
     layer: &Qwen35LayerWeights<B>,
     rope: &Qwen35BackendRopeCache<B>,
     config: &Qwen35TextConfig,
+    use_vllm_paged_attn: bool,
     tokens: usize,
     eps: f32,
     mut residual_f32: Option<&mut B::Buffer>,
@@ -4980,63 +5049,124 @@ fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend + BackendPagedK
         }
         let q_buf = scratch.q.as_mut().expect("qwen35 paged q missing");
         let out_buf = scratch.out.as_mut().expect("qwen35 paged out missing");
-        B::qwen35_split_qkv_norm_rope_into_paged_cache_varlen(
-            ctx,
-            &query_raw,
-            &key_raw,
-            &value_raw,
-            &attention.q_norm_weight,
-            &attention.k_norm_weight,
-            &rope.cos,
-            &rope.sin,
-            q_buf,
-            &mut pool.0,
-            &mut pool.1,
-            cu_buf,
-            pos_buf,
-            bt_buf,
-            1,
-            tokens,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
-            attention_shape.rope_dim,
-            q_proj_total,
-            if attention_shape.attn_output_gate {
-                2 * config.head_dim
-            } else {
-                config.head_dim
-            },
-            kv_total,
-            eps,
-            if attention_shape.rope_interleaved {
-                3
-            } else {
-                1
-            },
-            block_size,
-            max_blocks_per_seq,
-        )?;
+        if use_vllm_paged_attn {
+            B::qwen35_split_qkv_norm_rope_into_paged_cache_varlen_vllm(
+                ctx,
+                &query_raw,
+                &key_raw,
+                &value_raw,
+                &attention.q_norm_weight,
+                &attention.k_norm_weight,
+                &rope.cos,
+                &rope.sin,
+                q_buf,
+                &mut pool.0,
+                &mut pool.1,
+                cu_buf,
+                pos_buf,
+                bt_buf,
+                1,
+                tokens,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                attention_shape.rope_dim,
+                q_proj_total,
+                if attention_shape.attn_output_gate {
+                    2 * config.head_dim
+                } else {
+                    config.head_dim
+                },
+                kv_total,
+                eps,
+                if attention_shape.rope_interleaved {
+                    3
+                } else {
+                    1
+                },
+                block_size,
+                max_blocks_per_seq,
+            )?;
+        } else {
+            B::qwen35_split_qkv_norm_rope_into_paged_cache_varlen(
+                ctx,
+                &query_raw,
+                &key_raw,
+                &value_raw,
+                &attention.q_norm_weight,
+                &attention.k_norm_weight,
+                &rope.cos,
+                &rope.sin,
+                q_buf,
+                &mut pool.0,
+                &mut pool.1,
+                cu_buf,
+                pos_buf,
+                bt_buf,
+                1,
+                tokens,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                attention_shape.rope_dim,
+                q_proj_total,
+                if attention_shape.attn_output_gate {
+                    2 * config.head_dim
+                } else {
+                    config.head_dim
+                },
+                kv_total,
+                eps,
+                if attention_shape.rope_interleaved {
+                    3
+                } else {
+                    1
+                },
+                block_size,
+                max_blocks_per_seq,
+            )?;
+        }
         kv.len += tokens;
-        B::paged_varlen_attention(
-            ctx,
-            q_buf,
-            &pool.0,
-            &pool.1,
-            out_buf,
-            cu_buf,
-            pos_buf,
-            bt_buf,
-            1,
-            tokens,
-            kv.len,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
-            0,
-            block_size,
-            max_blocks_per_seq,
-        )?;
+        if use_vllm_paged_attn {
+            B::paged_varlen_attention_vllm(
+                ctx,
+                q_buf,
+                &pool.0,
+                &pool.1,
+                out_buf,
+                cu_buf,
+                pos_buf,
+                bt_buf,
+                1,
+                tokens,
+                kv.len,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                block_size,
+                max_blocks_per_seq,
+            )?;
+        } else {
+            B::paged_varlen_attention(
+                ctx,
+                q_buf,
+                &pool.0,
+                &pool.1,
+                out_buf,
+                cu_buf,
+                pos_buf,
+                bt_buf,
+                1,
+                tokens,
+                kv.len,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                0,
+                block_size,
+                max_blocks_per_seq,
+            )?;
+        }
         let mut context = B::alloc(tokens * q_total);
         B::copy_slice(ctx, out_buf, 0, &mut context, 0, tokens * q_total);
         if attention_shape.attn_output_gate {
