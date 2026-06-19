@@ -46,10 +46,11 @@ impl EngineInner {
                         .tokenizer
                         .encode(&scheduled_req.request.prompt, true)
                         .unwrap_or_else(|_| vec![TokenId::new(0)]);
-                    SequenceState::new_with_tokenizer(
+                    SequenceState::new_with_tokenizer_and_model_vocab_size(
                         scheduled_req.request.clone(),
                         input_tokens,
                         Some(self.tokenizer.clone()),
+                        Some(self.model_executor.info().vocab_size),
                     )
                 });
                 if !seq.prefill_complete {
@@ -123,10 +124,11 @@ impl EngineInner {
                         .tokenizer
                         .encode(&scheduled_req.request.prompt, true)
                         .unwrap_or_else(|_| vec![TokenId::new(0)]);
-                    SequenceState::new_with_tokenizer(
+                    SequenceState::new_with_tokenizer_and_model_vocab_size(
                         scheduled_req.request.clone(),
                         input_tokens,
                         Some(self.tokenizer.clone()),
+                        Some(self.model_executor.info().vocab_size),
                     )
                 });
                 if !seq.prefill_complete {

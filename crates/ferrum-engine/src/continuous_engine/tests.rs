@@ -535,6 +535,48 @@ fn model_decode_metadata_keeps_sampling_masks_on_model_argmax_path() {
 }
 
 #[test]
+fn model_decode_argmax_mask_uses_model_vocab_for_extended_stop_tokens() {
+    let mut tok = PolicyTokenizer::new(
+        4,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("ok", 3),
+            ("<pad>", 4),
+            ("<|im_end|>", 5),
+        ],
+    );
+    tok.special.eos_token = Some(TokenId::new(5));
+    tok.special.pad_token = Some(TokenId::new(4));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tok);
+
+    let state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        policy_request(),
+        vec![TokenId::new(0)],
+        Some(tokenizer),
+        Some(6),
+    );
+
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+        repetition_penalty: None,
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("plain greedy decode should use a model-side argmax policy");
+    };
+    assert_eq!(mask.len(), 6);
+    assert_eq!(
+        mask.valid_token_mask[5], 1,
+        "extended EOS must remain selectable"
+    );
+    assert_eq!(
+        mask.valid_token_mask[4], 0,
+        "unallowed extended PAD must stay masked"
+    );
+}
+
+#[test]
 fn model_decode_logits_policy_keeps_repetition_penalty_on_greedy_argmax_path() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         4,

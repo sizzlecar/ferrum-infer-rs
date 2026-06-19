@@ -310,18 +310,36 @@ fn resolve_sampling_token_constraints(
 
 fn build_argmax_token_mask(
     tok: &(dyn Tokenizer + Send + Sync),
+    model_vocab_size: Option<usize>,
     forbidden_token_ids: &HashSet<u32>,
     initial_forbidden_token_ids: &HashSet<u32>,
     stop_token_ids: &HashSet<u32>,
     allowed_extended_token_ids: &HashSet<u32>,
 ) -> TokenSelectionMask {
-    let mut valid = vec![1i8; tok.vocab_size()];
+    let tokenizer_vocab_size = tok.vocab_size();
+    let max_allowed_id = allowed_extended_token_ids
+        .iter()
+        .chain(stop_token_ids.iter())
+        .copied()
+        .max()
+        .map(|id| id as usize + 1)
+        .unwrap_or(0);
+    let mask_len = model_vocab_size
+        .unwrap_or(tokenizer_vocab_size)
+        .max(tokenizer_vocab_size)
+        .max(max_allowed_id);
+    let mut valid = vec![1i8; mask_len];
     for &token_id in forbidden_token_ids
         .iter()
         .chain(initial_forbidden_token_ids.iter())
     {
         if let Some(slot) = valid.get_mut(token_id as usize) {
             *slot = 0;
+        }
+    }
+    for token_id in tokenizer_vocab_size..mask_len {
+        if !allowed_extended_token_ids.contains(&(token_id as u32)) {
+            valid[token_id] = 0;
         }
     }
     for &token_id in allowed_extended_token_ids {
@@ -639,6 +657,15 @@ impl SequenceState {
         input_tokens: Vec<TokenId>,
         tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
     ) -> Self {
+        Self::new_with_tokenizer_and_model_vocab_size(request, input_tokens, tokenizer, None)
+    }
+
+    pub fn new_with_tokenizer_and_model_vocab_size(
+        request: InferenceRequest,
+        input_tokens: Vec<TokenId>,
+        tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
+        model_vocab_size: Option<usize>,
+    ) -> Self {
         use ferrum_types::ResponseFormat;
         let rng = request
             .sampling_params
@@ -708,6 +735,7 @@ impl SequenceState {
         let argmax_token_mask = tokenizer.as_deref().map(|tok| {
             build_argmax_token_mask(
                 tok,
+                model_vocab_size,
                 &forbidden_token_ids,
                 &empty_initial_forbidden,
                 &stop_token_ids,
@@ -720,6 +748,7 @@ impl SequenceState {
             tokenizer.as_deref().map(|tok| {
                 build_argmax_token_mask(
                     tok,
+                    model_vocab_size,
                     &forbidden_token_ids,
                     &initial_forbidden_token_ids,
                     &stop_token_ids,
@@ -1626,10 +1655,11 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
 
         // Create sequence state with oneshot channel
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let mut seq_state = SequenceState::new_with_tokenizer(
+        let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
             request,
             input_tokens,
             Some(self.inner.tokenizer.clone()),
+            Some(self.inner.model_executor.info().vocab_size),
         );
         seq_state.response_sender = Some(resp_tx);
         self.inner
@@ -1697,10 +1727,11 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         self.inner.scheduler.submit(request.clone()).await?;
 
         // Create sequence state with stream sender
-        let mut seq_state = SequenceState::new_with_tokenizer(
+        let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
             request,
             input_tokens,
             Some(self.inner.tokenizer.clone()),
+            Some(self.inner.model_executor.info().vocab_size),
         );
         seq_state.stream_sender = Some(tx);
         self.inner
