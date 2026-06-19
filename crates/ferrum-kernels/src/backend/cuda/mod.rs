@@ -1209,7 +1209,7 @@ impl Backend for CudaBackend {
             let n_i32 = n as i32;
             let mask_len_i32 = mask_len as i32;
             let mut b = stream.launch_builder(&func);
-            b.arg(&mut *logits);
+            b.arg(logits);
             b.arg(&n_i32);
             b.arg(valid_token_mask);
             b.arg(&mask_len_i32);
@@ -1255,7 +1255,7 @@ impl Backend for CudaBackend {
             let n_i32 = n as i32;
             let total_i32 = total_token_ids as i32;
             let mut b = ctx.stream.launch_builder(&func);
-            b.arg(logits);
+            b.arg(&mut *logits);
             b.arg(&n_i32);
             b.arg(row_offsets);
             b.arg(token_ids);
