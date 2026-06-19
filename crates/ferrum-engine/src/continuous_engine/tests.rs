@@ -805,6 +805,31 @@ fn sample_masks_unknown_pad_reserved_and_bos_tokens() {
 }
 
 #[test]
+fn sample_masks_tokenizer_vocab_holes() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        12,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("</s>", 3),
+            ("<pad>", 4),
+            ("ok", 6),
+        ],
+    ));
+    let mut state =
+        SequenceState::new_with_tokenizer(policy_request(), vec![TokenId::new(0)], Some(tokenizer));
+    let mut logits = vec![0.0f32; 12];
+    logits[11] = 100.0;
+    logits[6] = 1.0;
+
+    let token = state.sample_with_processors(&mut logits).unwrap();
+
+    assert_eq!(token.get(), 6);
+    assert_eq!(logits[11], f32::NEG_INFINITY);
+}
+
+#[test]
 fn sample_resamples_candidate_that_would_flush_replacement_char() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         8,

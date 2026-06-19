@@ -77,6 +77,7 @@ pub struct Qwen35RopeParameters {
     pub rope_theta: f64,
     pub partial_rotary_factor: f32,
     pub mrope_interleaved: bool,
+    pub mrope_section: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -374,6 +375,10 @@ impl Qwen35TextConfig {
         ((self.head_dim as f32) * self.rope_parameters.partial_rotary_factor).round() as usize
     }
 
+    pub fn full_attention_text_rope_interleaved(&self) -> bool {
+        self.rope_parameters.mrope_interleaved && self.rope_parameters.mrope_section.is_none()
+    }
+
     /// Per-layer causal-convolution recurrent state shape, excluding the request slot.
     ///
     /// vLLM stores Qwen GDN convolution state before the temporal DeltaNet state.
@@ -491,6 +496,21 @@ impl Qwen35TextConfig {
                 self.head_dim
             ));
         }
+        if let Some(section) = &self.rope_parameters.mrope_section {
+            if section.len() != 2 && section.len() != 3 {
+                return Err(format!(
+                    "mrope_section length must be 2 or 3, got {}",
+                    section.len()
+                ));
+            }
+            let section_sum: usize = section.iter().sum();
+            if section_sum != rope_dim / 2 {
+                return Err(format!(
+                    "mrope_section sum {section_sum} must equal rope_dim/2 {}",
+                    rope_dim / 2
+                ));
+            }
+        }
         if let Some(moe) = &self.moe {
             if moe.num_experts_per_tok > moe.num_experts {
                 return Err(format!(
@@ -542,11 +562,33 @@ fn parse_rope_parameters(
         })
         .or_else(|| root.get("mrope_interleaved").and_then(Value::as_bool))
         .unwrap_or(false);
+    let mrope_section = rope_obj
+        .and_then(|obj| obj.get("mrope_section"))
+        .or_else(|| text_config.get("mrope_section"))
+        .or_else(|| root.get("mrope_section"))
+        .map(parse_usize_array)
+        .transpose()?;
     Ok(Qwen35RopeParameters {
         rope_theta,
         partial_rotary_factor,
         mrope_interleaved,
+        mrope_section,
     })
+}
+
+fn parse_usize_array(value: &Value) -> Result<Vec<usize>, String> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| "mrope_section must be an array".to_string())?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .map(|value| value as usize)
+                .ok_or_else(|| "mrope_section entries must be unsigned integers".to_string())
+        })
+        .collect()
 }
 
 fn required_string(map: &serde_json::Map<String, Value>, key: &str) -> Result<String, String> {
@@ -678,8 +720,8 @@ fn sparse_moe_weight_specs(layer_prefix: &str) -> Vec<Qwen35WeightSpec> {
             "mlp.shared_expert.down_proj.weight",
             true,
         ),
-        ("moe_fused_gate_up_proj", "mlp.experts.gate_up_proj", true),
-        ("moe_fused_down_proj", "mlp.experts.down_proj", true),
+        ("moe_fused_gate_up_proj", "mlp.experts.gate_up_proj", false),
+        ("moe_fused_down_proj", "mlp.experts.down_proj", false),
         (
             "moe_per_expert_gate_proj",
             "mlp.experts.*.gate_proj.weight",
@@ -693,6 +735,21 @@ fn sparse_moe_weight_specs(layer_prefix: &str) -> Vec<Qwen35WeightSpec> {
         (
             "moe_per_expert_down_proj",
             "mlp.experts.*.down_proj.weight",
+            false,
+        ),
+        (
+            "moe_per_expert_gate_proj_qweight",
+            "mlp.experts.*.gate_proj.qweight",
+            false,
+        ),
+        (
+            "moe_per_expert_up_proj_qweight",
+            "mlp.experts.*.up_proj.qweight",
+            false,
+        ),
+        (
+            "moe_per_expert_down_proj_qweight",
+            "mlp.experts.*.down_proj.qweight",
             false,
         ),
     ]

@@ -149,16 +149,20 @@ pub unsafe fn launch_marlin_mm_f16_u4b8(
 /// tile format** (NOT IST-DASLab Marlin format). For each expert we
 /// repack the raw GPTQ qweight via `ferrum_vllm_gptq_marlin_repack`
 /// and concatenate into one stacked buffer. Scales are concatenated
-/// as-is (raw GPTQ); vLLM's marlin kernel reads them without a
-/// permute step in the sym/no-act-order path.
+/// after the same Marlin scale permutation used by the vLLM kernel.
+/// Asymmetric GPTQ qzeros are converted from AutoGPTQ's packed
+/// `zero - 1` encoding into packed runtime zero-points while preserving
+/// the kernel's `[groups, N/8]` zero-point layout.
 ///
 /// Caller-side per-expert input:
 ///   qweights[e]: `[K/8, N]` i32 (GPTQ on-disk, sym=true)
 ///   scales[e]:   `[K/G, N]` f32 (NativeSafetensorsLoader format)
+///   qzeros[e]:   `[K/G, N/8]` i32 (GPTQ on-disk, packed `zero - 1`)
 pub fn load_stacked_gptq_vllm_marlin(
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     qweights: &[&[i32]],
     scales_f32: &[&[f32]],
+    qzeros: &[&[i32]],
     bits: u32,
     group_size: usize,
     k: usize,
@@ -170,16 +174,28 @@ pub fn load_stacked_gptq_vllm_marlin(
         )));
     }
     let num_experts = qweights.len();
-    if num_experts == 0 || scales_f32.len() != num_experts {
+    if num_experts == 0 || scales_f32.len() != num_experts || qzeros.len() != num_experts {
         return Err(candle_core::Error::Msg(format!(
-            "vLLM stacked Marlin: shape mismatch qw={} sc={}",
+            "vLLM stacked Marlin: shape mismatch qw={} sc={} qz={}",
             num_experts,
-            scales_f32.len()
+            scales_f32.len(),
+            qzeros.len()
+        )));
+    }
+    if group_size == 0 || k % group_size != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "vLLM stacked Marlin: K={k} not divisible by group_size={group_size}"
+        )));
+    }
+    if n_per_expert % 8 != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "vLLM stacked Marlin: N={n_per_expert} must be divisible by 8 for INT4 qzeros"
         )));
     }
     let qw_per = (k / 8) * n_per_expert;
     let groups = k / group_size;
     let sc_per = groups * n_per_expert;
+    let qz_per = groups * (n_per_expert / 8);
 
     let total_qw = num_experts * qw_per;
     let total_sc = num_experts * sc_per;
@@ -231,6 +247,12 @@ pub fn load_stacked_gptq_vllm_marlin(
                 scales_f32[e].len()
             )));
         }
+        if qzeros[e].len() != qz_per {
+            return Err(candle_core::Error::Msg(format!(
+                "vLLM stacked Marlin: qzeros[{e}].len()={} expected {qz_per}",
+                qzeros[e].len()
+            )));
+        }
         // Per-expert: convert to f16 then apply IST-DASLab Marlin scale
         // permutation. The vLLM marlin_template.h kernel reads scales
         // through a fragment-pattern shared-memory load (s_sh_rd) — same
@@ -249,6 +271,25 @@ pub fn load_stacked_gptq_vllm_marlin(
         .clone_htod(sc_flat_f16.as_slice())
         .map_err(|err| candle_core::Error::Msg(format!("htod stacked scales: {err}")))?;
 
+    let has_asymmetric_qzeros = qzeros.iter().any(|qz| !gptq_qzeros_are_symmetric_code7(qz));
+    let qzeros_dev = if has_asymmetric_qzeros {
+        let mut qz_flat: Vec<i32> = Vec::with_capacity(num_experts * qz_per);
+        for (e, qz) in qzeros.iter().enumerate() {
+            let qz_repacked = repack_gptq_qzeros_to_marlin(qz, k, n_per_expert, group_size)
+                .map_err(|err| {
+                    candle_core::Error::Msg(format!("vLLM stacked Marlin qzeros[{e}]: {err}"))
+                })?;
+            qz_flat.extend(qz_repacked);
+        }
+        Some(
+            stream
+                .clone_htod(qz_flat.as_slice())
+                .map_err(|err| candle_core::Error::Msg(format!("htod stacked qzeros: {err}")))?,
+        )
+    } else {
+        None
+    };
+
     // Workspace: stacked across experts. IST-DASLab uses ceil(N/min_thread_n=64) ×
     // max_par lock slots. We mirror that and multiply by num_experts so
     // marlin_zero_stacked_workspace can clear per-expert tiles.
@@ -265,12 +306,68 @@ pub fn load_stacked_gptq_vllm_marlin(
     Ok(crate::marlin::MarlinWeight {
         qweight: qw_out,
         scales: sc_dev,
+        qzeros: qzeros_dev,
         workspace,
         k,
         n: n_per_expert * num_experts, // stacked N (per-expert tiles concatenated)
         group_size: group_size as i32,
+        vllm_moe: true,
         perm: None,
     })
+}
+
+pub(crate) fn gptq_qzeros_are_symmetric_code7(qzeros: &[i32]) -> bool {
+    !qzeros.is_empty()
+        && qzeros.iter().all(|&word| {
+            let word = word as u32;
+            (0..8).all(|i| ((word >> (i * 4)) & 0xF) == 7)
+        })
+}
+
+pub(crate) fn repack_gptq_qzeros_to_marlin(
+    qzeros: &[i32],
+    k: usize,
+    n: usize,
+    group_size: usize,
+) -> candle_core::Result<Vec<i32>> {
+    if group_size == 0 || k % group_size != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "K={k} not divisible by group_size={group_size}"
+        )));
+    }
+    if n % 8 != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "N={n} must be divisible by 8 for INT4 qzeros"
+        )));
+    }
+    let groups = k / group_size;
+    let qz_per = groups * (n / 8);
+    if qzeros.len() != qz_per {
+        return Err(candle_core::Error::Msg(format!(
+            "qzeros len={} expected {qz_per} for groups={groups} N={n}",
+            qzeros.len()
+        )));
+    }
+    let packed_cols = n / 8;
+    let mut packed = vec![0i32; qz_per];
+    for group in 0..groups {
+        for packed_col in 0..packed_cols {
+            let word = qzeros[group * packed_cols + packed_col] as u32;
+            let mut out_word = 0u32;
+            for lane in 0..8 {
+                let raw = ((word >> (lane * 4)) & 0xF) as u8;
+                if raw == 15 {
+                    return Err(candle_core::Error::Msg(format!(
+                        "qzeros group={group} packed_col={packed_col} lane={lane} has code 15; \
+                         AutoGPTQ zero+1 would exceed INT4 range"
+                    )));
+                }
+                out_word |= ((raw + 1) as u32) << (lane * 4);
+            }
+            packed[group * packed_cols + packed_col] = out_word as i32;
+        }
+    }
+    Ok(packed)
 }
 
 /// Safe wrapper for the GPTQ → vLLM-Marlin repack. Allocates an output
@@ -310,4 +407,43 @@ pub fn vllm_gptq_marlin_repack(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gptq_qzeros_are_symmetric_code7, repack_gptq_qzeros_to_marlin};
+
+    #[test]
+    fn qzeros_code7_detects_symmetric_gptq() {
+        assert!(gptq_qzeros_are_symmetric_code7(&[0x7777_7777]));
+        assert!(!gptq_qzeros_are_symmetric_code7(&[0x7777_7778]));
+        assert!(!gptq_qzeros_are_symmetric_code7(&[]));
+    }
+
+    #[test]
+    fn qzeros_code8_repack_converts_to_actual_zero_point_9() {
+        let qzeros = vec![0x8888_8888u32 as i32; 8];
+        let packed = repack_gptq_qzeros_to_marlin(&qzeros, 128, 64, 128).unwrap();
+        assert_eq!(packed, vec![0x9999_9999u32 as i32; 8]);
+    }
+
+    #[test]
+    fn qzeros_repack_preserves_kernel_layout() {
+        let actual = [1u8, 2, 3, 4, 5, 6, 7, 8, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut qzeros = vec![0i32; 8];
+        for packed_col in 0..2 {
+            let mut word = 0u32;
+            for lane in 0..8 {
+                let raw = actual[packed_col * 8 + lane] - 1;
+                word |= (raw as u32) << (lane * 4);
+            }
+            qzeros[packed_col] = word as i32;
+        }
+        qzeros[2..].fill(0x7777_7777);
+
+        let packed = repack_gptq_qzeros_to_marlin(&qzeros, 128, 64, 128).unwrap();
+        assert_eq!(packed[0] as u32, 0x8765_4321);
+        assert_eq!(packed[1] as u32, 0xFEDC_BA98);
+        assert_eq!(packed[2] as u32, 0x8888_8888);
+    }
 }

@@ -934,16 +934,18 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 // All caller-side validation must happen on the Rust side before this is
 // called — TORCH_CHECK inside marlin_mm aborts the process on mismatch.
 //
-// Required GPTQ INT4 (uint4b8) flow only — bias / zp / g_idx / perm /
-// global_scale paths are exposed but our wrapper passes nullptr where the
-// corresponding feature is disabled. is_k_full=true, has_act_order=false,
-// has_zp=false, has_bias=false matches Qwen3-MoE GPTQ-Int4-sym.
+// Required GPTQ INT4 flow only. Symmetric checkpoints use uint4b8
+// (`has_zp=false`); asymmetric GPTQ checkpoints pass packed zero-points and
+// use uint4 (`has_zp=true`). Bias / g_idx / perm / global_scale remain
+// disabled. is_k_full=true and has_act_order=false match Ferrum's stacked
+// expert load path.
 extern "C" int ferrum_vllm_marlin_moe_f16(
     const void* A,                        // [size_m, size_k] fp16
     const void* B,                        // marlin-packed weights [k/16, n*pack_factor] i32
     void* C,                              // [size_m * top_k, size_n] fp16
     void* C_tmp,                          // fp32 scratch for global reduce (or nullptr if use_atomic_add)
     const void* b_scales,                 // [num_experts, num_groups, size_n] fp16
+    const void* b_zeros,                  // [num_experts, num_groups, size_n/8] i32 or nullptr
     void* workspace,                      // [N/128 * sms * 4] i32, mutex slots
     const int* sorted_token_ids,          // moe_align output
     const int* expert_ids,                // moe_align output
@@ -955,13 +957,14 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
     int is_ep,                            // 0 or 1
     int prob_m, int prob_n, int prob_k,
     int group_size,                       // 128 typically; -1 for per-channel
+    int has_zp,                           // 0 symmetric uint4b8, 1 asymmetric uint4 + b_zeros
     int dev,
     cudaStream_t stream,
     int use_atomic_add,                   // 0 or 1
     int use_fp32_reduce                   // 0 or 1
 ) {
-  // q_type = uint4b8 (GPTQ INT4 sym): hard-coded for our path.
-  vllm::ScalarType const q_type = vllm::kU4B8;
+  bool const use_zp = has_zp != 0 && b_zeros != nullptr;
+  vllm::ScalarType const q_type = use_zp ? vllm::kU4 : vllm::kU4B8;
   int num_groups = (group_size > 0) ? (prob_k / group_size) : 1;
   // marlin_mm computes `blocks = sms * blocks_per_sm` — passing sms=-1
   // gives a negative grid_dim and the kernel never launches. The vLLM
@@ -975,7 +978,7 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
       /*b_bias=*/nullptr,
       /*s=*/(void*)b_scales,
       /*s2=*/nullptr,
-      /*zp=*/nullptr,
+      /*zp=*/(void*)b_zeros,
       /*g_idx=*/nullptr,
       /*perm=*/nullptr,
       /*a_tmp=*/nullptr,
@@ -990,7 +993,7 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
       /*has_bias=*/false,
       /*has_act_order=*/false,
       /*is_k_full=*/true,
-      /*has_zp=*/false,
+      /*has_zp=*/use_zp,
       num_groups, group_size, dev, stream,
       ferrum_env.force_thread_k, ferrum_env.force_thread_n, sms,
       ferrum_env.force_blocks_per_sm,

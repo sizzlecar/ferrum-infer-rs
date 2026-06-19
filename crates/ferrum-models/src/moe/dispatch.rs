@@ -1529,10 +1529,19 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     //
     // This is the prerequisite for CUDA Graph capture over the MoE
     // layer loop in Qwen3MoeModel::decode_batch_internal.
-    let use_vllm_moe = runtime_config.vllm_moe;
+    let stack_requires_vllm = experts
+        .gate_up_marlin_stack
+        .as_ref()
+        .is_some_and(|stack| stack.requires_vllm_moe())
+        || experts
+            .down_marlin_stack
+            .as_ref()
+            .is_some_and(|stack| stack.requires_vllm_moe());
+    let use_vllm_moe = runtime_config.vllm_moe || stack_requires_vllm;
     // Device-routing path: enabled whenever the caller passes
-    // pre-allocated `DeviceRouteScratch` AND `FERRUM_VLLM_MOE=1` is on.
-    // No separate env var — the device path is strictly faster than
+    // pre-allocated `DeviceRouteScratch` AND the vLLM MoE path is selected
+    // by runtime config or by the loaded weight stack. No separate env var
+    // — the device path is strictly faster than
     // the host path (+15.4% c=32 on Qwen3-30B-A3B-GPTQ-Int4, RTX 4090
     // bench docs/bench/moe-phase3-vast-2026-05-12); the host path's
     // per-layer `try_gpu_route_topk_into_host` (D2H + cuStreamSynchronize)

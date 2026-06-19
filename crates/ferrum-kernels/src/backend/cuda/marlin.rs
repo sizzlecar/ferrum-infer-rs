@@ -308,6 +308,7 @@ extern "C" {
         c: *mut std::ffi::c_void,          // [size_m * top_k, size_n] fp16
         c_tmp: *mut std::ffi::c_void,      // fp32 scratch (or null)
         b_scales: *const std::ffi::c_void, // [num_experts, num_groups, size_n] fp16
+        b_zeros: *const std::ffi::c_void,  // [num_experts, num_groups, size_n/8] i32 or null
         workspace: *mut std::ffi::c_void,  // [N/128 * sms * 4] i32
         sorted_token_ids: *const i32,
         expert_ids: *const i32,
@@ -321,6 +322,7 @@ extern "C" {
         prob_n: i32,
         prob_k: i32,
         group_size: i32, // 128 typically
+        has_zp: i32,     // 0 symmetric kU4B8, 1 asymmetric kU4 + b_zeros
         dev: i32,
         stream: cudarc::driver::sys::CUstream,
         use_atomic_add: i32,
@@ -397,11 +399,19 @@ pub struct MarlinWeight {
     pub qweight: CudaSlice<i32>,
     /// Per-group FP16 scales (permuted for Marlin access pattern)
     pub scales: CudaSlice<half::f16>,
+    /// Optional per-group GPTQ zero-points for vLLM Marlin-MoE asymmetric
+    /// INT4. Stored packed as actual zero-point codes, not AutoGPTQ's
+    /// on-disk `qzeros = zero - 1`.
+    pub qzeros: Option<CudaSlice<i32>>,
     /// Workspace for Marlin kernel: [N/128 * max_par] int32, zeroed
     pub workspace: CudaSlice<i32>,
     pub k: usize,
     pub n: usize,
     pub group_size: i32,
+    /// True when `qweight` is in vLLM Marlin-MoE tile layout. Such stacks
+    /// must be dispatched through `marlin_gemm_moe_vllm`, not bucketed
+    /// IST-DASLab offset GEMMs.
+    pub vllm_moe: bool,
     /// Activation gather permutation for desc_act=true (act-order) GPTQ.
     /// `perm[i]` = original column index that should appear at position i
     /// after gather. Computed at load time as `argsort(g_idx_disk)`.
@@ -1032,6 +1042,10 @@ pub fn marlin_gemm_moe_vllm(
     let (b_ptr, _bg) = weight.qweight.device_ptr(stream);
     let (c_ptr, _cg) = output.device_ptr(stream);
     let (s_ptr, _sg) = weight.scales.device_ptr(stream);
+    let z_ptr = match weight.qzeros.as_ref() {
+        Some(z) => z.device_ptr(stream).0 as *const std::ffi::c_void,
+        None => std::ptr::null(),
+    };
     let (ws_ptr, _wg) = weight.workspace.device_ptr(stream);
     let (st_ptr, _stg) = sorted_token_ids.device_ptr(stream);
     let (eid_ptr, _eidg) = expert_ids.device_ptr(stream);
@@ -1053,6 +1067,7 @@ pub fn marlin_gemm_moe_vllm(
             c_ptr as *mut _,
             c_tmp_ptr,
             s_ptr as *const _,
+            z_ptr,
             ws_ptr as *mut _,
             st_ptr as *const _,
             eid_ptr as *const _,
@@ -1066,6 +1081,7 @@ pub fn marlin_gemm_moe_vllm(
             prob_n,
             prob_k,
             weight.group_size,
+            if weight.qzeros.is_some() { 1 } else { 0 },
             0, // dev
             raw_stream,
             // Atomic-add path when c_tmp is null (fp32-reduce needs the

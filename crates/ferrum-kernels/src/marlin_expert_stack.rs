@@ -36,6 +36,13 @@ pub trait MarlinExpertStack<B: Backend>: Send + Sync {
     /// Number of experts packed into the tile.
     fn num_experts(&self) -> usize;
 
+    /// True when the packed representation requires the vLLM MoE
+    /// dispatcher. For CUDA this covers vLLM Marlin-MoE tile layout and
+    /// asymmetric GPTQ qzeros.
+    fn requires_vllm_moe(&self) -> bool {
+        false
+    }
+
     /// Downcast hook — used at FFN dispatch boundaries where the
     /// caller needs to reach into the concrete store to e.g. share
     /// workspace memory across phases. Standard `dyn Any` pattern.

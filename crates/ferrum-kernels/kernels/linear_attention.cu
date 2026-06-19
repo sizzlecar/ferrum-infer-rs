@@ -30,14 +30,14 @@ static __device__ __forceinline__ float ferrum_softplus(float x) {
   return log1pf(expf(x));
 }
 
-template <typename InputT>
+template <typename InputT, typename ParamT>
 static __device__ void linear_attention_prepare_impl(
     const InputT* __restrict__ mixed_qkv_raw,
     const InputT* __restrict__ conv_weight,
     const InputT* __restrict__ a_raw,
     const InputT* __restrict__ b_raw,
-    const InputT* __restrict__ a_log,
-    const InputT* __restrict__ dt_bias,
+    const ParamT* __restrict__ a_log,
+    const ParamT* __restrict__ dt_bias,
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
@@ -113,7 +113,7 @@ extern "C" __global__ void linear_attention_prepare_f32(
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_prepare_impl<float>(
+  linear_attention_prepare_impl<float, float>(
       mixed_qkv_raw, conv_weight, a_raw, b_raw, a_log, dt_bias, query, key,
       value, g, beta, tokens, key_heads, value_heads, key_dim, value_dim,
       conv_kernel);
@@ -137,21 +137,45 @@ extern "C" __global__ void linear_attention_prepare_f16_to_f32(
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_prepare_impl<__half>(
+  linear_attention_prepare_impl<__half, __half>(
       mixed_qkv_raw, conv_weight, a_raw, b_raw, a_log, dt_bias, query, key,
       value, g, beta, tokens, key_heads, value_heads, key_dim, value_dim,
       conv_kernel);
 }
 
-template <typename InputT>
+extern "C" __global__ void linear_attention_prepare_f16_params_f32(
+    const __half* __restrict__ mixed_qkv_raw,
+    const __half* __restrict__ conv_weight,
+    const __half* __restrict__ a_raw,
+    const __half* __restrict__ b_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    const int tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_prepare_impl<__half, float>(
+      mixed_qkv_raw, conv_weight, a_raw, b_raw, a_log, dt_bias, query, key,
+      value, g, beta, tokens, key_heads, value_heads, key_dim, value_dim,
+      conv_kernel);
+}
+
+template <typename InputT, typename ParamT>
 static __device__ void linear_attention_decode_prepare_impl(
     const InputT* __restrict__ mixed_qkv_raw,
     const InputT* __restrict__ conv_weight,
     const float* __restrict__ conv_state,
     const InputT* __restrict__ a_raw,
     const InputT* __restrict__ b_raw,
-    const InputT* __restrict__ a_log,
-    const InputT* __restrict__ dt_bias,
+    const ParamT* __restrict__ a_log,
+    const ParamT* __restrict__ dt_bias,
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
@@ -229,7 +253,7 @@ extern "C" __global__ void linear_attention_decode_prepare_f32(
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_decode_prepare_impl<float>(
+  linear_attention_decode_prepare_impl<float, float>(
       mixed_qkv_raw, conv_weight, conv_state, a_raw, b_raw, a_log, dt_bias,
       query, key, value, g, beta, next_conv_state, key_heads, value_heads,
       key_dim, value_dim, conv_kernel);
@@ -254,7 +278,32 @@ extern "C" __global__ void linear_attention_decode_prepare_f16_to_f32(
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_decode_prepare_impl<__half>(
+  linear_attention_decode_prepare_impl<__half, __half>(
+      mixed_qkv_raw, conv_weight, conv_state, a_raw, b_raw, a_log, dt_bias,
+      query, key, value, g, beta, next_conv_state, key_heads, value_heads,
+      key_dim, value_dim, conv_kernel);
+}
+
+extern "C" __global__ void linear_attention_decode_prepare_f16_params_f32(
+    const __half* __restrict__ mixed_qkv_raw,
+    const __half* __restrict__ conv_weight,
+    const float* __restrict__ conv_state,
+    const __half* __restrict__ a_raw,
+    const __half* __restrict__ b_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    float* __restrict__ next_conv_state,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_decode_prepare_impl<__half, float>(
       mixed_qkv_raw, conv_weight, conv_state, a_raw, b_raw, a_log, dt_bias,
       query, key, value, g, beta, next_conv_state, key_heads, value_heads,
       key_dim, value_dim, conv_kernel);
@@ -301,10 +350,11 @@ extern "C" __global__ void linear_attention_qk_l2norm_f32(
   }
 }
 
-extern "C" __global__ void gated_rms_norm_f32(
+template <typename InputT, typename WeightT>
+static __device__ void gated_rms_norm_impl(
     const float* __restrict__ core,
-    const float* __restrict__ z,
-    const float* __restrict__ weight,
+    const InputT* __restrict__ z,
+    const WeightT* __restrict__ weight,
     float* __restrict__ out,
     const int rows,
     const int dim,
@@ -330,6 +380,40 @@ extern "C" __global__ void gated_rms_norm_f32(
   }
   const float inv = rsqrtf(shared[0] / static_cast<float>(dim) + eps);
   for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-    out[base + d] = core[base + d] * inv * weight[d] * ferrum_silu(z[base + d]);
+    out[base + d] = core[base + d] * inv * ferrum_load_value(weight, d) *
+                    ferrum_silu(ferrum_load_value(z, base + d));
   }
+}
+
+extern "C" __global__ void gated_rms_norm_f32(
+    const float* __restrict__ core,
+    const float* __restrict__ z,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    const int rows,
+    const int dim,
+    const float eps) {
+  gated_rms_norm_impl<float, float>(core, z, weight, out, rows, dim, eps);
+}
+
+extern "C" __global__ void gated_rms_norm_f16_to_f32(
+    const float* __restrict__ core,
+    const __half* __restrict__ z,
+    const __half* __restrict__ weight,
+    float* __restrict__ out,
+    const int rows,
+    const int dim,
+    const float eps) {
+  gated_rms_norm_impl<__half, __half>(core, z, weight, out, rows, dim, eps);
+}
+
+extern "C" __global__ void gated_rms_norm_f16_z_f32_weight(
+    const float* __restrict__ core,
+    const __half* __restrict__ z,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    const int rows,
+    const int dim,
+    const float eps) {
+  gated_rms_norm_impl<__half, float>(core, z, weight, out, rows, dim, eps);
 }

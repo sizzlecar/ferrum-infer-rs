@@ -19,6 +19,17 @@ extern "C" __global__ void activation_to_f32_shadow_f16(
     }
 }
 
+extern "C" __global__ void f32_to_activation_f16(
+    const float* __restrict__ input,
+    __half* __restrict__ output,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __float2half(input[idx]);
+    }
+}
+
 extern "C" __global__ void rms_norm_f16_to_f32(
     const __half* __restrict__ input,
     const __half* __restrict__ weight,

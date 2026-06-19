@@ -10,10 +10,14 @@ use crate::ptx;
 const MODULE_NAME: &str = "linear_attention";
 const PREPARE_FUNC: &str = "linear_attention_prepare_f32";
 const PREPARE_F16_TO_F32_FUNC: &str = "linear_attention_prepare_f16_to_f32";
+const PREPARE_F16_PARAMS_F32_FUNC: &str = "linear_attention_prepare_f16_params_f32";
 const DECODE_PREPARE_FUNC: &str = "linear_attention_decode_prepare_f32";
 const DECODE_PREPARE_F16_TO_F32_FUNC: &str = "linear_attention_decode_prepare_f16_to_f32";
+const DECODE_PREPARE_F16_PARAMS_F32_FUNC: &str = "linear_attention_decode_prepare_f16_params_f32";
 const QK_L2NORM_FUNC: &str = "linear_attention_qk_l2norm_f32";
 const GATED_RMS_NORM_FUNC: &str = "gated_rms_norm_f32";
+const GATED_RMS_NORM_F16_TO_F32_FUNC: &str = "gated_rms_norm_f16_to_f32";
+const GATED_RMS_NORM_F16_Z_F32_WEIGHT_FUNC: &str = "gated_rms_norm_f16_z_f32_weight";
 
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attention_prepare_f32(
@@ -57,7 +61,7 @@ pub fn linear_attention_prepare_f32(
         conv_kernel,
     )?;
 
-    let input_dtype = validate_prepare_dtype(
+    let (input_dtype, param_dtype) = validate_prepare_dtype(
         mixed_qkv_raw,
         conv_weight,
         a_raw,
@@ -77,9 +81,10 @@ pub fn linear_attention_prepare_f32(
     let conv_total = tokens * conv_channels;
     let gate_total = tokens * value_heads;
     let total = conv_total.max(gate_total);
-    let func_name = match input_dtype {
-        Dtype::F32 => PREPARE_FUNC,
-        Dtype::F16 => PREPARE_F16_TO_F32_FUNC,
+    let func_name = match (input_dtype, param_dtype) {
+        (Dtype::F32, Dtype::F32) => PREPARE_FUNC,
+        (Dtype::F16, Dtype::F16) => PREPARE_F16_TO_F32_FUNC,
+        (Dtype::F16, Dtype::F32) => PREPARE_F16_PARAMS_F32_FUNC,
         _ => unreachable!("validate_prepare_dtype filters unsupported inputs"),
     };
     let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
@@ -97,18 +102,25 @@ pub fn linear_attention_prepare_f32(
             builder.arg(conv_weight.as_f32());
             builder.arg(a_raw.as_f32());
             builder.arg(b_raw.as_f32());
-            builder.arg(a_log.as_f32());
-            builder.arg(dt_bias.as_f32());
         }
         Dtype::F16 => {
             builder.arg(mixed_qkv_raw.as_f16());
             builder.arg(conv_weight.as_f16());
             builder.arg(a_raw.as_f16());
             builder.arg(b_raw.as_f16());
+        }
+        _ => unreachable!("validate_prepare_dtype filters unsupported inputs"),
+    }
+    match param_dtype {
+        Dtype::F32 => {
+            builder.arg(a_log.as_f32());
+            builder.arg(dt_bias.as_f32());
+        }
+        Dtype::F16 => {
             builder.arg(a_log.as_f16());
             builder.arg(dt_bias.as_f16());
         }
-        _ => unreachable!("validate_prepare_dtype filters unsupported inputs"),
+        _ => unreachable!("validate_prepare_dtype filters unsupported params"),
     }
     builder.arg(query.as_f32_mut());
     builder.arg(key.as_f32_mut());
@@ -205,7 +217,7 @@ pub fn linear_attention_decode_prepare_f32(
         conv_kernel,
     )?;
 
-    let input_dtype = validate_decode_prepare_dtype(
+    let (input_dtype, param_dtype) = validate_decode_prepare_dtype(
         mixed_qkv_raw,
         conv_weight,
         conv_state,
@@ -225,9 +237,10 @@ pub fn linear_attention_decode_prepare_f32(
     let value_total = value_heads * value_dim;
     let conv_channels = 2 * qk_total + value_total;
     let total = conv_channels.max(value_heads);
-    let func_name = match input_dtype {
-        Dtype::F32 => DECODE_PREPARE_FUNC,
-        Dtype::F16 => DECODE_PREPARE_F16_TO_F32_FUNC,
+    let func_name = match (input_dtype, param_dtype) {
+        (Dtype::F32, Dtype::F32) => DECODE_PREPARE_FUNC,
+        (Dtype::F16, Dtype::F16) => DECODE_PREPARE_F16_TO_F32_FUNC,
+        (Dtype::F16, Dtype::F32) => DECODE_PREPARE_F16_PARAMS_F32_FUNC,
         _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
     };
     let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
@@ -254,16 +267,23 @@ pub fn linear_attention_decode_prepare_f32(
         Dtype::F32 => {
             builder.arg(a_raw.as_f32());
             builder.arg(b_raw.as_f32());
-            builder.arg(a_log.as_f32());
-            builder.arg(dt_bias.as_f32());
         }
         Dtype::F16 => {
             builder.arg(a_raw.as_f16());
             builder.arg(b_raw.as_f16());
+        }
+        _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
+    }
+    match param_dtype {
+        Dtype::F32 => {
+            builder.arg(a_log.as_f32());
+            builder.arg(dt_bias.as_f32());
+        }
+        Dtype::F16 => {
             builder.arg(a_log.as_f16());
             builder.arg(dt_bias.as_f16());
         }
-        _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
+        _ => unreachable!("validate_decode_prepare_dtype filters unsupported params"),
     }
     builder.arg(query.as_f32_mut());
     builder.arg(key.as_f32_mut());
@@ -330,16 +350,35 @@ pub fn gated_rms_norm_f32(
     eps: f32,
 ) -> Result<()> {
     validate_gated_rms_norm_shape(core, z, weight, out, tokens, heads, dim)?;
+    let (input_dtype, weight_dtype) = validate_gated_rms_norm_dtype(core, z, weight, out)?;
 
-    let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, GATED_RMS_NORM_FUNC);
+    let func_name = match (input_dtype, weight_dtype) {
+        (Dtype::F32, Dtype::F32) => GATED_RMS_NORM_FUNC,
+        (Dtype::F16, Dtype::F16) => GATED_RMS_NORM_F16_TO_F32_FUNC,
+        (Dtype::F16, Dtype::F32) => GATED_RMS_NORM_F16_Z_F32_WEIGHT_FUNC,
+        _ => unreachable!("validate_gated_rms_norm_dtype filters unsupported inputs"),
+    };
+    let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
     let block = dim.next_power_of_two().min(256).max(1) as u32;
     let stream = ctx.stream.clone();
     let rows_i32 = (tokens * heads) as i32;
     let dim_i32 = dim as i32;
     let mut builder = stream.launch_builder(&func);
     builder.arg(core.as_f32());
-    builder.arg(z.as_f32());
-    builder.arg(weight.as_f32());
+    match input_dtype {
+        Dtype::F32 => {
+            builder.arg(z.as_f32());
+        }
+        Dtype::F16 => {
+            builder.arg(z.as_f16());
+        }
+        _ => unreachable!("validate_gated_rms_norm_dtype filters unsupported inputs"),
+    }
+    match weight_dtype {
+        Dtype::F32 => builder.arg(weight.as_f32()),
+        Dtype::F16 => builder.arg(weight.as_f16()),
+        _ => unreachable!("validate_gated_rms_norm_dtype filters unsupported weights"),
+    };
     builder.arg(out.as_f32_mut());
     builder.arg(&rows_i32);
     builder.arg(&dim_i32);
@@ -354,6 +393,28 @@ pub fn gated_rms_norm_f32(
             .map_err(|err| FerrumError::backend(format!("gated_rms_norm launch: {err}")))?;
     }
     Ok(())
+}
+
+fn validate_gated_rms_norm_dtype(
+    core: &CudaBuf,
+    z: &CudaBuf,
+    weight: &CudaBuf,
+    out: &CudaBuf,
+) -> Result<(Dtype, Dtype)> {
+    let op = "gated_rms_norm";
+    require_dtype(op, "core", core.dtype(), Dtype::F32)?;
+    require_dtype(op, "out", out.dtype(), Dtype::F32)?;
+    let input_dtype = z.dtype();
+    require_supported_input_dtype(op, "z", input_dtype)?;
+    let weight_dtype = weight.dtype();
+    require_supported_input_dtype(op, "weight", weight_dtype)?;
+    if input_dtype == Dtype::F32 && weight_dtype != Dtype::F32 {
+        return Err(FerrumError::model(format!(
+            "{op} weight dtype {} is unsupported for f32 z; expected f32",
+            weight_dtype.name()
+        )));
+    }
+    Ok((input_dtype, weight_dtype))
 }
 
 fn require_dtype(op: &str, label: &str, actual: Dtype, expected: Dtype) -> Result<()> {
@@ -390,7 +451,7 @@ fn validate_prepare_dtype(
     value: &CudaBuf,
     g: &CudaBuf,
     beta: &CudaBuf,
-) -> Result<Dtype> {
+) -> Result<(Dtype, Dtype)> {
     let op = "linear_attention_prepare";
     let input_dtype = mixed_qkv_raw.dtype();
     require_supported_input_dtype(op, "mixed_qkv_raw", input_dtype)?;
@@ -398,10 +459,17 @@ fn validate_prepare_dtype(
         ("conv_weight", conv_weight.dtype()),
         ("a_raw", a_raw.dtype()),
         ("b_raw", b_raw.dtype()),
-        ("a_log", a_log.dtype()),
-        ("dt_bias", dt_bias.dtype()),
     ] {
         require_dtype(op, label, actual, input_dtype)?;
+    }
+    let param_dtype = a_log.dtype();
+    require_supported_input_dtype(op, "a_log", param_dtype)?;
+    require_dtype(op, "dt_bias", dt_bias.dtype(), param_dtype)?;
+    if input_dtype == Dtype::F32 && param_dtype != Dtype::F32 {
+        return Err(FerrumError::model(format!(
+            "{op} param dtype {} is unsupported for f32 input; expected f32",
+            param_dtype.name()
+        )));
     }
     for (label, actual) in [
         ("query", query.dtype()),
@@ -412,7 +480,7 @@ fn validate_prepare_dtype(
     ] {
         require_dtype(op, label, actual, Dtype::F32)?;
     }
-    Ok(input_dtype)
+    Ok((input_dtype, param_dtype))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -430,7 +498,7 @@ fn validate_decode_prepare_dtype(
     g: &CudaBuf,
     beta: &CudaBuf,
     next_conv_state: &CudaBuf,
-) -> Result<Dtype> {
+) -> Result<(Dtype, Dtype)> {
     let op = "linear_attention_decode_prepare";
     let input_dtype = mixed_qkv_raw.dtype();
     require_supported_input_dtype(op, "mixed_qkv_raw", input_dtype)?;
@@ -438,10 +506,17 @@ fn validate_decode_prepare_dtype(
         ("conv_weight", conv_weight.dtype()),
         ("a_raw", a_raw.dtype()),
         ("b_raw", b_raw.dtype()),
-        ("a_log", a_log.dtype()),
-        ("dt_bias", dt_bias.dtype()),
     ] {
         require_dtype(op, label, actual, input_dtype)?;
+    }
+    let param_dtype = a_log.dtype();
+    require_supported_input_dtype(op, "a_log", param_dtype)?;
+    require_dtype(op, "dt_bias", dt_bias.dtype(), param_dtype)?;
+    if input_dtype == Dtype::F32 && param_dtype != Dtype::F32 {
+        return Err(FerrumError::model(format!(
+            "{op} param dtype {} is unsupported for f32 input; expected f32",
+            param_dtype.name()
+        )));
     }
     for (label, actual) in [
         ("conv_state", conv_state.dtype()),
@@ -454,7 +529,7 @@ fn validate_decode_prepare_dtype(
     ] {
         require_dtype(op, label, actual, Dtype::F32)?;
     }
-    Ok(input_dtype)
+    Ok((input_dtype, param_dtype))
 }
 
 #[allow(clippy::too_many_arguments)]
