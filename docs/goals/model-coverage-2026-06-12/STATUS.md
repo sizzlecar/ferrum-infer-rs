@@ -2,6 +2,74 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ33 — W3 Qwen35 final-token prefill LM head smoke PASS, perf still prefill-bound
+
+- Scope:
+  - targeted 1x Vast CUDA validation for commit
+    `adf70f90 perf(qwen35): project only final prefill token`;
+  - fixes a real Qwen35 prefill hot-path waste: fresh prefill previously ran
+    LM head over every prompt token (`tokens_len * vocab`) and then copied only
+    the last logits row; it now projects only the final hidden row because the
+    product interface only returns last-token logits for sampling;
+  - diagnostic bench ran only after product correctness passed;
+  - no W3 final PASS and no release-grade performance claim.
+- Local source validation before GPU:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-models --all-targets` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS: 80 matched
+    library tests plus `qwen35_config_test` 1 test;
+  - `cargo test -p ferrum-models linear_attention_decode_backend_matches_full_reference_last_token -- --nocapture`
+    PASS: 1 matched test;
+  - `git diff --check` PASS.
+- GPU / lifecycle:
+  - Vast instance `41422823`, SSH `ssh7.vast.ai:22822`, was started only for
+    this targeted lane and stopped after artifact copyback;
+  - final stop check: `cur_state=stopped`, `actual_status=exited`;
+  - GPU: 1x `NVIDIA GeForce RTX 4090`, `49140 MiB` reported by `nvidia-smi`,
+    driver `580.126.09`, compute capability `8.9`;
+  - CUDA toolkit `12.4`, Rust `1.96.0`.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_final_prefill_lm_head_adf70f90_20260619T222916Z`;
+  - smoke PASS line:
+    `W3 QWEN35 VLLM H256 SMOKE PASS: /workspace/artifacts/w3_qwen35_final_prefill_lm_head_adf70f90_20260619T222916Z`;
+  - CUDA release build PASS, binary SHA256:
+    `2dffff645429f8081edf1d8938137dd1ba148ca5c0b2d63ff8d9498806f9d1f0`.
+- Correctness result:
+  - `ferrum run` PASS; output:
+    `The mysterious ferrum-ok appears only in rare scientific texts.`;
+  - `ferrum serve` effective config selected `vllm_paged_attn_v2`, with
+    `FERRUM_USE_VLLM_PAGED_ATTN=1` and `FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0`;
+  - non-stream chat HTTP 200, `finish_reason=stop`;
+  - stream chat HTTP 200, exactly one `[DONE]`, usage present, final
+    `finish_reason=stop`;
+  - required tool call HTTP 200, parsed `get_weather({"city":"Paris"})`,
+    `finish_reason=tool_calls`;
+  - strict structured output HTTP 200, content exactly
+    `{"answer":"scenario-ok"}`, `finish_reason=stop`;
+  - post-validation rejects `finish_reason=length`, missing tool calls,
+    malformed streams, duplicate `[DONE]`, and obvious repetition.
+- Diagnostic bench only:
+  - command used `bench-serve --dataset sharegpt --num-prompts 8
+    --n-repeats 1 --concurrency-sweep 1,32 --fail-on-error --seed 9271`;
+  - c=1: 8 completed / 0 errored / 24.2s, output throughput
+    `14.60 tok/s`, p50 TTFT `2348.5 ms`,
+    `output_token_count_source=usage`;
+  - c=32: 8 completed / 0 errored / 20.0s, output throughput
+    `19.19 tok/s`, p50 TTFT `18176.8 ms`,
+    `output_token_count_source=usage`;
+  - this is a bottleneck signal only (`n_repeats=1`, small prompt count), not
+    W3 performance evidence.
+- Interpretation / next work:
+  - the final-token LM head fix is correct and modestly improves the diagnostic
+    path versus the previous `13.57`/`16.03 tok/s` artifact;
+  - the small delta proves LM head waste was real but not the dominant blocker;
+  - c=32 TTFT is still ~18 seconds for 8 prompts, which matches serial
+    prefill rather than true multi-request prefill batching;
+  - next work should implement or prototype Qwen35 native unified/batch prefill
+    instead of further decode-only tuning: full-attention layers can reuse the
+    existing paged varlen path, but linear-attention layers need batched
+    recurrent/conv prefill state handling and final-row-only LM head.
+
 ## 2026-06-20 ZZZ32 — W3 Qwen35 batched linear-attention decode smoke PASS, batch scaling still blocked
 
 - Scope:

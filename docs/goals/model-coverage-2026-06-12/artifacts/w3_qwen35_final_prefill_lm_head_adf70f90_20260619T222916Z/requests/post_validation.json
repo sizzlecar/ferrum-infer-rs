@@ -1,0 +1,11 @@
+{
+  "status": "pass",
+  "stream_done_count": 1,
+  "stream_usage_seen": true,
+  "stream_finish_reasons": [
+    "stop"
+  ],
+  "nonstream_finish_reason": "stop",
+  "tool_finish_reason": "tool_calls",
+  "structured_finish_reason": "stop"
+}
