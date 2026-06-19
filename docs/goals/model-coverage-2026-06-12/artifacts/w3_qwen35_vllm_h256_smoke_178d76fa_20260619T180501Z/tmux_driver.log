@@ -1,0 +1,19 @@
+started_at_utc=2026-06-19T18:05:01Z
+repo=/workspace/ferrum-clean
+artifact=/workspace/artifacts/w3_qwen35_vllm_h256_smoke_178d76fa_20260619T180501Z
+git_head=178d76fad2a7f6d947fc3d78afe7b960208ebca3
+git_status_short_begin
+## goal/w2-w3-release-grade...origin/goal/w2-w3-release-grade
+git_status_short_end
+nvidia_smi_query_begin
+0, NVIDIA GeForce RTX 4090, 49140 MiB, 580.126.09, 8.9
+nvidia_smi_query_end
+nvcc_begin
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2024 NVIDIA Corporation
+Built on Thu_Mar_28_02:18:24_PDT_2024
+Cuda compilation tools, release 12.4, V12.4.131
+Build cuda_12.4.r12.4/compiler.34097967_0
+nvcc_end
+/workspace/artifacts/w3_qwen35_vllm_h256_smoke_178d76fa_20260619T180501Z/run_smoke.sh: line 86: rustc: command not found
+W3 QWEN35 VLLM H256 SMOKE FAIL rc=127: /workspace/artifacts/w3_qwen35_vllm_h256_smoke_178d76fa_20260619T180501Z

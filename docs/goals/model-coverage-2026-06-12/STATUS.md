@@ -2,6 +2,56 @@
 
 进度日志,倒序。
 
+## 2026-06-19 ZZZ26 — W3 Qwen35 vLLM H256 path GPU smoke failed at structured output
+
+- Scope:
+  - Qwen35 CUDA product-path smoke for the vLLM-layout paged KV/H256 paged
+    attention route;
+  - no release-grade PASS, no W3 final PASS, and no performance claim.
+- Code:
+  - pushed `178d76fa fix(config): enable qwen35 moe vllm paged attention
+    defaults` on `goal/w2-w3-release-grade`;
+  - this follows `aeb0f33e perf(qwen35): route paged kv through vllm h256
+    attention`;
+  - root cause fixed: auto-config previously recognized `qwen3_moe` but not
+    `qwen3_5_moe`, so Qwen35 product defaults still selected
+    `legacy_paged_decode`.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-types auto_config -- --nocapture` PASS: 45 tests;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS: 80 matched
+    tests plus Qwen35 config test.
+- GPU artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_vllm_h256_smoke_178d76fa_20260619T181820Z_hot_target`;
+  - Vast instance `41422823` stopped after triage, stop check:
+    `cur_state=stopped`, `actual_status=exited`;
+  - CUDA build PASS, release binary SHA256:
+    `4052134f6abbc1e9971165d386dac1510172d8a0c259d5a0fecffef1f50ad42f`;
+  - `ferrum run` smoke PASS and `run_effective_config.json` confirms
+    `selected_attention_impl=vllm_paged_attn_v2`,
+    `FERRUM_USE_VLLM_PAGED_ATTN=1`,
+    `FERRUM_VLLM_PAGED_ATTN_V1_SHORT=0`,
+    `model_capabilities.architecture=qwen3_5_moe`, `head_dim=256`;
+  - `ferrum serve` started and `serve_effective_config.json` confirms the
+    same vLLM H256/V2 path.
+- Serve request results:
+  - non-stream chat: HTTP 200, but answer repeated `Paris` until
+    `finish_reason=length`;
+  - stream chat: HTTP 200, exactly one `[DONE]`, usage present, but also
+    finished by length;
+  - required tool call: HTTP 200 and parsed `get_weather({"city":"Paris"})`;
+  - strict structured output: HTTP 500,
+    `model output did not satisfy response_format.json_schema.strict:
+    invalid JSON: trailing characters at line 2 column 1`.
+- Limitation / next work:
+  - this smoke proves the product defaults now route Qwen35 to the intended
+    vLLM H256 paged-attention path;
+  - it does not satisfy W3 L2/L3/L4/L5 or the final
+    `MODEL_RELEASE_GRADE_W3 PASS`;
+  - no diagnostic `bench-serve` was run because correctness failed first;
+  - next fix target is structured-output/repetition/length quality on the
+    product path, not another VPA routing patch.
+
 ## 2026-06-19 ZZZ25 — W3 Qwen35 GPU argmax/readback hot-path checkpoint
 
 - Scope:
