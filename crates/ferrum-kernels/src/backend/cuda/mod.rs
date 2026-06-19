@@ -1169,7 +1169,7 @@ impl Backend for CudaBackend {
         let host = with_argmax_out(&stream, ctx.ordinal, m, |out_dev| -> Result<Vec<i32>> {
             let n_i32 = n as i32;
             let mut b = stream.launch_builder(&func);
-            b.arg(&mut *logits);
+            b.arg(logits);
             b.arg(&n_i32);
             b.arg(&mut *out_dev);
             unsafe {
@@ -1209,7 +1209,7 @@ impl Backend for CudaBackend {
             let n_i32 = n as i32;
             let mask_len_i32 = mask_len as i32;
             let mut b = stream.launch_builder(&func);
-            b.arg(logits);
+            b.arg(&mut *logits);
             b.arg(&n_i32);
             b.arg(valid_token_mask);
             b.arg(&mask_len_i32);
