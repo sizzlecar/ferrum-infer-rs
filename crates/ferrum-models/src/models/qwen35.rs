@@ -58,6 +58,7 @@ pub struct Qwen35BackendModel<B: MoeLlmBackend> {
     pub paged_max_seqs: usize,
     pub paged_max_blocks_per_seq: usize,
     paged_scratch: Qwen35PagedScratch<B>,
+    decode_scratch: Option<Qwen35DecodeScratch<B>>,
     linear_state_pools: Option<Qwen35LinearStatePools<B>>,
     linear_free_slots: Vec<usize>,
     linear_slot_indices: Option<B::Buffer>,
@@ -299,6 +300,38 @@ pub struct Qwen35PagedScratch<B: MoeLlmBackend> {
     max_seqs: usize,
     max_tokens: usize,
     max_blocks_per_seq: usize,
+}
+
+pub struct Qwen35DecodeScratch<B: MoeLlmBackend> {
+    max_tokens: usize,
+    hidden_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    expert_intermediate_size: usize,
+    shared_expert_intermediate_size: usize,
+    post_attention_norm: B::Buffer,
+    mlp_output: B::Buffer,
+    router_logits: B::Buffer,
+    routed_output: B::Buffer,
+    x_packed: B::Buffer,
+    gate_up_packed: B::Buffer,
+    silu_packed: B::Buffer,
+    down_packed: B::Buffer,
+    shared_gate: B::Buffer,
+    shared_gate_up: B::Buffer,
+    shared_gate_proj: B::Buffer,
+    shared_up_proj: B::Buffer,
+    shared_fused: B::Buffer,
+    shared_output: B::Buffer,
+    route_selected_ids: B::Buffer,
+    route_pair_weights: B::Buffer,
+    route_pairs_by_token: B::Buffer,
+    route_packed_token_idx: B::Buffer,
+    route_expert_offsets: B::Buffer,
+    route_sorted_tokens: B::Buffer,
+    route_block_ids: B::Buffer,
+    route_total_post_pad: B::Buffer,
+    route_scratch: MoeRouteScratch,
 }
 
 pub struct Qwen35BackendFullAttentionOutput<B: Backend> {
@@ -701,6 +734,79 @@ impl<B: MoeLlmBackend> Qwen35PagedScratch<B> {
     }
 }
 
+impl<B: MoeLlmBackend> Qwen35DecodeScratch<B> {
+    fn alloc(config: &Qwen35TextConfig, max_tokens: usize) -> Self {
+        let max_tokens = max_tokens.max(1);
+        let hidden_size = config.hidden_size.max(1);
+        let (num_experts, top_k, expert_intermediate_size, shared_expert_intermediate_size) =
+            if let Some(moe) = config.moe.as_ref() {
+                (
+                    moe.num_experts.max(1),
+                    moe.num_experts_per_tok.max(1),
+                    moe.moe_intermediate_size.max(1),
+                    moe.shared_expert_intermediate_size.max(1),
+                )
+            } else {
+                (1, 1, config.dense_intermediate_size.unwrap_or(1).max(1), 1)
+            };
+        let total_pairs = max_tokens * top_k;
+        Self {
+            max_tokens,
+            hidden_size,
+            num_experts,
+            top_k,
+            expert_intermediate_size,
+            shared_expert_intermediate_size,
+            post_attention_norm: B::alloc(max_tokens * hidden_size),
+            mlp_output: B::alloc(max_tokens * hidden_size),
+            router_logits: B::alloc(max_tokens * num_experts),
+            routed_output: B::alloc(max_tokens * hidden_size),
+            x_packed: B::alloc(total_pairs * hidden_size),
+            gate_up_packed: B::alloc(total_pairs * 2 * expert_intermediate_size),
+            silu_packed: B::alloc(total_pairs * expert_intermediate_size),
+            down_packed: B::alloc(total_pairs * hidden_size),
+            shared_gate: B::alloc(max_tokens),
+            shared_gate_up: B::alloc(max_tokens * 2 * shared_expert_intermediate_size),
+            shared_gate_proj: B::alloc(max_tokens * shared_expert_intermediate_size),
+            shared_up_proj: B::alloc(max_tokens * shared_expert_intermediate_size),
+            shared_fused: B::alloc(max_tokens * shared_expert_intermediate_size),
+            shared_output: B::alloc(max_tokens * hidden_size),
+            route_selected_ids: B::alloc_typed(Dtype::I32, total_pairs),
+            route_pair_weights: B::alloc_typed(Dtype::F32, total_pairs),
+            route_pairs_by_token: B::alloc_typed(Dtype::I32, total_pairs),
+            route_packed_token_idx: B::alloc_typed(Dtype::I32, total_pairs),
+            route_expert_offsets: B::alloc_typed(Dtype::I32, num_experts + 1),
+            route_sorted_tokens: B::alloc_typed(
+                Dtype::I32,
+                total_pairs + num_experts * crate::moe::dispatch::MOE_BLOCK_SIZE_MAX,
+            ),
+            route_block_ids: B::alloc_typed(Dtype::I32, total_pairs / 16 + num_experts + 1),
+            route_total_post_pad: B::alloc_typed(Dtype::I32, 1),
+            route_scratch: MoeRouteScratch::new(),
+        }
+    }
+
+    fn covers(&self, config: &Qwen35TextConfig, tokens: usize) -> bool {
+        let (num_experts, top_k, expert_intermediate_size, shared_expert_intermediate_size) =
+            if let Some(moe) = config.moe.as_ref() {
+                (
+                    moe.num_experts.max(1),
+                    moe.num_experts_per_tok.max(1),
+                    moe.moe_intermediate_size.max(1),
+                    moe.shared_expert_intermediate_size.max(1),
+                )
+            } else {
+                (1, 1, config.dense_intermediate_size.unwrap_or(1).max(1), 1)
+            };
+        self.max_tokens >= tokens.max(1)
+            && self.hidden_size == config.hidden_size.max(1)
+            && self.num_experts == num_experts
+            && self.top_k == top_k
+            && self.expert_intermediate_size == expert_intermediate_size
+            && self.shared_expert_intermediate_size == shared_expert_intermediate_size
+    }
+}
+
 fn qwen35_effective_max_seq_len_from_snapshot(
     snapshot: &ferrum_types::RuntimeConfigSnapshot,
     model_max_seq_len: usize,
@@ -887,6 +993,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             paged_max_seqs,
             paged_max_blocks_per_seq,
             paged_scratch: Qwen35PagedScratch::new(),
+            decode_scratch: None,
             linear_state_pools: None,
             linear_free_slots: Vec::new(),
             linear_slot_indices: None,
@@ -949,6 +1056,19 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         self.paged_block_alloc = Some(std::sync::Mutex::new(BlockAllocator::new(
             total_blocks as u32,
         )));
+    }
+
+    fn ensure_decode_scratch(&mut self, tokens: usize) {
+        let needed_tokens = tokens.max(1);
+        let keep_existing = self
+            .decode_scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.covers(&self.weights.config, needed_tokens));
+        if keep_existing {
+            return;
+        }
+        let capacity = needed_tokens.next_power_of_two();
+        self.decode_scratch = Some(Qwen35DecodeScratch::alloc(&self.weights.config, capacity));
     }
 
     fn has_linear_attention_layers(&self) -> Result<bool> {
@@ -1927,6 +2047,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         if batch_len == 0 {
             return Ok(Vec::new());
         }
+        self.ensure_decode_scratch(batch_len);
         let mut ctx = B::new_context();
         let decode_profile_enabled = qwen35_decode_profile_enabled();
         let mut decode_profile = Qwen35DecodeProfile::default();
@@ -1988,6 +2109,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                         eps,
                         residual_f32.as_mut(),
                         branch_f32.as_mut(),
+                        self.decode_scratch.as_mut(),
                     )?
                 }
                 Qwen35AttentionWeights::Full(_) => {
@@ -2011,6 +2133,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                         eps,
                         residual_f32.as_mut(),
                         branch_f32.as_mut(),
+                        self.decode_scratch.as_mut(),
                     )?
                 }
             };
@@ -5037,6 +5160,299 @@ pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
     })
 }
 
+fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    moe: &Qwen35SparseMoeSharedExpertWeights<B>,
+    shape: Qwen35SparseMoeShape,
+    layer_index: usize,
+    scratch: &mut Qwen35DecodeScratch<B>,
+) -> Result<()> {
+    shape.validate()?;
+    if shape.tokens > scratch.max_tokens
+        || shape.hidden_size != scratch.hidden_size
+        || shape.num_experts != scratch.num_experts
+        || shape.top_k != scratch.top_k
+        || shape.expert_intermediate_size != scratch.expert_intermediate_size
+        || shape.shared_expert_intermediate_size != scratch.shared_expert_intermediate_size
+    {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 decode scratch shape mismatch: scratch tokens={} hidden={} experts={} top_k={} expert_inter={} shared_inter={} vs request tokens={} hidden={} experts={} top_k={} expert_inter={} shared_inter={}",
+            scratch.max_tokens,
+            scratch.hidden_size,
+            scratch.num_experts,
+            scratch.top_k,
+            scratch.expert_intermediate_size,
+            scratch.shared_expert_intermediate_size,
+            shape.tokens,
+            shape.hidden_size,
+            shape.num_experts,
+            shape.top_k,
+            shape.expert_intermediate_size,
+            shape.shared_expert_intermediate_size,
+        )));
+    }
+    if moe.router.in_features() != shape.hidden_size
+        || moe.router.out_features() != shape.num_experts
+    {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 sparse MoE router shape {}x{} does not match hidden={} experts={}",
+            moe.router.out_features(),
+            moe.router.in_features(),
+            shape.hidden_size,
+            shape.num_experts
+        )));
+    }
+    if moe.shared_expert_gate_proj.in_features() != shape.hidden_size
+        || moe.shared_expert_gate_proj.out_features() != shape.shared_expert_intermediate_size
+        || moe.shared_expert_up_proj.in_features() != shape.hidden_size
+        || moe.shared_expert_up_proj.out_features() != shape.shared_expert_intermediate_size
+        || moe.shared_expert_down_proj.in_features() != shape.shared_expert_intermediate_size
+        || moe.shared_expert_down_proj.out_features() != shape.hidden_size
+    {
+        return Err(FerrumError::model(
+            "Qwen3.5 sparse MoE shared expert projection shapes do not match config",
+        ));
+    }
+
+    let x = &scratch.post_attention_norm;
+    let detail_enabled = qwen35_layer_detail_profile_enabled();
+    let total_timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    let mut detail = Qwen35SparseMoeDetailProfile::default();
+
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    moe.router
+        .forward(ctx, x, &mut scratch.router_logits, shape.tokens);
+    detail.router_us += qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_router");
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.router_logits",
+        &scratch.router_logits,
+        shape.tokens * shape.num_experts,
+    );
+
+    B::zero_buffer(
+        ctx,
+        &mut scratch.routed_output,
+        shape.tokens * shape.hidden_size,
+    )?;
+    let total_pairs = shape.tokens * shape.top_k;
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    moe_forward_bucketed(MoeForwardBucketedParams {
+        ctx,
+        x,
+        router_logits: &scratch.router_logits,
+        out: &mut scratch.routed_output,
+        batch: shape.tokens,
+        hidden_size: shape.hidden_size,
+        expert_intermediate: shape.expert_intermediate_size,
+        num_experts: shape.num_experts,
+        top_k: shape.top_k,
+        norm_topk_prob: shape.norm_topk_prob,
+        experts: &moe.experts,
+        x_packed: &mut scratch.x_packed,
+        gate_up_packed: &mut scratch.gate_up_packed,
+        silu_packed: &mut scratch.silu_packed,
+        down_packed: &mut scratch.down_packed,
+        route_scratch: &mut scratch.route_scratch,
+        device_route: Some(crate::moe::dispatch::DeviceRouteScratch {
+            selected_ids: &mut scratch.route_selected_ids,
+            pair_weights: &mut scratch.route_pair_weights,
+            pairs_by_token: &mut scratch.route_pairs_by_token,
+            packed_token_idx: &mut scratch.route_packed_token_idx,
+            expert_offsets: &mut scratch.route_expert_offsets,
+            sorted_tokens: &mut scratch.route_sorted_tokens,
+            block_ids: &mut scratch.route_block_ids,
+            total_post_pad: &mut scratch.route_total_post_pad,
+        }),
+    })?;
+    detail.routed_experts_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_routed_experts");
+    qwen35_trace_layer_moe_route(
+        layer_index,
+        shape.tokens,
+        shape.num_experts,
+        shape.top_k,
+        &scratch.route_scratch.output.expert_ids,
+        &scratch.route_scratch.output.expert_weights,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.x_packed",
+        &scratch.x_packed,
+        total_pairs * shape.hidden_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.gate_up_packed",
+        &scratch.gate_up_packed,
+        total_pairs * 2 * shape.expert_intermediate_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.silu_packed",
+        &scratch.silu_packed,
+        total_pairs * shape.expert_intermediate_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.down_packed",
+        &scratch.down_packed,
+        total_pairs * shape.hidden_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.routed_output",
+        &scratch.routed_output,
+        shape.tokens * shape.hidden_size,
+    );
+
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    B::gemm(
+        ctx,
+        x,
+        &moe.shared_expert_gate,
+        &mut scratch.shared_gate,
+        shape.tokens,
+        1,
+        shape.hidden_size,
+    );
+    detail.shared_gate_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_gate");
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_gate",
+        &scratch.shared_gate,
+        shape.tokens,
+    );
+
+    let shared_inter = shape.shared_expert_intermediate_size;
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    moe.shared_expert_gate_proj
+        .forward(ctx, x, &mut scratch.shared_gate_proj, shape.tokens);
+    detail.shared_gate_proj_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_gate_proj");
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    moe.shared_expert_up_proj
+        .forward(ctx, x, &mut scratch.shared_up_proj, shape.tokens);
+    detail.shared_up_proj_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_up_proj");
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_gate_proj",
+        &scratch.shared_gate_proj,
+        shape.tokens * shared_inter,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_up_proj",
+        &scratch.shared_up_proj,
+        shape.tokens * shared_inter,
+    );
+
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    B::qwen35_interleave_gate_up(
+        ctx,
+        &scratch.shared_gate_proj,
+        &scratch.shared_up_proj,
+        &mut scratch.shared_gate_up,
+        shape.tokens,
+        shared_inter,
+    )?;
+    detail.shared_pack_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_pack");
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    B::fused_silu_mul_split(
+        ctx,
+        &scratch.shared_gate_up,
+        &mut scratch.shared_fused,
+        shape.tokens,
+        shared_inter,
+    );
+    detail.shared_fused_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_fused");
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_fused",
+        &scratch.shared_fused,
+        shape.tokens * shared_inter,
+    );
+
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    moe.shared_expert_down_proj.forward(
+        ctx,
+        &scratch.shared_fused,
+        &mut scratch.shared_output,
+        shape.tokens,
+    );
+    detail.shared_down_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_down");
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_down_output",
+        &scratch.shared_output,
+        shape.tokens * shape.hidden_size,
+    );
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    B::qwen35_apply_token_gate(
+        ctx,
+        &mut scratch.shared_output,
+        &scratch.shared_gate,
+        shape.tokens,
+        shape.hidden_size,
+    )?;
+    detail.shared_apply_gate_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_apply_gate");
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.shared_output",
+        &scratch.shared_output,
+        shape.tokens * shape.hidden_size,
+    );
+
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    B::copy_slice(
+        ctx,
+        &scratch.routed_output,
+        0,
+        &mut scratch.mlp_output,
+        0,
+        shape.tokens * shape.hidden_size,
+    );
+    B::add_inplace(
+        ctx,
+        &mut scratch.mlp_output,
+        &scratch.shared_output,
+        shape.tokens * shape.hidden_size,
+    );
+    detail.merge_us += qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_merge");
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer_index,
+        "moe.output",
+        &scratch.mlp_output,
+        shape.tokens * shape.hidden_size,
+    );
+
+    detail.total_us = qwen35_detail_profile_stage_finish::<B>(ctx, total_timer, "qwen35_moe_total");
+    if detail_enabled {
+        detail.log(layer_index, shape.tokens, shape.top_k, shape.num_experts);
+    }
+
+    Ok(())
+}
+
 fn qwen35_mlp_backend<B: MoeLlmBackend>(
     ctx: &mut B::Context,
     x: &B::Buffer,
@@ -5191,6 +5607,201 @@ fn qwen35_finish_layer_with_mlp_f32_residual<B: MoeLlmBackend>(
     Ok(layer_output)
 }
 
+fn qwen35_sparse_moe_shape_from_config(
+    config: &Qwen35TextConfig,
+    tokens: usize,
+) -> Result<Qwen35SparseMoeShape> {
+    let moe_config = config
+        .moe
+        .as_ref()
+        .ok_or_else(|| FerrumError::model("Qwen3.5 sparse MoE config missing"))?;
+    Ok(Qwen35SparseMoeShape {
+        tokens,
+        hidden_size: config.hidden_size,
+        num_experts: moe_config.num_experts,
+        top_k: moe_config.num_experts_per_tok,
+        expert_intermediate_size: moe_config.moe_intermediate_size,
+        shared_expert_intermediate_size: moe_config.shared_expert_intermediate_size,
+        norm_topk_prob: moe_config.norm_topk_prob,
+    })
+}
+
+fn qwen35_finish_layer_with_mlp_decode_scratch<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    residual_after_attention: &B::Buffer,
+    layer: &Qwen35LayerWeights<B>,
+    config: &Qwen35TextConfig,
+    tokens: usize,
+    eps: f32,
+    scratch: &mut Qwen35DecodeScratch<B>,
+) -> Result<B::Buffer> {
+    let hidden_len = tokens * config.hidden_size;
+    B::rms_norm(
+        ctx,
+        residual_after_attention,
+        &layer.post_attention_layernorm,
+        eps,
+        &mut scratch.post_attention_norm,
+        tokens,
+        config.hidden_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "post_attention_norm",
+        &scratch.post_attention_norm,
+        hidden_len,
+    );
+    match &layer.mlp {
+        Qwen35MlpWeights::SparseMoeSharedExpert(moe) => {
+            qwen35_sparse_moe_shared_expert_decode_scratch::<B>(
+                ctx,
+                moe,
+                qwen35_sparse_moe_shape_from_config(config, tokens)?,
+                layer.layer_index,
+                scratch,
+            )?;
+            qwen35_trace_layer_buffer_stats::<B>(
+                ctx,
+                layer.layer_index,
+                "mlp_out",
+                &scratch.mlp_output,
+                hidden_len,
+            );
+            let mut layer_output = B::alloc(hidden_len);
+            B::copy_slice(
+                ctx,
+                residual_after_attention,
+                0,
+                &mut layer_output,
+                0,
+                hidden_len,
+            );
+            B::add_inplace(ctx, &mut layer_output, &scratch.mlp_output, hidden_len);
+            qwen35_trace_layer_buffer_stats::<B>(
+                ctx,
+                layer.layer_index,
+                "layer_output_after_mlp",
+                &layer_output,
+                hidden_len,
+            );
+            Ok(layer_output)
+        }
+        Qwen35MlpWeights::Dense(_) => {
+            let mlp_out = qwen35_mlp_backend::<B>(
+                ctx,
+                &scratch.post_attention_norm,
+                &layer.mlp,
+                config,
+                tokens,
+                layer.layer_index,
+            )?;
+            qwen35_trace_layer_buffer_stats::<B>(
+                ctx,
+                layer.layer_index,
+                "mlp_out",
+                &mlp_out,
+                hidden_len,
+            );
+            let mut layer_output = B::alloc(hidden_len);
+            B::copy_slice(
+                ctx,
+                residual_after_attention,
+                0,
+                &mut layer_output,
+                0,
+                hidden_len,
+            );
+            B::add_inplace(ctx, &mut layer_output, &mlp_out, hidden_len);
+            qwen35_trace_layer_buffer_stats::<B>(
+                ctx,
+                layer.layer_index,
+                "layer_output_after_mlp",
+                &layer_output,
+                hidden_len,
+            );
+            Ok(layer_output)
+        }
+    }
+}
+
+fn qwen35_finish_layer_with_mlp_f32_residual_decode_scratch<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    residual_f32: &mut B::Buffer,
+    branch_f32: &mut B::Buffer,
+    layer: &Qwen35LayerWeights<B>,
+    config: &Qwen35TextConfig,
+    tokens: usize,
+    eps: f32,
+    scratch: &mut Qwen35DecodeScratch<B>,
+) -> Result<B::Buffer> {
+    let hidden_len = tokens * config.hidden_size;
+    B::rms_norm_f32_to_activation(
+        ctx,
+        residual_f32,
+        &layer.post_attention_layernorm,
+        eps,
+        &mut scratch.post_attention_norm,
+        tokens,
+        config.hidden_size,
+    );
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "post_attention_norm",
+        &scratch.post_attention_norm,
+        hidden_len,
+    );
+    match &layer.mlp {
+        Qwen35MlpWeights::SparseMoeSharedExpert(moe) => {
+            qwen35_sparse_moe_shared_expert_decode_scratch::<B>(
+                ctx,
+                moe,
+                qwen35_sparse_moe_shape_from_config(config, tokens)?,
+                layer.layer_index,
+                scratch,
+            )?;
+            qwen35_trace_layer_buffer_stats::<B>(
+                ctx,
+                layer.layer_index,
+                "mlp_out",
+                &scratch.mlp_output,
+                hidden_len,
+            );
+            B::activation_to_f32_shadow(ctx, &scratch.mlp_output, branch_f32, hidden_len);
+        }
+        Qwen35MlpWeights::Dense(_) => {
+            let mlp_out = qwen35_mlp_backend::<B>(
+                ctx,
+                &scratch.post_attention_norm,
+                &layer.mlp,
+                config,
+                tokens,
+                layer.layer_index,
+            )?;
+            qwen35_trace_layer_buffer_stats::<B>(
+                ctx,
+                layer.layer_index,
+                "mlp_out",
+                &mlp_out,
+                hidden_len,
+            );
+            B::activation_to_f32_shadow(ctx, &mlp_out, branch_f32, hidden_len);
+        }
+    }
+    B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+    qwen35_trace_layer_buffer_stats::<B>(
+        ctx,
+        layer.layer_index,
+        "layer_output_after_mlp",
+        residual_f32,
+        hidden_len,
+    );
+    let mut layer_output = B::alloc(hidden_len);
+    B::f32_to_activation(ctx, residual_f32, &mut layer_output, hidden_len);
+    Ok(layer_output)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
     ctx: &mut B::Context,
@@ -5204,6 +5815,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
     eps: f32,
     mut residual_f32: Option<&mut B::Buffer>,
     mut branch_f32: Option<&mut B::Buffer>,
+    mut decode_scratch: Option<&mut Qwen35DecodeScratch<B>>,
 ) -> Result<B::Buffer> {
     let batch_len = states.len();
     let attention_shape = Qwen35LinearAttentionShape {
@@ -5651,15 +6263,28 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
             "qwen35_linear_decode_residual_update",
         );
         let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-        let output = qwen35_finish_layer_with_mlp_f32_residual::<B>(
-            ctx,
-            residual_f32,
-            branch_f32,
-            layer,
-            config,
-            batch_len,
-            eps,
-        )?;
+        let output = if let Some(scratch) = decode_scratch.as_deref_mut() {
+            qwen35_finish_layer_with_mlp_f32_residual_decode_scratch::<B>(
+                ctx,
+                residual_f32,
+                branch_f32,
+                layer,
+                config,
+                batch_len,
+                eps,
+                scratch,
+            )?
+        } else {
+            qwen35_finish_layer_with_mlp_f32_residual::<B>(
+                ctx,
+                residual_f32,
+                branch_f32,
+                layer,
+                config,
+                batch_len,
+                eps,
+            )?
+        };
         detail.mlp_us +=
             qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_decode_mlp");
         output
@@ -5681,14 +6306,26 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
             "qwen35_linear_decode_residual_update",
         );
         let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-        let output = qwen35_finish_layer_with_mlp::<B>(
-            ctx,
-            &residual_after_mixer,
-            layer,
-            config,
-            batch_len,
-            eps,
-        )?;
+        let output = if let Some(scratch) = decode_scratch.as_deref_mut() {
+            qwen35_finish_layer_with_mlp_decode_scratch::<B>(
+                ctx,
+                &residual_after_mixer,
+                layer,
+                config,
+                batch_len,
+                eps,
+                scratch,
+            )?
+        } else {
+            qwen35_finish_layer_with_mlp::<B>(
+                ctx,
+                &residual_after_mixer,
+                layer,
+                config,
+                batch_len,
+                eps,
+            )?
+        };
         detail.mlp_us +=
             qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_decode_mlp");
         output
@@ -6365,6 +7002,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
     eps: f32,
     mut residual_f32: Option<&mut B::Buffer>,
     mut branch_f32: Option<&mut B::Buffer>,
+    mut decode_scratch: Option<&mut Qwen35DecodeScratch<B>>,
 ) -> Result<B::Buffer> {
     let batch_len = states.len();
     let hidden_len = batch_len * config.hidden_size;
@@ -6642,15 +7280,28 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
         {
             B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
             B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
-            return qwen35_finish_layer_with_mlp_f32_residual::<B>(
-                ctx,
-                residual_f32,
-                branch_f32,
-                layer,
-                config,
-                batch_len,
-                eps,
-            );
+            return if let Some(scratch) = decode_scratch.as_deref_mut() {
+                qwen35_finish_layer_with_mlp_f32_residual_decode_scratch::<B>(
+                    ctx,
+                    residual_f32,
+                    branch_f32,
+                    layer,
+                    config,
+                    batch_len,
+                    eps,
+                    scratch,
+                )
+            } else {
+                qwen35_finish_layer_with_mlp_f32_residual::<B>(
+                    ctx,
+                    residual_f32,
+                    branch_f32,
+                    layer,
+                    config,
+                    batch_len,
+                    eps,
+                )
+            };
         }
         let mut residual_after_attention = B::alloc(hidden_len);
         B::copy_slice(
@@ -6662,14 +7313,26 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
             hidden_len,
         );
         B::add_inplace(ctx, &mut residual_after_attention, &attn_output, hidden_len);
-        return qwen35_finish_layer_with_mlp::<B>(
-            ctx,
-            &residual_after_attention,
-            layer,
-            config,
-            batch_len,
-            eps,
-        );
+        return if let Some(scratch) = decode_scratch.as_deref_mut() {
+            qwen35_finish_layer_with_mlp_decode_scratch::<B>(
+                ctx,
+                &residual_after_attention,
+                layer,
+                config,
+                batch_len,
+                eps,
+                scratch,
+            )
+        } else {
+            qwen35_finish_layer_with_mlp::<B>(
+                ctx,
+                &residual_after_attention,
+                layer,
+                config,
+                batch_len,
+                eps,
+            )
+        };
     }
 
     let mut context = B::alloc(batch_len * q_total);
@@ -6854,15 +7517,28 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
     {
         B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
         B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
-        qwen35_finish_layer_with_mlp_f32_residual::<B>(
-            ctx,
-            residual_f32,
-            branch_f32,
-            layer,
-            config,
-            batch_len,
-            eps,
-        )
+        if let Some(scratch) = decode_scratch.as_deref_mut() {
+            qwen35_finish_layer_with_mlp_f32_residual_decode_scratch::<B>(
+                ctx,
+                residual_f32,
+                branch_f32,
+                layer,
+                config,
+                batch_len,
+                eps,
+                scratch,
+            )
+        } else {
+            qwen35_finish_layer_with_mlp_f32_residual::<B>(
+                ctx,
+                residual_f32,
+                branch_f32,
+                layer,
+                config,
+                batch_len,
+                eps,
+            )
+        }
     } else {
         let mut residual_after_attention = B::alloc(hidden_len);
         B::copy_slice(
@@ -6874,14 +7550,26 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
             hidden_len,
         );
         B::add_inplace(ctx, &mut residual_after_attention, &attn_output, hidden_len);
-        qwen35_finish_layer_with_mlp::<B>(
-            ctx,
-            &residual_after_attention,
-            layer,
-            config,
-            batch_len,
-            eps,
-        )
+        if let Some(scratch) = decode_scratch.as_deref_mut() {
+            qwen35_finish_layer_with_mlp_decode_scratch::<B>(
+                ctx,
+                &residual_after_attention,
+                layer,
+                config,
+                batch_len,
+                eps,
+                scratch,
+            )
+        } else {
+            qwen35_finish_layer_with_mlp::<B>(
+                ctx,
+                &residual_after_attention,
+                layer,
+                config,
+                batch_len,
+                eps,
+            )
+        }
     }
 }
 
