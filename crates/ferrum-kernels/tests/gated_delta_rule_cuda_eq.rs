@@ -345,9 +345,9 @@ fn packed_indexed_expected(
         let slot = slot_indices[row] as usize;
         assert!(slot < max_slots);
         let mixed_base = row * conv_channels;
-        let query = &mixed_qkv[mixed_base..mixed_base + qk_total];
-        let key = &mixed_qkv[mixed_base + qk_total..mixed_base + 2 * qk_total];
-        let value = &mixed_qkv[mixed_base + 2 * qk_total..mixed_base + conv_channels];
+        let query = mixed_qkv[mixed_base..mixed_base + qk_total].to_vec();
+        let key = mixed_qkv[mixed_base + qk_total..mixed_base + 2 * qk_total].to_vec();
+        let value = mixed_qkv[mixed_base + 2 * qk_total..mixed_base + conv_channels].to_vec();
         let ba_base = row * 2 * value_heads;
         let mut g = vec![0.0; value_heads];
         let mut beta = vec![0.0; value_heads];
@@ -360,16 +360,18 @@ fn packed_indexed_expected(
 
         let state_base = slot * state_len;
         let out_base = row * value_total;
+        let initial_state = expected_slots[state_base..state_base + state_len].to_vec();
+        let mut row_out = vec![0.0; value_total];
         let mut final_state = vec![0.0; state_len];
         CpuBackend::recurrent_gated_delta_rule_f32(
             &mut cpu_ctx,
-            query,
-            key,
-            value,
+            &query,
+            &key,
+            &value,
             &g,
             &beta,
-            &expected_slots[state_base..state_base + state_len],
-            &mut expected_out[out_base..out_base + value_total],
+            &initial_state,
+            &mut row_out,
             &mut final_state,
             1,
             key_heads,
@@ -380,6 +382,7 @@ fn packed_indexed_expected(
             (key_dim as f32).sqrt().recip(),
         )
         .unwrap();
+        expected_out[out_base..out_base + value_total].copy_from_slice(&row_out);
         expected_slots[state_base..state_base + state_len].copy_from_slice(&final_state);
     }
 
