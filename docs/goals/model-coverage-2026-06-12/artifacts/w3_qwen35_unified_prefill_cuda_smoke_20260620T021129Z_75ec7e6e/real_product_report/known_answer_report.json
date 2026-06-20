@@ -1,0 +1,199 @@
+{
+  "commands": [
+    {
+      "command_line": [
+        "/workspace/ferrum-target-w3-varlen/release/ferrum",
+        "run",
+        "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+        "--backend",
+        "cuda",
+        "--gpu-devices",
+        "0",
+        "--gpu-memory-utilization",
+        "0.90",
+        "--max-model-len",
+        "2048",
+        "--max-num-seqs",
+        "4",
+        "--max-num-batched-tokens",
+        "2048",
+        "--kv-capacity",
+        "2048",
+        "--disable-thinking",
+        "--output-format",
+        "jsonl",
+        "--temperature",
+        "0",
+        "--max-tokens",
+        "8",
+        "--prompt",
+        "What is 2+3? Answer with only the number."
+      ],
+      "entrypoint": "ferrum run"
+    },
+    {
+      "command_line": [
+        "/workspace/ferrum-target-w3-varlen/release/ferrum",
+        "serve",
+        "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "33677",
+        "--backend",
+        "cuda",
+        "--gpu-devices",
+        "0",
+        "--gpu-memory-utilization",
+        "0.90",
+        "--max-model-len",
+        "2048",
+        "--max-num-seqs",
+        "4",
+        "--max-num-batched-tokens",
+        "2048",
+        "--kv-capacity",
+        "2048"
+      ],
+      "entrypoint": "ferrum serve"
+    }
+  ],
+  "format": "hf-gptq-int4",
+  "generated_at": "2026-06-20T02:43:23.885197+00:00",
+  "hidden_env": [],
+  "known_answer_cases": [
+    {
+      "artifact": "run_stdout.jsonl",
+      "content": "5",
+      "entrypoint": "ferrum run",
+      "expected": "5",
+      "finish_reason": "stop",
+      "id": "addition_2_plus_3",
+      "passed": true,
+      "prompt": "What is 2+3? Answer with only the number.",
+      "semantic_pass": true
+    },
+    {
+      "artifact": "known_answers/01_addition_2_plus_3.response.json",
+      "content": "5",
+      "entrypoint": "ferrum serve",
+      "expected": "5",
+      "finish_reason": "stop",
+      "id": "addition_2_plus_3",
+      "passed": true,
+      "prompt": "What is 2+3? Answer with only the number.",
+      "semantic_pass": true
+    },
+    {
+      "artifact": "known_answers/02_subtraction_7_minus_4.response.json",
+      "content": "3",
+      "entrypoint": "ferrum serve",
+      "expected": "3",
+      "finish_reason": "stop",
+      "id": "subtraction_7_minus_4",
+      "passed": true,
+      "prompt": "What is 7-4? Answer with only the number.",
+      "semantic_pass": true
+    },
+    {
+      "artifact": "known_answers/03_capital_france.response.json",
+      "content": "Paris",
+      "entrypoint": "ferrum serve",
+      "expected": "Paris",
+      "finish_reason": "stop",
+      "id": "capital_france",
+      "passed": true,
+      "prompt": "What is the capital of France? Answer with one word.",
+      "semantic_pass": true
+    },
+    {
+      "artifact": "known_answers/04_capital_italy.response.json",
+      "content": "Rome",
+      "entrypoint": "ferrum serve",
+      "expected": "Rome",
+      "finish_reason": "stop",
+      "id": "capital_italy",
+      "passed": true,
+      "prompt": "What is the capital of Italy? Answer with one word.",
+      "semantic_pass": true
+    },
+    {
+      "artifact": "known_answers/05_capital_japan.response.json",
+      "content": "Tokyo",
+      "entrypoint": "ferrum serve",
+      "expected": "Tokyo",
+      "finish_reason": "stop",
+      "id": "capital_japan",
+      "passed": true,
+      "prompt": "What is the capital of Japan? Answer with one word.",
+      "semantic_pass": true
+    },
+    {
+      "artifact": "known_answers/06_clear_sky_color.response.json",
+      "content": "Blue",
+      "entrypoint": "ferrum serve",
+      "expected": "blue",
+      "finish_reason": "stop",
+      "id": "clear_sky_color",
+      "passed": true,
+      "prompt": "What color is the sky on a clear day? Answer with one word.",
+      "semantic_pass": true
+    },
+    {
+      "artifact": "known_answers/07_opposite_hot.response.json",
+      "content": "Cold",
+      "entrypoint": "ferrum serve",
+      "expected": "cold",
+      "finish_reason": "stop",
+      "id": "opposite_hot",
+      "passed": true,
+      "prompt": "What is the opposite of hot? Answer with one word.",
+      "semantic_pass": true
+    },
+    {
+      "artifact": "known_answers/08_alphabet_first_letter.response.json",
+      "content": "A",
+      "entrypoint": "ferrum serve",
+      "expected": "A",
+      "finish_reason": "stop",
+      "id": "alphabet_first_letter",
+      "passed": true,
+      "prompt": "What is the first letter of the English alphabet? Answer with one letter.",
+      "semantic_pass": true
+    },
+    {
+      "artifact": "known_answers/09_days_in_week.response.json",
+      "content": "7",
+      "entrypoint": "ferrum serve",
+      "expected": "7",
+      "finish_reason": "stop",
+      "id": "days_in_week",
+      "passed": true,
+      "prompt": "How many days are in a week? Answer with only the number.",
+      "semantic_pass": true
+    },
+    {
+      "artifact": "known_answers/10_freezing_water_celsius.response.json",
+      "content": "Yes",
+      "entrypoint": "ferrum serve",
+      "expected": "yes",
+      "finish_reason": "stop",
+      "id": "freezing_water_celsius",
+      "passed": true,
+      "prompt": "Does water freeze at 0 degrees Celsius? Answer yes or no.",
+      "semantic_pass": true
+    }
+  ],
+  "known_answer_passed": 11,
+  "known_answer_total": 11,
+  "model_id": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "product_entrypoints": [
+    "ferrum run",
+    "ferrum serve"
+  ],
+  "product_surface": "typed_cli",
+  "real_size_model": true,
+  "schema_version": 1,
+  "semantic_pass": true,
+  "waived": false
+}

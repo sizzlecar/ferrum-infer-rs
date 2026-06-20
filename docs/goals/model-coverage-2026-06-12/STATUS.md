@@ -2,6 +2,75 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ36 — W3 Qwen35 unified fresh prefill source + CUDA product smoke PASS
+
+- Scope:
+  - wired Qwen35 product `unified_forward` to a native fresh final prefill
+    batch path for paged KV;
+  - the fast path is deliberately narrow and correct: non-empty tokens,
+    `pos_offset == 0`, `is_final_chunk == true`, unique cache ids, empty
+    sequence state, and empty full-attention KV are required; unsupported
+    mixed/decode/chunked shapes fall back through the executor;
+  - batch prefill now runs linear-attention layers through the varlen
+    prepare/GDN core and full-attention layers through paged varlen
+    split-QKV-to-cache plus paged varlen attention, then gathers one final
+    hidden row per request for LM head logits;
+  - this is still smoke/product correctness evidence only: no c=1/4/16/32
+    performance matrix, no same-hardware vLLM ratio, and no final
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+- Commit:
+  - `75ec7e6e perf(qwen35): route fresh prefill through unified forward`;
+  - pushed to `origin/goal/w2-w3-release-grade`.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - `cargo check -p ferrum-models --all-targets` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS: 83 matched
+    library tests plus `qwen35_config_test` 1 test;
+  - added CPU/non-paged product-entry test
+    `qwen35_unified_forward_requires_paged_kv_for_fresh_batch_prefill`, so
+    unsupported backends keep executor fallback semantics.
+- CUDA validation / lifecycle:
+  - Vast instance `41422823`, 1x `NVIDIA GeForce RTX 4090`, `49140 MiB`,
+    driver `580.126.09`, CUDA toolkit `12.4`, Rust `1.96.0`;
+  - clean remote checkout:
+    `/workspace/ferrum-w3-unified-75ec7e6e`,
+    `HEAD=75ec7e6ebd82e017e74651490ccd1c15f55b1f5a`,
+    `git status --short` clean before and after;
+  - artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e`;
+  - CUDA release build command:
+    `cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - binary SHA256:
+    `e32d89a44ac4759cf177ac2d64115389652e27b67c44ceebbbb5ecc3a6eb6c30`;
+  - CUDA unit command:
+    `cargo test -p ferrum-models --features cuda linear_attention_prefill_varlen_cuda_backend_matches_per_sequence_stateful_reference -- --nocapture`;
+  - real product report PASS line:
+    `W3 QWEN35 REAL PRODUCT REPORT PASS: /workspace/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report`;
+  - smoke PASS line:
+    `W3 QWEN35 UNIFIED PREFILL CUDA SMOKE PASS: /workspace/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e`;
+  - Vast stop check after artifact copyback:
+    `cur_state=stopped`, `actual_status=exited`, `intended_status=stopped`.
+- Product result:
+  - model: `Qwen/Qwen3.5-35B-A3B-GPTQ-Int4`;
+  - command surface used typed CLI flags only:
+    `--backend cuda --gpu-devices 0 --gpu-memory-utilization 0.90
+    --max-model-len 2048 --max-num-seqs 4 --max-num-batched-tokens 2048
+    --kv-capacity 2048`;
+  - `ferrum run` PASS for known answer `What is 2+3?`, assistant content
+    `5`, `finish_reason=stop`;
+  - `w3_qwen35_real_product_report.py` PASS with 11 known-answer cases and
+    5 behavior cases, covering `ferrum run`, `ferrum serve`, non-stream,
+    stream, natural EOS, custom stop, and reasoning extraction;
+  - `w3_s2_whole_model_product_path.json` reports:
+    `W3 QWEN35 REAL PRODUCT PATH PASS: /workspace/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report`.
+- Next:
+  - run a targeted concurrent `bench-serve` smoke that forces multiple fresh
+    prompts into the new Qwen35 `unified_forward` batch prefill path;
+  - then run W3 L5/full c=1/4/16/32 performance and same-hardware vLLM ratio
+    only after that correctness smoke remains clean.
+
 ## 2026-06-20 ZZZ35 — W3 Qwen35 varlen linear-attention prepare CUDA exec PASS
 
 - Scope:

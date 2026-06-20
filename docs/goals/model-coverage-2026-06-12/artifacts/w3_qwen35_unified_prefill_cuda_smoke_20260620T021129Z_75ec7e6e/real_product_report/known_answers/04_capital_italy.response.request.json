@@ -1,0 +1,16 @@
+{
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "max_tokens": 8,
+  "messages": [
+    {
+      "content": "What is the capital of Italy? Answer with one word.",
+      "role": "user"
+    }
+  ],
+  "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "seed": 9271,
+  "stream": false,
+  "temperature": 0
+}
