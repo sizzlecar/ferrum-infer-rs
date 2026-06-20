@@ -1,0 +1,8 @@
+data: {"id":"9b8463c0-e633-48ec-9421-f4049d26ebba","object":"chat.completion.chunk","created":1781929019,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":"Paris"}}]}
+
+data: {"id":"9b8463c0-e633-48ec-9421-f4049d26ebba","object":"chat.completion.chunk","created":1781929019,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]}
+
+data: {"id":"9b8463c0-e633-48ec-9421-f4049d26ebba","object":"chat.completion.chunk","created":1781929019,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":2,"total_tokens":22}}
+
+data: [DONE]
+
