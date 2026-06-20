@@ -2,6 +2,59 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ35 — W3 Qwen35 varlen linear-attention prepare CUDA exec PASS
+
+- Scope:
+  - added a backend-native varlen Qwen35 linear-attention prepare primitive:
+    depthwise causal conv + Q/K/V split + GDN gate preparation with
+    `cu_seqlens` sequence boundaries;
+  - the new primitive reads per-sequence initial conv state and writes
+    per-sequence final conv state, so batched prefill can avoid cross-request
+    conv bleed;
+  - added the Qwen35 varlen prefill core that composes varlen prepare,
+    existing varlen recurrent GDN, and gated RMSNorm;
+  - added CPU reference coverage and a CUDA feature test that executes the new
+    CUDA kernel against the same per-sequence stateful reference;
+  - this is still prerequisite work only: Qwen35 product `unified_forward` /
+    `batch_prefill` has not yet been switched to this path, so no W3 final PASS
+    and no performance claim.
+- Commit:
+  - `a50d42c6 perf(qwen35): add varlen linear attention prepare`.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - `cargo check -p ferrum-kernels --all-targets` PASS;
+  - `cargo check -p ferrum-models --all-targets` PASS;
+  - `cargo test -p ferrum-models linear_attention_prefill_varlen_backend_matches_per_sequence_stateful_reference -- --nocapture` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS: 82 matched
+    library tests plus `qwen35_config_test` 1 test.
+- CUDA validation / lifecycle:
+  - Vast instance `41422823`, 1x `NVIDIA GeForce RTX 4090`, `49140 MiB`,
+    driver `580.126.09`, CUDA toolkit `12.4`, Rust `cargo 1.96.0`;
+  - remote clean smoke checkout was `HEAD=d60bb92a` plus exactly the six source
+    files from `a50d42c6` before the local commit was created;
+  - build artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_varlen_prepare_cuda_smoke_retry_20260620T010212Z`;
+  - CUDA build smoke PASS line:
+    `W3 QWEN35 VARLEN PREPARE CUDA BUILD SMOKE PASS: /workspace/artifacts/w3_qwen35_varlen_prepare_cuda_smoke_retry_20260620T010212Z`;
+  - exec artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_varlen_prepare_cuda_exec_20260620T010925Z`;
+  - CUDA execution test command:
+    `cargo test -p ferrum-models --features cuda linear_attention_prefill_varlen_cuda_backend_matches_per_sequence_stateful_reference -- --nocapture`;
+  - CUDA execution PASS line:
+    `W3 QWEN35 VARLEN PREPARE CUDA EXEC SMOKE PASS: /workspace/artifacts/w3_qwen35_varlen_prepare_cuda_exec_20260620T010925Z`;
+  - an earlier build-smoke attempt failed with `cargo: command not found`
+    because the tmux shell did not load `/root/.cargo/env`; this was an
+    environment setup failure, not a source failure;
+  - Vast stop check after artifact copyback:
+    `cur_state=stopped`, `actual_status=exited`, `intended_status=stopped`.
+- Next:
+  - wire Qwen35 `unified_forward` / product `batch_prefill` to the varlen
+    prepare + varlen GDN core with per-request state writeback;
+  - then run `ferrum run` and `ferrum serve` correctness before any W3 perf
+    comparison.
+
 ## 2026-06-20 ZZZ34 — W3 Qwen35 varlen GDN primitive source checkpoint
 
 - Scope:

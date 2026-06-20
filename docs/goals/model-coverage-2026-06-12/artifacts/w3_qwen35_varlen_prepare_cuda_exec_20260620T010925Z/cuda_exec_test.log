@@ -1,0 +1,429 @@
+   Compiling cfg-if v1.0.4
+   Compiling once_cell v1.21.3
+   Compiling memchr v2.7.6
+   Compiling shlex v1.3.0
+   Compiling bitflags v2.10.0
+   Compiling find-msvc-tools v0.1.4
+   Compiling itoa v1.0.15
+   Compiling pin-project-lite v0.2.16
+   Compiling futures-core v0.3.31
+   Compiling libc v0.2.186
+   Compiling serde_core v1.0.228
+   Compiling libm v0.2.15
+   Compiling crossbeam-utils v0.8.21
+   Compiling bytes v1.10.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling log v0.4.28
+   Compiling scopeguard v1.2.0
+   Compiling equivalent v1.0.2
+   Compiling bytemuck v1.24.0
+   Compiling zerocopy v0.8.27
+   Compiling zerofrom v0.1.6
+   Compiling ryu v1.0.20
+   Compiling lock_api v0.4.14
+   Compiling futures-sink v0.3.31
+   Compiling fnv v1.0.7
+   Compiling slab v0.4.11
+   Compiling cc v1.2.43
+   Compiling hashbrown v0.17.1
+   Compiling pkg-config v0.3.32
+   Compiling either v1.15.0
+   Compiling futures-channel v0.3.31
+   Compiling pin-utils v0.1.0
+   Compiling futures-io v0.3.31
+   Compiling futures-task v0.3.31
+   Compiling yoke v0.8.1
+   Compiling raw-cpuid v11.6.0
+   Compiling tracing-core v0.1.34
+   Compiling zerovec-derive v0.11.1
+   Compiling reborrow v0.5.5
+   Compiling pulp-wasm-simd-flag v0.1.0
+   Compiling dyn-stack v0.13.2
+   Compiling displaydoc v0.2.5
+   Compiling typenum v1.19.0
+   Compiling crc32fast v1.5.0
+   Compiling bitflags v1.3.2
+   Compiling crossbeam-epoch v0.9.18
+   Compiling futures-util v0.3.31
+   Compiling arrayvec v0.7.6
+   Compiling vcpkg v0.2.15
+   Compiling lazy_static v1.5.0
+   Compiling encoding_rs v0.8.35
+   Compiling tracing v0.1.41
+   Compiling crossbeam-deque v0.8.6
+   Compiling indexmap v2.14.0
+   Compiling symphonia-core v0.5.5
+   Compiling http v1.3.1
+   Compiling zeroize v1.8.2
+   Compiling writeable v0.6.1
+   Compiling rayon-core v1.13.0
+   Compiling getrandom v0.3.4
+   Compiling num-traits v0.2.19
+   Compiling mio v1.1.0
+   Compiling signal-hook-registry v1.4.6
+   Compiling rand_core v0.9.3
+   Compiling socket2 v0.6.1
+   Compiling num_cpus v1.17.0
+   Compiling generic-array v0.14.9
+   Compiling getrandom v0.2.16
+   Compiling litemap v0.8.0
+   Compiling rayon v1.11.0
+   Compiling zerovec v0.11.4
+   Compiling zerotrie v0.2.2
+   Compiling rustls-pki-types v1.12.0
+   Compiling byteorder v1.5.0
+   Compiling icu_normalizer_data v2.0.0
+   Compiling openssl-sys v0.9.110
+   Compiling ring v0.17.14
+   Compiling num-complex v0.4.6
+   Compiling crypto-common v0.1.6
+   Compiling block-buffer v0.10.4
+   Compiling icu_properties_data v2.0.1
+   Compiling percent-encoding v2.3.2
+   Compiling symphonia-metadata v0.5.5
+   Compiling http-body v1.0.1
+   Compiling digest v0.10.7
+   Compiling thiserror v2.0.17
+   Compiling libloading v0.9.0
+   Compiling httparse v1.10.1
+   Compiling foldhash v0.2.0
+   Compiling foreign-types-shared v0.1.1
+   Compiling untrusted v0.9.0
+   Compiling allocator-api2 v0.2.21
+   Compiling openssl v0.10.74
+   Compiling cpufeatures v0.2.17
+   Compiling ppv-lite86 v0.2.21
+   Compiling iana-time-zone v0.1.64
+   Compiling pulp v0.22.2
+   Compiling sha2 v0.10.9
+   Compiling foreign-types v0.3.2
+   Compiling thiserror v1.0.69
+   Compiling openssl-macros v0.1.1
+   Compiling tower-service v0.3.3
+   Compiling typed-path v0.12.3
+   Compiling atomic-waker v1.1.2
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.145
+   Compiling tinystr v0.8.1
+   Compiling potential_utf v0.1.3
+   Compiling rand_chacha v0.9.0
+   Compiling ident_case v1.0.1
+   Compiling strsim v0.11.1
+   Compiling try-lock v0.2.5
+   Compiling icu_collections v2.0.0
+   Compiling simd-adler32 v0.3.7
+   Compiling native-tls v0.2.14
+   Compiling rustls v0.23.34
+   Compiling want v0.3.1
+   Compiling icu_locale_core v2.0.0
+   Compiling memmap2 v0.9.9
+   Compiling rand v0.9.2
+   Compiling darling_core v0.20.11
+   Compiling openssl-probe v0.1.6
+   Compiling base64 v0.22.1
+   Compiling subtle v2.6.1
+   Compiling adler2 v2.0.1
+   Compiling symphonia-utils-xiph v0.5.5
+   Compiling smallvec v1.15.1
+   Compiling uuid v1.18.1
+   Compiling hashbrown v0.16.0
+   Compiling chrono v0.4.42
+   Compiling miniz_oxide v0.8.9
+   Compiling form_urlencoded v1.2.2
+   Compiling webpki-roots v1.0.3
+   Compiling parking_lot_core v0.9.12
+   Compiling num-integer v0.1.46
+   Compiling aho-corasick v1.1.3
+   Compiling regex-syntax v0.8.8
+   Compiling futures-executor v0.3.31
+   Compiling parking_lot v0.12.5
+   Compiling rand_distr v0.5.1
+   Compiling icu_provider v2.0.0
+   Compiling zip v7.2.0
+   Compiling futures v0.3.31
+   Compiling rustversion v1.0.22
+   Compiling bindgen_cuda v0.1.6
+   Compiling tokio v1.48.0
+   Compiling icu_normalizer v2.0.0
+   Compiling icu_properties v2.0.1
+   Compiling safetensors v0.7.0
+   Compiling portable-atomic v1.11.1
+   Compiling utf8_iter v1.0.4
+   Compiling option-ext v0.2.0
+   Compiling ipnet v2.11.0
+   Compiling flate2 v1.1.5
+   Compiling onig_sys v69.9.1
+   Compiling half v2.7.1
+   Compiling sync_wrapper v1.0.2
+   Compiling tower-layer v0.3.3
+   Compiling strength_reduce v0.2.4
+   Compiling candle-kernels v0.9.2
+   Compiling ferrum-types v0.7.7 (/workspace/ferrum-w3-varlen-smoke-20260620005925/crates/ferrum-types)
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-w3-varlen-smoke-20260620005925/crates/ferrum-kernels)
+   Compiling anyhow v1.0.100
+   Compiling audio-core v0.2.1
+   Compiling float8 v0.7.0
+   Compiling unicode-width v0.2.2
+   Compiling transpose v0.2.3
+   Compiling cudarc v0.19.4
+   Compiling primal-check v0.3.4
+   Compiling console v0.15.11
+   Compiling http-body-util v0.1.3
+   Compiling esaxx-rs v0.1.10
+   Compiling idna_adapter v1.2.1
+   Compiling ahash v0.8.12
+   Compiling minimal-lexical v0.2.1
+   Compiling iri-string v0.7.8
+   Compiling idna v1.1.0
+   Compiling bit-vec v0.8.0
+   Compiling number_prefix v0.4.0
+   Compiling castaway v0.2.4
+   Compiling regex-automata v0.4.13
+   Compiling indicatif v0.17.11
+   Compiling nom v7.1.3
+   Compiling bit-set v0.8.0
+   Compiling darling_macro v0.20.11
+   Compiling url v2.5.7
+   Compiling gemm-common v0.19.0
+   Compiling rustls-webpki v0.103.7
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling rustfft v6.4.1
+   Compiling gemm-f32 v0.19.0
+   Compiling gemm-c64 v0.19.0
+   Compiling gemm-c32 v0.19.0
+   Compiling gemm-f16 v0.19.0
+   Compiling gemm-f64 v0.19.0
+   Compiling float8 v0.6.1
+   Compiling derive_builder_macro v0.20.2
+   Compiling audioadapter-sample v3.0.0
+   Compiling audioadapter v3.0.0
+   Compiling dirs-sys v0.5.0
+   Compiling gemm v0.19.0
+   Compiling webpki-roots v0.26.11
+   Compiling serde_urlencoded v0.7.1
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling fdeflate v0.3.7
+   Compiling socks v0.3.4
+   Compiling rand_core v0.6.4
+   Compiling itertools v0.14.0
+   Compiling monostate-impl v0.1.18
+   Compiling static_assertions v1.1.0
+   Compiling byteorder-lite v0.1.0
+   Compiling extended v0.1.0
+   Compiling mime v0.3.17
+   Compiling rustix v1.1.2
+   Compiling winnow v0.7.13
+   Compiling quick-error v2.0.1
+   Compiling toml_write v0.1.2
+   Compiling base64 v0.13.1
+   Compiling pxfm v0.1.28
+   Compiling zune-core v0.5.1
+   Compiling unicode-segmentation v1.12.0
+   Compiling macro_rules_attribute-proc_macro v0.2.2
+   Compiling image-webp v0.2.4
+   Compiling regex v1.12.2
+   Compiling fancy-regex v0.17.0
+   Compiling zune-jpeg v0.5.15
+   Compiling tokio-util v0.7.16
+   Compiling tower v0.5.2
+   Compiling tokio-native-tls v0.3.1
+   Compiling macro_rules_attribute v0.2.2
+   Compiling spm_precompiled v0.1.4
+   Compiling monostate v0.1.18
+   Compiling onig v6.5.1
+   Compiling h2 v0.4.12
+   Compiling tower-http v0.6.6
+   Compiling png v0.18.1
+   Compiling rayon-cond v0.4.0
+   Compiling symphonia-format-riff v0.5.5
+   Compiling compact_str v0.9.0
+   Compiling rand_chacha v0.3.1
+   Compiling dirs v6.0.0
+   Compiling audioadapter-buffers v3.0.0
+   Compiling toml_edit v0.22.27
+   Compiling derive_builder v0.20.2
+   Compiling dirs-sys v0.4.1
+   Compiling safetensors v0.4.5
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling symphonia-format-isomp4 v0.5.5
+   Compiling symphonia-format-ogg v0.5.5
+   Compiling symphonia-codec-vorbis v0.5.5
+   Compiling symphonia-bundle-flac v0.5.5
+   Compiling dary_heap v0.3.8
+   Compiling serde_plain v1.0.2
+   Compiling symphonia-bundle-mp3 v0.5.5
+   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-w3-varlen-smoke-20260620005925/crates/ferrum-interfaces)
+   Compiling ferrum-bench-core v0.7.7 (/workspace/ferrum-w3-varlen-smoke-20260620005925/crates/ferrum-bench-core)
+   Compiling moxcms v0.8.1
+   Compiling symphonia-codec-aac v0.5.5
+   Compiling tokio-rustls v0.26.4
+   Compiling ureq v2.12.1
+   Compiling realfft v3.5.0
+   Compiling symphonia-codec-pcm v0.5.5
+   Compiling windowfunctions v0.1.1
+   Compiling async-stream-impl v0.3.6
+   Compiling visibility v0.1.1
+   Compiling linux-raw-sys v0.11.0
+   Compiling unicode_categories v0.1.1
+   Compiling rubato v2.0.0
+   Compiling tokenizers v0.21.4
+   Compiling symphonia v0.5.5
+   Compiling dirs v5.0.1
+   Compiling toml v0.8.23
+   Compiling rand v0.8.5
+   Compiling tokio-stream v0.1.17
+   Compiling async-stream v0.3.6
+   Compiling hyper v1.7.0
+   Compiling fastrand v2.3.0
+   Compiling pathdiff v0.2.3
+   Compiling tokio-test v0.4.4
+   Compiling hyper-util v0.1.17
+   Compiling ferrum-kv v0.7.7 (/workspace/ferrum-w3-varlen-smoke-20260620005925/crates/ferrum-kv)
+   Compiling tempfile v3.23.0
+   Compiling hyper-rustls v0.27.7
+   Compiling hyper-tls v0.6.0
+   Compiling reqwest v0.12.24
+   Compiling image v0.25.10
+   Compiling hf-hub v0.4.3
+   Compiling candle-core v0.9.2
+   Compiling candle-nn v0.9.2
+   Compiling candle-transformers v0.9.2
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-w3-varlen-smoke-20260620005925/crates/ferrum-quantization)
+   Compiling ferrum-testkit v0.7.7 (/workspace/ferrum-w3-varlen-smoke-20260620005925/crates/ferrum-testkit)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-w3-varlen-smoke-20260620005925/crates/ferrum-models)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 20s
+     Running unittests src/lib.rs (/workspace/ferrum-target-w3-varlen/debug/deps/ferrum_models-e3a5f4f32fd7ee95)
+
+running 1 test
+test models::qwen35::tests::linear_attention_prefill_varlen_cuda_backend_matches_per_sequence_stateful_reference ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 237 filtered out; finished in 0.66s
+
+     Running tests/audio_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/audio_test-a3f9600fdff68e2b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/executor_common_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/executor_common_test-9d1f27b692d3486d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/gguf_config_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/gguf_config_test-aac45086e7360247)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/llama_gguf_metal_batched_decode.rs (/workspace/ferrum-target-w3-varlen/debug/deps/llama_gguf_metal_batched_decode-75b2edfe55bd1218)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lora_loader.rs (/workspace/ferrum-target-w3-varlen/debug/deps/lora_loader-56907870a02f4f95)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/lora_runtime_loader.rs (/workspace/ferrum-target-w3-varlen/debug/deps/lora_runtime_loader-4b66c3c45778c290)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/mistral_config_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/mistral_config_test-8806ef3e3a2a2cdb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/moe_bucketed_parity_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/moe_bucketed_parity_test-5b29f5fab1c18119)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/moe_config_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/moe_config_test-68ffa852e8e235d0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/moe_dispatch_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/moe_dispatch_test-966c187016dd83a0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/moe_layer_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/moe_layer_test-3ec3852a4f3f24d2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/moe_router_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/moe_router_test-8b7d7fbf248c402d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/qwen35_config_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/qwen35_config_test-653cf0eedb2c88bc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/qwen3_cuda_parity_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/qwen3_cuda_parity_test-d637864ad6d91975)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/qwen3_f16_parity_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/qwen3_f16_parity_test-4ef97710b2b338b5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/qwen3_logit_dump_native.rs (/workspace/ferrum-target-w3-varlen/debug/deps/qwen3_logit_dump_native-447e1a0d4c5731b0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/qwen3_model_parity_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/qwen3_model_parity_test-913e54df4486f5aa)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/qwen3_moe_model_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/qwen3_moe_model_test-2f5a7880c3087a90)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/qwen3_moe_safetensors_smoke.rs (/workspace/ferrum-target-w3-varlen/debug/deps/qwen3_moe_safetensors_smoke-cf68cdb24eec637b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/qwen3_tts_backend_smoke.rs (/workspace/ferrum-target-w3-varlen/debug/deps/qwen3_tts_backend_smoke-91566f2d1907ac63)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/tp_sharding_test.rs (/workspace/ferrum-target-w3-varlen/debug/deps/tp_sharding_test-0dd130eb7dfbed6e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
