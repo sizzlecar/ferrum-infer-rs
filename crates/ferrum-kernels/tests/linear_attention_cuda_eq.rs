@@ -676,6 +676,256 @@ fn linear_attention_decode_prepare_batch_cuda_matches_cpu_reference() {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn packed_qkvz_to_mixed_expected(
+    mixed_qkvz_raw: &[f32],
+    conv_weight: &[f32],
+    initial_slots: &[f32],
+    slot_indices: &[u32],
+    batch: usize,
+    max_slots: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let qkvz_width = conv_channels + value_total;
+    let state_len = conv_kernel - 1;
+    let conv_state_len = conv_channels * state_len;
+    let mut expected_mixed = vec![0.0; batch * conv_channels];
+    let mut expected_z = vec![0.0; batch * value_total];
+    let mut expected_slots = initial_slots.to_vec();
+    let mut cpu_ctx = CpuBackend::new_context();
+    let conv_weight = conv_weight.to_vec();
+    let a_raw = vec![0.0; value_heads];
+    let b_raw = vec![0.0; value_heads];
+    let a_log = vec![0.0; value_heads];
+    let dt_bias = vec![0.0; value_heads];
+
+    for row in 0..batch {
+        let slot = slot_indices[row] as usize;
+        assert!(slot < max_slots);
+        let raw_base = row * qkvz_width;
+        let state_base = slot * conv_state_len;
+        let mixed_qkv_raw = mixed_qkvz_raw[raw_base..raw_base + conv_channels].to_vec();
+        let conv_state = expected_slots[state_base..state_base + conv_state_len].to_vec();
+        let mut query = vec![0.0; qk_total];
+        let mut key = vec![0.0; qk_total];
+        let mut value = vec![0.0; value_total];
+        let mut g = vec![0.0; value_heads];
+        let mut beta = vec![0.0; value_heads];
+        let mut next_state = vec![0.0; conv_state_len];
+        CpuBackend::linear_attention_decode_prepare_f32(
+            &mut cpu_ctx,
+            &mixed_qkv_raw,
+            &conv_weight,
+            &conv_state,
+            &a_raw,
+            &b_raw,
+            &a_log,
+            &dt_bias,
+            &mut query,
+            &mut key,
+            &mut value,
+            &mut g,
+            &mut beta,
+            &mut next_state,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+            false,
+        )
+        .unwrap();
+
+        let mixed_base = row * conv_channels;
+        expected_mixed[mixed_base..mixed_base + qk_total].copy_from_slice(&query);
+        expected_mixed[mixed_base + qk_total..mixed_base + 2 * qk_total].copy_from_slice(&key);
+        expected_mixed[mixed_base + 2 * qk_total..mixed_base + conv_channels]
+            .copy_from_slice(&value);
+        expected_z[row * value_total..(row + 1) * value_total]
+            .copy_from_slice(&mixed_qkvz_raw[raw_base + conv_channels..raw_base + qkvz_width]);
+        expected_slots[state_base..state_base + conv_state_len].copy_from_slice(&next_state);
+    }
+
+    (expected_mixed, expected_z, expected_slots)
+}
+
+#[test]
+fn linear_attention_decode_prepare_batch_indexed_packed_to_mixed_cuda_matches_reference() {
+    let batch = 3;
+    let max_slots = 5;
+    let key_heads = 2;
+    let value_heads = 4;
+    let key_dim = 3;
+    let value_dim = 2;
+    let conv_kernel = 4;
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let qkvz_width = conv_channels + value_total;
+    let conv_state_len = conv_channels * (conv_kernel - 1);
+    let mixed_qkvz_raw: Vec<f32> = (0..batch * qkvz_width)
+        .map(|i| ((i as f32 % 29.0) - 14.0) * 0.03125)
+        .collect();
+    let conv_weight: Vec<f32> = (0..conv_channels * conv_kernel)
+        .map(|i| match i % 5 {
+            0 => -0.25,
+            1 => 0.125,
+            2 => 0.5,
+            3 => -0.375,
+            _ => 0.75,
+        })
+        .collect();
+    let initial_slots: Vec<f32> = (0..max_slots * conv_state_len)
+        .map(|i| ((i as f32 % 23.0) - 11.0) * 0.015)
+        .collect();
+    let slot_indices = vec![2u32, 0, 4];
+    let (expected_mixed, expected_z, expected_slots) = packed_qkvz_to_mixed_expected(
+        &mixed_qkvz_raw,
+        &conv_weight,
+        &initial_slots,
+        &slot_indices,
+        batch,
+        max_slots,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+    );
+
+    let mut cuda_ctx = CudaBackend::new_context();
+    let mixed_dev = CudaBackend::from_slice_typed(&mixed_qkvz_raw);
+    let conv_dev = CudaBackend::from_slice_typed(&conv_weight);
+    let mut state_dev = CudaBackend::from_slice_typed(&initial_slots);
+    let slot_dev = CudaBackend::from_slice_typed(&slot_indices);
+    let mut mixed_out = CudaBackend::alloc_typed(Dtype::F32, batch * conv_channels);
+    let mut z_out = CudaBackend::alloc_typed(Dtype::F32, batch * value_total);
+    CudaBackend::linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+        &mut cuda_ctx,
+        &mixed_dev,
+        &conv_dev,
+        &mut state_dev,
+        &slot_dev,
+        &mut mixed_out,
+        &mut z_out,
+        batch,
+        max_slots,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+    )
+    .unwrap();
+    CudaBackend::sync(&mut cuda_ctx);
+
+    assert_close(
+        &CudaBackend::to_vec(&mixed_out, batch * conv_channels),
+        &expected_mixed,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&z_out, batch * value_total),
+        &expected_z,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&state_dev, max_slots * conv_state_len),
+        &expected_slots,
+        2e-5,
+    );
+}
+
+#[test]
+fn linear_attention_decode_prepare_batch_indexed_packed_to_mixed_cuda_accepts_f16_inputs() {
+    let batch = 2;
+    let max_slots = 3;
+    let key_heads = 1;
+    let value_heads = 2;
+    let key_dim = 4;
+    let value_dim = 3;
+    let conv_kernel = 3;
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let qkvz_width = conv_channels + value_total;
+    let conv_state_len = conv_channels * (conv_kernel - 1);
+    let mixed_qkvz_raw: Vec<f32> = (0..batch * qkvz_width)
+        .map(|i| ((i as f32 % 19.0) - 9.0) * 0.02)
+        .collect();
+    let conv_weight: Vec<f32> = (0..conv_channels * conv_kernel)
+        .map(|i| ((i as f32 % 11.0) - 5.0) * 0.05)
+        .collect();
+    let initial_slots: Vec<f32> = (0..max_slots * conv_state_len)
+        .map(|i| ((i as f32 % 17.0) - 8.0) * 0.01)
+        .collect();
+    let slot_indices = vec![1u32, 2];
+    let mixed_expected = quantize_to_f16_f32(&mixed_qkvz_raw);
+    let conv_expected = quantize_to_f16_f32(&conv_weight);
+    let (expected_mixed, expected_z, expected_slots) = packed_qkvz_to_mixed_expected(
+        &mixed_expected,
+        &conv_expected,
+        &initial_slots,
+        &slot_indices,
+        batch,
+        max_slots,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+    );
+
+    let mut cuda_ctx = CudaBackend::new_context();
+    let mixed_dev = CudaBackend::from_slice_typed(&to_f16_vec(&mixed_qkvz_raw));
+    let conv_dev = CudaBackend::from_slice_typed(&to_f16_vec(&conv_weight));
+    let mut state_dev = CudaBackend::from_slice_typed(&initial_slots);
+    let slot_dev = CudaBackend::from_slice_typed(&slot_indices);
+    let mut mixed_out = CudaBackend::alloc_typed(Dtype::F32, batch * conv_channels);
+    let mut z_out = CudaBackend::alloc_typed(Dtype::F32, batch * value_total);
+    CudaBackend::linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+        &mut cuda_ctx,
+        &mixed_dev,
+        &conv_dev,
+        &mut state_dev,
+        &slot_dev,
+        &mut mixed_out,
+        &mut z_out,
+        batch,
+        max_slots,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+    )
+    .unwrap();
+    CudaBackend::sync(&mut cuda_ctx);
+
+    assert_close(
+        &CudaBackend::to_vec(&mixed_out, batch * conv_channels),
+        &expected_mixed,
+        5e-4,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&z_out, batch * value_total),
+        &expected_z,
+        5e-4,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&state_dev, max_slots * conv_state_len),
+        &expected_slots,
+        5e-4,
+    );
+}
+
 #[test]
 fn gated_rms_norm_cuda_matches_cpu_reference() {
     let tokens = 4;

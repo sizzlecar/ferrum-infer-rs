@@ -982,6 +982,111 @@ extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_
       key_heads, value_heads, key_dim, value_dim, conv_kernel);
 }
 
+template <typename InputT>
+static __device__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl(
+    const InputT* __restrict__ mixed_qkvz_raw,
+    const InputT* __restrict__ conv_weight,
+    float* __restrict__ conv_state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ mixed_qkv,
+    float* __restrict__ z,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  const int qk_total = key_heads * key_dim;
+  const int value_total = value_heads * value_dim;
+  const int conv_channels = 2 * qk_total + value_total;
+  const int qkvz_width = conv_channels + value_total;
+  const int state_len = conv_kernel - 1;
+  const int conv_state_len = conv_channels * state_len;
+  const int row_total = max(conv_channels, value_total);
+  const int global = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch * row_total;
+  if (global >= total) return;
+
+  const int row = global / row_total;
+  const int idx = global - row * row_total;
+  const unsigned int slot_u = slot_indices[row];
+  if (slot_u >= static_cast<unsigned int>(max_slots)) return;
+  const int slot = static_cast<int>(slot_u);
+
+  if (idx < conv_channels) {
+    const int channel = idx;
+    const int state_base = slot * conv_state_len + channel * state_len;
+    const int input_base = row * qkvz_width;
+    float acc = 0.0f;
+    for (int kernel_idx = 0; kernel_idx < conv_kernel; ++kernel_idx) {
+      const float x = kernel_idx < state_len
+                          ? conv_state_slots[state_base + kernel_idx]
+                          : ferrum_load_value(mixed_qkvz_raw,
+                                              input_base + channel);
+      acc += x *
+             ferrum_load_value(conv_weight,
+                               channel * conv_kernel + kernel_idx);
+    }
+
+    if (state_len > 0) {
+      for (int pos = 0; pos < state_len; ++pos) {
+        conv_state_slots[state_base + pos] =
+            (pos + 1 < state_len)
+                ? conv_state_slots[state_base + pos + 1]
+                : ferrum_load_value(mixed_qkvz_raw, input_base + channel);
+      }
+    }
+
+    mixed_qkv[row * conv_channels + channel] = ferrum_silu(acc);
+  }
+
+  if (idx < value_total) {
+    z[row * value_total + idx] =
+        ferrum_load_value(mixed_qkvz_raw, row * qkvz_width + conv_channels + idx);
+  }
+}
+
+extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+    const float* __restrict__ mixed_qkvz_raw,
+    const float* __restrict__ conv_weight,
+    float* __restrict__ conv_state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ mixed_qkv,
+    float* __restrict__ z,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<float>(
+      mixed_qkvz_raw, conv_weight, conv_state_slots, slot_indices, mixed_qkv,
+      z, batch, max_slots, key_heads, value_heads, key_dim, value_dim,
+      conv_kernel);
+}
+
+extern "C" __global__ void linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f16_to_f32(
+    const __half* __restrict__ mixed_qkvz_raw,
+    const __half* __restrict__ conv_weight,
+    float* __restrict__ conv_state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ mixed_qkv,
+    float* __restrict__ z,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_impl<__half>(
+      mixed_qkvz_raw, conv_weight, conv_state_slots, slot_indices, mixed_qkv,
+      z, batch, max_slots, key_heads, value_heads, key_dim, value_dim,
+      conv_kernel);
+}
+
 extern "C" __global__ void linear_attention_qk_l2norm_f32(
     float* __restrict__ query,
     float* __restrict__ key,

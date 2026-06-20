@@ -33,6 +33,10 @@ const DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_TO_F32_FUNC: &str =
     "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f16_to_f32";
 const DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_PARAMS_F32_FUNC: &str =
     "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f16_params_f32";
+const DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_FUNC: &str =
+    "linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32";
+const DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_F16_TO_F32_FUNC: &str =
+    "linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f16_to_f32";
 const QK_L2NORM_FUNC: &str = "linear_attention_qk_l2norm_f32";
 const GATED_RMS_NORM_FUNC: &str = "gated_rms_norm_f32";
 const GATED_RMS_NORM_F16_TO_F32_FUNC: &str = "gated_rms_norm_f16_to_f32";
@@ -1074,6 +1078,107 @@ pub fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+    ctx: &mut CudaState,
+    mixed_qkvz_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    conv_state_slots: &mut CudaBuf,
+    slot_indices: &CudaBuf,
+    mixed_qkv: &mut CudaBuf,
+    z: &mut CudaBuf,
+    batch: usize,
+    max_slots: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+) -> Result<()> {
+    validate_decode_prepare_batch_indexed_packed_to_mixed_shape(
+        mixed_qkvz_raw,
+        conv_weight,
+        conv_state_slots,
+        slot_indices,
+        mixed_qkv,
+        z,
+        batch,
+        max_slots,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+    )?;
+
+    let op = "linear_attention_decode_prepare_batch_indexed_packed_to_mixed";
+    let input_dtype = mixed_qkvz_raw.dtype();
+    require_supported_input_dtype(op, "mixed_qkvz_raw", input_dtype)?;
+    require_dtype(op, "conv_weight", conv_weight.dtype(), input_dtype)?;
+    require_dtype(op, "conv_state_slots", conv_state_slots.dtype(), Dtype::F32)?;
+    require_dtype(op, "slot_indices", slot_indices.dtype(), Dtype::U32)?;
+    require_dtype(op, "mixed_qkv", mixed_qkv.dtype(), Dtype::F32)?;
+    require_dtype(op, "z", z.dtype(), Dtype::F32)?;
+
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let row_total = conv_channels.max(value_total);
+    let total = batch * row_total;
+    let func_name = match input_dtype {
+        Dtype::F32 => DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_FUNC,
+        Dtype::F16 => DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_F16_TO_F32_FUNC,
+        _ => unreachable!("dtype checked above"),
+    };
+    let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
+    let stream = ctx.stream.clone();
+    let batch_i32 = batch as i32;
+    let max_slots_i32 = max_slots as i32;
+    let key_heads_i32 = key_heads as i32;
+    let value_heads_i32 = value_heads as i32;
+    let key_dim_i32 = key_dim as i32;
+    let value_dim_i32 = value_dim as i32;
+    let conv_kernel_i32 = conv_kernel as i32;
+    let mut builder = stream.launch_builder(&func);
+    match input_dtype {
+        Dtype::F32 => {
+            builder.arg(mixed_qkvz_raw.as_f32());
+            builder.arg(conv_weight.as_f32());
+        }
+        Dtype::F16 => {
+            builder.arg(mixed_qkvz_raw.as_f16());
+            builder.arg(conv_weight.as_f16());
+        }
+        _ => unreachable!("dtype checked above"),
+    }
+    builder.arg(conv_state_slots.as_f32_mut());
+    builder.arg(slot_indices.as_u32());
+    builder.arg(mixed_qkv.as_f32_mut());
+    builder.arg(z.as_f32_mut());
+    builder.arg(&batch_i32);
+    builder.arg(&max_slots_i32);
+    builder.arg(&key_heads_i32);
+    builder.arg(&value_heads_i32);
+    builder.arg(&key_dim_i32);
+    builder.arg(&value_dim_i32);
+    builder.arg(&conv_kernel_i32);
+    unsafe {
+        builder
+            .launch(LaunchConfig {
+                grid_dim: (total.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .map_err(|err| {
+                FerrumError::backend(format!(
+                    "linear_attention_decode_prepare_batch_indexed_packed_to_mixed launch: {err}"
+                ))
+            })?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn gated_rms_norm_f32(
     ctx: &mut CudaState,
     core: &CudaBuf,
@@ -1733,6 +1838,64 @@ fn validate_decode_prepare_batch_indexed_packed_shape(
         if actual < expected {
             return Err(FerrumError::model(format!(
                 "linear_attention_decode_prepare_batch_indexed_packed {label} length {actual} < expected {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_decode_prepare_batch_indexed_packed_to_mixed_shape(
+    mixed_qkvz_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    conv_state_slots: &CudaBuf,
+    slot_indices: &CudaBuf,
+    mixed_qkv: &CudaBuf,
+    z: &CudaBuf,
+    batch: usize,
+    max_slots: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+) -> Result<()> {
+    if batch == 0
+        || max_slots == 0
+        || key_heads == 0
+        || value_heads == 0
+        || key_dim == 0
+        || value_dim == 0
+        || conv_kernel == 0
+    {
+        return Err(FerrumError::model(format!(
+            "linear_attention_decode_prepare_batch_indexed_packed_to_mixed shape must be positive, got batch={batch} max_slots={max_slots} key_heads={key_heads} value_heads={value_heads} key_dim={key_dim} value_dim={value_dim} conv_kernel={conv_kernel}"
+        )));
+    }
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let conv_state_elements = conv_channels * conv_kernel.saturating_sub(1);
+    let qkvz_width = conv_channels + value_total;
+    for (label, actual, expected) in [
+        ("mixed_qkvz_raw", mixed_qkvz_raw.len(), batch * qkvz_width),
+        (
+            "conv_weight",
+            conv_weight.len(),
+            conv_channels * conv_kernel,
+        ),
+        (
+            "conv_state_slots",
+            conv_state_slots.len(),
+            max_slots * conv_state_elements,
+        ),
+        ("slot_indices", slot_indices.len(), batch),
+        ("mixed_qkv", mixed_qkv.len(), batch * conv_channels),
+        ("z", z.len(), batch * value_total),
+    ] {
+        if actual < expected {
+            return Err(FerrumError::model(format!(
+                "linear_attention_decode_prepare_batch_indexed_packed_to_mixed {label} length {actual} < expected {expected}"
             )));
         }
     }
