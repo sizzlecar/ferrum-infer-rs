@@ -115,6 +115,15 @@ impl EngineInner {
         // ── 0. Materialize SequenceState for every request, classify ──
         let mut prefill_ids: Vec<RequestId> = Vec::new();
         let mut decode_ids: Vec<RequestId> = Vec::new();
+        let scheduled_tokens_by_id: HashMap<RequestId, usize> = batch
+            .requests
+            .iter()
+            .filter_map(|scheduled_req| {
+                scheduled_req
+                    .tokens_to_process
+                    .map(|tokens| (scheduled_req.request.id.clone(), tokens))
+            })
+            .collect();
         {
             let mut sequences = self.sequences.write();
             for scheduled_req in &batch.requests {
@@ -167,7 +176,7 @@ impl EngineInner {
             is_final_chunk: bool,
         }
 
-        let active_prefill_chunk_size = self.runtime_config.active_decode_prefill_chunk;
+        let explicit_active_prefill_chunk_size = self.runtime_config.active_decode_prefill_chunk;
         let has_decode_items = !decode_ids.is_empty();
         let mut unified_prefills: Vec<UnifiedPrefillWork> = Vec::new();
         for rid in &prefill_ids {
@@ -298,10 +307,15 @@ impl EngineInner {
                 }
                 .or(existing_recurrent_state);
             let remaining = num_tokens - chunk_start;
-            let chunk_len = match active_prefill_chunk_size {
-                Some(chunk) if has_decode_items || chunk_start > 0 => chunk.min(remaining),
-                _ => remaining,
-            };
+            let chunk_len = scheduled_tokens_by_id
+                .get(rid)
+                .copied()
+                .or_else(|| match explicit_active_prefill_chunk_size {
+                    Some(chunk) if has_decode_items || chunk_start > 0 => Some(chunk),
+                    _ => None,
+                })
+                .map(|chunk| chunk.min(remaining).max(1))
+                .unwrap_or(remaining);
             let is_final_chunk = chunk_start + chunk_len >= num_tokens;
             unified_prefills.push(UnifiedPrefillWork {
                 rid: rid.clone(),

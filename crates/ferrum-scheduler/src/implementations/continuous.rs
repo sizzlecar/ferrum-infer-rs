@@ -383,8 +383,42 @@ impl ContinuousBatchScheduler {
             .filter(|&v| v > 0)
     }
 
-    fn maybe_active_decode_prefill_chunk(&self, req: &ContinuousBatchRequest) -> Option<usize> {
-        let chunk = self.runtime_config.active_decode_prefill_chunk?;
+    fn default_active_decode_prefill_chunk(&self) -> usize {
+        self.cb_config.prefill_chunk_size.div_ceil(8).max(1)
+    }
+
+    fn decode_pressure_prefill_cap_threshold(&self, hint: &BatchHint) -> usize {
+        hint.max_batch_size
+            .min(self.cb_config.max_decode_batch)
+            .min(self.config.max_running_requests)
+            .max(1)
+            .div_ceil(2)
+            .max(1)
+    }
+
+    fn active_decode_prefill_chunk_for_iteration(
+        &self,
+        hint: &BatchHint,
+        scheduled_decode_count: usize,
+    ) -> Option<usize> {
+        if scheduled_decode_count == 0 {
+            return None;
+        }
+        if let Some(chunk) = self.runtime_config.active_decode_prefill_chunk {
+            return Some(chunk);
+        }
+        if scheduled_decode_count < self.decode_pressure_prefill_cap_threshold(hint) {
+            return None;
+        }
+        Some(self.default_active_decode_prefill_chunk())
+    }
+
+    fn maybe_active_decode_prefill_chunk(
+        &self,
+        req: &ContinuousBatchRequest,
+        active_decode_prefill_chunk: Option<usize>,
+    ) -> Option<usize> {
+        let chunk = active_decode_prefill_chunk?;
         if !req.chunked_prefill && self.decoding_count() == 0 {
             return None;
         }
@@ -411,8 +445,14 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    fn prefill_budget_tokens(&self, req: &ContinuousBatchRequest) -> usize {
-        if let Some(chunk) = self.maybe_active_decode_prefill_chunk(req) {
+    fn prefill_budget_tokens(
+        &self,
+        req: &ContinuousBatchRequest,
+        active_decode_prefill_chunk: Option<usize>,
+    ) -> usize {
+        if let Some(chunk) =
+            self.maybe_active_decode_prefill_chunk(req, active_decode_prefill_chunk)
+        {
             return self.chunked_prefill_budget_tokens(req, chunk);
         }
 
@@ -433,8 +473,9 @@ impl ContinuousBatchScheduler {
         &self,
         hint: &BatchHint,
         scheduled_decode_count: usize,
+        active_decode_prefill_chunk: Option<usize>,
     ) -> Option<usize> {
-        let chunk = self.runtime_config.active_decode_prefill_chunk?;
+        let chunk = active_decode_prefill_chunk?;
         if scheduled_decode_count == 0 {
             return None;
         }
@@ -479,6 +520,7 @@ impl ContinuousBatchScheduler {
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
         active_decode_prefill_tokens_remaining: &mut Option<usize>,
+        active_decode_prefill_chunk: Option<usize>,
     ) {
         if batch_requests.len() >= hint.max_batch_size || *total_tokens >= hint.max_tokens {
             return;
@@ -493,7 +535,7 @@ impl ContinuousBatchScheduler {
                 continue;
             }
 
-            let prefill_chunk_tokens = self.prefill_budget_tokens(req);
+            let prefill_chunk_tokens = self.prefill_budget_tokens(req, active_decode_prefill_chunk);
             // Skip fully-prefilled requests that are still in the queue
             // (they'll be promoted by mark_prefill_chunk_processed on the
             // next iteration boundary).
@@ -512,6 +554,7 @@ impl ContinuousBatchScheduler {
             if *total_tokens + prefill_chunk_tokens <= hint.max_tokens {
                 let mut scheduled = req.inner.clone();
                 scheduled.tokens_processed = req.total_tokens();
+                scheduled.tokens_to_process = Some(prefill_chunk_tokens);
                 scheduled_request_ids.insert(scheduled.request.id.clone());
                 batch_requests.push(scheduled);
                 *total_tokens += prefill_chunk_tokens;
@@ -558,6 +601,7 @@ impl ContinuousBatchScheduler {
                 if total_tokens < hint.max_tokens {
                     let mut scheduled = req.inner.clone();
                     scheduled.tokens_processed = req.total_tokens();
+                    scheduled.tokens_to_process = Some(1);
                     scheduled_request_ids.insert(scheduled.request.id.clone());
                     batch_requests.push(scheduled);
                     total_tokens += 1;
@@ -566,8 +610,13 @@ impl ContinuousBatchScheduler {
             drop(decode_queue);
         }
         let scheduled_decode_count = batch_requests.len();
-        let mut active_decode_prefill_tokens_remaining =
-            self.active_decode_prefill_budget_tokens(&hint, scheduled_decode_count);
+        let active_decode_prefill_chunk =
+            self.active_decode_prefill_chunk_for_iteration(&hint, scheduled_decode_count);
+        let mut active_decode_prefill_tokens_remaining = self.active_decode_prefill_budget_tokens(
+            &hint,
+            scheduled_decode_count,
+            active_decode_prefill_chunk,
+        );
 
         // Then, add prefill requests up to the per-iter token budget.
         // Phase 3: `max_prefill_batch=8` no longer caps the count —
@@ -583,6 +632,7 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
+            active_decode_prefill_chunk,
         );
 
         // Check if we should admit new requests from waiting queue
@@ -619,6 +669,7 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
+            active_decode_prefill_chunk,
         );
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
@@ -1354,6 +1405,90 @@ mod tests {
             "newly admitted prefill should use remaining same-iteration budget"
         );
         assert_eq!(mixed_batch.resource_requirements.gpu_memory, 3 * 16);
+    }
+
+    #[test]
+    fn default_scheduler_caps_mixed_prefill_only_under_decode_pressure() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 2048,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let first = create_test_request_with_prompt_tokens(Priority::Normal, 256);
+        let first_id = first.id.clone();
+        enqueue_waiting(&scheduler, first);
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 1);
+        scheduler.mark_prefill_complete(&first_id, 256);
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let low_decode_pressure = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(
+            low_decode_pressure.requests.len(),
+            5,
+            "small decode cohorts should use remaining token budget to build concurrency"
+        );
+        assert_eq!(
+            low_decode_pressure.resource_requirements.gpu_memory,
+            (1 + 4 * 256) * 16
+        );
+        assert_eq!(
+            low_decode_pressure
+                .requests
+                .iter()
+                .filter(|request| request.request.id != first_id)
+                .map(|request| request.tokens_to_process)
+                .collect::<Vec<_>>(),
+            vec![Some(256), Some(256), Some(256), Some(256)]
+        );
+
+        for request in low_decode_pressure
+            .requests
+            .iter()
+            .filter(|request| request.request.id != first_id)
+        {
+            scheduler.mark_prefill_complete(&request.request.id, 256);
+        }
+        assert_eq!(scheduler.decoding_count(), 5);
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let high_decode_pressure = scheduler.create_iteration_batch(hint).unwrap();
+        let prefill_tokens: Vec<_> = high_decode_pressure
+            .requests
+            .iter()
+            .filter(|request| request.tokens_to_process != Some(1))
+            .map(|request| request.tokens_to_process)
+            .collect();
+        assert_eq!(
+            high_decode_pressure.requests.len(),
+            7,
+            "high decode pressure should admit only bounded partial prefills"
+        );
+        assert_eq!(prefill_tokens, vec![Some(64), Some(64)]);
+        assert_eq!(
+            high_decode_pressure.resource_requirements.gpu_memory,
+            (5 + 128) * 16
+        );
     }
 
     #[test]

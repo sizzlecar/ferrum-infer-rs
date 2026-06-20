@@ -125,7 +125,10 @@ impl BatchPlan {
     pub fn total_tokens(&self) -> usize {
         self.requests
             .iter()
-            .map(|req| req.request.sampling_params.max_tokens)
+            .map(|req| {
+                req.tokens_to_process
+                    .unwrap_or(req.request.sampling_params.max_tokens)
+            })
             .sum()
     }
 
@@ -162,6 +165,11 @@ pub struct ScheduledRequest {
     pub estimated_wait_time: Option<Duration>,
     /// Number of tokens processed so far
     pub tokens_processed: usize,
+    /// Number of tokens the engine should process for this request in this batch.
+    ///
+    /// `None` preserves legacy schedulers that did not carry per-request
+    /// token budgets.
+    pub tokens_to_process: Option<usize>,
     /// Allocated resources
     pub allocated_resources: AllocatedResources,
     /// Request submission time
@@ -179,6 +187,7 @@ impl ScheduledRequest {
             queue_position: None,
             estimated_wait_time: None,
             tokens_processed: 0,
+            tokens_to_process: None,
             allocated_resources: AllocatedResources::default(),
             submitted_at: chrono::Utc::now(),
             started_at: None,
