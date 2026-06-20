@@ -188,11 +188,9 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_f32(
   const int state_len = value_heads * value_dim * key_dim;
   const int row_state_base = slot * state_len;
 
-  for (int value_offset = threadIdx.x; value_offset < value_dim;
-       value_offset += blockDim.x) {
-    const int state_base =
-        row_state_base + (value_head * value_dim + value_offset) * key_dim;
-
+  __shared__ float q_inv_shared;
+  __shared__ float k_inv_shared;
+  if (threadIdx.x == 0) {
     float q_inv = 1.0f;
     float k_inv = 1.0f;
     if (use_qk_l2norm != 0) {
@@ -208,6 +206,17 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_f32(
       q_inv = rsqrtf(q_norm + 1.0e-6f);
       k_inv = rsqrtf(k_norm + 1.0e-6f);
     }
+    q_inv_shared = q_inv;
+    k_inv_shared = k_inv;
+  }
+  __syncthreads();
+  const float q_inv = q_inv_shared;
+  const float k_inv = k_inv_shared;
+
+  for (int value_offset = threadIdx.x; value_offset < value_dim;
+       value_offset += blockDim.x) {
+    const int state_base =
+        row_state_base + (value_head * value_dim + value_offset) * key_dim;
 
     const int gate_idx = row * value_heads + value_head;
     const float decay = expf(g[gate_idx]);
@@ -224,17 +233,13 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_f32(
     const int value_idx =
         ((row * value_heads + value_head) * value_dim) + value_offset;
     const float delta = (value[value_idx] - kv_mem) * beta_t;
-    for (int kd = 0; kd < key_dim; ++kd) {
-      const int state_idx = state_base + kd;
-      const int qk_idx = ((row * key_heads + key_head) * key_dim) + kd;
-      state_slots[state_idx] += delta * (key[qk_idx] * k_inv);
-    }
-
     float acc = 0.0f;
     for (int kd = 0; kd < key_dim; ++kd) {
       const int state_idx = state_base + kd;
       const int qk_idx = ((row * key_heads + key_head) * key_dim) + kd;
-      acc += state_slots[state_idx] * (query[qk_idx] * q_inv * scale);
+      const float updated = state_slots[state_idx] + delta * (key[qk_idx] * k_inv);
+      state_slots[state_idx] = updated;
+      acc += updated * (query[qk_idx] * q_inv * scale);
     }
     out[value_idx] = acc;
   }
