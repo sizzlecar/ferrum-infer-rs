@@ -315,6 +315,48 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Whether this backend can update Qwen3.5 decode-time recurrent state
+    /// directly from a persistent slot-indexed state slab.
+    fn supports_qwen35_indexed_recurrent_state() -> bool {
+        false
+    }
+
+    /// Batched one-token recurrent gated DeltaNet update over a persistent
+    /// slot-indexed state slab.
+    ///
+    /// Layouts:
+    /// - `query` / `key`: `[batch, key_heads, key_dim]`
+    /// - `value` / `out`: `[batch, value_heads, value_dim]`
+    /// - `g` / `beta`: `[batch, value_heads]`
+    /// - `state_slots`: `[max_slots, value_heads, value_dim, key_dim]`
+    /// - `slot_indices`: `[batch]` u32 indices into `state_slots`
+    ///
+    /// Each row reads and updates the state slot selected by `slot_indices[row]`.
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_indexed_f32(
+        _ctx: &mut Self::Context,
+        _query: &Self::Buffer,
+        _key: &Self::Buffer,
+        _value: &Self::Buffer,
+        _g: &Self::Buffer,
+        _beta: &Self::Buffer,
+        _state_slots: &mut Self::Buffer,
+        _slot_indices: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _batch: usize,
+        _max_slots: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _use_qk_l2norm: bool,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "recurrent_gated_delta_rule_batch_indexed_f32 not implemented for this backend",
+        ))
+    }
+
     /// Variable-length batched recurrent gated DeltaNet prefill update.
     ///
     /// Layouts are token-major over all concatenated prefill chunks:
@@ -500,6 +542,41 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "linear_attention_decode_prepare_batch_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Batched stateful one-token linear-attention preparation over a
+    /// persistent slot-indexed conv-state slab.
+    ///
+    /// `conv_state_slots` has layout `[max_slots, conv_channels, conv_kernel-1]`
+    /// and is updated in place at `slot_indices[row]`.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _conv_state_slots: &mut Self::Buffer,
+        _slot_indices: &Self::Buffer,
+        _a_raw: &Self::Buffer,
+        _b_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _batch: usize,
+        _max_slots: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_decode_prepare_batch_indexed_f32 not implemented for this backend",
         ))
     }
 
