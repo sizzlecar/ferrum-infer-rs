@@ -18,6 +18,7 @@ const BATCH_INDEXED_FUNC_NAME: &str = "recurrent_gated_delta_rule_batch_indexed_
 const BATCH_INDEXED_TILED16_FUNC_NAME: &str =
     "recurrent_gated_delta_rule_batch_indexed_tiled16_f32";
 const VARLEN_FUNC_NAME: &str = "recurrent_gated_delta_rule_varlen_f32";
+const VARLEN_TILED16_FUNC_NAME: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32";
 
 #[allow(clippy::too_many_arguments)]
 pub fn recurrent_gated_delta_rule_f32(
@@ -303,8 +304,18 @@ pub fn recurrent_gated_delta_rule_varlen_f32(
         value_dim,
     )?;
 
-    let func = ctx.func(MODULE_NAME, ptx::GATED_DELTA_RULE, VARLEN_FUNC_NAME);
-    let block = value_dim.min(256).max(1) as u32;
+    let use_tiled = !use_qk_l2norm && key_dim == 128 && value_dim == 128;
+    let func_name = if use_tiled {
+        VARLEN_TILED16_FUNC_NAME
+    } else {
+        VARLEN_FUNC_NAME
+    };
+    let func = ctx.func(MODULE_NAME, ptx::GATED_DELTA_RULE, func_name);
+    let block = if use_tiled {
+        256
+    } else {
+        value_dim.min(256).max(1) as u32
+    };
     let stream = ctx.stream.clone();
     let batch_i32 = batch as i32;
     let total_tokens_i32 = total_tokens as i32;
@@ -329,12 +340,25 @@ pub fn recurrent_gated_delta_rule_varlen_f32(
     builder.arg(&value_heads_i32);
     builder.arg(&key_dim_i32);
     builder.arg(&value_dim_i32);
-    builder.arg(&use_qk_l2norm_i32);
-    builder.arg(&scale);
+    if use_tiled {
+        builder.arg(&scale);
+    } else {
+        builder.arg(&use_qk_l2norm_i32);
+        builder.arg(&scale);
+    }
+    let grid_dim = if use_tiled {
+        (
+            value_dim.div_ceil(16) as u32,
+            value_heads as u32,
+            batch as u32,
+        )
+    } else {
+        (value_heads as u32, batch as u32, 1)
+    };
     unsafe {
         builder
             .launch(LaunchConfig {
-                grid_dim: (value_heads as u32, batch as u32, 1),
+                grid_dim,
                 block_dim: (block, 1, 1),
                 shared_mem_bytes: 0,
             })
