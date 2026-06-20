@@ -132,6 +132,34 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
         self.inner.load_linear(&format!("{prefix}gate_up_proj"))
     }
 
+    pub fn load_layer_linear_attention_qkvz(
+        &self,
+        layer_index: usize,
+    ) -> FerrumResult<Box<dyn Linear<B>>> {
+        self.load_fused_layer_linear(
+            layer_index,
+            "linear_attn_qkv",
+            "linear_attn_z",
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_qkvz",
+        )
+    }
+
+    pub fn load_layer_linear_attention_ba(
+        &self,
+        layer_index: usize,
+    ) -> FerrumResult<Box<dyn Linear<B>>> {
+        self.load_fused_layer_linear(
+            layer_index,
+            "linear_attn_b",
+            "linear_attn_a",
+            "in_proj_b",
+            "in_proj_a",
+            "in_proj_ba",
+        )
+    }
+
     pub fn load_layer_stacked_gptq_experts(
         &self,
         layer_index: usize,
@@ -175,6 +203,36 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
                 "Qwen3.5 resolved weight plan has no present layer tensor role {role:?} at layer {layer_index}"
             ))
         })
+    }
+
+    fn load_fused_layer_linear(
+        &self,
+        layer_index: usize,
+        first_role: &str,
+        second_role: &str,
+        first_suffix: &str,
+        second_suffix: &str,
+        fused_suffix: &str,
+    ) -> FerrumResult<Box<dyn Linear<B>>> {
+        let first = self.required_layer_tensor(layer_index, first_role)?;
+        let second = self.required_layer_tensor(layer_index, second_role)?;
+        let first_module = linear_module_name(&first.name);
+        let second_module = linear_module_name(&second.name);
+        let prefix = first_module.strip_suffix(first_suffix).ok_or_else(|| {
+            FerrumError::model(format!(
+                "Qwen3.5 layer {layer_index} tensor for role {first_role:?} does not end with \
+                 {first_suffix}: {first_module}"
+            ))
+        })?;
+        let expected_second = format!("{prefix}{second_suffix}");
+        if second_module != expected_second {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 layer {layer_index} fused projection roles {first_role:?}/{second_role:?} \
+                 do not share a fusion prefix: first={first_module} second={second_module}"
+            )));
+        }
+
+        self.inner.load_linear(&format!("{prefix}{fused_suffix}"))
     }
 }
 
@@ -831,6 +889,41 @@ mod tests {
             .load_global_tensor("lm_head")
             .expect_err("tied lm_head is optional and absent");
         assert!(err.to_string().contains("lm_head"), "{err}");
+    }
+
+    #[test]
+    fn planned_loader_loads_packed_linear_attention_projection_names() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        let inventory = Qwen35WeightInventory::from_names(names.clone());
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+        let loader = RecordingLoader::from_names(names);
+        let planned = Qwen35WeightPlanLoader::<CpuBackend>::new(&plan, &loader);
+
+        let qkvz = planned.load_layer_linear_attention_qkvz(0).unwrap();
+        let ba = planned.load_layer_linear_attention_ba(0).unwrap();
+
+        assert_eq!(qkvz.in_features(), 2);
+        assert_eq!(ba.in_features(), 2);
+        assert_eq!(
+            loader.linear_names(),
+            vec![
+                "model.layers.0.linear_attn.in_proj_qkvz".to_string(),
+                "model.layers.0.linear_attn.in_proj_ba".to_string(),
+            ]
+        );
     }
 
     #[test]

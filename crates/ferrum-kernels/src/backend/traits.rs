@@ -321,6 +321,17 @@ pub trait Backend: Send + Sync + Sized + 'static {
         false
     }
 
+    /// Whether this backend can consume Qwen3.5 GDN decode projections in the
+    /// vLLM-packed layout:
+    /// - `in_proj_qkvz`: `[q, k, v, z]`
+    /// - `in_proj_ba`: `[b, a]`
+    ///
+    /// This avoids two small decode projection launches and lets the prepare
+    /// kernel split the packed outputs while updating indexed recurrent state.
+    fn supports_qwen35_packed_gdn_decode_prepare() -> bool {
+        false
+    }
+
     /// Batched one-token recurrent gated DeltaNet update over a persistent
     /// slot-indexed state slab.
     ///
@@ -577,6 +588,36 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "linear_attention_decode_prepare_batch_indexed_f32 not implemented for this backend",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkvz_raw: &Self::Buffer,
+        _ba_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _conv_state_slots: &mut Self::Buffer,
+        _slot_indices: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _z: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _batch: usize,
+        _max_slots: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32 not implemented for this backend",
         ))
     }
 

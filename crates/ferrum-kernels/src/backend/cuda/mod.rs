@@ -942,6 +942,10 @@ impl Backend for CudaBackend {
         true
     }
 
+    fn supports_qwen35_packed_gdn_decode_prepare() -> bool {
+        true
+    }
+
     fn activation_to_f32_shadow(
         ctx: &mut Self::Context,
         src: &Self::Buffer,
@@ -1998,6 +2002,57 @@ impl Backend for CudaBackend {
             query,
             key,
             value,
+            g,
+            beta,
+            batch,
+            max_slots,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+            apply_qk_l2norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
+        ctx: &mut Self::Context,
+        mixed_qkvz_raw: &Self::Buffer,
+        ba_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        conv_state_slots: &mut Self::Buffer,
+        slot_indices: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        z: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        batch: usize,
+        max_slots: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        linear_attention::linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
+            ctx,
+            mixed_qkvz_raw,
+            ba_raw,
+            conv_weight,
+            conv_state_slots,
+            slot_indices,
+            a_log,
+            dt_bias,
+            query,
+            key,
+            value,
+            z,
             g,
             beta,
             batch,
