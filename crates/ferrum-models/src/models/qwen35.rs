@@ -1838,6 +1838,8 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         }
         let total_tokens = all_tokens.len();
         let mut ctx = B::new_context();
+        let profile_enabled = qwen35_prefill_profile_enabled();
+        let mut prefill_profile = Qwen35PrefillProfile::default();
         for (row, ((cache_id, _, _, _), (_, state))) in
             items.iter().zip(states.iter_mut()).enumerate()
         {
@@ -1850,6 +1852,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         let rope = &self.rope;
         let hidden_len = total_tokens * weights.config.hidden_size;
         let mut hidden = B::alloc(hidden_len);
+        let t_embedding = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
         B::embedding_lookup(
             &mut ctx,
             &weights.embed_tokens,
@@ -1857,6 +1860,8 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             &mut hidden,
             weights.config.hidden_size,
         );
+        prefill_profile.embedding_us +=
+            qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_embedding, "qwen35_embedding");
         let eps = 1e-6f32;
         let mut residual_f32 = if B::supports_device_f32_residual_shadow() {
             let mut shadow = B::alloc_typed(Dtype::F32, hidden_len);
@@ -1870,6 +1875,11 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .map(|_| B::alloc_typed(Dtype::F32, hidden_len));
 
         for (layer_index, layer) in weights.layers.iter().enumerate() {
+            let layer_kind = match &layer.attention {
+                Qwen35AttentionWeights::Linear(_) => "linear",
+                Qwen35AttentionWeights::Full(_) => "full",
+            };
+            let t_layer = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
             hidden = match &layer.attention {
                 Qwen35AttentionWeights::Linear(_) => {
                     qwen35_linear_attention_prefill_batch_layer_backend::<B>(
@@ -1915,9 +1925,13 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                     )?
                 }
             };
+            let layer_elapsed =
+                qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_layer, "qwen35_prefill_layer");
+            prefill_profile.record_layer(layer_index, layer_kind, layer_elapsed);
         }
 
         let mut final_hidden = B::alloc(hidden_len);
+        let t_final_norm = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
         if let Some(residual_f32) = residual_f32.as_ref() {
             B::rms_norm_f32_to_activation(
                 &mut ctx,
@@ -1939,6 +1953,10 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 weights.config.hidden_size,
             );
         }
+        prefill_profile.final_norm_us +=
+            qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_final_norm, "qwen35_final_norm");
+        let t_final_gather =
+            qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled && batch_len > 1);
         let mut sampled_hidden = B::alloc(batch_len * weights.config.hidden_size);
         for row in 0..batch_len {
             let final_token = cu[row + 1] as usize - 1;
@@ -1951,14 +1969,33 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 weights.config.hidden_size,
             );
         }
+        prefill_profile.final_gather_us += qwen35_prefill_profile_stage_finish::<B>(
+            &mut ctx,
+            t_final_gather,
+            "qwen35_final_token_gather",
+        );
         let vocab = weights.runtime_cfg.vocab_size;
         let mut logits = B::alloc(batch_len * vocab);
+        let t_lm_head = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
         weights
             .lm_head
             .forward(&mut ctx, &sampled_hidden, &mut logits, batch_len);
+        prefill_profile.lm_head_us +=
+            qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_lm_head, "qwen35_lm_head");
+        let t_readback = if profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         B::sync_before_host_readback(&mut ctx);
         B::sync(&mut ctx);
         let flat = B::to_vec(&logits, batch_len * vocab);
+        if let Some(start) = t_readback {
+            prefill_profile.readback_us += start.elapsed().as_micros() as u64;
+        }
+        if profile_enabled {
+            prefill_profile.log("batch", 0, total_tokens, weights.layers.len());
+        }
         Ok(flat.chunks_exact(vocab).map(|row| row.to_vec()).collect())
     }
 
