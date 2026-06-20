@@ -2829,8 +2829,8 @@ impl Backend for CudaBackend {
         }
 
         let func_name = match gate.dtype() {
-            Dtype::F16 => "qwen35_interleave_gate_up_f16",
-            Dtype::F32 => "qwen35_interleave_gate_up_f32",
+            crate::backend::Dtype::F16 => "qwen35_interleave_gate_up_f16",
+            crate::backend::Dtype::F32 => "qwen35_interleave_gate_up_f32",
             dtype => {
                 return Err(FerrumError::model(format!(
                     "qwen35_interleave_gate_up unsupported dtype {}",
