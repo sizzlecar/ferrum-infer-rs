@@ -488,3 +488,182 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32(
     }
   }
 }
+
+template <int BV_TILE>
+static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const float* __restrict__ initial_states,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    float* __restrict__ final_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  const int value_tile = blockIdx.x;
+  const int value_head = blockIdx.y;
+  const int seq = blockIdx.z;
+  if (value_head >= value_heads || seq >= batch) return;
+
+  const int token_start = static_cast<int>(cu_seqlens[seq]);
+  const int token_end = static_cast<int>(cu_seqlens[seq + 1]);
+  if (token_start < 0 || token_end <= token_start || token_end > total_tokens) {
+    return;
+  }
+
+  const int value_start = value_tile * BV_TILE;
+  const int repeat_factor = value_heads / key_heads;
+  const int key_head = value_head / repeat_factor;
+  const int state_len = value_heads * value_dim * key_dim;
+  const int row_state_base = seq * state_len;
+
+  __shared__ float partial[BV_TILE][256];
+  __shared__ float delta[BV_TILE];
+  float local[BV_TILE];
+
+  for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+    const int local_v = i / key_dim;
+    const int kd = i - local_v * key_dim;
+    const int value_offset = value_start + local_v;
+    if (value_offset >= value_dim) continue;
+
+    const int state_idx =
+        row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
+    final_states[state_idx] = initial_states[state_idx];
+  }
+  __syncthreads();
+
+  for (int token = token_start; token < token_end; ++token) {
+    const int gate_idx = token * value_heads + value_head;
+    const float decay = expf(g[gate_idx]);
+    const float beta_t = beta[gate_idx];
+
+#pragma unroll
+    for (int i = 0; i < BV_TILE; ++i) {
+      local[i] = 0.0f;
+    }
+
+    for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+      const int local_v = i / key_dim;
+      const int kd = i - local_v * key_dim;
+      const int value_offset = value_start + local_v;
+      if (value_offset >= value_dim) continue;
+
+      const int state_idx =
+          row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
+      const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+      const float state = final_states[state_idx] * decay;
+      final_states[state_idx] = state;
+      local[local_v] += state * key[qk_idx];
+    }
+
+#pragma unroll
+    for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+      partial[local_v][threadIdx.x] = local[local_v];
+    }
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+#pragma unroll
+        for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+          partial[local_v][threadIdx.x] += partial[local_v][threadIdx.x + stride];
+        }
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+      for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+        const int value_offset = value_start + local_v;
+        if (value_offset < value_dim) {
+          const int value_idx =
+              ((token * value_heads + value_head) * value_dim) + value_offset;
+          delta[local_v] = (value[value_idx] - partial[local_v][0]) * beta_t;
+        } else {
+          delta[local_v] = 0.0f;
+        }
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int i = 0; i < BV_TILE; ++i) {
+      local[i] = 0.0f;
+    }
+
+    for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+      const int local_v = i / key_dim;
+      const int kd = i - local_v * key_dim;
+      const int value_offset = value_start + local_v;
+      if (value_offset >= value_dim) continue;
+
+      const int state_idx =
+          row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
+      const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
+      const float updated = final_states[state_idx] + delta[local_v] * key[qk_idx];
+      final_states[state_idx] = updated;
+      local[local_v] += updated * (query[qk_idx] * scale);
+    }
+
+#pragma unroll
+    for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+      partial[local_v][threadIdx.x] = local[local_v];
+    }
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+#pragma unroll
+        for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+          partial[local_v][threadIdx.x] += partial[local_v][threadIdx.x + stride];
+        }
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+      for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+        const int value_offset = value_start + local_v;
+        if (value_offset < value_dim) {
+          const int value_idx =
+              ((token * value_heads + value_head) * value_dim) + value_offset;
+          out[value_idx] = partial[local_v][0];
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const float* __restrict__ initial_states,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    float* __restrict__ final_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_varlen_tiled_f32_impl<16>(
+      query, key, value, g, beta, initial_states, cu_seqlens, out,
+      final_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, scale);
+}
