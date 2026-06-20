@@ -305,16 +305,10 @@ pub struct Qwen35PagedScratch<B: MoeLlmBackend> {
 pub struct Qwen35DecodeScratch<B: MoeLlmBackend> {
     max_tokens: usize,
     hidden_size: usize,
-    vocab_size: usize,
     num_experts: usize,
     top_k: usize,
     expert_intermediate_size: usize,
     shared_expert_intermediate_size: usize,
-    hidden: Option<B::Buffer>,
-    residual_f32: Option<B::Buffer>,
-    branch_f32: Option<B::Buffer>,
-    final_hidden: Option<B::Buffer>,
-    logits: Option<B::Buffer>,
     post_attention_norm: B::Buffer,
     mlp_output: B::Buffer,
     router_logits: B::Buffer,
@@ -741,10 +735,9 @@ impl<B: MoeLlmBackend> Qwen35PagedScratch<B> {
 }
 
 impl<B: MoeLlmBackend> Qwen35DecodeScratch<B> {
-    fn alloc(config: &Qwen35TextConfig, vocab_size: usize, max_tokens: usize) -> Self {
+    fn alloc(config: &Qwen35TextConfig, max_tokens: usize) -> Self {
         let max_tokens = max_tokens.max(1);
         let hidden_size = config.hidden_size.max(1);
-        let vocab_size = vocab_size.max(1);
         let (num_experts, top_k, expert_intermediate_size, shared_expert_intermediate_size) =
             if let Some(moe) = config.moe.as_ref() {
                 (
@@ -760,16 +753,10 @@ impl<B: MoeLlmBackend> Qwen35DecodeScratch<B> {
         Self {
             max_tokens,
             hidden_size,
-            vocab_size,
             num_experts,
             top_k,
             expert_intermediate_size,
             shared_expert_intermediate_size,
-            hidden: Some(B::alloc(max_tokens * hidden_size)),
-            residual_f32: Some(B::alloc_typed(Dtype::F32, max_tokens * hidden_size)),
-            branch_f32: Some(B::alloc_typed(Dtype::F32, max_tokens * hidden_size)),
-            final_hidden: Some(B::alloc(max_tokens * hidden_size)),
-            logits: Some(B::alloc(max_tokens * vocab_size)),
             post_attention_norm: B::alloc(max_tokens * hidden_size),
             mlp_output: B::alloc(max_tokens * hidden_size),
             router_logits: B::alloc(max_tokens * num_experts),
@@ -799,7 +786,7 @@ impl<B: MoeLlmBackend> Qwen35DecodeScratch<B> {
         }
     }
 
-    fn covers(&self, config: &Qwen35TextConfig, vocab_size: usize, tokens: usize) -> bool {
+    fn covers(&self, config: &Qwen35TextConfig, tokens: usize) -> bool {
         let (num_experts, top_k, expert_intermediate_size, shared_expert_intermediate_size) =
             if let Some(moe) = config.moe.as_ref() {
                 (
@@ -813,7 +800,6 @@ impl<B: MoeLlmBackend> Qwen35DecodeScratch<B> {
             };
         self.max_tokens >= tokens.max(1)
             && self.hidden_size == config.hidden_size.max(1)
-            && self.vocab_size == vocab_size.max(1)
             && self.num_experts == num_experts
             && self.top_k == top_k
             && self.expert_intermediate_size == expert_intermediate_size
@@ -1074,20 +1060,15 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
 
     fn ensure_decode_scratch(&mut self, tokens: usize) {
         let needed_tokens = tokens.max(1);
-        let vocab_size = self.weights.runtime_cfg.vocab_size;
         let keep_existing = self
             .decode_scratch
             .as_ref()
-            .is_some_and(|scratch| scratch.covers(&self.weights.config, vocab_size, needed_tokens));
+            .is_some_and(|scratch| scratch.covers(&self.weights.config, needed_tokens));
         if keep_existing {
             return;
         }
         let capacity = needed_tokens.next_power_of_two();
-        self.decode_scratch = Some(Qwen35DecodeScratch::alloc(
-            &self.weights.config,
-            vocab_size,
-            capacity,
-        ));
+        self.decode_scratch = Some(Qwen35DecodeScratch::alloc(&self.weights.config, capacity));
     }
 
     fn has_linear_attention_layers(&self) -> Result<bool> {
@@ -2083,17 +2064,13 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         let rope = &self.rope;
         let total_layers = weights.layers.len();
         let hidden_len = batch_len * weights.config.hidden_size;
-        let mut scratch_hidden = self
-            .decode_scratch
-            .as_mut()
-            .and_then(|scratch| scratch.hidden.take())
-            .expect("Qwen3.5 decode hidden scratch missing");
+        let mut hidden = B::alloc(hidden_len);
         let t_embedding = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
         B::embedding_lookup(
             &mut ctx,
             &weights.embed_tokens,
             tokens,
-            &mut scratch_hidden,
+            &mut hidden,
             weights.config.hidden_size,
         );
         decode_profile.embedding_us += qwen35_decode_profile_stage_finish::<B>(
@@ -2103,39 +2080,26 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         );
         let eps = 1e-6f32;
         let mut residual_f32 = if B::supports_device_f32_residual_shadow() {
-            let mut shadow = self
-                .decode_scratch
-                .as_mut()
-                .and_then(|scratch| scratch.residual_f32.take())
-                .expect("Qwen3.5 decode residual_f32 scratch missing");
-            B::activation_to_f32_shadow(&mut ctx, &scratch_hidden, &mut shadow, hidden_len);
+            let mut shadow = B::alloc_typed(Dtype::F32, hidden_len);
+            B::activation_to_f32_shadow(&mut ctx, &hidden, &mut shadow, hidden_len);
             Some(shadow)
         } else {
             None
         };
-        let mut branch_f32 = if residual_f32.is_some() {
-            Some(
-                self.decode_scratch
-                    .as_mut()
-                    .and_then(|scratch| scratch.branch_f32.take())
-                    .expect("Qwen3.5 decode branch_f32 scratch missing"),
-            )
-        } else {
-            None
-        };
-        let mut hidden_owned: Option<B::Buffer> = None;
+        let mut branch_f32 = residual_f32
+            .as_ref()
+            .map(|_| B::alloc_typed(Dtype::F32, hidden_len));
         for (layer_index, layer) in weights.layers.iter().enumerate() {
             let layer_kind = match &layer.attention {
                 Qwen35AttentionWeights::Linear(_) => "linear",
                 Qwen35AttentionWeights::Full(_) => "full",
             };
             let t_layer = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
-            let layer_input = hidden_owned.as_ref().unwrap_or(&scratch_hidden);
-            let layer_output = match &layer.attention {
+            hidden = match &layer.attention {
                 Qwen35AttentionWeights::Linear(_) => {
                     qwen35_linear_attention_decode_batch_layer_backend::<B>(
                         &mut ctx,
-                        layer_input,
+                        &hidden,
                         states,
                         self.linear_state_pools.as_mut(),
                         self.linear_slot_indices.as_ref(),
@@ -2158,7 +2122,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                     };
                     qwen35_full_attention_decode_batch_layer_backend::<B>(
                         &mut ctx,
-                        layer_input,
+                        &hidden,
                         states,
                         paged,
                         layer_index,
@@ -2173,18 +2137,12 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                     )?
                 }
             };
-            hidden_owned = Some(layer_output);
             let layer_elapsed =
                 qwen35_decode_profile_stage_finish::<B>(&mut ctx, t_layer, "qwen35_decode_layer");
             decode_profile.record_layer(layer_index, layer_kind, layer_elapsed);
         }
 
-        let final_input = hidden_owned.as_ref().unwrap_or(&scratch_hidden);
-        let mut final_hidden = self
-            .decode_scratch
-            .as_mut()
-            .and_then(|scratch| scratch.final_hidden.take())
-            .expect("Qwen3.5 decode final_hidden scratch missing");
+        let mut final_hidden = B::alloc(hidden_len);
         let t_final_norm = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
         if let Some(residual_f32) = residual_f32.as_ref() {
             B::rms_norm_f32_to_activation(
@@ -2199,7 +2157,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         } else {
             B::rms_norm(
                 &mut ctx,
-                final_input,
+                &hidden,
                 &weights.final_norm,
                 eps,
                 &mut final_hidden,
@@ -2213,11 +2171,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             "qwen35_decode_final_norm",
         );
         let vocab = weights.runtime_cfg.vocab_size;
-        let mut logits = self
-            .decode_scratch
-            .as_mut()
-            .and_then(|scratch| scratch.logits.take())
-            .expect("Qwen3.5 decode logits scratch missing");
+        let mut logits = B::alloc(batch_len * vocab);
         let t_lm_head = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
         weights
             .lm_head
@@ -2246,7 +2200,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 }
             }
         };
-        let mut argmax_out: Option<Vec<Vec<f32>>> = None;
         if let Some(argmax_mode) = argmax_mode {
             let t_argmax = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
             let tokens = match argmax_mode {
@@ -2316,28 +2269,13 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 qwen35_decode_profile_stage_finish::<B>(&mut ctx, t_argmax, "qwen35_decode_argmax");
             if let Ok(tokens) = tokens {
                 if tokens.iter().all(|&token| token != u32::MAX) {
-                    argmax_out = Some(tokens.into_iter().map(|token| vec![token as f32]).collect());
+                    let out = tokens.into_iter().map(|token| vec![token as f32]).collect();
                     if decode_profile_enabled {
                         decode_profile.log(batch_len, total_layers, "argmax");
                     }
+                    return Ok(out);
                 }
             }
-        }
-        if let Some(out) = argmax_out {
-            let scratch = self
-                .decode_scratch
-                .as_mut()
-                .expect("Qwen3.5 decode scratch missing");
-            scratch.hidden = Some(scratch_hidden);
-            scratch.final_hidden = Some(final_hidden);
-            scratch.logits = Some(logits);
-            if let Some(residual_f32) = residual_f32.take() {
-                scratch.residual_f32 = Some(residual_f32);
-            }
-            if let Some(branch_f32) = branch_f32.take() {
-                scratch.branch_f32 = Some(branch_f32);
-            }
-            return Ok(out);
         }
         let t_readback = if decode_profile_enabled {
             Some(Instant::now())
@@ -2350,19 +2288,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         if let Some(start) = t_readback {
             decode_profile.readback_us += start.elapsed().as_micros() as u64;
             decode_profile.log(batch_len, total_layers, "full_logits");
-        }
-        let scratch = self
-            .decode_scratch
-            .as_mut()
-            .expect("Qwen3.5 decode scratch missing");
-        scratch.hidden = Some(scratch_hidden);
-        scratch.final_hidden = Some(final_hidden);
-        scratch.logits = Some(logits);
-        if let Some(residual_f32) = residual_f32.take() {
-            scratch.residual_f32 = Some(residual_f32);
-        }
-        if let Some(branch_f32) = branch_f32.take() {
-            scratch.branch_f32 = Some(branch_f32);
         }
         Ok(flat.chunks_exact(vocab).map(|row| row.to_vec()).collect())
     }
