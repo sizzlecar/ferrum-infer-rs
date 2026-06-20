@@ -249,6 +249,44 @@ extern "C" __global__ void qwen35_apply_token_gate_f16(
     values[idx] = __float2half(value * sigmoid_f32(gate_value));
 }
 
+extern "C" __global__ void qwen35_interleave_gate_up_f16(
+    const __half* __restrict__ gate,
+    const __half* __restrict__ up,
+    __half* __restrict__ out,
+    const int tokens,
+    const int intermediate
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = tokens * intermediate;
+    if (idx >= total) return;
+
+    const int tok = idx / intermediate;
+    const int col = idx - tok * intermediate;
+    const int src_idx = tok * intermediate + col;
+    const int dst_base = tok * 2 * intermediate + col;
+    out[dst_base] = gate[src_idx];
+    out[dst_base + intermediate] = up[src_idx];
+}
+
+extern "C" __global__ void qwen35_interleave_gate_up_f32(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ out,
+    const int tokens,
+    const int intermediate
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = tokens * intermediate;
+    if (idx >= total) return;
+
+    const int tok = idx / intermediate;
+    const int col = idx - tok * intermediate;
+    const int src_idx = tok * intermediate + col;
+    const int dst_base = tok * 2 * intermediate + col;
+    out[dst_base] = gate[src_idx];
+    out[dst_base + intermediate] = up[src_idx];
+}
+
 // Batched per-item-position variant for batched decode (m sequences, q_len=1
 // each, every item at its own absolute position). Replaces M sequential
 // `qk_norm_rope_transpose_f16` launches with one launch.
