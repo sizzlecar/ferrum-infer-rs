@@ -2,6 +2,52 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ34 — W3 Qwen35 varlen GDN primitive source checkpoint
+
+- Scope:
+  - added a native variable-length batched recurrent gated-DeltaNet prefill
+    primitive for Qwen35 linear-attention work, matching the `cu_seqlens`
+    shape used by vLLM-style chunked GDN prefill;
+  - this is an architectural prerequisite only: it adds backend/kernel/API
+    surface and CPU reference coverage, but does not yet switch product
+    prefill scheduling to the new primitive;
+  - no W3 final PASS and no performance claim.
+- Commit:
+  - `19920b3e perf(qwen35): add varlen gated delta primitive`;
+  - pushed to `origin/goal/w2-w3-release-grade`.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - `cargo check -p ferrum-kernels --all-targets` PASS;
+  - `cargo check -p ferrum-models --all-targets` PASS;
+  - `cargo test -p ferrum-models recurrent_delta_rule_varlen_backend_matches_per_sequence_reference -- --nocapture` PASS;
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS: 81 matched tests
+    plus `qwen35_config_test` 1 test.
+- CUDA validation / lifecycle:
+  - Vast instance `41422823`, 1x `NVIDIA GeForce RTX 4090`, `49140 MiB`,
+    driver `580.126.09`, CUDA toolkit `12.4`;
+  - artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_varlen_gdn_cuda_build_19920b3e_clean_retry_20260619T235447Z`;
+  - clean remote state was `HEAD=19920b3e`, branch ahead of origin only because
+    the commit had not been pushed before the remote smoke;
+  - `cargo check -p ferrum-kernels --features cuda --all-targets` PASS in
+    46.38s;
+  - focused remote test PASS:
+    `cargo test -p ferrum-models recurrent_delta_rule_varlen_backend_matches_per_sequence_reference -- --nocapture`;
+  - smoke PASS line:
+    `W3 QWEN35 VARLEN GDN CUDA KERNEL BUILD SMOKE PASS: /workspace/artifacts/w3_qwen35_varlen_gdn_cuda_build_19920b3e_clean_retry_20260619T235447Z`;
+  - wider `cargo check -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`
+    was intentionally stopped at the paid-lane stop condition after roughly
+    15 minutes while compiling `vllm_marlin_moe/ops.cu`; it did not fail and
+    is not counted as PASS evidence;
+  - Vast stop check after artifact copyback:
+    `cur_state=stopped`, `actual_status=exited`, `intended_status=stopped`.
+- Next:
+  - route Qwen35 product prefill batches through the varlen primitive and
+    write back per-sequence recurrent states;
+  - then rerun `ferrum run` / `ferrum serve` correctness and only after that
+    same-host diagnostic perf.
+
 ## 2026-06-20 ZZZ33 — W3 Qwen35 final-token prefill LM head smoke PASS, perf still prefill-bound
 
 - Scope:

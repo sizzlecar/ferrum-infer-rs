@@ -1,0 +1,11 @@
+{
+  "id": 41422823,
+  "cur_state": "stopped",
+  "actual_status": "exited",
+  "intended_status": "stopped",
+  "gpu_name": "RTX 4090",
+  "gpu_totalram": 49140,
+  "ssh_host": "ssh7.vast.ai",
+  "ssh_port": 22822,
+  "ssh_probe": "connection_refused"
+}
