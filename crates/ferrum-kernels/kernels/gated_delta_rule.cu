@@ -398,27 +398,6 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_tiled16_f32(
       max_slots, key_heads, value_heads, key_dim, value_dim, scale);
 }
 
-extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_tiled32_f32(
-    const float* __restrict__ query,
-    const float* __restrict__ key,
-    const float* __restrict__ value,
-    const float* __restrict__ g,
-    const float* __restrict__ beta,
-    float* __restrict__ state_slots,
-    const unsigned int* __restrict__ slot_indices,
-    float* __restrict__ out,
-    const int batch,
-    const int max_slots,
-    const int key_heads,
-    const int value_heads,
-    const int key_dim,
-    const int value_dim,
-    const float scale) {
-  recurrent_gated_delta_rule_batch_indexed_tiled_f32_impl<32>(
-      query, key, value, g, beta, state_slots, slot_indices, out, batch,
-      max_slots, key_heads, value_heads, key_dim, value_dim, scale);
-}
-
 extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32(
     const float* __restrict__ query,
     const float* __restrict__ key,

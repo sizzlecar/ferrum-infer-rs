@@ -17,8 +17,6 @@ const BATCH_FUNC_NAME: &str = "recurrent_gated_delta_rule_batch_f32";
 const BATCH_INDEXED_FUNC_NAME: &str = "recurrent_gated_delta_rule_batch_indexed_f32";
 const BATCH_INDEXED_TILED16_FUNC_NAME: &str =
     "recurrent_gated_delta_rule_batch_indexed_tiled16_f32";
-const BATCH_INDEXED_TILED32_FUNC_NAME: &str =
-    "recurrent_gated_delta_rule_batch_indexed_tiled32_f32";
 const VARLEN_FUNC_NAME: &str = "recurrent_gated_delta_rule_varlen_f32";
 const VARLEN_TILED16_FUNC_NAME: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32";
 
@@ -203,20 +201,14 @@ pub fn recurrent_gated_delta_rule_batch_indexed_f32(
         value_dim,
     )?;
 
-    let value_tile = if !use_qk_l2norm && key_dim == 128 && value_dim == 128 {
-        32
-    } else {
-        0
-    };
-    let func_name = if value_tile == 32 {
-        BATCH_INDEXED_TILED32_FUNC_NAME
-    } else if value_tile == 16 {
+    let use_tiled = !use_qk_l2norm && key_dim == 128 && value_dim == 128;
+    let func_name = if use_tiled {
         BATCH_INDEXED_TILED16_FUNC_NAME
     } else {
         BATCH_INDEXED_FUNC_NAME
     };
     let func = ctx.func(MODULE_NAME, ptx::GATED_DELTA_RULE, func_name);
-    let block = if value_tile != 0 {
+    let block = if use_tiled {
         256
     } else {
         value_dim.min(256).max(1) as u32
@@ -244,15 +236,15 @@ pub fn recurrent_gated_delta_rule_batch_indexed_f32(
     builder.arg(&value_heads_i32);
     builder.arg(&key_dim_i32);
     builder.arg(&value_dim_i32);
-    if value_tile != 0 {
+    if use_tiled {
         builder.arg(&scale);
     } else {
         builder.arg(&use_qk_l2norm_i32);
         builder.arg(&scale);
     }
-    let grid_dim = if value_tile != 0 {
+    let grid_dim = if use_tiled {
         (
-            value_dim.div_ceil(value_tile) as u32,
+            value_dim.div_ceil(16) as u32,
             value_heads as u32,
             batch as u32,
         )
