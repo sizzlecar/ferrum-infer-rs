@@ -8,7 +8,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use ferrum_types::{FerrumError, Result};
 
 use super::CudaState;
-use crate::backend::CudaBuf;
+use crate::backend::{CudaBuf, Dtype};
 use crate::ptx;
 
 const MODULE_NAME: &str = "gated_delta_rule";
@@ -497,6 +497,16 @@ fn validate_batch_indexed_shape(
         return Err(FerrumError::model(format!(
             "gated_delta_rule_batch_indexed slot_indices dtype {} != u32",
             slot_indices.dtype().name()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dtype(label: &str, buf: &CudaBuf) -> Result<()> {
+    if buf.dtype() != Dtype::F32 {
+        return Err(FerrumError::model(format!(
+            "gated_delta_rule_batch_indexed {label} dtype {} != f32",
+            buf.dtype().name()
         )));
     }
     Ok(())
