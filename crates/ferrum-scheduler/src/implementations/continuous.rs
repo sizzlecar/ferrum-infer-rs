@@ -425,6 +425,14 @@ impl ContinuousBatchScheduler {
         Some(chunk)
     }
 
+    fn remaining_prefill_tokens(&self, req: &ContinuousBatchRequest) -> usize {
+        if req.prefill_tokens == 0 {
+            self.initial_prefill_token_estimate(req)
+        } else {
+            req.prefill_tokens.saturating_sub(req.prefill_chunk_offset)
+        }
+    }
+
     fn chunked_prefill_budget_tokens(&self, req: &ContinuousBatchRequest, chunk: usize) -> usize {
         let remaining = if req.prefill_tokens == 0 {
             self.prompt_token_estimate(req)
@@ -435,37 +443,29 @@ impl ContinuousBatchScheduler {
         chunk.min(remaining).max(1)
     }
 
-    fn initial_prefill_token_estimate_capped(&self, estimated_tokens: usize) -> usize {
-        if self.cb_config.enable_chunked_prefill {
-            estimated_tokens
-                .min(self.cb_config.prefill_chunk_size)
-                .max(1)
-        } else {
-            estimated_tokens.max(1)
-        }
-    }
-
     fn prefill_budget_tokens(
         &self,
         req: &ContinuousBatchRequest,
         active_decode_prefill_chunk: Option<usize>,
+        step_tokens_remaining: usize,
     ) -> usize {
+        if step_tokens_remaining == 0 {
+            return 0;
+        }
         if let Some(chunk) =
             self.maybe_active_decode_prefill_chunk(req, active_decode_prefill_chunk)
         {
-            return self.chunked_prefill_budget_tokens(req, chunk);
+            return self
+                .chunked_prefill_budget_tokens(req, chunk)
+                .min(step_tokens_remaining)
+                .max(1);
         }
 
-        if req.prefill_tokens == 0 {
-            let estimated = self.initial_prefill_token_estimate(req);
-            return self.initial_prefill_token_estimate_capped(estimated);
-        }
-
-        let remaining = req.prefill_tokens.saturating_sub(req.prefill_chunk_offset);
+        let remaining = self.remaining_prefill_tokens(req);
         if self.cb_config.enable_chunked_prefill {
-            self.cb_config.prefill_chunk_size.min(remaining)
+            remaining.min(step_tokens_remaining).max(1)
         } else {
-            remaining
+            remaining.max(1)
         }
     }
 
@@ -492,10 +492,9 @@ impl ContinuousBatchScheduler {
         }
 
         // vLLM's scheduler uses the per-step token budget dynamically rather
-        // than a fixed "N prefill chunks while decoding" rule. Ferrum still
-        // needs a conservative mixed-prefill guard for Gemma3, so scale the
-        // guard by same-iteration batch headroom: fewer active decodes permit
-        // more partial prefills; near a full decode cohort admits fewer.
+        // than a fixed "N prefill chunks while decoding" rule. Ferrum keeps a
+        // conservative mixed-prefill guard only once decode pressure is high,
+        // scaling by same-iteration batch headroom.
         let max_mixed_prefill_chunks = self.cb_config.max_prefill_batch.div_ceil(2).max(1);
         let scaled_chunks = free_batch_slots
             .saturating_mul(max_mixed_prefill_chunks)
@@ -535,7 +534,12 @@ impl ContinuousBatchScheduler {
                 continue;
             }
 
-            let prefill_chunk_tokens = self.prefill_budget_tokens(req, active_decode_prefill_chunk);
+            let mut step_tokens_remaining = hint.max_tokens.saturating_sub(*total_tokens);
+            if let Some(remaining) = active_decode_prefill_tokens_remaining.as_ref() {
+                step_tokens_remaining = step_tokens_remaining.min(*remaining);
+            }
+            let prefill_chunk_tokens =
+                self.prefill_budget_tokens(req, active_decode_prefill_chunk, step_tokens_remaining);
             // Skip fully-prefilled requests that are still in the queue
             // (they'll be promoted by mark_prefill_chunk_processed on the
             // next iteration boundary).
@@ -545,9 +549,6 @@ impl ContinuousBatchScheduler {
             if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
                 if *remaining == 0 {
                     break;
-                }
-                if prefill_chunk_tokens > *remaining {
-                    continue;
                 }
             }
 
@@ -1270,7 +1271,8 @@ mod tests {
         }
 
         let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
-        assert_eq!(mixed_batch.requests.len(), 15);
+        assert_eq!(mixed_batch.requests.len(), 16);
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, 2048 * 16);
     }
 
     #[test]
@@ -1523,6 +1525,42 @@ mod tests {
             "max_tokens limits the emitted iteration batch, not waiting-to-prefill promotion"
         );
         assert_eq!(scheduler.waiting_count(), 0);
+    }
+
+    #[test]
+    fn long_prefill_uses_remaining_step_budget_instead_of_fixed_chunk() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..2 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 1536),
+            );
+        }
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 8,
+                max_tokens: 2048,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+
+        assert_eq!(batch.requests.len(), 2);
+        assert_eq!(
+            batch
+                .requests
+                .iter()
+                .map(|request| request.tokens_to_process)
+                .collect::<Vec<_>>(),
+            vec![Some(1536), Some(512)]
+        );
+        assert_eq!(batch.resource_requirements.gpu_memory, 2048 * 16);
     }
 
     #[test]

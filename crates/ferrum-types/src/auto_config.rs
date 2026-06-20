@@ -16,7 +16,6 @@ pub const QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET: &str =
     "qwen25_72b_gptq_int4_2x4090_layer_split";
 const DEFAULT_KV_BLOCK_SIZE_TOKENS: usize = 16;
 const DEFAULT_KV_BLOCKS: usize = 2048;
-const GEMMA3_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK: usize = 16;
 const GIB: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -688,8 +687,6 @@ impl FerrumConfigBuilder {
             default_max_batched_tokens.source,
         )?;
         let max_model_len = self.optional_usize_value("FERRUM_MAX_MODEL_LEN")?;
-        let default_active_decode_prefill_chunk = self.default_active_decode_prefill_chunk();
-
         self.validate_attention(
             use_vllm_paged_attn.value,
             fa_layout.value,
@@ -762,20 +759,6 @@ impl FerrumConfigBuilder {
                 );
             }
         }
-        if let Some(chunk) = default_active_decode_prefill_chunk.as_ref() {
-            if self.entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").is_none()
-                && self
-                    .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
-                    .is_none()
-                && self.entry("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE").is_none()
-            {
-                runtime_config.upsert(
-                    "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
-                    chunk.value.to_string(),
-                    RuntimeConfigSource::Default,
-                );
-            }
-        }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
         decisions.push(self.decode_graph_decision(
@@ -807,7 +790,7 @@ impl FerrumConfigBuilder {
             ));
         }
         decisions.push(self.prefix_cache_decision(prefix_cache));
-        decisions.push(self.scheduler_decision(default_active_decode_prefill_chunk)?);
+        decisions.push(self.scheduler_decision()?);
         decisions.push(self.sampling_decision(greedy));
 
         Ok(ResolvedFerrumConfig {
@@ -912,18 +895,6 @@ impl FerrumConfigBuilder {
             },
             source_key: None,
         }
-    }
-
-    fn default_active_decode_prefill_chunk(&self) -> Option<ResolvedValue<usize>> {
-        let quant = self.model.quantization.as_deref()?.to_ascii_lowercase();
-        let gemma3_cuda_gptq = self.is_cuda_backend()
-            && self.model.architecture.eq_ignore_ascii_case("gemma3")
-            && (quant.contains("gptq") || quant.contains("int4"));
-        gemma3_cuda_gptq.then_some(ResolvedValue {
-            value: GEMMA3_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK,
-            source: AutoConfigSource::ModelMetadata,
-            source_key: None,
-        })
     }
 
     fn default_kv_blocks(&self, max_sequences: &ResolvedValue<usize>) -> ResolvedValue<usize> {
@@ -1625,10 +1596,7 @@ impl FerrumConfigBuilder {
         )
     }
 
-    fn scheduler_decision(
-        &self,
-        default_active_decode_prefill_chunk: Option<ResolvedValue<usize>>,
-    ) -> Result<AutoConfigDecision, AutoConfigError> {
+    fn scheduler_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
         let entries = self.entries();
         let prompt_scheduler =
             || -> Result<(String, AutoConfigSource, Option<String>), AutoConfigError> {
@@ -1672,16 +1640,6 @@ impl FerrumConfigBuilder {
                 self.source_for_key(key, AutoConfigSource::Default),
                 Some(key.to_string()),
             )
-        } else if !entries.contains_key("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE") {
-            if let Some(chunk) = default_active_decode_prefill_chunk.as_ref() {
-                (
-                    format!("active_decode_prefill_chunk:{}", chunk.value),
-                    chunk.source,
-                    chunk.source_key.clone(),
-                )
-            } else {
-                prompt_scheduler()?
-            }
         } else {
             prompt_scheduler()?
         };
@@ -3058,7 +3016,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_gemma3_gptq_defaults_to_active_decode_prefill_chunk() {
+    fn cuda_gemma3_gptq_uses_generic_scheduler_default() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
@@ -3073,29 +3031,17 @@ mod tests {
             .iter()
             .find(|decision| decision.selection == "scheduler_admission_policy")
             .unwrap();
-        assert_eq!(
-            scheduler.selected,
-            format!(
-                "active_decode_prefill_chunk:{}",
-                GEMMA3_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK
-            )
-        );
-        assert_eq!(scheduler.source, AutoConfigSource::ModelMetadata);
-        let entry = resolved
+        assert_eq!(scheduler.selected, "prompt_token_estimate");
+        assert_eq!(scheduler.source, AutoConfigSource::Default);
+        assert!(resolved
             .runtime_config
             .entries
             .iter()
-            .find(|entry| entry.key == "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
-            .expect("default scheduler chunk should be materialized");
-        assert_eq!(
-            entry.effective_value,
-            GEMMA3_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK.to_string()
-        );
-        assert_eq!(entry.source, RuntimeConfigSource::Default);
+            .all(|entry| entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"));
     }
 
     #[test]
-    fn explicit_scheduler_prompt_estimate_overrides_gemma3_chunk_default() {
+    fn explicit_scheduler_prompt_estimate_is_reflected_for_gemma3() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
