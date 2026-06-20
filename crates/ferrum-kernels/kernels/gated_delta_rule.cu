@@ -1,4 +1,30 @@
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+static __device__ __forceinline__ float ferrum_gdr_load_value(const float* ptr,
+                                                              int idx) {
+  return ptr[idx];
+}
+
+static __device__ __forceinline__ float ferrum_gdr_load_value(const __half* ptr,
+                                                              int idx) {
+  return __half2float(ptr[idx]);
+}
+
+static __device__ __forceinline__ float ferrum_gdr_sigmoid(float x) {
+  if (x >= 0.0f) {
+    const float z = expf(-x);
+    return 1.0f / (1.0f + z);
+  }
+  const float z = expf(x);
+  return z / (1.0f + z);
+}
+
+static __device__ __forceinline__ float ferrum_gdr_softplus(float x) {
+  if (x > 20.0f) return x;
+  if (x < -20.0f) return expf(x);
+  return log1pf(expf(x));
+}
 
 extern "C" __global__ void recurrent_gated_delta_rule_f32(
     const float* __restrict__ query,
@@ -395,6 +421,251 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_tiled16_f32(
     const float scale) {
   recurrent_gated_delta_rule_batch_indexed_tiled_f32_impl<16>(
       query, key, value, g, beta, state_slots, slot_indices, out, batch,
+      max_slots, key_heads, value_heads, key_dim, value_dim, scale);
+}
+
+template <typename GateT, typename ParamT, int BV_TILE>
+static __device__ void recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl(
+    const float* __restrict__ mixed_qkv,
+    const GateT* __restrict__ ba_raw,
+    const ParamT* __restrict__ a_log,
+    const ParamT* __restrict__ dt_bias,
+    float* __restrict__ state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ out,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  const int value_tile = blockIdx.x;
+  const int value_head = blockIdx.y;
+  const int row = blockIdx.z;
+  if (value_head >= value_heads || row >= batch) return;
+
+  const unsigned int slot_u = slot_indices[row];
+  if (slot_u >= static_cast<unsigned int>(max_slots)) return;
+  const int slot = static_cast<int>(slot_u);
+
+  const int value_start = value_tile * BV_TILE;
+  const int repeat_factor = value_heads / key_heads;
+  const int key_head = value_head / repeat_factor;
+  const int qk_total = key_heads * key_dim;
+  const int value_total = value_heads * value_dim;
+  const int conv_channels = 2 * qk_total + value_total;
+  const int state_len = value_heads * value_dim * key_dim;
+  const int row_state_base = slot * state_len;
+  const int row_mixed_base = row * conv_channels;
+  const int ba_base = row * 2 * value_heads;
+
+  float q_norm_local = 0.0f;
+  float k_norm_local = 0.0f;
+  for (int kd = threadIdx.x; kd < key_dim; kd += blockDim.x) {
+    const int q_idx = row_mixed_base + key_head * key_dim + kd;
+    const int k_idx = row_mixed_base + qk_total + key_head * key_dim + kd;
+    const float q = mixed_qkv[q_idx];
+    const float k = mixed_qkv[k_idx];
+    q_norm_local += q * q;
+    k_norm_local += k * k;
+  }
+
+  __shared__ float reduce_q[256];
+  __shared__ float reduce_k[256];
+  __shared__ float partial[BV_TILE][256];
+  __shared__ float delta[BV_TILE];
+  __shared__ float q_inv_shared;
+  __shared__ float k_inv_shared;
+  reduce_q[threadIdx.x] = q_norm_local;
+  reduce_k[threadIdx.x] = k_norm_local;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduce_q[threadIdx.x] += reduce_q[threadIdx.x + stride];
+      reduce_k[threadIdx.x] += reduce_k[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    q_inv_shared = rsqrtf(reduce_q[0] + 1.0e-6f);
+    k_inv_shared = rsqrtf(reduce_k[0] + 1.0e-6f);
+  }
+  __syncthreads();
+  const float q_inv = q_inv_shared;
+  const float k_inv = k_inv_shared;
+
+  const float b_raw = ferrum_gdr_load_value(ba_raw, ba_base + value_head);
+  const float a_raw =
+      ferrum_gdr_load_value(ba_raw, ba_base + value_heads + value_head);
+  const float a = a_raw + ferrum_gdr_load_value(dt_bias, value_head);
+  const float g_val = -expf(ferrum_gdr_load_value(a_log, value_head)) *
+                      ferrum_gdr_softplus(a);
+  const float decay = expf(g_val);
+  const float beta_t = ferrum_gdr_sigmoid(b_raw);
+
+  float local[BV_TILE];
+
+#pragma unroll
+  for (int i = 0; i < BV_TILE; ++i) {
+    local[i] = 0.0f;
+  }
+
+  for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+    const int local_v = i / key_dim;
+    const int kd = i - local_v * key_dim;
+    const int value_offset = value_start + local_v;
+    if (value_offset >= value_dim) continue;
+
+    const int state_idx =
+        row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
+    const int k_idx = row_mixed_base + qk_total + key_head * key_dim + kd;
+    const float k = mixed_qkv[k_idx] * k_inv;
+    const float state = state_slots[state_idx] * decay;
+    state_slots[state_idx] = state;
+    local[local_v] += state * k;
+  }
+
+#pragma unroll
+  for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+    partial[local_v][threadIdx.x] = local[local_v];
+  }
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+#pragma unroll
+      for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+        partial[local_v][threadIdx.x] += partial[local_v][threadIdx.x + stride];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+      const int value_offset = value_start + local_v;
+      if (value_offset < value_dim) {
+        const int value_idx =
+            row_mixed_base + 2 * qk_total + value_head * value_dim + value_offset;
+        delta[local_v] = (mixed_qkv[value_idx] - partial[local_v][0]) * beta_t;
+      } else {
+        delta[local_v] = 0.0f;
+      }
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int i = 0; i < BV_TILE; ++i) {
+    local[i] = 0.0f;
+  }
+
+  for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+    const int local_v = i / key_dim;
+    const int kd = i - local_v * key_dim;
+    const int value_offset = value_start + local_v;
+    if (value_offset >= value_dim) continue;
+
+    const int state_idx =
+        row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
+    const int q_idx = row_mixed_base + key_head * key_dim + kd;
+    const int k_idx = row_mixed_base + qk_total + key_head * key_dim + kd;
+    const float k = mixed_qkv[k_idx] * k_inv;
+    const float q = mixed_qkv[q_idx] * q_inv * scale;
+    const float updated = state_slots[state_idx] + delta[local_v] * k;
+    state_slots[state_idx] = updated;
+    local[local_v] += updated * q;
+  }
+
+#pragma unroll
+  for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+    partial[local_v][threadIdx.x] = local[local_v];
+  }
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+#pragma unroll
+      for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+        partial[local_v][threadIdx.x] += partial[local_v][threadIdx.x + stride];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+      const int value_offset = value_start + local_v;
+      if (value_offset < value_dim) {
+        const int value_idx =
+            ((row * value_heads + value_head) * value_dim) + value_offset;
+        out[value_idx] = partial[local_v][0];
+      }
+    }
+  }
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f32_params_f32(
+    const float* __restrict__ mixed_qkv,
+    const float* __restrict__ ba_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ out,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<float, float, 16>(
+      mixed_qkv, ba_raw, a_log, dt_bias, state_slots, slot_indices, out, batch,
+      max_slots, key_heads, value_heads, key_dim, value_dim, scale);
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f16_params_f16(
+    const float* __restrict__ mixed_qkv,
+    const __half* __restrict__ ba_raw,
+    const __half* __restrict__ a_log,
+    const __half* __restrict__ dt_bias,
+    float* __restrict__ state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ out,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<__half, __half, 16>(
+      mixed_qkv, ba_raw, a_log, dt_bias, state_slots, slot_indices, out, batch,
+      max_slots, key_heads, value_heads, key_dim, value_dim, scale);
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f16_params_f32(
+    const float* __restrict__ mixed_qkv,
+    const __half* __restrict__ ba_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ out,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<__half, float, 16>(
+      mixed_qkv, ba_raw, a_log, dt_bias, state_slots, slot_indices, out, batch,
       max_slots, key_heads, value_heads, key_dim, value_dim, scale);
 }
 
