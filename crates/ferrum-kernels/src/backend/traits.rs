@@ -828,6 +828,40 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Interleave shared-expert gate/up projections from token-major
+    /// `[tokens, intermediate]` buffers into `[tokens, 2 * intermediate]`.
+    ///
+    /// The default keeps backend behavior unchanged. CUDA overrides this to
+    /// avoid `2 * tokens` tiny device-to-device copies per MoE layer.
+    fn qwen35_interleave_gate_up(
+        ctx: &mut Self::Context,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        intermediate: usize,
+    ) -> Result<()> {
+        for token in 0..tokens {
+            Self::copy_slice(
+                ctx,
+                gate,
+                token * intermediate,
+                out,
+                token * 2 * intermediate,
+                intermediate,
+            );
+            Self::copy_slice(
+                ctx,
+                up,
+                token * intermediate,
+                out,
+                token * 2 * intermediate + intermediate,
+                intermediate,
+            );
+        }
+        Ok(())
+    }
+
     /// Batched kv_cache_append across M caches in one launch. Each item
     /// writes its (head-major) K-or-V row into its own cache at offset
     /// read from `cache_lens[i]`. Replaces M sequential

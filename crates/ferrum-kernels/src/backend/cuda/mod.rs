@@ -2797,6 +2797,70 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    fn qwen35_interleave_gate_up(
+        ctx: &mut Self::Context,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        intermediate: usize,
+    ) -> Result<()> {
+        if tokens == 0 || intermediate == 0 {
+            return Ok(());
+        }
+        let expected = tokens * intermediate;
+        if gate.len() < expected || up.len() < expected || out.len() < 2 * expected {
+            return Err(FerrumError::model(format!(
+                "qwen35_interleave_gate_up buffer too small: gate={} up={} out={} expected={} out_expected={}",
+                gate.len(),
+                up.len(),
+                out.len(),
+                expected,
+                2 * expected
+            )));
+        }
+        if gate.dtype() != up.dtype() || gate.dtype() != out.dtype() {
+            return Err(FerrumError::model(format!(
+                "qwen35_interleave_gate_up dtype mismatch: gate={} up={} out={}",
+                gate.dtype().name(),
+                up.dtype().name(),
+                out.dtype().name()
+            )));
+        }
+
+        let func_name = match gate.dtype() {
+            Dtype::F16 => "qwen35_interleave_gate_up_f16",
+            Dtype::F32 => "qwen35_interleave_gate_up_f32",
+            dtype => {
+                return Err(FerrumError::model(format!(
+                    "qwen35_interleave_gate_up unsupported dtype {}",
+                    dtype.name()
+                )))
+            }
+        };
+        let func = ctx.func("qk_norm_rope_gate", ptx::QK_NORM_ROPE, func_name);
+        let tokens_i32 = tokens as i32;
+        let intermediate_i32 = intermediate as i32;
+        let block = 256u32;
+        let grid = ((expected as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(gate);
+        b.arg(up);
+        b.arg(out);
+        b.arg(&tokens_i32);
+        b.arg(&intermediate_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qwen35_interleave_gate_up: {e}")))?;
+        Ok(())
+    }
+
     /// Split QKV + qk-norm + RoPE into FP16 head-major scratch buffers.
     /// Implemented as a chain over the existing primitives: `split_qkv` →
     /// 3× `qk_norm_rope` (Q/K with their respective norms; V with mode=0).

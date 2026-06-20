@@ -4909,24 +4909,14 @@ pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
         shape.tokens * shared_inter,
     );
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    for token in 0..shape.tokens {
-        B::copy_slice(
-            ctx,
-            &shared_gate_proj,
-            token * shared_inter,
-            &mut shared_gate_up,
-            token * 2 * shared_inter,
-            shared_inter,
-        );
-        B::copy_slice(
-            ctx,
-            &shared_up_proj,
-            token * shared_inter,
-            &mut shared_gate_up,
-            token * 2 * shared_inter + shared_inter,
-            shared_inter,
-        );
-    }
+    B::qwen35_interleave_gate_up(
+        ctx,
+        &shared_gate_proj,
+        &shared_up_proj,
+        &mut shared_gate_up,
+        shape.tokens,
+        shared_inter,
+    )?;
     detail.shared_pack_us +=
         qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_pack");
     let mut shared_fused = B::alloc(shape.tokens * shared_inter);
