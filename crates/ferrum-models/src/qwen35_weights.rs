@@ -132,6 +132,20 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
         self.inner.load_linear(&format!("{prefix}gate_up_proj"))
     }
 
+    pub fn load_layer_shared_expert_gate_up_linear(
+        &self,
+        layer_index: usize,
+    ) -> FerrumResult<Box<dyn Linear<B>>> {
+        self.load_fused_layer_linear(
+            layer_index,
+            "moe_shared_expert_gate_proj",
+            "moe_shared_expert_up_proj",
+            "gate_proj",
+            "up_proj",
+            "gate_up_proj",
+        )
+    }
+
     pub fn load_layer_linear_attention_qkvz(
         &self,
         layer_index: usize,
