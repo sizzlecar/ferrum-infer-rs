@@ -217,6 +217,7 @@ fn recurrent_gated_delta_rule_varlen_tiled_cuda_matches_cpu_reference() {
     let mut cpu_ctx = CpuBackend::new_context();
     let mut expected_out = vec![0.0; value_len];
     let mut expected_state = vec![0.0; state_len];
+    let cu_cpu = CpuBackend::from_slice_typed(&cu_seqlens);
     CpuBackend::recurrent_gated_delta_rule_varlen_f32(
         &mut cpu_ctx,
         &query,
@@ -225,7 +226,7 @@ fn recurrent_gated_delta_rule_varlen_tiled_cuda_matches_cpu_reference() {
         &g,
         &beta,
         &initial_states,
-        &cu_seqlens,
+        &cu_cpu,
         &mut expected_out,
         &mut expected_state,
         batch,
