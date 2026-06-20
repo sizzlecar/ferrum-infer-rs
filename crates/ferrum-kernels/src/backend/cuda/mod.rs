@@ -3542,111 +3542,6 @@ fn blas_slots() -> &'static std::sync::RwLock<HashMap<usize, BlasSlot>> {
     BLAS_HANDLES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
-struct MoeSharedAuxSlot {
-    stream: Arc<CudaStream>,
-    blas: Arc<CudaBlas>,
-    _workspace: CudaSlice<u8>,
-    entry_event: usize,
-    exit_event: usize,
-}
-unsafe impl Send for MoeSharedAuxSlot {}
-unsafe impl Sync for MoeSharedAuxSlot {}
-
-static MOE_SHARED_AUX: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, MoeSharedAuxSlot>>> =
-    std::sync::OnceLock::new();
-
-fn moe_shared_aux_slots() -> &'static std::sync::RwLock<HashMap<usize, MoeSharedAuxSlot>> {
-    MOE_SHARED_AUX.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
-}
-
-fn configure_blas_workspace(
-    stream: &Arc<CudaStream>,
-    blas: &Arc<CudaBlas>,
-    workspace: &CudaSlice<u8>,
-) {
-    unsafe {
-        use cudarc::cublas::sys;
-        use cudarc::driver::DevicePtr;
-        let (ws_ptr, _g) = workspace.device_ptr(stream);
-        let st = sys::cublasSetWorkspace_v2(*blas.handle(), ws_ptr as *mut _, workspace.len());
-        assert_eq!(
-            st,
-            sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
-            "set workspace"
-        );
-        let st = sys::cublasSetPointerMode_v2(
-            *blas.handle(),
-            sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE,
-        );
-        assert_eq!(
-            st,
-            sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
-            "set pointer mode"
-        );
-    }
-}
-
-pub(super) fn moe_shared_aux(
-    ctx: &mut CudaState,
-) -> (
-    Arc<CudaStream>,
-    Arc<CudaBlas>,
-    cudarc::driver::sys::CUevent,
-    cudarc::driver::sys::CUevent,
-) {
-    let slots = moe_shared_aux_slots();
-    let ordinal = ctx.ordinal;
-    {
-        let g = slots.read().expect("MOE_SHARED_AUX poisoned");
-        if let Some(slot) = g.get(&ordinal) {
-            return (
-                slot.stream.clone(),
-                slot.blas.clone(),
-                slot.entry_event as cudarc::driver::sys::CUevent,
-                slot.exit_event as cudarc::driver::sys::CUevent,
-            );
-        }
-    }
-
-    let mut w = slots.write().expect("MOE_SHARED_AUX poisoned");
-    if !w.contains_key(&ordinal) {
-        const WS_BYTES: usize = 32 * 1024 * 1024;
-        let stream = ctx
-            .ctx
-            .new_stream()
-            .expect("CudaState::moe_shared_aux: new_stream failed");
-        let blas = Arc::new(CudaBlas::new(stream.clone()).expect("CudaBlas::new moe shared aux"));
-        let workspace = unsafe { stream.alloc::<u8>(WS_BYTES) }.expect("moe shared aux ws alloc");
-        configure_blas_workspace(&stream, &blas, &workspace);
-
-        let mut entry: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-        let mut exit: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-        unsafe {
-            cudarc::driver::sys::cuEventCreate(&mut entry, 2);
-            cudarc::driver::sys::cuEventCreate(&mut exit, 2);
-        }
-        tracing::info!("MoE shared-expert auxiliary stream initialized");
-        w.insert(
-            ordinal,
-            MoeSharedAuxSlot {
-                stream,
-                blas,
-                _workspace: workspace,
-                entry_event: entry as usize,
-                exit_event: exit as usize,
-            },
-        );
-    }
-
-    let slot = w.get(&ordinal).expect("moe shared aux inserted");
-    (
-        slot.stream.clone(),
-        slot.blas.clone(),
-        slot.entry_event as cudarc::driver::sys::CUevent,
-        slot.exit_event as cudarc::driver::sys::CUevent,
-    )
-}
-
 fn ensure_blas_handle(stream: &Arc<CudaStream>) -> Arc<CudaBlas> {
     let ordinal = current_device_ordinal();
     if let Some(slot) = blas_slots().read().expect("BLAS poisoned").get(&ordinal) {
@@ -3659,11 +3554,30 @@ fn ensure_blas_handle(stream: &Arc<CudaStream>) -> Arc<CudaBlas> {
         let workspace = unsafe { stream.alloc::<u8>(WS_BYTES) }.expect("blas ws alloc");
         let alpha_f32 = stream.clone_htod(&[1.0f32]).expect("alpha htod");
         let beta_f32 = stream.clone_htod(&[0.0f32]).expect("beta htod");
-        // Switch to device-pointer mode so alpha/beta pass cleanly through
-        // graph capture. cuBLAS is HOST mode by default; in HOST mode it
-        // internally memcpies the scalar from host, and that memcpy lands
-        // in the captured graph with a stack-local pointer → UB at replay.
-        configure_blas_workspace(stream, &blas, &workspace);
+        unsafe {
+            use cudarc::cublas::sys;
+            use cudarc::driver::DevicePtr;
+            let (ws_ptr, _g) = workspace.device_ptr(stream);
+            let st = sys::cublasSetWorkspace_v2(*blas.handle(), ws_ptr as *mut _, WS_BYTES);
+            assert_eq!(
+                st,
+                sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+                "set workspace"
+            );
+            // Switch to device-pointer mode so alpha/beta pass cleanly through
+            // graph capture. cuBLAS is HOST mode by default; in HOST mode it
+            // internally memcpies the scalar from host, and that memcpy lands
+            // in the captured graph with a stack-local pointer → UB at replay.
+            let st = sys::cublasSetPointerMode_v2(
+                *blas.handle(),
+                sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE,
+            );
+            assert_eq!(
+                st,
+                sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+                "set pointer mode"
+            );
+        }
         w.insert(
             ordinal,
             BlasSlot {
