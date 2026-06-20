@@ -1,0 +1,33 @@
+{
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "max_tokens": 128,
+  "messages": [
+    {
+      "content": "Return exactly this JSON object and nothing else: {\"answer\":\"ok-12\"}",
+      "role": "user"
+    }
+  ],
+  "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "response_format": {
+    "json_schema": {
+      "name": "Answer",
+      "schema": {
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "type": "object"
+      },
+      "strict": true
+    },
+    "type": "json_schema"
+  },
+  "seed": 9283,
+  "temperature": 0
+}

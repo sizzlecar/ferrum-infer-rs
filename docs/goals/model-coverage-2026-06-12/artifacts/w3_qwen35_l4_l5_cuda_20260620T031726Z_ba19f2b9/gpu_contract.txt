@@ -1,0 +1,5 @@
+lane: W3 Qwen3.5 L4 agent + L5 concurrency/perf-shape CUDA
+expected_runtime_cost: 1-3h at Vast dph 0.662962962962963
+stop_condition: L4 fail, L5 fail, or L4/L5 artifacts collected
+correctness_gate: W3 L4 AGENT PASS then W3 L5 CONCURRENCY PASS
+performance_command: ferrum bench-serve --dataset sharegpt --sharegpt-path /workspace/artifacts/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja/dataset/ascii_sharegpt_w3_100_58d5721d.jsonl --random-output-len 128 --concurrency-sweep 1,4,16,32 --num-prompts 100 --warmup-requests 10 --n-repeats 3 --fail-on-error --require-ci --seed 9271
