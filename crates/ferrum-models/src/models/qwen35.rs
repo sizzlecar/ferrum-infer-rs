@@ -1355,6 +1355,234 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         Ok(out)
     }
 
+    fn forward_stateful_prefill_batch(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.use_paged_kv {
+            return Err(FerrumError::unsupported(
+                "Qwen3.5 unified_forward fresh prefill requires paged KV",
+            ));
+        }
+        for (_, tokens, pos_offset, is_final_chunk) in items {
+            if tokens.is_empty() {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 unified_forward does not accept empty prefill chunks",
+                ));
+            }
+            if *pos_offset != 0 || !*is_final_chunk {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 unified_forward currently supports fresh final prefill batches only",
+                ));
+            }
+        }
+        let mut seen = HashSet::with_capacity(items.len());
+        for (cache_id, _, _, _) in items {
+            if !seen.insert(cache_id.as_str()) {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 unified_forward requires unique cache ids",
+                ));
+            }
+        }
+        for (cache_id, _, _, _) in items {
+            self.ensure_sequence_state(cache_id)?;
+            let state = self.sequences.get(cache_id).ok_or_else(|| {
+                FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
+            })?;
+            if !state.tokens.is_empty() {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 unified_forward fresh prefill received a non-empty sequence state",
+                ));
+            }
+            if qwen35_first_full_kv(state).is_some_and(|kv| kv.len != 0) {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 unified_forward fresh prefill received non-empty full-attention KV",
+                ));
+            }
+            if state.layers.len() != self.weights.layers.len() {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 sequence state layer count {} != model layers {}",
+                    state.layers.len(),
+                    self.weights.layers.len()
+                )));
+            }
+        }
+        self.ensure_paged_pools();
+
+        let mut states = Vec::with_capacity(items.len());
+        for (cache_id, _, _, _) in items {
+            let state = self.sequences.remove(cache_id).ok_or_else(|| {
+                FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
+            })?;
+            states.push((cache_id.clone(), state));
+        }
+        let result = self.forward_stateful_prefill_batch_taken(items, &mut states);
+        let success = result.is_ok();
+        for ((cache_id, mut state), (_, tokens, _, _)) in states.into_iter().zip(items.iter()) {
+            if success {
+                state.tokens.extend_from_slice(tokens);
+            }
+            self.sequences.insert(cache_id, state);
+        }
+        result.map(|rows| rows.into_iter().map(Some).collect())
+    }
+
+    fn forward_stateful_prefill_batch_taken(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        states: &mut [(String, Qwen35SequenceState<B>)],
+    ) -> Result<Vec<Vec<f32>>> {
+        let batch_len = items.len();
+        if batch_len == 0 {
+            return Ok(Vec::new());
+        }
+        let mut q_lens = Vec::with_capacity(batch_len);
+        let mut cu = Vec::with_capacity(batch_len + 1);
+        let mut all_tokens = Vec::new();
+        cu.push(0u32);
+        for (_, tokens, _, _) in items {
+            if tokens.len() > self.kv_capacity {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 prefill length {} exceeds KV capacity {}",
+                    tokens.len(),
+                    self.kv_capacity
+                )));
+            }
+            all_tokens.extend_from_slice(tokens);
+            q_lens.push(tokens.len());
+            let next = u32::try_from(all_tokens.len()).map_err(|_| {
+                FerrumError::model("Qwen3.5 unified prefill total token count exceeds u32")
+            })?;
+            cu.push(next);
+        }
+        let total_tokens = all_tokens.len();
+        let mut ctx = B::new_context();
+        for (row, ((cache_id, _, _, _), (_, state))) in
+            items.iter().zip(states.iter_mut()).enumerate()
+        {
+            self.ensure_paged_kv_capacity_for_state(&mut ctx, cache_id, state, q_lens[row])?;
+        }
+        let mut cu_buf = B::alloc_typed(Dtype::U32, cu.len());
+        B::write_typed::<u32>(&mut ctx, &mut cu_buf, &cu);
+
+        let weights = &self.weights;
+        let rope = &self.rope;
+        let hidden_len = total_tokens * weights.config.hidden_size;
+        let mut hidden = B::alloc(hidden_len);
+        B::embedding_lookup(
+            &mut ctx,
+            &weights.embed_tokens,
+            &all_tokens,
+            &mut hidden,
+            weights.config.hidden_size,
+        );
+        let eps = 1e-6f32;
+        let mut residual_f32 = if B::supports_device_f32_residual_shadow() {
+            let mut shadow = B::alloc_typed(Dtype::F32, hidden_len);
+            B::activation_to_f32_shadow(&mut ctx, &hidden, &mut shadow, hidden_len);
+            Some(shadow)
+        } else {
+            None
+        };
+        let mut branch_f32 = residual_f32
+            .as_ref()
+            .map(|_| B::alloc_typed(Dtype::F32, hidden_len));
+
+        for (layer_index, layer) in weights.layers.iter().enumerate() {
+            hidden = match &layer.attention {
+                Qwen35AttentionWeights::Linear(_) => {
+                    qwen35_linear_attention_prefill_batch_layer_backend::<B>(
+                        &mut ctx,
+                        &hidden,
+                        states,
+                        layer_index,
+                        layer,
+                        &weights.config,
+                        &cu_buf,
+                        &q_lens,
+                        total_tokens,
+                        eps,
+                        residual_f32.as_mut(),
+                        branch_f32.as_mut(),
+                    )?
+                }
+                Qwen35AttentionWeights::Full(_) => {
+                    let pools = self.paged_pools.as_mut().ok_or_else(|| {
+                        FerrumError::model(
+                            "Qwen3.5 unified prefill missing paged full-attention pools",
+                        )
+                    })?;
+                    qwen35_full_attention_prefill_batch_layer_backend::<B>(
+                        &mut ctx,
+                        &hidden,
+                        states,
+                        &mut pools[layer_index],
+                        &mut self.paged_scratch,
+                        layer_index,
+                        layer,
+                        rope,
+                        &weights.config,
+                        self.use_vllm_paged_attn,
+                        &cu_buf,
+                        &cu,
+                        &q_lens,
+                        total_tokens,
+                        eps,
+                        residual_f32.as_mut(),
+                        branch_f32.as_mut(),
+                    )?
+                }
+            };
+        }
+
+        let mut final_hidden = B::alloc(hidden_len);
+        if let Some(residual_f32) = residual_f32.as_ref() {
+            B::rms_norm_f32_to_activation(
+                &mut ctx,
+                residual_f32,
+                &weights.final_norm,
+                eps,
+                &mut final_hidden,
+                total_tokens,
+                weights.config.hidden_size,
+            );
+        } else {
+            B::rms_norm(
+                &mut ctx,
+                &hidden,
+                &weights.final_norm,
+                eps,
+                &mut final_hidden,
+                total_tokens,
+                weights.config.hidden_size,
+            );
+        }
+        let mut sampled_hidden = B::alloc(batch_len * weights.config.hidden_size);
+        for row in 0..batch_len {
+            let final_token = cu[row + 1] as usize - 1;
+            B::copy_slice(
+                &mut ctx,
+                &final_hidden,
+                final_token * weights.config.hidden_size,
+                &mut sampled_hidden,
+                row * weights.config.hidden_size,
+                weights.config.hidden_size,
+            );
+        }
+        let vocab = weights.runtime_cfg.vocab_size;
+        let mut logits = B::alloc(batch_len * vocab);
+        weights
+            .lm_head
+            .forward(&mut ctx, &sampled_hidden, &mut logits, batch_len);
+        B::sync_before_host_readback(&mut ctx);
+        B::sync(&mut ctx);
+        let flat = B::to_vec(&logits, batch_len * vocab);
+        Ok(flat.chunks_exact(vocab).map(|row| row.to_vec()).collect())
+    }
+
     fn forward_stateful_decode_batch(
         &mut self,
         batch: &[(String, u32, u32)],
@@ -2068,6 +2296,13 @@ impl<B: MoeLlmBackend + BackendPagedKv> DecoderOnlyLLM for Qwen35BackendModel<B>
         }
         self.forward_stateful_decode_batch_with_logits_return(batch, logits_return)
             .unwrap_or_else(|err| panic!("Qwen3.5 decode_batch failed: {err}"))
+    }
+
+    fn unified_forward(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+    ) -> std::result::Result<Vec<Option<Vec<f32>>>, FerrumError> {
+        self.forward_stateful_prefill_batch(items)
     }
 
     fn release(&mut self, cache_id: &str) {
@@ -4492,6 +4727,620 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         );
         B::add_inplace(ctx, &mut residual_after_mixer, &delta_output, hidden_len);
         qwen35_finish_layer_with_mlp::<B>(ctx, &residual_after_mixer, layer, config, batch_len, eps)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    layer_input: &B::Buffer,
+    states: &mut [(String, Qwen35SequenceState<B>)],
+    layer_index: usize,
+    layer: &Qwen35LayerWeights<B>,
+    config: &Qwen35TextConfig,
+    cu_seqlens: &B::Buffer,
+    q_lens: &[usize],
+    total_tokens: usize,
+    eps: f32,
+    mut residual_f32: Option<&mut B::Buffer>,
+    mut branch_f32: Option<&mut B::Buffer>,
+) -> Result<B::Buffer> {
+    let batch_len = states.len();
+    if q_lens.len() != batch_len {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 prefill batch q_lens {} != states {}",
+            q_lens.len(),
+            batch_len
+        )));
+    }
+    let attention_shape = Qwen35LinearAttentionShape {
+        tokens: total_tokens,
+        key_heads: config.linear_attention.num_key_heads,
+        value_heads: config.linear_attention.num_value_heads,
+        key_dim: config.linear_attention.key_head_dim,
+        value_dim: config.linear_attention.value_head_dim,
+        conv_kernel: config.linear_attention.conv_kernel_dim,
+    };
+    let hidden_len = total_tokens * config.hidden_size;
+    let qkv_width = attention_shape.conv_channels();
+    let value_total = attention_shape.value_total();
+    let gating_width = attention_shape.value_heads;
+    let attention = match &layer.attention {
+        Qwen35AttentionWeights::Linear(attention) => attention,
+        Qwen35AttentionWeights::Full(_) => {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch prefill expected linear attention at layer {}",
+                layer.layer_index
+            )));
+        }
+    };
+
+    let mut input_norm = B::alloc(hidden_len);
+    if let Some(residual_f32) = residual_f32.as_ref() {
+        B::rms_norm_f32_to_activation(
+            ctx,
+            residual_f32,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            total_tokens,
+            config.hidden_size,
+        );
+    } else {
+        B::rms_norm(
+            ctx,
+            layer_input,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            total_tokens,
+            config.hidden_size,
+        );
+    }
+
+    let mut mixed_qkv_raw = B::alloc(total_tokens * qkv_width);
+    let mut z_raw = B::alloc(total_tokens * value_total);
+    let mut b_raw = B::alloc(total_tokens * gating_width);
+    let mut a_raw = B::alloc(total_tokens * gating_width);
+    attention
+        .qkv_proj
+        .forward(ctx, &input_norm, &mut mixed_qkv_raw, total_tokens);
+    attention
+        .z_proj
+        .forward(ctx, &input_norm, &mut z_raw, total_tokens);
+    attention
+        .b_proj
+        .forward(ctx, &input_norm, &mut b_raw, total_tokens);
+    attention
+        .a_proj
+        .forward(ctx, &input_norm, &mut a_raw, total_tokens);
+
+    let conv_state_len = qkv_width * attention_shape.conv_kernel.saturating_sub(1);
+    let delta_state_len = attention_shape.state_len();
+    let mut initial_conv_states = B::alloc_typed(Dtype::F32, batch_len * conv_state_len);
+    let mut initial_delta_states = B::alloc_typed(Dtype::F32, batch_len * delta_state_len);
+    for (row, (cache_id, state)) in states.iter_mut().enumerate() {
+        let Qwen35LayerRuntimeState::Linear {
+            conv_state,
+            delta_state,
+        } = state.layers.get_mut(layer_index).ok_or_else(|| {
+            FerrumError::model(format!(
+                "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+            ))
+        })?
+        else {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch prefill expected linear layer state at layer {layer_index} for {cache_id:?}"
+            )));
+        };
+        B::copy_slice(
+            ctx,
+            conv_state,
+            0,
+            &mut initial_conv_states,
+            row * conv_state_len,
+            conv_state_len,
+        );
+        B::copy_slice(
+            ctx,
+            delta_state,
+            0,
+            &mut initial_delta_states,
+            row * delta_state_len,
+            delta_state_len,
+        );
+    }
+
+    let attention_out = qwen35_linear_attention_prefill_varlen_core_backend::<B>(
+        ctx,
+        &mixed_qkv_raw,
+        &z_raw,
+        &a_raw,
+        &b_raw,
+        &attention.conv1d_weight,
+        &initial_conv_states,
+        &attention.a_log,
+        &attention.dt_bias,
+        &attention.norm_weight,
+        &initial_delta_states,
+        cu_seqlens,
+        batch_len,
+        attention_shape,
+        eps,
+    )?;
+
+    for (row, (cache_id, state)) in states.iter_mut().enumerate() {
+        let Qwen35LayerRuntimeState::Linear {
+            conv_state,
+            delta_state,
+        } = state.layers.get_mut(layer_index).ok_or_else(|| {
+            FerrumError::model(format!(
+                "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+            ))
+        })?
+        else {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch prefill expected linear layer state at layer {layer_index} for {cache_id:?}"
+            )));
+        };
+        B::copy_slice(
+            ctx,
+            &attention_out.final_conv_states,
+            row * conv_state_len,
+            conv_state,
+            0,
+            conv_state_len,
+        );
+        B::copy_slice(
+            ctx,
+            &attention_out.final_states,
+            row * delta_state_len,
+            delta_state,
+            0,
+            delta_state_len,
+        );
+    }
+
+    let mut delta_activation = B::alloc(total_tokens * value_total);
+    B::f32_to_activation(
+        ctx,
+        &attention_out.delta_norm,
+        &mut delta_activation,
+        total_tokens * value_total,
+    );
+    let mut delta_output = B::alloc(hidden_len);
+    attention
+        .out_proj
+        .forward(ctx, &delta_activation, &mut delta_output, total_tokens);
+
+    if let (Some(residual_f32), Some(branch_f32)) =
+        (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
+    {
+        B::activation_to_f32_shadow(ctx, &delta_output, branch_f32, hidden_len);
+        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        qwen35_finish_layer_with_mlp_f32_residual::<B>(
+            ctx,
+            residual_f32,
+            branch_f32,
+            layer,
+            config,
+            total_tokens,
+            eps,
+        )
+    } else {
+        let mut residual_after_mixer = B::alloc(hidden_len);
+        B::copy_slice(
+            ctx,
+            layer_input,
+            0,
+            &mut residual_after_mixer,
+            0,
+            hidden_len,
+        );
+        B::add_inplace(ctx, &mut residual_after_mixer, &delta_output, hidden_len);
+        qwen35_finish_layer_with_mlp::<B>(
+            ctx,
+            &residual_after_mixer,
+            layer,
+            config,
+            total_tokens,
+            eps,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen35_full_attention_prefill_batch_layer_backend<B: MoeLlmBackend + BackendPagedKv>(
+    ctx: &mut B::Context,
+    layer_input: &B::Buffer,
+    states: &mut [(String, Qwen35SequenceState<B>)],
+    pool: &mut (B::Buffer, B::Buffer),
+    scratch: &mut Qwen35PagedScratch<B>,
+    layer_index: usize,
+    layer: &Qwen35LayerWeights<B>,
+    rope: &Qwen35BackendRopeCache<B>,
+    config: &Qwen35TextConfig,
+    use_vllm_paged_attn: bool,
+    cu_seqlens: &B::Buffer,
+    cu_host: &[u32],
+    q_lens: &[usize],
+    total_tokens: usize,
+    eps: f32,
+    mut residual_f32: Option<&mut B::Buffer>,
+    mut branch_f32: Option<&mut B::Buffer>,
+) -> Result<B::Buffer> {
+    let batch_len = states.len();
+    if batch_len == 0 {
+        return Err(FerrumError::model(
+            "Qwen3.5 batch prefill full attention received empty states",
+        ));
+    }
+    if q_lens.len() != batch_len {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 full-attention prefill q_lens {} != states {}",
+            q_lens.len(),
+            batch_len
+        )));
+    }
+    if cu_host.len() != batch_len + 1
+        || cu_host.first().copied() != Some(0)
+        || cu_host.last().copied() != Some(total_tokens as u32)
+    {
+        return Err(FerrumError::model(
+            "Qwen3.5 full-attention prefill received invalid cu_seqlens",
+        ));
+    }
+    if q_lens.iter().any(|len| *len == 0) {
+        return Err(FerrumError::model(
+            "Qwen3.5 full-attention prefill does not accept empty sequences",
+        ));
+    }
+
+    let attention = match &layer.attention {
+        Qwen35AttentionWeights::Full(attention) => attention,
+        Qwen35AttentionWeights::Linear(_) => {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch prefill expected full attention at layer {}",
+                layer.layer_index
+            )));
+        }
+    };
+    let attention_shape = Qwen35FullAttentionShape {
+        tokens: total_tokens,
+        num_heads: config.num_attention_heads,
+        num_kv_heads: config.num_key_value_heads,
+        head_dim: config.head_dim,
+        rope_dim: config.full_attention_rope_dim(),
+        position_offset: 0,
+        rope_theta: config.rope_parameters.rope_theta as f32,
+        rope_interleaved: config.full_attention_text_rope_interleaved(),
+        attn_output_gate: config.attn_output_gate,
+    };
+    attention_shape.validate()?;
+    let hidden_len = total_tokens * config.hidden_size;
+    let q_total = attention_shape.q_total();
+    let q_proj_total = attention_shape.q_proj_total();
+    let kv_total = attention_shape.kv_total();
+
+    let mut input_norm = B::alloc(hidden_len);
+    if let Some(residual_f32) = residual_f32.as_ref() {
+        B::rms_norm_f32_to_activation(
+            ctx,
+            residual_f32,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            total_tokens,
+            config.hidden_size,
+        );
+    } else {
+        B::rms_norm(
+            ctx,
+            layer_input,
+            &layer.input_layernorm,
+            eps,
+            &mut input_norm,
+            total_tokens,
+            config.hidden_size,
+        );
+    }
+
+    let mut query_raw = B::alloc(total_tokens * q_proj_total);
+    let mut key_raw = B::alloc(total_tokens * kv_total);
+    let mut value_raw = B::alloc(total_tokens * kv_total);
+    attention
+        .q_proj
+        .forward(ctx, &input_norm, &mut query_raw, total_tokens);
+    attention
+        .k_proj
+        .forward(ctx, &input_norm, &mut key_raw, total_tokens);
+    attention
+        .v_proj
+        .forward(ctx, &input_norm, &mut value_raw, total_tokens);
+
+    let mut pos_offsets = Vec::with_capacity(batch_len);
+    let mut context_lens = Vec::with_capacity(batch_len);
+    let mut stacked = Vec::new();
+    let mut block_size = None;
+    let mut max_blocks_per_seq = None;
+    for (row, (cache_id, state)) in states.iter().enumerate() {
+        let Qwen35LayerRuntimeState::Full { kv } =
+            state.layers.get(layer_index).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+                ))
+            })?
+        else {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch prefill expected full layer state at layer {layer_index} for {cache_id:?}"
+            )));
+        };
+        if kv.block_size == 0 {
+            return Err(FerrumError::model(
+                "Qwen3.5 batch prefill received non-paged KV metadata",
+            ));
+        }
+        let this_max_blocks = kv.capacity / kv.block_size;
+        if this_max_blocks == 0 {
+            return Err(FerrumError::model(
+                "Qwen3.5 batch prefill received empty paged block table capacity",
+            ));
+        }
+        if block_size.is_some_and(|expected| expected != kv.block_size) {
+            return Err(FerrumError::model(
+                "Qwen3.5 batch prefill received mixed paged KV block sizes",
+            ));
+        }
+        if max_blocks_per_seq.is_some_and(|expected| expected != this_max_blocks) {
+            return Err(FerrumError::model(
+                "Qwen3.5 batch prefill received mixed paged KV table widths",
+            ));
+        }
+        block_size = Some(kv.block_size);
+        max_blocks_per_seq = Some(this_max_blocks);
+        if kv.paged_block_indices.len() > this_max_blocks {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch prefill block table overflow at layer {layer_index} for {cache_id:?}"
+            )));
+        }
+        let context_len = kv.len + q_lens[row];
+        if context_len > kv.capacity {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch prefill KV overflow at layer {layer_index} for {cache_id:?}: \
+                 target={context_len} capacity={}",
+                kv.capacity
+            )));
+        }
+        pos_offsets
+            .push(u32::try_from(kv.len).map_err(|_| {
+                FerrumError::model("Qwen3.5 batch prefill KV position exceeds u32")
+            })?);
+        context_lens.push(
+            u32::try_from(context_len)
+                .map_err(|_| FerrumError::model("Qwen3.5 batch prefill KV length exceeds u32"))?,
+        );
+        let mut blocks = kv.paged_block_indices.clone();
+        blocks.resize(this_max_blocks, 0);
+        stacked.extend(blocks);
+    }
+    let block_size = block_size
+        .ok_or_else(|| FerrumError::model("Qwen3.5 batch prefill missing paged KV block size"))?;
+    let max_blocks_per_seq = max_blocks_per_seq
+        .ok_or_else(|| FerrumError::model("Qwen3.5 batch prefill missing paged KV table width"))?;
+
+    scratch.ensure(total_tokens, batch_len, max_blocks_per_seq, q_total);
+    let pos_buf = scratch
+        .pos_offsets
+        .as_mut()
+        .expect("qwen35 paged pos missing");
+    let bt_buf = scratch
+        .block_tables
+        .as_mut()
+        .expect("qwen35 paged block_tables missing");
+    let lens_buf = scratch
+        .context_lens
+        .as_mut()
+        .expect("qwen35 paged context_lens missing");
+    B::write_typed::<u32>(ctx, pos_buf, &pos_offsets);
+    B::write_typed::<u32>(ctx, bt_buf, &stacked);
+    B::write_typed::<u32>(ctx, lens_buf, &context_lens);
+    let q_buf = scratch.q.as_mut().expect("qwen35 paged q missing");
+    let out_buf = scratch.out.as_mut().expect("qwen35 paged out missing");
+
+    if use_vllm_paged_attn {
+        B::qwen35_split_qkv_norm_rope_into_paged_cache_varlen_vllm(
+            ctx,
+            &query_raw,
+            &key_raw,
+            &value_raw,
+            &attention.q_norm_weight,
+            &attention.k_norm_weight,
+            &rope.cos,
+            &rope.sin,
+            q_buf,
+            &mut pool.0,
+            &mut pool.1,
+            cu_seqlens,
+            pos_buf,
+            bt_buf,
+            batch_len,
+            total_tokens,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            attention_shape.rope_dim,
+            q_proj_total,
+            if attention_shape.attn_output_gate {
+                2 * config.head_dim
+            } else {
+                config.head_dim
+            },
+            kv_total,
+            eps,
+            if attention_shape.rope_interleaved {
+                3
+            } else {
+                1
+            },
+            block_size,
+            max_blocks_per_seq,
+        )?;
+    } else {
+        B::qwen35_split_qkv_norm_rope_into_paged_cache_varlen(
+            ctx,
+            &query_raw,
+            &key_raw,
+            &value_raw,
+            &attention.q_norm_weight,
+            &attention.k_norm_weight,
+            &rope.cos,
+            &rope.sin,
+            q_buf,
+            &mut pool.0,
+            &mut pool.1,
+            cu_seqlens,
+            pos_buf,
+            bt_buf,
+            batch_len,
+            total_tokens,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            attention_shape.rope_dim,
+            q_proj_total,
+            if attention_shape.attn_output_gate {
+                2 * config.head_dim
+            } else {
+                config.head_dim
+            },
+            kv_total,
+            eps,
+            if attention_shape.rope_interleaved {
+                3
+            } else {
+                1
+            },
+            block_size,
+            max_blocks_per_seq,
+        )?;
+    }
+
+    for (row, (cache_id, state)) in states.iter_mut().enumerate() {
+        let Qwen35LayerRuntimeState::Full { kv } =
+            state.layers.get_mut(layer_index).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+                ))
+            })?
+        else {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch prefill expected full layer state at layer {layer_index} for {cache_id:?}"
+            )));
+        };
+        kv.len += q_lens[row];
+        if kv.len != context_lens[row] as usize {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch prefill context length mismatch at layer {layer_index} for {cache_id:?}"
+            )));
+        }
+        if let Some(cl) = kv.context_lens.as_mut() {
+            B::write_typed::<u32>(ctx, cl, &[context_lens[row]]);
+        }
+    }
+
+    let max_kv_len = context_lens.iter().copied().max().unwrap_or(1) as usize;
+    if use_vllm_paged_attn {
+        B::paged_varlen_attention_vllm(
+            ctx,
+            q_buf,
+            &pool.0,
+            &pool.1,
+            out_buf,
+            cu_seqlens,
+            pos_buf,
+            bt_buf,
+            batch_len,
+            total_tokens,
+            max_kv_len,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            block_size,
+            max_blocks_per_seq,
+        )?;
+    } else {
+        B::paged_varlen_attention(
+            ctx,
+            q_buf,
+            &pool.0,
+            &pool.1,
+            out_buf,
+            cu_seqlens,
+            pos_buf,
+            bt_buf,
+            batch_len,
+            total_tokens,
+            max_kv_len,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            0,
+            block_size,
+            max_blocks_per_seq,
+        )?;
+    }
+
+    let mut context = B::alloc(total_tokens * q_total);
+    B::copy_slice(ctx, out_buf, 0, &mut context, 0, total_tokens * q_total);
+    if attention_shape.attn_output_gate {
+        B::qwen35_apply_attention_gate(
+            ctx,
+            &mut context,
+            &query_raw,
+            total_tokens,
+            q_total,
+            q_proj_total,
+            config.head_dim,
+        )?;
+    }
+    let mut attn_output = B::alloc(hidden_len);
+    attention
+        .o_proj
+        .forward(ctx, &context, &mut attn_output, total_tokens);
+
+    if let (Some(residual_f32), Some(branch_f32)) =
+        (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
+    {
+        B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
+        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        qwen35_finish_layer_with_mlp_f32_residual::<B>(
+            ctx,
+            residual_f32,
+            branch_f32,
+            layer,
+            config,
+            total_tokens,
+            eps,
+        )
+    } else {
+        let mut residual_after_attention = B::alloc(hidden_len);
+        B::copy_slice(
+            ctx,
+            layer_input,
+            0,
+            &mut residual_after_attention,
+            0,
+            hidden_len,
+        );
+        B::add_inplace(ctx, &mut residual_after_attention, &attn_output, hidden_len);
+        qwen35_finish_layer_with_mlp::<B>(
+            ctx,
+            &residual_after_attention,
+            layer,
+            config,
+            total_tokens,
+            eps,
+        )
     }
 }
 
@@ -8430,6 +9279,35 @@ mod tests {
         assert!(loader
             .linears()
             .contains(&"model.layers.0.linear_attn.in_proj_qkv".to_string()));
+    }
+
+    #[test]
+    fn qwen35_unified_forward_requires_paged_kv_for_fresh_batch_prefill() {
+        let config = dense_config();
+        let loader = RecordingLoader::from_required_manifest(&config);
+        let plan = loader.plan(&config);
+        let mut model = Qwen35BackendModel::<CpuBackend>::from_weight_plan(
+            config.clone(),
+            runtime_config(&config),
+            plan,
+            &loader,
+        )
+        .unwrap();
+
+        let err = <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::unified_forward(
+            &mut model,
+            &[
+                ("req-a".to_string(), vec![1, 2, 3], 0, true),
+                ("req-b".to_string(), vec![4, 5], 0, true),
+            ],
+        )
+        .expect_err("CPU/non-paged Qwen3.5 unified prefill must fall back through Unsupported");
+
+        assert!(
+            err.to_string()
+                .contains("Qwen3.5 unified_forward fresh prefill requires paged KV"),
+            "{err}"
+        );
     }
 
     #[test]
