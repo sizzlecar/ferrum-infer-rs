@@ -5238,65 +5238,16 @@ pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
     })
 }
 
-fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
+fn qwen35_sparse_moe_routed_decode_scratch<B: MoeLlmBackend>(
     ctx: &mut B::Context,
     moe: &Qwen35SparseMoeSharedExpertWeights<B>,
     shape: Qwen35SparseMoeShape,
     layer_index: usize,
     scratch: &mut Qwen35DecodeScratch<B>,
+    detail_enabled: bool,
+    detail: &mut Qwen35SparseMoeDetailProfile,
 ) -> Result<()> {
-    shape.validate()?;
-    if shape.tokens > scratch.max_tokens
-        || shape.hidden_size != scratch.hidden_size
-        || shape.num_experts != scratch.num_experts
-        || shape.top_k != scratch.top_k
-        || shape.expert_intermediate_size != scratch.expert_intermediate_size
-        || shape.shared_expert_intermediate_size != scratch.shared_expert_intermediate_size
-    {
-        return Err(FerrumError::model(format!(
-            "Qwen3.5 decode scratch shape mismatch: scratch tokens={} hidden={} experts={} top_k={} expert_inter={} shared_inter={} vs request tokens={} hidden={} experts={} top_k={} expert_inter={} shared_inter={}",
-            scratch.max_tokens,
-            scratch.hidden_size,
-            scratch.num_experts,
-            scratch.top_k,
-            scratch.expert_intermediate_size,
-            scratch.shared_expert_intermediate_size,
-            shape.tokens,
-            shape.hidden_size,
-            shape.num_experts,
-            shape.top_k,
-            shape.expert_intermediate_size,
-            shape.shared_expert_intermediate_size,
-        )));
-    }
-    if moe.router.in_features() != shape.hidden_size
-        || moe.router.out_features() != shape.num_experts
-    {
-        return Err(FerrumError::model(format!(
-            "Qwen3.5 sparse MoE router shape {}x{} does not match hidden={} experts={}",
-            moe.router.out_features(),
-            moe.router.in_features(),
-            shape.hidden_size,
-            shape.num_experts
-        )));
-    }
-    if moe.shared_expert_gate_proj.in_features() != shape.hidden_size
-        || moe.shared_expert_gate_proj.out_features() != shape.shared_expert_intermediate_size
-        || moe.shared_expert_up_proj.in_features() != shape.hidden_size
-        || moe.shared_expert_up_proj.out_features() != shape.shared_expert_intermediate_size
-        || moe.shared_expert_down_proj.in_features() != shape.shared_expert_intermediate_size
-        || moe.shared_expert_down_proj.out_features() != shape.hidden_size
-    {
-        return Err(FerrumError::model(
-            "Qwen3.5 sparse MoE shared expert projection shapes do not match config",
-        ));
-    }
-
     let x = &scratch.post_attention_norm;
-    let detail_enabled = qwen35_layer_detail_profile_enabled();
-    let total_timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    let mut detail = Qwen35SparseMoeDetailProfile::default();
-
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
     moe.router
         .forward(ctx, x, &mut scratch.router_logits, shape.tokens);
@@ -5389,7 +5340,19 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
         &scratch.routed_output,
         shape.tokens * shape.hidden_size,
     );
+    Ok(())
+}
 
+fn qwen35_sparse_moe_shared_decode_scratch<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    moe: &Qwen35SparseMoeSharedExpertWeights<B>,
+    shape: Qwen35SparseMoeShape,
+    layer_index: usize,
+    scratch: &mut Qwen35DecodeScratch<B>,
+    detail_enabled: bool,
+    detail: &mut Qwen35SparseMoeDetailProfile,
+) -> Result<()> {
+    let x = &scratch.post_attention_norm;
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
     B::gemm(
         ctx,
@@ -5498,7 +5461,17 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
         &scratch.shared_output,
         shape.tokens * shape.hidden_size,
     );
+    Ok(())
+}
 
+fn qwen35_sparse_moe_merge_decode_scratch<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    shape: Qwen35SparseMoeShape,
+    layer_index: usize,
+    scratch: &mut Qwen35DecodeScratch<B>,
+    detail_enabled: bool,
+    detail: &mut Qwen35SparseMoeDetailProfile,
+) {
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
     B::copy_slice(
         ctx,
@@ -5521,6 +5494,115 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
         "moe.output",
         &scratch.mlp_output,
         shape.tokens * shape.hidden_size,
+    );
+}
+
+fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    moe: &Qwen35SparseMoeSharedExpertWeights<B>,
+    shape: Qwen35SparseMoeShape,
+    layer_index: usize,
+    scratch: &mut Qwen35DecodeScratch<B>,
+) -> Result<()> {
+    shape.validate()?;
+    if shape.tokens > scratch.max_tokens
+        || shape.hidden_size != scratch.hidden_size
+        || shape.num_experts != scratch.num_experts
+        || shape.top_k != scratch.top_k
+        || shape.expert_intermediate_size != scratch.expert_intermediate_size
+        || shape.shared_expert_intermediate_size != scratch.shared_expert_intermediate_size
+    {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 decode scratch shape mismatch: scratch tokens={} hidden={} experts={} top_k={} expert_inter={} shared_inter={} vs request tokens={} hidden={} experts={} top_k={} expert_inter={} shared_inter={}",
+            scratch.max_tokens,
+            scratch.hidden_size,
+            scratch.num_experts,
+            scratch.top_k,
+            scratch.expert_intermediate_size,
+            scratch.shared_expert_intermediate_size,
+            shape.tokens,
+            shape.hidden_size,
+            shape.num_experts,
+            shape.top_k,
+            shape.expert_intermediate_size,
+            shape.shared_expert_intermediate_size,
+        )));
+    }
+    if moe.router.in_features() != shape.hidden_size
+        || moe.router.out_features() != shape.num_experts
+    {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 sparse MoE router shape {}x{} does not match hidden={} experts={}",
+            moe.router.out_features(),
+            moe.router.in_features(),
+            shape.hidden_size,
+            shape.num_experts
+        )));
+    }
+    if moe.shared_expert_gate_proj.in_features() != shape.hidden_size
+        || moe.shared_expert_gate_proj.out_features() != shape.shared_expert_intermediate_size
+        || moe.shared_expert_up_proj.in_features() != shape.hidden_size
+        || moe.shared_expert_up_proj.out_features() != shape.shared_expert_intermediate_size
+        || moe.shared_expert_down_proj.in_features() != shape.shared_expert_intermediate_size
+        || moe.shared_expert_down_proj.out_features() != shape.hidden_size
+    {
+        return Err(FerrumError::model(
+            "Qwen3.5 sparse MoE shared expert projection shapes do not match config",
+        ));
+    }
+
+    let detail_enabled = qwen35_layer_detail_profile_enabled();
+    let total_timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    let mut detail = Qwen35SparseMoeDetailProfile::default();
+
+    let overlap_safe = !detail_enabled
+        && std::env::var_os("FERRUM_QWEN35_LAYER_TRACE").is_none()
+        && std::env::var_os("FERRUM_QWEN35_BUFFER_TRACE").is_none();
+    let overlapped = if overlap_safe {
+        B::try_launch_moe_aux_stream(ctx, shape.tokens, |aux_ctx| {
+            qwen35_sparse_moe_shared_decode_scratch::<B>(
+                aux_ctx,
+                moe,
+                shape,
+                layer_index,
+                scratch,
+                false,
+                &mut detail,
+            )
+        })?
+    } else {
+        false
+    };
+
+    qwen35_sparse_moe_routed_decode_scratch::<B>(
+        ctx,
+        moe,
+        shape,
+        layer_index,
+        scratch,
+        detail_enabled,
+        &mut detail,
+    )?;
+    if overlapped {
+        B::wait_moe_aux_stream(ctx)?;
+    } else {
+        qwen35_sparse_moe_shared_decode_scratch::<B>(
+            ctx,
+            moe,
+            shape,
+            layer_index,
+            scratch,
+            detail_enabled,
+            &mut detail,
+        )?;
+    }
+    qwen35_sparse_moe_merge_decode_scratch::<B>(
+        ctx,
+        shape,
+        layer_index,
+        scratch,
+        detail_enabled,
+        &mut detail,
     );
 
     detail.total_us = qwen35_detail_profile_stage_finish::<B>(ctx, total_timer, "qwen35_moe_total");
