@@ -139,8 +139,7 @@ pub struct Qwen35SparseMoeSharedExpertWeights<B: MoeLlmBackend> {
     pub router: Box<dyn Linear<B>>,
     pub experts: ExpertStack<B>,
     pub shared_expert_gate: B::Buffer,
-    pub shared_expert_gate_proj: Box<dyn Linear<B>>,
-    pub shared_expert_up_proj: Box<dyn Linear<B>>,
+    pub shared_expert_gate_up_proj: Box<dyn Linear<B>>,
     pub shared_expert_down_proj: Box<dyn Linear<B>>,
     pub fused_gate_up_proj: B::Buffer,
     pub fused_down_proj: B::Buffer,
@@ -319,8 +318,6 @@ pub struct Qwen35DecodeScratch<B: MoeLlmBackend> {
     down_packed: B::Buffer,
     shared_gate: B::Buffer,
     shared_gate_up: B::Buffer,
-    shared_gate_proj: B::Buffer,
-    shared_up_proj: B::Buffer,
     shared_fused: B::Buffer,
     shared_output: B::Buffer,
     route_selected_ids: B::Buffer,
@@ -767,8 +764,6 @@ impl<B: MoeLlmBackend> Qwen35DecodeScratch<B> {
             down_packed: B::alloc(total_pairs * hidden_size),
             shared_gate: B::alloc(max_tokens),
             shared_gate_up: B::alloc(max_tokens * 2 * shared_expert_intermediate_size),
-            shared_gate_proj: B::alloc(max_tokens * shared_expert_intermediate_size),
-            shared_up_proj: B::alloc(max_tokens * shared_expert_intermediate_size),
             shared_fused: B::alloc(max_tokens * shared_expert_intermediate_size),
             shared_output: B::alloc(max_tokens * hidden_size),
             route_selected_ids: B::alloc_typed(Dtype::I32, total_pairs),
@@ -2507,9 +2502,7 @@ struct Qwen35SparseMoeDetailProfile {
     router_us: u64,
     routed_experts_us: u64,
     shared_gate_us: u64,
-    shared_gate_proj_us: u64,
-    shared_up_proj_us: u64,
-    shared_pack_us: u64,
+    shared_gate_up_proj_us: u64,
     shared_fused_us: u64,
     shared_down_us: u64,
     shared_apply_gate_us: u64,
@@ -2848,10 +2841,9 @@ impl Qwen35LinearPrefillCoreDetailProfile {
 impl Qwen35SparseMoeDetailProfile {
     fn log(&self, layer_index: usize, tokens: usize, top_k: usize, num_experts: usize) {
         let event = QWEN35_SPARSE_MOE_DETAIL_PROFILE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
-        let shared_projection_us = self.shared_gate_proj_us + self.shared_up_proj_us;
+        let shared_projection_us = self.shared_gate_up_proj_us;
         let shared_path_us = self.shared_gate_us
             + shared_projection_us
-            + self.shared_pack_us
             + self.shared_fused_us
             + self.shared_down_us
             + self.shared_apply_gate_us;
@@ -2861,8 +2853,8 @@ impl Qwen35SparseMoeDetailProfile {
             eprintln!(
                 "[qwen35-sparse-moe-detail] event#{} layer={} tokens={} top_k={} experts={} \
                  total={}us accounted={}us router={}us routed_experts={}us shared_path={}us \
-                 shared_gate={}us shared_projection={}us shared_gate_proj={}us \
-                 shared_up_proj={}us shared_pack={}us shared_fused={}us shared_down={}us \
+                 shared_gate={}us shared_projection={}us shared_gate_up_proj={}us \
+                 shared_fused={}us shared_down={}us \
                  shared_apply_gate={}us merge={}us",
                 event,
                 layer_index,
@@ -2876,9 +2868,7 @@ impl Qwen35SparseMoeDetailProfile {
                 shared_path_us,
                 self.shared_gate_us,
                 shared_projection_us,
-                self.shared_gate_proj_us,
-                self.shared_up_proj_us,
-                self.shared_pack_us,
+                self.shared_gate_up_proj_us,
                 self.shared_fused_us,
                 self.shared_down_us,
                 self.shared_apply_gate_us,
@@ -2905,9 +2895,7 @@ impl Qwen35SparseMoeDetailProfile {
                     "shared_path": shared_path_us,
                     "shared_gate": self.shared_gate_us,
                     "shared_projection": shared_projection_us,
-                    "shared_gate_proj": self.shared_gate_proj_us,
-                    "shared_up_proj": self.shared_up_proj_us,
-                    "shared_pack": self.shared_pack_us,
+                    "shared_gate_up_proj": self.shared_gate_up_proj_us,
                     "shared_fused": self.shared_fused_us,
                     "shared_down": self.shared_down_us,
                     "shared_apply_gate": self.shared_apply_gate_us,
@@ -5173,10 +5161,9 @@ pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
             shape.num_experts
         )));
     }
-    if moe.shared_expert_gate_proj.in_features() != shape.hidden_size
-        || moe.shared_expert_gate_proj.out_features() != shape.shared_expert_intermediate_size
-        || moe.shared_expert_up_proj.in_features() != shape.hidden_size
-        || moe.shared_expert_up_proj.out_features() != shape.shared_expert_intermediate_size
+    if moe.shared_expert_gate_up_proj.in_features() != shape.hidden_size
+        || moe.shared_expert_gate_up_proj.out_features()
+            != 2 * shape.shared_expert_intermediate_size
         || moe.shared_expert_down_proj.in_features() != shape.shared_expert_intermediate_size
         || moe.shared_expert_down_proj.out_features() != shape.hidden_size
     {
@@ -5297,43 +5284,18 @@ pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
     );
     let shared_inter = shape.shared_expert_intermediate_size;
     let mut shared_gate_up = B::alloc(shape.tokens * 2 * shared_inter);
-    let mut shared_gate_proj = B::alloc(shape.tokens * shared_inter);
-    let mut shared_up_proj = B::alloc(shape.tokens * shared_inter);
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    moe.shared_expert_gate_proj
-        .forward(ctx, x, &mut shared_gate_proj, shape.tokens);
-    detail.shared_gate_proj_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_gate_proj");
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    moe.shared_expert_up_proj
-        .forward(ctx, x, &mut shared_up_proj, shape.tokens);
-    detail.shared_up_proj_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_up_proj");
+    moe.shared_expert_gate_up_proj
+        .forward(ctx, x, &mut shared_gate_up, shape.tokens);
+    detail.shared_gate_up_proj_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_gate_up_proj");
     qwen35_trace_layer_buffer_stats::<B>(
         ctx,
         layer_index,
-        "moe.shared_gate_proj",
-        &shared_gate_proj,
-        shape.tokens * shared_inter,
+        "moe.shared_gate_up",
+        &shared_gate_up,
+        shape.tokens * 2 * shared_inter,
     );
-    qwen35_trace_layer_buffer_stats::<B>(
-        ctx,
-        layer_index,
-        "moe.shared_up_proj",
-        &shared_up_proj,
-        shape.tokens * shared_inter,
-    );
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::qwen35_interleave_gate_up(
-        ctx,
-        &shared_gate_proj,
-        &shared_up_proj,
-        &mut shared_gate_up,
-        shape.tokens,
-        shared_inter,
-    )?;
-    detail.shared_pack_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_pack");
     let mut shared_fused = B::alloc(shape.tokens * shared_inter);
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
     B::fused_silu_mul_split(
@@ -5466,10 +5428,9 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
             shape.num_experts
         )));
     }
-    if moe.shared_expert_gate_proj.in_features() != shape.hidden_size
-        || moe.shared_expert_gate_proj.out_features() != shape.shared_expert_intermediate_size
-        || moe.shared_expert_up_proj.in_features() != shape.hidden_size
-        || moe.shared_expert_up_proj.out_features() != shape.shared_expert_intermediate_size
+    if moe.shared_expert_gate_up_proj.in_features() != shape.hidden_size
+        || moe.shared_expert_gate_up_proj.out_features()
+            != 2 * shape.shared_expert_intermediate_size
         || moe.shared_expert_down_proj.in_features() != shape.shared_expert_intermediate_size
         || moe.shared_expert_down_proj.out_features() != shape.hidden_size
     {
@@ -5598,41 +5559,17 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
 
     let shared_inter = shape.shared_expert_intermediate_size;
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    moe.shared_expert_gate_proj
-        .forward(ctx, x, &mut scratch.shared_gate_proj, shape.tokens);
-    detail.shared_gate_proj_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_gate_proj");
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    moe.shared_expert_up_proj
-        .forward(ctx, x, &mut scratch.shared_up_proj, shape.tokens);
-    detail.shared_up_proj_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_up_proj");
+    moe.shared_expert_gate_up_proj
+        .forward(ctx, x, &mut scratch.shared_gate_up, shape.tokens);
+    detail.shared_gate_up_proj_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_gate_up_proj");
     qwen35_trace_layer_buffer_stats::<B>(
         ctx,
         layer_index,
-        "moe.shared_gate_proj",
-        &scratch.shared_gate_proj,
-        shape.tokens * shared_inter,
+        "moe.shared_gate_up",
+        &scratch.shared_gate_up,
+        shape.tokens * 2 * shared_inter,
     );
-    qwen35_trace_layer_buffer_stats::<B>(
-        ctx,
-        layer_index,
-        "moe.shared_up_proj",
-        &scratch.shared_up_proj,
-        shape.tokens * shared_inter,
-    );
-
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::qwen35_interleave_gate_up(
-        ctx,
-        &scratch.shared_gate_proj,
-        &scratch.shared_up_proj,
-        &mut scratch.shared_gate_up,
-        shape.tokens,
-        shared_inter,
-    )?;
-    detail.shared_pack_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_pack");
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
     B::fused_silu_mul_split(
         ctx,
@@ -10878,14 +10815,10 @@ impl<B: MoeLlmBackend> Qwen35ModelWeights<B> {
                                     layer_plan.layer_index,
                                     "moe_shared_expert_gate",
                                 )?,
-                                shared_expert_gate_proj: planned.load_layer_linear(
-                                    layer_plan.layer_index,
-                                    "moe_shared_expert_gate_proj",
-                                )?,
-                                shared_expert_up_proj: planned.load_layer_linear(
-                                    layer_plan.layer_index,
-                                    "moe_shared_expert_up_proj",
-                                )?,
+                                shared_expert_gate_up_proj: planned
+                                    .load_layer_shared_expert_gate_up_linear(
+                                        layer_plan.layer_index,
+                                    )?,
                                 shared_expert_down_proj: planned.load_layer_linear(
                                     layer_plan.layer_index,
                                     "moe_shared_expert_down_proj",
