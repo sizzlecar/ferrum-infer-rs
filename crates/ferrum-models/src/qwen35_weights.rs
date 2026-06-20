@@ -132,6 +132,31 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
         self.inner.load_linear(&format!("{prefix}gate_up_proj"))
     }
 
+    pub fn load_layer_shared_expert_gate_up_linear(
+        &self,
+        layer_index: usize,
+    ) -> FerrumResult<Box<dyn Linear<B>>> {
+        let gate = self.required_layer_tensor(layer_index, "moe_shared_expert_gate_proj")?;
+        let up = self.required_layer_tensor(layer_index, "moe_shared_expert_up_proj")?;
+        let gate_module = linear_module_name(&gate.name);
+        let up_module = linear_module_name(&up.name);
+        let prefix = gate_module.strip_suffix("gate_proj").ok_or_else(|| {
+            FerrumError::model(format!(
+                "Qwen3.5 shared expert gate tensor for layer {layer_index} does not end with \
+                 gate_proj: {gate_module}"
+            ))
+        })?;
+        let expected_up = format!("{prefix}up_proj");
+        if up_module != expected_up {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 shared expert gate/up tensors for layer {layer_index} do not share a \
+                 fusion prefix: gate={gate_module} up={up_module}"
+            )));
+        }
+
+        self.inner.load_linear(&format!("{prefix}gate_up_proj"))
+    }
+
     pub fn load_layer_linear_attention_qkvz(
         &self,
         layer_index: usize,
