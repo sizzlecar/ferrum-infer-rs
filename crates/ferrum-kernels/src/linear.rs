@@ -25,6 +25,12 @@ pub enum LinearProjectionRole {
     Query,
     Key,
     Value,
+    GdnQkv,
+    GdnZ,
+    GdnQkvz,
+    GdnB,
+    GdnA,
+    GdnBa,
     Output,
     GateUp,
     Gate,
@@ -74,6 +80,12 @@ impl LinearMetadata {
         let role = match roles.as_slice() {
             [LinearProjectionRole::Query, LinearProjectionRole::Key, LinearProjectionRole::Value] => {
                 Some(LinearProjectionRole::Qkv)
+            }
+            [LinearProjectionRole::GdnQkv, LinearProjectionRole::GdnZ] => {
+                Some(LinearProjectionRole::GdnQkvz)
+            }
+            [LinearProjectionRole::GdnB, LinearProjectionRole::GdnA] => {
+                Some(LinearProjectionRole::GdnBa)
             }
             [LinearProjectionRole::Gate, LinearProjectionRole::Up] => {
                 Some(LinearProjectionRole::GateUp)
@@ -140,6 +152,12 @@ fn parse_projection_role(name: &str) -> Option<LinearProjectionRole> {
         "q_proj" => Some(LinearProjectionRole::Query),
         "k_proj" => Some(LinearProjectionRole::Key),
         "v_proj" => Some(LinearProjectionRole::Value),
+        "in_proj_qkv" => Some(LinearProjectionRole::GdnQkv),
+        "in_proj_z" => Some(LinearProjectionRole::GdnZ),
+        "in_proj_qkvz" => Some(LinearProjectionRole::GdnQkvz),
+        "in_proj_b" => Some(LinearProjectionRole::GdnB),
+        "in_proj_a" => Some(LinearProjectionRole::GdnA),
+        "in_proj_ba" => Some(LinearProjectionRole::GdnBa),
         "o_proj" => Some(LinearProjectionRole::Output),
         "gate_up_proj" => Some(LinearProjectionRole::GateUp),
         "gate_proj" => Some(LinearProjectionRole::Gate),
@@ -186,6 +204,20 @@ mod tests {
                 "model.layers.9.mlp.up_proj.qweight",
             ]),
             LinearMetadata::new(Some(9), Some(LinearProjectionRole::GateUp))
+        );
+        assert_eq!(
+            LinearMetadata::from_fused_names([
+                "model.layers.2.linear_attn.in_proj_qkv.qweight",
+                "model.layers.2.linear_attn.in_proj_z.qweight",
+            ]),
+            LinearMetadata::new(Some(2), Some(LinearProjectionRole::GdnQkvz))
+        );
+        assert_eq!(
+            LinearMetadata::from_fused_names([
+                "model.layers.2.linear_attn.in_proj_b.qweight",
+                "model.layers.2.linear_attn.in_proj_a.qweight",
+            ]),
+            LinearMetadata::new(Some(2), Some(LinearProjectionRole::GdnBa))
         );
     }
 }

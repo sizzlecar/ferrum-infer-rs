@@ -619,6 +619,18 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
                 return self.load_gptq_linear_fused(&parts);
             }
         }
+        if let Some(prefix) = name.strip_suffix("in_proj_qkvz") {
+            let parts = [format!("{prefix}in_proj_qkv"), format!("{prefix}in_proj_z")];
+            if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
+                return self.load_gptq_linear_fused(&parts);
+            }
+        }
+        if let Some(prefix) = name.strip_suffix("in_proj_ba") {
+            let parts = [format!("{prefix}in_proj_b"), format!("{prefix}in_proj_a")];
+            if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
+                return self.load_gptq_linear_fused(&parts);
+            }
+        }
 
         // Direct fused `<name>.weight` next. Load straight from raw bytes
         // so fp16-preferring backends can skip the f32 Vec intermediate.
@@ -663,6 +675,40 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             let parts = [
                 format!("{prefix}gate_proj.weight"),
                 format!("{prefix}up_proj.weight"),
+            ];
+            if parts.iter().all(|p| self.has(p)) {
+                let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
+                let weight = B::from_weight_bytes(&bytes, dtype);
+                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
+                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
+                );
+                if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
+                    linear = linear.with_bias(B::from_slice(&bias));
+                }
+                return Ok(Box::new(linear));
+            }
+        }
+        if let Some(prefix) = name.strip_suffix("in_proj_qkvz") {
+            let parts = [
+                format!("{prefix}in_proj_qkv.weight"),
+                format!("{prefix}in_proj_z.weight"),
+            ];
+            if parts.iter().all(|p| self.has(p)) {
+                let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
+                let weight = B::from_weight_bytes(&bytes, dtype);
+                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
+                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
+                );
+                if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
+                    linear = linear.with_bias(B::from_slice(&bias));
+                }
+                return Ok(Box::new(linear));
+            }
+        }
+        if let Some(prefix) = name.strip_suffix("in_proj_ba") {
+            let parts = [
+                format!("{prefix}in_proj_b.weight"),
+                format!("{prefix}in_proj_a.weight"),
             ];
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
