@@ -1,0 +1,252 @@
+{
+  "commands": [
+    "/workspace/ferrum-target-w3-varlen/release/ferrum bench-serve --base-url http://127.0.0.1:18173 --model 3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b --tokenizer /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b --dataset sharegpt --sharegpt-path /workspace/artifacts/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja/dataset/ascii_sharegpt_w3_100_58d5721d.jsonl --random-output-len 128 --concurrency-sweep 1\\,4\\,16\\,32 --num-prompts 100 --warmup-requests 10 --n-repeats 3 --fail-on-error --require-ci --seed 9271 --timeout 900 --output json --out /workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/perf/bench_ferrum_sharegpt_sweep_100x3.json "
+  ],
+  "concurrency": {
+    "cells": [
+      {
+        "bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "effective_active_concurrency": 1,
+        "errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "n_repeats": 3,
+        "output_token_count_source": "usage",
+        "panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "requested_concurrency": 1,
+        "requests_per_run": 100,
+        "source_report": "/workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/perf/bench_ferrum_sharegpt_sweep_100x3.json",
+        "stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "effective_active_concurrency": 4,
+        "errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "n_repeats": 3,
+        "output_token_count_source": "usage",
+        "panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "requested_concurrency": 4,
+        "requests_per_run": 100,
+        "source_report": "/workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/perf/bench_ferrum_sharegpt_sweep_100x3.json",
+        "stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "effective_active_concurrency": 16,
+        "errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "n_repeats": 3,
+        "output_token_count_source": "usage",
+        "panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "requested_concurrency": 16,
+        "requests_per_run": 100,
+        "source_report": "/workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/perf/bench_ferrum_sharegpt_sweep_100x3.json",
+        "stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "bad_output_per_run": [
+          0,
+          0,
+          0
+        ],
+        "completed_per_run": [
+          100,
+          100,
+          100
+        ],
+        "duplicate_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "effective_active_concurrency": 32,
+        "errored_per_run": [
+          0,
+          0,
+          0
+        ],
+        "http_500_per_run": [
+          0,
+          0,
+          0
+        ],
+        "malformed_stream_per_run": [
+          0,
+          0,
+          0
+        ],
+        "missing_done_per_run": [
+          0,
+          0,
+          0
+        ],
+        "n_repeats": 3,
+        "output_token_count_source": "usage",
+        "panic_per_run": [
+          0,
+          0,
+          0
+        ],
+        "requested_concurrency": 32,
+        "requests_per_run": 100,
+        "source_report": "/workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/perf/bench_ferrum_sharegpt_sweep_100x3.json",
+        "stream_bulk_flush_per_run": [
+          0,
+          0,
+          0
+        ],
+        "zero_output_tokens_per_run": [
+          0,
+          0,
+          0
+        ]
+      }
+    ],
+    "closed_loop": true,
+    "output_token_count_source": "usage",
+    "stream_options_include_usage": true
+  },
+  "generated_at": "2026-06-20T03:29:07.623224+00:00",
+  "hidden_env": [],
+  "level": "l5_concurrency",
+  "model_id": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "pass_line": "W3 L5 CONCURRENCY PASS: /workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/l5_concurrency",
+  "product_surface": "typed_cli",
+  "schema_version": 1,
+  "status": "pass"
+}

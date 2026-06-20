@@ -1,0 +1,1 @@
+{"id":"0ddd21c9-0a5c-4f0c-8e20-a57c28c24a0e","object":"chat.completion","created":1781925492,"model":"Qwen/Qwen3.5-35B-A3B-GPTQ-Int4","choices":[{"index":0,"message":{"role":"assistant","content":"{\"answer\":\"ok-16\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":91,"completion_tokens":9,"total_tokens":100}}

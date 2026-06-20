@@ -2,6 +2,96 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ37 — W3 Qwen35 L2/L4/L5 correctness PASS, performance ratio FAIL
+
+- Scope:
+  - packaged the existing real CUDA product known-answer report into the
+    formal W3 L2 quantized artifact;
+  - ran real-model W3 L4 agent checks against `ferrum serve`;
+  - ran release-shape W3 L5 concurrency with the same ShareGPT/vLLM baseline
+    shape: `c=1/4/16/32`, `num_prompts=100`, `warmup=10`,
+    `n_repeats=3`, `--fail-on-error`, `--require-ci`, `--seed 9271`;
+  - this is correctness evidence, not W3 completion: the vLLM 80% performance
+    gate fails in every required cell, and there is still no final
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+- L2 artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_l2_qwen35_gptq_int4_from_real_product_20260620T025952Z_75ec7e6e`;
+  - PASS line:
+    `W3 L2 QUANTIZED PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_l2_qwen35_gptq_int4_from_real_product_20260620T025952Z_75ec7e6e`;
+  - source report was the real Qwen35 CUDA product report from
+    `w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e`;
+  - report has 11/11 known-answer cases, both `ferrum run` and
+    `ferrum serve`, typed CLI product surface, and `hidden_env=[]`.
+- L4/L5 CUDA artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9`;
+  - remote clean checkout:
+    `/workspace/ferrum-w3-unified-75ec7e6e`,
+    `HEAD=ba19f2b97457202f9c0dbe108cedf17eca594531`,
+    `git status --short` clean before and after;
+  - binary SHA256:
+    `e32d89a44ac4759cf177ac2d64115389652e27b67c44ceebbbb5ecc3a6eb6c30`;
+  - server used typed flags:
+    `--backend cuda --gpu-devices 0 --gpu-memory-utilization 0.90
+    --max-model-len 2048 --max-num-seqs 32 --max-num-batched-tokens 8192
+    --kv-capacity 2048 --scheduler-prefill-first-until-active 32
+    --scheduler-active-decode-prefill-chunk 8192 --greedy-argmax`;
+  - `HF_HOME=/workspace/hf-cache` was recorded only to select the existing
+    Hugging Face cache location; inference behavior remained typed CLI.
+- PASS lines:
+  - `W3 L4 AGENT PASS: /workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/l4_agent`;
+  - `W3 L5 CONCURRENCY PASS: /workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/l5_concurrency`;
+  - `W3 QWEN35 L4 L5 CUDA PASS: /workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9`.
+- L4 result:
+  - required tool-call smoke passed `10/10`;
+  - strict JSON schema smoke passed `20/20`;
+  - negative contracts returned HTTP 400 for invalid `tool_choice` and invalid
+    `response_format`.
+- L5 result:
+  - c=1 completed `[100,100,100]`, errored `[0,0,0]`;
+  - c=4 completed `[100,100,100]`, errored `[0,0,0]`;
+  - c=16 completed `[100,100,100]`, errored `[0,0,0]`;
+  - c=32 completed `[100,100,100]`, errored `[0,0,0]`;
+  - output token count source is `usage`, and the stream/quality zero-error
+    fields in the L5 artifact are all zero.
+- vLLM 80% ratio status:
+  - comparison artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/perf_ratio_vs_vllm.json`;
+  - baseline artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_vllm_sharegpt_baseline_20260619/bench_vllm_sharegpt_sweep_100x3.json`;
+  - c=1: Ferrum `53.806` tok/s vs vLLM `136.143` tok/s,
+    mean ratio `39.5%`, LCB ratio `39.2%`, p95 ITL `2.17x`;
+  - c=4: Ferrum `99.130` tok/s vs vLLM `405.420` tok/s,
+    mean ratio `24.5%`, LCB ratio `22.5%`, p95 ITL `3.58x`;
+  - c=16: Ferrum `142.177` tok/s vs vLLM `1190.692` tok/s,
+    mean ratio `11.9%`, LCB ratio `10.9%`, p95 ITL `11.56x`;
+  - c=32: Ferrum `142.839` tok/s vs vLLM `1708.528` tok/s,
+    mean ratio `8.4%`, LCB ratio `8.1%`, p95 ITL `12.67x`;
+  - conclusion: W3 performance gate is currently FAIL, and these numbers are
+    diagnostic evidence for the next optimization lane.
+- GPU lifecycle:
+  - Vast instance `41422823`, 1x `NVIDIA GeForce RTX 4090`, driver
+    `580.126.09`, CUDA toolkit `12.4`, dph `$0.662962962962963`;
+  - artifacts were copied back locally;
+  - stop check after copyback:
+    `cur_state=stopped`, `actual_status=exited`, `intended_status=stopped`.
+- vLLM comparison notes:
+  - local vLLM checkout inspected at
+    `/Users/chejinxuan/py_ws/vllm`, `HEAD=0b3ba88f165976e77ca5e6a7a3f5bba4562b80af`;
+  - relevant files:
+    `vllm/model_executor/models/qwen3_5.py`,
+    `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`,
+    `vllm/v1/worker/gpu/model_states/mamba_hybrid.py`;
+  - vLLM's Qwen3.5 path uses hybrid attention metadata, GDN-specific
+    `is_prefilling`, chunked prefill, and packed recurrent decode fast paths;
+    Ferrum currently has correctness-clean varlen prefill but does not yet
+    match vLLM's packed decode/GDN hot path, which matches the observed
+    high-concurrency throughput plateau around `142 tok/s`.
+- Next:
+  - commit/push this evidence first;
+  - then implement the next high-return architecture lever: align Ferrum's
+    Qwen35 decode-side GDN path with vLLM's packed recurrent decode structure
+    and profile only after the new path has a correctness gate.
+
 ## 2026-06-20 ZZZ36 — W3 Qwen35 unified fresh prefill source + CUDA product smoke PASS
 
 - Scope:
