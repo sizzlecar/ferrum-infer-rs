@@ -1767,8 +1767,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         weights
             .lm_head
             .forward(&mut ctx, &final_hidden, &mut logits, batch_len);
-        B::sync_before_host_readback(&mut ctx);
-        B::sync(&mut ctx);
         let argmax_mode = match &logits_return {
             Qwen35DecodeLogitsReturn::Full => None,
             Qwen35DecodeLogitsReturn::LegacyDefault if self.greedy_argmax => {
@@ -1861,6 +1859,8 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 }
             }
         }
+        B::sync_before_host_readback(&mut ctx);
+        B::sync(&mut ctx);
         let flat = B::to_vec(&logits, batch_len * vocab);
         Ok(flat.chunks_exact(vocab).map(|row| row.to_vec()).collect())
     }
