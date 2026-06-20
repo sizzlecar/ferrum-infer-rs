@@ -946,6 +946,10 @@ impl Backend for CudaBackend {
         true
     }
 
+    fn supports_qwen35_packed_gdn_recurrent_decode() -> bool {
+        true
+    }
+
     fn activation_to_f32_shadow(
         ctx: &mut Self::Context,
         src: &Self::Buffer,
@@ -1728,6 +1732,43 @@ impl Backend for CudaBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_indexed_packed_f32(
+        ctx: &mut Self::Context,
+        mixed_qkv: &Self::Buffer,
+        ba_raw: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        state_slots: &mut Self::Buffer,
+        slot_indices: &Self::Buffer,
+        out: &mut Self::Buffer,
+        batch: usize,
+        max_slots: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        scale: f32,
+    ) -> Result<()> {
+        gated_delta_rule::recurrent_gated_delta_rule_batch_indexed_packed_f32(
+            ctx,
+            mixed_qkv,
+            ba_raw,
+            a_log,
+            dt_bias,
+            state_slots,
+            slot_indices,
+            out,
+            batch,
+            max_slots,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn recurrent_gated_delta_rule_varlen_f32(
         ctx: &mut Self::Context,
         query: &Self::Buffer,
@@ -2063,6 +2104,41 @@ impl Backend for CudaBackend {
             value_dim,
             conv_kernel,
             apply_qk_l2norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+        ctx: &mut Self::Context,
+        mixed_qkvz_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        conv_state_slots: &mut Self::Buffer,
+        slot_indices: &Self::Buffer,
+        mixed_qkv: &mut Self::Buffer,
+        z: &mut Self::Buffer,
+        batch: usize,
+        max_slots: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+    ) -> Result<()> {
+        linear_attention::linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+            ctx,
+            mixed_qkvz_raw,
+            conv_weight,
+            conv_state_slots,
+            slot_indices,
+            mixed_qkv,
+            z,
+            batch,
+            max_slots,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
         )
     }
 

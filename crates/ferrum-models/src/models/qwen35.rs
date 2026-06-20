@@ -6180,11 +6180,6 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         }
     };
 
-    let mut query = B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
-    let mut key = B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
-    let mut value = B::alloc_typed(Dtype::F32, batch_len * value_total);
-    let mut g = B::alloc_typed(Dtype::F32, batch_len * gating_width);
-    let mut beta = B::alloc_typed(Dtype::F32, batch_len * gating_width);
     let mut delta_core = B::alloc_typed(Dtype::F32, batch_len * value_total);
 
     let used_indexed = if B::supports_qwen35_indexed_recurrent_state() {
@@ -6197,27 +6192,30 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
                     "Qwen3.5 missing linear conv state slot pool for decode layer {layer_index}"
                 ))
             })?;
-            let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-            match &mut projection_buffers {
-                Qwen35LinearDecodeProjectionBuffers::Packed {
+            let use_packed_recurrent = B::supports_qwen35_packed_gdn_recurrent_decode()
+                && matches!(
+                    &projection_buffers,
+                    Qwen35LinearDecodeProjectionBuffers::Packed { .. }
+                );
+            if use_packed_recurrent {
+                let Qwen35LinearDecodeProjectionBuffers::Packed {
                     mixed_qkvz_raw,
                     ba_raw,
                     z_raw,
-                } => B::linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
+                } = &mut projection_buffers
+                else {
+                    unreachable!("checked by use_packed_recurrent");
+                };
+                let mut mixed_qkv_conv = B::alloc_typed(Dtype::F32, batch_len * qkv_width);
+                let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+                B::linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
                     ctx,
                     mixed_qkvz_raw,
-                    ba_raw,
                     &attention.conv1d_weight,
                     conv_slots,
                     slot_indices,
-                    &attention.a_log,
-                    &attention.dt_bias,
-                    &mut query,
-                    &mut key,
-                    &mut value,
+                    &mut mixed_qkv_conv,
                     z_raw,
-                    &mut g,
-                    &mut beta,
                     batch_len,
                     pools.max_slots,
                     attention_shape.key_heads,
@@ -6225,74 +6223,144 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
                     attention_shape.key_dim,
                     attention_shape.value_dim,
                     attention_shape.conv_kernel,
-                    true,
-                )?,
-                Qwen35LinearDecodeProjectionBuffers::Separate {
-                    mixed_qkv_raw,
-                    b_raw,
-                    a_raw,
-                    ..
-                } => B::linear_attention_decode_prepare_batch_indexed_f32(
+                )?;
+                detail.indexed_prepare_us += qwen35_detail_profile_stage_finish::<B>(
                     ctx,
-                    mixed_qkv_raw,
-                    &attention.conv1d_weight,
-                    conv_slots,
-                    slot_indices,
-                    a_raw,
-                    b_raw,
-                    &attention.a_log,
-                    &attention.dt_bias,
-                    &mut query,
-                    &mut key,
-                    &mut value,
-                    &mut g,
-                    &mut beta,
-                    batch_len,
-                    pools.max_slots,
-                    attention_shape.key_heads,
-                    attention_shape.value_heads,
-                    attention_shape.key_dim,
-                    attention_shape.value_dim,
-                    attention_shape.conv_kernel,
-                    true,
-                )?,
-            }
-            detail.indexed_prepare_us += qwen35_detail_profile_stage_finish::<B>(
-                ctx,
-                timer,
-                "qwen35_linear_decode_indexed_prepare",
-            );
+                    timer,
+                    "qwen35_linear_decode_indexed_packed_prepare",
+                );
 
-            let delta_slots = pools.delta_states[layer_index].as_mut().ok_or_else(|| {
-                FerrumError::model(format!(
-                    "Qwen3.5 missing linear delta state slot pool for decode layer {layer_index}"
-                ))
-            })?;
-            let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-            B::recurrent_gated_delta_rule_batch_indexed_f32(
-                ctx,
-                &query,
-                &key,
-                &value,
-                &g,
-                &beta,
-                delta_slots,
-                slot_indices,
-                &mut delta_core,
-                batch_len,
-                pools.max_slots,
-                attention_shape.key_heads,
-                attention_shape.value_heads,
-                attention_shape.key_dim,
-                attention_shape.value_dim,
-                false,
-                (attention_shape.key_dim as f32).sqrt().recip(),
-            )?;
-            detail.indexed_recurrent_us += qwen35_detail_profile_stage_finish::<B>(
-                ctx,
-                timer,
-                "qwen35_linear_decode_indexed_recurrent",
-            );
+                let delta_slots = pools.delta_states[layer_index].as_mut().ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing linear delta state slot pool for decode layer {layer_index}"
+                    ))
+                })?;
+                let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+                B::recurrent_gated_delta_rule_batch_indexed_packed_f32(
+                    ctx,
+                    &mixed_qkv_conv,
+                    ba_raw,
+                    &attention.a_log,
+                    &attention.dt_bias,
+                    delta_slots,
+                    slot_indices,
+                    &mut delta_core,
+                    batch_len,
+                    pools.max_slots,
+                    attention_shape.key_heads,
+                    attention_shape.value_heads,
+                    attention_shape.key_dim,
+                    attention_shape.value_dim,
+                    (attention_shape.key_dim as f32).sqrt().recip(),
+                )?;
+                detail.indexed_recurrent_us += qwen35_detail_profile_stage_finish::<B>(
+                    ctx,
+                    timer,
+                    "qwen35_linear_decode_indexed_packed_recurrent",
+                );
+            } else {
+                let mut query = B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
+                let mut key = B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
+                let mut value = B::alloc_typed(Dtype::F32, batch_len * value_total);
+                let mut g = B::alloc_typed(Dtype::F32, batch_len * gating_width);
+                let mut beta = B::alloc_typed(Dtype::F32, batch_len * gating_width);
+                let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+                match &mut projection_buffers {
+                    Qwen35LinearDecodeProjectionBuffers::Packed {
+                        mixed_qkvz_raw,
+                        ba_raw,
+                        z_raw,
+                    } => B::linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
+                        ctx,
+                        mixed_qkvz_raw,
+                        ba_raw,
+                        &attention.conv1d_weight,
+                        conv_slots,
+                        slot_indices,
+                        &attention.a_log,
+                        &attention.dt_bias,
+                        &mut query,
+                        &mut key,
+                        &mut value,
+                        z_raw,
+                        &mut g,
+                        &mut beta,
+                        batch_len,
+                        pools.max_slots,
+                        attention_shape.key_heads,
+                        attention_shape.value_heads,
+                        attention_shape.key_dim,
+                        attention_shape.value_dim,
+                        attention_shape.conv_kernel,
+                        true,
+                    )?,
+                    Qwen35LinearDecodeProjectionBuffers::Separate {
+                        mixed_qkv_raw,
+                        b_raw,
+                        a_raw,
+                        ..
+                    } => B::linear_attention_decode_prepare_batch_indexed_f32(
+                        ctx,
+                        mixed_qkv_raw,
+                        &attention.conv1d_weight,
+                        conv_slots,
+                        slot_indices,
+                        a_raw,
+                        b_raw,
+                        &attention.a_log,
+                        &attention.dt_bias,
+                        &mut query,
+                        &mut key,
+                        &mut value,
+                        &mut g,
+                        &mut beta,
+                        batch_len,
+                        pools.max_slots,
+                        attention_shape.key_heads,
+                        attention_shape.value_heads,
+                        attention_shape.key_dim,
+                        attention_shape.value_dim,
+                        attention_shape.conv_kernel,
+                        true,
+                    )?,
+                }
+                detail.indexed_prepare_us += qwen35_detail_profile_stage_finish::<B>(
+                    ctx,
+                    timer,
+                    "qwen35_linear_decode_indexed_prepare",
+                );
+
+                let delta_slots = pools.delta_states[layer_index].as_mut().ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing linear delta state slot pool for decode layer {layer_index}"
+                    ))
+                })?;
+                let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+                B::recurrent_gated_delta_rule_batch_indexed_f32(
+                    ctx,
+                    &query,
+                    &key,
+                    &value,
+                    &g,
+                    &beta,
+                    delta_slots,
+                    slot_indices,
+                    &mut delta_core,
+                    batch_len,
+                    pools.max_slots,
+                    attention_shape.key_heads,
+                    attention_shape.value_heads,
+                    attention_shape.key_dim,
+                    attention_shape.value_dim,
+                    false,
+                    (attention_shape.key_dim as f32).sqrt().recip(),
+                )?;
+                detail.indexed_recurrent_us += qwen35_detail_profile_stage_finish::<B>(
+                    ctx,
+                    timer,
+                    "qwen35_linear_decode_indexed_recurrent",
+                );
+            }
             true
         } else {
             false
@@ -6357,6 +6425,11 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
                 "Qwen3.5 packed linear decode projections require indexed recurrent state",
             ));
         };
+        let mut query = B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
+        let mut key = B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
+        let mut value = B::alloc_typed(Dtype::F32, batch_len * value_total);
+        let mut g = B::alloc_typed(Dtype::F32, batch_len * gating_width);
+        let mut beta = B::alloc_typed(Dtype::F32, batch_len * gating_width);
         let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
         B::linear_attention_decode_prepare_batch_f32(
             ctx,

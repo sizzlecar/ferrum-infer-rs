@@ -332,6 +332,13 @@ pub trait Backend: Send + Sync + Sized + 'static {
         false
     }
 
+    /// Whether this backend can keep Qwen3.5 packed GDN decode projections
+    /// packed through the recurrent update, without splitting q/k/v/g/beta
+    /// into intermediate buffers.
+    fn supports_qwen35_packed_gdn_recurrent_decode() -> bool {
+        false
+    }
+
     /// Batched one-token recurrent gated DeltaNet update over a persistent
     /// slot-indexed state slab.
     ///
@@ -365,6 +372,38 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "recurrent_gated_delta_rule_batch_indexed_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Batched one-token recurrent gated DeltaNet update directly from packed
+    /// decode-time q/k/v and raw b/a projections.
+    ///
+    /// Layouts:
+    /// - `mixed_qkv`: `[batch, q, k, v]` where q/k are
+    ///   `[key_heads, key_dim]` and v is `[value_heads, value_dim]`
+    /// - `ba_raw`: `[batch, b, a]` with each half `[value_heads]`
+    /// - `state_slots`: `[max_slots, value_heads, value_dim, key_dim]`
+    /// - `slot_indices`: `[batch]` u32 indices into `state_slots`
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_indexed_packed_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv: &Self::Buffer,
+        _ba_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _state_slots: &mut Self::Buffer,
+        _slot_indices: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _batch: usize,
+        _max_slots: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "recurrent_gated_delta_rule_batch_indexed_packed_f32 not implemented for this backend",
         ))
     }
 
@@ -618,6 +657,28 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32 not implemented for this backend",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkvz_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _conv_state_slots: &mut Self::Buffer,
+        _slot_indices: &Self::Buffer,
+        _mixed_qkv: &mut Self::Buffer,
+        _z: &mut Self::Buffer,
+        _batch: usize,
+        _max_slots: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32 not implemented for this backend",
         ))
     }
 
