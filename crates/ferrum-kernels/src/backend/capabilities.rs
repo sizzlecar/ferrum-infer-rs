@@ -303,6 +303,30 @@ pub trait BackendQuantGguf: Backend {
 
 /// Capability-trait for backends that natively dispatch MoE post-ops + routing.
 pub trait BackendMoeFused: Backend {
+    /// Launch a small MoE side branch on a backend-managed auxiliary stream.
+    ///
+    /// CUDA uses this for shared experts: the side branch reads the same
+    /// normalized hidden states as routed experts but writes disjoint scratch,
+    /// so it can overlap with routing/expert GEMMs. Backends that do not have
+    /// a safe auxiliary-stream implementation return `Ok(false)` and the model
+    /// runs the existing serial path.
+    fn try_launch_moe_aux_stream<F>(
+        _ctx: &mut Self::Context,
+        _tokens: usize,
+        _body: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&mut Self::Context) -> Result<()>,
+    {
+        Ok(false)
+    }
+
+    /// Make the main stream wait for the last successful
+    /// [`Self::try_launch_moe_aux_stream`] submission.
+    fn wait_moe_aux_stream(_ctx: &mut Self::Context) -> Result<()> {
+        Ok(())
+    }
+
     /// Routing inputs for `moe_gemm_phase_vllm` — host-built i32 arrays
     /// uploaded once per layer (or per token, depending on caller cadence).
     /// Matches the shape contract of `moe_align_block_size` outputs but is
