@@ -17,6 +17,8 @@ pub const QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET: &str =
 const DEFAULT_KV_BLOCK_SIZE_TOKENS: usize = 16;
 const DEFAULT_KV_BLOCKS: usize = 2048;
 const GEMMA3_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK: usize = 16;
+const QWEN35_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK: usize = 64;
+const QWEN35_GPTQ_PREFILL_FIRST_UNTIL_ACTIVE: usize = 32;
 const GIB: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,6 +691,7 @@ impl FerrumConfigBuilder {
         )?;
         let max_model_len = self.optional_usize_value("FERRUM_MAX_MODEL_LEN")?;
         let default_active_decode_prefill_chunk = self.default_active_decode_prefill_chunk();
+        let default_prefill_first_until_active = self.default_prefill_first_until_active();
 
         self.validate_attention(
             use_vllm_paged_attn.value,
@@ -762,13 +765,20 @@ impl FerrumConfigBuilder {
                 );
             }
         }
-        if let Some(chunk) = default_active_decode_prefill_chunk.as_ref() {
-            if self.entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").is_none()
-                && self
-                    .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
-                    .is_none()
-                && self.entry("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE").is_none()
-            {
+        let scheduler_override_present = self.entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").is_some()
+            || self
+                .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+                .is_some()
+            || self.entry("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE").is_some();
+        if !scheduler_override_present {
+            if let Some(until) = default_prefill_first_until_active.as_ref() {
+                runtime_config.upsert(
+                    "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+                    until.value.to_string(),
+                    RuntimeConfigSource::Default,
+                );
+            }
+            if let Some(chunk) = default_active_decode_prefill_chunk.as_ref() {
                 runtime_config.upsert(
                     "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
                     chunk.value.to_string(),
@@ -919,8 +929,30 @@ impl FerrumConfigBuilder {
         let gemma3_cuda_gptq = self.is_cuda_backend()
             && self.model.architecture.eq_ignore_ascii_case("gemma3")
             && (quant.contains("gptq") || quant.contains("int4"));
-        gemma3_cuda_gptq.then_some(ResolvedValue {
-            value: GEMMA3_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK,
+        let qwen35_cuda_gptq = self.is_cuda_backend()
+            && qwen35_architecture_uses_scheduler_defaults(&self.model.architecture)
+            && (quant.contains("gptq") || quant.contains("int4"));
+        let value = if gemma3_cuda_gptq {
+            GEMMA3_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK
+        } else if qwen35_cuda_gptq {
+            QWEN35_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK
+        } else {
+            return None;
+        };
+        Some(ResolvedValue {
+            value,
+            source: AutoConfigSource::ModelMetadata,
+            source_key: None,
+        })
+    }
+
+    fn default_prefill_first_until_active(&self) -> Option<ResolvedValue<usize>> {
+        let quant = self.model.quantization.as_deref()?.to_ascii_lowercase();
+        let qwen35_cuda_gptq = self.is_cuda_backend()
+            && qwen35_architecture_uses_scheduler_defaults(&self.model.architecture)
+            && (quant.contains("gptq") || quant.contains("int4"));
+        qwen35_cuda_gptq.then_some(ResolvedValue {
+            value: QWEN35_GPTQ_PREFILL_FIRST_UNTIL_ACTIVE,
             source: AutoConfigSource::ModelMetadata,
             source_key: None,
         })
@@ -1844,6 +1876,13 @@ fn qwen_moe_architecture_uses_vllm_paged_attn(architecture: &str) -> bool {
         || architecture.eq_ignore_ascii_case("qwen3_5_moe")
 }
 
+fn qwen35_architecture_uses_scheduler_defaults(architecture: &str) -> bool {
+    architecture.eq_ignore_ascii_case("qwen3_5")
+        || architecture.eq_ignore_ascii_case("qwen3_5_text")
+        || architecture.eq_ignore_ascii_case("qwen3_5_moe")
+        || architecture.eq_ignore_ascii_case("qwen3_5_moe_text")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedValue<T> {
     value: T,
@@ -1965,6 +2004,15 @@ mod tests {
             supported_dtypes: vec!["fp16".to_string()],
             graph_safe_moe: false,
         }
+    }
+
+    fn qwen35_moe_gptq_model() -> ModelCapabilities {
+        let mut model = ModelCapabilities::qwen3_30b_a3b_gptq_int4();
+        model.architecture = "qwen3_5_moe".to_string();
+        model.max_context_len = Some(262_144);
+        model.num_hidden_layers = Some(40);
+        model.head_dim = Some(256);
+        model
     }
 
     fn expect_invalid_key(vars: &[(&str, &str)], key: &str) {
@@ -3095,6 +3143,54 @@ mod tests {
     }
 
     #[test]
+    fn cuda_qwen35_gptq_defaults_to_active_decode_prefill_chunk_and_prefill_first() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(qwen35_moe_gptq_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(
+            scheduler.selected,
+            format!(
+                "active_decode_prefill_chunk:{}",
+                QWEN35_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK
+            )
+        );
+        assert_eq!(scheduler.source, AutoConfigSource::ModelMetadata);
+
+        let entry = |key: &str| {
+            resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing runtime config entry {key}"))
+        };
+        let active_chunk = entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK");
+        assert_eq!(
+            active_chunk.effective_value,
+            QWEN35_GPTQ_ACTIVE_DECODE_PREFILL_CHUNK.to_string()
+        );
+        assert_eq!(active_chunk.source, RuntimeConfigSource::Default);
+
+        let prefill_first = entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE");
+        assert_eq!(
+            prefill_first.effective_value,
+            QWEN35_GPTQ_PREFILL_FIRST_UNTIL_ACTIVE.to_string()
+        );
+        assert_eq!(prefill_first.source, RuntimeConfigSource::Default);
+    }
+
+    #[test]
     fn explicit_scheduler_prompt_estimate_overrides_gemma3_chunk_default() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
@@ -3121,6 +3217,34 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"));
+    }
+
+    #[test]
+    fn explicit_scheduler_prompt_estimate_overrides_qwen35_scheduler_defaults() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved =
+            FerrumConfigBuilder::new(snapshot(&[("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE", "1")]))
+                .with_model_capabilities(qwen35_moe_gptq_model())
+                .with_hardware_capabilities(hardware)
+                .with_workload_profile(workload)
+                .resolve()
+                .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(scheduler.selected, "prompt_token_estimate");
+        assert_eq!(
+            scheduler.source_key.as_deref(),
+            Some("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE")
+        );
+        assert!(resolved.runtime_config.entries.iter().all(|entry| {
+            entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"
+                && entry.key != "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE"
+        }));
     }
 
     #[test]
