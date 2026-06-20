@@ -687,6 +687,8 @@ impl FerrumConfigBuilder {
             default_max_batched_tokens.source,
         )?;
         let max_model_len = self.optional_usize_value("FERRUM_MAX_MODEL_LEN")?;
+        let default_prefill_first_until_active =
+            self.default_prefill_first_until_active(&max_sequences);
         self.validate_attention(
             use_vllm_paged_attn.value,
             fa_layout.value,
@@ -759,6 +761,20 @@ impl FerrumConfigBuilder {
                 );
             }
         }
+        if let Some(until) = default_prefill_first_until_active.as_ref() {
+            if self.entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").is_none()
+                && self
+                    .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+                    .is_none()
+                && self.entry("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE").is_none()
+            {
+                runtime_config.upsert(
+                    "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+                    until.value.to_string(),
+                    RuntimeConfigSource::Default,
+                );
+            }
+        }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
         decisions.push(self.decode_graph_decision(
@@ -790,7 +806,7 @@ impl FerrumConfigBuilder {
             ));
         }
         decisions.push(self.prefix_cache_decision(prefix_cache));
-        decisions.push(self.scheduler_decision()?);
+        decisions.push(self.scheduler_decision(default_prefill_first_until_active)?);
         decisions.push(self.sampling_decision(greedy));
 
         Ok(ResolvedFerrumConfig {
@@ -831,6 +847,10 @@ impl FerrumConfigBuilder {
 
     fn is_cuda_backend(&self) -> bool {
         self.hardware.backend.eq_ignore_ascii_case("cuda")
+    }
+
+    fn is_accelerator_backend(&self) -> bool {
+        self.is_cuda_backend() || self.hardware.backend.eq_ignore_ascii_case("metal")
     }
 
     fn cuda_compute_capability_at_least(&self, major: u32, minor: u32) -> Option<bool> {
@@ -895,6 +915,20 @@ impl FerrumConfigBuilder {
             },
             source_key: None,
         }
+    }
+
+    fn default_prefill_first_until_active(
+        &self,
+        max_sequences: &ResolvedValue<usize>,
+    ) -> Option<ResolvedValue<usize>> {
+        if max_sequences.value <= 1 || !self.is_accelerator_backend() {
+            return None;
+        }
+        Some(ResolvedValue {
+            value: max_sequences.value,
+            source: AutoConfigSource::Default,
+            source_key: None,
+        })
     }
 
     fn default_kv_blocks(&self, max_sequences: &ResolvedValue<usize>) -> ResolvedValue<usize> {
@@ -1596,7 +1630,10 @@ impl FerrumConfigBuilder {
         )
     }
 
-    fn scheduler_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+    fn scheduler_decision(
+        &self,
+        default_prefill_first_until_active: Option<ResolvedValue<usize>>,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
         let entries = self.entries();
         let prompt_scheduler =
             || -> Result<(String, AutoConfigSource, Option<String>), AutoConfigError> {
@@ -1640,6 +1677,16 @@ impl FerrumConfigBuilder {
                 self.source_for_key(key, AutoConfigSource::Default),
                 Some(key.to_string()),
             )
+        } else if !entries.contains_key("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE") {
+            if let Some(until) = default_prefill_first_until_active.as_ref() {
+                (
+                    format!("prefill_first_until_active:{}", until.value),
+                    until.source,
+                    until.source_key.clone(),
+                )
+            } else {
+                prompt_scheduler()?
+            }
         } else {
             prompt_scheduler()?
         };
@@ -2524,6 +2571,21 @@ mod tests {
             .find(|decision| decision.selection == "max_sequences")
             .unwrap();
         assert_eq!(max_sequences.selected, "32");
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(scheduler.selected, "prefill_first_until_active:32");
+        assert_eq!(scheduler.source, AutoConfigSource::Default);
+        let scheduler_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+            .unwrap_or_else(|| panic!("missing FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE entry"));
+        assert_eq!(scheduler_entry.effective_value, "32");
+        assert_eq!(scheduler_entry.source, RuntimeConfigSource::Default);
     }
 
     #[test]
@@ -2593,6 +2655,23 @@ mod tests {
         };
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
         assert_eq!(workload.target_concurrency, 1);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(scheduler.selected, "prompt_token_estimate");
+        assert!(resolved
+            .runtime_config
+            .entries
+            .iter()
+            .all(|entry| entry.key != "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE"));
     }
 
     #[test]
@@ -3031,13 +3110,21 @@ mod tests {
             .iter()
             .find(|decision| decision.selection == "scheduler_admission_policy")
             .unwrap();
-        assert_eq!(scheduler.selected, "prompt_token_estimate");
+        assert_eq!(scheduler.selected, "prefill_first_until_active:32");
         assert_eq!(scheduler.source, AutoConfigSource::Default);
         assert!(resolved
             .runtime_config
             .entries
             .iter()
             .all(|entry| entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"));
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+            .expect("generic scheduler default should be materialized");
+        assert_eq!(entry.effective_value, "32");
+        assert_eq!(entry.source, RuntimeConfigSource::Default);
     }
 
     #[test]
@@ -3070,7 +3157,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_prompt_token_estimate_is_default_policy() {
+    fn scheduler_prefill_first_is_default_accelerator_policy() {
         let resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
             .resolve()
             .unwrap();
@@ -3079,9 +3166,17 @@ mod tests {
             .iter()
             .find(|decision| decision.selection == "scheduler_admission_policy")
             .unwrap();
-        assert_eq!(scheduler.selected, "prompt_token_estimate");
+        assert_eq!(scheduler.selected, "prefill_first_until_active:32");
         assert_eq!(scheduler.source, AutoConfigSource::Default);
         assert_eq!(scheduler.source_key, None);
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+            .expect("generic scheduler default should be materialized");
+        assert_eq!(entry.effective_value, "32");
+        assert_eq!(entry.source, RuntimeConfigSource::Default);
     }
 
     #[test]
