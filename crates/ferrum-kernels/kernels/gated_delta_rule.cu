@@ -240,6 +240,164 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_f32(
   }
 }
 
+template <int BV_TILE>
+static __device__ void recurrent_gated_delta_rule_batch_indexed_tiled_f32_impl(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    float* __restrict__ state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ out,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  const int value_tile = blockIdx.x;
+  const int value_head = blockIdx.y;
+  const int row = blockIdx.z;
+  if (value_head >= value_heads || row >= batch) return;
+
+  const unsigned int slot_u = slot_indices[row];
+  if (slot_u >= static_cast<unsigned int>(max_slots)) return;
+  const int slot = static_cast<int>(slot_u);
+
+  const int value_start = value_tile * BV_TILE;
+  const int repeat_factor = value_heads / key_heads;
+  const int key_head = value_head / repeat_factor;
+  const int state_len = value_heads * value_dim * key_dim;
+  const int row_state_base = slot * state_len;
+  const int gate_idx = row * value_heads + value_head;
+  const float decay = expf(g[gate_idx]);
+  const float beta_t = beta[gate_idx];
+
+  __shared__ float partial[BV_TILE][256];
+  __shared__ float delta[BV_TILE];
+  float local[BV_TILE];
+
+#pragma unroll
+  for (int i = 0; i < BV_TILE; ++i) {
+    local[i] = 0.0f;
+  }
+
+  for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+    const int local_v = i / key_dim;
+    const int kd = i - local_v * key_dim;
+    const int value_offset = value_start + local_v;
+    if (value_offset >= value_dim) continue;
+
+    const int state_idx =
+        row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
+    const int qk_idx = ((row * key_heads + key_head) * key_dim) + kd;
+    const float state = state_slots[state_idx] * decay;
+    state_slots[state_idx] = state;
+    local[local_v] += state * key[qk_idx];
+  }
+
+#pragma unroll
+  for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+    partial[local_v][threadIdx.x] = local[local_v];
+  }
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+#pragma unroll
+      for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+        partial[local_v][threadIdx.x] += partial[local_v][threadIdx.x + stride];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+      const int value_offset = value_start + local_v;
+      if (value_offset < value_dim) {
+        const int value_idx =
+            ((row * value_heads + value_head) * value_dim) + value_offset;
+        delta[local_v] = (value[value_idx] - partial[local_v][0]) * beta_t;
+      } else {
+        delta[local_v] = 0.0f;
+      }
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int i = 0; i < BV_TILE; ++i) {
+    local[i] = 0.0f;
+  }
+
+  for (int i = threadIdx.x; i < BV_TILE * key_dim; i += blockDim.x) {
+    const int local_v = i / key_dim;
+    const int kd = i - local_v * key_dim;
+    const int value_offset = value_start + local_v;
+    if (value_offset >= value_dim) continue;
+
+    const int state_idx =
+        row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
+    const int qk_idx = ((row * key_heads + key_head) * key_dim) + kd;
+    const float updated = state_slots[state_idx] + delta[local_v] * key[qk_idx];
+    state_slots[state_idx] = updated;
+    local[local_v] += updated * (query[qk_idx] * scale);
+  }
+
+#pragma unroll
+  for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+    partial[local_v][threadIdx.x] = local[local_v];
+  }
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+#pragma unroll
+      for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+        partial[local_v][threadIdx.x] += partial[local_v][threadIdx.x + stride];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int local_v = 0; local_v < BV_TILE; ++local_v) {
+      const int value_offset = value_start + local_v;
+      if (value_offset < value_dim) {
+        const int value_idx =
+            ((row * value_heads + value_head) * value_dim) + value_offset;
+        out[value_idx] = partial[local_v][0];
+      }
+    }
+  }
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_tiled16_f32(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    float* __restrict__ state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ out,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_batch_indexed_tiled_f32_impl<16>(
+      query, key, value, g, beta, state_slots, slot_indices, out, batch,
+      max_slots, key_heads, value_heads, key_dim, value_dim, scale);
+}
+
 extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32(
     const float* __restrict__ query,
     const float* __restrict__ key,
