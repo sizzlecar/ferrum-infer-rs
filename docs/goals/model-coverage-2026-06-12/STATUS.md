@@ -2,6 +2,43 @@
 
 进度日志,倒序。
 
+## 2026-06-20 ZZZ38 — Qwen35 decode sync fix correctness OK, no material perf gain
+
+- Scope:
+  - validated `7852c139 perf(qwen35): avoid decode sync before gpu argmax`
+    on the same existing Vast 1x RTX 4090 lane;
+  - this is diagnostic evidence only, not release-grade performance evidence:
+    `bench-serve` used `n_repeats=1` for c=1/c=32 to avoid wasting paid GPU
+    time after the first no-gain signal.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_syncfix_cuda_diag_20260620T040711Z_7852c139`;
+  - remote clean checkout `HEAD=7852c13957b9b3085c82aea57e34d4b49fc66947`;
+  - CUDA release binary SHA256:
+    `154db666e682978ab8f130e0ad4c6771b9a65bf164409279e3b53cbaf7781ebe`;
+  - build status `BUILD_PASS`.
+- Product smoke:
+  - `ferrum run` real CUDA Qwen3.5 GPTQ smoke passed and output `Paris`;
+  - `ferrum serve` non-stream and stream smoke passed and output `Paris`;
+  - streaming emitted exactly one `[DONE]` and included usage.
+- Diagnostic performance:
+  - comparison artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_syncfix_cuda_diag_20260620T040711Z_7852c139/perf_ratio_vs_vllm_diag.json`;
+  - c=1: Ferrum `53.264` tok/s vs vLLM `136.143` tok/s, mean ratio
+    `39.1%`, p95 ITL `2.24x`;
+  - c=32: Ferrum `142.443` tok/s vs vLLM `1708.528` tok/s, mean ratio
+    `8.3%`, p95 ITL `7.27x`;
+  - previous full release-shape sweep was c=1 `53.806` tok/s and c=32
+    `142.839` tok/s, so the sync fix does not materially move throughput.
+- Conclusion:
+  - W3 performance gate remains FAIL; no `MODEL_RELEASE_GRADE_W3 PASS`;
+  - the next optimization must be architectural: replace Qwen35 decode's
+    per-sequence recurrent state gather/scatter with vLLM-style indexed packed
+    conv/GDN state updates.
+- GPU lifecycle:
+  - Vast instance `41422823` was stopped after copyback;
+  - stop check: `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`.
+
 ## 2026-06-20 ZZZ37 — W3 Qwen35 L2/L4/L5 correctness PASS, performance ratio FAIL
 
 - Scope:

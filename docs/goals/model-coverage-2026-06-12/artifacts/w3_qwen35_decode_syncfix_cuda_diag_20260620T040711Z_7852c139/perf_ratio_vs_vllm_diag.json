@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_syncfix_cuda_diag_20260620T040711Z_7852c139",
+  "ferrum_git_sha": "7852c13957b9b3085c82aea57e34d4b49fc66947",
+  "ferrum_binary_sha256": "154db666e682978ab8f130e0ad4c6771b9a65bf164409279e3b53cbaf7781ebe",
+  "diagnostic_only": true,
+  "reason": "n_repeats=1 c=1,32 probe after decode sync removal; not release-grade CI evidence",
+  "verdict": "NO_MATERIAL_PERF_GAIN_SYNC_FIX_NOT_MAIN_BOTTLENECK",
+  "rows": [
+    {
+      "concurrency": 1,
+      "ferrum_tok_s_diag_n1": 53.263796237517276,
+      "vllm_tok_s_baseline_mean_n3": 136.14293135992386,
+      "mean_ratio": 0.3912343865779023,
+      "ferrum_p95_itl_ms_diag_n1": 15.216591999999999,
+      "vllm_p95_itl_ms_baseline_mean_n3": 6.792227883333332,
+      "p95_itl_multiple": 2.2402946811219695,
+      "completed": [
+        100
+      ],
+      "errored": [
+        0
+      ]
+    },
+    {
+      "concurrency": 32,
+      "ferrum_tok_s_diag_n1": 142.44326192646614,
+      "vllm_tok_s_baseline_mean_n3": 1708.527850243052,
+      "mean_ratio": 0.08337192859115666,
+      "ferrum_p95_itl_ms_diag_n1": 114.242324,
+      "vllm_p95_itl_ms_baseline_mean_n3": 15.709839666666667,
+      "p95_itl_multiple": 7.272023548553508,
+      "completed": [
+        100
+      ],
+      "errored": [
+        0
+      ]
+    }
+  ]
+}
