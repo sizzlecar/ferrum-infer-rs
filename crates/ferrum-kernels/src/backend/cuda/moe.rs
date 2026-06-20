@@ -14,10 +14,9 @@ use cudarc::driver::{CudaStream, LaunchConfig, PushKernelArg};
 use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_types::{FerrumError, Result};
 use half::f16;
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use super::{moe_shared_aux, CudaBackend, CudaState, HOST_STAGING_TOTAL};
+use super::CudaBackend;
 use crate::backend::{Backend, BackendMoeFused, CudaBuf};
 use crate::ptx;
 
@@ -144,78 +143,6 @@ fn maybe_dump_moe_routing(
 }
 
 impl BackendMoeFused for CudaBackend {
-    fn try_launch_moe_aux_stream<F>(
-        ctx: &mut Self::Context,
-        _tokens: usize,
-        body: F,
-    ) -> Result<bool>
-    where
-        F: FnOnce(&mut Self::Context) -> Result<()>,
-    {
-        if ctx.capture_in_flight {
-            return Ok(false);
-        }
-
-        let (aux_stream, aux_blas, entry_event, exit_event) = moe_shared_aux(ctx);
-        let default_stream = ctx.stream.clone();
-        unsafe {
-            cudarc::driver::sys::cuEventRecord(entry_event, default_stream.cu_stream());
-            cudarc::driver::sys::cuStreamWaitEvent(aux_stream.cu_stream(), entry_event, 0);
-        }
-
-        let mut aux_ctx = CudaState {
-            ordinal: ctx.ordinal,
-            ctx: ctx.ctx.clone(),
-            stream: aux_stream.clone(),
-            blas: aux_blas,
-            modules: HashMap::new(),
-            use_dev_state: ctx.use_dev_state,
-            capture_in_flight: false,
-            batched_scratch_u64_k: None,
-            batched_scratch_u64_v: None,
-            batched_scratch_u64_cache: None,
-            batched_scratch_i32_kv_lens: None,
-            batched_scratch_i32_cache_lens: None,
-            batched_host_k_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            batched_host_v_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            batched_host_cache_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            batched_host_kv_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
-            batched_host_cache_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
-            moe_streams: None,
-            moe_entry_event: None,
-            moe_exit_events: None,
-            moe_route_ids: None,
-            moe_route_weights: None,
-            moe_route_capacity: 0,
-            paged_attn_out_tm: None,
-            paged_attn_out_tm_capacity: 0,
-        };
-
-        let result = body(&mut aux_ctx);
-        unsafe {
-            cudarc::driver::sys::cuEventRecord(exit_event, aux_stream.cu_stream());
-        }
-        if result.is_err() {
-            unsafe {
-                cudarc::driver::sys::cuStreamWaitEvent(default_stream.cu_stream(), exit_event, 0);
-            }
-        }
-        result?;
-        Ok(true)
-    }
-
-    fn wait_moe_aux_stream(ctx: &mut Self::Context) -> Result<()> {
-        if ctx.capture_in_flight {
-            return Ok(());
-        }
-        let (_, _, _, exit_event) = moe_shared_aux(ctx);
-        let default_stream = ctx.stream.clone();
-        unsafe {
-            cudarc::driver::sys::cuStreamWaitEvent(default_stream.cu_stream(), exit_event, 0);
-        }
-        Ok(())
-    }
-
     fn route_topk_softmax(
         ctx: &mut Self::Context,
         logits: &Self::Buffer,
