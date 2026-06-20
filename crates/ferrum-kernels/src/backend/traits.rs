@@ -384,6 +384,53 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Varlen prefill-time gated-Delta linear-attention preparation.
+    ///
+    /// This is the batched/stateful counterpart of
+    /// [`Self::linear_attention_prepare_f32`]:
+    /// - `mixed_qkv_raw`: `[total_tokens, conv_channels]`
+    /// - `a_raw` / `b_raw` / `g` / `beta`: `[total_tokens, value_heads]`
+    /// - `query` / `key`: `[total_tokens, key_heads, key_dim]`
+    /// - `value`: `[total_tokens, value_heads, value_dim]`
+    /// - `cu_seqlens`: `[batch + 1]` u32 prefix sum into the flat token axis
+    /// - `initial_conv_states` / `final_conv_states`:
+    ///   `[batch, conv_channels, conv_kernel - 1]`
+    ///
+    /// Each sequence's depthwise causal conv reads only that sequence plus its
+    /// own initial conv state and writes one final conv state. That boundary
+    /// handling is required before a varlen recurrent GDN pass can be used for
+    /// product prefill batching.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_varlen_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _initial_conv_states: &Self::Buffer,
+        _a_raw: &Self::Buffer,
+        _b_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _cu_seqlens: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _final_conv_states: &mut Self::Buffer,
+        _batch: usize,
+        _total_tokens: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_prepare_varlen_f32 not implemented for this backend",
+        ))
+    }
+
     /// Decode-time gated-Delta linear-attention preparation for one token.
     ///
     /// This is the stateful counterpart of [`Self::linear_attention_prepare_f32`]:
