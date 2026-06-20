@@ -1,0 +1,9 @@
+lane: W3 qwen35 unified fresh prefill CUDA smoke
+repo: /workspace/ferrum-w3-unified-75ec7e6e
+sha: 75ec7e6ebd82e017e74651490ccd1c15f55b1f5a
+artifact: /workspace/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e
+started_at_utc: 20260620T021129Z
+stop_condition: first PASS or first actionable failure artifact
+release_grade: false
+expected_pass_line: W3 QWEN35 UNIFIED PREFILL CUDA SMOKE PASS: /workspace/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e
+W3 QWEN35 UNIFIED PREFILL CUDA SMOKE PASS: /workspace/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e

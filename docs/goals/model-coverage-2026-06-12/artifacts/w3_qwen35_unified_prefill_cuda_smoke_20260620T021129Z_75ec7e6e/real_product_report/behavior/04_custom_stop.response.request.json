@@ -1,0 +1,19 @@
+{
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "max_tokens": 24,
+  "messages": [
+    {
+      "content": "Repeat exactly this text: alpha <END> beta",
+      "role": "user"
+    }
+  ],
+  "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "seed": 9271,
+  "stop": [
+    "<END>"
+  ],
+  "stream": false,
+  "temperature": 0
+}

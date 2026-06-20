@@ -1,0 +1,27 @@
+{
+  "command_line": [
+    "/workspace/ferrum-target-w3-varlen/release/ferrum",
+    "serve",
+    "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "33677",
+    "--backend",
+    "cuda",
+    "--gpu-devices",
+    "0",
+    "--gpu-memory-utilization",
+    "0.90",
+    "--max-model-len",
+    "2048",
+    "--max-num-seqs",
+    "4",
+    "--max-num-batched-tokens",
+    "2048",
+    "--kv-capacity",
+    "2048"
+  ],
+  "port": 33677,
+  "request_model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+}
