@@ -1912,6 +1912,8 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             return Ok(Vec::new());
         }
         let mut ctx = B::new_context();
+        let decode_profile_enabled = qwen35_decode_profile_enabled();
+        let mut decode_profile = Qwen35DecodeProfile::default();
         for (cache_id, state) in states.iter_mut() {
             self.ensure_paged_kv_capacity_for_state(
                 &mut ctx,
@@ -1923,14 +1925,21 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         self.upload_linear_slot_indices(&mut ctx, states)?;
         let weights = &self.weights;
         let rope = &self.rope;
+        let total_layers = weights.layers.len();
         let hidden_len = batch_len * weights.config.hidden_size;
         let mut hidden = B::alloc(hidden_len);
+        let t_embedding = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
         B::embedding_lookup(
             &mut ctx,
             &weights.embed_tokens,
             tokens,
             &mut hidden,
             weights.config.hidden_size,
+        );
+        decode_profile.embedding_us += qwen35_decode_profile_stage_finish::<B>(
+            &mut ctx,
+            t_embedding,
+            "qwen35_decode_embedding",
         );
         let eps = 1e-6f32;
         let mut residual_f32 = if B::supports_device_f32_residual_shadow() {
@@ -1944,6 +1953,11 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .as_ref()
             .map(|_| B::alloc_typed(Dtype::F32, hidden_len));
         for (layer_index, layer) in weights.layers.iter().enumerate() {
+            let layer_kind = match &layer.attention {
+                Qwen35AttentionWeights::Linear(_) => "linear",
+                Qwen35AttentionWeights::Full(_) => "full",
+            };
+            let t_layer = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
             hidden = match &layer.attention {
                 Qwen35AttentionWeights::Linear(_) => {
                     qwen35_linear_attention_decode_batch_layer_backend::<B>(
@@ -1984,9 +1998,13 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                     )?
                 }
             };
+            let layer_elapsed =
+                qwen35_decode_profile_stage_finish::<B>(&mut ctx, t_layer, "qwen35_decode_layer");
+            decode_profile.record_layer(layer_index, layer_kind, layer_elapsed);
         }
 
         let mut final_hidden = B::alloc(hidden_len);
+        let t_final_norm = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
         if let Some(residual_f32) = residual_f32.as_ref() {
             B::rms_norm_f32_to_activation(
                 &mut ctx,
@@ -2008,11 +2026,19 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 weights.config.hidden_size,
             );
         }
+        decode_profile.final_norm_us += qwen35_decode_profile_stage_finish::<B>(
+            &mut ctx,
+            t_final_norm,
+            "qwen35_decode_final_norm",
+        );
         let vocab = weights.runtime_cfg.vocab_size;
         let mut logits = B::alloc(batch_len * vocab);
+        let t_lm_head = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
         weights
             .lm_head
             .forward(&mut ctx, &final_hidden, &mut logits, batch_len);
+        decode_profile.lm_head_us +=
+            qwen35_decode_profile_stage_finish::<B>(&mut ctx, t_lm_head, "qwen35_decode_lm_head");
         let argmax_mode = match &logits_return {
             Qwen35DecodeLogitsReturn::Full => None,
             Qwen35DecodeLogitsReturn::LegacyDefault if self.greedy_argmax => {
@@ -2036,6 +2062,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             }
         };
         if let Some(argmax_mode) = argmax_mode {
+            let t_argmax = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
             let tokens = match argmax_mode {
                 Qwen35ArgmaxMode::Raw => B::argmax_rows_f16(&mut ctx, &logits, batch_len, vocab),
                 Qwen35ArgmaxMode::Masked(mask) => {
@@ -2099,15 +2126,30 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                     )
                 }
             };
+            decode_profile.argmax_us +=
+                qwen35_decode_profile_stage_finish::<B>(&mut ctx, t_argmax, "qwen35_decode_argmax");
             if let Ok(tokens) = tokens {
                 if tokens.iter().all(|&token| token != u32::MAX) {
-                    return Ok(tokens.into_iter().map(|token| vec![token as f32]).collect());
+                    let out = tokens.into_iter().map(|token| vec![token as f32]).collect();
+                    if decode_profile_enabled {
+                        decode_profile.log(batch_len, total_layers, "argmax");
+                    }
+                    return Ok(out);
                 }
             }
         }
+        let t_readback = if decode_profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         B::sync_before_host_readback(&mut ctx);
         B::sync(&mut ctx);
         let flat = B::to_vec(&logits, batch_len * vocab);
+        if let Some(start) = t_readback {
+            decode_profile.readback_us += start.elapsed().as_micros() as u64;
+            decode_profile.log(batch_len, total_layers, "full_logits");
+        }
         Ok(flat.chunks_exact(vocab).map(|row| row.to_vec()).collect())
     }
 
@@ -2224,6 +2266,22 @@ struct Qwen35PrefillProfile {
 
 static QWEN35_PREFILL_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Default)]
+struct Qwen35DecodeProfile {
+    embedding_us: u64,
+    linear_layer_us: u64,
+    full_layer_us: u64,
+    linear_layers: usize,
+    full_layers: usize,
+    final_norm_us: u64,
+    lm_head_us: u64,
+    argmax_us: u64,
+    readback_us: u64,
+    slow_layers: Vec<(usize, &'static str, u64)>,
+}
+
+static QWEN35_DECODE_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
+
 fn qwen35_env_flag_enabled(name: &str) -> bool {
     let Some(value) = std::env::var_os(name) else {
         return false;
@@ -2238,6 +2296,10 @@ fn qwen35_env_flag_enabled(name: &str) -> bool {
 
 fn qwen35_prefill_profile_enabled() -> bool {
     qwen35_env_flag_enabled("FERRUM_QWEN35_PREFILL_PROFILE")
+}
+
+fn qwen35_decode_profile_enabled() -> bool {
+    qwen35_env_flag_enabled("FERRUM_QWEN35_DECODE_PROFILE")
 }
 
 fn qwen35_prefill_profile_stage_start<B: Backend>(
@@ -2260,6 +2322,126 @@ fn qwen35_prefill_profile_stage_finish<B: Backend>(
         0,
     )
     .unwrap_or(0)
+}
+
+fn qwen35_decode_profile_stage_start<B: Backend>(
+    ctx: &mut B::Context,
+    enabled: bool,
+) -> Option<B::Timer> {
+    ferrum_kernels::backend::timer::start_probe_timer_if::<B>(enabled, ctx)
+}
+
+fn qwen35_decode_profile_stage_finish<B: Backend>(
+    ctx: &mut B::Context,
+    timer: Option<B::Timer>,
+    name: &str,
+) -> u64 {
+    ferrum_kernels::backend::timer::finish_probe_timer_traced::<B>(
+        timer,
+        ctx,
+        name,
+        "qwen35_decode",
+        0,
+    )
+    .unwrap_or(0)
+}
+
+impl Qwen35DecodeProfile {
+    fn record_layer(&mut self, layer_index: usize, kind: &'static str, elapsed_us: u64) {
+        match kind {
+            "linear" => {
+                self.linear_layers += 1;
+                self.linear_layer_us += elapsed_us;
+            }
+            "full" => {
+                self.full_layers += 1;
+                self.full_layer_us += elapsed_us;
+            }
+            _ => {}
+        }
+
+        let insert_at = self
+            .slow_layers
+            .iter()
+            .position(|&(_, _, value)| elapsed_us > value)
+            .unwrap_or(self.slow_layers.len());
+        if insert_at < 8 {
+            self.slow_layers
+                .insert(insert_at, (layer_index, kind, elapsed_us));
+            self.slow_layers.truncate(8);
+        }
+    }
+
+    fn log(&self, batch: usize, total_layers: usize, logits_return: &'static str) {
+        let call = QWEN35_DECODE_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if call > 16 && call % 32 != 0 {
+            return;
+        }
+
+        let layer_sum = self.linear_layer_us + self.full_layer_us;
+        let final_sum = self.final_norm_us + self.lm_head_us + self.argmax_us + self.readback_us;
+        eprintln!(
+            "[qwen35-decode-prof] call#{} batch={} logits_return={} layers={} \
+             linear_layers={} full_layers={} embedding={}us layer_sum={}us \
+             linear_layer_sum={}us full_layer_sum={}us final_sum={}us final_norm={}us \
+             lm_head={}us argmax={}us readback={}us slow_layers={:?}",
+            call,
+            batch,
+            logits_return,
+            total_layers,
+            self.linear_layers,
+            self.full_layers,
+            self.embedding_us,
+            layer_sum,
+            self.linear_layer_us,
+            self.full_layer_us,
+            final_sum,
+            self.final_norm_us,
+            self.lm_head_us,
+            self.argmax_us,
+            self.readback_us,
+            self.slow_layers,
+        );
+
+        let profile = ferrum_bench_core::global_profile();
+        if profile.is_enabled() {
+            let slow_layers = self
+                .slow_layers
+                .iter()
+                .map(|(layer, kind, us)| {
+                    serde_json::json!({
+                        "layer": layer,
+                        "kind": kind,
+                        "us": us,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let _ = profile.push_event(
+                "qwen35_decode_prof",
+                ferrum_bench_core::profile_fields_from_json(serde_json::json!({
+                    "call": call,
+                    "batch": batch,
+                    "layers": total_layers,
+                    "linear_layers": self.linear_layers,
+                    "full_layers": self.full_layers,
+                    "logits_return": logits_return,
+                })),
+                ferrum_bench_core::profile_fields_from_json(serde_json::json!({
+                    "embedding": self.embedding_us,
+                    "layer_sum": layer_sum,
+                    "linear_layer_sum": self.linear_layer_us,
+                    "full_layer_sum": self.full_layer_us,
+                    "final_sum": final_sum,
+                    "final_norm": self.final_norm_us,
+                    "lm_head": self.lm_head_us,
+                    "argmax": self.argmax_us,
+                    "readback": self.readback_us,
+                    "slow_layers": slow_layers,
+                })),
+                false,
+            );
+        }
+    }
 }
 
 impl Qwen35PrefillProfile {
