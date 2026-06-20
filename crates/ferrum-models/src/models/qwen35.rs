@@ -1958,7 +1958,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 Qwen35AttentionWeights::Full(_) => "full",
             };
             let t_layer = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
-            let next_hidden = match &layer.attention {
+            hidden = match &layer.attention {
                 Qwen35AttentionWeights::Linear(_) => {
                     qwen35_linear_attention_decode_batch_layer_backend::<B>(
                         &mut ctx,
@@ -1998,9 +1998,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                     )?
                 }
             };
-            if let Some(next_hidden) = next_hidden {
-                hidden = next_hidden;
-            }
             let layer_elapsed =
                 qwen35_decode_profile_stage_finish::<B>(&mut ctx, t_layer, "qwen35_decode_layer");
             decode_profile.record_layer(layer_index, layer_kind, layer_elapsed);
@@ -5125,30 +5122,6 @@ fn qwen35_finish_layer_with_mlp_f32_residual<B: MoeLlmBackend>(
     tokens: usize,
     eps: f32,
 ) -> Result<B::Buffer> {
-    qwen35_finish_layer_with_mlp_f32_residual_shadow_only::<B>(
-        ctx,
-        residual_f32,
-        branch_f32,
-        layer,
-        config,
-        tokens,
-        eps,
-    )?;
-    let hidden_len = tokens * config.hidden_size;
-    let mut layer_output = B::alloc(hidden_len);
-    B::f32_to_activation(ctx, residual_f32, &mut layer_output, hidden_len);
-    Ok(layer_output)
-}
-
-fn qwen35_finish_layer_with_mlp_f32_residual_shadow_only<B: MoeLlmBackend>(
-    ctx: &mut B::Context,
-    residual_f32: &mut B::Buffer,
-    branch_f32: &mut B::Buffer,
-    layer: &Qwen35LayerWeights<B>,
-    config: &Qwen35TextConfig,
-    tokens: usize,
-    eps: f32,
-) -> Result<()> {
     let hidden_len = tokens * config.hidden_size;
     let mut post_attention_norm = B::alloc(hidden_len);
     B::rms_norm_f32_to_activation(
@@ -5185,7 +5158,9 @@ fn qwen35_finish_layer_with_mlp_f32_residual_shadow_only<B: MoeLlmBackend>(
         residual_f32,
         hidden_len,
     );
-    Ok(())
+    let mut layer_output = B::alloc(hidden_len);
+    B::f32_to_activation(ctx, residual_f32, &mut layer_output, hidden_len);
+    Ok(layer_output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5201,7 +5176,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
     eps: f32,
     mut residual_f32: Option<&mut B::Buffer>,
     mut branch_f32: Option<&mut B::Buffer>,
-) -> Result<Option<B::Buffer>> {
+) -> Result<B::Buffer> {
     let batch_len = states.len();
     let attention_shape = Qwen35LinearAttentionShape {
         tokens: 1,
@@ -5557,7 +5532,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
             "qwen35_linear_decode_residual_update",
         );
         let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-        qwen35_finish_layer_with_mlp_f32_residual_shadow_only::<B>(
+        let output = qwen35_finish_layer_with_mlp_f32_residual::<B>(
             ctx,
             residual_f32,
             branch_f32,
@@ -5568,7 +5543,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         )?;
         detail.mlp_us +=
             qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_decode_mlp");
-        None
+        output
     } else {
         let mut residual_after_mixer = B::alloc(hidden_len);
         let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
@@ -5597,7 +5572,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         )?;
         detail.mlp_us +=
             qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_decode_mlp");
-        Some(output)
+        output
     };
 
     if detail_enabled {
@@ -6271,7 +6246,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
     eps: f32,
     mut residual_f32: Option<&mut B::Buffer>,
     mut branch_f32: Option<&mut B::Buffer>,
-) -> Result<Option<B::Buffer>> {
+) -> Result<B::Buffer> {
     let batch_len = states.len();
     let hidden_len = batch_len * config.hidden_size;
     let attention = match &layer.attention {
@@ -6548,7 +6523,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
         {
             B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
             B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
-            qwen35_finish_layer_with_mlp_f32_residual_shadow_only::<B>(
+            return qwen35_finish_layer_with_mlp_f32_residual::<B>(
                 ctx,
                 residual_f32,
                 branch_f32,
@@ -6556,8 +6531,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 config,
                 batch_len,
                 eps,
-            )?;
-            return Ok(None);
+            );
         }
         let mut residual_after_attention = B::alloc(hidden_len);
         B::copy_slice(
@@ -6569,14 +6543,14 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
             hidden_len,
         );
         B::add_inplace(ctx, &mut residual_after_attention, &attn_output, hidden_len);
-        return Ok(Some(qwen35_finish_layer_with_mlp::<B>(
+        return qwen35_finish_layer_with_mlp::<B>(
             ctx,
             &residual_after_attention,
             layer,
             config,
             batch_len,
             eps,
-        )?));
+        );
     }
 
     let mut context = B::alloc(batch_len * q_total);
@@ -6761,7 +6735,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
     {
         B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
         B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
-        qwen35_finish_layer_with_mlp_f32_residual_shadow_only::<B>(
+        qwen35_finish_layer_with_mlp_f32_residual::<B>(
             ctx,
             residual_f32,
             branch_f32,
@@ -6769,8 +6743,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
             config,
             batch_len,
             eps,
-        )?;
-        Ok(None)
+        )
     } else {
         let mut residual_after_attention = B::alloc(hidden_len);
         B::copy_slice(
@@ -6782,14 +6755,14 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
             hidden_len,
         );
         B::add_inplace(ctx, &mut residual_after_attention, &attn_output, hidden_len);
-        Ok(Some(qwen35_finish_layer_with_mlp::<B>(
+        qwen35_finish_layer_with_mlp::<B>(
             ctx,
             &residual_after_attention,
             layer,
             config,
             batch_len,
             eps,
-        )?))
+        )
     }
 }
 
