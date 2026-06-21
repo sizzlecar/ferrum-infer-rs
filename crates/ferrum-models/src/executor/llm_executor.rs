@@ -771,7 +771,8 @@ impl ModelExecutor for LlmExecutor {
             let logits = if force_full_logits {
                 model.decode_batch_with_full_logits(&tuples, true)
             } else {
-                match model.unified_forward(&unified_items) {
+                let policies: Vec<_> = prepped.iter().map(|p| p.logits_policy.clone()).collect();
+                match model.unified_forward_with_logits_policy(&unified_items, &policies) {
                     Ok(per_item) => {
                         if per_item.len() != prepped.len() {
                             return Err(FerrumError::model(format!(
@@ -791,8 +792,6 @@ impl ModelExecutor for LlmExecutor {
                         out
                     }
                     Err(FerrumError::Unsupported { .. }) => {
-                        let policies: Vec<_> =
-                            prepped.iter().map(|p| p.logits_policy.clone()).collect();
                         model.decode_batch_with_logits_policy(&tuples, &policies)
                     }
                     Err(e) => return Err(e),
@@ -1488,6 +1487,33 @@ mod tests {
         let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
 
         assert_eq!(output[0].as_ref().unwrap().len(), 4);
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 1);
+        assert_eq!(
+            calls.unified_forward_policy_requires_full,
+            vec![vec![false]]
+        );
+        assert!(calls.decode_batch_force_full_logits.is_empty());
+    }
+
+    #[test]
+    fn batch_decode_forwards_logits_policy_to_unified_model() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor(calls.clone());
+        let inputs = vec![DecodeInput::new(
+            MockTensor::from_u32(&[7], &[1]).into_ref(),
+            test_kv_handle("decode-cache", 3),
+        )
+        .with_logits_policy(
+            ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
+                token_mask: None,
+                repetition_penalty: None,
+            },
+        )];
+
+        let output = tokio_test::block_on(executor.batch_decode(&inputs)).unwrap();
+
+        assert_eq!(output[0].logits.to_vec_f32().unwrap().len(), 4);
         let calls = calls.lock();
         assert_eq!(calls.unified_forward, 1);
         assert_eq!(

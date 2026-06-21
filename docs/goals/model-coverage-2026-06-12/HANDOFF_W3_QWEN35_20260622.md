@@ -111,6 +111,11 @@ adding model-name defaults or hidden environment switches.
   decode batch path to preserve old no-policy behavior.
 - Added regressions that lock this boundary and directly verify the shared
   argmax helper returns token sentinels for raw greedy policy rows.
+- `LlmExecutor::batch_decode` now forwards `LogitsReturnPolicy` through
+  `unified_forward_with_logits_policy` on the fast unified path. The fallback
+  already used `decode_batch_with_logits_policy`; this closes the no-policy
+  unified gap for decode-only batches using model-side greedy argmax, token
+  masks, or sparse repetition penalties.
 
 The key vLLM reference is:
 
@@ -165,6 +170,10 @@ cargo test -p ferrum-models \
   qwen35_unified_forward_multitoken_continuation_matches_stepwise -- --nocapture
 cargo test -p ferrum-models \
   qwen35_unified_forward_non_final_continuation_skips_logits_tail -- --nocapture
+cargo test -p ferrum-models \
+  batch_decode_forwards_logits_policy_to_unified_model -- --nocapture
+cargo test -p ferrum-models \
+  unified_decode_forwards_logits_policy_to_unified_model -- --nocapture
 cargo check -p ferrum-models
 cargo fmt --all -- --check
 git diff --check
@@ -273,6 +282,10 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
 - Qwen3.5 prefill profiles now include `argmax` time; for policy-driven merged
   continuation batches, confirm the profile shows argmax rather than full
   vocab readback when masks/penalties allow it.
+- Decode-only `batch_decode` should now show the same policy-aware model-side
+  argmax behavior as `unified_decode`; if masked/repetition-penalty decode
+  correctness differs between the two product paths, inspect executor policy
+  construction before changing model kernels.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
