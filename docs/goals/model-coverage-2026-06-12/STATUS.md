@@ -2,6 +2,46 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ69 — W3 final manifest probe now reaches the real performance blocker
+
+- Scope:
+  - fixed `scripts/release/model_release_grade_goal_gate.py` so nested
+    artifacts referenced from a loaded artifact are also resolved relative to
+    that artifact's directory;
+  - this matters for real W3 S2 product evidence, where
+    `w3_s2_whole_model_product_path.json` records `run_stdout.jsonl`,
+    `serve.log`, and behavior response files relative to its own artifact
+    directory;
+  - added a final-validator self-test that moves S2 and its nested evidence
+    into a subdirectory, proving the validator accepts artifact-local relative
+    paths instead of accidentally depending on files in the final output root.
+- Validation passed locally:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - direct probe of the real S2 artifact:
+    `W3 S2 REAL ARTIFACT PATH-RESOLUTION PROBE PASS`;
+  - direct probe of current real S0/S1/S2 evidence:
+    `W3 S0/S1/S2 FINAL-VALIDATOR PROBE PASS`;
+  - `git diff --check`.
+- Final-manifest probe:
+  - built a temporary W3 manifest from the current available evidence:
+    current L0-L5 artifacts, S0 design, S0 CUDA microbench, S1 single-layer
+    compare, S2 product path, the historical vLLM ShareGPT baseline, and the
+    W3 L4/L5 Ferrum performance matrix;
+  - the final validator reached performance evaluation and failed with exactly
+    eight performance problems:
+    c1/c4/c16/c32 throughput ratio below `0.800`, and c1/c4/c16/c32 p95 ITL
+    above the `1.25x` baseline limit;
+  - diagnostic ratios from that probe were c1 `0.396989`, c4 `0.224899`,
+    c16 `0.115835`, and c32 `0.081663`;
+  - no L0-L5 or S0/S1/S2 correctness artifact problem remained in that probe.
+- Status:
+  - this is final-gate/tooling progress and a sharper blocker diagnosis, not a
+    performance claim;
+  - W3 remains incomplete and there is still no real
+    `MODEL_RELEASE_GRADE_W3 PASS` artifact directory.
+
 ## 2026-06-22 ZZZ68 — W3 L1 numeric artifact regenerated with official full-attention shape coverage
 
 - Scope:
