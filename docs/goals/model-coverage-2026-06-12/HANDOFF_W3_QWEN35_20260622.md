@@ -103,9 +103,14 @@ adding model-name defaults or hidden environment switches.
   present, and every decode row requires full logits. Greedy-argmax/no-policy
   rows keep the decode batch path so the model-side argmax sentinel contract is
   preserved.
-- Added a regression that locks this merge boundary: full-logits policies may
-  merge, but `GreedyArgmax`, partial policy lists, no continuation rows, and
-  no-policy `FERRUM_GREEDY_ARGMAX=1` do not merge.
+- Paged continuation varlen prefill batch now accepts
+  `Qwen35DecodeLogitsReturn` and reuses the same model-side argmax helper as
+  decode batch. Complete explicit `LogitsReturnPolicy` batches, including
+  `GreedyArgmax`, may merge into the continuation batch and return argmax
+  sentinels; legacy no-policy `FERRUM_GREEDY_ARGMAX=1` still stays on the
+  decode batch path to preserve old no-policy behavior.
+- Added regressions that lock this boundary and directly verify the shared
+  argmax helper returns token sentinels for raw greedy policy rows.
 
 The key vLLM reference is:
 
@@ -151,7 +156,9 @@ cargo test -p ferrum-models \
 cargo test -p ferrum-models \
   qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture
 cargo test -p ferrum-models \
-  qwen35_decode_merge_policy_preserves_argmax_contract -- --nocapture
+  qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture
+cargo test -p ferrum-models \
+  qwen35_try_argmax_logits_rows_returns_policy_sentinel -- --nocapture
 cargo test -p ferrum-models \
   qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture
 cargo test -p ferrum-models \
@@ -260,9 +267,12 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   calls. CPU cannot execute this paged varlen path; local evidence only proves
   non-paged fallback and type-level compilation.
 - Full-logits mixed continuation+decode frames should also enter that same
-  paged continuation batch. Greedy-argmax policy rows should still use decode
-  batch until a policy-aware varlen continuation logits/argmax path is added
-  and validated.
+  paged continuation batch. Explicit `GreedyArgmax` policy rows can now enter
+  the same batch and should return model-side argmax sentinels; no-policy
+  `FERRUM_GREEDY_ARGMAX=1` remains on decode batch by design.
+- Qwen3.5 prefill profiles now include `argmax` time; for policy-driven merged
+  continuation batches, confirm the profile shows argmax rather than full
+  vocab readback when masks/penalties allow it.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
