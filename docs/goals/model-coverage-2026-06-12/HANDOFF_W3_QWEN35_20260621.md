@@ -106,6 +106,11 @@ Trace/evidence change after the prefill-step update:
 - The next GPU artifact should use these fields to verify whether the
   prefill-step cap actually changes prefill-only stalls and whether decode
   cohorts stay near c32.
+- Added `scripts/release/analyze_scheduler_trace.py` to turn scheduler trace
+  JSONL into a stable diagnostic summary. It prints
+  `SCHEDULER TRACE ANALYSIS PASS: <out>` and reports phase mix, request-detail
+  presence, prefill chunk/final chunk distributions, decode generated-token
+  distribution, and slowest process iterations.
 
 Validation run locally:
 
@@ -118,6 +123,8 @@ Validation run locally:
 - `cargo test -p ferrum-types --test config_tests engine_config_applies_runtime_snapshot -- --nocapture`
 - `cargo test -p ferrum-cli serve_cli_runtime_entries_are_cli_sourced_and_classified -- --nocapture`
 - `cargo test -p ferrum-engine scheduler_trace_plan_stats_reports_request_details -- --nocapture`
+- `python3 scripts/release/analyze_scheduler_trace.py --self-test`
+- `python3 -m py_compile scripts/release/analyze_scheduler_trace.py`
 
 Still needed on GPU after Vast resources become available:
 
@@ -134,6 +141,9 @@ Still needed on GPU after Vast resources become available:
    no-prefill-first failure.
 5. Inspect the scheduler trace for reduced prefill-only stalls before treating
    any throughput delta as meaningful.
+6. Run `python3 scripts/release/analyze_scheduler_trace.py
+   <run>/scheduler_trace_c32.jsonl --out <run>/scheduler_trace_summary.json`
+   and include the summary in the copied artifact.
 
 ## Important artifacts
 
