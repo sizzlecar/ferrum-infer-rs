@@ -149,6 +149,11 @@ adding model-name defaults or hidden environment switches.
   The test constructs a real `BatchPlan`, preloads one decode-ready sequence,
   and captures one unified model call with a non-final fresh chunk at
   `pos_offset=0` plus a decode row at `pos_offset>0`.
+- `LlmExecutor::unified_decode` now has an executor-level regression proving
+  the same mixed `UnifiedBatch` shape is forwarded as one
+  `unified_forward_with_logits_policy` call to the model layer. The regression
+  locks row order, `pos_offset`, non-final `None` output for the fresh chunk,
+  and no fallback to split prefill/decode.
 - Existing Vast instance `41422823` was checked for a W3 Qwen35 mixed-prefill
   CUDA smoke/c32 diagnostic. SSH to `ssh7.vast.ai:22822` returned connection
   refused, and the sanitized API summary says `cur_state=stopped`,
@@ -221,6 +226,14 @@ cargo test -p ferrum-engine \
   process_batch_unified_honors_runtime_chunked_prefill -- --nocapture
 cargo test -p ferrum-engine \
   process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk -- --nocapture
+cargo test -p ferrum-models \
+  unified_decode_forwards_mixed_fresh_prefill_and_decode_to_unified_model -- --nocapture
+cargo test -p ferrum-models \
+  unified_decode_forwards_logits_policy_to_unified_model -- --nocapture
+cargo test -p ferrum-models \
+  unified_decode_forwards_prefill_logits_policy_to_unified_model -- --nocapture
+cargo test -p ferrum-models \
+  batch_decode_forwards_logits_policy_to_unified_model -- --nocapture
 cargo test -p ferrum-models qwen35_unified_forward -- --nocapture
 cargo test -p ferrum-models \
   qwen35_fresh_prefill_initial_state_slabs_are_zero_not_gathered -- --nocapture

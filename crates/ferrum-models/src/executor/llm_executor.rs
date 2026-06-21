@@ -1114,6 +1114,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingCalls {
         unified_forward: usize,
+        unified_forward_items: Vec<Vec<(String, Vec<u32>, usize, bool)>>,
         unified_forward_policy_requires_full: Vec<Vec<bool>>,
         prefill: usize,
         decode: usize,
@@ -1194,7 +1195,10 @@ mod tests {
             &mut self,
             items: &[(String, Vec<u32>, usize, bool)],
         ) -> std::result::Result<Vec<Option<Vec<f32>>>, FerrumError> {
-            self.calls.lock().unified_forward += 1;
+            let mut calls = self.calls.lock();
+            calls.unified_forward += 1;
+            calls.unified_forward_items.push(items.to_vec());
+            drop(calls);
             if let Some(message) = &self.unified_unsupported_message {
                 return Err(FerrumError::unsupported(message.clone()));
             }
@@ -1525,6 +1529,58 @@ mod tests {
             vec![vec![false]]
         );
         assert!(calls.decode_batch_force_full_logits.is_empty());
+    }
+
+    #[test]
+    fn unified_decode_forwards_mixed_fresh_prefill_and_decode_to_unified_model() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor(calls.clone());
+        let greedy = ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
+            token_mask: None,
+            repetition_penalty: None,
+        };
+        let mut batch = UnifiedBatch::new();
+        batch.items.push(UnifiedBatchItem {
+            seq_id: "fresh-cache".to_string(),
+            q_tokens: vec![1],
+            kv_cache: test_kv_handle("fresh-cache", 0),
+            recurrent_state: None,
+            pos_offset: 0,
+            is_final_chunk: false,
+            metadata: HashMap::new(),
+            logits_policy: greedy.clone(),
+        });
+        batch.items.push(UnifiedBatchItem {
+            seq_id: "decode-cache".to_string(),
+            q_tokens: vec![7],
+            kv_cache: test_kv_handle("decode-cache", 3),
+            recurrent_state: None,
+            pos_offset: 3,
+            is_final_chunk: true,
+            metadata: HashMap::new(),
+            logits_policy: greedy,
+        });
+
+        let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
+
+        assert!(output[0].is_none());
+        assert_eq!(output[1].as_ref().unwrap().len(), 4);
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 1);
+        assert_eq!(calls.prefill, 0);
+        assert_eq!(calls.decode, 0);
+        assert!(calls.decode_batch_force_full_logits.is_empty());
+        assert_eq!(
+            calls.unified_forward_items,
+            vec![vec![
+                ("fresh-cache".to_string(), vec![1], 0, false),
+                ("decode-cache".to_string(), vec![7], 3, true),
+            ]]
+        );
+        assert_eq!(
+            calls.unified_forward_policy_requires_full,
+            vec![vec![false, false]]
+        );
     }
 
     #[test]

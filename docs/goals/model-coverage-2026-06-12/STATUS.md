@@ -2,6 +2,31 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ55 — LlmExecutor keeps mixed fresh chunk + decode unified
+
+- Scope:
+  - added an executor-level regression for `LlmExecutor::unified_decode` with
+    one fresh non-final prefill chunk and one decode row in the same
+    `UnifiedBatch`;
+  - the fake model now records the exact items received by
+    `unified_forward_with_logits_policy`, and the regression proves the
+    executor forwards both rows in one model call, preserves row order and
+    `pos_offset`, returns `None` only for the non-final fresh chunk, and does
+    not fall back to split prefill/decode paths;
+  - this closes the source-level bridge between the ZZZ54 engine product batch
+    and the ZZZ53 Qwen35 mixed paged prefill model path.
+- Validation passed locally:
+  - `cargo test -p ferrum-models unified_decode_forwards_mixed_fresh_prefill_and_decode_to_unified_model -- --nocapture`;
+  - `cargo test -p ferrum-models unified_decode_forwards_logits_policy_to_unified_model -- --nocapture`;
+  - `cargo test -p ferrum-models unified_decode_forwards_prefill_logits_policy_to_unified_model -- --nocapture`;
+  - `cargo test -p ferrum-models batch_decode_forwards_logits_policy_to_unified_model -- --nocapture`;
+  - `cargo check -p ferrum-models`.
+- Status:
+  - source/product-path bridge progress only; CUDA correctness/performance still
+    has not run;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ54 — Engine product path emits active decode + fresh chunk mixed batches
 
 - Scope:
