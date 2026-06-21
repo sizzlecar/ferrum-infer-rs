@@ -1011,6 +1011,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
             "coverage": {
                 "linear_attention": True,
                 "full_attention": True,
+                "full_attention_official_shape": True,
                 "deltanet": True,
                 "moe_or_dense": True,
                 "lm_head": True,
@@ -1034,6 +1035,28 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
                 "known_answer_passed": 10,
                 "format": "hf-gptq-int4",
             },
+            "commands": [
+                {
+                    "entrypoint": "ferrum run",
+                    "command_line": [
+                        "ferrum",
+                        "run",
+                        "selftest-qwen35",
+                        "--backend",
+                        "cuda",
+                    ],
+                },
+                {
+                    "entrypoint": "ferrum serve",
+                    "command_line": [
+                        "ferrum",
+                        "serve",
+                        "selftest-qwen35",
+                        "--backend",
+                        "cuda",
+                    ],
+                },
+            ],
         },
     )
     write_json(
@@ -1087,6 +1110,23 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
         {
             **common,
             "level": "l5_concurrency",
+            "commands": [
+                {
+                    "command_line": [
+                        "ferrum",
+                        "bench-serve",
+                        "--fail-on-error",
+                        "--require-ci",
+                        "--seed",
+                        "9271",
+                        "--n-repeats",
+                        "3",
+                        "--concurrency-sweep",
+                        "1,4,16,32",
+                    ],
+                    "covers_concurrency": [1, 4, 16, 32],
+                }
+            ],
             "concurrency": {
                 "closed_loop": True,
                 "stream_options_include_usage": True,
