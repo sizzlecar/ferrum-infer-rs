@@ -96,6 +96,17 @@ Additional source change after the trace A/B:
   back to engine-level `FERRUM_CHUNKED_PREFILL`, which bypasses the unified
   batch path.
 
+Trace/evidence change after the prefill-step update:
+
+- `scheduler_trace_jsonl` plan records now include per-request detail:
+  `request_id`, `phase`, `scheduled_tokens`, `prompt_tokens`,
+  `generated_tokens`, `prefill_tokens_processed`,
+  `prefill_tokens_remaining_before`, and `is_final_prefill_chunk`.
+- This is only collected when scheduler trace is explicitly enabled.
+- The next GPU artifact should use these fields to verify whether the
+  prefill-step cap actually changes prefill-only stalls and whether decode
+  cohorts stay near c32.
+
 Validation run locally:
 
 - `cargo fmt --all`
@@ -106,6 +117,7 @@ Validation run locally:
 - `cargo test -p ferrum-scheduler -- --nocapture`
 - `cargo test -p ferrum-types --test config_tests engine_config_applies_runtime_snapshot -- --nocapture`
 - `cargo test -p ferrum-cli serve_cli_runtime_entries_are_cli_sourced_and_classified -- --nocapture`
+- `cargo test -p ferrum-engine scheduler_trace_plan_stats_reports_request_details -- --nocapture`
 
 Still needed on GPU after Vast resources become available:
 
@@ -214,20 +226,20 @@ same binary.
 
 ## Next engineering step
 
-Do not continue blind env-flip sweeps. The next useful work is targeted
-localization:
+Do not continue blind env-flip sweeps. The scheduler/serve trace now has enough
+request-level detail for the next same-pod c32 diagnostic. The next useful work:
 
-1. Instrument the scheduler/serve loop for c32 ShareGPT to record per decode
-   step: requested concurrency, active decode sequences, newly admitted
-   requests, completed requests, generated token counts, and batch size sent to
-   Qwen35.
-2. Compare that trace against vLLM's effective batch behavior for the same
-   dataset and output length. If Ferrum is not keeping decode batches near 32,
-   fix scheduler/admission/finish handling before touching kernels again.
-3. If effective batch really is near 32 and linear layers still dominate, compare
+1. Start the 1x4090 lane when Vast can allocate it; sync current PR head and run
+   the smoke + c32 64x1 diagnostic with `--scheduler-trace-jsonl`.
+2. Use the request-level trace fields to compare effective decode cohort size,
+   prefill chunk sizes, final prefill chunks, and completed/generated token
+   progression against vLLM's expected c32 behavior.
+3. If Ferrum is not keeping decode batches near 32, fix scheduler/admission or
+   finish handling before touching kernels again.
+4. If effective batch really is near 32 and linear layers still dominate, compare
    Ferrum's Marlin-MoE call shapes and launch counts against vLLM at the same
    step. Focus on routed-expert linear work, not shared-expert overlap.
-4. Only after a profiler-backed lever is identified, make one source change and
+5. Only after a profiler-backed lever is identified, make one source change and
    rerun correctness before same-hardware A/B.
 
 ## Deadline policy from user

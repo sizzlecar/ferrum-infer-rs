@@ -25,27 +25,41 @@ pub(super) fn kv_slot_requests_for_unified_batch(
 }
 
 #[derive(Debug, Default, serde::Serialize)]
-struct SchedulerTraceDistribution {
-    count: usize,
-    min: Option<usize>,
-    p50: Option<usize>,
-    max: Option<usize>,
+pub(super) struct SchedulerTraceDistribution {
+    pub(super) count: usize,
+    pub(super) min: Option<usize>,
+    pub(super) p50: Option<usize>,
+    pub(super) max: Option<usize>,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
-struct SchedulerTracePlanStats {
-    batch_size: usize,
-    prefill_items: usize,
-    decode_items: usize,
-    waiting_items: usize,
-    preempted_items: usize,
-    unknown_items: usize,
-    scheduled_tokens_total: usize,
-    prefill_tokens: usize,
-    decode_tokens: usize,
-    tokens_to_process_missing: usize,
-    decode_generated_tokens: SchedulerTraceDistribution,
-    prefill_prompt_tokens: SchedulerTraceDistribution,
+pub(super) struct SchedulerTracePlanStats {
+    pub(super) batch_size: usize,
+    pub(super) prefill_items: usize,
+    pub(super) decode_items: usize,
+    pub(super) waiting_items: usize,
+    pub(super) preempted_items: usize,
+    pub(super) unknown_items: usize,
+    pub(super) scheduled_tokens_total: usize,
+    pub(super) prefill_tokens: usize,
+    pub(super) decode_tokens: usize,
+    pub(super) tokens_to_process_missing: usize,
+    pub(super) decode_generated_tokens: SchedulerTraceDistribution,
+    pub(super) prefill_prompt_tokens: SchedulerTraceDistribution,
+    pub(super) requests: Vec<SchedulerTraceRequestStats>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(super) struct SchedulerTraceRequestStats {
+    pub(super) request_id: String,
+    pub(super) phase: Option<String>,
+    pub(super) scheduled_tokens: usize,
+    pub(super) tokens_to_process_missing: bool,
+    pub(super) prompt_tokens: Option<usize>,
+    pub(super) generated_tokens: Option<usize>,
+    pub(super) prefill_tokens_processed: Option<usize>,
+    pub(super) prefill_tokens_remaining_before: Option<usize>,
+    pub(super) is_final_prefill_chunk: Option<bool>,
 }
 
 fn scheduler_trace_distribution(mut values: Vec<usize>) -> SchedulerTraceDistribution {
@@ -153,7 +167,7 @@ impl EngineInner {
         self.scheduler_trace_jsonl.is_some()
     }
 
-    fn scheduler_trace_plan_stats(
+    pub(super) fn scheduler_trace_plan_stats(
         &self,
         batch: &ferrum_interfaces::BatchPlan,
     ) -> SchedulerTracePlanStats {
@@ -173,19 +187,34 @@ impl EngineInner {
             }
             stats.scheduled_tokens_total += scheduled_tokens;
 
-            match self.scheduler.trace_phase(request_id) {
+            let phase = self.scheduler.trace_phase(request_id);
+            let seq = sequences.get(request_id);
+            let prompt_tokens = seq.map(|seq| seq.prefill_context_len());
+            let generated_tokens = seq.map(|seq| seq.generated_tokens.len());
+            let prefill_tokens_processed = seq.map(|seq| seq.prefill_tokens_processed);
+            let prefill_tokens_remaining_before = prompt_tokens
+                .zip(prefill_tokens_processed)
+                .map(|(prompt, processed)| prompt.saturating_sub(processed));
+            let is_final_prefill_chunk = match (phase, prefill_tokens_remaining_before) {
+                (Some(RequestPhase::Prefilling), Some(remaining)) => {
+                    Some(scheduled_tokens >= remaining)
+                }
+                _ => None,
+            };
+
+            match phase {
                 Some(RequestPhase::Decoding) => {
                     stats.decode_items += 1;
                     stats.decode_tokens += scheduled_tokens;
-                    if let Some(seq) = sequences.get(request_id) {
-                        decode_generated_tokens.push(seq.generated_tokens.len());
+                    if let Some(generated_tokens) = generated_tokens {
+                        decode_generated_tokens.push(generated_tokens);
                     }
                 }
                 Some(RequestPhase::Prefilling) => {
                     stats.prefill_items += 1;
                     stats.prefill_tokens += scheduled_tokens;
-                    if let Some(seq) = sequences.get(request_id) {
-                        prefill_prompt_tokens.push(seq.prefill_context_len());
+                    if let Some(prompt_tokens) = prompt_tokens {
+                        prefill_prompt_tokens.push(prompt_tokens);
                     }
                 }
                 Some(RequestPhase::Waiting) => {
@@ -199,6 +228,18 @@ impl EngineInner {
                     stats.unknown_items += 1;
                 }
             }
+
+            stats.requests.push(SchedulerTraceRequestStats {
+                request_id: request_id.to_string(),
+                phase: phase.map(|phase| format!("{phase:?}")),
+                scheduled_tokens,
+                tokens_to_process_missing: scheduled_req.tokens_to_process.is_none(),
+                prompt_tokens,
+                generated_tokens,
+                prefill_tokens_processed,
+                prefill_tokens_remaining_before,
+                is_final_prefill_chunk,
+            });
         }
 
         stats.decode_generated_tokens = scheduler_trace_distribution(decode_generated_tokens);

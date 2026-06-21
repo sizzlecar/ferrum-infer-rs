@@ -348,6 +348,63 @@ fn decode_ready_request_ids_skip_preempted_sequences_without_kv() {
     assert_eq!(ready, vec![ready_id]);
 }
 
+#[tokio::test]
+async fn scheduler_trace_plan_stats_reports_request_details() {
+    let engine = test_continuous_engine();
+    let request = policy_request();
+    let request_id = request.id.clone();
+
+    engine
+        .inner
+        .scheduler
+        .submit(request.clone())
+        .await
+        .unwrap();
+    let batch = engine
+        .inner
+        .scheduler
+        .next_batch(ferrum_interfaces::BatchHint {
+            max_batch_size: 4,
+            max_tokens: 4,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        })
+        .await
+        .expect("batch should schedule submitted request");
+
+    let mut seq = SequenceState::new(
+        request,
+        vec![
+            TokenId::new(10),
+            TokenId::new(11),
+            TokenId::new(12),
+            TokenId::new(13),
+        ],
+    );
+    seq.prefill_tokens_processed = 1;
+    {
+        let mut sequences = engine.inner.sequences.write();
+        sequences.insert(request_id.clone(), seq);
+    }
+
+    let stats = engine.inner.scheduler_trace_plan_stats(&batch);
+    assert_eq!(stats.batch_size, 1);
+    assert_eq!(stats.prefill_items, 1);
+    assert_eq!(stats.prefill_tokens, 4);
+    assert_eq!(stats.requests.len(), 1);
+
+    let request_stats = &stats.requests[0];
+    assert_eq!(request_stats.request_id, request_id.to_string());
+    assert_eq!(request_stats.phase.as_deref(), Some("Prefilling"));
+    assert_eq!(request_stats.scheduled_tokens, 4);
+    assert_eq!(request_stats.prompt_tokens, Some(4));
+    assert_eq!(request_stats.generated_tokens, Some(0));
+    assert_eq!(request_stats.prefill_tokens_processed, Some(1));
+    assert_eq!(request_stats.prefill_tokens_remaining_before, Some(3));
+    assert_eq!(request_stats.is_final_prefill_chunk, Some(true));
+}
+
 #[test]
 fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
     let mut config = EngineConfig::default();
