@@ -6976,40 +6976,54 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
     detail.attention_core_us +=
         qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_core");
 
+    // With indexed state pools, the slot slab is the decode source of truth;
+    // sequence-local buffers are synchronized from the slot only when needed.
+    let write_sequence_states = linear_state_pools.is_none();
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    for (row, (cache_id, state)) in states.iter_mut().enumerate() {
-        let Qwen35LayerRuntimeState::Linear {
-            conv_state,
-            delta_state,
-        } = state.layers.get_mut(layer_index).ok_or_else(|| {
-            FerrumError::model(format!(
-                "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
-            ))
-        })?
-        else {
-            return Err(FerrumError::model(format!(
-                "Qwen3.5 batch prefill expected linear layer state at layer {layer_index} for {cache_id:?}"
-            )));
-        };
-        B::copy_slice(
+    if write_sequence_states {
+        for (row, (cache_id, state)) in states.iter_mut().enumerate() {
+            let Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                delta_state,
+            } = state.layers.get_mut(layer_index).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+                ))
+            })?
+            else {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 batch prefill expected linear layer state at layer {layer_index} for {cache_id:?}"
+                )));
+            };
+            B::copy_slice(
+                ctx,
+                &attention_out.final_conv_states,
+                row * conv_state_len,
+                conv_state,
+                0,
+                conv_state_len,
+            );
+            B::copy_slice(
+                ctx,
+                &attention_out.final_states,
+                row * delta_state_len,
+                delta_state,
+                0,
+                delta_state_len,
+            );
+        }
+        detail.state_scatter_us += qwen35_detail_profile_stage_finish::<B>(
             ctx,
-            &attention_out.final_conv_states,
-            row * conv_state_len,
-            conv_state,
-            0,
-            conv_state_len,
+            timer,
+            "qwen35_linear_prefill_state_scatter",
         );
-        B::copy_slice(
+    } else {
+        let _ = qwen35_detail_profile_stage_finish::<B>(
             ctx,
-            &attention_out.final_states,
-            row * delta_state_len,
-            delta_state,
-            0,
-            delta_state_len,
+            timer,
+            "qwen35_linear_prefill_state_scatter",
         );
     }
-    detail.state_scatter_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_state_scatter");
 
     let mut wrote_pools = false;
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);

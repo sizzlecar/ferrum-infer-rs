@@ -16,6 +16,10 @@
   - routed product varlen prefill through compact core outputs so
     `query/key/value/g/beta/delta_core` debug/reference intermediates are not
     held past the GDN core boundary;
+  - when indexed linear state pools are present, product batch prefill now
+    writes final recurrent/conv state only to the slot pool and skips the
+    duplicate per-sequence state scatter; sequence-local state is still
+    synchronized from the slot before any non-indexed use;
   - kept the old separate `qkv/z/b/a` path as the fallback for backends that
     do not support packed prefill prepare.
 - vLLM alignment:
