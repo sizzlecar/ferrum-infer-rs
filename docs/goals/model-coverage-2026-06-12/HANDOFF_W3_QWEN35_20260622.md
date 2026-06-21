@@ -8,12 +8,32 @@
 - Correctness evidence exists for real Qwen3.5 GPTQ product paths, including
   `ferrum run`, `ferrum serve`, streaming usage, tool calls, structured output,
   and L5 zero-error concurrency.
+- Current W3 L1 numeric/reference evidence is
+  `docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058/w3_l1_numeric.json`.
 - Performance remains below the W3 80% vLLM target. The accepted vLLM c32 mean
   baseline is `1708.52785 output tok/s`, so the 80% target is
   `1366.82228 output tok/s`. Recent Ferrum c32 diagnostics have been around
   `629-695 output tok/s`.
 
 ## Latest Source Progress
+
+### 2026-06-22 L1 Numeric Artifact Regenerated
+
+- Regenerated the W3 L1 numeric/reference artifact with current
+  `scripts/release/w3_l1_numeric_gate.py`.
+- New artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058/w3_l1_numeric.json`.
+- Official PASS line:
+  `W3 L1 NUMERIC PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058`.
+- The new artifact records `coverage.full_attention_official_shape=true` with
+  `rope_uses_partial_interleaved_rotation`,
+  `full_attention_core_applies_qwen35_output_gate`, and
+  `dense_full_attention_layer_accepts_qwen35_gate_shape_with_hidden_not_q_total`.
+- Validation passed locally:
+  `python3 scripts/release/w3_l1_numeric_gate.py --out docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058`
+  and a direct final-validator L1 probe.
+- This is source/reference correctness evidence only. It is not CUDA
+  performance evidence and does not complete W3.
 
 ### 2026-06-22 L0-L5 PASS-Line Gate Hardening
 
@@ -35,10 +55,9 @@
   and `git diff --check`.
 - A stricter full-artifact probe of the existing
   `w3_l1_numeric_qwen35_family_20260618` artifact still fails current final
-  validation because it lacks `coverage.full_attention_official_shape=true`.
-  Do not hand-edit that historical artifact; W3 needs a regenerated real L1
-  numeric artifact, or a valid newer L1 artifact, before the final gate can
-  pass.
+  validation because it lacks `coverage.full_attention_official_shape=true`;
+  this was resolved by the regenerated
+  `w3_l1_numeric_qwen35_family_20260622_da48e058` artifact above.
 
 ### 2026-06-22 L3 Case-Level Gate Hardening
 

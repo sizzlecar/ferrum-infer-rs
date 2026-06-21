@@ -2,6 +2,38 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ68 — W3 L1 numeric artifact regenerated with official full-attention shape coverage
+
+- Scope:
+  - regenerated the W3 L1 numeric/reference artifact with the current
+    `scripts/release/w3_l1_numeric_gate.py`;
+  - new artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058/w3_l1_numeric.json`;
+  - official PASS line:
+    `W3 L1 NUMERIC PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058`;
+  - the artifact records `coverage.full_attention_official_shape=true` and
+    includes the required official-shape tests:
+    `rope_uses_partial_interleaved_rotation`,
+    `full_attention_core_applies_qwen35_output_gate`, and
+    `dense_full_attention_layer_accepts_qwen35_gate_shape_with_hidden_not_q_total`.
+- Why:
+  - the older
+    `w3_l1_numeric_qwen35_family_20260618/w3_l1_numeric.json` artifact was
+    generated before this final-validator requirement and fails current W3 L1
+    validation;
+  - hand-editing historical artifacts would be invalid, so the gate was rerun
+    to produce fresh evidence.
+- Validation passed locally:
+  - `python3 scripts/release/w3_l1_numeric_gate.py --out docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058`;
+  - direct final-validator probe of the new L1 artifact:
+    `W3 L1 FINAL-VALIDATOR PROBE PASS:
+    docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058/w3_l1_numeric.json`.
+- Status:
+  - source/reference correctness evidence progress only; no new CUDA
+    correctness or performance claim;
+  - W3 remains incomplete and there is still no real
+    `MODEL_RELEASE_GRADE_W3 PASS` artifact directory.
+
 ## 2026-06-22 ZZZ67 — W3 L0-L5 final validator requires official PASS lines
 
 - Scope:
