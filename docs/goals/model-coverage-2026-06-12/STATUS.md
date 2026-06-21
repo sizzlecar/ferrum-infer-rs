@@ -2,6 +2,31 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ49 — batch_decode unified path forwards logits policy
+
+- Scope:
+  - fixed `LlmExecutor::batch_decode` so the fast unified path calls
+    `unified_forward_with_logits_policy` instead of the no-policy
+    `unified_forward`;
+  - fallback still uses `decode_batch_with_logits_policy`, so unsupported
+    models keep the previous policy-aware behavior;
+  - added an executor regression proving a `GreedyArgmax` decode batch reaches
+    the unified model with `requires_full_logits=false` rather than losing the
+    policy at the unified boundary.
+- Validation passed locally:
+  - `cargo check -p ferrum-models`;
+  - `cargo test -p ferrum-models batch_decode_forwards_logits_policy_to_unified_model -- --nocapture`;
+  - `cargo test -p ferrum-models unified_decode_forwards_logits_policy_to_unified_model -- --nocapture`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - this closes a product-path policy hole for decode-only batches and lets
+    Qwen3.5's policy-aware continuation/decode logits path from ZZZ48 be used
+    from both `batch_decode` and `unified_decode`;
+  - source progress only; no CUDA performance claim without 1x4090 evidence;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ48 — Qwen35 paged continuation batch can honor logits policies
 
 - Scope:
