@@ -16,6 +16,8 @@
   baseline is `1708.52785 output tok/s`, so the 80% target is
   `1366.82228 output tok/s`. Recent Ferrum c32 diagnostics have been around
   `629-695 output tok/s`.
+- Short two-hour cutoff handoff:
+  `docs/goals/model-coverage-2026-06-12/HANDOFF_W3_QWEN35_20260622_2H.md`.
 
 ## Latest Source Progress
 
