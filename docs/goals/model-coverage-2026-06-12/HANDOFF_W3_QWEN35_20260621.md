@@ -145,6 +145,20 @@ Still needed on GPU after Vast resources become available:
    <run>/scheduler_trace_c32.jsonl --out <run>/scheduler_trace_summary.json`
    and include the summary in the copied artifact.
 
+Current GPU blocker:
+
+- Existing cached Vast instance `41422823` remains `cur_state=stopped`,
+  `actual_status=exited`.
+- A replacement 1x RTX 4090 offer search found suitable offers, but creation is
+  externally blocked by Vast account credit:
+  `insufficient_credit`, `Your account lacks credit; see the billing page.`
+- No new instance was created; `GET /api/v0/instances/` shows only the old
+  stopped/exited `41422823`.
+- Local diagnostic attempt artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_step_diag_20260621T180847Z_8b14507d/local_vast/`.
+- Do not keep cycling paid offers until credit is restored. Once credit is
+  available, repeat the exact 1x4090 lane and use the same smoke+c32 commands.
+
 ## Important artifacts
 
 - W3 L2 real product PASS:

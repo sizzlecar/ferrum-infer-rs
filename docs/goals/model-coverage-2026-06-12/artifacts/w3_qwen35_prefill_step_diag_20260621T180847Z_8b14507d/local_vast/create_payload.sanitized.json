@@ -1,0 +1,11 @@
+{
+  "client_id": "me",
+  "disk": 300,
+  "env": {
+    "-p 22:22": "1"
+  },
+  "image": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+  "label": "ferrum-w3-qwen35-prefill-step-20260622",
+  "onstart": "<ssh bootstrap redacted public-key command>",
+  "runtype": "ssh ssh_proxy"
+}
