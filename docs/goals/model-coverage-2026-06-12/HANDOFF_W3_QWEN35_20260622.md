@@ -19,6 +19,26 @@
 
 ## Latest Source Progress
 
+### 2026-06-22 Full-Attention Varlen Token-Row Metadata
+
+- Qwen35 full-attention paged QKV varlen writer now consumes the same
+  `token_seq_indices` metadata already added for GDN/linear-attention prefill.
+- `BackendPagedKv::qwen35_split_qkv_norm_rope_into_paged_cache_varlen{,_vllm}`
+  now receives `[total_q_tokens]` token-row metadata.
+- The CUDA kernels use `token_seq_indices[tok]` to locate the sequence row
+  directly, removing the previous per-token `cu_seqlens_q` linear scan.
+- Qwen35 batch prefill reuses the existing token-row buffer; batch decode and
+  single/stateful prefill populate the corresponding scratch buffer.
+- Local validation passed:
+  `cargo fmt --all -- --check`,
+  `cargo check -p ferrum-kernels -p ferrum-models`,
+  `cargo test -p ferrum-models linear_attention_prefill_varlen_backend_matches_per_sequence_stateful_reference -- --nocapture`,
+  `cargo test -p ferrum-models dense_full_attention_layer_accepts_qwen35_gate_shape_with_hidden_not_q_total -- --nocapture`,
+  and `git diff --check`.
+- Limitation: local `nvcc` is not available, so CUDA feature build, `.cu`
+  compilation, and same-hardware performance verdict still need the 1x4090
+  CUDA lane. This is source progress, not a performance claim.
+
 ### 2026-06-22 Shared MoE Expert-Count Contract
 
 - `crates/ferrum-models/src/moe/dispatch.rs` now makes
