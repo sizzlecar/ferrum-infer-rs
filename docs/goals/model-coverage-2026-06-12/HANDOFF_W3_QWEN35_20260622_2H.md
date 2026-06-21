@@ -32,6 +32,9 @@
 - The final validator also reloads the referenced Ferrum and baseline
   `bench-serve` report artifacts and cross-checks their output-token matrices
   against the manifest.
+- It also cross-checks original report `n_repeats`, `n_requests_per_run`,
+  completed/error counts, and per-run quality counts against the manifest, so
+  a hand-written zero-error manifest cannot hide failed measured requests.
 - The manifest builder now copies the output-token matrices from
   `bench-serve` reports into the final manifest and validates their shape.
 
