@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shlex
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -21,7 +23,10 @@ from typing import Any
 
 ARTIFACT_NAME = "w3_l2_quantized.json"
 PASS_LINE_PREFIX = "W3 L2 QUANTIZED PASS"
-REQUIRED_ENTRYPOINTS = {"ferrum run", "ferrum serve"}
+REQUIRED_ENTRYPOINTS = {
+    "ferrum run": "run",
+    "ferrum serve": "serve",
+}
 
 
 class GateError(Exception):
@@ -85,47 +90,81 @@ def report_section(report: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
-def normalize_command_text(command: Any) -> str:
-    if isinstance(command, str):
-        return command
-    if isinstance(command, list):
-        return " ".join(str(part) for part in command)
-    if isinstance(command, dict):
-        if isinstance(command.get("command_line"), list):
-            return " ".join(str(part) for part in command["command_line"])
-        if isinstance(command.get("command"), str):
-            return command["command"]
-        if isinstance(command.get("entrypoint"), str):
-            return command["entrypoint"]
-    return ""
+def command_parts(raw: Any, label: str) -> list[str]:
+    if isinstance(raw, str):
+        try:
+            parts = shlex.split(raw)
+        except ValueError as exc:
+            raise GateError(f"{label} is not a valid shell command: {exc}") from exc
+    elif isinstance(raw, list) and all(isinstance(part, str) for part in raw):
+        parts = raw
+    elif isinstance(raw, dict):
+        if "command_line" in raw:
+            return command_parts(raw["command_line"], f"{label}.command_line")
+        if isinstance(raw.get("command"), str):
+            return command_parts(raw["command"], f"{label}.command")
+        raise GateError(f"{label} must include command_line or command")
+    else:
+        raise GateError(f"{label} must be a command string, string list, or command object")
+    if not parts:
+        raise GateError(f"{label} must not be empty")
+    return parts
 
 
-def normalize_entrypoint(command: Any) -> str | None:
-    if isinstance(command, dict) and isinstance(command.get("entrypoint"), str):
-        entrypoint = command["entrypoint"].strip()
-        if entrypoint in REQUIRED_ENTRYPOINTS:
-            return entrypoint
-    text = normalize_command_text(command)
-    if not text:
-        return None
-    if "ferrum serve" in text or " serve " in f" {text} ":
-        return "ferrum serve"
-    if "ferrum run" in text or " run " in f" {text} ":
-        return "ferrum run"
-    return None
+def ferrum_subcommands(parts: list[str], label: str) -> set[str]:
+    if not any(part == "ferrum" or part.endswith("/ferrum") for part in parts):
+        raise GateError(f"{label} must invoke the ferrum binary")
+    for part in parts:
+        if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
+            raise GateError(f"{label} uses hidden env override: {part.split('=', 1)[0]}")
+    found = {subcommand for subcommand in REQUIRED_ENTRYPOINTS.values() if subcommand in parts}
+    if not found:
+        raise GateError(f"{label} must invoke ferrum run or ferrum serve")
+    if len(found) > 1:
+        raise GateError(f"{label} ambiguously contains both ferrum run and ferrum serve")
+    return found
 
 
-def product_entrypoints(report: dict[str, Any]) -> tuple[set[str], list[Any]]:
+def validate_product_command(raw: Any, label: str) -> dict[str, Any]:
+    parts = command_parts(raw, label)
+    subcommand = next(iter(ferrum_subcommands(parts, label)))
+    entrypoint = f"ferrum {subcommand}"
+    if isinstance(raw, dict) and isinstance(raw.get("entrypoint"), str):
+        declared = raw["entrypoint"].strip()
+        if declared != entrypoint:
+            raise GateError(f"{label}.entrypoint {declared!r} does not match command {entrypoint!r}")
+    return {
+        "entrypoint": entrypoint,
+        "command_line": parts,
+    }
+
+
+def product_commands(report: dict[str, Any]) -> list[Any]:
     commands: list[Any] = []
     for key in ["commands", "product_commands", "command_log"]:
         value = report.get(key)
         if isinstance(value, list):
             commands.extend(value)
-    entrypoints = report.get("product_entrypoints")
-    if isinstance(entrypoints, list):
-        commands.extend({"entrypoint": item} for item in entrypoints)
-    detected = {entrypoint for command in commands if (entrypoint := normalize_entrypoint(command))}
-    return detected, commands
+    return commands
+
+
+def validate_product_commands(report: dict[str, Any]) -> list[dict[str, Any]]:
+    commands = product_commands(report)
+    if not commands:
+        raise GateError("W3 L2 report must include real product command_line evidence")
+    normalized: list[dict[str, Any]] = []
+    detected: set[str] = set()
+    for idx, command in enumerate(commands):
+        normalized_command = validate_product_command(command, f"commands[{idx}]")
+        normalized.append(normalized_command)
+        detected.add(normalized_command["entrypoint"])
+    missing_entrypoints = sorted(set(REQUIRED_ENTRYPOINTS) - detected)
+    if missing_entrypoints:
+        raise GateError(
+            "W3 L2 report must include product commands for both ferrum run and "
+            f"ferrum serve; missing {missing_entrypoints}"
+        )
+    return normalized
 
 
 def case_passed(case: Any) -> bool:
@@ -192,13 +231,7 @@ def validate_report(
     if hidden_env != []:
         raise GateError("hidden_env must be empty for W3 L2 release-grade evidence")
 
-    detected_entrypoints, commands = product_entrypoints(source)
-    missing_entrypoints = sorted(REQUIRED_ENTRYPOINTS - detected_entrypoints)
-    if missing_entrypoints:
-        raise GateError(
-            "W3 L2 report must include product commands for both ferrum run and "
-            f"ferrum serve; missing {missing_entrypoints}"
-        )
+    commands = validate_product_commands(source)
 
     if cases:
         failed = [case for case in cases if not case_passed(case)]
@@ -319,6 +352,8 @@ def run_selftest() -> int:
         )
         if artifact["quantized_semantics"]["known_answer_total"] != 10:
             raise AssertionError("selftest artifact did not preserve known-answer total")
+        if {command["entrypoint"] for command in artifact["commands"]} != set(REQUIRED_ENTRYPOINTS):
+            raise AssertionError("selftest artifact did not preserve required product commands")
 
         bad = as_object(load_json(report), "selftest report")
         bad["known_answer_cases"][0]["passed"] = False
@@ -353,6 +388,50 @@ def run_selftest() -> int:
                 raise AssertionError(f"unexpected toy-report error: {exc}") from exc
         else:
             raise AssertionError("toy model report unexpectedly passed")
+
+        entrypoint_only = as_object(load_json(report), "selftest report")
+        entrypoint_only["commands"] = [
+            {"entrypoint": "ferrum run"},
+            {"entrypoint": "ferrum serve"},
+        ]
+        entrypoint_only_path = root / "entrypoint_only_report.json"
+        write_json(entrypoint_only_path, entrypoint_only)
+        try:
+            build_artifact(
+                report_path=entrypoint_only_path,
+                out_dir=root / "entrypoint_only_out",
+                model_id_override=None,
+                format_override=None,
+            )
+        except GateError as exc:
+            if "must include command_line or command" not in str(exc):
+                raise AssertionError(f"unexpected entrypoint-only error: {exc}") from exc
+        else:
+            raise AssertionError("entrypoint-only product evidence unexpectedly passed")
+
+        hidden_env = as_object(load_json(report), "selftest report")
+        hidden_env["commands"][0]["command_line"] = [
+            "FERRUM_FORCE_FAST_PATH=1",
+            "ferrum",
+            "run",
+            "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+            "--backend",
+            "cuda",
+        ]
+        hidden_env_path = root / "hidden_env_command_report.json"
+        write_json(hidden_env_path, hidden_env)
+        try:
+            build_artifact(
+                report_path=hidden_env_path,
+                out_dir=root / "hidden_env_out",
+                model_id_override=None,
+                format_override=None,
+            )
+        except GateError as exc:
+            if "hidden env override" not in str(exc):
+                raise AssertionError(f"unexpected hidden-env command error: {exc}") from exc
+        else:
+            raise AssertionError("hidden-env product command unexpectedly passed")
 
     print("W3 L2 QUANTIZED SELFTEST PASS")
     return 0

@@ -15,6 +15,30 @@
 
 ## Latest Source Progress
 
+### 2026-06-22 L2 Product-Command Gate Hardening
+
+- `scripts/release/w3_l2_quantized_gate.py` now requires real
+  `command_line` evidence for both `ferrum run` and `ferrum serve`.
+- Declaration-only evidence such as `product_entrypoints` or
+  `{"entrypoint": "ferrum run"}` no longer counts toward W3 L2 product
+  coverage.
+- L2 command evidence is normalized, must invoke the `ferrum` binary, must
+  contain exactly one of `run` / `serve`, and must not embed hidden
+  `FERRUM_*=` overrides.
+- `scripts/release/model_release_grade_goal_gate.py` now re-checks those L2
+  commands in the final W3 validator. It still tolerates older artifacts with
+  extra declaration-only entries as long as real command lines cover both
+  required product entrypoints.
+- Validation passed locally:
+  `python3 -m py_compile scripts/release/w3_l2_quantized_gate.py scripts/release/model_release_grade_goal_gate.py`,
+  `python3 scripts/release/w3_l2_quantized_gate.py --self-test`,
+  `python3 scripts/release/model_release_grade_goal_gate.py --self-test`,
+  `python3 scripts/release/w3_qwen35_real_product_report.py --self-test`, an
+  existing-artifact L2 final-validator probe, a temporary re-package of the
+  historical real known-answer report, and `git diff --check`.
+- Direct SSH probe to `ssh7.vast.ai:22822` still returned
+  `Connection refused`, so no CUDA run was started from this checkpoint.
+
 ### 2026-06-22 L5 Release-Command Gate Hardening
 
 - `scripts/release/w3_l5_concurrency_gate.py` now requires saved
