@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 struct ContinuousBatchRuntimeConfig {
     prompt_token_estimate: bool,
     prefill_first_until_active: Option<usize>,
+    prefill_step_chunk: Option<usize>,
     active_decode_prefill_chunk: Option<usize>,
     scheduler_none_prof: bool,
 }
@@ -44,6 +45,7 @@ impl ContinuousBatchRuntimeConfig {
         Self {
             prompt_token_estimate: config.prompt_token_estimate,
             prefill_first_until_active: config.prefill_first_until_active,
+            prefill_step_chunk: config.prefill_step_chunk,
             active_decode_prefill_chunk: config.active_decode_prefill_chunk,
             scheduler_none_prof: config.scheduler_none_prof,
         }
@@ -491,6 +493,7 @@ impl ContinuousBatchScheduler {
         &self,
         req: &ContinuousBatchRequest,
         active_decode_prefill_chunk: Option<usize>,
+        prefill_step_chunk: Option<usize>,
         step_tokens_remaining: usize,
     ) -> usize {
         if step_tokens_remaining == 0 {
@@ -499,6 +502,9 @@ impl ContinuousBatchScheduler {
         if let Some(chunk) =
             self.maybe_active_decode_prefill_chunk(req, active_decode_prefill_chunk)
         {
+            let chunk = prefill_step_chunk
+                .map(|step_chunk| step_chunk.min(chunk))
+                .unwrap_or(chunk);
             return self
                 .chunked_prefill_budget_tokens(req, chunk)
                 .min(step_tokens_remaining)
@@ -506,6 +512,12 @@ impl ContinuousBatchScheduler {
         }
 
         let remaining = self.remaining_prefill_tokens(req);
+        if let Some(chunk) = prefill_step_chunk {
+            return self
+                .chunked_prefill_budget_tokens(req, chunk)
+                .min(step_tokens_remaining)
+                .max(1);
+        }
         if self.cb_config.enable_chunked_prefill {
             remaining.min(step_tokens_remaining).max(1)
         } else {
@@ -564,6 +576,7 @@ impl ContinuousBatchScheduler {
         scheduled_request_ids: &mut HashSet<RequestId>,
         active_decode_prefill_tokens_remaining: &mut Option<usize>,
         active_decode_prefill_chunk: Option<usize>,
+        prefill_step_chunk: Option<usize>,
     ) {
         if batch_requests.len() >= hint.max_batch_size || *total_tokens >= hint.max_tokens {
             return;
@@ -582,8 +595,12 @@ impl ContinuousBatchScheduler {
             if let Some(remaining) = active_decode_prefill_tokens_remaining.as_ref() {
                 step_tokens_remaining = step_tokens_remaining.min(*remaining);
             }
-            let prefill_chunk_tokens =
-                self.prefill_budget_tokens(req, active_decode_prefill_chunk, step_tokens_remaining);
+            let prefill_chunk_tokens = self.prefill_budget_tokens(
+                req,
+                active_decode_prefill_chunk,
+                prefill_step_chunk,
+                step_tokens_remaining,
+            );
             // Skip fully-prefilled requests that are still in the queue
             // (they'll be promoted by mark_prefill_chunk_processed on the
             // next iteration boundary).
@@ -657,6 +674,7 @@ impl ContinuousBatchScheduler {
         let scheduled_decode_count = batch_requests.len();
         let active_decode_prefill_chunk =
             self.active_decode_prefill_chunk_for_iteration(&hint, scheduled_decode_count);
+        let prefill_step_chunk = self.runtime_config.prefill_step_chunk;
         let mut active_decode_prefill_tokens_remaining = self.active_decode_prefill_budget_tokens(
             &hint,
             scheduled_decode_count,
@@ -678,6 +696,7 @@ impl ContinuousBatchScheduler {
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
             active_decode_prefill_chunk,
+            prefill_step_chunk,
         );
 
         // Check if we should admit new requests from waiting queue
@@ -715,6 +734,7 @@ impl ContinuousBatchScheduler {
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
             active_decode_prefill_chunk,
+            prefill_step_chunk,
         );
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
@@ -1676,6 +1696,44 @@ mod tests {
                 .all(|request| !first_ids.contains(&request.request.id)),
             "fill-first should schedule more prefills before decoding early requests"
         );
+    }
+
+    #[test]
+    fn prefill_step_chunk_caps_prefill_first_batches() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            prefill_first_until_active: Some(4),
+            prefill_step_chunk: Some(128),
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 512),
+            );
+        }
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 8,
+                max_tokens: 2048,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+
+        assert_eq!(batch.requests.len(), 4);
+        assert_eq!(
+            batch
+                .requests
+                .iter()
+                .map(|request| request.tokens_to_process)
+                .collect::<Vec<_>>(),
+            vec![Some(128), Some(128), Some(128), Some(128)]
+        );
+        assert_eq!(batch.resource_requirements.gpu_memory, (4 * 128) * 16);
     }
 
     #[test]
