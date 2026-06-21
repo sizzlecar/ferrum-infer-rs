@@ -952,6 +952,25 @@ fn qwen35_has_repetition_penalties(penalties: &[Option<&GreedyRepetitionPenalty>
         .any(|penalty| !penalty.is_empty())
 }
 
+fn qwen35_should_merge_decode_rows_into_paged_continuation(
+    use_paged_kv: bool,
+    greedy_argmax: bool,
+    policies: &[LogitsReturnPolicy],
+    item_count: usize,
+    has_continuation_rows: bool,
+) -> bool {
+    if !use_paged_kv || !has_continuation_rows {
+        return false;
+    }
+    if policies.is_empty() {
+        return !greedy_argmax;
+    }
+    policies.len() == item_count
+        && policies
+            .iter()
+            .all(LogitsReturnPolicy::requires_full_logits)
+}
+
 pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<LlmRuntimeConfig> {
     let config =
         Qwen35TextConfig::from_model_definition(def).map_err(ferrum_types::FerrumError::model)?;
@@ -2178,6 +2197,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         let mut decode = Vec::new();
         let mut decode_rows = Vec::new();
         let mut decode_policies = Vec::new();
+        let mut decode_candidate_rows = Vec::new();
         let mut chunk_rows = Vec::new();
 
         for (row, (cache_id, tokens, pos_offset, is_final_chunk)) in items.iter().enumerate() {
@@ -2201,16 +2221,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 )));
             }
             if tokens.len() == 1 && *is_final_chunk && state_len > 0 {
-                let pos = u32::try_from(*pos_offset).map_err(|_| {
-                    FerrumError::model(format!(
-                        "Qwen3.5 unified_forward position for {cache_id:?} exceeds u32"
-                    ))
-                })?;
-                decode.push((cache_id.clone(), tokens[0], pos));
-                decode_rows.push(row);
-                if policies.len() == items.len() {
-                    decode_policies.push(policies[row].clone());
-                }
+                decode_candidate_rows.push(row);
             } else if *pos_offset == 0 {
                 fresh_prefill.push((
                     cache_id.clone(),
@@ -2221,6 +2232,32 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 fresh_rows.push(row);
             } else {
                 chunk_rows.push(row);
+            }
+        }
+
+        let merge_decode_with_continuation =
+            qwen35_should_merge_decode_rows_into_paged_continuation(
+                self.use_paged_kv,
+                self.greedy_argmax,
+                policies,
+                items.len(),
+                !chunk_rows.is_empty(),
+            );
+        if merge_decode_with_continuation {
+            chunk_rows.extend(decode_candidate_rows.iter().copied());
+        } else {
+            for row in decode_candidate_rows {
+                let (cache_id, tokens, pos_offset, _) = &items[row];
+                let pos = u32::try_from(*pos_offset).map_err(|_| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 unified_forward position for {cache_id:?} exceeds u32"
+                    ))
+                })?;
+                decode.push((cache_id.clone(), tokens[0], pos));
+                decode_rows.push(row);
+                if policies.len() == items.len() {
+                    decode_policies.push(policies[row].clone());
+                }
             }
         }
 
@@ -12807,6 +12844,68 @@ mod tests {
         };
         assert!(repetition_penalties[0].is_some());
         assert!(repetition_penalties[1].is_none());
+    }
+
+    #[test]
+    fn qwen35_decode_merge_policy_preserves_argmax_contract() {
+        assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
+            false,
+            false,
+            &[],
+            2,
+            true
+        ));
+        assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
+            true,
+            false,
+            &[],
+            2,
+            false
+        ));
+        assert!(qwen35_should_merge_decode_rows_into_paged_continuation(
+            true,
+            false,
+            &[],
+            2,
+            true
+        ));
+        assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
+            true,
+            true,
+            &[],
+            2,
+            true
+        ));
+
+        let full_logits = [
+            LogitsReturnPolicy::FullLogits,
+            LogitsReturnPolicy::FullLogits,
+        ];
+        assert!(qwen35_should_merge_decode_rows_into_paged_continuation(
+            true,
+            true,
+            &full_logits,
+            2,
+            true
+        ));
+
+        let greedy = [
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: None,
+                repetition_penalty: None,
+            },
+            LogitsReturnPolicy::FullLogits,
+        ];
+        assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
+            true, true, &greedy, 2, true
+        ));
+        assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
+            true,
+            true,
+            &full_logits[..1],
+            2,
+            true
+        ));
     }
 
     #[test]
