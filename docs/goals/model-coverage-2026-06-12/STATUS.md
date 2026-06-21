@@ -2,6 +2,35 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ57 — Qwen35 weight plan accepts GPTQ-only required linears
+
+- Scope:
+  - changed Qwen3.5/Qwen3.6 weight inventory resolution so required linear
+    roles can be satisfied by either dense `.weight` tensors or a complete
+    GPTQ tensor set: `.qweight`, `.scales`, and `.qzeros`;
+  - resolved GPTQ linear specs now keep the present `.qweight` name, while
+    `Qwen35WeightPlanLoader` still converts it back to the module name before
+    calling `WeightLoader::load_linear`, matching the existing
+    `NativeSafetensorsLoader` GPTQ path;
+  - incomplete GPTQ aliases do not satisfy the manifest, so a lone `.qweight`
+    or missing `.qzeros` remains a loud missing-weight failure;
+  - this removes a real-model blocker where a Qwen3.5 GPTQ checkpoint with
+    quantized required linears could be rejected by the plan layer before the
+    GPTQ-capable loader was reached.
+- Validation passed locally:
+  - `cargo test -p ferrum-models qwen35_weights -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - source/loader-boundary progress only; CUDA correctness/performance still
+    has not run;
+  - `mlp.shared_expert_gate.weight` is still loaded as a raw tensor in Ferrum
+    and needs real-checkpoint confirmation or a follow-up linear-loader repair
+    if the GPTQ checkpoint quantizes that one-output gate;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ56 — Qwen35 full-attention official-like backend shape is locked
 
 - Scope:
