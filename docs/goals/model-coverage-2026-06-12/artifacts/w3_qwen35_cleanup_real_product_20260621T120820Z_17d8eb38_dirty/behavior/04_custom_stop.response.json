@@ -1,0 +1,1 @@
+{"id":"20fd70f0-5f6f-4f5c-b08a-5873c56bb9e3","object":"chat.completion","created":1782043766,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"message":{"role":"assistant","content":"alpha "},"finish_reason":"stop"}],"usage":{"prompt_tokens":22,"completion_tokens":4,"total_tokens":26}}

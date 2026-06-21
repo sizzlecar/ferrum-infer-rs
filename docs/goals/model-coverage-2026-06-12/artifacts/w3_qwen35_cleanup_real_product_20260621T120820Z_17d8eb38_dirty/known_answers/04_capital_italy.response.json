@@ -1,0 +1,1 @@
+{"id":"b07ec4ce-db7d-4e5d-bbb4-9c4546c6fe30","object":"chat.completion","created":1782043765,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"message":{"role":"assistant","content":"Rome"},"finish_reason":"stop"}],"usage":{"prompt_tokens":24,"completion_tokens":3,"total_tokens":27}}

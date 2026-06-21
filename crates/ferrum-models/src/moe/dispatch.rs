@@ -1910,6 +1910,14 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     };
     if let Some((sorted_tokens, block_ids, total_post_pad)) = vllm_refs {
         // fp32_reduce path: kernel writes C directly via global reduce.
+        #[cfg(feature = "cuda")]
+        let _marlin_label = if ferrum_kernels::backend::cuda::marlin::profile_marlin() {
+            Some(ferrum_kernels::backend::cuda::push_alloc_label(
+                "moe.vllm.gate_up_proj",
+            ))
+        } else {
+            None
+        };
         if use_vllm_pair_ids {
             gu_store.gemm_phase_vllm(
                 ctx,
@@ -2004,6 +2012,14 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         None
     };
     if let Some((sorted_tokens, block_ids, total_post_pad)) = vllm_refs {
+        #[cfg(feature = "cuda")]
+        let _marlin_label = if ferrum_kernels::backend::cuda::marlin::profile_marlin() {
+            Some(ferrum_kernels::backend::cuda::push_alloc_label(
+                "moe.vllm.down_proj",
+            ))
+        } else {
+            None
+        };
         d_store.gemm_phase_vllm(
             ctx,
             silu_packed,

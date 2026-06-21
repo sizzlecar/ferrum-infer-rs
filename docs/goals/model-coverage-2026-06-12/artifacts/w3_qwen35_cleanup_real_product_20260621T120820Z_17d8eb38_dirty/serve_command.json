@@ -1,0 +1,27 @@
+{
+  "command_line": [
+    "/workspace/ferrum-w3-clean-b6/target/release/ferrum",
+    "serve",
+    "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18261",
+    "--backend",
+    "cuda",
+    "--gpu-devices",
+    "0",
+    "--gpu-memory-utilization",
+    "0.90",
+    "--max-model-len",
+    "2048",
+    "--max-num-seqs",
+    "32",
+    "--max-num-batched-tokens",
+    "8192",
+    "--kv-capacity",
+    "2048"
+  ],
+  "port": 18261,
+  "request_model": "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b"
+}

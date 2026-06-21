@@ -146,6 +146,63 @@ enum MarlinProfileBucket {
 static MARLIN_PROFILE_BY_PROJECTION: Mutex<MarlinProfileByProjection> =
     Mutex::new(MarlinProfileByProjection::ZERO);
 
+struct CudaMarlinEventTimer {
+    start: cudarc::driver::sys::CUevent,
+    end: cudarc::driver::sys::CUevent,
+}
+
+impl CudaMarlinEventTimer {
+    fn start(raw_stream: cudarc::driver::sys::CUstream) -> Option<Self> {
+        use cudarc::driver::sys as cu;
+        let mut start: cu::CUevent = std::ptr::null_mut();
+        let mut end: cu::CUevent = std::ptr::null_mut();
+        unsafe {
+            let _ = cu::cuEventCreate(&mut start, 0);
+            let _ = cu::cuEventCreate(&mut end, 0);
+        }
+        if start.is_null() || end.is_null() {
+            unsafe {
+                if !start.is_null() {
+                    let _ = cu::cuEventDestroy_v2(start);
+                }
+                if !end.is_null() {
+                    let _ = cu::cuEventDestroy_v2(end);
+                }
+            }
+            return None;
+        }
+        let timer = Self { start, end };
+        timer.record_start(raw_stream);
+        Some(timer)
+    }
+
+    fn record_start(&self, raw_stream: cudarc::driver::sys::CUstream) {
+        unsafe {
+            let _ = cudarc::driver::sys::cuEventRecord(self.start, raw_stream);
+        }
+    }
+
+    fn finish_us(&self, raw_stream: cudarc::driver::sys::CUstream) -> u64 {
+        unsafe {
+            let _ = cudarc::driver::sys::cuEventRecord(self.end, raw_stream);
+            let _ = cudarc::driver::sys::cuEventSynchronize(self.end);
+        }
+        (unsafe { cudarc::driver::result::event::elapsed(self.start, self.end) }
+            .ok()
+            .unwrap_or(0.0) as f64
+            * 1000.0) as u64
+    }
+}
+
+impl Drop for CudaMarlinEventTimer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cudarc::driver::sys::cuEventDestroy_v2(self.start);
+            let _ = cudarc::driver::sys::cuEventDestroy_v2(self.end);
+        }
+    }
+}
+
 fn marlin_profile_bucket_from_label(label: &str) -> MarlinProfileBucket {
     if label.contains("qkv_proj") {
         MarlinProfileBucket::Qkv
@@ -481,21 +538,15 @@ fn marlin_gemm_chunk(
     // Zero workspace on the runner's stream — Marlin uses it as mutex locks.
     // All operations (memset + kernel) on same stream → naturally ordered.
     if should_zero_workspace(cuda_marlin_runtime_config()) {
-        if profile {
-            stream
-                .synchronize()
-                .map_err(|e| candle_core::Error::Msg(format!("marlin ws profile pre-sync: {e}")))?;
-        }
-        let t0 = profile.then(std::time::Instant::now);
+        let timer = profile
+            .then(|| CudaMarlinEventTimer::start(raw_stream))
+            .flatten();
         let (ws_ptr, _guard) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, weight.workspace.len(), raw_stream);
         }
-        if let Some(t0) = t0 {
-            stream.synchronize().map_err(|e| {
-                candle_core::Error::Msg(format!("marlin ws profile post-sync: {e}"))
-            })?;
-            let elapsed_us = t0.elapsed().as_micros() as u64;
+        if let Some(timer) = timer {
+            let elapsed_us = timer.finish_us(raw_stream);
             MARLIN_WS_ZERO_TIME_US.fetch_add(elapsed_us, Ordering::Relaxed);
             MARLIN_WS_ZERO_CALLS.fetch_add(1, Ordering::Relaxed);
             if let Some(bucket) = profile_bucket {
@@ -537,12 +588,9 @@ fn marlin_gemm_chunk(
         }
     }
 
-    if profile {
-        stream
-            .synchronize()
-            .map_err(|e| candle_core::Error::Msg(format!("marlin kernel profile pre-sync: {e}")))?;
-    }
-    let t0 = profile.then(std::time::Instant::now);
+    let timer = profile
+        .then(|| CudaMarlinEventTimer::start(raw_stream))
+        .flatten();
     let ret = unsafe {
         marlin_cuda(
             a_ptr as *const _,
@@ -563,11 +611,8 @@ fn marlin_gemm_chunk(
             -1, // prob_n_full = prob_n (non-stacked)
         )
     };
-    if let Some(t0) = t0 {
-        stream.synchronize().map_err(|e| {
-            candle_core::Error::Msg(format!("marlin kernel profile post-sync: {e}"))
-        })?;
-        let elapsed_us = t0.elapsed().as_micros() as u64;
+    if let Some(timer) = timer {
+        let elapsed_us = timer.finish_us(raw_stream);
         MARLIN_KERNEL_TIME_US.fetch_add(elapsed_us, Ordering::Relaxed);
         MARLIN_KERNEL_CALLS.fetch_add(1, Ordering::Relaxed);
         if let Some(bucket) = profile_bucket {
@@ -1037,6 +1082,8 @@ pub fn marlin_gemm_moe_vllm(
 ) -> candle_core::Result<()> {
     use cudarc::driver::DevicePtr;
     let raw_stream = stream.cu_stream();
+    let profile = profile_marlin();
+    let profile_bucket = profile.then(current_marlin_profile_bucket);
 
     let (a_ptr, _ag) = input.device_ptr(stream);
     let (b_ptr, _bg) = weight.qweight.device_ptr(stream);
@@ -1060,6 +1107,9 @@ pub fn marlin_gemm_moe_vllm(
         None => std::ptr::null(),
     };
 
+    let timer = profile
+        .then(|| CudaMarlinEventTimer::start(raw_stream))
+        .flatten();
     let ret = unsafe {
         ferrum_vllm_marlin_moe_f16(
             a_ptr as *const _,
@@ -1091,6 +1141,14 @@ pub fn marlin_gemm_moe_vllm(
             if c_tmp_ptr.is_null() { 0 } else { 1 }, // use_fp32_reduce
         )
     };
+    if let Some(timer) = timer {
+        let elapsed_us = timer.finish_us(raw_stream);
+        MARLIN_KERNEL_TIME_US.fetch_add(elapsed_us, Ordering::Relaxed);
+        MARLIN_KERNEL_CALLS.fetch_add(1, Ordering::Relaxed);
+        if let Some(bucket) = profile_bucket {
+            record_marlin_kernel(bucket, elapsed_us);
+        }
+    }
     if ret != 0 {
         return Err(candle_core::Error::Msg(format!(
             "ferrum_vllm_marlin_moe_f16 failed: ret={ret} (m={prob_m}, n={prob_n}, k={prob_k})"
