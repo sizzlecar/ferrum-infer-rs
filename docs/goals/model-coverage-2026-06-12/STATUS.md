@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ41 — Qwen35 fresh GDN prefill skips initial recurrent state gather
+
+- Scope:
+  - made Qwen3.5 batch linear-attention prefill carry an explicit
+    `fresh_initial_linear_state` semantic from the fresh final prefill entry;
+  - fresh batch prefill now passes zero-initialized initial conv/GDN state
+    slabs directly into the varlen core instead of gathering per-sequence
+    zero state buffers for every linear-attention layer;
+  - non-fresh/chunked semantics keep the old gather path so future chunked
+    prefill can still feed real recurrent state;
+  - added a CPU unit test proving `fresh_initial_linear_state=true` ignores
+    dirty sequence-local state and produces zero slabs, while
+    `fresh_initial_linear_state=false` still gathers the existing state.
+- Why:
+  - `forward_stateful_prefill_batch` already rejects non-fresh work:
+    `pos_offset != 0`, non-final chunks, non-empty tokens, and non-empty
+    full-attention KV all fail before this path;
+  - CPU and CUDA `alloc_typed(F32)` are zero-initialized, so this removes
+    redundant GPU copies while preserving the current product-path semantics;
+  - this complements the previous indexed-pool scatter skip by reducing the
+    other side of the per-layer prefill state-copy cost.
+- Validation passed locally:
+  - `cargo fmt --all -- --check`;
+  - `cargo test -p ferrum-models qwen35_fresh_prefill_initial_state_slabs_are_zero_not_gathered -- --nocapture`;
+  - `cargo test -p ferrum-models linear_attention_prefill_varlen_backend_matches_per_sequence_stateful_reference -- --nocapture`;
+  - `cargo check --workspace --all-targets`.
+- Status:
+  - this is source/hot-path progress, not a performance claim;
+  - local machine still has no `nvcc`, so CUDA feature build, CUDA parity, and
+    same-hardware c32 diagnostics are pending on the next available 1x RTX
+    4090 lane;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ40 — Qwen35 GDN prefill now uses vLLM-style packed qkvz/ba source path
 
 - Scope:
