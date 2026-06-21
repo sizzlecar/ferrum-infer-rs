@@ -1091,6 +1091,18 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
                 "strict_schema_total": 20,
                 "strict_schema_passed": 20,
             },
+            "negative_contracts": {
+                "tool_choice_400": True,
+                "response_format_400": True,
+            },
+            "tool_call_cases": [
+                {"id": f"tool_{idx:02d}", "passed": True, "finish_reason": "tool_calls"}
+                for idx in range(10)
+            ],
+            "strict_schema_cases": [
+                {"id": f"strict_schema_{idx:02d}", "passed": True, "finish_reason": "stop"}
+                for idx in range(20)
+            ],
         },
     )
     cells = []

@@ -345,6 +345,10 @@ def run_selftest() -> int:
                 "strict_schema_total": len(strict_results),
                 "strict_schema_passed": len(strict_results),
             },
+            "negative_contracts": {
+                "tool_choice_400": True,
+                "response_format_400": True,
+            },
             "tool_call_cases": tool_results,
             "strict_schema_cases": strict_results,
         }

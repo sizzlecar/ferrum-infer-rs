@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ65 — W3 L4 final validator checks case-level tool/schema evidence
+
+- Scope:
+  - hardened `scripts/release/model_release_grade_goal_gate.py` so W3 L4
+    final validation no longer trusts only aggregate tool/schema counts;
+  - L4 artifacts must now include `negative_contracts.tool_choice_400=true`
+    and `negative_contracts.response_format_400=true`;
+  - L4 artifacts must include `tool_call_cases` with per-case `passed=true`
+    and `finish_reason=tool_calls`;
+  - L4 artifacts must include `strict_schema_cases` with per-case
+    `passed=true` and non-`length` finish reasons;
+  - updated `w3_l4_agent_gate.py --self-test` and
+    `model_release_grade_manifest.py --self-test` fixtures to emit those
+    details.
+- Why:
+  - W3 explicitly requires required-tool and strict structured-output behavior;
+  - before this change, a hand-written L4 artifact could satisfy the final
+    validator with only aggregate counts.
+- Validation passed locally:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py scripts/release/w3_l4_agent_gate.py`;
+  - `python3 scripts/release/w3_l4_agent_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - direct final-validator probe of existing real W3 L4 artifact
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/l4_agent/w3_l4_agent.json`;
+  - `git diff --check`.
+- Status:
+  - source/tooling progress only; no new CUDA correctness or performance claim;
+  - W3 remains incomplete and there is still no real
+    `MODEL_RELEASE_GRADE_W3 PASS` artifact directory.
+
 ## 2026-06-22 ZZZ64 — W3 manifest self-test matches hardened L2/L5 contracts
 
 - Scope:
