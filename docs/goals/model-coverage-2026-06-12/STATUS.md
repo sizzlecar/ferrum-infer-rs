@@ -2,6 +2,27 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ72 — 1x4090 W3 diagnostic lane start blocked by Vast resource state
+
+- Scope:
+  - attempted to start the existing Vast 1x RTX 4090 instance `41422823`
+    after recording the paid-GPU lane contract for W3 Qwen3.5 GPTQ-Int4 CUDA
+    build, product correctness smoke, and c32 diagnostic benchmark;
+  - saved the non-secret startup artifact under
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_token_rows_cuda_diag_20260621T231558Z_8b33416d/`;
+  - removed the raw Vast instance response because it contained a provider
+    `jupyter_token`; only sanitized status remains in the committed artifact.
+- Result:
+  - initial SSH to `ssh7.vast.ai:22822` failed with `Connection refused`;
+  - Vast start response was `success=false`, `error=resources_unavailable`,
+    `msg="Required resources are currently unavailable, state change queued."`;
+  - follow-up instance list still reported `cur_state=stopped` and
+    `actual_status=exited` for instance `41422823`.
+- Status:
+  - no CUDA build, correctness smoke, or c32 benchmark ran;
+  - no performance claim;
+  - next GPU step still requires a reachable running 1x RTX 4090 instance.
+
 ## 2026-06-22 ZZZ71 — W3 S1 archived absolute artifact paths are relocatable
 
 - Scope:

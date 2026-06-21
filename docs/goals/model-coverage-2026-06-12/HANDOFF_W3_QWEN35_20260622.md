@@ -19,6 +19,22 @@
 
 ## Latest Source Progress
 
+### 2026-06-22 Vast 1x4090 Start Blocked
+
+- Tried to start existing Vast instance `41422823` for the W3 Qwen3.5
+  GPTQ-Int4 CUDA build + correctness smoke + c32 diagnostic lane.
+- SSH to `ssh7.vast.ai:22822` returned `Connection refused` because the
+  instance is still stopped.
+- Vast start response was `success=false`, `error=resources_unavailable`, with
+  the message that required resources are unavailable and the state change was
+  queued.
+- Follow-up instance list still reported `cur_state=stopped` and
+  `actual_status=exited`.
+- Non-secret artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_token_rows_cuda_diag_20260621T231558Z_8b33416d/`.
+- No CUDA build or benchmark ran. The next GPU step still needs a reachable
+  running 1x RTX 4090 instance.
+
 ### 2026-06-22 Final Validator Archived S1 Path Resolution
 
 - `scripts/release/model_release_grade_goal_gate.py` now treats archived
