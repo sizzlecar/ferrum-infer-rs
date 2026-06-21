@@ -530,8 +530,12 @@ impl ContinuousBatchScheduler {
         hint: &BatchHint,
         scheduled_decode_count: usize,
         active_decode_prefill_chunk: Option<usize>,
+        prefill_step_chunk: Option<usize>,
     ) -> Option<usize> {
         let chunk = active_decode_prefill_chunk?;
+        let chunk = prefill_step_chunk
+            .map(|step_chunk| step_chunk.min(chunk))
+            .unwrap_or(chunk);
         if scheduled_decode_count == 0 {
             return None;
         }
@@ -679,6 +683,7 @@ impl ContinuousBatchScheduler {
             &hint,
             scheduled_decode_count,
             active_decode_prefill_chunk,
+            prefill_step_chunk,
         );
 
         // Then, add prefill requests up to the per-iter token budget.
@@ -1852,6 +1857,58 @@ mod tests {
             "high decode pressure should admit only one prefill chunk"
         );
         assert_eq!(mixed_batch.resource_requirements.gpu_memory, (6 + 64) * 16);
+    }
+
+    #[test]
+    fn active_decode_prefill_budget_uses_effective_step_chunk_for_aggregate_cap() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 32,
+            prompt_token_estimate: true,
+            active_decode_prefill_chunk: Some(8192),
+            prefill_step_chunk: Some(64),
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 32,
+            max_tokens: 8192,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let mut decode_ids = Vec::new();
+        for _ in 0..7 {
+            let request = create_test_request_with_prompt_tokens(Priority::Normal, 128);
+            decode_ids.push(request.id.clone());
+            enqueue_waiting(&scheduler, request);
+        }
+        let initial_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(initial_batch.requests.len(), 7);
+        for id in &decode_ids {
+            scheduler.mark_prefill_complete(id, 128);
+        }
+
+        for _ in 0..25 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
+        let prefill_tokens: Vec<_> = mixed_batch
+            .requests
+            .iter()
+            .filter(|request| request.tokens_to_process != Some(1))
+            .map(|request| request.tokens_to_process)
+            .collect();
+        assert_eq!(
+            mixed_batch.requests.len(),
+            11,
+            "large explicit active chunks must not bypass the prefill-step aggregate cap"
+        );
+        assert_eq!(prefill_tokens, vec![Some(64), Some(64), Some(64), Some(64)]);
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (7 + 256) * 16);
     }
 
     #[tokio::test]
