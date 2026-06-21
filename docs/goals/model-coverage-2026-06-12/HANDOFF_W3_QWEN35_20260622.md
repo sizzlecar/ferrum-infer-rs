@@ -168,6 +168,10 @@ adding model-name defaults or hidden environment switches.
   to the module name before `WeightLoader::load_linear`, matching the existing
   `NativeSafetensorsLoader` GPTQ path. Incomplete GPTQ aliases still fail the
   manifest instead of being treated as usable weights.
+- `mlp.shared_expert_gate` now also uses the linear-loader boundary instead of
+  a raw tensor GEMM. This matches vLLM's `ReplicatedLinear(hidden_size, 1)`
+  modeling and lets dense or GPTQ shared-expert gate weights use the same
+  `WeightLoader::load_linear` path as router and shared expert projections.
 - Existing Vast instance `41422823` was checked for a W3 Qwen35 mixed-prefill
   CUDA smoke/c32 diagnostic. SSH to `ssh7.vast.ai:22822` returned connection
   refused, and the sanitized API summary says `cur_state=stopped`,
@@ -261,6 +265,8 @@ cargo test -p ferrum-models \
   full_attention_backend_core_matches_reference -- --nocapture
 cargo check -p ferrum-models
 cargo test -p ferrum-models qwen35_weights -- --nocapture
+cargo test -p ferrum-models \
+  sparse_moe_shared_expert_composes_router_fused_experts_and_shared_gate -- --nocapture
 cargo check -p ferrum-models
 cargo check -p ferrum-engine
 cargo fmt --all -- --check
@@ -389,10 +395,9 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   `q_proj_total` is twice `q_total`, RoPE is partial/interleaved, and `o_proj`
   consumes `q_total`, not `hidden_size`.
 - Real GPTQ checkpoint inventory should now pass for required linears that are
-  present only as `.qweight/.scales/.qzeros`. If the next real load still fails
-  on `mlp.shared_expert_gate.weight`, inspect the checkpoint first: Ferrum still
-  loads that one-output gate as a raw tensor, while vLLM models it as a
-  `ReplicatedLinear`.
+  present only as `.qweight/.scales/.qzeros`, including
+  `mlp.shared_expert_gate`. If real load still fails at this boundary, inspect
+  the checkpoint tensor names first before adding aliases.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly

@@ -155,7 +155,7 @@ pub struct Qwen35DenseMlpWeights<B: MoeLlmBackend> {
 pub struct Qwen35SparseMoeSharedExpertWeights<B: MoeLlmBackend> {
     pub router: Box<dyn Linear<B>>,
     pub experts: ExpertStack<B>,
-    pub shared_expert_gate: B::Buffer,
+    pub shared_expert_gate: Box<dyn Linear<B>>,
     pub shared_expert_gate_up_proj: Box<dyn Linear<B>>,
     pub shared_expert_down_proj: Box<dyn Linear<B>>,
     pub fused_gate_up_proj: B::Buffer,
@@ -5678,7 +5678,9 @@ pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
             shape.num_experts
         )));
     }
-    if moe.shared_expert_gate_up_proj.in_features() != shape.hidden_size
+    if moe.shared_expert_gate.in_features() != shape.hidden_size
+        || moe.shared_expert_gate.out_features() != 1
+        || moe.shared_expert_gate_up_proj.in_features() != shape.hidden_size
         || moe.shared_expert_gate_up_proj.out_features()
             != 2 * shape.shared_expert_intermediate_size
         || moe.shared_expert_down_proj.in_features() != shape.shared_expert_intermediate_size
@@ -5781,15 +5783,8 @@ pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
 
     let mut shared_gate = B::alloc(shape.tokens);
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::gemm(
-        ctx,
-        x,
-        &moe.shared_expert_gate,
-        &mut shared_gate,
-        shape.tokens,
-        1,
-        shape.hidden_size,
-    );
+    moe.shared_expert_gate
+        .forward(ctx, x, &mut shared_gate, shape.tokens);
     detail.shared_gate_us +=
         qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_gate");
     qwen35_trace_layer_buffer_stats::<B>(
@@ -5945,7 +5940,9 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
             shape.num_experts
         )));
     }
-    if moe.shared_expert_gate_up_proj.in_features() != shape.hidden_size
+    if moe.shared_expert_gate.in_features() != shape.hidden_size
+        || moe.shared_expert_gate.out_features() != 1
+        || moe.shared_expert_gate_up_proj.in_features() != shape.hidden_size
         || moe.shared_expert_gate_up_proj.out_features()
             != 2 * shape.shared_expert_intermediate_size
         || moe.shared_expert_down_proj.in_features() != shape.shared_expert_intermediate_size
@@ -6055,15 +6052,8 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
     );
 
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::gemm(
-        ctx,
-        x,
-        &moe.shared_expert_gate,
-        &mut scratch.shared_gate,
-        shape.tokens,
-        1,
-        shape.hidden_size,
-    );
+    moe.shared_expert_gate
+        .forward(ctx, x, &mut scratch.shared_gate, shape.tokens);
     detail.shared_gate_us +=
         qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_gate");
     qwen35_trace_layer_buffer_stats::<B>(
@@ -11797,7 +11787,7 @@ impl<B: MoeLlmBackend> Qwen35ModelWeights<B> {
                                 router: planned
                                     .load_layer_linear(layer_plan.layer_index, "moe_router")?,
                                 experts,
-                                shared_expert_gate: planned.load_layer_tensor(
+                                shared_expert_gate: planned.load_layer_linear(
                                     layer_plan.layer_index,
                                     "moe_shared_expert_gate",
                                 )?,
