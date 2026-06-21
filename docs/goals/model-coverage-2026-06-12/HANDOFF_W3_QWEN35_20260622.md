@@ -33,10 +33,19 @@ adding model-name defaults or hidden environment switches.
 - Avoided duplicate product batch prefill state scatter when indexed linear
   state pools are present: final GDN/conv state is written to the slot pool,
   and sequence-local buffers are synchronized from the slot only when needed.
+- Avoided the matching fresh-prefill initial state gather: the product batch
+  prefill entry only accepts fresh final chunks, so linear-attention layers now
+  pass zero-initialized initial conv/GDN state slabs directly to the varlen core
+  instead of copying per-sequence zero state buffers every layer. The non-fresh
+  gather path remains for future chunked/non-fresh prefill.
 - Kept separate `qkv/z/b/a` projection fallback for unsupported backends.
 - Added prefill profile fields for `qkvz_proj` and `ba_proj`.
 - Added CPU packed-vs-separate contract test and a CUDA packed-vs-CPU parity
   test for the next GPU lane.
+- Added a CPU fresh-prefill initial-state unit test that verifies
+  `fresh_initial_linear_state=true` produces zero slabs even if sequence-local
+  recurrent state is dirty, while `fresh_initial_linear_state=false` still
+  gathers the existing state.
 
 The key vLLM reference is:
 
@@ -61,6 +70,10 @@ cargo test -p ferrum-models \
   linear_attention_prefill_varlen_compact_core_matches_full_core_outputs -- --nocapture
 cargo test -p ferrum-models \
   linear_attention_prefill_varlen_backend_matches_per_sequence_stateful_reference -- --nocapture
+cargo fmt --all -- --check
+cargo test -p ferrum-models \
+  qwen35_fresh_prefill_initial_state_slabs_are_zero_not_gathered -- --nocapture
+cargo check --workspace --all-targets
 ```
 
 Not yet validated locally:
@@ -128,6 +141,9 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
 - On CUDA indexed-state runs, `qwen35_linear_prefill_state_scatter` should be
   near zero and `qwen35_linear_prefill_pool_scatter` should contain the state
   write cost.
+- Fresh product batch prefill should also show little/no
+  `qwen35_linear_prefill_state_gather` work, because initial recurrent state is
+  now a zero slab instead of per-sequence copies.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly

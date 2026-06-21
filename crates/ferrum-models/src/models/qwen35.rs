@@ -1911,6 +1911,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                         &hidden,
                         states,
                         self.linear_state_pools.as_mut(),
+                        true,
                         layer_index,
                         layer,
                         &weights.config,
@@ -6748,12 +6749,80 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
     Ok(layer_output)
 }
 
+fn qwen35_prepare_linear_prefill_initial_states<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    states: &mut [(String, Qwen35SequenceState<B>)],
+    layer_index: usize,
+    batch_len: usize,
+    conv_state_len: usize,
+    delta_state_len: usize,
+    fresh_initial_linear_state: bool,
+    detail_enabled: bool,
+    detail: &mut Qwen35LinearPrefillDetailProfile,
+) -> Result<(B::Buffer, B::Buffer)> {
+    let mut initial_conv_states = B::alloc_typed(Dtype::F32, batch_len * conv_state_len);
+    let mut initial_delta_states = B::alloc_typed(Dtype::F32, batch_len * delta_state_len);
+    if fresh_initial_linear_state {
+        for (cache_id, state) in states.iter_mut() {
+            let Qwen35LayerRuntimeState::Linear { .. } =
+                state.layers.get_mut(layer_index).ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+                    ))
+                })?
+            else {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 batch prefill expected linear layer state at layer {layer_index} for {cache_id:?}"
+                )));
+            };
+        }
+        return Ok((initial_conv_states, initial_delta_states));
+    }
+
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    for (row, (cache_id, state)) in states.iter_mut().enumerate() {
+        let Qwen35LayerRuntimeState::Linear {
+            conv_state,
+            delta_state,
+        } = state.layers.get_mut(layer_index).ok_or_else(|| {
+            FerrumError::model(format!(
+                "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+            ))
+        })?
+        else {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 batch prefill expected linear layer state at layer {layer_index} for {cache_id:?}"
+            )));
+        };
+        B::copy_slice(
+            ctx,
+            conv_state,
+            0,
+            &mut initial_conv_states,
+            row * conv_state_len,
+            conv_state_len,
+        );
+        B::copy_slice(
+            ctx,
+            delta_state,
+            0,
+            &mut initial_delta_states,
+            row * delta_state_len,
+            delta_state_len,
+        );
+    }
+    detail.state_gather_us +=
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_state_gather");
+    Ok((initial_conv_states, initial_delta_states))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
     ctx: &mut B::Context,
     layer_input: &B::Buffer,
     states: &mut [(String, Qwen35SequenceState<B>)],
     linear_state_pools: Option<&mut Qwen35LinearStatePools<B>>,
+    fresh_initial_linear_state: bool,
     layer_index: usize,
     layer: &Qwen35LayerWeights<B>,
     config: &Qwen35TextConfig,
@@ -6891,42 +6960,18 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
 
     let conv_state_len = qkv_width * attention_shape.conv_kernel.saturating_sub(1);
     let delta_state_len = attention_shape.state_len();
-    let mut initial_conv_states = B::alloc_typed(Dtype::F32, batch_len * conv_state_len);
-    let mut initial_delta_states = B::alloc_typed(Dtype::F32, batch_len * delta_state_len);
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    for (row, (cache_id, state)) in states.iter_mut().enumerate() {
-        let Qwen35LayerRuntimeState::Linear {
-            conv_state,
-            delta_state,
-        } = state.layers.get_mut(layer_index).ok_or_else(|| {
-            FerrumError::model(format!(
-                "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
-            ))
-        })?
-        else {
-            return Err(FerrumError::model(format!(
-                "Qwen3.5 batch prefill expected linear layer state at layer {layer_index} for {cache_id:?}"
-            )));
-        };
-        B::copy_slice(
+    let (initial_conv_states, initial_delta_states) =
+        qwen35_prepare_linear_prefill_initial_states::<B>(
             ctx,
-            conv_state,
-            0,
-            &mut initial_conv_states,
-            row * conv_state_len,
+            states,
+            layer_index,
+            batch_len,
             conv_state_len,
-        );
-        B::copy_slice(
-            ctx,
-            delta_state,
-            0,
-            &mut initial_delta_states,
-            row * delta_state_len,
             delta_state_len,
-        );
-    }
-    detail.state_gather_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_state_gather");
+            fresh_initial_linear_state,
+            detail_enabled,
+            &mut detail,
+        )?;
 
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
     let attention_out = match &mut projection_buffers {
@@ -11641,6 +11686,82 @@ mod tests {
                 "idx {idx}: {got} != {expected}"
             );
         }
+    }
+
+    #[test]
+    fn qwen35_fresh_prefill_initial_state_slabs_are_zero_not_gathered() {
+        let conv_state_len = 3;
+        let delta_state_len = 4;
+        let mut states = vec![
+            (
+                "req-a".to_string(),
+                Qwen35SequenceState {
+                    tokens: Vec::new(),
+                    layers: vec![Qwen35LayerRuntimeState::Linear {
+                        conv_state: CpuBackend::from_slice_typed(&[1.0, 2.0, 3.0]),
+                        delta_state: CpuBackend::from_slice_typed(&[4.0, 5.0, 6.0, 7.0]),
+                    }],
+                    linear_slot: Some(0),
+                },
+            ),
+            (
+                "req-b".to_string(),
+                Qwen35SequenceState {
+                    tokens: Vec::new(),
+                    layers: vec![Qwen35LayerRuntimeState::Linear {
+                        conv_state: CpuBackend::from_slice_typed(&[8.0, 9.0, 10.0]),
+                        delta_state: CpuBackend::from_slice_typed(&[11.0, 12.0, 13.0, 14.0]),
+                    }],
+                    linear_slot: Some(1),
+                },
+            ),
+        ];
+
+        let mut ctx = CpuBackend::new_context();
+        let mut detail = Qwen35LinearPrefillDetailProfile::default();
+        let (fresh_conv, fresh_delta) = qwen35_prepare_linear_prefill_initial_states::<CpuBackend>(
+            &mut ctx,
+            &mut states,
+            0,
+            2,
+            conv_state_len,
+            delta_state_len,
+            true,
+            false,
+            &mut detail,
+        )
+        .unwrap();
+        assert_eq!(
+            CpuBackend::to_vec(&fresh_conv, 2 * conv_state_len),
+            vec![0.0; 6]
+        );
+        assert_eq!(
+            CpuBackend::to_vec(&fresh_delta, 2 * delta_state_len),
+            vec![0.0; 8]
+        );
+        assert_eq!(detail.state_gather_us, 0);
+
+        let (gathered_conv, gathered_delta) =
+            qwen35_prepare_linear_prefill_initial_states::<CpuBackend>(
+                &mut ctx,
+                &mut states,
+                0,
+                2,
+                conv_state_len,
+                delta_state_len,
+                false,
+                false,
+                &mut detail,
+            )
+            .unwrap();
+        assert_eq!(
+            CpuBackend::to_vec(&gathered_conv, 2 * conv_state_len),
+            vec![1.0, 2.0, 3.0, 8.0, 9.0, 10.0]
+        );
+        assert_eq!(
+            CpuBackend::to_vec(&gathered_delta, 2 * delta_state_len),
+            vec![4.0, 5.0, 6.0, 7.0, 11.0, 12.0, 13.0, 14.0]
+        );
     }
 
     fn token_major_to_head_major(
