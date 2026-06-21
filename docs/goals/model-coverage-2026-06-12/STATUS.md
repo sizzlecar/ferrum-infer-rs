@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ56 — Qwen35 full-attention official-like backend shape is locked
+
+- Scope:
+  - added a Qwen3.5 dense full-attention backend/reference parity regression
+    for the official scaled shape family: `hidden_size != q_total`,
+    `q_proj_total = 2 * q_total`, `attn_output_gate=true`,
+    `num_heads > num_kv_heads`, `rope_dim < head_dim`, interleaved partial
+    RoPE, and non-zero `position_offset`;
+  - the regression runs the full dense full-attention layer backend path, not
+    only the CPU reference helper: q projection/gate split, Q/K RMSNorm,
+    partial RoPE, head-major attention, attention output gate, `o_proj`, and
+    the following dense MLP are all compared against the CPU reference;
+  - this closes the previous source-level gap where the official gated
+    `hidden != q_total` shape had a CPU acceptance test but the backend parity
+    coverage still used the non-gated old shape.
+- Validation passed locally:
+  - `cargo test -p ferrum-models dense_full_attention_backend_matches_reference_for_qwen35_gated_official_like_shape -- --nocapture`;
+  - `cargo test -p ferrum-models dense_full_attention -- --nocapture`;
+  - `cargo test -p ferrum-models full_attention_backend_core_matches_reference -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - source/backend-correctness progress only; CUDA correctness/performance still
+    has not run;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ55 — LlmExecutor keeps mixed fresh chunk + decode unified
 
 - Scope:

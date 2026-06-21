@@ -14660,6 +14660,212 @@ mod tests {
     }
 
     #[test]
+    fn dense_full_attention_backend_matches_reference_for_qwen35_gated_official_like_shape() {
+        let attention_shape = Qwen35FullAttentionShape {
+            tokens: 2,
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 4,
+            rope_dim: 2,
+            position_offset: 1,
+            rope_theta: 10_000_000.0,
+            rope_interleaved: true,
+            attn_output_gate: true,
+        };
+        let shape = Qwen35DenseFullAttentionLayerShape {
+            tokens: attention_shape.tokens,
+            hidden_size: 8,
+            intermediate_size: 6,
+            attention: attention_shape,
+        };
+        assert_eq!(shape.hidden_size, 8);
+        assert_eq!(attention_shape.q_total(), 16);
+        assert_eq!(attention_shape.q_proj_total(), 32);
+        assert_eq!(attention_shape.kv_total(), 8);
+        assert!(attention_shape.rope_dim < attention_shape.head_dim);
+
+        let layer_input = ForwardLoader::values(shape.tokens * shape.hidden_size, 1);
+        let input_norm_weight = ForwardLoader::values(shape.hidden_size, 2);
+        let q_weight = ForwardLoader::values(attention_shape.q_proj_total() * shape.hidden_size, 3);
+        let k_weight = ForwardLoader::values(attention_shape.kv_total() * shape.hidden_size, 4);
+        let v_weight = ForwardLoader::values(attention_shape.kv_total() * shape.hidden_size, 5);
+        let q_norm_weight = ForwardLoader::values(attention_shape.head_dim, 6);
+        let k_norm_weight = ForwardLoader::values(attention_shape.head_dim, 7);
+        let o_weight = ForwardLoader::values(shape.hidden_size * attention_shape.q_total(), 8);
+        let post_attention_norm_weight = ForwardLoader::values(shape.hidden_size, 9);
+        let gate_proj_weight =
+            ForwardLoader::values(shape.intermediate_size * shape.hidden_size, 10);
+        let up_proj_weight = ForwardLoader::values(shape.intermediate_size * shape.hidden_size, 11);
+        let down_proj_weight =
+            ForwardLoader::values(shape.hidden_size * shape.intermediate_size, 12);
+
+        let reference = qwen35_dense_full_attention_layer_cpu(
+            &layer_input,
+            &input_norm_weight,
+            &q_weight,
+            &k_weight,
+            &v_weight,
+            &q_norm_weight,
+            &k_norm_weight,
+            &o_weight,
+            &post_attention_norm_weight,
+            &gate_proj_weight,
+            &up_proj_weight,
+            &down_proj_weight,
+            shape,
+            1e-6,
+        )
+        .unwrap();
+        assert_eq!(reference.query_raw.len(), attention_shape.q_proj_len());
+        assert_eq!(
+            reference.attention.attention_gate.as_ref().unwrap().len(),
+            attention_shape.q_len()
+        );
+        assert!(
+            reference
+                .attention
+                .context
+                .iter()
+                .zip(&reference.attention.context_ungated)
+                .any(|(gated, ungated)| (gated - ungated).abs() > 1e-7),
+            "attention gate must change at least one context value"
+        );
+
+        let input_norm_folded = input_norm_weight
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let q_norm_folded = q_norm_weight
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let k_norm_folded = k_norm_weight
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let post_norm_folded = post_attention_norm_weight
+            .iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let mut gate_up_weight = gate_proj_weight.clone();
+        gate_up_weight.extend_from_slice(&up_proj_weight);
+        let layer = Qwen35LayerWeights {
+            layer_index: 0,
+            input_layernorm: CpuBackend::from_slice(&input_norm_folded),
+            post_attention_layernorm: CpuBackend::from_slice(&post_norm_folded),
+            attention: Qwen35AttentionWeights::Full(Qwen35FullAttentionWeights {
+                q_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &q_weight,
+                    attention_shape.q_proj_total(),
+                    shape.hidden_size,
+                )),
+                k_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &k_weight,
+                    attention_shape.kv_total(),
+                    shape.hidden_size,
+                )),
+                v_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &v_weight,
+                    attention_shape.kv_total(),
+                    shape.hidden_size,
+                )),
+                o_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &o_weight,
+                    shape.hidden_size,
+                    attention_shape.q_total(),
+                )),
+                q_norm_weight: CpuBackend::from_slice(&q_norm_folded),
+                k_norm_weight: CpuBackend::from_slice(&k_norm_folded),
+            }),
+            mlp: Qwen35MlpWeights::Dense(Qwen35DenseMlpWeights {
+                gate_up_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &gate_up_weight,
+                    2 * shape.intermediate_size,
+                    shape.hidden_size,
+                )),
+                down_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                    &down_proj_weight,
+                    shape.hidden_size,
+                    shape.intermediate_size,
+                )),
+            }),
+        };
+        let rope = qwen35_build_rope_cache_backend::<CpuBackend>(
+            attention_shape.position_offset + attention_shape.tokens,
+            attention_shape.rope_dim,
+            attention_shape.rope_theta,
+        )
+        .unwrap();
+        let mut ctx = CpuBackend::new_context();
+        let backend = qwen35_dense_full_attention_layer_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice(&layer_input),
+            &layer,
+            &rope,
+            shape,
+            1e-6,
+        )
+        .unwrap();
+
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.query_raw, reference.query_raw.len()),
+            &reference.query_raw,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attention.query_head_major, attention_shape.q_len()),
+            &token_major_to_head_major(
+                &reference.attention.query,
+                attention_shape.tokens,
+                attention_shape.num_heads,
+                attention_shape.head_dim,
+            ),
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attention.key_head_major, attention_shape.kv_len()),
+            &token_major_to_head_major(
+                &reference.attention.key,
+                attention_shape.tokens,
+                attention_shape.num_kv_heads,
+                attention_shape.head_dim,
+            ),
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(
+                &backend.attention.value_head_major,
+                attention_shape.kv_len(),
+            ),
+            &token_major_to_head_major(
+                &reference.attention.value,
+                attention_shape.tokens,
+                attention_shape.num_kv_heads,
+                attention_shape.head_dim,
+            ),
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(
+                &backend.attention.context,
+                reference.attention.context.len(),
+            ),
+            &reference.attention.context,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.attn_output, reference.attn_output.len()),
+            &reference.attn_output,
+            1e-5,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.layer_output, reference.layer_output.len()),
+            &reference.layer_output,
+            1e-5,
+        );
+    }
+
+    #[test]
     fn sparse_moe_shared_expert_composes_router_fused_experts_and_shared_gate() {
         let shape = Qwen35SparseMoeShape {
             tokens: 2,
