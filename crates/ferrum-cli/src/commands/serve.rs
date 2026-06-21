@@ -207,6 +207,10 @@ pub struct ServeCommand {
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
 
+    /// Write scheduler iteration trace events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub scheduler_trace_jsonl: Option<PathBuf>,
+
     /// Git commit stamped into native structured profile events.
     #[arg(long, value_name = "SHA")]
     pub profile_commit_sha: Option<String>,
@@ -279,6 +283,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         effective_config_json,
         decision_trace_jsonl,
         profile_jsonl,
+        scheduler_trace_jsonl,
         profile_commit_sha,
         profile_env_hash,
         profile_model,
@@ -630,6 +635,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         session_cache_max_entries,
         session_cache_max_tokens,
         profile_jsonl.as_ref(),
+        scheduler_trace_jsonl.as_ref(),
         profile_commit_sha.as_deref(),
         profile_env_hash.as_deref(),
         profile_model.as_deref(),
@@ -1129,6 +1135,7 @@ fn serve_cli_runtime_entries(
     session_cache_max_entries: Option<usize>,
     session_cache_max_tokens: Option<usize>,
     profile_jsonl: Option<&PathBuf>,
+    scheduler_trace_jsonl: Option<&PathBuf>,
     profile_commit_sha: Option<&str>,
     profile_env_hash: Option<&str>,
     profile_model: Option<&str>,
@@ -1195,6 +1202,13 @@ fn serve_cli_runtime_entries(
     if let Some(path) = profile_jsonl {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_PROFILE_JSONL",
+            path.to_string_lossy().to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(path) = scheduler_trace_jsonl {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_SCHEDULER_TRACE_JSONL",
             path.to_string_lossy().to_string(),
             RuntimeConfigSource::Cli,
         ));
@@ -1885,6 +1899,7 @@ mod tests {
             Some(16),
             Some(1024),
             Some(&PathBuf::from("/tmp/profile.jsonl")),
+            Some(&PathBuf::from("/tmp/scheduler-trace.jsonl")),
             Some("abc123"),
             Some("sha256:test"),
             Some("Qwen/Qwen3-30B-A3B-GPTQ-Int4"),
@@ -1943,6 +1958,10 @@ mod tests {
             "/tmp/profile.jsonl"
         );
         assert_eq!(
+            entry("FERRUM_SCHEDULER_TRACE_JSONL").effective_value,
+            "/tmp/scheduler-trace.jsonl"
+        );
+        assert_eq!(
             entry("FERRUM_PROFILE_ENV_HASH").effective_value,
             "sha256:test"
         );
@@ -1952,6 +1971,9 @@ mod tests {
             "batch"
         );
         assert!(entry("FERRUM_PROFILE_JSONL")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Diagnostics));
+        assert!(entry("FERRUM_SCHEDULER_TRACE_JSONL")
             .affects
             .contains(&ferrum_types::RuntimeConfigEffect::Diagnostics));
     }
@@ -1987,6 +2009,7 @@ mod tests {
         .runtime_config_entries();
         let cli_entries = serve_cli_runtime_entries(
             Some("int8"),
+            None,
             None,
             None,
             None,
@@ -2068,6 +2091,7 @@ mod tests {
             Some(32),
             Some(false),
             Some(false),
+            None,
             None,
             None,
             None,
@@ -2668,6 +2692,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -2720,6 +2745,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
             None,
@@ -2732,6 +2758,7 @@ mod tests {
             None,
             None,
             prefix_cache_cli_override(false, false, true, false),
+            None,
             None,
             None,
             None,
@@ -2764,6 +2791,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
             None,
@@ -2776,6 +2804,7 @@ mod tests {
             None,
             None,
             prefix_cache_cli_override(false, false, false, true),
+            None,
             None,
             None,
             None,

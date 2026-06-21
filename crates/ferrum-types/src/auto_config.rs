@@ -762,10 +762,9 @@ impl FerrumConfigBuilder {
             }
         }
         if let Some(until) = default_prefill_first_until_active.as_ref() {
-            if self.entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").is_none()
-                && self
-                    .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
-                    .is_none()
+            if self
+                .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+                .is_none()
                 && self.entry("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE").is_none()
             {
                 runtime_config.upsert(
@@ -1653,9 +1652,39 @@ impl FerrumConfigBuilder {
                     prompt_token_estimate.source_key,
                 ))
             };
-        let (selected, source, source_key) = if let Some(chunk) =
-            entries.get("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
+        let explicit_prefill_first = entries.get("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE");
+        let explicit_prefill_first_present = explicit_prefill_first.is_some();
+        let implicit_prefill_first = if explicit_prefill_first.is_none()
+            && !entries.contains_key("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE")
         {
+            default_prefill_first_until_active
+                .as_ref()
+                .map(|until| until.value.to_string())
+        } else {
+            None
+        };
+        let prefill_first = explicit_prefill_first
+            .copied()
+            .or(implicit_prefill_first.as_deref());
+        let active_decode_chunk = entries.get("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK");
+        let (selected, source, source_key) = if let (Some(until), Some(chunk)) =
+            (prefill_first, active_decode_chunk)
+        {
+            parse_usize_env_value(until).map_err(|reason| AutoConfigError::InvalidOverride {
+                key: "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE".to_string(),
+                reason,
+            })?;
+            parse_usize_env_value(chunk).map_err(|reason| AutoConfigError::InvalidOverride {
+                key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
+                reason,
+            })?;
+            let key = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
+            (
+                format!("prefill_first_until_active:{until}+active_decode_prefill_chunk:{chunk}"),
+                self.source_for_key(key, AutoConfigSource::Default),
+                Some(key.to_string()),
+            )
+        } else if let Some(chunk) = active_decode_chunk {
             parse_usize_env_value(chunk).map_err(|reason| AutoConfigError::InvalidOverride {
                 key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
                 reason,
@@ -1666,16 +1695,26 @@ impl FerrumConfigBuilder {
                 self.source_for_key(key, AutoConfigSource::Default),
                 Some(key.to_string()),
             )
-        } else if let Some(until) = entries.get("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE") {
+        } else if let Some(until) = prefill_first {
             parse_usize_env_value(until).map_err(|reason| AutoConfigError::InvalidOverride {
                 key: "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE".to_string(),
                 reason,
             })?;
             let key = "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE";
+            let (source, source_key) = if explicit_prefill_first_present {
+                (
+                    self.source_for_key(key, AutoConfigSource::Default),
+                    Some(key.to_string()),
+                )
+            } else if let Some(default) = default_prefill_first_until_active.as_ref() {
+                (default.source, default.source_key.clone())
+            } else {
+                (AutoConfigSource::Default, None)
+            };
             (
                 format!("prefill_first_until_active:{until}"),
-                self.source_for_key(key, AutoConfigSource::Default),
-                Some(key.to_string()),
+                source,
+                source_key,
             )
         } else if !entries.contains_key("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE") {
             if let Some(until) = default_prefill_first_until_active.as_ref() {
@@ -1705,6 +1744,7 @@ impl FerrumConfigBuilder {
                 "continuous_default",
                 "prompt_token_estimate",
                 "prefill_first_until_active",
+                "prefill_first_until_active+active_decode_prefill_chunk",
                 "active_decode_prefill_chunk",
             ],
             Vec::new(),
@@ -3075,7 +3115,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_override_is_reflected_in_decision_trace() {
+    fn scheduler_active_chunk_combines_with_accelerator_prefill_first_default() {
         let resolved = m3(
             &[("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK", "64")],
             CompiledKernelFeatures::m3_fast_path_without_fa2(),
@@ -3087,11 +3127,22 @@ mod tests {
             .iter()
             .find(|decision| decision.selection == "scheduler_admission_policy")
             .unwrap();
-        assert_eq!(scheduler.selected, "active_decode_prefill_chunk:64");
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+active_decode_prefill_chunk:64"
+        );
         assert_eq!(
             scheduler.source_key.as_deref(),
             Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
         );
+        let prefill_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+            .expect("accelerator default prefill-first should still be materialized");
+        assert_eq!(prefill_entry.effective_value, "32");
+        assert_eq!(prefill_entry.source, RuntimeConfigSource::Default);
     }
 
     #[test]

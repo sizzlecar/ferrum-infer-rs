@@ -187,6 +187,7 @@ fn continuous_engine_runtime_config_parses_env_snapshot() {
             (NEXT_BATCH_PROF_ENV, "1"),
             (WHOLE_PROMPT_PREFIX_CACHE_ENV, "1"),
             (RBD_PROF_ENV, "1"),
+            ("FERRUM_SCHEDULER_TRACE_JSONL", "/tmp/scheduler-trace.jsonl"),
             (UNIFIED_POST_PROF_ENV, "1"),
         ],
     );
@@ -202,6 +203,10 @@ fn continuous_engine_runtime_config_parses_env_snapshot() {
     assert!(cfg.next_batch_prof);
     assert!(cfg.prefix_cache_enabled);
     assert!(cfg.rbd_prof);
+    assert_eq!(
+        cfg.scheduler_trace_jsonl.as_deref(),
+        Some(std::path::Path::new("/tmp/scheduler-trace.jsonl"))
+    );
     assert!(cfg.unified_post_prof);
 }
 

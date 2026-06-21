@@ -26,9 +26,11 @@ use ferrum_types::{
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -83,6 +85,7 @@ struct ContinuousEngineRuntimeConfig {
     next_batch_prof: bool,
     prefix_cache_enabled: bool,
     rbd_prof: bool,
+    scheduler_trace_jsonl: Option<PathBuf>,
     unified_post_prof: bool,
 }
 
@@ -102,6 +105,7 @@ impl ContinuousEngineRuntimeConfig {
             next_batch_prof: r.next_batch_prof,
             prefix_cache_enabled: r.prefix_cache_enabled,
             rbd_prof: r.rbd_prof,
+            scheduler_trace_jsonl: r.scheduler_trace_jsonl.clone(),
             unified_post_prof: r.unified_post_prof,
         }
     }
@@ -129,6 +133,9 @@ impl ContinuousEngineRuntimeConfig {
                 .get(WHOLE_PROMPT_PREFIX_CACHE_ENV)
                 .is_some_and(|v| v == "1"),
             rbd_prof: vars.contains_key(RBD_PROF_ENV),
+            scheduler_trace_jsonl: vars
+                .get("FERRUM_SCHEDULER_TRACE_JSONL")
+                .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
             unified_post_prof: vars.contains_key(UNIFIED_POST_PROF_ENV),
         }
     }
@@ -1323,6 +1330,8 @@ struct EngineInner {
     /// Prefix cache: shares KV blocks across requests with common prompts.
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
+    scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
+    scheduler_trace_none_streak: AtomicU64,
     // stats
     iteration_count: AtomicU64,
     total_prefill_tokens: AtomicU64,
@@ -1429,6 +1438,37 @@ fn avg_duration_ms(total_us: u64, samples: u64) -> f64 {
     }
 }
 
+fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Mutex<std::fs::File>> {
+    let path = path?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                warn!(
+                    "Failed to create scheduler trace directory {}: {}",
+                    parent.display(),
+                    error
+                );
+                return None;
+            }
+        }
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => Some(Mutex::new(file)),
+        Err(error) => {
+            warn!(
+                "Failed to open scheduler trace JSONL {}: {}",
+                path.display(),
+                error
+            );
+            None
+        }
+    }
+}
+
 mod inner;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1517,6 +1557,8 @@ impl ContinuousBatchEngine {
             recurrent_state_manager.is_some()
         );
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
+        let scheduler_trace_jsonl =
+            create_scheduler_trace_sink(runtime_config.scheduler_trace_jsonl.as_deref());
 
         Self {
             inner: Arc::new(EngineInner {
@@ -1538,6 +1580,8 @@ impl ContinuousBatchEngine {
                 iteration_count: AtomicU64::new(0),
                 prefix_cache: PrefixCache::new(256, 2),
                 runtime_config,
+                scheduler_trace_jsonl,
+                scheduler_trace_none_streak: AtomicU64::new(0),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),

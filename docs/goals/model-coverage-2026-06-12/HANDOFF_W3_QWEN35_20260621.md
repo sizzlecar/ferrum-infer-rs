@@ -3,6 +3,9 @@
 ## Current status
 
 - Branch: `goal/w2-w3-release-grade`.
+- 2026-06-22 01:31 CST update: W3 performance is still not release-grade, but
+  this round produced a material scheduler/engine bottleneck localization and a
+  source fix for scheduler policy materialization.
 - Latest pushed commit before this handoff update: `4a0fdbfc640b24534330c2844ba9ee3ee8f09652`.
 - Draft PR to `main`: <https://github.com/sizzlecar/ferrum-infer-rs/pull/237>.
 - Final W3 is not complete. There is no `MODEL_RELEASE_GRADE_W3 PASS`.
@@ -13,6 +16,85 @@
   `690-695 output tok/s` on the 1x RTX 4090 Vast host, while the accepted vLLM
   c32 mean is `1708.52785 output tok/s`; the W3 80% mean target is
   `1366.82228 output tok/s`.
+
+## 2026-06-22 scheduler-trace update
+
+I added explicit typed scheduler JSONL tracing and used it on the existing Vast
+1x RTX 4090 Qwen3.5 GPTQ lane. This is diagnostic evidence only: `n_repeats=1`,
+no final W3 validator, and no `MODEL_RELEASE_GRADE_W3 PASS`.
+
+- Remote artifact root:
+  `/workspace/artifacts/w3_qwen35_sched_trace_20260621T164651Z`.
+- Local copyback status: not copied yet. The Vast instance stopped before rsync;
+  a restart request returned queued/unavailable, and the latest API check showed
+  `cur_state=stopped`, `actual_status=exited`.
+- Product smoke before bench:
+  - non-stream chat: HTTP 200, content `5`, usage present;
+  - stream chat with `stream_options.include_usage=true`: HTTP 200, exactly one
+    `[DONE]`, 3 chunks, no malformed SSE, content `5`, usage present.
+- Good diagnostic c32 run with cohort prefill policy:
+  - command shape: `bench-serve --dataset sharegpt --num-prompts 64
+    --warmup-requests 8 --random-output-len 128 --concurrency 32
+    --n-repeats 1 --seed 9271 --fail-on-error`;
+  - result: `64 completed / 0 errored / 4.5s`;
+  - throughput `651.4 output tok/s`, goodput `14.13 req/s`;
+  - TTFT p50/p95 `636.0 / 1121.4 ms`;
+  - TPOT p50/p95 `32.5 / 45.4 ms`;
+  - ITL p50/p95 `20.5 / 79.9 ms`.
+- Trace readout for that run:
+  - effective iterations: 169 `Some`, 220 rate-limited `None` records;
+  - `decode=32` appeared 81 times; pure `decode=32` process p50 was about
+    `19.1 ms`, i.e. the hot pure-decode path itself is near the historical vLLM
+    c32 throughput scale;
+  - prefill-only steps were few but expensive: `prefill=21` took `735 ms`,
+    `prefill=19` took `636 ms`;
+  - scheduler scheduling cost was not the bottleneck: schedule p50 `37 us`.
+- Minimal A/B removing `prefill_first_until_active`:
+  - same binary, same model, same dataset, no source rebuild;
+  - result collapsed to `22.7 output tok/s`, `64 completed / 0 errored /
+    131.1s`;
+  - TTFT p50/p95 `40674.1 / 56641.6 ms`;
+  - trace showed catastrophic mixed prefill+decode steps:
+    `decode=7,prefill=25` took `56.38s`,
+    `decode=12,prefill=18` took `40.67s`,
+    `decode=24,prefill=6` took `13.60s`;
+  - pure decode remained fast (`decode=32` p50 around `19-20 ms`).
+
+Conclusion: the current main W3 c32 gap is not pure decode scheduling overhead
+and not the steady-state `decode=32` step. The immediate correctness/performance
+hazard is large mixed prefill+decode for Qwen3.5's current engine path. The
+cohort-prefill scheduler policy is not a cosmetic tuning flag; it prevents the
+catastrophic mixed path until the model executor has an efficient vLLM-style
+mixed/chunked Qwen3.5 GDN path.
+
+Source change from this round:
+
+- `FerrumConfigBuilder` now materializes accelerator default
+  `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE=<max_sequences>` even when
+  `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK` is explicitly set.
+- The auto-config decision trace now reports the combined scheduler policy as
+  `prefill_first_until_active:<N>+active_decode_prefill_chunk:<M>` instead of
+  incorrectly showing only `active_decode_prefill_chunk:<M>`.
+- This avoids the product-path footgun where setting active decode prefill chunk
+  alone silently disabled the default cohort-prefill policy and reproduced the
+  `22.7 tok/s` failure mode.
+
+Validation run locally:
+
+- `cargo fmt --all`
+- `cargo test -p ferrum-types scheduler_active_chunk_combines_with_accelerator_prefill_first_default`
+- `cargo check -p ferrum-types -p ferrum-scheduler -p ferrum-engine -p ferrum-cli`
+
+Still needed on GPU after Vast resources become available:
+
+1. Build current source on the same cached target.
+2. Run `ferrum serve` with `--scheduler-active-decode-prefill-chunk 8192` but
+   without explicit `--scheduler-prefill-first-until-active`.
+3. Confirm effective config contains
+   `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE=32` from default auto-config and
+   scheduler decision shows the combined policy.
+4. Rerun the same c32 64x1 diagnostic and verify it stays near the
+   `650-700 tok/s` range, not the `22.7 tok/s` no-prefill-first failure.
 
 ## Important artifacts
 
