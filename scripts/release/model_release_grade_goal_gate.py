@@ -148,13 +148,31 @@ def non_empty_string(value: Any, label: str, problems: list[str]) -> str | None:
 
 def artifact_candidates(raw: str, out_dir: Path, base_dir: Path | None = None) -> list[Path]:
     path = Path(raw)
+    candidates: list[Path] = []
     if path.is_absolute():
-        return [path]
-    candidates = []
-    if base_dir is not None:
-        candidates.append(base_dir / path)
-    candidates.extend([REPO_ROOT / path, out_dir / path])
-    return candidates
+        candidates.append(path)
+        if base_dir is not None:
+            # Some GPU artifacts are generated under /tmp or /workspace and then
+            # archived next to their manifest.  Keep those artifacts relocatable
+            # without rewriting the original evidence JSON.
+            candidates.append(base_dir / path.name)
+            candidates.append(base_dir.parent / path.name)
+            if path.parent.name:
+                candidates.append(base_dir / path.parent.name / path.name)
+                candidates.append(base_dir.parent / path.parent.name / path.name)
+    else:
+        if base_dir is not None:
+            candidates.append(base_dir / path)
+        candidates.extend([REPO_ROOT / path, out_dir / path])
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        rendered = str(candidate)
+        if rendered not in seen:
+            deduped.append(candidate)
+            seen.add(rendered)
+    return deduped
 
 
 def require_artifact(
@@ -2378,6 +2396,29 @@ def run_selftest() -> int:
         good_w3_problems = validate_manifest(load_json(good_w3_manifest), "w3", good_w3)
         if good_w3_problems:
             raise AssertionError("good W3 selftest manifest failed: " + "; ".join(good_w3_problems))
+
+        good_w3_archived_s1 = tmp_root / "good-w3-archived-s1"
+        good_w3_archived_s1_manifest = write_selftest_manifest(
+            good_w3_archived_s1,
+            lane="w3",
+            ratio=0.82,
+        )
+        (good_w3_archived_s1 / "reference_bundle" / "reference_dump").mkdir(parents=True)
+        (good_w3_archived_s1 / "ferrum_dump").mkdir()
+        archived_s1 = load_json(good_w3_archived_s1 / "w3_s1_single_layer.json")
+        archived_s1["reference_dump"] = "/tmp/original-s1/reference_bundle/reference_dump"
+        archived_s1["ferrum_dump"] = "/tmp/original-s1/ferrum_dump"
+        write_json(good_w3_archived_s1 / "w3_s1_single_layer.json", archived_s1)
+        good_w3_archived_s1_problems = validate_manifest(
+            load_json(good_w3_archived_s1_manifest),
+            "w3",
+            good_w3_archived_s1,
+        )
+        if good_w3_archived_s1_problems:
+            raise AssertionError(
+                "good W3 archived S1 selftest failed: "
+                + "; ".join(good_w3_archived_s1_problems)
+            )
 
         good_w3_nested_s2 = tmp_root / "good-w3-nested-s2"
         good_w3_nested_s2_manifest = write_selftest_manifest(

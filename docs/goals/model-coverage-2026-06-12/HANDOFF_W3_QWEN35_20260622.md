@@ -19,6 +19,26 @@
 
 ## Latest Source Progress
 
+### 2026-06-22 Final Validator Archived S1 Path Resolution
+
+- `scripts/release/model_release_grade_goal_gate.py` now treats archived
+  absolute artifact paths as relocatable evidence paths.
+- This specifically fixes the real S1 artifact pattern where
+  `w3_deltanet_s1_layer_compare_manifest.json` records generation-time
+  `/private/tmp/.../reference_bundle/reference_dump` and
+  `/private/tmp/.../ferrum_dump` paths, while the archived bundle contains the
+  dumps next to the manifest.
+- Added a W3 final-validator self-test for archived S1 absolute paths.
+- Validation passed locally:
+  `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py`,
+  `python3 scripts/release/model_release_grade_goal_gate.py --self-test`, and a
+  temporary full W3 manifest probe using the current real L0-L5, S0/S1/S2,
+  historical vLLM baseline, and W3 Ferrum performance artifacts.
+- The full W3 probe now fails only on the expected eight performance checks:
+  c1/c4/c16/c32 throughput ratio below `0.800` and c1/c4/c16/c32 p95 ITL above
+  `1.25x` baseline. This is gate reproducibility progress, not performance
+  evidence.
+
 ### 2026-06-22 Full-Attention Varlen Token-Row Metadata
 
 - Qwen35 full-attention paged QKV varlen writer now consumes the same

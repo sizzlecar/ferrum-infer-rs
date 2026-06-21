@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ71 — W3 S1 archived absolute artifact paths are relocatable
+
+- Scope:
+  - fixed `scripts/release/model_release_grade_goal_gate.py` so artifact paths
+    that were recorded as absolute `/tmp` or `/workspace` paths can still be
+    resolved after the evidence bundle is archived next to its manifest;
+  - the resolver now keeps the original absolute candidate but also checks
+    artifact-local fallback locations, including `<artifact_dir>/<basename>`,
+    `<artifact_dir>/../<basename>`, and the same forms preserving the immediate
+    parent directory name;
+  - added a W3 final-validator self-test covering an archived S1 artifact whose
+    `reference_dump` is recorded as
+    `/tmp/original-s1/reference_bundle/reference_dump` while the archived copy
+    lives under `reference_bundle/reference_dump`.
+- Why:
+  - the real archived S1 evidence
+    `w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/compare/w3_deltanet_s1_layer_compare_manifest.json`
+    contains generation-time absolute dump paths under `/private/tmp`;
+  - before this change, a clean local final W3 probe could falsely fail S1
+    artifact lookup even though the dump directories are present in the checked
+    artifact bundle.
+- Validation passed locally:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - a direct temporary W3 manifest probe using the current real L0-L5,
+    S0/S1/S2, historical vLLM baseline, and W3 Ferrum performance artifacts.
+- Final-manifest probe result:
+  - with the correct S0 design artifact and archived S1 artifact, the final
+    validator reached performance evaluation and failed with exactly eight
+    performance problems:
+    c1/c4/c16/c32 throughput ratio below `0.800`, and c1/c4/c16/c32 p95 ITL
+    above the `1.25x` baseline limit;
+  - no L0-L5 or S0/S1/S2 correctness artifact problem remained in that probe.
+- Status:
+  - final-gate reproducibility progress only; no new CUDA build or performance
+    claim;
+  - W3 remains incomplete and there is still no real
+    `MODEL_RELEASE_GRADE_W3 PASS` artifact directory.
+
 ## 2026-06-22 ZZZ70 — Shared MoE expert-count contract fixed for stacked fast paths
 
 - Scope:
