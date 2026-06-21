@@ -13,6 +13,9 @@
     `[q,k,v,z]` + `[b,a]` prefill prepare;
   - routed Qwen3.5 product prefill through fused `qkvz_proj` and `ba_proj`
     when the backend advertises the packed prefill capability;
+  - routed product varlen prefill through compact core outputs so
+    `query/key/value/g/beta/delta_core` debug/reference intermediates are not
+    held past the GDN core boundary;
   - kept the old separate `qkv/z/b/a` path as the fallback for backends that
     do not support packed prefill prepare.
 - vLLM alignment:
@@ -25,6 +28,7 @@
   - `cargo fmt --all`;
   - `cargo test -p ferrum-kernels --test linear_attention_cpu linear_attention_prepare_varlen_packed_cpu_matches_separate_prepare -- --nocapture`;
   - `cargo check -p ferrum-kernels -p ferrum-models`;
+  - `cargo test -p ferrum-models linear_attention_prefill_varlen_compact_core_matches_full_core_outputs -- --nocapture`;
   - `cargo test -p ferrum-models linear_attention_prefill_varlen_backend_matches_per_sequence_stateful_reference -- --nocapture`.
 - Added GPU-targeted test:
   - `linear_attention_prepare_varlen_packed_cuda_matches_cpu_reference` in
