@@ -1818,9 +1818,10 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         }
         let mut q_lens = Vec::with_capacity(batch_len);
         let mut cu = Vec::with_capacity(batch_len + 1);
+        let mut token_seq_indices = Vec::new();
         let mut all_tokens = Vec::new();
         cu.push(0u32);
-        for (_, tokens, _, _) in items {
+        for (row, (_, tokens, _, _)) in items.iter().enumerate() {
             if tokens.len() > self.kv_capacity {
                 return Err(FerrumError::model(format!(
                     "Qwen3.5 prefill length {} exceeds KV capacity {}",
@@ -1829,6 +1830,9 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 )));
             }
             all_tokens.extend_from_slice(tokens);
+            let row = u32::try_from(row)
+                .map_err(|_| FerrumError::model("Qwen3.5 unified prefill batch row exceeds u32"))?;
+            token_seq_indices.extend(std::iter::repeat(row).take(tokens.len()));
             q_lens.push(tokens.len());
             let next = u32::try_from(all_tokens.len()).map_err(|_| {
                 FerrumError::model("Qwen3.5 unified prefill total token count exceeds u32")
@@ -1846,6 +1850,8 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         }
         let mut cu_buf = B::alloc_typed(Dtype::U32, cu.len());
         B::write_typed::<u32>(&mut ctx, &mut cu_buf, &cu);
+        let mut token_seq_buf = B::alloc_typed(Dtype::U32, token_seq_indices.len().max(1));
+        B::write_typed::<u32>(&mut ctx, &mut token_seq_buf, &token_seq_indices);
 
         let weights = &self.weights;
         let rope = &self.rope;
@@ -1890,6 +1896,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                         layer,
                         &weights.config,
                         &cu_buf,
+                        &token_seq_buf,
                         &q_lens,
                         total_tokens,
                         eps,
@@ -6721,6 +6728,7 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
     layer: &Qwen35LayerWeights<B>,
     config: &Qwen35TextConfig,
     cu_seqlens: &B::Buffer,
+    token_seq_indices: &B::Buffer,
     q_lens: &[usize],
     total_tokens: usize,
     eps: f32,
@@ -6868,6 +6876,7 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
         &attention.norm_weight,
         &initial_delta_states,
         cu_seqlens,
+        token_seq_indices,
         batch_len,
         attention_shape,
         eps,
@@ -9877,6 +9886,7 @@ pub fn qwen35_linear_attention_prefill_varlen_core_backend<B: Backend>(
     norm_weight: &B::Buffer,
     initial_states: &B::Buffer,
     cu_seqlens: &B::Buffer,
+    token_seq_indices: &B::Buffer,
     batch: usize,
     shape: Qwen35LinearAttentionShape,
     eps: f32,
@@ -9911,6 +9921,7 @@ pub fn qwen35_linear_attention_prefill_varlen_core_backend<B: Backend>(
         a_log,
         dt_bias,
         cu_seqlens,
+        token_seq_indices,
         &mut query,
         &mut key,
         &mut value,
@@ -14531,6 +14542,7 @@ mod tests {
             conv_kernel: 3,
         };
         let cu_seqlens = vec![0u32, 2, 5];
+        let token_seq_indices = vec![0u32, 0, 1, 1, 1];
         let batch = cu_seqlens.len() - 1;
         let conv_state_len = shape.conv_channels() * shape.conv_kernel.saturating_sub(1);
         let delta_state_len = shape.state_len();
@@ -14654,6 +14666,7 @@ mod tests {
             &B::from_slice_typed(&norm_weight),
             &B::from_slice_typed(&initial_states),
             &B::from_slice_typed(&cu_seqlens),
+            &B::from_slice_typed(&token_seq_indices),
             batch,
             shape,
             eps,

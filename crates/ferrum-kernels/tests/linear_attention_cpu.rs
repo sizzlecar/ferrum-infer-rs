@@ -125,6 +125,69 @@ fn linear_attention_prepare_cpu_splits_gates_and_l2_normalizes_qk() {
 }
 
 #[test]
+fn linear_attention_prepare_varlen_cpu_rejects_mismatched_token_seq_indices() {
+    let batch = 2;
+    let total_tokens = 3;
+    let key_heads = 1;
+    let value_heads = 1;
+    let key_dim = 1;
+    let value_dim = 1;
+    let conv_kernel = 2;
+    let conv_channels = 2 * key_heads * key_dim + value_heads * value_dim;
+    let state_len = conv_kernel - 1;
+
+    let mixed_qkv_raw = vec![0.0; total_tokens * conv_channels];
+    let conv_weight = vec![1.0; conv_channels * conv_kernel];
+    let initial_conv_states = vec![0.0; batch * conv_channels * state_len];
+    let a_raw = vec![0.0; total_tokens * value_heads];
+    let b_raw = vec![0.0; total_tokens * value_heads];
+    let a_log = vec![0.0; value_heads];
+    let dt_bias = vec![0.0; value_heads];
+    let cu_seqlens = vec![0u32, 1, 3];
+    let bad_token_seq_indices = vec![0u32, 0, 1];
+
+    let mut ctx = CpuBackend::new_context();
+    let mut query = vec![0.0; total_tokens * key_heads * key_dim];
+    let mut key = vec![0.0; total_tokens * key_heads * key_dim];
+    let mut value = vec![0.0; total_tokens * value_heads * value_dim];
+    let mut g = vec![0.0; total_tokens * value_heads];
+    let mut beta = vec![0.0; total_tokens * value_heads];
+    let mut final_conv_states = vec![0.0; batch * conv_channels * state_len];
+
+    let err = CpuBackend::linear_attention_prepare_varlen_f32(
+        &mut ctx,
+        &mixed_qkv_raw,
+        &conv_weight,
+        &initial_conv_states,
+        &a_raw,
+        &b_raw,
+        &a_log,
+        &dt_bias,
+        &CpuBackend::from_slice_typed(&cu_seqlens),
+        &CpuBackend::from_slice_typed(&bad_token_seq_indices),
+        &mut query,
+        &mut key,
+        &mut value,
+        &mut g,
+        &mut beta,
+        &mut final_conv_states,
+        batch,
+        total_tokens,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("token_seq_indices[1]=0 != seq 1"),
+        "{err}"
+    );
+}
+
+#[test]
 fn linear_attention_decode_prepare_cpu_updates_conv_state_and_splits_current_token() {
     let key_heads = 1;
     let value_heads = 2;
