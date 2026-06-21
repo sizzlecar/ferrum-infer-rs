@@ -248,6 +248,31 @@ same binary.
   than at KV paging, pair-id routing, MoE-body graphing, auxiliary shared expert
   overlap, or block-size selection.
 
+## Current source delta: varlen GDN prefill metadata
+
+Latest source work removes a GPU-side metadata scan in Qwen35 varlen
+linear-attention prefill:
+
+- Qwen35 product fresh batch prefill now builds `token_seq_indices` alongside
+  `cu_seqlens`.
+- `Backend::linear_attention_prepare_varlen_f32` accepts that token-row mapping.
+- CUDA `linear_attention_prepare_varlen_*` uses
+  `token_seq_indices[token]` instead of linearly scanning `cu_seqlens` for each
+  token/channel.
+- CPU backend validates that `token_seq_indices` matches `cu_seqlens`.
+
+Local validation passed:
+
+- `cargo test -p ferrum-kernels --test linear_attention_cpu linear_attention_prepare_varlen_cpu_rejects_mismatched_token_seq_indices -- --nocapture`
+- `cargo test -p ferrum-models linear_attention_prefill_varlen_backend_matches_per_sequence_stateful_reference -- --nocapture`
+- `cargo check -p ferrum-kernels -p ferrum-models`
+
+This is not a performance claim. The first GPU rerun should compare
+`qwen35_linear_prefill_core_prepare`, `qwen35_linear_prefill_core_recurrent`,
+and c32 output tok/s against the last clean diagnostic.
+Local machine has no `nvcc`, so CUDA feature build for the `.cu` signature
+change is still pending on the next 1x4090 CUDA lane.
+
 ## Next engineering step
 
 Do not continue blind env-flip sweeps. The scheduler/serve trace now has enough

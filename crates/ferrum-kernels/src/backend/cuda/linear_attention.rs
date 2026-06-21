@@ -207,6 +207,7 @@ pub fn linear_attention_prepare_varlen_f32(
     a_log: &CudaBuf,
     dt_bias: &CudaBuf,
     cu_seqlens: &CudaBuf,
+    token_seq_indices: &CudaBuf,
     query: &mut CudaBuf,
     key: &mut CudaBuf,
     value: &mut CudaBuf,
@@ -231,6 +232,7 @@ pub fn linear_attention_prepare_varlen_f32(
         a_log,
         dt_bias,
         cu_seqlens,
+        token_seq_indices,
         query,
         key,
         value,
@@ -255,6 +257,7 @@ pub fn linear_attention_prepare_varlen_f32(
         a_log,
         dt_bias,
         cu_seqlens,
+        token_seq_indices,
         query,
         key,
         value,
@@ -322,6 +325,7 @@ pub fn linear_attention_prepare_varlen_f32(
         _ => unreachable!("validate_prepare_varlen_dtype filters unsupported params"),
     }
     builder.arg(cu_seqlens.as_u32());
+    builder.arg(token_seq_indices.as_u32());
     builder.arg(query.as_f32_mut());
     builder.arg(key.as_f32_mut());
     builder.arg(value.as_f32_mut());
@@ -1334,6 +1338,7 @@ fn validate_prepare_varlen_dtype(
     a_log: &CudaBuf,
     dt_bias: &CudaBuf,
     cu_seqlens: &CudaBuf,
+    token_seq_indices: &CudaBuf,
     query: &CudaBuf,
     key: &CudaBuf,
     value: &CudaBuf,
@@ -1372,6 +1377,12 @@ fn validate_prepare_varlen_dtype(
         require_dtype(op, label, actual, Dtype::F32)?;
     }
     require_dtype(op, "cu_seqlens", cu_seqlens.dtype(), Dtype::U32)?;
+    require_dtype(
+        op,
+        "token_seq_indices",
+        token_seq_indices.dtype(),
+        Dtype::U32,
+    )?;
     Ok((input_dtype, param_dtype))
 }
 
@@ -1494,6 +1505,7 @@ fn validate_prepare_varlen_shape(
     a_log: &CudaBuf,
     dt_bias: &CudaBuf,
     cu_seqlens: &CudaBuf,
+    token_seq_indices: &CudaBuf,
     query: &CudaBuf,
     key: &CudaBuf,
     value: &CudaBuf,
@@ -1545,6 +1557,7 @@ fn validate_prepare_varlen_shape(
         ("a_log", a_log.len(), value_heads),
         ("dt_bias", dt_bias.len(), value_heads),
         ("cu_seqlens", cu_seqlens.len(), batch + 1),
+        ("token_seq_indices", token_seq_indices.len(), total_tokens),
         ("query", query.len(), total_tokens * qk_total),
         ("key", key.len(), total_tokens * qk_total),
         ("value", value.len(), total_tokens * value_total),

@@ -177,6 +177,7 @@ static __device__ void linear_attention_prepare_varlen_impl(
     const ParamT* __restrict__ a_log,
     const ParamT* __restrict__ dt_bias,
     const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
@@ -205,10 +206,8 @@ static __device__ void linear_attention_prepare_varlen_impl(
   if (idx < conv_total) {
     const int token = idx / conv_channels;
     const int channel = idx - token * conv_channels;
-    int seq = 0;
-    while (seq + 1 < batch && token >= static_cast<int>(cu_seqlens[seq + 1])) {
-      ++seq;
-    }
+    const int seq = static_cast<int>(token_seq_indices[token]);
+    if (seq < 0 || seq >= batch) return;
     const int token_start = static_cast<int>(cu_seqlens[seq]);
     const int local_token = token - token_start;
     const int state_base = seq * conv_state_len + channel * state_len;
@@ -271,6 +270,7 @@ extern "C" __global__ void linear_attention_prepare_varlen_f32(
     const float* __restrict__ a_log,
     const float* __restrict__ dt_bias,
     const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
@@ -286,9 +286,9 @@ extern "C" __global__ void linear_attention_prepare_varlen_f32(
     const int conv_kernel) {
   linear_attention_prepare_varlen_impl<float, float>(
       mixed_qkv_raw, conv_weight, initial_conv_states, a_raw, b_raw, a_log,
-      dt_bias, cu_seqlens, query, key, value, g, beta, final_conv_states,
-      batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
-      conv_kernel);
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, g, beta,
+      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_prepare_varlen_f16_to_f32(
@@ -300,6 +300,7 @@ extern "C" __global__ void linear_attention_prepare_varlen_f16_to_f32(
     const __half* __restrict__ a_log,
     const __half* __restrict__ dt_bias,
     const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
@@ -315,9 +316,9 @@ extern "C" __global__ void linear_attention_prepare_varlen_f16_to_f32(
     const int conv_kernel) {
   linear_attention_prepare_varlen_impl<__half, __half>(
       mixed_qkv_raw, conv_weight, initial_conv_states, a_raw, b_raw, a_log,
-      dt_bias, cu_seqlens, query, key, value, g, beta, final_conv_states,
-      batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
-      conv_kernel);
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, g, beta,
+      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
 }
 
 extern "C" __global__ void linear_attention_prepare_varlen_f16_params_f32(
@@ -329,6 +330,7 @@ extern "C" __global__ void linear_attention_prepare_varlen_f16_params_f32(
     const float* __restrict__ a_log,
     const float* __restrict__ dt_bias,
     const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
@@ -344,9 +346,9 @@ extern "C" __global__ void linear_attention_prepare_varlen_f16_params_f32(
     const int conv_kernel) {
   linear_attention_prepare_varlen_impl<__half, float>(
       mixed_qkv_raw, conv_weight, initial_conv_states, a_raw, b_raw, a_log,
-      dt_bias, cu_seqlens, query, key, value, g, beta, final_conv_states,
-      batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
-      conv_kernel);
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, g, beta,
+      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
 }
 
 template <typename InputT, typename ParamT>

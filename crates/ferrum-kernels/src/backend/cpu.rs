@@ -976,6 +976,7 @@ impl Backend for CpuBackend {
         a_log: &Self::Buffer,
         dt_bias: &Self::Buffer,
         cu_seqlens: &Self::Buffer,
+        token_seq_indices: &Self::Buffer,
         query: &mut Self::Buffer,
         key: &mut Self::Buffer,
         value: &mut Self::Buffer,
@@ -1043,6 +1044,11 @@ impl Backend for CpuBackend {
             batch + 1,
             "linear_attention_prepare_varlen cu_seqlens",
         )?;
+        let token_rows = cpu_read_u32_buffer(
+            token_seq_indices,
+            total_tokens,
+            "linear_attention_prepare_varlen token_seq_indices",
+        )?;
         if cu.first().copied() != Some(0) || cu.last().copied() != Some(total_tokens as u32) {
             return Err(FerrumError::model(format!(
                 "linear_attention_prepare_varlen cu_seqlens must start at 0 and end at total_tokens {total_tokens}, got first={:?} last={:?}",
@@ -1057,6 +1063,14 @@ impl Backend for CpuBackend {
                     cu[seq],
                     cu[seq + 1]
                 )));
+            }
+            for token in cu[seq] as usize..cu[seq + 1] as usize {
+                if token_rows[token] != seq as u32 {
+                    return Err(FerrumError::model(format!(
+                        "linear_attention_prepare_varlen token_seq_indices[{token}]={} != seq {seq}",
+                        token_rows[token]
+                    )));
+                }
             }
         }
 

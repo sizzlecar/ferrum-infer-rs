@@ -485,6 +485,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// - `query` / `key`: `[total_tokens, key_heads, key_dim]`
     /// - `value`: `[total_tokens, value_heads, value_dim]`
     /// - `cu_seqlens`: `[batch + 1]` u32 prefix sum into the flat token axis
+    /// - `token_seq_indices`: `[total_tokens]` u32 sequence row per flat token
     /// - `initial_conv_states` / `final_conv_states`:
     ///   `[batch, conv_channels, conv_kernel - 1]`
     ///
@@ -503,6 +504,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
         _a_log: &Self::Buffer,
         _dt_bias: &Self::Buffer,
         _cu_seqlens: &Self::Buffer,
+        _token_seq_indices: &Self::Buffer,
         _query: &mut Self::Buffer,
         _key: &mut Self::Buffer,
         _value: &mut Self::Buffer,
