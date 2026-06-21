@@ -1,0 +1,17 @@
+CUDA GPUs: 0 (single_gpu)
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Chat)
+Loading /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b...
+Using CUDA(0) backend
+Loading weights to GPU... (30s+ for >10 GB models)
+2026-06-21T16:13:43.290833Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-21T16:13:43.290872Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-21T16:13:43.291004Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b/tokenizer.json"
+2026-06-21T16:13:43.725023Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-21T16:13:43.725060Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-21T16:13:43.725066Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-21T16:13:43.725073Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=2048
+2026-06-21T16:13:43.725179Z  INFO ferrum_engine::registry: Loading model from /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b (format: safetensors)
+2026-06-21T16:13:43.725433Z  INFO ferrum_engine::registry:   Architecture: Qwen35Moe, Layers: 40, Vocab: 248320
+2026-06-21T16:13:43.874589Z  INFO ferrum_engine::registry: Building model...
+2026-06-21T16:13:43.874611Z  INFO ferrum_engine::registry: Using Qwen3.5/Qwen3.6 CUDA backend executor
+Model loaded in 32.7s.

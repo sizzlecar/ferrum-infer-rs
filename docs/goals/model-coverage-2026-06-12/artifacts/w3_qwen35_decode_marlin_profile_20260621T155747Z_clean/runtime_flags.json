@@ -1,0 +1,1 @@
+{"profile":"qwen35_decode_marlin","FERRUM_QWEN35_DECODE_PROFILE":"1","FERRUM_MARLIN_PROFILE":"1","gpu_memory_utilization":0.9,"max_model_len":2048,"max_num_seqs":32,"max_num_batched_tokens":8192,"kv_capacity":2048,"scheduler_prefill_first_until_active":32,"scheduler_active_decode_prefill_chunk":8192,"greedy_argmax":true,"disable_batched_graph":true,"disable_unified_graph":true}

@@ -1,0 +1,7 @@
+{
+  "ferrum_candidate_default": "same density policy",
+  "ferrum_previous_default": 16,
+  "qwen35_c32_density": "M=32, topk=8, E=256 => density=1.0, so vLLM selects 8",
+  "vllm_policy": "for block_size_m in [8,16,32,48,64]: break when M*topk/E/block_size_m < 0.9",
+  "vllm_source": "/Users/chejinxuan/py_ws/vllm/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py"
+}

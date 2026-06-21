@@ -1,0 +1,60 @@
+{
+  "artifact_dir": "/workspace/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty",
+  "binary_sha256": "e3e5ff6e19e404b09216b9f5815d77eab37551e1c210faa332da54690fab85a6",
+  "dirty": true,
+  "git_head": "4a0fdbfc640b24534330c2844ba9ee3ee8f09652",
+  "off": {
+    "aux_context_overlap": "0",
+    "bad_output_per_run": [
+      0
+    ],
+    "completed_per_run": [
+      100
+    ],
+    "duplicate_done_per_run": [
+      0
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "missing_done_per_run": [
+      0
+    ],
+    "output_token_count_source": "usage",
+    "output_tps_mean": 692.0108299917425,
+    "path": "/workspace/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/bench_off/bench_c32_100x1.json",
+    "zero_output_tokens_per_run": [
+      0
+    ]
+  },
+  "on": {
+    "aux_context_overlap": "1",
+    "bad_output_per_run": [
+      0
+    ],
+    "completed_per_run": [
+      100
+    ],
+    "duplicate_done_per_run": [
+      0
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "missing_done_per_run": [
+      0
+    ],
+    "output_token_count_source": "usage",
+    "output_tps_mean": 695.211236472971,
+    "path": "/workspace/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/bench_on/bench_c32_100x1.json",
+    "zero_output_tokens_per_run": [
+      0
+    ]
+  },
+  "on_vs_vllm_mean_ratio": 0.40690658713755884,
+  "ratio_on_over_off": 1.0046247924779828,
+  "schema_version": 1,
+  "status": "pass",
+  "vllm_80pct_target_mean": 1366.82228,
+  "vllm_c32_mean": 1708.52785
+}
