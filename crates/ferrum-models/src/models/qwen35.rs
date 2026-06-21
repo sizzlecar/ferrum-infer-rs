@@ -952,6 +952,17 @@ fn qwen35_has_repetition_penalties(penalties: &[Option<&GreedyRepetitionPenalty>
         .any(|penalty| !penalty.is_empty())
 }
 
+fn qwen35_logits_return_uses_argmax(
+    greedy_argmax: bool,
+    logits_return: &Qwen35DecodeLogitsReturn<'_>,
+) -> bool {
+    match logits_return {
+        Qwen35DecodeLogitsReturn::Full => false,
+        Qwen35DecodeLogitsReturn::LegacyDefault => greedy_argmax,
+        Qwen35DecodeLogitsReturn::GreedyArgmax { .. } => true,
+    }
+}
+
 fn qwen35_should_merge_decode_rows_into_paged_continuation(
     use_paged_kv: bool,
     greedy_argmax: bool,
@@ -966,9 +977,6 @@ fn qwen35_should_merge_decode_rows_into_paged_continuation(
         return !greedy_argmax;
     }
     policies.len() == item_count
-        && policies
-            .iter()
-            .all(LogitsReturnPolicy::requires_full_logits)
 }
 
 pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<LlmRuntimeConfig> {
@@ -1849,7 +1857,12 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             })?;
             states.push((cache_id.clone(), state));
         }
-        let result = self.forward_stateful_prefill_batch_taken(items, &mut states, true);
+        let result = self.forward_stateful_prefill_batch_taken(
+            items,
+            &mut states,
+            true,
+            Qwen35DecodeLogitsReturn::Full,
+        );
         let success = result.is_ok();
         for ((cache_id, mut state), (_, tokens, _, _)) in states.into_iter().zip(items.iter()) {
             if success {
@@ -1863,6 +1876,17 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
     fn forward_stateful_prefill_continuation_batch(
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        self.forward_stateful_prefill_continuation_batch_with_logits_return(
+            items,
+            Qwen35DecodeLogitsReturn::Full,
+        )
+    }
+
+    fn forward_stateful_prefill_continuation_batch_with_logits_return(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        logits_return: Qwen35DecodeLogitsReturn<'_>,
     ) -> Result<Vec<Option<Vec<f32>>>> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -1927,7 +1951,8 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             })?;
             states.push((cache_id.clone(), state));
         }
-        let result = self.forward_stateful_prefill_batch_taken(items, &mut states, false);
+        let result =
+            self.forward_stateful_prefill_batch_taken(items, &mut states, false, logits_return);
         let success = result.is_ok();
         for ((cache_id, mut state), (_, tokens, _, _)) in states.into_iter().zip(items.iter()) {
             if success {
@@ -1943,6 +1968,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         items: &[(String, Vec<u32>, usize, bool)],
         states: &mut [(String, Qwen35SequenceState<B>)],
         fresh_initial_linear_state: bool,
+        logits_return: Qwen35DecodeLogitsReturn<'_>,
     ) -> Result<Vec<Option<Vec<f32>>>> {
         let batch_len = items.len();
         if batch_len == 0 {
@@ -1999,6 +2025,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
 
         let weights = &self.weights;
         let rope = &self.rope;
+        let total_layers = weights.layers.len();
         let hidden_len = total_tokens * weights.config.hidden_size;
         let mut hidden = B::alloc(hidden_len);
         let t_embedding = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
@@ -2088,7 +2115,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .collect::<Vec<_>>();
         if final_rows.is_empty() {
             if profile_enabled {
-                prefill_profile.log("batch", 0, total_tokens, weights.layers.len());
+                prefill_profile.log("batch", 0, total_tokens, total_layers);
             }
             return Ok(vec![None; batch_len]);
         }
@@ -2146,6 +2173,28 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .forward(&mut ctx, &sampled_hidden, &mut logits, final_count);
         prefill_profile.lm_head_us +=
             qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_lm_head, "qwen35_lm_head");
+        if qwen35_logits_return_uses_argmax(self.greedy_argmax, &logits_return) {
+            let t_argmax = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
+            let argmax_rows = self.try_argmax_logits_rows(
+                &mut ctx,
+                &mut logits,
+                final_count,
+                vocab,
+                &logits_return,
+            );
+            prefill_profile.argmax_us +=
+                qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_argmax, "qwen35_argmax");
+            if let Some(rows) = argmax_rows {
+                if profile_enabled {
+                    prefill_profile.log("batch", 0, total_tokens, total_layers);
+                }
+                let mut out = vec![None; batch_len];
+                for (&row, logits) in final_rows.iter().zip(rows) {
+                    out[row] = Some(logits);
+                }
+                return Ok(out);
+            }
+        }
         let t_readback = if profile_enabled {
             Some(Instant::now())
         } else {
@@ -2158,7 +2207,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             prefill_profile.readback_us += start.elapsed().as_micros() as u64;
         }
         if profile_enabled {
-            prefill_profile.log("batch", 0, total_tokens, weights.layers.len());
+            prefill_profile.log("batch", 0, total_tokens, total_layers);
         }
         let mut out = vec![None; batch_len];
         for (&row, logits) in final_rows.iter().zip(flat.chunks_exact(vocab)) {
@@ -2274,7 +2323,26 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                     .iter()
                     .map(|&row| items[row].clone())
                     .collect::<Vec<_>>();
-                let rows = self.forward_stateful_prefill_continuation_batch(&chunk_items)?;
+                let chunk_final_policies = if policies.len() == items.len() {
+                    chunk_rows
+                        .iter()
+                        .filter_map(|&row| items[row].3.then(|| policies[row].clone()))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let logits_return = if chunk_final_policies.is_empty() {
+                    Qwen35DecodeLogitsReturn::Full
+                } else {
+                    qwen35_decode_logits_return_from_policies(
+                        &chunk_final_policies,
+                        chunk_final_policies.len(),
+                    )
+                };
+                let rows = self.forward_stateful_prefill_continuation_batch_with_logits_return(
+                    &chunk_items,
+                    logits_return,
+                )?;
                 for (row, logits) in chunk_rows.into_iter().zip(rows) {
                     out[row] = logits;
                 }
@@ -2523,103 +2591,22 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .forward(&mut ctx, &final_hidden, &mut logits, batch_len);
         decode_profile.lm_head_us +=
             qwen35_decode_profile_stage_finish::<B>(&mut ctx, t_lm_head, "qwen35_decode_lm_head");
-        let argmax_mode = match &logits_return {
-            Qwen35DecodeLogitsReturn::Full => None,
-            Qwen35DecodeLogitsReturn::LegacyDefault if self.greedy_argmax => {
-                Some(Qwen35ArgmaxMode::Raw)
-            }
-            Qwen35DecodeLogitsReturn::LegacyDefault => None,
-            Qwen35DecodeLogitsReturn::GreedyArgmax {
-                token_mask,
-                repetition_penalties,
-            } => {
-                if qwen35_has_repetition_penalties(repetition_penalties) {
-                    Some(Qwen35ArgmaxMode::SparseRepetition {
-                        token_mask: *token_mask,
-                        repetition_penalties,
-                    })
-                } else {
-                    token_mask
-                        .map(Qwen35ArgmaxMode::Masked)
-                        .or(Some(Qwen35ArgmaxMode::Raw))
-                }
-            }
-        };
-        if let Some(argmax_mode) = argmax_mode {
+        if qwen35_logits_return_uses_argmax(self.greedy_argmax, &logits_return) {
             let t_argmax = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
-            let tokens = match argmax_mode {
-                Qwen35ArgmaxMode::Raw => B::argmax_rows_f16(&mut ctx, &logits, batch_len, vocab),
-                Qwen35ArgmaxMode::Masked(mask) => {
-                    self.ensure_argmax_token_mask(&mut ctx, mask);
-                    let mask_len = self.argmax_token_mask_len;
-                    let device_mask = self
-                        .argmax_token_mask
-                        .as_ref()
-                        .expect("Qwen3.5 argmax token mask upload failed");
-                    B::argmax_rows_f16_masked(
-                        &mut ctx,
-                        &logits,
-                        device_mask,
-                        mask_len,
-                        batch_len,
-                        vocab,
-                    )
-                }
-                Qwen35ArgmaxMode::SparseRepetition {
-                    token_mask,
-                    repetition_penalties,
-                } => {
-                    if let Some(mask) = token_mask {
-                        self.ensure_argmax_token_mask(&mut ctx, mask);
-                    }
-                    let total_token_ids = self.upload_argmax_repetition_penalty(
-                        &mut ctx,
-                        repetition_penalties,
-                        batch_len,
-                    );
-                    let valid_token_mask = token_mask.map(|_| {
-                        (
-                            self.argmax_token_mask
-                                .as_ref()
-                                .expect("Qwen3.5 argmax token mask upload failed"),
-                            self.argmax_token_mask_len,
-                        )
-                    });
-                    let row_offsets = self
-                        .argmax_repetition_offsets
-                        .as_ref()
-                        .expect("Qwen3.5 repetition row offsets upload failed");
-                    let token_ids = self
-                        .argmax_repetition_token_ids
-                        .as_ref()
-                        .expect("Qwen3.5 repetition token ids upload failed");
-                    let penalties = self
-                        .argmax_repetition_penalties
-                        .as_ref()
-                        .expect("Qwen3.5 repetition penalties upload failed");
-                    B::argmax_rows_f16_sparse_repetition_penalty(
-                        &mut ctx,
-                        &mut logits,
-                        valid_token_mask,
-                        row_offsets,
-                        token_ids,
-                        penalties,
-                        total_token_ids,
-                        batch_len,
-                        vocab,
-                    )
-                }
-            };
+            let argmax_rows = self.try_argmax_logits_rows(
+                &mut ctx,
+                &mut logits,
+                batch_len,
+                vocab,
+                &logits_return,
+            );
             decode_profile.argmax_us +=
                 qwen35_decode_profile_stage_finish::<B>(&mut ctx, t_argmax, "qwen35_decode_argmax");
-            if let Ok(tokens) = tokens {
-                if tokens.iter().all(|&token| token != u32::MAX) {
-                    let out = tokens.into_iter().map(|token| vec![token as f32]).collect();
-                    if decode_profile_enabled {
-                        decode_profile.log(batch_len, total_layers, "argmax");
-                    }
-                    return Ok(out);
+            if let Some(rows) = argmax_rows {
+                if decode_profile_enabled {
+                    decode_profile.log(batch_len, total_layers, "argmax");
                 }
+                return Ok(rows);
             }
         }
         let t_readback = if decode_profile_enabled {
@@ -2635,6 +2622,108 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             decode_profile.log(batch_len, total_layers, "full_logits");
         }
         Ok(flat.chunks_exact(vocab).map(|row| row.to_vec()).collect())
+    }
+
+    fn try_argmax_logits_rows(
+        &mut self,
+        ctx: &mut B::Context,
+        logits: &mut B::Buffer,
+        batch_len: usize,
+        vocab: usize,
+        logits_return: &Qwen35DecodeLogitsReturn<'_>,
+    ) -> Option<Vec<Vec<f32>>> {
+        let tokens = match logits_return {
+            Qwen35DecodeLogitsReturn::Full => return None,
+            Qwen35DecodeLogitsReturn::LegacyDefault if self.greedy_argmax => {
+                B::argmax_rows_f16(ctx, logits, batch_len, vocab)
+            }
+            Qwen35DecodeLogitsReturn::LegacyDefault => return None,
+            Qwen35DecodeLogitsReturn::GreedyArgmax {
+                token_mask,
+                repetition_penalties,
+            } => {
+                let argmax_mode = if qwen35_has_repetition_penalties(repetition_penalties) {
+                    Qwen35ArgmaxMode::SparseRepetition {
+                        token_mask: *token_mask,
+                        repetition_penalties,
+                    }
+                } else {
+                    token_mask
+                        .map(Qwen35ArgmaxMode::Masked)
+                        .unwrap_or(Qwen35ArgmaxMode::Raw)
+                };
+                match argmax_mode {
+                    Qwen35ArgmaxMode::Raw => B::argmax_rows_f16(ctx, logits, batch_len, vocab),
+                    Qwen35ArgmaxMode::Masked(mask) => {
+                        self.ensure_argmax_token_mask(ctx, mask);
+                        let mask_len = self.argmax_token_mask_len;
+                        let device_mask = self
+                            .argmax_token_mask
+                            .as_ref()
+                            .expect("Qwen3.5 argmax token mask upload failed");
+                        B::argmax_rows_f16_masked(
+                            ctx,
+                            logits,
+                            device_mask,
+                            mask_len,
+                            batch_len,
+                            vocab,
+                        )
+                    }
+                    Qwen35ArgmaxMode::SparseRepetition {
+                        token_mask,
+                        repetition_penalties,
+                    } => {
+                        if let Some(mask) = token_mask {
+                            self.ensure_argmax_token_mask(ctx, mask);
+                        }
+                        let total_token_ids = self.upload_argmax_repetition_penalty(
+                            ctx,
+                            repetition_penalties,
+                            batch_len,
+                        );
+                        let valid_token_mask = token_mask.map(|_| {
+                            (
+                                self.argmax_token_mask
+                                    .as_ref()
+                                    .expect("Qwen3.5 argmax token mask upload failed"),
+                                self.argmax_token_mask_len,
+                            )
+                        });
+                        let row_offsets = self
+                            .argmax_repetition_offsets
+                            .as_ref()
+                            .expect("Qwen3.5 repetition row offsets upload failed");
+                        let token_ids = self
+                            .argmax_repetition_token_ids
+                            .as_ref()
+                            .expect("Qwen3.5 repetition token ids upload failed");
+                        let penalties = self
+                            .argmax_repetition_penalties
+                            .as_ref()
+                            .expect("Qwen3.5 repetition penalties upload failed");
+                        B::argmax_rows_f16_sparse_repetition_penalty(
+                            ctx,
+                            logits,
+                            valid_token_mask,
+                            row_offsets,
+                            token_ids,
+                            penalties,
+                            total_token_ids,
+                            batch_len,
+                            vocab,
+                        )
+                    }
+                }
+            }
+        };
+        let Ok(tokens) = tokens else {
+            return None;
+        };
+        if tokens.iter().any(|&token| token == u32::MAX) {
+            return None;
+        }
+        Some(tokens.into_iter().map(|token| vec![token as f32]).collect())
     }
 
     fn ensure_argmax_token_mask(
@@ -2744,6 +2833,7 @@ struct Qwen35PrefillProfile {
     final_norm_us: u64,
     final_gather_us: u64,
     lm_head_us: u64,
+    argmax_us: u64,
     readback_us: u64,
     slow_layers: Vec<(usize, &'static str, u64)>,
 }
@@ -3484,13 +3574,16 @@ impl Qwen35PrefillProfile {
         }
 
         let layer_sum = self.linear_layer_us + self.full_layer_us;
-        let final_sum =
-            self.final_norm_us + self.final_gather_us + self.lm_head_us + self.readback_us;
+        let final_sum = self.final_norm_us
+            + self.final_gather_us
+            + self.lm_head_us
+            + self.argmax_us
+            + self.readback_us;
         eprintln!(
             "[qwen35-prefill-prof] call#{} cache_id={cache_id:?} prior_len={} tokens={} \
              layers={} linear_layers={} full_layers={} embedding={}us layer_sum={}us \
              linear_layer_sum={}us full_layer_sum={}us final_sum={}us final_norm={}us \
-             final_gather={}us lm_head={}us readback={}us slow_layers={:?}",
+             final_gather={}us lm_head={}us argmax={}us readback={}us slow_layers={:?}",
             call,
             prior_len,
             tokens_len,
@@ -3505,6 +3598,7 @@ impl Qwen35PrefillProfile {
             self.final_norm_us,
             self.final_gather_us,
             self.lm_head_us,
+            self.argmax_us,
             self.readback_us,
             self.slow_layers,
         );
@@ -3541,6 +3635,7 @@ impl Qwen35PrefillProfile {
                     "final_norm": self.final_norm_us,
                     "final_gather": self.final_gather_us,
                     "lm_head": self.lm_head_us,
+                    "argmax": self.argmax_us,
                     "readback": self.readback_us,
                     "slow_layers": slow_layers,
                 })),
@@ -12847,7 +12942,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_decode_merge_policy_preserves_argmax_contract() {
+    fn qwen35_decode_merge_policy_preserves_legacy_no_policy_contract() {
         assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
             false,
             false,
@@ -12896,7 +12991,7 @@ mod tests {
             },
             LogitsReturnPolicy::FullLogits,
         ];
-        assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
+        assert!(qwen35_should_merge_decode_rows_into_paged_continuation(
             true, true, &greedy, 2, true
         ));
         assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
@@ -12905,6 +13000,42 @@ mod tests {
             &full_logits[..1],
             2,
             true
+        ));
+    }
+
+    #[test]
+    fn qwen35_try_argmax_logits_rows_returns_policy_sentinel() {
+        let config = tiny_linear_config();
+        let vocab_size = 128;
+        let loader = ForwardLoader::from_required_manifest(&config, vocab_size);
+        let plan = loader.plan();
+        let mut model = Qwen35BackendModel::<CpuBackend>::from_weight_plan(
+            config.clone(),
+            qwen35_runtime_config(&config, vocab_size, 64),
+            plan,
+            &loader,
+        )
+        .unwrap();
+        let mut ctx = CpuBackend::new_context();
+        let mut logits = CpuBackend::from_slice(&[0.1, 2.0, 1.0, -1.0, 5.0, 4.0]);
+        let policy_return = Qwen35DecodeLogitsReturn::GreedyArgmax {
+            token_mask: None,
+            repetition_penalties: vec![None, None],
+        };
+
+        let rows = model
+            .try_argmax_logits_rows(&mut ctx, &mut logits, 2, 3, &policy_return)
+            .expect("raw greedy argmax should return token sentinels");
+
+        assert_eq!(rows, vec![vec![1.0], vec![1.0]]);
+        assert!(!qwen35_logits_return_uses_argmax(
+            false,
+            &Qwen35DecodeLogitsReturn::LegacyDefault
+        ));
+        model.greedy_argmax = true;
+        assert!(qwen35_logits_return_uses_argmax(
+            model.greedy_argmax,
+            &Qwen35DecodeLogitsReturn::LegacyDefault
         ));
     }
 

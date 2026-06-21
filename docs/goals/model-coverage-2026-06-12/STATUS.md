@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ48 — Qwen35 paged continuation batch can honor logits policies
+
+- Scope:
+  - factored Qwen3.5 decode-batch argmax/readback tail into a shared
+    `try_argmax_logits_rows` helper covering raw greedy argmax, token masks,
+    and sparse repetition penalties;
+  - wired paged continuation varlen prefill batch to accept
+    `Qwen35DecodeLogitsReturn`, so merged final rows can return model-side
+    greedy argmax sentinels instead of always reading back full vocab logits;
+  - changed the mixed decode merge gate so complete explicit
+    `LogitsReturnPolicy` batches, including `GreedyArgmax`, can join the
+    continuation batch; legacy no-policy `FERRUM_GREEDY_ARGMAX=1` still stays
+    on the decode batch path to preserve old no-policy sentinel behavior;
+  - added prefill profile `argmax_us`, making continuation-batch argmax vs
+    full-logits readback visible in Qwen3.5 profiles.
+- Validation passed locally:
+  - `cargo check -p ferrum-models`;
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_try_argmax_logits_rows_returns_policy_sentinel -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_multitoken_continuation_matches_stepwise -- --nocapture`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - this is source/hot-path progress, not a CUDA performance claim;
+  - the intended W3 c32 impact is on policy-driven greedy serving frames where
+    continuation/chunked rows and decode rows can now share one paged varlen
+    continuation pass while still returning argmax sentinels;
+  - CPU tests prove the shared logits-return contract and non-paged fallback;
+    CUDA correctness/performance evidence still requires a reachable 1x4090;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ47 — Qwen35 full-logits mixed decode rows can join paged continuation batch
 
 - Scope:
@@ -18,7 +51,7 @@
   - pure decode batches still use the decode batch path, so this targets mixed
     continuation+decode frames rather than replacing the optimized decode path.
 - Validation passed locally:
-  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_argmax_contract -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture`;
   - `cargo test -p ferrum-models qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture`;
   - `cargo test -p ferrum-models qwen35_unified_forward_multitoken_continuation_matches_stepwise -- --nocapture`;
   - `cargo test -p ferrum-models qwen35_unified_forward_non_final_continuation_skips_logits_tail -- --nocapture`;
