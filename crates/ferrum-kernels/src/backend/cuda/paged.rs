@@ -642,6 +642,7 @@ impl BackendPagedKv for CudaBackend {
         cache_k: &mut Self::Buffer,
         cache_v: &mut Self::Buffer,
         cu_seqlens_q: &Self::Buffer,
+        token_seq_indices: &Self::Buffer,
         pos_offsets: &Self::Buffer,
         block_tables: &Self::Buffer,
         num_seqs: usize,
@@ -691,6 +692,7 @@ impl BackendPagedKv for CudaBackend {
         b.arg(cache_k);
         b.arg(cache_v);
         b.arg(cu_seqlens_q);
+        b.arg(token_seq_indices);
         b.arg(pos_offsets);
         b.arg(block_tables);
         b.arg(&num_seqs_i32);
@@ -736,6 +738,7 @@ impl BackendPagedKv for CudaBackend {
         cache_k: &mut Self::Buffer,
         cache_v: &mut Self::Buffer,
         cu_seqlens_q: &Self::Buffer,
+        token_seq_indices: &Self::Buffer,
         pos_offsets: &Self::Buffer,
         block_tables: &Self::Buffer,
         num_seqs: usize,
@@ -785,6 +788,7 @@ impl BackendPagedKv for CudaBackend {
         b.arg(cache_k);
         b.arg(cache_v);
         b.arg(cu_seqlens_q);
+        b.arg(token_seq_indices);
         b.arg(pos_offsets);
         b.arg(block_tables);
         b.arg(&num_seqs_i32);

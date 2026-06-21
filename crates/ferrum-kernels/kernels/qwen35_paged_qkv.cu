@@ -76,6 +76,7 @@ extern "C" __global__ void qwen35_split_qkv_norm_rope_into_paged_cache_varlen_f1
     __half* __restrict__ cache_k,
     __half* __restrict__ cache_v,
     const int* __restrict__ cu_seqlens_q,
+    const unsigned int* __restrict__ token_seq_indices,
     const int* __restrict__ pos_offsets,
     const int* __restrict__ block_tables,
     const int num_seqs,
@@ -98,10 +99,9 @@ extern "C" __global__ void qwen35_split_qkv_norm_rope_into_paged_cache_varlen_f1
     const int total_heads = q_heads + 2 * kv_heads;
     if (tok >= total_q_tokens || head_idx >= total_heads) return;
 
-    int seq = 0;
-    while (seq + 1 < num_seqs && tok >= cu_seqlens_q[seq + 1]) {
-        ++seq;
-    }
+    const unsigned int seq_u = token_seq_indices[tok];
+    if (seq_u >= static_cast<unsigned int>(num_seqs)) return;
+    const int seq = static_cast<int>(seq_u);
     const int local_tok = tok - cu_seqlens_q[seq];
     const int abs_pos = pos_offsets[seq] + local_tok;
 
@@ -220,6 +220,7 @@ extern "C" __global__ void qwen35_split_qkv_norm_rope_into_paged_cache_varlen_vl
     __half* __restrict__ cache_k,
     __half* __restrict__ cache_v,
     const int* __restrict__ cu_seqlens_q,
+    const unsigned int* __restrict__ token_seq_indices,
     const int* __restrict__ pos_offsets,
     const int* __restrict__ block_tables,
     const int num_seqs,
@@ -242,10 +243,9 @@ extern "C" __global__ void qwen35_split_qkv_norm_rope_into_paged_cache_varlen_vl
     const int total_heads = q_heads + 2 * kv_heads;
     if (tok >= total_q_tokens || head_idx >= total_heads) return;
 
-    int seq = 0;
-    while (seq + 1 < num_seqs && tok >= cu_seqlens_q[seq + 1]) {
-        ++seq;
-    }
+    const unsigned int seq_u = token_seq_indices[tok];
+    if (seq_u >= static_cast<unsigned int>(num_seqs)) return;
+    const int seq = static_cast<int>(seq_u);
     const int local_tok = tok - cu_seqlens_q[seq];
     const int abs_pos = pos_offsets[seq] + local_tok;
 
