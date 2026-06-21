@@ -525,6 +525,92 @@ def validate_report_output_tokens(
         problems.append(f"{label}.output_tokens_per_request must match manifest cell")
 
 
+def optional_int(value: Any, label: str, problems: list[str]) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        problems.append(f"{label} must be an integer")
+        return None
+    return value
+
+
+def report_int_list(value: Any, label: str, problems: list[str]) -> list[int] | None:
+    if not isinstance(value, list):
+        problems.append(f"{label} must be an integer list")
+        return None
+    out: list[int] = []
+    for idx, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, int):
+            problems.append(f"{label}[{idx}] must be an integer")
+            return None
+        out.append(item)
+    return out
+
+
+def report_quality_values(
+    report: dict[str, Any],
+    field: str,
+    label: str,
+    problems: list[str],
+) -> list[int] | None:
+    if field in report:
+        return report_int_list(report.get(field), f"{label}.{field}", problems)
+    base_field = field.removesuffix("_per_run")
+    issues = report.get("quality_issues_per_run")
+    if not isinstance(issues, list):
+        problems.append(f"{label} missing {field} and quality_issues_per_run")
+        return None
+    values: list[int] = []
+    for idx, issue in enumerate(issues):
+        if not isinstance(issue, dict):
+            problems.append(f"{label}.quality_issues_per_run[{idx}] must be a JSON object")
+            return None
+        raw = issue.get(base_field)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            problems.append(
+                f"{label}.quality_issues_per_run[{idx}].{base_field} must be an integer"
+            )
+            return None
+        values.append(raw)
+    return values
+
+
+def validate_report_counts_match_cell(
+    *,
+    report: dict[str, Any] | None,
+    cell: dict[str, Any],
+    label: str,
+    field_prefix: str,
+    n_repeats: int | None,
+    requests: int | None,
+    problems: list[str],
+) -> None:
+    if report is None:
+        return
+    report_repeats = optional_int(report.get("n_repeats"), f"{label}.n_repeats", problems)
+    report_requests = optional_int(
+        report.get("n_requests_per_run"),
+        f"{label}.n_requests_per_run",
+        problems,
+    )
+    if n_repeats is not None and report_repeats is not None and report_repeats != n_repeats:
+        problems.append(f"{label}.n_repeats must match manifest cell")
+    if requests is not None and report_requests is not None and report_requests != requests:
+        problems.append(f"{label}.n_requests_per_run must match manifest cell")
+
+    for key in ["completed_per_run", "errored_per_run", *REQUIRED_ZERO_RUN_COUNT_FIELDS]:
+        manifest_key = f"{field_prefix}{key}"
+        manifest_values = cell.get(manifest_key)
+        if not isinstance(manifest_values, list):
+            # The manifest-level validator already reports the structural error.
+            continue
+        report_values = (
+            report_int_list(report.get(key), f"{label}.{key}", problems)
+            if key in {"completed_per_run", "errored_per_run"}
+            else report_quality_values(report, key, label, problems)
+        )
+        if report_values is not None and report_values != manifest_values:
+            problems.append(f"{label}.{key} must match manifest {manifest_key}")
+
+
 def validate_w3_fixed_output_contract(
     cell: dict[str, Any],
     baseline: dict[str, Any],
@@ -608,6 +694,15 @@ def validate_w3_fixed_output_contract(
             expected_tokens=expected,
             problems=problems,
         )
+        validate_report_counts_match_cell(
+            report=ferrum_report,
+            cell=cell,
+            label=f"{label}.artifact",
+            field_prefix="",
+            n_repeats=n_repeats,
+            requests=requests,
+            problems=problems,
+        )
 
     baseline_path = first_existing_evidence_path(
         baseline.get("artifact"),
@@ -630,6 +725,15 @@ def validate_w3_fixed_output_contract(
             n_repeats=baseline_n_repeats,
             requests=baseline_requests,
             expected_tokens=expected,
+            problems=problems,
+        )
+        validate_report_counts_match_cell(
+            report=baseline_report,
+            cell=cell,
+            label=f"{label}.baseline.artifact",
+            field_prefix="baseline_",
+            n_repeats=baseline_n_repeats,
+            requests=baseline_requests,
             problems=problems,
         )
 
@@ -2433,11 +2537,19 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
                 "output_token_count_source": "usage",
                 "output_tokens_per_request": cell["output_tokens_per_request"],
             }
+            for field in REQUIRED_ZERO_RUN_COUNT_FIELDS:
+                common_report[field] = cell[field]
             ferrum_reports.append(common_report)
             baseline_reports.append(
                 {
                     **common_report,
+                    "completed_per_run": cell["baseline_completed_per_run"],
+                    "errored_per_run": cell["baseline_errored_per_run"],
                     "output_tokens_per_request": cell["baseline_output_tokens_per_request"],
+                    **{
+                        field: cell[f"baseline_{field}"]
+                        for field in REQUIRED_ZERO_RUN_COUNT_FIELDS
+                    },
                 }
             )
         write_json(root / "ferrum_perf.json", ferrum_reports)
@@ -3040,6 +3152,27 @@ def run_selftest() -> int:
             for problem in bad_w3_output_tokens_problems
         ):
             raise AssertionError("bad W3 output-token selftest did not fail as expected")
+
+        bad_w3_artifact_error = tmp_root / "bad-w3-artifact-error-count"
+        bad_w3_artifact_error_manifest = write_selftest_manifest(
+            bad_w3_artifact_error,
+            lane="w3",
+            ratio=0.82,
+        )
+        ferrum_perf = load_json(bad_w3_artifact_error / "ferrum_perf.json")
+        ferrum_perf[0]["errored_per_run"] = [0, 1, 0]
+        write_json(bad_w3_artifact_error / "ferrum_perf.json", ferrum_perf)
+        bad_w3_artifact_error_problems = validate_manifest(
+            load_json(bad_w3_artifact_error_manifest),
+            "w3",
+            bad_w3_artifact_error,
+        )
+        if not any(
+            "performance.c1.artifact.errored_per_run must match manifest errored_per_run"
+            in problem
+            for problem in bad_w3_artifact_error_problems
+        ):
+            raise AssertionError("bad W3 artifact error-count selftest did not fail as expected")
 
         bad = tmp_root / "bad-ratio"
         bad_manifest = write_selftest_manifest(bad, ratio=0.79)
