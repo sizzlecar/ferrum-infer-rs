@@ -86,6 +86,17 @@ adding model-name defaults or hidden environment switches.
   weights instead of all-zero weights, and a model-level parity regression
   compares stepwise continuation `[4] + [5]` with one final continuation chunk
   `[4, 5]`, including both returned logits and next-token decode logits.
+- Added a paged-KV continuation batch path for Qwen3.5 unified prefill rows:
+  when `use_paged_kv` is active, continuation/chunked prefill rows are grouped
+  and sent through the existing varlen batch prefill layer path instead of the
+  row-by-row stateful path.
+- Generalized `forward_stateful_prefill_batch_taken` with an explicit
+  `fresh_initial_linear_state` flag. Fresh prefill keeps zero initial recurrent
+  state; continuation batch prefill syncs indexed linear-state slots back to
+  sequence-local state before gathering.
+- Fixed batch prefill KV allocation to target
+  `state.tokens.len() + q_lens[row]`, which is required for continuation
+  chunks and is equivalent to the old value for fresh prefill.
 
 The key vLLM reference is:
 
@@ -128,6 +139,9 @@ cargo test -p ferrum-models \
   qwen35_unified_forward_non_final_continuation_skips_logits_tail -- --nocapture
 cargo test -p ferrum-models \
   qwen35_unified_forward_multitoken_continuation_matches_stepwise -- --nocapture
+cargo test -p ferrum-models \
+  qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture
+cargo check -p ferrum-models
 cargo fmt --all -- --check
 git diff --check
 ```
@@ -223,6 +237,10 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   than per-token model passes. The local parity test allows small float-path
   differences (`1e-3`) against stepwise continuation and also compares the next
   decode logits.
+- With paged KV active on CUDA, multiple continuation/chunked prefill rows
+  should enter the varlen batch prefill path rather than row-by-row stateful
+  calls. CPU cannot execute this paged varlen path; local evidence only proves
+  non-paged fallback and type-level compilation.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly

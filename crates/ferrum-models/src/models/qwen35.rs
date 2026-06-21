@@ -1830,7 +1830,85 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             })?;
             states.push((cache_id.clone(), state));
         }
-        let result = self.forward_stateful_prefill_batch_taken(items, &mut states);
+        let result = self.forward_stateful_prefill_batch_taken(items, &mut states, true);
+        let success = result.is_ok();
+        for ((cache_id, mut state), (_, tokens, _, _)) in states.into_iter().zip(items.iter()) {
+            if success {
+                state.tokens.extend_from_slice(tokens);
+            }
+            self.sequences.insert(cache_id, state);
+        }
+        result
+    }
+
+    fn forward_stateful_prefill_continuation_batch(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.use_paged_kv {
+            return Err(FerrumError::unsupported(
+                "Qwen3.5 unified_forward continuation batch prefill requires paged KV",
+            ));
+        }
+        let mut seen = HashSet::with_capacity(items.len());
+        for (cache_id, tokens, pos_offset, _) in items {
+            if tokens.is_empty() {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 unified_forward does not accept empty continuation chunks",
+                ));
+            }
+            if *pos_offset == 0 {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 unified_forward continuation batch received fresh prefill",
+                ));
+            }
+            if !seen.insert(cache_id.as_str()) {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 unified_forward requires unique cache ids",
+                ));
+            }
+            self.ensure_sequence_state(cache_id)?;
+            let state = self.sequences.get(cache_id).ok_or_else(|| {
+                FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
+            })?;
+            if state.tokens.len() != *pos_offset {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 unified_forward continuation position mismatch for {cache_id:?}: \
+                     state len {} != pos {}",
+                    state.tokens.len(),
+                    pos_offset
+                )));
+            }
+            if state.layers.len() != self.weights.layers.len() {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 sequence state layer count {} != model layers {}",
+                    state.layers.len(),
+                    self.weights.layers.len()
+                )));
+            }
+            if let Some(kv) = qwen35_first_full_kv(state) {
+                if kv.len != *pos_offset {
+                    return Err(FerrumError::model(format!(
+                        "Qwen3.5 unified_forward continuation KV position mismatch for \
+                         {cache_id:?}: kv len {} != pos {}",
+                        kv.len, pos_offset
+                    )));
+                }
+            }
+        }
+        self.ensure_paged_pools();
+
+        let mut states = Vec::with_capacity(items.len());
+        for (cache_id, _, _, _) in items {
+            let state = self.sequences.remove(cache_id).ok_or_else(|| {
+                FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
+            })?;
+            states.push((cache_id.clone(), state));
+        }
+        let result = self.forward_stateful_prefill_batch_taken(items, &mut states, false);
         let success = result.is_ok();
         for ((cache_id, mut state), (_, tokens, _, _)) in states.into_iter().zip(items.iter()) {
             if success {
@@ -1845,6 +1923,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
         states: &mut [(String, Qwen35SequenceState<B>)],
+        fresh_initial_linear_state: bool,
     ) -> Result<Vec<Option<Vec<f32>>>> {
         let batch_len = items.len();
         if batch_len == 0 {
@@ -1877,10 +1956,22 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         let mut ctx = B::new_context();
         let profile_enabled = qwen35_prefill_profile_enabled();
         let mut prefill_profile = Qwen35PrefillProfile::default();
+        if !fresh_initial_linear_state {
+            for (_, state) in states.iter_mut() {
+                if !state.tokens.is_empty() {
+                    self.sync_sequence_linear_state_from_slot(&mut ctx, state)?;
+                }
+            }
+        }
         for (row, ((cache_id, _, _, _), (_, state))) in
             items.iter().zip(states.iter_mut()).enumerate()
         {
-            self.ensure_paged_kv_capacity_for_state(&mut ctx, cache_id, state, q_lens[row])?;
+            self.ensure_paged_kv_capacity_for_state(
+                &mut ctx,
+                cache_id,
+                state,
+                state.tokens.len() + q_lens[row],
+            )?;
         }
         let mut cu_buf = B::alloc_typed(Dtype::U32, cu.len());
         B::write_typed::<u32>(&mut ctx, &mut cu_buf, &cu);
@@ -1926,7 +2017,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                         &hidden,
                         states,
                         self.linear_state_pools.as_mut(),
-                        true,
+                        fresh_initial_linear_state,
                         layer_index,
                         layer,
                         &weights.config,
@@ -2140,13 +2231,26 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             }
         }
 
-        for row in chunk_rows {
-            let (cache_id, tokens, _, is_final_chunk) = &items[row];
-            if *is_final_chunk {
-                let logits = self.forward_stateful(cache_id, tokens)?;
-                out[row] = Some(logits);
+        if !chunk_rows.is_empty() {
+            if self.use_paged_kv {
+                let chunk_items = chunk_rows
+                    .iter()
+                    .map(|&row| items[row].clone())
+                    .collect::<Vec<_>>();
+                let rows = self.forward_stateful_prefill_continuation_batch(&chunk_items)?;
+                for (row, logits) in chunk_rows.into_iter().zip(rows) {
+                    out[row] = logits;
+                }
             } else {
-                self.forward_stateful_without_logits(cache_id, tokens)?;
+                for row in chunk_rows {
+                    let (cache_id, tokens, _, is_final_chunk) = &items[row];
+                    if *is_final_chunk {
+                        let logits = self.forward_stateful(cache_id, tokens)?;
+                        out[row] = Some(logits);
+                    } else {
+                        self.forward_stateful_without_logits(cache_id, tokens)?;
+                    }
+                }
             }
         }
 

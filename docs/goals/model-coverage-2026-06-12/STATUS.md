@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ46 — Qwen35 paged continuation rows can use varlen batch prefill
+
+- Scope:
+  - added a paged-KV continuation batch path for Qwen3.5 unified prefill rows;
+  - when `use_paged_kv` is active, continuation/chunked prefill rows are now
+    grouped and sent through the existing varlen batch prefill layer path
+    instead of being handled row-by-row;
+  - non-paged backends keep the serial stateful fallback, so local CPU tests
+    remain valid without pretending CPU proves CUDA paged behavior;
+  - generalized `forward_stateful_prefill_batch_taken` with an explicit
+    `fresh_initial_linear_state` flag: fresh batch prefill still uses zero
+    initial recurrent state, while continuation batch prefill synchronizes
+    indexed linear-state slots back to sequence-local state before gathering;
+  - fixed batch prefill KV allocation to use
+    `state.tokens.len() + q_lens[row]` as the target length, which is required
+    for continuation chunks and is unchanged for fresh prefill.
+- Validation passed locally:
+  - `cargo fmt --all`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_multitoken_continuation_matches_stepwise -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_non_final_continuation_skips_logits_tail -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - this is source/hot-path progress, not a performance claim;
+  - local CPU cannot execute the paged varlen continuation batch kernel, so the
+    new CUDA path still needs 1x4090 correctness and c32 trace evidence;
+  - Vast instance `41422823` still reports `cur_state=stopped`,
+    `actual_status=exited`, and SSH still refuses connection;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ45 — Qwen35 continuation chunks advance as one chunk instead of per-token loop
 
 - Scope:
