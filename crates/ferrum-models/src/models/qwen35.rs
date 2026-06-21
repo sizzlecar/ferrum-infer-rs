@@ -963,20 +963,27 @@ fn qwen35_logits_return_uses_argmax(
     }
 }
 
-fn qwen35_should_merge_decode_rows_into_paged_continuation(
+fn qwen35_should_merge_decode_rows_into_paged_prefill(
     use_paged_kv: bool,
     greedy_argmax: bool,
     policies: &[LogitsReturnPolicy],
     item_count: usize,
-    has_continuation_rows: bool,
+    has_prefill_rows: bool,
 ) -> bool {
-    if !use_paged_kv || !has_continuation_rows {
+    if !use_paged_kv || !has_prefill_rows {
         return false;
     }
     if policies.is_empty() {
         return !greedy_argmax;
     }
     policies.len() == item_count
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Qwen35PagedPrefillBatchMode {
+    FreshOnly,
+    ContinuationOnly,
+    Mixed,
 }
 
 pub fn qwen35_runtime_config_from_definition(def: &ModelDefinition) -> Result<LlmRuntimeConfig> {
@@ -1808,76 +1815,11 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         items: &[(String, Vec<u32>, usize, bool)],
         logits_return: Qwen35DecodeLogitsReturn<'_>,
     ) -> Result<Vec<Option<Vec<f32>>>> {
-        if items.is_empty() {
-            return Ok(Vec::new());
-        }
-        if !self.use_paged_kv {
-            return Err(FerrumError::unsupported(
-                "Qwen3.5 unified_forward fresh prefill requires paged KV",
-            ));
-        }
-        for (_, tokens, pos_offset, _) in items {
-            if tokens.is_empty() {
-                return Err(FerrumError::unsupported(
-                    "Qwen3.5 unified_forward does not accept empty prefill chunks",
-                ));
-            }
-            if *pos_offset != 0 {
-                return Err(FerrumError::unsupported(
-                    "Qwen3.5 unified_forward batch prefill currently supports fresh chunks only",
-                ));
-            }
-        }
-        let mut seen = HashSet::with_capacity(items.len());
-        for (cache_id, _, _, _) in items {
-            if !seen.insert(cache_id.as_str()) {
-                return Err(FerrumError::unsupported(
-                    "Qwen3.5 unified_forward requires unique cache ids",
-                ));
-            }
-        }
-        for (cache_id, _, _, _) in items {
-            self.ensure_sequence_state(cache_id)?;
-            let state = self.sequences.get(cache_id).ok_or_else(|| {
-                FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
-            })?;
-            if !state.tokens.is_empty() {
-                return Err(FerrumError::unsupported(
-                    "Qwen3.5 unified_forward fresh prefill received a non-empty sequence state",
-                ));
-            }
-            if qwen35_first_full_kv(state).is_some_and(|kv| kv.len != 0) {
-                return Err(FerrumError::unsupported(
-                    "Qwen3.5 unified_forward fresh prefill received non-empty full-attention KV",
-                ));
-            }
-            if state.layers.len() != self.weights.layers.len() {
-                return Err(FerrumError::model(format!(
-                    "Qwen3.5 sequence state layer count {} != model layers {}",
-                    state.layers.len(),
-                    self.weights.layers.len()
-                )));
-            }
-        }
-        self.ensure_paged_pools();
-
-        let mut states = Vec::with_capacity(items.len());
-        for (cache_id, _, _, _) in items {
-            let state = self.sequences.remove(cache_id).ok_or_else(|| {
-                FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
-            })?;
-            states.push((cache_id.clone(), state));
-        }
-        let result =
-            self.forward_stateful_prefill_batch_taken(items, &mut states, true, logits_return);
-        let success = result.is_ok();
-        for ((cache_id, mut state), (_, tokens, _, _)) in states.into_iter().zip(items.iter()) {
-            if success {
-                state.tokens.extend_from_slice(tokens);
-            }
-            self.sequences.insert(cache_id, state);
-        }
-        result
+        self.forward_stateful_paged_prefill_batch_with_logits_return(
+            items,
+            logits_return,
+            Qwen35PagedPrefillBatchMode::FreshOnly,
+        )
     }
 
     fn forward_stateful_prefill_continuation_batch(
@@ -1895,22 +1837,70 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         items: &[(String, Vec<u32>, usize, bool)],
         logits_return: Qwen35DecodeLogitsReturn<'_>,
     ) -> Result<Vec<Option<Vec<f32>>>> {
+        self.forward_stateful_paged_prefill_batch_with_logits_return(
+            items,
+            logits_return,
+            Qwen35PagedPrefillBatchMode::ContinuationOnly,
+        )
+    }
+
+    fn forward_stateful_prefill_mixed_batch_with_logits_return(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        logits_return: Qwen35DecodeLogitsReturn<'_>,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        self.forward_stateful_paged_prefill_batch_with_logits_return(
+            items,
+            logits_return,
+            Qwen35PagedPrefillBatchMode::Mixed,
+        )
+    }
+
+    fn forward_stateful_paged_prefill_batch_with_logits_return(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        logits_return: Qwen35DecodeLogitsReturn<'_>,
+        mode: Qwen35PagedPrefillBatchMode,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
         if !self.use_paged_kv {
-            return Err(FerrumError::unsupported(
-                "Qwen3.5 unified_forward continuation batch prefill requires paged KV",
-            ));
+            let message = match mode {
+                Qwen35PagedPrefillBatchMode::FreshOnly => {
+                    "Qwen3.5 unified_forward fresh prefill requires paged KV"
+                }
+                Qwen35PagedPrefillBatchMode::ContinuationOnly => {
+                    "Qwen3.5 unified_forward continuation batch prefill requires paged KV"
+                }
+                Qwen35PagedPrefillBatchMode::Mixed => {
+                    "Qwen3.5 unified_forward mixed batch prefill requires paged KV"
+                }
+            };
+            return Err(FerrumError::unsupported(message));
         }
         let mut seen = HashSet::with_capacity(items.len());
         for (cache_id, tokens, pos_offset, _) in items {
             if tokens.is_empty() {
+                let message = match mode {
+                    Qwen35PagedPrefillBatchMode::FreshOnly => {
+                        "Qwen3.5 unified_forward does not accept empty prefill chunks"
+                    }
+                    Qwen35PagedPrefillBatchMode::ContinuationOnly => {
+                        "Qwen3.5 unified_forward does not accept empty continuation chunks"
+                    }
+                    Qwen35PagedPrefillBatchMode::Mixed => {
+                        "Qwen3.5 unified_forward does not accept empty mixed prefill chunks"
+                    }
+                };
+                return Err(FerrumError::unsupported(message));
+            }
+            if mode == Qwen35PagedPrefillBatchMode::FreshOnly && *pos_offset != 0 {
                 return Err(FerrumError::unsupported(
-                    "Qwen3.5 unified_forward does not accept empty continuation chunks",
+                    "Qwen3.5 unified_forward batch prefill currently supports fresh chunks only",
                 ));
             }
-            if *pos_offset == 0 {
+            if mode == Qwen35PagedPrefillBatchMode::ContinuationOnly && *pos_offset == 0 {
                 return Err(FerrumError::unsupported(
                     "Qwen3.5 unified_forward continuation batch received fresh prefill",
                 ));
@@ -1924,9 +1914,21 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             let state = self.sequences.get(cache_id).ok_or_else(|| {
                 FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
             })?;
+            if *pos_offset == 0 {
+                if !state.tokens.is_empty() {
+                    return Err(FerrumError::unsupported(
+                        "Qwen3.5 unified_forward fresh prefill received a non-empty sequence state",
+                    ));
+                }
+                if qwen35_first_full_kv(state).is_some_and(|kv| kv.len != 0) {
+                    return Err(FerrumError::unsupported(
+                        "Qwen3.5 unified_forward fresh prefill received non-empty full-attention KV",
+                    ));
+                }
+            }
             if state.tokens.len() != *pos_offset {
                 return Err(FerrumError::model(format!(
-                    "Qwen3.5 unified_forward continuation position mismatch for {cache_id:?}: \
+                    "Qwen3.5 unified_forward prefill position mismatch for {cache_id:?}: \
                      state len {} != pos {}",
                     state.tokens.len(),
                     pos_offset
@@ -1939,13 +1941,15 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                     self.weights.layers.len()
                 )));
             }
-            if let Some(kv) = qwen35_first_full_kv(state) {
-                if kv.len != *pos_offset {
-                    return Err(FerrumError::model(format!(
-                        "Qwen3.5 unified_forward continuation KV position mismatch for \
-                         {cache_id:?}: kv len {} != pos {}",
-                        kv.len, pos_offset
-                    )));
+            if *pos_offset != 0 {
+                if let Some(kv) = qwen35_first_full_kv(state) {
+                    if kv.len != *pos_offset {
+                        return Err(FerrumError::model(format!(
+                            "Qwen3.5 unified_forward continuation KV position mismatch for \
+                             {cache_id:?}: kv len {} != pos {}",
+                            kv.len, pos_offset
+                        )));
+                    }
                 }
             }
         }
@@ -1958,8 +1962,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             })?;
             states.push((cache_id.clone(), state));
         }
-        let result =
-            self.forward_stateful_prefill_batch_taken(items, &mut states, false, logits_return);
+        let result = self.forward_stateful_prefill_batch_taken(items, &mut states, logits_return);
         let success = result.is_ok();
         for ((cache_id, mut state), (_, tokens, _, _)) in states.into_iter().zip(items.iter()) {
             if success {
@@ -1974,7 +1977,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
         states: &mut [(String, Qwen35SequenceState<B>)],
-        fresh_initial_linear_state: bool,
         logits_return: Qwen35DecodeLogitsReturn<'_>,
     ) -> Result<Vec<Option<Vec<f32>>>> {
         let batch_len = items.len();
@@ -2008,11 +2010,14 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         let mut ctx = B::new_context();
         let profile_enabled = qwen35_prefill_profile_enabled();
         let mut prefill_profile = Qwen35PrefillProfile::default();
-        if !fresh_initial_linear_state {
-            for (_, state) in states.iter_mut() {
-                if !state.tokens.is_empty() {
-                    self.sync_sequence_linear_state_from_slot(&mut ctx, state)?;
-                }
+        let fresh_initial_rows = items
+            .iter()
+            .zip(states.iter())
+            .map(|((_, _, pos_offset, _), (_, state))| *pos_offset == 0 && state.tokens.is_empty())
+            .collect::<Vec<_>>();
+        for (is_fresh_initial, (_, state)) in fresh_initial_rows.iter().zip(states.iter_mut()) {
+            if !*is_fresh_initial && !state.tokens.is_empty() {
+                self.sync_sequence_linear_state_from_slot(&mut ctx, state)?;
             }
         }
         for (row, ((cache_id, _, _, _), (_, state))) in
@@ -2070,7 +2075,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                         &hidden,
                         states,
                         self.linear_state_pools.as_mut(),
-                        fresh_initial_linear_state,
+                        &fresh_initial_rows,
                         layer_index,
                         layer,
                         &weights.config,
@@ -2291,15 +2296,14 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             }
         }
 
-        let merge_decode_with_continuation =
-            qwen35_should_merge_decode_rows_into_paged_continuation(
-                self.use_paged_kv,
-                self.greedy_argmax,
-                policies,
-                items.len(),
-                !chunk_rows.is_empty(),
-            );
-        if merge_decode_with_continuation {
+        let merge_decode_with_prefill = qwen35_should_merge_decode_rows_into_paged_prefill(
+            self.use_paged_kv,
+            self.greedy_argmax,
+            policies,
+            items.len(),
+            !fresh_rows.is_empty() || !chunk_rows.is_empty(),
+        );
+        if merge_decode_with_prefill {
             chunk_rows.extend(decode_candidate_rows.iter().copied());
         } else {
             for row in decode_candidate_rows {
@@ -2317,60 +2321,66 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             }
         }
 
-        if !fresh_prefill.is_empty() {
-            let fresh_final_policies = if policies.len() == items.len() {
-                fresh_rows
+        if self.use_paged_kv && (!fresh_rows.is_empty() || !chunk_rows.is_empty()) {
+            let mut prefill_rows = Vec::with_capacity(fresh_rows.len() + chunk_rows.len());
+            prefill_rows.extend(fresh_rows.iter().copied());
+            prefill_rows.extend(chunk_rows.iter().copied());
+            prefill_rows.sort_unstable();
+            let prefill_items = prefill_rows
+                .iter()
+                .map(|&row| items[row].clone())
+                .collect::<Vec<_>>();
+            let prefill_final_policies = if policies.len() == items.len() {
+                prefill_rows
                     .iter()
                     .filter_map(|&row| items[row].3.then(|| policies[row].clone()))
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
-            let logits_return = if fresh_final_policies.is_empty() {
+            let logits_return = if prefill_final_policies.is_empty() {
                 Qwen35DecodeLogitsReturn::Full
             } else {
                 qwen35_decode_logits_return_from_policies(
-                    &fresh_final_policies,
-                    fresh_final_policies.len(),
+                    &prefill_final_policies,
+                    prefill_final_policies.len(),
                 )
             };
-            let rows = self
-                .forward_stateful_prefill_batch_with_logits_return(&fresh_prefill, logits_return)?;
-            for (row, logits) in fresh_rows.into_iter().zip(rows) {
+            let rows = self.forward_stateful_prefill_mixed_batch_with_logits_return(
+                &prefill_items,
+                logits_return,
+            )?;
+            for (row, logits) in prefill_rows.into_iter().zip(rows) {
                 out[row] = logits;
             }
-        }
-
-        if !chunk_rows.is_empty() {
-            if self.use_paged_kv {
-                let chunk_items = chunk_rows
-                    .iter()
-                    .map(|&row| items[row].clone())
-                    .collect::<Vec<_>>();
-                let chunk_final_policies = if policies.len() == items.len() {
-                    chunk_rows
+        } else {
+            if !fresh_prefill.is_empty() {
+                let fresh_final_policies = if policies.len() == items.len() {
+                    fresh_rows
                         .iter()
                         .filter_map(|&row| items[row].3.then(|| policies[row].clone()))
                         .collect::<Vec<_>>()
                 } else {
                     Vec::new()
                 };
-                let logits_return = if chunk_final_policies.is_empty() {
+                let logits_return = if fresh_final_policies.is_empty() {
                     Qwen35DecodeLogitsReturn::Full
                 } else {
                     qwen35_decode_logits_return_from_policies(
-                        &chunk_final_policies,
-                        chunk_final_policies.len(),
+                        &fresh_final_policies,
+                        fresh_final_policies.len(),
                     )
                 };
-                let rows = self.forward_stateful_prefill_continuation_batch_with_logits_return(
-                    &chunk_items,
+                let rows = self.forward_stateful_prefill_batch_with_logits_return(
+                    &fresh_prefill,
                     logits_return,
                 )?;
-                for (row, logits) in chunk_rows.into_iter().zip(rows) {
+                for (row, logits) in fresh_rows.into_iter().zip(rows) {
                     out[row] = logits;
                 }
-            } else {
+            }
+
+            if !chunk_rows.is_empty() {
                 for row in chunk_rows {
                     let (cache_id, tokens, _, is_final_chunk) = &items[row];
                     if *is_final_chunk {
@@ -7165,30 +7175,22 @@ fn qwen35_prepare_linear_prefill_initial_states<B: MoeLlmBackend>(
     batch_len: usize,
     conv_state_len: usize,
     delta_state_len: usize,
-    fresh_initial_linear_state: bool,
+    fresh_initial_rows: &[bool],
     detail_enabled: bool,
     detail: &mut Qwen35LinearPrefillDetailProfile,
 ) -> Result<(B::Buffer, B::Buffer)> {
+    if fresh_initial_rows.len() != batch_len {
+        return Err(FerrumError::model(format!(
+            "Qwen3.5 batch prefill fresh row count {} != batch len {}",
+            fresh_initial_rows.len(),
+            batch_len
+        )));
+    }
     let mut initial_conv_states = B::alloc_typed(Dtype::F32, batch_len * conv_state_len);
     let mut initial_delta_states = B::alloc_typed(Dtype::F32, batch_len * delta_state_len);
-    if fresh_initial_linear_state {
-        for (cache_id, state) in states.iter_mut() {
-            let Qwen35LayerRuntimeState::Linear { .. } =
-                state.layers.get_mut(layer_index).ok_or_else(|| {
-                    FerrumError::model(format!(
-                        "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
-                    ))
-                })?
-            else {
-                return Err(FerrumError::model(format!(
-                    "Qwen3.5 batch prefill expected linear layer state at layer {layer_index} for {cache_id:?}"
-                )));
-            };
-        }
-        return Ok((initial_conv_states, initial_delta_states));
-    }
 
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    let gather_any = fresh_initial_rows.iter().any(|is_fresh| !*is_fresh);
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled && gather_any);
     for (row, (cache_id, state)) in states.iter_mut().enumerate() {
         let Qwen35LayerRuntimeState::Linear {
             conv_state,
@@ -7203,6 +7205,9 @@ fn qwen35_prepare_linear_prefill_initial_states<B: MoeLlmBackend>(
                 "Qwen3.5 batch prefill expected linear layer state at layer {layer_index} for {cache_id:?}"
             )));
         };
+        if fresh_initial_rows[row] {
+            continue;
+        }
         B::copy_slice(
             ctx,
             conv_state,
@@ -7220,8 +7225,13 @@ fn qwen35_prepare_linear_prefill_initial_states<B: MoeLlmBackend>(
             delta_state_len,
         );
     }
-    detail.state_gather_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_state_gather");
+    if gather_any {
+        detail.state_gather_us += qwen35_detail_profile_stage_finish::<B>(
+            ctx,
+            timer,
+            "qwen35_linear_prefill_state_gather",
+        );
+    }
     Ok((initial_conv_states, initial_delta_states))
 }
 
@@ -7231,7 +7241,7 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
     layer_input: &B::Buffer,
     states: &mut [(String, Qwen35SequenceState<B>)],
     linear_state_pools: Option<&mut Qwen35LinearStatePools<B>>,
-    fresh_initial_linear_state: bool,
+    fresh_initial_rows: &[bool],
     layer_index: usize,
     layer: &Qwen35LayerWeights<B>,
     config: &Qwen35TextConfig,
@@ -7377,7 +7387,7 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
             batch_len,
             conv_state_len,
             delta_state_len,
-            fresh_initial_linear_state,
+            fresh_initial_rows,
             detail_enabled,
             &mut detail,
         )?;
@@ -12362,7 +12372,7 @@ mod tests {
             2,
             conv_state_len,
             delta_state_len,
-            true,
+            &[true, true],
             false,
             &mut detail,
         )
@@ -12385,7 +12395,7 @@ mod tests {
                 2,
                 conv_state_len,
                 delta_state_len,
-                false,
+                &[false, false],
                 false,
                 &mut detail,
             )
@@ -12397,6 +12407,28 @@ mod tests {
         assert_eq!(
             CpuBackend::to_vec(&gathered_delta, 2 * delta_state_len),
             vec![4.0, 5.0, 6.0, 7.0, 11.0, 12.0, 13.0, 14.0]
+        );
+
+        let mut detail = Qwen35LinearPrefillDetailProfile::default();
+        let (mixed_conv, mixed_delta) = qwen35_prepare_linear_prefill_initial_states::<CpuBackend>(
+            &mut ctx,
+            &mut states,
+            0,
+            2,
+            conv_state_len,
+            delta_state_len,
+            &[true, false],
+            false,
+            &mut detail,
+        )
+        .unwrap();
+        assert_eq!(
+            CpuBackend::to_vec(&mixed_conv, 2 * conv_state_len),
+            vec![0.0, 0.0, 0.0, 8.0, 9.0, 10.0]
+        );
+        assert_eq!(
+            CpuBackend::to_vec(&mixed_delta, 2 * delta_state_len),
+            vec![0.0, 0.0, 0.0, 0.0, 11.0, 12.0, 13.0, 14.0]
         );
     }
 
@@ -12672,6 +12704,57 @@ mod tests {
             "decode row must return logits"
         );
         assert_eq!(model.sequences["chunk-req"].tokens, vec![3, 4, 5]);
+        assert_eq!(model.sequences["decode-req"].tokens, vec![1, 2, 6]);
+    }
+
+    #[test]
+    fn qwen35_unified_forward_mixes_fresh_prefill_and_decode_candidate() {
+        let config = tiny_linear_config();
+        let vocab_size = 128;
+        let loader = ForwardLoader::from_required_manifest(&config, vocab_size);
+        let plan = loader.plan();
+        let mut model = Qwen35BackendModel::<CpuBackend>::from_weight_plan(
+            config.clone(),
+            qwen35_runtime_config(&config, vocab_size, 64),
+            plan,
+            &loader,
+        )
+        .unwrap();
+        // CPU has no paged full-attention prefill kernel; keep this regression
+        // focused on the Qwen3.5 linear/GDN mixed-prefill state contract.
+        model.weights.layers.truncate(1);
+        model.weights.config.num_hidden_layers = 1;
+        model.weights.config.layer_types = vec![Qwen35LayerType::LinearAttention];
+        model.use_paged_kv = true;
+        model.greedy_argmax = true;
+
+        <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::prefill(
+            &mut model,
+            "decode-req",
+            &[1, 2],
+        );
+
+        let rows =
+            <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::unified_forward_with_logits_policy(
+                &mut model,
+                &[
+                    ("fresh-req".to_string(), vec![3, 4], 0, false),
+                    ("decode-req".to_string(), vec![6], 2, true),
+                ],
+                &[
+                    LogitsReturnPolicy::FullLogits,
+                    LogitsReturnPolicy::FullLogits,
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_none(), "fresh non-final chunk must skip logits");
+        assert!(
+            rows[1].as_ref().is_some_and(|logits| !logits.is_empty()),
+            "decode candidate merged into mixed prefill must return logits"
+        );
+        assert_eq!(model.sequences["fresh-req"].tokens, vec![3, 4]);
         assert_eq!(model.sequences["decode-req"].tokens, vec![1, 2, 6]);
     }
 
@@ -12967,28 +13050,28 @@ mod tests {
 
     #[test]
     fn qwen35_decode_merge_policy_preserves_legacy_no_policy_contract() {
-        assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
+        assert!(!qwen35_should_merge_decode_rows_into_paged_prefill(
             false,
             false,
             &[],
             2,
             true
         ));
-        assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
+        assert!(!qwen35_should_merge_decode_rows_into_paged_prefill(
             true,
             false,
             &[],
             2,
             false
         ));
-        assert!(qwen35_should_merge_decode_rows_into_paged_continuation(
+        assert!(qwen35_should_merge_decode_rows_into_paged_prefill(
             true,
             false,
             &[],
             2,
             true
         ));
-        assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
+        assert!(!qwen35_should_merge_decode_rows_into_paged_prefill(
             true,
             true,
             &[],
@@ -13000,7 +13083,7 @@ mod tests {
             LogitsReturnPolicy::FullLogits,
             LogitsReturnPolicy::FullLogits,
         ];
-        assert!(qwen35_should_merge_decode_rows_into_paged_continuation(
+        assert!(qwen35_should_merge_decode_rows_into_paged_prefill(
             true,
             true,
             &full_logits,
@@ -13015,10 +13098,10 @@ mod tests {
             },
             LogitsReturnPolicy::FullLogits,
         ];
-        assert!(qwen35_should_merge_decode_rows_into_paged_continuation(
+        assert!(qwen35_should_merge_decode_rows_into_paged_prefill(
             true, true, &greedy, 2, true
         ));
-        assert!(!qwen35_should_merge_decode_rows_into_paged_continuation(
+        assert!(!qwen35_should_merge_decode_rows_into_paged_prefill(
             true,
             true,
             &full_logits[..1],

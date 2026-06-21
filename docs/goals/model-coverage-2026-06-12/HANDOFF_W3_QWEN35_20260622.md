@@ -131,6 +131,19 @@ adding model-name defaults or hidden environment switches.
   upper bounds and uses the smallest cap, so explicit chunked-prefill can still
   use the unified/chunked prefill architecture instead of bypassing the Qwen3.5
   paged continuation path.
+- Qwen3.5 paged prefill now has one typed batch entry for fresh-only,
+  continuation-only, and mixed prefill rows. This removes duplicated validation
+  and gives `forward_stateful_unified_items` one place to run mixed varlen
+  prefill work.
+- Linear-attention batch prefill initial state is now selected per row instead
+  of per batch: fresh first chunks keep zero initial conv/GDN state, while
+  continuation and decode-candidate rows gather existing recurrent state in the
+  same batch.
+- Paged unified Qwen3.5 work can now place fresh first chunks, continuation
+  chunks, and eligible decode candidates into one mixed prefill batch. This is
+  the source-side architecture change needed after runtime chunked prefill was
+  kept on the unified path; it avoids splitting fresh first chunk work from
+  decode solely because the prefill row starts at position 0.
 
 The key vLLM reference is:
 
@@ -195,6 +208,11 @@ cargo test -p ferrum-engine \
   process_batch_unified_forwards_prefill_logits_policy -- --nocapture
 cargo test -p ferrum-engine \
   process_batch_unified_honors_runtime_chunked_prefill -- --nocapture
+cargo test -p ferrum-models qwen35_unified_forward -- --nocapture
+cargo test -p ferrum-models \
+  qwen35_fresh_prefill_initial_state_slabs_are_zero_not_gathered -- --nocapture
+cargo test -p ferrum-models \
+  qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture
 cargo check -p ferrum-models
 cargo check -p ferrum-engine
 cargo fmt --all -- --check
