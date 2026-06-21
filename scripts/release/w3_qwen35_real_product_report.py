@@ -1121,6 +1121,7 @@ def build_s2_artifact(
     serve_result: dict[str, Any],
     ferrum_bin: Path | None,
     hidden_env: list[str],
+    pre_run_git: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if hidden_env:
         raise ReportError(
@@ -1135,7 +1136,7 @@ def build_s2_artifact(
         "pass_line": f"{S2_PASS_LINE_PREFIX}: {out_dir}",
         "created_at": iso_now(),
         "command_line": command_line(),
-        "git": git_summary(),
+        "git": pre_run_git or git_summary(),
         "model_id": args.release_model_id,
         "architecture": "qwen3_5_moe",
         "backend": args.backend,
@@ -1155,13 +1156,13 @@ def build_s2_artifact(
 
 def run_report(args: argparse.Namespace) -> int:
     out_dir = args.out.resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
     git = git_summary()
     if args.require_clean_git and git["is_dirty"]:
         raise ReportError(
             "git worktree is dirty; commit or stash changes before collecting "
             f"release-grade evidence: {git['tracked_status_short'][:5]}"
         )
+    out_dir.mkdir(parents=True, exist_ok=True)
     ferrum_bin = resolve_ferrum_bin(args.ferrum_bin)
     env, hidden_env = product_env(args, out_dir)
     if hidden_env:
@@ -1192,6 +1193,7 @@ def run_report(args: argparse.Namespace) -> int:
         serve_result=serve_result,
         ferrum_bin=ferrum_bin,
         hidden_env=hidden_env,
+        pre_run_git=git,
     )
     summary = {
         "schema_version": 1,
@@ -1202,6 +1204,7 @@ def run_report(args: argparse.Namespace) -> int:
         "format": args.quantized_format,
         "generated_at": iso_now(),
         "pass_line": f"{PASS_LINE_PREFIX}: {out_dir}",
+        "git": git,
         "artifacts": {
             "known_answer_report": artifact_ref(out_dir / KNOWN_REPORT_NAME, out_dir),
             "l3_behavior": artifact_ref(out_dir / L3_ARTIFACT_NAME, out_dir),
@@ -1331,6 +1334,13 @@ def run_selftest() -> int:
             serve_result=serve_result,
             ferrum_bin=None,
             hidden_env=[],
+            pre_run_git={
+                "sha": "selftest-pre-run",
+                "is_dirty": False,
+                "tracked_status_short": [],
+                "untracked_count": 0,
+                "untracked_sample": [],
+            },
         )
         if known_report["known_answer_total"] < 10:
             raise AssertionError("known-answer self-test total is too small")
@@ -1338,6 +1348,8 @@ def run_selftest() -> int:
             raise AssertionError("L3 behavior self-test did not pass all cases")
         if s2_artifact["product_entrypoints"]["ferrum_serve"]["stream"]["done_count"] != 1:
             raise AssertionError("S2 self-test did not preserve stream done count")
+        if s2_artifact["git"]["sha"] != "selftest-pre-run":
+            raise AssertionError("S2 self-test did not preserve pre-run git evidence")
 
         from model_release_grade_goal_gate import (  # type: ignore
             validate_w3_l0_l5_artifact,

@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ61 — W3 real-product report records pre-run git evidence
+
+- Scope:
+  - fixed `scripts/release/w3_qwen35_real_product_report.py` so release-grade
+    evidence captures git status before creating the artifact directory;
+  - the S2 whole-model product-path artifact now records the pre-run git
+    summary instead of re-reading git after `known_answer_report.json`,
+    `w3_l3_behavior.json`, and product logs have been written;
+  - the report summary also records that same pre-run git snapshot.
+- Why:
+  - if a GPU lane writes artifacts inside the repository, reading git after
+    artifact generation can make an otherwise clean run appear dirty because of
+    its own evidence files;
+  - W3 requires current-SHA correctness evidence with explicit dirty status, so
+    the runner must preserve the state that existed before inference started.
+- Validation passed locally:
+  - `python3 -m py_compile scripts/release/w3_qwen35_real_product_report.py`;
+  - `python3 scripts/release/w3_qwen35_real_product_report.py --self-test`;
+  - `python3 scripts/release/w3_l2_quantized_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `git diff --check`.
+- Status:
+  - local tooling progress only; CUDA correctness/performance still requires a
+    runnable 1x4090 and restored Vast credit;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ60 — Current-SHA W3 CUDA lane could not start on cached Vast instance
 
 - Scope:
