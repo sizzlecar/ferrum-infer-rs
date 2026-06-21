@@ -469,14 +469,21 @@ impl Qwen35WeightInventory {
 
     fn matching_names(&self, tensor: &Qwen35WeightSpec) -> Vec<String> {
         if !tensor.name.contains('*') {
-            if tensor.name.ends_with(".lm_head.weight") && self.contains("lm_head.weight") {
-                return vec!["lm_head.weight".to_string()];
+            let mut candidates = vec![tensor.name.clone()];
+            if tensor.name.ends_with(".lm_head.weight") {
+                candidates.push("lm_head.weight".to_string());
             }
-            return self
-                .contains(&tensor.name)
-                .then(|| tensor.name.clone())
-                .into_iter()
-                .collect();
+            for candidate in candidates {
+                if self.contains(&candidate) {
+                    return vec![candidate];
+                }
+                if role_accepts_quantized_linear_alias(&tensor.role) {
+                    if let Some(qweight) = self.quantized_linear_qweight_name(&candidate) {
+                        return vec![qweight];
+                    }
+                }
+            }
+            return Vec::new();
         }
         let mut pieces = tensor.name.splitn(2, '*');
         let prefix = pieces.next().unwrap_or("");
@@ -486,6 +493,15 @@ impl Qwen35WeightInventory {
             .filter(|name| name.starts_with(prefix) && name.ends_with(suffix))
             .cloned()
             .collect()
+    }
+
+    fn quantized_linear_qweight_name(&self, dense_weight_name: &str) -> Option<String> {
+        let module = dense_weight_name.strip_suffix(".weight")?;
+        let qweight = format!("{module}.qweight");
+        let scales = format!("{module}.scales");
+        let qzeros = format!("{module}.qzeros");
+        (self.contains(&qweight) && self.contains(&scales) && self.contains(&qzeros))
+            .then_some(qweight)
     }
 
     fn resolve_weight_specs(&self, specs: &[Qwen35WeightSpec]) -> Vec<Qwen35ResolvedWeightSpec> {
@@ -577,8 +593,32 @@ impl Qwen35ResolvedWeightPlan {
 fn linear_module_name(tensor_name: &str) -> String {
     tensor_name
         .strip_suffix(".weight")
+        .or_else(|| tensor_name.strip_suffix(".qweight"))
         .unwrap_or(tensor_name)
         .to_string()
+}
+
+fn role_accepts_quantized_linear_alias(role: &str) -> bool {
+    matches!(
+        role,
+        "lm_head"
+            | "linear_attn_qkv"
+            | "linear_attn_z"
+            | "linear_attn_b"
+            | "linear_attn_a"
+            | "linear_attn_out"
+            | "self_attn_q"
+            | "self_attn_k"
+            | "self_attn_v"
+            | "self_attn_o"
+            | "mlp_gate"
+            | "mlp_up"
+            | "mlp_down"
+            | "moe_router"
+            | "moe_shared_expert_gate_proj"
+            | "moe_shared_expert_up_proj"
+            | "moe_shared_expert_down_proj"
+    )
 }
 
 #[cfg(test)]
@@ -717,6 +757,39 @@ mod tests {
         }
     }
 
+    fn required_names_with_gptq_linear_aliases(
+        config: &Qwen35TextConfig,
+        prefix: &str,
+    ) -> Vec<String> {
+        let manifest = config.weight_manifest(prefix).unwrap();
+        manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .flat_map(|tensor| {
+                if role_accepts_quantized_linear_alias(&tensor.role) {
+                    let module = tensor
+                        .name
+                        .strip_suffix(".weight")
+                        .expect("quantized linear aliases are declared as .weight specs");
+                    vec![
+                        format!("{module}.qweight"),
+                        format!("{module}.scales"),
+                        format!("{module}.qzeros"),
+                    ]
+                } else {
+                    vec![tensor.name.clone()]
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn validates_single_file_safetensors_against_manifest() {
         let config = dense_config();
@@ -810,6 +883,88 @@ mod tests {
                 .map(|tensor| tensor.name.as_str()),
             Some("model.layers.0.linear_attn.in_proj_qkv.weight")
         );
+    }
+
+    #[test]
+    fn resolves_required_gptq_linear_aliases_without_dense_weight_tensors() {
+        let config = moe_config();
+        let names = required_names_with_gptq_linear_aliases(&config, "model");
+        assert!(!names.contains(&"model.layers.3.self_attn.q_proj.weight".to_string()));
+        assert!(names.contains(&"model.layers.3.self_attn.q_proj.qweight".to_string()));
+        assert!(names.contains(&"model.layers.3.self_attn.q_proj.scales".to_string()));
+        assert!(names.contains(&"model.layers.3.self_attn.q_proj.qzeros".to_string()));
+        let inventory = Qwen35WeightInventory::from_names(names.clone());
+
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+        let validation = plan.validation();
+
+        assert_eq!(plan.prefix, "model");
+        assert!(validation.is_pass());
+        assert_eq!(
+            plan.global_tensor("lm_head")
+                .map(|tensor| tensor.name.as_str()),
+            Some("model.lm_head.qweight")
+        );
+        assert_eq!(
+            plan.layer_tensor(3, "self_attn_q")
+                .map(|tensor| tensor.name.as_str()),
+            Some("model.layers.3.self_attn.q_proj.qweight")
+        );
+        assert_eq!(
+            plan.layer_tensor(0, "linear_attn_qkv")
+                .map(|tensor| tensor.name.as_str()),
+            Some("model.layers.0.linear_attn.in_proj_qkv.qweight")
+        );
+        assert_eq!(
+            plan.layer_tensor(0, "moe_router")
+                .map(|tensor| tensor.name.as_str()),
+            Some("model.layers.0.mlp.gate.qweight")
+        );
+
+        let loader = RecordingLoader::from_names(names);
+        let planned = Qwen35WeightPlanLoader::<CpuBackend>::new(&plan, &loader);
+        assert!(planned.has_global_tensor("lm_head"));
+        assert!(planned.has_layer_tensor(3, "self_attn_q"));
+        planned.load_global_linear("lm_head").unwrap();
+        planned.load_layer_linear(3, "self_attn_q").unwrap();
+        planned.load_layer_shared_expert_gate_up_linear(0).unwrap();
+
+        assert_eq!(
+            loader.linear_names(),
+            vec![
+                "model.lm_head".to_string(),
+                "model.layers.3.self_attn.q_proj".to_string(),
+                "model.layers.0.mlp.shared_expert.gate_up_proj".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_gptq_linear_alias() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let mut names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        names.retain(|name| name != "model.layers.3.self_attn.q_proj.weight");
+        names.push("model.layers.3.self_attn.q_proj.qweight".to_string());
+        names.push("model.layers.3.self_attn.q_proj.scales".to_string());
+        let inventory = Qwen35WeightInventory::from_names(names);
+
+        let err = inventory
+            .detect_prefix_and_resolve(&config)
+            .expect_err("incomplete GPTQ q_proj alias must not satisfy manifest");
+
+        assert!(err.contains("self_attn.q_proj.weight"), "{err}");
     }
 
     #[test]

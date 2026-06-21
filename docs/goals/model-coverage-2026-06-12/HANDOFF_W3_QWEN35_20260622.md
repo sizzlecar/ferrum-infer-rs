@@ -162,6 +162,12 @@ adding model-name defaults or hidden environment switches.
   against the CPU reference across q projection/gate split, Q/K RMSNorm,
   partial RoPE, head-major attention, context gating, `o_proj`, and dense MLP
   output.
+- Qwen3.5/Qwen3.6 weight inventory now accepts complete GPTQ tensor sets for
+  required linear roles. A required linear can resolve from `.weight` or from
+  `.qweight` + `.scales` + `.qzeros`; the resolved `.qweight` still maps back
+  to the module name before `WeightLoader::load_linear`, matching the existing
+  `NativeSafetensorsLoader` GPTQ path. Incomplete GPTQ aliases still fail the
+  manifest instead of being treated as usable weights.
 - Existing Vast instance `41422823` was checked for a W3 Qwen35 mixed-prefill
   CUDA smoke/c32 diagnostic. SSH to `ssh7.vast.ai:22822` returned connection
   refused, and the sanitized API summary says `cur_state=stopped`,
@@ -253,6 +259,8 @@ cargo test -p ferrum-models \
 cargo test -p ferrum-models dense_full_attention -- --nocapture
 cargo test -p ferrum-models \
   full_attention_backend_core_matches_reference -- --nocapture
+cargo check -p ferrum-models
+cargo test -p ferrum-models qwen35_weights -- --nocapture
 cargo check -p ferrum-models
 cargo check -p ferrum-engine
 cargo fmt --all -- --check
@@ -380,6 +388,11 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   old dense assumptions: q projection rows are `[query, gate]` per head,
   `q_proj_total` is twice `q_total`, RoPE is partial/interleaved, and `o_proj`
   consumes `q_total`, not `hidden_size`.
+- Real GPTQ checkpoint inventory should now pass for required linears that are
+  present only as `.qweight/.scales/.qzeros`. If the next real load still fails
+  on `mlp.shared_expert_gate.weight`, inspect the checkpoint first: Ferrum still
+  loads that one-output gate as a raw tensor, while vLLM models it as a
+  `ReplicatedLinear`.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
