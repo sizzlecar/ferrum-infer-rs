@@ -301,13 +301,6 @@ pub struct Qwen35PagedScratch<B: MoeLlmBackend> {
     max_blocks_per_seq: usize,
 }
 
-#[derive(Clone, Copy)]
-struct Qwen35PagedDecodeMetadata {
-    block_size: usize,
-    max_blocks_per_seq: usize,
-    max_kv_len: usize,
-}
-
 pub struct Qwen35DecodeScratch<B: MoeLlmBackend> {
     max_tokens: usize,
     hidden_size: usize,
@@ -1288,140 +1281,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         Ok(())
     }
 
-    fn populate_paged_decode_scratch(
-        &mut self,
-        ctx: &mut B::Context,
-        states: &mut [(String, Qwen35SequenceState<B>)],
-        batch_len: usize,
-        q_total: usize,
-    ) -> Result<Option<Qwen35PagedDecodeMetadata>> {
-        if !self.use_paged_kv {
-            return Ok(None);
-        }
-
-        let mut pos_offsets = Vec::with_capacity(batch_len);
-        let mut context_lens = Vec::with_capacity(batch_len);
-        let mut stacked_block_tables = Vec::new();
-        let mut block_size = 0usize;
-        let mut max_blocks_per_seq = 0usize;
-        let mut max_kv_len = 0usize;
-
-        for (cache_id, state) in states.iter_mut() {
-            let (state_block_size, state_capacity, pos, mut blocks) = {
-                let first_kv = qwen35_first_full_kv(state).ok_or_else(|| {
-                    FerrumError::model(format!(
-                        "Qwen3.5 paged decode missing full-attention state for {cache_id:?}"
-                    ))
-                })?;
-                if first_kv.block_size == 0 {
-                    return Err(FerrumError::model(format!(
-                        "Qwen3.5 paged decode received non-paged KV metadata for {cache_id:?}"
-                    )));
-                }
-                (
-                    first_kv.block_size,
-                    first_kv.capacity,
-                    first_kv.len,
-                    first_kv.paged_block_indices.clone(),
-                )
-            };
-            let this_blocks_per_seq = state_capacity / state_block_size;
-            if this_blocks_per_seq == 0 {
-                return Err(FerrumError::model(format!(
-                    "Qwen3.5 paged decode empty block table for {cache_id:?}"
-                )));
-            }
-            if block_size == 0 {
-                block_size = state_block_size;
-                max_blocks_per_seq = this_blocks_per_seq;
-            } else if block_size != state_block_size || max_blocks_per_seq != this_blocks_per_seq {
-                return Err(FerrumError::model(
-                    "Qwen3.5 paged decode received mixed block table shapes",
-                ));
-            }
-
-            let next_len = pos + 1;
-            if next_len > state_capacity {
-                return Err(FerrumError::model(format!(
-                    "Qwen3.5 paged decode KV overflow for {cache_id:?}: target={next_len} \
-                     capacity={}",
-                    state_capacity
-                )));
-            }
-            pos_offsets.push(
-                u32::try_from(pos)
-                    .map_err(|_| FerrumError::model("Qwen3.5 KV position exceeds u32"))?,
-            );
-            let next_len_u32 = u32::try_from(next_len)
-                .map_err(|_| FerrumError::model("Qwen3.5 KV length exceeds u32"))?;
-            context_lens.push(next_len_u32);
-            max_kv_len = max_kv_len.max(next_len);
-
-            if blocks.len() > max_blocks_per_seq {
-                return Err(FerrumError::model(format!(
-                    "Qwen3.5 paged decode block table overflow for {cache_id:?}"
-                )));
-            }
-            blocks.resize(max_blocks_per_seq, 0);
-            stacked_block_tables.extend(blocks);
-
-            for layer_state in &mut state.layers {
-                let Qwen35LayerRuntimeState::Full { kv } = layer_state else {
-                    continue;
-                };
-                if kv.len != pos
-                    || kv.block_size != block_size
-                    || kv.capacity / kv.block_size.max(1) != max_blocks_per_seq
-                {
-                    return Err(FerrumError::model(format!(
-                        "Qwen3.5 paged decode full-layer KV metadata diverged for {cache_id:?}"
-                    )));
-                }
-                kv.len = next_len;
-                if let Some(cl) = kv.context_lens.as_mut() {
-                    B::write_typed::<u32>(ctx, cl, &[next_len_u32]);
-                }
-            }
-        }
-
-        if block_size == 0 {
-            return Ok(None);
-        }
-        let cu: Vec<u32> = (0..=batch_len as u32).collect();
-        self.paged_scratch
-            .ensure(batch_len, batch_len, max_blocks_per_seq, q_total);
-        let cu_buf = self
-            .paged_scratch
-            .cu_seqlens_q
-            .as_mut()
-            .expect("qwen35 paged cu missing");
-        let pos_buf = self
-            .paged_scratch
-            .pos_offsets
-            .as_mut()
-            .expect("qwen35 paged pos missing");
-        let bt_buf = self
-            .paged_scratch
-            .block_tables
-            .as_mut()
-            .expect("qwen35 paged block_tables missing");
-        let lens_buf = self
-            .paged_scratch
-            .context_lens
-            .as_mut()
-            .expect("qwen35 paged context_lens missing");
-        B::write_typed::<u32>(ctx, cu_buf, &cu);
-        B::write_typed::<u32>(ctx, pos_buf, &pos_offsets);
-        B::write_typed::<u32>(ctx, bt_buf, &stacked_block_tables);
-        B::write_typed::<u32>(ctx, lens_buf, &context_lens);
-
-        Ok(Some(Qwen35PagedDecodeMetadata {
-            block_size,
-            max_blocks_per_seq,
-            max_kv_len,
-        }))
-    }
-
     fn ensure_paged_kv_capacity_for_state(
         &mut self,
         ctx: &mut B::Context,
@@ -2233,9 +2092,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             )?;
         }
         self.upload_linear_slot_indices(&mut ctx, states)?;
-        let q_total = self.weights.config.num_attention_heads * self.weights.config.head_dim;
-        let paged_decode_metadata =
-            self.populate_paged_decode_scratch(&mut ctx, states, batch_len, q_total)?;
         let weights = &self.weights;
         let rope = &self.rope;
         let total_layers = weights.layers.len();
@@ -2301,7 +2157,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                         &hidden,
                         states,
                         paged,
-                        paged_decode_metadata,
                         layer_index,
                         layer,
                         rope,
@@ -7530,7 +7385,6 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
     layer_input: &B::Buffer,
     states: &mut [(String, Qwen35SequenceState<B>)],
     paged: Option<(&mut (B::Buffer, B::Buffer), &mut Qwen35PagedScratch<B>)>,
-    paged_decode_metadata: Option<Qwen35PagedDecodeMetadata>,
     layer_index: usize,
     layer: &Qwen35LayerWeights<B>,
     rope: &Qwen35BackendRopeCache<B>,
@@ -7597,74 +7451,40 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
         .forward(ctx, &input_norm, &mut value_raw, batch_len);
 
     if let Some((pool, scratch)) = paged {
-        let (block_size, max_blocks_per_seq, max_kv_len) =
-            if let Some(metadata) = paged_decode_metadata {
-                scratch.ensure(batch_len, batch_len, metadata.max_blocks_per_seq, q_total);
-                (
-                    metadata.block_size,
-                    metadata.max_blocks_per_seq,
-                    metadata.max_kv_len,
-                )
-            } else {
-                let mut pos_offsets = Vec::with_capacity(batch_len);
-                let mut context_lens = Vec::with_capacity(batch_len);
-                let mut stacked = Vec::new();
-                let mut block_size = 0usize;
-                let mut max_blocks_per_seq = 0usize;
-                for (_, state) in states.iter() {
-                    let Qwen35LayerRuntimeState::Full { kv } =
-                        state.layers.get(layer_index).ok_or_else(|| {
-                            FerrumError::model(format!(
-                                "Qwen3.5 missing layer {layer_index} state during paged decode"
-                            ))
-                        })?
-                    else {
-                        return Err(FerrumError::model(format!(
-                            "Qwen3.5 paged decode expected full layer state at layer {layer_index}"
-                        )));
-                    };
-                    if kv.block_size == 0 {
-                        return Err(FerrumError::model(
-                            "Qwen3.5 paged decode received non-paged KV metadata",
-                        ));
-                    }
-                    if block_size == 0 {
-                        block_size = kv.block_size;
-                        max_blocks_per_seq = kv.capacity / kv.block_size;
-                    }
-                    pos_offsets.push(kv.len as u32);
-                    context_lens.push((kv.len + 1) as u32);
-                    let mut blocks = kv.paged_block_indices.clone();
-                    blocks.resize(max_blocks_per_seq, 0);
-                    stacked.extend(blocks);
-                }
-                let cu: Vec<u32> = (0..=batch_len as u32).collect();
-                scratch.ensure(batch_len, batch_len, max_blocks_per_seq, q_total);
-                {
-                    let cu_buf = scratch
-                        .cu_seqlens_q
-                        .as_mut()
-                        .expect("qwen35 paged cu missing");
-                    let pos_buf = scratch
-                        .pos_offsets
-                        .as_mut()
-                        .expect("qwen35 paged pos missing");
-                    let bt_buf = scratch
-                        .block_tables
-                        .as_mut()
-                        .expect("qwen35 paged block_tables missing");
-                    let lens_buf = scratch
-                        .context_lens
-                        .as_mut()
-                        .expect("qwen35 paged context_lens missing");
-                    B::write_typed::<u32>(ctx, cu_buf, &cu);
-                    B::write_typed::<u32>(ctx, pos_buf, &pos_offsets);
-                    B::write_typed::<u32>(ctx, bt_buf, &stacked);
-                    B::write_typed::<u32>(ctx, lens_buf, &context_lens);
-                }
-                let max_kv_len = context_lens.iter().copied().max().unwrap_or(1) as usize;
-                (block_size, max_blocks_per_seq, max_kv_len)
+        let mut pos_offsets = Vec::with_capacity(batch_len);
+        let mut context_lens = Vec::with_capacity(batch_len);
+        let mut stacked = Vec::new();
+        let mut block_size = 0usize;
+        let mut max_blocks_per_seq = 0usize;
+        for (_, state) in states.iter() {
+            let Qwen35LayerRuntimeState::Full { kv } =
+                state.layers.get(layer_index).ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing layer {layer_index} state during paged decode"
+                    ))
+                })?
+            else {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 paged decode expected full layer state at layer {layer_index}"
+                )));
             };
+            if kv.block_size == 0 {
+                return Err(FerrumError::model(
+                    "Qwen3.5 paged decode received non-paged KV metadata",
+                ));
+            }
+            if block_size == 0 {
+                block_size = kv.block_size;
+                max_blocks_per_seq = kv.capacity / kv.block_size;
+            }
+            pos_offsets.push(kv.len as u32);
+            context_lens.push((kv.len + 1) as u32);
+            let mut blocks = kv.paged_block_indices.clone();
+            blocks.resize(max_blocks_per_seq, 0);
+            stacked.extend(blocks);
+        }
+        let cu: Vec<u32> = (0..=batch_len as u32).collect();
+        scratch.ensure(batch_len, batch_len, max_blocks_per_seq, q_total);
         let cu_buf = scratch
             .cu_seqlens_q
             .as_mut()
@@ -7681,6 +7501,10 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
             .context_lens
             .as_mut()
             .expect("qwen35 paged context_lens missing");
+        B::write_typed::<u32>(ctx, cu_buf, &cu);
+        B::write_typed::<u32>(ctx, pos_buf, &pos_offsets);
+        B::write_typed::<u32>(ctx, bt_buf, &stacked);
+        B::write_typed::<u32>(ctx, lens_buf, &context_lens);
         let q_buf = scratch.q.as_mut().expect("qwen35 paged q missing");
         let out_buf = scratch.out.as_mut().expect("qwen35 paged out missing");
         let attention_shape = Qwen35FullAttentionShape {
@@ -7772,26 +7596,24 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 max_blocks_per_seq,
             )?;
         }
-        if paged_decode_metadata.is_none() {
-            for (_, state) in states.iter_mut() {
-                let Qwen35LayerRuntimeState::Full { kv } =
-                    state.layers.get_mut(layer_index).ok_or_else(|| {
-                        FerrumError::model(format!(
-                            "Qwen3.5 missing layer {layer_index} state during paged decode len \
-                             update"
-                        ))
-                    })?
-                else {
-                    return Err(FerrumError::model(format!(
-                        "Qwen3.5 paged decode expected full layer state at layer {layer_index}"
-                    )));
-                };
-                kv.len += 1;
-                if let Some(cl) = kv.context_lens.as_mut() {
-                    B::write_typed::<u32>(ctx, cl, &[kv.len as u32]);
-                }
+        for (_, state) in states.iter_mut() {
+            let Qwen35LayerRuntimeState::Full { kv } =
+                state.layers.get_mut(layer_index).ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing layer {layer_index} state during paged decode len update"
+                    ))
+                })?
+            else {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 paged decode expected full layer state at layer {layer_index}"
+                )));
+            };
+            kv.len += 1;
+            if let Some(cl) = kv.context_lens.as_mut() {
+                B::write_typed::<u32>(ctx, cl, &[kv.len as u32]);
             }
         }
+        let max_kv_len = context_lens.iter().copied().max().unwrap_or(1) as usize;
         if use_vllm_paged_attn {
             B::paged_decode_attention_v2(
                 ctx,
