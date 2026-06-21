@@ -154,6 +154,14 @@ adding model-name defaults or hidden environment switches.
   `unified_forward_with_logits_policy` call to the model layer. The regression
   locks row order, `pos_offset`, non-final `None` output for the fresh chunk,
   and no fallback to split prefill/decode.
+- Qwen3.5 dense full-attention backend now has a source parity regression for
+  the official scaled shape family: `hidden_size != q_total`,
+  `q_proj_total = 2 * q_total`, `attn_output_gate=true`,
+  `num_heads > num_kv_heads`, `rope_dim < head_dim`, interleaved partial RoPE,
+  and non-zero `position_offset`. The test compares the backend layer path
+  against the CPU reference across q projection/gate split, Q/K RMSNorm,
+  partial RoPE, head-major attention, context gating, `o_proj`, and dense MLP
+  output.
 - Existing Vast instance `41422823` was checked for a W3 Qwen35 mixed-prefill
   CUDA smoke/c32 diagnostic. SSH to `ssh7.vast.ai:22822` returned connection
   refused, and the sanitized API summary says `cur_state=stopped`,
@@ -239,6 +247,12 @@ cargo test -p ferrum-models \
   qwen35_fresh_prefill_initial_state_slabs_are_zero_not_gathered -- --nocapture
 cargo test -p ferrum-models \
   qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture
+cargo check -p ferrum-models
+cargo test -p ferrum-models \
+  dense_full_attention_backend_matches_reference_for_qwen35_gated_official_like_shape -- --nocapture
+cargo test -p ferrum-models dense_full_attention -- --nocapture
+cargo test -p ferrum-models \
+  full_attention_backend_core_matches_reference -- --nocapture
 cargo check -p ferrum-models
 cargo check -p ferrum-engine
 cargo fmt --all -- --check
@@ -362,6 +376,10 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   prefill items, not as a legacy split-path prefill loop. If a CUDA run still
   shows split-path behavior, inspect whether speculative decoding is enabled or
   whether the executor reports `supports_native_unified_decode=false`.
+- Full-attention CUDA parity should include the official gated shape, not only
+  old dense assumptions: q projection rows are `[query, gate]` per head,
+  `q_proj_total` is twice `q_total`, RoPE is partial/interleaved, and `o_proj`
+  consumes `q_total`, not `hidden_size`.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
