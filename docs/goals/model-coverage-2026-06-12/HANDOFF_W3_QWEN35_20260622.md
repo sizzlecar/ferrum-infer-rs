@@ -32,6 +32,9 @@
 - Validation passed locally:
   `python3 scripts/release/w3_l1_numeric_gate.py --out docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058`
   and a direct final-validator L1 probe.
+- With this new L1 artifact, the existing real L0/L2/L3/L4/L5 artifacts also
+  pass direct final-validator level checks:
+  `W3 L0-L5 FINAL-VALIDATOR PROBE PASS`.
 - This is source/reference correctness evidence only. It is not CUDA
   performance evidence and does not complete W3.
 
