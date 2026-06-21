@@ -134,6 +134,23 @@ def integer_list(report: dict[str, Any], key: str, label: str) -> list[int]:
     return value
 
 
+def integer_matrix(report: dict[str, Any], key: str, label: str) -> list[list[int]]:
+    value = report.get(key)
+    if not isinstance(value, list):
+        raise BuildError(f"{label}.{key} must be a list of integer lists")
+    out: list[list[int]] = []
+    for row_idx, row in enumerate(value):
+        if not isinstance(row, list):
+            raise BuildError(f"{label}.{key}[{row_idx}] must be an integer list")
+        parsed_row: list[int] = []
+        for col_idx, item in enumerate(row):
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise BuildError(f"{label}.{key}[{row_idx}][{col_idx}] must be an integer")
+            parsed_row.append(item)
+        out.append(parsed_row)
+    return out
+
+
 def quality_list(report: dict[str, Any], field: str, label: str) -> list[int]:
     direct_key = f"{field}_per_run"
     if direct_key in report:
@@ -167,6 +184,14 @@ def assert_report_quality(report: dict[str, Any], label: str) -> None:
     if len(completed) != n_repeats or len(errored) != n_repeats:
         raise BuildError(f"{label} completed/errors length must equal n_repeats")
     requests = positive_int(report.get("n_requests_per_run"), f"{label}.n_requests_per_run")
+    output_tokens = integer_matrix(report, "output_tokens_per_request", label)
+    if len(output_tokens) != n_repeats:
+        raise BuildError(f"{label}.output_tokens_per_request length must equal n_repeats")
+    for idx, row in enumerate(output_tokens):
+        if len(row) != requests:
+            raise BuildError(
+                f"{label}.output_tokens_per_request[{idx}] length must equal n_requests_per_run"
+            )
     if completed != [requests] * n_repeats:
         raise BuildError(f"{label} completed_per_run must be full")
     if any(value != 0 for value in errored):
@@ -333,6 +358,16 @@ def build_cell(
             "errored_per_run",
             f"baseline c={concurrency}",
         ),
+        "output_tokens_per_request": integer_matrix(
+            ferrum,
+            "output_tokens_per_request",
+            f"ferrum c={concurrency}",
+        ),
+        "baseline_output_tokens_per_request": integer_matrix(
+            baseline,
+            "output_tokens_per_request",
+            f"baseline c={concurrency}",
+        ),
         "output_token_count_source": ferrum.get("output_token_count_source"),
         "stream_options_include_usage": True,
         "baseline_output_token_count_source": baseline.get("output_token_count_source"),
@@ -423,6 +458,16 @@ def build_direct_cell(
         "baseline_errored_per_run": integer_list(
             baseline,
             "errored_per_run",
+            f"baseline c={concurrency}",
+        ),
+        "output_tokens_per_request": integer_matrix(
+            ferrum,
+            "output_tokens_per_request",
+            f"ferrum c={concurrency}",
+        ),
+        "baseline_output_tokens_per_request": integer_matrix(
+            baseline,
+            "output_tokens_per_request",
             f"baseline c={concurrency}",
         ),
         "output_token_count_source": ferrum.get("output_token_count_source"),
@@ -739,11 +784,13 @@ def write_selftest_source(root: Path) -> Path:
     write_json(source / "vllm/vllm_server.command.json", {"cmd": ["python", "-m", "vllm"]})
     (source / "perf/bench-ferrum.command.txt").write_text(
         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
-        "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3\n"
+        "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3 "
+        "--random-output-len 128\n"
     )
     (source / "perf/bench-vllm.command.txt").write_text(
         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
-        "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3\n"
+        "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3 "
+        "--random-output-len 128\n"
     )
     ferrum_reports = []
     baseline_reports = []
@@ -754,6 +801,7 @@ def write_selftest_source(root: Path) -> Path:
             "n_requests_per_run": 100,
             "completed_per_run": [100, 100, 100],
             "errored_per_run": [0, 0, 0],
+            "output_tokens_per_request": [[128] * 100, [128] * 100, [128] * 100],
             "output_token_count_source": "usage",
             "itl_ms": {"p95": metric(10.0)},
             "bad_output_per_run": [0, 0, 0],
@@ -793,6 +841,7 @@ def write_selftest_reports(root: Path) -> tuple[Path, Path]:
             "n_requests_per_run": 100,
             "completed_per_run": [100, 100, 100],
             "errored_per_run": [0, 0, 0],
+            "output_tokens_per_request": [[128] * 100, [128] * 100, [128] * 100],
             "output_token_count_source": "usage",
             "itl_ms": {"p95": metric(10.0)},
             "bad_output_per_run": [0, 0, 0],
@@ -1221,11 +1270,13 @@ def write_selftest_w3_args(root: Path) -> argparse.Namespace:
     ferrum_perf, baseline_perf = write_selftest_reports(root / "perf")
     (root / "ferrum_bench.command.txt").write_text(
         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
-        "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3\n"
+        "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3 "
+        "--random-output-len 128 --ignore-eos\n"
     )
     (root / "baseline_bench.command.txt").write_text(
         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
-        "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3\n"
+        "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3 "
+        "--random-output-len 128 --ignore-eos\n"
     )
     (root / "baseline_server.command.txt").write_text("python -m vllm serve selftest-qwen35\n")
     (root / "baseline_build.command.txt").write_text("python -m pip install vllm==selftest\n")

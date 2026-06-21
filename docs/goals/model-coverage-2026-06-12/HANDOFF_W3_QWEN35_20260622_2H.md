@@ -25,6 +25,12 @@
   conditions.
 - This is not a hidden env flip and not a model-family default. It is an
   explicit CLI/configured benchmark contract.
+- The W3 final validator now enforces this benchmark contract. W3 performance
+  cells must include `--ignore-eos`, must record
+  `output_tokens_per_request` and `baseline_output_tokens_per_request`, and
+  every request in both matrices must equal `--random-output-len`.
+- The manifest builder now copies the output-token matrices from
+  `bench-serve` reports into the final manifest and validates their shape.
 
 ## Why This Matters
 
@@ -50,6 +56,9 @@ cargo test -p ferrum-cli chat_completion_body -- --nocapture
 cargo check -p ferrum-cli
 cargo test -p ferrum-cli commands::bench_serve::tests -- --nocapture
 cargo run -p ferrum-cli -- bench-serve --help
+python3 -m py_compile scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py
+python3 scripts/release/model_release_grade_goal_gate.py --self-test
+python3 scripts/release/model_release_grade_manifest.py --self-test
 git diff --check
 ```
 
@@ -58,6 +67,21 @@ Important outputs:
 - `chat_completion_body_*`: 2 passed.
 - `commands::bench_serve::tests`: 18 passed.
 - CLI help prints `--ignore-eos`.
+- `MODEL RELEASE GRADE GOAL SELFTEST PASS`.
+- `MODEL RELEASE GRADE MANIFEST SELFTEST PASS`.
+
+## Gate Probe
+
+A local probe using the old Ferrum perf artifact
+`w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9` now fails the W3 final
+validator for the expected fixed-output reasons:
+
+- `performance.c{1,4,16,32} command missing --ignore-eos`
+- `performance.c{1,4,16,32}.output_tokens_per_request[...] must equal --random-output-len 128`
+
+The old ratio and p95 ITL failures still remain. The important change is that
+the old short-output Ferrum artifact can no longer be treated as valid W3 80%
+performance evidence.
 
 ## Next GPU Validation
 
