@@ -30,6 +30,9 @@ adding model-name defaults or hidden environment switches.
 - Routed product varlen prefill through compact core outputs so
   `query/key/value/g/beta/delta_core` debug/reference intermediates do not stay
   live after the GDN core boundary.
+- Avoided duplicate product batch prefill state scatter when indexed linear
+  state pools are present: final GDN/conv state is written to the slot pool,
+  and sequence-local buffers are synchronized from the slot only when needed.
 - Kept separate `qkv/z/b/a` projection fallback for unsupported backends.
 - Added prefill profile fields for `qkvz_proj` and `ba_proj`.
 - Added CPU packed-vs-separate contract test and a CUDA packed-vs-CPU parity
@@ -122,6 +125,9 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   `qkv/z/b/a` entries to `qkvz/ba`.
 - Product prefill should use compact core output; debug/reference tests still
   keep full intermediates for parity checks.
+- On CUDA indexed-state runs, `qwen35_linear_prefill_state_scatter` should be
+  near zero and `qwen35_linear_prefill_pool_scatter` should contain the state
+  write cost.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
