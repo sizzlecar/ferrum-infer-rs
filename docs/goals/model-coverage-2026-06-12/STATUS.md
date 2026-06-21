@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ52 — Runtime chunked prefill stays on unified path
+
+- Scope:
+  - removed the stale `FERRUM_CHUNKED_PREFILL`/typed
+    `chunked_prefill_size` fallback that forced `process_batch` onto the
+    legacy split path;
+  - `process_batch_unified` now treats scheduler `tokens_to_process`,
+    active-decode prefill chunk, and runtime chunked-prefill size as
+    coexisting upper bounds and uses the smallest cap, so one knob cannot
+    bypass another;
+  - added a product-path regression through `ContinuousBatchEngine::infer`
+    proving a 2-token prompt with runtime chunk size `1` emits two unified
+    forwards: a non-final prefill chunk at position `0`, then a final prefill
+    chunk at position `1`.
+- Validation passed locally:
+  - `cargo test -p ferrum-engine process_batch_unified_honors_runtime_chunked_prefill -- --nocapture`;
+  - `cargo test -p ferrum-engine process_batch_unified_forwards_prefill_logits_policy -- --nocapture`;
+  - `cargo check -p ferrum-engine`;
+  - `cargo fmt --all`.
+- Status:
+  - source/product-path progress only; this should let explicit chunked
+    prefill use the same unified/paged continuation architecture instead of
+    silently reverting to split prefill+decode;
+  - CUDA correctness/performance still requires a reachable 1x4090;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ51 — Product unified prefill policy is locked at engine boundary
 
 - Scope:
