@@ -1,0 +1,9 @@
+{
+  "non_stream_text": "Paris",
+  "non_stream_usage_ok": true,
+  "stream_chunk_count": 3,
+  "stream_done_count": 1,
+  "stream_malformed_count": 0,
+  "stream_text": "Paris",
+  "stream_usage_seen": true
+}
