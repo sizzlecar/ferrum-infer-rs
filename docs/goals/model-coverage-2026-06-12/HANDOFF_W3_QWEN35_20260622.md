@@ -78,6 +78,14 @@ adding model-name defaults or hidden environment switches.
 - Added a regression that replaces final norm/lm_head with deliberately broken
   test fixtures after the seed prefill, then proves a non-final continuation
   chunk still advances state without touching the logits tail.
+- Removed the Qwen3.5 stateful continuation special case that split
+  already-started multi-token chunks into one model pass per token. Final and
+  non-final continuation chunks now advance through the stateful layer path as
+  one chunk.
+- The tiny Qwen35 forward test loader now uses small deterministic non-zero
+  weights instead of all-zero weights, and a model-level parity regression
+  compares stepwise continuation `[4] + [5]` with one final continuation chunk
+  `[4, 5]`, including both returned logits and next-token decode logits.
 
 The key vLLM reference is:
 
@@ -118,6 +126,8 @@ cargo test -p ferrum-models \
 cargo check -p ferrum-models
 cargo test -p ferrum-models \
   qwen35_unified_forward_non_final_continuation_skips_logits_tail -- --nocapture
+cargo test -p ferrum-models \
+  qwen35_unified_forward_multitoken_continuation_matches_stepwise -- --nocapture
 cargo fmt --all -- --check
 git diff --check
 ```
@@ -209,6 +219,10 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
 - Non-final continuation chunks should show no final norm/lm_head/readback
   tail; if scheduler traces still show high chunk cost, profile the layer body
   rather than the logits tail first.
+- Multi-token continuation chunks should show one stateful chunk pass rather
+  than per-token model passes. The local parity test allows small float-path
+  differences (`1e-3`) against stepwise continuation and also compares the next
+  decode logits.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
