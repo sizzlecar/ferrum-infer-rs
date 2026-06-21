@@ -97,6 +97,10 @@ pub struct ServeCommand {
     #[arg(long, value_name = "N")]
     pub scheduler_prefill_first_until_active: Option<usize>,
 
+    /// Cap per-request scheduler prefill chunks before they enter the engine.
+    #[arg(long, value_name = "N")]
+    pub scheduler_prefill_step_chunk: Option<usize>,
+
     /// Cap prefill chunks while decode requests are active.
     #[arg(long, value_name = "N")]
     pub scheduler_active_decode_prefill_chunk: Option<usize>,
@@ -258,6 +262,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_num_seqs,
         max_num_batched_tokens,
         scheduler_prefill_first_until_active,
+        scheduler_prefill_step_chunk,
         scheduler_active_decode_prefill_chunk,
         enable_prefix_caching,
         no_enable_prefix_caching,
@@ -623,6 +628,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_num_seqs,
         max_num_batched_tokens,
         scheduler_prefill_first_until_active,
+        scheduler_prefill_step_chunk,
         scheduler_active_decode_prefill_chunk,
         greedy_argmax_cli_override(greedy_argmax, disable_greedy_argmax),
         prefix_cache_cli_override(
@@ -1128,6 +1134,7 @@ fn serve_cli_runtime_entries(
     max_num_seqs: Option<usize>,
     max_num_batched_tokens: Option<usize>,
     scheduler_prefill_first_until_active: Option<usize>,
+    scheduler_prefill_step_chunk: Option<usize>,
     scheduler_active_decode_prefill_chunk: Option<usize>,
     greedy_argmax: Option<bool>,
     prefix_cache: Option<bool>,
@@ -1158,6 +1165,11 @@ fn serve_cli_runtime_entries(
         &mut entries,
         "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
         scheduler_prefill_first_until_active,
+    );
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_SCHED_PREFILL_STEP_CHUNK",
+        scheduler_prefill_step_chunk,
     );
     push_cli_runtime_usize(
         &mut entries,
@@ -1892,6 +1904,7 @@ mod tests {
             Some(64),
             Some(2048),
             Some(8),
+            Some(16),
             Some(24),
             Some(true),
             Some(false),
@@ -1933,6 +1946,10 @@ mod tests {
         assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
             "8"
+        );
+        assert_eq!(
+            entry("FERRUM_SCHED_PREFILL_STEP_CHUNK").effective_value,
+            "16"
         );
         assert_eq!(
             entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
@@ -2029,6 +2046,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(
@@ -2088,6 +2106,7 @@ mod tests {
             Some(8),
             Some(512),
             Some(8),
+            Some(16),
             Some(32),
             Some(false),
             Some(false),
@@ -2693,6 +2712,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -2734,6 +2754,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(true, false, false, false),
             None,
             None,
@@ -2748,6 +2769,7 @@ mod tests {
             None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,
@@ -2780,6 +2802,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(false, true, false, false),
             None,
             None,
@@ -2794,6 +2817,7 @@ mod tests {
             None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,

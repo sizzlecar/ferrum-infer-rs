@@ -177,6 +177,9 @@ pub struct SchedulerConfig {
     /// Prefer new prefills over early decodes until this many requests are active.
     #[serde(default)]
     pub prefill_first_until_active: Option<usize>,
+    /// Cap per-request prefill chunks at the scheduler token-budget layer.
+    #[serde(default)]
+    pub prefill_step_chunk: Option<usize>,
     /// Cap prefill admission chunks only while decode requests are already active.
     #[serde(default)]
     pub active_decode_prefill_chunk: Option<usize>,
@@ -197,6 +200,7 @@ impl Default for SchedulerConfig {
             enable_sla_enforcement: false,
             prompt_token_estimate: default_prompt_token_estimate(),
             prefill_first_until_active: None,
+            prefill_step_chunk: None,
             active_decode_prefill_chunk: None,
             scheduler_none_prof: false,
         }
@@ -221,6 +225,10 @@ impl SchedulerConfig {
         {
             self.prefill_first_until_active =
                 parse_optional_positive_usize("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE", value)?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_PREFILL_STEP_CHUNK") {
+            self.prefill_step_chunk =
+                parse_optional_positive_usize("FERRUM_SCHED_PREFILL_STEP_CHUNK", value)?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK") {
             self.active_decode_prefill_chunk =

@@ -689,6 +689,8 @@ impl FerrumConfigBuilder {
         let max_model_len = self.optional_usize_value("FERRUM_MAX_MODEL_LEN")?;
         let default_prefill_first_until_active =
             self.default_prefill_first_until_active(&max_sequences);
+        let default_prefill_step_chunk =
+            self.default_prefill_step_chunk(&max_sequences, &max_batched_tokens);
         self.validate_attention(
             use_vllm_paged_attn.value,
             fa_layout.value,
@@ -774,6 +776,17 @@ impl FerrumConfigBuilder {
                 );
             }
         }
+        if let Some(chunk) = default_prefill_step_chunk.as_ref() {
+            if self.entry("FERRUM_SCHED_PREFILL_STEP_CHUNK").is_none()
+                && self.entry("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE").is_none()
+            {
+                runtime_config.upsert(
+                    "FERRUM_SCHED_PREFILL_STEP_CHUNK",
+                    chunk.value.to_string(),
+                    RuntimeConfigSource::Default,
+                );
+            }
+        }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
         decisions.push(self.decode_graph_decision(
@@ -805,7 +818,10 @@ impl FerrumConfigBuilder {
             ));
         }
         decisions.push(self.prefix_cache_decision(prefix_cache));
-        decisions.push(self.scheduler_decision(default_prefill_first_until_active)?);
+        decisions.push(self.scheduler_decision(
+            default_prefill_first_until_active,
+            default_prefill_step_chunk,
+        )?);
         decisions.push(self.sampling_decision(greedy));
 
         Ok(ResolvedFerrumConfig {
@@ -925,6 +941,24 @@ impl FerrumConfigBuilder {
         }
         Some(ResolvedValue {
             value: max_sequences.value,
+            source: AutoConfigSource::Default,
+            source_key: None,
+        })
+    }
+
+    fn default_prefill_step_chunk(
+        &self,
+        max_sequences: &ResolvedValue<usize>,
+        max_batched_tokens: &ResolvedValue<usize>,
+    ) -> Option<ResolvedValue<usize>> {
+        if max_sequences.value <= 1 || !self.is_accelerator_backend() {
+            return None;
+        }
+        Some(ResolvedValue {
+            value: max_batched_tokens
+                .value
+                .div_ceil(max_sequences.value.max(1))
+                .max(1),
             source: AutoConfigSource::Default,
             source_key: None,
         })
@@ -1632,6 +1666,7 @@ impl FerrumConfigBuilder {
     fn scheduler_decision(
         &self,
         default_prefill_first_until_active: Option<ResolvedValue<usize>>,
+        default_prefill_step_chunk: Option<ResolvedValue<usize>>,
     ) -> Result<AutoConfigDecision, AutoConfigError> {
         let entries = self.entries();
         let prompt_scheduler =
@@ -1667,7 +1702,47 @@ impl FerrumConfigBuilder {
             .copied()
             .or(implicit_prefill_first.as_deref());
         let active_decode_chunk = entries.get("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK");
-        let (selected, source, source_key) = if let (Some(until), Some(chunk)) =
+        if let Some(chunk) = active_decode_chunk {
+            let chunk_value = parse_usize_env_value(chunk).map_err(|reason| {
+                AutoConfigError::InvalidOverride {
+                    key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
+                    reason,
+                }
+            })?;
+            self.unsupported_if(
+                chunk_value == 0,
+                "scheduler_admission_policy",
+                "active decode prefill chunk must be greater than zero",
+            )?;
+        }
+        let explicit_prefill_step_chunk = entries.get("FERRUM_SCHED_PREFILL_STEP_CHUNK");
+        let explicit_prefill_step_chunk_present = explicit_prefill_step_chunk.is_some();
+        let implicit_prefill_step_chunk = if explicit_prefill_step_chunk.is_none()
+            && !entries.contains_key("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE")
+        {
+            default_prefill_step_chunk
+                .as_ref()
+                .map(|chunk| chunk.value.to_string())
+        } else {
+            None
+        };
+        let prefill_step_chunk = explicit_prefill_step_chunk
+            .copied()
+            .or(implicit_prefill_step_chunk.as_deref());
+        if let Some(chunk) = prefill_step_chunk {
+            let chunk_value = parse_usize_env_value(chunk).map_err(|reason| {
+                AutoConfigError::InvalidOverride {
+                    key: "FERRUM_SCHED_PREFILL_STEP_CHUNK".to_string(),
+                    reason,
+                }
+            })?;
+            self.unsupported_if(
+                chunk_value == 0,
+                "scheduler_admission_policy",
+                "scheduler prefill step chunk must be greater than zero",
+            )?;
+        }
+        let (mut selected, mut source, mut source_key) = if let (Some(until), Some(chunk)) =
             (prefill_first, active_decode_chunk)
         {
             parse_usize_env_value(until).map_err(|reason| AutoConfigError::InvalidOverride {
@@ -1729,12 +1804,14 @@ impl FerrumConfigBuilder {
         } else {
             prompt_scheduler()?
         };
-        self.unsupported_if(
-            source_key.as_deref() == Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
-                && selected.ends_with(":0"),
-            "scheduler_admission_policy",
-            "active decode prefill chunk must be greater than zero",
-        )?;
+        if let Some(chunk) = prefill_step_chunk {
+            selected.push_str(&format!("+prefill_step_chunk:{chunk}"));
+            if explicit_prefill_step_chunk_present && source_key.is_none() {
+                let key = "FERRUM_SCHED_PREFILL_STEP_CHUNK";
+                source = self.source_for_key(key, AutoConfigSource::Default);
+                source_key = Some(key.to_string());
+            }
+        }
         Ok(self.decision(
             "scheduler_admission_policy",
             &selected,
@@ -1746,6 +1823,7 @@ impl FerrumConfigBuilder {
                 "prefill_first_until_active",
                 "prefill_first_until_active+active_decode_prefill_chunk",
                 "active_decode_prefill_chunk",
+                "prefill_step_chunk",
             ],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
@@ -2269,7 +2347,7 @@ mod tests {
         assert_eq!(decision("max_model_len").selected, "4096");
         assert_eq!(
             decision("scheduler_admission_policy").selected,
-            "prefill_first_until_active:16"
+            "prefill_first_until_active:16+prefill_step_chunk:96"
         );
         assert_eq!(
             decision("scheduler_admission_policy").source,
@@ -2616,7 +2694,10 @@ mod tests {
             .iter()
             .find(|decision| decision.selection == "scheduler_admission_policy")
             .unwrap();
-        assert_eq!(scheduler.selected, "prefill_first_until_active:32");
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+prefill_step_chunk:64"
+        );
         assert_eq!(scheduler.source, AutoConfigSource::Default);
         let scheduler_entry = resolved
             .runtime_config
@@ -2626,6 +2707,14 @@ mod tests {
             .unwrap_or_else(|| panic!("missing FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE entry"));
         assert_eq!(scheduler_entry.effective_value, "32");
         assert_eq!(scheduler_entry.source, RuntimeConfigSource::Default);
+        let step_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_STEP_CHUNK")
+            .unwrap_or_else(|| panic!("missing FERRUM_SCHED_PREFILL_STEP_CHUNK entry"));
+        assert_eq!(step_entry.effective_value, "64");
+        assert_eq!(step_entry.source, RuntimeConfigSource::Default);
     }
 
     #[test]
@@ -2712,6 +2801,11 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.key != "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE"));
+        assert!(resolved
+            .runtime_config
+            .entries
+            .iter()
+            .all(|entry| entry.key != "FERRUM_SCHED_PREFILL_STEP_CHUNK"));
     }
 
     #[test]
@@ -3129,7 +3223,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             scheduler.selected,
-            "prefill_first_until_active:32+active_decode_prefill_chunk:64"
+            "prefill_first_until_active:32+active_decode_prefill_chunk:64+prefill_step_chunk:64"
         );
         assert_eq!(
             scheduler.source_key.as_deref(),
@@ -3143,6 +3237,46 @@ mod tests {
             .expect("accelerator default prefill-first should still be materialized");
         assert_eq!(prefill_entry.effective_value, "32");
         assert_eq!(prefill_entry.source, RuntimeConfigSource::Default);
+        let step_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_STEP_CHUNK")
+            .expect("accelerator default prefill-step chunk should be materialized");
+        assert_eq!(step_entry.effective_value, "64");
+        assert_eq!(step_entry.source, RuntimeConfigSource::Default);
+    }
+
+    #[test]
+    fn scheduler_prefill_step_chunk_override_is_reflected_in_decision_trace() {
+        let resolved = m3(
+            &[("FERRUM_SCHED_PREFILL_STEP_CHUNK", "128")],
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        )
+        .resolve()
+        .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+prefill_step_chunk:128"
+        );
+        assert_eq!(scheduler.source, AutoConfigSource::Env);
+        assert_eq!(
+            scheduler.source_key.as_deref(),
+            Some("FERRUM_SCHED_PREFILL_STEP_CHUNK")
+        );
+        let step_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_STEP_CHUNK")
+            .expect("explicit prefill-step chunk should be preserved");
+        assert_eq!(step_entry.effective_value, "128");
+        assert_eq!(step_entry.source, RuntimeConfigSource::Env);
     }
 
     #[test]
@@ -3161,7 +3295,10 @@ mod tests {
             .iter()
             .find(|decision| decision.selection == "scheduler_admission_policy")
             .unwrap();
-        assert_eq!(scheduler.selected, "prefill_first_until_active:32");
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+prefill_step_chunk:64"
+        );
         assert_eq!(scheduler.source, AutoConfigSource::Default);
         assert!(resolved
             .runtime_config
@@ -3217,7 +3354,10 @@ mod tests {
             .iter()
             .find(|decision| decision.selection == "scheduler_admission_policy")
             .unwrap();
-        assert_eq!(scheduler.selected, "prefill_first_until_active:32");
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+prefill_step_chunk:64"
+        );
         assert_eq!(scheduler.source, AutoConfigSource::Default);
         assert_eq!(scheduler.source_key, None);
         let entry = resolved
@@ -3228,6 +3368,14 @@ mod tests {
             .expect("generic scheduler default should be materialized");
         assert_eq!(entry.effective_value, "32");
         assert_eq!(entry.source, RuntimeConfigSource::Default);
+        let step_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_STEP_CHUNK")
+            .expect("generic scheduler chunk default should be materialized");
+        assert_eq!(step_entry.effective_value, "64");
+        assert_eq!(step_entry.source, RuntimeConfigSource::Default);
     }
 
     #[test]
@@ -3319,7 +3467,10 @@ mod tests {
         );
 
         let scheduler = decision("scheduler_admission_policy");
-        assert_eq!(scheduler.selected, "prefill_first_until_active:32");
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+prefill_step_chunk:64"
+        );
         assert_eq!(scheduler.source, AutoConfigSource::ScriptCase);
         assert_eq!(
             scheduler.source_key.as_deref(),

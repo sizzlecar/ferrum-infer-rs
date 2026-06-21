@@ -3,10 +3,12 @@
 ## Current status
 
 - Branch: `goal/w2-w3-release-grade`.
-- 2026-06-22 01:31 CST update: W3 performance is still not release-grade, but
-  this round produced a material scheduler/engine bottleneck localization and a
-  source fix for scheduler policy materialization.
-- Latest pushed commit before this handoff update: `4a0fdbfc640b24534330c2844ba9ee3ee8f09652`.
+- 2026-06-22 01:52 CST update: W3 performance is still not release-grade, but
+  this round produced a material scheduler/engine bottleneck localization,
+  source fixes for scheduler policy materialization, and a typed prefill-step
+  token cap that is ready for same-pod GPU A/B.
+- Latest pushed commit before the prefill-step update:
+  `3b3aab52d067314ddf3ad1245056979372d7f504`.
 - Draft PR to `main`: <https://github.com/sizzlecar/ferrum-infer-rs/pull/237>.
 - Final W3 is not complete. There is no `MODEL_RELEASE_GRADE_W3 PASS`.
 - Correctness/product-path evidence exists for real Qwen3.5 GPTQ through `ferrum run`
@@ -79,22 +81,47 @@ Source change from this round:
   alone silently disabled the default cohort-prefill policy and reproduced the
   `22.7 tok/s` failure mode.
 
+Additional source change after the trace A/B:
+
+- Added typed scheduler control `FERRUM_SCHED_PREFILL_STEP_CHUNK`, exposed as
+  `ferrum serve --scheduler-prefill-step-chunk <N>`.
+- `ContinuousBatchScheduler` now applies the prefill-step chunk when assigning
+  `tokens_to_process`; if active-decode chunk is also set, it uses the stricter
+  per-request cap.
+- Auto-config now materializes a generic accelerator default:
+  `ceil(max_batched_tokens / max_sequences)`. This is not model-name-gated and
+  enters effective config/decision trace as
+  `prefill_first_until_active:<N>+prefill_step_chunk:<M>`.
+- This is intended to attack the observed prefill-only stalls without falling
+  back to engine-level `FERRUM_CHUNKED_PREFILL`, which bypasses the unified
+  batch path.
+
 Validation run locally:
 
 - `cargo fmt --all`
 - `cargo test -p ferrum-types scheduler_active_chunk_combines_with_accelerator_prefill_first_default`
 - `cargo check -p ferrum-types -p ferrum-scheduler -p ferrum-engine -p ferrum-cli`
+- `cargo fmt --all -- --check`
+- `cargo test -p ferrum-types auto_config::tests:: -- --nocapture`
+- `cargo test -p ferrum-scheduler -- --nocapture`
+- `cargo test -p ferrum-types --test config_tests engine_config_applies_runtime_snapshot -- --nocapture`
+- `cargo test -p ferrum-cli serve_cli_runtime_entries_are_cli_sourced_and_classified -- --nocapture`
 
 Still needed on GPU after Vast resources become available:
 
 1. Build current source on the same cached target.
-2. Run `ferrum serve` with `--scheduler-active-decode-prefill-chunk 8192` but
-   without explicit `--scheduler-prefill-first-until-active`.
+2. Run `ferrum serve` without explicit
+   `--scheduler-prefill-first-until-active`; optionally keep
+   `--scheduler-active-decode-prefill-chunk 8192` only for the historical
+   comparison.
 3. Confirm effective config contains
    `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE=32` from default auto-config and
-   scheduler decision shows the combined policy.
+   `FERRUM_SCHED_PREFILL_STEP_CHUNK=<ceil(max_batched_tokens/max_sequences)>`.
 4. Rerun the same c32 64x1 diagnostic and verify it stays near the
-   `650-700 tok/s` range, not the `22.7 tok/s` no-prefill-first failure.
+   `650-700 tok/s` range or improves it, not the `22.7 tok/s`
+   no-prefill-first failure.
+5. Inspect the scheduler trace for reduced prefill-only stalls before treating
+   any throughput delta as meaningful.
 
 ## Important artifacts
 
