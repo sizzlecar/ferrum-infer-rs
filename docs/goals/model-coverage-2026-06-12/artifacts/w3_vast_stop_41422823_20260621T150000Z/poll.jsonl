@@ -1,0 +1,3 @@
+{"ts":"2026-06-21T15:02:40Z","phase":"before_stop","success":null,"msg":null,"id":41422823,"cur_state":"running","actual_status":"running","intended_status":"running","ssh_host":"ssh7.vast.ai","ssh_port":22822,"gpu_name":"RTX 4090","num_gpus":1,"gpu_ram":49140}
+{"ts":"2026-06-21T15:02:42Z","phase":"stop_response","success":true,"msg":null,"id":null,"cur_state":null,"actual_status":null,"intended_status":null,"ssh_host":null,"ssh_port":null,"gpu_name":null,"num_gpus":null,"gpu_ram":null}
+{"ts":"2026-06-21T15:02:48Z","phase":"poll_1","success":null,"msg":null,"id":41422823,"cur_state":"stopped","actual_status":"exited","intended_status":"stopped","ssh_host":"ssh7.vast.ai","ssh_port":22822,"gpu_name":"RTX 4090","num_gpus":1,"gpu_ram":49140}
