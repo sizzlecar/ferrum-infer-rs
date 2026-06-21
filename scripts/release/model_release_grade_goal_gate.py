@@ -840,6 +840,63 @@ def validate_w3_l3_artifact(data: dict[str, Any], label: str, problems: list[str
     ]:
         require_true(behavior.get(key), f"{label}.behavior.{key}", problems)
     require_passed_total(behavior, "cases_total", "cases_passed", 5, f"{label}.behavior", problems)
+    validate_w3_l3_cases(data.get("cases", data.get("behavior_cases")), behavior, label, problems)
+
+
+def validate_w3_l3_cases(
+    raw_cases: Any,
+    behavior: dict[str, Any],
+    label: str,
+    problems: list[str],
+) -> None:
+    cases = as_list(raw_cases, f"{label}.cases", problems)
+    expected_total = behavior.get("cases_total")
+    if isinstance(expected_total, int) and not isinstance(expected_total, bool):
+        if len(cases) != expected_total:
+            problems.append(f"{label}.cases length {len(cases)} must equal behavior.cases_total {expected_total}")
+    required = {
+        "multi_turn",
+        "stream_nonstream_match",
+        "natural_eos",
+        "custom_stop",
+        "reasoning_extraction",
+    }
+    seen: set[str] = set()
+    by_id: dict[str, dict[str, Any]] = {}
+    for idx, raw_case in enumerate(cases):
+        case_label = f"{label}.cases[{idx}]"
+        case = as_object(raw_case, case_label, problems)
+        if not case:
+            continue
+        case_id = non_empty_string(case.get("id"), f"{case_label}.id", problems)
+        require_true(case.get("passed"), f"{case_label}.passed", problems)
+        non_empty_string(case.get("artifact"), f"{case_label}.artifact", problems)
+        detail = as_object(case.get("detail", {}), f"{case_label}.detail", problems)
+        if case_id is not None:
+            seen.add(case_id)
+            by_id[case_id] = case
+        if detail and "finish_reason" in detail and detail.get("finish_reason") == "":
+            problems.append(f"{case_label}.detail.finish_reason must not be empty")
+    missing = sorted(required - seen)
+    if missing:
+        problems.append(f"{label}.cases missing required behavior cases: {missing}")
+    stream_case = by_id.get("stream_nonstream_match")
+    if stream_case:
+        detail = as_object(stream_case.get("detail"), f"{label}.cases.stream_nonstream_match.detail", problems)
+        done_count = positive_int(
+            detail.get("stream_done_count"),
+            f"{label}.cases.stream_nonstream_match.detail.stream_done_count",
+            problems,
+        )
+        if done_count is not None and done_count != 1:
+            problems.append(f"{label}.cases.stream_nonstream_match.detail.stream_done_count must be exactly 1")
+        usage_chunks = positive_int(
+            detail.get("stream_usage_chunks"),
+            f"{label}.cases.stream_nonstream_match.detail.stream_usage_chunks",
+            problems,
+        )
+        if usage_chunks is not None and usage_chunks < 1:
+            problems.append(f"{label}.cases.stream_nonstream_match.detail.stream_usage_chunks must be >= 1")
 
 
 def validate_w3_l4_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
@@ -1769,6 +1826,50 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
                 "stream_done_exactly_once": True,
                 "stream_usage_present": True,
             },
+            "cases": [
+                {
+                    "id": "multi_turn",
+                    "passed": True,
+                    "artifact": "behavior/01_multi_turn.response.json",
+                    "detail": {"finish_reason": "stop"},
+                },
+                {
+                    "id": "stream_nonstream_match",
+                    "passed": True,
+                    "artifact": "behavior/02_stream_match_stream.response.sse",
+                    "detail": {"stream_done_count": 1, "stream_usage_chunks": 1},
+                },
+                {
+                    "id": "natural_eos",
+                    "passed": True,
+                    "artifact": "behavior/03_natural_eos.response.json",
+                    "detail": {"finish_reason": "stop"},
+                },
+                {
+                    "id": "custom_stop",
+                    "passed": True,
+                    "artifact": "behavior/04_custom_stop.response.json",
+                    "detail": {"finish_reason": "stop"},
+                },
+                {
+                    "id": "reasoning_extraction",
+                    "passed": True,
+                    "artifact": "behavior/05_reasoning_extraction.response.json",
+                    "detail": {"reasoning_len": 8, "leaked_think": False},
+                },
+                {
+                    "id": "multi_turn_repeat",
+                    "passed": True,
+                    "artifact": "behavior/06_multi_turn_repeat.response.json",
+                    "detail": {"finish_reason": "stop"},
+                },
+                {
+                    "id": "stop_repeat",
+                    "passed": True,
+                    "artifact": "behavior/07_stop_repeat.response.json",
+                    "detail": {"finish_reason": "stop"},
+                },
+            ],
         },
     )
     write_json(
@@ -2233,6 +2334,27 @@ def run_selftest() -> int:
             for problem in bad_w3_l2_command_problems
         ):
             raise AssertionError("bad W3 L2 command selftest did not fail as expected")
+
+        bad_w3_l3_stream = tmp_root / "bad-w3-l3-stream"
+        bad_w3_l3_stream_manifest = write_selftest_manifest(
+            bad_w3_l3_stream,
+            lane="w3",
+            ratio=0.82,
+        )
+        l3_behavior = load_json(bad_w3_l3_stream / "l3.json")
+        l3_behavior["cases"][1]["detail"]["stream_done_count"] = 2
+        write_json(bad_w3_l3_stream / "l3.json", l3_behavior)
+        bad_w3_l3_stream_problems = validate_manifest(
+            load_json(bad_w3_l3_stream_manifest),
+            "w3",
+            bad_w3_l3_stream,
+        )
+        if not any(
+            "correctness.l3_behavior.cases.stream_nonstream_match.detail.stream_done_count must be exactly 1"
+            in problem
+            for problem in bad_w3_l3_stream_problems
+        ):
+            raise AssertionError("bad W3 L3 stream selftest did not fail as expected")
 
         bad_w3_l4 = tmp_root / "bad-w3-l4-schema-count"
         bad_w3_l4_manifest = write_selftest_manifest(bad_w3_l4, lane="w3", ratio=0.82)
