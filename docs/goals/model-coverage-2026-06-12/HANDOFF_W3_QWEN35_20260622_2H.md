@@ -25,8 +25,8 @@
   conditions.
 - This is not a hidden env flip and not a model-family default. It is an
   explicit CLI/configured benchmark contract.
-- The W3 final validator now enforces this benchmark contract. W3 performance
-  cells must include `--ignore-eos`, must record
+- The W3 final validator now enforces this benchmark contract. W3 Ferrum and
+  baseline performance commands must include `--ignore-eos`, must record
   `output_tokens_per_request` and `baseline_output_tokens_per_request`, and
   every request in both matrices must equal `--random-output-len`.
 - The final validator also reloads the referenced Ferrum and baseline
@@ -80,6 +80,7 @@ A local probe using the old Ferrum perf artifact
 validator for the expected fixed-output reasons:
 
 - `performance.c{1,4,16,32} command missing --ignore-eos`
+- `performance.c{1,4,16,32}.baseline command missing --ignore-eos`
 - `performance.c{1,4,16,32}.output_tokens_per_request[...] must equal --random-output-len 128`
 - `performance.c{1,4,16,32}.artifact.output_tokens_per_request[...] must equal --random-output-len 128`
 
