@@ -378,6 +378,7 @@ def validate_l5_bench_commands(
 ) -> None:
     commands = as_list(commands_raw, f"{label}.commands", problems)
     if not commands:
+        problems.append(f"{label}.commands must include at least one bench-serve command")
         return
     covered: set[int] = set()
     for idx, raw in enumerate(commands):
@@ -2093,6 +2094,26 @@ def run_selftest() -> int:
             for problem in bad_w3_l5_command_problems
         ):
             raise AssertionError("bad W3 L5 command selftest did not fail as expected")
+
+        bad_w3_l5_empty_command = tmp_root / "bad-w3-l5-empty-command"
+        bad_w3_l5_empty_command_manifest = write_selftest_manifest(
+            bad_w3_l5_empty_command,
+            lane="w3",
+            ratio=0.82,
+        )
+        l5_empty_command = load_json(bad_w3_l5_empty_command / "l5.json")
+        l5_empty_command["commands"] = []
+        write_json(bad_w3_l5_empty_command / "l5.json", l5_empty_command)
+        bad_w3_l5_empty_command_problems = validate_manifest(
+            load_json(bad_w3_l5_empty_command_manifest),
+            "w3",
+            bad_w3_l5_empty_command,
+        )
+        if not any(
+            "correctness.l5_concurrency.commands must include at least one" in problem
+            for problem in bad_w3_l5_empty_command_problems
+        ):
+            raise AssertionError("bad W3 L5 empty-command selftest did not fail as expected")
 
         bad_w3 = tmp_root / "bad-w3-missing-s0"
         bad_w3_manifest = write_selftest_manifest(bad_w3, lane="w3", ratio=0.82)
