@@ -3,7 +3,10 @@ use super::*;
 impl EngineInner {
     // ── batch processing ───────────────────────────────────────────────
 
-    pub(super) async fn process_batch(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
+    pub(in crate::continuous_engine) async fn process_batch(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+    ) -> Result<()> {
         // Single-shot unified path: prefill + decode items go through ONE
         // `model_executor.unified_decode` call. Phase-2/3 redesign goal —
         // prefill chunks and decode tokens are co-batched at the kernel

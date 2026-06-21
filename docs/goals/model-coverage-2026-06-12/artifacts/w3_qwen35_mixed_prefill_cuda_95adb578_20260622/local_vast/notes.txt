@@ -1,0 +1,8 @@
+lane=W3 Qwen35 mixed prefill CUDA smoke/c32 diagnostic
+instance_id=41422823
+hardware=1x RTX 4090
+source_commit=95adb578
+stop_condition=ssh unavailable, correctness/build failure with logs, or smoke/perf artifacts collected
+ssh_check=connection refused on ssh7.vast.ai:22822
+api_state=cur_state stopped, actual_status exited, intended_status stopped
+result=CUDA validation not run because the existing instance was not reachable/running
