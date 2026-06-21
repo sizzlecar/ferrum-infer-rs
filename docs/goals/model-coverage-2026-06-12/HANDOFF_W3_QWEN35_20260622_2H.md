@@ -29,6 +29,9 @@
   cells must include `--ignore-eos`, must record
   `output_tokens_per_request` and `baseline_output_tokens_per_request`, and
   every request in both matrices must equal `--random-output-len`.
+- The final validator also reloads the referenced Ferrum and baseline
+  `bench-serve` report artifacts and cross-checks their output-token matrices
+  against the manifest.
 - The manifest builder now copies the output-token matrices from
   `bench-serve` reports into the final manifest and validates their shape.
 
@@ -78,6 +81,7 @@ validator for the expected fixed-output reasons:
 
 - `performance.c{1,4,16,32} command missing --ignore-eos`
 - `performance.c{1,4,16,32}.output_tokens_per_request[...] must equal --random-output-len 128`
+- `performance.c{1,4,16,32}.artifact.output_tokens_per_request[...] must equal --random-output-len 128`
 
 The old ratio and p95 ITL failures still remain. The important change is that
 the old short-output Ferrum artifact can no longer be treated as valid W3 80%

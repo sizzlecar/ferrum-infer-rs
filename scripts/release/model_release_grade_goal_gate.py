@@ -450,12 +450,90 @@ def validate_output_token_matrix(
                 )
 
 
+def report_cells_by_concurrency(
+    path: Path,
+    label: str,
+    problems: list[str],
+) -> dict[int, dict[str, Any]]:
+    try:
+        data = load_json(path)
+    except ValidationError as exc:
+        problems.append(str(exc))
+        return {}
+    reports = data.get("reports") if isinstance(data, dict) else data
+    if not isinstance(reports, list):
+        problems.append(f"{label} must contain a report list")
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for idx, report in enumerate(reports):
+        if not isinstance(report, dict):
+            problems.append(f"{label}[{idx}] must be a JSON object")
+            continue
+        concurrency = report.get("concurrency")
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int):
+            problems.append(f"{label}[{idx}].concurrency must be an integer")
+            continue
+        if concurrency in out:
+            problems.append(f"{label} has duplicate c={concurrency} report")
+            continue
+        out[concurrency] = report
+    return out
+
+
+def first_existing_evidence_path(
+    entry: Any,
+    label: str,
+    out_dir: Path,
+    problems: list[str],
+) -> Path | None:
+    paths = evidence_artifact_values(entry, label, problems)
+    for raw in paths:
+        path = existing_artifact_path(raw, out_dir)
+        if path is not None:
+            return path
+    return None
+
+
+def validate_report_output_tokens(
+    *,
+    report: dict[str, Any] | None,
+    matrix: list[list[int]] | None,
+    label: str,
+    n_repeats: int | None,
+    requests: int | None,
+    expected_tokens: int | None,
+    problems: list[str],
+) -> None:
+    if report is None:
+        return
+    if report.get("output_token_count_source") != "usage":
+        problems.append(f"{label}.output_token_count_source must be usage")
+    report_matrix = int_matrix(
+        report.get("output_tokens_per_request"),
+        f"{label}.output_tokens_per_request",
+        problems,
+    )
+    validate_output_token_matrix(
+        report_matrix,
+        f"{label}.output_tokens_per_request",
+        n_repeats=n_repeats,
+        requests=requests,
+        expected_tokens=expected_tokens,
+        problems=problems,
+    )
+    if matrix is not None and report_matrix is not None and matrix != report_matrix:
+        problems.append(f"{label}.output_tokens_per_request must match manifest cell")
+
+
 def validate_w3_fixed_output_contract(
     cell: dict[str, Any],
+    baseline: dict[str, Any],
     label: str,
     *,
     command: list[str],
     baseline_command: list[str],
+    concurrency: int,
+    out_dir: Path,
     n_repeats: int | None,
     requests: int | None,
     baseline_n_repeats: int | None,
@@ -506,6 +584,54 @@ def validate_w3_fixed_output_contract(
         expected_tokens=expected,
         problems=problems,
     )
+
+    ferrum_path = first_existing_evidence_path(
+        cell.get("artifact"),
+        f"{label}.artifact",
+        out_dir,
+        problems,
+    )
+    if ferrum_path is not None:
+        ferrum_report = report_cells_by_concurrency(
+            ferrum_path,
+            f"{label}.artifact",
+            problems,
+        ).get(concurrency)
+        if ferrum_report is None:
+            problems.append(f"{label}.artifact missing c={concurrency} report")
+        validate_report_output_tokens(
+            report=ferrum_report,
+            matrix=ferrum_tokens,
+            label=f"{label}.artifact",
+            n_repeats=n_repeats,
+            requests=requests,
+            expected_tokens=expected,
+            problems=problems,
+        )
+
+    baseline_path = first_existing_evidence_path(
+        baseline.get("artifact"),
+        "performance.baseline.artifact",
+        out_dir,
+        problems,
+    )
+    if baseline_path is not None:
+        baseline_report = report_cells_by_concurrency(
+            baseline_path,
+            f"{label}.baseline.artifact",
+            problems,
+        ).get(concurrency)
+        if baseline_report is None:
+            problems.append(f"{label}.baseline.artifact missing c={concurrency} report")
+        validate_report_output_tokens(
+            report=baseline_report,
+            matrix=baseline_tokens,
+            label=f"{label}.baseline.artifact",
+            n_repeats=baseline_n_repeats,
+            requests=baseline_requests,
+            expected_tokens=expected,
+            problems=problems,
+        )
 
 
 def l5_command_parts(raw: Any, label: str, problems: list[str]) -> list[str]:
@@ -1815,9 +1941,12 @@ def validate_performance_cell(
     if lane == "w3" and command and baseline_command:
         validate_w3_fixed_output_contract(
             cell,
+            baseline,
             label,
             command=command,
             baseline_command=baseline_command,
+            concurrency=concurrency,
+            out_dir=out_dir,
             n_repeats=n_repeats,
             requests=requests,
             baseline_n_repeats=baseline_n_repeats,
@@ -2166,6 +2295,9 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
                         "3",
                         "--concurrency-sweep",
                         "1,4,16,32",
+                        "--random-output-len",
+                        "128",
+                        "--ignore-eos",
                     ],
                     "covers_concurrency": [1, 4, 16, 32],
                 }
@@ -2285,9 +2417,31 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
                 "ratio": ratio,
                 "ferrum_p95_itl_ms": 10.0,
                 "baseline_p95_itl_ms": 9.0,
-                "artifact": f"c{concurrency}.json",
+                "artifact": "ferrum_perf.json" if lane == "w3" else f"c{concurrency}.json",
             }
         )
+    if lane == "w3":
+        ferrum_reports = []
+        baseline_reports = []
+        for cell in cells:
+            common_report = {
+                "concurrency": cell["requested_concurrency"],
+                "n_repeats": cell["n_repeats"],
+                "n_requests_per_run": cell["requests_per_run"],
+                "completed_per_run": cell["completed_per_run"],
+                "errored_per_run": cell["errored_per_run"],
+                "output_token_count_source": "usage",
+                "output_tokens_per_request": cell["output_tokens_per_request"],
+            }
+            ferrum_reports.append(common_report)
+            baseline_reports.append(
+                {
+                    **common_report,
+                    "output_tokens_per_request": cell["baseline_output_tokens_per_request"],
+                }
+            )
+        write_json(root / "ferrum_perf.json", ferrum_reports)
+        write_json(root / "baseline_perf.json", baseline_reports)
     correctness = {
         "l0_template": {"status": "pass", "artifact": "l0.json"},
         "l1_numeric": {"status": "pass", "artifact": "l1.json"},
@@ -2530,7 +2684,7 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
                 "same_hardware": True,
                 "same_model": True,
                 "same_quantization": True,
-                "artifact": "baseline.json",
+                "artifact": "baseline_perf.json" if lane == "w3" else "baseline.json",
             },
             "cells": cells,
         },
