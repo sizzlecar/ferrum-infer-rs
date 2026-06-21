@@ -144,6 +144,17 @@ adding model-name defaults or hidden environment switches.
   the source-side architecture change needed after runtime chunked prefill was
   kept on the unified path; it avoids splitting fresh first chunk work from
   decode solely because the prefill row starts at position 0.
+- The continuous-engine product path now has a regression proving active decode
+  work and a fresh first prefill chunk are emitted in the same `UnifiedBatch`.
+  The test constructs a real `BatchPlan`, preloads one decode-ready sequence,
+  and captures one unified model call with a non-final fresh chunk at
+  `pos_offset=0` plus a decode row at `pos_offset>0`.
+- Existing Vast instance `41422823` was checked for a W3 Qwen35 mixed-prefill
+  CUDA smoke/c32 diagnostic. SSH to `ssh7.vast.ai:22822` returned connection
+  refused, and the sanitized API summary says `cur_state=stopped`,
+  `actual_status=exited`, `intended_status=stopped`. CUDA validation did not
+  run; the sanitized status artifact is
+  `artifacts/w3_qwen35_mixed_prefill_cuda_95adb578_20260622/local_vast/status_summary.json`.
 
 The key vLLM reference is:
 
@@ -208,6 +219,8 @@ cargo test -p ferrum-engine \
   process_batch_unified_forwards_prefill_logits_policy -- --nocapture
 cargo test -p ferrum-engine \
   process_batch_unified_honors_runtime_chunked_prefill -- --nocapture
+cargo test -p ferrum-engine \
+  process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk -- --nocapture
 cargo test -p ferrum-models qwen35_unified_forward -- --nocapture
 cargo test -p ferrum-models \
   qwen35_fresh_prefill_initial_state_slabs_are_zero_not_gathered -- --nocapture

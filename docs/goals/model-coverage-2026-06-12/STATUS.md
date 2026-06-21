@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ54 — Engine product path emits active decode + fresh chunk mixed batches
+
+- Scope:
+  - added a continuous-engine product-path regression that constructs a real
+    `BatchPlan` containing one decode-ready request and one fresh prefill
+    request with `chunked_prefill_size=1`;
+  - the test calls the real engine `process_batch` path and captures the
+    `UnifiedBatch` sent to the model executor, proving the product path emits
+    one unified call containing both a fresh non-final first chunk
+    (`pos_offset=0`) and an active decode row (`pos_offset>0`);
+  - widened `EngineInner::process_batch` visibility only within the
+    `continuous_engine` module so this product-path regression can exercise
+    the real batch processing path without exposing a public API.
+- Validation passed locally:
+  - `cargo test -p ferrum-engine process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk -- --nocapture`;
+  - `cargo test -p ferrum-engine process_batch_unified_honors_runtime_chunked_prefill -- --nocapture`;
+  - `cargo test -p ferrum-engine process_batch_unified_forwards_prefill_logits_policy -- --nocapture`;
+  - `cargo check -p ferrum-engine`.
+- GPU status:
+  - attempted to reuse existing Vast instance `41422823` (`ssh7.vast.ai:22822`,
+    1x RTX 4090) for a W3 Qwen35 mixed-prefill CUDA smoke/c32 diagnostic;
+  - SSH returned `connection refused`, and sanitized API evidence shows
+    `cur_state=stopped`, `actual_status=exited`, `intended_status=stopped`;
+  - sanitized local artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_prefill_cuda_95adb578_20260622/local_vast/status_summary.json`.
+- Status:
+  - source/product-path progress only; CUDA correctness/performance still has
+    not run;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ53 — Qwen35 fresh first chunks can join paged mixed prefill
 
 - Scope:

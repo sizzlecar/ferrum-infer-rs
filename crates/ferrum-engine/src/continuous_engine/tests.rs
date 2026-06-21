@@ -347,6 +347,94 @@ async fn process_batch_unified_honors_runtime_chunked_prefill() {
     assert!(captured[1][0].is_final_chunk);
 }
 
+#[tokio::test]
+async fn process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.runtime.chunked_prefill_size = Some(1);
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        64,
+        &[("test", 5), ("ok", 6), ("<unk>", 2), ("<pad>", 4)],
+    ));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(CapturingUnifiedExecutor {
+        inner: MockModelExecutor::instant(64),
+        captured: captured.clone(),
+        output_token: 6,
+    });
+    let engine = ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+    );
+
+    let mut decode_request = policy_request();
+    decode_request.prompt = "test".to_string();
+    decode_request.sampling_params.max_tokens = 3;
+    let decode_id = decode_request.id.clone();
+    let decode_kv = engine
+        .inner
+        .make_model_kv_handle_with_seq("decode-cache".to_string(), 2);
+    let mut decode_seq = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        decode_request.clone(),
+        vec![TokenId::new(5)],
+        Some(tokenizer.clone()),
+        Some(64),
+    );
+    decode_seq.generated_tokens.push(TokenId::new(6));
+    decode_seq.prefill_complete = true;
+    decode_seq.prefill_tokens_processed = 1;
+    decode_seq.kv_cache = Some(decode_kv);
+    decode_seq.model_cache_id = Some("decode-cache".to_string());
+    decode_seq.phase = RequestPhase::Decoding;
+    {
+        let mut sequences = engine.inner.sequences.write();
+        sequences.insert(decode_id.clone(), decode_seq);
+    }
+
+    let mut prefill_request = policy_request();
+    prefill_request.prompt = "test ok".to_string();
+    prefill_request.sampling_params.max_tokens = 1;
+    let mut prefill_scheduled =
+        ferrum_interfaces::scheduler::ScheduledRequest::new(prefill_request);
+    prefill_scheduled.tokens_to_process = Some(1);
+    let mut decode_scheduled = ferrum_interfaces::scheduler::ScheduledRequest::new(decode_request);
+    decode_scheduled.tokens_to_process = Some(1);
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![prefill_scheduled, decode_scheduled],
+        max_sequence_length: 2,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    engine.inner.process_batch(&batch).await.unwrap();
+
+    let captured = captured.lock().expect("capture mutex poisoned");
+    assert_eq!(captured.len(), 1, "mixed work must use one unified call");
+    assert_eq!(captured[0].len(), 2);
+    let prefill = &captured[0][0];
+    assert_eq!(prefill.q_len, 1);
+    assert_eq!(prefill.pos_offset, 0);
+    assert!(
+        !prefill.is_final_chunk,
+        "fresh first chunk should stay non-final in the mixed batch"
+    );
+    let decode = &captured[0][1];
+    assert_eq!(decode.q_len, 1);
+    assert_eq!(decode.pos_offset, 1);
+    assert!(decode.is_final_chunk);
+}
+
 #[test]
 fn continuous_engine_runtime_config_parses_env_snapshot() {
     let cfg = ContinuousEngineRuntimeConfig::from_env_vars(
