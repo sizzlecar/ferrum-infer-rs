@@ -27,7 +27,10 @@
   - `python3 scripts/release/w3_l1_numeric_gate.py --out docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058`;
   - direct final-validator probe of the new L1 artifact:
     `W3 L1 FINAL-VALIDATOR PROBE PASS:
-    docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058/w3_l1_numeric.json`.
+    docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058/w3_l1_numeric.json`;
+  - direct W3 L0-L5 final-validator probe using the new L1 artifact plus the
+    existing real L0/L2/L3/L4/L5 artifacts:
+    `W3 L0-L5 FINAL-VALIDATOR PROBE PASS`.
 - Status:
   - source/reference correctness evidence progress only; no new CUDA
     correctness or performance claim;
