@@ -982,7 +982,35 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
             self.down.len(),
             "ExpertStack: gate_up and down disagree on expert count"
         );
-        self.gate_up.len()
+        if !self.gate_up.is_empty() || !self.down.is_empty() {
+            return self.gate_up.len();
+        }
+        if let Some(gate) = self.gate_stacked.as_deref() {
+            let num_experts = gate.num_experts();
+            debug_assert_eq!(
+                self.up_stacked.as_deref().map(|up| up.num_experts()),
+                Some(num_experts),
+                "ExpertStack: gate/up stacked expert counts disagree"
+            );
+            debug_assert_eq!(
+                self.down_stacked.as_deref().map(|down| down.num_experts()),
+                Some(num_experts),
+                "ExpertStack: gate/down stacked expert counts disagree"
+            );
+            return num_experts;
+        }
+        if let Some(gate_up) = self.gate_up_marlin_stack.as_deref() {
+            let num_experts = gate_up.num_experts();
+            debug_assert_eq!(
+                self.down_marlin_stack
+                    .as_deref()
+                    .map(|down| down.num_experts()),
+                Some(num_experts),
+                "ExpertStack: gate_up/down Marlin expert counts disagree"
+            );
+            return num_experts;
+        }
+        0
     }
 }
 
@@ -2276,7 +2304,156 @@ type _CandleResult<T> = CandleResult<T>;
 
 #[cfg(test)]
 mod tests {
-    use super::{pick_moe_block_size_with_config, MoeDispatchRuntimeConfig};
+    use ferrum_kernels::backend::cpu::CpuBackend;
+    use ferrum_kernels::backend::Backend;
+    use ferrum_kernels::StackedExpertGgufLinear;
+
+    use super::{pick_moe_block_size_with_config, ExpertStack, MoeDispatchRuntimeConfig};
+
+    struct FakeStackedGgufLinear {
+        num_experts: usize,
+        rows: usize,
+        cols: usize,
+    }
+
+    impl StackedExpertGgufLinear<CpuBackend> for FakeStackedGgufLinear {
+        fn num_experts(&self) -> usize {
+            self.num_experts
+        }
+
+        fn n_rows(&self) -> usize {
+            self.rows
+        }
+
+        fn n_cols(&self) -> usize {
+            self.cols
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn gemv_moe_id(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _n_selected: usize,
+            _src1_stride: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemv_moe_id_offset(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _a_offset: usize,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _ids_offset: usize,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _n_selected: usize,
+            _src1_stride: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemv_moe_id_gate_up_silu(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _other_up: &dyn StackedExpertGgufLinear<CpuBackend>,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _silu_out: &mut <CpuBackend as Backend>::Buffer,
+            _n_selected: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemv_moe_id_batched(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _m: usize,
+            _top_k: usize,
+            _src1_outer_stride: usize,
+            _src1_inner_stride: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemv_moe_id_gate_up_silu_batched(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _other_up: &dyn StackedExpertGgufLinear<CpuBackend>,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _silu_out: &mut <CpuBackend as Backend>::Buffer,
+            _m: usize,
+            _top_k: usize,
+            _src1_outer_stride: usize,
+            _src1_inner_stride: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemm_moe_id(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _tpe: &<CpuBackend as Backend>::Buffer,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _ne11: usize,
+            _top_k: usize,
+            _max_per_expert: usize,
+            _batch: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemm_moe_id_indirect(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _src1: &<CpuBackend as Backend>::Buffer,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _tpe: &<CpuBackend as Backend>::Buffer,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _args_buf: &<CpuBackend as Backend>::Buffer,
+            _ne11: usize,
+            _top_k: usize,
+            _max_per_expert: usize,
+            _batch: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+    }
+
+    fn fake_stacked(num_experts: usize) -> Box<dyn StackedExpertGgufLinear<CpuBackend>> {
+        Box::new(FakeStackedGgufLinear {
+            num_experts,
+            rows: 4,
+            cols: 4,
+        })
+    }
+
+    #[test]
+    fn expert_stack_num_experts_uses_stacked_fast_path_count() {
+        let experts = ExpertStack::<CpuBackend> {
+            gate_up: Vec::new(),
+            down: Vec::new(),
+            gate_stacked: Some(fake_stacked(7)),
+            up_stacked: Some(fake_stacked(7)),
+            down_stacked: Some(fake_stacked(7)),
+            gate_up_marlin_stack: None,
+            down_marlin_stack: None,
+        };
+
+        assert_eq!(experts.num_experts(), 7);
+    }
 
     #[test]
     fn moe_dispatch_runtime_config_parses_m3_startup_knobs() {
