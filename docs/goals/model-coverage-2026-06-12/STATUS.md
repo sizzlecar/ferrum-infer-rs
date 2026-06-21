@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ44 — Qwen35 non-final continuation chunks skip logits tail
+
+- Scope:
+  - split Qwen3.5 stateful chunk execution into logits-returning and
+    no-logits paths;
+  - non-final continuation/chunked prefill rows in `unified_forward` now
+    advance recurrent/full-attention state and sync the linear state slot, then
+    return `None` without running final norm, final-token gather, lm_head, or
+    logits host readback;
+  - kept the existing continuation semantics that split already-started
+    multi-token chunks into token-by-token state updates, avoiding an unproven
+    behavior change while removing the known logits-tail waste;
+  - added a CPU regression with a deliberately broken final norm and panic
+    lm_head after the seed prefill, proving a non-final continuation chunk does
+    not touch the logits tail while still advancing sequence state.
+- Validation passed locally:
+  - `cargo fmt --all`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_non_final_continuation_skips_logits_tail -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- GPU status:
+  - attempted to use existing Vast instance `41422823`
+    (`ssh7.vast.ai:22822`, 1x RTX 4090);
+  - direct SSH returned `Connection refused`;
+  - Vast API showed `cur_state=stopped`, `actual_status=exited`;
+  - start request returned
+    `Required resources are currently unavailable, state change queued`;
+  - a 5-minute poll kept reporting `cur_state=stopped`,
+    `actual_status=exited`, so no CUDA build or performance artifact was
+    produced this turn.
+- Status:
+  - this is source/hot-path progress, not a performance claim;
+  - same-hardware CUDA evidence is still required for W3;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ43 — Qwen35 unified_forward now handles mixed continuation chunks and decode
 
 - Scope:

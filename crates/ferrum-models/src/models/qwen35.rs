@@ -1493,20 +1493,49 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 .get(cache_id)
                 .is_some_and(|state| !state.tokens.is_empty())
         {
-            let mut last = Vec::new();
+            let mut last = None;
             for token in tokens {
-                last = self.forward_stateful_chunk(cache_id, &[*token])?;
+                last = self.forward_stateful_chunk(cache_id, &[*token], true)?;
             }
-            return Ok(last);
+            return last
+                .ok_or_else(|| FerrumError::model("Qwen3.5 stateful forward produced no logits"));
         }
-        self.forward_stateful_chunk(cache_id, tokens)
+        self.forward_stateful_chunk(cache_id, tokens, true)?
+            .ok_or_else(|| FerrumError::model("Qwen3.5 stateful forward produced no logits"))
     }
 
-    fn forward_stateful_chunk(&mut self, cache_id: &str, tokens: &[u32]) -> Result<Vec<f32>> {
+    fn forward_stateful_without_logits(&mut self, cache_id: &str, tokens: &[u32]) -> Result<()> {
+        if tokens.is_empty() {
+            return Err(FerrumError::model(
+                "Qwen3.5 stateful forward requires at least one token",
+            ));
+        }
+        self.ensure_sequence_state(cache_id)?;
+        if tokens.len() > 1
+            && self
+                .sequences
+                .get(cache_id)
+                .is_some_and(|state| !state.tokens.is_empty())
+        {
+            for token in tokens {
+                self.forward_stateful_chunk(cache_id, &[*token], false)?;
+            }
+            return Ok(());
+        }
+        self.forward_stateful_chunk(cache_id, tokens, false)?;
+        Ok(())
+    }
+
+    fn forward_stateful_chunk(
+        &mut self,
+        cache_id: &str,
+        tokens: &[u32],
+        return_logits: bool,
+    ) -> Result<Option<Vec<f32>>> {
         let mut state = self.sequences.remove(cache_id).ok_or_else(|| {
             FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
         })?;
-        let result = self.forward_stateful_chunk_taken(cache_id, tokens, &mut state);
+        let result = self.forward_stateful_chunk_taken(cache_id, tokens, &mut state, return_logits);
         if result.is_ok() {
             state.tokens.extend_from_slice(tokens);
         }
@@ -1519,7 +1548,8 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         cache_id: &str,
         tokens: &[u32],
         state: &mut Qwen35SequenceState<B>,
-    ) -> Result<Vec<f32>> {
+        return_logits: bool,
+    ) -> Result<Option<Vec<f32>>> {
         if state.layers.len() != self.weights.layers.len() {
             return Err(FerrumError::model(format!(
                 "Qwen3.5 sequence state layer count {} != model layers {}",
@@ -1551,6 +1581,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         )?;
         let weights = &self.weights;
         let rope = &self.rope;
+        let layer_count = weights.layers.len();
         let mut hidden = B::alloc(tokens_len * weights.config.hidden_size);
         let t_embedding = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
         B::embedding_lookup(
@@ -1645,6 +1676,15 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             }
         }
 
+        if !return_logits {
+            self.sync_sequence_linear_state_to_slot(&mut ctx, state)?;
+            B::sync(&mut ctx);
+            if profile_enabled {
+                prefill_profile.log(cache_id, prior_len, tokens_len, layer_count);
+            }
+            return Ok(None);
+        }
+
         let mut final_hidden = B::alloc(tokens_len * weights.config.hidden_size);
         let t_final_norm = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
         if let Some(residual_f32) = residual_f32.as_ref() {
@@ -1677,7 +1717,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             tokens_len * weights.config.hidden_size,
         );
         let vocab_size = weights.runtime_cfg.vocab_size;
-        let layer_count = weights.layers.len();
         let t_final_gather =
             qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled && tokens_len > 1);
         let last_hidden = if tokens_len == 1 {
@@ -1748,7 +1787,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 out.len().saturating_sub(finite),
             );
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     fn forward_stateful_prefill_batch(
@@ -2127,9 +2166,11 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
 
         for row in chunk_rows {
             let (cache_id, tokens, _, is_final_chunk) = &items[row];
-            let logits = self.forward_stateful(cache_id, tokens)?;
             if *is_final_chunk {
+                let logits = self.forward_stateful(cache_id, tokens)?;
                 out[row] = Some(logits);
+            } else {
+                self.forward_stateful_without_logits(cache_id, tokens)?;
             }
         }
 
@@ -11980,6 +12021,31 @@ mod tests {
         }
     }
 
+    struct PanicLinear {
+        in_features: usize,
+        out_features: usize,
+    }
+
+    impl ferrum_quantization::Linear<CpuBackend> for PanicLinear {
+        fn in_features(&self) -> usize {
+            self.in_features
+        }
+
+        fn out_features(&self) -> usize {
+            self.out_features
+        }
+
+        fn forward(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _input: &<CpuBackend as Backend>::Buffer,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _m: usize,
+        ) {
+            panic!("PanicLinear forward must not be called");
+        }
+    }
+
     fn runtime_config(config: &Qwen35TextConfig) -> LlmRuntimeConfig {
         qwen35_runtime_config(config, 128, 64)
     }
@@ -12357,6 +12423,37 @@ mod tests {
         );
         assert_eq!(model.sequences["chunk-req"].tokens, vec![3, 4, 5]);
         assert_eq!(model.sequences["decode-req"].tokens, vec![1, 2, 6]);
+    }
+
+    #[test]
+    fn qwen35_unified_forward_non_final_continuation_skips_logits_tail() {
+        let config = tiny_linear_config();
+        let vocab_size = 128;
+        let loader = ForwardLoader::from_required_manifest(&config, vocab_size);
+        let plan = loader.plan();
+        let mut model = Qwen35BackendModel::<CpuBackend>::from_weight_plan(
+            config.clone(),
+            qwen35_runtime_config(&config, vocab_size, 64),
+            plan,
+            &loader,
+        )
+        .unwrap();
+
+        <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::prefill(&mut model, "chunk-req", &[3]);
+        model.weights.final_norm = CpuBackend::from_slice(&[]);
+        model.weights.lm_head = Box::new(PanicLinear {
+            in_features: config.hidden_size,
+            out_features: vocab_size,
+        });
+
+        let rows = <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::unified_forward(
+            &mut model,
+            &[("chunk-req".to_string(), vec![4], 1, false)],
+        )
+        .unwrap();
+
+        assert_eq!(rows, vec![None]);
+        assert_eq!(model.sequences["chunk-req"].tokens, vec![3, 4]);
     }
 
     #[test]
