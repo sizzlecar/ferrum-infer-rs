@@ -195,6 +195,21 @@ adding model-name defaults or hidden environment switches.
   `actual_status=exited`, `intended_status=stopped`. CUDA validation did not
   run; the sanitized status artifact is
   `artifacts/w3_qwen35_mixed_prefill_cuda_95adb578_20260622/local_vast/status_summary.json`.
+- A later current-SHA start attempt for the same cached instance also did not
+  produce a runnable GPU lane. The lane was W3 Qwen35 GPTQ-Int4 current-SHA
+  CUDA correctness smoke at `7ba1f415c54f7eab050563b801a37fb38f0f28af`;
+  intended correctness path was `w3_qwen35_real_product_report.py` followed by
+  `w3_l2_quantized_gate.py`, with performance deferred. Vast `PUT
+  state=running` returned an empty object and the follow-up API query still
+  reported `cur_state=stopped`, `actual_status=exited`,
+  `intended_status=stopped`; no remote SSH/build/gate command ran. Sanitized
+  artifact:
+  `artifacts/w3_qwen35_cuda_current_sha_7ba1f415_start_20260621T214634Z/summary.json`.
+- While the GPU lane was unavailable, the local evidence pipeline was checked:
+  `w3_qwen35_real_product_report.py --self-test`,
+  `w3_l2_quantized_gate.py --self-test`, `w3_l4_agent_gate.py --self-test`,
+  `w3_l5_concurrency_gate.py --self-test`, and
+  `model_release_grade_goal_gate.py --self-test` all passed.
 
 The key vLLM reference is:
 
