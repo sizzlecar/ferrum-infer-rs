@@ -1,0 +1,19 @@
+{
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "max_tokens": 8,
+  "messages": [
+    {
+      "content": "What is 2+3? Answer with only the number.",
+      "role": "user"
+    }
+  ],
+  "model": "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+  "seed": 9271,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "temperature": 0
+}

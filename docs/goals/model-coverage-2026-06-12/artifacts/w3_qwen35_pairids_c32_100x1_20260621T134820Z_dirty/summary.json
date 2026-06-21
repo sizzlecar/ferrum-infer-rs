@@ -1,0 +1,27 @@
+{
+  "artifact": "/workspace/artifacts/w3_qwen35_pairids_c32_100x1_20260621T134820Z_dirty",
+  "bad_output": [
+    0
+  ],
+  "completed": [
+    100
+  ],
+  "duplicate_done": [
+    0
+  ],
+  "errored": [
+    0
+  ],
+  "itl_p50_ms": 19.57545,
+  "missing_done": [
+    0
+  ],
+  "output_token_count_source": "usage",
+  "output_tps": {
+    "mean": 666.550775901937
+  },
+  "tpot_p50_ms": 32.7685691744186,
+  "zero_output_tokens": [
+    0
+  ]
+}

@@ -1,0 +1,10 @@
+lane=W3 Qwen35 c32 pair-id MoE diagnostic
+started_utc=2026-06-21T13:48:20Z
+head=690ba923b652109aea09d99ebe5702a4897b6995
+status_short_begin<<STATUS
+ M crates/ferrum-models/src/models/qwen35.rs
+STATUS
+FERRUM_VLLM_MOE_PAIR_IDS=1
+model=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+dataset=/workspace/artifacts/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja/dataset/ascii_sharegpt_w3_100_58d5721d.jsonl
+port=18267

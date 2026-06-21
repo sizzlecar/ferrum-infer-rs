@@ -1,0 +1,2 @@
+name, memory.total [MiB], memory.used [MiB], utilization.gpu [%], driver_version
+NVIDIA GeForce RTX 4090, 49140 MiB, 30174 MiB, 0 %, 580.126.09

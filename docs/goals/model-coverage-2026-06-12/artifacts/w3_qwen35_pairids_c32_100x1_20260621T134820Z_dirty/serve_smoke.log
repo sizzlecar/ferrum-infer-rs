@@ -1,0 +1,2 @@
+{"id":"b4b0774a-a915-4b99-94c2-74cb1c37cf59","object":"chat.completion","created":1782049735,"model":"/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"message":{"role":"assistant","content":"Paris"},"finish_reason":"stop"}],"usage":{"prompt_tokens":24,"completion_tokens":2,"total_tokens":26}}
+SERVE_SMOKE_PASS
