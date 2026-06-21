@@ -215,6 +215,10 @@ adding model-name defaults or hidden environment switches.
   `w3_l2_quantized_gate.py --self-test`, `w3_l4_agent_gate.py --self-test`,
   `w3_l5_concurrency_gate.py --self-test`, and
   `model_release_grade_goal_gate.py --self-test` all passed.
+- `w3_qwen35_real_product_report.py` now captures git status before creating
+  the artifact directory and writes that pre-run snapshot into the S2 product
+  artifact and report summary. This prevents a clean GPU run from being marked
+  dirty solely because the runner wrote its own evidence files under the repo.
 
 The key vLLM reference is:
 
