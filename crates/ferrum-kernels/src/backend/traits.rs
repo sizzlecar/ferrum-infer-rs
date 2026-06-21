@@ -332,6 +332,17 @@ pub trait Backend: Send + Sync + Sized + 'static {
         false
     }
 
+    /// Whether this backend can consume Qwen3.5 GDN prefill projections in the
+    /// vLLM-packed layout:
+    /// - `in_proj_qkvz`: `[q, k, v, z]`
+    /// - `in_proj_ba`: `[b, a]`
+    ///
+    /// This avoids two projection launches on chunked/varlen prefill and lets
+    /// the prepare kernel split the packed outputs while doing causal conv.
+    fn supports_qwen35_packed_gdn_prefill_prepare() -> bool {
+        false
+    }
+
     /// Whether this backend can keep Qwen3.5 packed GDN decode projections
     /// packed through the recurrent update, without splitting q/k/v/g/beta
     /// into intermediate buffers.
@@ -522,6 +533,46 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "linear_attention_prepare_varlen_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Varlen prefill-time gated-Delta linear-attention preparation from
+    /// vLLM-packed Qwen3.5 projections.
+    ///
+    /// Layouts:
+    /// - `mixed_qkvz_raw`: `[total_tokens, q, k, v, z]`
+    /// - `ba_raw`: `[total_tokens, b, a]`
+    /// - `z`: `[total_tokens, value_heads, value_dim]`
+    /// Other outputs and state layouts match [`Self::linear_attention_prepare_varlen_f32`].
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_varlen_packed_qkvz_ba_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkvz_raw: &Self::Buffer,
+        _ba_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _initial_conv_states: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _cu_seqlens: &Self::Buffer,
+        _token_seq_indices: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _z: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _final_conv_states: &mut Self::Buffer,
+        _batch: usize,
+        _total_tokens: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_prepare_varlen_packed_qkvz_ba_f32 not implemented for this backend",
         ))
     }
 
