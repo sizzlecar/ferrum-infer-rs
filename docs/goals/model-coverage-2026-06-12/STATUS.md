@@ -2,6 +2,43 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ40 — Qwen35 GDN prefill now uses vLLM-style packed qkvz/ba source path
+
+- Scope:
+  - added backend capability
+    `supports_qwen35_packed_gdn_prefill_prepare`;
+  - added packed varlen GDN prepare API
+    `linear_attention_prepare_varlen_packed_qkvz_ba_f32`;
+  - added CPU reference implementation and CUDA launcher/kernel for packed
+    `[q,k,v,z]` + `[b,a]` prefill prepare;
+  - routed Qwen3.5 product prefill through fused `qkvz_proj` and `ba_proj`
+    when the backend advertises the packed prefill capability;
+  - kept the old separate `qkv/z/b/a` path as the fallback for backends that
+    do not support packed prefill prepare.
+- vLLM alignment:
+  - local vLLM path inspected:
+    `/Users/chejinxuan/py_ws/vllm/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`;
+  - vLLM Qwen3.5 prefill projects with `in_proj_qkvz` and `in_proj_ba`, then
+    splits `[q,k,v,z]` and `[b,a]`; Ferrum prefill previously still launched
+    four separate projections.
+- Validation passed locally:
+  - `cargo fmt --all`;
+  - `cargo test -p ferrum-kernels --test linear_attention_cpu linear_attention_prepare_varlen_packed_cpu_matches_separate_prepare -- --nocapture`;
+  - `cargo check -p ferrum-kernels -p ferrum-models`;
+  - `cargo test -p ferrum-models linear_attention_prefill_varlen_backend_matches_per_sequence_stateful_reference -- --nocapture`.
+- Added GPU-targeted test:
+  - `linear_attention_prepare_varlen_packed_cuda_matches_cpu_reference` in
+    `crates/ferrum-kernels/tests/linear_attention_cuda_eq.rs`;
+  - local machine has no `nvcc`, so CUDA feature build and this CUDA test are
+    pending on the next 1x RTX 4090 lane.
+- Status:
+  - this is source/hot-path progress, not a performance claim;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`;
+  - next evidence must be same-hardware CUDA build, CUDA kernel parity test,
+    real `ferrum run`/`ferrum serve` smoke, then c32 diagnostic against the
+    existing vLLM baseline.
+
 ## 2026-06-22 ZZZ39 — W3 scheduler trace localized mixed prefill+decode bottleneck
 
 - Scope:

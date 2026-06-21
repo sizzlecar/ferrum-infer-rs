@@ -14,6 +14,11 @@ const PREPARE_F16_PARAMS_F32_FUNC: &str = "linear_attention_prepare_f16_params_f
 const PREPARE_VARLEN_FUNC: &str = "linear_attention_prepare_varlen_f32";
 const PREPARE_VARLEN_F16_TO_F32_FUNC: &str = "linear_attention_prepare_varlen_f16_to_f32";
 const PREPARE_VARLEN_F16_PARAMS_F32_FUNC: &str = "linear_attention_prepare_varlen_f16_params_f32";
+const PREPARE_VARLEN_PACKED_FUNC: &str = "linear_attention_prepare_varlen_packed_qkvz_ba_f32";
+const PREPARE_VARLEN_PACKED_F16_TO_F32_FUNC: &str =
+    "linear_attention_prepare_varlen_packed_qkvz_ba_f16_to_f32";
+const PREPARE_VARLEN_PACKED_F16_PARAMS_F32_FUNC: &str =
+    "linear_attention_prepare_varlen_packed_qkvz_ba_f16_params_f32";
 const DECODE_PREPARE_FUNC: &str = "linear_attention_decode_prepare_f32";
 const DECODE_PREPARE_F16_TO_F32_FUNC: &str = "linear_attention_decode_prepare_f16_to_f32";
 const DECODE_PREPARE_F16_PARAMS_F32_FUNC: &str = "linear_attention_decode_prepare_f16_params_f32";
@@ -372,6 +377,186 @@ pub fn linear_attention_prepare_varlen_f32(
                 })
                 .map_err(|err| {
                     FerrumError::backend(format!("linear_attention_varlen_qk_l2norm launch: {err}"))
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn linear_attention_prepare_varlen_packed_qkvz_ba_f32(
+    ctx: &mut CudaState,
+    mixed_qkvz_raw: &CudaBuf,
+    ba_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    initial_conv_states: &CudaBuf,
+    a_log: &CudaBuf,
+    dt_bias: &CudaBuf,
+    cu_seqlens: &CudaBuf,
+    token_seq_indices: &CudaBuf,
+    query: &mut CudaBuf,
+    key: &mut CudaBuf,
+    value: &mut CudaBuf,
+    z: &mut CudaBuf,
+    g: &mut CudaBuf,
+    beta: &mut CudaBuf,
+    final_conv_states: &mut CudaBuf,
+    batch: usize,
+    total_tokens: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+    apply_qk_l2norm: bool,
+) -> Result<()> {
+    validate_prepare_varlen_packed_shape(
+        mixed_qkvz_raw,
+        ba_raw,
+        conv_weight,
+        initial_conv_states,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        token_seq_indices,
+        query,
+        key,
+        value,
+        z,
+        g,
+        beta,
+        final_conv_states,
+        batch,
+        total_tokens,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+    )?;
+
+    let (input_dtype, param_dtype) = validate_prepare_varlen_packed_dtype(
+        mixed_qkvz_raw,
+        ba_raw,
+        conv_weight,
+        initial_conv_states,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        token_seq_indices,
+        query,
+        key,
+        value,
+        z,
+        g,
+        beta,
+        final_conv_states,
+    )?;
+
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let state_len = conv_kernel.saturating_sub(1);
+    let conv_total = total_tokens * conv_channels;
+    let z_total = total_tokens * value_total;
+    let gate_total = total_tokens * value_heads;
+    let state_total = batch * conv_channels * state_len;
+    let total = conv_total.max(z_total).max(gate_total).max(state_total);
+    let func_name = match (input_dtype, param_dtype) {
+        (Dtype::F32, Dtype::F32) => PREPARE_VARLEN_PACKED_FUNC,
+        (Dtype::F16, Dtype::F16) => PREPARE_VARLEN_PACKED_F16_TO_F32_FUNC,
+        (Dtype::F16, Dtype::F32) => PREPARE_VARLEN_PACKED_F16_PARAMS_F32_FUNC,
+        _ => unreachable!("validate_prepare_varlen_packed_dtype filters unsupported inputs"),
+    };
+    let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
+    let stream = ctx.stream.clone();
+    let batch_i32 = batch as i32;
+    let total_tokens_i32 = total_tokens as i32;
+    let key_heads_i32 = key_heads as i32;
+    let value_heads_i32 = value_heads as i32;
+    let key_dim_i32 = key_dim as i32;
+    let value_dim_i32 = value_dim as i32;
+    let conv_kernel_i32 = conv_kernel as i32;
+    let mut builder = stream.launch_builder(&func);
+    match input_dtype {
+        Dtype::F32 => {
+            builder.arg(mixed_qkvz_raw.as_f32());
+            builder.arg(ba_raw.as_f32());
+            builder.arg(conv_weight.as_f32());
+        }
+        Dtype::F16 => {
+            builder.arg(mixed_qkvz_raw.as_f16());
+            builder.arg(ba_raw.as_f16());
+            builder.arg(conv_weight.as_f16());
+        }
+        _ => unreachable!("validate_prepare_varlen_packed_dtype filters unsupported inputs"),
+    }
+    builder.arg(initial_conv_states.as_f32());
+    match param_dtype {
+        Dtype::F32 => {
+            builder.arg(a_log.as_f32());
+            builder.arg(dt_bias.as_f32());
+        }
+        Dtype::F16 => {
+            builder.arg(a_log.as_f16());
+            builder.arg(dt_bias.as_f16());
+        }
+        _ => unreachable!("validate_prepare_varlen_packed_dtype filters unsupported params"),
+    }
+    builder.arg(cu_seqlens.as_u32());
+    builder.arg(token_seq_indices.as_u32());
+    builder.arg(query.as_f32_mut());
+    builder.arg(key.as_f32_mut());
+    builder.arg(value.as_f32_mut());
+    builder.arg(z.as_f32_mut());
+    builder.arg(g.as_f32_mut());
+    builder.arg(beta.as_f32_mut());
+    builder.arg(final_conv_states.as_f32_mut());
+    builder.arg(&batch_i32);
+    builder.arg(&total_tokens_i32);
+    builder.arg(&key_heads_i32);
+    builder.arg(&value_heads_i32);
+    builder.arg(&key_dim_i32);
+    builder.arg(&value_dim_i32);
+    builder.arg(&conv_kernel_i32);
+    unsafe {
+        builder
+            .launch(LaunchConfig {
+                grid_dim: (total.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .map_err(|err| {
+                FerrumError::backend(format!(
+                    "linear_attention_prepare_varlen_packed launch: {err}"
+                ))
+            })?;
+    }
+
+    if apply_qk_l2norm {
+        let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, QK_L2NORM_FUNC);
+        let block = key_dim.next_power_of_two().min(256).max(1) as u32;
+        let stream = ctx.stream.clone();
+        let eps = 1e-6f32;
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(query.as_f32_mut());
+        builder.arg(key.as_f32_mut());
+        builder.arg(&total_tokens_i32);
+        builder.arg(&key_heads_i32);
+        builder.arg(&key_dim_i32);
+        builder.arg(&eps);
+        unsafe {
+            builder
+                .launch(LaunchConfig {
+                    grid_dim: ((total_tokens * key_heads) as u32, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|err| {
+                    FerrumError::backend(format!(
+                        "linear_attention_varlen_packed_qk_l2norm launch: {err}"
+                    ))
                 })?;
         }
     }
@@ -1387,6 +1572,64 @@ fn validate_prepare_varlen_dtype(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn validate_prepare_varlen_packed_dtype(
+    mixed_qkvz_raw: &CudaBuf,
+    ba_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    initial_conv_states: &CudaBuf,
+    a_log: &CudaBuf,
+    dt_bias: &CudaBuf,
+    cu_seqlens: &CudaBuf,
+    token_seq_indices: &CudaBuf,
+    query: &CudaBuf,
+    key: &CudaBuf,
+    value: &CudaBuf,
+    z: &CudaBuf,
+    g: &CudaBuf,
+    beta: &CudaBuf,
+    final_conv_states: &CudaBuf,
+) -> Result<(Dtype, Dtype)> {
+    let op = "linear_attention_prepare_varlen_packed";
+    let input_dtype = mixed_qkvz_raw.dtype();
+    require_supported_input_dtype(op, "mixed_qkvz_raw", input_dtype)?;
+    for (label, actual) in [
+        ("ba_raw", ba_raw.dtype()),
+        ("conv_weight", conv_weight.dtype()),
+    ] {
+        require_dtype(op, label, actual, input_dtype)?;
+    }
+    let param_dtype = a_log.dtype();
+    require_supported_input_dtype(op, "a_log", param_dtype)?;
+    require_dtype(op, "dt_bias", dt_bias.dtype(), param_dtype)?;
+    if input_dtype == Dtype::F32 && param_dtype != Dtype::F32 {
+        return Err(FerrumError::model(format!(
+            "{op} param dtype {} is unsupported for f32 input; expected f32",
+            param_dtype.name()
+        )));
+    }
+    for (label, actual) in [
+        ("initial_conv_states", initial_conv_states.dtype()),
+        ("query", query.dtype()),
+        ("key", key.dtype()),
+        ("value", value.dtype()),
+        ("z", z.dtype()),
+        ("g", g.dtype()),
+        ("beta", beta.dtype()),
+        ("final_conv_states", final_conv_states.dtype()),
+    ] {
+        require_dtype(op, label, actual, Dtype::F32)?;
+    }
+    require_dtype(op, "cu_seqlens", cu_seqlens.dtype(), Dtype::U32)?;
+    require_dtype(
+        op,
+        "token_seq_indices",
+        token_seq_indices.dtype(),
+        Dtype::U32,
+    )?;
+    Ok((input_dtype, param_dtype))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_decode_prepare_dtype(
     mixed_qkv_raw: &CudaBuf,
     conv_weight: &CudaBuf,
@@ -1572,6 +1815,91 @@ fn validate_prepare_varlen_shape(
         if actual < expected {
             return Err(FerrumError::model(format!(
                 "linear_attention_prepare_varlen {label} length {actual} < expected {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_prepare_varlen_packed_shape(
+    mixed_qkvz_raw: &CudaBuf,
+    ba_raw: &CudaBuf,
+    conv_weight: &CudaBuf,
+    initial_conv_states: &CudaBuf,
+    a_log: &CudaBuf,
+    dt_bias: &CudaBuf,
+    cu_seqlens: &CudaBuf,
+    token_seq_indices: &CudaBuf,
+    query: &CudaBuf,
+    key: &CudaBuf,
+    value: &CudaBuf,
+    z: &CudaBuf,
+    g: &CudaBuf,
+    beta: &CudaBuf,
+    final_conv_states: &CudaBuf,
+    batch: usize,
+    total_tokens: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel: usize,
+) -> Result<()> {
+    if batch == 0
+        || total_tokens == 0
+        || key_heads == 0
+        || value_heads == 0
+        || key_dim == 0
+        || value_dim == 0
+        || conv_kernel == 0
+    {
+        return Err(FerrumError::model(format!(
+            "linear_attention_prepare_varlen_packed shape must be positive, got batch={batch} total_tokens={total_tokens} key_heads={key_heads} value_heads={value_heads} key_dim={key_dim} value_dim={value_dim} conv_kernel={conv_kernel}"
+        )));
+    }
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let qkvz_width = conv_channels + value_total;
+    let ba_width = 2 * value_heads;
+    let conv_state_elements = conv_channels * conv_kernel.saturating_sub(1);
+    for (label, actual, expected) in [
+        (
+            "mixed_qkvz_raw",
+            mixed_qkvz_raw.len(),
+            total_tokens * qkvz_width,
+        ),
+        ("ba_raw", ba_raw.len(), total_tokens * ba_width),
+        (
+            "conv_weight",
+            conv_weight.len(),
+            conv_channels * conv_kernel,
+        ),
+        (
+            "initial_conv_states",
+            initial_conv_states.len(),
+            batch * conv_state_elements,
+        ),
+        ("a_log", a_log.len(), value_heads),
+        ("dt_bias", dt_bias.len(), value_heads),
+        ("cu_seqlens", cu_seqlens.len(), batch + 1),
+        ("token_seq_indices", token_seq_indices.len(), total_tokens),
+        ("query", query.len(), total_tokens * qk_total),
+        ("key", key.len(), total_tokens * qk_total),
+        ("value", value.len(), total_tokens * value_total),
+        ("z", z.len(), total_tokens * value_total),
+        ("g", g.len(), total_tokens * value_heads),
+        ("beta", beta.len(), total_tokens * value_heads),
+        (
+            "final_conv_states",
+            final_conv_states.len(),
+            batch * conv_state_elements,
+        ),
+    ] {
+        if actual < expected {
+            return Err(FerrumError::model(format!(
+                "linear_attention_prepare_varlen_packed {label} length {actual} < expected {expected}"
             )));
         }
     }

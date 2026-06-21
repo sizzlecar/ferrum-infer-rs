@@ -188,6 +188,143 @@ fn linear_attention_prepare_varlen_cpu_rejects_mismatched_token_seq_indices() {
 }
 
 #[test]
+fn linear_attention_prepare_varlen_packed_cpu_matches_separate_prepare() {
+    let batch = 2;
+    let total_tokens = 3;
+    let key_heads = 1;
+    let value_heads = 2;
+    let key_dim = 2;
+    let value_dim = 1;
+    let conv_kernel = 3;
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let qkvz_width = conv_channels + value_total;
+    let ba_width = 2 * value_heads;
+    let state_len = conv_kernel - 1;
+
+    let mixed_qkv_raw = (0..total_tokens * conv_channels)
+        .map(|idx| idx as f32 * 0.1 - 0.7)
+        .collect::<Vec<_>>();
+    let z_raw = (0..total_tokens * value_total)
+        .map(|idx| idx as f32 * -0.2 + 0.9)
+        .collect::<Vec<_>>();
+    let b_raw = (0..total_tokens * value_heads)
+        .map(|idx| idx as f32 * 0.07 - 0.4)
+        .collect::<Vec<_>>();
+    let a_raw = (0..total_tokens * value_heads)
+        .map(|idx| idx as f32 * -0.05 + 0.3)
+        .collect::<Vec<_>>();
+    let mut mixed_qkvz_raw = vec![0.0; total_tokens * qkvz_width];
+    let mut ba_raw = vec![0.0; total_tokens * ba_width];
+    for token in 0..total_tokens {
+        let qkv_src = token * conv_channels;
+        let qkvz_dst = token * qkvz_width;
+        mixed_qkvz_raw[qkvz_dst..qkvz_dst + conv_channels]
+            .copy_from_slice(&mixed_qkv_raw[qkv_src..qkv_src + conv_channels]);
+        let z_src = token * value_total;
+        mixed_qkvz_raw[qkvz_dst + conv_channels..qkvz_dst + qkvz_width]
+            .copy_from_slice(&z_raw[z_src..z_src + value_total]);
+
+        let gate_src = token * value_heads;
+        let ba_dst = token * ba_width;
+        ba_raw[ba_dst..ba_dst + value_heads]
+            .copy_from_slice(&b_raw[gate_src..gate_src + value_heads]);
+        ba_raw[ba_dst + value_heads..ba_dst + ba_width]
+            .copy_from_slice(&a_raw[gate_src..gate_src + value_heads]);
+    }
+
+    let conv_weight = (0..conv_channels * conv_kernel)
+        .map(|idx| 0.05 + idx as f32 * 0.01)
+        .collect::<Vec<_>>();
+    let initial_conv_states = (0..batch * conv_channels * state_len)
+        .map(|idx| idx as f32 * 0.03 - 0.2)
+        .collect::<Vec<_>>();
+    let a_log = vec![0.5f32.ln(), 1.75f32.ln()];
+    let dt_bias = vec![0.1, -0.25];
+    let cu_seqlens = CpuBackend::from_slice_typed(&[0u32, 2, 3]);
+    let token_seq_indices = CpuBackend::from_slice_typed(&[0u32, 0, 1]);
+
+    let mut ctx = CpuBackend::new_context();
+    let mut query = vec![0.0; total_tokens * qk_total];
+    let mut key = vec![0.0; total_tokens * qk_total];
+    let mut value = vec![0.0; total_tokens * value_total];
+    let mut g = vec![0.0; total_tokens * value_heads];
+    let mut beta = vec![0.0; total_tokens * value_heads];
+    let mut final_conv_states = vec![0.0; batch * conv_channels * state_len];
+    CpuBackend::linear_attention_prepare_varlen_f32(
+        &mut ctx,
+        &mixed_qkv_raw,
+        &conv_weight,
+        &initial_conv_states,
+        &a_raw,
+        &b_raw,
+        &a_log,
+        &dt_bias,
+        &cu_seqlens,
+        &token_seq_indices,
+        &mut query,
+        &mut key,
+        &mut value,
+        &mut g,
+        &mut beta,
+        &mut final_conv_states,
+        batch,
+        total_tokens,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+        true,
+    )
+    .unwrap();
+
+    let mut packed_query = vec![0.0; total_tokens * qk_total];
+    let mut packed_key = vec![0.0; total_tokens * qk_total];
+    let mut packed_value = vec![0.0; total_tokens * value_total];
+    let mut packed_z = vec![0.0; total_tokens * value_total];
+    let mut packed_g = vec![0.0; total_tokens * value_heads];
+    let mut packed_beta = vec![0.0; total_tokens * value_heads];
+    let mut packed_final_conv_states = vec![0.0; batch * conv_channels * state_len];
+    CpuBackend::linear_attention_prepare_varlen_packed_qkvz_ba_f32(
+        &mut ctx,
+        &mixed_qkvz_raw,
+        &ba_raw,
+        &conv_weight,
+        &initial_conv_states,
+        &a_log,
+        &dt_bias,
+        &cu_seqlens,
+        &token_seq_indices,
+        &mut packed_query,
+        &mut packed_key,
+        &mut packed_value,
+        &mut packed_z,
+        &mut packed_g,
+        &mut packed_beta,
+        &mut packed_final_conv_states,
+        batch,
+        total_tokens,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+        true,
+    )
+    .unwrap();
+
+    assert_close(&packed_query, &query, 1e-6);
+    assert_close(&packed_key, &key, 1e-6);
+    assert_close(&packed_value, &value, 1e-6);
+    assert_close(&packed_z, &z_raw, 1e-6);
+    assert_close(&packed_g, &g, 1e-6);
+    assert_close(&packed_beta, &beta, 1e-6);
+    assert_close(&packed_final_conv_states, &final_conv_states, 1e-6);
+}
+
+#[test]
 fn linear_attention_decode_prepare_cpu_updates_conv_state_and_splits_current_token() {
     let key_heads = 1;
     let value_heads = 2;

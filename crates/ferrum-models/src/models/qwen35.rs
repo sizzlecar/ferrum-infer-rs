@@ -129,6 +129,19 @@ enum Qwen35LinearDecodeProjectionBuffers<T> {
     },
 }
 
+enum Qwen35LinearPrefillProjectionBuffers<T> {
+    Separate {
+        mixed_qkv_raw: T,
+        z_raw: T,
+        b_raw: T,
+        a_raw: T,
+    },
+    Packed {
+        mixed_qkvz_raw: T,
+        ba_raw: T,
+    },
+}
+
 pub enum Qwen35MlpWeights<B: MoeLlmBackend> {
     Dense(Qwen35DenseMlpWeights<B>),
     SparseMoeSharedExpert(Qwen35SparseMoeSharedExpertWeights<B>),
@@ -2491,6 +2504,8 @@ struct Qwen35LinearPrefillDetailProfile {
     z_proj_us: u64,
     b_proj_us: u64,
     a_proj_us: u64,
+    qkvz_proj_us: u64,
+    ba_proj_us: u64,
     state_gather_us: u64,
     attention_core_us: u64,
     state_scatter_us: u64,
@@ -2782,7 +2797,12 @@ impl Qwen35LinearDecodeDetailProfile {
 impl Qwen35LinearPrefillDetailProfile {
     fn log(&self, layer_index: usize, batch: usize, tokens: usize, wrote_pools: bool) {
         let event = QWEN35_LINEAR_PREFILL_DETAIL_PROFILE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
-        let projection_us = self.qkv_proj_us + self.z_proj_us + self.b_proj_us + self.a_proj_us;
+        let projection_us = self.qkv_proj_us
+            + self.z_proj_us
+            + self.b_proj_us
+            + self.a_proj_us
+            + self.qkvz_proj_us
+            + self.ba_proj_us;
         let state_copy_us = self.state_gather_us + self.state_scatter_us + self.pool_scatter_us;
         let attention_post_us = self.f32_to_activation_us + self.out_proj_us;
         let accounted_us = self.input_norm_us
@@ -2797,7 +2817,7 @@ impl Qwen35LinearPrefillDetailProfile {
             eprintln!(
                 "[qwen35-linear-prefill-detail] event#{} layer={} batch={} tokens={} \
                  wrote_pools={} accounted={}us input_norm={}us projections={}us \
-                 qkv={}us z={}us b={}us a={}us state_copy={}us state_gather={}us \
+                 qkv={}us z={}us b={}us a={}us qkvz={}us ba={}us state_copy={}us state_gather={}us \
                  state_scatter={}us pool_scatter={}us attention_core={}us attention_post={}us \
                  f32_to_activation={}us out_proj={}us residual_update={}us mlp={}us",
                 event,
@@ -2812,6 +2832,8 @@ impl Qwen35LinearPrefillDetailProfile {
                 self.z_proj_us,
                 self.b_proj_us,
                 self.a_proj_us,
+                self.qkvz_proj_us,
+                self.ba_proj_us,
                 state_copy_us,
                 self.state_gather_us,
                 self.state_scatter_us,
@@ -2844,6 +2866,8 @@ impl Qwen35LinearPrefillDetailProfile {
                     "z_proj": self.z_proj_us,
                     "b_proj": self.b_proj_us,
                     "a_proj": self.a_proj_us,
+                    "qkvz_proj": self.qkvz_proj_us,
+                    "ba_proj": self.ba_proj_us,
                     "state_copy": state_copy_us,
                     "state_gather": self.state_gather_us,
                     "state_scatter": self.state_scatter_us,
@@ -6794,34 +6818,70 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
     detail.input_norm_us +=
         qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_input_norm");
 
-    let mut mixed_qkv_raw = B::alloc(total_tokens * qkv_width);
-    let mut z_raw = B::alloc(total_tokens * value_total);
-    let mut b_raw = B::alloc(total_tokens * gating_width);
-    let mut a_raw = B::alloc(total_tokens * gating_width);
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    attention
-        .qkv_proj
-        .forward(ctx, &input_norm, &mut mixed_qkv_raw, total_tokens);
-    detail.qkv_proj_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_qkv_proj");
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    attention
-        .z_proj
-        .forward(ctx, &input_norm, &mut z_raw, total_tokens);
-    detail.z_proj_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_z_proj");
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    attention
-        .b_proj
-        .forward(ctx, &input_norm, &mut b_raw, total_tokens);
-    detail.b_proj_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_b_proj");
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    attention
-        .a_proj
-        .forward(ctx, &input_norm, &mut a_raw, total_tokens);
-    detail.a_proj_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_a_proj");
+    let can_use_packed_prefill_prepare = B::supports_qwen35_packed_gdn_prefill_prepare()
+        && attention.qkvz_proj.is_some()
+        && attention.ba_proj.is_some();
+    let mut projection_buffers = if can_use_packed_prefill_prepare {
+        let qkvz_width = qkv_width + value_total;
+        let mut mixed_qkvz_raw = B::alloc(total_tokens * qkvz_width);
+        let mut ba_raw = B::alloc(total_tokens * 2 * gating_width);
+        let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+        attention
+            .qkvz_proj
+            .as_ref()
+            .expect("checked above")
+            .forward(ctx, &input_norm, &mut mixed_qkvz_raw, total_tokens);
+        detail.qkvz_proj_us +=
+            qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_qkvz_proj");
+        let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+        attention.ba_proj.as_ref().expect("checked above").forward(
+            ctx,
+            &input_norm,
+            &mut ba_raw,
+            total_tokens,
+        );
+        detail.ba_proj_us +=
+            qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_ba_proj");
+        Qwen35LinearPrefillProjectionBuffers::Packed {
+            mixed_qkvz_raw,
+            ba_raw,
+        }
+    } else {
+        let mut mixed_qkv_raw = B::alloc(total_tokens * qkv_width);
+        let mut z_raw = B::alloc(total_tokens * value_total);
+        let mut b_raw = B::alloc(total_tokens * gating_width);
+        let mut a_raw = B::alloc(total_tokens * gating_width);
+        let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+        attention
+            .qkv_proj
+            .forward(ctx, &input_norm, &mut mixed_qkv_raw, total_tokens);
+        detail.qkv_proj_us +=
+            qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_qkv_proj");
+        let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+        attention
+            .z_proj
+            .forward(ctx, &input_norm, &mut z_raw, total_tokens);
+        detail.z_proj_us +=
+            qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_z_proj");
+        let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+        attention
+            .b_proj
+            .forward(ctx, &input_norm, &mut b_raw, total_tokens);
+        detail.b_proj_us +=
+            qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_b_proj");
+        let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+        attention
+            .a_proj
+            .forward(ctx, &input_norm, &mut a_raw, total_tokens);
+        detail.a_proj_us +=
+            qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_a_proj");
+        Qwen35LinearPrefillProjectionBuffers::Separate {
+            mixed_qkv_raw,
+            z_raw,
+            b_raw,
+            a_raw,
+        }
+    };
 
     let conv_state_len = qkv_width * attention_shape.conv_kernel.saturating_sub(1);
     let delta_state_len = attention_shape.state_len();
@@ -6863,24 +6923,50 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
         qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_state_gather");
 
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    let attention_out = qwen35_linear_attention_prefill_varlen_core_backend::<B>(
-        ctx,
-        &mixed_qkv_raw,
-        &z_raw,
-        &a_raw,
-        &b_raw,
-        &attention.conv1d_weight,
-        &initial_conv_states,
-        &attention.a_log,
-        &attention.dt_bias,
-        &attention.norm_weight,
-        &initial_delta_states,
-        cu_seqlens,
-        token_seq_indices,
-        batch_len,
-        attention_shape,
-        eps,
-    )?;
+    let attention_out = match &mut projection_buffers {
+        Qwen35LinearPrefillProjectionBuffers::Packed {
+            mixed_qkvz_raw,
+            ba_raw,
+        } => qwen35_linear_attention_prefill_varlen_packed_core_backend::<B>(
+            ctx,
+            mixed_qkvz_raw,
+            ba_raw,
+            &attention.conv1d_weight,
+            &initial_conv_states,
+            &attention.a_log,
+            &attention.dt_bias,
+            &attention.norm_weight,
+            &initial_delta_states,
+            cu_seqlens,
+            token_seq_indices,
+            batch_len,
+            attention_shape,
+            eps,
+        )?,
+        Qwen35LinearPrefillProjectionBuffers::Separate {
+            mixed_qkv_raw,
+            z_raw,
+            b_raw,
+            a_raw,
+        } => qwen35_linear_attention_prefill_varlen_core_backend::<B>(
+            ctx,
+            mixed_qkv_raw,
+            z_raw,
+            a_raw,
+            b_raw,
+            &attention.conv1d_weight,
+            &initial_conv_states,
+            &attention.a_log,
+            &attention.dt_bias,
+            &attention.norm_weight,
+            &initial_delta_states,
+            cu_seqlens,
+            token_seq_indices,
+            batch_len,
+            attention_shape,
+            eps,
+        )?,
+    };
     detail.attention_core_us +=
         qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_core");
 
@@ -9993,6 +10079,133 @@ pub fn qwen35_linear_attention_prefill_varlen_core_backend<B: Backend>(
     })
 }
 
+/// Varlen Qwen3.5 linear-attention prefill from vLLM-packed projections.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_linear_attention_prefill_varlen_packed_core_backend<B: Backend>(
+    ctx: &mut B::Context,
+    mixed_qkvz_raw: &B::Buffer,
+    ba_raw: &B::Buffer,
+    conv1d_weight: &B::Buffer,
+    initial_conv_states: &B::Buffer,
+    a_log: &B::Buffer,
+    dt_bias: &B::Buffer,
+    norm_weight: &B::Buffer,
+    initial_states: &B::Buffer,
+    cu_seqlens: &B::Buffer,
+    token_seq_indices: &B::Buffer,
+    batch: usize,
+    shape: Qwen35LinearAttentionShape,
+    eps: f32,
+) -> Result<Qwen35BackendLinearAttentionVarlenPrefillOutput<B>> {
+    shape.validate()?;
+    if batch == 0 {
+        return Err(FerrumError::model(
+            "Qwen3.5 varlen packed linear-attention batch must be positive",
+        ));
+    }
+    let qk_total = shape.qk_total();
+    let value_len = shape.value_len();
+    let gating_len = shape.gating_len();
+    let conv_state_len = shape.conv_channels() * shape.conv_kernel.saturating_sub(1);
+    let detail_enabled = qwen35_layer_detail_profile_enabled();
+    let mut detail = Qwen35LinearPrefillCoreDetailProfile::default();
+
+    let mut query = B::alloc_typed(Dtype::F32, shape.tokens * qk_total);
+    let mut key = B::alloc_typed(Dtype::F32, shape.tokens * qk_total);
+    let mut value = B::alloc_typed(Dtype::F32, value_len);
+    let mut z = B::alloc_typed(Dtype::F32, value_len);
+    let mut g = B::alloc_typed(Dtype::F32, gating_len);
+    let mut beta = B::alloc_typed(Dtype::F32, gating_len);
+    let mut final_conv_states = B::alloc_typed(Dtype::F32, batch * conv_state_len);
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    B::linear_attention_prepare_varlen_packed_qkvz_ba_f32(
+        ctx,
+        mixed_qkvz_raw,
+        ba_raw,
+        conv1d_weight,
+        initial_conv_states,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        token_seq_indices,
+        &mut query,
+        &mut key,
+        &mut value,
+        &mut z,
+        &mut g,
+        &mut beta,
+        &mut final_conv_states,
+        batch,
+        shape.tokens,
+        shape.key_heads,
+        shape.value_heads,
+        shape.key_dim,
+        shape.value_dim,
+        shape.conv_kernel,
+        true,
+    )?;
+    detail.prepare_us += qwen35_detail_profile_stage_finish::<B>(
+        ctx,
+        timer,
+        "qwen35_linear_prefill_core_packed_prepare",
+    );
+
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    let delta = qwen35_recurrent_gated_delta_rule_varlen_backend::<B>(
+        ctx,
+        &query,
+        &key,
+        &value,
+        &g,
+        &beta,
+        initial_states,
+        cu_seqlens,
+        batch,
+        shape.delta_shape(),
+        false,
+        Some((shape.key_dim as f32).sqrt().recip()),
+    )?;
+    detail.recurrent_us += qwen35_detail_profile_stage_finish::<B>(
+        ctx,
+        timer,
+        "qwen35_linear_prefill_core_packed_recurrent",
+    );
+    let mut delta_norm = B::alloc_typed(Dtype::F32, value_len);
+    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    B::gated_rms_norm_f32(
+        ctx,
+        &delta.output,
+        &z,
+        norm_weight,
+        &mut delta_norm,
+        shape.tokens,
+        shape.value_heads,
+        shape.value_dim,
+        eps,
+    )?;
+    detail.gated_norm_us += qwen35_detail_profile_stage_finish::<B>(
+        ctx,
+        timer,
+        "qwen35_linear_prefill_core_packed_gated_norm",
+    );
+
+    if detail_enabled {
+        detail.log(batch, shape.tokens);
+    }
+
+    Ok(Qwen35BackendLinearAttentionVarlenPrefillOutput {
+        query,
+        key,
+        value,
+        g,
+        beta,
+        final_conv_states,
+        delta_core: delta.output,
+        delta_norm,
+        final_states: delta.final_states,
+    })
+}
+
 /// Backend-native Qwen3.5 linear-attention core for one decode token.
 ///
 /// This mirrors vLLM's decode ordering: update the dim-first causal-conv state,
@@ -10867,7 +11080,9 @@ impl<B: MoeLlmBackend> Qwen35ModelWeights<B> {
                                 .load_layer_linear(layer_plan.layer_index, "linear_attn_b")?,
                             a_proj: planned
                                 .load_layer_linear(layer_plan.layer_index, "linear_attn_a")?,
-                            qkvz_proj: if B::supports_qwen35_packed_gdn_decode_prepare() {
+                            qkvz_proj: if B::supports_qwen35_packed_gdn_decode_prepare()
+                                || B::supports_qwen35_packed_gdn_prefill_prepare()
+                            {
                                 Some(
                                     planned
                                         .load_layer_linear_attention_qkvz(layer_plan.layer_index)?,
@@ -10875,7 +11090,9 @@ impl<B: MoeLlmBackend> Qwen35ModelWeights<B> {
                             } else {
                                 None
                             },
-                            ba_proj: if B::supports_qwen35_packed_gdn_decode_prepare() {
+                            ba_proj: if B::supports_qwen35_packed_gdn_decode_prepare()
+                                || B::supports_qwen35_packed_gdn_prefill_prepare()
+                            {
                                 Some(
                                     planned
                                         .load_layer_linear_attention_ba(layer_plan.layer_index)?,

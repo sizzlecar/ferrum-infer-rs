@@ -282,6 +282,165 @@ fn linear_attention_prepare_cuda_accepts_f16_inputs_and_writes_f32() {
 }
 
 #[test]
+fn linear_attention_prepare_varlen_packed_cuda_matches_cpu_reference() {
+    let batch = 2;
+    let total_tokens = 5;
+    let key_heads = 2;
+    let value_heads = 4;
+    let key_dim = 3;
+    let value_dim = 2;
+    let conv_kernel = 4;
+    let qk_total = key_heads * key_dim;
+    let value_total = value_heads * value_dim;
+    let conv_channels = 2 * qk_total + value_total;
+    let qkvz_width = conv_channels + value_total;
+    let ba_width = 2 * value_heads;
+    let conv_state_len = conv_channels * (conv_kernel - 1);
+
+    let mixed_qkvz_raw: Vec<f32> = (0..total_tokens * qkvz_width)
+        .map(|i| ((i as f32 % 31.0) - 15.0) * 0.03125)
+        .collect();
+    let ba_raw: Vec<f32> = (0..total_tokens * ba_width)
+        .map(|i| ((i as f32 % 17.0) - 8.0) * 0.0625)
+        .collect();
+    let conv_weight: Vec<f32> = (0..conv_channels * conv_kernel)
+        .map(|i| match i % 5 {
+            0 => -0.25,
+            1 => 0.125,
+            2 => 0.5,
+            3 => -0.375,
+            _ => 0.75,
+        })
+        .collect();
+    let initial_conv_states: Vec<f32> = (0..batch * conv_state_len)
+        .map(|i| ((i as f32 % 23.0) - 11.0) * 0.015)
+        .collect();
+    let a_log: Vec<f32> = (0..value_heads)
+        .map(|i| (0.5 + i as f32 * 0.25).ln())
+        .collect();
+    let dt_bias: Vec<f32> = (0..value_heads).map(|i| -0.2 + i as f32 * 0.1).collect();
+    let cu_seqlens = vec![0u32, 3, 5];
+    let token_seq_indices = vec![0u32, 0, 0, 1, 1];
+
+    let mut cpu_ctx = CpuBackend::new_context();
+    let mut expected_q = vec![0.0; total_tokens * qk_total];
+    let mut expected_k = vec![0.0; total_tokens * qk_total];
+    let mut expected_v = vec![0.0; total_tokens * value_total];
+    let mut expected_z = vec![0.0; total_tokens * value_total];
+    let mut expected_g = vec![0.0; total_tokens * value_heads];
+    let mut expected_beta = vec![0.0; total_tokens * value_heads];
+    let mut expected_final_conv_states = vec![0.0; batch * conv_state_len];
+    CpuBackend::linear_attention_prepare_varlen_packed_qkvz_ba_f32(
+        &mut cpu_ctx,
+        &mixed_qkvz_raw,
+        &ba_raw,
+        &conv_weight,
+        &initial_conv_states,
+        &a_log,
+        &dt_bias,
+        &CpuBackend::from_slice_typed(&cu_seqlens),
+        &CpuBackend::from_slice_typed(&token_seq_indices),
+        &mut expected_q,
+        &mut expected_k,
+        &mut expected_v,
+        &mut expected_z,
+        &mut expected_g,
+        &mut expected_beta,
+        &mut expected_final_conv_states,
+        batch,
+        total_tokens,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+        true,
+    )
+    .unwrap();
+
+    let mut cuda_ctx = CudaBackend::new_context();
+    let mixed_dev = CudaBackend::from_slice_typed(&mixed_qkvz_raw);
+    let ba_dev = CudaBackend::from_slice_typed(&ba_raw);
+    let conv_dev = CudaBackend::from_slice_typed(&conv_weight);
+    let initial_conv_dev = CudaBackend::from_slice_typed(&initial_conv_states);
+    let a_log_dev = CudaBackend::from_slice_typed(&a_log);
+    let dt_bias_dev = CudaBackend::from_slice_typed(&dt_bias);
+    let cu_dev = CudaBackend::from_slice_typed(&cu_seqlens);
+    let token_rows_dev = CudaBackend::from_slice_typed(&token_seq_indices);
+    let mut q_dev = CudaBackend::alloc_typed(Dtype::F32, total_tokens * qk_total);
+    let mut k_dev = CudaBackend::alloc_typed(Dtype::F32, total_tokens * qk_total);
+    let mut v_dev = CudaBackend::alloc_typed(Dtype::F32, total_tokens * value_total);
+    let mut z_dev = CudaBackend::alloc_typed(Dtype::F32, total_tokens * value_total);
+    let mut g_dev = CudaBackend::alloc_typed(Dtype::F32, total_tokens * value_heads);
+    let mut beta_dev = CudaBackend::alloc_typed(Dtype::F32, total_tokens * value_heads);
+    let mut final_conv_dev = CudaBackend::alloc_typed(Dtype::F32, batch * conv_state_len);
+    CudaBackend::linear_attention_prepare_varlen_packed_qkvz_ba_f32(
+        &mut cuda_ctx,
+        &mixed_dev,
+        &ba_dev,
+        &conv_dev,
+        &initial_conv_dev,
+        &a_log_dev,
+        &dt_bias_dev,
+        &cu_dev,
+        &token_rows_dev,
+        &mut q_dev,
+        &mut k_dev,
+        &mut v_dev,
+        &mut z_dev,
+        &mut g_dev,
+        &mut beta_dev,
+        &mut final_conv_dev,
+        batch,
+        total_tokens,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+        true,
+    )
+    .unwrap();
+    CudaBackend::sync(&mut cuda_ctx);
+
+    assert_close(
+        &CudaBackend::to_vec(&q_dev, total_tokens * qk_total),
+        &expected_q,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&k_dev, total_tokens * qk_total),
+        &expected_k,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&v_dev, total_tokens * value_total),
+        &expected_v,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&z_dev, total_tokens * value_total),
+        &expected_z,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&g_dev, total_tokens * value_heads),
+        &expected_g,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&beta_dev, total_tokens * value_heads),
+        &expected_beta,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec(&final_conv_dev, batch * conv_state_len),
+        &expected_final_conv_states,
+        2e-5,
+    );
+}
+
+#[test]
 fn linear_attention_decode_prepare_cuda_matches_cpu_reference() {
     let key_heads = 2;
     let value_heads = 4;
