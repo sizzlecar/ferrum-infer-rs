@@ -1,0 +1,26 @@
+{
+  "artifact": "/workspace/artifacts/w3_qwen35_linear_scratch_c32_100x1_20260621T131205Z_dirty",
+  "bad_output": [
+    0
+  ],
+  "completed": [
+    100
+  ],
+  "duplicate_done": [
+    0
+  ],
+  "errored": [
+    0
+  ],
+  "itl_p50_ms": 19.0882485,
+  "missing_done": [
+    0
+  ],
+  "output_tps": {
+    "mean": 694.5331903521005
+  },
+  "tpot_p50_ms": 24.977582627906976,
+  "zero_output_tokens": [
+    0
+  ]
+}
