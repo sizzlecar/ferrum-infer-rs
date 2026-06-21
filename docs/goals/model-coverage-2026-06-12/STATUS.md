@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ64 — W3 manifest self-test matches hardened L2/L5 contracts
+
+- Scope:
+  - fixed `scripts/release/model_release_grade_manifest.py --self-test`
+    fixtures after the stricter L2/L5 final-validator changes;
+  - the W3 manifest self-test L1 artifact now advertises
+    `full_attention_official_shape=true`;
+  - the W3 manifest self-test L2 artifact now includes real `ferrum run` and
+    `ferrum serve` command lines;
+  - the W3 manifest self-test L5 artifact now includes a release-shape
+    `bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`
+    command covering `c=1/4/16/32`.
+- Why:
+  - after hardening `model_release_grade_goal_gate.py`, the manifest builder's
+    W3 self-test failed because its synthetic fixtures were behind the current
+    evidence contract;
+  - this keeps the final manifest builder covered by the same checks that will
+    reject invalid GPU artifacts.
+- Validation passed locally:
+  - `python3 -m py_compile scripts/release/model_release_grade_manifest.py scripts/release/model_release_grade_goal_gate.py scripts/release/w3_l2_quantized_gate.py`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`
+    printed synthetic
+    `MODEL_RELEASE_GRADE_W2 PASS: ...`,
+    `MODEL_RELEASE_GRADE_W3 PASS: ...`, and
+    `MODEL RELEASE GRADE MANIFEST SELFTEST PASS`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/w3_l2_quantized_gate.py --self-test`;
+  - `git diff --check`.
+- Status:
+  - source/tooling progress only; the self-test PASS lines are temporary
+    synthetic artifacts and are not W3 real-model completion evidence;
+  - W3 remains incomplete and there is still no real
+    `MODEL_RELEASE_GRADE_W3 PASS` artifact directory.
+
 ## 2026-06-22 ZZZ63 — W3 L2 now requires real product command evidence
 
 - Scope:

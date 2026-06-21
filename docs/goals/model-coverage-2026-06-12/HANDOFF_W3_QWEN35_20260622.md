@@ -15,6 +15,26 @@
 
 ## Latest Source Progress
 
+### 2026-06-22 Manifest Self-Test Contract Sync
+
+- `scripts/release/model_release_grade_manifest.py --self-test` was updated
+  after the stricter L2/L5 final-validator contracts.
+- Its synthetic W3 L1 fixture now includes
+  `full_attention_official_shape=true`.
+- Its synthetic W3 L2 fixture now includes real `ferrum run` and
+  `ferrum serve` command lines.
+- Its synthetic W3 L5 fixture now includes a compliant
+  `bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`
+  command covering `c=1/4/16/32`.
+- Validation passed locally:
+  `python3 scripts/release/model_release_grade_manifest.py --self-test`,
+  `python3 scripts/release/model_release_grade_goal_gate.py --self-test`,
+  `python3 scripts/release/w3_l2_quantized_gate.py --self-test`, Python
+  compile checks, and `git diff --check`.
+- The `MODEL_RELEASE_GRADE_W3 PASS` printed by this self-test is synthetic
+  temporary-directory evidence only. W3 real-model release-grade remains
+  incomplete.
+
 ### 2026-06-22 L2 Product-Command Gate Hardening
 
 - `scripts/release/w3_l2_quantized_gate.py` now requires real
