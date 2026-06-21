@@ -46,6 +46,14 @@ W3_L0_L5_LEVELS = {
     "l4_agent": "l4_agent",
     "l5_concurrency": "l5_concurrency",
 }
+W3_L0_L5_PASS_PREFIXES = {
+    "l0_template": "W3 L0 TEMPLATE PASS:",
+    "l1_numeric": "W3 L1 NUMERIC PASS:",
+    "l2_quantized": "W3 L2 QUANTIZED PASS:",
+    "l3_behavior": "W3 L3 BEHAVIOR PASS:",
+    "l4_agent": "W3 L4 AGENT PASS:",
+    "l5_concurrency": "W3 L5 CONCURRENCY PASS:",
+}
 REQUIRED_PRODUCT_ENTRYPOINTS = {"ferrum_run", "ferrum_serve"}
 REQUIRED_L2_PRODUCT_COMMANDS = {
     "ferrum run": "run",
@@ -747,6 +755,7 @@ def validate_w3_l0_l5_common(
     if data.get("status") != "pass":
         problems.append(f"{label}.status must be pass")
     require_level(data, W3_L0_L5_LEVELS[key], label, problems)
+    require_pass_line_prefix(data, label, W3_L0_L5_PASS_PREFIXES[key], problems)
     non_empty_string(data.get("model_id"), f"{label}.model_id", problems)
     surface = data.get("product_surface", data.get("runtime_surface"))
     if surface not in {"typed_cli", "typed_config", "typed_defaults", "model_defaults"}:
@@ -1736,6 +1745,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
         {
             **common,
             "level": "l0_template",
+            "pass_line": "W3 L0 TEMPLATE PASS: selftest",
             "chat_template_golden": {
                 "cases_total": 5,
                 "cases_passed": 5,
@@ -1752,6 +1762,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
         {
             **common,
             "level": "l1_numeric",
+            "pass_line": "W3 L1 NUMERIC PASS: selftest",
             "numeric": {
                 "comparisons_total": 6,
                 "comparisons_passed": 6,
@@ -1778,6 +1789,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
         {
             **common,
             "level": "l2_quantized",
+            "pass_line": "W3 L2 QUANTIZED PASS: selftest",
             "quantized_semantics": {
                 "real_size_model": True,
                 "waived": False,
@@ -1815,6 +1827,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
         {
             **common,
             "level": "l3_behavior",
+            "pass_line": "W3 L3 BEHAVIOR PASS: selftest",
             "behavior": {
                 "cases_total": 7,
                 "cases_passed": 7,
@@ -1877,6 +1890,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
         {
             **common,
             "level": "l4_agent",
+            "pass_line": "W3 L4 AGENT PASS: selftest",
             "agent": {
                 "real_model": True,
                 "required_tool_enforced": True,
@@ -1917,6 +1931,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
         {
             **common,
             "level": "l5_concurrency",
+            "pass_line": "W3 L5 CONCURRENCY PASS: selftest",
             "commands": [
                 {
                     "command_line": [
@@ -2311,6 +2326,26 @@ def run_selftest() -> int:
         good_w3_problems = validate_manifest(load_json(good_w3_manifest), "w3", good_w3)
         if good_w3_problems:
             raise AssertionError("good W3 selftest manifest failed: " + "; ".join(good_w3_problems))
+
+        bad_w3_pass_line = tmp_root / "bad-w3-pass-line"
+        bad_w3_pass_line_manifest = write_selftest_manifest(
+            bad_w3_pass_line,
+            lane="w3",
+            ratio=0.82,
+        )
+        l0_template = load_json(bad_w3_pass_line / "l0.json")
+        l0_template["pass_line"] = "W3 L0 TEMPLATE SELFTEST PASS: selftest"
+        write_json(bad_w3_pass_line / "l0.json", l0_template)
+        bad_w3_pass_line_problems = validate_manifest(
+            load_json(bad_w3_pass_line_manifest),
+            "w3",
+            bad_w3_pass_line,
+        )
+        if not any(
+            "correctness.l0_template.pass_line must start with 'W3 L0 TEMPLATE PASS:'" in problem
+            for problem in bad_w3_pass_line_problems
+        ):
+            raise AssertionError("bad W3 L0 pass-line selftest did not fail as expected")
 
         bad_w3_l2_command = tmp_root / "bad-w3-l2-command"
         bad_w3_l2_command_manifest = write_selftest_manifest(

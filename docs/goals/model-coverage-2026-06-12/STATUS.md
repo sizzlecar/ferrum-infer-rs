@@ -2,6 +2,42 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ67 — W3 L0-L5 final validator requires official PASS lines
+
+- Scope:
+  - hardened `scripts/release/model_release_grade_goal_gate.py` so every W3
+    L0-L5 artifact loaded by the final validator must carry the official
+    goal-level PASS line prefix:
+    `W3 L0 TEMPLATE PASS:`, `W3 L1 NUMERIC PASS:`,
+    `W3 L2 QUANTIZED PASS:`, `W3 L3 BEHAVIOR PASS:`,
+    `W3 L4 AGENT PASS:`, and `W3 L5 CONCURRENCY PASS:`;
+  - updated `scripts/release/model_release_grade_manifest.py --self-test`
+    fixtures to emit those pass lines;
+  - added a negative final-validator self-test that corrupts the L0 pass line
+    and verifies W3 final validation rejects it.
+- Why:
+  - W3 completion must be based on gate-produced artifacts, not hand-written
+    JSON that only happens to match a few summary fields;
+  - before this change, L0-L5 artifacts could be accepted by the final
+    validator without proving their own gate printed the required PASS line.
+- Validation passed locally:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - direct W3 L0-L5 common/pass-line probe across the existing real artifact
+    set;
+  - `git diff --check`.
+- Additional finding:
+  - a stricter full-artifact probe of the existing
+    `w3_l1_numeric_qwen35_family_20260618` artifact still fails current final
+    validation because it lacks `coverage.full_attention_official_shape=true`;
+  - that historical artifact was not edited. W3 still needs a real regenerated
+    L1 numeric artifact, or a valid newer L1 artifact, before final W3 can pass.
+- Status:
+  - source/tooling progress only; no new CUDA correctness or performance claim;
+  - W3 remains incomplete and there is still no real
+    `MODEL_RELEASE_GRADE_W3 PASS` artifact directory.
+
 ## 2026-06-22 ZZZ66 — W3 L3 final validator checks stream/multi-turn case evidence
 
 - Scope:
