@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ45 — Qwen35 continuation chunks advance as one chunk instead of per-token loop
+
+- Scope:
+  - removed the model-level Qwen3.5 stateful continuation special case that
+    split an already-started multi-token chunk into one `forward_stateful_chunk`
+    call per token;
+  - final and non-final continuation chunks now use the same multi-token
+    stateful layer path, so chunked prefill can amortize layer traversal,
+    recurrent/full-attention setup, linear-state slot sync, and final logits
+    tail when logits are requested;
+  - kept the no-logits path from ZZZ44, so non-final continuation chunks still
+    skip final norm/lm_head/readback after advancing the whole chunk;
+  - changed the tiny Qwen35 forward test loader from all-zero weights to small
+    deterministic non-zero weights, so chunk parity tests exercise real math
+    instead of only zero tensors;
+  - added a model-level parity regression comparing stepwise continuation
+    `[4] + [5]` with a single final continuation chunk `[4, 5]`, including
+    both returned logits and the next decode logits.
+- Validation passed locally:
+  - `cargo fmt --all`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_multitoken_continuation_matches_stepwise -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_non_final_continuation_skips_logits_tail -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - this is source/hot-path progress, not a performance claim;
+  - CUDA correctness/performance evidence is still blocked on the 1x4090 lane
+    becoming reachable;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ44 — Qwen35 non-final continuation chunks skip logits tail
 
 - Scope:

@@ -1487,19 +1487,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             ));
         }
         self.ensure_sequence_state(cache_id)?;
-        if tokens.len() > 1
-            && self
-                .sequences
-                .get(cache_id)
-                .is_some_and(|state| !state.tokens.is_empty())
-        {
-            let mut last = None;
-            for token in tokens {
-                last = self.forward_stateful_chunk(cache_id, &[*token], true)?;
-            }
-            return last
-                .ok_or_else(|| FerrumError::model("Qwen3.5 stateful forward produced no logits"));
-        }
         self.forward_stateful_chunk(cache_id, tokens, true)?
             .ok_or_else(|| FerrumError::model("Qwen3.5 stateful forward produced no logits"))
     }
@@ -1511,17 +1498,6 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             ));
         }
         self.ensure_sequence_state(cache_id)?;
-        if tokens.len() > 1
-            && self
-                .sequences
-                .get(cache_id)
-                .is_some_and(|state| !state.tokens.is_empty())
-        {
-            for token in tokens {
-                self.forward_stateful_chunk(cache_id, &[*token], false)?;
-            }
-            return Ok(());
-        }
         self.forward_stateful_chunk(cache_id, tokens, false)?;
         Ok(())
     }
@@ -11865,6 +11841,16 @@ mod tests {
     }
 
     impl ForwardLoader {
+        fn values(len: usize, salt: usize) -> Vec<f32> {
+            (0..len)
+                .map(|idx| (((idx + salt) % 17) as f32 - 8.0) * 0.01)
+                .collect()
+        }
+
+        fn role_salt(role: &str) -> usize {
+            role.bytes().map(usize::from).sum::<usize>() % 17
+        }
+
         fn from_required_manifest(config: &Qwen35TextConfig, vocab_size: usize) -> Self {
             let manifest = config.weight_manifest("model").unwrap();
             let shape = Qwen35LinearAttentionShape {
@@ -11918,7 +11904,10 @@ mod tests {
                         "mlp_down" => config.hidden_size * intermediate_size,
                         _ => 1,
                     };
-                    (tensor.name.clone(), vec![0.0; len])
+                    (
+                        tensor.name.clone(),
+                        Self::values(len, Self::role_salt(&tensor.role)),
+                    )
                 })
                 .collect();
             Self {
@@ -11936,11 +11925,12 @@ mod tests {
 
         fn dense_linear(
             &self,
+            name: &str,
             out_features: usize,
             in_features: usize,
         ) -> Box<dyn ferrum_quantization::Linear<CpuBackend>> {
             Box::new(DenseLinear::<CpuBackend>::from_rows(
-                &vec![0.0; out_features * in_features],
+                &Self::values(out_features * in_features, Self::role_salt(name)),
                 out_features,
                 in_features,
             ))
@@ -12009,7 +11999,7 @@ mod tests {
                     "forward loader missing linear shape for {name}"
                 )));
             };
-            Ok(self.dense_linear(out_features, in_features))
+            Ok(self.dense_linear(name, out_features, in_features))
         }
 
         fn has_tensor(&self, name: &str) -> bool {
@@ -12454,6 +12444,64 @@ mod tests {
 
         assert_eq!(rows, vec![None]);
         assert_eq!(model.sequences["chunk-req"].tokens, vec![3, 4]);
+    }
+
+    #[test]
+    fn qwen35_unified_forward_multitoken_continuation_matches_stepwise() {
+        let config = tiny_linear_config();
+        let vocab_size = 128;
+        let loader = ForwardLoader::from_required_manifest(&config, vocab_size);
+        let plan = loader.plan();
+        let mut step_model = Qwen35BackendModel::<CpuBackend>::from_weight_plan(
+            config.clone(),
+            qwen35_runtime_config(&config, vocab_size, 64),
+            plan.clone(),
+            &loader,
+        )
+        .unwrap();
+        let mut chunk_model = Qwen35BackendModel::<CpuBackend>::from_weight_plan(
+            config.clone(),
+            qwen35_runtime_config(&config, vocab_size, 64),
+            plan,
+            &loader,
+        )
+        .unwrap();
+
+        <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::prefill(&mut step_model, "req", &[3]);
+        <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::prefill(&mut chunk_model, "req", &[3]);
+        <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::prefill(&mut step_model, "req", &[4]);
+        let step_logits = <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::prefill(
+            &mut step_model,
+            "req",
+            &[5],
+        );
+
+        let chunk_rows = <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::unified_forward(
+            &mut chunk_model,
+            &[("req".to_string(), vec![4, 5], 1, true)],
+        )
+        .unwrap();
+        let chunk_logits = chunk_rows[0]
+            .as_ref()
+            .expect("final continuation chunk must return logits");
+
+        assert_eq!(step_model.sequences["req"].tokens, vec![3, 4, 5]);
+        assert_eq!(chunk_model.sequences["req"].tokens, vec![3, 4, 5]);
+        assert_close_slice(chunk_logits, &step_logits, 1e-3);
+
+        let step_decode = <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::decode(
+            &mut step_model,
+            "req",
+            6,
+            3,
+        );
+        let chunk_decode = <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::decode(
+            &mut chunk_model,
+            "req",
+            6,
+            3,
+        );
+        assert_close_slice(&chunk_decode, &step_decode, 1e-3);
     }
 
     #[test]
