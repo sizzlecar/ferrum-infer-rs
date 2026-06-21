@@ -1,0 +1,384 @@
+{
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/w3_qwen35_weight_index_probe.py",
+    "--out",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_weight_index_probe_20260622",
+    "--model-id",
+    "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+    "--revision",
+    "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b"
+  ],
+  "config_summary": {
+    "full_attention_layers": 10,
+    "hidden_size": 2048,
+    "layer_pattern_sample": [
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention"
+    ],
+    "linear_attention_layers": 30,
+    "moe_intermediate_size": 512,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "num_hidden_layers": 40,
+    "shared_expert_intermediate_size": 512,
+    "text_model_type": "qwen3_5_moe_text",
+    "tie_word_embeddings": false,
+    "top_level_model_type": "qwen3_5_moe"
+  },
+  "expert_coverage": {
+    "g_idx_modes": {
+      "all": 40
+    },
+    "layers_checked": 40,
+    "layers_sample": [
+      {
+        "fused_dense_complete": false,
+        "g_idx_mode": "all",
+        "layer_index": 0,
+        "missing_count": 0,
+        "missing_sample": [],
+        "per_expert_gptq_complete": true,
+        "supported_by_loader": true
+      },
+      {
+        "fused_dense_complete": false,
+        "g_idx_mode": "all",
+        "layer_index": 1,
+        "missing_count": 0,
+        "missing_sample": [],
+        "per_expert_gptq_complete": true,
+        "supported_by_loader": true
+      },
+      {
+        "fused_dense_complete": false,
+        "g_idx_mode": "all",
+        "layer_index": 2,
+        "missing_count": 0,
+        "missing_sample": [],
+        "per_expert_gptq_complete": true,
+        "supported_by_loader": true
+      },
+      {
+        "fused_dense_complete": false,
+        "g_idx_mode": "all",
+        "layer_index": 3,
+        "missing_count": 0,
+        "missing_sample": [],
+        "per_expert_gptq_complete": true,
+        "supported_by_loader": true
+      },
+      {
+        "fused_dense_complete": false,
+        "g_idx_mode": "all",
+        "layer_index": 4,
+        "missing_count": 0,
+        "missing_sample": [],
+        "per_expert_gptq_complete": true,
+        "supported_by_loader": true
+      },
+      {
+        "fused_dense_complete": false,
+        "g_idx_mode": "all",
+        "layer_index": 5,
+        "missing_count": 0,
+        "missing_sample": [],
+        "per_expert_gptq_complete": true,
+        "supported_by_loader": true
+      },
+      {
+        "fused_dense_complete": false,
+        "g_idx_mode": "all",
+        "layer_index": 6,
+        "missing_count": 0,
+        "missing_sample": [],
+        "per_expert_gptq_complete": true,
+        "supported_by_loader": true
+      },
+      {
+        "fused_dense_complete": false,
+        "g_idx_mode": "all",
+        "layer_index": 7,
+        "missing_count": 0,
+        "missing_sample": [],
+        "per_expert_gptq_complete": true,
+        "supported_by_loader": true
+      }
+    ],
+    "mode": "sparse_moe_shared_expert",
+    "num_experts": 256,
+    "pass": true,
+    "per_expert_gptq_tensors_checked": 92160,
+    "unsupported_layer_sample": [],
+    "unsupported_layers": []
+  },
+  "generated_at": "2026-06-22T05:41:26.725012+08:00",
+  "git": {
+    "is_dirty": true,
+    "sha": "2d86a3f198f1827b9058e0a8f65ee188776088ea",
+    "tracked_status_short": [],
+    "untracked_count": 2,
+    "untracked_sample": [
+      "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_weight_index_probe_20260622/w3_qwen35_weight_index_probe.json",
+      "scripts/release/w3_qwen35_weight_index_probe.py"
+    ]
+  },
+  "goal_doc": "docs/goals/model-coverage-2026-06-12/W3_QWEN35_RELEASE_GRADE_GOAL.md",
+  "index_summary": {
+    "metadata": {
+      "total_size": 24403162208
+    },
+    "shard_count": 14,
+    "shard_sample": [
+      "model.safetensors-00001-of-00014.safetensors",
+      "model.safetensors-00002-of-00014.safetensors",
+      "model.safetensors-00003-of-00014.safetensors",
+      "model.safetensors-00004-of-00014.safetensors",
+      "model.safetensors-00005-of-00014.safetensors",
+      "model.safetensors-00006-of-00014.safetensors",
+      "model.safetensors-00007-of-00014.safetensors",
+      "model.safetensors-00008-of-00014.safetensors"
+    ],
+    "tensor_count": 124611
+  },
+  "pass_line": "W3 QWEN35 WEIGHT INDEX PROBE PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_weight_index_probe_20260622",
+  "prefix_validation": {
+    "candidates": [
+      {
+        "missing_required_count": 0,
+        "missing_required_sample": [],
+        "optional_resolution_kind_counts": {
+          "gptq_qweight": 30720
+        },
+        "prefix": "model.language_model",
+        "present_optional_count": 30720,
+        "present_required_count": 613,
+        "required_resolution_kind_counts": {
+          "dense_weight": 552,
+          "non_linear_tensor": 60,
+          "top_level_lm_head_weight": 1
+        },
+        "resolved_samples": [
+          {
+            "declared": "model.language_model.embed_tokens.weight",
+            "required": true,
+            "resolved": "model.language_model.embed_tokens.weight",
+            "role": "embed_tokens"
+          },
+          {
+            "declared": "model.language_model.norm.weight",
+            "required": true,
+            "resolved": "model.language_model.norm.weight",
+            "role": "final_norm"
+          },
+          {
+            "declared": "model.language_model.lm_head.weight",
+            "required": true,
+            "resolved": "lm_head.weight",
+            "role": "lm_head"
+          },
+          {
+            "declared": "model.language_model.layers.0.input_layernorm.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.input_layernorm.weight",
+            "role": "input_layernorm"
+          },
+          {
+            "declared": "model.language_model.layers.0.post_attention_layernorm.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.post_attention_layernorm.weight",
+            "role": "post_attention_layernorm"
+          },
+          {
+            "declared": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "role": "linear_attn_qkv"
+          },
+          {
+            "declared": "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+            "role": "linear_attn_z"
+          },
+          {
+            "declared": "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+            "role": "linear_attn_b"
+          },
+          {
+            "declared": "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+            "role": "linear_attn_a"
+          },
+          {
+            "declared": "model.language_model.layers.0.linear_attn.conv1d.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.linear_attn.conv1d.weight",
+            "role": "linear_attn_conv"
+          },
+          {
+            "declared": "model.language_model.layers.0.linear_attn.A_log",
+            "required": true,
+            "resolved": "model.language_model.layers.0.linear_attn.A_log",
+            "role": "linear_attn_a_log"
+          },
+          {
+            "declared": "model.language_model.layers.0.linear_attn.dt_bias",
+            "required": true,
+            "resolved": "model.language_model.layers.0.linear_attn.dt_bias",
+            "role": "linear_attn_dt_bias"
+          },
+          {
+            "declared": "model.language_model.layers.0.linear_attn.norm.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.linear_attn.norm.weight",
+            "role": "linear_attn_norm"
+          },
+          {
+            "declared": "model.language_model.layers.0.linear_attn.out_proj.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.linear_attn.out_proj.weight",
+            "role": "linear_attn_out"
+          },
+          {
+            "declared": "model.language_model.layers.0.mlp.gate.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.mlp.gate.weight",
+            "role": "moe_router"
+          },
+          {
+            "declared": "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+            "role": "moe_shared_expert_gate"
+          },
+          {
+            "declared": "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "role": "moe_shared_expert_gate_proj"
+          },
+          {
+            "declared": "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+            "role": "moe_shared_expert_up_proj"
+          },
+          {
+            "declared": "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+            "role": "moe_shared_expert_down_proj"
+          },
+          {
+            "declared": "model.language_model.layers.0.mlp.experts.*.gate_proj.qweight",
+            "required": false,
+            "resolved": "model.language_model.layers.0.mlp.experts.0.gate_proj.qweight",
+            "role": "moe_per_expert_gate_proj_qweight"
+          },
+          {
+            "declared": "model.language_model.layers.0.mlp.experts.*.up_proj.qweight",
+            "required": false,
+            "resolved": "model.language_model.layers.0.mlp.experts.0.up_proj.qweight",
+            "role": "moe_per_expert_up_proj_qweight"
+          },
+          {
+            "declared": "model.language_model.layers.0.mlp.experts.*.down_proj.qweight",
+            "required": false,
+            "resolved": "model.language_model.layers.0.mlp.experts.0.down_proj.qweight",
+            "role": "moe_per_expert_down_proj_qweight"
+          },
+          {
+            "declared": "model.language_model.layers.1.input_layernorm.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.1.input_layernorm.weight",
+            "role": "input_layernorm"
+          },
+          {
+            "declared": "model.language_model.layers.1.post_attention_layernorm.weight",
+            "required": true,
+            "resolved": "model.language_model.layers.1.post_attention_layernorm.weight",
+            "role": "post_attention_layernorm"
+          }
+        ]
+      },
+      {
+        "missing_required_count": 612,
+        "missing_required_sample": [
+          "model.embed_tokens.weight",
+          "model.norm.weight",
+          "model.layers.0.input_layernorm.weight",
+          "model.layers.0.post_attention_layernorm.weight",
+          "model.layers.0.linear_attn.in_proj_qkv.weight",
+          "model.layers.0.linear_attn.in_proj_z.weight",
+          "model.layers.0.linear_attn.in_proj_b.weight",
+          "model.layers.0.linear_attn.in_proj_a.weight",
+          "model.layers.0.linear_attn.conv1d.weight",
+          "model.layers.0.linear_attn.A_log",
+          "model.layers.0.linear_attn.dt_bias",
+          "model.layers.0.linear_attn.norm.weight",
+          "model.layers.0.linear_attn.out_proj.weight",
+          "model.layers.0.mlp.gate.weight",
+          "model.layers.0.mlp.shared_expert_gate.weight",
+          "model.layers.0.mlp.shared_expert.gate_proj.weight",
+          "model.layers.0.mlp.shared_expert.up_proj.weight",
+          "model.layers.0.mlp.shared_expert.down_proj.weight",
+          "model.layers.1.input_layernorm.weight",
+          "model.layers.1.post_attention_layernorm.weight"
+        ],
+        "optional_resolution_kind_counts": {},
+        "prefix": "model",
+        "present_optional_count": 0,
+        "present_required_count": 1,
+        "required_resolution_kind_counts": {
+          "top_level_lm_head_weight": 1
+        },
+        "resolved_samples": [
+          {
+            "declared": "model.lm_head.weight",
+            "required": true,
+            "resolved": "lm_head.weight",
+            "role": "lm_head"
+          }
+        ]
+      }
+    ],
+    "selected_missing_required": [],
+    "selected_prefix": "model.language_model"
+  },
+  "problems": [],
+  "quantization": {
+    "bits": 4,
+    "desc_act": false,
+    "group_size": 128,
+    "pass": true,
+    "problems": [],
+    "quant_method": "gptq",
+    "source": "config.quantization_config",
+    "sym": true
+  },
+  "source": {
+    "config_json": null,
+    "hf_token_present": true,
+    "index_json": null,
+    "model_id": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+    "quantize_config_json": null,
+    "remote_bytes_read": 15138538,
+    "remote_requests": 2,
+    "revision": "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b"
+  },
+  "status": "pass"
+}
