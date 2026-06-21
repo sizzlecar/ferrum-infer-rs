@@ -56,6 +56,21 @@ adding model-name defaults or hidden environment switches.
   `waiting_prefill=25`, `max_batch=32`, `max_tokens=8192`,
   `active_decode_prefill_chunk=8192`, `prefill_step_chunk=64`; the scheduler
   now emits `7 decode + 4 prefill chunks`, not all 25 free prefill slots.
+- Added a Qwen3.5 model-level `forward_stateful_unified_items` path that
+  classifies unified work into fresh prefill, continuation/chunked prefill, and
+  decode. This removes the old assumption that Qwen35 unified work is only
+  fresh final prefill.
+- Fresh batch prefill now accepts non-final chunks and returns `None` for
+  non-final rows. If only some rows are final, final norm/lm_head/readback is
+  run only for those final rows.
+- Continuation chunks now use the existing stateful Qwen35 path and only return
+  logits for final chunks; decode rows still use batched decode and preserve
+  `LogitsReturnPolicy` behavior.
+- Added duplicate `cache_id` rejection and checked decode position conversion
+  before batching.
+- Added a focused CPU regression that runs real Qwen35 forward with a tiny
+  valid config and verifies a mixed continuation chunk plus decode frame
+  advances both sequence states while returning logits only for the decode row.
 
 The key vLLM reference is:
 
@@ -89,6 +104,11 @@ cargo test -p ferrum-scheduler \
   newly_admitted_prefill_uses_remaining_budget_with_decode -- --nocapture
 cargo test -p ferrum-scheduler -- --nocapture
 cargo check -p ferrum-types -p ferrum-scheduler -p ferrum-engine -p ferrum-cli
+cargo test -p ferrum-models \
+  qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture
+cargo test -p ferrum-models \
+  qwen35_unified_forward_requires_paged_kv_for_fresh_batch_prefill -- --nocapture
+cargo check -p ferrum-models
 ```
 
 Not yet validated locally:
@@ -163,6 +183,10 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   cohorts caused by explicit `active_decode_prefill_chunk=8192` bypassing the
   smaller `prefill_step_chunk`; the W3-like source regression caps that case to
   four 64-token prefill chunks when seven decodes are active.
+- Qwen35 unified trace should no longer reject a mixed frame solely because it
+  contains continuation/chunked prefill. Fresh prefill still requires paged KV;
+  continuation chunks use the stateful path until a faster batched chunked
+  prefill implementation is justified by GPU profile evidence.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly

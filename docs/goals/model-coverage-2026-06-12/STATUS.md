@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ43 — Qwen35 unified_forward now handles mixed continuation chunks and decode
+
+- Scope:
+  - added a Qwen3.5 model-level `forward_stateful_unified_items` path that
+    classifies each unified item as fresh prefill, continuation/chunked
+    prefill, or decode instead of only accepting fresh final prefill batches;
+  - fresh batch prefill now accepts non-final chunks and returns `None` for
+    non-final rows; when a batch has final rows, final norm/lm_head/readback is
+    restricted to those final rows instead of all rows;
+  - continuation chunks use the existing stateful Qwen35 path and only return
+    logits on final chunks;
+  - decode rows still use the batched decode path and preserve
+    `LogitsReturnPolicy` handling for unified decode;
+  - added duplicate `cache_id` rejection and checked `usize -> u32` position
+    conversion before decode batching.
+- Why:
+  - the scheduler can now cap active-decode prefill chunk admission, but the
+    model entrypoint also has to accept chunked/mixed work; otherwise Qwen35
+    falls back through executor-level split behavior as soon as a mixed frame
+    contains continuation prefill;
+  - this is an architecture-path cleanup: Qwen35 now has a model-owned unified
+    classifier for mixed frames instead of pretending all unified work is fresh
+    final prefill.
+- Validation passed locally:
+  - `cargo fmt --all`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_requires_paged_kv_for_fresh_batch_prefill -- --nocapture`;
+  - `cargo check -p ferrum-models`.
+- Status:
+  - this is source/hot-path progress, not a performance claim;
+  - same-hardware CUDA evidence is still required to prove scheduler trace and
+    throughput impact;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ42 — Scheduler mixed-prefill aggregate cap now honors effective step chunk
 
 - Scope:

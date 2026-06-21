@@ -1763,15 +1763,15 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 "Qwen3.5 unified_forward fresh prefill requires paged KV",
             ));
         }
-        for (_, tokens, pos_offset, is_final_chunk) in items {
+        for (_, tokens, pos_offset, _) in items {
             if tokens.is_empty() {
                 return Err(FerrumError::unsupported(
                     "Qwen3.5 unified_forward does not accept empty prefill chunks",
                 ));
             }
-            if *pos_offset != 0 || !*is_final_chunk {
+            if *pos_offset != 0 {
                 return Err(FerrumError::unsupported(
-                    "Qwen3.5 unified_forward currently supports fresh final prefill batches only",
+                    "Qwen3.5 unified_forward batch prefill currently supports fresh chunks only",
                 ));
             }
         }
@@ -1823,14 +1823,14 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             }
             self.sequences.insert(cache_id, state);
         }
-        result.map(|rows| rows.into_iter().map(Some).collect())
+        result
     }
 
     fn forward_stateful_prefill_batch_taken(
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
         states: &mut [(String, Qwen35SequenceState<B>)],
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<Vec<Option<Vec<f32>>>> {
         let batch_len = items.len();
         if batch_len == 0 {
             return Ok(Vec::new());
@@ -1956,6 +1956,18 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             prefill_profile.record_layer(layer_index, layer_kind, layer_elapsed);
         }
 
+        let final_rows = items
+            .iter()
+            .enumerate()
+            .filter_map(|(row, (_, _, _, is_final_chunk))| is_final_chunk.then_some(row))
+            .collect::<Vec<_>>();
+        if final_rows.is_empty() {
+            if profile_enabled {
+                prefill_profile.log("batch", 0, total_tokens, weights.layers.len());
+            }
+            return Ok(vec![None; batch_len]);
+        }
+
         let mut final_hidden = B::alloc(hidden_len);
         let t_final_norm = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
         if let Some(residual_f32) = residual_f32.as_ref() {
@@ -1983,15 +1995,16 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_final_norm, "qwen35_final_norm");
         let t_final_gather =
             qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled && batch_len > 1);
-        let mut sampled_hidden = B::alloc(batch_len * weights.config.hidden_size);
-        for row in 0..batch_len {
+        let final_count = final_rows.len();
+        let mut sampled_hidden = B::alloc(final_count * weights.config.hidden_size);
+        for (out_row, &row) in final_rows.iter().enumerate() {
             let final_token = cu[row + 1] as usize - 1;
             B::copy_slice(
                 &mut ctx,
                 &final_hidden,
                 final_token * weights.config.hidden_size,
                 &mut sampled_hidden,
-                row * weights.config.hidden_size,
+                out_row * weights.config.hidden_size,
                 weights.config.hidden_size,
             );
         }
@@ -2001,11 +2014,11 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             "qwen35_final_token_gather",
         );
         let vocab = weights.runtime_cfg.vocab_size;
-        let mut logits = B::alloc(batch_len * vocab);
+        let mut logits = B::alloc(final_count * vocab);
         let t_lm_head = qwen35_prefill_profile_stage_start::<B>(&mut ctx, profile_enabled);
         weights
             .lm_head
-            .forward(&mut ctx, &sampled_hidden, &mut logits, batch_len);
+            .forward(&mut ctx, &sampled_hidden, &mut logits, final_count);
         prefill_profile.lm_head_us +=
             qwen35_prefill_profile_stage_finish::<B>(&mut ctx, t_lm_head, "qwen35_lm_head");
         let t_readback = if profile_enabled {
@@ -2015,14 +2028,125 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         };
         B::sync_before_host_readback(&mut ctx);
         B::sync(&mut ctx);
-        let flat = B::to_vec(&logits, batch_len * vocab);
+        let flat = B::to_vec(&logits, final_count * vocab);
         if let Some(start) = t_readback {
             prefill_profile.readback_us += start.elapsed().as_micros() as u64;
         }
         if profile_enabled {
             prefill_profile.log("batch", 0, total_tokens, weights.layers.len());
         }
-        Ok(flat.chunks_exact(vocab).map(|row| row.to_vec()).collect())
+        let mut out = vec![None; batch_len];
+        for (&row, logits) in final_rows.iter().zip(flat.chunks_exact(vocab)) {
+            out[row] = Some(logits.to_vec());
+        }
+        Ok(out)
+    }
+
+    fn forward_stateful_unified_items(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        policies: &[LogitsReturnPolicy],
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !policies.is_empty() && policies.len() != items.len() {
+            return Err(FerrumError::model(format!(
+                "Qwen3.5 unified_forward logits policy count {} != item count {}",
+                policies.len(),
+                items.len()
+            )));
+        }
+        let mut seen = HashSet::with_capacity(items.len());
+        for (cache_id, _, _, _) in items {
+            if !seen.insert(cache_id.as_str()) {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 unified_forward requires unique cache ids",
+                ));
+            }
+        }
+
+        let mut out = vec![None; items.len()];
+        let mut fresh_prefill = Vec::new();
+        let mut fresh_rows = Vec::new();
+        let mut decode = Vec::new();
+        let mut decode_rows = Vec::new();
+        let mut decode_policies = Vec::new();
+        let mut chunk_rows = Vec::new();
+
+        for (row, (cache_id, tokens, pos_offset, is_final_chunk)) in items.iter().enumerate() {
+            if tokens.is_empty() {
+                return Err(FerrumError::unsupported(
+                    "Qwen3.5 unified_forward does not accept empty chunks",
+                ));
+            }
+            self.ensure_sequence_state(cache_id)?;
+            let state_len = self
+                .sequences
+                .get(cache_id)
+                .map(|state| state.tokens.len())
+                .ok_or_else(|| {
+                    FerrumError::model(format!("Qwen3.5 missing sequence state for {cache_id:?}"))
+                })?;
+            if *pos_offset != state_len {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 unified_forward position mismatch for {cache_id:?}: \
+                     state len {state_len} != pos {pos_offset}"
+                )));
+            }
+            if tokens.len() == 1 && *is_final_chunk && state_len > 0 {
+                let pos = u32::try_from(*pos_offset).map_err(|_| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 unified_forward position for {cache_id:?} exceeds u32"
+                    ))
+                })?;
+                decode.push((cache_id.clone(), tokens[0], pos));
+                decode_rows.push(row);
+                if policies.len() == items.len() {
+                    decode_policies.push(policies[row].clone());
+                }
+            } else if *pos_offset == 0 {
+                fresh_prefill.push((
+                    cache_id.clone(),
+                    tokens.clone(),
+                    *pos_offset,
+                    *is_final_chunk,
+                ));
+                fresh_rows.push(row);
+            } else {
+                chunk_rows.push(row);
+            }
+        }
+
+        if !fresh_prefill.is_empty() {
+            let rows = self.forward_stateful_prefill_batch(&fresh_prefill)?;
+            for (row, logits) in fresh_rows.into_iter().zip(rows) {
+                out[row] = logits;
+            }
+        }
+
+        for row in chunk_rows {
+            let (cache_id, tokens, _, is_final_chunk) = &items[row];
+            let logits = self.forward_stateful(cache_id, tokens)?;
+            if *is_final_chunk {
+                out[row] = Some(logits);
+            }
+        }
+
+        if !decode.is_empty() {
+            let logits_return = if decode_policies.is_empty() {
+                Qwen35DecodeLogitsReturn::LegacyDefault
+            } else {
+                qwen35_decode_logits_return_from_policies(&decode_policies, decode.len())
+            };
+            let rows =
+                self.forward_stateful_decode_batch_with_logits_return(&decode, logits_return)?;
+            for (row, logits) in decode_rows.into_iter().zip(rows) {
+                out[row] = Some(logits);
+            }
+        }
+
+        Ok(out)
     }
 
     fn forward_stateful_decode_batch(
@@ -3455,7 +3579,15 @@ impl<B: MoeLlmBackend + BackendPagedKv> DecoderOnlyLLM for Qwen35BackendModel<B>
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
     ) -> std::result::Result<Vec<Option<Vec<f32>>>, FerrumError> {
-        self.forward_stateful_prefill_batch(items)
+        self.forward_stateful_unified_items(items, &[])
+    }
+
+    fn unified_forward_with_logits_policy(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        policies: &[LogitsReturnPolicy],
+    ) -> std::result::Result<Vec<Option<Vec<f32>>>, FerrumError> {
+        self.forward_stateful_unified_items(items, policies)
     }
 
     fn release(&mut self, cache_id: &str) {
@@ -11482,6 +11614,31 @@ mod tests {
         .unwrap()
     }
 
+    fn tiny_linear_config() -> Qwen35TextConfig {
+        Qwen35TextConfig::from_hf_config_str(
+            r#"{
+              "model_type": "qwen3_5",
+              "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 4,
+                "num_hidden_layers": 2,
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 1,
+                "linear_key_head_dim": 2,
+                "linear_value_head_dim": 4,
+                "linear_conv_kernel_dim": 2,
+                "head_dim": 4,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "intermediate_size": 8,
+                "tie_word_embeddings": false
+              }
+            }"#,
+        )
+        .unwrap()
+    }
+
     fn moe_config() -> Qwen35TextConfig {
         Qwen35TextConfig::from_hf_config_str(
             r#"{
@@ -11649,6 +11806,169 @@ mod tests {
                 1,
                 2,
             )))
+        }
+
+        fn has_tensor(&self, name: &str) -> bool {
+            self.tensors.contains_key(name)
+        }
+
+        fn quant_config(&self) -> Option<&QuantConfig> {
+            None
+        }
+    }
+
+    struct ForwardLoader {
+        tensors: HashMap<String, Vec<f32>>,
+        config: Qwen35TextConfig,
+        vocab_size: usize,
+    }
+
+    impl ForwardLoader {
+        fn from_required_manifest(config: &Qwen35TextConfig, vocab_size: usize) -> Self {
+            let manifest = config.weight_manifest("model").unwrap();
+            let shape = Qwen35LinearAttentionShape {
+                tokens: 1,
+                key_heads: config.linear_attention.num_key_heads,
+                value_heads: config.linear_attention.num_value_heads,
+                key_dim: config.linear_attention.key_head_dim,
+                value_dim: config.linear_attention.value_head_dim,
+                conv_kernel: config.linear_attention.conv_kernel_dim,
+            };
+            let full_shape = Qwen35FullAttentionShape {
+                tokens: 1,
+                num_heads: config.num_attention_heads,
+                num_kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+                rope_dim: config.full_attention_rope_dim(),
+                position_offset: 0,
+                rope_theta: config.rope_parameters.rope_theta as f32,
+                rope_interleaved: config.full_attention_text_rope_interleaved(),
+                attn_output_gate: config.attn_output_gate,
+            };
+            let intermediate_size = config.dense_intermediate_size.unwrap_or(1);
+            let tensors = manifest
+                .global_tensors
+                .iter()
+                .chain(
+                    manifest
+                        .layers
+                        .iter()
+                        .flat_map(|layer| layer.tensors.iter()),
+                )
+                .filter(|tensor| tensor.required)
+                .map(|tensor| {
+                    let len = match tensor.role.as_str() {
+                        "embed_tokens" | "lm_head" => vocab_size * config.hidden_size,
+                        "final_norm" | "input_layernorm" | "post_attention_layernorm" => {
+                            config.hidden_size
+                        }
+                        "linear_attn_conv" => shape.conv_channels() * shape.conv_kernel,
+                        "linear_attn_a_log" | "linear_attn_dt_bias" => shape.value_heads,
+                        "linear_attn_norm" => shape.value_dim,
+                        "linear_attn_qkv" => shape.conv_channels() * config.hidden_size,
+                        "linear_attn_z" => shape.value_total() * config.hidden_size,
+                        "linear_attn_a" | "linear_attn_b" => shape.value_heads * config.hidden_size,
+                        "linear_attn_out" => config.hidden_size * shape.value_total(),
+                        "self_attn_q" => full_shape.q_proj_total() * config.hidden_size,
+                        "self_attn_k" | "self_attn_v" => full_shape.kv_total() * config.hidden_size,
+                        "self_attn_o" => config.hidden_size * full_shape.q_total(),
+                        "self_attn_q_norm" | "self_attn_k_norm" => config.head_dim,
+                        "mlp_gate" | "mlp_up" => intermediate_size * config.hidden_size,
+                        "mlp_down" => config.hidden_size * intermediate_size,
+                        _ => 1,
+                    };
+                    (tensor.name.clone(), vec![0.0; len])
+                })
+                .collect();
+            Self {
+                tensors,
+                config: config.clone(),
+                vocab_size,
+            }
+        }
+
+        fn plan(&self) -> Qwen35ResolvedWeightPlan {
+            Qwen35WeightInventory::from_names(self.tensors.keys().cloned())
+                .detect_prefix_and_resolve(&self.config)
+                .unwrap()
+        }
+
+        fn dense_linear(
+            &self,
+            out_features: usize,
+            in_features: usize,
+        ) -> Box<dyn ferrum_quantization::Linear<CpuBackend>> {
+            Box::new(DenseLinear::<CpuBackend>::from_rows(
+                &vec![0.0; out_features * in_features],
+                out_features,
+                in_features,
+            ))
+        }
+    }
+
+    impl WeightLoader<CpuBackend> for ForwardLoader {
+        fn load_tensor(&self, name: &str) -> FerrumResult<Vec<f32>> {
+            self.tensors
+                .get(name)
+                .cloned()
+                .ok_or_else(|| FerrumError::model(format!("missing tensor {name}")))
+        }
+
+        fn load_linear(
+            &self,
+            name: &str,
+        ) -> FerrumResult<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+            let shape = Qwen35LinearAttentionShape {
+                tokens: 1,
+                key_heads: self.config.linear_attention.num_key_heads,
+                value_heads: self.config.linear_attention.num_value_heads,
+                key_dim: self.config.linear_attention.key_head_dim,
+                value_dim: self.config.linear_attention.value_head_dim,
+                conv_kernel: self.config.linear_attention.conv_kernel_dim,
+            };
+            let full_shape = Qwen35FullAttentionShape {
+                tokens: 1,
+                num_heads: self.config.num_attention_heads,
+                num_kv_heads: self.config.num_key_value_heads,
+                head_dim: self.config.head_dim,
+                rope_dim: self.config.full_attention_rope_dim(),
+                position_offset: 0,
+                rope_theta: self.config.rope_parameters.rope_theta as f32,
+                rope_interleaved: self.config.full_attention_text_rope_interleaved(),
+                attn_output_gate: self.config.attn_output_gate,
+            };
+            let hidden_size = self.config.hidden_size;
+            let intermediate_size = self.config.dense_intermediate_size.unwrap_or(1);
+            let (out_features, in_features) = if name == "model.lm_head"
+                || name == "model.embed_tokens"
+            {
+                (self.vocab_size, hidden_size)
+            } else if name.ends_with(".linear_attn.in_proj_qkv") {
+                (shape.conv_channels(), hidden_size)
+            } else if name.ends_with(".linear_attn.in_proj_z") {
+                (shape.value_total(), hidden_size)
+            } else if name.ends_with(".linear_attn.in_proj_a")
+                || name.ends_with(".linear_attn.in_proj_b")
+            {
+                (shape.value_heads, hidden_size)
+            } else if name.ends_with(".linear_attn.out_proj") {
+                (hidden_size, shape.value_total())
+            } else if name.ends_with(".self_attn.q_proj") {
+                (full_shape.q_proj_total(), hidden_size)
+            } else if name.ends_with(".self_attn.k_proj") || name.ends_with(".self_attn.v_proj") {
+                (full_shape.kv_total(), hidden_size)
+            } else if name.ends_with(".self_attn.o_proj") {
+                (hidden_size, full_shape.q_total())
+            } else if name.ends_with(".mlp.gate_up_proj") {
+                (2 * intermediate_size, hidden_size)
+            } else if name.ends_with(".mlp.down_proj") {
+                (hidden_size, intermediate_size)
+            } else {
+                return Err(FerrumError::model(format!(
+                    "forward loader missing linear shape for {name}"
+                )));
+            };
+            Ok(self.dense_linear(out_features, in_features))
         }
 
         fn has_tensor(&self, name: &str) -> bool {
@@ -11994,6 +12314,49 @@ mod tests {
                 .contains("Qwen3.5 unified_forward fresh prefill requires paged KV"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn qwen35_unified_forward_mixes_decode_and_continuation_chunk() {
+        let config = tiny_linear_config();
+        let vocab_size = 128;
+        let loader = ForwardLoader::from_required_manifest(&config, vocab_size);
+        let plan = loader.plan();
+        let mut model = Qwen35BackendModel::<CpuBackend>::from_weight_plan(
+            config.clone(),
+            qwen35_runtime_config(&config, vocab_size, 64),
+            plan,
+            &loader,
+        )
+        .unwrap();
+
+        <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::prefill(&mut model, "chunk-req", &[3]);
+        <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::prefill(
+            &mut model,
+            "decode-req",
+            &[1, 2],
+        );
+
+        let rows = <Qwen35BackendModel<CpuBackend> as DecoderOnlyLLM>::unified_forward(
+            &mut model,
+            &[
+                ("chunk-req".to_string(), vec![4, 5], 1, false),
+                ("decode-req".to_string(), vec![6], 2, true),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows[0].is_none(),
+            "non-final continuation chunk must not return logits"
+        );
+        assert!(
+            rows[1].as_ref().is_some_and(|logits| !logits.is_empty()),
+            "decode row must return logits"
+        );
+        assert_eq!(model.sequences["chunk-req"].tokens, vec![3, 4, 5]);
+        assert_eq!(model.sequences["decode-req"].tokens, vec![1, 2, 6]);
     }
 
     #[test]
