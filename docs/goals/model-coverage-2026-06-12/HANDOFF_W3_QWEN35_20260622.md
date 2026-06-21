@@ -19,6 +19,19 @@
 
 ## Latest Source Progress
 
+### 2026-06-22 Shared MoE Expert-Count Contract
+
+- `crates/ferrum-models/src/moe/dispatch.rs` now makes
+  `ExpertStack::num_experts()` work for stacked-only fast paths.
+- It falls back from per-expert `gate_up/down` vectors to GGUF stacked stores,
+  then Marlin stacked stores, with debug checks that paired stacks agree.
+- This does not claim CUDA throughput improvement. It removes shared MoE
+  abstraction debt so new model/backend fast paths do not need to reimplement
+  the expert-count contract.
+- Validation passed locally:
+  `cargo test -p ferrum-models expert_stack_num_experts_uses_stacked_fast_path_count -- --nocapture`
+  and `cargo fmt --all -- --check`.
+
 ### 2026-06-22 Final Manifest Probe Reaches Performance Blocker
 
 - `scripts/release/model_release_grade_goal_gate.py` now resolves nested

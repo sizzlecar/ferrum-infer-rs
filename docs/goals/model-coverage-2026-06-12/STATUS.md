@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ70 — Shared MoE expert-count contract fixed for stacked fast paths
+
+- Scope:
+  - fixed `crates/ferrum-models/src/moe/dispatch.rs` so
+    `ExpertStack::num_experts()` no longer assumes that per-expert
+    `gate_up/down` `Vec`s are populated;
+  - the method now falls back to the GGUF stacked expert stores and then to
+    Marlin stacked expert stores, with debug assertions that paired stacks
+    agree on expert count;
+  - this closes an abstraction mismatch where the comment described
+    stacked-only support but the implementation returned `0` for that shape.
+- Why:
+  - Qwen3.5 CUDA GPTQ currently builds per-expert Marlin views, so this is not
+    the measured W3 CUDA throughput blocker;
+  - it is still real shared MoE code debt: GGUF/Metal stacked-only fast paths
+    and future Marlin stacked-only paths should not need model-specific
+    workarounds just to pass the same MoE dispatch count contract.
+- Validation passed locally:
+  - `cargo test -p ferrum-models expert_stack_num_experts_uses_stacked_fast_path_count -- --nocapture`;
+  - `cargo fmt --all -- --check`.
+- Status:
+  - source/architecture hygiene progress only; no new GPU correctness or
+    performance claim;
+  - W3 remains incomplete and there is still no real
+    `MODEL_RELEASE_GRADE_W3 PASS` artifact directory.
+
 ## 2026-06-22 ZZZ69 — W3 final manifest probe now reaches the real performance blocker
 
 - Scope:
