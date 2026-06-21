@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ60 — Current-SHA W3 CUDA lane could not start on cached Vast instance
+
+- Scope:
+  - attempted one paid-GPU start of existing cached Vast instance `41422823`
+    for the current clean SHA `7ba1f415c54f7eab050563b801a37fb38f0f28af`;
+  - lane stated before start: W3 Qwen35 GPTQ-Int4 1x4090 current-SHA CUDA
+    correctness smoke;
+  - intended correctness path: `w3_qwen35_real_product_report.py` for real
+    `ferrum run` + `ferrum serve`, followed by `w3_l2_quantized_gate.py`;
+  - performance remained explicitly deferred until correctness; no benchmark or
+    performance claim was made.
+- Vast/API evidence:
+  - sanitized artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_cuda_current_sha_7ba1f415_start_20260621T214634Z/summary.json`;
+  - before start, API reported instance `41422823` as `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`, `gpu_name=RTX 4090`,
+    `num_gpus=1`, SSH `ssh7.vast.ai:22822`;
+  - `PUT state=running` returned an empty response object, and a follow-up API
+    query still reported `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`;
+  - no remote SSH, build, correctness gate, or CUDA benchmark command ran.
+- Local validator health checks passed while the GPU lane was unavailable:
+  - `python3 scripts/release/w3_qwen35_real_product_report.py --self-test`;
+  - `python3 scripts/release/w3_l2_quantized_gate.py --self-test`;
+  - `python3 scripts/release/w3_l4_agent_gate.py --self-test`;
+  - `python3 scripts/release/w3_l5_concurrency_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`.
+- Status:
+  - W3 current-SHA CUDA evidence is still missing because the cached instance
+    did not enter `running`;
+  - this is external instance availability, not a Ferrum correctness failure;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ59 — Real Qwen35 GPTQ index matches the loader boundary
 
 - Scope:
