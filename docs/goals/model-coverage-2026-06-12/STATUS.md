@@ -2,6 +2,43 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ42 — Scheduler mixed-prefill aggregate cap now honors effective step chunk
+
+- Scope:
+  - fixed continuous scheduler active-decode mixed-prefill budgeting so the
+    aggregate budget uses the effective chunk
+    `min(active_decode_prefill_chunk, prefill_step_chunk)` instead of the raw
+    `active_decode_prefill_chunk`;
+  - this closes the gap where an explicit large active-decode chunk, for
+    example `8192`, could still allow many small prefill chunks into a decode
+    iteration even though each individual prefill was capped by
+    `prefill_step_chunk`;
+  - added a scheduler regression matching the W3 trace shape:
+    `max_batch=32`, `max_tokens=8192`, `decode=7`, `waiting_prefill=25`,
+    `active_decode_prefill_chunk=8192`, `prefill_step_chunk=64`; the expected
+    mixed batch is now `7 decode + 4 prefill chunks` rather than filling all
+    25 free batch slots.
+- Why:
+  - W3 scheduler trace previously showed large mixed frames such as
+    `decode=7,prefill=25` and `decode=12,prefill=18` with very high latency;
+  - the previous product diagnostic command explicitly used
+    `--scheduler-active-decode-prefill-chunk 8192`, while auto-config still
+    materialized a smaller prefill-step chunk. Before this fix, the per-request
+    cap and aggregate cap disagreed.
+- Validation passed locally:
+  - `cargo fmt --all -- --check`;
+  - `cargo test -p ferrum-scheduler active_decode_prefill -- --nocapture`;
+  - `cargo test -p ferrum-scheduler newly_admitted_prefill_uses_remaining_budget_with_decode -- --nocapture`;
+  - `cargo test -p ferrum-scheduler -- --nocapture`;
+  - `cargo check -p ferrum-types -p ferrum-scheduler -p ferrum-engine -p ferrum-cli`.
+- Status:
+  - this is source/scheduler progress, not a performance claim;
+  - next same-hardware CUDA diagnostic should verify the scheduler trace no
+    longer admits large active-decode mixed prefill cohorts under the W3 c32
+    command shape;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ41 — Qwen35 fresh GDN prefill skips initial recurrent state gather
 
 - Scope:

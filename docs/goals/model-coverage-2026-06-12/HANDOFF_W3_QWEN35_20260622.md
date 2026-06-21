@@ -46,6 +46,16 @@ adding model-name defaults or hidden environment switches.
   `fresh_initial_linear_state=true` produces zero slabs even if sequence-local
   recurrent state is dirty, while `fresh_initial_linear_state=false` still
   gathers the existing state.
+- Fixed continuous scheduler mixed-prefill budgeting so the aggregate
+  active-decode prefill cap uses the effective per-request chunk
+  `min(active_decode_prefill_chunk, prefill_step_chunk)`. This targets the W3
+  trace pattern where an explicit large active chunk such as `8192` could still
+  admit many small prefills into a decode iteration even though individual
+  prefills were capped by `prefill_step_chunk`.
+- Added a scheduler regression for the W3-like shape `decode=7`,
+  `waiting_prefill=25`, `max_batch=32`, `max_tokens=8192`,
+  `active_decode_prefill_chunk=8192`, `prefill_step_chunk=64`; the scheduler
+  now emits `7 decode + 4 prefill chunks`, not all 25 free prefill slots.
 
 The key vLLM reference is:
 
@@ -74,6 +84,11 @@ cargo fmt --all -- --check
 cargo test -p ferrum-models \
   qwen35_fresh_prefill_initial_state_slabs_are_zero_not_gathered -- --nocapture
 cargo check --workspace --all-targets
+cargo test -p ferrum-scheduler active_decode_prefill -- --nocapture
+cargo test -p ferrum-scheduler \
+  newly_admitted_prefill_uses_remaining_budget_with_decode -- --nocapture
+cargo test -p ferrum-scheduler -- --nocapture
+cargo check -p ferrum-types -p ferrum-scheduler -p ferrum-engine -p ferrum-cli
 ```
 
 Not yet validated locally:
@@ -144,6 +159,10 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
 - Fresh product batch prefill should also show little/no
   `qwen35_linear_prefill_state_gather` work, because initial recurrent state is
   now a zero slab instead of per-sequence copies.
+- Scheduler trace should no longer show large active-decode mixed-prefill
+  cohorts caused by explicit `active_decode_prefill_chunk=8192` bypassing the
+  smaller `prefill_step_chunk`; the W3-like source regression caps that case to
+  four 64-token prefill chunks when seven decodes are active.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
