@@ -15,6 +15,26 @@
 
 ## Latest Source Progress
 
+### 2026-06-22 L4 Case-Level Gate Hardening
+
+- `scripts/release/model_release_grade_goal_gate.py` now validates W3 L4
+  tool/schema evidence at the case level instead of trusting only aggregate
+  counts.
+- L4 artifacts must include negative contract checks for invalid required tool
+  choice and invalid response format, both returning HTTP 400.
+- L4 artifacts must include all `tool_call_cases` with `passed=true` and
+  `finish_reason=tool_calls`.
+- L4 artifacts must include all `strict_schema_cases` with `passed=true` and
+  non-`length` finish reasons.
+- `scripts/release/w3_l4_agent_gate.py --self-test` and
+  `scripts/release/model_release_grade_manifest.py --self-test` fixtures were
+  updated to emit those fields.
+- Validation passed locally:
+  `python3 scripts/release/w3_l4_agent_gate.py --self-test`,
+  `python3 scripts/release/model_release_grade_goal_gate.py --self-test`,
+  `python3 scripts/release/model_release_grade_manifest.py --self-test`,
+  Python compile checks, an existing-artifact L4 probe, and `git diff --check`.
+
 ### 2026-06-22 Manifest Self-Test Contract Sync
 
 - `scripts/release/model_release_grade_manifest.py --self-test` was updated

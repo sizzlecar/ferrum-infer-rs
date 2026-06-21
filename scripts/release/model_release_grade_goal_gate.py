@@ -858,6 +858,54 @@ def validate_w3_l4_artifact(data: dict[str, Any], label: str, problems: list[str
         f"{label}.agent",
         problems,
     )
+    negative = as_object(data.get("negative_contracts"), f"{label}.negative_contracts", problems)
+    if negative:
+        require_true(negative.get("tool_choice_400"), f"{label}.negative_contracts.tool_choice_400", problems)
+        require_true(
+            negative.get("response_format_400"),
+            f"{label}.negative_contracts.response_format_400",
+            problems,
+        )
+    validate_l4_case_list(
+        data.get("tool_call_cases"),
+        f"{label}.tool_call_cases",
+        expected_total=agent.get("tool_calls_total"),
+        expected_finish_reason="tool_calls",
+        problems=problems,
+    )
+    validate_l4_case_list(
+        data.get("strict_schema_cases"),
+        f"{label}.strict_schema_cases",
+        expected_total=agent.get("strict_schema_total"),
+        expected_finish_reason=None,
+        problems=problems,
+    )
+
+
+def validate_l4_case_list(
+    raw_cases: Any,
+    label: str,
+    *,
+    expected_total: Any,
+    expected_finish_reason: str | None,
+    problems: list[str],
+) -> None:
+    cases = as_list(raw_cases, label, problems)
+    if isinstance(expected_total, int) and not isinstance(expected_total, bool):
+        if len(cases) != expected_total:
+            problems.append(f"{label} length {len(cases)} must equal expected total {expected_total}")
+    for idx, raw_case in enumerate(cases):
+        case_label = f"{label}[{idx}]"
+        case = as_object(raw_case, case_label, problems)
+        if not case:
+            continue
+        non_empty_string(case.get("id"), f"{case_label}.id", problems)
+        require_true(case.get("passed"), f"{case_label}.passed", problems)
+        finish_reason = case.get("finish_reason")
+        if expected_finish_reason is not None and finish_reason != expected_finish_reason:
+            problems.append(f"{case_label}.finish_reason must be {expected_finish_reason}")
+        if expected_finish_reason is None and finish_reason == "length":
+            problems.append(f"{case_label}.finish_reason must not be length")
 
 
 def validate_w3_l5_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
@@ -1737,6 +1785,18 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
                 "strict_schema_total": 20,
                 "strict_schema_passed": 20,
             },
+            "negative_contracts": {
+                "tool_choice_400": True,
+                "response_format_400": True,
+            },
+            "tool_call_cases": [
+                {"id": f"tool_{idx:02d}", "passed": True, "finish_reason": "tool_calls"}
+                for idx in range(10)
+            ],
+            "strict_schema_cases": [
+                {"id": f"strict_schema_{idx:02d}", "passed": True, "finish_reason": "stop"}
+                for idx in range(20)
+            ],
         },
     )
     cells = []
@@ -2182,6 +2242,19 @@ def run_selftest() -> int:
         bad_w3_l4_problems = validate_manifest(load_json(bad_w3_l4_manifest), "w3", bad_w3_l4)
         if not any("correctness.l4_agent.agent.strict_schema_passed" in problem for problem in bad_w3_l4_problems):
             raise AssertionError("bad W3 L4 strict-schema selftest did not fail as expected")
+
+        bad_w3_l4_case = tmp_root / "bad-w3-l4-case"
+        bad_w3_l4_case_manifest = write_selftest_manifest(bad_w3_l4_case, lane="w3", ratio=0.82)
+        l4_case = load_json(bad_w3_l4_case / "l4.json")
+        l4_case["tool_call_cases"][0]["passed"] = False
+        write_json(bad_w3_l4_case / "l4.json", l4_case)
+        bad_w3_l4_case_problems = validate_manifest(
+            load_json(bad_w3_l4_case_manifest),
+            "w3",
+            bad_w3_l4_case,
+        )
+        if not any("correctness.l4_agent.tool_call_cases[0].passed" in problem for problem in bad_w3_l4_case_problems):
+            raise AssertionError("bad W3 L4 case selftest did not fail as expected")
 
         bad_w3_l5 = tmp_root / "bad-w3-l5-error-count"
         bad_w3_l5_manifest = write_selftest_manifest(bad_w3_l5, lane="w3", ratio=0.82)
