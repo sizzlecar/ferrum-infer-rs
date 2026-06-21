@@ -15,6 +15,26 @@
 
 ## Latest Source Progress
 
+### 2026-06-22 L5 Release-Command Gate Hardening
+
+- `scripts/release/w3_l5_concurrency_gate.py` now requires saved
+  `bench-serve` command evidence before packaging a W3 L5 artifact.
+- The command evidence is parsed with `shlex`, normalized into
+  `command_line`, and must prove closed-loop coverage of `c=1/4/16/32`.
+- The L5 gate rejects hidden `FERRUM_*` env overrides, `--request-rate`, missing
+  `--fail-on-error`, missing `--require-ci`, wrong seed, and wrong repeat
+  count.
+- `scripts/release/model_release_grade_goal_gate.py` now re-checks those L5
+  commands in the final W3 validator, so a hand-built zero-error L5 report
+  cannot satisfy release-grade evidence without the required benchmark command.
+- Validation passed locally:
+  `python3 -m py_compile scripts/release/w3_l5_concurrency_gate.py scripts/release/model_release_grade_goal_gate.py`,
+  `python3 scripts/release/w3_l5_concurrency_gate.py --self-test`,
+  `python3 scripts/release/model_release_grade_goal_gate.py --self-test`, an
+  existing-artifact L5 command validation probe, and `git diff --check`.
+- This is tooling/evidence progress only. It does not add new CUDA correctness
+  or performance evidence, and W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 This update moves Qwen3.5 GDN prefill toward the vLLM architecture instead of
 adding model-name defaults or hidden environment switches.
 

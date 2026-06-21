@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import re
+import shlex
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -204,7 +205,7 @@ def command_parts(value: Any, label: str, problems: list[str]) -> list[str]:
 
 
 def has_flag(parts: list[str], flag: str) -> bool:
-    return flag in parts
+    return flag in parts or any(part.startswith(f"{flag}=") for part in parts)
 
 
 def flag_value(parts: list[str], flag: str) -> str | None:
@@ -215,6 +216,37 @@ def flag_value(parts: list[str], flag: str) -> str | None:
         if part == flag and idx + 1 < len(parts):
             return parts[idx + 1]
     return None
+
+
+def flag_values(parts: list[str], flag: str) -> list[str]:
+    values: list[str] = []
+    prefix = f"{flag}="
+    idx = 0
+    while idx < len(parts):
+        part = parts[idx]
+        if part.startswith(prefix):
+            values.append(part[len(prefix) :])
+        elif part == flag and idx + 1 < len(parts):
+            values.append(parts[idx + 1])
+            idx += 1
+        idx += 1
+    return values
+
+
+def command_parts_or_shell(value: Any, label: str, problems: list[str]) -> list[str]:
+    if isinstance(value, list) and all(isinstance(part, str) for part in value):
+        return value
+    if isinstance(value, str):
+        try:
+            parts = shlex.split(value)
+        except ValueError as exc:
+            problems.append(f"{label} is not a valid shell command: {exc}")
+            return []
+        if not parts:
+            problems.append(f"{label} must not be empty")
+        return parts
+    problems.append(f"{label} must be a command string or string list")
+    return []
 
 
 def parse_positive_int_list(value: str, label: str, problems: list[str]) -> set[int]:
@@ -305,6 +337,74 @@ def validate_bench_command(
     for part in parts:
         if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
             problems.append(f"{label} command uses hidden env override: {part.split('=', 1)[0]}")
+
+
+def l5_command_parts(raw: Any, label: str, problems: list[str]) -> list[str]:
+    if isinstance(raw, dict):
+        if "command_line" in raw:
+            return command_parts_or_shell(raw["command_line"], f"{label}.command_line", problems)
+        if "raw" in raw:
+            return command_parts_or_shell(raw["raw"], f"{label}.raw", problems)
+        problems.append(f"{label} must include command_line or raw")
+        return []
+    return command_parts_or_shell(raw, label, problems)
+
+
+def l5_command_concurrency_cells(parts: list[str], label: str, problems: list[str]) -> set[int]:
+    cells: set[int] = set()
+    for raw in flag_values(parts, "--concurrency-sweep"):
+        cells.update(parse_positive_int_list(raw, f"{label} command --concurrency-sweep", problems))
+    for flag in ["--concurrency", "--max-concurrency"]:
+        for raw in flag_values(parts, flag):
+            try:
+                parsed = int(raw)
+            except ValueError:
+                problems.append(f"{label} command {flag} must be integer, got {raw!r}")
+                continue
+            if parsed <= 0:
+                problems.append(f"{label} command {flag} must be positive, got {parsed}")
+                continue
+            cells.add(parsed)
+    if not cells:
+        problems.append(f"{label} command must include --concurrency-sweep or --concurrency")
+    return cells
+
+
+def validate_l5_bench_commands(
+    commands_raw: Any,
+    label: str,
+    expected_cells: set[int],
+    problems: list[str],
+) -> None:
+    commands = as_list(commands_raw, f"{label}.commands", problems)
+    if not commands:
+        return
+    covered: set[int] = set()
+    for idx, raw in enumerate(commands):
+        command_label = f"{label}.commands[{idx}]"
+        parts = l5_command_parts(raw, command_label, problems)
+        if not parts:
+            continue
+        if not any(part == "bench-serve" or part.endswith("/bench-serve") for part in parts):
+            problems.append(f"{command_label} command must invoke ferrum bench-serve")
+        if has_flag(parts, "--request-rate"):
+            problems.append(f"{command_label} command must use closed-loop concurrency")
+        for flag in ["--fail-on-error", "--require-ci"]:
+            if not has_flag(parts, flag):
+                problems.append(f"{command_label} command missing {flag}")
+        if flag_value(parts, "--seed") != "9271":
+            problems.append(f"{command_label} command must include --seed 9271")
+        if flag_value(parts, "--n-repeats") != "3":
+            problems.append(f"{command_label} command must include --n-repeats 3")
+        for part in parts:
+            if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
+                problems.append(
+                    f"{command_label} command uses hidden env override: {part.split('=', 1)[0]}"
+                )
+        covered.update(l5_command_concurrency_cells(parts, command_label, problems))
+    missing = sorted(expected_cells - covered)
+    if missing:
+        problems.append(f"{label}.commands missing required concurrency cells: {missing}")
 
 
 def validate_release_scope(scope: dict[str, Any], lane: str, problems: list[str]) -> None:
@@ -721,6 +821,7 @@ def validate_w3_l5_artifact(data: dict[str, Any], label: str, problems: list[str
     missing = sorted(REQUIRED_CONCURRENCY - seen)
     if missing:
         problems.append(f"{label}.concurrency.cells missing concurrency cells: {missing}")
+    validate_l5_bench_commands(data.get("commands"), label, REQUIRED_CONCURRENCY, problems)
 
 
 def validate_w3_l0_l5_artifact(
@@ -1559,6 +1660,23 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
         {
             **common,
             "level": "l5_concurrency",
+            "commands": [
+                {
+                    "command_line": [
+                        "ferrum",
+                        "bench-serve",
+                        "--fail-on-error",
+                        "--require-ci",
+                        "--seed",
+                        "9271",
+                        "--n-repeats",
+                        "3",
+                        "--concurrency-sweep",
+                        "1,4,16,32",
+                    ],
+                    "covers_concurrency": [1, 4, 16, 32],
+                }
+            ],
             "concurrency": {
                 "closed_loop": True,
                 "stream_options_include_usage": True,
@@ -1954,6 +2072,27 @@ def run_selftest() -> int:
         bad_w3_l5_problems = validate_manifest(load_json(bad_w3_l5_manifest), "w3", bad_w3_l5)
         if not any("correctness.l5_concurrency.concurrency.cells[2].errored_per_run" in problem for problem in bad_w3_l5_problems):
             raise AssertionError("bad W3 L5 error-count selftest did not fail as expected")
+
+        bad_w3_l5_command = tmp_root / "bad-w3-l5-command"
+        bad_w3_l5_command_manifest = write_selftest_manifest(
+            bad_w3_l5_command,
+            lane="w3",
+            ratio=0.82,
+        )
+        l5_command = load_json(bad_w3_l5_command / "l5.json")
+        command = l5_command["commands"][0]["command_line"]
+        command.remove("--require-ci")
+        write_json(bad_w3_l5_command / "l5.json", l5_command)
+        bad_w3_l5_command_problems = validate_manifest(
+            load_json(bad_w3_l5_command_manifest),
+            "w3",
+            bad_w3_l5_command,
+        )
+        if not any(
+            "correctness.l5_concurrency.commands[0] command missing --require-ci" in problem
+            for problem in bad_w3_l5_command_problems
+        ):
+            raise AssertionError("bad W3 L5 command selftest did not fail as expected")
 
         bad_w3 = tmp_root / "bad-w3-missing-s0"
         bad_w3_manifest = write_selftest_manifest(bad_w3, lane="w3", ratio=0.82)
