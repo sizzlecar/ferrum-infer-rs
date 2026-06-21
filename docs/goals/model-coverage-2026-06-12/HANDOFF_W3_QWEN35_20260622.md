@@ -27,6 +27,9 @@ adding model-name defaults or hidden environment switches.
   varlen GDN prefill prepare.
 - Routed Qwen3.5 product prefill through fused `qkvz_proj` and `ba_proj` when
   the backend supports packed prefill prepare.
+- Routed product varlen prefill through compact core outputs so
+  `query/key/value/g/beta/delta_core` debug/reference intermediates do not stay
+  live after the GDN core boundary.
 - Kept separate `qkv/z/b/a` projection fallback for unsupported backends.
 - Added prefill profile fields for `qkvz_proj` and `ba_proj`.
 - Added CPU packed-vs-separate contract test and a CUDA packed-vs-CPU parity
@@ -51,6 +54,8 @@ cargo fmt --all
 cargo test -p ferrum-kernels --test linear_attention_cpu \
   linear_attention_prepare_varlen_packed_cpu_matches_separate_prepare -- --nocapture
 cargo check -p ferrum-kernels -p ferrum-models
+cargo test -p ferrum-models \
+  linear_attention_prefill_varlen_compact_core_matches_full_core_outputs -- --nocapture
 cargo test -p ferrum-models \
   linear_attention_prefill_varlen_backend_matches_per_sequence_stateful_reference -- --nocapture
 ```
@@ -115,6 +120,8 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
 
 - Profile should show prefill projection time moving from separate
   `qkv/z/b/a` entries to `qkvz/ba`.
+- Product prefill should use compact core output; debug/reference tests still
+  keep full intermediates for parity checks.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly

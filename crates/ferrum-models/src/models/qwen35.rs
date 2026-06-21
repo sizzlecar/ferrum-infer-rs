@@ -289,6 +289,12 @@ pub struct Qwen35BackendLinearAttentionVarlenPrefillOutput<B: Backend> {
     pub final_states: B::Buffer,
 }
 
+pub struct Qwen35BackendLinearAttentionVarlenPrefillCompactOutput<B: Backend> {
+    pub final_conv_states: B::Buffer,
+    pub delta_norm: B::Buffer,
+    pub final_states: B::Buffer,
+}
+
 pub struct Qwen35BackendLinearAttentionDecodeOutput<B: Backend> {
     pub query: B::Buffer,
     pub key: B::Buffer,
@@ -6927,7 +6933,7 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
         Qwen35LinearPrefillProjectionBuffers::Packed {
             mixed_qkvz_raw,
             ba_raw,
-        } => qwen35_linear_attention_prefill_varlen_packed_core_backend::<B>(
+        } => qwen35_linear_attention_prefill_varlen_packed_compact_core_backend::<B>(
             ctx,
             mixed_qkvz_raw,
             ba_raw,
@@ -6948,7 +6954,7 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
             z_raw,
             b_raw,
             a_raw,
-        } => qwen35_linear_attention_prefill_varlen_core_backend::<B>(
+        } => qwen35_linear_attention_prefill_varlen_compact_core_backend::<B>(
             ctx,
             mixed_qkv_raw,
             z_raw,
@@ -9952,6 +9958,24 @@ pub fn qwen35_linear_attention_prefill_core_backend<B: Backend>(
     })
 }
 
+enum Qwen35LinearAttentionVarlenCoreInput<'a, B: Backend> {
+    Separate {
+        mixed_qkv_raw: &'a B::Buffer,
+        z_raw: &'a B::Buffer,
+        a_raw: &'a B::Buffer,
+        b_raw: &'a B::Buffer,
+    },
+    Packed {
+        mixed_qkvz_raw: &'a B::Buffer,
+        ba_raw: &'a B::Buffer,
+    },
+}
+
+enum Qwen35LinearAttentionVarlenCoreReturn<B: Backend> {
+    Full(Qwen35BackendLinearAttentionVarlenPrefillOutput<B>),
+    Compact(Qwen35BackendLinearAttentionVarlenPrefillCompactOutput<B>),
+}
+
 /// Backend-native Qwen3.5 varlen linear-attention prefill core.
 ///
 /// This is the product-batchable counterpart of
@@ -9959,12 +9983,9 @@ pub fn qwen35_linear_attention_prefill_core_backend<B: Backend>(
 /// partitioned by `cu_seqlens`; each sequence reads its own causal-conv and
 /// DeltaNet initial states and writes one final state for each.
 #[allow(clippy::too_many_arguments)]
-pub fn qwen35_linear_attention_prefill_varlen_core_backend<B: Backend>(
+fn qwen35_linear_attention_prefill_varlen_core_impl<B: Backend>(
     ctx: &mut B::Context,
-    mixed_qkv_raw: &B::Buffer,
-    z_raw: &B::Buffer,
-    a_raw: &B::Buffer,
-    b_raw: &B::Buffer,
+    input: Qwen35LinearAttentionVarlenCoreInput<'_, B>,
     conv1d_weight: &B::Buffer,
     initial_conv_states: &B::Buffer,
     a_log: &B::Buffer,
@@ -9976,7 +9997,8 @@ pub fn qwen35_linear_attention_prefill_varlen_core_backend<B: Backend>(
     batch: usize,
     shape: Qwen35LinearAttentionShape,
     eps: f32,
-) -> Result<Qwen35BackendLinearAttentionVarlenPrefillOutput<B>> {
+    keep_intermediates: bool,
+) -> Result<Qwen35LinearAttentionVarlenCoreReturn<B>> {
     shape.validate()?;
     if batch == 0 {
         return Err(FerrumError::model(
@@ -9993,161 +10015,87 @@ pub fn qwen35_linear_attention_prefill_varlen_core_backend<B: Backend>(
     let mut query = B::alloc_typed(Dtype::F32, shape.tokens * qk_total);
     let mut key = B::alloc_typed(Dtype::F32, shape.tokens * qk_total);
     let mut value = B::alloc_typed(Dtype::F32, value_len);
-    let mut g = B::alloc_typed(Dtype::F32, gating_len);
-    let mut beta = B::alloc_typed(Dtype::F32, gating_len);
-    let mut final_conv_states = B::alloc_typed(Dtype::F32, batch * conv_state_len);
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::linear_attention_prepare_varlen_f32(
-        ctx,
-        mixed_qkv_raw,
-        conv1d_weight,
-        initial_conv_states,
-        a_raw,
-        b_raw,
-        a_log,
-        dt_bias,
-        cu_seqlens,
-        token_seq_indices,
-        &mut query,
-        &mut key,
-        &mut value,
-        &mut g,
-        &mut beta,
-        &mut final_conv_states,
-        batch,
-        shape.tokens,
-        shape.key_heads,
-        shape.value_heads,
-        shape.key_dim,
-        shape.value_dim,
-        shape.conv_kernel,
-        true,
-    )?;
-    detail.prepare_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_core_prepare");
-
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    let delta = qwen35_recurrent_gated_delta_rule_varlen_backend::<B>(
-        ctx,
-        &query,
-        &key,
-        &value,
-        &g,
-        &beta,
-        initial_states,
-        cu_seqlens,
-        batch,
-        shape.delta_shape(),
-        false,
-        Some((shape.key_dim as f32).sqrt().recip()),
-    )?;
-    detail.recurrent_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_prefill_core_recurrent");
-    let mut delta_norm = B::alloc_typed(Dtype::F32, value_len);
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::gated_rms_norm_f32(
-        ctx,
-        &delta.output,
-        z_raw,
-        norm_weight,
-        &mut delta_norm,
-        shape.tokens,
-        shape.value_heads,
-        shape.value_dim,
-        eps,
-    )?;
-    detail.gated_norm_us += qwen35_detail_profile_stage_finish::<B>(
-        ctx,
-        timer,
-        "qwen35_linear_prefill_core_gated_norm",
-    );
-
-    if detail_enabled {
-        detail.log(batch, shape.tokens);
-    }
-
-    Ok(Qwen35BackendLinearAttentionVarlenPrefillOutput {
-        query,
-        key,
-        value,
-        g,
-        beta,
-        final_conv_states,
-        delta_core: delta.output,
-        delta_norm,
-        final_states: delta.final_states,
-    })
-}
-
-/// Varlen Qwen3.5 linear-attention prefill from vLLM-packed projections.
-#[allow(clippy::too_many_arguments)]
-pub fn qwen35_linear_attention_prefill_varlen_packed_core_backend<B: Backend>(
-    ctx: &mut B::Context,
-    mixed_qkvz_raw: &B::Buffer,
-    ba_raw: &B::Buffer,
-    conv1d_weight: &B::Buffer,
-    initial_conv_states: &B::Buffer,
-    a_log: &B::Buffer,
-    dt_bias: &B::Buffer,
-    norm_weight: &B::Buffer,
-    initial_states: &B::Buffer,
-    cu_seqlens: &B::Buffer,
-    token_seq_indices: &B::Buffer,
-    batch: usize,
-    shape: Qwen35LinearAttentionShape,
-    eps: f32,
-) -> Result<Qwen35BackendLinearAttentionVarlenPrefillOutput<B>> {
-    shape.validate()?;
-    if batch == 0 {
-        return Err(FerrumError::model(
-            "Qwen3.5 varlen packed linear-attention batch must be positive",
-        ));
-    }
-    let qk_total = shape.qk_total();
-    let value_len = shape.value_len();
-    let gating_len = shape.gating_len();
-    let conv_state_len = shape.conv_channels() * shape.conv_kernel.saturating_sub(1);
-    let detail_enabled = qwen35_layer_detail_profile_enabled();
-    let mut detail = Qwen35LinearPrefillCoreDetailProfile::default();
-
-    let mut query = B::alloc_typed(Dtype::F32, shape.tokens * qk_total);
-    let mut key = B::alloc_typed(Dtype::F32, shape.tokens * qk_total);
-    let mut value = B::alloc_typed(Dtype::F32, value_len);
     let mut z = B::alloc_typed(Dtype::F32, value_len);
     let mut g = B::alloc_typed(Dtype::F32, gating_len);
     let mut beta = B::alloc_typed(Dtype::F32, gating_len);
     let mut final_conv_states = B::alloc_typed(Dtype::F32, batch * conv_state_len);
+    let mut packed_z: Option<B::Buffer> = None;
+    let is_packed = matches!(&input, Qwen35LinearAttentionVarlenCoreInput::Packed { .. });
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::linear_attention_prepare_varlen_packed_qkvz_ba_f32(
-        ctx,
-        mixed_qkvz_raw,
-        ba_raw,
-        conv1d_weight,
-        initial_conv_states,
-        a_log,
-        dt_bias,
-        cu_seqlens,
-        token_seq_indices,
-        &mut query,
-        &mut key,
-        &mut value,
-        &mut z,
-        &mut g,
-        &mut beta,
-        &mut final_conv_states,
-        batch,
-        shape.tokens,
-        shape.key_heads,
-        shape.value_heads,
-        shape.key_dim,
-        shape.value_dim,
-        shape.conv_kernel,
-        true,
-    )?;
+    match &input {
+        Qwen35LinearAttentionVarlenCoreInput::Separate {
+            mixed_qkv_raw,
+            a_raw,
+            b_raw,
+            ..
+        } => B::linear_attention_prepare_varlen_f32(
+            ctx,
+            mixed_qkv_raw,
+            conv1d_weight,
+            initial_conv_states,
+            a_raw,
+            b_raw,
+            a_log,
+            dt_bias,
+            cu_seqlens,
+            token_seq_indices,
+            &mut query,
+            &mut key,
+            &mut value,
+            &mut g,
+            &mut beta,
+            &mut final_conv_states,
+            batch,
+            shape.tokens,
+            shape.key_heads,
+            shape.value_heads,
+            shape.key_dim,
+            shape.value_dim,
+            shape.conv_kernel,
+            true,
+        )?,
+        Qwen35LinearAttentionVarlenCoreInput::Packed {
+            mixed_qkvz_raw,
+            ba_raw,
+        } => {
+            packed_z = Some(B::alloc_typed(Dtype::F32, value_len));
+            let z = packed_z.as_mut().expect("packed z allocated");
+            B::linear_attention_prepare_varlen_packed_qkvz_ba_f32(
+                ctx,
+                mixed_qkvz_raw,
+                ba_raw,
+                conv1d_weight,
+                initial_conv_states,
+                a_log,
+                dt_bias,
+                cu_seqlens,
+                token_seq_indices,
+                &mut query,
+                &mut key,
+                &mut value,
+                z,
+                &mut g,
+                &mut beta,
+                &mut final_conv_states,
+                batch,
+                shape.tokens,
+                shape.key_heads,
+                shape.value_heads,
+                shape.key_dim,
+                shape.value_dim,
+                shape.conv_kernel,
+                true,
+            )?
+        }
+    }
     detail.prepare_us += qwen35_detail_profile_stage_finish::<B>(
         ctx,
         timer,
-        "qwen35_linear_prefill_core_packed_prepare",
+        if is_packed {
+            "qwen35_linear_prefill_core_packed_prepare"
+        } else {
+            "qwen35_linear_prefill_core_prepare"
+        },
     );
 
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
@@ -10168,14 +10116,24 @@ pub fn qwen35_linear_attention_prefill_varlen_packed_core_backend<B: Backend>(
     detail.recurrent_us += qwen35_detail_profile_stage_finish::<B>(
         ctx,
         timer,
-        "qwen35_linear_prefill_core_packed_recurrent",
+        if is_packed {
+            "qwen35_linear_prefill_core_packed_recurrent"
+        } else {
+            "qwen35_linear_prefill_core_recurrent"
+        },
     );
     let mut delta_norm = B::alloc_typed(Dtype::F32, value_len);
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    let z_for_norm = match &input {
+        Qwen35LinearAttentionVarlenCoreInput::Separate { z_raw, .. } => *z_raw,
+        Qwen35LinearAttentionVarlenCoreInput::Packed { .. } => {
+            packed_z.as_ref().expect("packed z prepared")
+        }
+    };
     B::gated_rms_norm_f32(
         ctx,
         &delta.output,
-        &z,
+        z_for_norm,
         norm_weight,
         &mut delta_norm,
         shape.tokens,
@@ -10186,24 +10144,213 @@ pub fn qwen35_linear_attention_prefill_varlen_packed_core_backend<B: Backend>(
     detail.gated_norm_us += qwen35_detail_profile_stage_finish::<B>(
         ctx,
         timer,
-        "qwen35_linear_prefill_core_packed_gated_norm",
+        if is_packed {
+            "qwen35_linear_prefill_core_packed_gated_norm"
+        } else {
+            "qwen35_linear_prefill_core_gated_norm"
+        },
     );
 
     if detail_enabled {
         detail.log(batch, shape.tokens);
     }
 
-    Ok(Qwen35BackendLinearAttentionVarlenPrefillOutput {
-        query,
-        key,
-        value,
-        g,
-        beta,
-        final_conv_states,
-        delta_core: delta.output,
-        delta_norm,
-        final_states: delta.final_states,
-    })
+    if keep_intermediates {
+        Ok(Qwen35LinearAttentionVarlenCoreReturn::Full(
+            Qwen35BackendLinearAttentionVarlenPrefillOutput {
+                query,
+                key,
+                value,
+                g,
+                beta,
+                final_conv_states,
+                delta_core: delta.output,
+                delta_norm,
+                final_states: delta.final_states,
+            },
+        ))
+    } else {
+        Ok(Qwen35LinearAttentionVarlenCoreReturn::Compact(
+            Qwen35BackendLinearAttentionVarlenPrefillCompactOutput {
+                final_conv_states,
+                delta_norm,
+                final_states: delta.final_states,
+            },
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_linear_attention_prefill_varlen_core_backend<B: Backend>(
+    ctx: &mut B::Context,
+    mixed_qkv_raw: &B::Buffer,
+    z_raw: &B::Buffer,
+    a_raw: &B::Buffer,
+    b_raw: &B::Buffer,
+    conv1d_weight: &B::Buffer,
+    initial_conv_states: &B::Buffer,
+    a_log: &B::Buffer,
+    dt_bias: &B::Buffer,
+    norm_weight: &B::Buffer,
+    initial_states: &B::Buffer,
+    cu_seqlens: &B::Buffer,
+    token_seq_indices: &B::Buffer,
+    batch: usize,
+    shape: Qwen35LinearAttentionShape,
+    eps: f32,
+) -> Result<Qwen35BackendLinearAttentionVarlenPrefillOutput<B>> {
+    match qwen35_linear_attention_prefill_varlen_core_impl(
+        ctx,
+        Qwen35LinearAttentionVarlenCoreInput::Separate {
+            mixed_qkv_raw,
+            z_raw,
+            a_raw,
+            b_raw,
+        },
+        conv1d_weight,
+        initial_conv_states,
+        a_log,
+        dt_bias,
+        norm_weight,
+        initial_states,
+        cu_seqlens,
+        token_seq_indices,
+        batch,
+        shape,
+        eps,
+        true,
+    )? {
+        Qwen35LinearAttentionVarlenCoreReturn::Full(output) => Ok(output),
+        Qwen35LinearAttentionVarlenCoreReturn::Compact(_) => unreachable!("requested full output"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_linear_attention_prefill_varlen_compact_core_backend<B: Backend>(
+    ctx: &mut B::Context,
+    mixed_qkv_raw: &B::Buffer,
+    z_raw: &B::Buffer,
+    a_raw: &B::Buffer,
+    b_raw: &B::Buffer,
+    conv1d_weight: &B::Buffer,
+    initial_conv_states: &B::Buffer,
+    a_log: &B::Buffer,
+    dt_bias: &B::Buffer,
+    norm_weight: &B::Buffer,
+    initial_states: &B::Buffer,
+    cu_seqlens: &B::Buffer,
+    token_seq_indices: &B::Buffer,
+    batch: usize,
+    shape: Qwen35LinearAttentionShape,
+    eps: f32,
+) -> Result<Qwen35BackendLinearAttentionVarlenPrefillCompactOutput<B>> {
+    match qwen35_linear_attention_prefill_varlen_core_impl(
+        ctx,
+        Qwen35LinearAttentionVarlenCoreInput::Separate {
+            mixed_qkv_raw,
+            z_raw,
+            a_raw,
+            b_raw,
+        },
+        conv1d_weight,
+        initial_conv_states,
+        a_log,
+        dt_bias,
+        norm_weight,
+        initial_states,
+        cu_seqlens,
+        token_seq_indices,
+        batch,
+        shape,
+        eps,
+        false,
+    )? {
+        Qwen35LinearAttentionVarlenCoreReturn::Compact(output) => Ok(output),
+        Qwen35LinearAttentionVarlenCoreReturn::Full(_) => unreachable!("requested compact output"),
+    }
+}
+
+/// Varlen Qwen3.5 linear-attention prefill from vLLM-packed projections.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_linear_attention_prefill_varlen_packed_core_backend<B: Backend>(
+    ctx: &mut B::Context,
+    mixed_qkvz_raw: &B::Buffer,
+    ba_raw: &B::Buffer,
+    conv1d_weight: &B::Buffer,
+    initial_conv_states: &B::Buffer,
+    a_log: &B::Buffer,
+    dt_bias: &B::Buffer,
+    norm_weight: &B::Buffer,
+    initial_states: &B::Buffer,
+    cu_seqlens: &B::Buffer,
+    token_seq_indices: &B::Buffer,
+    batch: usize,
+    shape: Qwen35LinearAttentionShape,
+    eps: f32,
+) -> Result<Qwen35BackendLinearAttentionVarlenPrefillOutput<B>> {
+    match qwen35_linear_attention_prefill_varlen_core_impl(
+        ctx,
+        Qwen35LinearAttentionVarlenCoreInput::Packed {
+            mixed_qkvz_raw,
+            ba_raw,
+        },
+        conv1d_weight,
+        initial_conv_states,
+        a_log,
+        dt_bias,
+        norm_weight,
+        initial_states,
+        cu_seqlens,
+        token_seq_indices,
+        batch,
+        shape,
+        eps,
+        true,
+    )? {
+        Qwen35LinearAttentionVarlenCoreReturn::Full(output) => Ok(output),
+        Qwen35LinearAttentionVarlenCoreReturn::Compact(_) => unreachable!("requested full output"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_linear_attention_prefill_varlen_packed_compact_core_backend<B: Backend>(
+    ctx: &mut B::Context,
+    mixed_qkvz_raw: &B::Buffer,
+    ba_raw: &B::Buffer,
+    conv1d_weight: &B::Buffer,
+    initial_conv_states: &B::Buffer,
+    a_log: &B::Buffer,
+    dt_bias: &B::Buffer,
+    norm_weight: &B::Buffer,
+    initial_states: &B::Buffer,
+    cu_seqlens: &B::Buffer,
+    token_seq_indices: &B::Buffer,
+    batch: usize,
+    shape: Qwen35LinearAttentionShape,
+    eps: f32,
+) -> Result<Qwen35BackendLinearAttentionVarlenPrefillCompactOutput<B>> {
+    match qwen35_linear_attention_prefill_varlen_core_impl(
+        ctx,
+        Qwen35LinearAttentionVarlenCoreInput::Packed {
+            mixed_qkvz_raw,
+            ba_raw,
+        },
+        conv1d_weight,
+        initial_conv_states,
+        a_log,
+        dt_bias,
+        norm_weight,
+        initial_states,
+        cu_seqlens,
+        token_seq_indices,
+        batch,
+        shape,
+        eps,
+        false,
+    )? {
+        Qwen35LinearAttentionVarlenCoreReturn::Compact(output) => Ok(output),
+        Qwen35LinearAttentionVarlenCoreReturn::Full(_) => unreachable!("requested compact output"),
+    }
 }
 
 /// Backend-native Qwen3.5 linear-attention core for one decode token.
@@ -14938,6 +15085,180 @@ mod tests {
         assert_linear_attention_prefill_varlen_backend_matches_per_sequence_stateful_reference::<
             CpuBackend,
         >();
+    }
+
+    #[test]
+    fn linear_attention_prefill_varlen_compact_core_matches_full_core_outputs() {
+        let shape = Qwen35LinearAttentionShape {
+            tokens: 5,
+            key_heads: 1,
+            value_heads: 2,
+            key_dim: 2,
+            value_dim: 2,
+            conv_kernel: 3,
+        };
+        let cu_seqlens = vec![0u32, 2, 5];
+        let token_seq_indices = vec![0u32, 0, 1, 1, 1];
+        let batch = cu_seqlens.len() - 1;
+        let conv_state_len = shape.conv_channels() * shape.conv_kernel.saturating_sub(1);
+        let delta_state_len = shape.state_len();
+        let mixed_qkv_raw: Vec<f32> = (0..shape.mixed_qkv_len())
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.075)
+            .collect();
+        let z_raw: Vec<f32> = (0..shape.value_len())
+            .map(|i| ((i as f32 % 11.0) - 5.0) * 0.09)
+            .collect();
+        let a_raw: Vec<f32> = (0..shape.gating_len())
+            .map(|i| ((i as f32 % 7.0) - 3.0) * 0.11)
+            .collect();
+        let b_raw: Vec<f32> = (0..shape.gating_len())
+            .map(|i| ((i as f32 % 5.0) - 2.0) * 0.17)
+            .collect();
+        let conv1d_weight: Vec<f32> = (0..shape.conv_channels() * shape.conv_kernel)
+            .map(|i| match i % 4 {
+                0 => -0.25,
+                1 => 0.5,
+                2 => 0.75,
+                _ => -0.125,
+            })
+            .collect();
+        let initial_conv_states: Vec<f32> = (0..batch * conv_state_len)
+            .map(|i| ((i as f32 % 17.0) - 8.0) * 0.03)
+            .collect();
+        let a_log = vec![0.5f32.ln(), 1.25f32.ln()];
+        let dt_bias = vec![-0.1, 0.2];
+        let norm_weight = vec![0.75, 1.5];
+        let initial_states: Vec<f32> = (0..batch * delta_state_len)
+            .map(|i| ((i as f32 % 19.0) - 9.0) * 0.02)
+            .collect();
+        let eps = 1e-6;
+
+        let qkvz_width = shape.conv_channels() + shape.value_total();
+        let ba_width = 2 * shape.value_heads;
+        let mut mixed_qkvz_raw = vec![0.0; shape.tokens * qkvz_width];
+        let mut ba_raw = vec![0.0; shape.tokens * ba_width];
+        for token in 0..shape.tokens {
+            let qkv_src = token * shape.conv_channels();
+            let qkvz_dst = token * qkvz_width;
+            mixed_qkvz_raw[qkvz_dst..qkvz_dst + shape.conv_channels()]
+                .copy_from_slice(&mixed_qkv_raw[qkv_src..qkv_src + shape.conv_channels()]);
+            let z_src = token * shape.value_total();
+            mixed_qkvz_raw[qkvz_dst + shape.conv_channels()..qkvz_dst + qkvz_width]
+                .copy_from_slice(&z_raw[z_src..z_src + shape.value_total()]);
+
+            let gate_src = token * shape.value_heads;
+            let ba_dst = token * ba_width;
+            ba_raw[ba_dst..ba_dst + shape.value_heads]
+                .copy_from_slice(&b_raw[gate_src..gate_src + shape.value_heads]);
+            ba_raw[ba_dst + shape.value_heads..ba_dst + ba_width]
+                .copy_from_slice(&a_raw[gate_src..gate_src + shape.value_heads]);
+        }
+
+        let mut ctx = CpuBackend::new_context();
+        let full = qwen35_linear_attention_prefill_varlen_core_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice_typed(&mixed_qkv_raw),
+            &CpuBackend::from_slice_typed(&z_raw),
+            &CpuBackend::from_slice_typed(&a_raw),
+            &CpuBackend::from_slice_typed(&b_raw),
+            &CpuBackend::from_slice_typed(&conv1d_weight),
+            &CpuBackend::from_slice_typed(&initial_conv_states),
+            &CpuBackend::from_slice_typed(&a_log),
+            &CpuBackend::from_slice_typed(&dt_bias),
+            &CpuBackend::from_slice_typed(&norm_weight),
+            &CpuBackend::from_slice_typed(&initial_states),
+            &CpuBackend::from_slice_typed(&cu_seqlens),
+            &CpuBackend::from_slice_typed(&token_seq_indices),
+            batch,
+            shape,
+            eps,
+        )
+        .unwrap();
+        let compact = qwen35_linear_attention_prefill_varlen_compact_core_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice_typed(&mixed_qkv_raw),
+            &CpuBackend::from_slice_typed(&z_raw),
+            &CpuBackend::from_slice_typed(&a_raw),
+            &CpuBackend::from_slice_typed(&b_raw),
+            &CpuBackend::from_slice_typed(&conv1d_weight),
+            &CpuBackend::from_slice_typed(&initial_conv_states),
+            &CpuBackend::from_slice_typed(&a_log),
+            &CpuBackend::from_slice_typed(&dt_bias),
+            &CpuBackend::from_slice_typed(&norm_weight),
+            &CpuBackend::from_slice_typed(&initial_states),
+            &CpuBackend::from_slice_typed(&cu_seqlens),
+            &CpuBackend::from_slice_typed(&token_seq_indices),
+            batch,
+            shape,
+            eps,
+        )
+        .unwrap();
+        assert_close_slice(
+            &CpuBackend::to_vec(&compact.final_conv_states, batch * conv_state_len),
+            &CpuBackend::to_vec(&full.final_conv_states, batch * conv_state_len),
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&compact.delta_norm, shape.value_len()),
+            &CpuBackend::to_vec(&full.delta_norm, shape.value_len()),
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&compact.final_states, batch * delta_state_len),
+            &CpuBackend::to_vec(&full.final_states, batch * delta_state_len),
+            1e-6,
+        );
+
+        let packed_full = qwen35_linear_attention_prefill_varlen_packed_core_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice_typed(&mixed_qkvz_raw),
+            &CpuBackend::from_slice_typed(&ba_raw),
+            &CpuBackend::from_slice_typed(&conv1d_weight),
+            &CpuBackend::from_slice_typed(&initial_conv_states),
+            &CpuBackend::from_slice_typed(&a_log),
+            &CpuBackend::from_slice_typed(&dt_bias),
+            &CpuBackend::from_slice_typed(&norm_weight),
+            &CpuBackend::from_slice_typed(&initial_states),
+            &CpuBackend::from_slice_typed(&cu_seqlens),
+            &CpuBackend::from_slice_typed(&token_seq_indices),
+            batch,
+            shape,
+            eps,
+        )
+        .unwrap();
+        let packed_compact =
+            qwen35_linear_attention_prefill_varlen_packed_compact_core_backend::<CpuBackend>(
+                &mut ctx,
+                &CpuBackend::from_slice_typed(&mixed_qkvz_raw),
+                &CpuBackend::from_slice_typed(&ba_raw),
+                &CpuBackend::from_slice_typed(&conv1d_weight),
+                &CpuBackend::from_slice_typed(&initial_conv_states),
+                &CpuBackend::from_slice_typed(&a_log),
+                &CpuBackend::from_slice_typed(&dt_bias),
+                &CpuBackend::from_slice_typed(&norm_weight),
+                &CpuBackend::from_slice_typed(&initial_states),
+                &CpuBackend::from_slice_typed(&cu_seqlens),
+                &CpuBackend::from_slice_typed(&token_seq_indices),
+                batch,
+                shape,
+                eps,
+            )
+            .unwrap();
+        assert_close_slice(
+            &CpuBackend::to_vec(&packed_compact.final_conv_states, batch * conv_state_len),
+            &CpuBackend::to_vec(&packed_full.final_conv_states, batch * conv_state_len),
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&packed_compact.delta_norm, shape.value_len()),
+            &CpuBackend::to_vec(&packed_full.delta_norm, shape.value_len()),
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&packed_compact.final_states, batch * delta_state_len),
+            &CpuBackend::to_vec(&packed_full.final_states, batch * delta_state_len),
+            1e-6,
+        );
     }
 
     #[cfg(feature = "cuda")]
