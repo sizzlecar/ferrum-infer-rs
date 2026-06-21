@@ -20,6 +20,7 @@ use ferrum_types::{
     Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
 };
 use parking_lot::RwLock;
+use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
@@ -128,6 +129,22 @@ impl ContinuousBatchRequest {
             RequestPhase::Completed | RequestPhase::Cancelled
         )
     }
+}
+
+/// Read-only scheduler counters for explicit engine diagnostics.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContinuousSchedulerTraceSnapshot {
+    pub current_iteration: u64,
+    pub waiting_queue_len: usize,
+    pub prefill_queue_len: usize,
+    pub decode_queue_len: usize,
+    pub preempted_queue_len: usize,
+    pub active_len: usize,
+    pub completed_total: u64,
+    pub failed_total: u64,
+    pub cancelled_total: u64,
+    pub preempted_total: u64,
+    pub admitted_total: u64,
 }
 
 /// Continuous batching scheduler
@@ -305,6 +322,33 @@ impl ContinuousBatchScheduler {
     /// Get number of prefilling requests
     pub fn prefilling_count(&self) -> usize {
         self.prefill_queue.read().len()
+    }
+
+    /// Snapshot queue lengths and counters for explicit scheduler trace artifacts.
+    pub fn trace_snapshot(&self) -> ContinuousSchedulerTraceSnapshot {
+        let waiting_queue_len = self.waiting_queue.read().len();
+        let prefill_queue_len = self.prefill_queue.read().len();
+        let decode_queue_len = self.decode_queue.read().len();
+        let preempted_queue_len = self.preempted_requests.read().len();
+
+        ContinuousSchedulerTraceSnapshot {
+            current_iteration: self.current_iteration.load(Ordering::Relaxed),
+            waiting_queue_len,
+            prefill_queue_len,
+            decode_queue_len,
+            preempted_queue_len,
+            active_len: prefill_queue_len + decode_queue_len,
+            completed_total: self.completed_counter.load(Ordering::Relaxed),
+            failed_total: self.failed_counter.load(Ordering::Relaxed),
+            cancelled_total: self.cancelled_counter.load(Ordering::Relaxed),
+            preempted_total: self.preempted_counter.load(Ordering::Relaxed),
+            admitted_total: self.admitted_counter.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Return the scheduler phase for trace-only plan classification.
+    pub fn trace_phase(&self, request_id: &RequestId) -> Option<RequestPhase> {
+        self.request_index.read().get(request_id).copied()
     }
 
     /// Move request from waiting to prefill queue
@@ -1219,6 +1263,36 @@ mod tests {
 
         assert_eq!(scheduler.waiting_count(), 2);
         assert_eq!(scheduler.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn trace_snapshot_reports_queue_counters_and_phase() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let request = create_test_request(Priority::Normal);
+        let request_id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+
+        let before = scheduler.trace_snapshot();
+        assert_eq!(before.waiting_queue_len, 1);
+        assert_eq!(before.active_len, 0);
+        assert_eq!(before.admitted_total, 0);
+        assert_eq!(
+            scheduler.trace_phase(&request_id),
+            Some(RequestPhase::Waiting)
+        );
+
+        let batch = scheduler.next_batch(BatchHint::simple(4)).await.unwrap();
+        assert_eq!(batch.size(), 1);
+
+        let after = scheduler.trace_snapshot();
+        assert_eq!(after.waiting_queue_len, 0);
+        assert_eq!(after.prefill_queue_len, 1);
+        assert_eq!(after.active_len, 1);
+        assert_eq!(after.admitted_total, 1);
+        assert_eq!(
+            scheduler.trace_phase(&request_id),
+            Some(RequestPhase::Prefilling)
+        );
     }
 
     #[tokio::test]

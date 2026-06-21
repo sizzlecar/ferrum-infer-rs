@@ -26,6 +26,11 @@ fn engine_config_applies_runtime_snapshot() {
             "1",
             RuntimeConfigSource::Env,
         ),
+        RuntimeConfigEntry::new(
+            "FERRUM_SCHEDULER_TRACE_JSONL",
+            "/tmp/sched.jsonl",
+            RuntimeConfigSource::Env,
+        ),
     ]);
     let mut cfg = EngineConfig::default();
 
@@ -35,6 +40,10 @@ fn engine_config_applies_runtime_snapshot() {
     assert_eq!(cfg.batching.max_num_batched_tokens, 8192);
     assert_eq!(cfg.scheduler.max_running_requests, 7);
     assert!(cfg.scheduler.prompt_token_estimate);
+    assert_eq!(
+        cfg.runtime.scheduler_trace_jsonl.as_deref(),
+        Some(std::path::Path::new("/tmp/sched.jsonl"))
+    );
 }
 
 #[test]

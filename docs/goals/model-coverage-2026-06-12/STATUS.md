@@ -2,6 +2,38 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ39 — W3 scheduler trace localized mixed prefill+decode bottleneck
+
+- Scope:
+  - added typed scheduler JSONL tracing for `ferrum serve`;
+  - ran real Qwen3.5 GPTQ CUDA product smokes and c32 ShareGPT diagnostics on
+    the existing Vast 1x RTX 4090 lane;
+  - fixed auto-config so accelerator default `prefill_first_until_active` is
+    still materialized when `active_decode_prefill_chunk` is explicitly set.
+- Artifact:
+  - remote root:
+    `/workspace/artifacts/w3_qwen35_sched_trace_20260621T164651Z`;
+  - local copyback is pending because Vast instance `41422823` stopped before
+    rsync and restart was queued/unavailable.
+- Correctness smoke:
+  - non-stream chat returned HTTP 200, content `5`, usage present;
+  - stream chat with `stream_options.include_usage=true` returned HTTP 200,
+    exactly one `[DONE]`, no malformed SSE, content `5`, usage present.
+- Diagnostic performance:
+  - with cohort prefill policy: `64 completed / 0 errored / 4.5s`,
+    `651.4 output tok/s`, TTFT p50/p95 `636.0 / 1121.4 ms`, TPOT p50/p95
+    `32.5 / 45.4 ms`;
+  - removing `prefill_first_until_active` collapsed the same binary/dataset to
+    `22.7 output tok/s`, TTFT p50/p95 `40674.1 / 56641.6 ms`;
+  - trace showed mixed prefill+decode outliers such as
+    `decode=7,prefill=25` at `56.38s` and `decode=12,prefill=18` at `40.67s`,
+    while pure `decode=32` stayed around `19-21 ms`.
+- Conclusion:
+  - W3 performance gate remains FAIL; no `MODEL_RELEASE_GRADE_W3 PASS`;
+  - the next high-return lever is not pure decode scheduling overhead. It is
+    either avoiding large mixed prefill+decode until the cohort is formed or
+    implementing an efficient vLLM-style mixed/chunked Qwen3.5 GDN path.
+
 ## 2026-06-20 ZZZ38 — Qwen35 decode sync fix correctness OK, no material perf gain
 
 - Scope:

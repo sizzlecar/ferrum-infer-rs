@@ -1,11 +1,11 @@
 //! Configuration types for Ferrum components
 
 use crate::{
-    parse_bool_env_value, parse_usize_env_value, DataType, Device, ModelId, ModelInfo,
-    RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
+    parse_bool_env_value, parse_path_env_value, parse_usize_env_value, DataType, Device, ModelId,
+    ModelInfo, RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 /// Engine runtime knobs the CLI/autosizer resolves and injects via the
 /// runtime-config snapshot. The continuous engine reads these from the typed
@@ -19,6 +19,7 @@ pub struct RuntimeKnobs {
     pub batch_decode_prof: bool,
     pub next_batch_prof: bool,
     pub rbd_prof: bool,
+    pub scheduler_trace_jsonl: Option<PathBuf>,
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
 
@@ -91,6 +92,9 @@ impl EngineConfig {
         self.runtime.next_batch_prof |=
             runtime_config_value(snapshot, "FERRUM_NEXT_BATCH_PROF").is_some();
         self.runtime.rbd_prof |= runtime_config_value(snapshot, "FERRUM_RBD_PROF").is_some();
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHEDULER_TRACE_JSONL") {
+            self.runtime.scheduler_trace_jsonl = Some(parse_path_env_value(value)?);
+        }
         self.runtime.unified_post_prof |=
             runtime_config_value(snapshot, "FERRUM_UNIFIED_POST_PROF").is_some();
         self.runtime.prefix_cache_enabled |=

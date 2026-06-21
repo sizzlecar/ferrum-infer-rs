@@ -24,6 +24,43 @@ pub(super) fn kv_slot_requests_for_unified_batch(
         .collect()
 }
 
+#[derive(Debug, Default, serde::Serialize)]
+struct SchedulerTraceDistribution {
+    count: usize,
+    min: Option<usize>,
+    p50: Option<usize>,
+    max: Option<usize>,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+struct SchedulerTracePlanStats {
+    batch_size: usize,
+    prefill_items: usize,
+    decode_items: usize,
+    waiting_items: usize,
+    preempted_items: usize,
+    unknown_items: usize,
+    scheduled_tokens_total: usize,
+    prefill_tokens: usize,
+    decode_tokens: usize,
+    tokens_to_process_missing: usize,
+    decode_generated_tokens: SchedulerTraceDistribution,
+    prefill_prompt_tokens: SchedulerTraceDistribution,
+}
+
+fn scheduler_trace_distribution(mut values: Vec<usize>) -> SchedulerTraceDistribution {
+    if values.is_empty() {
+        return SchedulerTraceDistribution::default();
+    }
+    values.sort_unstable();
+    SchedulerTraceDistribution {
+        count: values.len(),
+        min: values.first().copied(),
+        p50: values.get(values.len() / 2).copied(),
+        max: values.last().copied(),
+    }
+}
+
 impl EngineInner {
     // ── tensor helper ──────────────────────────────────────────────────
 
@@ -112,6 +149,77 @@ impl EngineInner {
             .collect()
     }
 
+    fn scheduler_trace_enabled(&self) -> bool {
+        self.scheduler_trace_jsonl.is_some()
+    }
+
+    fn scheduler_trace_plan_stats(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+    ) -> SchedulerTracePlanStats {
+        let mut stats = SchedulerTracePlanStats {
+            batch_size: batch.size(),
+            ..SchedulerTracePlanStats::default()
+        };
+        let mut decode_generated_tokens = Vec::new();
+        let mut prefill_prompt_tokens = Vec::new();
+        let sequences = self.sequences.read();
+
+        for scheduled_req in &batch.requests {
+            let request_id = &scheduled_req.request.id;
+            let scheduled_tokens = scheduled_req.tokens_to_process.unwrap_or(0);
+            if scheduled_req.tokens_to_process.is_none() {
+                stats.tokens_to_process_missing += 1;
+            }
+            stats.scheduled_tokens_total += scheduled_tokens;
+
+            match self.scheduler.trace_phase(request_id) {
+                Some(RequestPhase::Decoding) => {
+                    stats.decode_items += 1;
+                    stats.decode_tokens += scheduled_tokens;
+                    if let Some(seq) = sequences.get(request_id) {
+                        decode_generated_tokens.push(seq.generated_tokens.len());
+                    }
+                }
+                Some(RequestPhase::Prefilling) => {
+                    stats.prefill_items += 1;
+                    stats.prefill_tokens += scheduled_tokens;
+                    if let Some(seq) = sequences.get(request_id) {
+                        prefill_prompt_tokens.push(seq.prefill_context_len());
+                    }
+                }
+                Some(RequestPhase::Waiting) => {
+                    stats.waiting_items += 1;
+                    stats.prefill_tokens += scheduled_tokens;
+                }
+                Some(RequestPhase::Preempted) => {
+                    stats.preempted_items += 1;
+                }
+                Some(RequestPhase::Completed | RequestPhase::Cancelled) | None => {
+                    stats.unknown_items += 1;
+                }
+            }
+        }
+
+        stats.decode_generated_tokens = scheduler_trace_distribution(decode_generated_tokens);
+        stats.prefill_prompt_tokens = scheduler_trace_distribution(prefill_prompt_tokens);
+        stats
+    }
+
+    fn write_scheduler_trace_event(&self, event: serde_json::Value) {
+        let Some(file) = &self.scheduler_trace_jsonl else {
+            return;
+        };
+        let mut file = file.lock();
+        if let Err(error) = serde_json::to_writer(&mut *file, &event) {
+            warn!("Failed to write scheduler trace event: {}", error);
+            return;
+        }
+        if let Err(error) = file.write_all(b"\n") {
+            warn!("Failed to terminate scheduler trace event: {}", error);
+        }
+    }
+
     // ── iteration loop ─────────────────────────────────────────────────
 
     /// Run one iteration: ask the scheduler for a batch, then process it.
@@ -120,6 +228,18 @@ impl EngineInner {
         counter!("ferrum.engine.iterations_total").increment(1);
         let prof = self.runtime_config.batch_decode_prof;
         let t_iter_start = if prof { Some(Instant::now()) } else { None };
+        let trace_enabled = self.scheduler_trace_enabled();
+        let trace_scheduler_before = trace_enabled.then(|| self.scheduler.trace_snapshot());
+        let trace_prefill_tokens_before = if trace_enabled {
+            Some(self.total_prefill_tokens.load(Ordering::Relaxed))
+        } else {
+            None
+        };
+        let trace_decode_tokens_before = if trace_enabled {
+            Some(self.total_decode_tokens.load(Ordering::Relaxed))
+        } else {
+            None
+        };
 
         // Phase 3 token-budget hint: scheduler emits a mixed batch
         // summing to at most `max_num_batched_tokens` Q tokens. This
@@ -134,6 +254,8 @@ impl EngineInner {
             available_memory: None,
             resource_constraints: ferrum_interfaces::scheduler::ResourceConstraints::default(),
         };
+        let hint_max_batch_size = hint.max_batch_size;
+        let hint_max_tokens = hint.max_tokens;
 
         // FERRUM_NEXT_BATCH_PROF=1: count Some/None returns to root-cause
         // the apples HTTP-serve 17 ms inter-batch-iter gap. Prints every
@@ -143,7 +265,8 @@ impl EngineInner {
         let sched_t0 = Instant::now();
         let nb_t0 = if nb_prof { Some(Instant::now()) } else { None };
         let nb_result = self.scheduler.next_batch(hint).await;
-        self.record_scheduling_time(sched_t0.elapsed());
+        let sched_elapsed = sched_t0.elapsed();
+        self.record_scheduling_time(sched_elapsed);
         if let Some(t0) = nb_t0 {
             use std::sync::atomic::AtomicU64;
             static SOME_N: AtomicU64 = AtomicU64::new(0);
@@ -183,10 +306,40 @@ impl EngineInner {
         let batch = match nb_result {
             Some(b) => b,
             None => {
+                if trace_enabled {
+                    let none_streak = self
+                        .scheduler_trace_none_streak
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    if none_streak <= 4 || none_streak.is_multiple_of(128) {
+                        self.write_scheduler_trace_event(serde_json::json!({
+                            "event": "scheduler_iteration",
+                            "iteration": iteration,
+                            "result": "none",
+                            "none_streak": none_streak,
+                            "hint": {
+                                "max_batch_size": hint_max_batch_size,
+                                "max_tokens": hint_max_tokens,
+                            },
+                            "scheduler_before": trace_scheduler_before.as_ref(),
+                            "scheduler_after_schedule": self.scheduler.trace_snapshot(),
+                            "timing_us": {
+                                "schedule": duration_to_us(sched_elapsed),
+                            },
+                        }));
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 return Ok(());
             }
         };
+        let trace_none_since_last_some = if trace_enabled {
+            Some(self.scheduler_trace_none_streak.swap(0, Ordering::Relaxed))
+        } else {
+            None
+        };
+        let trace_scheduler_after_schedule = trace_enabled.then(|| self.scheduler.trace_snapshot());
+        let trace_plan = trace_enabled.then(|| self.scheduler_trace_plan_stats(&batch));
         let t_after_sched = if prof { Some(Instant::now()) } else { None };
 
         debug!(
@@ -197,7 +350,42 @@ impl EngineInner {
 
         let process_t0 = Instant::now();
         let r = self.process_batch(&batch).await;
-        self.record_model_execution_time(process_t0.elapsed());
+        let process_elapsed = process_t0.elapsed();
+        self.record_model_execution_time(process_elapsed);
+        if trace_enabled {
+            let prefill_tokens_after = self.total_prefill_tokens.load(Ordering::Relaxed);
+            let decode_tokens_after = self.total_decode_tokens.load(Ordering::Relaxed);
+            self.write_scheduler_trace_event(serde_json::json!({
+                "event": "scheduler_iteration",
+                "iteration": iteration,
+                "result": if r.is_ok() { "some_ok" } else { "some_error" },
+                "error": r.as_ref().err().map(|error| error.to_string()),
+                "none_since_last_some": trace_none_since_last_some,
+                "hint": {
+                    "max_batch_size": hint_max_batch_size,
+                    "max_tokens": hint_max_tokens,
+                },
+                "scheduler_before": trace_scheduler_before.as_ref(),
+                "scheduler_after_schedule": trace_scheduler_after_schedule.as_ref(),
+                "scheduler_after_process": self.scheduler.trace_snapshot(),
+                "plan": trace_plan.as_ref(),
+                "engine_counters": {
+                    "prefill_tokens_before": trace_prefill_tokens_before,
+                    "prefill_tokens_after": prefill_tokens_after,
+                    "prefill_tokens_delta": prefill_tokens_after
+                        .saturating_sub(trace_prefill_tokens_before.unwrap_or(prefill_tokens_after)),
+                    "decode_tokens_before": trace_decode_tokens_before,
+                    "decode_tokens_after": decode_tokens_after,
+                    "decode_tokens_delta": decode_tokens_after
+                        .saturating_sub(trace_decode_tokens_before.unwrap_or(decode_tokens_after)),
+                },
+                "timing_us": {
+                    "schedule": duration_to_us(sched_elapsed),
+                    "process": duration_to_us(process_elapsed),
+                    "total_since_schedule_start": duration_to_us(sched_t0.elapsed()),
+                },
+            }));
+        }
         if let (Some(t0), Some(ts)) = (t_iter_start, t_after_sched) {
             let n = self.iteration_count.load(Ordering::Relaxed);
             if n < 64 || n.is_multiple_of(32) {
