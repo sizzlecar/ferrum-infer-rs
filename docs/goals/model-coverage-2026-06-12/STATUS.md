@@ -2,6 +2,36 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ53 — Qwen35 fresh first chunks can join paged mixed prefill
+
+- Scope:
+  - replaced the duplicated Qwen3.5 fresh-only and continuation-only paged
+    prefill validation with one typed paged prefill batch entry that supports
+    `FreshOnly`, `ContinuationOnly`, and `Mixed` modes;
+  - changed Qwen3.5 linear-attention batch prefill initial state from one
+    global `fresh_initial_linear_state` bool to a per-row fresh mask, so fresh
+    rows keep zero initial conv/GDN state while continuation/decode rows gather
+    their existing recurrent state in the same varlen batch;
+  - changed `forward_stateful_unified_items` so paged KV frames with any
+    prefill row can build one mixed prefill batch containing fresh rows,
+    continuation/chunk rows, and eligible decode candidates. The legacy
+    no-policy greedy-argmax merge contract remains unchanged;
+  - renamed the decode merge helper to `paged_prefill` semantics so the code no
+    longer claims this is continuation-only behavior.
+- Validation passed locally:
+  - `cargo test -p ferrum-models qwen35_unified_forward -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_fresh_prefill_initial_state_slabs_are_zero_not_gathered -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - source/hot-path progress only; this is intended to remove the split fresh
+    prefill + decode forward in chunked mixed frames, but CUDA correctness and
+    performance still require a reachable 1x4090;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ52 — Runtime chunked prefill stays on unified path
 
 - Scope:
