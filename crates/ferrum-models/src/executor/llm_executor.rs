@@ -1497,6 +1497,37 @@ mod tests {
     }
 
     #[test]
+    fn unified_decode_forwards_prefill_logits_policy_to_unified_model() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let executor = recording_executor(calls.clone());
+        let mut batch = UnifiedBatch::new();
+        batch.items.push(UnifiedBatchItem {
+            seq_id: "prefill-cache".to_string(),
+            q_tokens: vec![1, 2, 3],
+            kv_cache: test_kv_handle("prefill-cache", 0),
+            recurrent_state: None,
+            pos_offset: 0,
+            is_final_chunk: true,
+            metadata: HashMap::new(),
+            logits_policy: ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
+                token_mask: None,
+                repetition_penalty: None,
+            },
+        });
+
+        let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
+
+        assert_eq!(output[0].as_ref().unwrap().len(), 4);
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 1);
+        assert_eq!(
+            calls.unified_forward_policy_requires_full,
+            vec![vec![false]]
+        );
+        assert!(calls.decode_batch_force_full_logits.is_empty());
+    }
+
+    #[test]
     fn batch_decode_forwards_logits_policy_to_unified_model() {
         let calls = Arc::new(Mutex::new(RecordingCalls::default()));
         let executor = recording_executor(calls.clone());
