@@ -116,6 +116,11 @@ adding model-name defaults or hidden environment switches.
   already used `decode_batch_with_logits_policy`; this closes the no-policy
   unified gap for decode-only batches using model-side greedy argmax, token
   masks, or sparse repetition penalties.
+- Fresh Qwen3.5 batch prefill now has a policy-aware entry point and
+  `forward_stateful_unified_items` derives logits return policy for final fresh
+  prefill rows. Product unified first-token generation can therefore return
+  model-side greedy argmax sentinels when policy-compatible, instead of forcing
+  full vocab logits readback for fresh final prefill.
 
 The key vLLM reference is:
 
@@ -174,6 +179,8 @@ cargo test -p ferrum-models \
   batch_decode_forwards_logits_policy_to_unified_model -- --nocapture
 cargo test -p ferrum-models \
   unified_decode_forwards_logits_policy_to_unified_model -- --nocapture
+cargo test -p ferrum-models \
+  unified_decode_forwards_prefill_logits_policy_to_unified_model -- --nocapture
 cargo check -p ferrum-models
 cargo fmt --all -- --check
 git diff --check
@@ -286,6 +293,10 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   argmax behavior as `unified_decode`; if masked/repetition-penalty decode
   correctness differs between the two product paths, inspect executor policy
   construction before changing model kernels.
+- Fresh final prefill in unified batches should also show policy-aware argmax
+  when the request is greedy-compatible; if first-token profiles still show
+  full vocab readback for ordinary greedy requests, inspect the engine-side
+  `LogitsReturnPolicy` attached to prefill work before changing Qwen3.5 kernels.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly

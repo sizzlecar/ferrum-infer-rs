@@ -2,6 +2,31 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ50 — Qwen35 fresh prefill can honor logits policies
+
+- Scope:
+  - added a policy-aware fresh prefill batch entry for Qwen3.5:
+    `forward_stateful_prefill_batch_with_logits_return`;
+  - `forward_stateful_unified_items` now derives logits return policy for final
+    fresh prefill rows from the caller's `LogitsReturnPolicy`, matching the
+    policy-aware continuation batch path added in ZZZ48;
+  - this lets product unified prefill return model-side greedy argmax
+    sentinels for first-token generation when the request policy allows it,
+    instead of always forcing full vocab logits readback;
+  - added an executor regression proving a final fresh prefill item carries
+    `GreedyArgmax` policy into the unified model boundary.
+- Validation passed locally:
+  - `cargo check -p ferrum-models`;
+  - `cargo test -p ferrum-models unified_decode_forwards_prefill_logits_policy_to_unified_model -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_try_argmax_logits_rows_returns_policy_sentinel -- --nocapture`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - source progress only; CPU tests prove policy forwarding and the shared
+    logits-return helper, but CUDA correctness/performance still needs 1x4090;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ49 — batch_decode unified path forwards logits policy
 
 - Scope:

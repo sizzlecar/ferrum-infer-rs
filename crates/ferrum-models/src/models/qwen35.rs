@@ -1797,6 +1797,17 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         &mut self,
         items: &[(String, Vec<u32>, usize, bool)],
     ) -> Result<Vec<Option<Vec<f32>>>> {
+        self.forward_stateful_prefill_batch_with_logits_return(
+            items,
+            Qwen35DecodeLogitsReturn::Full,
+        )
+    }
+
+    fn forward_stateful_prefill_batch_with_logits_return(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        logits_return: Qwen35DecodeLogitsReturn<'_>,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -1857,12 +1868,8 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             })?;
             states.push((cache_id.clone(), state));
         }
-        let result = self.forward_stateful_prefill_batch_taken(
-            items,
-            &mut states,
-            true,
-            Qwen35DecodeLogitsReturn::Full,
-        );
+        let result =
+            self.forward_stateful_prefill_batch_taken(items, &mut states, true, logits_return);
         let success = result.is_ok();
         for ((cache_id, mut state), (_, tokens, _, _)) in states.into_iter().zip(items.iter()) {
             if success {
@@ -2311,7 +2318,24 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         }
 
         if !fresh_prefill.is_empty() {
-            let rows = self.forward_stateful_prefill_batch(&fresh_prefill)?;
+            let fresh_final_policies = if policies.len() == items.len() {
+                fresh_rows
+                    .iter()
+                    .filter_map(|&row| items[row].3.then(|| policies[row].clone()))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let logits_return = if fresh_final_policies.is_empty() {
+                Qwen35DecodeLogitsReturn::Full
+            } else {
+                qwen35_decode_logits_return_from_policies(
+                    &fresh_final_policies,
+                    fresh_final_policies.len(),
+                )
+            };
+            let rows = self
+                .forward_stateful_prefill_batch_with_logits_return(&fresh_prefill, logits_return)?;
             for (row, logits) in fresh_rows.into_iter().zip(rows) {
                 out[row] = logits;
             }
