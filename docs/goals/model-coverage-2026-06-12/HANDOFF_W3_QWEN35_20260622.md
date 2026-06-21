@@ -205,6 +205,11 @@ adding model-name defaults or hidden environment switches.
   `intended_status=stopped`; no remote SSH/build/gate command ran. Sanitized
   artifact:
   `artifacts/w3_qwen35_cuda_current_sha_7ba1f415_start_20260621T214634Z/summary.json`.
+- A follow-up read-only Vast inventory/credit check saved
+  `artifacts/w3_qwen35_vast_credit_inventory_20260622T0554CST/summary.json`.
+  It reports `credit=0`, negative balance state, and only the stopped/exited
+  cached 1x4090 instance. Do not create replacement instances until credit is
+  restored.
 - While the GPU lane was unavailable, the local evidence pipeline was checked:
   `w3_qwen35_real_product_report.py --self-test`,
   `w3_l2_quantized_gate.py --self-test`, `w3_l4_agent_gate.py --self-test`,

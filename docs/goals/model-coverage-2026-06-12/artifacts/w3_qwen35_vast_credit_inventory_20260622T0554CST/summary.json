@@ -1,0 +1,23 @@
+{
+  "balance_state": "negative",
+  "billing_creditonly": 1,
+  "conclusion": "Do not create replacement Vast instances until credit is restored; cached 1x4090 is stopped/exited.",
+  "credit": 0,
+  "generated_at": "2026-06-22T05:54:42.127268+08:00",
+  "instance_count": 1,
+  "instances": [
+    {
+      "actual_status": "exited",
+      "cur_state": "stopped",
+      "dph_total": 0.662962962962963,
+      "gpu_name": "RTX 4090",
+      "id": 41422823,
+      "intended_status": "stopped",
+      "num_gpus": 1,
+      "ssh_host": "ssh7.vast.ai",
+      "ssh_port": 22822
+    }
+  ],
+  "source": "read-only Vast API queries",
+  "status": "external_credit_blocker"
+}

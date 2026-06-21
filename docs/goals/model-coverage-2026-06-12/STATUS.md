@@ -22,6 +22,11 @@
   - `PUT state=running` returned an empty response object, and a follow-up API
     query still reported `cur_state=stopped`, `actual_status=exited`,
     `intended_status=stopped`;
+  - read-only credit/inventory artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_vast_credit_inventory_20260622T0554CST/summary.json`;
+  - that read-only check reported `credit=0`, negative balance state, and only
+    the stopped/exited `41422823` instance, so replacement rental attempts must
+    stop until credit is restored;
   - no remote SSH, build, correctness gate, or CUDA benchmark command ran.
 - Local validator health checks passed while the GPU lane was unavailable:
   - `python3 scripts/release/w3_qwen35_real_product_report.py --self-test`;
