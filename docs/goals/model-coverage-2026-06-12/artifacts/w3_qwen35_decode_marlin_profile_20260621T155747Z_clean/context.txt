@@ -1,0 +1,9 @@
+lane=W3 Qwen35 c32 decode+marlin profile diagnostic
+started_utc=2026-06-21T15:57:47Z
+head=4a0fdbfc640b24534330c2844ba9ee3ee8f09652
+branch=goal/w2-w3-release-grade
+source_diff_stat_begin
+source_diff_stat_end
+model=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+dataset=/workspace/artifacts/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja/dataset/ascii_sharegpt_w3_100_58d5721d.jsonl
+port=18333

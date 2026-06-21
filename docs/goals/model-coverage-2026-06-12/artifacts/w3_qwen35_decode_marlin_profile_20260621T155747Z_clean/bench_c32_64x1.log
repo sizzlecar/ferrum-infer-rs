@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=64 warmup=8 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/1 (72 prompts including 8 warmup)
+    64 completed / 0 errored / 4.5s
+    summary c=32 (n_repeats=1, no CI)
+      TTFT_ms  p50=744.7  p95=1141.0  p99=1141.4
+      TPOT_ms  p50=31.1  p95=36.4  p99=48.2
+      ITL_ms   p50=22.0  p95=24.8  p99=243.4
+      throughput      629.5 tok/s
+      goodput         14.14 req/s
+
+→ wrote /workspace/artifacts/w3_qwen35_decode_marlin_profile_20260621T155747Z_clean/bench_c32_64x1.json

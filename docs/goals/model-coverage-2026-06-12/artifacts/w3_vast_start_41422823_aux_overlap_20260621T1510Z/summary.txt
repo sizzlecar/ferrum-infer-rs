@@ -1,0 +1,5 @@
+instance_id=41422823
+final_cur_state=running
+final_actual_status=running
+ssh_host=ssh7.vast.ai
+ssh_port=22822
