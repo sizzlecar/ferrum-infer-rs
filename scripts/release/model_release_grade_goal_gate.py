@@ -146,26 +146,38 @@ def non_empty_string(value: Any, label: str, problems: list[str]) -> str | None:
     return value
 
 
-def artifact_candidates(raw: str, out_dir: Path) -> list[Path]:
+def artifact_candidates(raw: str, out_dir: Path, base_dir: Path | None = None) -> list[Path]:
     path = Path(raw)
     if path.is_absolute():
         return [path]
-    return [REPO_ROOT / path, out_dir / path]
+    candidates = []
+    if base_dir is not None:
+        candidates.append(base_dir / path)
+    candidates.extend([REPO_ROOT / path, out_dir / path])
+    return candidates
 
 
-def require_artifact(raw: Any, label: str, out_dir: Path, problems: list[str]) -> None:
+def require_artifact(
+    raw: Any,
+    label: str,
+    out_dir: Path,
+    problems: list[str],
+    *,
+    base_dir: Path | None = None,
+) -> None:
     if not isinstance(raw, str) or not raw:
         problems.append(f"{label} artifact path must be a non-empty string")
         return
-    if not any(candidate.exists() for candidate in artifact_candidates(raw, out_dir)):
-        candidates = ", ".join(str(candidate) for candidate in artifact_candidates(raw, out_dir))
+    candidates = artifact_candidates(raw, out_dir, base_dir)
+    if not any(candidate.exists() for candidate in candidates):
+        candidates = ", ".join(str(candidate) for candidate in candidates)
         problems.append(f"{label} artifact missing: {raw} (checked {candidates})")
 
 
-def existing_artifact_path(raw: Any, out_dir: Path) -> Path | None:
+def existing_artifact_path(raw: Any, out_dir: Path, base_dir: Path | None = None) -> Path | None:
     if not isinstance(raw, str) or not raw:
         return None
-    for candidate in artifact_candidates(raw, out_dir):
+    for candidate in artifact_candidates(raw, out_dir, base_dir):
         if candidate.exists():
             return candidate
     return None
@@ -196,6 +208,8 @@ def validate_evidence_entry(
     label: str,
     out_dir: Path,
     problems: list[str],
+    *,
+    base_dir: Path | None = None,
 ) -> None:
     obj = entry if isinstance(entry, dict) else None
     if obj is not None:
@@ -206,7 +220,7 @@ def validate_evidence_entry(
     if not paths:
         problems.append(f"{label} must reference at least one artifact")
     for idx, raw in enumerate(paths):
-        require_artifact(raw, f"{label}[{idx}]", out_dir, problems)
+        require_artifact(raw, f"{label}[{idx}]", out_dir, problems, base_dir=base_dir)
 
 
 def command_parts(value: Any, label: str, problems: list[str]) -> list[str]:
@@ -663,31 +677,41 @@ def validate_product_command(
             problems.append(f"{label} command uses hidden env override: {part.split('=', 1)[0]}")
 
 
-def load_first_artifact_object(
+def load_first_artifact_object_with_path(
     entry: Any,
     label: str,
     out_dir: Path,
     problems: list[str],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], Path | None]:
     artifacts = evidence_artifact_values(
         entry,
         label,
         problems,
     )
     if not artifacts:
-        return {}
+        return {}, None
     artifact_path = existing_artifact_path(artifacts[0], out_dir)
     if artifact_path is None:
-        return {}
+        return {}, None
     try:
         return as_object(
             load_json(artifact_path),
             f"{label}.artifact",
             problems,
-        )
+        ), artifact_path
     except ValidationError as exc:
         problems.append(f"{label} invalid JSON: {exc}")
-        return {}
+        return {}, artifact_path
+
+
+def load_first_artifact_object(
+    entry: Any,
+    label: str,
+    out_dir: Path,
+    problems: list[str],
+) -> dict[str, Any]:
+    data, _artifact_path = load_first_artifact_object_with_path(entry, label, out_dir, problems)
+    return data
 
 
 def require_pass_line_prefix(
@@ -1166,9 +1190,10 @@ def validate_numeric_comparison(
 
 def validate_w3_s1_single_layer_artifact(entry: Any, out_dir: Path, problems: list[str]) -> None:
     label = "correctness.w3_s1_single_layer"
-    data = load_first_artifact_object(entry, label, out_dir, problems)
+    data, artifact_path = load_first_artifact_object_with_path(entry, label, out_dir, problems)
     if not data:
         return
+    artifact_base_dir = artifact_path.parent if artifact_path is not None else None
 
     if data.get("status") != "pass":
         problems.append(f"{label}.status must be pass")
@@ -1182,9 +1207,15 @@ def validate_w3_s1_single_layer_artifact(entry: Any, out_dir: Path, problems: li
 
     reference_dump = non_empty_string(data.get("reference_dump"), f"{label}.reference_dump", problems)
     ferrum_dump = non_empty_string(data.get("ferrum_dump"), f"{label}.ferrum_dump", problems)
-    if reference_dump is not None and existing_artifact_path(reference_dump, out_dir) is None:
+    if (
+        reference_dump is not None
+        and existing_artifact_path(reference_dump, out_dir, artifact_base_dir) is None
+    ):
         problems.append(f"{label}.reference_dump artifact missing: {reference_dump}")
-    if ferrum_dump is not None and existing_artifact_path(ferrum_dump, out_dir) is None:
+    if (
+        ferrum_dump is not None
+        and existing_artifact_path(ferrum_dump, out_dir, artifact_base_dir) is None
+    ):
         problems.append(f"{label}.ferrum_dump artifact missing: {ferrum_dump}")
 
     checks = as_object(data.get("checks"), f"{label}.checks", problems)
@@ -1227,9 +1258,10 @@ def validate_w3_s1_single_layer_artifact(entry: Any, out_dir: Path, problems: li
 
 def validate_w3_s2_product_artifact(entry: Any, out_dir: Path, problems: list[str]) -> None:
     label = "correctness.w3_s2_whole_model_product_path"
-    data = load_first_artifact_object(entry, label, out_dir, problems)
+    data, artifact_path = load_first_artifact_object_with_path(entry, label, out_dir, problems)
     if not data:
         return
+    artifact_base_dir = artifact_path.parent if artifact_path is not None else None
 
     label = "correctness.w3_s2_whole_model_product_path"
     if data.get("status") != "pass":
@@ -1271,9 +1303,21 @@ def validate_w3_s2_product_artifact(entry: Any, out_dir: Path, problems: list[st
             if not isinstance(content, str) or not content.strip():
                 problems.append(f"{label}.ferrum_run.content must be non-empty")
         if "stdout" in run_entry:
-            validate_evidence_entry(run_entry["stdout"], f"{label}.ferrum_run.stdout", out_dir, problems)
+            validate_evidence_entry(
+                run_entry["stdout"],
+                f"{label}.ferrum_run.stdout",
+                out_dir,
+                problems,
+                base_dir=artifact_base_dir,
+            )
         if "stderr" in run_entry:
-            validate_evidence_entry(run_entry["stderr"], f"{label}.ferrum_run.stderr", out_dir, problems)
+            validate_evidence_entry(
+                run_entry["stderr"],
+                f"{label}.ferrum_run.stderr",
+                out_dir,
+                problems,
+                base_dir=artifact_base_dir,
+            )
 
     serve_entry = as_object(
         product.get("ferrum_serve"),
@@ -1291,7 +1335,13 @@ def validate_w3_s2_product_artifact(entry: Any, out_dir: Path, problems: list[st
         if serve_command:
             validate_product_command(serve_command, f"{label}.ferrum_serve", "serve", problems)
         if "log" in serve_entry:
-            validate_evidence_entry(serve_entry["log"], f"{label}.ferrum_serve.log", out_dir, problems)
+            validate_evidence_entry(
+                serve_entry["log"],
+                f"{label}.ferrum_serve.log",
+                out_dir,
+                problems,
+                base_dir=artifact_base_dir,
+            )
         nonstream = as_object(
             serve_entry.get("nonstream"),
             f"{label}.ferrum_serve.nonstream",
@@ -1307,6 +1357,7 @@ def validate_w3_s2_product_artifact(entry: Any, out_dir: Path, problems: list[st
                     f"{label}.ferrum_serve.nonstream.artifact",
                     out_dir,
                     problems,
+                    base_dir=artifact_base_dir,
                 )
         stream = as_object(serve_entry.get("stream"), f"{label}.ferrum_serve.stream", problems)
         if stream:
@@ -1325,6 +1376,7 @@ def validate_w3_s2_product_artifact(entry: Any, out_dir: Path, problems: list[st
                     f"{label}.ferrum_serve.stream.artifact",
                     out_dir,
                     problems,
+                    base_dir=artifact_base_dir,
                 )
 
 
@@ -2326,6 +2378,56 @@ def run_selftest() -> int:
         good_w3_problems = validate_manifest(load_json(good_w3_manifest), "w3", good_w3)
         if good_w3_problems:
             raise AssertionError("good W3 selftest manifest failed: " + "; ".join(good_w3_problems))
+
+        good_w3_nested_s2 = tmp_root / "good-w3-nested-s2"
+        good_w3_nested_s2_manifest = write_selftest_manifest(
+            good_w3_nested_s2,
+            lane="w3",
+            ratio=0.82,
+        )
+        nested_s2_dir = good_w3_nested_s2 / "nested_s2"
+        nested_s2_dir.mkdir()
+        (nested_s2_dir / "nested_run_stdout.jsonl").write_text(
+            '{"role":"assistant","content":"ok"}\n',
+            encoding="utf-8",
+        )
+        (nested_s2_dir / "nested_run_stderr.txt").write_text("", encoding="utf-8")
+        (nested_s2_dir / "nested_serve.log").write_text("nested serve log\n", encoding="utf-8")
+        write_json(
+            nested_s2_dir / "nested_serve_nonstream.json",
+            {"choices": [{"message": {"content": "ok"}}]},
+        )
+        (nested_s2_dir / "nested_serve_stream.sse").write_text(
+            'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+            'data: {"usage":{"completion_tokens":1}}\n\n'
+            "data: [DONE]\n\n",
+            encoding="utf-8",
+        )
+        nested_s2 = load_json(good_w3_nested_s2 / "w3_s2_whole_model_product_path.json")
+        nested_s2["product_entrypoints"]["ferrum_run"]["stdout"] = "nested_run_stdout.jsonl"
+        nested_s2["product_entrypoints"]["ferrum_run"]["stderr"] = "nested_run_stderr.txt"
+        nested_s2["product_entrypoints"]["ferrum_serve"]["log"] = "nested_serve.log"
+        nested_s2["product_entrypoints"]["ferrum_serve"]["nonstream"]["artifact"] = (
+            "nested_serve_nonstream.json"
+        )
+        nested_s2["product_entrypoints"]["ferrum_serve"]["stream"]["artifact"] = (
+            "nested_serve_stream.sse"
+        )
+        write_json(nested_s2_dir / "w3_s2_whole_model_product_path.json", nested_s2)
+        nested_manifest = load_json(good_w3_nested_s2_manifest)
+        nested_manifest["correctness"]["w3_s2_whole_model_product_path"]["artifact"] = (
+            "nested_s2/w3_s2_whole_model_product_path.json"
+        )
+        write_json(good_w3_nested_s2_manifest, nested_manifest)
+        good_w3_nested_s2_problems = validate_manifest(
+            load_json(good_w3_nested_s2_manifest),
+            "w3",
+            good_w3_nested_s2,
+        )
+        if good_w3_nested_s2_problems:
+            raise AssertionError(
+                "good W3 nested S2 selftest failed: " + "; ".join(good_w3_nested_s2_problems)
+            )
 
         bad_w3_pass_line = tmp_root / "bad-w3-pass-line"
         bad_w3_pass_line_manifest = write_selftest_manifest(

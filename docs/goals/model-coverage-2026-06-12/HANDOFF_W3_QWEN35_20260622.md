@@ -10,12 +10,39 @@
   and L5 zero-error concurrency.
 - Current W3 L1 numeric/reference evidence is
   `docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058/w3_l1_numeric.json`.
+- Current L0-L5 and S0/S1/S2 artifacts pass direct final-validator probes.
+  A temporary full W3 manifest probe now reaches only the performance checks.
 - Performance remains below the W3 80% vLLM target. The accepted vLLM c32 mean
   baseline is `1708.52785 output tok/s`, so the 80% target is
   `1366.82228 output tok/s`. Recent Ferrum c32 diagnostics have been around
   `629-695 output tok/s`.
 
 ## Latest Source Progress
+
+### 2026-06-22 Final Manifest Probe Reaches Performance Blocker
+
+- `scripts/release/model_release_grade_goal_gate.py` now resolves nested
+  artifacts relative to the loaded artifact's directory, in addition to repo
+  root and final out dir.
+- This fixes real W3 S2 validation for artifacts that record files such as
+  `run_stdout.jsonl`, `serve.log`, and streamed response files relative to the
+  S2 artifact directory.
+- Added a final-validator self-test that puts S2 and its nested evidence under
+  a subdirectory and requires the W3 self-test manifest to pass.
+- Validation passed locally:
+  `python3 scripts/release/model_release_grade_goal_gate.py --self-test`,
+  `python3 scripts/release/model_release_grade_manifest.py --self-test`, a
+  real S2 artifact path-resolution probe, a real S0/S1/S2 final-validator
+  probe, Python compile, and `git diff --check`.
+- A temporary W3 final manifest probe using current L0-L5, S0/S1/S2, the
+  historical vLLM ShareGPT baseline, and the W3 L4/L5 Ferrum performance
+  matrix reached performance evaluation and failed only on the expected eight
+  performance items: c1/c4/c16/c32 throughput ratio below `0.800` and
+  c1/c4/c16/c32 p95 ITL above `1.25x` baseline.
+- The diagnostic ratios from that probe were c1 `0.396989`, c4 `0.224899`,
+  c16 `0.115835`, and c32 `0.081663`.
+- W3 is still incomplete. The probe is a blocker diagnosis, not release
+  evidence or a performance claim.
 
 ### 2026-06-22 L1 Numeric Artifact Regenerated
 
