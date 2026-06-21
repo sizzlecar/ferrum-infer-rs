@@ -19,6 +19,10 @@ use ferrum_interfaces::{
     RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
     RecurrentStateManagerStats, RecurrentStateSpec,
 };
+#[cfg(feature = "cuda")]
+use ferrum_kernels::backend::cuda::marlin::{
+    drain_marlin_profile_by_projection, MarlinProfileBucketStats,
+};
 use ferrum_kernels::backend::{AttnConfig, Backend, BackendPagedKv, Dtype, KvCache, MoeLlmBackend};
 use ferrum_quantization::{Linear, NativeSafetensorsLoader, StackedExpertLinear, WeightLoader};
 use ferrum_types::{DataType, Device, FerrumError, RequestId, Result};
@@ -2618,6 +2622,59 @@ fn qwen35_detail_profile_stage_finish<B: Backend>(
     .unwrap_or(0)
 }
 
+#[cfg(feature = "cuda")]
+fn qwen35_marlin_bucket_json(stats: MarlinProfileBucketStats) -> serde_json::Value {
+    serde_json::json!({
+        "ws_zero_us": stats.ws_zero_us,
+        "ws_zero_calls": stats.ws_zero_calls,
+        "gather_us": stats.gather_us,
+        "gather_calls": stats.gather_calls,
+        "kernel_us": stats.kernel_us,
+        "kernel_calls": stats.kernel_calls,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn qwen35_marlin_bucket_text(label: &str, stats: MarlinProfileBucketStats) -> String {
+    format!(
+        "{label}[ws={}us/{} gather={}us/{} kernel={}us/{}]",
+        stats.ws_zero_us,
+        stats.ws_zero_calls,
+        stats.gather_us,
+        stats.gather_calls,
+        stats.kernel_us,
+        stats.kernel_calls
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn qwen35_drain_marlin_projection_profile() -> (String, serde_json::Value) {
+    let profile = drain_marlin_profile_by_projection();
+    let text = [
+        qwen35_marlin_bucket_text("marlin_qkv", profile.qkv),
+        qwen35_marlin_bucket_text("marlin_o", profile.o_proj),
+        qwen35_marlin_bucket_text("marlin_gate_up", profile.gate_up),
+        qwen35_marlin_bucket_text("marlin_down", profile.down),
+        qwen35_marlin_bucket_text("marlin_lm_head", profile.lm_head),
+        qwen35_marlin_bucket_text("marlin_other", profile.other),
+    ]
+    .join(" ");
+    let json = serde_json::json!({
+        "qkv": qwen35_marlin_bucket_json(profile.qkv),
+        "o_proj": qwen35_marlin_bucket_json(profile.o_proj),
+        "gate_up": qwen35_marlin_bucket_json(profile.gate_up),
+        "down": qwen35_marlin_bucket_json(profile.down),
+        "lm_head": qwen35_marlin_bucket_json(profile.lm_head),
+        "other": qwen35_marlin_bucket_json(profile.other),
+    });
+    (text, json)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn qwen35_drain_marlin_projection_profile() -> (String, serde_json::Value) {
+    ("marlin=unavailable".to_string(), serde_json::json!({}))
+}
+
 impl Qwen35LinearDecodeDetailProfile {
     fn log(&self, layer_index: usize, batch: usize, used_indexed: bool) {
         let event = QWEN35_LINEAR_DECODE_DETAIL_PROFILE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3001,6 +3058,7 @@ impl Qwen35DecodeProfile {
 
     fn log(&self, batch: usize, total_layers: usize, logits_return: &'static str) {
         let call = QWEN35_DECODE_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let (marlin_text, marlin_json) = qwen35_drain_marlin_projection_profile();
         if call > 16 && call % 32 != 0 {
             return;
         }
@@ -3011,7 +3069,7 @@ impl Qwen35DecodeProfile {
             "[qwen35-decode-prof] call#{} batch={} logits_return={} layers={} \
              linear_layers={} full_layers={} embedding={}us layer_sum={}us \
              linear_layer_sum={}us full_layer_sum={}us final_sum={}us final_norm={}us \
-             lm_head={}us argmax={}us readback={}us slow_layers={:?}",
+             lm_head={}us argmax={}us readback={}us slow_layers={:?} {}",
             call,
             batch,
             logits_return,
@@ -3028,6 +3086,7 @@ impl Qwen35DecodeProfile {
             self.argmax_us,
             self.readback_us,
             self.slow_layers,
+            marlin_text,
         );
 
         let profile = ferrum_bench_core::global_profile();
@@ -3064,6 +3123,7 @@ impl Qwen35DecodeProfile {
                     "argmax": self.argmax_us,
                     "readback": self.readback_us,
                     "slow_layers": slow_layers,
+                    "marlin": marlin_json,
                 })),
                 false,
             );

@@ -8,8 +8,32 @@
 use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 use ferrum_kernels::Linear;
 use ferrum_kernels::LinearMetadata;
+#[cfg(feature = "cuda")]
+use ferrum_kernels::LinearProjectionRole;
 use ferrum_types::Result;
 use std::sync::Arc;
+
+#[cfg(feature = "cuda")]
+fn cuda_marlin_profile_label(metadata: LinearMetadata) -> Option<&'static str> {
+    match metadata.role? {
+        LinearProjectionRole::Qkv
+        | LinearProjectionRole::Query
+        | LinearProjectionRole::Key
+        | LinearProjectionRole::Value
+        | LinearProjectionRole::GdnQkv
+        | LinearProjectionRole::GdnZ
+        | LinearProjectionRole::GdnQkvz => Some("gptq.linear.qkv_proj"),
+        LinearProjectionRole::Output => Some("gptq.linear.o_proj"),
+        LinearProjectionRole::GateUp | LinearProjectionRole::Gate | LinearProjectionRole::Up => {
+            Some("gptq.linear.gate_up_proj")
+        }
+        LinearProjectionRole::Down => Some("gptq.linear.down_proj"),
+        LinearProjectionRole::LmHead => Some("gptq.linear.lm_head"),
+        LinearProjectionRole::GdnB | LinearProjectionRole::GdnA | LinearProjectionRole::GdnBa => {
+            Some("gptq.linear.other_proj")
+        }
+    }
+}
 
 /// GPTQ-format Linear projection, polymorphic over backend.
 ///
@@ -109,6 +133,13 @@ impl<B: Backend + BackendQuantMarlin> Linear<B> for GptqLinear<B> {
     }
 
     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize) {
+        #[cfg(feature = "cuda")]
+        let _cuda_alloc_label = if ferrum_kernels::backend::cuda::marlin::profile_marlin() {
+            cuda_marlin_profile_label(self.metadata())
+                .map(ferrum_kernels::backend::cuda::push_alloc_label)
+        } else {
+            None
+        };
         self.inner.forward(ctx, input, out, m);
     }
 }

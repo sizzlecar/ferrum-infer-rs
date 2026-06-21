@@ -1,0 +1,12 @@
+lane=W3 Qwen35 cleanup c32 100x1 diagnostic
+started_utc=2026-06-21T12:15:47Z
+head=17d8eb38a958e2c166c140f025f25c6fed783b78
+status_short_begin<<STATUS
+ M crates/ferrum-kernels/src/backend/cuda/marlin.rs
+ M crates/ferrum-models/src/models/qwen35.rs
+ M crates/ferrum-models/src/moe/dispatch.rs
+ M crates/ferrum-quantization/src/gptq.rs
+STATUS
+model=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+dataset=/workspace/artifacts/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja/dataset/ascii_sharegpt_w3_100_58d5721d.jsonl
+port=18262
