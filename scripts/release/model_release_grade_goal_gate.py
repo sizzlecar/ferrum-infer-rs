@@ -383,6 +383,131 @@ def validate_bench_command(
             problems.append(f"{label} command uses hidden env override: {part.split('=', 1)[0]}")
 
 
+def command_output_len(
+    parts: list[str],
+    label: str,
+    problems: list[str],
+    *,
+    require_ignore_eos: bool,
+) -> int | None:
+    if require_ignore_eos and not has_flag(parts, "--ignore-eos"):
+        problems.append(f"{label} command missing --ignore-eos")
+    raw = flag_value(parts, "--random-output-len")
+    if raw is None:
+        problems.append(f"{label} command missing --random-output-len")
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError:
+        problems.append(f"{label} command --random-output-len must be integer, got {raw!r}")
+        return None
+    if parsed <= 0:
+        problems.append(f"{label} command --random-output-len must be > 0")
+        return None
+    return parsed
+
+
+def int_matrix(value: Any, label: str, problems: list[str]) -> list[list[int]] | None:
+    if not isinstance(value, list):
+        problems.append(f"{label} must be a list of integer lists")
+        return None
+    out: list[list[int]] = []
+    for row_idx, row in enumerate(value):
+        if not isinstance(row, list):
+            problems.append(f"{label}[{row_idx}] must be an integer list")
+            return None
+        parsed_row: list[int] = []
+        for col_idx, item in enumerate(row):
+            if isinstance(item, bool) or not isinstance(item, int):
+                problems.append(f"{label}[{row_idx}][{col_idx}] must be an integer")
+                return None
+            parsed_row.append(item)
+        out.append(parsed_row)
+    return out
+
+
+def validate_output_token_matrix(
+    matrix: list[list[int]] | None,
+    label: str,
+    *,
+    n_repeats: int | None,
+    requests: int | None,
+    expected_tokens: int | None,
+    problems: list[str],
+) -> None:
+    if matrix is None:
+        return
+    if n_repeats is not None and len(matrix) != n_repeats:
+        problems.append(f"{label} length must equal n_repeats")
+    for row_idx, row in enumerate(matrix):
+        if requests is not None and len(row) != requests:
+            problems.append(f"{label}[{row_idx}] length must equal requests_per_run")
+        if expected_tokens is not None:
+            bad = [value for value in row if value != expected_tokens]
+            if bad:
+                problems.append(
+                    f"{label}[{row_idx}] must equal --random-output-len {expected_tokens}"
+                )
+
+
+def validate_w3_fixed_output_contract(
+    cell: dict[str, Any],
+    label: str,
+    *,
+    command: list[str],
+    baseline_command: list[str],
+    n_repeats: int | None,
+    requests: int | None,
+    baseline_n_repeats: int | None,
+    baseline_requests: int | None,
+    problems: list[str],
+) -> None:
+    expected = command_output_len(
+        command,
+        label,
+        problems,
+        require_ignore_eos=True,
+    )
+    baseline_expected = command_output_len(
+        baseline_command,
+        f"{label}.baseline",
+        problems,
+        require_ignore_eos=False,
+    )
+    if expected is not None and baseline_expected is not None and expected != baseline_expected:
+        problems.append(
+            f"{label}.baseline command --random-output-len={baseline_expected}, "
+            f"expected {expected}"
+        )
+
+    ferrum_tokens = int_matrix(
+        cell.get("output_tokens_per_request"),
+        f"{label}.output_tokens_per_request",
+        problems,
+    )
+    baseline_tokens = int_matrix(
+        cell.get("baseline_output_tokens_per_request"),
+        f"{label}.baseline_output_tokens_per_request",
+        problems,
+    )
+    validate_output_token_matrix(
+        ferrum_tokens,
+        f"{label}.output_tokens_per_request",
+        n_repeats=n_repeats,
+        requests=requests,
+        expected_tokens=expected,
+        problems=problems,
+    )
+    validate_output_token_matrix(
+        baseline_tokens,
+        f"{label}.baseline_output_tokens_per_request",
+        n_repeats=baseline_n_repeats,
+        requests=baseline_requests,
+        expected_tokens=expected,
+        problems=problems,
+    )
+
+
 def l5_command_parts(raw: Any, label: str, problems: list[str]) -> list[str]:
     if isinstance(raw, dict):
         if "command_line" in raw:
@@ -1568,6 +1693,8 @@ def validate_performance_cell(
     perf: dict[str, Any],
     out_dir: Path,
     problems: list[str],
+    *,
+    lane: str,
 ) -> int | None:
     concurrency = positive_int(
         cell.get("requested_concurrency", cell.get("concurrency")),
@@ -1685,6 +1812,18 @@ def validate_performance_cell(
             requests_per_run=baseline_requests,
             expected_concurrency=concurrency,
         )
+    if lane == "w3" and command and baseline_command:
+        validate_w3_fixed_output_contract(
+            cell,
+            label,
+            command=command,
+            baseline_command=baseline_command,
+            n_repeats=n_repeats,
+            requests=requests,
+            baseline_n_repeats=baseline_n_repeats,
+            baseline_requests=baseline_requests,
+            problems=problems,
+        )
 
     ferrum_metric = metric_from_cell(cell, problems, label)
     baseline_metric = baseline_tps_from_cell(cell, baseline, problems, label)
@@ -1712,7 +1851,12 @@ def validate_performance_cell(
     return concurrency
 
 
-def validate_performance(manifest: dict[str, Any], out_dir: Path, problems: list[str]) -> None:
+def validate_performance(
+    manifest: dict[str, Any],
+    lane: str,
+    out_dir: Path,
+    problems: list[str],
+) -> None:
     perf = as_object(manifest.get("performance"), "performance", problems)
     baseline = as_object(perf.get("baseline"), "performance.baseline", problems)
     for key in ["engine", "version", "build_command_line", "command_line"]:
@@ -1734,7 +1878,14 @@ def validate_performance(manifest: dict[str, Any], out_dir: Path, problems: list
         cell = as_object(raw_cell, f"performance.cells[{idx}]", problems)
         if not cell:
             continue
-        concurrency = validate_performance_cell(cell, baseline, perf, out_dir, problems)
+        concurrency = validate_performance_cell(
+            cell,
+            baseline,
+            perf,
+            out_dir,
+            problems,
+            lane=lane,
+        )
         if concurrency is not None:
             if concurrency in seen:
                 problems.append(f"performance has duplicate c={concurrency} cell")
@@ -1748,7 +1899,7 @@ def validate_manifest(data: dict[str, Any], lane: str, out_dir: Path) -> list[st
     problems: list[str] = []
     validate_top_level(data, lane, out_dir, problems)
     validate_correctness(data, lane, out_dir, problems)
-    validate_performance(data, out_dir, problems)
+    validate_performance(data, lane, out_dir, problems)
     return problems
 
 
@@ -2050,6 +2201,9 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
     ]:
         write_json(root / rel, {"status": "pass", "name": rel})
     cells = []
+    fixed_output_args = ["--random-output-len", "128"]
+    if lane == "w3":
+        fixed_output_args.append("--ignore-eos")
     for concurrency in sorted(REQUIRED_CONCURRENCY):
         effective = 16 if concurrency == 32 else concurrency
         cells.append(
@@ -2082,6 +2236,8 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
                 "baseline_stream_bulk_flush_per_run": [0, 0, 0],
                 "baseline_http_500_per_run": [0, 0, 0],
                 "baseline_panic_per_run": [0, 0, 0],
+                "output_tokens_per_request": [[128] * 100, [128] * 100, [128] * 100],
+                "baseline_output_tokens_per_request": [[128] * 100, [128] * 100, [128] * 100],
                 "output_token_count_source": "usage",
                 "stream_options_include_usage": True,
                 "baseline_output_token_count_source": "usage",
@@ -2107,6 +2263,7 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
                     "100",
                     "--n-repeats",
                     "3",
+                    *fixed_output_args,
                 ],
                 "baseline_bench_command_line": [
                     "ferrum",
@@ -2121,6 +2278,7 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
                     "100",
                     "--n-repeats",
                     "3",
+                    *fixed_output_args,
                 ],
                 "ferrum_output_tps_lcb": 100.0 * ratio,
                 "baseline_output_tps": 100.0,
@@ -2663,6 +2821,48 @@ def run_selftest() -> int:
         )
         if not any("ferrum_serve.stream.has_usage" in problem for problem in bad_w3_product_problems):
             raise AssertionError("bad W3 product no-usage selftest did not fail as expected")
+
+        bad_w3_ignore_eos = tmp_root / "bad-w3-missing-ignore-eos"
+        bad_w3_ignore_eos_manifest = write_selftest_manifest(
+            bad_w3_ignore_eos,
+            lane="w3",
+            ratio=0.82,
+        )
+        data = load_json(bad_w3_ignore_eos_manifest)
+        command = data["performance"]["cells"][0]["bench_command_line"]
+        command.remove("--ignore-eos")
+        write_json(bad_w3_ignore_eos_manifest, data)
+        bad_w3_ignore_eos_problems = validate_manifest(
+            data,
+            "w3",
+            bad_w3_ignore_eos,
+        )
+        if not any(
+            "performance.c1 command missing --ignore-eos" in problem
+            for problem in bad_w3_ignore_eos_problems
+        ):
+            raise AssertionError("bad W3 missing ignore-eos selftest did not fail as expected")
+
+        bad_w3_output_tokens = tmp_root / "bad-w3-output-tokens"
+        bad_w3_output_tokens_manifest = write_selftest_manifest(
+            bad_w3_output_tokens,
+            lane="w3",
+            ratio=0.82,
+        )
+        data = load_json(bad_w3_output_tokens_manifest)
+        data["performance"]["cells"][0]["output_tokens_per_request"][0][0] = 45
+        write_json(bad_w3_output_tokens_manifest, data)
+        bad_w3_output_tokens_problems = validate_manifest(
+            data,
+            "w3",
+            bad_w3_output_tokens,
+        )
+        if not any(
+            "performance.c1.output_tokens_per_request[0] must equal --random-output-len 128"
+            in problem
+            for problem in bad_w3_output_tokens_problems
+        ):
+            raise AssertionError("bad W3 output-token selftest did not fail as expected")
 
         bad = tmp_root / "bad-ratio"
         bad_manifest = write_selftest_manifest(bad, ratio=0.79)
