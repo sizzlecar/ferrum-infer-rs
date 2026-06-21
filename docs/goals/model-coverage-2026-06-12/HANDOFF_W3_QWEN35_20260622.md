@@ -15,6 +15,31 @@
 
 ## Latest Source Progress
 
+### 2026-06-22 L0-L5 PASS-Line Gate Hardening
+
+- `scripts/release/model_release_grade_goal_gate.py` now requires every W3
+  L0-L5 artifact loaded by the final validator to carry the official PASS line
+  prefix for that level:
+  `W3 L0 TEMPLATE PASS:`, `W3 L1 NUMERIC PASS:`,
+  `W3 L2 QUANTIZED PASS:`, `W3 L3 BEHAVIOR PASS:`,
+  `W3 L4 AGENT PASS:`, and `W3 L5 CONCURRENCY PASS:`.
+- `scripts/release/model_release_grade_manifest.py --self-test` fixtures were
+  updated to emit those pass lines.
+- A negative final-validator self-test now corrupts the L0 pass line and
+  verifies W3 final validation rejects it.
+- Validation passed locally:
+  `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py`,
+  `python3 scripts/release/model_release_grade_goal_gate.py --self-test`,
+  `python3 scripts/release/model_release_grade_manifest.py --self-test`, a
+  direct W3 L0-L5 common/pass-line probe across the existing real artifacts,
+  and `git diff --check`.
+- A stricter full-artifact probe of the existing
+  `w3_l1_numeric_qwen35_family_20260618` artifact still fails current final
+  validation because it lacks `coverage.full_attention_official_shape=true`.
+  Do not hand-edit that historical artifact; W3 needs a regenerated real L1
+  numeric artifact, or a valid newer L1 artifact, before the final gate can
+  pass.
+
 ### 2026-06-22 L3 Case-Level Gate Hardening
 
 - `scripts/release/model_release_grade_goal_gate.py` now validates W3 L3

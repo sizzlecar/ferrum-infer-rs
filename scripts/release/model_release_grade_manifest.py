@@ -985,6 +985,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
         {
             **common,
             "level": "l0_template",
+            "pass_line": "W3 L0 TEMPLATE PASS: selftest",
             "chat_template_golden": {
                 "cases_total": 5,
                 "cases_passed": 5,
@@ -1001,6 +1002,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
         {
             **common,
             "level": "l1_numeric",
+            "pass_line": "W3 L1 NUMERIC PASS: selftest",
             "numeric": {
                 "comparisons_total": 6,
                 "comparisons_passed": 6,
@@ -1027,6 +1029,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
         {
             **common,
             "level": "l2_quantized",
+            "pass_line": "W3 L2 QUANTIZED PASS: selftest",
             "quantized_semantics": {
                 "real_size_model": True,
                 "waived": False,
@@ -1064,6 +1067,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
         {
             **common,
             "level": "l3_behavior",
+            "pass_line": "W3 L3 BEHAVIOR PASS: selftest",
             "behavior": {
                 "cases_total": 7,
                 "cases_passed": 7,
@@ -1126,6 +1130,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
         {
             **common,
             "level": "l4_agent",
+            "pass_line": "W3 L4 AGENT PASS: selftest",
             "agent": {
                 "real_model": True,
                 "required_tool_enforced": True,
@@ -1166,6 +1171,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
         {
             **common,
             "level": "l5_concurrency",
+            "pass_line": "W3 L5 CONCURRENCY PASS: selftest",
             "commands": [
                 {
                     "command_line": [
