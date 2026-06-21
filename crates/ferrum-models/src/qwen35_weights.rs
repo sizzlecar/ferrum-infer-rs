@@ -615,6 +615,7 @@ fn role_accepts_quantized_linear_alias(role: &str) -> bool {
             | "mlp_up"
             | "mlp_down"
             | "moe_router"
+            | "moe_shared_expert_gate"
             | "moe_shared_expert_gate_proj"
             | "moe_shared_expert_up_proj"
             | "moe_shared_expert_down_proj"
@@ -920,6 +921,11 @@ mod tests {
                 .map(|tensor| tensor.name.as_str()),
             Some("model.layers.0.mlp.gate.qweight")
         );
+        assert_eq!(
+            plan.layer_tensor(0, "moe_shared_expert_gate")
+                .map(|tensor| tensor.name.as_str()),
+            Some("model.layers.0.mlp.shared_expert_gate.qweight")
+        );
 
         let loader = RecordingLoader::from_names(names);
         let planned = Qwen35WeightPlanLoader::<CpuBackend>::new(&plan, &loader);
@@ -927,6 +933,9 @@ mod tests {
         assert!(planned.has_layer_tensor(3, "self_attn_q"));
         planned.load_global_linear("lm_head").unwrap();
         planned.load_layer_linear(3, "self_attn_q").unwrap();
+        planned
+            .load_layer_linear(0, "moe_shared_expert_gate")
+            .unwrap();
         planned.load_layer_shared_expert_gate_up_linear(0).unwrap();
 
         assert_eq!(
@@ -934,6 +943,7 @@ mod tests {
             vec![
                 "model.lm_head".to_string(),
                 "model.layers.3.self_attn.q_proj".to_string(),
+                "model.layers.0.mlp.shared_expert_gate".to_string(),
                 "model.layers.0.mlp.shared_expert.gate_up_proj".to_string(),
             ]
         );

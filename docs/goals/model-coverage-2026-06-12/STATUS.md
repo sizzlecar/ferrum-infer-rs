@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ58 — Qwen35 shared expert gate uses linear loader
+
+- Scope:
+  - changed `Qwen35SparseMoeSharedExpertWeights::shared_expert_gate` from a raw
+    backend buffer to a `Linear`, matching vLLM's `ReplicatedLinear` modeling
+    for the one-output shared expert gate;
+  - both Qwen3.5 MoE backend paths now validate `shared_expert_gate` as
+    `hidden_size -> 1` and call `Linear::forward` instead of hand-running GEMM
+    over a raw tensor;
+  - `Qwen35ModelWeights::load` now loads `mlp.shared_expert_gate` through
+    `Qwen35WeightPlanLoader::load_layer_linear`, so dense weights and GPTQ
+    `.qweight/.scales/.qzeros` aliases use the same loader boundary as router
+    and shared expert projections;
+  - extended the GPTQ-required-linear manifest regression to include
+    `moe_shared_expert_gate`.
+- Validation passed locally:
+  - `cargo test -p ferrum-models qwen35_weights -- --nocapture`;
+  - `cargo test -p ferrum-models sparse_moe_shared_expert_composes_router_fused_experts_and_shared_gate -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - source/loader-boundary progress only; CUDA correctness/performance still
+    has not run;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ57 — Qwen35 weight plan accepts GPTQ-only required linears
 
 - Scope:
@@ -25,9 +52,8 @@
 - Status:
   - source/loader-boundary progress only; CUDA correctness/performance still
     has not run;
-  - `mlp.shared_expert_gate.weight` is still loaded as a raw tensor in Ferrum
-    and needs real-checkpoint confirmation or a follow-up linear-loader repair
-    if the GPTQ checkpoint quantizes that one-output gate;
+  - `mlp.shared_expert_gate.weight` was still loaded as a raw tensor at this
+    checkpoint; ZZZ58 moved it to the same linear-loader boundary;
   - W3 remains incomplete and there is still no
     `MODEL_RELEASE_GRADE_W3 PASS`.
 
