@@ -1,0 +1,6 @@
+date_utc=2026-06-20T08:49:46Z
+bench_kind=c32_tiled_100x1
+binary_sha256=6aa10496ef3d7c8358a74005946164cfe3a0b3f606955970898e83da32512ed3
+dataset=/workspace/artifacts/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja/dataset/ascii_sharegpt_w3_100_58d5721d.jsonl
+server=http://127.0.0.1:18180
+0, NVIDIA GeForce RTX 4090, GPU-42c92344-3195-9df2-4b65-884f1180fb3a, 49140, 28222, 0

@@ -1,0 +1,8 @@
+date_utc=2026-06-20T09:19:46Z
+git_head=1fa76a807d8a209fe900e190c1e52931a09a5319
+git_status_start
+## goal/w2-w3-release-grade...origin/goal/w2-w3-release-grade
+git_status_end
+binary_sha256=224877153020d5ce7b1a531bb61773069054ed2d237ff5bc2bdad780d5690d7d
+model=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+0, NVIDIA GeForce RTX 4090, GPU-42c92344-3195-9df2-4b65-884f1180fb3a, 49140, 1, 580.126.09

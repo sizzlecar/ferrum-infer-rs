@@ -1,0 +1,9 @@
+date_utc=2026-06-20T08:47:32Z
+repo=/workspace/ferrum-w3-unified-75ec7e6e
+git_head=5d16eed8f28e5191499b70a5dbf9718814dafeb3
+git_status_start
+## goal/w2-w3-release-grade...origin/goal/w2-w3-release-grade
+git_status_end
+binary=/workspace/ferrum-target-w3-varlen/release/ferrum
+6aa10496ef3d7c8358a74005946164cfe3a0b3f606955970898e83da32512ed3  /workspace/ferrum-target-w3-varlen/release/ferrum
+model=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b

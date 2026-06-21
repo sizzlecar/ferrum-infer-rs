@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=100 warmup=10 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/1 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 16.7s
+    summary c=32 (n_repeats=1, no CI)
+      TTFT_ms  p50=2534.0  p95=4153.4  p99=4154.3
+      TPOT_ms  p50=61.3  p95=113.4  p99=128.4
+      ITL_ms   p50=22.5  p95=203.4  p99=695.0
+      throughput      269.0 tok/s
+      goodput         5.97 req/s
+
+→ wrote /workspace/artifacts/w3_qwen35_shadow_activation_ab_20260620T091328Z_1fa76a80/perf/bench_ferrum_c32_shadow_100x1.json

@@ -1,0 +1,1 @@
+{"id": "2fc0f16c-de6a-4895-85d9-c667960ab740", "object": "chat.completion", "created": 1782016328, "model": "qwen35-w3", "choices": [{"index": 0, "message": {"role": "assistant", "content": "{\"answer\":\"strict-ok\"}"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 88, "completion_tokens": 7, "total_tokens": 95}}

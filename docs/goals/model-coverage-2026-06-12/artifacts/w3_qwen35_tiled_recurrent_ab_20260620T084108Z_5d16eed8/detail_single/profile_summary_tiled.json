@@ -1,0 +1,29 @@
+{
+  "bench": {
+    "completed_per_run": [
+      32
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "output_throughput_tps": {
+      "mean": 173.14356714689995
+    }
+  },
+  "event_counts": {
+    "first_token_prof": 36,
+    "iter_prof": 64,
+    "qwen35_decode_prof": 19,
+    "qwen35_linear_decode_detail": 3180,
+    "qwen35_sparse_moe_detail": 4360,
+    "stream_ttft_prof": 36,
+    "unified_prof": 66
+  },
+  "linear": {
+    "events": 3180
+  },
+  "moe": {
+    "events": 0
+  },
+  "profile_line_count": 7761
+}
