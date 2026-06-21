@@ -4,7 +4,7 @@ use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
 use ferrum_interfaces::{
     model_executor::{
         DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PrefillInput,
-        PrefillOutput,
+        PrefillOutput, UnifiedBatch,
     },
     ModelExecutor, RecurrentStateManager, RecurrentStateSpec, RecurrentStateTensorSpec,
 };
@@ -137,6 +137,67 @@ struct RecurrentSpecExecutor {
     inner: MockModelExecutor,
 }
 
+#[derive(Clone, Debug)]
+struct CapturedUnifiedItem {
+    q_len: usize,
+    pos_offset: usize,
+    is_final_chunk: bool,
+    logits_policy: ferrum_interfaces::model_executor::LogitsReturnPolicy,
+}
+
+struct CapturingUnifiedExecutor {
+    inner: MockModelExecutor,
+    captured: Arc<std::sync::Mutex<Vec<CapturedUnifiedItem>>>,
+    output_token: u32,
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for CapturingUnifiedExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+
+    fn supports_native_unified_decode(&self) -> bool {
+        true
+    }
+
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        self.inner.prefill(input).await
+    }
+
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.inner.decode(input).await
+    }
+
+    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
+        let captured = batch
+            .items
+            .iter()
+            .map(|item| CapturedUnifiedItem {
+                q_len: item.q_tokens.len(),
+                pos_offset: item.pos_offset,
+                is_final_chunk: item.is_final_chunk,
+                logits_policy: item.logits_policy.clone(),
+            })
+            .collect::<Vec<_>>();
+        *self.captured.lock().expect("capture mutex poisoned") = captured;
+
+        Ok(batch
+            .items
+            .iter()
+            .map(|item| item.is_final_chunk.then(|| vec![self.output_token as f32]))
+            .collect())
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
+    }
+}
+
 #[async_trait::async_trait]
 impl ModelExecutor for RecurrentSpecExecutor {
     fn info(&self) -> &ferrum_types::ModelInfo {
@@ -173,6 +234,59 @@ impl ModelExecutor for RecurrentSpecExecutor {
     fn status(&self) -> ExecutorStatus {
         self.inner.status()
     }
+}
+
+#[tokio::test]
+async fn process_batch_unified_forwards_prefill_logits_policy() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        64,
+        &[("test", 5), ("ok", 6), ("<unk>", 2), ("<pad>", 4)],
+    ));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(CapturingUnifiedExecutor {
+        inner: MockModelExecutor::instant(64),
+        captured: captured.clone(),
+        output_token: 6,
+    });
+    let engine = ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+    );
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+
+    let response = engine.infer(request).await.unwrap();
+    assert_eq!(response.finish_reason, FinishReason::Length);
+
+    let captured = captured.lock().expect("capture mutex poisoned");
+    assert_eq!(captured.len(), 1);
+    let item = &captured[0];
+    assert_eq!(item.q_len, 1);
+    assert_eq!(item.pos_offset, 0);
+    assert!(item.is_final_chunk);
+    let ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+        repetition_penalty: None,
+    } = &item.logits_policy
+    else {
+        panic!("final product prefill should use model-side greedy argmax policy");
+    };
+    assert_eq!(mask.valid_token_mask[2], 0, "unk token must stay masked");
+    assert_eq!(
+        mask.valid_token_mask[6], 1,
+        "normal generated token must be selectable"
+    );
 }
 
 #[test]

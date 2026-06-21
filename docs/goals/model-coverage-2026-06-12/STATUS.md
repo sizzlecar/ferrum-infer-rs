@@ -2,6 +2,26 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ51 — Product unified prefill policy is locked at engine boundary
+
+- Scope:
+  - added a `ContinuousBatchEngine` product-path regression that calls the
+    public `infer` entrypoint with a native-unified test executor;
+  - the test captures the generated `UnifiedBatch` and proves a final prefill
+    item carries `LogitsReturnPolicy::GreedyArgmax` with the expected token
+    mask, not `FullLogits`;
+  - this closes the remaining source-evidence gap between the ZZZ50 model
+    support and the actual product batch construction path.
+- Validation passed locally:
+  - `cargo test -p ferrum-engine process_batch_unified_forwards_prefill_logits_policy -- --nocapture`;
+  - `cargo check -p ferrum-engine`;
+  - `cargo fmt --all`.
+- Status:
+  - source/product-path regression only; CUDA correctness/performance still
+    requires a reachable 1x4090;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ50 — Qwen35 fresh prefill can honor logits policies
 
 - Scope:
