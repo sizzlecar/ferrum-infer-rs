@@ -172,6 +172,23 @@ adding model-name defaults or hidden environment switches.
   a raw tensor GEMM. This matches vLLM's `ReplicatedLinear(hidden_size, 1)`
   modeling and lets dense or GPTQ shared-expert gate weights use the same
   `WeightLoader::load_linear` path as router and shared expert projections.
+- Added a real HF metadata probe:
+  `scripts/release/w3_qwen35_weight_index_probe.py`. It reads only
+  `config.json`, `model.safetensors.index.json`, and optional
+  `quantize_config.json`, then validates Ferrum's Qwen3.5 manifest against the
+  actual `Qwen/Qwen3.5-35B-A3B-GPTQ-Int4` checkpoint at
+  `3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b`.
+- The real probe produced:
+  `W3 QWEN35 WEIGHT INDEX PROBE PASS:
+  docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_weight_index_probe_20260622`.
+  Key results: selected prefix `model.language_model`, zero missing required
+  tensors, `124611` tensor names across `14` shards, GPTQ config
+  `bits=4/group_size=128/desc_act=false/sym=true`, and complete sparse-MoE
+  per-expert GPTQ coverage for `40` layers x `256` experts
+  (`92160` checked `.qweight/.scales/.qzeros` tensors, `g_idx` present for all
+  layers). Required non-expert tensors resolve as dense/meta tensors:
+  `552` dense `.weight`, `60` non-linear tensors, and top-level
+  `lm_head.weight`.
 - Existing Vast instance `41422823` was checked for a W3 Qwen35 mixed-prefill
   CUDA smoke/c32 diagnostic. SSH to `ssh7.vast.ai:22822` returned connection
   refused, and the sanitized API summary says `cur_state=stopped`,

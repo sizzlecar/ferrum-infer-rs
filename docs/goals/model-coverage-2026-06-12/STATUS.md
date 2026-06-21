@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ59 — Real Qwen35 GPTQ index matches the loader boundary
+
+- Scope:
+  - added `scripts/release/w3_qwen35_weight_index_probe.py`, a dependency-free
+    W3 metadata probe that reads only HF `config.json`,
+    `model.safetensors.index.json`, and optional `quantize_config.json`;
+  - the probe validates the same Qwen3.5 prefix/manifest assumptions as the
+    Rust loader boundary, including dense `.weight` tensors, complete GPTQ
+    `.qweight/.scales/.qzeros` aliases for linear roles, and sparse MoE expert
+    layouts;
+  - self-test covers a passing synthetic GPTQ manifest and an incomplete GPTQ
+    triplet failure.
+- Real metadata artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_weight_index_probe_20260622/w3_qwen35_weight_index_probe.json`;
+  - PASS line:
+    `W3 QWEN35 WEIGHT INDEX PROBE PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_weight_index_probe_20260622`.
+- Real model facts from the artifact:
+  - model/revision:
+    `Qwen/Qwen3.5-35B-A3B-GPTQ-Int4` at
+    `3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b`;
+  - selected checkpoint prefix: `model.language_model`;
+  - index shape: `124611` tensor names across `14` safetensors shards,
+    total indexed size `24403162208` bytes;
+  - quantization config matches W3 target:
+    `quant_method=gptq`, `bits=4`, `group_size=128`, `desc_act=false`,
+    `sym=true`;
+  - required manifest resolution has zero missing tensors:
+    `552` dense `.weight`, `60` non-linear metadata tensors, and one
+    top-level `lm_head.weight` alias;
+  - sparse MoE per-expert GPTQ coverage is complete:
+    `40` layers, `256` experts, `92160` checked
+    `.qweight/.scales/.qzeros` tensors, and `g_idx` present for all layers.
+- Validation passed locally:
+  - `python3 -m py_compile scripts/release/w3_qwen35_weight_index_probe.py`;
+  - `python3 scripts/release/w3_qwen35_weight_index_probe.py --self-test`;
+  - `python3 scripts/release/w3_qwen35_weight_index_probe.py --out docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_weight_index_probe_20260622 --model-id Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 --revision 3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b`.
+- Status:
+  - this closes the W3 implementation-plan item that required inspecting real
+    GPTQ safetensors index metadata before changing loader assumptions;
+  - source/metadata-boundary progress only; CUDA correctness/performance still
+    has not run;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ58 — Qwen35 shared expert gate uses linear loader
 
 - Scope:
