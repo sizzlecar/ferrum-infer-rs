@@ -50,6 +50,13 @@ impl Tokenizer for PolicyTokenizer {
         if let Some(id) = self.ids.get(text) {
             return Ok(vec![*id]);
         }
+        let split_tokens = text
+            .split_whitespace()
+            .map(|part| self.ids.get(part).copied())
+            .collect::<Option<Vec<_>>>();
+        if let Some(tokens) = split_tokens.filter(|tokens| !tokens.is_empty()) {
+            return Ok(tokens);
+        }
         Ok(vec![TokenId::new(0)])
     }
 
@@ -147,7 +154,7 @@ struct CapturedUnifiedItem {
 
 struct CapturingUnifiedExecutor {
     inner: MockModelExecutor,
-    captured: Arc<std::sync::Mutex<Vec<CapturedUnifiedItem>>>,
+    captured: Arc<std::sync::Mutex<Vec<Vec<CapturedUnifiedItem>>>>,
     output_token: u32,
 }
 
@@ -180,7 +187,10 @@ impl ModelExecutor for CapturingUnifiedExecutor {
                 logits_policy: item.logits_policy.clone(),
             })
             .collect::<Vec<_>>();
-        *self.captured.lock().expect("capture mutex poisoned") = captured;
+        self.captured
+            .lock()
+            .expect("capture mutex poisoned")
+            .push(captured);
 
         Ok(batch
             .items
@@ -271,7 +281,8 @@ async fn process_batch_unified_forwards_prefill_logits_policy() {
 
     let captured = captured.lock().expect("capture mutex poisoned");
     assert_eq!(captured.len(), 1);
-    let item = &captured[0];
+    assert_eq!(captured[0].len(), 1);
+    let item = &captured[0][0];
     assert_eq!(item.q_len, 1);
     assert_eq!(item.pos_offset, 0);
     assert!(item.is_final_chunk);
@@ -287,6 +298,53 @@ async fn process_batch_unified_forwards_prefill_logits_policy() {
         mask.valid_token_mask[6], 1,
         "normal generated token must be selectable"
     );
+}
+
+#[tokio::test]
+async fn process_batch_unified_honors_runtime_chunked_prefill() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.runtime.chunked_prefill_size = Some(1);
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        64,
+        &[("test", 5), ("ok", 6), ("<unk>", 2), ("<pad>", 4)],
+    ));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(CapturingUnifiedExecutor {
+        inner: MockModelExecutor::instant(64),
+        captured: captured.clone(),
+        output_token: 6,
+    });
+    let engine = ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+    );
+    let mut request = policy_request();
+    request.prompt = "test ok".to_string();
+    request.sampling_params.max_tokens = 1;
+
+    let response = engine.infer(request).await.unwrap();
+    assert_eq!(response.finish_reason, FinishReason::Length);
+
+    let captured = captured.lock().expect("capture mutex poisoned");
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0].len(), 1);
+    assert_eq!(captured[0][0].q_len, 1);
+    assert_eq!(captured[0][0].pos_offset, 0);
+    assert!(!captured[0][0].is_final_chunk);
+    assert_eq!(captured[1].len(), 1);
+    assert_eq!(captured[1][0].q_len, 1);
+    assert_eq!(captured[1][0].pos_offset, 1);
+    assert!(captured[1][0].is_final_chunk);
 }
 
 #[test]

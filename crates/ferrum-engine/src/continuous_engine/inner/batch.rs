@@ -10,12 +10,11 @@ impl EngineInner {
         // level, eliminating the cohort gap (decode_queue=0 ↔ 32
         // alternation that consumed half the bench wall on apples).
         //
-        // For chunked-prefill (FERRUM_CHUNKED_PREFILL=N) or speculative
-        // decoding, fall back to the legacy split path. Phase 3 will
-        // extend chunked-prefill into the unified mode.
-        let chunked_or_spec =
-            self.runtime_config.chunked_prefill_present || self.spec_config.is_some();
-        if chunked_or_spec {
+        // Speculative decoding still owns a separate multi-token verify path.
+        // Typed chunked prefill can stay on the unified path: the unified
+        // producer below emits non-final prefill chunks and can co-batch them
+        // with decode work when the executor has a native unified forward.
+        if self.spec_config.is_some() {
             return self.process_batch_legacy_split(batch).await;
         }
         let info = self.model_executor.info();
@@ -307,15 +306,19 @@ impl EngineInner {
                 }
                 .or(existing_recurrent_state);
             let remaining = num_tokens - chunk_start;
-            let chunk_len = scheduled_tokens_by_id
-                .get(rid)
-                .copied()
-                .or_else(|| match explicit_active_prefill_chunk_size {
+            let chunk_len = [
+                scheduled_tokens_by_id.get(rid).copied(),
+                match explicit_active_prefill_chunk_size {
                     Some(chunk) if has_decode_items || chunk_start > 0 => Some(chunk),
                     _ => None,
-                })
-                .map(|chunk| chunk.min(remaining).max(1))
-                .unwrap_or(remaining);
+                },
+                self.runtime_config.chunked_prefill_size_for(num_tokens),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|chunk| chunk.min(remaining).max(1))
+            .unwrap_or(remaining);
             let is_final_chunk = chunk_start + chunk_len >= num_tokens;
             unified_prefills.push(UnifiedPrefillWork {
                 rid: rid.clone(),

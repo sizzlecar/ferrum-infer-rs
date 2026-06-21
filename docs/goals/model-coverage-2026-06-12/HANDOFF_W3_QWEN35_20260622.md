@@ -125,6 +125,12 @@ adding model-name defaults or hidden environment switches.
   `ContinuousBatchEngine::infer`, captures the generated `UnifiedBatch`, and
   verifies final prefill work carries `LogitsReturnPolicy::GreedyArgmax` with
   the expected token mask instead of silently falling back to full logits.
+- Runtime chunked prefill no longer forces `process_batch` onto the legacy
+  split path. The unified producer now treats scheduler `tokens_to_process`,
+  active-decode prefill chunk, and typed `chunked_prefill_size` as coexisting
+  upper bounds and uses the smallest cap, so explicit chunked-prefill can still
+  use the unified/chunked prefill architecture instead of bypassing the Qwen3.5
+  paged continuation path.
 
 The key vLLM reference is:
 
@@ -187,6 +193,8 @@ cargo test -p ferrum-models \
   unified_decode_forwards_prefill_logits_policy_to_unified_model -- --nocapture
 cargo test -p ferrum-engine \
   process_batch_unified_forwards_prefill_logits_policy -- --nocapture
+cargo test -p ferrum-engine \
+  process_batch_unified_honors_runtime_chunked_prefill -- --nocapture
 cargo check -p ferrum-models
 cargo check -p ferrum-engine
 cargo fmt --all -- --check
@@ -306,6 +314,10 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   sampling, structured-output requests, prefix-cache full-logits mode, or token
   mask inconsistency before changing Qwen3.5 kernels. The engine-level source
   regression now proves ordinary greedy product prefill attaches the policy.
+- Explicit typed chunked-prefill should now appear as non-final/final unified
+  prefill items, not as a legacy split-path prefill loop. If a CUDA run still
+  shows split-path behavior, inspect whether speculative decoding is enabled or
+  whether the executor reports `supports_native_unified_decode=false`.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
