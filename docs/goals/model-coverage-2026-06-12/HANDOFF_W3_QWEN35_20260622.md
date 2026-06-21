@@ -71,6 +71,13 @@ adding model-name defaults or hidden environment switches.
 - Added a focused CPU regression that runs real Qwen35 forward with a tiny
   valid config and verifies a mixed continuation chunk plus decode frame
   advances both sequence states while returning logits only for the decode row.
+- Split Qwen3.5 stateful chunk execution into logits-returning and no-logits
+  paths. Non-final continuation/chunked prefill rows now advance state and sync
+  the linear state slot without running final norm, final-token gather,
+  lm_head, or logits readback.
+- Added a regression that replaces final norm/lm_head with deliberately broken
+  test fixtures after the seed prefill, then proves a non-final continuation
+  chunk still advances state without touching the logits tail.
 
 The key vLLM reference is:
 
@@ -109,6 +116,10 @@ cargo test -p ferrum-models \
 cargo test -p ferrum-models \
   qwen35_unified_forward_requires_paged_kv_for_fresh_batch_prefill -- --nocapture
 cargo check -p ferrum-models
+cargo test -p ferrum-models \
+  qwen35_unified_forward_non_final_continuation_skips_logits_tail -- --nocapture
+cargo fmt --all -- --check
+git diff --check
 ```
 
 Not yet validated locally:
@@ -165,6 +176,14 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
 - Existing cached Vast instance `41422823` was last observed stopped/exited.
 - A replacement 1x RTX 4090 attempt was externally blocked by Vast
   `insufficient_credit`.
+- On 2026-06-21 UTC, direct SSH to `ssh7.vast.ai:22822` returned
+  `Connection refused`.
+- The Vast API still listed instance `41422823` as 1x RTX 4090 with
+  `cur_state=stopped`, `actual_status=exited`.
+- A start request returned
+  `Required resources are currently unavailable, state change queued`; a
+  5-minute poll kept reporting `cur_state=stopped`,
+  `actual_status=exited`, so no CUDA artifact was produced from that attempt.
 - Do not keep cycling rental attempts until credit is restored.
 
 ## What To Watch
@@ -187,6 +206,9 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   contains continuation/chunked prefill. Fresh prefill still requires paged KV;
   continuation chunks use the stateful path until a faster batched chunked
   prefill implementation is justified by GPU profile evidence.
+- Non-final continuation chunks should show no final norm/lm_head/readback
+  tail; if scheduler traces still show high chunk cost, profile the layer body
+  rather than the logits tail first.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
