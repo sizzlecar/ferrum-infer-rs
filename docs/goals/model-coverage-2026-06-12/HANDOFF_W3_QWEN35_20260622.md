@@ -15,6 +15,23 @@
 
 ## Latest Source Progress
 
+### 2026-06-22 L3 Case-Level Gate Hardening
+
+- `scripts/release/model_release_grade_goal_gate.py` now validates W3 L3
+  behavior cases instead of trusting only aggregate booleans.
+- L3 artifacts must include passed cases for multi-turn, stream/non-stream
+  matching, natural EOS, custom stop, and reasoning extraction.
+- The stream/non-stream case must record exactly one `[DONE]` and at least one
+  usage chunk.
+- `scripts/release/model_release_grade_manifest.py --self-test` was updated to
+  include L3 case details; `w3_qwen35_real_product_report.py` already emitted
+  compatible `cases`.
+- Validation passed locally:
+  `python3 scripts/release/w3_qwen35_real_product_report.py --self-test`,
+  `python3 scripts/release/model_release_grade_goal_gate.py --self-test`,
+  `python3 scripts/release/model_release_grade_manifest.py --self-test`,
+  Python compile checks, an existing-artifact L3 probe, and `git diff --check`.
+
 ### 2026-06-22 L4 Case-Level Gate Hardening
 
 - `scripts/release/model_release_grade_goal_gate.py` now validates W3 L4

@@ -1075,6 +1075,50 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
                 "stream_done_exactly_once": True,
                 "stream_usage_present": True,
             },
+            "cases": [
+                {
+                    "id": "multi_turn",
+                    "passed": True,
+                    "artifact": "behavior/01_multi_turn.response.json",
+                    "detail": {"finish_reason": "stop"},
+                },
+                {
+                    "id": "stream_nonstream_match",
+                    "passed": True,
+                    "artifact": "behavior/02_stream_match_stream.response.sse",
+                    "detail": {"stream_done_count": 1, "stream_usage_chunks": 1},
+                },
+                {
+                    "id": "natural_eos",
+                    "passed": True,
+                    "artifact": "behavior/03_natural_eos.response.json",
+                    "detail": {"finish_reason": "stop"},
+                },
+                {
+                    "id": "custom_stop",
+                    "passed": True,
+                    "artifact": "behavior/04_custom_stop.response.json",
+                    "detail": {"finish_reason": "stop"},
+                },
+                {
+                    "id": "reasoning_extraction",
+                    "passed": True,
+                    "artifact": "behavior/05_reasoning_extraction.response.json",
+                    "detail": {"reasoning_len": 8, "leaked_think": False},
+                },
+                {
+                    "id": "multi_turn_repeat",
+                    "passed": True,
+                    "artifact": "behavior/06_multi_turn_repeat.response.json",
+                    "detail": {"finish_reason": "stop"},
+                },
+                {
+                    "id": "stop_repeat",
+                    "passed": True,
+                    "artifact": "behavior/07_stop_repeat.response.json",
+                    "detail": {"finish_reason": "stop"},
+                },
+            ],
         },
     )
     write_json(

@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ66 — W3 L3 final validator checks stream/multi-turn case evidence
+
+- Scope:
+  - hardened `scripts/release/model_release_grade_goal_gate.py` so W3 L3
+    final validation checks the per-case behavior evidence, not only aggregate
+    booleans;
+  - L3 artifacts must now include behavior cases for multi-turn,
+    stream/non-stream matching, natural EOS, custom stop, and reasoning
+    extraction;
+  - each case must have `passed=true`, a non-empty id, a non-empty artifact
+    reference, and a JSON detail object;
+  - the stream/non-stream case must explicitly record exactly one
+    `stream_done_count` and at least one `stream_usage_chunks`;
+  - updated `model_release_grade_manifest.py --self-test` fixtures to include
+    L3 case details.
+- Why:
+  - W3 correctness requires stream behavior, usage, stop/EOS, and multi-turn
+    behavior to be proven, not only summarized by booleans;
+  - before this change, a hand-written L3 artifact could satisfy the final
+    validator with aggregate fields alone.
+- Validation passed locally:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py scripts/release/w3_qwen35_real_product_report.py`;
+  - `python3 scripts/release/w3_qwen35_real_product_report.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - direct final-validator probe of existing real W3 L3 artifact
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report/w3_l3_behavior.json`;
+  - `git diff --check`.
+- Status:
+  - source/tooling progress only; no new CUDA correctness or performance claim;
+  - W3 remains incomplete and there is still no real
+    `MODEL_RELEASE_GRADE_W3 PASS` artifact directory.
+
 ## 2026-06-22 ZZZ65 — W3 L4 final validator checks case-level tool/schema evidence
 
 - Scope:
