@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shlex
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -94,6 +96,122 @@ def positive_int(value: Any, label: str) -> int:
     return value
 
 
+def command_parts(raw: Any, label: str) -> list[str]:
+    if isinstance(raw, str):
+        try:
+            parts = shlex.split(raw)
+        except ValueError as exc:
+            raise GateError(f"{label} is not a valid shell command: {exc}") from exc
+    elif isinstance(raw, list) and all(isinstance(part, str) for part in raw):
+        parts = raw
+    else:
+        raise GateError(f"{label} must be a command string or string list")
+    if not parts:
+        raise GateError(f"{label} must not be empty")
+    return parts
+
+
+def has_flag(parts: list[str], flag: str) -> bool:
+    return flag in parts or any(part.startswith(f"{flag}=") for part in parts)
+
+
+def flag_values(parts: list[str], flag: str) -> list[str]:
+    values: list[str] = []
+    prefix = f"{flag}="
+    idx = 0
+    while idx < len(parts):
+        part = parts[idx]
+        if part.startswith(prefix):
+            values.append(part[len(prefix) :])
+        elif part == flag and idx + 1 < len(parts):
+            values.append(parts[idx + 1])
+            idx += 1
+        idx += 1
+    return values
+
+
+def single_flag_value(parts: list[str], flag: str, label: str) -> str | None:
+    values = flag_values(parts, flag)
+    if len(values) > 1:
+        raise GateError(f"{label} must not repeat {flag}")
+    return values[0] if values else None
+
+
+def parse_positive_int_set(raw: str, label: str) -> set[int]:
+    out: set[int] = set()
+    for item in raw.split(","):
+        text = item.strip()
+        if not text:
+            raise GateError(f"{label} contains an empty concurrency cell")
+        try:
+            parsed = int(text)
+        except ValueError as exc:
+            raise GateError(f"{label} contains non-integer concurrency cell {text!r}") from exc
+        if parsed <= 0:
+            raise GateError(f"{label} contains non-positive concurrency cell {parsed}")
+        out.add(parsed)
+    return out
+
+
+def command_concurrency_cells(parts: list[str], label: str) -> set[int]:
+    cells: set[int] = set()
+    for raw in flag_values(parts, "--concurrency-sweep"):
+        cells.update(parse_positive_int_set(raw, f"{label} --concurrency-sweep"))
+    for flag in ["--concurrency", "--max-concurrency"]:
+        for raw in flag_values(parts, flag):
+            try:
+                parsed = int(raw)
+            except ValueError as exc:
+                raise GateError(f"{label} {flag} must be integer, got {raw!r}") from exc
+            if parsed <= 0:
+                raise GateError(f"{label} {flag} must be positive, got {parsed}")
+            cells.add(parsed)
+    if not cells:
+        raise GateError(f"{label} must include --concurrency-sweep or --concurrency")
+    return cells
+
+
+def validate_bench_command(raw: Any, label: str) -> tuple[list[str], set[int]]:
+    parts = command_parts(raw, label)
+    if not any(part == "bench-serve" or part.endswith("/bench-serve") for part in parts):
+        raise GateError(f"{label} must invoke ferrum bench-serve")
+    if has_flag(parts, "--request-rate"):
+        raise GateError(f"{label} must use closed-loop concurrency, not --request-rate")
+    for flag in ["--fail-on-error", "--require-ci"]:
+        if not has_flag(parts, flag):
+            raise GateError(f"{label} missing {flag}")
+    if single_flag_value(parts, "--seed", label) != "9271":
+        raise GateError(f"{label} must include --seed 9271")
+    if single_flag_value(parts, "--n-repeats", label) != "3":
+        raise GateError(f"{label} must include --n-repeats 3")
+    for part in parts:
+        if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
+            raise GateError(f"{label} uses hidden env override: {part.split('=', 1)[0]}")
+    return parts, command_concurrency_cells(parts, label)
+
+
+def validate_bench_commands(commands: list[Any], expected_cells: set[int]) -> list[dict[str, Any]]:
+    if not commands:
+        raise GateError("at least one bench-serve command must be supplied with --command")
+    normalized: list[dict[str, Any]] = []
+    covered: set[int] = set()
+    for idx, raw in enumerate(commands):
+        label = f"commands[{idx}]"
+        parts, cells = validate_bench_command(raw, label)
+        covered.update(cells)
+        entry: dict[str, Any] = {
+            "command_line": parts,
+            "covers_concurrency": sorted(cells),
+        }
+        if isinstance(raw, str):
+            entry["raw"] = raw
+        normalized.append(entry)
+    missing = sorted(expected_cells - covered)
+    if missing:
+        raise GateError(f"bench commands missing required concurrency cells: {missing}")
+    return normalized
+
+
 def report_concurrency(report: dict[str, Any], label: str) -> int:
     if report.get("scenario") != "closed_loop":
         raise GateError(f"{label}.scenario must be closed_loop")
@@ -158,6 +276,7 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
     if missing:
         raise GateError(f"missing required concurrency cells: {missing}")
     cells.sort(key=lambda item: item["requested_concurrency"])
+    commands = validate_bench_commands(args.command or [], REQUIRED_CONCURRENCY)
 
     artifact = {
         "schema_version": 1,
@@ -168,7 +287,7 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
         "hidden_env": [],
         "generated_at": iso_now(),
         "pass_line": f"{PASS_LINE_PREFIX}: {args.out}",
-        "commands": args.command or [],
+        "commands": commands,
         "concurrency": {
             "closed_loop": True,
             "stream_options_include_usage": True,
@@ -224,6 +343,8 @@ def run_selftest() -> int:
         artifact = build_artifact(args)
         if len(artifact["concurrency"]["cells"]) != 4:
             raise AssertionError("selftest did not preserve four cells")
+        if artifact["commands"][0]["covers_concurrency"] != [1, 4, 16, 32]:
+            raise AssertionError("selftest did not preserve command concurrency coverage")
 
         from model_release_grade_goal_gate import validate_w3_l0_l5_artifact  # type: ignore
 
@@ -255,6 +376,30 @@ def run_selftest() -> int:
                 raise AssertionError(f"unexpected bad-report error: {exc}") from exc
         else:
             raise AssertionError("bad L5 report unexpectedly passed")
+
+        bad_command_path = root / "bad_command.jsonl"
+        bad_command_path.write_text(
+            "\n".join(json.dumps(fake_report(c), sort_keys=True) for c in [1, 4, 16, 32])
+            + "\n",
+            encoding="utf-8",
+        )
+        try:
+            build_artifact(
+                argparse.Namespace(
+                    report=[bad_command_path],
+                    out=root / "bad_command_out",
+                    model_id=DEFAULT_MODEL_ID,
+                    command=[
+                        "ferrum bench-serve --fail-on-error --seed 9271 "
+                        "--n-repeats 3 --concurrency-sweep 1,4,16"
+                    ],
+                )
+            )
+        except GateError as exc:
+            if "--require-ci" not in str(exc):
+                raise AssertionError(f"unexpected bad-command error: {exc}") from exc
+        else:
+            raise AssertionError("bad L5 command unexpectedly passed")
     print("W3 L5 CONCURRENCY SELFTEST PASS")
     return 0
 

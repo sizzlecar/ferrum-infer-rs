@@ -2,6 +2,36 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ62 — W3 L5 now requires release bench command evidence
+
+- Scope:
+  - hardened `scripts/release/w3_l5_concurrency_gate.py` so L5 concurrency
+    packaging rejects artifacts unless at least one saved `bench-serve`
+    command covers `c=1/4/16/32`;
+  - the L5 packaging gate now parses command strings with `shlex`, stores
+    normalized `command_line` evidence, rejects hidden `FERRUM_*` env
+    overrides, rejects `--request-rate`, and requires `--fail-on-error`,
+    `--require-ci`, `--seed 9271`, and `--n-repeats 3`;
+  - hardened `scripts/release/model_release_grade_goal_gate.py` so the final
+    W3 validator re-checks L5 command evidence and refuses hand-built L5
+    artifacts that lack compliant release commands.
+- Why:
+  - W3 goal text requires release-grade L5 evidence to use
+    `bench-serve --fail-on-error --require-ci --seed 9271 --n-repeats 3`;
+  - before this change, L5 validated zero-error report contents but did not
+    prove the report came from the required product benchmark command.
+- Validation passed locally:
+  - `python3 -m py_compile scripts/release/w3_l5_concurrency_gate.py scripts/release/model_release_grade_goal_gate.py`;
+  - `python3 scripts/release/w3_l5_concurrency_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - direct validator probe of existing W3 L5 artifact
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/l5_concurrency/w3_l5_concurrency.json`;
+  - `git diff --check`.
+- Status:
+  - source/tooling progress only; no new CUDA correctness or performance claim;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ61 — W3 real-product report records pre-run git evidence
 
 - Scope:
