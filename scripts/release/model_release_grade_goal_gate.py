@@ -550,7 +550,7 @@ def validate_w3_fixed_output_contract(
         baseline_command,
         f"{label}.baseline",
         problems,
-        require_ignore_eos=False,
+        require_ignore_eos=True,
     )
     if expected is not None and baseline_expected is not None and expected != baseline_expected:
         problems.append(
@@ -2996,6 +2996,29 @@ def run_selftest() -> int:
             for problem in bad_w3_ignore_eos_problems
         ):
             raise AssertionError("bad W3 missing ignore-eos selftest did not fail as expected")
+
+        bad_w3_baseline_ignore_eos = tmp_root / "bad-w3-baseline-missing-ignore-eos"
+        bad_w3_baseline_ignore_eos_manifest = write_selftest_manifest(
+            bad_w3_baseline_ignore_eos,
+            lane="w3",
+            ratio=0.82,
+        )
+        data = load_json(bad_w3_baseline_ignore_eos_manifest)
+        baseline_command = data["performance"]["cells"][0]["baseline_bench_command_line"]
+        baseline_command.remove("--ignore-eos")
+        write_json(bad_w3_baseline_ignore_eos_manifest, data)
+        bad_w3_baseline_ignore_eos_problems = validate_manifest(
+            data,
+            "w3",
+            bad_w3_baseline_ignore_eos,
+        )
+        if not any(
+            "performance.c1.baseline command missing --ignore-eos" in problem
+            for problem in bad_w3_baseline_ignore_eos_problems
+        ):
+            raise AssertionError(
+                "bad W3 baseline missing ignore-eos selftest did not fail as expected"
+            )
 
         bad_w3_output_tokens = tmp_root / "bad-w3-output-tokens"
         bad_w3_output_tokens_manifest = write_selftest_manifest(
