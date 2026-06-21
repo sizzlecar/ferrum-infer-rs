@@ -121,6 +121,10 @@ adding model-name defaults or hidden environment switches.
   prefill rows. Product unified first-token generation can therefore return
   model-side greedy argmax sentinels when policy-compatible, instead of forcing
   full vocab logits readback for fresh final prefill.
+- Added an engine-level product-path regression that goes through
+  `ContinuousBatchEngine::infer`, captures the generated `UnifiedBatch`, and
+  verifies final prefill work carries `LogitsReturnPolicy::GreedyArgmax` with
+  the expected token mask instead of silently falling back to full logits.
 
 The key vLLM reference is:
 
@@ -181,7 +185,10 @@ cargo test -p ferrum-models \
   unified_decode_forwards_logits_policy_to_unified_model -- --nocapture
 cargo test -p ferrum-models \
   unified_decode_forwards_prefill_logits_policy_to_unified_model -- --nocapture
+cargo test -p ferrum-engine \
+  process_batch_unified_forwards_prefill_logits_policy -- --nocapture
 cargo check -p ferrum-models
+cargo check -p ferrum-engine
 cargo fmt --all -- --check
 git diff --check
 ```
@@ -295,8 +302,10 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   construction before changing model kernels.
 - Fresh final prefill in unified batches should also show policy-aware argmax
   when the request is greedy-compatible; if first-token profiles still show
-  full vocab readback for ordinary greedy requests, inspect the engine-side
-  `LogitsReturnPolicy` attached to prefill work before changing Qwen3.5 kernels.
+  full vocab readback for ordinary greedy requests, first rule out non-greedy
+  sampling, structured-output requests, prefix-cache full-logits mode, or token
+  mask inconsistency before changing Qwen3.5 kernels. The engine-level source
+  regression now proves ordinary greedy product prefill attaches the policy.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
