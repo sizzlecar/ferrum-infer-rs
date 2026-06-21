@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ47 — Qwen35 full-logits mixed decode rows can join paged continuation batch
+
+- Scope:
+  - changed Qwen3.5 unified item classification to collect decode candidates
+    first, then decide whether they can safely join the paged continuation
+    varlen prefill batch;
+  - when `use_paged_kv` is active, at least one continuation/chunked row is
+    present, and all decode rows require full logits, decode rows can now share
+    the same `forward_stateful_prefill_continuation_batch` call instead of
+    forcing a second decode batch forward;
+  - preserved the existing greedy-argmax contract: no-policy decode rows are
+    not merged when `FERRUM_GREEDY_ARGMAX=1`, and policy rows are merged only
+    when every policy is `FullLogits`;
+  - pure decode batches still use the decode batch path, so this targets mixed
+    continuation+decode frames rather than replacing the optimized decode path.
+- Validation passed locally:
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_argmax_contract -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_multitoken_continuation_matches_stepwise -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_unified_forward_non_final_continuation_skips_logits_tail -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - this is source/hot-path progress, not a performance claim;
+  - it should help full-logits mixed frames such as structured/tool paths that
+    cannot use model-side greedy argmax, but the primary greedy c32 path still
+    needs a policy-aware varlen continuation logits/argmax follow-up;
+  - direct SSH to Vast instance `41422823` still returns connection refused,
+    and the API reports `cur_state=stopped`, `actual_status=exited`;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ46 — Qwen35 paged continuation rows can use varlen batch prefill
 
 - Scope:

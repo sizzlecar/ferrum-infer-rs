@@ -97,6 +97,15 @@ adding model-name defaults or hidden environment switches.
 - Fixed batch prefill KV allocation to target
   `state.tokens.len() + q_lens[row]`, which is required for continuation
   chunks and is equivalent to the old value for fresh prefill.
+- Full-logits mixed continuation+decode frames can now share the paged
+  continuation varlen prefill batch when it is semantically safe. Decode rows
+  are merged only when paged KV is active, a continuation/chunked row is
+  present, and every decode row requires full logits. Greedy-argmax/no-policy
+  rows keep the decode batch path so the model-side argmax sentinel contract is
+  preserved.
+- Added a regression that locks this merge boundary: full-logits policies may
+  merge, but `GreedyArgmax`, partial policy lists, no continuation rows, and
+  no-policy `FERRUM_GREEDY_ARGMAX=1` do not merge.
 
 The key vLLM reference is:
 
@@ -141,6 +150,14 @@ cargo test -p ferrum-models \
   qwen35_unified_forward_multitoken_continuation_matches_stepwise -- --nocapture
 cargo test -p ferrum-models \
   qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture
+cargo test -p ferrum-models \
+  qwen35_decode_merge_policy_preserves_argmax_contract -- --nocapture
+cargo test -p ferrum-models \
+  qwen35_unified_forward_mixes_decode_and_continuation_chunk -- --nocapture
+cargo test -p ferrum-models \
+  qwen35_unified_forward_multitoken_continuation_matches_stepwise -- --nocapture
+cargo test -p ferrum-models \
+  qwen35_unified_forward_non_final_continuation_skips_logits_tail -- --nocapture
 cargo check -p ferrum-models
 cargo fmt --all -- --check
 git diff --check
@@ -202,6 +219,8 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   `insufficient_credit`.
 - On 2026-06-21 UTC, direct SSH to `ssh7.vast.ai:22822` returned
   `Connection refused`.
+- On 2026-06-22 Asia/Shanghai, direct SSH to `ssh7.vast.ai:22822` still
+  returned `Connection refused`.
 - The Vast API still listed instance `41422823` as 1x RTX 4090 with
   `cur_state=stopped`, `actual_status=exited`.
 - A start request returned
@@ -228,8 +247,7 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   four 64-token prefill chunks when seven decodes are active.
 - Qwen35 unified trace should no longer reject a mixed frame solely because it
   contains continuation/chunked prefill. Fresh prefill still requires paged KV;
-  continuation chunks use the stateful path until a faster batched chunked
-  prefill implementation is justified by GPU profile evidence.
+  CUDA paged-KV continuation chunks should use the varlen batch prefill path.
 - Non-final continuation chunks should show no final norm/lm_head/readback
   tail; if scheduler traces still show high chunk cost, profile the layer body
   rather than the logits tail first.
@@ -241,6 +259,10 @@ L5 cells with `c=1/4/16/32`, `--require-ci`, and `--n-repeats 3`.
   should enter the varlen batch prefill path rather than row-by-row stateful
   calls. CPU cannot execute this paged varlen path; local evidence only proves
   non-paged fallback and type-level compilation.
+- Full-logits mixed continuation+decode frames should also enter that same
+  paged continuation batch. Greedy-argmax policy rows should still use decode
+  batch until a policy-aware varlen continuation logits/argmax path is added
+  and validated.
 - CUDA build must confirm the new `.cu` symbols are present.
 - If packed prefill improves projection cost but c32 remains far below target,
   continue with profiler-backed bottleneck localization; do not revert blindly
