@@ -47,6 +47,10 @@ W3_L0_L5_LEVELS = {
     "l5_concurrency": "l5_concurrency",
 }
 REQUIRED_PRODUCT_ENTRYPOINTS = {"ferrum_run", "ferrum_serve"}
+REQUIRED_L2_PRODUCT_COMMANDS = {
+    "ferrum run": "run",
+    "ferrum serve": "serve",
+}
 W3_REQUIRED_CORRECTNESS = {
     "w3_s0_design",
     "w3_s0_microbench",
@@ -408,6 +412,74 @@ def validate_l5_bench_commands(
         problems.append(f"{label}.commands missing required concurrency cells: {missing}")
 
 
+def l2_command_parts(raw: Any, label: str, problems: list[str]) -> list[str]:
+    if isinstance(raw, dict):
+        if "command_line" in raw:
+            return command_parts_or_shell(raw["command_line"], f"{label}.command_line", problems)
+        if "command" in raw:
+            return command_parts_or_shell(raw["command"], f"{label}.command", problems)
+        if "raw" in raw:
+            return command_parts_or_shell(raw["raw"], f"{label}.raw", problems)
+        # Legacy W3 L2 artifacts may include declaration-only entries in
+        # addition to real commands. They are ignored and never count as
+        # evidence.
+        if "entrypoint" in raw:
+            return []
+        problems.append(f"{label} must include command_line or command")
+        return []
+    return command_parts_or_shell(raw, label, problems)
+
+
+def l2_command_entrypoint(parts: list[str], label: str, problems: list[str]) -> str | None:
+    if not any(part == "ferrum" or part.endswith("/ferrum") for part in parts):
+        problems.append(f"{label} command must invoke the ferrum binary")
+    for part in parts:
+        if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
+            problems.append(f"{label} command uses hidden env override: {part.split('=', 1)[0]}")
+    found = [
+        entrypoint
+        for entrypoint, subcommand in REQUIRED_L2_PRODUCT_COMMANDS.items()
+        if subcommand in parts
+    ]
+    if not found:
+        problems.append(f"{label} command must invoke ferrum run or ferrum serve")
+        return None
+    if len(found) > 1:
+        problems.append(f"{label} command ambiguously contains both ferrum run and ferrum serve")
+        return None
+    return found[0]
+
+
+def validate_l2_product_commands(commands_raw: Any, label: str, problems: list[str]) -> None:
+    commands = as_list(commands_raw, f"{label}.commands", problems)
+    if not commands:
+        problems.append(f"{label}.commands must include ferrum run and ferrum serve command evidence")
+        return
+    detected: set[str] = set()
+    saw_parseable_command = False
+    for idx, raw in enumerate(commands):
+        command_label = f"{label}.commands[{idx}]"
+        parts = l2_command_parts(raw, command_label, problems)
+        if not parts:
+            continue
+        saw_parseable_command = True
+        entrypoint = l2_command_entrypoint(parts, command_label, problems)
+        if entrypoint is None:
+            continue
+        if isinstance(raw, dict) and isinstance(raw.get("entrypoint"), str):
+            declared = raw["entrypoint"].strip()
+            if declared != entrypoint:
+                problems.append(
+                    f"{command_label}.entrypoint {declared!r} does not match command {entrypoint!r}"
+                )
+        detected.add(entrypoint)
+    if not saw_parseable_command:
+        problems.append(f"{label}.commands must include real command_line evidence")
+    missing = sorted(set(REQUIRED_L2_PRODUCT_COMMANDS) - detected)
+    if missing:
+        problems.append(f"{label}.commands missing required product commands: {missing}")
+
+
 def validate_release_scope(scope: dict[str, Any], lane: str, problems: list[str]) -> None:
     backends = scope.get("backends")
     formats = scope.get("formats")
@@ -752,6 +824,7 @@ def validate_w3_l2_artifact(data: dict[str, Any], label: str, problems: list[str
         problems,
     )
     non_empty_string(quantized.get("format"), f"{label}.quantized_semantics.format", problems)
+    validate_l2_product_commands(data.get("commands"), label, problems)
 
 
 def validate_w3_l3_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
@@ -1608,6 +1681,28 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
                 "known_answer_passed": 10,
                 "format": "hf-gptq-int4",
             },
+            "commands": [
+                {
+                    "entrypoint": "ferrum run",
+                    "command_line": [
+                        "ferrum",
+                        "run",
+                        "selftest-qwen35",
+                        "--backend",
+                        "cuda",
+                    ],
+                },
+                {
+                    "entrypoint": "ferrum serve",
+                    "command_line": [
+                        "ferrum",
+                        "serve",
+                        "selftest-qwen35",
+                        "--backend",
+                        "cuda",
+                    ],
+                },
+            ],
         },
     )
     write_json(
@@ -2055,6 +2150,29 @@ def run_selftest() -> int:
         good_w3_problems = validate_manifest(load_json(good_w3_manifest), "w3", good_w3)
         if good_w3_problems:
             raise AssertionError("good W3 selftest manifest failed: " + "; ".join(good_w3_problems))
+
+        bad_w3_l2_command = tmp_root / "bad-w3-l2-command"
+        bad_w3_l2_command_manifest = write_selftest_manifest(
+            bad_w3_l2_command,
+            lane="w3",
+            ratio=0.82,
+        )
+        l2_quantized = load_json(bad_w3_l2_command / "l2.json")
+        l2_quantized["commands"] = [
+            {"entrypoint": "ferrum run"},
+            {"entrypoint": "ferrum serve"},
+        ]
+        write_json(bad_w3_l2_command / "l2.json", l2_quantized)
+        bad_w3_l2_command_problems = validate_manifest(
+            load_json(bad_w3_l2_command_manifest),
+            "w3",
+            bad_w3_l2_command,
+        )
+        if not any(
+            "correctness.l2_quantized.commands must include real command_line evidence" in problem
+            for problem in bad_w3_l2_command_problems
+        ):
+            raise AssertionError("bad W3 L2 command selftest did not fail as expected")
 
         bad_w3_l4 = tmp_root / "bad-w3-l4-schema-count"
         bad_w3_l4_manifest = write_selftest_manifest(bad_w3_l4, lane="w3", ratio=0.82)

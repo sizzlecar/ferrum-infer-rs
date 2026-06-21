@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ63 — W3 L2 now requires real product command evidence
+
+- Scope:
+  - hardened `scripts/release/w3_l2_quantized_gate.py` so W3 L2 packaging
+    requires real `command_line` evidence for both `ferrum run` and
+    `ferrum serve`;
+  - declaration-only `product_entrypoints` / `{"entrypoint": ...}` evidence
+    no longer counts as product-path proof;
+  - the L2 gate now normalizes commands and rejects hidden `FERRUM_*`
+    overrides embedded in command lines;
+  - hardened `scripts/release/model_release_grade_goal_gate.py` so the final
+    W3 validator re-checks L2 command evidence. It accepts older artifacts
+    that contain extra declaration-only entries only when real `command_line`
+    entries cover both required product commands.
+- Why:
+  - W3 L2 is the next real Qwen3.5 correctness lane entrypoint, and the goal
+    requires both `ferrum run` and `ferrum serve` product evidence;
+  - before this change, an L2 report could satisfy entrypoint coverage with
+    names only, without proving the actual typed product command.
+- Validation passed locally:
+  - `python3 -m py_compile scripts/release/w3_l2_quantized_gate.py scripts/release/model_release_grade_goal_gate.py`;
+  - `python3 scripts/release/w3_l2_quantized_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - direct final-validator probe of existing real W3 L2 artifact
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_l2_qwen35_gptq_int4_from_real_product_20260620T025952Z_75ec7e6e/w3_l2_quantized.json`;
+  - re-packaged the historical real
+    `w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report/known_answer_report.json`
+    into a temporary L2 artifact and got
+    `W3 L2 QUANTIZED PASS`;
+  - `python3 scripts/release/w3_qwen35_real_product_report.py --self-test`;
+  - `git diff --check`.
+- GPU status:
+  - direct SSH probe to `ssh7.vast.ai:22822` still returned
+    `Connection refused`, so no remote CUDA work was started.
+- Status:
+  - source/tooling progress only; no new CUDA correctness or performance claim;
+  - W3 remains incomplete and there is still no
+    `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-22 ZZZ62 — W3 L5 now requires release bench command evidence
 
 - Scope:
