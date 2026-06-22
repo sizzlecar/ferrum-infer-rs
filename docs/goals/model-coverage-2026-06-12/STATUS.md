@@ -13096,3 +13096,31 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
   - 仍无 1x4090 W3 PASS artifact。
   - Vast 当前资源不可用;不要循环 start。下一次 GPU 可达时,runner 会自动避免
     复用不合格历史 baseline。
+
+## 2026-06-22 — W3 live baseline early environment preflight
+
+- 背景:
+  - 上一条修正让 `w3_qwen35_cuda_release_lane.py` 在历史 vLLM baseline command
+    缺 `--ignore-eos` 时自动改跑 live vLLM baseline。
+  - 但 live vLLM 可用性如果只在 Ferrum product/L4/L5/perf 之后才检查,远端
+    vLLM Python 环境缺失会导致 Ferrum 长矩阵白跑。
+- 源码变更:
+  - `preflight_baseline()` 现在返回是否需要 live baseline。
+  - 当 `--baseline-mode auto` 且历史 baseline 不合格时,runner 在 CUDA build
+    和 HF prefetch 完成后、`ferrum run` / `ferrum serve` product correctness
+    和 Ferrum perf 之前,先执行 `run_vllm_version_probe()`。
+  - 预检 artifact:
+    `baseline_vllm_preflight/vllm_versions.json`,
+    `baseline_vllm_preflight/commands/vllm_version_probe.*`,
+    `baseline_vllm_preflight.json`。
+  - 如果 vLLM import 或 CUDA visibility 在该 Python 环境不可用,runner 会早
+    失败,不会继续跑 Ferrum 长 perf sweep。
+- 本地验证:
+  - `python3 -m py_compile scripts/release/w3_qwen35_cuda_release_lane.py`
+    PASS。
+  - `python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test` PASS。
+  - `git diff --check` PASS。
+- 限制:
+  - 该预检不替代 live baseline report;真正的
+    `baseline_vllm/perf/bench_vllm_sharegpt_sweep_100x3.json` 仍必须在 1x4090
+    上跑出来并进入 final manifest。

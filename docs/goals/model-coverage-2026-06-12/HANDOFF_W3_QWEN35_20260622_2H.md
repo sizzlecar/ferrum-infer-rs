@@ -361,3 +361,29 @@ git diff --check
 ```
 
 All three passed locally.
+
+## 2026-06-22 Baseline Preflight Refinement
+
+Follow-up fix:
+
+- `w3_qwen35_cuda_release_lane.py` now records whether the historical baseline
+  is valid early.
+- If `--baseline-mode auto` needs live vLLM because the historical command is
+  invalid, the runner probes the selected vLLM Python environment immediately
+  after CUDA build and HF prefetch, before product correctness and before the
+  Ferrum ShareGPT sweep.
+- This writes `baseline_vllm_preflight/` and `baseline_vllm_preflight.json`.
+- If vLLM is not importable or CUDA is not visible from that Python
+  environment, the lane fails before the expensive Ferrum performance matrix.
+- The real same-host live vLLM baseline report is still run later and is still
+  required for the final W3 manifest when the historical baseline is invalid.
+
+Validation:
+
+```bash
+python3 -m py_compile scripts/release/w3_qwen35_cuda_release_lane.py
+python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test
+git diff --check
+```
+
+All passed locally.
