@@ -13124,3 +13124,28 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
   - 该预检不替代 live baseline report;真正的
     `baseline_vllm/perf/bench_vllm_sharegpt_sweep_100x3.json` 仍必须在 1x4090
     上跑出来并进入 final manifest。
+
+## 2026-06-22 — W3 vLLM preflight requires CUDA visibility
+
+- 背景:
+  - live baseline 预检如果只检查 `import vllm`,远端 Python 环境可能能导入
+    vLLM,但 `torch.cuda.is_available()` 为 false;这样 vLLM server 会在后续
+    才失败。
+- 源码变更:
+  - `scripts/release/w3_qwen35_cuda_release_lane.py` 新增
+    `validate_vllm_probe_data()`。
+  - vLLM preflight 现在要求:
+    - `vllm` 字段存在且非空;
+    - `cuda_available == true`;
+    - `cuda_device_count >= 1`。
+  - 不再让 probe 子进程只用 exit code 表示成功/失败;runner 会保存
+    `vllm_versions.json` 后解析 JSON 并给出明确错误。
+  - self-test 覆盖缺 vLLM、CUDA 不可见、GPU 数量为 0 三个负例。
+- 本地验证:
+  - `python3 -m py_compile scripts/release/w3_qwen35_cuda_release_lane.py`
+    PASS。
+  - `python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test` PASS。
+  - `git diff --check` PASS。
+- 限制:
+  - 这仍是 GPU lane 前置保护;W3 release-grade 仍需要真实 1x4090 artifact
+    和最终 `MODEL_RELEASE_GRADE_W3 PASS`。
