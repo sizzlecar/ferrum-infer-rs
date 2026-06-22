@@ -924,6 +924,17 @@ def apply_baseline_paths(args: argparse.Namespace, paths: dict[str, Path]) -> No
     args.baseline_build_command = paths["build_command"]
 
 
+def validate_vllm_probe_data(data: dict[str, Any]) -> str:
+    if not isinstance(data.get("vllm"), str) or not data["vllm"]:
+        raise LaneError(f"vLLM is not importable in selected Python: {data.get('vllm_error')}")
+    if data.get("cuda_available") is not True:
+        raise LaneError("torch CUDA is not visible in selected vLLM Python")
+    device_count = data.get("cuda_device_count")
+    if isinstance(device_count, bool) or not isinstance(device_count, int) or device_count < 1:
+        raise LaneError(f"selected vLLM Python reports invalid cuda_device_count={device_count!r}")
+    return str(data["vllm"])
+
+
 def run_vllm_version_probe(
     args: argparse.Namespace,
     out_dir: Path,
@@ -945,7 +956,6 @@ def run_vllm_version_probe(
         "except Exception as exc:\n"
         "    data['torch_error'] = type(exc).__name__ + ': ' + str(exc)\n"
         "print(json.dumps(data, sort_keys=True))\n"
-        "raise SystemExit(0 if 'vllm' in data else 1)\n"
     )
     cmd = [args.vllm_python, "-c", code]
     proc = run_logged(
@@ -958,7 +968,7 @@ def run_vllm_version_probe(
     version_data = json.loads(proc.stdout.strip().splitlines()[-1])
     write_json(out_dir / "vllm_versions.json", version_data)
     write_text(out_dir / "baseline-build.command.txt", shlex_join(cmd) + "\n")
-    return str(version_data.get("vllm", "unknown"))
+    return validate_vllm_probe_data(version_data)
 
 
 def start_vllm_server(
@@ -1432,6 +1442,22 @@ def run_selftest() -> int:
         )
         if not baseline_ok:
             raise AssertionError(f"selftest valid baseline unexpectedly failed: {baseline_problems}")
+        if validate_vllm_probe_data(
+            {"vllm": "0.23.0", "torch": "2.11.0+cu130", "cuda_available": True, "cuda_device_count": 1}
+        ) != "0.23.0":
+            raise AssertionError("selftest did not accept valid vLLM/CUDA probe data")
+        for bad_probe, expected in [
+            ({"vllm_error": "missing", "cuda_available": True, "cuda_device_count": 1}, "vLLM"),
+            ({"vllm": "0.23.0", "cuda_available": False, "cuda_device_count": 1}, "CUDA"),
+            ({"vllm": "0.23.0", "cuda_available": True, "cuda_device_count": 0}, "cuda_device_count"),
+        ]:
+            try:
+                validate_vllm_probe_data(bad_probe)
+            except LaneError as exc:
+                if expected not in str(exc):
+                    raise AssertionError(f"unexpected vLLM probe error: {exc}") from exc
+            else:
+                raise AssertionError(f"bad vLLM probe unexpectedly passed: {bad_probe}")
         prefetch = prefetch_command(args.model, args.model_revision)
         if "HF_TOKEN" in " ".join(prefetch):
             raise AssertionError("prefetch command must not expose HF_TOKEN")

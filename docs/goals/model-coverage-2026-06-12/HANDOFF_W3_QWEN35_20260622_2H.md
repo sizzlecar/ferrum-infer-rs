@@ -387,3 +387,26 @@ git diff --check
 ```
 
 All passed locally.
+
+## 2026-06-22 vLLM CUDA Probe Tightening
+
+`w3_qwen35_cuda_release_lane.py` now treats the live vLLM preflight as valid
+only when the selected Python reports all of:
+
+- importable `vllm`;
+- `torch.cuda.is_available() == true`;
+- `torch.cuda.device_count() >= 1`.
+
+The probe still writes `baseline_vllm_preflight/vllm_versions.json` before
+failing, so a remote failure should show whether the problem is import, CUDA
+visibility, or device count. Self-test now covers all three bad cases.
+
+Validation:
+
+```bash
+python3 -m py_compile scripts/release/w3_qwen35_cuda_release_lane.py
+python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test
+git diff --check
+```
+
+All passed locally.
