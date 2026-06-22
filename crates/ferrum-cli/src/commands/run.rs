@@ -474,6 +474,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let startup_auto_config = run_startup_auto_config(
         &device,
         model_definition_for_config.as_ref(),
+        crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
         effective_runtime_config,
     )?;
     // Apply the resolved auto-config knobs the same way `serve` does. Without
@@ -1805,10 +1806,16 @@ fn materialize_run_cli_runtime_entries(entries: &[RuntimeConfigEntry]) {
 fn run_startup_auto_config(
     device: &ferrum_types::Device,
     model_definition: Option<&ferrum_models::ModelDefinition>,
+    model_weight_bytes: Option<u64>,
     runtime_config: RuntimeConfigSnapshot,
 ) -> Result<ResolvedFerrumConfig> {
     let model = model_definition
-        .map(crate::commands::serve::model_capabilities_from_definition)
+        .map(|definition| {
+            crate::commands::serve::model_capabilities_from_definition_with_weight_bytes(
+                definition,
+                model_weight_bytes,
+            )
+        })
         .unwrap_or_else(ModelCapabilities::unknown);
     let hardware = crate::commands::serve::hardware_capabilities_for_device(device);
     let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
@@ -2072,6 +2079,7 @@ mod tests {
     fn run_startup_auto_config_renders_effective_config_schema() {
         let resolved = run_startup_auto_config(
             &ferrum_types::Device::CPU,
+            None,
             None,
             RuntimeConfigSnapshot::from_entries(Vec::new()),
         )

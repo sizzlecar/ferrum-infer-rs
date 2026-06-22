@@ -13,6 +13,7 @@ use ferrum_types::{
     RuntimeConfigSource, WorkloadProfile, M3_QWEN3_30B_A3B_INT4_PRESET,
     QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
 };
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -719,6 +720,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         &device,
         arch_for_dispatch,
         model_definition.as_ref(),
+        model_weight_bytes_from_path(&source.local_path),
         selected_runtime_preset_name.as_deref(),
         non_env_runtime_entries,
         materialized_runtime_keys,
@@ -995,6 +997,7 @@ fn startup_auto_config(
     device: &ferrum_types::Device,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
+    model_weight_bytes: Option<u64>,
     runtime_preset: Option<&str>,
     non_env_runtime_entries: Vec<RuntimeConfigEntry>,
     materialized_runtime_keys: Vec<String>,
@@ -1005,7 +1008,9 @@ fn startup_auto_config(
     let runtime_config =
         merge_runtime_config_sources(non_env_runtime_entries, env_snapshot, cli_runtime_entries);
     let model = model_definition
-        .map(model_capabilities_from_definition)
+        .map(|definition| {
+            model_capabilities_from_definition_with_weight_bytes(definition, model_weight_bytes)
+        })
         .unwrap_or_else(ModelCapabilities::unknown);
     let hardware = hardware_capabilities_for_device(device);
     let workload = match runtime_preset {
@@ -1413,8 +1418,9 @@ fn configure_profile_sink(
     Ok(())
 }
 
-pub(crate) fn model_capabilities_from_definition(
+pub(crate) fn model_capabilities_from_definition_with_weight_bytes(
     definition: &ferrum_models::ModelDefinition,
+    model_weight_bytes: Option<u64>,
 ) -> ModelCapabilities {
     let architecture = match definition.architecture {
         ferrum_models::Architecture::Qwen3Moe => "qwen3_moe",
@@ -1478,10 +1484,40 @@ pub(crate) fn model_capabilities_from_definition(
         num_hidden_layers: Some(definition.num_hidden_layers),
         head_dim,
         kv_heads: definition.num_key_value_heads,
-        estimated_weight_bytes: estimated_weight_bytes_from_definition(definition),
+        estimated_weight_bytes: model_weight_bytes
+            .filter(|value| *value > 0)
+            .or_else(|| estimated_weight_bytes_from_definition(definition)),
         supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
         graph_safe_moe: false,
     }
+}
+
+pub(crate) fn model_weight_bytes_from_path(path: &Path) -> Option<u64> {
+    if path.is_file() {
+        return std::fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.len())
+            .filter(|value| *value > 0);
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        let entry_path = entry.path();
+        let is_weight = entry_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|ext| ext == "safetensors" || ext == "bin")
+            .unwrap_or(false);
+        if !is_weight {
+            continue;
+        }
+        if let Ok(metadata) = std::fs::metadata(&entry_path) {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    (total > 0).then_some(total)
 }
 
 fn quantization_from_definition(definition: &ferrum_models::ModelDefinition) -> Option<String> {
@@ -1501,7 +1537,7 @@ fn quantization_from_definition(definition: &ferrum_models::ModelDefinition) -> 
 fn estimated_weight_bytes_from_definition(
     definition: &ferrum_models::ModelDefinition,
 ) -> Option<u64> {
-    let params = definition.to_model_info("__auto_config").num_parameters;
+    let params = estimated_total_parameters_from_definition(definition)?;
     if params == 0 {
         return None;
     }
@@ -1512,6 +1548,64 @@ fn estimated_weight_bytes_from_definition(
         .filter(|bits| *bits > 0)
         .unwrap_or(16);
     Some(params.saturating_mul(bits_per_param).div_ceil(8))
+}
+
+fn estimated_total_parameters_from_definition(
+    definition: &ferrum_models::ModelDefinition,
+) -> Option<u64> {
+    let dense_params = definition.to_model_info("__auto_config").num_parameters;
+    if !matches!(
+        definition.architecture,
+        ferrum_models::Architecture::Qwen3Moe | ferrum_models::Architecture::Qwen35Moe
+    ) {
+        return Some(dense_params);
+    }
+
+    let hidden = definition.hidden_size as u128;
+    let layers = definition.num_hidden_layers as u128;
+    let vocab = definition.vocab_size as u128;
+    let num_experts = definition
+        .extra_params
+        .get("num_experts")
+        .and_then(|value| value.as_u64())? as u128;
+    let moe_intermediate = definition
+        .extra_params
+        .get("moe_intermediate_size")
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            (definition.intermediate_size > 0).then_some(definition.intermediate_size as u64)
+        })? as u128;
+    let shared_intermediate = definition
+        .extra_params
+        .get("shared_expert_intermediate_size")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u128;
+
+    let embedding_params = vocab.saturating_mul(hidden);
+    let lm_head_params = embedding_params;
+    let attention_params = layers
+        .saturating_mul(4)
+        .saturating_mul(hidden)
+        .saturating_mul(hidden);
+    let norm_params = layers.saturating_mul(2).saturating_mul(hidden);
+    let router_params = layers.saturating_mul(hidden).saturating_mul(num_experts);
+    let expert_params = layers
+        .saturating_mul(num_experts)
+        .saturating_mul(3)
+        .saturating_mul(hidden)
+        .saturating_mul(moe_intermediate);
+    let shared_expert_params = layers
+        .saturating_mul(3)
+        .saturating_mul(hidden)
+        .saturating_mul(shared_intermediate);
+    let total = embedding_params
+        .saturating_add(lm_head_params)
+        .saturating_add(attention_params)
+        .saturating_add(norm_params)
+        .saturating_add(router_params)
+        .saturating_add(expert_params)
+        .saturating_add(shared_expert_params);
+    Some(total.min(u64::MAX as u128) as u64)
 }
 
 pub(crate) fn hardware_capabilities_for_device(
@@ -2385,7 +2479,7 @@ mod tests {
             "shared_expert_intermediate_size": 512
         });
 
-        let capabilities = model_capabilities_from_definition(&definition);
+        let capabilities = model_capabilities_from_definition_with_weight_bytes(&definition, None);
 
         assert_eq!(capabilities.architecture, "qwen3_5_moe");
         assert_eq!(capabilities.head_dim, Some(256));
@@ -2394,6 +2488,61 @@ mod tests {
         assert_eq!(moe.num_experts, 256);
         assert_eq!(moe.experts_per_token, 8);
         assert_eq!(moe.moe_intermediate_size, Some(512));
+        assert!(
+            capabilities.estimated_weight_bytes.unwrap() > 14 * 1024 * 1024 * 1024,
+            "Qwen3.5 MoE weight estimate must account for all resident experts, not only active params"
+        );
+    }
+
+    #[test]
+    fn model_capabilities_prefer_measured_weight_bytes_from_model_source() {
+        let mut definition = ferrum_models::ModelDefinition {
+            architecture: ferrum_models::Architecture::Qwen35Moe,
+            hidden_size: 2048,
+            intermediate_size: 512,
+            num_hidden_layers: 40,
+            num_attention_heads: 16,
+            num_key_value_heads: Some(2),
+            max_position_embeddings: 262144,
+            ..Default::default()
+        };
+        definition.extra_params = serde_json::json!({
+            "head_dim": 256,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512,
+            "quantization_config": {
+                "bits": 4,
+                "quant_method": "gptq"
+            }
+        });
+
+        let capabilities =
+            model_capabilities_from_definition_with_weight_bytes(&definition, Some(19_123_456_789));
+
+        assert_eq!(capabilities.estimated_weight_bytes, Some(19_123_456_789));
+    }
+
+    #[test]
+    fn model_weight_bytes_from_path_sums_local_weight_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrum-weight-bytes-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp model dir");
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), vec![0u8; 7])
+            .expect("write safetensors shard");
+        std::fs::write(dir.join("model-00002-of-00002.safetensors"), vec![0u8; 11])
+            .expect("write safetensors shard");
+        std::fs::write(dir.join("tokenizer.json"), vec![0u8; 101]).expect("write non-weight file");
+
+        let result = model_weight_bytes_from_path(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(result, Some(18));
     }
 
     fn two_gpu_layer_split_selection() -> crate::gpu_devices::GpuDeviceSelection {

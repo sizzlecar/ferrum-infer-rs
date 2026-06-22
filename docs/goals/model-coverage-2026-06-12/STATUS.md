@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ73 — `run`/`serve` auto-config now uses real model weight bytes
+
+- Scope:
+  - fixed `ferrum run` and `ferrum serve` startup auto-config so
+    `model_capabilities.estimated_weight_bytes` is derived from the resolved
+    model source when local `.safetensors` / `.bin` shards are present;
+  - the file-size path follows Hugging Face cache symlinks via
+    `std::fs::metadata`, so cached snapshots account for the real shard bytes;
+  - when file sizes are unavailable, the MoE fallback estimate now counts all
+    resident experts plus shared expert/router/attention/embedding weights
+    instead of reusing dense active-parameter approximation.
+- Why:
+  - current W3 Qwen3.5 artifacts record
+    `model_capabilities.estimated_weight_bytes=907100160`, which is not a
+    credible 35B A3B GPTQ footprint;
+  - `default_kv_blocks()` consumes that value when deriving KV/admission
+    budgets, so a too-low estimate can over-budget KV and hide the real memory
+    constraint until runtime pressure or allocation failure;
+  - this is a shared typed-runtime fix, not a model-specific default override.
+- Validation passed locally:
+  - `cargo fmt --all -- --check`;
+  - `cargo test -p ferrum-cli model_capabilities -- --nocapture`;
+  - `cargo test -p ferrum-cli model_weight_bytes -- --nocapture`;
+  - `cargo check -p ferrum-cli`.
+- GPU state:
+  - SSH to `ssh7.vast.ai:22822` still returned `Connection refused`;
+  - sanitized Vast API status for instance `41422823` showed
+    `cur_state=stopped`, `actual_status=exited`, `gpu_name=RTX 4090`,
+    `num_gpus=1`, `gpu_ram=49140`;
+  - no CUDA build, correctness smoke, benchmark, or performance claim ran.
+- Status:
+  - source/runtime-control progress only;
+  - W3 remains incomplete and there is still no real
+    `MODEL_RELEASE_GRADE_W3 PASS` artifact directory.
+
 ## 2026-06-22 ZZZ72 — 1x4090 W3 diagnostic lane start blocked by Vast resource state
 
 - Scope:
