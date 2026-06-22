@@ -28,6 +28,53 @@ QUALITY_FIELDS = [
     "http_500",
     "panic",
 ]
+PATH_CONFIG_KEYS = {
+    "source",
+    "baseline_source",
+    "out",
+    "matrix",
+    "dirty_status_json",
+    "hardware",
+    "runtime_snapshot",
+    "l0_template",
+    "l1_numeric",
+    "l2_quantized",
+    "l3_behavior",
+    "l4_agent",
+    "l5_concurrency",
+    "w3_s0_design",
+    "w3_s0_microbench",
+    "w3_s1_single_layer",
+    "w3_s2_product",
+    "ferrum_run",
+    "ferrum_serve",
+    "ferrum_perf_report",
+    "baseline_perf_report",
+}
+COMMAND_CONFIG_KEYS = {
+    "ferrum_bench_command",
+    "baseline_bench_command",
+    "baseline_server_command",
+    "baseline_build_command",
+}
+SCALAR_CONFIG_KEYS = {
+    "lane",
+    "dataset_id",
+    "model_id",
+    "backend",
+    "quantization",
+    "git_sha",
+    "binary_sha256",
+    "product_surface",
+    "baseline_engine",
+    "baseline_version",
+    "dataset_sha",
+    "no_run_validator",
+}
+CONFIG_KEYS = PATH_CONFIG_KEYS | COMMAND_CONFIG_KEYS | SCALAR_CONFIG_KEYS | {
+    "effective_concurrency",
+    "dirty_status",
+}
 
 
 class BuildError(Exception):
@@ -46,6 +93,137 @@ def load_json(path: Path) -> Any:
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def resolve_config_path(value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise BuildError(f"{label} must be a non-empty path string")
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return REPO_ROOT / path
+
+
+def command_config_text(value: Any, label: str) -> str:
+    if isinstance(value, list):
+        if not value or not all(isinstance(part, str) and part for part in value):
+            raise BuildError(f"{label} command list must contain non-empty strings")
+        return shlex.join(value)
+    if isinstance(value, str):
+        if not value.strip():
+            raise BuildError(f"{label} command must not be empty")
+        return value.strip()
+    if isinstance(value, dict):
+        if "path" in value:
+            raise BuildError(f"{label}.path must be handled as a command file path")
+        for key in ["command_line", "command", "raw", "cmd"]:
+            if key in value:
+                return command_config_text(value[key], f"{label}.{key}")
+    raise BuildError(f"{label} must be a command string, string list, or {{path: ...}}")
+
+
+def config_out_dir(args: argparse.Namespace) -> Path:
+    out_dir = getattr(args, "out", None)
+    if not isinstance(out_dir, Path):
+        raise BuildError("--config inline values require --out or config out")
+    return out_dir
+
+
+def materialize_config_json(args: argparse.Namespace, name: str, value: Any) -> Path:
+    path = config_out_dir(args) / "_config_inputs" / f"{name}.json"
+    write_json(path, value)
+    return path
+
+
+def materialize_config_command(args: argparse.Namespace, name: str, value: Any) -> Path:
+    if isinstance(value, dict) and "path" in value:
+        return resolve_config_path(value["path"], name)
+    if isinstance(value, str):
+        candidate = resolve_config_path(value, name)
+        if candidate.is_file():
+            return candidate
+    text = command_config_text(value, name)
+    path = config_out_dir(args) / "_config_inputs" / f"{name}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.rstrip() + "\n", encoding="utf-8")
+    return path
+
+
+def normalize_config_key(raw: str) -> str:
+    return raw.replace("-", "_")
+
+
+def apply_config(args: argparse.Namespace) -> argparse.Namespace:
+    config_path = getattr(args, "config", None)
+    if config_path is None:
+        return args
+    config_path = require_file(config_path, "--config").resolve()
+    config = load_json(config_path)
+    if not isinstance(config, dict):
+        raise BuildError("--config must be a JSON object")
+
+    raw_args = config.get("args", {})
+    if raw_args is None:
+        raw_args = {}
+    if not isinstance(raw_args, dict):
+        raise BuildError("--config args must be a JSON object")
+    values: dict[str, Any] = {}
+    for source in [config, raw_args]:
+        for raw_key, raw_value in source.items():
+            key = normalize_config_key(raw_key)
+            if key == "args":
+                continue
+            if key not in CONFIG_KEYS:
+                if source is raw_args:
+                    raise BuildError(f"--config args contains unknown key: {raw_key}")
+                continue
+            values[key] = raw_value
+
+    lane = values.get("lane")
+    if lane is not None:
+        if lane not in {"w2", "w3"}:
+            raise BuildError("--config lane must be w2 or w3")
+        cli_lane = getattr(args, "lane", None)
+        if cli_lane is not None and cli_lane != lane:
+            raise BuildError(f"--config lane {lane!r} conflicts with CLI lane {cli_lane!r}")
+        args.lane = lane
+
+    if "out" in values and getattr(args, "out", None) is None:
+        args.out = resolve_config_path(values["out"], "out")
+    if "no_run_validator" in values:
+        args.no_run_validator = bool(values["no_run_validator"]) or bool(
+            getattr(args, "no_run_validator", False)
+        )
+    if "effective_concurrency" in values:
+        raw_effective = values["effective_concurrency"]
+        if not isinstance(raw_effective, list) or not all(
+            isinstance(item, str) for item in raw_effective
+        ):
+            raise BuildError("--config effective_concurrency must be a string list")
+        args.effective_concurrency = raw_effective + list(
+            getattr(args, "effective_concurrency", [])
+        )
+
+    for key in sorted(PATH_CONFIG_KEYS - {"out"}):
+        if key in values and getattr(args, key, None) is None:
+            setattr(args, key, resolve_config_path(values[key], key))
+
+    if "dirty_status" in values and getattr(args, "dirty_status_json", None) is None:
+        args.dirty_status_json = materialize_config_json(
+            args,
+            "dirty_status",
+            values["dirty_status"],
+        )
+
+    for key in sorted(COMMAND_CONFIG_KEYS):
+        if key in values and getattr(args, key, None) is None:
+            setattr(args, key, materialize_config_command(args, key, values[key]))
+
+    for key in sorted(SCALAR_CONFIG_KEYS - {"lane", "no_run_validator"}):
+        if key in values:
+            setattr(args, key, values[key])
+
+    return args
 
 
 def require_file(path: Path, label: str) -> Path:
@@ -1324,6 +1502,82 @@ def write_selftest_w3_args(root: Path) -> argparse.Namespace:
     )
 
 
+def write_selftest_w3_config(root: Path, config_path: Path, out_dir: Path) -> Path:
+    args = write_selftest_w3_args(root)
+    path_keys = [
+        "hardware",
+        "runtime_snapshot",
+        "l0_template",
+        "l1_numeric",
+        "l2_quantized",
+        "l3_behavior",
+        "l4_agent",
+        "l5_concurrency",
+        "w3_s0_design",
+        "w3_s0_microbench",
+        "w3_s1_single_layer",
+        "w3_s2_product",
+        "ferrum_run",
+        "ferrum_serve",
+        "ferrum_perf_report",
+        "baseline_perf_report",
+    ]
+    config_args = {key: str(getattr(args, key)) for key in path_keys}
+    config_args.update(
+        {
+            "model_id": args.model_id,
+            "backend": args.backend,
+            "quantization": args.quantization,
+            "git_sha": args.git_sha,
+            "binary_sha256": args.binary_sha256,
+            "dirty_status": {"dirty": False, "status_short": ""},
+            "product_surface": args.product_surface,
+            "ferrum_bench_command": [
+                "ferrum",
+                "bench-serve",
+                "--fail-on-error",
+                "--require-ci",
+                "--seed",
+                "9271",
+                "--concurrency-sweep",
+                "1,4,16,32",
+                "--num-prompts",
+                "100",
+                "--n-repeats",
+                "3",
+                "--random-output-len",
+                "128",
+                "--ignore-eos",
+            ],
+            "baseline_bench_command": (
+                "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
+                "--concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3 "
+                "--random-output-len 128 --ignore-eos"
+            ),
+            "baseline_server_command": {
+                "command_line": ["python", "-m", "vllm", "serve", "selftest-qwen35"],
+            },
+            "baseline_build_command": {
+                "command": ["python", "-m", "pip", "install", "vllm==selftest"],
+            },
+            "baseline_engine": args.baseline_engine,
+            "baseline_version": args.baseline_version,
+            "dataset_id": args.dataset_id,
+            "dataset_sha": args.dataset_sha,
+        }
+    )
+    write_json(
+        config_path,
+        {
+            "lane": "w3",
+            "out": str(out_dir),
+            "effective_concurrency": ["32=16"],
+            "args": config_args,
+        },
+    )
+    return config_path
+
+
 def run_selftest() -> int:
     with tempfile.TemporaryDirectory(prefix="ferrum-w2-release-grade-manifest-") as tmp:
         root = Path(tmp)
@@ -1357,6 +1611,31 @@ def run_selftest() -> int:
         if rc != 0:
             raise AssertionError(f"W3 selftest final validator failed with rc={rc}")
 
+        w3_config = write_selftest_w3_config(
+            root / "w3-config-source",
+            root / "w3-config.json",
+            root / "w3-config-out",
+        )
+        config_args = apply_config(
+            argparse.Namespace(
+                config=w3_config,
+                lane=None,
+                no_run_validator=False,
+                effective_concurrency=[],
+            )
+        )
+        require_w3_args(config_args)
+        w3_config_manifest = build_w3_manifest(
+            args=config_args,
+            out_dir=config_args.out,
+            effective_concurrency=parse_effective_concurrency(config_args.effective_concurrency),
+        )
+        if not w3_config_manifest.is_file():
+            raise AssertionError("W3 config manifest was not written")
+        rc = run_validator(config_args.out, "w3")
+        if rc != 0:
+            raise AssertionError(f"W3 config selftest final validator failed with rc={rc}")
+
         bad_args = write_selftest_w3_args(root / "bad-w3-source")
         reports = load_json(bad_args.ferrum_perf_report)
         write_json(
@@ -1381,6 +1660,11 @@ def run_selftest() -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("lane", choices=["w2", "w3"], nargs="?", help="release-grade lane")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="JSON config for manifest inputs; paths are resolved relative to the repo root",
+    )
     parser.add_argument("--source", type=Path, help="full-matrix artifact source dir")
     parser.add_argument(
         "--baseline-source",
@@ -1483,6 +1767,7 @@ def main() -> int:
     args = parse_args()
     if args.self_test:
         return run_selftest()
+    args = apply_config(args)
     effective = parse_effective_concurrency(args.effective_concurrency)
     if args.lane == "w2":
         if args.source is None or args.out is None:

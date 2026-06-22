@@ -16,6 +16,44 @@
 
 ## Effective Progress In This Slice
 
+- Added a checked-in current-evidence config for the W3 final manifest:
+  `docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json`.
+- `scripts/release/model_release_grade_manifest.py` now accepts `--config` for
+  W3/W2 manifest inputs.
+- Config paths are resolved relative to the repo root, matching the checked-in
+  artifact paths used in this goal.
+- Inline `dirty_status` JSON is materialized under
+  `<out>/_config_inputs/dirty_status.json`.
+- Inline command strings/lists are materialized under
+  `<out>/_config_inputs/*.txt`; existing command-file paths are reused.
+- The manifest self-test now covers this config path and validates the generated
+  synthetic W3 manifest with the final validator.
+- Local validation passed:
+  `python3 -m py_compile scripts/release/model_release_grade_manifest.py scripts/release/model_release_grade_goal_gate.py`,
+  `python3 scripts/release/model_release_grade_manifest.py --self-test`, and
+  JSON syntax validation for the checked-in config.
+- Running the checked-in current-evidence config produced
+  `target/w3_qwen35_current_evidence_probe/model_release_grade_manifest.json`
+  and failed the final validator as expected:
+  `MODEL_RELEASE_GRADE_W3 FAIL (45 problems)`.
+- The failure is now reproducible from one command:
+
+```bash
+python3 scripts/release/model_release_grade_manifest.py \
+  --config docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json
+```
+
+- The current failure buckets are:
+  - old L5 artifact lacks `--ignore-eos` command evidence;
+  - old L5 artifact lacks `output_tokens_per_request` matrices;
+  - old Ferrum and vLLM benchmark commands lack `--ignore-eos`;
+  - old Ferrum report does not produce fixed 128 output tokens per request;
+  - c1/c4/c16/c32 throughput ratios are still below `0.800`;
+  - c1/c4/c16/c32 p95 ITL still exceeds `1.25x` vLLM baseline.
+- This is not a W3 completion claim. It is a reproducible final-gate blocker
+  snapshot so the next GPU run can replace only the L5/perf artifacts and rerun
+  the same config path.
+
 - Added a typed `ferrum bench-serve --ignore-eos` flag in
   `crates/ferrum-cli/src/commands/bench_serve.rs`.
 - When the flag is present, the canonical HTTP performance client sends the
