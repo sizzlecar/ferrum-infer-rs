@@ -245,6 +245,18 @@ def serve_runtime_flags(args: argparse.Namespace) -> list[str]:
     flags = runtime_flags(args)
     if args.runtime_preset is not None:
         flags.extend(["--runtime-preset", str(args.runtime_preset)])
+    optional_flags = [
+        ("--scheduler-prefill-first-until-active", args.scheduler_prefill_first_until_active),
+        ("--scheduler-prefill-step-chunk", args.scheduler_prefill_step_chunk),
+        ("--scheduler-active-decode-prefill-chunk", args.scheduler_active_decode_prefill_chunk),
+    ]
+    for flag, value in optional_flags:
+        if value is not None:
+            flags.extend([flag, str(value)])
+    if args.enable_prefix_caching:
+        flags.append("--enable-prefix-caching")
+    if args.disable_prefix_cache:
+        flags.append("--disable-prefix-cache")
     return flags
 
 
@@ -1240,6 +1252,11 @@ def selftest_args(out_dir: Path) -> argparse.Namespace:
         kv_max_blocks=None,
         kv_dtype=None,
         runtime_preset=None,
+        scheduler_prefill_first_until_active=None,
+        scheduler_prefill_step_chunk=None,
+        scheduler_active_decode_prefill_chunk=None,
+        enable_prefix_caching=False,
+        disable_prefix_cache=False,
         require_clean_git=True,
         disable_thinking=True,
         preserve_ferrum_env=False,
@@ -1420,6 +1437,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-max-blocks")
     parser.add_argument("--kv-dtype")
     parser.add_argument("--runtime-preset")
+    parser.add_argument("--scheduler-prefill-first-until-active")
+    parser.add_argument("--scheduler-prefill-step-chunk")
+    parser.add_argument("--scheduler-active-decode-prefill-chunk")
+    parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument("--disable-prefix-cache", action="store_true")
     parser.add_argument(
         "--require-clean-git",
         action=argparse.BooleanOptionalAction,
@@ -1441,7 +1463,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serve-startup-timeout-seconds", type=float, default=1200.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=240.0)
     parser.add_argument("--self-test", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.enable_prefix_caching and args.disable_prefix_cache:
+        parser.error("--enable-prefix-caching conflicts with --disable-prefix-cache")
+    return args
 
 
 def main() -> int:
