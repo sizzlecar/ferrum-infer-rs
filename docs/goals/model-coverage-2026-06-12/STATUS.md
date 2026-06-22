@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-22 ZZZ74 — W3 Qwen35 goal cancelled and cleanup handoff written
+
+- User cancelled the active W3 Qwen3.5 release-grade goal and asked to clean
+  machines, organize code, commit, push, and leave a handoff.
+- Cleanup:
+  - Vast instance `41422823` stop request returned `success=true`;
+  - final checked state:
+    `cur_state=stopped actual_status=exited intended_status=stopped`;
+  - no local `cargo`, `bench-serve`, `ferrum serve`, W3 lane, or remote SSH
+    process was left running.
+- Corrected performance-status wording:
+  - no new same-hardware A/B performance result was produced in this cleanup;
+  - the old release-shape L5 c32 `142.839 tok/s` artifact must not be quoted as
+    current post-scheduler performance;
+  - the latest copied local scheduler/cohort diagnostic records c32
+    `651.4 output tok/s` against vLLM c32 `1708.52785 output tok/s`;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+- Code cleanup kept:
+  - canonical `FERRUM_PAGED_KV` is emitted alongside legacy
+    `FERRUM_METAL_PAGED_KV`;
+  - Qwen35 model construction reads canonical paged-KV first, with legacy
+    fallback;
+  - `ferrum run` now selects engine-level paged KV from the resolved startup
+    auto-config snapshot instead of the pre-auto-config snapshot.
+- Validation passed locally:
+  - `cargo fmt --all`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`;
+  - `cargo test -p ferrum-models qwen35_paged_kv_prefers_canonical_key_with_legacy_fallback -- --nocapture`;
+  - `cargo test -p ferrum-cli source_resolver -- --nocapture`.
+- Handoff:
+  `docs/goals/model-coverage-2026-06-12/HANDOFF_W3_QWEN35_CANCELLED_20260622.md`.
+
 ## 2026-06-22 ZZZ73 — `run`/`serve` auto-config now uses real model weight bytes
 
 - Scope:

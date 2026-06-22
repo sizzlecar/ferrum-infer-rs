@@ -491,7 +491,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     engine_config
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
-    if runtime_config_bool(&runtime_config, "FERRUM_METAL_PAGED_KV").unwrap_or(false) {
+    if runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_PAGED_KV")
+        .or_else(|| {
+            runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_METAL_PAGED_KV")
+        })
+        .unwrap_or(false)
+    {
         engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
     }
     let effective_kv_dtype = cmd
