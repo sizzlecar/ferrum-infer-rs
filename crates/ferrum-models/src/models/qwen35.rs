@@ -871,6 +871,12 @@ fn qwen35_runtime_bool(snapshot: &ferrum_types::RuntimeConfigSnapshot, key: &str
         })
 }
 
+fn qwen35_paged_kv_enabled(snapshot: &ferrum_types::RuntimeConfigSnapshot) -> bool {
+    qwen35_runtime_bool(snapshot, "FERRUM_PAGED_KV")
+        .or_else(|| qwen35_runtime_bool(snapshot, "FERRUM_METAL_PAGED_KV"))
+        .unwrap_or(true)
+}
+
 fn qwen35_paged_max_seqs(snapshot: &ferrum_types::RuntimeConfigSnapshot) -> usize {
     qwen35_runtime_positive_usize(snapshot, "FERRUM_PAGED_MAX_SEQS").unwrap_or(32)
 }
@@ -1027,7 +1033,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         let use_paged_kv = B::supports_paged_kv()
             && B::supports_varlen_qkv()
             && B::supports_qwen35_paged_qkv()
-            && qwen35_runtime_bool(&snapshot, "FERRUM_METAL_PAGED_KV").unwrap_or(true);
+            && qwen35_paged_kv_enabled(&snapshot);
         let use_vllm_paged_attn = use_paged_kv
             && qwen35_runtime_bool(&snapshot, "FERRUM_USE_VLLM_PAGED_ATTN").unwrap_or(false)
             && B::supports_vllm_paged_attn()
@@ -12983,6 +12989,31 @@ mod tests {
             Some(false)
         );
         assert_eq!(qwen35_runtime_bool(&invalid, "FERRUM_GREEDY_ARGMAX"), None);
+    }
+
+    #[test]
+    fn qwen35_paged_kv_prefers_canonical_key_with_legacy_fallback() {
+        assert!(qwen35_paged_kv_enabled(&RuntimeConfigSnapshot::default()));
+        assert!(qwen35_paged_kv_enabled(&runtime_snapshot(&[(
+            "FERRUM_PAGED_KV",
+            "1",
+        )])));
+        assert!(!qwen35_paged_kv_enabled(&runtime_snapshot(&[(
+            "FERRUM_PAGED_KV",
+            "0",
+        )])));
+        assert!(qwen35_paged_kv_enabled(&runtime_snapshot(&[(
+            "FERRUM_METAL_PAGED_KV",
+            "1",
+        )])));
+        assert!(!qwen35_paged_kv_enabled(&runtime_snapshot(&[(
+            "FERRUM_METAL_PAGED_KV",
+            "0",
+        )])));
+        assert!(qwen35_paged_kv_enabled(&runtime_snapshot(&[
+            ("FERRUM_PAGED_KV", "1"),
+            ("FERRUM_METAL_PAGED_KV", "0"),
+        ])));
     }
 
     #[test]
