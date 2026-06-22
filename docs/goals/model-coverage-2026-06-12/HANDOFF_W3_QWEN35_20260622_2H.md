@@ -37,6 +37,13 @@
   a hand-written zero-error manifest cannot hide failed measured requests.
 - The manifest builder now copies the output-token matrices from
   `bench-serve` reports into the final manifest and validates their shape.
+- The W3 L5 concurrency packaging gate now enforces the same fixed-output
+  contract before it writes `w3_l5_concurrency.json`: saved L5 commands must
+  include `--ignore-eos` and `--random-output-len 128`, and each report cell
+  must carry an `output_tokens_per_request` matrix where every request equals
+  128.
+- The final W3 validator now re-checks those L5 fields, so old L5 artifacts
+  without fixed-output evidence no longer pass the W3 L5 correctness link.
 
 ## Why This Matters
 
@@ -91,6 +98,12 @@ The old ratio and p95 ITL failures still remain. The important change is that
 the old short-output Ferrum artifact can no longer be treated as valid W3 80%
 performance evidence.
 
+A direct probe of the old L5 artifact
+`w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/l5_concurrency/w3_l5_concurrency.json`
+now also fails: it is missing `--ignore-eos` command evidence and its four
+concurrency cells do not include `output_tokens_per_request`. Re-run L5 from
+the new fixed-output bench report instead of reusing that artifact.
+
 ## Next GPU Validation
 
 Use a reachable exact 1x RTX 4090 lane. Do not claim performance from local
@@ -130,6 +143,17 @@ First acceptance check for this diagnostic: every measured request should have
 `output_tokens=128` from usage. If not, debug stop-condition propagation before
 looking at kernels.
 
+Package L5 from the same fixed-output report, using the exact command string
+that produced it:
+
+```bash
+python3 scripts/release/w3_l5_concurrency_gate.py \
+  --report /workspace/artifacts/<run>/perf/bench_ferrum_sharegpt_sweep_100x3_ignore_eos.json \
+  --out /workspace/artifacts/<run>/l5_concurrency \
+  --expected-output-len 128 \
+  --command "/workspace/ferrum-target-w3/release/ferrum bench-serve --base-url http://127.0.0.1:18173 --model 3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b --tokenizer /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b --dataset sharegpt --sharegpt-path /workspace/artifacts/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja/dataset/ascii_sharegpt_w3_100_58d5721d.jsonl --random-output-len 128 --ignore-eos --concurrency-sweep 1,4,16,32 --num-prompts 100 --warmup-requests 10 --n-repeats 3 --fail-on-error --require-ci --seed 9271 --timeout 900 --output json --out /workspace/artifacts/<run>/perf/bench_ferrum_sharegpt_sweep_100x3_ignore_eos.json"
+```
+
 ## Current Performance Gap To Recheck
 
 Historical release-shape numbers before this CLI contract fix:
@@ -163,6 +187,7 @@ distributions were not equivalent.
   - source-level W3 hot-path metadata cleanup,
   - final-validator artifact-path hardening,
   - explicit fixed-output benchmark contract via `bench-serve --ignore-eos`.
+  - L5 fixed-output evidence packaging and final-validator cross-checks.
 - State that the next required evidence is a 1x RTX 4090 correctness smoke plus
   same-hardware ShareGPT `--ignore-eos` sweep, followed by the W3 final
   validator.

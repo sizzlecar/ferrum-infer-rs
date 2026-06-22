@@ -774,12 +774,13 @@ def validate_l5_bench_commands(
     label: str,
     expected_cells: set[int],
     problems: list[str],
-) -> None:
+) -> int | None:
     commands = as_list(commands_raw, f"{label}.commands", problems)
     if not commands:
         problems.append(f"{label}.commands must include at least one bench-serve command")
-        return
+        return None
     covered: set[int] = set()
+    expected_output_len: int | None = None
     for idx, raw in enumerate(commands):
         command_label = f"{label}.commands[{idx}]"
         parts = l5_command_parts(raw, command_label, problems)
@@ -796,6 +797,19 @@ def validate_l5_bench_commands(
             problems.append(f"{command_label} command must include --seed 9271")
         if flag_value(parts, "--n-repeats") != "3":
             problems.append(f"{command_label} command must include --n-repeats 3")
+        command_expected = command_output_len(
+            parts,
+            command_label,
+            problems,
+            require_ignore_eos=True,
+        )
+        if expected_output_len is None:
+            expected_output_len = command_expected
+        elif command_expected is not None and command_expected != expected_output_len:
+            problems.append(
+                f"{command_label} command --random-output-len={command_expected}, "
+                f"expected {expected_output_len}"
+            )
         for part in parts:
             if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
                 problems.append(
@@ -805,6 +819,7 @@ def validate_l5_bench_commands(
     missing = sorted(expected_cells - covered)
     if missing:
         problems.append(f"{label}.commands missing required concurrency cells: {missing}")
+    return expected_output_len
 
 
 def l2_command_parts(raw: Any, label: str, problems: list[str]) -> list[str]:
@@ -1383,6 +1398,26 @@ def validate_w3_l5_artifact(data: dict[str, Any], label: str, problems: list[str
     )
     if concurrency.get("output_token_count_source") != "usage":
         problems.append(f"{label}.concurrency.output_token_count_source must be usage")
+    expected_output_len: int | None = None
+    if "expected_output_tokens_per_request" in concurrency:
+        expected_output_len = positive_int(
+            concurrency.get("expected_output_tokens_per_request"),
+            f"{label}.concurrency.expected_output_tokens_per_request",
+            problems,
+        )
+    command_output_tokens = validate_l5_bench_commands(
+        data.get("commands"),
+        label,
+        REQUIRED_CONCURRENCY,
+        problems,
+    )
+    if expected_output_len is None:
+        expected_output_len = command_output_tokens
+    elif command_output_tokens is not None and command_output_tokens != expected_output_len:
+        problems.append(
+            f"{label}.concurrency.expected_output_tokens_per_request "
+            f"{expected_output_len} does not match L5 commands {command_output_tokens}"
+        )
     cells = as_list(concurrency.get("cells"), f"{label}.concurrency.cells", problems)
     seen: set[int] = set()
     for idx, raw_cell in enumerate(cells):
@@ -1403,10 +1438,22 @@ def validate_w3_l5_artifact(data: dict[str, Any], label: str, problems: list[str
             requests=requests,
             problems=problems,
         )
+        output_tokens = int_matrix(
+            cell.get("output_tokens_per_request"),
+            f"{cell_label}.output_tokens_per_request",
+            problems,
+        )
+        validate_output_token_matrix(
+            output_tokens,
+            f"{cell_label}.output_tokens_per_request",
+            n_repeats=n_repeats,
+            requests=requests,
+            expected_tokens=expected_output_len,
+            problems=problems,
+        )
     missing = sorted(REQUIRED_CONCURRENCY - seen)
     if missing:
         problems.append(f"{label}.concurrency.cells missing concurrency cells: {missing}")
-    validate_l5_bench_commands(data.get("commands"), label, REQUIRED_CONCURRENCY, problems)
 
 
 def validate_w3_l0_l5_artifact(
@@ -2376,6 +2423,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
             "n_repeats": 3,
             "completed_per_run": [100, 100, 100],
             "errored_per_run": [0, 0, 0],
+            "output_tokens_per_request": [[128] * 100, [128] * 100, [128] * 100],
         }
         for field in REQUIRED_ZERO_RUN_COUNT_FIELDS:
             cell[field] = [0, 0, 0]
@@ -2410,6 +2458,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
                 "closed_loop": True,
                 "stream_options_include_usage": True,
                 "output_token_count_source": "usage",
+                "expected_output_tokens_per_request": 128,
                 "cells": cells,
             },
         },

@@ -17,6 +17,7 @@ from typing import Any
 ARTIFACT_NAME = "w3_l5_concurrency.json"
 PASS_LINE_PREFIX = "W3 L5 CONCURRENCY PASS"
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+DEFAULT_EXPECTED_OUTPUT_LEN = 128
 REQUIRED_CONCURRENCY = {1, 4, 16, 32}
 ZERO_FIELDS = [
     "bad_output_per_run",
@@ -85,6 +86,33 @@ def int_list(report: dict[str, Any], field: str, n_repeats: int, label: str) -> 
         if isinstance(value, bool) or not isinstance(value, int):
             raise GateError(f"{label}.{field} contains non-integer value {value!r}")
         out.append(value)
+    if len(out) != n_repeats:
+        raise GateError(f"{label}.{field} length {len(out)} != n_repeats {n_repeats}")
+    return out
+
+
+def int_matrix(
+    report: dict[str, Any],
+    field: str,
+    n_repeats: int,
+    row_len: int,
+    label: str,
+) -> list[list[int]]:
+    values = report.get(field)
+    if not isinstance(values, list):
+        raise GateError(f"{label}.{field} must be a list of integer lists")
+    out: list[list[int]] = []
+    for row_idx, row in enumerate(values):
+        if not isinstance(row, list):
+            raise GateError(f"{label}.{field}[{row_idx}] must be an integer list")
+        parsed_row: list[int] = []
+        for col_idx, value in enumerate(row):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise GateError(f"{label}.{field}[{row_idx}][{col_idx}] must be an integer")
+            parsed_row.append(value)
+        if len(parsed_row) != row_len:
+            raise GateError(f"{label}.{field}[{row_idx}] length {len(parsed_row)} != {row_len}")
+        out.append(parsed_row)
     if len(out) != n_repeats:
         raise GateError(f"{label}.{field} length {len(out)} != n_repeats {n_repeats}")
     return out
@@ -171,7 +199,12 @@ def command_concurrency_cells(parts: list[str], label: str) -> set[int]:
     return cells
 
 
-def validate_bench_command(raw: Any, label: str) -> tuple[list[str], set[int]]:
+def validate_bench_command(
+    raw: Any,
+    label: str,
+    *,
+    expected_output_len: int,
+) -> tuple[list[str], set[int]]:
     parts = command_parts(raw, label)
     if not any(part == "bench-serve" or part.endswith("/bench-serve") for part in parts):
         raise GateError(f"{label} must invoke ferrum bench-serve")
@@ -184,20 +217,33 @@ def validate_bench_command(raw: Any, label: str) -> tuple[list[str], set[int]]:
         raise GateError(f"{label} must include --seed 9271")
     if single_flag_value(parts, "--n-repeats", label) != "3":
         raise GateError(f"{label} must include --n-repeats 3")
+    if not has_flag(parts, "--ignore-eos"):
+        raise GateError(f"{label} missing --ignore-eos")
+    if single_flag_value(parts, "--random-output-len", label) != str(expected_output_len):
+        raise GateError(f"{label} must include --random-output-len {expected_output_len}")
     for part in parts:
         if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
             raise GateError(f"{label} uses hidden env override: {part.split('=', 1)[0]}")
     return parts, command_concurrency_cells(parts, label)
 
 
-def validate_bench_commands(commands: list[Any], expected_cells: set[int]) -> list[dict[str, Any]]:
+def validate_bench_commands(
+    commands: list[Any],
+    expected_cells: set[int],
+    *,
+    expected_output_len: int,
+) -> list[dict[str, Any]]:
     if not commands:
         raise GateError("at least one bench-serve command must be supplied with --command")
     normalized: list[dict[str, Any]] = []
     covered: set[int] = set()
     for idx, raw in enumerate(commands):
         label = f"commands[{idx}]"
-        parts, cells = validate_bench_command(raw, label)
+        parts, cells = validate_bench_command(
+            raw,
+            label,
+            expected_output_len=expected_output_len,
+        )
         covered.update(cells)
         entry: dict[str, Any] = {
             "command_line": parts,
@@ -218,7 +264,13 @@ def report_concurrency(report: dict[str, Any], label: str) -> int:
     return positive_int(report.get("concurrency"), f"{label}.concurrency")
 
 
-def cell_from_report(report: dict[str, Any], source: str, label: str) -> dict[str, Any]:
+def cell_from_report(
+    report: dict[str, Any],
+    source: str,
+    label: str,
+    *,
+    expected_output_len: int,
+) -> dict[str, Any]:
     concurrency = report_concurrency(report, label)
     n_repeats = positive_int(report.get("n_repeats"), f"{label}.n_repeats")
     requests = positive_int(report.get("n_requests_per_run"), f"{label}.n_requests_per_run")
@@ -235,6 +287,19 @@ def cell_from_report(report: dict[str, Any], source: str, label: str) -> dict[st
         raise GateError(f"{label}.completed_per_run must be full for every repeat")
     if any(value != 0 for value in errored):
         raise GateError(f"{label}.errored_per_run must be all zero")
+    output_tokens = int_matrix(
+        report,
+        "output_tokens_per_request",
+        n_repeats,
+        requests,
+        label,
+    )
+    for row_idx, row in enumerate(output_tokens):
+        if any(value != expected_output_len for value in row):
+            raise GateError(
+                f"{label}.output_tokens_per_request[{row_idx}] must equal "
+                f"--random-output-len {expected_output_len}"
+            )
 
     cell = {
         "requested_concurrency": concurrency,
@@ -243,6 +308,7 @@ def cell_from_report(report: dict[str, Any], source: str, label: str) -> dict[st
         "requests_per_run": requests,
         "completed_per_run": completed,
         "errored_per_run": errored,
+        "output_tokens_per_request": output_tokens,
         "output_token_count_source": "usage",
         "source_report": source,
     }
@@ -255,6 +321,10 @@ def cell_from_report(report: dict[str, Any], source: str, label: str) -> dict[st
 
 
 def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
+    expected_output_len = positive_int(
+        getattr(args, "expected_output_len", DEFAULT_EXPECTED_OUTPUT_LEN),
+        "expected_output_len",
+    )
     reports: list[tuple[dict[str, Any], str]] = []
     for path in args.report:
         for report in load_reports(path):
@@ -265,7 +335,12 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
     cells: list[dict[str, Any]] = []
     seen: set[int] = set()
     for idx, (report, source) in enumerate(reports):
-        cell = cell_from_report(report, source, f"reports[{idx}]")
+        cell = cell_from_report(
+            report,
+            source,
+            f"reports[{idx}]",
+            expected_output_len=expected_output_len,
+        )
         concurrency = cell["requested_concurrency"]
         if concurrency in seen:
             raise GateError(f"duplicate concurrency cell c={concurrency}")
@@ -276,7 +351,11 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
     if missing:
         raise GateError(f"missing required concurrency cells: {missing}")
     cells.sort(key=lambda item: item["requested_concurrency"])
-    commands = validate_bench_commands(args.command or [], REQUIRED_CONCURRENCY)
+    commands = validate_bench_commands(
+        args.command or [],
+        REQUIRED_CONCURRENCY,
+        expected_output_len=expected_output_len,
+    )
 
     artifact = {
         "schema_version": 1,
@@ -292,6 +371,7 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
             "closed_loop": True,
             "stream_options_include_usage": True,
             "output_token_count_source": "usage",
+            "expected_output_tokens_per_request": expected_output_len,
             "cells": cells,
         },
     }
@@ -316,6 +396,7 @@ def fake_report(concurrency: int) -> dict[str, Any]:
         "warmup_requests": 0,
         "completed_per_run": [8, 8, 8],
         "errored_per_run": zeros,
+        "output_tokens_per_request": [[DEFAULT_EXPECTED_OUTPUT_LEN] * 8 for _ in range(3)],
     }
     for field in ZERO_FIELDS:
         report[field] = zeros
@@ -335,9 +416,11 @@ def run_selftest() -> int:
             report=[report_path],
             out=root / "out",
             model_id=DEFAULT_MODEL_ID,
+            expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
             command=[
                 "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
-                "--n-repeats 3 --concurrency-sweep 1,4,16,32"
+                "--n-repeats 3 --concurrency-sweep 1,4,16,32 "
+                "--random-output-len 128 --ignore-eos"
             ],
         )
         artifact = build_artifact(args)
@@ -368,6 +451,7 @@ def run_selftest() -> int:
                     report=[bad_path],
                     out=root / "bad_out",
                     model_id=DEFAULT_MODEL_ID,
+                    expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
                     command=[],
                 )
             )
@@ -389,9 +473,11 @@ def run_selftest() -> int:
                     report=[bad_command_path],
                     out=root / "bad_command_out",
                     model_id=DEFAULT_MODEL_ID,
+                    expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
                     command=[
                         "ferrum bench-serve --fail-on-error --seed 9271 "
-                        "--n-repeats 3 --concurrency-sweep 1,4,16"
+                        "--n-repeats 3 --concurrency-sweep 1,4,16 "
+                        "--random-output-len 128 --ignore-eos"
                     ],
                 )
             )
@@ -400,6 +486,56 @@ def run_selftest() -> int:
                 raise AssertionError(f"unexpected bad-command error: {exc}") from exc
         else:
             raise AssertionError("bad L5 command unexpectedly passed")
+
+        bad_output_path = root / "bad_output.jsonl"
+        bad_output = fake_report(1)
+        bad_output["output_tokens_per_request"][0][0] = DEFAULT_EXPECTED_OUTPUT_LEN - 1
+        bad_output_path.write_text(json.dumps(bad_output) + "\n", encoding="utf-8")
+        try:
+            build_artifact(
+                argparse.Namespace(
+                    report=[bad_output_path],
+                    out=root / "bad_output_out",
+                    model_id=DEFAULT_MODEL_ID,
+                    expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    command=[
+                        "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
+                        "--n-repeats 3 --concurrency-sweep 1,4,16,32 "
+                        "--random-output-len 128 --ignore-eos"
+                    ],
+                )
+            )
+        except GateError as exc:
+            if "output_tokens_per_request" not in str(exc):
+                raise AssertionError(f"unexpected bad-output error: {exc}") from exc
+        else:
+            raise AssertionError("bad L5 output-token report unexpectedly passed")
+
+        missing_ignore_eos_path = root / "missing_ignore_eos.jsonl"
+        missing_ignore_eos_path.write_text(
+            "\n".join(json.dumps(fake_report(c), sort_keys=True) for c in [1, 4, 16, 32])
+            + "\n",
+            encoding="utf-8",
+        )
+        try:
+            build_artifact(
+                argparse.Namespace(
+                    report=[missing_ignore_eos_path],
+                    out=root / "missing_ignore_eos_out",
+                    model_id=DEFAULT_MODEL_ID,
+                    expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    command=[
+                        "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
+                        "--n-repeats 3 --concurrency-sweep 1,4,16,32 "
+                        "--random-output-len 128"
+                    ],
+                )
+            )
+        except GateError as exc:
+            if "--ignore-eos" not in str(exc):
+                raise AssertionError(f"unexpected missing-ignore-eos error: {exc}") from exc
+        else:
+            raise AssertionError("missing-ignore-eos L5 command unexpectedly passed")
     print("W3 L5 CONCURRENCY SELFTEST PASS")
     return 0
 
@@ -409,6 +545,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, action="append", default=[])
     parser.add_argument("--out", type=Path)
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--expected-output-len", type=int, default=DEFAULT_EXPECTED_OUTPUT_LEN)
     parser.add_argument("--command", action="append", help="bench command line used")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()

@@ -1211,6 +1211,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
             "n_repeats": 3,
             "completed_per_run": [100, 100, 100],
             "errored_per_run": [0, 0, 0],
+            "output_tokens_per_request": [[128] * 100, [128] * 100, [128] * 100],
         }
         for field in QUALITY_FIELDS:
             cell[f"{field}_per_run"] = [0, 0, 0]
@@ -1234,6 +1235,9 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
                         "3",
                         "--concurrency-sweep",
                         "1,4,16,32",
+                        "--random-output-len",
+                        "128",
+                        "--ignore-eos",
                     ],
                     "covers_concurrency": [1, 4, 16, 32],
                 }
@@ -1242,6 +1246,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
                 "closed_loop": True,
                 "stream_options_include_usage": True,
                 "output_token_count_source": "usage",
+                "expected_output_tokens_per_request": 128,
                 "cells": cells,
             },
         },
