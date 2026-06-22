@@ -241,3 +241,76 @@ distributions were not equivalent.
 - State that the next required evidence is a 1x RTX 4090 correctness smoke plus
   same-hardware ShareGPT `--ignore-eos` sweep, followed by the W3 final
   validator.
+
+## 2026-06-22 Two-Hour Update
+
+Concrete code progress in this window:
+
+- Added `scripts/release/w3_qwen35_cuda_release_lane.py`, a GPU-first W3 lane
+  runner that composes the existing product/L2/L4/L5/final-manifest gates.
+- The runner starts HF model snapshot prefetch asynchronously while the CUDA
+  release binary builds. It uses `HF_HOME=/workspace/hf-cache` and
+  `HF_XET_HIGH_PERFORMANCE=1`; `HF_TOKEN` may be present in the environment but
+  is never printed or written to command artifacts.
+- The runner records the paid GPU contract, hardware snapshot, git state,
+  binary SHA256, sanitized env summary, command JSON/txt files, server logs,
+  bench report, L5 artifact, manifest config, and final manifest output under
+  one artifact root.
+- It enforces the W3 fixed-output perf command shape:
+  `bench-serve --dataset sharegpt --random-output-len 128 --ignore-eos
+  --concurrency-sweep 1,4,16,32 --num-prompts 100 --n-repeats 3
+  --fail-on-error --require-ci --seed 9271`.
+- `scripts/release/w3_qwen35_real_product_report.py` now accepts typed serve
+  CLI knobs for scheduler/prefix-cache validation:
+  `--scheduler-prefill-first-until-active`,
+  `--scheduler-prefill-step-chunk`,
+  `--scheduler-active-decode-prefill-chunk`,
+  `--enable-prefix-caching`, and `--disable-prefix-cache`.
+
+Run this when a reachable 1x RTX 4090 host is available:
+
+```bash
+python3 scripts/release/w3_qwen35_cuda_release_lane.py \
+  --out docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_cuda_release_lane_<YYYYMMDDTHHMMSSZ> \
+  --hf-home /workspace/hf-cache \
+  --gpu-devices 0
+```
+
+Optional typed CLI tuning is passed explicitly, for example:
+
+```bash
+  --max-model-len 4096 \
+  --max-num-seqs 32 \
+  --max-num-batched-tokens 8192 \
+  --scheduler-prefill-first-until-active 8
+```
+
+Do not use hidden `FERRUM_*` overrides for release evidence; the runner scrubs
+them from child processes and records the scrubbed key names.
+
+Validation completed locally:
+
+```bash
+python3 -m py_compile \
+  scripts/release/w3_qwen35_cuda_release_lane.py \
+  scripts/release/w3_qwen35_real_product_report.py \
+  scripts/release/w3_l2_quantized_gate.py \
+  scripts/release/w3_l4_agent_gate.py \
+  scripts/release/w3_l5_concurrency_gate.py \
+  scripts/release/model_release_grade_manifest.py
+python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test
+python3 scripts/release/w3_qwen35_real_product_report.py --self-test
+python3 scripts/release/w3_l2_quantized_gate.py --self-test
+python3 scripts/release/w3_l4_agent_gate.py --self-test
+python3 scripts/release/w3_l5_concurrency_gate.py --self-test
+python3 scripts/release/model_release_grade_manifest.py --self-test
+git diff --check
+```
+
+Current status after this update:
+
+- Branch has real code progress, but still no new 1x4090 execution artifact.
+- No `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` exists.
+- The next blocker is external GPU availability, not local command assembly.
+- If the lane fails on GPU, stop at the first failing step and inspect that
+  step's artifact/log instead of running another full sweep.
