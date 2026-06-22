@@ -1087,6 +1087,13 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
                 "known_answer_passed": 10,
                 "format": "hf-gptq-int4",
             },
+            "output_hygiene": {
+                "known_answer_cases_checked": 10,
+                "response_artifacts_checked": 10,
+                "content_non_empty": True,
+                "forbidden_patterns_absent": True,
+                "artifact_text_scanned": True,
+            },
             "commands": [
                 {
                     "entrypoint": "ferrum run",

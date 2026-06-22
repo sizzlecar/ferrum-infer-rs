@@ -1245,6 +1245,48 @@ def validate_w3_l2_artifact(data: dict[str, Any], label: str, problems: list[str
         problems,
     )
     non_empty_string(quantized.get("format"), f"{label}.quantized_semantics.format", problems)
+    hygiene = as_object(data.get("output_hygiene"), f"{label}.output_hygiene", problems)
+    if hygiene:
+        require_true(
+            hygiene.get("content_non_empty"),
+            f"{label}.output_hygiene.content_non_empty",
+            problems,
+        )
+        require_true(
+            hygiene.get("forbidden_patterns_absent"),
+            f"{label}.output_hygiene.forbidden_patterns_absent",
+            problems,
+        )
+        require_true(
+            hygiene.get("artifact_text_scanned"),
+            f"{label}.output_hygiene.artifact_text_scanned",
+            problems,
+        )
+        checked = positive_int(
+            hygiene.get("known_answer_cases_checked"),
+            f"{label}.output_hygiene.known_answer_cases_checked",
+            problems,
+        )
+        artifacts = positive_int(
+            hygiene.get("response_artifacts_checked"),
+            f"{label}.output_hygiene.response_artifacts_checked",
+            problems,
+        )
+        total = quantized.get("known_answer_total")
+        if (
+            checked is not None
+            and isinstance(total, int)
+            and not isinstance(total, bool)
+            and checked < total
+        ):
+            problems.append(f"{label}.output_hygiene.known_answer_cases_checked must cover all cases")
+        if (
+            artifacts is not None
+            and isinstance(total, int)
+            and not isinstance(total, bool)
+            and artifacts < total
+        ):
+            problems.append(f"{label}.output_hygiene.response_artifacts_checked must cover all cases")
     validate_l2_product_commands(data.get("commands"), label, problems)
 
 
@@ -2298,6 +2340,13 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
                 "known_answer_total": 10,
                 "known_answer_passed": 10,
                 "format": "hf-gptq-int4",
+            },
+            "output_hygiene": {
+                "known_answer_cases_checked": 10,
+                "response_artifacts_checked": 10,
+                "content_non_empty": True,
+                "forbidden_patterns_absent": True,
+                "artifact_text_scanned": True,
             },
             "commands": [
                 {
