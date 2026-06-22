@@ -1093,9 +1093,9 @@ def prepare_baseline(
     write_json(out_dir / "baseline_decision.json", decision)
 
 
-def preflight_baseline(args: argparse.Namespace, out_dir: Path) -> None:
+def preflight_baseline(args: argparse.Namespace, out_dir: Path) -> bool:
     if args.baseline_mode not in {"auto", "historical"}:
-        return
+        return True
     ok, problems, paths = historical_baseline_contract(args, out_dir / "baseline_preflight")
     write_json(
         out_dir / "baseline_preflight.json",
@@ -1111,6 +1111,31 @@ def preflight_baseline(args: argparse.Namespace, out_dir: Path) -> None:
         if not ok:
             raise LaneError("historical baseline is not W3 fixed-output valid: " + "; ".join(problems))
         apply_baseline_paths(args, paths)
+        return False
+    if ok:
+        apply_baseline_paths(args, paths)
+        return False
+    return True
+
+
+def preflight_live_vllm_if_needed(
+    args: argparse.Namespace,
+    out_dir: Path,
+    env: dict[str, str],
+    needs_live_baseline: bool,
+) -> None:
+    if not needs_live_baseline:
+        return
+    version = run_vllm_version_probe(args, out_dir / "baseline_vllm_preflight", env)
+    write_json(
+        out_dir / "baseline_vllm_preflight.json",
+        {
+            "status": "pass",
+            "version": version,
+            "reason": "historical baseline is not fixed-output command-valid",
+            "generated_at": iso_now(),
+        },
+    )
 
 
 def render_manifest_config(
@@ -1253,7 +1278,7 @@ def run_lane(args: argparse.Namespace) -> int:
         raise LaneError(
             f"ShareGPT dataset sha mismatch for {args.sharegpt_path}; expected {args.dataset_sha}"
         )
-    preflight_baseline(args, out_dir)
+    needs_live_baseline = preflight_baseline(args, out_dir)
 
     gpu_snapshot(out_dir / "hardware", env, args.require_gpu)
     prefetch = start_prefetch(args, out_dir / "prefetch", env)
@@ -1269,6 +1294,7 @@ def run_lane(args: argparse.Namespace) -> int:
         out_dir / "env/binary.json",
         {"path": str(ferrum_bin), "sha256": binary_sha, "generated_at": iso_now()},
     )
+    preflight_live_vllm_if_needed(args, out_dir, env, needs_live_baseline)
 
     run_product_report(args, out_dir / "product", ferrum_bin, env)
     run_l2(out_dir / "product", out_dir / "l2", args, env)
