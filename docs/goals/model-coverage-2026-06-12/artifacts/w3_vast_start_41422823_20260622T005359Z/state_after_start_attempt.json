@@ -1,0 +1,14 @@
+{
+  "actual_status": "exited",
+  "checked_at": "2026-06-22T00:59:53.194449+00:00",
+  "conclusion": "not_running_no_ssh_expected",
+  "cur_state": "stopped",
+  "dph_total": 0.662962962962963,
+  "gpu_name": "RTX 4090",
+  "gpu_ram": 49140,
+  "id": 41422823,
+  "num_gpus": 1,
+  "public_ipaddr": "23.158.136.85",
+  "ssh_host": "ssh7.vast.ai",
+  "ssh_port": 22822
+}

@@ -314,3 +314,50 @@ Current status after this update:
 - The next blocker is external GPU availability, not local command assembly.
 - If the lane fails on GPU, stop at the first failing step and inspect that
   step's artifact/log instead of running another full sweep.
+
+## 2026-06-22 Continuation Update
+
+External GPU state:
+
+- Direct SSH to `ssh7.vast.ai:22822` still returned `Connection refused`.
+- Vast inventory still lists only instance `41422823`, 1x `RTX 4090`,
+  `49140` MiB visible VRAM, `cur_state=stopped`,
+  `actual_status=exited`, at about `$0.663/h`.
+- One start attempt was made after recording the paid GPU lane/cost/stop/gate
+  contract. Vast returned HTTP 200 with
+  `success=false`, `error=resources_unavailable`.
+- A follow-up query still reported `stopped/exited`, so there was no running
+  GPU to use and no idle running instance left behind.
+- Artifact:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w3_vast_start_41422823_20260622T005359Z/`.
+
+Important runner fix after the GPU blocker:
+
+- The checked-in historical vLLM baseline report is fixed-output, but its saved
+  `bench-vllm.command.txt` lacks `--ignore-eos`.
+- Current W3 final validation requires `--ignore-eos` on both Ferrum and
+  baseline bench commands. Without a fix, the next GPU run could pass Ferrum
+  product/L2/L4/L5 and still fail final manifest on baseline command evidence.
+- `scripts/release/w3_qwen35_cuda_release_lane.py` now defaults to
+  `--baseline-mode auto`:
+  - if the historical baseline command/report passes the fixed-output
+    contract, it is reused;
+  - if it does not, the lane runs a live same-host vLLM OpenAI server and
+    re-runs the baseline with the same Ferrum `bench-serve` client and
+    `--ignore-eos --random-output-len 128 --concurrency-sweep 1,4,16,32`.
+- The script records `baseline_decision.json`, vLLM versions, vLLM server
+  command, vLLM bench command, and live baseline report before building the
+  final manifest config.
+- Use `--baseline-mode historical` only when intentionally requiring a
+  pre-existing fixed-output baseline; with the current checked-in baseline
+  command, that mode should fail rather than fabricate command evidence.
+
+Validation for this continuation:
+
+```bash
+python3 -m py_compile scripts/release/w3_qwen35_cuda_release_lane.py
+python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test
+git diff --check
+```
+
+All three passed locally.

@@ -257,6 +257,25 @@ def server_model_id(base_url: str, timeout: float, fallback: str) -> str:
     return fallback
 
 
+def wait_for_openai_server(
+    proc: subprocess.Popen[str],
+    base_url: str,
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise LaneError(f"OpenAI-compatible server exited early with rc={proc.returncode}")
+        try:
+            status, _ = http_get(f"{base_url}/v1/models", timeout=2.0)
+            if 200 <= status < 300:
+                return
+        except Exception:
+            pass
+        time.sleep(1.0)
+    raise LaneError(f"OpenAI-compatible server did not become ready before {timeout_seconds}s")
+
+
 def gpu_snapshot(out_dir: Path, env: dict[str, str], require_gpu: bool) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     nvidia_smi = shutil.which("nvidia-smi")
@@ -740,6 +759,360 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def resolve_config_path(value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise LaneError(f"{label} must be a non-empty path string")
+    path = Path(value)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def config_args(args: argparse.Namespace) -> dict[str, Any]:
+    config = load_json(args.base_evidence_config)
+    if not isinstance(config, dict):
+        raise LaneError(f"base evidence config is not a JSON object: {args.base_evidence_config}")
+    raw = config.get("args", {})
+    if not isinstance(raw, dict):
+        raise LaneError(f"base evidence config args must be a JSON object: {args.base_evidence_config}")
+    return raw
+
+
+def has_flag(parts: list[str], flag: str) -> bool:
+    return flag in parts or any(part.startswith(f"{flag}=") for part in parts)
+
+
+def flag_values(parts: list[str], flag: str) -> list[str]:
+    values: list[str] = []
+    prefix = f"{flag}="
+    idx = 0
+    while idx < len(parts):
+        part = parts[idx]
+        if part.startswith(prefix):
+            values.append(part[len(prefix) :])
+        elif part == flag and idx + 1 < len(parts):
+            values.append(parts[idx + 1])
+            idx += 1
+        idx += 1
+    return values
+
+
+def command_file_fixed_output_ok(path: Path, label: str) -> tuple[bool, list[str]]:
+    problems: list[str] = []
+    if not path.is_file():
+        return False, [f"{label} missing: {path}"]
+    try:
+        parts = shlex.split(path.read_text(encoding="utf-8").strip())
+    except ValueError as exc:
+        return False, [f"{label} is not a valid shell command: {exc}"]
+    if not has_flag(parts, "--ignore-eos"):
+        problems.append(f"{label} missing --ignore-eos")
+    values = flag_values(parts, "--random-output-len")
+    if values != [str(EXPECTED_OUTPUT_LEN)]:
+        problems.append(f"{label} must include --random-output-len {EXPECTED_OUTPUT_LEN}")
+    if "--concurrency-sweep" not in parts:
+        problems.append(f"{label} must include --concurrency-sweep {REQUIRED_CELLS}")
+    elif REQUIRED_CELLS not in flag_values(parts, "--concurrency-sweep"):
+        problems.append(f"{label} --concurrency-sweep must include {REQUIRED_CELLS}")
+    return not problems, problems
+
+
+def bench_report_fixed_output_ok(path: Path, label: str) -> tuple[bool, list[str]]:
+    problems: list[str] = []
+    if not path.is_file():
+        return False, [f"{label} missing: {path}"]
+    data = load_json(path)
+    reports = data.get("reports") if isinstance(data, dict) else data
+    if not isinstance(reports, list):
+        return False, [f"{label} must contain a report list"]
+    seen: set[int] = set()
+    for idx, report in enumerate(reports):
+        if not isinstance(report, dict):
+            problems.append(f"{label}[{idx}] must be a JSON object")
+            continue
+        concurrency = report.get("concurrency")
+        if isinstance(concurrency, int):
+            seen.add(concurrency)
+        if report.get("output_token_count_source") != "usage":
+            problems.append(f"{label}[{idx}] output_token_count_source must be usage")
+        rows = report.get("output_tokens_per_request")
+        if not isinstance(rows, list):
+            problems.append(f"{label}[{idx}] missing output_tokens_per_request")
+            continue
+        for row_idx, row in enumerate(rows):
+            if not isinstance(row, list):
+                problems.append(f"{label}[{idx}].output_tokens_per_request[{row_idx}] invalid")
+                continue
+            if any(token != EXPECTED_OUTPUT_LEN for token in row):
+                problems.append(
+                    f"{label}[{idx}].output_tokens_per_request[{row_idx}] "
+                    f"must equal {EXPECTED_OUTPUT_LEN}"
+                )
+    required = {1, 4, 16, 32}
+    missing = sorted(required - seen)
+    if missing:
+        problems.append(f"{label} missing concurrency cells: {missing}")
+    return not problems, problems
+
+
+def materialize_command_value(value: Any, label: str, out_dir: Path) -> Path:
+    if isinstance(value, str):
+        candidate = Path(value)
+        candidate = candidate if candidate.is_absolute() else REPO_ROOT / candidate
+        if candidate.is_file():
+            return candidate
+        text = value
+    elif isinstance(value, list) and value and all(isinstance(part, str) for part in value):
+        text = shlex_join(value)
+    else:
+        raise LaneError(f"{label} must be a command string, command list, or path")
+    path = out_dir / f"{label}.txt"
+    write_text(path, text.strip() + "\n")
+    return path
+
+
+def configured_baseline_paths(args: argparse.Namespace, out_dir: Path) -> dict[str, Path]:
+    raw = config_args(args)
+    return {
+        "perf_report": args.baseline_perf_report
+        or resolve_config_path(raw.get("baseline_perf_report"), "baseline_perf_report"),
+        "bench_command": args.baseline_bench_command
+        or materialize_command_value(
+            raw.get("baseline_bench_command"),
+            "baseline_bench_command",
+            out_dir / "configured_baseline",
+        ),
+        "server_command": args.baseline_server_command
+        or materialize_command_value(
+            raw.get("baseline_server_command"),
+            "baseline_server_command",
+            out_dir / "configured_baseline",
+        ),
+        "build_command": args.baseline_build_command
+        or materialize_command_value(
+            raw.get("baseline_build_command"),
+            "baseline_build_command",
+            out_dir / "configured_baseline",
+        ),
+    }
+
+
+def historical_baseline_contract(
+    args: argparse.Namespace,
+    out_dir: Path,
+) -> tuple[bool, list[str], dict[str, Path]]:
+    paths = configured_baseline_paths(args, out_dir)
+    problems: list[str] = []
+    command_ok, command_problems = command_file_fixed_output_ok(
+        paths["bench_command"],
+        "historical baseline bench command",
+    )
+    report_ok, report_problems = bench_report_fixed_output_ok(
+        paths["perf_report"],
+        "historical baseline report",
+    )
+    problems.extend(command_problems)
+    problems.extend(report_problems)
+    for key in ["server_command", "build_command"]:
+        if not paths[key].is_file():
+            problems.append(f"historical baseline {key} missing: {paths[key]}")
+    return command_ok and report_ok and not problems, problems, paths
+
+
+def apply_baseline_paths(args: argparse.Namespace, paths: dict[str, Path]) -> None:
+    args.baseline_perf_report = paths["perf_report"]
+    args.baseline_bench_command = paths["bench_command"]
+    args.baseline_server_command = paths["server_command"]
+    args.baseline_build_command = paths["build_command"]
+
+
+def run_vllm_version_probe(
+    args: argparse.Namespace,
+    out_dir: Path,
+    env: dict[str, str],
+) -> str:
+    code = (
+        "import json\n"
+        "data = {}\n"
+        "try:\n"
+        "    import vllm\n"
+        "    data['vllm'] = getattr(vllm, '__version__', 'unknown')\n"
+        "except Exception as exc:\n"
+        "    data['vllm_error'] = type(exc).__name__ + ': ' + str(exc)\n"
+        "try:\n"
+        "    import torch\n"
+        "    data['torch'] = getattr(torch, '__version__', 'unknown')\n"
+        "    data['cuda_available'] = bool(torch.cuda.is_available())\n"
+        "    data['cuda_device_count'] = int(torch.cuda.device_count())\n"
+        "except Exception as exc:\n"
+        "    data['torch_error'] = type(exc).__name__ + ': ' + str(exc)\n"
+        "print(json.dumps(data, sort_keys=True))\n"
+        "raise SystemExit(0 if 'vllm' in data else 1)\n"
+    )
+    cmd = [args.vllm_python, "-c", code]
+    proc = run_logged(
+        label="vllm_version_probe",
+        cmd=cmd,
+        out_dir=out_dir / "commands",
+        env=env,
+        timeout=args.short_gate_timeout_seconds,
+    )
+    version_data = json.loads(proc.stdout.strip().splitlines()[-1])
+    write_json(out_dir / "vllm_versions.json", version_data)
+    write_text(out_dir / "baseline-build.command.txt", shlex_join(cmd) + "\n")
+    return str(version_data.get("vllm", "unknown"))
+
+
+def start_vllm_server(
+    args: argparse.Namespace,
+    out_dir: Path,
+    env: dict[str, str],
+) -> tuple[subprocess.Popen[str], str, str]:
+    server_dir = out_dir / "server"
+    server_dir.mkdir(parents=True, exist_ok=True)
+    port = args.vllm_port if args.vllm_port is not None else free_port()
+    served_model = args.vllm_served_model_name or args.release_model_id
+    cmd = [
+        args.vllm_python,
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        args.model,
+        "--served-model-name",
+        served_model,
+        "--host",
+        args.host,
+        "--port",
+        str(port),
+        "--tensor-parallel-size",
+        "1",
+    ]
+    if args.vllm_gpu_memory_utilization is not None:
+        cmd.extend(["--gpu-memory-utilization", str(args.vllm_gpu_memory_utilization)])
+    if args.model_revision:
+        cmd.extend(["--revision", args.model_revision])
+    cmd.extend(args.vllm_extra_arg)
+    write_json(
+        server_dir / "vllm_server.command.json",
+        {"cmd": cmd, "cwd": str(REPO_ROOT), "env": sanitize_env_for_record(env)},
+    )
+    write_text(server_dir / "vllm-server.command.txt", shlex_join(cmd) + "\n")
+    log = (server_dir / "vllm_server.log").open("w", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    finally:
+        log.close()
+    base_url = f"http://{args.host}:{port}"
+    wait_for_openai_server(proc, base_url, args.vllm_startup_timeout_seconds)
+    return proc, base_url, served_model
+
+
+def run_live_vllm_baseline(
+    args: argparse.Namespace,
+    out_dir: Path,
+    ferrum_bin: Path,
+    env: dict[str, str],
+) -> dict[str, Path | str]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    version = run_vllm_version_probe(args, out_dir, env)
+    proc: subprocess.Popen[str] | None = None
+    try:
+        proc, base_url, request_model = start_vllm_server(args, out_dir, env)
+        tokenizer = resolve_tokenizer_path(args.model, args.hf_home, args.tokenizer)
+        perf_dir = out_dir / "perf"
+        perf_dir.mkdir(parents=True, exist_ok=True)
+        report = perf_dir / "bench_vllm_sharegpt_sweep_100x3.json"
+        cmd = bench_command(args, ferrum_bin, base_url, request_model, tokenizer, report)
+        write_text(perf_dir / "bench-vllm.command.txt", shlex_join(cmd) + "\n")
+        run_logged(
+            label="bench_vllm_sharegpt_sweep_100x3",
+            cmd=cmd,
+            out_dir=perf_dir / "commands",
+            env=env,
+            timeout=args.vllm_baseline_timeout_seconds,
+        )
+        ok, problems = bench_report_fixed_output_ok(report, "live vLLM baseline report")
+        if not ok:
+            raise LaneError("live vLLM baseline report failed fixed-output contract: " + "; ".join(problems))
+    finally:
+        if proc is not None:
+            stop_server(proc, out_dir / "server")
+    return {
+        "perf_report": out_dir / "perf/bench_vllm_sharegpt_sweep_100x3.json",
+        "bench_command": out_dir / "perf/bench-vllm.command.txt",
+        "server_command": out_dir / "server/vllm-server.command.txt",
+        "build_command": out_dir / "baseline-build.command.txt",
+        "version": version,
+    }
+
+
+def prepare_baseline(
+    args: argparse.Namespace,
+    out_dir: Path,
+    ferrum_bin: Path,
+    env: dict[str, str],
+) -> None:
+    ok, problems, paths = historical_baseline_contract(args, out_dir)
+    decision = {
+        "baseline_mode": args.baseline_mode,
+        "historical_ok": ok,
+        "historical_paths": {key: str(value) for key, value in paths.items()},
+        "historical_problems": problems,
+        "generated_at": iso_now(),
+    }
+    if args.baseline_mode == "historical":
+        if not ok:
+            write_json(out_dir / "baseline_decision.json", decision)
+            raise LaneError("historical baseline is not W3 fixed-output valid: " + "; ".join(problems))
+        apply_baseline_paths(args, paths)
+        decision["selected"] = "historical"
+        write_json(out_dir / "baseline_decision.json", decision)
+        return
+    if args.baseline_mode == "auto" and ok:
+        apply_baseline_paths(args, paths)
+        decision["selected"] = "historical"
+        write_json(out_dir / "baseline_decision.json", decision)
+        return
+    live = run_live_vllm_baseline(args, out_dir / "baseline_vllm", ferrum_bin, env)
+    live_paths = {
+        "perf_report": live["perf_report"],
+        "bench_command": live["bench_command"],
+        "server_command": live["server_command"],
+        "build_command": live["build_command"],
+    }
+    apply_baseline_paths(args, live_paths)  # type: ignore[arg-type]
+    args.baseline_version = str(live["version"])
+    decision["selected"] = "live_vllm"
+    decision["live_paths"] = {key: str(value) for key, value in live_paths.items()}
+    decision["live_version"] = args.baseline_version
+    write_json(out_dir / "baseline_decision.json", decision)
+
+
+def preflight_baseline(args: argparse.Namespace, out_dir: Path) -> None:
+    if args.baseline_mode not in {"auto", "historical"}:
+        return
+    ok, problems, paths = historical_baseline_contract(args, out_dir / "baseline_preflight")
+    write_json(
+        out_dir / "baseline_preflight.json",
+        {
+            "baseline_mode": args.baseline_mode,
+            "historical_ok": ok,
+            "historical_paths": {key: str(value) for key, value in paths.items()},
+            "historical_problems": problems,
+            "generated_at": iso_now(),
+        },
+    )
+    if args.baseline_mode == "historical":
+        if not ok:
+            raise LaneError("historical baseline is not W3 fixed-output valid: " + "; ".join(problems))
+        apply_baseline_paths(args, paths)
+
+
 def render_manifest_config(
     *,
     args: argparse.Namespace,
@@ -795,6 +1168,10 @@ def render_manifest_config(
         cfg_args["baseline_server_command"] = str(args.baseline_server_command)
     if args.baseline_build_command is not None:
         cfg_args["baseline_build_command"] = str(args.baseline_build_command)
+    if args.baseline_engine is not None:
+        cfg_args["baseline_engine"] = str(args.baseline_engine)
+    if args.baseline_version is not None:
+        cfg_args["baseline_version"] = str(args.baseline_version)
     config["args"] = cfg_args
     path = out_dir / "manifest_config.json"
     write_json(path, config)
@@ -844,6 +1221,7 @@ def write_gpu_contract(args: argparse.Namespace, out_dir: Path) -> None:
                 "--ignore-eos --concurrency-sweep 1,4,16,32 --num-prompts "
                 f"{args.num_prompts} --n-repeats 3 --fail-on-error --require-ci --seed 9271"
             ),
+            "baseline_mode": args.baseline_mode,
             "model": args.model,
             "release_model_id": args.release_model_id,
             "backend": args.backend,
@@ -875,6 +1253,7 @@ def run_lane(args: argparse.Namespace) -> int:
         raise LaneError(
             f"ShareGPT dataset sha mismatch for {args.sharegpt_path}; expected {args.dataset_sha}"
         )
+    preflight_baseline(args, out_dir)
 
     gpu_snapshot(out_dir / "hardware", env, args.require_gpu)
     prefetch = start_prefetch(args, out_dir / "prefetch", env)
@@ -903,6 +1282,7 @@ def run_lane(args: argparse.Namespace) -> int:
         if server_proc is not None:
             stop_server(server_proc, out_dir / "server")
     run_l5(args, out_dir / "perf", out_dir / "l5", env)
+    prepare_baseline(args, out_dir, ferrum_bin, env)
     config_path = render_manifest_config(
         args=args,
         out_dir=out_dir,
@@ -1006,6 +1386,26 @@ def run_selftest() -> int:
                 "--no-run-final-validator",
             ]
         )
+        historical_ok, historical_problems, _ = historical_baseline_contract(
+            args,
+            root / "historical_probe",
+        )
+        if historical_ok or not any("--ignore-eos" in problem for problem in historical_problems):
+            raise AssertionError("selftest did not reject the checked-in historical baseline command")
+        baseline_server = root / "baseline-server.command.txt"
+        baseline_build = root / "baseline-build.command.txt"
+        write_text(baseline_server, "python -m vllm.entrypoints.openai.api_server --model test\n")
+        write_text(baseline_build, "python -c 'import vllm; print(vllm.__version__)'\n")
+        args.baseline_perf_report = report
+        args.baseline_bench_command = bench_cmd_path
+        args.baseline_server_command = baseline_server
+        args.baseline_build_command = baseline_build
+        baseline_ok, baseline_problems, _ = historical_baseline_contract(
+            args,
+            root / "valid_baseline_probe",
+        )
+        if not baseline_ok:
+            raise AssertionError(f"selftest valid baseline unexpectedly failed: {baseline_problems}")
         prefetch = prefetch_command(args.model, args.model_revision)
         if "HF_TOKEN" in " ".join(prefetch):
             raise AssertionError("prefetch command must not expose HF_TOKEN")
@@ -1065,6 +1465,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--baseline-bench-command", type=Path)
     parser.add_argument("--baseline-server-command", type=Path)
     parser.add_argument("--baseline-build-command", type=Path)
+    parser.add_argument("--baseline-mode", choices=["auto", "historical", "live"], default="auto")
+    parser.add_argument("--baseline-engine", default="vLLM")
+    parser.add_argument("--baseline-version")
+    parser.add_argument("--vllm-python", default=sys.executable)
+    parser.add_argument("--vllm-port", type=int)
+    parser.add_argument("--vllm-served-model-name")
+    parser.add_argument("--vllm-gpu-memory-utilization")
+    parser.add_argument("--vllm-extra-arg", action="append", default=[])
     parser.add_argument("--num-prompts", type=int, default=100)
     parser.add_argument("--warmup-requests", type=int, default=10)
     parser.add_argument("--l4-tool-total", type=int, default=10)
@@ -1082,6 +1490,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--short-gate-timeout-seconds", type=float, default=600.0)
     parser.add_argument("--run-timeout-seconds", type=float, default=900.0)
     parser.add_argument("--serve-startup-timeout-seconds", type=float, default=1200.0)
+    parser.add_argument("--vllm-startup-timeout-seconds", type=float, default=1800.0)
+    parser.add_argument("--vllm-baseline-timeout-seconds", type=float, default=14400.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=240.0)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
