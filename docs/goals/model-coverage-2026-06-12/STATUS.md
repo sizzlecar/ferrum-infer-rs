@@ -13044,3 +13044,55 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
   - 当前 Vast SSH 之前返回 `Connection refused`;不要在机器不可达时反复
     停机/开机。GPU 可达后先跑上面的 lane,首个失败 step 即停止并看对应
     artifact/log。
+
+## 2026-06-22 — W3 baseline preflight and Vast retry artifact
+
+- Vast 状态:
+  - 复核当前账号实例列表,只有现有 `41422823`:
+    `RTX 4090`, `num_gpus=1`, `gpu_ram=49140`, `dph_total=0.662962962962963`,
+    `cur_state=stopped`, `actual_status=exited`。
+  - SSH `ssh -p 22822 root@ssh7.vast.ai` 仍为 `Connection refused`。
+  - 按付费 GPU 策略记录 lane/cost/stop/correctness/perf command 后,对该
+    实例做了一次 start 请求;Vast 返回 HTTP 200 但 body 为
+    `success=false`, `error=resources_unavailable`, message 为 required
+    resources unavailable / state change queued。
+  - start 后验查询仍为 `cur_state=stopped`, `actual_status=exited`,因此没有
+    running GPU 空转。
+  - artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_vast_start_41422823_20260622T005359Z/`。
+- 新发现的本地证据链 blocker:
+  - 现有历史 vLLM baseline
+    `artifacts/w3_vllm_sharegpt_baseline_20260619/bench_vllm_sharegpt_sweep_100x3.json`
+    的 output-token matrix 是 fixed 128,但
+    `bench-vllm.command.txt` 没有 `--ignore-eos`。
+  - 当前 final validator 要求 Ferrum 和 baseline command 都显式携带
+    `--ignore-eos`;否则 GPU 上 Ferrum 全链路跑完也会在 final manifest
+    失败。
+- 源码变更:
+  - `scripts/release/w3_qwen35_cuda_release_lane.py` 新增 baseline preflight。
+  - `--baseline-mode auto` 默认先检查历史 baseline 的 bench command 和
+    report:
+    - command 必须含 `--ignore-eos`, `--random-output-len 128`,
+      `--concurrency-sweep 1,4,16,32`;
+    - report 必须覆盖 c=1/4/16/32, `output_token_count_source=usage`,
+      且每个 request 的 output token 都为 128。
+  - 如果历史 baseline 合格,直接复用;如果不合格且 mode 为 `auto`,同机启动
+    live vLLM OpenAI server,用同一个 Ferrum `bench-serve` client 重跑 baseline:
+    `--ignore-eos --random-output-len 128 --concurrency-sweep 1,4,16,32
+    --num-prompts 100 --n-repeats 3 --fail-on-error --require-ci --seed 9271`。
+  - live baseline 会保存 `baseline_vllm/vllm_versions.json`,
+    `baseline_vllm/server/vllm-server.command.txt`,
+    `baseline_vllm/perf/bench-vllm.command.txt`,
+    `baseline_vllm/perf/bench_vllm_sharegpt_sweep_100x3.json`,并把这些路径写入
+    manifest config。
+  - 如果用户强制 `--baseline-mode historical`,历史 baseline 不合格会在
+    Ferrum 跑完前/manifest 前失败,不会伪造 command。
+- 本地验证:
+  - `python3 -m py_compile scripts/release/w3_qwen35_cuda_release_lane.py`
+    PASS。
+  - `python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test` PASS。
+  - `git diff --check` PASS。
+- 限制:
+  - 仍无 1x4090 W3 PASS artifact。
+  - Vast 当前资源不可用;不要循环 start。下一次 GPU 可达时,runner 会自动避免
+    复用不合格历史 baseline。
