@@ -27,6 +27,21 @@ REQUIRED_ENTRYPOINTS = {
     "ferrum run": "run",
     "ferrum serve": "serve",
 }
+FORBIDDEN_OUTPUT_PATTERNS = [
+    "<unk>",
+    "[PAD",
+    "<pad>",
+    "<|endoftext|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|reserved_special_token",
+    "\ufffd",
+    "KV cache overflow",
+    "panicked at",
+    "panic:",
+    "malformed UTF-8",
+    "stream error",
+]
 
 
 class GateError(Exception):
@@ -79,6 +94,13 @@ def int_value(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise GateError(f"{label} must be an integer")
     return value
+
+
+def read_text(path: Path, label: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError as exc:
+        raise GateError(f"{label} missing: {path}") from exc
 
 
 def report_section(report: dict[str, Any]) -> dict[str, Any]:
@@ -181,6 +203,57 @@ def case_passed(case: Any) -> bool:
     return False
 
 
+def assert_no_forbidden_output(label: str, text: str) -> None:
+    for pattern in FORBIDDEN_OUTPUT_PATTERNS:
+        if pattern in text:
+            raise GateError(f"{label} contains forbidden output pattern {pattern!r}")
+
+
+def case_output_text(case: dict[str, Any], label: str) -> str:
+    for key in ["content", "output", "text", "response"]:
+        value = case.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    raise GateError(f"{label} must include non-empty output content")
+
+
+def resolve_artifact(raw: Any, report_dir: Path, label: str) -> Path:
+    if not isinstance(raw, str) or not raw.strip():
+        raise GateError(f"{label}.artifact must be a non-empty string")
+    path = Path(raw)
+    candidates = [path] if path.is_absolute() else [report_dir / path, report_dir.parent / path]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    checked = ", ".join(str(candidate) for candidate in candidates)
+    raise GateError(f"{label}.artifact missing: {raw} (checked {checked})")
+
+
+def validate_known_answer_hygiene(cases: list[Any], report_dir: Path) -> dict[str, Any]:
+    if not cases:
+        raise GateError("known_answer_cases must be present for W3 L2 output hygiene")
+    checked_artifacts = 0
+    for idx, raw_case in enumerate(cases):
+        label = f"known_answer_cases[{idx}]"
+        case = as_object(raw_case, label)
+        text = case_output_text(case, label)
+        assert_no_forbidden_output(f"{label}.content", text)
+        artifact = resolve_artifact(case.get("artifact"), report_dir, label)
+        artifact_text = read_text(artifact, f"{label}.artifact")
+        assert_no_forbidden_output(f"{label}.artifact", artifact_text)
+        checked_artifacts += 1
+        finish_reason = case.get("finish_reason")
+        if finish_reason is not None and finish_reason not in {"stop", "length"}:
+            raise GateError(f"{label}.finish_reason must be stop or length, got {finish_reason!r}")
+    return {
+        "known_answer_cases_checked": len(cases),
+        "response_artifacts_checked": checked_artifacts,
+        "content_non_empty": True,
+        "forbidden_patterns_absent": True,
+        "artifact_text_scanned": True,
+    }
+
+
 def known_answer_counts(source: dict[str, Any]) -> tuple[int, int, list[Any]]:
     for key in ["known_answer_cases", "cases", "known_answers"]:
         if key in source:
@@ -199,6 +272,7 @@ def validate_report(
     *,
     model_id_override: str | None,
     format_override: str | None,
+    report_dir: Path,
 ) -> dict[str, Any]:
     source = report_section(report)
     model_id = model_id_override or non_empty_string(source.get("model_id"), "model_id")
@@ -237,6 +311,7 @@ def validate_report(
         failed = [case for case in cases if not case_passed(case)]
         if failed:
             raise GateError(f"known-answer cases include failures: {failed[:3]}")
+    hygiene = validate_known_answer_hygiene(cases, report_dir)
 
     return {
         "model_id": model_id,
@@ -245,6 +320,7 @@ def validate_report(
         "known_answer_total": known_answer_total,
         "known_answer_passed": known_answer_passed,
         "commands": commands,
+        "output_hygiene": hygiene,
     }
 
 
@@ -260,6 +336,7 @@ def build_artifact(
         report,
         model_id_override=model_id_override,
         format_override=format_override,
+        report_dir=report_path.parent,
     )
     source_ref = str(report_path)
     artifact = {
@@ -280,6 +357,7 @@ def build_artifact(
             "format": validated["format"],
             "source_report": source_ref,
         },
+        "output_hygiene": validated["output_hygiene"],
         "product_entrypoints": sorted(REQUIRED_ENTRYPOINTS),
         "commands": validated["commands"],
     }
@@ -298,10 +376,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def selftest_report(root: Path) -> Path:
-    cases = [
-        {"id": f"known_answer_{index:02d}", "passed": True, "semantic_pass": True}
-        for index in range(10)
-    ]
+    cases = []
+    for index in range(10):
+        artifact = root / "responses" / f"known_answer_{index:02d}.json"
+        write_json(artifact, {"choices": [{"message": {"content": "Paris"}, "finish_reason": "stop"}]})
+        cases.append(
+            {
+                "id": f"known_answer_{index:02d}",
+                "passed": True,
+                "semantic_pass": True,
+                "content": "Paris",
+                "finish_reason": "stop",
+                "artifact": artifact.relative_to(root).as_posix(),
+            }
+        )
     report = {
         "model_id": "selftest/Qwen3.5-35B-A3B-GPTQ-Int4",
         "format": "hf-gptq-int4",
@@ -354,6 +442,8 @@ def run_selftest() -> int:
             raise AssertionError("selftest artifact did not preserve known-answer total")
         if {command["entrypoint"] for command in artifact["commands"]} != set(REQUIRED_ENTRYPOINTS):
             raise AssertionError("selftest artifact did not preserve required product commands")
+        if artifact["output_hygiene"]["response_artifacts_checked"] != 10:
+            raise AssertionError("selftest artifact did not scan known-answer artifacts")
 
         bad = as_object(load_json(report), "selftest report")
         bad["known_answer_cases"][0]["passed"] = False
@@ -432,6 +522,23 @@ def run_selftest() -> int:
                 raise AssertionError(f"unexpected hidden-env command error: {exc}") from exc
         else:
             raise AssertionError("hidden-env product command unexpectedly passed")
+
+        bad_output = as_object(load_json(report), "selftest report")
+        bad_output["known_answer_cases"][0]["content"] = "<unk>"
+        bad_output_path = root / "bad_output_report.json"
+        write_json(bad_output_path, bad_output)
+        try:
+            build_artifact(
+                report_path=bad_output_path,
+                out_dir=root / "bad_output_out",
+                model_id_override=None,
+                format_override=None,
+            )
+        except GateError as exc:
+            if "forbidden output pattern" not in str(exc):
+                raise AssertionError(f"unexpected bad-output error: {exc}") from exc
+        else:
+            raise AssertionError("bad-output known-answer report unexpectedly passed")
 
     print("W3 L2 QUANTIZED SELFTEST PASS")
     return 0

@@ -5,8 +5,12 @@
 - Branch: `goal/w2-w3-release-grade`.
 - PR: <https://github.com/sizzlecar/ferrum-infer-rs/pull/237>.
 - W3 is not complete. There is no `MODEL_RELEASE_GRADE_W3 PASS`.
-- Correctness artifacts for real Qwen3.5 GPTQ product paths exist and the
-  final-validator probe now reaches the performance checks.
+- Correctness artifacts for real Qwen3.5 GPTQ product paths exist. Use the
+  refreshed L2 artifact with output-hygiene evidence:
+  `docs/goals/model-coverage-2026-06-12/artifacts/w3_l2_qwen35_gptq_int4_hygiene_from_real_product_20260622_75ec7e6e/w3_l2_quantized.json`.
+- The older L2 artifact
+  `w3_l2_qwen35_gptq_int4_from_real_product_20260620T025952Z_75ec7e6e`
+  is no longer sufficient because it lacks `output_hygiene`.
 - The current blocking item is still W3 performance versus the vLLM ShareGPT
   baseline, not product-path correctness.
 
@@ -44,6 +48,13 @@
   128.
 - The final W3 validator now re-checks those L5 fields, so old L5 artifacts
   without fixed-output evidence no longer pass the W3 L5 correctness link.
+- The W3 L2 packaging gate now scans every known-answer output and response
+  artifact for release-blocking text such as `<unk>`, `[PAD]`, reserved special
+  tokens, mojibake, panic, and KV overflow. The final validator requires this
+  `output_hygiene` field.
+- A new L2 artifact was generated from the tracked real-product
+  `known_answer_report.json`: 11/11 known-answer cases and 11/11 response
+  artifacts scanned, with `forbidden_patterns_absent=true`.
 
 ## Why This Matters
 
@@ -82,6 +93,7 @@ Important outputs:
 - CLI help prints `--ignore-eos`.
 - `MODEL RELEASE GRADE GOAL SELFTEST PASS`.
 - `MODEL RELEASE GRADE MANIFEST SELFTEST PASS`.
+- `W3 L2 QUANTIZED PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_l2_qwen35_gptq_int4_hygiene_from_real_product_20260622_75ec7e6e`.
 
 ## Gate Probe
 
