@@ -2,6 +2,64 @@
 
 进度日志,倒序。
 
+## 2026-06-23 ZZZ75 — W3 Qwen35 resumed; OOM guard is not a throughput fix
+
+- Scope:
+  - resumed W3 Qwen3.5 GPTQ-Int4 CUDA work on the new 1x RTX 4090 Vast
+    instance `42216671`;
+  - synced source with `git pull --rebase` / `git push`;
+  - latest pushed commit:
+    `e5daa58c2676d5afc810e293e9d120840e4295fb`
+    (`fix(types): guard qwen35 true c32 on 24gb cuda`).
+- Current evidence:
+  - full L5 default-path artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623`;
+  - PASS line:
+    `W3 L5 CONCURRENCY PASS: /workspace/artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/l5`;
+  - measured output throughput:
+    c1 `85.05`, c4 `263.68`, c16 `622.66`, c32/effective16 `627.24`
+    tok/s;
+  - c32 still misses the historical vLLM 80% target
+    `1366.82228 tok/s`.
+- OOM status:
+  - default product path avoids runtime OOM by selecting effective concurrency
+    16 on this 24GB CUDA target;
+  - forced true c32 previously OOMed in the Qwen35 linear-attention recurrent
+    state pool, not in paged KV;
+  - the new guard only rejects this unsupported true-c32 shape before model
+    load on RTX4090-class VRAM, with artifact
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_true_c32_guard_e5daa58c_20260623`;
+  - PASS line:
+    `QWEN35 TRUE C32 GUARD PASS: /workspace/artifacts/w3_qwen35_true_c32_guard_e5daa58c_20260623`;
+  - this is not a root-cause fix for running true c32 on 24GB.
+- Root cause clarification:
+  - Qwen35 preallocates F32 recurrent conv/delta state pools by
+    `paged_max_seqs` for every linear-attention layer;
+  - true c32 needs a larger persistent non-KV recurrent-state slab, including
+    a 64MiB F32 delta-state allocation per linear layer;
+  - dynamic KV wait/release logic does not prevent this allocation from OOMing.
+- Profile and A/B diagnostics:
+  - profile artifact:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623`;
+  - PASS line:
+    `W3 QWEN35 PROFILE DIAG PASS: /workspace/artifacts/w3_qwen35_profile_diag_e5daa58c_20260623`;
+  - batch16 decode profile is dominated by MLP/MoE finish, not recurrent state:
+    linear decode detail mean `accounted=1286.54us`,
+    `indexed_core=113.93us`, `indexed_recurrent=105.79us`,
+    `mlp=1027.75us`;
+  - `FERRUM_VLLM_MOE_PAIR_IDS=1` diagnostic was slightly slower than baseline
+    and should not be defaulted:
+    baseline c16/c32 `559.94`/`574.97`, pair_ids c16/c32
+    `555.69`/`567.57` tok/s;
+  - `FERRUM_MOE_BLOCK_SIZE=8` and `32` were both slower than default:
+    default c16/c32 `561.40`/`574.30`, block8 `542.57`/`562.41`,
+    block32 `542.23`/`557.75` tok/s.
+- Status:
+  - no `MODEL_RELEASE_GRADE_W3 PASS`;
+  - no release-ready or performance-ready claim;
+  - next useful source direction is the Qwen35 MoE/MLP finish path, while
+    true-c32-on-24GB requires a separate recurrent-state memory design change.
+
 ## 2026-06-22 ZZZ74 — W3 Qwen35 goal cancelled and cleanup handoff written
 
 - User cancelled the active W3 Qwen3.5 release-grade goal and asked to clean
