@@ -2,6 +2,42 @@
 
 进度日志,倒序。
 
+## 2026-06-23 ZZZ76 — Qwen35 decode MoE output-buffer reuse rejected and reverted
+
+- Scope:
+  - tested commit `ee2084270d2a3c63f99a56480926940d3f980b92`
+    (`perf(qwen35): reuse decode moe output buffer`) against the previous
+    pushed baseline `a4179a89` on the same 1x RTX 4090 Vast instance
+    `42216671`;
+  - no live vLLM run was performed; comparison was Ferrum old/new only,
+    using historical vLLM target data for context.
+- Diagnostic artifact:
+  - local:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2`;
+  - remote:
+    `/workspace/artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2`;
+  - PASS line:
+    `W3 QWEN35 DECODE MOE OUTPUT REUSE AB PASS: /workspace/artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2`.
+- Result:
+  - old `a4179a89`: c16 `574.83`, c32/effective16 `572.16` output tok/s;
+  - new `ee208427`: c16 `541.44`, c32/effective16 `563.16` output tok/s;
+  - deltas: c16 `-5.81%`, c32/effective16 `-1.57%`.
+- Decision:
+  - this source direction is rejected and was reverted by
+    `bc86cfc86836fc999c39c837c5f5710b4011bac5`
+    (`revert(qwen35): restore decode moe output buffer`);
+  - validation before the revert commit:
+    `cargo fmt --all -- --check`, `git diff --cached --check`,
+    `cargo check -p ferrum-models`,
+    `cargo test -p ferrum-models sparse_moe_shared_expert_composes_router_fused_experts_and_shared_gate -- --nocapture`,
+    and
+    `cargo test -p ferrum-models bucketed_matches_per_pair_dispatch -- --nocapture`.
+- Status:
+  - OOM root cause remains unsolved: true c32 on 24GB is guarded/rejected,
+    not made runnable by dynamic KV waiting;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`;
+  - no release-ready or performance-ready claim.
+
 ## 2026-06-23 ZZZ75 — W3 Qwen35 resumed; OOM guard is not a throughput fix
 
 - Scope:
