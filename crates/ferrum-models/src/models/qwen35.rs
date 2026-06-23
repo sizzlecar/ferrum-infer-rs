@@ -890,6 +890,12 @@ fn qwen35_linear_state_max_slots(
         .max(1)
 }
 
+fn qwen35_linear_state_slot_pool_exhausted(max_slots: usize) -> FerrumError {
+    FerrumError::resource_exhausted(format!(
+        "Qwen3.5 linear state slot pool exhausted: max_slots={max_slots}"
+    ))
+}
+
 fn qwen35_paged_total_blocks(
     snapshot: &ferrum_types::RuntimeConfigSnapshot,
     max_blocks_per_seq: usize,
@@ -1211,13 +1217,12 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         }
         self.ensure_linear_state_pools()?;
         let slot = self.linear_free_slots.pop().ok_or_else(|| {
-            FerrumError::model(format!(
-                "Qwen3.5 linear state slot pool exhausted: max_slots={}",
+            qwen35_linear_state_slot_pool_exhausted(
                 self.linear_state_pools
                     .as_ref()
                     .map(|pools| pools.max_slots)
-                    .unwrap_or(0)
-            ))
+                    .unwrap_or(0),
+            )
         })?;
         Ok(Some(slot))
     }
@@ -13215,6 +13220,17 @@ mod tests {
 
         let invalid = runtime_snapshot(&[("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "bad")]);
         assert_eq!(qwen35_linear_state_max_slots(&invalid, 8), 8);
+    }
+
+    #[test]
+    fn qwen35_linear_state_slot_exhaustion_is_resource_exhausted() {
+        let err = qwen35_linear_state_slot_pool_exhausted(16);
+        assert!(matches!(
+            err,
+            FerrumError::ResourceExhausted { ref message }
+                if message.contains("linear state slot pool exhausted")
+                    && message.contains("max_slots=16")
+        ));
     }
 
     #[test]

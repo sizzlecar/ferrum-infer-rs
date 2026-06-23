@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ80 — Qwen35 linear slot exhaustion is resource exhaustion
+
+- Correction:
+  - OOM is not solved by this entry. This change only fixes the error class
+    emitted when the Qwen3.5 indexed linear recurrent-state slot pool is
+    exhausted.
+  - True c32 on 24GB CUDA still requires same-hardware GPU evidence and has no
+    W3 release-grade PASS.
+- Scope:
+  - `Qwen35BackendModel::allocate_linear_slot()` now returns
+    `FerrumError::ResourceExhausted` when the linear recurrent slot pool is
+    empty, instead of returning a generic model error;
+  - this keeps Qwen3.5 non-KV recurrent-state capacity exhaustion aligned with
+    the engine paths that recognize resource exhaustion for deferral, splitting,
+    or preemption decisions.
+- Code:
+  - `crates/ferrum-models/src/models/qwen35.rs`.
+- Validation:
+  - `cargo fmt --all -- --check`;
+  - `cargo test -p ferrum-models qwen35_linear_state_slot_exhaustion_is_resource_exhausted -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no throughput claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ79 — Qwen35 decode MoE merge avoids scratch copy
 
 - Scope:
