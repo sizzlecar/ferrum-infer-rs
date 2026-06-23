@@ -22,6 +22,7 @@ pub struct RuntimeKnobs {
     pub scheduler_trace_jsonl: Option<PathBuf>,
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
+    pub qwen35_linear_state_max_slots: Option<usize>,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -80,6 +81,13 @@ impl EngineConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_MAX_MODEL_LEN") {
             self.runtime.max_model_len = Some(parse_required_positive_usize(
                 "FERRUM_MAX_MODEL_LEN",
+                value,
+            )?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
+        {
+            self.runtime.qwen35_linear_state_max_slots = Some(parse_required_positive_usize(
+                "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
                 value,
             )?);
         }
@@ -665,5 +673,23 @@ impl Default for BatchConfig {
             enable_continuous: false,
             max_num_batched_tokens: Self::default_max_num_batched_tokens(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_config_applies_qwen35_linear_state_max_slots_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot =
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(config.runtime.qwen35_linear_state_max_slots, Some(16));
     }
 }

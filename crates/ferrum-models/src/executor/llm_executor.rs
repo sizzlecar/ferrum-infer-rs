@@ -22,9 +22,9 @@ use ferrum_interfaces::{
         KvSlotRequest, KvSlotReservation, LogitsReturnPolicy, MemoryRequirements, PrefillInput,
         PrefillOutput, UnifiedBatch,
     },
-    ModelExecutor,
+    ModelExecutor, RecurrentStateSpec,
 };
-use ferrum_types::{DataType, FerrumError, ModelInfo, Result};
+use ferrum_types::{DataType, FerrumError, ModelInfo, RequestId, Result, TokenId};
 
 use crate::common::DecoderOnlyLLM;
 use crate::lora::ActiveLoraAdapter;
@@ -269,6 +269,20 @@ impl ModelExecutor for LlmExecutor {
 
     fn reserve_kv_slots(&self, requests: &[KvSlotRequest]) -> Result<Option<KvSlotReservation>> {
         self.lock_model().reserve_kv_slots(requests)
+    }
+
+    fn recurrent_state_spec(
+        &self,
+        request_id: &RequestId,
+        input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        let mut spec = self
+            .lock_model()
+            .recurrent_state_spec(request_id, input_tokens)?;
+        if let Some(spec) = spec.as_mut() {
+            spec.device = self.info.device.clone();
+        }
+        Ok(spec)
     }
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
@@ -1127,6 +1141,7 @@ mod tests {
         config: crate::common::LlmRuntimeConfig,
         unified_unsupported_message: Option<String>,
         unified_full_logits_supported: bool,
+        recurrent_state_spec: Option<RecurrentStateSpec>,
     }
 
     impl RecordingLlm {
@@ -1135,6 +1150,7 @@ mod tests {
                 calls,
                 unified_unsupported_message: None,
                 unified_full_logits_supported: true,
+                recurrent_state_spec: None,
                 config: crate::common::LlmRuntimeConfig {
                     hidden_size: 4,
                     num_layers: 1,
@@ -1156,6 +1172,16 @@ mod tests {
             }
         }
 
+        fn with_recurrent_state_spec(
+            calls: Arc<Mutex<RecordingCalls>>,
+            spec: RecurrentStateSpec,
+        ) -> Self {
+            Self {
+                recurrent_state_spec: Some(spec),
+                ..Self::new(calls)
+            }
+        }
+
         fn without_unified_full_logits(calls: Arc<Mutex<RecordingCalls>>) -> Self {
             Self {
                 unified_full_logits_supported: false,
@@ -1167,6 +1193,19 @@ mod tests {
     impl DecoderOnlyLLM for RecordingLlm {
         fn config(&self) -> &crate::common::LlmRuntimeConfig {
             &self.config
+        }
+
+        fn recurrent_state_spec(
+            &self,
+            request_id: &RequestId,
+            _input_tokens: &[TokenId],
+        ) -> Result<Option<RecurrentStateSpec>> {
+            let Some(spec) = &self.recurrent_state_spec else {
+                return Ok(None);
+            };
+            let mut spec = spec.clone();
+            spec.request_id = request_id.clone();
+            Ok(Some(spec))
         }
 
         fn prefill(&mut self, _cache_id: &str, _tokens: &[u32]) -> Vec<f32> {
@@ -1277,6 +1316,41 @@ mod tests {
             )),
             test_model_info(),
         )
+    }
+
+    #[test]
+    fn llm_executor_delegates_recurrent_state_spec_and_sets_executor_device() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let spec = RecurrentStateSpec {
+            request_id: RequestId::new(),
+            num_layers: 1,
+            tensors: vec![ferrum_interfaces::RecurrentStateTensorSpec::new(
+                0,
+                "delta_state",
+                vec![1, 2, 3],
+            )],
+            dtype: DataType::FP32,
+            device: Device::CPU,
+            max_batch_slots: 1,
+        };
+        let mut info = test_model_info();
+        info.device = Device::CUDA(0);
+        let executor = LlmExecutor::new(
+            Box::new(RecordingLlm::with_recurrent_state_spec(calls, spec.clone())),
+            info,
+        );
+        let request_id = RequestId::new();
+
+        let actual = executor
+            .recurrent_state_spec(&request_id, &[TokenId::new(7)])
+            .expect("recurrent state spec should resolve")
+            .expect("recording model should expose recurrent state");
+
+        assert_eq!(actual.request_id, request_id);
+        assert_eq!(actual.device, Device::CUDA(0));
+        assert_eq!(actual.dtype, spec.dtype);
+        assert_eq!(actual.max_batch_slots, spec.max_batch_slots);
+        assert_eq!(actual.tensors, spec.tensors);
     }
 
     fn recording_executor_without_unified_full_logits(

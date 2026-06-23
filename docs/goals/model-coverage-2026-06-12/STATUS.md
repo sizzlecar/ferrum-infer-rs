@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ82 — Qwen35 recurrent-state admission reaches the CUDA product path
+
+- Correction:
+  - OOM is not solved by this entry. This change fixes a product-path
+    admission/backpressure gap so Qwen3.5 recurrent-state capacity can be
+    visible to the engine before dispatch.
+  - True c32 on 24GB CUDA still requires same-hardware GPU evidence and has no
+    W3 release-grade PASS.
+- Scope:
+  - `DecoderOnlyLLM` now exposes an optional recurrent-state spec hook;
+  - `LlmExecutor` delegates `ModelExecutor::recurrent_state_spec()` to the
+    wrapped model and stamps the spec with the executor's actual device;
+  - `Qwen35BackendModel` now declares its linear recurrent-state requirement
+    through that hook;
+  - `EngineConfig.runtime` now carries
+    `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS`;
+  - the default engine builder installs a recurrent-state admission manager for
+    non-reference product paths as well, capped by
+    `qwen35_linear_state_max_slots` when present.
+- Code:
+  - `crates/ferrum-types/src/config.rs`;
+  - `crates/ferrum-models/src/common/llm.rs`;
+  - `crates/ferrum-models/src/executor/llm_executor.rs`;
+  - `crates/ferrum-models/src/models/qwen35.rs`;
+  - `crates/ferrum-engine/src/builder.rs`.
+- Validation:
+  - `cargo fmt --all -- --check`;
+  - `cargo test -p ferrum-types engine_config_applies_qwen35_linear_state_max_slots_runtime_key -- --nocapture`;
+  - `cargo test -p ferrum-models llm_executor_delegates_recurrent_state_spec_and_sets_executor_device -- --nocapture`;
+  - `cargo test -p ferrum-engine test_builder_cuda_recurrent_state_manager_uses_qwen35_linear_slot_cap -- --nocapture`;
+  - `cargo check -p ferrum-cli`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no throughput claim is made;
+  - this moves the CUDA product path toward the intended wait/release model for
+    Qwen3.5 recurrent-state capacity;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ81 — Qwen35 decode residual shadow skips unused layer output materialization
 
 - Scope:
