@@ -357,11 +357,13 @@ impl EngineInner {
                                         "Unified prefill alloc deferred for {} after preempt: {}",
                                         rid, e
                                     );
+                                    self.release_recurrent_state(rid).await;
                                     continue;
                                 }
                             }
                         } else {
                             warn!("Unified prefill alloc deferred for {}: no victim", rid);
+                            self.release_recurrent_state(rid).await;
                             continue;
                         }
                     }
