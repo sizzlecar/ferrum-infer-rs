@@ -149,6 +149,10 @@ struct FailingBatchPrefillExecutor {
     inner: RecurrentSpecExecutor,
 }
 
+struct FailingUnifiedReserveExecutor {
+    inner: FailingBatchPrefillExecutor,
+}
+
 struct RecurrentSpecLlm {
     config: LlmRuntimeConfig,
 }
@@ -351,6 +355,54 @@ impl ModelExecutor for FailingBatchPrefillExecutor {
         Err(FerrumError::resource_exhausted(
             "synthetic model-side KV reserve failure",
         ))
+    }
+
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.inner.decode(input).await
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for FailingUnifiedReserveExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+
+    fn supports_native_unified_decode(&self) -> bool {
+        true
+    }
+
+    fn recurrent_state_spec(
+        &self,
+        request_id: &RequestId,
+        input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        self.inner.recurrent_state_spec(request_id, input_tokens)
+    }
+
+    fn reserve_kv_slots(
+        &self,
+        _requests: &[ferrum_interfaces::model_executor::KvSlotRequest],
+    ) -> Result<Option<ferrum_interfaces::model_executor::KvSlotReservation>> {
+        Err(FerrumError::resource_exhausted(
+            "synthetic unified reserve failure",
+        ))
+    }
+
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        self.inner.prefill(input).await
+    }
+
+    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
+        self.inner.batch_prefill(inputs).await
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
@@ -1126,6 +1178,73 @@ async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fail
         tensor_factory,
         None,
         Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        Some(recurrent_manager.clone()),
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 2;
+    let request_id = request.id.clone();
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
+        max_sequence_length: 1,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    engine.inner.process_batch(&batch).await.unwrap();
+
+    let active_kv = kv_cache.list_handles();
+    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
+    let recurrent_stats = recurrent_manager.stats();
+    assert_eq!(recurrent_stats.allocation_count, 2);
+    assert_eq!(recurrent_stats.active_states, 0);
+    assert_eq!(recurrent_stats.used_batch_slots, 0);
+
+    let sequences = engine.inner.sequences.read();
+    let sequence = sequences
+        .get(&request_id)
+        .expect("failed request should remain available for retry");
+    assert!(!sequence.prefill_complete);
+    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.recurrent_state.is_none());
+}
+
+#[tokio::test]
+async fn process_batch_unified_reserve_failure_then_fallback_failure_releases_recurrent_state() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedReserveExecutor {
+        inner: FailingBatchPrefillExecutor {
+            inner: RecurrentSpecExecutor {
+                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+            },
+        },
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        sampler,
+        kv_cache.clone(),
+        executor,
+        tensor_factory,
+        None,
+        None,
         Some(recurrent_manager.clone()),
     );
 

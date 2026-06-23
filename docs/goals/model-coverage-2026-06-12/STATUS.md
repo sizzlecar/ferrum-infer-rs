@@ -13580,3 +13580,31 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     KV/recurrent 资源,但仍不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 unified reserve fallback cleanup coverage
+
+- 背景:
+  - 继续审计 unified path 发现一个组合路径需要锁定:engine unified batch 在
+    `model_executor.reserve_kv_slots()` 先返回 ResourceExhausted 后,会释放 fresh
+    KV 并 fallback 到 legacy split;如果 legacy batched/single prefill 随后也因
+    model-side admission 失败,必须仍保证 KV 和 recurrent state 都归零。
+  - 上一条代码修复理论上已经覆盖该组合路径,但没有专门回归测试。
+- 源码变更:
+  - 新增 `FailingUnifiedReserveExecutor` 测试夹具。
+  - 新增
+    `process_batch_unified_reserve_failure_then_fallback_failure_releases_recurrent_state`。
+    该测试走 `process_batch` 产品路径,模拟 unified reserve failure 后 fallback
+    batch/single prefill 也失败,并断言请求保持可重试、KV handle 归零、
+    recurrent active slots 归零。
+  - 本次只补回归覆盖,不改运行逻辑。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-engine process_batch_unified_reserve_failure_then_fallback_failure_releases_recurrent_state -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,12 个相关测试通过。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这证明本地 regression 覆盖了 unified reserve fallback 资源回滚组合路径,
+    但仍不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
