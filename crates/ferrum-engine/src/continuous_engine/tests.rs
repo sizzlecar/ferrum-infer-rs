@@ -1411,6 +1411,101 @@ async fn process_batch_single_decode_resource_exhausted_keeps_recurrent_state_wa
     assert_eq!(recurrent_manager.stats().active_states, 1);
 }
 
+#[tokio::test]
+async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_waiting() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedReserveExecutor {
+        inner: FailingBatchPrefillExecutor {
+            inner: RecurrentSpecExecutor {
+                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+            },
+        },
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager.clone()),
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 4;
+    let request_id = request.id.clone();
+    let recurrent_spec = RecurrentStateSpec {
+        request_id: request_id.clone(),
+        num_layers: 1,
+        tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
+        dtype: DataType::BF16,
+        device: Device::CPU,
+        max_batch_slots: 1,
+    };
+    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
+    let kv = engine
+        .inner
+        .make_model_kv_handle_with_seq("decode-cache".to_string(), 1);
+    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request.clone(),
+        vec![TokenId::new(5)],
+        Some(tokenizer),
+        Some(64),
+    );
+    sequence.generated_tokens.push(TokenId::new(6));
+    sequence.prefill_complete = true;
+    sequence.prefill_tokens_processed = 1;
+    sequence.kv_cache = Some(kv);
+    sequence.recurrent_state = Some(recurrent_state);
+    sequence.model_cache_id = Some("decode-cache".to_string());
+    sequence.phase = RequestPhase::Decoding;
+    engine
+        .inner
+        .sequences
+        .write()
+        .insert(request_id.clone(), sequence);
+
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
+        max_sequence_length: 1,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    engine.inner.process_batch(&batch).await.unwrap();
+
+    let sequences = engine.inner.sequences.read();
+    let sequence = sequences
+        .get(&request_id)
+        .expect("resource-exhausted unified decode should remain queued");
+    assert!(sequence.prefill_complete);
+    assert!(sequence.kv_cache.is_some());
+    assert!(sequence.recurrent_state.is_some());
+    assert_eq!(sequence.generated_tokens, vec![TokenId::new(6)]);
+    let recurrent_stats = recurrent_manager.stats();
+    assert_eq!(recurrent_stats.active_states, 1);
+    assert_eq!(recurrent_stats.used_batch_slots, 1);
+}
+
 #[test]
 fn sequence_state_detects_text_stop_before_length() {
     let tokenizer = PolicyTokenizer::new(8, &[("OK", 5), ("<END>", 6), ("TAIL", 7)]);

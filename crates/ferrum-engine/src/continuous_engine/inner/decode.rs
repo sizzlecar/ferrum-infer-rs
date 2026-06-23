@@ -23,7 +23,11 @@ impl EngineInner {
                     if self.preempt_victim_excluding(&exclude).await {
                         stack.push(chunk);
                     } else {
-                        return Err(e);
+                        warn!(
+                            "Batch decode deferred for {} request(s): no preempt victim",
+                            chunk.len()
+                        );
+                        continue;
                     }
                 }
                 Err(e) => return Err(e),
