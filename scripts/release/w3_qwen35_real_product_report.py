@@ -132,6 +132,46 @@ def run_command(
     )
 
 
+def run_command_to_files(
+    cmd: list[str],
+    *,
+    stdout_path: Path,
+    stderr_path: Path,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    stdin = subprocess.PIPE if input_text is not None else subprocess.DEVNULL
+    with stdout_path.open("w", encoding="utf-8", errors="replace") as stdout_file, stderr_path.open(
+        "w", encoding="utf-8", errors="replace"
+    ) as stderr_file:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdin=stdin,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            text=True,
+        )
+        try:
+            proc.communicate(input=input_text, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+            raise
+
+    return subprocess.CompletedProcess(
+        cmd,
+        proc.returncode,
+        stdout_path.read_text(encoding="utf-8", errors="replace"),
+        stderr_path.read_text(encoding="utf-8", errors="replace"),
+    )
+
+
 def git_output(args: list[str], *, default: str = "unknown") -> str:
     try:
         proc = run_command(["git", *args], cwd=REPO_ROOT)
@@ -609,10 +649,47 @@ def run_ferrum_run(
         ],
         ferrum_bin,
     )
-    proc = run_command(cmd, cwd=out_dir, env=env, timeout=args.run_timeout_seconds)
-    write_json(out_dir / "run_command.json", {"command_line": cmd, "returncode": proc.returncode})
-    write_text(out_dir / "run_stdout.jsonl", proc.stdout)
-    write_text(out_dir / "run_stderr.txt", proc.stderr)
+    stdout_path = out_dir / "run_stdout.jsonl"
+    stderr_path = out_dir / "run_stderr.txt"
+    command_path = out_dir / "run_command.json"
+    try:
+        proc = run_command_to_files(
+            cmd,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            cwd=out_dir,
+            env=env,
+            timeout=args.run_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        write_json(
+            command_path,
+            {
+                "command_line": cmd,
+                "returncode": None,
+                "timed_out": True,
+                "timeout_seconds": args.run_timeout_seconds,
+                "stdout": artifact_ref(stdout_path, out_dir),
+                "stderr": artifact_ref(stderr_path, out_dir),
+            },
+        )
+        stderr_tail = stderr_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+        raise ReportError(
+            f"ferrum run timed out after {args.run_timeout_seconds}s; "
+            f"stdout={artifact_ref(stdout_path, out_dir)} "
+            f"stderr={artifact_ref(stderr_path, out_dir)} "
+            f"stderr_tail={stderr_tail!r}"
+        ) from exc
+    write_json(
+        command_path,
+        {
+            "command_line": cmd,
+            "returncode": proc.returncode,
+            "timed_out": False,
+            "stdout": artifact_ref(stdout_path, out_dir),
+            "stderr": artifact_ref(stderr_path, out_dir),
+        },
+    )
     if proc.returncode != 0:
         raise ReportError(f"ferrum run failed with rc={proc.returncode}: {proc.stderr[-2000:]}")
     assistant = validate_run_stdout(proc.stdout)
@@ -1394,6 +1471,34 @@ def run_selftest() -> int:
         )
         if problems:
             raise AssertionError(f"self-test artifacts failed existing validators: {problems}")
+
+        timeout_dir = out_dir / "timeout_helper"
+        timeout_stdout = timeout_dir / "stdout.txt"
+        timeout_stderr = timeout_dir / "stderr.txt"
+        try:
+            run_command_to_files(
+                [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    (
+                        "import sys, time; "
+                        "print('partial-out', flush=True); "
+                        "print('partial-err', file=sys.stderr, flush=True); "
+                        "time.sleep(2)"
+                    ),
+                ],
+                stdout_path=timeout_stdout,
+                stderr_path=timeout_stderr,
+                timeout=0.2,
+            )
+        except subprocess.TimeoutExpired:
+            if "partial-out" not in timeout_stdout.read_text(encoding="utf-8"):
+                raise AssertionError("timeout helper did not preserve stdout")
+            if "partial-err" not in timeout_stderr.read_text(encoding="utf-8"):
+                raise AssertionError("timeout helper did not preserve stderr")
+        else:
+            raise AssertionError("timeout helper command unexpectedly completed")
 
         bad_cases = list(known_cases)
         bad_cases[0] = dict(bad_cases[0])
