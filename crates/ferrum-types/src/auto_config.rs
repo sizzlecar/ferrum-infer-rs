@@ -675,6 +675,15 @@ impl FerrumConfigBuilder {
             default_max_sequences.value,
             default_max_sequences.source,
         )?;
+        let qwen35_linear_state_max_slots = if self.is_qwen35_moe_gptq_int4() {
+            Some(self.usize_value(
+                "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
+                max_sequences.value,
+                max_sequences.source,
+            )?)
+        } else {
+            None
+        };
         let default_kv_blocks = self.default_kv_blocks(&max_sequences);
         let kv_blocks = self.usize_value(
             "FERRUM_KV_MAX_BLOCKS",
@@ -716,6 +725,9 @@ impl FerrumConfigBuilder {
         self.validate_memory(
             kv_blocks.value,
             max_sequences.value,
+            qwen35_linear_state_max_slots
+                .as_ref()
+                .map(|slots| slots.value),
             max_batched_tokens.value,
             max_model_len.as_ref().map(|value| value.value),
         )?;
@@ -789,6 +801,15 @@ impl FerrumConfigBuilder {
                 );
             }
         }
+        if let Some(slots) = qwen35_linear_state_max_slots.as_ref() {
+            if self.entry("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS").is_none() {
+                runtime_config.upsert(
+                    "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
+                    slots.value.to_string(),
+                    RuntimeConfigSource::MemoryProfile,
+                );
+            }
+        }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
         decisions.push(self.decode_graph_decision(
@@ -807,6 +828,13 @@ impl FerrumConfigBuilder {
             max_sequences,
             RuntimeConfigEffect::Memory,
         ));
+        if let Some(slots) = qwen35_linear_state_max_slots {
+            decisions.push(self.scalar_decision(
+                "qwen35_linear_state_max_slots",
+                slots,
+                RuntimeConfigEffect::Memory,
+            ));
+        }
         decisions.push(self.scalar_decision(
             "max_batched_tokens",
             max_batched_tokens,
@@ -1324,6 +1352,7 @@ impl FerrumConfigBuilder {
         &self,
         kv_blocks: usize,
         max_sequences: usize,
+        qwen35_linear_state_max_slots: Option<usize>,
         max_batched_tokens: usize,
         requested_max_model_len: Option<usize>,
     ) -> Result<(), AutoConfigError> {
@@ -1333,12 +1362,24 @@ impl FerrumConfigBuilder {
         if max_sequences == 0 {
             return self.invalid("FERRUM_PAGED_MAX_SEQS", "must be greater than zero");
         }
+        if qwen35_linear_state_max_slots == Some(0) {
+            return self.invalid(
+                "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
+                "must be greater than zero",
+            );
+        }
         if let Some(limit) = self.qwen35_moe_gptq_recurrent_state_max_sequences() {
-            if max_sequences > limit {
+            let recurrent_slots = qwen35_linear_state_max_slots.unwrap_or(max_sequences);
+            if recurrent_slots > limit {
+                let key = if self.entry("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS").is_some() {
+                    "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS"
+                } else {
+                    "FERRUM_PAGED_MAX_SEQS"
+                };
                 return Err(AutoConfigError::InvalidOverride {
-                    key: "FERRUM_PAGED_MAX_SEQS".to_string(),
+                    key: key.to_string(),
                     reason: format!(
-                        "Qwen3.5 MoE GPTQ Int4 on <=26 GiB CUDA must use max sequences <= {limit}; true c32 requires a non-KV F32 recurrent-state pool that exceeds RTX 4090-class memory. Use --max-num-seqs {limit} or a larger-memory GPU."
+                        "Qwen3.5 MoE GPTQ Int4 on <=26 GiB CUDA must use linear recurrent-state slots <= {limit}; larger slot pools require a non-KV F32 recurrent-state slab that exceeds RTX 4090-class memory. Use FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS={limit}, lower --max-num-seqs, or a larger-memory GPU."
                     ),
                 });
             }
@@ -1378,15 +1419,17 @@ impl FerrumConfigBuilder {
         Ok(())
     }
 
-    fn qwen35_moe_gptq_recurrent_state_max_sequences(&self) -> Option<usize> {
-        if !self.is_cuda_backend()
-            || !self.model.architecture.eq_ignore_ascii_case("qwen3_5_moe")
-            || !self
+    fn is_qwen35_moe_gptq_int4(&self) -> bool {
+        self.model.architecture.eq_ignore_ascii_case("qwen3_5_moe")
+            && self
                 .model
                 .quantization
                 .as_deref()
                 .is_some_and(|quant| quant.eq_ignore_ascii_case("gptq_int4"))
-        {
+    }
+
+    fn qwen35_moe_gptq_recurrent_state_max_sequences(&self) -> Option<usize> {
+        if !self.is_cuda_backend() || !self.is_qwen35_moe_gptq_int4() {
             return None;
         }
         let vram_bytes = self.hardware.vram_bytes?;
@@ -2343,13 +2386,70 @@ mod tests {
             AutoConfigError::InvalidOverride { key, reason } => {
                 assert_eq!(key, "FERRUM_PAGED_MAX_SEQS");
                 assert!(
-                    reason.contains("non-KV F32 recurrent-state pool"),
+                    reason.contains("linear recurrent-state slots <= 16"),
                     "{reason}"
                 );
-                assert!(reason.contains("max sequences <= 16"), "{reason}");
+                assert!(
+                    reason.contains("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS=16"),
+                    "{reason}"
+                );
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn cuda_qwen35_moe_gptq_c32_can_cap_linear_recurrent_slots_on_24gb() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[
+            ("FERRUM_PAGED_MAX_SEQS", "32"),
+            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16"),
+        ]))
+        .with_model_capabilities(qwen35_moe_gptq_int4_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decision = |selection: &str| {
+            resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == selection)
+                .unwrap_or_else(|| panic!("missing decision {selection}"))
+        };
+        assert_eq!(decision("max_sequences").selected, "32");
+        assert_eq!(decision("qwen35_linear_state_max_slots").selected, "16");
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
+            .expect("linear recurrent slot cap should reach effective runtime config");
+        assert_eq!(entry.effective_value, "16");
+    }
+
+    #[test]
+    fn cuda_qwen35_moe_gptq_rejects_zero_linear_recurrent_slots() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[
+            ("FERRUM_PAGED_MAX_SEQS", "16"),
+            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "0"),
+        ]))
+        .with_model_capabilities(qwen35_moe_gptq_int4_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. }
+                if key == "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS"
+        ));
     }
 
     #[test]

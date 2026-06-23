@@ -185,6 +185,11 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub paged_max_seqs: Option<usize>,
 
+    /// Qwen3.5 linear recurrent-state slot-pool size, equivalent to
+    /// `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS`.
+    #[serde(default)]
+    pub qwen35_linear_state_max_slots: Option<usize>,
+
     /// Scheduler/model max batched-token budget, equivalent to
     /// `FERRUM_MAX_BATCHED_TOKENS`.
     #[serde(default)]
@@ -343,6 +348,11 @@ impl RuntimeCliConfig {
         push_usize_entry(&mut entries, "FERRUM_KV_MAX_BLOCKS", self.kv_max_blocks);
         push_usize_entry(&mut entries, "FERRUM_KV_CAPACITY", self.kv_capacity);
         push_usize_entry(&mut entries, "FERRUM_PAGED_MAX_SEQS", self.paged_max_seqs);
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
+            self.qwen35_linear_state_max_slots,
+        );
         push_usize_entry(
             &mut entries,
             "FERRUM_MAX_BATCHED_TOKENS",
@@ -680,6 +690,7 @@ mod tests {
             kv_max_blocks: Some(4096),
             kv_capacity: Some(2048),
             paged_max_seqs: Some(64),
+            qwen35_linear_state_max_slots: Some(16),
             max_batched_tokens: Some(2048),
             scheduler_prefill_first_until_active: Some(16),
             scheduler_active_decode_prefill_chunk: Some(24),
@@ -714,7 +725,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 35);
+        assert_eq!(entries.len(), 36);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -732,6 +743,13 @@ mod tests {
         assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
+        assert_eq!(
+            entry("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS").effective_value,
+            "16"
+        );
+        assert!(entry("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
+            .affects
+            .contains(&RuntimeConfigEffect::Memory));
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
         assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
