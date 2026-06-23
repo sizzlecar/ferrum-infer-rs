@@ -2035,9 +2035,13 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .zip(states.iter())
             .map(|((_, _, pos_offset, _), (_, state))| *pos_offset == 0 && state.tokens.is_empty())
             .collect::<Vec<_>>();
-        for (is_fresh_initial, (_, state)) in fresh_initial_rows.iter().zip(states.iter_mut()) {
-            if !*is_fresh_initial && !state.tokens.is_empty() {
-                self.sync_sequence_linear_state_from_slot(&mut ctx, state)?;
+        let compact_indexed_linear_state =
+            self.linear_state_pools.is_some() && self.paged_max_seqs > 2;
+        if !compact_indexed_linear_state {
+            for (is_fresh_initial, (_, state)) in fresh_initial_rows.iter().zip(states.iter_mut()) {
+                if !*is_fresh_initial && !state.tokens.is_empty() {
+                    self.sync_sequence_linear_state_from_slot(&mut ctx, state)?;
+                }
             }
         }
         for (row, ((cache_id, _, _, _), (_, state))) in
