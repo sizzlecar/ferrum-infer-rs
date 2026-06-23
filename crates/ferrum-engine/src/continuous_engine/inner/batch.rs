@@ -258,6 +258,79 @@ impl EngineInner {
                 }
             }
 
+            if existing_recurrent_state.is_none() {
+                if let (Some(spec), Some(manager)) =
+                    (recurrent_state_spec.as_ref(), &self.recurrent_state_manager)
+                {
+                    if !manager.can_allocate(spec) {
+                        if self.preempt_victim(rid).await {
+                            if !manager.can_allocate(spec) {
+                                warn!(
+                                    "Unified prefill recurrent-state alloc deferred for {} after preempt: insufficient capacity",
+                                    rid
+                                );
+                                continue;
+                            }
+                        } else {
+                            warn!(
+                                "Unified prefill recurrent-state alloc deferred for {}: no preempt victim",
+                                rid
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let recurrent_state =
+                match self.ensure_recurrent_state(rid, recurrent_state_spec).await {
+                    Ok(state) => state,
+                    Err(FerrumError::ResourceExhausted { message }) => {
+                        if self.preempt_victim(rid).await {
+                            match self
+                                .ensure_recurrent_state(
+                                    rid,
+                                    self.model_executor
+                                        .recurrent_state_spec(rid, &input_tokens)?,
+                                )
+                                .await
+                            {
+                                Ok(state) => state,
+                                Err(FerrumError::ResourceExhausted { message }) => {
+                                    warn!(
+                                        "Unified prefill recurrent-state alloc deferred for {} after preempt: {}",
+                                        rid, message
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Unified prefill recurrent-state alloc failed for {} after preempt: {}",
+                                        rid, e
+                                    );
+                                    self.complete_request(rid, FinishReason::Error).await?;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "Unified prefill recurrent-state alloc deferred for {}: {}",
+                                rid, message
+                            );
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Unified prefill recurrent-state alloc failed for {}: {}",
+                            rid, e
+                        );
+                        self.complete_request(rid, FinishReason::Error).await?;
+                        continue;
+                    }
+                }
+                .or(existing_recurrent_state);
+
             let (kv_handle, fresh_kv) = if let Some(kv) = existing_kv {
                 (kv, false)
             } else {
@@ -295,19 +368,6 @@ impl EngineInner {
                 };
                 (allocated, true)
             };
-            let recurrent_state =
-                match self.ensure_recurrent_state(rid, recurrent_state_spec).await {
-                    Ok(state) => state,
-                    Err(e) => {
-                        warn!(
-                            "Unified prefill recurrent-state alloc failed for {}: {}",
-                            rid, e
-                        );
-                        self.complete_request(rid, FinishReason::Error).await?;
-                        continue;
-                    }
-                }
-                .or(existing_recurrent_state);
             let remaining = num_tokens - chunk_start;
             let chunk_len = [
                 scheduled_tokens_by_id.get(rid).copied(),

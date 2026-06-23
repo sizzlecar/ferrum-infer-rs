@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-23 ZZZ77 — Unified prefill defers on recurrent-state capacity instead of erroring
+
+- Scope:
+  - fixed the engine unified prefill admission path so a fresh request that
+    needs recurrent state does not allocate KV first and then fail the request
+    when recurrent-state capacity is temporarily exhausted;
+  - the path now checks recurrent-state capacity before fresh KV allocation,
+    preempts an active decode victim when possible, and defers the prefill
+    request if capacity is still unavailable.
+- Code:
+  - `crates/ferrum-engine/src/continuous_engine/inner/batch.rs`;
+  - `crates/ferrum-engine/src/continuous_engine/tests.rs`.
+- Validation:
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`;
+  - `cargo test -p ferrum-engine process_batch_unified_preempts_decode_for_recurrent_state_capacity -- --nocapture`;
+  - `cargo test -p ferrum-engine engine_allocates_and_deallocates_model_declared_recurrent_state -- --nocapture`;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture`;
+  - `cargo check -p ferrum-engine`.
+- Status:
+  - this moves the product scheduler/admission behavior toward the intended
+    wait/release model for recurrent state;
+  - it does not prove true c32 Qwen35 on 24GB CUDA is runnable, because the
+    current Qwen35 CUDA product path still preallocates the large non-KV F32
+    recurrent-state pool by `FERRUM_PAGED_MAX_SEQS`;
+  - no GPU lane was run and no performance claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-23 ZZZ76 — Qwen35 decode MoE output-buffer reuse rejected and reverted
 
 - Scope:
