@@ -191,7 +191,14 @@ impl EngineInner {
                 if let Some(state) = current_recurrent_state.clone() {
                     input = input.with_recurrent_state(state);
                 }
-                let out = self.model_executor.prefill(&input).await?;
+                let out = match self.model_executor.prefill(&input).await {
+                    Ok(out) => out,
+                    Err(e) => {
+                        let _ = self.kv_cache.deallocate(request_id.clone()).await;
+                        self.release_recurrent_state(request_id).await;
+                        return Err(e);
+                    }
+                };
                 current_kv = out.kv_cache.clone();
                 current_recurrent_state = out.recurrent_state.clone();
 
@@ -220,7 +227,14 @@ impl EngineInner {
             } else {
                 prefill_input
             };
-            self.model_executor.prefill(&prefill_input).await?
+            match self.model_executor.prefill(&prefill_input).await {
+                Ok(out) => out,
+                Err(e) => {
+                    let _ = self.kv_cache.deallocate(request_id.clone()).await;
+                    self.release_recurrent_state(request_id).await;
+                    return Err(e);
+                }
+            }
         };
 
         let last_logits = prefill_output.last_token_logits()?;
@@ -475,6 +489,7 @@ impl EngineInner {
             Err(e) => {
                 for (rid, _, _, _, _, _) in &to_prefill {
                     let _ = self.kv_cache.deallocate(rid.clone()).await;
+                    self.release_recurrent_state(rid).await;
                 }
                 return Err(e);
             }

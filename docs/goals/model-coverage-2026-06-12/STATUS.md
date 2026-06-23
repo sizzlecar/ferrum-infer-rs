@@ -13547,3 +13547,36 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 prefill model-side admission failure rolls back resources
+
+- 背景:
+  - 上一条修复覆盖 engine KV allocation defer,但继续审计发现另一个半分配
+    风险:model/executor 侧 `reserve_kv_slots` 或 prefill 内部 admission 失败
+    时,engine 已经分配了 KV manager handle 和 recurrent state。
+  - `run_batch_prefill` 的 `model_executor.batch_prefill` 失败分支只释放 KV,
+    未释放 recurrent state。
+  - 单请求 `run_prefill` 的 `model_executor.prefill` 失败会直接返回错误,
+    未释放 KV 和 recurrent state。外层对 ResourceExhausted 会让请求等待重试,
+    因此这些半分配资源会占住后续容量。
+- 源码变更:
+  - `run_prefill` 的 chunked/non-chunked model prefill error 分支都会释放
+    KV manager handle 和 recurrent state 后再返回错误。
+  - `run_batch_prefill` 的 `batch_prefill` error 分支释放每个待 prefill 请求的
+    KV manager handle 和 recurrent state。
+  - 新增 `FailingBatchPrefillExecutor` 测试夹具和
+    `process_batch_releases_kv_and_recurrent_state_when_model_admission_fails`。
+    该测试走 `process_batch` 产品路径,覆盖 batched prefill failure 后 fallback
+    single prefill 也因 ResourceExhausted 失败时,请求保持可重试且 KV/recurrent
+    active 计数归零。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-engine process_batch_releases_kv_and_recurrent_state_when_model_admission_fails -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,11 个相关测试通过。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这进一步证明本地 admission 在 model-side ResourceExhausted 后不会占死
+    KV/recurrent 资源,但仍不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
