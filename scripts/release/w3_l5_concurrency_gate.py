@@ -181,6 +181,36 @@ def parse_positive_int_set(raw: str, label: str) -> set[int]:
     return out
 
 
+def parse_effective_concurrency_overrides(raw_values: list[str] | None) -> dict[int, int]:
+    overrides: dict[int, int] = {}
+    for raw in raw_values or []:
+        if not isinstance(raw, str) or not raw.strip():
+            raise GateError("--effective-concurrency must be requested=effective")
+        text = raw.strip()
+        separator = "=" if "=" in text else ":"
+        if separator not in text:
+            raise GateError("--effective-concurrency must be requested=effective")
+        requested_text, effective_text = [part.strip() for part in text.split(separator, 1)]
+        try:
+            requested = int(requested_text)
+            effective = int(effective_text)
+        except ValueError as exc:
+            raise GateError(f"--effective-concurrency contains non-integer value: {raw!r}") from exc
+        if requested <= 0 or effective <= 0:
+            raise GateError(f"--effective-concurrency values must be positive: {raw!r}")
+        if effective > requested:
+            raise GateError(
+                f"--effective-concurrency effective value {effective} exceeds requested {requested}"
+            )
+        previous = overrides.get(requested)
+        if previous is not None and previous != effective:
+            raise GateError(
+                f"conflicting --effective-concurrency overrides for requested c={requested}"
+            )
+        overrides[requested] = effective
+    return overrides
+
+
 def command_concurrency_cells(parts: list[str], label: str) -> set[int]:
     cells: set[int] = set()
     for raw in flag_values(parts, "--concurrency-sweep"):
@@ -301,9 +331,16 @@ def cell_from_report(
                 f"--random-output-len {expected_output_len}"
             )
 
+    raw_effective = report.get("effective_active_concurrency", concurrency)
+    effective = positive_int(raw_effective, f"{label}.effective_active_concurrency")
+    if effective > concurrency:
+        raise GateError(
+            f"{label}.effective_active_concurrency {effective} exceeds requested c={concurrency}"
+        )
+
     cell = {
         "requested_concurrency": concurrency,
-        "effective_active_concurrency": report.get("effective_active_concurrency", concurrency),
+        "effective_active_concurrency": effective,
         "n_repeats": n_repeats,
         "requests_per_run": requests,
         "completed_per_run": completed,
@@ -325,6 +362,9 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
         getattr(args, "expected_output_len", DEFAULT_EXPECTED_OUTPUT_LEN),
         "expected_output_len",
     )
+    effective_overrides = parse_effective_concurrency_overrides(
+        getattr(args, "effective_concurrency", None)
+    )
     reports: list[tuple[dict[str, Any], str]] = []
     for path in args.report:
         for report in load_reports(path):
@@ -345,11 +385,16 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
         if concurrency in seen:
             raise GateError(f"duplicate concurrency cell c={concurrency}")
         seen.add(concurrency)
+        if concurrency in effective_overrides:
+            cell["effective_active_concurrency"] = effective_overrides[concurrency]
         if concurrency in REQUIRED_CONCURRENCY:
             cells.append(cell)
     missing = sorted(REQUIRED_CONCURRENCY - seen)
     if missing:
         raise GateError(f"missing required concurrency cells: {missing}")
+    unknown_overrides = sorted(set(effective_overrides) - seen)
+    if unknown_overrides:
+        raise GateError(f"--effective-concurrency references missing cells: {unknown_overrides}")
     cells.sort(key=lambda item: item["requested_concurrency"])
     commands = validate_bench_commands(
         args.command or [],
@@ -372,6 +417,13 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
             "stream_options_include_usage": True,
             "output_token_count_source": "usage",
             "expected_output_tokens_per_request": expected_output_len,
+            "effective_concurrency_overrides": [
+                {
+                    "requested_concurrency": requested,
+                    "effective_active_concurrency": effective,
+                }
+                for requested, effective in sorted(effective_overrides.items())
+            ],
             "cells": cells,
         },
     }
@@ -417,6 +469,7 @@ def run_selftest() -> int:
             out=root / "out",
             model_id=DEFAULT_MODEL_ID,
             expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+            effective_concurrency=["16=8", "32=8"],
             command=[
                 "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
                 "--n-repeats 3 --concurrency-sweep 1,4,16,32 "
@@ -426,6 +479,14 @@ def run_selftest() -> int:
         artifact = build_artifact(args)
         if len(artifact["concurrency"]["cells"]) != 4:
             raise AssertionError("selftest did not preserve four cells")
+        cells_by_c = {
+            cell["requested_concurrency"]: cell
+            for cell in artifact["concurrency"]["cells"]
+        }
+        if cells_by_c[16]["effective_active_concurrency"] != 8:
+            raise AssertionError("selftest did not preserve c16 effective concurrency")
+        if cells_by_c[32]["effective_active_concurrency"] != 8:
+            raise AssertionError("selftest did not preserve c32 effective concurrency")
         if artifact["commands"][0]["covers_concurrency"] != [1, 4, 16, 32]:
             raise AssertionError("selftest did not preserve command concurrency coverage")
 
@@ -452,6 +513,7 @@ def run_selftest() -> int:
                     out=root / "bad_out",
                     model_id=DEFAULT_MODEL_ID,
                     expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    effective_concurrency=[],
                     command=[],
                 )
             )
@@ -474,6 +536,7 @@ def run_selftest() -> int:
                     out=root / "bad_command_out",
                     model_id=DEFAULT_MODEL_ID,
                     expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    effective_concurrency=[],
                     command=[
                         "ferrum bench-serve --fail-on-error --seed 9271 "
                         "--n-repeats 3 --concurrency-sweep 1,4,16 "
@@ -498,6 +561,7 @@ def run_selftest() -> int:
                     out=root / "bad_output_out",
                     model_id=DEFAULT_MODEL_ID,
                     expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    effective_concurrency=[],
                     command=[
                         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
                         "--n-repeats 3 --concurrency-sweep 1,4,16,32 "
@@ -524,6 +588,7 @@ def run_selftest() -> int:
                     out=root / "missing_ignore_eos_out",
                     model_id=DEFAULT_MODEL_ID,
                     expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    effective_concurrency=[],
                     command=[
                         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
                         "--n-repeats 3 --concurrency-sweep 1,4,16,32 "
@@ -536,6 +601,27 @@ def run_selftest() -> int:
                 raise AssertionError(f"unexpected missing-ignore-eos error: {exc}") from exc
         else:
             raise AssertionError("missing-ignore-eos L5 command unexpectedly passed")
+
+        try:
+            build_artifact(
+                argparse.Namespace(
+                    report=[report_path],
+                    out=root / "bad_effective_out",
+                    model_id=DEFAULT_MODEL_ID,
+                    expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    effective_concurrency=["16=17"],
+                    command=[
+                        "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
+                        "--n-repeats 3 --concurrency-sweep 1,4,16,32 "
+                        "--random-output-len 128 --ignore-eos"
+                    ],
+                )
+            )
+        except GateError as exc:
+            if "exceeds requested" not in str(exc):
+                raise AssertionError(f"unexpected bad-effective error: {exc}") from exc
+        else:
+            raise AssertionError("bad effective concurrency unexpectedly passed")
     print("W3 L5 CONCURRENCY SELFTEST PASS")
     return 0
 
@@ -547,6 +633,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--expected-output-len", type=int, default=DEFAULT_EXPECTED_OUTPUT_LEN)
     parser.add_argument("--command", action="append", help="bench command line used")
+    parser.add_argument(
+        "--effective-concurrency",
+        action="append",
+        default=[],
+        help="Record a requested-to-effective active concurrency cap, e.g. 32=8",
+    )
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
