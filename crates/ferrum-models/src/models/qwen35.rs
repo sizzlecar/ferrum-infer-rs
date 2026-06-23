@@ -336,7 +336,6 @@ pub struct Qwen35DecodeScratch<B: MoeLlmBackend> {
     post_attention_norm: B::Buffer,
     mlp_output: B::Buffer,
     router_logits: B::Buffer,
-    routed_output: B::Buffer,
     x_packed: B::Buffer,
     gate_up_packed: B::Buffer,
     silu_packed: B::Buffer,
@@ -784,7 +783,6 @@ impl<B: MoeLlmBackend> Qwen35DecodeScratch<B> {
             post_attention_norm: B::alloc(max_tokens * hidden_size),
             mlp_output: B::alloc(max_tokens * hidden_size),
             router_logits: B::alloc(max_tokens * num_experts),
-            routed_output: B::alloc(max_tokens * hidden_size),
             x_packed: B::alloc(total_pairs * hidden_size),
             gate_up_packed: B::alloc(total_pairs * 2 * expert_intermediate_size),
             silu_packed: B::alloc(total_pairs * expert_intermediate_size),
@@ -5995,18 +5993,16 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
         shape.tokens * shape.num_experts,
     );
 
-    B::zero_buffer(
-        ctx,
-        &mut scratch.routed_output,
-        shape.tokens * shape.hidden_size,
-    )?;
     let total_pairs = shape.tokens * shape.top_k;
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    // `moe_forward_bucketed` combines every routed row into `out`, so the decode
+    // scratch can receive routed output directly in `mlp_output` and merge the
+    // shared expert in place below.
     moe_forward_bucketed(MoeForwardBucketedParams {
         ctx,
         x,
         router_logits: &scratch.router_logits,
-        out: &mut scratch.routed_output,
+        out: &mut scratch.mlp_output,
         batch: shape.tokens,
         hidden_size: shape.hidden_size,
         expert_intermediate: shape.expert_intermediate_size,
@@ -6072,7 +6068,7 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
         ctx,
         layer_index,
         "moe.routed_output",
-        &scratch.routed_output,
+        &scratch.mlp_output,
         shape.tokens * shape.hidden_size,
     );
 
@@ -6155,14 +6151,6 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
     );
 
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::copy_slice(
-        ctx,
-        &scratch.routed_output,
-        0,
-        &mut scratch.mlp_output,
-        0,
-        shape.tokens * shape.hidden_size,
-    );
     B::add_inplace(
         ctx,
         &mut scratch.mlp_output,
