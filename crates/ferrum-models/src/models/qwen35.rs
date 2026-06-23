@@ -25,7 +25,7 @@ use ferrum_kernels::backend::cuda::marlin::{
 };
 use ferrum_kernels::backend::{AttnConfig, Backend, BackendPagedKv, Dtype, KvCache, MoeLlmBackend};
 use ferrum_quantization::{Linear, NativeSafetensorsLoader, StackedExpertLinear, WeightLoader};
-use ferrum_types::{DataType, Device, FerrumError, RequestId, Result};
+use ferrum_types::{DataType, Device, FerrumError, RequestId, Result, TokenId};
 use parking_lot::{Mutex, MutexGuard};
 use tracing::info;
 
@@ -3844,6 +3844,21 @@ impl<B: MoeLlmBackend + BackendPagedKv> DecoderOnlyLLM for Qwen35BackendModel<B>
 
     fn kv_capacity(&self) -> usize {
         self.kv_capacity
+    }
+
+    fn recurrent_state_spec(
+        &self,
+        request_id: &RequestId,
+        _input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        if !self.has_linear_attention_layers()? {
+            return Ok(None);
+        }
+        self.weights
+            .config
+            .to_recurrent_state_spec(request_id.clone(), DataType::FP32, Device::CPU, 1)
+            .map(Some)
+            .map_err(|err| FerrumError::model(format!("invalid Qwen3.5 recurrent spec: {err}")))
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {

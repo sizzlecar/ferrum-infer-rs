@@ -5,7 +5,11 @@
 //! `LlmExecutor` (living in `ferrum-engine`) holds a `Box<dyn DecoderOnlyLLM>`
 //! and adapts it to the `ModelExecutor` trait that the scheduler calls.
 
-use ferrum_interfaces::model_executor::{KvSlotRequest, KvSlotReservation, LogitsReturnPolicy};
+use ferrum_interfaces::{
+    model_executor::{KvSlotRequest, KvSlotReservation, LogitsReturnPolicy},
+    RecurrentStateSpec,
+};
+use ferrum_types::{RequestId, Result, TokenId};
 
 /// Runtime configuration every decoder-only LLM must expose.
 ///
@@ -128,6 +132,19 @@ pub trait DecoderOnlyLLM: Send + Sync {
         &mut self,
         _requests: &[KvSlotRequest],
     ) -> std::result::Result<Option<KvSlotReservation>, ferrum_types::FerrumError> {
+        Ok(None)
+    }
+
+    /// Recurrent-state allocation spec for state-space or hybrid models.
+    ///
+    /// Most decoder-only models are KV-only and return `None`. Models with
+    /// model-owned recurrent state can return a spec here so the engine can
+    /// apply admission/backpressure before dispatching a forward.
+    fn recurrent_state_spec(
+        &self,
+        _request_id: &RequestId,
+        _input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
         Ok(None)
     }
 
