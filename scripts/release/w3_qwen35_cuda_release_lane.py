@@ -746,6 +746,8 @@ def run_l5(args: argparse.Namespace, perf_dir: Path, l5_dir: Path, env: dict[str
         "--command",
         (perf_dir / "bench-ferrum.command.txt").read_text(encoding="utf-8").strip(),
     ]
+    for value in args.effective_concurrency:
+        cmd.extend(["--effective-concurrency", value])
     run_logged(
         label="w3_l5_concurrency",
         cmd=cmd,
@@ -1407,6 +1409,31 @@ def run_selftest() -> int:
             env=env,
             timeout=60,
         )
+        lane_perf_dir = root / "lane_perf"
+        write_json(
+            lane_perf_dir / "bench_ferrum_sharegpt_sweep_100x3.json",
+            [fake_bench_report(c) for c in [1, 4, 16, 32]],
+        )
+        write_text(lane_perf_dir / "bench-ferrum.command.txt", shlex_join(cmd) + "\n")
+        run_l5(
+            argparse.Namespace(
+                release_model_id=DEFAULT_MODEL_ID,
+                effective_concurrency=["16=8", "32=8"],
+                short_gate_timeout_seconds=60,
+            ),
+            lane_perf_dir,
+            root / "l5_forwarded",
+            env,
+        )
+        forwarded_l5 = load_json(root / "l5_forwarded/w3_l5_concurrency.json")
+        forwarded_cells = {
+            cell["requested_concurrency"]: cell
+            for cell in forwarded_l5["concurrency"]["cells"]
+        }
+        if forwarded_cells[16]["effective_active_concurrency"] != 8:
+            raise AssertionError("lane selftest did not forward c16 effective concurrency")
+        if forwarded_cells[32]["effective_active_concurrency"] != 8:
+            raise AssertionError("lane selftest did not forward c32 effective concurrency")
         args = parse_args(
             [
                 "--out",
