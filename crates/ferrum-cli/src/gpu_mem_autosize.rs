@@ -22,6 +22,9 @@ const SCRATCH_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// PagedKvPool block_size — must match `PAGED_BLOCK_SIZE` in
 /// `llama_family.rs`.
 const PAGED_BLOCK_SIZE: u64 = 16;
+const DEFAULT_MAX_BATCHED_TOKENS: usize = 2048;
+const QWEN35_1X4090_MAX_BATCHED_TOKENS: usize = 192;
+const QWEN35_1X4090_KV_BLOCK_FLOOR: usize = 256;
 
 /// Bytes per element of the KV cache. ferrum currently always uses FP16
 /// for KV regardless of weight dtype (Marlin INT4 weights → FP16 KV).
@@ -128,16 +131,12 @@ fn auto_size_kv_blocks_with_pool_copies_for_snapshot(
     let config_path = model_dir.join("config.json");
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).ok()?).ok()?;
-    let num_layers = config["num_hidden_layers"]
-        .as_u64()
-        .or_else(|| config["num_layers"].as_u64())?;
-    let hidden_size = config["hidden_size"].as_u64()?;
-    let num_attn_heads = config["num_attention_heads"].as_u64()?;
-    let num_kv_heads = config["num_key_value_heads"]
-        .as_u64()
-        .unwrap_or(num_attn_heads);
-    let head_dim = config["head_dim"]
-        .as_u64()
+    let num_layers = config_or_text_u64(&config, "num_hidden_layers")
+        .or_else(|| config_or_text_u64(&config, "num_layers"))?;
+    let hidden_size = config_or_text_u64(&config, "hidden_size")?;
+    let num_attn_heads = config_or_text_u64(&config, "num_attention_heads")?;
+    let num_kv_heads = config_or_text_u64(&config, "num_key_value_heads").unwrap_or(num_attn_heads);
+    let head_dim = config_or_text_u64(&config, "head_dim")
         .unwrap_or_else(|| hidden_size / num_attn_heads.max(1));
 
     // 3. Sum .safetensors / .bin file sizes for weight estimate.
@@ -218,6 +217,20 @@ pub enum AutoSizeProfile {
     Chat,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ModelAutoSizeClass {
+    #[default]
+    Generic,
+    Qwen35MoeGptqInt4,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ModelAutoSizeDefaults {
+    max_batched_tokens: usize,
+    presets: &'static [(usize, usize)],
+    kv_block_floor: usize,
+}
+
 /// Apply auto-sizing: read CLI flag, query nvidia-smi, set env vars.
 /// Sets `FERRUM_KV_MAX_BLOCKS` (global physical paged-KV block budget),
 /// `FERRUM_PAGED_MAX_SEQS` (scheduler/model concurrency shape), and
@@ -244,6 +257,8 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     let max_seqs_overridden = snapshot_value(&current, "FERRUM_PAGED_MAX_SEQS").is_some();
     let max_batched_tokens_overridden =
         snapshot_value(&current, "FERRUM_MAX_BATCHED_TOKENS").is_some();
+    let model_class = model_auto_size_class(model_dir);
+    let defaults = model_auto_size_defaults(model_class, profile);
     let mut entries = Vec::new();
     // ALL three knobs covered by the user — nothing to set.
     if kv_overridden && max_seqs_overridden && max_batched_tokens_overridden {
@@ -253,25 +268,22 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     // FERRUM_KV_MAX_BLOCKS + FERRUM_PAGED_MAX_SEQS (apples bench does both,
     // which used to silently skip the Phase 3 scratch budget alongside).
     if !max_batched_tokens_overridden {
-        // 2048 is the safe default across both apples M2 (Llama-INT4 8B,
-        // ~4 GB) and M3 (Qwen3-30B-A3B, ~17 GB weights + 1 GB scratch +
-        // 6 GB KV pool on 24 GB cards). 4096 OOMs on M3 because the
-        // Qwen3MoE scratch grows linearly with `t` (batch_logits =
-        // t × vocab × 2 B alone is 1.2 GB at t=4096). The unified path
-        // still activates at 2048 — scheduler admits up to 4 prefill
-        // chunks (4 × 512 = 2048) per iter, m_total stays ≤ scratch.
-        let mbt = match profile {
-            AutoSizeProfile::Server => 2048,
-            AutoSizeProfile::Chat => 2048,
-        };
+        // 2048 is the safe generic default across both apples M2
+        // (Llama-INT4 8B, ~4 GB) and M3 (Qwen3-30B-A3B, ~17 GB weights +
+        // 1 GB scratch + 6 GB KV pool on 24 GB cards). Qwen3.5-35B-A3B
+        // GPTQ is much tighter on a 1x4090: the MoE prefill scratch grows
+        // with aggregate prefill tokens, and c16 diagnostics showed the
+        // 1016-token scratch shape OOMs while a 192-token aggregate budget
+        // completes cleanly.
+        let mbt = defaults.max_batched_tokens;
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_MAX_BATCHED_TOKENS",
             mbt.to_string(),
             RuntimeConfigSource::MemoryProfile,
         ));
         eprintln!(
-            "[auto-size] MAX_BATCHED_TOKENS={} (profile={:?})",
-            mbt, profile
+            "[auto-size] MAX_BATCHED_TOKENS={} (profile={:?} model={:?})",
+            mbt, profile, model_class
         );
     }
     if kv_overridden && max_seqs_overridden {
@@ -279,47 +291,29 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         return;
     }
     let kv_pool_copies = kv_pool_copies_from_snapshot(&current);
-    let Some(result) = auto_size_kv_blocks_with_pool_copies(model_dir, gpu_util, kv_pool_copies)
-    else {
+    let mut budget_snapshot = current.clone();
+    for entry in &entries {
+        budget_snapshot.upsert_entry(entry.clone());
+    }
+    let Some(result) = auto_size_kv_blocks_with_pool_copies_for_snapshot(
+        model_dir,
+        gpu_util,
+        kv_pool_copies,
+        &budget_snapshot,
+    ) else {
         crate::runtime_env::materialize_runtime_env_defaults(&entries);
         return;
     };
     result.print_summary();
+    let max_blocks = result.max_blocks.max(defaults.kv_block_floor);
 
-    const SERVER_PRESETS: &[(usize, usize)] = &[
-        // (max_seqs, KV_CAPACITY tokens)
-        (32, 2048), // best — INT4 8B on 24 GB usually lands here
-        (32, 1024), // FP16 8B at util=1.0
-        (32, 512),  // FP16 8B at util=0.95
-        (16, 2048), // long-context narrow batch
-        (16, 1024),
-        (16, 512), // last that supports c=16
-        (8, 1024), // <c=16 only
-        (8, 512),
-    ];
-    // 16384 fits a long thinking-mode reply + ~20 conversation turns
-    // before /clear. max_seqs=2 leaves a slot for any internal use;
-    // single-user CLI never needs more.
-    const CHAT_PRESETS: &[(usize, usize)] = &[
-        (2, 16384),
-        (2, 8192),
-        (2, 4096),
-        (1, 16384),
-        (1, 8192),
-        (1, 4096),
-        (1, 2048),
-    ];
-    let presets: &[(usize, usize)] = match profile {
-        AutoSizeProfile::Server => SERVER_PRESETS,
-        AutoSizeProfile::Chat => CHAT_PRESETS,
-    };
     // Dynamic paged-KV sizing: the physical pool is `KV_MAX_BLOCKS`.
     // Picks the largest (max_seqs, KV_CAP) tuple whose per-sequence table
     // can fit in the global block budget. Multiple sequences share that pool
     // on demand; they do not each reserve KV_CAPACITY at startup.
     //   Server: prioritise wide batch (c=16/32) over context.
     //   Chat:   single user, multi-turn -- pile budget into context.
-    let (max_seqs_clamped, kv_capacity) = select_paged_pool_preset(presets, result.max_blocks);
+    let (max_seqs_clamped, kv_capacity) = select_paged_pool_preset(defaults.presets, max_blocks);
 
     let kv_capacity_overridden = snapshot_value(&current, "FERRUM_KV_CAPACITY").is_some();
     // MAX_BATCHED_TOKENS already set above (it's independent of the KV pool
@@ -330,7 +324,7 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     if !kv_overridden {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_KV_MAX_BLOCKS",
-            result.max_blocks.to_string(),
+            max_blocks.to_string(),
             RuntimeConfigSource::MemoryProfile,
         ));
     }
@@ -354,7 +348,7 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         if kv_overridden {
             "<user>".to_string()
         } else {
-            result.max_blocks.to_string()
+            max_blocks.to_string()
         },
         if max_seqs_overridden {
             "<user>".to_string()
@@ -369,6 +363,136 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
             "<default>".to_string()
         },
     );
+}
+
+const SERVER_PRESETS: &[(usize, usize)] = &[
+    // (max_seqs, KV_CAPACITY tokens)
+    (32, 2048), // best — INT4 8B on 24 GB usually lands here
+    (32, 1024), // FP16 8B at util=1.0
+    (32, 512),  // FP16 8B at util=0.95
+    (16, 2048), // long-context narrow batch
+    (16, 1024),
+    (16, 512), // last that supports c=16
+    (8, 1024), // <c=16 only
+    (8, 512),
+];
+
+// 16384 fits a long thinking-mode reply + ~20 conversation turns before
+// /clear. max_seqs=2 leaves a slot for any internal use; single-user CLI
+// never needs more.
+const CHAT_PRESETS: &[(usize, usize)] = &[
+    (2, 16384),
+    (2, 8192),
+    (2, 4096),
+    (1, 16384),
+    (1, 8192),
+    (1, 4096),
+    (1, 2048),
+];
+
+const QWEN35_SERVER_PRESETS: &[(usize, usize)] = &[(8, 512), (4, 512), (1, 512)];
+const QWEN35_CHAT_PRESETS: &[(usize, usize)] = &[(2, 512), (1, 512)];
+
+fn model_auto_size_defaults(
+    model_class: ModelAutoSizeClass,
+    profile: AutoSizeProfile,
+) -> ModelAutoSizeDefaults {
+    match (model_class, profile) {
+        (ModelAutoSizeClass::Qwen35MoeGptqInt4, AutoSizeProfile::Server) => ModelAutoSizeDefaults {
+            max_batched_tokens: QWEN35_1X4090_MAX_BATCHED_TOKENS,
+            presets: QWEN35_SERVER_PRESETS,
+            kv_block_floor: QWEN35_1X4090_KV_BLOCK_FLOOR,
+        },
+        (ModelAutoSizeClass::Qwen35MoeGptqInt4, AutoSizeProfile::Chat) => ModelAutoSizeDefaults {
+            max_batched_tokens: QWEN35_1X4090_MAX_BATCHED_TOKENS,
+            presets: QWEN35_CHAT_PRESETS,
+            kv_block_floor: QWEN35_1X4090_KV_BLOCK_FLOOR,
+        },
+        (ModelAutoSizeClass::Generic, AutoSizeProfile::Server) => ModelAutoSizeDefaults {
+            max_batched_tokens: DEFAULT_MAX_BATCHED_TOKENS,
+            presets: SERVER_PRESETS,
+            kv_block_floor: 0,
+        },
+        (ModelAutoSizeClass::Generic, AutoSizeProfile::Chat) => ModelAutoSizeDefaults {
+            max_batched_tokens: DEFAULT_MAX_BATCHED_TOKENS,
+            presets: CHAT_PRESETS,
+            kv_block_floor: 0,
+        },
+    }
+}
+
+fn model_auto_size_class(model_dir: &Path) -> ModelAutoSizeClass {
+    let Ok(config_text) = std::fs::read_to_string(model_dir.join("config.json")) else {
+        return ModelAutoSizeClass::Generic;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_text) else {
+        return ModelAutoSizeClass::Generic;
+    };
+    model_auto_size_class_from_config(&config)
+}
+
+fn model_auto_size_class_from_config(config: &serde_json::Value) -> ModelAutoSizeClass {
+    if !is_qwen35_moe_config(config) || !is_gptq_int4_config(config) {
+        return ModelAutoSizeClass::Generic;
+    }
+    ModelAutoSizeClass::Qwen35MoeGptqInt4
+}
+
+fn is_qwen35_moe_config(config: &serde_json::Value) -> bool {
+    let model_type_matches = config
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .is_some_and(is_qwen35_moe_model_type)
+        || config
+            .get("text_config")
+            .and_then(|text| text.get("model_type"))
+            .and_then(|value| value.as_str())
+            .is_some_and(is_qwen35_moe_model_type);
+    let architecture_matches = config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .is_some_and(|architectures| {
+            architectures.iter().any(|entry| {
+                entry.as_str().is_some_and(|name| {
+                    name.eq_ignore_ascii_case("Qwen3_5MoeForConditionalGeneration")
+                })
+            })
+        });
+    model_type_matches || architecture_matches
+}
+
+fn is_qwen35_moe_model_type(value: &str) -> bool {
+    value.eq_ignore_ascii_case("qwen3_5_moe") || value.eq_ignore_ascii_case("qwen3_5_moe_text")
+}
+
+fn is_gptq_int4_config(config: &serde_json::Value) -> bool {
+    let quant = config.get("quantization_config").or_else(|| {
+        config
+            .get("text_config")
+            .and_then(|text| text.get("quantization_config"))
+    });
+    let Some(quant) = quant else {
+        return false;
+    };
+    let method = quant
+        .get("quant_method")
+        .or_else(|| quant.get("type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let bits = quant.get("bits").and_then(|value| value.as_u64());
+    method.eq_ignore_ascii_case("gptq") && bits == Some(4)
+}
+
+fn config_or_text_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
+    config
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|text| text.get(key))
+                .and_then(|value| value.as_u64())
+        })
 }
 
 fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
@@ -563,5 +687,76 @@ mod tests {
             select_paged_pool_preset(&[(32, 2048), (8, 1024)], 64),
             (8, 1024)
         );
+    }
+
+    #[test]
+    fn qwen35_gptq_config_selects_tight_1x4090_memory_profile() {
+        let config = serde_json::json!({
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "model_type": "qwen3_5_moe_text"
+            },
+            "quantization_config": {
+                "quant_method": "gptq",
+                "bits": 4
+            }
+        });
+
+        let class = model_auto_size_class_from_config(&config);
+        assert_eq!(class, ModelAutoSizeClass::Qwen35MoeGptqInt4);
+        let server = model_auto_size_defaults(class, AutoSizeProfile::Server);
+        assert_eq!(server.max_batched_tokens, QWEN35_1X4090_MAX_BATCHED_TOKENS);
+        assert_eq!(server.kv_block_floor, QWEN35_1X4090_KV_BLOCK_FLOOR);
+        assert_eq!(
+            select_paged_pool_preset(server.presets, server.kv_block_floor),
+            (8, 512)
+        );
+
+        let chat = model_auto_size_defaults(class, AutoSizeProfile::Chat);
+        assert_eq!(
+            select_paged_pool_preset(chat.presets, chat.kv_block_floor),
+            (2, 512)
+        );
+    }
+
+    #[test]
+    fn qwen35_memory_profile_requires_gptq_int4() {
+        let dense_or_unquantized = serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "quantization_config": {
+                "quant_method": "gptq",
+                "bits": 8
+            }
+        });
+        assert_eq!(
+            model_auto_size_class_from_config(&dense_or_unquantized),
+            ModelAutoSizeClass::Generic
+        );
+
+        let generic =
+            model_auto_size_defaults(ModelAutoSizeClass::Generic, AutoSizeProfile::Server);
+        assert_eq!(generic.max_batched_tokens, DEFAULT_MAX_BATCHED_TOKENS);
+        assert_eq!(generic.presets, SERVER_PRESETS);
+        assert_eq!(generic.kv_block_floor, 0);
+    }
+
+    #[test]
+    fn autosize_dimension_lookup_falls_back_to_text_config() {
+        let config = serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "hidden_size": 2048,
+                "num_hidden_layers": 40,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "head_dim": 256
+            }
+        });
+
+        assert_eq!(config_or_text_u64(&config, "hidden_size"), Some(2048));
+        assert_eq!(config_or_text_u64(&config, "num_hidden_layers"), Some(40));
+        assert_eq!(config_or_text_u64(&config, "num_key_value_heads"), Some(2));
+        assert_eq!(config_or_text_u64(&config, "head_dim"), Some(256));
     }
 }
