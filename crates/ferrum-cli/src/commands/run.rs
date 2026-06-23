@@ -2081,6 +2081,28 @@ mod tests {
     }
 
     #[test]
+    fn run_effective_runtime_config_applies_qwen35_linear_slots_to_engine_config() {
+        let cmd = test_run_cmd();
+        let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
+            "16",
+            RuntimeConfigSource::ConfigFile,
+        )]);
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let mut engine_config = ferrum_types::EngineConfig::default();
+
+        engine_config
+            .apply_runtime_config_snapshot(&effective)
+            .expect("run effective runtime config should apply");
+
+        assert_eq!(
+            engine_config.runtime.qwen35_linear_state_max_slots,
+            Some(16)
+        );
+    }
+
+    #[test]
     fn run_startup_auto_config_renders_effective_config_schema() {
         let resolved = run_startup_auto_config(
             &ferrum_types::Device::CPU,
