@@ -390,7 +390,7 @@ const CHAT_PRESETS: &[(usize, usize)] = &[
     (1, 2048),
 ];
 
-const QWEN35_SERVER_PRESETS: &[(usize, usize)] = &[(8, 512), (4, 512), (1, 512)];
+const QWEN35_SERVER_PRESETS: &[(usize, usize)] = &[(16, 512), (8, 512), (4, 512), (1, 512)];
 const QWEN35_CHAT_PRESETS: &[(usize, usize)] = &[(2, 512), (1, 512)];
 
 fn model_auto_size_defaults(
@@ -710,7 +710,7 @@ mod tests {
         assert_eq!(server.kv_block_floor, QWEN35_1X4090_KV_BLOCK_FLOOR);
         assert_eq!(
             select_paged_pool_preset(server.presets, server.kv_block_floor),
-            (8, 512)
+            (16, 512)
         );
 
         let chat = model_auto_size_defaults(class, AutoSizeProfile::Chat);
