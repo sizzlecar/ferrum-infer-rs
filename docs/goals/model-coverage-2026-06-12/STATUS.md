@@ -13637,3 +13637,33 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 unified decode-only ResourceExhausted no longer escapes
+
+- 背景:
+  - 继续审计发现上一条 legacy decode fix 之外还有一条 unified decode-only
+    路径:`process_batch_unified()` 在 unified `reserve_kv_slots()` 返回
+    `ResourceExhausted` 且 batch 只有 decode item 时,会转入
+    `run_batch_decode_adaptive()`。
+  - `run_batch_decode_adaptive()` 对单请求、无可抢占 victim 的
+    `ResourceExhausted` 仍然 `return Err(e)`,可能把“等待释放再处理”的语义
+    变成外层错误。
+- 源码变更:
+  - `run_batch_decode_adaptive()` 在单请求 decode 资源不足且没有 victim 可抢占时,
+    现在记录 warn 并继续等待下一轮,不再把 `ResourceExhausted` 冒泡为请求错误。
+  - 新增
+    `process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_waiting`。
+    测试走 `process_batch` 产品路径,覆盖 unified reserve failure ->
+    adaptive decode -> single decode reserve failure,并验证请求仍在 sequence 中,
+    KV/recurrent state 均保留,没有新增 token。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-engine process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_waiting -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,14 个相关测试通过。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只证明本地 unified decode admission 在 ResourceExhausted 后保持等待语义,
+    仍不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
