@@ -61,6 +61,7 @@ pub struct Qwen35BackendModel<B: MoeLlmBackend> {
     pub paged_pools: Option<Vec<(B::Buffer, B::Buffer)>>,
     pub paged_block_alloc: Option<std::sync::Mutex<BlockAllocator>>,
     pub paged_max_seqs: usize,
+    pub linear_state_max_slots: usize,
     pub paged_max_blocks_per_seq: usize,
     paged_scratch: Qwen35PagedScratch<B>,
     decode_scratch: Option<Qwen35DecodeScratch<B>>,
@@ -882,6 +883,15 @@ fn qwen35_paged_max_seqs(snapshot: &ferrum_types::RuntimeConfigSnapshot) -> usiz
     qwen35_runtime_positive_usize(snapshot, "FERRUM_PAGED_MAX_SEQS").unwrap_or(32)
 }
 
+fn qwen35_linear_state_max_slots(
+    snapshot: &ferrum_types::RuntimeConfigSnapshot,
+    paged_max_seqs: usize,
+) -> usize {
+    qwen35_runtime_positive_usize(snapshot, "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
+        .unwrap_or(paged_max_seqs)
+        .max(1)
+}
+
 fn qwen35_paged_total_blocks(
     snapshot: &ferrum_types::RuntimeConfigSnapshot,
     max_blocks_per_seq: usize,
@@ -1040,6 +1050,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             && B::supports_vllm_paged_attn()
             && B::supports_qwen35_paged_qkv_vllm();
         let paged_max_seqs = qwen35_paged_max_seqs(&snapshot);
+        let linear_state_max_slots = qwen35_linear_state_max_slots(&snapshot, paged_max_seqs);
         let paged_max_blocks_per_seq = kv_capacity.div_ceil(QWEN35_PAGED_BLOCK_SIZE);
         Ok(Self {
             weights,
@@ -1053,6 +1064,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             paged_pools: None,
             paged_block_alloc: None,
             paged_max_seqs,
+            linear_state_max_slots,
             paged_max_blocks_per_seq,
             paged_scratch: Qwen35PagedScratch::new(),
             decode_scratch: None,
@@ -1164,7 +1176,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         let shape = self.linear_attention_state_shape();
         let conv_state_len = shape.conv_channels() * shape.conv_kernel.saturating_sub(1);
         let delta_state_len = shape.state_len();
-        let max_slots = self.paged_max_seqs.max(1);
+        let max_slots = self.linear_state_max_slots.max(1);
         let layer_plan = self
             .weights
             .config
@@ -1440,7 +1452,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         let linear_slot = self.allocate_linear_slot()?;
         // In wide serving, indexed recurrent pools are the decode source of truth.
         let compact_indexed_linear_state =
-            self.linear_state_pools.is_some() && self.paged_max_seqs > 2;
+            self.linear_state_pools.is_some() && self.linear_state_max_slots > 2;
         let mut layers = Vec::with_capacity(self.weights.config.num_hidden_layers);
         for layer_plan in layer_plan {
             match layer_plan.attention {
@@ -2036,7 +2048,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .map(|((_, _, pos_offset, _), (_, state))| *pos_offset == 0 && state.tokens.is_empty())
             .collect::<Vec<_>>();
         let compact_indexed_linear_state =
-            self.linear_state_pools.is_some() && self.paged_max_seqs > 2;
+            self.linear_state_pools.is_some() && self.linear_state_max_slots > 2;
         if !compact_indexed_linear_state {
             for (is_fresh_initial, (_, state)) in fresh_initial_rows.iter().zip(states.iter_mut()) {
                 if !*is_fresh_initial && !state.tokens.is_empty() {
@@ -13164,6 +13176,22 @@ mod tests {
             Some(false)
         );
         assert_eq!(qwen35_runtime_bool(&invalid, "FERRUM_GREEDY_ARGMAX"), None);
+    }
+
+    #[test]
+    fn qwen35_linear_state_max_slots_can_be_capped_independently_from_paged_seqs() {
+        let capped = runtime_snapshot(&[
+            ("FERRUM_PAGED_MAX_SEQS", "32"),
+            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16"),
+        ]);
+        assert_eq!(qwen35_paged_max_seqs(&capped), 32);
+        assert_eq!(qwen35_linear_state_max_slots(&capped, 32), 16);
+
+        let absent = runtime_snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]);
+        assert_eq!(qwen35_linear_state_max_slots(&absent, 32), 32);
+
+        let invalid = runtime_snapshot(&[("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "bad")]);
+        assert_eq!(qwen35_linear_state_max_slots(&invalid, 8), 8);
     }
 
     #[test]

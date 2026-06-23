@@ -232,6 +232,7 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
         || key.contains("BATCHED_TOKENS")
         || key.contains("PAGED_MAX_SEQS")
         || key.contains("MODEL_LEN")
+        || key.contains("STATE_MAX_SLOTS")
         || key.contains("MEMORY")
     {
         effects.push(RuntimeConfigEffect::Memory);

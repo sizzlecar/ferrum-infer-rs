@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ78 — Qwen35 linear recurrent slots decoupled from paged seqs
+
+- Correction:
+  - OOM is not solved. The current work only isolates the direct allocation
+    path that made `FERRUM_PAGED_MAX_SEQS=32` preallocate a 32-slot non-KV F32
+    Qwen3.5 linear recurrent-state slab on 24GB CUDA.
+  - True c32 on 24GB CUDA is still unproven and has no W3 release-grade PASS.
+- Scope:
+  - added typed/product config for
+    `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS`;
+  - default behavior is unchanged for Qwen35: if the new key is absent, the
+    linear recurrent slot pool defaults to `FERRUM_PAGED_MAX_SEQS`;
+  - auto-config now materializes the effective Qwen35 linear slot value and
+    validates the 24GB CUDA recurrent-state cap against linear slots rather
+    than only against paged max sequences;
+  - with explicit `FERRUM_PAGED_MAX_SEQS=32` and
+    `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS=16`, config resolution can keep
+    paged admission at 32 while sizing the Qwen35 F32 linear recurrent pool at
+    16.
+- Code:
+  - `crates/ferrum-types/src/auto_config.rs`;
+  - `crates/ferrum-types/src/runtime_config.rs`;
+  - `crates/ferrum-cli/src/config.rs`;
+  - `crates/ferrum-models/src/models/qwen35.rs`.
+- Validation:
+  - `cargo fmt --all -- --check`;
+  - `cargo test -p ferrum-types cuda_qwen35_moe_gptq -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_linear_state_max_slots_can_be_capped_independently_from_paged_seqs -- --nocapture`;
+  - `cargo test -p ferrum-cli runtime_cli_config_emits_config_file_source_entries -- --nocapture`;
+  - `cargo check -p ferrum-cli`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run;
+  - no performance claim is made;
+  - this does not establish that `ferrum run` or `ferrum serve` can sustain
+    true c32 Qwen35 on 24GB CUDA;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-23 ZZZ77 — Unified prefill defers on recurrent-state capacity instead of erroring
 
 - Scope:
