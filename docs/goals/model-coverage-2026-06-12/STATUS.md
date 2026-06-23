@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ79 — Qwen35 decode MoE merge avoids scratch copy
+
+- Scope:
+  - optimized the Qwen35 decode scratch sparse-MoE merge path after the
+    profile showed decode MLP/MoE finish dominates batch16 time;
+  - `qwen35_sparse_moe_shared_expert_decode_scratch()` now merges shared
+    expert output directly into `scratch.routed_output` instead of copying
+    routed output into a separate `scratch.mlp_output` and then adding shared
+    output;
+  - removed the decode `mlp_output` scratch buffer and updated both activation
+    and F32-residual decode finish paths to consume `scratch.routed_output` as
+    the MoE output.
+- Code:
+  - `crates/ferrum-models/src/models/qwen35.rs`.
+- Validation:
+  - `cargo fmt --all -- --check`;
+  - `cargo test -p ferrum-models sparse_moe_decode_merge_adds_shared_output_into_routed_output_inplace -- --nocapture`;
+  - `cargo test -p ferrum-models sparse_moe_shared_expert_composes_router_fused_experts_and_shared_gate -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no throughput claim is made;
+  - this is a candidate source-side improvement for the next same-pod GPU A/B,
+    not evidence that the W3 performance target is met;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ78 — Qwen35 linear recurrent slots decoupled from paged seqs
 
 - Correction:

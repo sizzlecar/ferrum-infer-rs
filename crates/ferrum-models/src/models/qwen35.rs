@@ -335,7 +335,6 @@ pub struct Qwen35DecodeScratch<B: MoeLlmBackend> {
     expert_intermediate_size: usize,
     shared_expert_intermediate_size: usize,
     post_attention_norm: B::Buffer,
-    mlp_output: B::Buffer,
     router_logits: B::Buffer,
     routed_output: B::Buffer,
     x_packed: B::Buffer,
@@ -783,7 +782,6 @@ impl<B: MoeLlmBackend> Qwen35DecodeScratch<B> {
             expert_intermediate_size,
             shared_expert_intermediate_size,
             post_attention_norm: B::alloc(max_tokens * hidden_size),
-            mlp_output: B::alloc(max_tokens * hidden_size),
             router_logits: B::alloc(max_tokens * num_experts),
             routed_output: B::alloc(max_tokens * hidden_size),
             x_packed: B::alloc(total_pairs * hidden_size),
@@ -6167,17 +6165,9 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
     );
 
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::copy_slice(
+    qwen35_merge_moe_outputs_inplace::<B>(
         ctx,
-        &scratch.routed_output,
-        0,
-        &mut scratch.mlp_output,
-        0,
-        shape.tokens * shape.hidden_size,
-    );
-    B::add_inplace(
-        ctx,
-        &mut scratch.mlp_output,
+        &mut scratch.routed_output,
         &scratch.shared_output,
         shape.tokens * shape.hidden_size,
     );
@@ -6186,7 +6176,7 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
         ctx,
         layer_index,
         "moe.output",
-        &scratch.mlp_output,
+        &scratch.routed_output,
         shape.tokens * shape.hidden_size,
     );
 
@@ -6196,6 +6186,15 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
     }
 
     Ok(())
+}
+
+fn qwen35_merge_moe_outputs_inplace<B: Backend>(
+    ctx: &mut B::Context,
+    routed_output: &mut B::Buffer,
+    shared_output: &B::Buffer,
+    len: usize,
+) {
+    B::add_inplace(ctx, routed_output, shared_output, len);
 }
 
 fn qwen35_mlp_backend<B: MoeLlmBackend>(
@@ -6410,7 +6409,7 @@ fn qwen35_finish_layer_with_mlp_decode_scratch<B: MoeLlmBackend>(
                 ctx,
                 layer.layer_index,
                 "mlp_out",
-                &scratch.mlp_output,
+                &scratch.routed_output,
                 hidden_len,
             );
             let mut layer_output = B::alloc(hidden_len);
@@ -6422,7 +6421,7 @@ fn qwen35_finish_layer_with_mlp_decode_scratch<B: MoeLlmBackend>(
                 0,
                 hidden_len,
             );
-            B::add_inplace(ctx, &mut layer_output, &scratch.mlp_output, hidden_len);
+            B::add_inplace(ctx, &mut layer_output, &scratch.routed_output, hidden_len);
             qwen35_trace_layer_buffer_stats::<B>(
                 ctx,
                 layer.layer_index,
@@ -6518,11 +6517,11 @@ fn qwen35_finish_layer_with_mlp_f32_residual_decode_scratch<B: MoeLlmBackend>(
                 ctx,
                 layer.layer_index,
                 "mlp_out",
-                &scratch.mlp_output,
+                &scratch.routed_output,
                 hidden_len,
             );
             let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-            B::activation_to_f32_shadow(ctx, &scratch.mlp_output, branch_f32, hidden_len);
+            B::activation_to_f32_shadow(ctx, &scratch.routed_output, branch_f32, hidden_len);
             detail.activation_to_f32_shadow_us += qwen35_detail_profile_stage_finish::<B>(
                 ctx,
                 timer,
@@ -12704,6 +12703,30 @@ mod tests {
                 -0.2, 0.75,
             ],
         }
+    }
+
+    #[test]
+    fn sparse_moe_decode_merge_adds_shared_output_into_routed_output_inplace() {
+        let mut ctx = CpuBackend::new_context();
+        let mut routed = CpuBackend::from_slice(&[
+            1.0, 2.0, //
+            -3.0, 4.0,
+        ]);
+        let shared = CpuBackend::from_slice(&[
+            0.25, -0.5, //
+            1.5, 2.0,
+        ]);
+
+        qwen35_merge_moe_outputs_inplace::<CpuBackend>(&mut ctx, &mut routed, &shared, 4);
+
+        assert_close_slice(
+            &CpuBackend::to_vec(&routed, 4),
+            &[
+                1.25, 1.5, //
+                -1.5, 6.0,
+            ],
+            1e-6,
+        );
     }
 
     #[test]
