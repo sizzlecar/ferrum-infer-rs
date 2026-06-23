@@ -17,6 +17,8 @@ pub const QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET: &str =
 const DEFAULT_KV_BLOCK_SIZE_TOKENS: usize = 16;
 const DEFAULT_KV_BLOCKS: usize = 2048;
 const GIB: u64 = 1024 * 1024 * 1024;
+const QWEN35_MOE_GPTQ_24GB_VRAM_GUARD_BYTES: u64 = 26 * GIB;
+const QWEN35_MOE_GPTQ_24GB_MAX_SEQUENCES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
@@ -1331,6 +1333,16 @@ impl FerrumConfigBuilder {
         if max_sequences == 0 {
             return self.invalid("FERRUM_PAGED_MAX_SEQS", "must be greater than zero");
         }
+        if let Some(limit) = self.qwen35_moe_gptq_recurrent_state_max_sequences() {
+            if max_sequences > limit {
+                return Err(AutoConfigError::InvalidOverride {
+                    key: "FERRUM_PAGED_MAX_SEQS".to_string(),
+                    reason: format!(
+                        "Qwen3.5 MoE GPTQ Int4 on <=26 GiB CUDA must use max sequences <= {limit}; true c32 requires a non-KV F32 recurrent-state pool that exceeds RTX 4090-class memory. Use --max-num-seqs {limit} or a larger-memory GPU."
+                    ),
+                });
+            }
+        }
         if max_batched_tokens < max_sequences {
             return self.invalid(
                 "FERRUM_MAX_BATCHED_TOKENS",
@@ -1364,6 +1376,22 @@ impl FerrumConfigBuilder {
             }
         }
         Ok(())
+    }
+
+    fn qwen35_moe_gptq_recurrent_state_max_sequences(&self) -> Option<usize> {
+        if !self.is_cuda_backend()
+            || !self.model.architecture.eq_ignore_ascii_case("qwen3_5_moe")
+            || !self
+                .model
+                .quantization
+                .as_deref()
+                .is_some_and(|quant| quant.eq_ignore_ascii_case("gptq_int4"))
+        {
+            return None;
+        }
+        let vram_bytes = self.hardware.vram_bytes?;
+        (vram_bytes <= QWEN35_MOE_GPTQ_24GB_VRAM_GUARD_BYTES)
+            .then_some(QWEN35_MOE_GPTQ_24GB_MAX_SEQUENCES)
     }
 
     fn validate_dtypes(&self) -> Result<(), AutoConfigError> {
@@ -2050,6 +2078,16 @@ mod tests {
             .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
     }
 
+    fn qwen35_moe_gptq_int4_model() -> ModelCapabilities {
+        let mut model = ModelCapabilities::qwen3_30b_a3b_gptq_int4();
+        model.architecture = "qwen3_5_moe".to_string();
+        model.head_dim = Some(256);
+        model.num_hidden_layers = Some(40);
+        model.kv_heads = Some(8);
+        model.estimated_weight_bytes = Some(23 * GIB);
+        model
+    }
+
     fn qwen25_layer_split_runtime_entries(source: RuntimeConfigSource) -> RuntimeConfigSnapshot {
         snapshot_with_sources(&[
             ("FERRUM_REQUESTED_GPU_DEVICES", "0,1", source),
@@ -2253,12 +2291,11 @@ mod tests {
         // full-attention head_dim is 256. The H256 path uses the v2 paged
         // attention launcher, so the default decision trace must not report
         // the H128-oriented v1-short path.
-        let hardware =
+        let mut hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        hardware.vram_bytes = Some(48 * GIB);
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let mut model = ModelCapabilities::qwen3_30b_a3b_gptq_int4();
-        model.architecture = "qwen3_5_moe".to_string();
-        model.head_dim = Some(256);
+        let model = qwen35_moe_gptq_int4_model();
         let resolved = FerrumConfigBuilder::new(snapshot(&[]))
             .with_model_capabilities(model)
             .with_hardware_capabilities(hardware)
@@ -2288,6 +2325,51 @@ mod tests {
             entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
             "0"
         );
+    }
+
+    #[test]
+    fn cuda_qwen35_moe_gptq_rejects_true_c32_on_24gb_recurrent_state_guard() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
+            .with_model_capabilities(qwen35_moe_gptq_int4_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap_err();
+
+        match err {
+            AutoConfigError::InvalidOverride { key, reason } => {
+                assert_eq!(key, "FERRUM_PAGED_MAX_SEQS");
+                assert!(
+                    reason.contains("non-KV F32 recurrent-state pool"),
+                    "{reason}"
+                );
+                assert!(reason.contains("max sequences <= 16"), "{reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cuda_qwen35_moe_gptq_allows_c32_on_larger_memory_gpu() {
+        let mut hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        hardware.vram_bytes = Some(48 * GIB);
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
+            .with_model_capabilities(qwen35_moe_gptq_int4_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let max_sequences = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "max_sequences")
+            .unwrap();
+        assert_eq!(max_sequences.selected, "32");
     }
 
     #[test]
