@@ -13667,3 +13667,36 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     仍不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 unified fallback releases fresh recurrent state before retry
+
+- 背景:
+  - 继续审计 unified prefill 失败路径发现:unified prefill setup 会先通过
+    `ensure_recurrent_state()` 分配并写入 sequence,再分配 engine KV。
+  - 如果 unified `reserve_kv_slots()` 或 `unified_decode()` 失败并转入 legacy
+    fallback,旧逻辑只释放本轮 fresh KV,没有释放本轮 fresh recurrent state。
+  - 这会在 fallback 随后因为 KV allocation defer 而没有进入 prefill model call
+    时留下 recurrent slot,违背“资源不足等待释放再处理,不要占死资源”的目标。
+- 源码变更:
+  - `UnifiedPrefillWork` 新增 `fresh_recurrent` 标记,区分本轮刚分配的 recurrent
+    state 和请求已有的 recurrent state。
+  - unified reserve failure 与 unified forward failure 转入 fallback 前,现在会
+    释放本轮 fresh KV 和本轮 fresh recurrent state。
+  - 新增 `FailingUnifiedForwardExecutor` 与
+    `FirstAllocateThenFailKvCacheManager` 测试夹具。
+  - 新增
+    `process_batch_unified_forward_failure_then_fallback_kv_defer_releases_recurrent_state`。
+    测试走 `process_batch` 产品路径,覆盖 unified forward ResourceExhausted 后
+    fallback KV allocation defer,并断言请求仍可重试、KV/recurrent active 计数归零。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-engine process_batch_unified_forward_failure_then_fallback_kv_defer_releases_recurrent_state -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,15 个相关测试通过。
+  - `git diff --check` PASS。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只证明本地 unified fallback 资源回滚路径不会占死 fresh recurrent slot,
+    仍不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。

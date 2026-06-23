@@ -179,6 +179,7 @@ impl EngineInner {
             logits_policy: LogitsReturnPolicy,
             can_use_prefix_cache: bool,
             fresh_kv: bool,
+            fresh_recurrent: bool,
             chunk_start: usize,
             chunk_len: usize,
             is_final_chunk: bool,
@@ -288,9 +289,10 @@ impl EngineInner {
                 }
             }
 
+            let had_recurrent_state = existing_recurrent_state.is_some();
             let recurrent_state =
-                match self.ensure_recurrent_state(rid, recurrent_state_spec).await {
-                    Ok(state) => state,
+	                match self.ensure_recurrent_state(rid, recurrent_state_spec).await {
+	                    Ok(state) => state,
                     Err(FerrumError::ResourceExhausted { message }) => {
                         if self.preempt_victim(rid).await {
                             match self
@@ -333,9 +335,10 @@ impl EngineInner {
                         );
                         self.complete_request(rid, FinishReason::Error).await?;
                         continue;
-                    }
-                }
-                .or(existing_recurrent_state);
+	                    }
+	                }
+	                .or(existing_recurrent_state);
+            let fresh_recurrent = !had_recurrent_state && recurrent_state.is_some();
 
             let (kv_handle, fresh_kv) = if let Some(kv) = existing_kv {
                 (kv, false)
@@ -400,6 +403,7 @@ impl EngineInner {
                 logits_policy,
                 can_use_prefix_cache,
                 fresh_kv,
+                fresh_recurrent,
                 chunk_start,
                 chunk_len,
                 is_final_chunk,
@@ -507,6 +511,9 @@ impl EngineInner {
                 if work.fresh_kv {
                     let _ = self.kv_cache.deallocate(work.rid.clone()).await;
                 }
+                if work.fresh_recurrent {
+                    self.release_recurrent_state(&work.rid).await;
+                }
             }
             if is_resource_exhausted_error(&e) && prefill_meta.is_empty() && !decode_meta.is_empty()
             {
@@ -527,6 +534,9 @@ impl EngineInner {
                 for work in &prefill_meta {
                     if work.fresh_kv {
                         let _ = self.kv_cache.deallocate(work.rid.clone()).await;
+                    }
+                    if work.fresh_recurrent {
+                        self.release_recurrent_state(&work.rid).await;
                     }
                 }
                 return self.process_batch_legacy_split(batch).await;
