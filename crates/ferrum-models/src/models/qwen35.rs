@@ -27,6 +27,7 @@ use ferrum_kernels::backend::{AttnConfig, Backend, BackendPagedKv, Dtype, KvCach
 use ferrum_quantization::{Linear, NativeSafetensorsLoader, StackedExpertLinear, WeightLoader};
 use ferrum_types::{DataType, Device, FerrumError, RequestId, Result};
 use parking_lot::{Mutex, MutexGuard};
+use tracing::info;
 
 use crate::{
     common::{paged_pool::BlockAllocator, DecoderOnlyLLM, LlmRuntimeConfig},
@@ -11684,6 +11685,11 @@ impl<B: MoeLlmBackend> Qwen35ModelWeights<B> {
         plan: &Qwen35ResolvedWeightPlan,
         loader: &dyn ferrum_quantization::WeightLoader<B>,
     ) -> Result<Self> {
+        let load_start = Instant::now();
+        info!(
+            "Qwen3.5 native weights: loading globals and {} layers",
+            config.num_hidden_layers
+        );
         let planned = Qwen35WeightPlanLoader::<B>::new(plan, loader);
         let hidden_size = config.hidden_size;
         let head_dim = config.head_dim;
@@ -11697,12 +11703,24 @@ impl<B: MoeLlmBackend> Qwen35ModelWeights<B> {
         } else {
             planned.load_global_linear("embed_tokens")?
         };
+        info!(
+            "Qwen3.5 native weights: globals loaded in {:.1}s",
+            load_start.elapsed().as_secs_f64()
+        );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_plan in config
             .layer_plan()
             .map_err(ferrum_types::FerrumError::model)?
         {
-            layers.push(Qwen35LayerWeights {
+            let layer_start = Instant::now();
+            info!(
+                "Qwen3.5 native weights: loading layer {}/{} ({:?}, {:?})",
+                layer_plan.layer_index + 1,
+                config.num_hidden_layers,
+                layer_plan.attention,
+                layer_plan.mlp
+            );
+            let layer = Qwen35LayerWeights {
                 layer_index: layer_plan.layer_index,
                 input_layernorm: qwen35_fold_gemma_norm_weight::<B>(
                     planned.load_layer_tensor(layer_plan.layer_index, "input_layernorm")?,
@@ -11834,8 +11852,20 @@ impl<B: MoeLlmBackend> Qwen35ModelWeights<B> {
                         )
                     }
                 },
-            });
+            };
+            info!(
+                "Qwen3.5 native weights: layer {}/{} loaded in {:.1}s",
+                layer_plan.layer_index + 1,
+                config.num_hidden_layers,
+                layer_start.elapsed().as_secs_f64()
+            );
+            layers.push(layer);
         }
+        info!(
+            "Qwen3.5 native weights: loaded {} layers in {:.1}s",
+            layers.len(),
+            load_start.elapsed().as_secs_f64()
+        );
 
         Ok(Self {
             config,
