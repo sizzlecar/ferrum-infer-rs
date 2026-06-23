@@ -13700,3 +13700,31 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     仍不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 unified result-shape errors clean up fresh resources
+
+- 背景:
+  - 继续审计 `process_batch_unified()` 的已分配资源后失败路径发现:
+    `unified_decode()` 如果返回的 result 数量与 unified item 数量不一致,
+    代码会直接 `return Err(...)`。
+  - 该分支发生在 fresh KV 和 fresh recurrent state 已经分配之后,且没有走
+    fallback cleanup 或 `complete_request()`,因此会留下本轮 fresh 资源。
+- 源码变更:
+  - unified result length mismatch 分支在返回 internal error 前,现在释放每个
+    prefill item 的本轮 fresh KV 和本轮 fresh recurrent state。
+  - 新增 `ShortUnifiedResultExecutor` 测试夹具。
+  - 新增 `process_batch_unified_result_len_mismatch_releases_recurrent_state`。
+    测试走 `process_batch` 产品路径,模拟 backend 返回空 result,并断言 error
+    返回后 KV/recurrent active 计数归零,request 仍可被检查且未标记 prefill 完成。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-engine process_batch_unified_result_len_mismatch_releases_recurrent_state -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,16 个相关测试通过。
+  - `git diff --check` PASS。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只证明本地 unified backend contract error 不会留下 fresh KV/recurrent 资源,
+    仍不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。

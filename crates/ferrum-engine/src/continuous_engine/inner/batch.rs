@@ -551,6 +551,14 @@ impl EngineInner {
             .zip(t_unified_model_done)
             .map(|(t0, t1)| t1.duration_since(t0).as_micros() as u64);
         if results.len() != unified.items.len() {
+            for work in &prefill_meta {
+                if work.fresh_kv {
+                    let _ = self.kv_cache.deallocate(work.rid.clone()).await;
+                }
+                if work.fresh_recurrent {
+                    self.release_recurrent_state(&work.rid).await;
+                }
+            }
             return Err(FerrumError::internal(format!(
                 "unified_decode returned {} results for {} items",
                 results.len(),
