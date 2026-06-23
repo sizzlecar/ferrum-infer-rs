@@ -13483,3 +13483,32 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
 - 限制:
   - 这仍是 GPU lane 前置保护;W3 release-grade 仍需要真实 1x4090 artifact
     和最终 `MODEL_RELEASE_GRADE_W3 PASS`。
+
+## 2026-06-24 — W3 Qwen35 run/serve runtime slot plumbing coverage
+
+- 背景:
+  - 之前已经把 Qwen35 FP32 linear/recurrent state slot cap 接到 typed
+    `EngineConfig.runtime.qwen35_linear_state_max_slots` 和 engine admission
+    manager,但这不能被表述成 OOM 已经解决。
+  - 还需要确认产品入口 `ferrum run` 和 `ferrum serve` 的 runtime snapshot /
+    config merge 会把 `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS` 带到 typed
+    engine config,避免底层逻辑存在但用户入口未生效。
+- 源码变更:
+  - `crates/ferrum-cli/src/commands/run.rs` 新增
+    `run_effective_runtime_config_applies_qwen35_linear_slots_to_engine_config`。
+  - `crates/ferrum-cli/src/commands/serve.rs` 新增
+    `serve_runtime_snapshot_applies_qwen35_linear_slots_to_engine_config`。
+  - 这次只补产品入口级覆盖,不改运行逻辑。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-cli run_effective_runtime_config_applies_qwen35_linear_slots_to_engine_config -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-cli serve_runtime_snapshot_applies_qwen35_linear_slots_to_engine_config -- --nocapture`
+    PASS。
+  - `git diff --check` PASS。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 不能声称 OOM 已经实机解决;这里只证明 run/serve 产品入口会把
+    Qwen35 slot cap 应用到 engine config。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
