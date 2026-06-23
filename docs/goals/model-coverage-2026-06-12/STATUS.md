@@ -2,6 +2,30 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ83 — LlmExecutor recurrent admission lifecycle is covered locally
+
+- Scope:
+  - added a continuous-engine regression test that wraps a recurrent-state
+    declaring `DecoderOnlyLLM` in the product `LlmExecutor` adapter;
+  - the test proves the engine allocates the recurrent-state admission handle
+    through the `LlmExecutor` path, completes the request, and deallocates the
+    handle at completion;
+  - reran the recurrent-state engine test group to keep the existing
+    custom-executor allocation, builder slot-cap, and preemption coverage tied
+    to the new product-adapter coverage.
+- Code:
+  - `crates/ferrum-engine/src/continuous_engine/tests.rs`.
+- Validation:
+  - `cargo fmt --all -- --check`;
+  - `cargo test -p ferrum-engine engine_allocates_and_deallocates_llm_executor_declared_recurrent_state -- --nocapture`;
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no throughput claim is made;
+  - this is local correctness coverage for the Qwen3.5 recurrent-capacity
+    admission path added in ZZZ82;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ82 — Qwen35 recurrent-state admission reaches the CUDA product path
 
 - Correction:

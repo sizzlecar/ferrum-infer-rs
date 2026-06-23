@@ -8,6 +8,7 @@ use ferrum_interfaces::{
     },
     ModelExecutor, RecurrentStateManager, RecurrentStateSpec, RecurrentStateTensorSpec,
 };
+use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
 use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensorFactory};
 use std::time::Duration;
 
@@ -142,6 +143,60 @@ fn policy_request() -> InferenceRequest {
 
 struct RecurrentSpecExecutor {
     inner: MockModelExecutor,
+}
+
+struct RecurrentSpecLlm {
+    config: LlmRuntimeConfig,
+}
+
+impl RecurrentSpecLlm {
+    fn new() -> Self {
+        Self {
+            config: LlmRuntimeConfig {
+                hidden_size: 4,
+                num_layers: 1,
+                num_kv_heads: 1,
+                head_dim: 4,
+                vocab_size: 64,
+                max_seq_len: 16,
+            },
+        }
+    }
+}
+
+impl DecoderOnlyLLM for RecurrentSpecLlm {
+    fn config(&self) -> &LlmRuntimeConfig {
+        &self.config
+    }
+
+    fn recurrent_state_spec(
+        &self,
+        request_id: &RequestId,
+        _input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        Ok(Some(RecurrentStateSpec {
+            request_id: request_id.clone(),
+            num_layers: 1,
+            tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
+            dtype: DataType::FP32,
+            device: Device::CPU,
+            max_batch_slots: 1,
+        }))
+    }
+
+    fn prefill(&mut self, _cache_id: &str, _tokens: &[u32]) -> Vec<f32> {
+        let mut logits = vec![0.0; self.config.vocab_size];
+        logits[0] = 1.0;
+        logits
+    }
+
+    fn decode(&mut self, _cache_id: &str, _token: u32, _pos: u32) -> Vec<f32> {
+        let mut logits = vec![0.0; self.config.vocab_size];
+        logits[0] = 1.0;
+        logits
+    }
+
+    fn release(&mut self, _cache_id: &str) {}
 }
 
 #[derive(Clone, Debug)]
@@ -761,6 +816,67 @@ async fn engine_allocates_and_deallocates_model_declared_recurrent_state() {
     assert_eq!(stats.allocation_failures, 0);
     assert_eq!(stats.active_states, 0);
     assert_eq!(stats.used_memory_bytes, 0);
+}
+
+#[tokio::test]
+async fn engine_allocates_and_deallocates_llm_executor_declared_recurrent_state() {
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(
+        ferrum_types::SchedulerConfig::default(),
+    ));
+    let tokenizer = Arc::new(PolicyTokenizer::new(64, &[]));
+    let sampler = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    let model_info = ferrum_types::ModelInfo {
+        model_id: ferrum_types::ModelId::new("recurrent-llm"),
+        model_type: ferrum_types::ModelType::Custom("recurrent-llm".to_string()),
+        num_parameters: 0,
+        hidden_size: 4,
+        num_layers: 1,
+        num_heads: 1,
+        num_kv_heads: 1,
+        vocab_size: 64,
+        max_sequence_length: 16,
+        dtype: DataType::FP32,
+        device: Device::CUDA(0),
+        version: None,
+        license: None,
+        metadata: HashMap::new(),
+    };
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(LlmExecutor::new(
+        Box::new(RecurrentSpecLlm::new()),
+        model_info,
+    ));
+    let tensor_factory = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 1024,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        EngineConfig::default(),
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager.clone()),
+    );
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+
+    let response = engine.infer(request).await.unwrap();
+
+    assert_eq!(response.finish_reason, FinishReason::Length);
+    let stats = recurrent_manager.stats();
+    assert_eq!(stats.total_batch_slots, 1);
+    assert_eq!(stats.allocation_count, 1);
+    assert_eq!(stats.allocation_failures, 0);
+    assert_eq!(stats.active_states, 0);
+    assert_eq!(stats.used_batch_slots, 0);
 }
 
 #[tokio::test]
