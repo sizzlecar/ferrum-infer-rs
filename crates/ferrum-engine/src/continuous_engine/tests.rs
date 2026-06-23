@@ -214,6 +214,10 @@ impl ModelExecutor for RecurrentSpecExecutor {
         self.inner.info()
     }
 
+    fn supports_native_unified_decode(&self) -> bool {
+        true
+    }
+
     fn recurrent_state_spec(
         &self,
         request_id: &RequestId,
@@ -235,6 +239,20 @@ impl ModelExecutor for RecurrentSpecExecutor {
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
         self.inner.decode(input).await
+    }
+
+    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
+        Ok(batch
+            .items
+            .iter()
+            .map(|item| {
+                item.is_final_chunk.then(|| {
+                    let mut logits = vec![0.0; self.info().vocab_size];
+                    logits[0] = 1.0;
+                    logits
+                })
+            })
+            .collect())
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
@@ -743,6 +761,112 @@ async fn engine_allocates_and_deallocates_model_declared_recurrent_state() {
     assert_eq!(stats.allocation_failures, 0);
     assert_eq!(stats.active_states, 0);
     assert_eq!(stats.used_memory_bytes, 0);
+}
+
+#[tokio::test]
+async fn process_batch_unified_preempts_decode_for_recurrent_state_capacity() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
+        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager.clone()),
+    );
+
+    let mut victim_request = policy_request();
+    victim_request.prompt = "test".to_string();
+    victim_request.sampling_params.max_tokens = 4;
+    let victim_id = victim_request.id.clone();
+    let victim_spec = RecurrentStateSpec {
+        request_id: victim_id.clone(),
+        num_layers: 1,
+        tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
+        dtype: DataType::BF16,
+        device: Device::CPU,
+        max_batch_slots: 1,
+    };
+    let victim_recurrent_state = recurrent_manager.allocate(&victim_spec).await.unwrap();
+    let victim_kv = engine
+        .inner
+        .make_model_kv_handle_with_seq("victim-cache".to_string(), 1);
+    let mut victim_seq = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        victim_request.clone(),
+        vec![TokenId::new(5)],
+        Some(tokenizer.clone()),
+        Some(64),
+    );
+    victim_seq.generated_tokens.push(TokenId::new(6));
+    victim_seq.prefill_complete = true;
+    victim_seq.prefill_tokens_processed = 1;
+    victim_seq.kv_cache = Some(victim_kv);
+    victim_seq.recurrent_state = Some(victim_recurrent_state);
+    victim_seq.model_cache_id = Some("victim-cache".to_string());
+    victim_seq.phase = RequestPhase::Decoding;
+    {
+        let mut sequences = engine.inner.sequences.write();
+        sequences.insert(victim_id.clone(), victim_seq);
+    }
+
+    let mut fresh_request = policy_request();
+    fresh_request.prompt = "test".to_string();
+    fresh_request.sampling_params.max_tokens = 2;
+    let fresh_id = fresh_request.id.clone();
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(
+            fresh_request,
+        )],
+        max_sequence_length: 1,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    engine.inner.process_batch(&batch).await.unwrap();
+
+    let stats = recurrent_manager.stats();
+    assert_eq!(stats.allocation_count, 2);
+    assert_eq!(stats.allocation_failures, 0);
+    assert_eq!(stats.active_states, 1);
+    assert_eq!(stats.used_batch_slots, 1);
+
+    let sequences = engine.inner.sequences.read();
+    let victim = sequences
+        .get(&victim_id)
+        .expect("preempted victim should remain queued for recompute");
+    assert!(!victim.prefill_complete);
+    assert!(victim.kv_cache.is_none());
+    assert!(victim.recurrent_state.is_none());
+    assert_eq!(victim.preemption_count, 1);
+
+    let fresh = sequences
+        .get(&fresh_id)
+        .expect("fresh request should remain active after prefill");
+    assert!(fresh.prefill_complete);
+    assert!(fresh.kv_cache.is_some());
+    assert!(fresh.recurrent_state.is_some());
 }
 
 #[test]
