@@ -144,8 +144,15 @@ impl EngineInner {
                 // OOM — try to free blocks by preempting a victim
                 if self.preempt_victim(request_id).await {
                     // Retry after preemption
-                    self.kv_cache.allocate(&alloc_request).await?
+                    match self.kv_cache.allocate(&alloc_request).await {
+                        Ok(h) => h,
+                        Err(e) => {
+                            self.release_recurrent_state(request_id).await;
+                            return Err(e);
+                        }
+                    }
                 } else {
+                    self.release_recurrent_state(request_id).await;
                     return Err(FerrumError::resource_exhausted(
                         "No blocks available and no request to preempt",
                     ));
@@ -424,6 +431,10 @@ impl EngineInner {
                 Ok(state) => state,
                 Err(e) => {
                     warn!("Recurrent-state alloc failed for {}: {}", rid, e);
+                    let _ = self.kv_cache.deallocate(rid.clone()).await;
+                    if is_resource_exhausted_error(&e) {
+                        continue;
+                    }
                     self.complete_request(rid, FinishReason::Error).await?;
                     continue;
                 }

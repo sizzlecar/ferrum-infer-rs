@@ -13512,3 +13512,38 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     Qwen35 slot cap 应用到 engine config。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 recurrent admission releases slots on KV defer
+
+- 背景:
+  - Qwen35 linear/recurrent state admission 需要在容量不足时等待释放,不能在
+    半分配状态下占死 slot,否则后续请求仍可能表现为资源耗尽或 OOM 风险。
+  - 审计发现两个半分配风险:
+    - 单请求 prefill 已分配 recurrent state 后,KV 分配/重试失败会直接返回错误,
+      没有释放 recurrent state。
+    - unified prefill 已分配 recurrent state 后,KV 分配失败并 defer 时会
+      `continue`,没有释放刚占用的 recurrent slot。
+    - legacy batched prefill 先分配 KV,再分配 recurrent state;recurrent
+      resource exhausted 时之前会 complete request,且 KV handle 尚未挂到
+      sequence,`complete_request` 清不到这份 KV。
+- 源码变更:
+  - `EngineInner::release_recurrent_state()` 新增统一释放 helper。
+  - 单请求 prefill 的 KV 重试失败/无 victim 分支会释放 recurrent state 后再
+    返回 resource error。
+  - unified prefill 的 KV defer 分支会释放 recurrent state,让请求保持未完成
+    并等待下一轮调度。
+  - legacy batched prefill 的 recurrent resource exhausted 改为释放已分配 KV
+    并 defer,不把请求完成为 Error。
+  - 新增
+    `process_batch_unified_releases_recurrent_state_when_kv_alloc_defers` 回归测试。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-engine process_batch_unified_releases_recurrent_state_when_kv_alloc_defers -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,10 个相关测试通过。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这证明本地 engine admission 在 KV defer 时不会占死 recurrent slot,但仍不能
+    声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。

@@ -1407,6 +1407,15 @@ impl EngineInner {
         Ok(Some(handle))
     }
 
+    async fn release_recurrent_state(&self, request_id: &RequestId) {
+        if let Some(seq) = self.sequences.write().get_mut(request_id) {
+            seq.recurrent_state = None;
+        }
+        if let Some(manager) = &self.recurrent_state_manager {
+            let _ = manager.deallocate(request_id.clone()).await;
+        }
+    }
+
     fn performance_breakdown(&self) -> ferrum_types::PerformanceBreakdown {
         ferrum_types::PerformanceBreakdown {
             scheduling_time_ms: avg_duration_ms(

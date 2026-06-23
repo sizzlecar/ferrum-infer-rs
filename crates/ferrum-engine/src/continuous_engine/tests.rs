@@ -985,6 +985,68 @@ async fn process_batch_unified_preempts_decode_for_recurrent_state_capacity() {
     assert!(fresh.recurrent_state.is_some());
 }
 
+#[tokio::test]
+async fn process_batch_unified_releases_recurrent_state_when_kv_alloc_defers() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 0;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(0));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
+        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache.clone(),
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager.clone()),
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 2;
+    let request_id = request.id.clone();
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
+        max_sequence_length: 1,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    engine.inner.process_batch(&batch).await.unwrap();
+
+    let recurrent_stats = recurrent_manager.stats();
+    assert_eq!(recurrent_stats.allocation_count, 1);
+    assert_eq!(recurrent_stats.active_states, 0);
+    assert_eq!(recurrent_stats.used_batch_slots, 0);
+    assert_eq!(kv_cache.active_count(), 0);
+
+    let sequences = engine.inner.sequences.read();
+    let sequence = sequences
+        .get(&request_id)
+        .expect("deferred request should remain queued");
+    assert!(!sequence.prefill_complete);
+    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.recurrent_state.is_none());
+}
+
 #[test]
 fn sequence_state_detects_text_stop_before_length() {
     let tokenizer = PolicyTokenizer::new(8, &[("OK", 5), ("<END>", 6), ("TAIL", 7)]);
