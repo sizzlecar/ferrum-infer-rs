@@ -13608,3 +13608,32 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     但仍不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 decode resource exhaustion waits instead of completing error
+
+- 背景:
+  - 继续审计 decode path 发现 legacy split 的单请求 decode 分支在
+    `run_decode_step()` 返回 `ResourceExhausted` 时会直接
+    `complete_request(FinishReason::Error)`。
+  - 这和 prefill/resource-admission 的等待语义不一致:decode 阶段如果只是
+    model-side KV admission 暂时不足,应该保留请求、KV 和 recurrent state,
+    等待后续资源释放,而不是把请求完成为错误。
+- 源码变更:
+  - `process_batch_legacy_split()` 的 batch-decode fallback per-request 分支,
+    以及单请求 decode 分支,遇到 `ResourceExhausted` 时现在 `continue`,保留
+    request state 等待下一轮。
+  - 新增 `FailingDecodeExecutor` 测试夹具和
+    `process_batch_single_decode_resource_exhausted_keeps_recurrent_state_waiting`。
+    测试走 `process_batch` 产品路径,验证 decode ResourceExhausted 后请求仍在
+    sequence 中,KV/recurrent state 均保留,没有新增 token,也没有被 Error 完成。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-engine process_batch_single_decode_resource_exhausted_keeps_recurrent_state_waiting -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,13 个相关测试通过。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这证明本地 decode admission 在 ResourceExhausted 后保持等待语义,但仍不能
+    声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。

@@ -83,6 +83,9 @@ impl EngineInner {
                 for rid in self.decode_ready_request_ids(&decode_ids) {
                     if let Err(e) = self.run_decode_step(&rid).await {
                         warn!("Decode failed for {}: {}", rid, e);
+                        if is_resource_exhausted_error(&e) {
+                            continue;
+                        }
                         self.complete_request(&rid, FinishReason::Error).await?;
                     }
                 }
@@ -91,6 +94,9 @@ impl EngineInner {
             for rid in self.decode_ready_request_ids(&decode_ids) {
                 if let Err(e) = self.run_decode_step(&rid).await {
                     warn!("Decode failed for {}: {}", rid, e);
+                    if is_resource_exhausted_error(&e) {
+                        continue;
+                    }
                     self.complete_request(&rid, FinishReason::Error).await?;
                 }
             }
