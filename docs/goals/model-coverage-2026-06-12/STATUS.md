@@ -2,6 +2,33 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ81 — Qwen35 decode residual shadow skips unused layer output materialization
+
+- Scope:
+  - used the copied historical profile artifact
+    `w3_qwen35_profile_diag_e5daa58c_20260623/server/profile.jsonl`
+    instead of rerunning vLLM or Ferrum on GPU;
+  - batch16 decode profile still points at the decode layer finish path:
+    `qwen35_linear_decode_detail` averaged `1286.54us`, with `mlp`
+    `1027.75us`;
+  - within `qwen35_mlp_finish_detail`, the per-layer F32 residual-shadow finish
+    still materialized an activation `layer_output` even though the next decode
+    layer reads from `residual_f32` through `rms_norm_f32_to_activation`;
+  - the decode scratch F32 residual path now skips hidden-size activation
+    materialization and allocates only a one-element placeholder for the unused
+    return buffer.
+- Code:
+  - `crates/ferrum-models/src/models/qwen35.rs`.
+- Validation:
+  - `cargo fmt --all -- --check`;
+  - `cargo test -p ferrum-models decode_residual_shadow_can_skip_layer_output_materialization -- --nocapture`;
+  - `cargo check -p ferrum-models`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no throughput claim is made;
+  - this is a source-side candidate for the next same-pod GPU A/B;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ80 — Qwen35 linear slot exhaustion is resource exhaustion
 
 - Correction:
