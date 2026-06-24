@@ -184,7 +184,14 @@ impl EngineInner {
                     .iter()
                     .map(|t| t.get())
                     .collect();
-                let chunk_tensor = self.tokens_to_tensor(&chunk_ids)?;
+                let chunk_tensor = match self.tokens_to_tensor(&chunk_ids) {
+                    Ok(tensor) => tensor,
+                    Err(e) => {
+                        let _ = self.kv_cache.deallocate(request_id.clone()).await;
+                        self.release_recurrent_state(request_id).await;
+                        return Err(e);
+                    }
+                };
                 let mut input = ferrum_interfaces::model_executor::PrefillInput::new(chunk_tensor)
                     .with_kv_cache(current_kv.clone())
                     .with_metadata(request_metadata.clone());
@@ -217,7 +224,14 @@ impl EngineInner {
         } else {
             let input_tensor = {
                 let token_u32s: Vec<u32> = context_tokens.iter().map(|t| t.get()).collect();
-                self.tokens_to_tensor(&token_u32s)?
+                match self.tokens_to_tensor(&token_u32s) {
+                    Ok(tensor) => tensor,
+                    Err(e) => {
+                        let _ = self.kv_cache.deallocate(request_id.clone()).await;
+                        self.release_recurrent_state(request_id).await;
+                        return Err(e);
+                    }
+                }
             };
             let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor)
                 .with_kv_cache(kv_handle)
@@ -476,21 +490,28 @@ impl EngineInner {
         }
 
         // ── Phase 1b: ONE batched model_executor.batch_prefill call ──
-        let inputs: Vec<PrefillInput> = to_prefill
-            .iter()
-            .map(|(_, tokens, kv, recurrent_state, metadata, _)| {
-                let token_u32s: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
-                let tensor = self.tokens_to_tensor(&token_u32s)?;
-                let input = PrefillInput::new(tensor)
-                    .with_kv_cache(kv.clone())
-                    .with_metadata(metadata.clone());
-                Ok(if let Some(state) = recurrent_state.clone() {
-                    input.with_recurrent_state(state)
-                } else {
-                    input
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut inputs: Vec<PrefillInput> = Vec::with_capacity(to_prefill.len());
+        for (_, tokens, kv, recurrent_state, metadata, _) in &to_prefill {
+            let token_u32s: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
+            let tensor = match self.tokens_to_tensor(&token_u32s) {
+                Ok(tensor) => tensor,
+                Err(e) => {
+                    for (rid, _, _, _, _, _) in &to_prefill {
+                        let _ = self.kv_cache.deallocate(rid.clone()).await;
+                        self.release_recurrent_state(rid).await;
+                    }
+                    return Err(e);
+                }
+            };
+            let input = PrefillInput::new(tensor)
+                .with_kv_cache(kv.clone())
+                .with_metadata(metadata.clone());
+            inputs.push(if let Some(state) = recurrent_state.clone() {
+                input.with_recurrent_state(state)
+            } else {
+                input
+            });
+        }
 
         let outputs = match self.model_executor.batch_prefill(&inputs).await {
             Ok(outputs) => outputs,

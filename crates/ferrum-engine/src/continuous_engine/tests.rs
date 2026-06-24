@@ -10,7 +10,7 @@ use ferrum_interfaces::{
         PrefillOutput, UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
-    RecurrentStateTensorSpec,
+    RecurrentStateTensorSpec, TensorRef,
 };
 use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
 use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensor, MockTensorFactory};
@@ -168,6 +168,8 @@ struct BadShapePrefillExecutor {
 struct ShortBatchPrefillExecutor {
     inner: RecurrentSpecExecutor,
 }
+
+struct FailingFromSliceTensorFactory;
 
 struct ShortUnifiedResultExecutor {
     inner: RecurrentSpecExecutor,
@@ -805,6 +807,78 @@ impl KvCacheManager for FirstAllocateThenFailKvCacheManager {
 
     fn list_handles(&self) -> Vec<(RequestId, Arc<dyn KvCacheHandle>)> {
         self.inner.list_handles()
+    }
+}
+
+impl TensorFactory for FailingFromSliceTensorFactory {
+    fn empty(&self, shape: &[usize], dtype: DataType, device: Device) -> Result<TensorRef> {
+        MockTensorFactory.empty(shape, dtype, device)
+    }
+
+    fn zeros_like(&self, tensor: &TensorRef) -> Result<TensorRef> {
+        MockTensorFactory.zeros_like(tensor)
+    }
+
+    fn from_slice(
+        &self,
+        _data: &[f32],
+        _shape: &[usize],
+        _dtype: DataType,
+        _device: Device,
+    ) -> Result<TensorRef> {
+        Err(FerrumError::backend("synthetic tokens_to_tensor failure"))
+    }
+
+    fn to_device(&self, tensor: &TensorRef, device: Device) -> Result<TensorRef> {
+        MockTensorFactory.to_device(tensor, device)
+    }
+
+    fn narrow(
+        &self,
+        tensor: &TensorRef,
+        dim: usize,
+        start: usize,
+        length: usize,
+    ) -> Result<TensorRef> {
+        MockTensorFactory.narrow(tensor, dim, start, length)
+    }
+
+    fn reshape(&self, tensor: &TensorRef, shape: &[usize]) -> Result<TensorRef> {
+        MockTensorFactory.reshape(tensor, shape)
+    }
+
+    fn zeros(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
+        MockTensorFactory.zeros(shape, dtype, device)
+    }
+
+    fn ones(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
+        MockTensorFactory.ones(shape, dtype, device)
+    }
+
+    fn uniform(
+        &self,
+        shape: &[usize],
+        low: f32,
+        high: f32,
+        dtype: DataType,
+        device: &Device,
+    ) -> Result<TensorRef> {
+        MockTensorFactory.uniform(shape, low, high, dtype, device)
+    }
+
+    fn normal(
+        &self,
+        shape: &[usize],
+        mean: f32,
+        std: f32,
+        dtype: DataType,
+        device: &Device,
+    ) -> Result<TensorRef> {
+        MockTensorFactory.normal(shape, mean, std, dtype, device)
+    }
+
+    fn from_tensor(&self, tensor: &TensorRef, device: &Device) -> Result<TensorRef> {
+        MockTensorFactory.from_tensor(tensor, device)
     }
 }
 
@@ -1783,6 +1857,125 @@ async fn process_batch_batch_prefill_postprocess_error_releases_kv_and_recurrent
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
     let recurrent_stats = recurrent_manager.stats();
     assert_eq!(recurrent_stats.allocation_count, 1);
+    assert_eq!(recurrent_stats.active_states, 0);
+    assert_eq!(recurrent_stats.used_batch_slots, 0);
+    assert!(
+        !engine.inner.sequences.read().contains_key(&request_id),
+        "error-completed request should be removed from active sequences"
+    );
+}
+
+#[tokio::test]
+async fn process_batch_chunked_prefill_tensor_error_releases_kv_and_recurrent_state() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.runtime.chunked_prefill_size = Some(1);
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
+        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        sampler,
+        kv_cache.clone(),
+        executor,
+        tensor_factory,
+        None,
+        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        Some(recurrent_manager.clone()),
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test ok".to_string();
+    request.sampling_params.max_tokens = 2;
+    let request_id = request.id.clone();
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
+        max_sequence_length: 2,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let _ = engine.inner.process_batch(&batch).await;
+
+    let active_kv = kv_cache.list_handles();
+    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
+    let recurrent_stats = recurrent_manager.stats();
+    assert_eq!(recurrent_stats.allocation_count, 1);
+    assert_eq!(recurrent_stats.active_states, 0);
+    assert_eq!(recurrent_stats.used_batch_slots, 0);
+    assert!(
+        !engine.inner.sequences.read().contains_key(&request_id),
+        "error-completed request should be removed from active sequences"
+    );
+}
+
+#[tokio::test]
+async fn process_batch_batch_prefill_tensor_error_releases_kv_and_recurrent_state() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
+        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        sampler,
+        kv_cache.clone(),
+        executor,
+        tensor_factory,
+        None,
+        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        Some(recurrent_manager.clone()),
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 2;
+    let request_id = request.id.clone();
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
+        max_sequence_length: 1,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let _ = engine.inner.process_batch(&batch).await;
+
+    let active_kv = kv_cache.list_handles();
+    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
+    let recurrent_stats = recurrent_manager.stats();
+    assert!(recurrent_stats.allocation_count >= 1);
     assert_eq!(recurrent_stats.active_states, 0);
     assert_eq!(recurrent_stats.used_batch_slots, 0);
     assert!(

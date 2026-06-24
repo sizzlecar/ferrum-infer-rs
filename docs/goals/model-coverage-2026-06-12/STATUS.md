@@ -13806,3 +13806,36 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     仍不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 prefill tensor-build failures release resources
+
+- 背景:
+  - 继续审计 fallback/legacy prefill 路径发现:KV/recurrent state 分配完成后,
+    `tokens_to_tensor()` 仍可能失败。
+  - single/chunked prefill 分支此前在 token tensor 构建失败时直接 `?` 返回,
+    会绕过本轮 KV/recurrent cleanup。
+  - batch prefill 分支此前在 `to_prefill` 已经包含 KV/recurrent 后,构造
+    `PrefillInput` 的 `tokens_to_tensor()` 失败也会直接返回。
+- 源码变更:
+  - chunked `run_prefill_inner()` 在每个 chunk 的 `tokens_to_tensor()` 失败时,
+    释放本轮 KV 和 recurrent state 后再返回错误。
+  - non-chunked `run_prefill_inner()` 在 input tensor 构建失败时同样释放
+    本轮 KV/recurrent。
+  - `run_batch_prefill()` 构造 batched `PrefillInput` 时改为显式循环;任一
+    tensor 构建失败会释放全部 `to_prefill` 请求的 KV/recurrent state。
+  - 新增 `FailingFromSliceTensorFactory` 测试夹具。
+  - 新增:
+    - `process_batch_chunked_prefill_tensor_error_releases_kv_and_recurrent_state`
+    - `process_batch_batch_prefill_tensor_error_releases_kv_and_recurrent_state`
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - 上述 2 个新增 `cargo test -p ferrum-engine ... -- --nocapture` 均 PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,
+    22 个 recurrent/resource 相关测试通过。
+  - `git diff --check` PASS。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只证明本地 legacy prefill tensor 构建失败不会留下本轮 KV/recurrent 资源,
+    仍不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
