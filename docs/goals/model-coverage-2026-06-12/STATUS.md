@@ -2,6 +2,47 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ95 — Current W3 evidence config uses current-schema L2/L4 artifacts
+
+- Scope:
+  - regenerated the W3 L2 quantized artifact from the already archived real
+    Qwen3.5 GPTQ product known-answer report, producing
+    `artifacts/w3_l2_qwen35_gptq_int4_repacked_current_schema_20260624_75ec7e6e/w3_l2_quantized.json`;
+  - the regenerated L2 artifact preserves the original `ferrum run` and
+    `ferrum serve` command evidence, records command model arguments, and
+    includes `output_hygiene.case_entrypoints=["ferrum run","ferrum serve"]`;
+  - added `scripts/release/w3_l4_agent_gate.py --repack-source` for archived
+    L4 directories that already contain response files but whose summary JSON
+    was produced before response `artifact` paths were required;
+  - repacked the archived 2026-06-20 L4 tool/strict-schema response directory
+    into `artifacts/w3_qwen35_l4_agent_repacked_current_schema_20260624_ba19f2b9/`,
+    adding response artifact paths while revalidating each tool-call and strict
+    JSON response;
+  - updated `w3_qwen35_current_evidence_config.json` to point at the
+    current-schema L2 and L4 artifacts.
+- Result:
+  - the diagnostic current-evidence manifest failure count dropped from `77`
+    to `45`;
+  - L2 and L4 schema/evidence-path failures are gone from the current diagnostic
+    final-validator output;
+  - remaining failures are L5/performance only: old L5/perf artifacts lack
+    `--ignore-eos` fixed-output evidence, lack list-of-list output-token
+    records, and remain far below the 80% vLLM target.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_l4_agent_gate.py scripts/release/model_release_grade_manifest.py scripts/release/model_release_grade_goal_gate.py scripts/release/w3_l2_quantized_gate.py`;
+  - `python3 scripts/release/w3_l4_agent_gate.py --self-test`;
+  - `python3 scripts/release/w3_l2_quantized_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --config docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json` produced the expected diagnostic `MODEL_RELEASE_GRADE_W3 FAIL (45 problems)`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - these are schema/current-validator repacks of existing archived real-model
+    evidence, not new correctness or performance measurements;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ94 — W3 L4 response artifacts are scanned by the final validator
 
 - Scope:
