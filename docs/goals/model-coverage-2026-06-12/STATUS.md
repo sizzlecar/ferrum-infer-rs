@@ -15145,3 +15145,46 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     product loader 前置校验,不构成真实 L2 artifact、OOM 实机证明或性能证据。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 Qwen3.5 MoE pair-ids default rollback candidate
+
+- 背景:
+  - 最新 c16 quick diagnostic
+    `w3_qwen35_block_table_skip_c16_quick_a857c166_20260624` 只有
+    `688.1409470636319 tok/s`,仍远低于 W3 目标;当前 W3 manifest 仍是
+    `MODEL_RELEASE_GRADE_W3 FAIL (8 problems)`。
+  - 历史 STATUS 已记录 `FERRUM_VLLM_MOE_PAIR_IDS=1` 诊断略慢于 baseline:
+    baseline c16/c32 `559.94`/`574.97`,pair_ids c16/c32
+    `555.69`/`567.57` tok/s,并记录不应默认启用。
+  - 当前 product effective config 仍自动选择
+    `vllm_marlin_moe_device_route_pair_ids`,和上述历史诊断结论冲突。
+- 源码变更:
+  - `FerrumConfigBuilder` 不再默认把 `FERRUM_VLLM_MOE_PAIR_IDS` 设为
+    `1`;默认仍保留 `FERRUM_VLLM_MOE=1` 和 `FERRUM_MOE_DEVICE_ROUTE=1`,
+    选择 `vllm_marlin_moe_device_route`。
+  - M3 runtime preset 把 `FERRUM_VLLM_MOE_PAIR_IDS` 的显式默认值改为
+    `0`。
+  - `moe_graph_default_entries()` 不再在打开 `FERRUM_MOE_GRAPH=1` 时隐式
+    注入 pair-ids;显式 env/config 仍可 opt in。
+  - 更新 backend runtime preset snapshots;CUDA Qwen3 MoE/GPTQ snapshot 的
+    selected `moe_decode_path` 现在是 `vllm_marlin_moe_device_route`。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-types auto_config -- --nocapture` PASS,
+    53 个 auto_config tests 通过。
+  - `cargo test -p ferrum-cli runtime_preset_entries -- --nocapture` PASS。
+  - `cargo test -p ferrum-cli runtime_cli_config_emits_config_file_source_entries -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-cli runtime_config_fields_override_preset_defaults_before_env -- --nocapture`
+    PASS。
+  - `python3 scripts/release/backend_runtime_preset_snapshot.py --out /tmp/ferrum_backend_runtime_preset_snapshot_20260624_pairids_default`
+    PASS line:
+    `BACKEND PRESET SNAPSHOT PASS: /private/tmp/ferrum_backend_runtime_preset_snapshot_20260624_pairids_default`。
+  - `git diff --check` PASS。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只是把 typed/product 默认路径与历史 pair-ids A/B 结论对齐;不构成
+    新吞吐证据、OOM 实机证明或 W3 完成证明。
+  - 需要下一次 targeted 1x4090 c16 quick A/B 验证这个默认路径对当前
+    Qwen3.5 artifact 的真实影响;W3 仍需要最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
