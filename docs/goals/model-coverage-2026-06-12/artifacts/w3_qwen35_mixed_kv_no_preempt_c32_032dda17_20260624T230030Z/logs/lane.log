@@ -1,0 +1,4 @@
+2026-06-24T23:00:30Z lane_start art=/workspace/artifacts/w3_qwen35_mixed_kv_no_preempt_c32_032dda17_20260624T230030Z sha=032dda17739593e4352e87b2805e71363fb82ddd release_evidence=false no_live_vllm=true cost_per_hr_approx=0.456
+2026-06-24T23:00:30Z bootstrap_start
+2026-06-24T23:00:50Z bootstrap_done
+2026-06-24T23:00:50Z git_sync_start

@@ -2,6 +2,89 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ148 — 032dda17 c32 diagnostic: decode cancellation removed, decode livelock exposed
+
+- Artifacts:
+  - main diagnostic:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_kv_no_preempt_c32_032dda17_20260624T230254Z/`;
+  - setup-script failure record:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_kv_no_preempt_c32_032dda17_20260624T230030Z/`.
+  - The first short artifact records a script bug: the expanded full SHA was
+    mistyped, so remote `git checkout --detach` failed before any build,
+    model load, or bench ran. The script was corrected and rerun on the same
+    instance without renting another machine.
+- Vast lifecycle:
+  - rented new verified 1x RTX 4090 instance `42439308` after retained
+    instance `42216671` remained unavailable;
+  - cost was approximately `$0.456/hr`;
+  - copied both artifacts back before shutdown;
+  - stop verification reported `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - the stopped instance keeps the HF cache and release build cache for the
+    next targeted rerun.
+- Git/build evidence:
+  - remote Git SHA:
+    `032dda17f5290571cde1eb96d28cc0b84bf61f33`;
+  - remote `git status --short` was clean;
+  - binary SHA256:
+    `3a31e22bf67decef577241a2b7f94969be5e517e530fcee2a261976ab34b40a1`;
+  - no live vLLM was run.
+- Correctness/build smoke:
+  - remote `cargo check -p ferrum-kernels -p ferrum-models -p ferrum-cli`
+    PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`
+    in `30m23s`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` non-streaming chat smoke PASS, response content `5`;
+  - run and serve effective-config assertions both passed:
+    `selected_max_sequences=32`,
+    `selected_recurrent_state_max_slots=32`,
+    `selected_admission_limit=32`.
+- c32 diagnostic bench:
+  - command shape: `bench-serve`, sharegpt dataset, `--concurrency 32`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`, `--timeout 600`;
+  - bench failed normally after the timeout window: `bench.exit=1`;
+  - `0 completed / 32 errored / 600.0s`;
+  - output throughput `0.0 tok/s`;
+  - error message:
+    `bench-serve error rate 1.0000 exceeds max 0.0000`;
+  - `output_token_count_source=stream_chunks`, diagnostic only.
+- Scheduler/log evidence:
+  - final scheduler summary:
+    `completed_total=5`, `failed_total=0`, `cancelled_total=0`,
+    `preempted_total=0`, `admitted_total=37`, `active_len=32`,
+    `decode_queue_len=32`, `waiting_queue_len=0`;
+  - final plan still scheduled `decode_items=32`, `decode_tokens=32`;
+  - the 32 active decode requests were stuck at `generated_tokens=2`;
+  - final trace iteration `108493`;
+  - log counts:
+    `unified_kv_admission_failed=108421`,
+    `cancelled_during_decode=0`, `preempting_request=0`,
+    `oom_mentions=0`, `panic_mentions=0`, `block_pool_exhausted=0`;
+  - full trace/log evidence is stored as
+    `server/scheduler_trace.jsonl.gz` and `server/serve.log.gz`.
+- Diagnosis:
+  - `032dda17` achieved its narrow goal: the mixed-KV fallback no longer
+    converts capacity pressure into decode cancellation in this c32 diagnostic.
+  - The remaining failure is a decode capacity livelock: the scheduler keeps
+    scheduling 32 decode items, model-owned paged-KV admission reports no free
+    blocks, the no-preempt decode path defers, and no request reaches EOS or
+    frees capacity.
+  - Source-only vLLM comparison remains the right direction: waiting/prefill
+    allocation pressure should wait, but running decode must either make
+    resource progress, use a bounded preemption/recompute path, or be removed
+    from immediate rescheduling until a resource-progress signal occurs. It
+    should not be solved by enumerating model/GPU hard caps.
+- Limits:
+  - This is a failed diagnostic only (`n_repeats=1`, c32 only).
+  - It is not W3 completion, performance evidence, OOM resolution, or release
+    readiness.
+  - Current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ147 — 032dda17 c32 GPU diagnostic prepared but Vast capacity blocked
 
 - Intended lane:
