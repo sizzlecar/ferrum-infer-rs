@@ -2,55 +2,6 @@
 
 进度日志,倒序。
 
-## 2026-06-25 ZZZ137 — Backpressure now stops waiting-prefill admission while decode can progress
-
-- Source of this patch:
-  - ZZZ136 proved c32 no longer OOMs or stalls, but throughput is still low:
-    `202.45 tok/s` versus the `671 tok/s` target;
-  - offline parsing of
-    `w3_qwen35_scheduler_backpressure_decode_c32_2bc1e6bb_20260624T194025Z`
-    showed `420` scheduler capacity defers and `493` block-pool defer
-    warnings despite a successful 32/32 bench;
-  - scheduler trace windows showed the main bench start spending many
-    iterations on prefill/capacity churn before reaching steady decode.
-- vLLM comparison:
-  - local source baseline:
-    `/Users/chejinxuan/py_ws/vllm` at
-    `0b3ba88f165976e77ca5e6a7a3f5bba4562b80af`;
-  - vLLM schedules running requests first, then waiting requests only when
-    token budget and running slots remain;
-  - vLLM also has `scheduler_reserve_full_isl=True`, so waiting admission can
-    fail at scheduler-side KV allocation instead of repeatedly pushing a
-    chunked prefill into execution that later cannot fit.
-- Source change:
-  - when Ferrum capacity backpressure is active and the current batch already
-    has decode work, waiting-request admission is suppressed for that
-    iteration;
-  - existing prefill work can still run, and waiting admission resumes once
-    decode pressure clears or real prefill progress relaxes backpressure;
-  - this avoids re-admitting a known capacity-blocked waiting prefill while
-    decode tokens can make progress.
-- Test update:
-  - strengthened
-    `capacity_backpressure_disables_prefill_first_decode_skip` so it now
-    asserts the second batch contains only the 3 decode-ready requests and does
-    not admit the waiting prefill.
-- Local validation:
-  - `cargo fmt --all` PASS;
-  - `cargo test -p ferrum-scheduler capacity_backpressure_disables_prefill_first_decode_skip -- --nocapture`
-    PASS;
-  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
-    PASS;
-  - `cargo fmt --all -- --check` PASS;
-  - `cargo test -p ferrum-scheduler` PASS (`64` tests);
-  - `cargo check -p ferrum-engine -p ferrum-scheduler` PASS;
-  - `git diff --check` PASS.
-- Limits:
-  - no GPU rerun has been performed for this patch yet;
-  - this does not prove throughput recovery, W3 performance, or release
-    readiness;
-  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
-
 ## 2026-06-25 ZZZ136 — 2bc1e6bb c32 diagnostic completes; starvation fixed, throughput still low
 
 - Artifact:
