@@ -2,6 +2,60 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ111 — Qwen35 block-table skip c16 quick diagnostic on 1x4090
+
+- Scope:
+  - reused existing Vast 1x RTX 4090 instance `42216671`, confirmed SSH,
+    `nvidia-smi`, CUDA 12.4, and the existing HF/model cache;
+  - reused remote repo/build cache at `/workspace/ferrum-infer-rs-git`, then
+    fast-forwarded it from `00757b41` to
+    `a857c166bc319c982037b05c6222abf6b8582085`;
+  - validated the combined ZZZ109 context-lens write trim and ZZZ110
+    block-table rewrite skip;
+  - did not run live vLLM; comparison is against historical Ferrum/vLLM
+    evidence only.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_block_table_skip_c16_quick_a857c166_20260624/`;
+  - diagnostic PASS line:
+    `W3 QWEN35 BLOCK TABLE SKIP C16 QUICK DIAG PASS: /workspace/artifacts/w3_qwen35_block_table_skip_c16_quick_a857c166_20260624`;
+  - artifact includes command logs, run/serve smoke outputs, bench report,
+    binary SHA256, git SHA/status, GPU metadata, and Vast stop polling.
+- Result:
+  - CUDA release build passed in `3m28s`, binary SHA256
+    `80e091d10e7be0e094b94dc47910d24955f6e706f220a6b00f3f51571bdf7242`;
+  - `ferrum run` smoke passed and returned `5`;
+  - `ferrum serve` chat smoke passed and returned `5`;
+  - c16 quick diagnostic bench completed `32/32` requests with `0` errors;
+  - c16 output throughput was `688.1409470636319` tok/s, p95 ITL was
+    `20.0247894` ms, and output token counts came from usage.
+- Interpretation:
+  - compared with ZZZ108 linear scratch c16 throughput
+    `678.630239827307` tok/s, this is only `+9.510707236324834` tok/s,
+    ratio `1.0140145644537517`;
+  - compared with ZZZ104 no-profile c16 throughput
+    `659.0665261344391` tok/s, this is `+29.074420929192797` tok/s,
+    ratio `1.0441145465234296`;
+  - the block-table/context-lens trims are small positive cleanup, but not the
+    main W3 throughput blocker.
+- Cleanup:
+  - copied the full artifact back before shutdown;
+  - Vast stop polling reached `cur_state=stopped actual_status=exited
+    intended_status=stopped`.
+- Local validation:
+  - summary validation confirmed `status=passed`, `diagnostic_only=true`,
+    `no_live_vllm=true`, git SHA
+    `a857c166bc319c982037b05c6222abf6b8582085`, `32/32` completed, `0`
+    errors, and `output_token_count_source=usage`;
+  - artifact secret scan found no `VAST_API_KEY`, bearer token, HF token, or
+    private-key pattern;
+  - `python3 scripts/release/model_release_grade_manifest.py --config docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json`
+    still produced the expected diagnostic `MODEL_RELEASE_GRADE_W3 FAIL (8
+    problems)`.
+- Status:
+  - this is diagnostic-only evidence, not release evidence;
+  - no OOM-fixed, release-ready, performance-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ110 — Qwen35 paged KV block-table rewrite skip candidate
 
 - Scope:
