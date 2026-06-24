@@ -1443,7 +1443,7 @@ async fn engine_allocates_and_deallocates_llm_executor_declared_recurrent_state(
 }
 
 #[tokio::test]
-async fn process_batch_unified_preempts_decode_for_recurrent_state_capacity() {
+async fn process_batch_unified_defers_prefill_for_recurrent_state_capacity() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
@@ -1526,7 +1526,7 @@ async fn process_batch_unified_preempts_decode_for_recurrent_state_capacity() {
     engine.inner.process_batch(&batch).await.unwrap();
 
     let stats = recurrent_manager.stats();
-    assert_eq!(stats.allocation_count, 2);
+    assert_eq!(stats.allocation_count, 1);
     assert_eq!(stats.allocation_failures, 0);
     assert_eq!(stats.active_states, 1);
     assert_eq!(stats.used_batch_slots, 1);
@@ -1534,18 +1534,19 @@ async fn process_batch_unified_preempts_decode_for_recurrent_state_capacity() {
     let sequences = engine.inner.sequences.read();
     let victim = sequences
         .get(&victim_id)
-        .expect("preempted victim should remain queued for recompute");
-    assert!(!victim.prefill_complete);
-    assert!(victim.kv_cache.is_none());
-    assert!(victim.recurrent_state.is_none());
-    assert_eq!(victim.preemption_count, 1);
+        .expect("decode request should stay active while prefill waits");
+    assert!(victim.prefill_complete);
+    assert!(victim.kv_cache.is_some());
+    assert!(victim.recurrent_state.is_some());
+    assert_eq!(victim.generated_tokens, vec![TokenId::new(6)]);
+    assert_eq!(victim.preemption_count, 0);
 
     let fresh = sequences
         .get(&fresh_id)
-        .expect("fresh request should remain active after prefill");
-    assert!(fresh.prefill_complete);
-    assert!(fresh.kv_cache.is_some());
-    assert!(fresh.recurrent_state.is_some());
+        .expect("fresh request should remain queued for retry");
+    assert!(!fresh.prefill_complete);
+    assert!(fresh.kv_cache.is_none());
+    assert!(fresh.recurrent_state.is_none());
 }
 
 #[tokio::test]

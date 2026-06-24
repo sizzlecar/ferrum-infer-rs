@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ120 — Align recurrent-state prefill admission with vLLM scheduling semantics
+
+- Scope:
+  - inspected the local vLLM baseline source at `../_external/vllm-v0.20.2`;
+  - did not run live vLLM or start a GPU instance;
+  - made a targeted Ferrum engine change only in unified prefill
+    recurrent-state admission.
+- vLLM source comparison:
+  - vLLM v1 scheduler does not model separate prefill/decode phases; it
+    schedules each request by advancing `num_computed_tokens` toward
+    `num_tokens_with_spec`;
+  - vLLM schedules existing `RUNNING` requests first; if a running request
+    cannot allocate KV slots, it may preempt another running request and
+    requeue it as `PREEMPTED`;
+  - vLLM only schedules `WAITING`/`PREEMPTED` requests after there were no
+    preemptions in the running phase, and if `allocate_slots()` fails while
+    admitting a waiting/resumed request, scheduling stops instead of
+    preempting an active running request to admit it;
+  - this differs from Ferrum's ZZZ119 c32 behavior, where recurrent-state
+    admission for prefill could preempt decode requests, causing
+    `4064` decode cancellations and requests with generated tokens to re-enter
+    prefill scheduling.
+- Code change:
+  - `process_batch_unified` now defers a prefill item when
+    `RecurrentStateManager::can_allocate` is false or recurrent-state
+    allocation returns `ResourceExhausted`;
+  - it no longer calls `preempt_victim()` for recurrent-state prefill
+    admission;
+  - existing KV-cache allocation preemption paths were left unchanged in this
+    patch.
+- Test change:
+  - replaced the old expectation that unified prefill should preempt an active
+    decode request for recurrent-state capacity;
+  - new test verifies that the decode request keeps KV/recurrent state and
+    generated tokens, while the fresh prefill remains queued without KV or
+    recurrent state.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-engine
+    process_batch_unified_defers_prefill_for_recurrent_state_capacity --
+    --nocapture` PASS;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture` PASS
+    (`12` tests).
+- Limit:
+  - this is source-level and unit-level progress only; no CUDA rerun has been
+    performed yet, and there is still no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ119 — Qwen35 fused gate+merge CUDA source check and scheduler-thrash evidence
 
 - Scope:

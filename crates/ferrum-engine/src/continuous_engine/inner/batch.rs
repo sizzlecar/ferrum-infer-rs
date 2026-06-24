@@ -270,63 +270,25 @@ impl EngineInner {
                     (recurrent_state_spec.as_ref(), &self.recurrent_state_manager)
                 {
                     if !manager.can_allocate(spec) {
-                        if self.preempt_victim(rid).await {
-                            if !manager.can_allocate(spec) {
-                                warn!(
-                                    "Unified prefill recurrent-state alloc deferred for {} after preempt: insufficient capacity",
-                                    rid
-                                );
-                                continue;
-                            }
-                        } else {
-                            warn!(
-                                "Unified prefill recurrent-state alloc deferred for {}: no preempt victim",
-                                rid
-                            );
-                            continue;
-                        }
+                        warn!(
+                            "Unified prefill recurrent-state alloc deferred for {}: insufficient capacity",
+                            rid
+                        );
+                        continue;
                     }
                 }
             }
 
             let had_recurrent_state = existing_recurrent_state.is_some();
             let recurrent_state =
-	                match self.ensure_recurrent_state(rid, recurrent_state_spec).await {
-	                    Ok(state) => state,
+                match self.ensure_recurrent_state(rid, recurrent_state_spec).await {
+                    Ok(state) => state,
                     Err(FerrumError::ResourceExhausted { message }) => {
-                        if self.preempt_victim(rid).await {
-                            match self
-                                .ensure_recurrent_state(
-                                    rid,
-                                    self.model_executor
-                                        .recurrent_state_spec(rid, &input_tokens)?,
-                                )
-                                .await
-                            {
-                                Ok(state) => state,
-                                Err(FerrumError::ResourceExhausted { message }) => {
-                                    warn!(
-                                        "Unified prefill recurrent-state alloc deferred for {} after preempt: {}",
-                                        rid, message
-                                    );
-                                    continue;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Unified prefill recurrent-state alloc failed for {} after preempt: {}",
-                                        rid, e
-                                    );
-                                    self.complete_request(rid, FinishReason::Error).await?;
-                                    continue;
-                                }
-                            }
-                        } else {
-                            warn!(
-                                "Unified prefill recurrent-state alloc deferred for {}: {}",
-                                rid, message
-                            );
-                            continue;
-                        }
+                        warn!(
+                            "Unified prefill recurrent-state alloc deferred for {}: {}",
+                            rid, message
+                        );
+                        continue;
                     }
                     Err(e) => {
                         warn!(
@@ -335,9 +297,9 @@ impl EngineInner {
                         );
                         self.complete_request(rid, FinishReason::Error).await?;
                         continue;
-	                    }
-	                }
-	                .or(existing_recurrent_state);
+                    }
+                }
+                .or(existing_recurrent_state);
             let fresh_recurrent = !had_recurrent_state && recurrent_state.is_some();
 
             let (kv_handle, fresh_kv) = if let Some(kv) = existing_kv {
