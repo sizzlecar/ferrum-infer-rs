@@ -2081,10 +2081,10 @@ mod tests {
     }
 
     #[test]
-    fn run_effective_runtime_config_applies_qwen35_linear_slots_to_engine_config() {
+    fn run_effective_runtime_config_applies_recurrent_state_slots_to_engine_config() {
         let cmd = test_run_cmd();
         let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
-            "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
+            "FERRUM_RECURRENT_STATE_MAX_SLOTS",
             "16",
             RuntimeConfigSource::ConfigFile,
         )]);
@@ -2096,10 +2096,7 @@ mod tests {
             .apply_runtime_config_snapshot(&effective)
             .expect("run effective runtime config should apply");
 
-        assert_eq!(
-            engine_config.runtime.qwen35_linear_state_max_slots,
-            Some(16)
-        );
+        assert_eq!(engine_config.runtime.recurrent_state_max_slots, Some(16));
     }
 
     #[test]

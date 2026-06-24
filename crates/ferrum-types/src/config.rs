@@ -22,6 +22,9 @@ pub struct RuntimeKnobs {
     pub scheduler_trace_jsonl: Option<PathBuf>,
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
+    pub recurrent_state_max_slots: Option<usize>,
+    /// Legacy Qwen3.5-specific alias retained for existing configs. New
+    /// product/runtime code should use `recurrent_state_max_slots`.
     pub qwen35_linear_state_max_slots: Option<usize>,
 
     // Engine-build composition knobs. Previously read directly from the
@@ -84,12 +87,20 @@ impl EngineConfig {
                 value,
             )?);
         }
-        if let Some(value) = runtime_config_value(snapshot, "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
-        {
-            self.runtime.qwen35_linear_state_max_slots = Some(parse_required_positive_usize(
-                "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_RECURRENT_STATE_MAX_SLOTS") {
+            self.runtime.recurrent_state_max_slots = Some(parse_required_positive_usize(
+                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
                 value,
             )?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
+        {
+            let parsed =
+                parse_required_positive_usize("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", value)?;
+            self.runtime.qwen35_linear_state_max_slots = Some(parsed);
+            if self.runtime.recurrent_state_max_slots.is_none() {
+                self.runtime.recurrent_state_max_slots = Some(parsed);
+            }
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
             self.runtime.chunked_prefill_size =
@@ -681,7 +692,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn engine_config_applies_qwen35_linear_state_max_slots_runtime_key() {
+    fn engine_config_applies_recurrent_state_max_slots_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot =
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(config.runtime.recurrent_state_max_slots, Some(16));
+        assert_eq!(config.runtime.qwen35_linear_state_max_slots, None);
+    }
+
+    #[test]
+    fn engine_config_accepts_legacy_qwen35_linear_state_max_slots_alias() {
         let mut config = EngineConfig::default();
         let snapshot =
             RuntimeConfigSnapshot::from_env_vars([("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16")]);
@@ -690,6 +715,23 @@ mod tests {
             .apply_runtime_config_snapshot(&snapshot)
             .expect("runtime config should apply");
 
+        assert_eq!(config.runtime.recurrent_state_max_slots, Some(16));
+        assert_eq!(config.runtime.qwen35_linear_state_max_slots, Some(16));
+    }
+
+    #[test]
+    fn engine_config_prefers_generic_recurrent_state_slots_over_legacy_alias() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([
+            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "8"),
+            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16"),
+        ]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(config.runtime.recurrent_state_max_slots, Some(8));
         assert_eq!(config.runtime.qwen35_linear_state_max_slots, Some(16));
     }
 }

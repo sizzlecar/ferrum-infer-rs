@@ -888,7 +888,8 @@ fn qwen35_linear_state_max_slots(
     snapshot: &ferrum_types::RuntimeConfigSnapshot,
     paged_max_seqs: usize,
 ) -> usize {
-    qwen35_runtime_positive_usize(snapshot, "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
+    qwen35_runtime_positive_usize(snapshot, "FERRUM_RECURRENT_STATE_MAX_SLOTS")
+        .or_else(|| qwen35_runtime_positive_usize(snapshot, "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS"))
         .unwrap_or(paged_max_seqs)
         .max(1)
 }
@@ -13372,15 +13373,27 @@ mod tests {
     fn qwen35_linear_state_max_slots_can_be_capped_independently_from_paged_seqs() {
         let capped = runtime_snapshot(&[
             ("FERRUM_PAGED_MAX_SEQS", "32"),
-            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16"),
+            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16"),
         ]);
         assert_eq!(qwen35_paged_max_seqs(&capped), 32);
         assert_eq!(qwen35_linear_state_max_slots(&capped, 32), 16);
 
+        let legacy_alias = runtime_snapshot(&[
+            ("FERRUM_PAGED_MAX_SEQS", "32"),
+            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "12"),
+        ]);
+        assert_eq!(qwen35_linear_state_max_slots(&legacy_alias, 32), 12);
+
+        let generic_wins = runtime_snapshot(&[
+            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "10"),
+            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "12"),
+        ]);
+        assert_eq!(qwen35_linear_state_max_slots(&generic_wins, 32), 10);
+
         let absent = runtime_snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]);
         assert_eq!(qwen35_linear_state_max_slots(&absent, 32), 32);
 
-        let invalid = runtime_snapshot(&[("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "bad")]);
+        let invalid = runtime_snapshot(&[("FERRUM_RECURRENT_STATE_MAX_SLOTS", "bad")]);
         assert_eq!(qwen35_linear_state_max_slots(&invalid, 8), 8);
     }
 

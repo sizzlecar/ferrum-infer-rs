@@ -2184,9 +2184,9 @@ mod tests {
     }
 
     #[test]
-    fn serve_runtime_snapshot_applies_qwen35_linear_slots_to_engine_config() {
+    fn serve_runtime_snapshot_applies_recurrent_state_slots_to_engine_config() {
         let config_entries = crate::config::RuntimeCliConfig {
-            qwen35_linear_state_max_slots: Some(16),
+            recurrent_state_max_slots: Some(16),
             ..Default::default()
         }
         .runtime_config_entries();
@@ -2198,8 +2198,8 @@ mod tests {
         let entry = snapshot
             .entries
             .iter()
-            .find(|entry| entry.key == "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
-            .expect("missing qwen35 linear state slot entry");
+            .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
+            .expect("missing recurrent state slot entry");
         let mut engine_config = ferrum_types::EngineConfig::default();
 
         engine_config
@@ -2208,10 +2208,7 @@ mod tests {
 
         assert_eq!(entry.effective_value, "16");
         assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
-        assert_eq!(
-            engine_config.runtime.qwen35_linear_state_max_slots,
-            Some(16)
-        );
+        assert_eq!(engine_config.runtime.recurrent_state_max_slots, Some(16));
     }
 
     #[test]
