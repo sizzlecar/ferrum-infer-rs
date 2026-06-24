@@ -1,0 +1,14 @@
+2026-06-24T21:36:50Z lane_start art=/workspace/artifacts/w3_qwen35_fast_state_dtype_c32_228933a2_20260624T213650Z sha=228933a27fd1a4c2bc1943e9b7dcafa6e7b75714 release_evidence=false no_live_vllm=true
+2026-06-24T21:36:50Z git_sync_start
+2026-06-24T21:36:50Z git_sync_done
+2026-06-24T21:36:50Z cargo_check_start
+2026-06-24T21:36:55Z cargo_check_done
+2026-06-24T21:36:55Z release_build_start
+2026-06-24T21:40:26Z release_build_done
+2026-06-24T21:40:26Z ferrum_run_smoke_start
+2026-06-24T21:40:52Z ferrum_run_smoke_done
+2026-06-24T21:40:52Z serve_start
+2026-06-24T21:41:17Z serve_ready
+2026-06-24T21:41:17Z serve_chat_smoke_done
+2026-06-24T21:41:17Z bench_c32_start
+2026-06-24T21:41:26Z FERRUM W3 QWEN35 FAST STATE DTYPE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_fast_state_dtype_c32_228933a2_20260624T213650Z

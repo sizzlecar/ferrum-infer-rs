@@ -2,6 +2,76 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ143 — 228933a2 c32 diagnostic restores 6bb7-level throughput; still diagnostic only
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fast_state_dtype_c32_228933a2_20260624T213650Z/`;
+  - start metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fast_state_dtype_c32_228933a2_start_20260624T213416Z/`;
+  - remote Git SHA:
+    `228933a27fd1a4c2bc1943e9b7dcafa6e7b75714`;
+  - binary SHA256:
+    `eebc96a592180afaffb978b640a9442690504249381bf2dcf0f947adb354cee1`;
+  - diagnostic PASS line:
+    `FERRUM W3 QWEN35 FAST STATE DTYPE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_fast_state_dtype_c32_228933a2_20260624T213650Z`;
+  - no live vLLM was run.
+- Vast lifecycle:
+  - reused Vast instance `42216671`, 1x RTX 4090 at `$0.47777777777777775/hr`;
+  - artifact and tmux logs were copied back before shutdown;
+  - stop verification reported `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Correctness/build smoke:
+  - remote CUDA `cargo check` PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`;
+  - run and serve effective-config assertions both passed:
+    `selected_max_sequences=32`,
+    `selected_recurrent_state_max_slots=16`,
+    `selected_admission_limit=16`.
+- c32 diagnostic result:
+  - command shape: `bench-serve`, sharegpt dataset, `--concurrency 32`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`;
+  - bench completed normally: `bench_exit=0`;
+  - completed `[32]`, errored `[0]`, HTTP 500 `[0]`, panic `[0]`;
+  - `output_token_count_source=usage`;
+  - output throughput `635.5743934095524 tok/s`;
+  - total throughput `1206.598262488447 tok/s`;
+  - request throughput `4.965424948512128 req/s`;
+  - p95 TTFT `4247.7746904 ms`;
+  - p95 TPOT `17.71838209448819 ms`.
+- Scheduler/log evidence:
+  - scheduler trace lines `464`, results `some_ok=454`, `none=10`;
+  - max active `32`, max decode queue `16`, max waiting queue `8`;
+  - `capacity_deferred_total=617`;
+  - `Unified prefill recurrent-state alloc deferred=617`;
+  - `cancelled_total=0`, `failed_total=0`, `preempted_total=0`;
+  - `Unified KV admission failed=0`;
+  - `Unified prefill alloc deferred=0`;
+  - `Block pool exhausted=0`;
+  - `no preemptable victim=0`;
+  - `cancelled during decode=0`;
+  - `OOM=0`, `out of memory=0`, `panic=0`.
+- Comparison:
+  - versus the bad `f304fd8d` diagnostic, output throughput recovered from
+    `265.5349974958471 tok/s` to `635.5743934095524 tok/s`;
+  - this is back to the earlier `6bb7af75` c32 quick diagnostic level
+    (`633.3518270005125 tok/s`);
+  - the configured c32 request pressure remains, but recurrent-state runtime
+    admission is now limited to 16 by the typed memory profile and fast indexed
+    state dtype, not by a model/GPU hard-coded special case.
+- Limits:
+  - this is diagnostic only (`n_repeats=1`, c32 only);
+  - it is not same-hardware release performance evidence and does not include
+    `--require-ci`;
+  - throughput is still below the W3/release target range and needs the next
+    targeted lever before a full gate is justified;
+  - no final W3 validator was run;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` exists.
+
 ## 2026-06-25 ZZZ142 — align Qwen3.5 recurrent-state defaults with fast indexed state dtype; local validation only
 
 - Source diagnosis from local artifacts and source:
