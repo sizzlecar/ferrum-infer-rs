@@ -2,6 +2,64 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ134 — 8150ca06 c32 diagnostic exposes decode starvation under capacity backpressure
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_forward_exhaustion_defer_c32_8150ca06_20260624T192135Z/`;
+  - remote Git SHA: `8150ca0641db67524422e1e9a8bdc1d3ef2d6d27`;
+  - diagnostic lane only, not release evidence, and did not run live vLLM;
+  - Vast instance `42216671` was reused, then stopped and confirmed
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-engine -p ferrum-scheduler -p ferrum-kv`
+    PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`.
+- c32 diagnostic result:
+  - command was the same focused `bench-serve` c=32, 32 prompts,
+    4 warmups, `n_repeats=1`, `--fail-on-error`, seed `9271`;
+  - bench was manually stopped per stop condition after no-token-progress churn
+    returned;
+  - `bench_exit=143`, so this is a failed/stopped diagnostic.
+- Failure shape:
+  - `completed_total=5`;
+  - `cancelled_total=4`;
+  - `capacity_deferred_total=118602`;
+  - `no_victim_warning_count=118932`;
+  - `oom_mentions=0`;
+  - last scheduler state had `waiting_queue_len=1`,
+    `prefill_queue_len=0`, `decode_queue_len=31`, `active_len=31`;
+  - last scheduled plan was prefill-only despite 31 decode-ready requests:
+    `prefill_items=1`, `decode_items=0`, `scheduled_tokens_total=6`;
+  - last engine counters had `prefill_tokens_delta=0` and
+    `decode_tokens_delta=0`.
+- Diagnosis:
+  - ZZZ133 changed model-side unified forward `ResourceExhausted` into a
+    capacity defer rather than split fallback, and the old 25-active-prefill
+    cohort is gone;
+  - the remaining failure is scheduler starvation: with capacity backpressure
+    active and 31 decode-ready requests queued, the scheduler keeps admitting one
+    waiting prefill because `prefill-first-until-active=32` sees active count 31;
+  - that prefill cannot allocate KV (`Block pool exhausted: 256/256 blocks
+    allocated`), is immediately deferred, and the loop repeats without scheduling
+    decode tokens that could make progress and eventually free capacity.
+- Next source direction:
+  - make capacity backpressure generic: when decode-ready work exists and a
+    waiting prefill has just been capacity-deferred, the scheduler must let
+    decode work run instead of repeatedly admitting the same capacity-blocked
+    prefill;
+  - keep this independent of model id, GPU memory, CUDA device, or hard-coded
+    concurrency.
+- Limits:
+  - no W3 PASS line exists;
+  - this does not prove c32 completion, throughput recovery, W3 performance, or
+    release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ133 — Unified forward ResourceExhausted now capacity-defers prefills
 
 - Source of this patch:
