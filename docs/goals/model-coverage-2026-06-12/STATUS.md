@@ -15706,3 +15706,63 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
   - It does not prove release performance, OOM resolution, or W3 completion.
   - Current W3 still lacks final
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-24 — W3 Qwen3.5 recurrent admission c32 diagnostic, prefill-first starvation found
+
+  - Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_recurrent_admission_c32_ce6ef62d_20260624T131658Z/`
+  - Diagnostic abort line:
+    `FERRUM W3 QWEN35 RECURRENT ADMISSION C32 DIAG ABORTED: /workspace/artifacts/w3_qwen35_recurrent_admission_c32_ce6ef62d_20260624T131658Z`
+  - The committed local artifact includes the scheduler trace summary and
+    compressed scheduler trace. The complete `serve.log.gz` remains only in the
+    remote artifact because the SSH transfer stalled; a partial local copy was
+    discarded after gzip validation failed.
+  - Git SHA `ce6ef62d1ded2ed2f429ed70a6b38a78fb92fc9f`.
+  - Binary SHA256
+    `83ebd7377e025a2cfdd17d87f8711f2f761afba2aa98a32f1f166de68d7fe290`.
+- Result:
+  - CUDA release build PASS in `3m33s`.
+  - `ferrum serve` `/v1/models` and chat smoke PASS before bench.
+  - c32 `bench-serve` was intentionally aborted after live trace showed
+    prefill-first decode starvation; this is not release evidence.
+  - Scheduler partial summary:
+    - `max_cancelled_total=0`.
+    - `prefill_with_generated_tokens_iterations=0`.
+    - `max_completed_total=5`.
+    - last state:
+      `decode_queue_len=16`, `prefill_queue_len=16`, `active_len=32`,
+      `waiting_queue_len=0`.
+    - `recurrent-state alloc deferred=1189408`.
+- Diagnosis:
+  - The prior recurrent admission fix aligned the ResourceExhausted path with
+    vLLM by deferring prefill instead of preempting decode; the c32 artifact
+    confirms decode cancellation disappeared in this run.
+  - With `--scheduler-prefill-first-until-active 32`, Ferrum still skipped
+    decode while `decoding_count < target` even when total active requests had
+    already reached the target. In the observed state, 16 decode requests held
+    recurrent-state slots and 16 prefill requests could not allocate recurrent
+    state, so the scheduler emitted prefill-only batches forever and GPU
+    utilization dropped to zero.
+  - vLLM comparison remains source-only/no live vLLM: vLLM schedules RUNNING
+    requests first and only schedules WAITING when no RUNNING preemption
+    occurred. A WAITING allocation failure breaks/defer; it does not keep
+    starving RUNNING decode work.
+- Follow-up source fix:
+  - `ContinuousBatchScheduler` now applies prefill-first decode skipping only
+    while total `active_count() < prefill_first_target`.
+  - Once active requests have reached the target, decode scheduling resumes
+    even if `decoding_count()` is still below the target and prefill backlog
+    remains.
+  - Added `prefill_first_until_active_resumes_decodes_at_active_target`.
+  - Adjusted `prefill_first_until_active_skips_early_decodes` to keep covering
+    the intended active-below-target behavior.
+- Local validation:
+  - `cargo fmt --all` PASS.
+  - `cargo test -p ferrum-scheduler prefill_first_until_active -- --nocapture`
+    PASS, 2 tests.
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS, 59 tests.
+- Limits:
+  - The scheduler fix has not yet been rerun on CUDA at c32.
+  - This does not prove W3 performance, OOM resolution, or release readiness.
+  - Current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
