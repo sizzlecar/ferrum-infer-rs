@@ -13728,3 +13728,41 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     仍不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 unified post-process failures reach cleanup paths
+
+- 背景:
+  - 继续审计 `process_batch_unified()` 发现两个后处理分支使用了普通 block 加
+    `?`:prefill 首 token 后处理和 decode token 后处理。
+  - 这些 `?` 会直接从 `process_batch_unified()` 返回错误,绕过后面用于释放
+    fresh KV/recurrent state 或 `complete_request()` 的错误处理分支。
+  - 结果是 backend 返回了形状正确但无法按请求策略接受的 logits/token 时,
+    可能留下本轮 fresh KV/recurrent state 或 active sequence。
+- 源码变更:
+  - prefill 首 token 后处理现在封装为返回 `Result<Option<(TokenId, u64)>>`
+    的闭包,缺失 sequence 时跳过,错误时进入统一 cleanup 分支。
+  - prefill 后处理错误现在会释放本轮 fresh KV 和本轮 fresh recurrent state,
+    然后 error-complete request。
+  - decode token 后处理现在封装为返回 `Result<Option<TokenId>>` 的闭包,
+    后处理错误不再绕过 `complete_request()`。
+  - unified prefill final result 缺失时,现在也会释放本轮 fresh KV/recurrent state
+    后再 error-complete request。
+  - 新增 `MissingFinalUnifiedResultExecutor` 和 `GreedySentinelUnifiedExecutor`
+    测试夹具。
+  - 新增:
+    - `process_batch_unified_missing_final_prefill_result_releases_fresh_kv`
+    - `process_batch_unified_prefill_postprocess_error_releases_fresh_kv`
+    - `process_batch_unified_decode_postprocess_error_releases_recurrent_state`
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-engine process_batch_unified_ -- --nocapture` PASS,
+    12 个 unified 相关测试通过。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,
+    17 个 recurrent/resource 相关测试通过。
+  - `git diff --check` PASS。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只证明本地 unified 后处理错误路径会进入 cleanup/complete 分支,
+    仍不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
