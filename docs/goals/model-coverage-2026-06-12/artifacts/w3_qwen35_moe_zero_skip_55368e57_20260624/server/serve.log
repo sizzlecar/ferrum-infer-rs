@@ -1,0 +1,127 @@
+
+  ______
+ |  ____|
+ | |__ ___ _ __ _ __ _   _ _ __ ___
+ |  __/ _ \ '__| '__| | | | '_ ` _ \
+ | | |  __/ |  | |  | |_| | | | | |
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.7
+
+Model: Qwen/Qwen3.5-35B-A3B-GPTQ-Int4
+Path: /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+CUDA GPUs: 0 (single_gpu)
+Device: CUDA(0)
+
+[auto-size] MAX_BATCHED_TOKENS=192 (profile=Server model=TightRecurrentState)
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=22.7 GB budget / 22.7 GB total | layers=40 budget | scratch reserve=4.0 GB | KV pool budget 0.0 GB → max_blocks=12
+[auto-size] requested runtime token floor requires KV_MAX_BLOCKS=12 above estimated budget 0; honoring explicit runtime limits
+[auto-size] KV_MAX_BLOCKS=256 PAGED_MAX_SEQS=16 KV_CAPACITY=512
+Initializing engine (continuous batching)...
+2026-06-24T08:11:10.109598Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-24T08:11:10.109613Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-24T08:11:10.109659Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b/tokenizer.json"
+2026-06-24T08:11:10.563110Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-24T08:11:10.563146Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-24T08:11:10.563151Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-24T08:11:10.563157Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=256
+2026-06-24T08:11:10.563213Z  INFO ferrum_engine::registry: Loading model from /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b (format: safetensors)
+2026-06-24T08:11:10.563361Z  INFO ferrum_engine::registry:   Architecture: Qwen35Moe, Layers: 40, Vocab: 248320
+2026-06-24T08:11:10.666817Z  INFO ferrum_engine::registry: Building model...
+2026-06-24T08:11:10.666847Z  INFO ferrum_engine::registry: Using Qwen3.5/Qwen3.6 CUDA backend executor
+2026-06-24T08:11:11.416619Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading globals and 40 layers
+2026-06-24T08:11:17.051129Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: globals loaded in 5.6s
+2026-06-24T08:11:17.051172Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 1/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:17.797009Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 1/40 loaded in 0.7s
+2026-06-24T08:11:17.797049Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 2/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:18.261002Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 2/40 loaded in 0.5s
+2026-06-24T08:11:18.261043Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 3/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:18.728391Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 3/40 loaded in 0.5s
+2026-06-24T08:11:18.728427Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 4/40 (FullAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:19.111972Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 4/40 loaded in 0.4s
+2026-06-24T08:11:19.112013Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 5/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:19.583216Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 5/40 loaded in 0.5s
+2026-06-24T08:11:19.583257Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 6/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:20.058746Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 6/40 loaded in 0.5s
+2026-06-24T08:11:20.058802Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 7/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:20.523811Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 7/40 loaded in 0.5s
+2026-06-24T08:11:20.523852Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 8/40 (FullAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:20.911092Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 8/40 loaded in 0.4s
+2026-06-24T08:11:20.911134Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 9/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:21.376101Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 9/40 loaded in 0.5s
+2026-06-24T08:11:21.376142Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 10/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:21.844560Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 10/40 loaded in 0.5s
+2026-06-24T08:11:21.844602Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 11/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:22.316294Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 11/40 loaded in 0.5s
+2026-06-24T08:11:22.316333Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 12/40 (FullAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:22.699319Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 12/40 loaded in 0.4s
+2026-06-24T08:11:22.699360Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 13/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:23.171805Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 13/40 loaded in 0.5s
+2026-06-24T08:11:23.171849Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 14/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:23.645372Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 14/40 loaded in 0.5s
+2026-06-24T08:11:23.645412Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 15/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:24.118600Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 15/40 loaded in 0.5s
+2026-06-24T08:11:24.118640Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 16/40 (FullAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:24.508720Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 16/40 loaded in 0.4s
+2026-06-24T08:11:24.508761Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 17/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:24.981096Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 17/40 loaded in 0.5s
+2026-06-24T08:11:24.981140Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 18/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:25.452377Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 18/40 loaded in 0.5s
+2026-06-24T08:11:25.452418Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 19/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:25.922344Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 19/40 loaded in 0.5s
+2026-06-24T08:11:25.922388Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 20/40 (FullAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:26.306179Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 20/40 loaded in 0.4s
+2026-06-24T08:11:26.306222Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 21/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:26.771342Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 21/40 loaded in 0.5s
+2026-06-24T08:11:26.771380Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 22/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:27.243622Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 22/40 loaded in 0.5s
+2026-06-24T08:11:27.243662Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 23/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:27.715247Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 23/40 loaded in 0.5s
+2026-06-24T08:11:27.715289Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 24/40 (FullAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:28.105469Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 24/40 loaded in 0.4s
+2026-06-24T08:11:28.105510Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 25/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:28.578039Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 25/40 loaded in 0.5s
+2026-06-24T08:11:28.578082Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 26/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:29.048337Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 26/40 loaded in 0.5s
+2026-06-24T08:11:29.048380Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 27/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:29.517557Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 27/40 loaded in 0.5s
+2026-06-24T08:11:29.517599Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 28/40 (FullAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:29.908890Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 28/40 loaded in 0.4s
+2026-06-24T08:11:29.908929Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 29/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:30.380692Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 29/40 loaded in 0.5s
+2026-06-24T08:11:30.380744Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 30/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:30.857734Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 30/40 loaded in 0.5s
+2026-06-24T08:11:30.857776Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 31/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:31.330136Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 31/40 loaded in 0.5s
+2026-06-24T08:11:31.330180Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 32/40 (FullAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:31.726708Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 32/40 loaded in 0.4s
+2026-06-24T08:11:31.726753Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 33/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:32.199562Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 33/40 loaded in 0.5s
+2026-06-24T08:11:32.199606Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 34/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:32.672870Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 34/40 loaded in 0.5s
+2026-06-24T08:11:32.672914Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 35/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:33.145248Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 35/40 loaded in 0.5s
+2026-06-24T08:11:33.145290Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 36/40 (FullAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:33.539459Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 36/40 loaded in 0.4s
+2026-06-24T08:11:33.539502Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 37/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:34.010991Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 37/40 loaded in 0.5s
+2026-06-24T08:11:34.011046Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 38/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:34.480938Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 38/40 loaded in 0.5s
+2026-06-24T08:11:34.480980Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 39/40 (LinearAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:34.950601Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 39/40 loaded in 0.5s
+2026-06-24T08:11:34.950643Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loading layer 40/40 (FullAttention, SparseMoeSharedExpert)
+2026-06-24T08:11:35.340240Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: layer 40/40 loaded in 0.4s
+2026-06-24T08:11:35.340280Z  INFO ferrum_models::models::qwen35: Qwen3.5 native weights: loaded 40 layers in 23.9s
+
+🚀 Server running at http://127.0.0.1:58692
+
+Endpoints:
+  POST /v1/chat/completions      - OpenAI-compatible chat
+  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)
+  POST /v1/audio/speech          - Text-to-speech (TTS)
+  POST /v1/embeddings            - Text/image embeddings
+  GET  /v1/models                - List models
+  GET  /health                   - Health check
+
+Press Ctrl+C to stop.

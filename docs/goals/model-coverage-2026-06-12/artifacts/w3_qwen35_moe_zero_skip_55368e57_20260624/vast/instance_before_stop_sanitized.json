@@ -1,0 +1,17 @@
+{
+  "id": 42216671,
+  "cur_state": "running",
+  "actual_status": "running",
+  "intended_status": "running",
+  "gpu_name": "RTX 4090",
+  "num_gpus": 1,
+  "ssh_host": "ssh3.vast.ai",
+  "ssh_port": 16670,
+  "dph_total": 0.47777777777777775,
+  "disk_space": 350.0,
+  "geolocation": "Pennsylvania, US",
+  "public_ipaddr": "71.175.237.103",
+  "driver_version": "570.153.02",
+  "gpu_totalram": 24564,
+  "duration": 99630532.00588465
+}
