@@ -468,7 +468,9 @@ impl EngineInner {
                     self.defer_prefill_for_capacity(&work.rid).await;
                 }
                 if !decode_meta.is_empty() {
-                    return self.run_batch_decode_adaptive(&decode_meta).await;
+                    return self
+                        .run_batch_decode_adaptive_no_preempt(&decode_meta)
+                        .await;
                 }
                 return Ok(());
             }
@@ -497,7 +499,9 @@ impl EngineInner {
                         self.defer_prefill_for_capacity(&work.rid).await;
                     }
                     if !decode_meta.is_empty() {
-                        return self.run_batch_decode_adaptive(&decode_meta).await;
+                        return self
+                            .run_batch_decode_adaptive_no_preempt(&decode_meta)
+                            .await;
                     }
                     return Ok(());
                 }
