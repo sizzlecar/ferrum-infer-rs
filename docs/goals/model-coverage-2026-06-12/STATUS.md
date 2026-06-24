@@ -2,6 +2,79 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ145 — 1cdc98f7 FP16 indexed-state c32 diagnostic passes build/smoke but regresses performance
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fp16_indexed_state_c32_1cdc98f7_20260624T221315Z/`;
+  - remote Git SHA:
+    `1cdc98f70f2ff544784fd677a934094749db0e6f`;
+  - binary SHA256:
+    `09134e1fb2bbebaa971af4efd2561b3c4f5803d4941f2cb863b2339601c46057`;
+  - diagnostic PASS line:
+    `FERRUM W3 QWEN35 FP16 INDEXED STATE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_fp16_indexed_state_c32_1cdc98f7_20260624T221315Z`;
+  - no live vLLM was run.
+- Vast lifecycle:
+  - reused Vast instance `42216671`, 1x RTX 4090 at
+    `$0.47777777777777775/hr`;
+  - copied artifact and tmux logs back before shutdown;
+  - stop verification reported `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-kernels -p ferrum-models -p ferrum-cli`
+    PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`;
+  - run and serve effective-config assertions both passed:
+    `selected_max_sequences=32`,
+    `selected_recurrent_state_max_slots=32`,
+    `selected_admission_limit=32`;
+  - recurrent-state memory estimate used FP16 state bytes:
+    `recurrent_state_bytes_per_sequence=32931840`,
+    `recurrent_state_budget_raw_slots=40`,
+    `recurrent_state_budget_max_slots=32`.
+- c32 diagnostic result:
+  - command shape: `bench-serve`, sharegpt dataset, `--concurrency 32`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`;
+  - bench completed normally: `bench_exit=0`;
+  - completed `[32]`, errored `[0]`, HTTP 500 `[0]`, panic `[0]`;
+  - `output_token_count_source=usage`;
+  - output throughput `468.3885859539078 tok/s`;
+  - total throughput `889.2064561468719 tok/s`;
+  - request throughput `3.6592858277649047 req/s`;
+  - p95 TTFT `1961.2546543500002 ms`;
+  - p95 TPOT `52.9450978964567 ms`;
+  - p95 ITL `55.165589 ms`.
+- Scheduler/log evidence:
+  - scheduler trace lines `487`;
+  - final trace state: `completed_total=37`, `failed_total=0`,
+    `cancelled_total=16`, `capacity_deferred_total=188`,
+    `admitted_total=241`, `active_len=0`, `waiting_queue_len=0`;
+  - log counts: `cancelled during decode=16`,
+    `Unified KV admission failed=126`, `Unified prefill alloc deferred=1`,
+    `Unified prefill recurrent-state alloc deferred=0`,
+    `Block pool exhausted=1`;
+  - `OOM=0`, `out of memory=0`, `OutOfMemory=0`, `panic=0`,
+    `no preemptable victim=0`.
+- Conclusion:
+  - the FP16 indexed recurrent-state CUDA symbols compile and the product
+    paths can run with typed 32/32 recurrent/admission slots;
+  - however, the 32/32 path is still not a usable performance fix: throughput
+    is below the prior 16/16 diagnostic (`635.5743934095524 tok/s`) and the
+    decode-cancel/KV-admission churn from the bad 32-slot path reappeared;
+  - next source work should focus on KV/admission capacity behavior under
+    32 active recurrent slots, not on enumerating model/GPU caps or rerunning
+    live vLLM.
+- Limits:
+  - this is diagnostic only (`n_repeats=1`, c32 only);
+  - it is not same-hardware release performance evidence and does not include
+    `--require-ci`;
+  - no final W3 validator was run;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` exists.
+
 ## 2026-06-25 ZZZ144 — FP16 indexed recurrent-state source candidate; local validation only
 
 - Source direction:
