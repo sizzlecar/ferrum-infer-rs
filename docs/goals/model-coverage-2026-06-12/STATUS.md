@@ -2,6 +2,53 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ127 — Paged KV partial allocation rollback fixed
+
+- Source of this patch:
+  - ZZZ126 narrowed the c32 stall: scheduler admission backpressure reached
+    `capacity_backpressure_admit_limit=1`, but a single fresh prefill still
+    repeatedly hit engine-side `Unified prefill alloc deferred ... no victim`;
+  - artifact config showed `FERRUM_KV_MAX_BLOCKS=256` and
+    `FERRUM_KV_CAPACITY=512`; ShareGPT c32 prompts in the failure trace were
+    about `129-130` tokens each, so a fresh engine KV allocation asks for
+    about `9` paged blocks per request;
+  - the failing path was before Qwen3.5 model-side `reserve_kv_slots`, in
+    `PagedKvCacheManager::allocate()`.
+- Root cause found in source:
+  - `PagedKvCacheManager::allocate_blocks()` allocated blocks one at a time;
+  - when the pool ran out partway through a multi-block request, it returned
+    `ResourceExhausted` without returning the blocks already allocated during
+    that call;
+  - for fresh `allocate()`, the handle is inserted into `active_handles` only
+    after all blocks are allocated, so those partial blocks were not reachable
+    by request id and could not be freed by capacity-defer cleanup;
+  - this matches the observed shape: no OOM, no active scheduler work, but
+    repeated no-victim allocation failures.
+- Source change:
+  - added `PagedKvCacheHandle::truncate_blocks()` to restore a handle block
+    table to its pre-call logical length;
+  - `PagedKvCacheManager::allocate_blocks()` now rolls back blocks allocated
+    during the current call, removes ownership mappings, truncates the handle
+    table, and returns the original allocation error.
+- Why this is not a model/GPU/concurrency special case:
+  - the fix is in the generic paged KV manager;
+  - it does not inspect model id, GPU memory size, max sequence count,
+    Qwen3.5 fields, or CUDA-specific runtime state.
+- Local validation:
+  - `cargo test -p ferrum-kv failed_ -- --nocapture` PASS, covering fresh
+    allocate and extend partial-failure rollback;
+  - `cargo test -p ferrum-kv` PASS (`69` unit tests, `4` integration tests);
+  - `cargo check -p ferrum-engine -p ferrum-kv` PASS;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture` PASS
+    (`14` tests);
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Limits:
+  - no GPU lane has been run for this source candidate yet;
+  - this does not prove c32 completion, throughput, OOM resolution, W3
+    performance, or release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ126 — Backpressure reached width 1, but c32 still stalls
 
 - Artifact:

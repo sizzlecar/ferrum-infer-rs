@@ -145,6 +145,27 @@ impl PagedKvCacheHandle {
         *self.last_access.write() = Instant::now();
     }
 
+    fn truncate_blocks(&self, logical_len: usize) {
+        let mut table = self.block_table.write();
+        table.logical_to_physical.truncate(logical_len);
+        table.physical_blocks.clear();
+
+        let used_blocks: Vec<u32> = table
+            .logical_to_physical
+            .iter()
+            .filter(|&&id| id > 0)
+            .copied()
+            .collect();
+        for physical_id in used_blocks {
+            if physical_id as usize >= table.physical_blocks.len() {
+                table.physical_blocks.resize((physical_id + 1) as usize, 0);
+            }
+            table.physical_blocks[physical_id as usize] = 1;
+        }
+
+        *self.last_access.write() = Instant::now();
+    }
+
     /// Get physical block for logical block
     pub fn get_physical_block(&self, logical_id: u32) -> Option<u32> {
         let table = self.block_table.read();
@@ -420,7 +441,17 @@ impl PagedKvCacheManager {
         let current_blocks = handle.num_blocks();
 
         for i in 0..num_blocks {
-            let allocation = self.gpu_pool.allocate()?;
+            let allocation = match self.gpu_pool.allocate() {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    for block_id in allocated.iter().copied() {
+                        let _ = self.gpu_pool.deallocate(block_id);
+                        self.block_to_request.write().remove(&block_id);
+                    }
+                    handle.truncate_blocks(current_blocks);
+                    return Err(error);
+                }
+            };
             let physical_id = allocation.physical_id;
 
             // Map logical to physical
@@ -1050,6 +1081,70 @@ mod tests {
         assert!(new_blocks > initial_blocks);
 
         manager.deallocate(request_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_allocate_rolls_back_partial_blocks() {
+        let manager = PagedKvCacheManager::with_defaults(Device::CPU, 16, 5).unwrap();
+
+        let first = create_test_request();
+        let first_id = first.request_id.clone();
+        manager.allocate(&first).await.unwrap();
+        assert_eq!(manager.stats().free_blocks, 0);
+
+        let mut second = create_test_request();
+        second.request_id = RequestId::new();
+        let err = manager.allocate(&second).await.unwrap_err();
+        assert!(matches!(err, FerrumError::ResourceExhausted { .. }));
+
+        let stats = manager.stats();
+        assert_eq!(stats.active_caches, 1);
+        assert_eq!(
+            stats.free_blocks, 1,
+            "partially allocated blocks must be returned to the pool"
+        );
+
+        manager.deallocate(first_id).await.unwrap();
+        let stats = manager.stats();
+        assert_eq!(stats.active_caches, 0);
+        assert_eq!(stats.free_blocks, stats.total_blocks);
+    }
+
+    #[tokio::test]
+    async fn failed_extend_rolls_back_partial_blocks_and_handle_table() {
+        let manager = PagedKvCacheManager::with_defaults(Device::CPU, 16, 5).unwrap();
+        let request = create_test_request();
+        let request_id = request.request_id.clone();
+
+        let handle_dyn = manager.allocate(&request).await.unwrap();
+        let handle = handle_dyn
+            .as_any()
+            .downcast_ref::<PagedKvCacheHandle>()
+            .unwrap();
+        assert_eq!(handle.num_blocks(), 4);
+
+        let err = manager.allocate_blocks(handle, 3).unwrap_err();
+        assert!(matches!(err, FerrumError::ResourceExhausted { .. }));
+        assert_eq!(
+            handle.num_blocks(),
+            4,
+            "failed extend must restore the original handle block table"
+        );
+        assert_eq!(
+            handle.get_physical_blocks().len(),
+            4,
+            "failed extend must not leave stale physical block mappings"
+        );
+        assert_eq!(
+            manager.stats().free_blocks,
+            1,
+            "partially extended block must be returned to the pool"
+        );
+
+        manager.deallocate(request_id).await.unwrap();
+        let stats = manager.stats();
+        assert_eq!(stats.active_caches, 0);
+        assert_eq!(stats.free_blocks, stats.total_blocks);
     }
 
     #[tokio::test]
