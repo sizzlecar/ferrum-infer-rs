@@ -15766,3 +15766,47 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
   - This does not prove W3 performance, OOM resolution, or release readiness.
   - Current W3 still lacks final
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-24 — W3 Qwen3.5 prefill-first starvation fix c32 validation
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_first_starvation_fix_c32_6bb7af75_20260624T135228Z/`
+  - Diagnostic PASS line:
+    `FERRUM W3 QWEN35 PREFILL-FIRST STARVATION FIX C32 DIAG PASS: /workspace/artifacts/w3_qwen35_prefill_first_starvation_fix_c32_6bb7af75_20260624T135228Z`
+  - Vast instance `42216671` reused, then stopped after artifact copyback;
+    stop verification reported `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+  - Git SHA `6bb7af7554babff95b14613a5e7b9d8d71235a3f`.
+  - Binary SHA256
+    `91052acef66b8c604281c72890c4eb5cf39303a89034fa8d2799839afb25dc56`.
+- Correctness smoke:
+  - CUDA release build PASS.
+  - `ferrum serve` `/v1/models` PASS.
+  - `ferrum serve` chat smoke PASS, response contained `5`.
+- c32 quick bench:
+  - Command shape: `bench-serve`, sharegpt dataset, `--concurrency 32`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`.
+  - Completed `[32]`, errored `[0]`.
+  - Output throughput `633.3518270005125 tok/s`.
+  - p95 TTFT `4276.2155575 ms`.
+  - p95 ITL `19.702023 ms`.
+- Scheduler evidence:
+  - `lines=463`, down from the prior aborted diagnostic's `74498`.
+  - `max_cancelled_total=0`.
+  - `max_completed_total=37`.
+  - `prefill_with_generated_tokens_iterations=0`.
+  - `recurrent-state alloc deferred=603`, down from the prior aborted
+    diagnostic's `1189408`.
+- Decision:
+  - The prefill-first starvation fix is validated for the c32 quick diagnostic:
+    the run no longer gets stuck in prefill-only scheduling with GPU idle.
+  - This also preserves the recurrent admission improvement from `ce6ef62d`:
+    no decode-cancel storm reappeared in this artifact.
+  - Throughput is still below W3 target and below the user's expected release
+    bar; this is not a W3 completion or performance-ready claim.
+- Limits:
+  - This is diagnostic only (`n_repeats=1`, c32 only).
+  - It validates `ferrum serve` for this targeted path, not `ferrum run`.
+  - Current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.

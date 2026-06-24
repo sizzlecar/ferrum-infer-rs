@@ -1,0 +1,14 @@
+started_at=2026-06-24T13:52:28Z
+lane=W3_QWEN35_PREFILL_FIRST_STARVATION_FIX_C32_DIAG
+release_evidence=false
+no_live_vllm=true
+port=55988
+git_head=6bb7af7554babff95b14613a5e7b9d8d71235a3f
+git_status_start
+git_status_end
+rustc_version=rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo_version=cargo 1.96.0 (30a34c682 2026-05-25)
+NVIDIA GeForce RTX 4090, 24564, 1, 24091, 570.153.02
+tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+dataset=/workspace/ferrum-infer-rs-git/docs/goals/model-coverage-2026-06-12/artifacts/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl
+finished_at=2026-06-24T13:56:24Z
