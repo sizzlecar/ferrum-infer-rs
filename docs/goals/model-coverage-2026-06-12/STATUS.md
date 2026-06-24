@@ -2,6 +2,125 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ133 — Unified forward ResourceExhausted now capacity-defers prefills
+
+- Source of this patch:
+  - ZZZ132 proved the failing c32 path was not unified KV admission:
+    `Unified KV admission failed=0`;
+  - the repeated failure was from `unified_decode()` itself:
+    `Resource exhausted: Qwen3.5 linear state slot pool exhausted: max_slots=32`;
+  - the old code treated every unified forward error as a generic model failure,
+    released only fresh resources, and entered split fallback. For capacity
+    pressure, that kept the same un-runnable active prefill cohort selected and
+    caused zero-token-progress churn.
+- Source change:
+  - `process_batch_unified` now handles `unified_decode()` `ResourceExhausted`
+    as capacity pressure;
+  - all prefill work in the failed unified batch is moved back to waiting through
+    `defer_prefill_for_capacity`;
+  - fresh KV handles are still explicitly deallocated before defer because they
+    have not yet been written into `SequenceState`;
+  - if the unified batch also contained decode work, decode is retried through
+    `run_batch_decode_adaptive`;
+  - non-resource unified forward failures still use the existing split fallback.
+- Tests added/updated:
+  - updated `FailingUnifiedForwardExecutor` so tests can distinguish
+    model-internal forward failure from resource exhaustion;
+  - added
+    `process_batch_unified_forward_resource_exhausted_defers_existing_kv_prefill`;
+  - the regression simulates an active prefill with existing KV and
+    `prefill_tokens_processed=1`; when unified forward returns
+    `ResourceExhausted`, the request must move to waiting, release KV and
+    recurrent state, clear `model_cache_id`, and reset prefill progress.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-engine process_batch_unified_forward_resource_exhausted_defers_existing_kv_prefill -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine process_batch_unified_forward_failure_then_fallback_kv_defer_releases_recurrent_state -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture` PASS
+    (`17` tests);
+  - `cargo check -p ferrum-engine -p ferrum-scheduler` PASS;
+  - `cargo test -p ferrum-engine` PASS (`154` lib tests plus integration
+    tests; only existing ignored tests remained ignored);
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Why this is not a model/GPU special case:
+  - no model id, CUDA device, GPU memory size, or fixed concurrency cap is
+    inspected;
+  - the behavior depends only on the typed `FerrumError::ResourceExhausted`
+    signal and owned resource state.
+- Limits:
+  - no GPU lane has been run for this source candidate yet;
+  - this does not prove c32 completion, throughput recovery, W3 performance, or
+    release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-25 ZZZ132 — 909747e6 c32 diagnostic disproves reserve-admission hypothesis
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_existing_kv_prefill_defer_c32_909747e6_20260624T185646Z/`;
+  - remote Git SHA: `909747e61dbf7527be2e1af3362ff58b677e7658`;
+  - diagnostic lane only, not release evidence, and did not run live vLLM;
+  - Vast instance `42216671` was reused, then stopped and confirmed
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`;
+  - this run intentionally removed the old hidden
+    `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS` env override. Effective config
+    still selected `selected_recurrent_state_max_slots=32` from the typed
+    product path (`--max-num-seqs 32` / CLI decision), not from the legacy
+    Qwen3.5-specific env key.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-engine -p ferrum-scheduler -p ferrum-kv`
+    PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`.
+- c32 diagnostic result:
+  - command was the planned diagnostic `bench-serve` c=32, 32 prompts,
+    4 warmups, `n_repeats=1`, `--fail-on-error`, seed `9271`;
+  - bench was manually stopped per stop condition after no-token-progress
+    churn returned and GPU utilization dropped to idle;
+  - `bench_exit=143`, so this is a failed/stopped diagnostic.
+- Failure shape:
+  - `completed_total=5`;
+  - `cancelled_total=36`;
+  - `capacity_deferred_total=22045`;
+  - `no_victim_warning_count=22113`;
+  - `oom_mentions=0`;
+  - last scheduler state had `prefill_queue_len=25`,
+    `waiting_queue_len=7`, `decode_queue_len=0`, `active_len=25`;
+  - last plan was prefill-only:
+    `prefill_items=27`, `decode_items=0`, `scheduled_tokens_total=162`;
+  - last engine counters had `prefill_tokens_delta=0` and
+    `decode_tokens_delta=0`.
+- Diagnosis:
+  - `Unified KV admission failed=0`, so the ZZZ131
+    `reserve_kv_slots(ResourceExhausted)` fix did not trigger in the failing
+    path;
+  - `Unified forward failed=11141`, with the repeated message:
+    `Resource exhausted: Qwen3.5 linear state slot pool exhausted: max_slots=32`;
+  - current `process_batch_unified` treats `unified_decode()` errors as
+    generic forward failures, releases only fresh resources, then falls back to
+    split prefill/decode. For `ResourceExhausted`, that preserves the same
+    un-runnable active prefill cohort and creates the observed zero-progress
+    churn.
+- Next source direction:
+  - treat `unified_decode()` `ResourceExhausted` like capacity pressure:
+    capacity-defer prefill items instead of entering split fallback;
+  - keep non-resource unified forward failures on the existing split fallback
+    path;
+  - add a regression where an existing-KV active prefill receives
+    `ResourceExhausted` from unified forward and must move back to waiting
+    with physical state cleared.
+- Limits:
+  - no W3 PASS line exists;
+  - this does not prove c32 completion, throughput recovery, W3 performance,
+    or release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ131 — Active existing-KV prefill now defers after model KV admission pressure
 
 - Source of this patch:
