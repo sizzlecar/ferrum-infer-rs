@@ -1287,6 +1287,31 @@ def validate_w3_l2_artifact(data: dict[str, Any], label: str, problems: list[str
             and artifacts < total
         ):
             problems.append(f"{label}.output_hygiene.response_artifacts_checked must cover all cases")
+        case_entrypoints_raw = as_list(
+            hygiene.get("case_entrypoints"),
+            f"{label}.output_hygiene.case_entrypoints",
+            problems,
+        )
+        case_entrypoints: set[str] = set()
+        for idx, raw_entrypoint in enumerate(case_entrypoints_raw):
+            entrypoint = non_empty_string(
+                raw_entrypoint,
+                f"{label}.output_hygiene.case_entrypoints[{idx}]",
+                problems,
+            )
+            if entrypoint is None:
+                continue
+            if entrypoint not in REQUIRED_L2_PRODUCT_COMMANDS:
+                problems.append(
+                    f"{label}.output_hygiene.case_entrypoints[{idx}] must be one of "
+                    f"{sorted(REQUIRED_L2_PRODUCT_COMMANDS)}"
+                )
+            case_entrypoints.add(entrypoint)
+        missing_case_entrypoints = sorted(set(REQUIRED_L2_PRODUCT_COMMANDS) - case_entrypoints)
+        if missing_case_entrypoints:
+            problems.append(
+                f"{label}.output_hygiene.case_entrypoints missing {missing_case_entrypoints}"
+            )
     validate_l2_product_commands(data.get("commands"), label, problems)
 
 
@@ -2359,6 +2384,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
             "output_hygiene": {
                 "known_answer_cases_checked": 10,
                 "response_artifacts_checked": 10,
+                "case_entrypoints": ["ferrum run", "ferrum serve"],
                 "content_non_empty": True,
                 "forbidden_patterns_absent": True,
                 "artifact_text_scanned": True,
@@ -3053,6 +3079,27 @@ def run_selftest() -> int:
             for problem in bad_w3_l2_command_problems
         ):
             raise AssertionError("bad W3 L2 command selftest did not fail as expected")
+
+        bad_w3_l2_case_entrypoint = tmp_root / "bad-w3-l2-case-entrypoint"
+        bad_w3_l2_case_entrypoint_manifest = write_selftest_manifest(
+            bad_w3_l2_case_entrypoint,
+            lane="w3",
+            ratio=0.82,
+        )
+        l2_case_entrypoint = load_json(bad_w3_l2_case_entrypoint / "l2.json")
+        l2_case_entrypoint["output_hygiene"]["case_entrypoints"] = ["ferrum serve"]
+        write_json(bad_w3_l2_case_entrypoint / "l2.json", l2_case_entrypoint)
+        bad_w3_l2_case_entrypoint_problems = validate_manifest(
+            load_json(bad_w3_l2_case_entrypoint_manifest),
+            "w3",
+            bad_w3_l2_case_entrypoint,
+        )
+        if not any(
+            "correctness.l2_quantized.output_hygiene.case_entrypoints missing ['ferrum run']"
+            in problem
+            for problem in bad_w3_l2_case_entrypoint_problems
+        ):
+            raise AssertionError("bad W3 L2 case-entrypoint selftest did not fail as expected")
 
         bad_w3_l3_stream = tmp_root / "bad-w3-l3-stream"
         bad_w3_l3_stream_manifest = write_selftest_manifest(

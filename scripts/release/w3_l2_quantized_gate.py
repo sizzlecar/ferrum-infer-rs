@@ -27,6 +27,7 @@ REQUIRED_ENTRYPOINTS = {
     "ferrum run": "run",
     "ferrum serve": "serve",
 }
+REQUIRED_CASE_ENTRYPOINTS = set(REQUIRED_ENTRYPOINTS)
 FORBIDDEN_OUTPUT_PATTERNS = [
     "<unk>",
     "[PAD",
@@ -217,6 +218,16 @@ def case_output_text(case: dict[str, Any], label: str) -> str:
     raise GateError(f"{label} must include non-empty output content")
 
 
+def case_entrypoint(case: dict[str, Any], label: str) -> str:
+    entrypoint = non_empty_string(case.get("entrypoint"), f"{label}.entrypoint")
+    if entrypoint not in REQUIRED_CASE_ENTRYPOINTS:
+        raise GateError(
+            f"{label}.entrypoint must be one of {sorted(REQUIRED_CASE_ENTRYPOINTS)}, "
+            f"got {entrypoint!r}"
+        )
+    return entrypoint
+
+
 def resolve_artifact(raw: Any, report_dir: Path, label: str) -> Path:
     if not isinstance(raw, str) or not raw.strip():
         raise GateError(f"{label}.artifact must be a non-empty string")
@@ -233,9 +244,11 @@ def validate_known_answer_hygiene(cases: list[Any], report_dir: Path) -> dict[st
     if not cases:
         raise GateError("known_answer_cases must be present for W3 L2 output hygiene")
     checked_artifacts = 0
+    seen_entrypoints: set[str] = set()
     for idx, raw_case in enumerate(cases):
         label = f"known_answer_cases[{idx}]"
         case = as_object(raw_case, label)
+        seen_entrypoints.add(case_entrypoint(case, label))
         text = case_output_text(case, label)
         assert_no_forbidden_output(f"{label}.content", text)
         artifact = resolve_artifact(case.get("artifact"), report_dir, label)
@@ -245,9 +258,16 @@ def validate_known_answer_hygiene(cases: list[Any], report_dir: Path) -> dict[st
         finish_reason = case.get("finish_reason")
         if finish_reason is not None and finish_reason not in {"stop", "length"}:
             raise GateError(f"{label}.finish_reason must be stop or length, got {finish_reason!r}")
+    missing_entrypoints = sorted(REQUIRED_CASE_ENTRYPOINTS - seen_entrypoints)
+    if missing_entrypoints:
+        raise GateError(
+            "known_answer_cases must include case-level entrypoint coverage for "
+            f"{missing_entrypoints}"
+        )
     return {
         "known_answer_cases_checked": len(cases),
         "response_artifacts_checked": checked_artifacts,
+        "case_entrypoints": sorted(seen_entrypoints),
         "content_non_empty": True,
         "forbidden_patterns_absent": True,
         "artifact_text_scanned": True,
@@ -383,6 +403,7 @@ def selftest_report(root: Path) -> Path:
         cases.append(
             {
                 "id": f"known_answer_{index:02d}",
+                "entrypoint": "ferrum run" if index == 0 else "ferrum serve",
                 "passed": True,
                 "semantic_pass": True,
                 "content": "Paris",
@@ -444,6 +465,8 @@ def run_selftest() -> int:
             raise AssertionError("selftest artifact did not preserve required product commands")
         if artifact["output_hygiene"]["response_artifacts_checked"] != 10:
             raise AssertionError("selftest artifact did not scan known-answer artifacts")
+        if set(artifact["output_hygiene"]["case_entrypoints"]) != REQUIRED_CASE_ENTRYPOINTS:
+            raise AssertionError("selftest artifact did not preserve case entrypoint coverage")
 
         bad = as_object(load_json(report), "selftest report")
         bad["known_answer_cases"][0]["passed"] = False
@@ -522,6 +545,24 @@ def run_selftest() -> int:
                 raise AssertionError(f"unexpected hidden-env command error: {exc}") from exc
         else:
             raise AssertionError("hidden-env product command unexpectedly passed")
+
+        serve_only_cases = as_object(load_json(report), "selftest report")
+        for case in serve_only_cases["known_answer_cases"]:
+            case["entrypoint"] = "ferrum serve"
+        serve_only_cases_path = root / "serve_only_cases_report.json"
+        write_json(serve_only_cases_path, serve_only_cases)
+        try:
+            build_artifact(
+                report_path=serve_only_cases_path,
+                out_dir=root / "serve_only_cases_out",
+                model_id_override=None,
+                format_override=None,
+            )
+        except GateError as exc:
+            if "case-level entrypoint coverage" not in str(exc):
+                raise AssertionError(f"unexpected serve-only-cases error: {exc}") from exc
+        else:
+            raise AssertionError("serve-only known-answer cases unexpectedly passed")
 
         bad_output = as_object(load_json(report), "selftest report")
         bad_output["known_answer_cases"][0]["content"] = "<unk>"
