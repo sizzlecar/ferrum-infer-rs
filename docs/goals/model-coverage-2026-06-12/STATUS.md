@@ -2,6 +2,71 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ141 — f304fd8d c32 diagnostic PASS; capacity churn reduced, throughput still blocked
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_backpressure_c32_f304fd8d_20260624T210905Z/`;
+  - remote Git SHA: `f304fd8de882c3bf729c314491167e8dcf8a84d5`;
+  - binary SHA256:
+    `1f131dce0735f96c9e9d2ba789c6e61cf45dea1ec3ffdf4c8ba4f5cf698b33b7`;
+  - diagnostic PASS line:
+    `FERRUM W3 QWEN35 DECODE BACKPRESSURE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_decode_backpressure_c32_f304fd8d_20260624T210905Z`;
+  - diagnostic only, not release evidence, and no live vLLM was run;
+  - Vast instance `42216671` was reused, artifact/tmux logs were copied back,
+    then the instance was stopped and confirmed `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-engine -p ferrum-scheduler -p ferrum-kv`
+    PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`;
+  - run and serve effective-config assertions both passed:
+    `selected_max_sequences=32`,
+    `selected_recurrent_state_max_slots=32`,
+    `selected_admission_limit=32`.
+- c32 diagnostic result:
+  - command shape: `bench-serve`, sharegpt dataset, `--concurrency 32`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`;
+  - bench completed normally: `bench_exit=0`;
+  - `completed_per_run=[32]`, `errored_per_run=[0]`, `http_500_per_run=[0]`,
+    `panic_per_run=[0]`;
+  - `output_token_count_source=usage`;
+  - output throughput mean: `265.5349974958471 tok/s`;
+  - total throughput mean: `504.10159680852223 tok/s`;
+  - request throughput mean: `2.0744921679363055 req/s`;
+  - TTFT p50 mean: `1927.430049 ms`;
+  - TPOT p50 mean: `67.80376340157481 ms`;
+  - `oom_mentions=0`;
+  - `capacity_deferred_total=188`;
+  - `no_victim_warning_count=1`;
+  - log counts: `Unified KV admission failed=126`,
+    `Unified prefill alloc deferred=1`, `Block pool exhausted=1`,
+    `cancelled during decode=16`, OOM/panic mentions `0`.
+- Trace comparison against ZZZ139/a0f1c444:
+  - output throughput improved only from `258.27 tok/s` to `265.53 tok/s`
+    (`+2.8%`), still far below the `671 tok/s` target;
+  - capacity-deferred churn dropped from `1594` to `188`;
+  - pure prefill iterations dropped from `215` to `91`;
+  - decode phase throughput stayed flat: `288.4 tok/s` to `288.5 tok/s`;
+  - mixed phase throughput slightly regressed: `557.1 tok/s` to `536.2 tok/s`.
+- Decision:
+  - the source change is useful because it removes most of the repeated
+    capacity-blocked prefill scheduling and preserves correctness smoke;
+  - it is not a performance breakthrough and should not be treated as W3
+    progress toward the final throughput target beyond cleanup of scheduler
+    churn;
+  - the next high-return work should focus on the decode/mixed execution path
+    rather than further model-specific admission caps.
+- Limits:
+  - this is diagnostic only (`n_repeats=1`, c32 only);
+  - no final W3 validator was run;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` exists;
+  - this does not prove W3 performance or release readiness.
+
 ## 2026-06-25 ZZZ140 — keep capacity backpressure through decode progress; local source validation only
 
 - Source diagnosis from ZZZ139:
