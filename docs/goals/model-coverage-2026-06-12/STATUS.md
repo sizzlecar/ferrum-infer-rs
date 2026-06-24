@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ109 — Qwen35 paged full-attention context-lens write trim candidate
+
+- Scope:
+  - did not start GPU and did not rerun live vLLM;
+  - reused latest ZZZ108 c16 artifact plus the ZZZ106 bucket profile to choose
+    the next lever;
+  - kept the change capability/path based, with no model-name or VRAM-size
+    special case.
+- Evidence reviewed:
+  - ZZZ108 scheduler trace shows main c16 decode rows stayed at `254`
+    iterations and improved only from about `15878.9us` to `15407.5us` per
+    process step after linear scratch reuse;
+  - ZZZ106 profile remains diagnostic-only because layer-detail profiling
+    adds sync/log overhead, but it still points at linear-layer MLP/MoE and
+    full-attention decode overhead rather than logits readback or routed bucket
+    GEMM as the next likely levers;
+  - Qwen3.5 custom paged full-attention decode already writes the per-batch
+    `context_lens` scratch buffer consumed by paged attention kernels and
+    keeps host `kv.len` as the sequence length source of truth.
+- Source change:
+  - removed redundant per-sequence `kv.context_lens` device writes from the
+    Qwen3.5 custom paged full-attention batch prefill, batch decode, and
+    stateful paged paths;
+  - retained the actual batch scratch `context_lens` writes used by
+    `paged_varlen_attention*` / `paged_decode_attention*`;
+  - retained host `kv.len` updates and all block-table / position scratch
+    writes.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo check -p ferrum-models` PASS;
+  - `cargo test -p ferrum-models qwen35_paged_kv_prefers_canonical_key_with_legacy_fallback`
+    PASS;
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_legacy_no_policy_contract`
+    PASS;
+  - `cargo test -p ferrum-models dense_full_attention_backend_matches_reference_for_qwen35_gated_official_like_shape`
+    PASS;
+  - `cargo test -p ferrum-models full_attention_core_applies_qwen35_output_gate`
+    PASS.
+- Status:
+  - this is a source-level performance candidate only;
+  - no CUDA artifact has measured the effect yet, so there is no OOM-fixed,
+    release-ready, performance-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ108 — Qwen35 linear scratch c16 quick diagnostic on 1x4090
 
 - Scope:
