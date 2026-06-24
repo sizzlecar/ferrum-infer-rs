@@ -2,6 +2,52 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ85 — recurrent-state slot runtime key is model-generic
+
+- Scope:
+  - promoted the runtime/product slot-pool key from the Qwen3.5-specific
+    `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS` to the generic
+    `FERRUM_RECURRENT_STATE_MAX_SLOTS`;
+  - `EngineConfig.runtime`, `ferrum run`, `ferrum serve`, the engine builder,
+    and Qwen35 model runtime snapshot reads now use the generic key/field as
+    the primary path;
+  - the old Qwen35-specific key is retained as a deprecated compatibility
+    alias and fallback, with tests proving the generic key wins when both are
+    present;
+  - `docs/runtime-env-registry.tsv` now documents the generic key and marks
+    the old Qwen35 key as deprecated.
+- Why:
+  - the previous source change made the budget decision model-capability
+    driven, but the user-facing runtime key still encoded a Qwen35-only
+    abstraction;
+  - this moves the product control surface toward the actual resource being
+    controlled: non-KV recurrent-state slots.
+- Code:
+  - `crates/ferrum-types/src/auto_config.rs`;
+  - `crates/ferrum-types/src/config.rs`;
+  - `crates/ferrum-cli/src/config.rs`;
+  - `crates/ferrum-cli/src/commands/run.rs`;
+  - `crates/ferrum-cli/src/commands/serve.rs`;
+  - `crates/ferrum-engine/src/builder.rs`;
+  - `crates/ferrum-models/src/models/qwen35.rs`;
+  - `docs/runtime-env-registry.tsv`.
+- Validation:
+  - `cargo test -p ferrum-types recurrent_state -- --nocapture`;
+  - `cargo test -p ferrum-models qwen35_linear_state_max_slots_can_be_capped_independently_from_paged_seqs -- --nocapture`;
+  - `cargo test -p ferrum-engine test_builder_cuda_recurrent_state_manager_uses_recurrent_state_slot_cap -- --nocapture`;
+  - `cargo test -p ferrum-engine test_builder_cuda_recurrent_state_manager_accepts_legacy_qwen35_slot_cap -- --nocapture`;
+  - `cargo test -p ferrum-cli serve_runtime_snapshot_applies_recurrent_state_slots_to_engine_config -- --nocapture`;
+  - `cargo test -p ferrum-cli runtime_cli_config_emits_config_file_source_entries -- --nocapture`;
+  - `cargo test -p ferrum-cli run_effective_runtime_config_applies_recurrent_state_slots_to_engine_config -- --nocapture`;
+  - `cargo test -p ferrum-types qwen35_moe_gptq -- --nocapture`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`;
+  - `cargo check --workspace --all-targets`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ84 — recurrent-state slot cap moved to capability memory budget
 
 - Correction:

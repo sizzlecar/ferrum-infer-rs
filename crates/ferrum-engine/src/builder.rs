@@ -431,7 +431,8 @@ fn default_recurrent_state_manager(
 ) -> Option<Arc<dyn RecurrentStateManager + Send + Sync>> {
     let total_batch_slots = config
         .runtime
-        .qwen35_linear_state_max_slots
+        .recurrent_state_max_slots
+        .or(config.runtime.qwen35_linear_state_max_slots)
         .unwrap_or(usize::MAX);
     if component_config
         .get_option::<bool>("qwen35_reference")
@@ -651,7 +652,7 @@ mod tests {
     fn test_builder_qwen35_reference_uses_typed_recurrent_state_manager() {
         let mut config = EngineConfig::default();
         config.backend.device = Device::CPU;
-        config.runtime.qwen35_linear_state_max_slots = Some(4);
+        config.runtime.recurrent_state_max_slots = Some(4);
         config.backend.backend_options.insert(
             "qwen35_reference".to_string(),
             serde_json::Value::Bool(true),
@@ -685,10 +686,10 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_cuda_recurrent_state_manager_uses_qwen35_linear_slot_cap() {
+    fn test_builder_cuda_recurrent_state_manager_uses_recurrent_state_slot_cap() {
         let mut config = EngineConfig::default();
         config.backend.device = Device::CUDA(0);
-        config.runtime.qwen35_linear_state_max_slots = Some(2);
+        config.runtime.recurrent_state_max_slots = Some(2);
         let component_config = ComponentConfig::from_engine_config(&config);
         let manager = default_recurrent_state_manager(&config, &component_config)
             .expect("cuda product path should install admission recurrent-state manager");
@@ -714,6 +715,38 @@ mod tests {
         let stats = manager.stats();
         assert_eq!(stats.total_batch_slots, 2);
         assert_eq!(stats.used_batch_slots, 2);
+        assert_eq!(stats.allocation_failures, 1);
+    }
+
+    #[test]
+    fn test_builder_cuda_recurrent_state_manager_accepts_legacy_qwen35_slot_cap() {
+        let mut config = EngineConfig::default();
+        config.backend.device = Device::CUDA(0);
+        config.runtime.qwen35_linear_state_max_slots = Some(1);
+        let component_config = ComponentConfig::from_engine_config(&config);
+        let manager = default_recurrent_state_manager(&config, &component_config)
+            .expect("cuda product path should install admission recurrent-state manager");
+        let spec = |request_id| RecurrentStateSpec {
+            request_id,
+            num_layers: 1,
+            tensors: vec![RecurrentStateTensorSpec::new(
+                0,
+                "delta_state",
+                vec![1, 1, 1],
+            )],
+            dtype: DataType::FP32,
+            device: Device::CUDA(0),
+            max_batch_slots: 1,
+        };
+
+        tokio_test::block_on(manager.allocate(&spec(RequestId::new()))).unwrap();
+        let err = tokio_test::block_on(manager.allocate(&spec(RequestId::new())))
+            .expect_err("second recurrent allocation should exceed the one-slot legacy cap");
+
+        assert!(matches!(err, FerrumError::ResourceExhausted { .. }));
+        let stats = manager.stats();
+        assert_eq!(stats.total_batch_slots, 1);
+        assert_eq!(stats.used_batch_slots, 1);
         assert_eq!(stats.allocation_failures, 1);
     }
 
