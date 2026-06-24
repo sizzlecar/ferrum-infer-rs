@@ -2248,6 +2248,22 @@ mod tests {
         model
     }
 
+    fn synthetic_tight_recurrent_state_model() -> ModelCapabilities {
+        ModelCapabilities {
+            architecture: "synthetic_recurrent_state".to_string(),
+            quantization: None,
+            moe: None,
+            max_context_len: Some(262_144),
+            num_hidden_layers: Some(40),
+            head_dim: Some(256),
+            kv_heads: Some(8),
+            estimated_weight_bytes: Some(24_419_939_760),
+            recurrent_state_bytes_per_sequence: Some(65_863_680),
+            supported_dtypes: vec!["fp16".to_string()],
+            graph_safe_moe: false,
+        }
+    }
+
     fn qwen25_layer_split_runtime_entries(source: RuntimeConfigSource) -> RuntimeConfigSnapshot {
         snapshot_with_sources(&[
             ("FERRUM_REQUESTED_GPU_DEVICES", "0,1", source),
@@ -2494,7 +2510,7 @@ mod tests {
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
         let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
-            .with_model_capabilities(qwen35_moe_gptq_int4_model())
+            .with_model_capabilities(synthetic_tight_recurrent_state_model())
             .with_hardware_capabilities(hardware)
             .with_workload_profile(workload)
             .resolve()
@@ -2567,7 +2583,7 @@ mod tests {
             ("FERRUM_PAGED_MAX_SEQS", "32"),
             ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "32"),
         ]))
-        .with_model_capabilities(qwen35_moe_gptq_int4_model())
+        .with_model_capabilities(synthetic_tight_recurrent_state_model())
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
         .resolve()
@@ -2607,7 +2623,7 @@ mod tests {
             ("FERRUM_PAGED_MAX_SEQS", "32"),
             ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16"),
         ]))
-        .with_model_capabilities(qwen35_moe_gptq_int4_model())
+        .with_model_capabilities(synthetic_tight_recurrent_state_model())
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
         .resolve()
@@ -2639,7 +2655,7 @@ mod tests {
             ("FERRUM_PAGED_MAX_SEQS", "32"),
             ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16"),
         ]))
-        .with_model_capabilities(qwen35_moe_gptq_int4_model())
+        .with_model_capabilities(synthetic_tight_recurrent_state_model())
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
         .resolve()
@@ -2671,7 +2687,7 @@ mod tests {
             ("FERRUM_PAGED_MAX_SEQS", "16"),
             ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "0"),
         ]))
-        .with_model_capabilities(qwen35_moe_gptq_int4_model())
+        .with_model_capabilities(synthetic_tight_recurrent_state_model())
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
         .resolve()
@@ -2691,7 +2707,7 @@ mod tests {
         hardware.vram_bytes = Some(48 * GIB);
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
         let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
-            .with_model_capabilities(qwen35_moe_gptq_int4_model())
+            .with_model_capabilities(synthetic_tight_recurrent_state_model())
             .with_hardware_capabilities(hardware)
             .with_workload_profile(workload)
             .resolve()

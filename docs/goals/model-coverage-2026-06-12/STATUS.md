@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ92 — CLI recurrent-state autosize is budget-pressure driven
+
+- Scope:
+  - `crates/ferrum-cli/src/gpu_mem_autosize.rs` no longer selects the tight
+    recurrent-state memory profile from a config-only recurrent+GPTQ match;
+  - config parsing now only emits a structural hint:
+    `has_recurrent_linear_attention_state`;
+  - the tight profile is selected only when the measured weight/VRAM KV budget
+    cannot cover the generic aggregate-prefill floor, so larger-memory hardware
+    or future recurrent-state models are not forced into the same small profile
+    by model family or quantization name;
+  - `gpu_mem_autosize` tests now use synthetic recurrent-state configs and
+    explicit budget fixtures instead of Qwen3.5/GPTQ model names;
+  - recurrent-state budget tests in `crates/ferrum-types/src/auto_config.rs`
+    now use a synthetic capability model for slot-budget behavior; the Qwen35
+    helper remains only for Qwen35-specific attention backend selection.
+- Why:
+  - a rule like "Qwen3.5 GPTQ on small CUDA GPUs gets 16 slots" does not scale;
+    the durable rule is "model-declared recurrent-state bytes plus actual
+    hardware/weight budget determines the slot/profile limit".
+- Validation:
+  - `cargo test -p ferrum-cli gpu_mem_autosize -- --nocapture`;
+  - `cargo test -p ferrum-types recurrent_state_budget -- --nocapture`;
+  - `cargo check -p ferrum-cli -p ferrum-types`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ91 — W3 L2 commands must match the release/source model
 
 - Scope:
