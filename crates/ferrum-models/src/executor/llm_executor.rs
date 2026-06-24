@@ -31,6 +31,8 @@ use crate::lora::ActiveLoraAdapter;
 
 use super::common::{self, GenericKvCacheHandle};
 
+const KV_ADMISSION_TARGET_LEN_METADATA_KEY: &str = "ferrum_kv_admission_target_len";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LlmExecutorRuntimeEnv {
     batch_prefill_prof: bool,
@@ -116,6 +118,16 @@ fn metadata_kv_capacity_hint(
         .get("ferrum_kv_capacity_hint")
         .and_then(|value| value.as_u64())
         .map(|value| value as usize)
+}
+
+fn metadata_kv_admission_target_len(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<usize> {
+    metadata
+        .get(KV_ADMISSION_TARGET_LEN_METADATA_KEY)
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .filter(|&value| value > 0)
 }
 
 fn unified_fallback_reason_code(message: &str) -> &'static str {
@@ -330,6 +342,8 @@ impl ModelExecutor for LlmExecutor {
             model.reserve_kv_slots(&[KvSlotRequest {
                 cache_id: cache_id.clone(),
                 target_len: prior_seq_len + tokens.len(),
+                admission_target_len: metadata_kv_admission_target_len(&input.metadata)
+                    .map(|len| len.max(prior_seq_len + tokens.len())),
             }])?;
             if force_full_logits {
                 model.prefill(&cache_id, &tokens)
@@ -463,9 +477,15 @@ impl ModelExecutor for LlmExecutor {
                 .iter()
                 .zip(prior_seq_lens.iter())
                 .zip(tokens_per_input.iter())
-                .map(|((cache_id, prior_seq_len), tokens)| KvSlotRequest {
-                    cache_id: cache_id.clone(),
-                    target_len: prior_seq_len.saturating_add(tokens.len()),
+                .zip(inputs.iter())
+                .map(|(((cache_id, prior_seq_len), tokens), input)| {
+                    let target_len = prior_seq_len.saturating_add(tokens.len());
+                    KvSlotRequest {
+                        cache_id: cache_id.clone(),
+                        target_len,
+                        admission_target_len: metadata_kv_admission_target_len(&input.metadata)
+                            .map(|len| len.max(target_len)),
+                    }
                 })
                 .collect();
             model.reserve_kv_slots(&kv_requests)?;
@@ -665,6 +685,8 @@ impl ModelExecutor for LlmExecutor {
             model.reserve_kv_slots(&[KvSlotRequest {
                 cache_id: cache_id.clone(),
                 target_len: seq_len.saturating_add(1),
+                admission_target_len: metadata_kv_admission_target_len(&input.metadata)
+                    .map(|len| len.max(seq_len.saturating_add(1))),
             }])?;
             if force_full_logits || input.logits_policy.requires_full_logits() {
                 model.decode(&cache_id, token, seq_len as u32)
@@ -768,6 +790,7 @@ impl ModelExecutor for LlmExecutor {
                 .map(|p| KvSlotRequest {
                     cache_id: p.cache_id.clone(),
                     target_len: (p.seq_len as usize).saturating_add(1),
+                    admission_target_len: None,
                 })
                 .collect();
             model.reserve_kv_slots(&kv_requests)?;
@@ -935,6 +958,9 @@ impl ModelExecutor for LlmExecutor {
                     .map(|item| KvSlotRequest {
                         cache_id: item.seq_id.clone(),
                         target_len: item.pos_offset.saturating_add(item.q_tokens.len()),
+                        admission_target_len: metadata_kv_admission_target_len(&item.metadata).map(
+                            |len| len.max(item.pos_offset.saturating_add(item.q_tokens.len())),
+                        ),
                     })
                     .collect();
                 model.reserve_kv_slots(&kv_requests)?;

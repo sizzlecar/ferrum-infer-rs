@@ -15,7 +15,10 @@ use std::time::Instant;
 
 use ferrum_interfaces::{
     kv_dtype::KvFp16,
-    model_executor::{GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask},
+    model_executor::{
+        GreedyRepetitionPenalty, KvSlotAllocation, KvSlotRequest, KvSlotReservation,
+        LogitsReturnPolicy, TokenSelectionMask,
+    },
     RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
     RecurrentStateManagerStats, RecurrentStateSpec,
 };
@@ -1572,6 +1575,150 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             }
         }
         Ok(())
+    }
+
+    fn reserve_paged_kv_slots(
+        &mut self,
+        requests: &[KvSlotRequest],
+    ) -> Result<Option<KvSlotReservation>> {
+        if requests.is_empty() || !self.use_paged_kv {
+            return Ok(None);
+        }
+        let has_full_attention = self
+            .weights
+            .config
+            .layer_plan()
+            .map_err(FerrumError::model)?
+            .iter()
+            .any(|layer| layer.attention == Qwen35LayerType::FullAttention);
+        if !has_full_attention {
+            return Ok(None);
+        }
+        self.ensure_paged_pools();
+
+        let mut targets: Vec<(String, usize, usize)> = Vec::new();
+        for request in requests {
+            let admission_target_len = request
+                .admission_target_len
+                .unwrap_or(request.target_len)
+                .max(request.target_len);
+            if let Some((_, target, admission_target)) = targets
+                .iter_mut()
+                .find(|(cache_id, _, _)| cache_id == &request.cache_id)
+            {
+                *target = (*target).max(request.target_len);
+                *admission_target = (*admission_target).max(admission_target_len);
+            } else {
+                targets.push((
+                    request.cache_id.clone(),
+                    request.target_len,
+                    admission_target_len,
+                ));
+            }
+        }
+
+        let mut plans = Vec::with_capacity(targets.len());
+        let mut total_new_blocks = 0usize;
+        let mut total_admission_new_blocks = 0usize;
+        for (cache_id, target_len, admission_target_len) in &targets {
+            if *target_len > self.kv_capacity {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 paged KV reservation: target_len={target_len} exceeds KV capacity {} for cache_id={cache_id:?}",
+                    self.kv_capacity
+                )));
+            }
+            if *admission_target_len > self.kv_capacity {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 paged KV admission: admission_target_len={admission_target_len} exceeds KV capacity {} for cache_id={cache_id:?}",
+                    self.kv_capacity
+                )));
+            }
+
+            let blocks_before = self
+                .sequences
+                .get(cache_id)
+                .and_then(qwen35_first_full_kv)
+                .map(|kv| kv.paged_block_indices.len())
+                .unwrap_or(0);
+            let blocks_after = target_len.div_ceil(QWEN35_PAGED_BLOCK_SIZE);
+            let admission_blocks_after = admission_target_len.div_ceil(QWEN35_PAGED_BLOCK_SIZE);
+            if blocks_after > self.paged_max_blocks_per_seq {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 paged KV reservation: target_len={target_len} needs {blocks_after} blocks, exceeds per-seq table capacity {} for cache_id={cache_id:?}",
+                    self.paged_max_blocks_per_seq
+                )));
+            }
+            if admission_blocks_after > self.paged_max_blocks_per_seq {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 paged KV admission: admission_target_len={admission_target_len} needs {admission_blocks_after} blocks, exceeds per-seq table capacity {} for cache_id={cache_id:?}",
+                    self.paged_max_blocks_per_seq
+                )));
+            }
+            let new_blocks = blocks_after.saturating_sub(blocks_before);
+            total_new_blocks += new_blocks;
+            total_admission_new_blocks += admission_blocks_after.saturating_sub(blocks_before);
+            plans.push(KvSlotAllocation {
+                cache_id: cache_id.clone(),
+                blocks_before,
+                blocks_after,
+                new_blocks,
+            });
+        }
+
+        let alloc = self.paged_block_alloc.as_ref().ok_or_else(|| {
+            FerrumError::model(
+                "Qwen3.5 paged KV reservation missing block allocator while paged pools are set",
+            )
+        })?;
+        let free_blocks_before = {
+            let alloc = alloc.lock().unwrap_or_else(|p| p.into_inner());
+            alloc.free_count()
+        };
+        if total_admission_new_blocks > free_blocks_before {
+            return Err(FerrumError::resource_exhausted(format!(
+                "Qwen3.5 paged KV admission: need {total_admission_new_blocks} admission blocks ({total_new_blocks} immediate) but only {free_blocks_before} free"
+            )));
+        }
+
+        let mut ctx = B::new_context();
+        for (plan, (_, target_len, _)) in plans.iter().zip(targets.iter()) {
+            if plan.new_blocks == 0 {
+                continue;
+            }
+            self.ensure_sequence_state(&plan.cache_id)?;
+            let mut state = self.sequences.remove(&plan.cache_id).ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Qwen3.5 paged KV reservation missing sequence state for {:?}",
+                    plan.cache_id
+                ))
+            })?;
+            let result = self.ensure_paged_kv_capacity_for_state(
+                &mut ctx,
+                &plan.cache_id,
+                &mut state,
+                *target_len,
+            );
+            self.sequences.insert(plan.cache_id.clone(), state);
+            result?;
+        }
+        B::sync(&mut ctx);
+
+        let alloc = self.paged_block_alloc.as_ref().ok_or_else(|| {
+            FerrumError::model(
+                "Qwen3.5 paged KV reservation lost block allocator while paged pools are set",
+            )
+        })?;
+        let (total_blocks, free_blocks_after) = {
+            let alloc = alloc.lock().unwrap_or_else(|p| p.into_inner());
+            (alloc.capacity() as usize, alloc.free_count())
+        };
+        Ok(Some(KvSlotReservation {
+            block_size: QWEN35_PAGED_BLOCK_SIZE,
+            total_blocks,
+            free_blocks_before,
+            free_blocks_after,
+            allocations: plans,
+        }))
     }
 
     fn release_sequence_state_blocks(&mut self, state: &mut Qwen35SequenceState<B>) {
@@ -4148,6 +4295,13 @@ impl<B: MoeLlmBackend + BackendPagedKv> DecoderOnlyLLM for Qwen35BackendModel<B>
 
     fn kv_capacity(&self) -> usize {
         self.kv_capacity
+    }
+
+    fn reserve_kv_slots(
+        &mut self,
+        requests: &[KvSlotRequest],
+    ) -> std::result::Result<Option<KvSlotReservation>, FerrumError> {
+        self.reserve_paged_kv_slots(requests)
     }
 
     fn recurrent_state_spec(

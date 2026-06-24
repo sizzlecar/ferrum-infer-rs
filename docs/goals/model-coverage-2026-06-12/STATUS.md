@@ -2,6 +2,43 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ138 — add vLLM-style KV admission target; local source validation only
+
+- Source change:
+  - added `KvSlotRequest.admission_target_len` as a separate admission-only
+    known-context bound;
+  - `SequenceState::model_decode_metadata()` now emits
+    `ferrum_kv_admission_target_len` equal to the current prefill context
+    length, separate from `ferrum_kv_capacity_hint`;
+  - engine and `LlmExecutor` pass this admission target into paged KV reserve
+    requests;
+  - Llama-family and Qwen3-MoE paged KV reserve now check admission blocks
+    before allocation, but still allocate only the immediate `target_len`;
+  - Qwen3.5 backend now implements `reserve_kv_slots()` over its existing paged
+    KV grow path, so W3 can receive model-side paged KV admission failures
+    instead of relying only on later forward-time growth.
+- Why:
+  - local vLLM source comparison showed `allocate_slots(...,
+    full_sequence_must_fit=True)` uses a full known-context admission fit gate
+    for chunked prefill;
+  - Ferrum had dynamic paged KV growth, but the admission signal was late and
+    W3/Qwen3.5 lacked the `reserve_kv_slots()` hook, causing promote/defer
+    churn rather than scheduler-visible capacity gating.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models paged_kv_reservation_admission_hint -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models paged_kv_reservation_allocates_before_forward_and_fails_atomically -- --nocapture`
+    PASS;
+  - `cargo check -p ferrum-interfaces -p ferrum-engine -p ferrum-models` PASS;
+  - `cargo test -p ferrum-engine model_decode_metadata -- --nocapture` PASS.
+- Limits:
+  - no paid GPU was started for this source edit;
+  - no CUDA c32 diagnostic exists yet for this candidate;
+  - no live vLLM was run;
+  - no W3 PASS line exists;
+  - this does not prove W3 performance or release readiness.
+
 ## 2026-06-25 ZZZ137 — 38230397 c32 diagnostic regressed throughput; source change reverted
 
 - Artifact:

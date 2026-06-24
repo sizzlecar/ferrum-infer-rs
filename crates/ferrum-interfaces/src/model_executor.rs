@@ -17,10 +17,14 @@ use std::{
 ///
 /// `cache_id` is the executor/model cache key attached to a sequence. `target_len`
 /// is the sequence length that must be writable before the next forward runs.
+/// `admission_target_len`, when present, is a larger known-context bound used
+/// only for admission fit checks. Paged models must not allocate future blocks
+/// for it; it mirrors vLLM's chunked-prefill full-context fit gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvSlotRequest {
     pub cache_id: String,
     pub target_len: usize,
+    pub admission_target_len: Option<usize>,
 }
 
 /// Per-cache outcome from a KV slot reservation attempt.

@@ -17,11 +17,26 @@ pub(super) fn kv_slot_requests_for_unified_batch(
     batch
         .items
         .iter()
-        .map(|item| KvSlotRequest {
-            cache_id: item.seq_id.clone(),
-            target_len: item.pos_offset.saturating_add(item.q_tokens.len()),
+        .map(|item| {
+            let target_len = item.pos_offset.saturating_add(item.q_tokens.len());
+            KvSlotRequest {
+                cache_id: item.seq_id.clone(),
+                target_len,
+                admission_target_len: metadata_kv_admission_target_len(&item.metadata)
+                    .map(|len| len.max(target_len)),
+            }
         })
         .collect()
+}
+
+pub(super) fn metadata_kv_admission_target_len(
+    metadata: &HashMap<String, serde_json::Value>,
+) -> Option<usize> {
+    metadata
+        .get(KV_ADMISSION_TARGET_LEN_METADATA_KEY)
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .filter(|&value| value > 0)
 }
 
 #[derive(Debug, Default, serde::Serialize)]
