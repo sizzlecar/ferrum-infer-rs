@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ114 — Qwen35 paged full-attention U32 scratch writes are cached
+
+- Scope:
+  - continued from ZZZ113 without starting GPU and without running live vLLM;
+  - inspected the current W3 goal, handoff, current evidence config, and the
+    latest c16 quick/profile artifacts;
+  - kept the change based on paged-attention scratch data invariants, not on
+    model name, GPU VRAM, or a hard-coded concurrency cap.
+- Finding:
+  - ZZZ113 showed that removing the paged attention context copy was
+    flat/slightly negative, so continuing allocation/copy micro-tweaks is low
+    confidence;
+  - scheduler traces still show scheduling overhead is tiny compared with
+    Qwen35 decode `process` time;
+  - the paged full-attention paths still rewrote identical small U32 scratch
+    tables (`cu_seqlens_q`, token row indices, position offsets, block
+    tables, and context lengths) for repeated full-attention layers when the
+    host data had not changed;
+  - in a decode step, the full-attention layers consume the same sequence
+    positions and block mappings before each layer updates its own KV length,
+    so redundant writes can be skipped when the data slice is byte-for-byte
+    unchanged.
+- Source change:
+  - added host-side U32 caches to `Qwen35PagedScratch`;
+  - `ensure()` clears the relevant cache when a scratch buffer is reallocated;
+  - paged full-attention batch prefill, batched decode, and stateful paths now
+    call cached write helpers before passing the same device buffers to the
+    kernels;
+  - added a unit test covering the cache update semantics for unchanged,
+    length-changed, and content-changed U32 slices.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-models` PASS;
+  - `cargo test -p ferrum-models qwen35_paged -- --nocapture` PASS, including
+    `qwen35_paged_scratch_u32_cache_writes_only_on_content_change`;
+  - `cargo test -p ferrum-models dense_full_attention_backend_matches_reference_for_qwen35_gated_official_like_shape -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models full_attention_core_applies_qwen35_output_gate -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture`
+    PASS;
+  - `git diff --check` PASS.
+- Status:
+  - source-level candidate only; no CUDA throughput artifact has measured it
+    yet;
+  - no OOM-fixed, release-ready, performance-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ113 — Qwen35 paged context scratch c16 quick diagnostic is flat
 
 - Scope:
