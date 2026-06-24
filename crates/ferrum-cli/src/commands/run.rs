@@ -1814,15 +1814,16 @@ fn run_startup_auto_config(
     model_weight_bytes: Option<u64>,
     runtime_config: RuntimeConfigSnapshot,
 ) -> Result<ResolvedFerrumConfig> {
+    let hardware = crate::commands::serve::hardware_capabilities_for_device(device);
     let model = model_definition
         .map(|definition| {
-            crate::commands::serve::model_capabilities_from_definition_with_weight_bytes(
+            crate::commands::serve::model_capabilities_from_definition_with_weight_bytes_for_hardware(
                 definition,
                 model_weight_bytes,
+                &hardware,
             )
         })
         .unwrap_or_else(ModelCapabilities::unknown);
-    let hardware = crate::commands::serve::hardware_capabilities_for_device(device);
     let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
     FerrumConfigBuilder::new(runtime_config)
         .with_model_capabilities(model)

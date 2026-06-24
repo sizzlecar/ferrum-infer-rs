@@ -11,6 +11,18 @@ static __device__ __forceinline__ float ferrum_gdr_load_value(const __half* ptr,
   return __half2float(ptr[idx]);
 }
 
+static __device__ __forceinline__ void ferrum_gdr_store_value(float* ptr,
+                                                              int idx,
+                                                              float value) {
+  ptr[idx] = value;
+}
+
+static __device__ __forceinline__ void ferrum_gdr_store_value(__half* ptr,
+                                                              int idx,
+                                                              float value) {
+  ptr[idx] = __float2half(value);
+}
+
 static __device__ __forceinline__ float ferrum_gdr_sigmoid(float x) {
   if (x >= 0.0f) {
     const float z = expf(-x);
@@ -266,14 +278,14 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_f32(
   }
 }
 
-template <int BV_TILE>
+template <typename StateT, int BV_TILE>
 static __device__ void recurrent_gated_delta_rule_batch_indexed_tiled_f32_impl(
     const float* __restrict__ query,
     const float* __restrict__ key,
     const float* __restrict__ value,
     const float* __restrict__ g,
     const float* __restrict__ beta,
-    float* __restrict__ state_slots,
+    StateT* __restrict__ state_slots,
     const unsigned int* __restrict__ slot_indices,
     float* __restrict__ out,
     const int batch,
@@ -319,8 +331,8 @@ static __device__ void recurrent_gated_delta_rule_batch_indexed_tiled_f32_impl(
     const int state_idx =
         row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
     const int qk_idx = ((row * key_heads + key_head) * key_dim) + kd;
-    const float state = state_slots[state_idx] * decay;
-    state_slots[state_idx] = state;
+    const float state = ferrum_gdr_load_value(state_slots, state_idx) * decay;
+    ferrum_gdr_store_value(state_slots, state_idx, state);
     local[local_v] += state * key[qk_idx];
   }
 
@@ -369,8 +381,9 @@ static __device__ void recurrent_gated_delta_rule_batch_indexed_tiled_f32_impl(
     const int state_idx =
         row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
     const int qk_idx = ((row * key_heads + key_head) * key_dim) + kd;
-    const float updated = state_slots[state_idx] + delta[local_v] * key[qk_idx];
-    state_slots[state_idx] = updated;
+    const float updated =
+        ferrum_gdr_load_value(state_slots, state_idx) + delta[local_v] * key[qk_idx];
+    ferrum_gdr_store_value(state_slots, state_idx, updated);
     local[local_v] += updated * (query[qk_idx] * scale);
   }
 
@@ -419,18 +432,39 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_tiled16_f32(
     const int key_dim,
     const int value_dim,
     const float scale) {
-  recurrent_gated_delta_rule_batch_indexed_tiled_f32_impl<16>(
+  recurrent_gated_delta_rule_batch_indexed_tiled_f32_impl<float, 16>(
       query, key, value, g, beta, state_slots, slot_indices, out, batch,
       max_slots, key_heads, value_heads, key_dim, value_dim, scale);
 }
 
-template <typename GateT, typename ParamT, int BV_TILE>
+extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_tiled16_state_f16(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    __half* __restrict__ state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ out,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_batch_indexed_tiled_f32_impl<__half, 16>(
+      query, key, value, g, beta, state_slots, slot_indices, out, batch,
+      max_slots, key_heads, value_heads, key_dim, value_dim, scale);
+}
+
+template <typename GateT, typename ParamT, typename StateT, int BV_TILE>
 static __device__ void recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl(
     const float* __restrict__ mixed_qkv,
     const GateT* __restrict__ ba_raw,
     const ParamT* __restrict__ a_log,
     const ParamT* __restrict__ dt_bias,
-    float* __restrict__ state_slots,
+    StateT* __restrict__ state_slots,
     const unsigned int* __restrict__ slot_indices,
     float* __restrict__ out,
     const int batch,
@@ -522,8 +556,8 @@ static __device__ void recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32
         row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
     const int k_idx = row_mixed_base + qk_total + key_head * key_dim + kd;
     const float k = mixed_qkv[k_idx] * k_inv;
-    const float state = state_slots[state_idx] * decay;
-    state_slots[state_idx] = state;
+    const float state = ferrum_gdr_load_value(state_slots, state_idx) * decay;
+    ferrum_gdr_store_value(state_slots, state_idx, state);
     local[local_v] += state * k;
   }
 
@@ -575,8 +609,8 @@ static __device__ void recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32
     const int k_idx = row_mixed_base + qk_total + key_head * key_dim + kd;
     const float k = mixed_qkv[k_idx] * k_inv;
     const float q = mixed_qkv[q_idx] * q_inv * scale;
-    const float updated = state_slots[state_idx] + delta[local_v] * k;
-    state_slots[state_idx] = updated;
+    const float updated = ferrum_gdr_load_value(state_slots, state_idx) + delta[local_v] * k;
+    ferrum_gdr_store_value(state_slots, state_idx, updated);
     local[local_v] += updated * q;
   }
 
@@ -624,7 +658,7 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_b
     const int key_dim,
     const int value_dim,
     const float scale) {
-  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<float, float, 16>(
+  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<float, float, float, 16>(
       mixed_qkv, ba_raw, a_log, dt_bias, state_slots, slot_indices, out, batch,
       max_slots, key_heads, value_heads, key_dim, value_dim, scale);
 }
@@ -644,7 +678,7 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_b
     const int key_dim,
     const int value_dim,
     const float scale) {
-  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<__half, __half, 16>(
+  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<__half, __half, float, 16>(
       mixed_qkv, ba_raw, a_log, dt_bias, state_slots, slot_indices, out, batch,
       max_slots, key_heads, value_heads, key_dim, value_dim, scale);
 }
@@ -664,7 +698,67 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_b
     const int key_dim,
     const int value_dim,
     const float scale) {
-  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<__half, float, 16>(
+  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<__half, float, float, 16>(
+      mixed_qkv, ba_raw, a_log, dt_bias, state_slots, slot_indices, out, batch,
+      max_slots, key_heads, value_heads, key_dim, value_dim, scale);
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f32_params_f32_state_f16(
+    const float* __restrict__ mixed_qkv,
+    const float* __restrict__ ba_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    __half* __restrict__ state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ out,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<float, float, __half, 16>(
+      mixed_qkv, ba_raw, a_log, dt_bias, state_slots, slot_indices, out, batch,
+      max_slots, key_heads, value_heads, key_dim, value_dim, scale);
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f16_params_f16_state_f16(
+    const float* __restrict__ mixed_qkv,
+    const __half* __restrict__ ba_raw,
+    const __half* __restrict__ a_log,
+    const __half* __restrict__ dt_bias,
+    __half* __restrict__ state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ out,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<__half, __half, __half, 16>(
+      mixed_qkv, ba_raw, a_log, dt_bias, state_slots, slot_indices, out, batch,
+      max_slots, key_heads, value_heads, key_dim, value_dim, scale);
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f16_params_f32_state_f16(
+    const float* __restrict__ mixed_qkv,
+    const __half* __restrict__ ba_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    __half* __restrict__ state_slots,
+    const unsigned int* __restrict__ slot_indices,
+    float* __restrict__ out,
+    const int batch,
+    const int max_slots,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_batch_indexed_packed_tiled_f32_impl<__half, float, __half, 16>(
       mixed_qkv, ba_raw, a_log, dt_bias, state_slots, slot_indices, out, batch,
       max_slots, key_heads, value_heads, key_dim, value_dim, scale);
 }

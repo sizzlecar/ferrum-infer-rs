@@ -17,12 +17,20 @@ const BATCH_FUNC_NAME: &str = "recurrent_gated_delta_rule_batch_f32";
 const BATCH_INDEXED_FUNC_NAME: &str = "recurrent_gated_delta_rule_batch_indexed_f32";
 const BATCH_INDEXED_TILED16_FUNC_NAME: &str =
     "recurrent_gated_delta_rule_batch_indexed_tiled16_f32";
+const BATCH_INDEXED_TILED16_STATE_F16_FUNC_NAME: &str =
+    "recurrent_gated_delta_rule_batch_indexed_tiled16_state_f16";
 const BATCH_INDEXED_PACKED_BA_F32_PARAMS_F32_FUNC_NAME: &str =
     "recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f32_params_f32";
 const BATCH_INDEXED_PACKED_BA_F16_PARAMS_F16_FUNC_NAME: &str =
     "recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f16_params_f16";
 const BATCH_INDEXED_PACKED_BA_F16_PARAMS_F32_FUNC_NAME: &str =
     "recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f16_params_f32";
+const BATCH_INDEXED_PACKED_BA_F32_PARAMS_F32_STATE_F16_FUNC_NAME: &str =
+    "recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f32_params_f32_state_f16";
+const BATCH_INDEXED_PACKED_BA_F16_PARAMS_F16_STATE_F16_FUNC_NAME: &str =
+    "recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f16_params_f16_state_f16";
+const BATCH_INDEXED_PACKED_BA_F16_PARAMS_F32_STATE_F16_FUNC_NAME: &str =
+    "recurrent_gated_delta_rule_batch_indexed_packed_f32_ba_f16_params_f32_state_f16";
 const VARLEN_FUNC_NAME: &str = "recurrent_gated_delta_rule_varlen_f32";
 const VARLEN_TILED16_FUNC_NAME: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32";
 
@@ -208,10 +216,22 @@ pub fn recurrent_gated_delta_rule_batch_indexed_f32(
     )?;
 
     let use_tiled = !use_qk_l2norm && key_dim == 128 && value_dim == 128;
-    let func_name = if use_tiled {
-        BATCH_INDEXED_TILED16_FUNC_NAME
-    } else {
-        BATCH_INDEXED_FUNC_NAME
+    let state_dtype = state_slots.dtype();
+    let func_name = match (state_dtype, use_tiled) {
+        (Dtype::F32, true) => BATCH_INDEXED_TILED16_FUNC_NAME,
+        (Dtype::F32, false) => BATCH_INDEXED_FUNC_NAME,
+        (Dtype::F16, true) => BATCH_INDEXED_TILED16_STATE_F16_FUNC_NAME,
+        (Dtype::F16, false) => {
+            return Err(FerrumError::model(format!(
+                "gated_delta_rule_batch_indexed f16 state slots require tiled official shape; got key_dim={key_dim} value_dim={value_dim} use_qk_l2norm={use_qk_l2norm}"
+            )));
+        }
+        (other, _) => {
+            return Err(FerrumError::model(format!(
+                "gated_delta_rule_batch_indexed state_slots dtype {} is unsupported",
+                other.name()
+            )));
+        }
     };
     let func = ctx.func(MODULE_NAME, ptx::GATED_DELTA_RULE, func_name);
     let block = if use_tiled {
@@ -233,7 +253,11 @@ pub fn recurrent_gated_delta_rule_batch_indexed_f32(
     builder.arg(value.as_f32());
     builder.arg(g.as_f32());
     builder.arg(beta.as_f32());
-    builder.arg(state_slots.as_f32_mut());
+    match state_dtype {
+        Dtype::F32 => builder.arg(state_slots.as_f32_mut()),
+        Dtype::F16 => builder.arg(state_slots.as_f16_mut()),
+        _ => unreachable!("state dtype checked above"),
+    };
     builder.arg(slot_indices.as_u32());
     builder.arg(out.as_f32_mut());
     builder.arg(&batch_i32);
@@ -306,21 +330,40 @@ pub fn recurrent_gated_delta_rule_batch_indexed_packed_f32(
     )?;
     let op = "gated_delta_rule_batch_indexed_packed";
     require_dtype(op, "mixed_qkv", mixed_qkv.dtype(), Dtype::F32)?;
-    require_dtype(op, "state_slots", state_slots.dtype(), Dtype::F32)?;
+    let state_dtype = state_slots.dtype();
+    match state_dtype {
+        Dtype::F32 | Dtype::F16 => {}
+        _ => {
+            return Err(FerrumError::model(format!(
+                "{op} state_slots dtype {} is unsupported",
+                state_dtype.name()
+            )));
+        }
+    }
     require_dtype(op, "out", out.dtype(), Dtype::F32)?;
     require_dtype(op, "slot_indices", slot_indices.dtype(), Dtype::U32)?;
     let ba_dtype = ba_raw.dtype();
     let param_dtype = a_log.dtype();
     require_dtype(op, "dt_bias", dt_bias.dtype(), param_dtype)?;
-    let func_name = match (ba_dtype, param_dtype) {
-        (Dtype::F32, Dtype::F32) => BATCH_INDEXED_PACKED_BA_F32_PARAMS_F32_FUNC_NAME,
-        (Dtype::F16, Dtype::F16) => BATCH_INDEXED_PACKED_BA_F16_PARAMS_F16_FUNC_NAME,
-        (Dtype::F16, Dtype::F32) => BATCH_INDEXED_PACKED_BA_F16_PARAMS_F32_FUNC_NAME,
+    let func_name = match (ba_dtype, param_dtype, state_dtype) {
+        (Dtype::F32, Dtype::F32, Dtype::F32) => BATCH_INDEXED_PACKED_BA_F32_PARAMS_F32_FUNC_NAME,
+        (Dtype::F16, Dtype::F16, Dtype::F32) => BATCH_INDEXED_PACKED_BA_F16_PARAMS_F16_FUNC_NAME,
+        (Dtype::F16, Dtype::F32, Dtype::F32) => BATCH_INDEXED_PACKED_BA_F16_PARAMS_F32_FUNC_NAME,
+        (Dtype::F32, Dtype::F32, Dtype::F16) => {
+            BATCH_INDEXED_PACKED_BA_F32_PARAMS_F32_STATE_F16_FUNC_NAME
+        }
+        (Dtype::F16, Dtype::F16, Dtype::F16) => {
+            BATCH_INDEXED_PACKED_BA_F16_PARAMS_F16_STATE_F16_FUNC_NAME
+        }
+        (Dtype::F16, Dtype::F32, Dtype::F16) => {
+            BATCH_INDEXED_PACKED_BA_F16_PARAMS_F32_STATE_F16_FUNC_NAME
+        }
         _ => {
             return Err(FerrumError::model(format!(
-                "{op} unsupported ba/param dtype combination: ba={} params={}",
+                "{op} unsupported ba/param/state dtype combination: ba={} params={} state={}",
                 ba_dtype.name(),
-                param_dtype.name()
+                param_dtype.name(),
+                state_dtype.name()
             )));
         }
     };
@@ -351,7 +394,11 @@ pub fn recurrent_gated_delta_rule_batch_indexed_packed_f32(
         }
         _ => unreachable!("dtype checked above"),
     };
-    builder.arg(state_slots.as_f32_mut());
+    match state_dtype {
+        Dtype::F32 => builder.arg(state_slots.as_f32_mut()),
+        Dtype::F16 => builder.arg(state_slots.as_f16_mut()),
+        _ => unreachable!("state dtype checked above"),
+    };
     builder.arg(slot_indices.as_u32());
     builder.arg(out.as_f32_mut());
     builder.arg(&batch_i32);
@@ -653,10 +700,15 @@ fn validate_batch_indexed_shape(
         ("value", value),
         ("g", g),
         ("beta", beta),
-        ("state_slots", state_slots),
         ("out", out),
     ] {
         validate_dtype(label, buf)?;
+    }
+    if !matches!(state_slots.dtype(), Dtype::F32 | Dtype::F16) {
+        return Err(FerrumError::model(format!(
+            "gated_delta_rule_batch_indexed state_slots dtype {} is unsupported",
+            state_slots.dtype().name()
+        )));
     }
     if slot_indices.dtype() != crate::backend::Dtype::U32 {
         return Err(FerrumError::model(format!(

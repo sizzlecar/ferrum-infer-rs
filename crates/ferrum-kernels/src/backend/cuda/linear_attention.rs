@@ -28,20 +28,36 @@ const DECODE_PREPARE_BATCH_F16_TO_F32_FUNC: &str =
 const DECODE_PREPARE_BATCH_F16_PARAMS_F32_FUNC: &str =
     "linear_attention_decode_prepare_batch_f16_params_f32";
 const DECODE_PREPARE_BATCH_INDEXED_FUNC: &str = "linear_attention_decode_prepare_batch_indexed_f32";
+const DECODE_PREPARE_BATCH_INDEXED_STATE_F16_FUNC: &str =
+    "linear_attention_decode_prepare_batch_indexed_f32_state_f16";
 const DECODE_PREPARE_BATCH_INDEXED_F16_TO_F32_FUNC: &str =
     "linear_attention_decode_prepare_batch_indexed_f16_to_f32";
+const DECODE_PREPARE_BATCH_INDEXED_F16_TO_F32_STATE_F16_FUNC: &str =
+    "linear_attention_decode_prepare_batch_indexed_f16_to_f32_state_f16";
 const DECODE_PREPARE_BATCH_INDEXED_F16_PARAMS_F32_FUNC: &str =
     "linear_attention_decode_prepare_batch_indexed_f16_params_f32";
+const DECODE_PREPARE_BATCH_INDEXED_F16_PARAMS_F32_STATE_F16_FUNC: &str =
+    "linear_attention_decode_prepare_batch_indexed_f16_params_f32_state_f16";
 const DECODE_PREPARE_BATCH_INDEXED_PACKED_FUNC: &str =
     "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32";
+const DECODE_PREPARE_BATCH_INDEXED_PACKED_STATE_F16_FUNC: &str =
+    "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32_state_f16";
 const DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_TO_F32_FUNC: &str =
     "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f16_to_f32";
+const DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_TO_F32_STATE_F16_FUNC: &str =
+    "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f16_to_f32_state_f16";
 const DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_PARAMS_F32_FUNC: &str =
     "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f16_params_f32";
+const DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_PARAMS_F32_STATE_F16_FUNC: &str =
+    "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f16_params_f32_state_f16";
 const DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_FUNC: &str =
     "linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32";
+const DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_STATE_F16_FUNC: &str =
+    "linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32_state_f16";
 const DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_F16_TO_F32_FUNC: &str =
     "linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f16_to_f32";
+const DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_F16_TO_F32_STATE_F16_FUNC: &str =
+    "linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f16_to_f32_state_f16";
 const QK_L2NORM_FUNC: &str = "linear_attention_qk_l2norm_f32";
 const GATED_RMS_NORM_FUNC: &str = "gated_rms_norm_f32";
 const GATED_RMS_NORM_F16_TO_F32_FUNC: &str = "gated_rms_norm_f16_to_f32";
@@ -974,10 +990,18 @@ pub fn linear_attention_decode_prepare_batch_indexed_f32(
     let conv_channels = 2 * qk_total + value_total;
     let row_total = conv_channels.max(value_heads);
     let total = batch * row_total;
-    let func_name = match (input_dtype, param_dtype) {
-        (Dtype::F32, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_FUNC,
-        (Dtype::F16, Dtype::F16) => DECODE_PREPARE_BATCH_INDEXED_F16_TO_F32_FUNC,
-        (Dtype::F16, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_F16_PARAMS_F32_FUNC,
+    let state_dtype = conv_state_slots.dtype();
+    let func_name = match (input_dtype, param_dtype, state_dtype) {
+        (Dtype::F32, Dtype::F32, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_FUNC,
+        (Dtype::F32, Dtype::F32, Dtype::F16) => DECODE_PREPARE_BATCH_INDEXED_STATE_F16_FUNC,
+        (Dtype::F16, Dtype::F16, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_F16_TO_F32_FUNC,
+        (Dtype::F16, Dtype::F16, Dtype::F16) => {
+            DECODE_PREPARE_BATCH_INDEXED_F16_TO_F32_STATE_F16_FUNC
+        }
+        (Dtype::F16, Dtype::F32, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_F16_PARAMS_F32_FUNC,
+        (Dtype::F16, Dtype::F32, Dtype::F16) => {
+            DECODE_PREPARE_BATCH_INDEXED_F16_PARAMS_F32_STATE_F16_FUNC
+        }
         _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
     };
     let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
@@ -1001,7 +1025,11 @@ pub fn linear_attention_decode_prepare_batch_indexed_f32(
         }
         _ => unreachable!("validate_decode_prepare_dtype filters unsupported inputs"),
     }
-    builder.arg(conv_state_slots.as_f32_mut());
+    match state_dtype {
+        Dtype::F32 => builder.arg(conv_state_slots.as_f32_mut()),
+        Dtype::F16 => builder.arg(conv_state_slots.as_f16_mut()),
+        _ => unreachable!("state dtype checked above"),
+    };
     builder.arg(slot_indices.as_u32());
     match input_dtype {
         Dtype::F32 => {
@@ -1157,7 +1185,16 @@ pub fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
         ("g", g.dtype()),
         ("beta", beta.dtype()),
     ] {
-        require_dtype(op, label, actual, Dtype::F32)?;
+        if label == "conv_state_slots" {
+            if !matches!(actual, Dtype::F32 | Dtype::F16) {
+                return Err(FerrumError::model(format!(
+                    "{op} {label} dtype {} is unsupported",
+                    actual.name()
+                )));
+            }
+        } else {
+            require_dtype(op, label, actual, Dtype::F32)?;
+        }
     }
     require_dtype(op, "slot_indices", slot_indices.dtype(), Dtype::U32)?;
 
@@ -1166,10 +1203,20 @@ pub fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
     let conv_channels = 2 * qk_total + value_total;
     let row_total = conv_channels.max(value_total).max(value_heads);
     let total = batch * row_total;
-    let func_name = match (input_dtype, param_dtype) {
-        (Dtype::F32, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_PACKED_FUNC,
-        (Dtype::F16, Dtype::F16) => DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_TO_F32_FUNC,
-        (Dtype::F16, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_PARAMS_F32_FUNC,
+    let state_dtype = conv_state_slots.dtype();
+    let func_name = match (input_dtype, param_dtype, state_dtype) {
+        (Dtype::F32, Dtype::F32, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_PACKED_FUNC,
+        (Dtype::F32, Dtype::F32, Dtype::F16) => DECODE_PREPARE_BATCH_INDEXED_PACKED_STATE_F16_FUNC,
+        (Dtype::F16, Dtype::F16, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_TO_F32_FUNC,
+        (Dtype::F16, Dtype::F16, Dtype::F16) => {
+            DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_TO_F32_STATE_F16_FUNC
+        }
+        (Dtype::F16, Dtype::F32, Dtype::F32) => {
+            DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_PARAMS_F32_FUNC
+        }
+        (Dtype::F16, Dtype::F32, Dtype::F16) => {
+            DECODE_PREPARE_BATCH_INDEXED_PACKED_F16_PARAMS_F32_STATE_F16_FUNC
+        }
         _ => unreachable!("packed decode prepare dtype validation filters unsupported inputs"),
     };
     let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
@@ -1195,7 +1242,11 @@ pub fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
         }
         _ => unreachable!("packed decode prepare dtype validation filters unsupported inputs"),
     }
-    builder.arg(conv_state_slots.as_f32_mut());
+    match state_dtype {
+        Dtype::F32 => builder.arg(conv_state_slots.as_f32_mut()),
+        Dtype::F16 => builder.arg(conv_state_slots.as_f16_mut()),
+        _ => unreachable!("state dtype checked above"),
+    };
     builder.arg(slot_indices.as_u32());
     match param_dtype {
         Dtype::F32 => {
@@ -1303,7 +1354,13 @@ pub fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
     let input_dtype = mixed_qkvz_raw.dtype();
     require_supported_input_dtype(op, "mixed_qkvz_raw", input_dtype)?;
     require_dtype(op, "conv_weight", conv_weight.dtype(), input_dtype)?;
-    require_dtype(op, "conv_state_slots", conv_state_slots.dtype(), Dtype::F32)?;
+    let state_dtype = conv_state_slots.dtype();
+    if !matches!(state_dtype, Dtype::F32 | Dtype::F16) {
+        return Err(FerrumError::model(format!(
+            "{op} conv_state_slots dtype {} is unsupported",
+            state_dtype.name()
+        )));
+    }
     require_dtype(op, "slot_indices", slot_indices.dtype(), Dtype::U32)?;
     require_dtype(op, "mixed_qkv", mixed_qkv.dtype(), Dtype::F32)?;
     require_dtype(op, "z", z.dtype(), Dtype::F32)?;
@@ -1313,9 +1370,13 @@ pub fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
     let conv_channels = 2 * qk_total + value_total;
     let row_total = conv_channels.max(value_total);
     let total = batch * row_total;
-    let func_name = match input_dtype {
-        Dtype::F32 => DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_FUNC,
-        Dtype::F16 => DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_F16_TO_F32_FUNC,
+    let func_name = match (input_dtype, state_dtype) {
+        (Dtype::F32, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_FUNC,
+        (Dtype::F32, Dtype::F16) => DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_STATE_F16_FUNC,
+        (Dtype::F16, Dtype::F32) => DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_F16_TO_F32_FUNC,
+        (Dtype::F16, Dtype::F16) => {
+            DECODE_PREPARE_BATCH_INDEXED_PACKED_TO_MIXED_F16_TO_F32_STATE_F16_FUNC
+        }
         _ => unreachable!("dtype checked above"),
     };
     let func = ctx.func(MODULE_NAME, ptx::LINEAR_ATTENTION, func_name);
@@ -1339,7 +1400,11 @@ pub fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
         }
         _ => unreachable!("dtype checked above"),
     }
-    builder.arg(conv_state_slots.as_f32_mut());
+    match state_dtype {
+        Dtype::F32 => builder.arg(conv_state_slots.as_f32_mut()),
+        Dtype::F16 => builder.arg(conv_state_slots.as_f16_mut()),
+        _ => unreachable!("state dtype checked above"),
+    };
     builder.arg(slot_indices.as_u32());
     builder.arg(mixed_qkv.as_f32_mut());
     builder.arg(z.as_f32_mut());
@@ -1673,7 +1738,16 @@ fn validate_decode_prepare_dtype(
         ("beta", beta.dtype()),
         ("next_conv_state", next_conv_state.dtype()),
     ] {
-        require_dtype(op, label, actual, Dtype::F32)?;
+        if matches!(label, "conv_state" | "next_conv_state") {
+            if !matches!(actual, Dtype::F32 | Dtype::F16) {
+                return Err(FerrumError::model(format!(
+                    "{op} {label} dtype {} is unsupported",
+                    actual.name()
+                )));
+            }
+        } else {
+            require_dtype(op, label, actual, Dtype::F32)?;
+        }
     }
     Ok((input_dtype, param_dtype))
 }
