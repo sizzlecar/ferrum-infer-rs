@@ -2,6 +2,62 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ113 — Qwen35 paged context scratch c16 quick diagnostic is flat
+
+- Scope:
+  - reused existing Vast 1x RTX 4090 instance `42216671` and its remote cache;
+  - fast-forwarded the remote repo to
+    `9cc0e77d562ca94659c15bc7fb61c439d7d588b2`;
+  - validated the ZZZ112 Qwen35 paged attention scratch-output-as-context
+    change;
+  - did not run live vLLM; comparison is against historical Ferrum evidence,
+    primarily ZZZ111.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_paged_context_scratch_c16_quick_9cc0e77d_20260624/`;
+  - diagnostic PASS line:
+    `W3 QWEN35 PAGED CONTEXT SCRATCH C16 QUICK DIAG PASS: /workspace/artifacts/w3_qwen35_paged_context_scratch_c16_quick_9cc0e77d_20260624`;
+  - artifact includes command logs, run/serve smoke outputs, bench report,
+    binary SHA256, git SHA/status, GPU metadata, and Vast lifecycle metadata.
+- Result:
+  - CUDA release build passed, binary SHA256
+    `4f03e1240569fba3d042fb56c0930d1b701c8c63dc2259a9f1dd285844d071d3`;
+  - `ferrum run` smoke passed and returned `5`;
+  - `ferrum serve` chat smoke passed and returned `5`;
+  - c16 quick diagnostic bench completed `32/32` requests with `0` errors;
+  - c16 output throughput was `685.9364276426528` tok/s, p95 ITL was
+    `19.820438` ms, p95 TTFT was `764.5376501999999` ms, and output token
+    counts came from usage.
+- Interpretation:
+  - compared with ZZZ111 block-table skip c16 throughput
+    `688.1409470636319` tok/s, this is `-2.204519420979068` tok/s, ratio
+    `0.9967964129581506`;
+  - correctness is intact, but the candidate is flat/slightly negative and is
+    not a high-return W3 throughput lever;
+  - this does not close the W3 gap or justify a performance-ready claim.
+- Vast cleanup:
+  - copied the full artifact back before cleanup;
+  - queried all three retained W3 Vast instances after cleanup:
+    `42184688` (`ferrum-w3-qwen35-release-20260623`),
+    `42194222` (`ferrum-w3-qwen35-diagnostic-20260623`), and `42216671`
+    (`ferrum-w3-qwen35-full-l5-20260623`) were all
+    `cur_state=stopped actual_status=exited intended_status=stopped`;
+  - the three instances are retained stopped environments from separate W3
+    routes, not running compute. Destroying them would save any residual disk
+    cost but lose remote caches/artifacts.
+- Local validation:
+  - summary validation confirmed `status=passed`, `diagnostic_only=true`,
+    `no_live_vllm=true`, git SHA
+    `9cc0e77d562ca94659c15bc7fb61c439d7d588b2`, `32/32` completed, `0`
+    errors, and `output_token_count_source=usage`;
+  - Vast metadata was scrubbed of token/startup fields before commit
+    consideration;
+  - artifact secret scan found no `VAST_API_KEY`, bearer token, HF token,
+    private-key, or SSH public-key pattern.
+- Status:
+  - this is diagnostic-only evidence, not release evidence;
+  - no OOM-fixed, release-ready, performance-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ112 — Qwen35 paged full-attention reuses scratch output as context
 
 - Scope:
