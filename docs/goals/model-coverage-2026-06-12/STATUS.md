@@ -2,6 +2,42 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ100 — Qwen35 decode F32 residual update uses fused backend primitive
+
+- Scope:
+  - added `Backend::activation_add_to_f32_shadow()` as a generic fallback
+    primitive for `activation_to_f32_shadow + residual add`;
+  - added a CUDA `activation_add_to_f32_shadow_f16` kernel so FP16 activation
+    output can be accumulated into the device-side F32 residual shadow in one
+    launch;
+  - rewired Qwen35 F32-residual paths, including decode MLP finish and
+    attention residual updates, to use the primitive instead of the repeated
+    two-kernel pattern;
+  - added a CPU fallback unit test for the new primitive.
+- Why:
+  - current historical W3 evidence is blocked by decode-step latency and
+    throughput, not by the old historical vLLM baseline rule;
+  - profile review showed the Qwen35 decode hot path still pays full
+    hidden-size residual update work around MLP/MoE finish, so this change
+    removes avoidable kernel launch overhead without adding model-name or
+    VRAM-literal special cases.
+- Validation:
+  - `cargo fmt --all -- --check`;
+  - `cargo check -p ferrum-kernels -p ferrum-models`;
+  - `cargo test -p ferrum-kernels --test activation_shadow_test`;
+  - `cargo test -p ferrum-models decode_residual_shadow_can_skip_layer_output_materialization`;
+  - `cargo test -p ferrum-models sparse_moe_decode_merge_adds_shared_output_into_routed_output_inplace`;
+  - `python3 scripts/release/model_release_grade_manifest.py --config docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json` produced the expected diagnostic `MODEL_RELEASE_GRADE_W3 FAIL (8 problems)`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - this is source-level hot-path progress, not measured throughput evidence;
+  - no OOM-fixed, release-ready, performance-ready, or W3 completion claim is
+    made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS` and still requires CUDA
+    validation to see whether this materially improves the 8 remaining
+    performance blockers.
+
 ## 2026-06-24 ZZZ99 — W3 lane runner no longer reroutes valid historical vLLM baseline to live vLLM
 
 - Scope:

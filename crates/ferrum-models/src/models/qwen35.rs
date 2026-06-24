@@ -6475,8 +6475,7 @@ fn qwen35_finish_layer_with_mlp_f32_residual<B: MoeLlmBackend>(
         layer.layer_index,
     )?;
     qwen35_trace_layer_buffer_stats::<B>(ctx, layer.layer_index, "mlp_out", &mlp_out, hidden_len);
-    B::activation_to_f32_shadow(ctx, &mlp_out, branch_f32, hidden_len);
-    B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+    B::activation_add_to_f32_shadow(ctx, &mlp_out, residual_f32, branch_f32, hidden_len);
     qwen35_trace_layer_buffer_stats::<B>(
         ctx,
         layer.layer_index,
@@ -6671,11 +6670,17 @@ fn qwen35_finish_layer_with_mlp_f32_residual_decode_scratch<B: MoeLlmBackend>(
                 hidden_len,
             );
             let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-            B::activation_to_f32_shadow(ctx, &scratch.routed_output, branch_f32, hidden_len);
+            B::activation_add_to_f32_shadow(
+                ctx,
+                &scratch.routed_output,
+                residual_f32,
+                branch_f32,
+                hidden_len,
+            );
             detail.activation_to_f32_shadow_us += qwen35_detail_profile_stage_finish::<B>(
                 ctx,
                 timer,
-                "qwen35_mlp_finish_activation_to_f32_shadow",
+                "qwen35_mlp_finish_activation_add_to_f32_shadow",
             );
         }
         Qwen35MlpWeights::Dense(_) => {
@@ -6698,18 +6703,14 @@ fn qwen35_finish_layer_with_mlp_f32_residual_decode_scratch<B: MoeLlmBackend>(
                 hidden_len,
             );
             let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-            B::activation_to_f32_shadow(ctx, &mlp_out, branch_f32, hidden_len);
+            B::activation_add_to_f32_shadow(ctx, &mlp_out, residual_f32, branch_f32, hidden_len);
             detail.activation_to_f32_shadow_us += qwen35_detail_profile_stage_finish::<B>(
                 ctx,
                 timer,
-                "qwen35_mlp_finish_activation_to_f32_shadow",
+                "qwen35_mlp_finish_activation_add_to_f32_shadow",
             );
         }
     }
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
-    detail.residual_add_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_mlp_finish_residual_add");
     qwen35_trace_layer_buffer_stats::<B>(
         ctx,
         layer.layer_index,
@@ -7270,8 +7271,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
     {
         let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-        B::activation_to_f32_shadow(ctx, &delta_output, branch_f32, hidden_len);
-        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        B::activation_add_to_f32_shadow(ctx, &delta_output, residual_f32, branch_f32, hidden_len);
         detail.residual_update_us += qwen35_detail_profile_stage_finish::<B>(
             ctx,
             timer,
@@ -7813,8 +7813,7 @@ fn qwen35_linear_attention_prefill_batch_layer_backend<B: MoeLlmBackend>(
         (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
     {
         let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-        B::activation_to_f32_shadow(ctx, &delta_output, branch_f32, hidden_len);
-        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        B::activation_add_to_f32_shadow(ctx, &delta_output, residual_f32, branch_f32, hidden_len);
         detail.residual_update_us += qwen35_detail_profile_stage_finish::<B>(
             ctx,
             timer,
@@ -8235,8 +8234,7 @@ fn qwen35_full_attention_prefill_batch_layer_backend<B: MoeLlmBackend + BackendP
     if let (Some(residual_f32), Some(branch_f32)) =
         (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
     {
-        B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
-        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        B::activation_add_to_f32_shadow(ctx, &attn_output, residual_f32, branch_f32, hidden_len);
         qwen35_finish_layer_with_mlp_f32_residual::<B>(
             ctx,
             residual_f32,
@@ -8566,8 +8564,13 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
         if let (Some(residual_f32), Some(branch_f32)) =
             (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
         {
-            B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
-            B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+            B::activation_add_to_f32_shadow(
+                ctx,
+                &attn_output,
+                residual_f32,
+                branch_f32,
+                hidden_len,
+            );
             return if let Some(scratch) = decode_scratch.as_deref_mut() {
                 qwen35_finish_layer_with_mlp_f32_residual_decode_scratch::<B>(
                     ctx,
@@ -8804,8 +8807,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
     if let (Some(residual_f32), Some(branch_f32)) =
         (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
     {
-        B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
-        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        B::activation_add_to_f32_shadow(ctx, &attn_output, residual_f32, branch_f32, hidden_len);
         if let Some(scratch) = decode_scratch.as_deref_mut() {
             qwen35_finish_layer_with_mlp_f32_residual_decode_scratch::<B>(
                 ctx,
@@ -9143,8 +9145,7 @@ fn qwen35_linear_attention_stateful_layer_backend<B: MoeLlmBackend>(
     if let (Some(residual_f32), Some(branch_f32)) =
         (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
     {
-        B::activation_to_f32_shadow(ctx, &delta_output, branch_f32, hidden_len);
-        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        B::activation_add_to_f32_shadow(ctx, &delta_output, residual_f32, branch_f32, hidden_len);
         qwen35_trace_layer_buffer_stats::<B>(
             ctx,
             layer.layer_index,
@@ -9480,8 +9481,13 @@ fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend + BackendPagedK
         if let (Some(residual_f32), Some(branch_f32)) =
             (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
         {
-            B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
-            B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+            B::activation_add_to_f32_shadow(
+                ctx,
+                &attn_output,
+                residual_f32,
+                branch_f32,
+                hidden_len,
+            );
             return qwen35_finish_layer_with_mlp_f32_residual::<B>(
                 ctx,
                 residual_f32,
@@ -9694,8 +9700,7 @@ fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend + BackendPagedK
     if let (Some(residual_f32), Some(branch_f32)) =
         (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
     {
-        B::activation_to_f32_shadow(ctx, &attn_output, branch_f32, hidden_len);
-        B::add_inplace(ctx, residual_f32, branch_f32, hidden_len);
+        B::activation_add_to_f32_shadow(ctx, &attn_output, residual_f32, branch_f32, hidden_len);
         qwen35_trace_layer_buffer_stats::<B>(
             ctx,
             layer.layer_index,

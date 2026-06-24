@@ -1003,6 +1003,56 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn activation_add_to_f32_shadow(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        residual_f32: &mut Self::Buffer,
+        scratch_f32: &mut Self::Buffer,
+        len: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        assert_eq!(
+            residual_f32.dtype(),
+            crate::backend::Dtype::F32,
+            "CudaBackend::activation_add_to_f32_shadow residual must be F32, got {}",
+            residual_f32.dtype().name()
+        );
+        match (src.dtype(), residual_f32.dtype()) {
+            (crate::backend::Dtype::F16, crate::backend::Dtype::F32) => {
+                let func = ctx.func(
+                    "sandwich_norm",
+                    ptx::SANDWICH_NORM,
+                    "activation_add_to_f32_shadow_f16",
+                );
+                let n_i32 = len as i32;
+                let block = 256u32;
+                let grid = ((len as u32) + block - 1) / block;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(src);
+                b.arg(residual_f32);
+                b.arg(&n_i32);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("activation_add_to_f32_shadow launch");
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F32) => {
+                Self::add_inplace(ctx, residual_f32, src, len);
+            }
+            _ => {
+                Self::activation_to_f32_shadow(ctx, src, scratch_f32, len);
+                Self::add_inplace(ctx, residual_f32, scratch_f32, len);
+            }
+        }
+    }
+
     fn rms_norm_activation_to_f32(
         ctx: &mut Self::Context,
         input: &Self::Buffer,
