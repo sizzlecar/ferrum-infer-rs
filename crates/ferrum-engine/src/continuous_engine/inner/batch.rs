@@ -952,7 +952,17 @@ impl EngineInner {
         }
 
         // Free KV cache manager blocks
+        let draft_kv_request_id = {
+            let sequences = self.sequences.read();
+            sequences
+                .get(&victim_id)
+                .and_then(|seq| seq.draft_kv_request_id.clone())
+        };
+
         let _ = self.kv_cache.deallocate(victim_id.clone()).await;
+        if let Some(draft_request_id) = draft_kv_request_id {
+            let _ = self.kv_cache.deallocate(draft_request_id).await;
+        }
 
         if let Some(manager) = &self.recurrent_state_manager {
             let _ = manager.deallocate(victim_id.clone()).await;
@@ -966,6 +976,8 @@ impl EngineInner {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(&victim_id) {
                 seq.kv_cache = None;
+                seq.draft_kv_cache = None;
+                seq.draft_kv_request_id = None;
                 seq.recurrent_state = None;
                 seq.model_cache_id = None;
                 seq.prefill_complete = false;

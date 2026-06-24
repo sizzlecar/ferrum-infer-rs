@@ -1985,6 +1985,94 @@ async fn process_batch_batch_prefill_tensor_error_releases_kv_and_recurrent_stat
 }
 
 #[tokio::test]
+async fn process_batch_speculative_draft_tensor_error_releases_target_and_draft_kv() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    let target_executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO));
+    let draft_executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        sampler,
+        kv_cache.clone(),
+        target_executor,
+        tensor_factory,
+        Some(draft_executor),
+        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        None,
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 2;
+    let request_id = request.id.clone();
+    let target_alloc = AllocationRequest {
+        request_id: request_id.clone(),
+        initial_tokens: 1,
+        max_sequence_length: 16,
+        num_layers: 1,
+        num_heads: 1,
+        head_dim: 4,
+        device: Device::CPU,
+        dtype: DataType::FP32,
+        priority: Priority::Normal,
+    };
+    let target_kv = kv_cache.allocate(&target_alloc).await.unwrap();
+    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request.clone(),
+        vec![TokenId::new(5)],
+        Some(tokenizer),
+        Some(64),
+    );
+    sequence.generated_tokens.push(TokenId::new(6));
+    sequence.prefill_complete = true;
+    sequence.prefill_tokens_processed = 1;
+    sequence.kv_cache = Some(target_kv);
+    sequence.phase = RequestPhase::Decoding;
+    engine
+        .inner
+        .sequences
+        .write()
+        .insert(request_id.clone(), sequence);
+
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
+        max_sequence_length: 1,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let _ = engine.inner.process_batch(&batch).await;
+
+    let stats = kv_cache.stats();
+    assert_eq!(
+        stats.allocation_count, 2,
+        "target and draft KV allocations should both be attempted"
+    );
+    assert_eq!(
+        stats.active_caches, 0,
+        "target and draft KV resources should both be released"
+    );
+    let active_kv = kv_cache.list_handles();
+    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
+    assert!(
+        !engine.inner.sequences.read().contains_key(&request_id),
+        "error-completed request should be removed from active sequences"
+    );
+}
+
+#[tokio::test]
 async fn process_batch_unified_reserve_failure_then_fallback_failure_releases_recurrent_state() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;

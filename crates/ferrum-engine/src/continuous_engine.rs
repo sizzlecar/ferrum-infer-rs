@@ -614,6 +614,12 @@ pub struct SequenceState {
     /// Draft-model KV cache (only populated when engine has speculative
     /// decoding enabled). Allocated + prefilled lazily on the first decode.
     pub draft_kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    /// Resource-manager request id for the draft-model KV allocation.
+    ///
+    /// Draft KV must not reuse the target request id because KV managers are
+    /// keyed by `RequestId`; a second allocation under the same key can
+    /// replace the target handle while leaving resource counters/blocks alive.
+    pub draft_kv_request_id: Option<RequestId>,
     /// Token frequency counts for repetition penalty.
     pub token_frequencies: HashMap<TokenId, usize>,
     /// Model executor's KV cache key for this sequence (for cleanup on completion).
@@ -786,6 +792,7 @@ impl SequenceState {
             json_processor,
             regex_processor,
             draft_kv_cache: None,
+            draft_kv_request_id: None,
             token_frequencies: HashMap::new(),
             model_cache_id: None,
             stop_token_ids,
