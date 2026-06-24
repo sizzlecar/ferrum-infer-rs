@@ -1218,7 +1218,11 @@ def write_selftest_w3_s0_s1_s2(root: Path) -> dict[str, Path]:
     write_json(root / "w3_serve_nonstream.json", {"choices": [{"message": {"content": "ok"}}]})
     (root / "w3_run_stderr.txt").write_text("")
     (root / "w3_serve.log").write_text("selftest serve log\n")
-    (root / "w3_serve_stream.sse").write_text("data: {}\n\ndata: [DONE]\n\n")
+    (root / "w3_serve_stream.sse").write_text(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+        'data: {"usage":{"completion_tokens":1},"choices":[]}\n\n'
+        "data: [DONE]\n\n"
+    )
     write_json(
         root / "w3_s2_product.json",
         {
@@ -1253,6 +1257,7 @@ def write_selftest_w3_s0_s1_s2(root: Path) -> dict[str, Path]:
                         "chunk_count": 2,
                         "done_count": 1,
                         "has_usage": True,
+                        "usage_chunks": 1,
                     },
                 },
             },
@@ -1374,7 +1379,11 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
     ]:
         path = root / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("data: [DONE]\n" if rel_path.endswith(".sse") else "{}\n")
+        path.write_text(
+            'data: {"usage":{"completion_tokens":1},"choices":[]}\n\ndata: [DONE]\n'
+            if rel_path.endswith(".sse")
+            else "{}\n"
+        )
 
     write_json(
         root / "l3.json",

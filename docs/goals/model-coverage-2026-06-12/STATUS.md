@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ93 — W3 stream artifacts are scanned by the final validator
+
+- Scope:
+  - `scripts/release/model_release_grade_goal_gate.py` now reads W3 L3
+    `stream_nonstream_match` SSE artifacts and requires the artifact text to
+    contain exactly one `data: [DONE]` plus at least one JSON `usage` chunk;
+  - the final validator also checks W3 S2 `ferrum_serve.stream.artifact` SSE
+    content against the recorded `done_count` / `usage_chunks` summary when
+    present;
+  - L3 detail counts must match the actual SSE artifact counts, so a report
+    cannot pass by setting `stream_done_count=1` or `stream_usage_chunks=1`
+    while archiving a bad stream response;
+  - W3 selftest fixtures in the final validator, manifest builder, and real
+    product report now include usage-bearing SSE chunks instead of bare
+    `[DONE]`-only fixtures;
+  - final-validator negative selftests now reject a missing-usage L3 stream
+    artifact and a missing-usage W3 S2 serve stream artifact.
+- Why:
+  - W3 acceptance requires streaming to emit exactly one `[DONE]` and usage when
+    `stream_options.include_usage=true`; the final gate must validate the saved
+    response artifact, not only a JSON summary field.
+- Validation:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py scripts/release/w3_qwen35_real_product_report.py`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/w3_qwen35_real_product_report.py --self-test`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ92 — CLI recurrent-state autosize is budget-pressure driven
 
 - Scope:

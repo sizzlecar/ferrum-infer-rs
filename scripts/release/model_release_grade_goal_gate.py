@@ -228,6 +228,47 @@ def existing_artifact_path(raw: Any, out_dir: Path, base_dir: Path | None = None
     return None
 
 
+def count_sse_done_and_usage(
+    raw: Any,
+    label: str,
+    out_dir: Path,
+    problems: list[str],
+    *,
+    base_dir: Path | None = None,
+) -> tuple[int | None, int | None]:
+    path = existing_artifact_path(raw, out_dir, base_dir)
+    if path is None:
+        return None, None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        problems.append(f"{label} is not valid UTF-8 SSE text: {exc}")
+        return None, None
+    done_count = 0
+    usage_chunks = 0
+    malformed: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if not payload:
+            continue
+        if payload == "[DONE]":
+            done_count += 1
+            continue
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            malformed.append(payload[:120])
+            continue
+        if isinstance(parsed, dict) and parsed.get("usage") is not None:
+            usage_chunks += 1
+    if malformed:
+        problems.append(f"{label} contains malformed SSE JSON chunks: {malformed[:3]}")
+    return done_count, usage_chunks
+
+
 def evidence_artifact_values(entry: Any, label: str, problems: list[str]) -> list[Any]:
     if isinstance(entry, str):
         return [entry]
@@ -1520,6 +1561,31 @@ def validate_w3_l3_cases(
         )
         if usage_chunks is not None and usage_chunks < 1:
             problems.append(f"{label}.cases.stream_nonstream_match.detail.stream_usage_chunks must be >= 1")
+        artifact_done_count, artifact_usage_chunks = count_sse_done_and_usage(
+            stream_case.get("artifact"),
+            f"{label}.cases.stream_nonstream_match.artifact",
+            out_dir,
+            problems,
+            base_dir=artifact_base_dir,
+        )
+        if artifact_done_count is not None:
+            if artifact_done_count != 1:
+                problems.append(
+                    f"{label}.cases.stream_nonstream_match.artifact stream_done_count must be exactly 1"
+                )
+            if done_count is not None and artifact_done_count != done_count:
+                problems.append(
+                    f"{label}.cases.stream_nonstream_match.detail.stream_done_count must match artifact"
+                )
+        if artifact_usage_chunks is not None:
+            if artifact_usage_chunks < 1:
+                problems.append(
+                    f"{label}.cases.stream_nonstream_match.artifact stream_usage_chunks must be >= 1"
+                )
+            if usage_chunks is not None and artifact_usage_chunks != usage_chunks:
+                problems.append(
+                    f"{label}.cases.stream_nonstream_match.detail.stream_usage_chunks must match artifact"
+                )
 
 
 def validate_w3_l4_artifact(
@@ -2027,6 +2093,13 @@ def validate_w3_s2_product_artifact(entry: Any, out_dir: Path, problems: list[st
             if done_count is not None and done_count != 1:
                 problems.append(f"{label}.ferrum_serve.stream.done_count must be exactly 1")
             require_true(stream.get("has_usage"), f"{label}.ferrum_serve.stream.has_usage", problems)
+            usage_chunks = None
+            if "usage_chunks" in stream:
+                usage_chunks = positive_int(
+                    stream.get("usage_chunks"),
+                    f"{label}.ferrum_serve.stream.usage_chunks",
+                    problems,
+                )
             if "artifact" in stream:
                 validate_evidence_entry(
                     stream["artifact"],
@@ -2035,6 +2108,23 @@ def validate_w3_s2_product_artifact(entry: Any, out_dir: Path, problems: list[st
                     problems,
                     base_dir=artifact_base_dir,
                 )
+                artifact_done_count, artifact_usage_chunks = count_sse_done_and_usage(
+                    stream["artifact"],
+                    f"{label}.ferrum_serve.stream.artifact",
+                    out_dir,
+                    problems,
+                    base_dir=artifact_base_dir,
+                )
+                if artifact_done_count is not None:
+                    if artifact_done_count != 1:
+                        problems.append(f"{label}.ferrum_serve.stream.artifact done_count must be exactly 1")
+                    if done_count is not None and artifact_done_count != done_count:
+                        problems.append(f"{label}.ferrum_serve.stream.done_count must match artifact")
+                if artifact_usage_chunks is not None:
+                    if artifact_usage_chunks < 1:
+                        problems.append(f"{label}.ferrum_serve.stream.artifact usage_chunks must be >= 1")
+                    if usage_chunks is not None and artifact_usage_chunks != usage_chunks:
+                        problems.append(f"{label}.ferrum_serve.stream.usage_chunks must match artifact")
 
 
 def metric_from_cell(cell: dict[str, Any], problems: list[str], label: str) -> float | None:
@@ -2579,7 +2669,12 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
     ]:
         path = root / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("data: [DONE]\n" if rel_path.endswith(".sse") else "{}\n", encoding="utf-8")
+        path.write_text(
+            'data: {"usage":{"completion_tokens":1},"choices":[]}\n\ndata: [DONE]\n'
+            if rel_path.endswith(".sse")
+            else "{}\n",
+            encoding="utf-8",
+        )
 
     write_json(
         root / "l3.json",
@@ -3066,6 +3161,7 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
                             "chunk_count": 2,
                             "done_count": 1,
                             "has_usage": True,
+                            "usage_chunks": 1,
                         },
                     },
                 },
@@ -3336,6 +3432,28 @@ def run_selftest() -> int:
         ):
             raise AssertionError("bad W3 L3 stream selftest did not fail as expected")
 
+        bad_w3_l3_stream_artifact = tmp_root / "bad-w3-l3-stream-artifact"
+        bad_w3_l3_stream_artifact_manifest = write_selftest_manifest(
+            bad_w3_l3_stream_artifact,
+            lane="w3",
+            ratio=0.82,
+        )
+        (bad_w3_l3_stream_artifact / "behavior/02_stream_match_stream.response.sse").write_text(
+            'data: {"choices":[]}\n\ndata: [DONE]\n',
+            encoding="utf-8",
+        )
+        bad_w3_l3_stream_artifact_problems = validate_manifest(
+            load_json(bad_w3_l3_stream_artifact_manifest),
+            "w3",
+            bad_w3_l3_stream_artifact,
+        )
+        if not any(
+            "correctness.l3_behavior.cases.stream_nonstream_match.artifact stream_usage_chunks must be >= 1"
+            in problem
+            for problem in bad_w3_l3_stream_artifact_problems
+        ):
+            raise AssertionError("bad W3 L3 stream artifact selftest did not fail as expected")
+
         bad_w3_l3_artifact = tmp_root / "bad-w3-l3-artifact"
         bad_w3_l3_artifact_manifest = write_selftest_manifest(
             bad_w3_l3_artifact,
@@ -3497,6 +3615,28 @@ def run_selftest() -> int:
         )
         if not any("ferrum_serve.stream.has_usage" in problem for problem in bad_w3_product_problems):
             raise AssertionError("bad W3 product no-usage selftest did not fail as expected")
+
+        bad_w3_product_artifact = tmp_root / "bad-w3-product-stream-artifact"
+        bad_w3_product_artifact_manifest = write_selftest_manifest(
+            bad_w3_product_artifact,
+            lane="w3",
+            ratio=0.82,
+        )
+        (bad_w3_product_artifact / "w3_serve_stream.sse").write_text(
+            'data: {"choices":[]}\n\ndata: [DONE]\n',
+            encoding="utf-8",
+        )
+        bad_w3_product_artifact_problems = validate_manifest(
+            load_json(bad_w3_product_artifact_manifest),
+            "w3",
+            bad_w3_product_artifact,
+        )
+        if not any(
+            "correctness.w3_s2_whole_model_product_path.ferrum_serve.stream.artifact usage_chunks must be >= 1"
+            in problem
+            for problem in bad_w3_product_artifact_problems
+        ):
+            raise AssertionError("bad W3 product stream artifact selftest did not fail as expected")
 
         bad_w3_ignore_eos = tmp_root / "bad-w3-missing-ignore-eos"
         bad_w3_ignore_eos_manifest = write_selftest_manifest(
