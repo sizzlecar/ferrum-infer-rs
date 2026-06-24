@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ107 — Qwen35 packed linear decode scratch reuse candidate
+
+- Scope:
+  - did not start GPU and did not rerun live vLLM;
+  - first re-ran the current local evidence manifest with the correct command:
+    `python3 scripts/release/model_release_grade_manifest.py --config docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json`;
+  - the manifest still failed with `MODEL_RELEASE_GRADE_W3 FAIL (8 problems)`,
+    all performance ratio / p95 ITL blockers for c1/c4/c16/c32.
+- Evidence reviewed:
+  - ZZZ104 c16 no-profile artifact selected `gpu_greedy_argmax`, used
+    `temperature: 0.0`, completed `32/32` with `0` errors, and did not show a
+    full-logits readback blocker;
+  - scheduler trace shows main c16 decode did fill `decode_items=16`
+    (`254` decode iterations, average process about `15879us`), while the
+    `decode_items=4` rows were warmup, not the main c16 bottleneck;
+  - ZZZ106 bucket profile showed routed MoE bucket GEMM is not the first lever.
+- Source change:
+  - extended `Qwen35DecodeScratch` with reusable packed indexed linear decode
+    temporaries;
+  - routed the CUDA-capability path
+    `packed_gdn_decode_prepare + packed_gdn_recurrent_decode +
+    indexed_recurrent_state + f32_residual_shadow` through a scratch helper;
+  - this avoids repeated per-layer temporary allocations for input norm,
+    qkvz/ba projections, z, mixed qkv convolution, delta core/norm,
+    activation, and output buffers on the packed linear decode path;
+  - fallback behavior is unchanged for non-packed, missing-scratch, or
+    non-f32-residual paths.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo check -p ferrum-models` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models qwen35_decode_logits_policy_uses_greedy_only_for_consistent_masks`
+    PASS;
+  - `cargo test -p ferrum-models sparse_moe_decode_merge_adds_shared_output_into_routed_output_inplace`
+    PASS;
+  - `cargo test -p ferrum-models drain_moe_bucket_profile_returns_and_clears_counters`
+    PASS;
+  - `git diff --check` PASS.
+- Status:
+  - this is a source-level candidate optimization only;
+  - no CUDA artifact has measured the effect yet, so there is no throughput,
+    OOM, release-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ106 — Qwen35 c16 MoE bucket profile diagnostic excludes routed bucket GEMM as first lever
 
 - Scope:
