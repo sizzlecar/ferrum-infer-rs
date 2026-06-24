@@ -1,0 +1,40 @@
+{
+  "bench": {
+    "completed_per_run": [
+      32
+    ],
+    "concurrency": 16,
+    "errored_per_run": [
+      0
+    ],
+    "itl_ms_p95_mean": 20.99177645,
+    "output_throughput_tps_mean": 663.3389819659881,
+    "ttft_ms_p95_mean": 733.52184875
+  },
+  "bench_exit": "0",
+  "binary_sha256": "963a1c46af7d44b4b69cac354e610f72b5fd3920ef06660362343dfa9ce4ea42  target/release/ferrum",
+  "git_sha": "0b0b8bb4063a5f3bc44e6ead4999a09112ea0eff",
+  "lane": "W3_QWEN35_PREFILL192_C16_QUICK_REGRESSION",
+  "no_live_vllm": true,
+  "oom_or_panic_lines": [],
+  "quick_exit": "0",
+  "run_effective_config": {
+    "selected_admission_limit": 2,
+    "selected_attention_impl": "vllm_paged_attn_v2",
+    "selected_kv_capacity": 512,
+    "selected_max_batched_tokens": 192,
+    "selected_max_sequences": 2,
+    "selected_scheduler_policy": null
+  },
+  "run_smoke_exit": "0",
+  "serve_chat_smoke_response_exists": true,
+  "server_effective_config": {
+    "selected_admission_limit": 16,
+    "selected_attention_impl": "vllm_paged_attn_v2",
+    "selected_kv_capacity": 512,
+    "selected_max_batched_tokens": 192,
+    "selected_max_sequences": 16,
+    "selected_scheduler_policy": null
+  },
+  "status": "passed"
+}
