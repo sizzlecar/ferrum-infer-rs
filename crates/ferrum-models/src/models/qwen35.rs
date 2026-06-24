@@ -372,6 +372,7 @@ pub struct Qwen35DecodeScratch<B: MoeLlmBackend> {
     linear_delta_norm_f32: B::Buffer,
     linear_delta_activation: B::Buffer,
     linear_delta_output: B::Buffer,
+    full_attn_output: B::Buffer,
 }
 
 pub struct Qwen35BackendFullAttentionOutput<B: Backend> {
@@ -911,6 +912,7 @@ impl<B: MoeLlmBackend> Qwen35DecodeScratch<B> {
             linear_delta_norm_f32: B::alloc_typed(Dtype::F32, max_tokens * value_total),
             linear_delta_activation: B::alloc(max_tokens * value_total),
             linear_delta_output: B::alloc(max_tokens * hidden_size),
+            full_attn_output: B::alloc(max_tokens * hidden_size),
         }
     }
 
@@ -8951,21 +8953,23 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 config.head_dim,
             )?;
         }
-        let mut attn_output = B::alloc(hidden_len);
-        attention
-            .o_proj
-            .forward(ctx, out_buf, &mut attn_output, batch_len);
         if let (Some(residual_f32), Some(branch_f32)) =
             (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
         {
-            B::activation_add_to_f32_shadow(
-                ctx,
-                &attn_output,
-                residual_f32,
-                branch_f32,
-                hidden_len,
-            );
             return if let Some(scratch) = decode_scratch.as_deref_mut() {
+                {
+                    let attn_output = &mut scratch.full_attn_output;
+                    attention
+                        .o_proj
+                        .forward(ctx, out_buf, attn_output, batch_len);
+                    B::activation_add_to_f32_shadow(
+                        ctx,
+                        attn_output,
+                        residual_f32,
+                        branch_f32,
+                        hidden_len,
+                    );
+                }
                 qwen35_finish_layer_with_mlp_f32_residual_decode_scratch::<B>(
                     ctx,
                     residual_f32,
@@ -8978,6 +8982,17 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                     false,
                 )
             } else {
+                let mut attn_output = B::alloc(hidden_len);
+                attention
+                    .o_proj
+                    .forward(ctx, out_buf, &mut attn_output, batch_len);
+                B::activation_add_to_f32_shadow(
+                    ctx,
+                    &attn_output,
+                    residual_f32,
+                    branch_f32,
+                    hidden_len,
+                );
                 qwen35_finish_layer_with_mlp_f32_residual::<B>(
                     ctx,
                     residual_f32,
@@ -8990,6 +9005,10 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 .map(Some)
             };
         }
+        let mut attn_output = B::alloc(hidden_len);
+        attention
+            .o_proj
+            .forward(ctx, out_buf, &mut attn_output, batch_len);
         let mut residual_after_attention = B::alloc(hidden_len);
         B::copy_slice(
             ctx,
@@ -9196,16 +9215,23 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
         B::copy_slice(ctx, &row_context, 0, &mut context, row * q_total, q_total);
     }
 
-    let mut attn_output = B::alloc(hidden_len);
-    attention
-        .o_proj
-        .forward(ctx, &context, &mut attn_output, batch_len);
-
     if let (Some(residual_f32), Some(branch_f32)) =
         (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
     {
-        B::activation_add_to_f32_shadow(ctx, &attn_output, residual_f32, branch_f32, hidden_len);
         if let Some(scratch) = decode_scratch.as_deref_mut() {
+            {
+                let attn_output = &mut scratch.full_attn_output;
+                attention
+                    .o_proj
+                    .forward(ctx, &context, attn_output, batch_len);
+                B::activation_add_to_f32_shadow(
+                    ctx,
+                    attn_output,
+                    residual_f32,
+                    branch_f32,
+                    hidden_len,
+                );
+            }
             qwen35_finish_layer_with_mlp_f32_residual_decode_scratch::<B>(
                 ctx,
                 residual_f32,
@@ -9218,6 +9244,17 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 false,
             )
         } else {
+            let mut attn_output = B::alloc(hidden_len);
+            attention
+                .o_proj
+                .forward(ctx, &context, &mut attn_output, batch_len);
+            B::activation_add_to_f32_shadow(
+                ctx,
+                &attn_output,
+                residual_f32,
+                branch_f32,
+                hidden_len,
+            );
             qwen35_finish_layer_with_mlp_f32_residual::<B>(
                 ctx,
                 residual_f32,
@@ -9230,6 +9267,10 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
             .map(Some)
         }
     } else {
+        let mut attn_output = B::alloc(hidden_len);
+        attention
+            .o_proj
+            .forward(ctx, &context, &mut attn_output, batch_len);
         let mut residual_after_attention = B::alloc(hidden_len);
         B::copy_slice(
             ctx,
