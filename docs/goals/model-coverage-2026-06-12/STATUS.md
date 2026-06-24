@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ147 — 032dda17 c32 GPU diagnostic prepared but Vast capacity blocked
+
+- Intended lane:
+  - `w3_qwen35_mixed_kv_no_preempt_032dda17_c32_diagnostic`;
+  - target SHA: `032dda17 fix(engine): avoid decode preemption after mixed kv defer`;
+  - exact hardware: 1x RTX 4090 CUDA;
+  - correctness gate: remote `cargo check`, CUDA release build, `ferrum run`
+    smoke, `ferrum serve` `/v1/models`, and non-streaming chat smoke;
+  - performance command shape: diagnostic c32 `bench-serve --concurrency 32
+    --num-prompts 32 --warmup-requests 4 --n-repeats 1 --fail-on-error
+    --seed 9271 --ignore-eos`;
+  - no live vLLM was planned.
+- Vast status:
+  - retained instance `42216671` was queried first and remained
+    `cur_state=stopped`, `actual_status=exited`, `intended_status=stopped`;
+  - two start attempts for `42216671` returned `resources_unavailable`
+    / "Required resources are currently unavailable";
+  - after polling, it still remained stopped/exited;
+  - account instance list showed no running/loading instances and only the
+    stopped retained instance.
+- New-offer attempt:
+  - current market was filtered for exact 1x RTX 4090 candidates;
+  - verified ask `42061571` and refreshed verified ask `42061576` both returned
+    `no_such_ask` before any instance was created;
+  - no deverified/unverified offer was rented.
+- Additional local validation while waiting:
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS: `56 passed; 0 failed`.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, or final W3 validator ran
+    for `032dda17`;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` exists.
+
 ## 2026-06-25 ZZZ146 — local source fix for mixed KV reserve fallback decode preemption
 
 - Source diagnosis:
