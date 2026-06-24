@@ -429,6 +429,7 @@ where
             silu_packed: &mut self.scratch.silu_stacked,
             down_packed: &mut self.scratch.down_out_stacked,
             route_scratch: &mut self.scratch.moe_route_scratch,
+            profile_bucket: false,
             device_route: Some(crate::moe::dispatch::DeviceRouteScratch {
                 selected_ids: &mut self.scratch.selected_ids_buf,
                 pair_weights: &mut self.scratch.route_pair_weights_dev,

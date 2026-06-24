@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ105 — Qwen35 MoE bucket substage profiling wired into layer detail events
+
+- Scope:
+  - did not start GPU and did not rerun live vLLM;
+  - followed up on the ZZZ104 negative c16 result, where removing the routed
+    MoE output clear did not improve throughput;
+  - inspected existing Qwen35 profile evidence and found the useful next gap:
+    `qwen35_mlp_finish_detail.sparse_moe` is much larger than the inner
+    `qwen35_sparse_moe_detail` breakdown explains.
+- Source change:
+  - added a reusable `MoeBucketProfileSnapshot` plus
+    `drain_moe_bucket_profile()` for bucketed MoE substage counters;
+  - added an explicit `profile_bucket` flag to `MoeForwardBucketedParams` so
+    callers can request bucket substage timing without adding Qwen35-specific
+    environment-variable coupling inside generic MoE dispatch;
+  - Qwen35 layer detail profiling now enables and drains bucketed MoE
+    substage counters per sparse MoE layer;
+  - `qwen35_sparse_moe_detail` profile JSON now includes nested
+    `routed_bucket` fields for `route/plan/gather/gemm1/silu/gemm3/combine`
+    and `total`, while keeping `accounted_us` unchanged because this is an
+    inner breakdown of `routed_experts_us`, not extra time.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models drain_moe_bucket_profile_returns_and_clears_counters`
+    PASS;
+  - `cargo test -p ferrum-models bucketed_matches_per_pair_dispatch` PASS;
+  - `cargo check -p ferrum-models` PASS;
+  - `git diff --check` PASS.
+- Status:
+  - this is diagnostic instrumentation only, not a performance fix and not
+    W3 completion evidence;
+  - next CUDA work, if approved/needed, should be a single narrow profile run
+    using this event shape to locate the missing Qwen35 MoE body time before
+    any further optimization attempt.
+
 ## 2026-06-24 ZZZ104 — Qwen35 MoE zero-skip c16 quick regression shows no throughput gain
 
 - Scope:
