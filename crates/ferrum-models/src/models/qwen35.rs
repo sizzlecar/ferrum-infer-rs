@@ -8474,9 +8474,6 @@ fn qwen35_full_attention_prefill_batch_layer_backend<B: MoeLlmBackend + BackendP
                 "Qwen3.5 batch prefill context length mismatch at layer {layer_index} for {cache_id:?}"
             )));
         }
-        if let Some(cl) = kv.context_lens.as_mut() {
-            B::write_typed::<u32>(ctx, cl, &[context_lens[row]]);
-        }
     }
 
     let max_kv_len = context_lens.iter().copied().max().unwrap_or(1) as usize;
@@ -8812,9 +8809,6 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 )));
             };
             kv.len += 1;
-            if let Some(cl) = kv.context_lens.as_mut() {
-                B::write_typed::<u32>(ctx, cl, &[kv.len as u32]);
-            }
         }
         let max_kv_len = context_lens.iter().copied().max().unwrap_or(1) as usize;
         if use_vllm_paged_attn {
@@ -9644,9 +9638,6 @@ fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend + BackendPagedK
         B::write_typed::<u32>(ctx, pos_buf, &pos_offsets);
         B::write_typed::<u32>(ctx, bt_buf, &padded);
         B::write_typed::<u32>(ctx, lens_buf, &context_lens);
-        if let Some(cl) = kv.context_lens.as_mut() {
-            B::write_typed::<u32>(ctx, cl, &context_lens);
-        }
         let q_buf = scratch.q.as_mut().expect("qwen35 paged q missing");
         let out_buf = scratch.out.as_mut().expect("qwen35 paged out missing");
         if use_vllm_paged_attn {
