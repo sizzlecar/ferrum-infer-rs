@@ -1,0 +1,25 @@
+{
+  "bench": {
+    "completed_per_run": [
+      32
+    ],
+    "delta_vs_zzz111_output_tps": -28.449655755793742,
+    "errored_per_run": [
+      0
+    ],
+    "itl_p95_ms": 20.472324999999994,
+    "output_throughput_tps": 659.6912913078381,
+    "output_token_count_source": "usage",
+    "previous_zzz111_output_tps": 688.1409470636319,
+    "ratio_vs_zzz111_output_tps": 0.9586572258529429,
+    "run_moe_decode_path": "vllm_marlin_moe_device_route",
+    "server_moe_decode_path": "vllm_marlin_moe_device_route",
+    "ttft_p95_ms": 786.04849485
+  },
+  "binary_sha256": "e80c2e1f514850d4ab1ed98051dfd25f83b7273c844e14b025dce2c8067b062c",
+  "diagnostic_only": true,
+  "git_sha": "cb831135c12f16cec1a3924178ce316c56f80813",
+  "lane": "W3_QWEN35_PAIR_IDS_DEFAULT_OFF_C16_QUICK_CB831135",
+  "no_live_vllm": true,
+  "status": "passed"
+}
