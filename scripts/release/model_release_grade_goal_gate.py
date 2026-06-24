@@ -59,6 +59,33 @@ REQUIRED_L2_PRODUCT_COMMANDS = {
     "ferrum run": "run",
     "ferrum serve": "serve",
 }
+L2_FLAGS_WITH_VALUE = {
+    "--backend",
+    "--decision-trace-jsonl",
+    "--effective-config-json",
+    "--gpu-devices",
+    "--gpu-memory-utilization",
+    "--host",
+    "--kv-capacity",
+    "--kv-dtype",
+    "--kv-max-blocks",
+    "--max-model-len",
+    "--max-num-batched-tokens",
+    "--max-num-seqs",
+    "--max-tokens",
+    "--model",
+    "--output-format",
+    "--port",
+    "--prompt",
+    "--runtime-preset",
+    "--scheduler-active-decode-prefill-chunk",
+    "--scheduler-prefill-first-until-active",
+    "--scheduler-prefill-step-chunk",
+    "--seed",
+    "--temperature",
+    "--top-k",
+    "--top-p",
+}
 W3_REQUIRED_CORRECTNESS = {
     "w3_s0_design",
     "w3_s0_microbench",
@@ -841,26 +868,94 @@ def l2_command_parts(raw: Any, label: str, problems: list[str]) -> list[str]:
 
 
 def l2_command_entrypoint(parts: list[str], label: str, problems: list[str]) -> str | None:
-    if not any(part == "ferrum" or part.endswith("/ferrum") for part in parts):
-        problems.append(f"{label} command must invoke the ferrum binary")
     for part in parts:
         if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
             problems.append(f"{label} command uses hidden env override: {part.split('=', 1)[0]}")
-    found = [
-        entrypoint
-        for entrypoint, subcommand in REQUIRED_L2_PRODUCT_COMMANDS.items()
-        if subcommand in parts
-    ]
-    if not found:
-        problems.append(f"{label} command must invoke ferrum run or ferrum serve")
+    invocation = l2_ferrum_invocation(parts, label, problems)
+    if invocation is None:
         return None
-    if len(found) > 1:
-        problems.append(f"{label} command ambiguously contains both ferrum run and ferrum serve")
-        return None
-    return found[0]
+    _, subcommand = invocation
+    for entrypoint, expected_subcommand in REQUIRED_L2_PRODUCT_COMMANDS.items():
+        if subcommand == expected_subcommand:
+            return entrypoint
+    problems.append(f"{label} command must invoke ferrum run or ferrum serve")
+    return None
 
 
-def validate_l2_product_commands(commands_raw: Any, label: str, problems: list[str]) -> None:
+def l2_ferrum_invocation(
+    parts: list[str],
+    label: str,
+    problems: list[str],
+) -> tuple[int, str] | None:
+    invokes_ferrum = any(part == "ferrum" or part.endswith("/ferrum") for part in parts)
+    if not invokes_ferrum:
+        problems.append(f"{label} command must invoke the ferrum binary")
+        return None
+    for idx, part in enumerate(parts):
+        if (
+            part == "--"
+            and idx + 1 < len(parts)
+            and parts[idx + 1] in REQUIRED_L2_PRODUCT_COMMANDS.values()
+        ):
+            return idx + 1, parts[idx + 1]
+    for idx, part in enumerate(parts):
+        if part == "ferrum" or part.endswith("/ferrum"):
+            if idx + 1 < len(parts) and parts[idx + 1] in REQUIRED_L2_PRODUCT_COMMANDS.values():
+                return idx + 1, parts[idx + 1]
+    problems.append(f"{label} command must invoke ferrum run or ferrum serve")
+    return None
+
+
+def l2_flag_value_after(parts: list[str], start: int, flag: str) -> str | None:
+    prefix = f"{flag}="
+    idx = start
+    while idx < len(parts):
+        part = parts[idx]
+        if part.startswith(prefix):
+            return part[len(prefix) :]
+        if part == flag and idx + 1 < len(parts):
+            return parts[idx + 1]
+        idx += 1
+    return None
+
+
+def l2_first_positional_after_subcommand(parts: list[str], subcommand_idx: int) -> str | None:
+    idx = subcommand_idx + 1
+    while idx < len(parts):
+        part = parts[idx]
+        if part == "--":
+            idx += 1
+            continue
+        if part.startswith("-"):
+            flag = part.split("=", 1)[0]
+            idx += 2 if flag in L2_FLAGS_WITH_VALUE and "=" not in part else 1
+            continue
+        return part
+    return None
+
+
+def l2_command_model(parts: list[str], label: str, problems: list[str]) -> str | None:
+    invocation = l2_ferrum_invocation(parts, label, problems)
+    if invocation is None:
+        return None
+    subcommand_idx, subcommand = invocation
+    if subcommand == "serve":
+        model = l2_flag_value_after(parts, subcommand_idx + 1, "--model")
+        if model:
+            return model
+    model = l2_first_positional_after_subcommand(parts, subcommand_idx)
+    if not model:
+        problems.append(f"{label} command must include a model argument")
+    return model
+
+
+def validate_l2_product_commands(
+    commands_raw: Any,
+    label: str,
+    problems: list[str],
+    *,
+    acceptable_models: set[str],
+) -> None:
     commands = as_list(commands_raw, f"{label}.commands", problems)
     if not commands:
         problems.append(f"{label}.commands must include ferrum run and ferrum serve command evidence")
@@ -882,6 +977,15 @@ def validate_l2_product_commands(commands_raw: Any, label: str, problems: list[s
                 problems.append(
                     f"{command_label}.entrypoint {declared!r} does not match command {entrypoint!r}"
                 )
+        raw_model = raw.get("model") if isinstance(raw, dict) else None
+        command_model = raw_model if isinstance(raw_model, str) and raw_model else None
+        if command_model is None:
+            command_model = l2_command_model(parts, command_label, problems)
+        if command_model is not None and command_model not in acceptable_models:
+            problems.append(
+                f"{command_label}.model {command_model!r} does not match release/source model "
+                f"{sorted(acceptable_models)}"
+            )
         detected.add(entrypoint)
     if not saw_parseable_command:
         problems.append(f"{label}.commands must include real command_line evidence")
@@ -1233,6 +1337,11 @@ def validate_w3_l2_artifact(data: dict[str, Any], label: str, problems: list[str
     quantized = as_object(data.get("quantized_semantics"), f"{label}.quantized_semantics", problems)
     if not quantized:
         return
+    model_id = non_empty_string(data.get("model_id"), f"{label}.model_id", problems)
+    model_source = data.get("model_source", quantized.get("model_source"))
+    acceptable_models = {model_id} if model_id is not None else set()
+    if isinstance(model_source, str) and model_source:
+        acceptable_models.add(model_source)
     require_true(quantized.get("real_size_model"), f"{label}.quantized_semantics.real_size_model", problems)
     require_false(quantized.get("waived"), f"{label}.quantized_semantics.waived", problems)
     require_true(quantized.get("semantic_pass"), f"{label}.quantized_semantics.semantic_pass", problems)
@@ -1312,7 +1421,12 @@ def validate_w3_l2_artifact(data: dict[str, Any], label: str, problems: list[str
             problems.append(
                 f"{label}.output_hygiene.case_entrypoints missing {missing_case_entrypoints}"
             )
-    validate_l2_product_commands(data.get("commands"), label, problems)
+    validate_l2_product_commands(
+        data.get("commands"),
+        label,
+        problems,
+        acceptable_models=acceptable_models,
+    )
 
 
 def validate_w3_l3_artifact(
@@ -3152,6 +3266,33 @@ def run_selftest() -> int:
             for problem in bad_w3_l2_command_problems
         ):
             raise AssertionError("bad W3 L2 command selftest did not fail as expected")
+
+        bad_w3_l2_command_model = tmp_root / "bad-w3-l2-command-model"
+        bad_w3_l2_command_model_manifest = write_selftest_manifest(
+            bad_w3_l2_command_model,
+            lane="w3",
+            ratio=0.82,
+        )
+        l2_command_model = load_json(bad_w3_l2_command_model / "l2.json")
+        l2_command_model["commands"][0]["command_line"] = [
+            "ferrum",
+            "run",
+            "other-model",
+            "--backend",
+            "cuda",
+        ]
+        write_json(bad_w3_l2_command_model / "l2.json", l2_command_model)
+        bad_w3_l2_command_model_problems = validate_manifest(
+            load_json(bad_w3_l2_command_model_manifest),
+            "w3",
+            bad_w3_l2_command_model,
+        )
+        if not any(
+            "correctness.l2_quantized.commands[0].model 'other-model' does not match"
+            in problem
+            for problem in bad_w3_l2_command_model_problems
+        ):
+            raise AssertionError("bad W3 L2 command-model selftest did not fail as expected")
 
         bad_w3_l2_case_entrypoint = tmp_root / "bad-w3-l2-case-entrypoint"
         bad_w3_l2_case_entrypoint_manifest = write_selftest_manifest(

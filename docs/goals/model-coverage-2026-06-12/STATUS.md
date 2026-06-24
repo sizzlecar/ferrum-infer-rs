@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ91 — W3 L2 commands must match the release/source model
+
+- Scope:
+  - `scripts/release/w3_l2_quantized_gate.py` now rejects `--model-id` or
+    `--format` overrides that disagree with the source known-answer report;
+  - L2 product command evidence is parsed to extract the model argument from
+    `ferrum run` and `ferrum serve` commands;
+  - each L2 command must target either the release `model_id` or the recorded
+    `model_source`, so a report cannot claim Qwen3.5 GPTQ while command lines
+    actually run another model;
+  - `scripts/release/w3_qwen35_real_product_report.py` now records
+    `model_source` in `known_answer_report.json`, preserving the local snapshot
+    path used by real GPU lanes;
+  - `scripts/release/model_release_grade_goal_gate.py` repeats the same
+    command/model consistency check for final W3 manifests.
+- Why:
+  - W3 L2 requires the actual `Qwen/Qwen3.5-35B-A3B-GPTQ-Int4` product model,
+    not just a JSON artifact whose `model_id` string was overwritten later.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_l2_quantized_gate.py scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py scripts/release/w3_qwen35_real_product_report.py scripts/release/w3_qwen35_cuda_release_lane.py`;
+  - `python3 scripts/release/w3_l2_quantized_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/w3_qwen35_real_product_report.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ90 — recurrent-state autosize is capability-based, not model-name based
 
 - Scope:
