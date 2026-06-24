@@ -485,6 +485,22 @@ impl EngineInner {
         let results = match self.model_executor.unified_decode(&unified).await {
             Ok(r) => r,
             Err(e) => {
+                if is_resource_exhausted_error(&e) {
+                    warn!(
+                        "Unified forward resource exhausted: {}; deferring prefills",
+                        e
+                    );
+                    for work in &prefill_meta {
+                        if work.fresh_kv {
+                            let _ = self.kv_cache.deallocate(work.rid.clone()).await;
+                        }
+                        self.defer_prefill_for_capacity(&work.rid).await;
+                    }
+                    if !decode_meta.is_empty() {
+                        return self.run_batch_decode_adaptive(&decode_meta).await;
+                    }
+                    return Ok(());
+                }
                 warn!("Unified forward failed: {}; falling back to split", e);
                 // Release the KV cache slots we just allocated for the
                 // unified-path prefills — otherwise the legacy split
