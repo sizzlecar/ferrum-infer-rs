@@ -2,6 +2,46 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ101 — W3 c16 quick diagnostic proves 1024-token tight recurrent prefill can OOM
+
+- Scope:
+  - reused existing Vast 1x RTX 4090 instance `42216671` after `git pull
+    --rebase` to validate commit `085fe3ce04368d4e3a89002783c9234c3ce60783`;
+  - built the CUDA release binary with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - ran a narrow product-path diagnostic: `ferrum run` smoke, `ferrum serve`
+    smoke, then Ferrum-only c16 `bench-serve --fail-on-error --seed 9271
+    --ignore-eos`;
+  - no live vLLM run was used.
+- Result:
+  - CUDA build passed and produced binary SHA256
+    `6b527da920fa0ef50ad85c144c711d6d1388043e4c7386b734175871bc2070f2`;
+  - `ferrum run` smoke passed with answer `5`;
+  - `ferrum serve` smoke passed with answer `5`;
+  - c16 bench failed because the server panicked with CUDA OOM:
+    `CudaBackend::alloc failed: dtype=F16 elements=14680064 bytes=29360128
+    free=34275328 total=25262096384 label=<none>:
+    DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")`.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_residual_fuse_085fe3ce_20260624/`;
+  - `summary.json` records `selected_max_sequences=16`,
+    `selected_max_batched_tokens=1024`, `selected_kv_capacity=512`,
+    `selected_admission_limit=16`, and
+    `selected_attention_impl=vllm_paged_attn_v2`;
+  - Vast cleanup evidence is in `vast/stop_poll.tsv`, ending at
+    `stopped exited`.
+- Follow-up:
+  - reverted the tight recurrent-state autosize aggregate prefill default from
+    `1024` back to the previously GPU-observed conservative value `192`;
+  - this remains a generic recurrent-state/budget-pressure default, not a
+    Qwen-specific or VRAM-literal model-name special case.
+- Status:
+  - this is failure evidence and a safety fix, not a throughput win;
+  - no OOM-fixed, release-ready, performance-ready, or W3 completion claim is
+    made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS` and still requires a new
+    CUDA quick regression before any performance conclusion.
+
 ## 2026-06-24 ZZZ100 — Qwen35 decode F32 residual update uses fused backend primitive
 
 - Scope:

@@ -1,0 +1,1 @@
+W3 residual fuse c16 quick diagnostic FAILED: server CUDA OOM during c16 bench after run/serve smoke passed. See summary.json and server/serve.log.

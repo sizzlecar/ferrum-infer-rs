@@ -1,0 +1,26 @@
+{
+  "lane": "W3_QWEN35_RESIDUAL_FUSE_C16_QUICK_DIAG",
+  "git_sha": "085fe3ce04368d4e3a89002783c9234c3ce60783",
+  "binary_sha256": "6b527da920fa0ef50ad85c144c711d6d1388043e4c7386b734175871bc2070f2  target/release/ferrum",
+  "status": "failed",
+  "failure": "server CUDA OOM during c16 bench diagnostic after run and serve smoke passed",
+  "run_smoke_exit": "0",
+  "serve_ready": true,
+  "chat_smoke_response_exists": true,
+  "bench_exit": null,
+  "quick_exit": "143",
+  "oom_lines": [
+    "thread 'tokio-runtime-worker' (1113) panicked at crates/ferrum-kernels/src/backend/cuda/mod.rs:598:5:",
+    "CudaBackend::alloc failed: dtype=F16 elements=14680064 bytes=29360128 free=34275328 total=25262096384 label=<none>: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+  ],
+  "effective_config": {
+    "selected_max_sequences": 16,
+    "selected_max_batched_tokens": 1024,
+    "selected_kv_capacity": 512,
+    "selected_admission_limit": 16,
+    "selected_attention_impl": "vllm_paged_attn_v2",
+    "selected_scheduler_policy": null,
+    "kv_block_count": null,
+    "kv_capacity_tokens": null
+  }
+}
