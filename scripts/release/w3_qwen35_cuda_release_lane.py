@@ -732,6 +732,9 @@ def run_bench(
 
 
 def run_l5(args: argparse.Namespace, perf_dir: Path, l5_dir: Path, env: dict[str, str]) -> None:
+    effective_config = l5_dir.parent / "server/effective_config.json"
+    if not effective_config.is_file():
+        raise LaneError(f"missing server effective config for L5 concurrency: {effective_config}")
     cmd = [
         sys.executable,
         str(REPO_ROOT / "scripts/release/w3_l5_concurrency_gate.py"),
@@ -745,6 +748,8 @@ def run_l5(args: argparse.Namespace, perf_dir: Path, l5_dir: Path, env: dict[str
         str(EXPECTED_OUTPUT_LEN),
         "--command",
         (perf_dir / "bench-ferrum.command.txt").read_text(encoding="utf-8").strip(),
+        "--effective-config",
+        str(effective_config),
     ]
     for value in args.effective_concurrency:
         cmd.extend(["--effective-concurrency", value])
@@ -1372,6 +1377,14 @@ def run_selftest() -> int:
         root = Path(tmp)
         report = root / "bench.json"
         write_json(report, [fake_bench_report(c) for c in [1, 4, 16, 32]])
+        effective_config = root / "server/effective_config.json"
+        write_json(
+            effective_config,
+            {
+                "selected_admission_limit": 8,
+                "admission": {"effective_max_concurrent": 8},
+            },
+        )
         cmd = [
             "target/release/ferrum",
             "bench-serve",
@@ -1404,6 +1417,8 @@ def run_selftest() -> int:
                 str(root / "l5"),
                 "--command",
                 bench_cmd_path.read_text(encoding="utf-8").strip(),
+                "--effective-config",
+                str(effective_config),
             ],
             out_dir=root / "commands",
             env=env,

@@ -211,6 +211,90 @@ def parse_effective_concurrency_overrides(raw_values: list[str] | None) -> dict[
     return overrides
 
 
+def load_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise GateError(f"missing {label}: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise GateError(f"invalid JSON in {label} {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise GateError(f"{label} must be a JSON object: {path}")
+    return data
+
+
+def nested_object(data: dict[str, Any], key: str) -> dict[str, Any]:
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def effective_limit_from_config(data: dict[str, Any], label: str) -> int:
+    auto_config = nested_object(data, "auto_config") or data
+    candidates: list[tuple[str, Any]] = [
+        (f"{label}.selected_admission_limit", auto_config.get("selected_admission_limit")),
+        (
+            f"{label}.admission.effective_max_concurrent",
+            nested_object(auto_config, "admission").get("effective_max_concurrent"),
+        ),
+        (
+            f"{label}.top_level_admission.effective_max_concurrent",
+            nested_object(data, "admission").get("effective_max_concurrent"),
+        ),
+    ]
+    parsed: list[tuple[str, int]] = []
+    for source, value in candidates:
+        if value is None:
+            continue
+        parsed.append((source, positive_int(value, source)))
+    if not parsed:
+        raise GateError(
+            f"{label} must contain selected_admission_limit or admission.effective_max_concurrent"
+        )
+    first_source, first_value = parsed[0]
+    for source, value in parsed[1:]:
+        if value != first_value:
+            raise GateError(
+                f"{source}={value} does not match {first_source}={first_value}"
+            )
+    return first_value
+
+
+def effective_concurrency_from_config(path: Path) -> tuple[dict[int, int], dict[str, Any]]:
+    data = load_json_object(path, "--effective-config")
+    limit = effective_limit_from_config(data, f"--effective-config {path}")
+    mapping = {
+        requested: min(requested, limit)
+        for requested in sorted(REQUIRED_CONCURRENCY)
+    }
+    return mapping, {
+        "source": "effective_config",
+        "path": str(path),
+        "selected_admission_limit": limit,
+        "effective_concurrency": [
+            {
+                "requested_concurrency": requested,
+                "effective_active_concurrency": effective,
+            }
+            for requested, effective in sorted(mapping.items())
+        ],
+    }
+
+
+def merge_effective_concurrency(
+    merged: dict[int, int],
+    incoming: dict[int, int],
+    source: str,
+) -> None:
+    for requested, effective in incoming.items():
+        previous = merged.get(requested)
+        if previous is not None and previous != effective:
+            raise GateError(
+                f"{source} conflicts for requested c={requested}: "
+                f"{effective} != existing {previous}"
+            )
+        merged[requested] = effective
+
+
 def command_concurrency_cells(parts: list[str], label: str) -> set[int]:
     cells: set[int] = set()
     for raw in flag_values(parts, "--concurrency-sweep"):
@@ -362,8 +446,23 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
         getattr(args, "expected_output_len", DEFAULT_EXPECTED_OUTPUT_LEN),
         "expected_output_len",
     )
-    effective_overrides = parse_effective_concurrency_overrides(
+    effective_sources: list[dict[str, Any]] = []
+    effective_overrides: dict[int, int] = {}
+    for path in getattr(args, "effective_config", None) or []:
+        mapping, source = effective_concurrency_from_config(path)
+        merge_effective_concurrency(
+            effective_overrides,
+            mapping,
+            f"--effective-config {path}",
+        )
+        effective_sources.append(source)
+    manual_overrides = parse_effective_concurrency_overrides(
         getattr(args, "effective_concurrency", None)
+    )
+    merge_effective_concurrency(
+        effective_overrides,
+        manual_overrides,
+        "--effective-concurrency",
     )
     reports: list[tuple[dict[str, Any], str]] = []
     for path in args.report:
@@ -386,7 +485,15 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
             raise GateError(f"duplicate concurrency cell c={concurrency}")
         seen.add(concurrency)
         if concurrency in effective_overrides:
+            reported_effective = cell["effective_active_concurrency"]
+            if reported_effective != concurrency and reported_effective != effective_overrides[concurrency]:
+                raise GateError(
+                    f"reports[{idx}].effective_active_concurrency {reported_effective} "
+                    f"conflicts with configured effective concurrency {effective_overrides[concurrency]}"
+                )
             cell["effective_active_concurrency"] = effective_overrides[concurrency]
+        if cell["effective_active_concurrency"] < concurrency:
+            cell["published_concurrency"] = cell["effective_active_concurrency"]
         if concurrency in REQUIRED_CONCURRENCY:
             cells.append(cell)
     missing = sorted(REQUIRED_CONCURRENCY - seen)
@@ -423,7 +530,9 @@ def build_artifact(args: argparse.Namespace) -> dict[str, Any]:
                     "effective_active_concurrency": effective,
                 }
                 for requested, effective in sorted(effective_overrides.items())
+                if effective != requested
             ],
+            "effective_concurrency_sources": effective_sources,
             "cells": cells,
         },
     }
@@ -464,12 +573,21 @@ def run_selftest() -> int:
             + "\n",
             encoding="utf-8",
         )
+        effective_config_path = root / "effective_config.json"
+        write_json(
+            effective_config_path,
+            {
+                "selected_admission_limit": 8,
+                "admission": {"effective_max_concurrent": 8},
+            },
+        )
         args = argparse.Namespace(
             report=[report_path],
             out=root / "out",
             model_id=DEFAULT_MODEL_ID,
             expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
-            effective_concurrency=["16=8", "32=8"],
+            effective_config=[effective_config_path],
+            effective_concurrency=[],
             command=[
                 "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
                 "--n-repeats 3 --concurrency-sweep 1,4,16,32 "
@@ -487,6 +605,10 @@ def run_selftest() -> int:
             raise AssertionError("selftest did not preserve c16 effective concurrency")
         if cells_by_c[32]["effective_active_concurrency"] != 8:
             raise AssertionError("selftest did not preserve c32 effective concurrency")
+        if cells_by_c[32].get("published_concurrency") != 8:
+            raise AssertionError("selftest did not publish capped c32 concurrency")
+        if not artifact["concurrency"].get("effective_concurrency_sources"):
+            raise AssertionError("selftest did not record effective config source")
         if artifact["commands"][0]["covers_concurrency"] != [1, 4, 16, 32]:
             raise AssertionError("selftest did not preserve command concurrency coverage")
 
@@ -513,6 +635,7 @@ def run_selftest() -> int:
                     out=root / "bad_out",
                     model_id=DEFAULT_MODEL_ID,
                     expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    effective_config=[],
                     effective_concurrency=[],
                     command=[],
                 )
@@ -536,6 +659,7 @@ def run_selftest() -> int:
                     out=root / "bad_command_out",
                     model_id=DEFAULT_MODEL_ID,
                     expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    effective_config=[],
                     effective_concurrency=[],
                     command=[
                         "ferrum bench-serve --fail-on-error --seed 9271 "
@@ -561,6 +685,7 @@ def run_selftest() -> int:
                     out=root / "bad_output_out",
                     model_id=DEFAULT_MODEL_ID,
                     expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    effective_config=[],
                     effective_concurrency=[],
                     command=[
                         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
@@ -588,6 +713,7 @@ def run_selftest() -> int:
                     out=root / "missing_ignore_eos_out",
                     model_id=DEFAULT_MODEL_ID,
                     expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    effective_config=[],
                     effective_concurrency=[],
                     command=[
                         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
@@ -609,6 +735,7 @@ def run_selftest() -> int:
                     out=root / "bad_effective_out",
                     model_id=DEFAULT_MODEL_ID,
                     expected_output_len=DEFAULT_EXPECTED_OUTPUT_LEN,
+                    effective_config=[],
                     effective_concurrency=["16=17"],
                     command=[
                         "ferrum bench-serve --fail-on-error --require-ci --seed 9271 "
@@ -633,6 +760,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--expected-output-len", type=int, default=DEFAULT_EXPECTED_OUTPUT_LEN)
     parser.add_argument("--command", action="append", help="bench command line used")
+    parser.add_argument(
+        "--effective-config",
+        type=Path,
+        action="append",
+        default=[],
+        help="Effective config JSON used to derive admission-capped concurrency",
+    )
     parser.add_argument(
         "--effective-concurrency",
         action="append",

@@ -1468,6 +1468,21 @@ def validate_w3_l5_artifact(data: dict[str, Any], label: str, problems: list[str
         requested = positive_int(cell.get("requested_concurrency"), f"{cell_label}.requested_concurrency", problems)
         if requested is not None:
             seen.add(requested)
+        effective = positive_int(
+            cell.get("effective_active_concurrency"),
+            f"{cell_label}.effective_active_concurrency",
+            problems,
+        )
+        if requested is not None and effective is not None:
+            if effective > requested:
+                problems.append(
+                    f"{cell_label}.effective_active_concurrency cannot exceed requested_concurrency"
+                )
+            if effective < requested and cell.get("published_concurrency") != effective:
+                problems.append(
+                    f"{cell_label}.published_concurrency must be {effective} "
+                    "when admission caps requested_concurrency"
+                )
         n_repeats = positive_int(cell.get("n_repeats"), f"{cell_label}.n_repeats", problems)
         requests = positive_int(cell.get("requests_per_run"), f"{cell_label}.requests_per_run", problems)
         if n_repeats is not None and n_repeats < 3:
@@ -2466,14 +2481,18 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
     )
     cells = []
     for concurrency in sorted(REQUIRED_CONCURRENCY):
+        effective = 16 if concurrency == 32 else concurrency
         cell: dict[str, Any] = {
             "requested_concurrency": concurrency,
+            "effective_active_concurrency": effective,
             "requests_per_run": 100,
             "n_repeats": 3,
             "completed_per_run": [100, 100, 100],
             "errored_per_run": [0, 0, 0],
             "output_tokens_per_request": [[128] * 100, [128] * 100, [128] * 100],
         }
+        if effective < concurrency:
+            cell["published_concurrency"] = effective
         for field in REQUIRED_ZERO_RUN_COUNT_FIELDS:
             cell[field] = [0, 0, 0]
         cells.append(cell)

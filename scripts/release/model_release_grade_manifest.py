@@ -473,8 +473,74 @@ def parse_effective_concurrency(values: list[str]) -> dict[int, int]:
             raise BuildError(f"--effective-concurrency must be integer C=E: {value!r}") from exc
         if requested <= 0 or effective <= 0 or effective > requested:
             raise BuildError(f"invalid effective concurrency mapping: {value!r}")
+        previous = result.get(requested)
+        if previous is not None and previous != effective:
+            raise BuildError(f"conflicting effective concurrency mapping for c={requested}")
         result[requested] = effective
     return result
+
+
+def nested_object(data: dict[str, Any], key: str) -> dict[str, Any]:
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def positive_int_value(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise BuildError(f"{label} must be a positive integer")
+    return value
+
+
+def admission_limit_from_runtime_snapshot(path: Path) -> int | None:
+    data = load_json(path)
+    if not isinstance(data, dict):
+        raise BuildError(f"runtime snapshot must be a JSON object: {path}")
+    auto_config = nested_object(data, "auto_config") or data
+    candidates: list[tuple[str, Any]] = [
+        ("runtime_snapshot.selected_admission_limit", auto_config.get("selected_admission_limit")),
+        (
+            "runtime_snapshot.admission.effective_max_concurrent",
+            nested_object(auto_config, "admission").get("effective_max_concurrent"),
+        ),
+        (
+            "runtime_snapshot.top_level_admission.effective_max_concurrent",
+            nested_object(data, "admission").get("effective_max_concurrent"),
+        ),
+    ]
+    parsed: list[tuple[str, int]] = []
+    for label, value in candidates:
+        if value is None:
+            continue
+        parsed.append((label, positive_int_value(value, label)))
+    if not parsed:
+        return None
+    first_label, first_value = parsed[0]
+    for label, value in parsed[1:]:
+        if value != first_value:
+            raise BuildError(f"{label}={value} does not match {first_label}={first_value}")
+    return first_value
+
+
+def effective_concurrency_from_runtime_snapshot(path: Path) -> dict[int, int]:
+    limit = admission_limit_from_runtime_snapshot(path)
+    if limit is None:
+        return {}
+    return {concurrency: min(concurrency, limit) for concurrency in REQUIRED_CELLS}
+
+
+def merge_effective_concurrency(
+    target: dict[int, int],
+    incoming: dict[int, int],
+    source: str,
+) -> None:
+    for concurrency, effective in incoming.items():
+        previous = target.get(concurrency)
+        if previous is not None and previous != effective:
+            raise BuildError(
+                f"{source} conflicts for requested c={concurrency}: "
+                f"{effective} != existing {previous}"
+            )
+        target[concurrency] = effective
 
 
 def build_cell(
@@ -1390,14 +1456,18 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
     )
     cells = []
     for concurrency in REQUIRED_CELLS:
+        effective = 16 if concurrency == 32 else concurrency
         cell: dict[str, Any] = {
             "requested_concurrency": concurrency,
+            "effective_active_concurrency": effective,
             "requests_per_run": 100,
             "n_repeats": 3,
             "completed_per_run": [100, 100, 100],
             "errored_per_run": [0, 0, 0],
             "output_tokens_per_request": [[128] * 100, [128] * 100, [128] * 100],
         }
+        if effective < concurrency:
+            cell["published_concurrency"] = effective
         for field in QUALITY_FIELDS:
             cell[f"{field}_per_run"] = [0, 0, 0]
         cells.append(cell)
@@ -1455,6 +1525,15 @@ def write_selftest_w3_args(root: Path) -> argparse.Namespace:
         "serve.json",
     ]:
         write_json(root / rel, {"status": "pass", "name": rel})
+    write_json(
+        root / "runtime.json",
+        {
+            "status": "pass",
+            "name": "runtime.json",
+            "selected_admission_limit": 16,
+            "admission": {"effective_max_concurrent": 16},
+        },
+    )
     write_selftest_w3_l0_l5(root)
     write_json(root / "dirty_status.json", {"dirty": False})
     ferrum_perf, baseline_perf = write_selftest_reports(root / "perf")
@@ -1768,7 +1847,18 @@ def main() -> int:
     if args.self_test:
         return run_selftest()
     args = apply_config(args)
-    effective = parse_effective_concurrency(args.effective_concurrency)
+    effective: dict[int, int] = {}
+    if args.lane == "w3" and args.runtime_snapshot is not None:
+        merge_effective_concurrency(
+            effective,
+            effective_concurrency_from_runtime_snapshot(args.runtime_snapshot),
+            f"--runtime-snapshot {args.runtime_snapshot}",
+        )
+    merge_effective_concurrency(
+        effective,
+        parse_effective_concurrency(args.effective_concurrency),
+        "--effective-concurrency",
+    )
     if args.lane == "w2":
         if args.source is None or args.out is None:
             raise BuildError("--source and --out are required")
