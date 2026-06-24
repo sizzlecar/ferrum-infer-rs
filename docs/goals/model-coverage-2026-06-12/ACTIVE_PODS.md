@@ -2,6 +2,7 @@
 
 | instance | config | offer $/hr | created | purpose | status |
 |---|---|---|---|---|---|
+| 42216671 | 1x RTX 4090, 350GB, Pennsylvania US host 47308 | 0.4778 running / retained storage cost | 2026-06-23 | Retained W3 Qwen35 cache instance `ferrum-w3-qwen35-full-l5-20260623`. Latest reuse on 2026-06-24 validated commit `a4bbc933`: CUDA source check PASS, full CUDA release-feature build PASS, c16 quick diagnostic `686.2411 tok/s`, and c32 typed diagnostic exposed scheduler/recurrent-state thrash (`max_cancelled_total=4064`, `prefill_with_generated_tokens_iterations=8214`). Artifacts: `artifacts/w3_qwen35_cuda_source_check_a4bbc933_20260624T121458Z/`, `artifacts/w3_qwen35_fused_gate_merge_c16_quick_a4bbc933_20260624T123416Z/`, `artifacts/w3_qwen35_fused_gate_merge_c32_short_a4bbc933_20260624T122245Z/`. | RETAINED STOPPED. API verified 2026-06-24 `cur_state=stopped`, `actual_status=exited`, `intended_status=stopped`; no running GPU process before stop. |
 | ~~40700470~~ | 1x RTX 4090, 220GB | 0.351 | 2026-06-12 ~20:00 | W1 CUDA gate batch (~9h) | DESTROYED 2026-06-13 ~04:40 |
 | ~~40700477~~ | 2x RTX 4090 | 0.589 | | broken host (raw cuInit=999) | DESTROYED 2026-06-12 ~20:30 |
 | ~~40703915~~ | 2x RTX 4090 | 0.336 | | host never booted (18min None) | DESTROYED |
@@ -12,6 +13,13 @@
 Destroy: `curl -X DELETE "https://console.vast.ai/api/v0/instances/{id}/?api_key=$VAST_API_KEY"`
 Goal completion cleanup: destroy any retained instance, or record explicit
 approval to keep it, before declaring the goal done.
+
+**2026-06-24 20:41 CST — W3 42216671 stopped after CUDA source-check and
+quick diagnostics.** API verified `cur_state=stopped`,
+`actual_status=exited`, `intended_status=stopped`. Before stop, SSH showed no
+Ferrum/bench process and `nvidia-smi` reported `1 MiB` GPU memory used.
+Instance intentionally retained, not destroyed, to preserve the Qwen35 model
+cache and avoid another environment rebuild.
 
 **2026-06-17 05:56Z — Vast keep-one cleanup.** User requested keeping one
 usable instance and destroying the rest after recharge. Kept `41241013`.

@@ -1,0 +1,14 @@
+{
+  "lines": 8402,
+  "max_active_len": 32,
+  "max_admitted_total": 4101,
+  "max_cancelled_total": 4064,
+  "max_completed_total": 37,
+  "max_generated_tokens_seen_in_prefill": 127,
+  "prefill_with_generated_tokens_iterations": 8214,
+  "result_counts": {
+    "none": 10,
+    "some_ok": 8392
+  },
+  "trace": "/workspace/artifacts/w3_qwen35_fused_gate_merge_c32_short_a4bbc933_20260624T122245Z/server/scheduler_trace.jsonl"
+}

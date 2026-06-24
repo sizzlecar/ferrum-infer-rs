@@ -1,0 +1,3 @@
+5
+FUSED_GATE_MERGE_C32_DIAG c 32 output_tps 9.516679634331323 completed [32] errored [0] ttft_p95 2331.6856477499996 itl_p95 4435.8990296
+FERRUM W3 QWEN35 FUSED GATE MERGE C32 SHORT DIAG PASS: /workspace/artifacts/w3_qwen35_fused_gate_merge_c32_short_a4bbc933_20260624T122245Z
