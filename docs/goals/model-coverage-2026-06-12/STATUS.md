@@ -2,6 +2,68 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ121 — Qwen35 recurrent-state pool dtype aligns with FP16 CUDA capacity
+
+- Scope:
+  - did not run live vLLM;
+  - did not start a paid GPU during this source slice;
+  - compared against local vLLM source behavior and existing Ferrum artifacts
+    only;
+  - targeted the generic Qwen3.5 recurrent-state byte accounting and actual
+    pool storage dtype, not a model-name/GPU-size/concurrency special case.
+- Finding:
+  - the latest c32 diagnostic is zero-error but still only
+    `633.3518270005125` tok/s, far below the W3 80% target;
+  - its effective active decode/admission is limited by recurrent-state slot
+    capacity: the runtime selected `max_sequences=32`, but the recurrent-state
+    memory budget selected only `16` slots;
+  - Ferrum was accounting and allocating Qwen3.5 linear recurrent state as
+    FP32 (`65,863,680` bytes/sequence);
+  - local vLLM source uses cache/model dtype for Qwen3.5 Mamba/GDN state when
+    the cache dtype is `auto`, which makes the comparable CUDA GPTQ lane a
+    FP16 state-capacity problem rather than a hard-coded 16-slot rule.
+- Source change:
+  - added `Qwen35TextConfig::recurrent_state_bytes_per_slot(dtype)`;
+  - `ferrum serve` Qwen3.5 model capabilities now report FP16 recurrent-state
+    bytes (`32,931,840` bytes/sequence);
+  - CUDA/indexed Qwen35 linear-state pools now allocate as FP16 when the
+    backend supports indexed recurrent state and uses 16-bit activation
+    storage; CPU/unsupported backends stay FP32;
+  - Qwen35 `recurrent_state_spec` now reports the same dtype as the selected
+    linear-state pool;
+  - existing F32 indexed recurrent CUDA kernels remain gated to F32 pools;
+  - FP16 pools use a pool-backed F32 gather/compute/scatter fallback, including
+    the single `ferrum run`/stateful path so compact indexed state does not
+    read zero-length sequence-local buffers;
+  - CUDA `copy_slice` now supports F16<->F32 slice casts for that
+    gather/scatter path.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-models -p ferrum-cli` PASS;
+  - `cargo test -p ferrum-types
+    qwen35_fp16_recurrent_state_budget_preserves_c32_admission_on_4090 --
+    --nocapture` PASS;
+  - `cargo test -p ferrum-types
+    recurrent_state_budget_caps_default_slots_without_model_vram_special_case
+    -- --nocapture` PASS;
+  - `cargo test -p ferrum-cli
+    qwen35_moe_model_capabilities_preserve_moe_shape -- --nocapture` PASS;
+  - `cargo test -p ferrum-models
+    qwen35_prefill_initial_state_can_gather_from_indexed_pool -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models
+    qwen35_linear_state_max_slots_can_be_capped_independently_from_paged_seqs
+    -- --nocapture` PASS;
+  - `git diff --check` PASS.
+- Limits:
+  - CUDA feature build and `.cu` kernel compile have not been validated yet on
+    the 4090;
+  - no new throughput number has been produced for this source candidate;
+  - no OOM-fixed, performance-ready, release-ready, or W3 completion claim is
+    made;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-24 ZZZ120 — Align recurrent-state prefill admission with vLLM scheduling semantics
 
 - Scope:

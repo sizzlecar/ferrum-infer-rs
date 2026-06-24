@@ -453,6 +453,13 @@ impl Qwen35TextConfig {
             .sum())
     }
 
+    pub fn recurrent_state_bytes_per_slot(&self, dtype: DataType) -> Result<u64, String> {
+        self.recurrent_state_elements_per_slot()?
+            .checked_mul(dtype.size_bytes())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| format!("Qwen3.5 recurrent state bytes overflow for dtype {dtype:?}"))
+    }
+
     pub fn to_recurrent_state_spec(
         &self,
         request_id: RequestId,

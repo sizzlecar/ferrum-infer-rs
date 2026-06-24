@@ -2278,6 +2278,9 @@ impl Backend for CudaBackend {
         dst_offset: usize,
         len: usize,
     ) {
+        if len == 0 {
+            return;
+        }
         match (src.dtype(), dst.dtype()) {
             (crate::backend::Dtype::F16, crate::backend::Dtype::F16) => {
                 let src_view = src.as_f16().slice(src_offset..src_offset + len);
@@ -2292,6 +2295,54 @@ impl Backend for CudaBackend {
                 ctx.stream
                     .memcpy_dtod(&src_view, &mut dst_view)
                     .expect("copy_slice f32 dtod");
+            }
+            (crate::backend::Dtype::F16, crate::backend::Dtype::F32) => {
+                let func = ctx.func("sandwich_norm", ptx::SANDWICH_NORM, "cast_f16_to_f32_slice");
+                let src_offset_i32 = src_offset as i32;
+                let dst_offset_i32 = dst_offset as i32;
+                let n_i32 = len as i32;
+                let block = 256u32;
+                let grid = ((len as u32) + block - 1) / block;
+                let stream = ctx.stream.clone();
+                let mut builder = stream.launch_builder(&func);
+                builder.arg(src.as_f16());
+                builder.arg(dst.as_f32_mut());
+                builder.arg(&src_offset_i32);
+                builder.arg(&dst_offset_i32);
+                builder.arg(&n_i32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .expect("copy_slice f16 to f32 cast");
+                }
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F16) => {
+                let func = ctx.func("sandwich_norm", ptx::SANDWICH_NORM, "cast_f32_to_f16_slice");
+                let src_offset_i32 = src_offset as i32;
+                let dst_offset_i32 = dst_offset as i32;
+                let n_i32 = len as i32;
+                let block = 256u32;
+                let grid = ((len as u32) + block - 1) / block;
+                let stream = ctx.stream.clone();
+                let mut builder = stream.launch_builder(&func);
+                builder.arg(src.as_f32());
+                builder.arg(dst.as_f16_mut());
+                builder.arg(&src_offset_i32);
+                builder.arg(&dst_offset_i32);
+                builder.arg(&n_i32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .expect("copy_slice f32 to f16 cast");
+                }
             }
             (src_dtype, dst_dtype) => panic!(
                 "CudaBackend::copy_slice unsupported dtypes src={} dst={}",
