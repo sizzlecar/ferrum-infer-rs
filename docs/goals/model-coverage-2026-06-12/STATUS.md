@@ -2,6 +2,47 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ87 — W3 L5 gates derive effective concurrency from config artifacts
+
+- Scope:
+  - `scripts/release/w3_l5_concurrency_gate.py` now accepts
+    `--effective-config` and derives each required L5 cell's
+    `effective_active_concurrency` from `selected_admission_limit` /
+    `admission.effective_max_concurrent`;
+  - admission-capped L5 cells now write `published_concurrency` equal to the
+    effective active concurrency;
+  - `scripts/release/model_release_grade_goal_gate.py` now requires every W3 L5
+    cell to record `effective_active_concurrency`, rejects values above the
+    requested concurrency, and requires `published_concurrency` when a cell is
+    capped;
+  - `scripts/release/model_release_grade_manifest.py` now derives W3
+    performance cell effective concurrency from `runtime_snapshot` and checks
+    conflicts with any explicit `--effective-concurrency`;
+  - `scripts/release/w3_qwen35_cuda_release_lane.py` now forwards the server
+    `effective_config.json` to the L5 gate and fails if it is missing.
+- Why:
+  - ZZZ86 made product config artifacts record the true recurrent-state
+    admission limit, but W3 release packaging still allowed that limit to be
+    lost or hand-entered later;
+  - this closes the evidence path so a future requested c=32 / effective c=16
+    artifact is mechanically derived from product runtime config and enforced
+    by the final validator.
+- Code:
+  - `scripts/release/w3_l5_concurrency_gate.py`;
+  - `scripts/release/model_release_grade_goal_gate.py`;
+  - `scripts/release/model_release_grade_manifest.py`;
+  - `scripts/release/w3_qwen35_cuda_release_lane.py`.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_l5_concurrency_gate.py scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py scripts/release/w3_qwen35_cuda_release_lane.py`;
+  - `python3 scripts/release/w3_l5_concurrency_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ86 — effective config records recurrent-state admission limit
 
 - Scope:
