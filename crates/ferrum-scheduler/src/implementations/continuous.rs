@@ -755,9 +755,13 @@ impl ContinuousBatchScheduler {
                     .min(self.cb_config.max_decode_batch)
             })
             .unwrap_or(0);
+        let decoding_count = self.decoding_count();
+        let active_count = self.active_count();
+        let capacity_backpressure_active = self.capacity_backpressure_admit_limit().is_some();
         let skip_decode_for_prefill_first = prefill_first_target > 0
-            && self.decoding_count() < prefill_first_target
-            && self.active_count() < prefill_first_target
+            && decoding_count < prefill_first_target
+            && active_count < prefill_first_target
+            && !(capacity_backpressure_active && decoding_count > 0)
             && (self.prefilling_count() > 0 || self.waiting_count() > 0);
 
         // First, collect decode requests (they have priority). The opt-in
@@ -2058,6 +2062,61 @@ mod tests {
         assert_eq!(
             scheduled_decodes, 2,
             "fill-first must not starve decode once the active target is reached"
+        );
+    }
+
+    #[test]
+    fn capacity_backpressure_disables_prefill_first_decode_skip() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            prompt_token_estimate: true,
+            prefill_first_until_active: Some(4),
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 512,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 4);
+        let first_ids: Vec<RequestId> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for id in first_ids.iter().take(3) {
+            scheduler.mark_prefill_complete(id, 128);
+        }
+        assert!(scheduler.defer_prefill_to_waiting(&first_ids[3]));
+
+        let after_defer = scheduler.trace_snapshot();
+        assert_eq!(after_defer.decode_queue_len, 3);
+        assert_eq!(after_defer.waiting_queue_len, 1);
+        assert_eq!(after_defer.active_len, 3);
+        assert_eq!(after_defer.capacity_backpressure_admit_limit, Some(1));
+
+        let second_batch = scheduler.create_iteration_batch(hint).unwrap();
+        let scheduled_decodes = second_batch
+            .requests
+            .iter()
+            .filter(|request| {
+                first_ids[..3].contains(&request.request.id) && request.tokens_to_process == Some(1)
+            })
+            .count();
+        assert_eq!(
+            scheduled_decodes, 3,
+            "capacity backpressure must let decode-ready requests run instead of repeatedly admitting a capacity-blocked prefill"
         );
     }
 

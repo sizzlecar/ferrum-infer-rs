@@ -2,6 +2,46 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ135 — Scheduler backpressure no longer lets fill-first starve decode
+
+- Source of this patch:
+  - ZZZ134 showed the post-8150ca06 failure was no longer OOM and no longer the
+    old unified-forward fallback loop;
+  - the scheduler had `decode_queue_len=31`, `waiting_queue_len=1`,
+    `active_len=31`, and `capacity_backpressure_admit_limit=1`;
+  - because `prefill-first-until-active=32` saw active count below target, it
+    skipped decode, admitted one waiting prefill, and scheduled only that
+    capacity-blocked prefill.
+- Source change:
+  - when capacity backpressure is active and decode-ready work exists,
+    `prefill-first-until-active` no longer suppresses decode scheduling;
+  - fill-first behavior is preserved for the normal early-fill case without
+    capacity backpressure;
+  - the change is based on scheduler state only, not on model id, CUDA device,
+    GPU memory, or a hard-coded concurrency cap.
+- Test added:
+  - added
+    `capacity_backpressure_disables_prefill_first_decode_skip`;
+  - the regression creates 3 decode-ready requests plus 1 capacity-deferred
+    waiting prefill below the fill-first active target. The next batch must
+    include the 3 decode steps instead of scheduling only the blocked prefill.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler capacity_backpressure_disables_prefill_first_decode_skip -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler prefill_first_until_active -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler` PASS (`64` tests);
+  - `cargo check -p ferrum-engine -p ferrum-scheduler` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Limits:
+  - no GPU lane has been run for this source candidate yet;
+  - this does not prove c32 completion, throughput recovery, W3 performance, or
+    release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ134 — 8150ca06 c32 diagnostic exposes decode starvation under capacity backpressure
 
 - Artifact:
