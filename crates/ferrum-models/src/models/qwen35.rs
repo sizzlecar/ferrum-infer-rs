@@ -7467,13 +7467,13 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         }
     };
 
-    let can_use_f32_indexed_state = linear_state_pools
+    let can_use_fast_indexed_state = linear_state_pools
         .as_ref()
-        .map(|pools| pools.state_dtype == Dtype::F32)
+        .map(|pools| pools.state_dtype == B::qwen35_indexed_recurrent_state_dtype())
         .unwrap_or(false);
     let can_use_packed_decode_prepare = B::supports_qwen35_packed_gdn_decode_prepare()
         && B::supports_qwen35_indexed_recurrent_state()
-        && can_use_f32_indexed_state
+        && can_use_fast_indexed_state
         && linear_slot_indices.is_some()
         && attention.qkvz_proj.is_some()
         && attention.ba_proj.is_some();
@@ -7611,7 +7611,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
             (linear_state_pools.as_mut(), linear_slot_indices)
         {
             let pools = &mut **pools;
-            if pools.state_dtype != Dtype::F32 {
+            if pools.state_dtype != B::qwen35_indexed_recurrent_state_dtype() {
                 false
             } else {
                 let conv_slots = pools.conv_states[layer_index].as_mut().ok_or_else(|| {

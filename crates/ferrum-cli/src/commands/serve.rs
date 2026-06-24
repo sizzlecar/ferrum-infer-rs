@@ -1007,12 +1007,16 @@ fn startup_auto_config(
     env_snapshot = remove_materialized_config_env_entries(env_snapshot, &materialized_runtime_keys);
     let runtime_config =
         merge_runtime_config_sources(non_env_runtime_entries, env_snapshot, cli_runtime_entries);
+    let hardware = hardware_capabilities_for_device(device);
     let model = model_definition
         .map(|definition| {
-            model_capabilities_from_definition_with_weight_bytes(definition, model_weight_bytes)
+            model_capabilities_from_definition_with_weight_bytes_for_hardware(
+                definition,
+                model_weight_bytes,
+                &hardware,
+            )
         })
         .unwrap_or_else(ModelCapabilities::unknown);
-    let hardware = hardware_capabilities_for_device(device);
     let workload = match runtime_preset {
         Some(M3_QWEN3_30B_A3B_INT4_PRESET) => WorkloadProfile::m3_qwen3_30b_a3b_int4(),
         Some(QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET) => {
@@ -1418,9 +1422,34 @@ fn configure_profile_sink(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn model_capabilities_from_definition_with_weight_bytes(
     definition: &ferrum_models::ModelDefinition,
     model_weight_bytes: Option<u64>,
+) -> ModelCapabilities {
+    model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+        definition,
+        model_weight_bytes,
+        ferrum_types::DataType::FP32,
+    )
+}
+
+pub(crate) fn model_capabilities_from_definition_with_weight_bytes_for_hardware(
+    definition: &ferrum_models::ModelDefinition,
+    model_weight_bytes: Option<u64>,
+    hardware: &HardwareCapabilities,
+) -> ModelCapabilities {
+    model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+        definition,
+        model_weight_bytes,
+        qwen35_recurrent_state_dtype_for_hardware(hardware),
+    )
+}
+
+fn model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+    definition: &ferrum_models::ModelDefinition,
+    model_weight_bytes: Option<u64>,
+    recurrent_state_dtype: ferrum_types::DataType,
 ) -> ModelCapabilities {
     let architecture = match definition.architecture {
         ferrum_models::Architecture::Qwen3Moe => "qwen3_moe",
@@ -1476,7 +1505,7 @@ pub(crate) fn model_capabilities_from_definition_with_weight_bytes(
         None
     };
     let recurrent_state_bytes_per_sequence =
-        recurrent_state_bytes_per_sequence_from_definition(definition);
+        recurrent_state_bytes_per_sequence_from_definition(definition, recurrent_state_dtype);
 
     ModelCapabilities {
         architecture,
@@ -1495,8 +1524,19 @@ pub(crate) fn model_capabilities_from_definition_with_weight_bytes(
     }
 }
 
+fn qwen35_recurrent_state_dtype_for_hardware(
+    hardware: &HardwareCapabilities,
+) -> ferrum_types::DataType {
+    if hardware.backend.eq_ignore_ascii_case("cuda") && hardware.compiled_features.cuda {
+        ferrum_types::DataType::FP16
+    } else {
+        ferrum_types::DataType::FP32
+    }
+}
+
 fn recurrent_state_bytes_per_sequence_from_definition(
     definition: &ferrum_models::ModelDefinition,
+    dtype: ferrum_types::DataType,
 ) -> Option<u64> {
     if !matches!(
         definition.architecture,
@@ -1507,10 +1547,7 @@ fn recurrent_state_bytes_per_sequence_from_definition(
     Some(
         ferrum_models::qwen35_config::Qwen35TextConfig::from_model_definition(definition)
             .ok()?
-            // Match the release-grade indexed recurrent state path. Current
-            // CUDA kernels accept fp16 activations/weights but keep the
-            // persistent Qwen3.5 DeltaNet state slab in fp32.
-            .recurrent_state_bytes_per_slot(ferrum_types::DataType::FP32)
+            .recurrent_state_bytes_per_slot(dtype)
             .ok()?,
     )
 }
@@ -2569,6 +2606,24 @@ mod tests {
         assert_eq!(
             capabilities.recurrent_state_bytes_per_sequence,
             Some(30 * (8192 * 3 + 32 * 128 * 128) * 4)
+        );
+    }
+
+    #[test]
+    fn qwen35_moe_cuda_model_capabilities_use_cuda_recurrent_state_dtype() {
+        let definition = qwen35_moe_reference_definition();
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+
+        let capabilities = model_capabilities_from_definition_with_weight_bytes_for_hardware(
+            &definition,
+            None,
+            &hardware,
+        );
+
+        assert_eq!(
+            capabilities.recurrent_state_bytes_per_sequence,
+            Some(30 * (8192 * 3 + 32 * 128 * 128) * 2)
         );
     }
 

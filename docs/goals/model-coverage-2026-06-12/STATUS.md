@@ -2,6 +2,48 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ144 — FP16 indexed recurrent-state source candidate; local validation only
+
+- Source direction:
+  - after `228933a2`, the c32 path was stable again at `635.5743934095524`
+    tok/s with no OOM/cancel storm, but it was still far below the W3 target;
+  - the next source lever is to make the CUDA indexed recurrent fast path
+    support FP16 persistent state slots directly, instead of limiting default
+    recurrent/admission slots to 16 to stay on the existing FP32 state path;
+  - this follows the backend-capability/memory-budget route and does not add
+    model-id, GPU-memory, or per-model concurrency enumeration.
+- Source changes in this candidate:
+  - added FP16-state CUDA symbol variants for indexed Qwen3.5 convolution
+    state updates in `linear_attention.cu`;
+  - added FP16-state CUDA symbol variants for indexed DeltaNet recurrent
+    state updates in `gated_delta_rule.cu`;
+  - changed CUDA Rust launch selection to accept `F16` state slots for the
+    indexed conv/DeltaNet paths and dispatch to the new symbols while keeping
+    output/accumulation buffers in `F32`;
+  - changed `CudaBackend::qwen35_indexed_recurrent_state_dtype()` to report
+    `Dtype::F16`;
+  - changed Qwen3.5 model gating so the packed indexed decode path compares
+    state pool dtype to the backend fast-state dtype, not a hard-coded `F32`;
+  - made `ferrum run` and `ferrum serve` startup auto-config build hardware
+    capabilities before model capabilities, so CUDA can report FP16
+    recurrent-state bytes while generic/non-CUDA capability fallback remains
+    FP32.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-types qwen35_fast_recurrent_state_budget_selects_default_slots_without_vram_special_case -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-cli qwen35_moe -- --nocapture` PASS;
+  - `cargo test -p ferrum-models qwen35_linear_state_pool_dtype_uses_fast_indexed_state_dtype -- --nocapture`
+    PASS;
+  - `cargo check -p ferrum-kernels -p ferrum-models -p ferrum-cli` PASS.
+- Limits:
+  - this is source/local validation only;
+  - the CUDA `.cu` translation units have not yet been compiled in a CUDA
+    release build for this candidate;
+  - no GPU diagnostic, correctness smoke, performance bench, or final W3
+    validator has run for this candidate;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` exists.
+
 ## 2026-06-25 ZZZ143 — 228933a2 c32 diagnostic restores 6bb7-level throughput; still diagnostic only
 
 - Artifact:

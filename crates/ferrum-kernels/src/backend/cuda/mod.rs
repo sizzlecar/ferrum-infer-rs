@@ -942,6 +942,10 @@ impl Backend for CudaBackend {
         true
     }
 
+    fn qwen35_indexed_recurrent_state_dtype() -> crate::backend::Dtype {
+        crate::backend::Dtype::F16
+    }
+
     fn supports_qwen35_packed_gdn_decode_prepare() -> bool {
         true
     }

@@ -323,8 +323,9 @@ pub trait Backend: Send + Sync + Sized + 'static {
     }
 
     /// Persistent state-slab dtype supported by the fast indexed Qwen3.5 GDN
-    /// kernels. Activation/cache dtype alone is not sufficient: the current
-    /// indexed recurrent kernels keep the long-lived DeltaNet state in FP32.
+    /// kernels. Activation/cache dtype alone is not sufficient: each backend
+    /// must report the dtype its indexed conv and DeltaNet kernels can update
+    /// directly.
     fn qwen35_indexed_recurrent_state_dtype() -> Dtype {
         Dtype::F32
     }
