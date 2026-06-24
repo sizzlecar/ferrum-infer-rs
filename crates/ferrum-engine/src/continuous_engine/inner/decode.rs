@@ -4,6 +4,23 @@ impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
 
     pub(super) async fn run_batch_decode_adaptive(&self, request_ids: &[RequestId]) -> Result<()> {
+        self.run_batch_decode_adaptive_inner(request_ids, true)
+            .await
+    }
+
+    pub(super) async fn run_batch_decode_adaptive_no_preempt(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Result<()> {
+        self.run_batch_decode_adaptive_inner(request_ids, false)
+            .await
+    }
+
+    async fn run_batch_decode_adaptive_inner(
+        &self,
+        request_ids: &[RequestId],
+        allow_preempt: bool,
+    ) -> Result<()> {
         let mut stack = vec![self.decode_ready_request_ids(request_ids)];
         while let Some(chunk) = stack.pop() {
             let chunk = self.decode_ready_request_ids(&chunk);
@@ -18,6 +35,13 @@ impl EngineInner {
                     stack.push(chunk[..mid].to_vec());
                 }
                 Err(e) if is_resource_exhausted_error(&e) => {
+                    if !allow_preempt {
+                        warn!(
+                            "Batch decode deferred for {} request(s): capacity pressure with preemption disabled",
+                            chunk.len()
+                        );
+                        continue;
+                    }
                     let exclude: std::collections::HashSet<RequestId> =
                         chunk.iter().cloned().collect();
                     if self.preempt_victim_excluding(&exclude).await {

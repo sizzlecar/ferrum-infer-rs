@@ -1731,6 +1731,140 @@ async fn process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefil
 }
 
 #[tokio::test]
+async fn process_batch_unified_reserve_defer_does_not_preempt_decode_fallback() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedReserveExecutor {
+        inner: FailingBatchPrefillExecutor {
+            inner: RecurrentSpecExecutor {
+                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+            },
+        },
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 32,
+            total_batch_slots: 4,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler.clone(),
+        tokenizer.clone(),
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager),
+    );
+
+    let mut first_decode_request = policy_request();
+    first_decode_request.prompt = "test".to_string();
+    first_decode_request.sampling_params.max_tokens = 4;
+    let first_decode_id = first_decode_request.id.clone();
+
+    let mut second_decode_request = policy_request();
+    second_decode_request.prompt = "ok".to_string();
+    second_decode_request.sampling_params.max_tokens = 4;
+    let second_decode_id = second_decode_request.id.clone();
+
+    scheduler
+        .submit(first_decode_request.clone())
+        .await
+        .unwrap();
+    scheduler
+        .submit(second_decode_request.clone())
+        .await
+        .unwrap();
+    let initial_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("decode requests should first be scheduled as prefills");
+    assert_eq!(initial_batch.requests.len(), 2);
+    scheduler.mark_prefill_complete(&first_decode_id, 1);
+    scheduler.mark_prefill_complete(&second_decode_id, 1);
+
+    for (request, request_id, token, cache_id) in [
+        (
+            first_decode_request.clone(),
+            first_decode_id.clone(),
+            TokenId::new(5),
+            "first-decode-cache",
+        ),
+        (
+            second_decode_request.clone(),
+            second_decode_id.clone(),
+            TokenId::new(6),
+            "second-decode-cache",
+        ),
+    ] {
+        let kv = engine
+            .inner
+            .make_model_kv_handle_with_seq(cache_id.to_string(), 1);
+        let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+            request,
+            vec![token],
+            Some(tokenizer.clone()),
+            Some(64),
+        );
+        sequence.generated_tokens.push(token);
+        sequence.prefill_complete = true;
+        sequence.prefill_tokens_processed = 1;
+        sequence.kv_cache = Some(kv);
+        sequence.model_cache_id = Some(cache_id.to_string());
+        sequence.phase = RequestPhase::Decoding;
+        engine.inner.sequences.write().insert(request_id, sequence);
+    }
+
+    let mut fresh_request = policy_request();
+    fresh_request.prompt = "test ok".to_string();
+    fresh_request.sampling_params.max_tokens = 2;
+    let fresh_id = fresh_request.id.clone();
+    scheduler.submit(fresh_request).await.unwrap();
+    let mixed_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("mixed decode/fresh prefill batch should be scheduled");
+    assert_eq!(mixed_batch.requests.len(), 3);
+
+    engine.inner.process_batch(&mixed_batch).await.unwrap();
+
+    let trace = scheduler.trace_snapshot();
+    assert_eq!(
+        trace.cancelled_total, 0,
+        "model-owned KV reserve pressure from a fresh prefill must not preempt active decodes"
+    );
+    assert_eq!(trace.decode_queue_len, 2);
+    assert_eq!(
+        scheduler.trace_phase(&fresh_id),
+        Some(RequestPhase::Waiting)
+    );
+
+    let sequences = engine.inner.sequences.read();
+    for request_id in [&first_decode_id, &second_decode_id] {
+        let decode = sequences
+            .get(request_id)
+            .expect("decode request should remain active");
+        assert!(decode.prefill_complete);
+        assert!(decode.kv_cache.is_some());
+        assert_eq!(decode.preemption_count, 0);
+    }
+    let fresh = sequences
+        .get(&fresh_id)
+        .expect("deferred fresh request should remain in sequence state");
+    assert!(!fresh.prefill_complete);
+    assert!(fresh.kv_cache.is_none());
+}
+
+#[tokio::test]
 async fn process_batch_unified_capacity_defer_releases_existing_kv() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;

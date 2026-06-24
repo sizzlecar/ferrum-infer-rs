@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ146 — local source fix for mixed KV reserve fallback decode preemption
+
+- Source diagnosis:
+  - `1cdc98f7` c32 diagnostic did not OOM, but it hit
+    `Unified KV admission failed` 126 times and `cancelled during decode`
+    16 times;
+  - source trace showed those decode cancellations are engine preemption:
+    `preempt_victim_excluding` calls `scheduler.cancel` and resubmits the
+    victim to rebuild KV, so the scheduler records it as cancellation;
+  - the bad path is model-owned paged-KV `reserve_kv_slots` failing for a
+    mixed batch, then the fallback decode path using adaptive decode with
+    preemption enabled, which can cancel another active decode while fresh
+    prefills are already deferred for capacity.
+- Source change:
+  - added a no-preempt variant of adaptive batch decode;
+  - changed unified mixed-batch resource-exhausted fallback to defer fresh
+    prefills and run decode best-effort without preempting other active decode
+    requests;
+  - left normal decode-only adaptive preemption behavior unchanged;
+  - this is a generic engine capacity fix, not a model-id/GPU-memory/slot cap
+    special case.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-engine process_batch_unified_reserve_defer_does_not_preempt_decode_fallback -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefill -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_waiting -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine process_batch_single_decode_resource_exhausted_keeps_recurrent_state_waiting -- --nocapture`
+    PASS;
+  - `cargo check -p ferrum-engine` PASS.
+- Limits:
+  - this is local source validation only;
+  - no CUDA build, GPU diagnostic, performance bench, or final W3 validator has
+    run for this candidate;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` exists.
+
 ## 2026-06-25 ZZZ145 — 1cdc98f7 FP16 indexed-state c32 diagnostic passes build/smoke but regresses performance
 
 - Artifact:
