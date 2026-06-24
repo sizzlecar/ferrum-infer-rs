@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ116 — Qwen35 full-attention decode reuses F32 residual output scratch
+
+- Scope:
+  - continued from ZZZ115 without starting GPU and without running live vLLM;
+  - focused on a full-attention decode allocation on the existing F32
+    residual-shadow path;
+  - kept the change tied to decode scratch/dataflow, not to model name, GPU
+    VRAM, or a hard-coded concurrency cap.
+- Finding:
+  - Qwen35 full-attention decode computes an `o_proj` output buffer before
+    adding the attention branch into the F32 residual shadow;
+  - on the F32 residual-shadow scratch path, that output is consumed only by
+    `activation_add_to_f32_shadow`;
+  - the next operation reads from the residual shadow and branch scratch, so
+    repeated full-attention decode layers do not need a freshly allocated
+    `hidden_len` attention-output buffer when decode scratch is available;
+  - both the paged and non-paged full-attention decode branches still allocated
+    that temporary per layer.
+- Source change:
+  - added `full_attn_output` to `Qwen35DecodeScratch`;
+  - paged full-attention decode now writes `o_proj` output into
+    `scratch.full_attn_output` on the F32 residual-shadow path, then adds it to
+    the residual shadow before entering the scratch MLP finish path;
+  - non-paged full-attention decode uses the same scratch buffer for the same
+    F32 residual-shadow flow;
+  - fallback/non-F32-residual paths keep their previous local `attn_output`
+    allocation and materialized-buffer behavior.
+- Local validation:
+  - `git pull --rebase --autostash` PASS, already up to date;
+  - `cargo check -p ferrum-models` PASS;
+  - `cargo test -p ferrum-models qwen35_paged -- --nocapture` PASS;
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models dense_full_attention_backend_matches_reference_for_qwen35_gated_official_like_shape -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models full_attention_core_applies_qwen35_output_gate -- --nocapture`
+    PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - current W3 manifest probe still failed with 8 performance problems:
+    c1/c4/c16/c32 ratios below 0.800 and p95 ITL above the required
+    threshold.
+- Status:
+  - source-level candidate only; no CUDA throughput artifact has measured it
+    yet;
+  - no OOM-fixed, release-ready, performance-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ115 — Qwen35 F32 residual decode stops materializing placeholder layer outputs
 
 - Scope:
