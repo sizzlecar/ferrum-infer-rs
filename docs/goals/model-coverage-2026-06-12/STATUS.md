@@ -2,6 +2,47 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ84 — recurrent-state slot cap moved to capability memory budget
+
+- Correction:
+  - the earlier `Qwen3.5 MoE GPTQ Int4 on <=26 GiB CUDA => 16 slots`
+    policy was the wrong abstraction because it encoded one model/hardware
+    combination instead of the actual memory property;
+  - this entry replaces that policy branch with model-capability driven
+    recurrent-state memory budgeting.
+- Scope:
+  - `ModelCapabilities` now carries
+    `recurrent_state_bytes_per_sequence`;
+  - `FerrumConfigBuilder` computes recurrent-state slot budget from
+    `vram_bytes - estimated_weight_bytes` divided by the model-declared
+    per-sequence recurrent-state bytes, then floors to a power-of-two slot
+    count;
+  - default auto-config can keep `FERRUM_PAGED_MAX_SEQS=32` while materializing
+    `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS=16` from `MemoryProfile`;
+  - an explicit recurrent-state slot override above the computed budget now
+    fails during config resolution;
+  - CLI model capability extraction now derives Qwen3.5 recurrent-state bytes
+    from `Qwen35TextConfig::recurrent_state_elements_per_slot()` and the
+    runtime F32 state-pool element size, instead of guessing from a model name
+    or GPU size.
+- Code:
+  - `crates/ferrum-types/src/auto_config.rs`;
+  - `crates/ferrum-cli/src/commands/serve.rs`;
+  - `crates/ferrum-types/examples/backend_runtime_preset_snapshot.rs`.
+- Validation:
+  - `cargo test -p ferrum-types recurrent_state_budget -- --nocapture`;
+  - `cargo test -p ferrum-cli qwen35_moe_model_capabilities_preserve_moe_shape -- --nocapture`;
+  - `cargo test -p ferrum-cli model_capabilities -- --nocapture`;
+  - `cargo check -p ferrum-types --examples`;
+  - `cargo test -p ferrum-types qwen35_moe_gptq -- --nocapture`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`;
+  - `cargo check --workspace --all-targets`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ83 — LlmExecutor recurrent admission lifecycle is covered locally
 
 - Scope:

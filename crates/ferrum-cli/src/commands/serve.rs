@@ -1475,6 +1475,8 @@ pub(crate) fn model_capabilities_from_definition_with_weight_bytes(
     } else {
         None
     };
+    let recurrent_state_bytes_per_sequence =
+        recurrent_state_bytes_per_sequence_from_definition(definition);
 
     ModelCapabilities {
         architecture,
@@ -1487,9 +1489,27 @@ pub(crate) fn model_capabilities_from_definition_with_weight_bytes(
         estimated_weight_bytes: model_weight_bytes
             .filter(|value| *value > 0)
             .or_else(|| estimated_weight_bytes_from_definition(definition)),
+        recurrent_state_bytes_per_sequence,
         supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
         graph_safe_moe: false,
     }
+}
+
+fn recurrent_state_bytes_per_sequence_from_definition(
+    definition: &ferrum_models::ModelDefinition,
+) -> Option<u64> {
+    if !matches!(
+        definition.architecture,
+        ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe
+    ) {
+        return None;
+    }
+    ferrum_models::qwen35_config::Qwen35TextConfig::from_model_definition(definition)
+        .ok()?
+        .recurrent_state_elements_per_slot()
+        .ok()?
+        .checked_mul(4)
+        .and_then(|bytes| u64::try_from(bytes).ok())
 }
 
 pub(crate) fn model_weight_bytes_from_path(path: &Path) -> Option<u64> {
@@ -1972,6 +1992,12 @@ fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const QWEN35_ARTIFACT_ROOT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/goals/model-coverage-2026-06-12/artifacts/",
+        "w3_hf_config_probe_20260617T131209Z_f97c1d6f"
+    );
 
     #[test]
     fn serve_parses_explicit_qwen35_reference_flag() {
@@ -2490,9 +2516,26 @@ mod tests {
         definition
     }
 
-    #[test]
-    fn qwen35_moe_model_capabilities_preserve_moe_shape() {
-        let mut definition = ferrum_models::ModelDefinition {
+    fn qwen35_moe_reference_definition() -> ferrum_models::ModelDefinition {
+        let raw = std::fs::read_to_string(format!(
+            "{QWEN35_ARTIFACT_ROOT}/moe_shared_expert_reference.config.json"
+        ))
+        .expect("read Qwen3.5 MoE reference config");
+        let root: serde_json::Value =
+            serde_json::from_str(&raw).expect("parse Qwen3.5 MoE reference config");
+        let text = root
+            .get("text_config")
+            .and_then(|value| value.as_object())
+            .expect("Qwen3.5 reference config should include text_config");
+        let mut extra_params = root
+            .as_object()
+            .expect("Qwen3.5 reference config root should be an object")
+            .clone();
+        for (key, value) in text {
+            extra_params.insert(key.clone(), value.clone());
+        }
+
+        ferrum_models::ModelDefinition {
             architecture: ferrum_models::Architecture::Qwen35Moe,
             hidden_size: 2048,
             intermediate_size: 512,
@@ -2500,15 +2543,15 @@ mod tests {
             num_attention_heads: 16,
             num_key_value_heads: Some(2),
             max_position_embeddings: 262144,
+            vocab_size: 248320,
+            extra_params: serde_json::Value::Object(extra_params),
             ..Default::default()
-        };
-        definition.extra_params = serde_json::json!({
-            "head_dim": 256,
-            "num_experts": 256,
-            "num_experts_per_tok": 8,
-            "moe_intermediate_size": 512,
-            "shared_expert_intermediate_size": 512
-        });
+        }
+    }
+
+    #[test]
+    fn qwen35_moe_model_capabilities_preserve_moe_shape() {
+        let definition = qwen35_moe_reference_definition();
 
         let capabilities = model_capabilities_from_definition_with_weight_bytes(&definition, None);
 
@@ -2522,6 +2565,10 @@ mod tests {
         assert!(
             capabilities.estimated_weight_bytes.unwrap() > 14 * 1024 * 1024 * 1024,
             "Qwen3.5 MoE weight estimate must account for all resident experts, not only active params"
+        );
+        assert_eq!(
+            capabilities.recurrent_state_bytes_per_sequence,
+            Some(30 * (8192 * 3 + 32 * 128 * 128) * 4)
         );
     }
 
