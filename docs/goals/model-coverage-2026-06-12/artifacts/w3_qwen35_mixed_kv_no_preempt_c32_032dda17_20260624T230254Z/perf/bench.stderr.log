@@ -1,0 +1,46 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=32 warmup=4 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/1 (36 prompts including 4 warmup)
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+[err] stream: error decoding response body
+    0 completed / 32 errored / 600.0s
+    summary c=32 (n_repeats=1, no CI)
+      TTFT_ms  p50=0.0  p95=0.0  p99=0.0
+      TPOT_ms  p50=0.0  p95=0.0  p99=0.0
+      ITL_ms   p50=0.0  p95=0.0  p99=0.0
+      throughput      0.0 tok/s
+      goodput         0.00 req/s
+
+→ wrote /workspace/artifacts/w3_qwen35_mixed_kv_no_preempt_c32_032dda17_20260624T230254Z/perf/bench_ferrum_c32_32x1.json
+Error: Model error: bench-serve error rate 1.0000 exceeds max 0.0000 for Qwen/Qwen3.5-35B-A3B-GPTQ-Int4
