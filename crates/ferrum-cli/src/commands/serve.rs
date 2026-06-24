@@ -1507,7 +1507,10 @@ fn recurrent_state_bytes_per_sequence_from_definition(
     Some(
         ferrum_models::qwen35_config::Qwen35TextConfig::from_model_definition(definition)
             .ok()?
-            .recurrent_state_bytes_per_slot(ferrum_types::DataType::FP16)
+            // Match the release-grade indexed recurrent state path. Current
+            // CUDA kernels accept fp16 activations/weights but keep the
+            // persistent Qwen3.5 DeltaNet state slab in fp32.
+            .recurrent_state_bytes_per_slot(ferrum_types::DataType::FP32)
             .ok()?,
     )
 }
@@ -2565,7 +2568,7 @@ mod tests {
         );
         assert_eq!(
             capabilities.recurrent_state_bytes_per_sequence,
-            Some(30 * (8192 * 3 + 32 * 128 * 128) * 2)
+            Some(30 * (8192 * 3 + 32 * 128 * 128) * 4)
         );
     }
 
