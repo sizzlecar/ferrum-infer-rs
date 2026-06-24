@@ -2,6 +2,64 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ126 — Backpressure reached width 1, but c32 still stalls
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_capacity_backpressure_c32_2203a9cd_20260624T173154Z/`;
+  - remote Git SHA: `2203a9cd9c0b1244705c756c6c204235638c8477`;
+  - diagnostic lane only, not release evidence, and did not run live vLLM;
+  - Vast instance `42216671` was reused, then stopped and confirmed
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-engine -p ferrum-scheduler` PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`;
+  - effective config assertions kept
+    `selected_max_sequences=32`, `selected_recurrent_state_max_slots=32`,
+    and `selected_admission_limit=32`.
+- c32 diagnostic result:
+  - command was the planned diagnostic `bench-serve` c=32, 32 prompts,
+    4 warmups, `n_repeats=1`, `--fail-on-error`, seed `9271`;
+  - bench was manually stopped per stop condition after the scheduler trace
+    showed no token progress and GPU util stayed idle;
+  - `bench_exit=143`, so this is a failed/stopped diagnostic.
+- Failure shape:
+  - the adaptive scheduler change did take effect:
+    `capacity_backpressure_admit_limit=1`;
+  - despite admission being reduced to one request at a time, the last trace
+    still had `completed_total=5`, `waiting_queue_len=32`,
+    `active_len=0`, `admitted_total=80841`,
+    `capacity_deferred_total=80798`;
+  - engine counters were stuck at `prefill_tokens_delta=0` and
+    `decode_tokens_delta=0`;
+  - `no_victim_warning_count=81055`;
+  - `oom_mentions=0`.
+- Conclusion:
+  - the earlier admission-flood part is improved, but the c32 problem is not
+    fixed;
+  - the remaining failure is now narrower: even a single scheduled waiting
+    prefill can repeatedly hit `no victim` with no token progress;
+  - this points back to generic KV/recurrent capacity accounting, release, or
+    waiting-prefill retry semantics after capacity defer, not to a
+    Qwen3.5/GPU/concurrency special case.
+- Next source direction before another paid GPU run:
+  - inspect the KV manager/model-executor allocation and release path for a
+    capacity-deferred single prefill;
+  - compare Ferrum's retry behavior with vLLM's waiting `allocate_slots`
+    failure behavior: vLLM breaks out of waiting admission instead of
+    immediately retrying the same impossible allocation in a tight loop;
+  - add a focused source-level regression for the single-prefill
+    capacity-defer retry/no-progress case before starting the next CUDA
+    diagnostic.
+- Limits:
+  - no W3 PASS line exists;
+  - this does not prove c32 completion, throughput, OOM resolution, W3
+    performance, or release readiness.
+
 ## 2026-06-25 ZZZ125 — Scheduler capacity backpressure uses adaptive admission
 
 - Source of this patch:
