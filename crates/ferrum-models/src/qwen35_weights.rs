@@ -19,6 +19,7 @@ use crate::qwen35_config::{
 };
 
 const PREFIX_CANDIDATES: &[&str] = &["model.language_model", "model"];
+const QWEN35_MOE_EXPERT_GPTQ_PROJECTIONS: &[&str] = &["gate_proj", "up_proj", "down_proj"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen35WeightInventory {
@@ -375,6 +376,7 @@ impl Qwen35WeightInventory {
             let manifest = config.weight_manifest(*prefix)?;
             let validation = self.validate_manifest(&manifest);
             if validation.missing_required.is_empty() {
+                self.validate_moe_gptq_expert_sidecars(config, &validation.prefix)?;
                 return Ok(validation);
             }
             if best.as_ref().is_none_or(|current| {
@@ -406,6 +408,7 @@ impl Qwen35WeightInventory {
             let manifest = config.weight_manifest(*prefix)?;
             let validation = self.validate_manifest(&manifest);
             if validation.missing_required.is_empty() {
+                self.validate_moe_gptq_expert_sidecars(config, &validation.prefix)?;
                 return self.resolve_manifest(&manifest);
             }
             if best.as_ref().is_none_or(|current| {
@@ -465,6 +468,80 @@ impl Qwen35WeightInventory {
 
     fn contains_weight_spec(&self, tensor: &Qwen35WeightSpec) -> bool {
         !self.matching_names(tensor).is_empty()
+    }
+
+    fn validate_moe_gptq_expert_sidecars(
+        &self,
+        config: &Qwen35TextConfig,
+        prefix: &str,
+    ) -> Result<(), String> {
+        let Some(moe) = &config.moe else {
+            return Ok(());
+        };
+        let mut any_gptq_expert_tensor = false;
+        let mut expected_sidecars = Vec::new();
+        let mut gate_up_g_idx = Vec::new();
+        let mut down_g_idx = Vec::new();
+        for layer_index in config.sparse_moe_layers() {
+            for expert in 0..moe.num_experts {
+                for proj in QWEN35_MOE_EXPERT_GPTQ_PROJECTIONS {
+                    let stem = qwen35_moe_expert_gptq_stem(prefix, layer_index, expert, proj);
+                    let qweight = format!("{stem}.qweight");
+                    let scales = format!("{stem}.scales");
+                    let qzeros = format!("{stem}.qzeros");
+                    let g_idx = format!("{stem}.g_idx");
+                    let has_qweight = self.contains(&qweight);
+                    let has_scales = self.contains(&scales);
+                    let has_qzeros = self.contains(&qzeros);
+                    let has_g_idx = self.contains(&g_idx);
+                    let has_any = has_qweight || has_scales || has_qzeros || has_g_idx;
+                    any_gptq_expert_tensor |= has_any;
+                    expected_sidecars.push((qweight, has_qweight));
+                    expected_sidecars.push((scales, has_scales));
+                    expected_sidecars.push((qzeros, has_qzeros));
+                    if *proj == "down_proj" {
+                        down_g_idx.push((g_idx, has_g_idx));
+                    } else {
+                        gate_up_g_idx.push((g_idx, has_g_idx));
+                    }
+                }
+            }
+        }
+        if !any_gptq_expert_tensor {
+            return Ok(());
+        }
+        let missing = expected_sidecars
+            .into_iter()
+            .filter_map(|(name, present)| (!present).then_some(name))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "incomplete Qwen3.5 per-expert GPTQ sidecars for prefix {prefix}: missing {} tensors, first: {}",
+                missing.len(),
+                missing
+                    .iter()
+                    .take(12)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for (label, entries) in [("gate/up", gate_up_g_idx), ("down", down_g_idx)] {
+            let present = entries.iter().filter(|(_, present)| *present).count();
+            if present != 0 && present != entries.len() {
+                let first_missing = entries
+                    .iter()
+                    .filter_map(|(name, present)| (!*present).then_some(name.as_str()))
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "inconsistent Qwen3.5 per-expert GPTQ g_idx sidecars for {label} stack under prefix {prefix}: present {present}/{}; first missing: {first_missing}",
+                    entries.len()
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn matching_names(&self, tensor: &Qwen35WeightSpec) -> Vec<String> {
@@ -530,6 +607,15 @@ impl Qwen35WeightInventory {
             })
             .collect()
     }
+}
+
+fn qwen35_moe_expert_gptq_stem(
+    prefix: &str,
+    layer_index: usize,
+    expert: usize,
+    proj: &str,
+) -> String {
+    format!("{prefix}.layers.{layer_index}.mlp.experts.{expert}.{proj}")
 }
 
 impl Qwen35WeightValidation {
@@ -791,6 +877,28 @@ mod tests {
             .collect()
     }
 
+    fn append_complete_moe_expert_gptq_sidecars(
+        names: &mut Vec<String>,
+        config: &Qwen35TextConfig,
+        prefix: &str,
+        include_g_idx: bool,
+    ) {
+        let moe = config.moe.as_ref().unwrap();
+        for layer_index in config.sparse_moe_layers() {
+            for expert in 0..moe.num_experts {
+                for proj in QWEN35_MOE_EXPERT_GPTQ_PROJECTIONS {
+                    let stem = qwen35_moe_expert_gptq_stem(prefix, layer_index, expert, proj);
+                    names.push(format!("{stem}.qweight"));
+                    names.push(format!("{stem}.scales"));
+                    names.push(format!("{stem}.qzeros"));
+                    if include_g_idx {
+                        names.push(format!("{stem}.g_idx"));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn validates_single_file_safetensors_against_manifest() {
         let config = dense_config();
@@ -1007,6 +1115,61 @@ mod tests {
             .validation()
             .present_optional
             .contains(&"model.layers.0.mlp.experts.0.gate_proj.weight".to_string()));
+    }
+
+    #[test]
+    fn validates_complete_per_expert_gptq_sidecars() {
+        let config = moe_config();
+        let mut names = required_names_with_gptq_linear_aliases(&config, "model");
+        append_complete_moe_expert_gptq_sidecars(&mut names, &config, "model", true);
+        let inventory = Qwen35WeightInventory::from_names(names);
+
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+
+        assert_eq!(
+            plan.layer_tensor(0, "moe_per_expert_gate_proj_qweight")
+                .map(|tensor| tensor.name.as_str()),
+            Some("model.layers.0.mlp.experts.0.gate_proj.qweight")
+        );
+        assert!(plan.validation().is_pass());
+    }
+
+    #[test]
+    fn rejects_incomplete_per_expert_gptq_sidecars() {
+        let config = moe_config();
+        let mut names = required_names_with_gptq_linear_aliases(&config, "model");
+        names.push("model.layers.0.mlp.experts.0.gate_proj.qweight".to_string());
+        let inventory = Qwen35WeightInventory::from_names(names);
+
+        let err = inventory
+            .detect_prefix_and_resolve(&config)
+            .expect_err("partial per-expert GPTQ sidecars should fail preflight");
+
+        assert!(
+            err.contains("incomplete Qwen3.5 per-expert GPTQ sidecars"),
+            "{err}"
+        );
+        assert!(err.contains("scales"), "{err}");
+        assert!(err.contains("qzeros"), "{err}");
+    }
+
+    #[test]
+    fn rejects_inconsistent_per_expert_gptq_g_idx_sidecars() {
+        let config = moe_config();
+        let mut names = required_names_with_gptq_linear_aliases(&config, "model");
+        append_complete_moe_expert_gptq_sidecars(&mut names, &config, "model", false);
+        names.push("model.layers.0.mlp.experts.0.gate_proj.g_idx".to_string());
+        let inventory = Qwen35WeightInventory::from_names(names);
+
+        let err = inventory
+            .detect_prefix_and_resolve(&config)
+            .expect_err("partial g_idx sidecars should fail preflight");
+
+        assert!(
+            err.contains("inconsistent Qwen3.5 per-expert GPTQ g_idx sidecars"),
+            "{err}"
+        );
+        assert!(err.contains("gate/up"), "{err}");
     }
 
     #[test]
