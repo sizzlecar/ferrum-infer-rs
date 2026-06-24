@@ -2,6 +2,60 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ106 — Qwen35 c16 MoE bucket profile diagnostic excludes routed bucket GEMM as first lever
+
+- Scope:
+  - reused existing Vast 1x RTX 4090 instance `42216671`, then stopped it and
+    confirmed `actual_status=exited`;
+  - validated commit `670a70f5ea81a8c2d5c60745e5405ddad4a3af0c`;
+  - rebuilt the CUDA release binary with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - ran product-path `ferrum run` smoke, `ferrum serve` smoke, then a short
+    diagnostic c16 `bench-serve --fail-on-error --seed 9271 --ignore-eos`;
+  - enabled Qwen35 layer-detail/profile JSONL diagnostics for this run only;
+  - no live vLLM run was used.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_bucket_profile_670a70f5_20260624/`;
+  - `summary.json` records lane metadata, binary SHA256, bench status, and
+    profile summary;
+  - `server/profile_gap_analysis.json` records the outer/inner/bucket gap
+    calculation;
+  - Vast cleanup evidence is in `vast/stop_poll.tsv`, ending at
+    `stopped exited`.
+- Result:
+  - CUDA build passed in `3m26s`, binary SHA256
+    `27627386cfec6a6051f8309608a7dc97dd7b0bdc3bc73239b76591c99fceea66`;
+  - `ferrum run` smoke passed;
+  - `ferrum serve` chat smoke passed;
+  - c16 short diagnostic bench completed `16/16` requests with `0` errors;
+  - diagnostic throughput was `129.44925443545154` output tok/s with heavy
+    layer-detail profiling enabled, so it is not performance evidence.
+- Profile finding for decode `tokens=16` rows:
+  - captured `1840` `qwen35_sparse_moe_detail` rows with nested
+    `routed_bucket` fields;
+  - routed bucket total averaged `83.137us/layer`; `gemm1+gemm3` averaged
+    `71.891us/layer`;
+  - inner `qwen35_sparse_moe_detail.total` averaged `213.090us/layer`;
+  - outer `qwen35_mlp_finish_detail.sparse_moe` averaged
+    `771.913us/layer`, leaving about `558.823us/layer` outside the inner
+    sparse-MoE total.
+- Interpretation:
+  - the new bucket instrumentation worked and shows routed bucket GEMM is not
+    the first high-return lever for the remaining W3 gap;
+  - the large outer-vs-inner gap is consistent with layer-detail diagnostic
+    emission overhead, because the inner sparse-MoE total stops before
+    `detail.log()` / profile JSON emission while the outer MLP timer includes
+    the function return path;
+  - do not spend the next iteration optimizing routed bucket GEMM based on
+    this profile.
+- Status:
+  - diagnostic-only artifact; no release-ready, performance-ready, or W3 PASS
+    claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`;
+  - next work should use lower-overhead evidence or source inspection for the
+    remaining no-profile decode gap instead of more model/VRAM-specific
+    special casing.
+
 ## 2026-06-24 ZZZ105 — Qwen35 MoE bucket substage profiling wired into layer detail events
 
 - Scope:

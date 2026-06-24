@@ -1,0 +1,125 @@
+{
+  "derived_us": {
+    "inner_sparse_total_minus_routed_bucket_total_mean": 129.9532258064516,
+    "outer_sparse_minus_inner_sparse_total_mean": 558.8225806451612,
+    "routed_bucket_gemm1_plus_gemm3_mean": 71.89112903225806
+  },
+  "interpretation": [
+    "For c16 decode rows, routed_bucket total averages about 83us/layer and gemm1+gemm3 about 72us/layer.",
+    "Inner qwen35_sparse_moe_detail total averages about 213us/layer, with router/shared/merge explaining the rest.",
+    "Outer qwen35_mlp_finish_detail.sparse_moe averages about 772us/layer under layer-detail profiling, leaving about 559us/layer outside the inner sparse MoE total.",
+    "Because qwen35_sparse_moe_detail stops its total timer before detail.log/profile emission, while the outer MLP timer includes that diagnostic emission overhead, this artifact should not be used to optimize production bucketed MoE GEMM directly.",
+    "Next optimization should not target routed bucket GEMM first; use lower-overhead profiling or source inspection for the remaining no-profile decode gap."
+  ],
+  "scope": "tokens=16 qwen35 sparse MoE decode profile rows only",
+  "stats_us": {
+    "mlp_finish.accounted": {
+      "mean": 781.7048387096775,
+      "n": 1240,
+      "p50": 783.0,
+      "p95": 800.0
+    },
+    "mlp_finish.gpu_accounted": {
+      "mean": 780.7,
+      "n": 1240,
+      "p50": 782.0,
+      "p95": 799.0
+    },
+    "mlp_finish.mlp_body": {
+      "mean": 771.9129032258064,
+      "n": 1240,
+      "p50": 773.0,
+      "p95": 790.0
+    },
+    "mlp_finish.sparse_moe": {
+      "mean": 771.9129032258064,
+      "n": 1240,
+      "p50": 773.0,
+      "p95": 790.0
+    },
+    "routed_bucket.combine": {
+      "mean": 5.937096774193549,
+      "n": 1240,
+      "p50": 6.0,
+      "p95": 6.0
+    },
+    "routed_bucket.gather": {
+      "mean": 0.0,
+      "n": 1240,
+      "p50": 0.0,
+      "p95": 0.0
+    },
+    "routed_bucket.gemm1": {
+      "mean": 47.66290322580645,
+      "n": 1240,
+      "p50": 47.0,
+      "p95": 56.0
+    },
+    "routed_bucket.gemm3": {
+      "mean": 24.22822580645161,
+      "n": 1240,
+      "p50": 24.0,
+      "p95": 29.0
+    },
+    "routed_bucket.plan": {
+      "mean": 0.0,
+      "n": 1240,
+      "p50": 0.0,
+      "p95": 0.0
+    },
+    "routed_bucket.route": {
+      "mean": 0.0,
+      "n": 1240,
+      "p50": 0.0,
+      "p95": 0.0
+    },
+    "routed_bucket.silu": {
+      "mean": 5.308870967741935,
+      "n": 1240,
+      "p50": 5.0,
+      "p95": 6.0
+    },
+    "routed_bucket.total": {
+      "mean": 83.13709677419355,
+      "n": 1240,
+      "p50": 83.0,
+      "p95": 96.0
+    },
+    "sparse_moe.accounted": {
+      "mean": 159.8491935483871,
+      "n": 1240,
+      "p50": 160.0,
+      "p95": 174.0
+    },
+    "sparse_moe.merge": {
+      "mean": 3.779032258064516,
+      "n": 1240,
+      "p50": 4.0,
+      "p95": 5.0
+    },
+    "sparse_moe.routed_experts": {
+      "mean": 91.75403225806451,
+      "n": 1240,
+      "p50": 92.0,
+      "p95": 105.0
+    },
+    "sparse_moe.router": {
+      "mean": 14.026612903225807,
+      "n": 1240,
+      "p50": 14.0,
+      "p95": 15.0
+    },
+    "sparse_moe.shared_path": {
+      "mean": 50.28951612903226,
+      "n": 1240,
+      "p50": 50.0,
+      "p95": 53.0
+    },
+    "sparse_moe.total": {
+      "mean": 213.09032258064516,
+      "n": 1240,
+      "p50": 212.0,
+      "p95": 227.0
+    }
+  }
+}
