@@ -387,8 +387,9 @@ impl EngineInner {
                 seq.input_tokens.iter().map(|t| t.get()).collect::<Vec<_>>()
             };
             let model_info = draft_exec.info();
+            let draft_kv_request_id = RequestId::new();
             let alloc_request = AllocationRequest {
-                request_id: request_id.clone(),
+                request_id: draft_kv_request_id.clone(),
                 initial_tokens: prompt_u32s.len(),
                 max_sequence_length: model_info.max_sequence_length,
                 num_layers: model_info.num_layers,
@@ -399,14 +400,27 @@ impl EngineInner {
                 priority: Priority::Normal,
             };
             let draft_kv_handle = self.kv_cache.allocate(&alloc_request).await?;
-            let prompt_tensor = self.tokens_to_tensor(&prompt_u32s)?;
+            let prompt_tensor = match self.tokens_to_tensor(&prompt_u32s) {
+                Ok(tensor) => tensor,
+                Err(e) => {
+                    let _ = self.kv_cache.deallocate(draft_kv_request_id).await;
+                    return Err(e);
+                }
+            };
             let pfx = PrefillInput::new(prompt_tensor).with_kv_cache(draft_kv_handle);
-            let pfx_out = draft_exec.prefill(&pfx).await?;
+            let pfx_out = match draft_exec.prefill(&pfx).await {
+                Ok(output) => output,
+                Err(e) => {
+                    let _ = self.kv_cache.deallocate(draft_kv_request_id).await;
+                    return Err(e);
+                }
+            };
             let kv = pfx_out.kv_cache.clone();
             {
                 let mut sequences = self.sequences.write();
                 if let Some(s) = sequences.get_mut(request_id) {
                     s.draft_kv_cache = Some(kv.clone());
+                    s.draft_kv_request_id = Some(draft_kv_request_id);
                 }
             }
             kv

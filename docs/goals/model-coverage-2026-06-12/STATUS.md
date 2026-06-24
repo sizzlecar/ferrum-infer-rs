@@ -13839,3 +13839,44 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     仍不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 speculative draft KV uses separate resource identity
+
+- 背景:
+  - 继续审计 decode/speculative 路径发现:首次 speculative decode 会给 draft
+    model 额外分配 draft KV。
+  - 旧逻辑用目标请求的 `request_id` 再次调用 `KvCacheManager::allocate()`。
+    KV managers 以 `RequestId` 为 key,这会让 draft allocation 覆盖 target
+    allocation 的 active handle,同时资源计数/blocks 仍可能保留。
+  - 如果 draft prompt tensor 构建或 draft prefill 失败,旧逻辑也没有显式释放
+    本轮 draft KV allocation。
+- 源码变更:
+  - `SequenceState` 新增 `draft_kv_request_id`,记录 draft KV 在
+    `KvCacheManager` 中的资源身份。
+  - speculative draft prefill 现在为 draft KV 生成独立 `RequestId`,不再复用
+    target request id。
+  - draft prompt `tokens_to_tensor()` 或 draft prefill 失败时,释放本轮 draft
+    KV allocation 后返回错误。
+  - `complete_request()` 现在同时释放 target KV 和 draft KV。
+  - `preempt_victim()` 现在也释放并清空 victim 的 draft KV 和
+    `draft_kv_request_id`。
+  - 新增
+    `process_batch_speculative_draft_tensor_error_releases_target_and_draft_kv`。
+    测试走 `process_batch` 产品路径,模拟 draft tensor 构建失败,并断言 target
+    和 draft 两次 KV allocation 最终 active 计数归零。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-engine process_batch_speculative_draft_tensor_error_releases_target_and_draft_kv -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,
+    22 个 recurrent/resource 相关测试通过。
+  - `cargo test -p ferrum-engine speculative -- --nocapture` PASS,
+    9 个 unit/test-filter 相关测试通过,并包含 `spec_decode_test.rs` 的 3 个
+    speculative integration tests。
+  - `git diff --check` PASS。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只证明本地 speculative draft KV resource identity/cleanup 正确性,
+    仍不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。

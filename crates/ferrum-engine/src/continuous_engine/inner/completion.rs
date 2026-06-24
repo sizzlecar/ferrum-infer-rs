@@ -156,6 +156,7 @@ impl EngineInner {
             response_sender,
             has_kv_cache,
             has_recurrent_state,
+            draft_kv_request_id,
             model_cache_id,
         ) = {
             let mut sequences = self.sequences.write();
@@ -194,6 +195,7 @@ impl EngineInner {
 
                 let has_kv = seq.kv_cache.is_some();
                 let has_recurrent_state = seq.recurrent_state.is_some();
+                let draft_kv_request_id = seq.draft_kv_request_id.clone();
                 let cache_id = seq.model_cache_id.clone();
                 (
                     response,
@@ -201,6 +203,7 @@ impl EngineInner {
                     seq.response_sender,
                     has_kv,
                     has_recurrent_state,
+                    draft_kv_request_id,
                     cache_id,
                 )
             } else {
@@ -215,6 +218,10 @@ impl EngineInner {
 
         if has_kv_cache {
             let _ = self.kv_cache.deallocate(request_id.clone()).await;
+        }
+
+        if let Some(draft_request_id) = draft_kv_request_id {
+            let _ = self.kv_cache.deallocate(draft_request_id).await;
         }
 
         if has_recurrent_state {
