@@ -1,0 +1,1 @@
+poll=4 cur_state=None actual_status=None intended_status=None

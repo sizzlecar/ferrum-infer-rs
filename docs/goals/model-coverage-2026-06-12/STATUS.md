@@ -2,6 +2,48 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ108 — Qwen35 linear scratch c16 quick diagnostic on 1x4090
+
+- Scope:
+  - reused existing Vast 1x RTX 4090 instance `42216671`, then stopped it and
+    confirmed `cur_state=stopped actual_status=exited`;
+  - validated commit `00757b41d8102d5718f6048f836c4ea5a78ad414`;
+  - rebuilt the CUDA release binary with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - ran product-path `ferrum run` smoke, `ferrum serve` smoke, then a short
+    diagnostic c16 `bench-serve --fail-on-error --seed 9271 --ignore-eos`;
+  - no live vLLM run was used.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_linear_scratch_c16_quick_00757b41_20260624/`;
+  - diagnostic PASS line:
+    `W3 QWEN35 LINEAR SCRATCH C16 QUICK DIAG PASS: /workspace/artifacts/w3_qwen35_linear_scratch_c16_quick_00757b41_20260624`;
+  - `summary.json` records lane metadata, binary SHA256, bench status, and the
+    delta against the previous ZZZ104 c16 no-profile artifact;
+  - Vast cleanup evidence is in `vast/instance_after_stop.json`, with
+    `cur_state=stopped actual_status=exited intended_status=stopped`.
+- Result:
+  - CUDA build passed in `3m26s`, binary SHA256
+    `d17948d06dba356d3f7f63cc07b57c5cf0ea5aa5a273ebc4cce430f3f454a2e1`;
+  - `ferrum run` smoke passed;
+  - `ferrum serve` chat smoke passed and returned `5` for the simple arithmetic
+    prompt;
+  - c16 quick diagnostic bench completed `32/32` requests with `0` errors;
+  - c16 output throughput was `678.630239827307` tok/s, p95 ITL was
+    `20.23245625` ms, and output token counts came from usage.
+- Interpretation:
+  - compared with ZZZ104 no-profile c16 throughput
+    `659.0665261344391` tok/s, the scratch reuse diagnostic is only
+    `+19.563713692867964` tok/s, ratio `1.0296839741013903`;
+  - this is a small positive movement and confirms the change did not introduce
+    an immediate run/serve/bench regression on the c16 smoke path;
+  - it is still far from the W3 release-grade ratio target and does not explain
+    or solve the full c1/c4/c16/c32 performance gap by itself.
+- Status:
+  - this artifact is diagnostic only because it is `n_repeats=1`, c16-only, and
+    Ferrum-only against historical vLLM data;
+  - no OOM-fixed, release-ready, or W3 performance-ready claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ107 — Qwen35 packed linear decode scratch reuse candidate
 
 - Scope:

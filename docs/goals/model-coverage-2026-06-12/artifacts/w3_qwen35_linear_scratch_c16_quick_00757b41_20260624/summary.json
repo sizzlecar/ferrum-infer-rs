@@ -1,0 +1,23 @@
+{
+  "bench": {
+    "completed_per_run": [
+      32
+    ],
+    "delta_vs_zzz104_output_tps": 19.563713692867964,
+    "errored_per_run": [
+      0
+    ],
+    "itl_p95_ms": 20.23245625,
+    "output_throughput_tps": 678.630239827307,
+    "output_token_count_source": "usage",
+    "previous_zzz104_output_tps": 659.0665261344391,
+    "ratio_vs_zzz104_output_tps": 1.0296839741013903,
+    "ttft_p95_ms": 737.6611609500001
+  },
+  "binary_sha256": "d17948d06dba356d3f7f63cc07b57c5cf0ea5aa5a273ebc4cce430f3f454a2e1",
+  "diagnostic_only": true,
+  "git_sha": "00757b41d8102d5718f6048f836c4ea5a78ad414",
+  "lane": "W3_QWEN35_LINEAR_SCRATCH_C16_QUICK_00757B41",
+  "no_live_vllm": true,
+  "status": "passed"
+}
