@@ -1352,7 +1352,10 @@ def run_selftest() -> int:
         write_text(out_dir / "run_stdout.jsonl", '{"event":"assistant","content":"5","finish_reason":"stop","n_tokens":1}\n')
         write_text(out_dir / "run_stderr.txt", "")
         write_text(out_dir / "serve.log", "server ok\n")
-        write_text(out_dir / "behavior_stream.sse", "data: {}\n\ndata: [DONE]\n")
+        write_text(
+            out_dir / "behavior_stream.sse",
+            'data: {"usage":{"completion_tokens":1},"choices":[]}\n\ndata: [DONE]\n',
+        )
         run_result = {
             "status": "pass",
             "case_id": "addition_2_plus_3",
