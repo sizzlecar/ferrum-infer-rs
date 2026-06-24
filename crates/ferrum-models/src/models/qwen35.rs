@@ -326,6 +326,11 @@ pub struct Qwen35PagedScratch<B: MoeLlmBackend> {
     context_lens: Option<B::Buffer>,
     q: Option<B::Buffer>,
     out: Option<B::Buffer>,
+    cached_cu_seqlens_q: Vec<u32>,
+    cached_token_seq_indices: Vec<u32>,
+    cached_pos_offsets: Vec<u32>,
+    cached_block_tables: Vec<u32>,
+    cached_context_lens: Vec<u32>,
     max_seqs: usize,
     max_tokens: usize,
     max_blocks_per_seq: usize,
@@ -737,6 +742,11 @@ impl<B: MoeLlmBackend> Qwen35PagedScratch<B> {
             context_lens: None,
             q: None,
             out: None,
+            cached_cu_seqlens_q: Vec::new(),
+            cached_token_seq_indices: Vec::new(),
+            cached_pos_offsets: Vec::new(),
+            cached_block_tables: Vec::new(),
+            cached_context_lens: Vec::new(),
             max_seqs: 0,
             max_tokens: 0,
             max_blocks_per_seq: 0,
@@ -759,6 +769,10 @@ impl<B: MoeLlmBackend> Qwen35PagedScratch<B> {
             self.pos_offsets = Some(B::alloc_typed(Dtype::U32, num_seqs));
             self.context_lens = Some(B::alloc_typed(Dtype::U32, num_seqs));
             self.block_tables = Some(B::alloc_typed(Dtype::U32, num_seqs * max_blocks_per_seq));
+            self.cached_cu_seqlens_q.clear();
+            self.cached_pos_offsets.clear();
+            self.cached_context_lens.clear();
+            self.cached_block_tables.clear();
             self.max_seqs = num_seqs;
             self.max_blocks_per_seq = max_blocks_per_seq;
         }
@@ -766,8 +780,68 @@ impl<B: MoeLlmBackend> Qwen35PagedScratch<B> {
             self.q = Some(B::alloc(total_tokens * q_total));
             self.out = Some(B::alloc(total_tokens * q_total));
             self.token_seq_indices = Some(B::alloc_typed(Dtype::U32, total_tokens.max(1)));
+            self.cached_token_seq_indices.clear();
             self.max_tokens = total_tokens;
         }
+    }
+
+    fn write_cu_seqlens_q(&mut self, ctx: &mut B::Context, data: &[u32]) {
+        let buf = self.cu_seqlens_q.as_mut().expect("qwen35 paged cu missing");
+        qwen35_write_cached_u32::<B>(ctx, &mut self.cached_cu_seqlens_q, buf, data);
+    }
+
+    fn write_token_seq_indices(&mut self, ctx: &mut B::Context, data: &[u32]) {
+        let buf = self
+            .token_seq_indices
+            .as_mut()
+            .expect("qwen35 paged token rows missing");
+        qwen35_write_cached_u32::<B>(ctx, &mut self.cached_token_seq_indices, buf, data);
+    }
+
+    fn write_pos_offsets(&mut self, ctx: &mut B::Context, data: &[u32]) {
+        let buf = self.pos_offsets.as_mut().expect("qwen35 paged pos missing");
+        qwen35_write_cached_u32::<B>(ctx, &mut self.cached_pos_offsets, buf, data);
+    }
+
+    fn write_block_tables(&mut self, ctx: &mut B::Context, data: &[u32]) {
+        let buf = self
+            .block_tables
+            .as_mut()
+            .expect("qwen35 paged block_tables missing");
+        qwen35_write_cached_u32::<B>(ctx, &mut self.cached_block_tables, buf, data);
+    }
+
+    fn write_context_lens(&mut self, ctx: &mut B::Context, data: &[u32]) {
+        let buf = self
+            .context_lens
+            .as_mut()
+            .expect("qwen35 paged context_lens missing");
+        qwen35_write_cached_u32::<B>(ctx, &mut self.cached_context_lens, buf, data);
+    }
+}
+
+fn qwen35_cached_u32_write_needed(cache: &[u32], data: &[u32]) -> bool {
+    cache != data
+}
+
+fn qwen35_update_cached_u32(cache: &mut Vec<u32>, data: &[u32]) -> bool {
+    if qwen35_cached_u32_write_needed(cache, data) {
+        cache.clear();
+        cache.extend_from_slice(data);
+        true
+    } else {
+        false
+    }
+}
+
+fn qwen35_write_cached_u32<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    cache: &mut Vec<u32>,
+    dst: &mut B::Buffer,
+    data: &[u32],
+) {
+    if qwen35_update_cached_u32(cache, data) {
+        B::write_typed::<u32>(ctx, dst, data);
     }
 }
 
@@ -8371,21 +8445,21 @@ fn qwen35_full_attention_prefill_batch_layer_backend<B: MoeLlmBackend + BackendP
         .ok_or_else(|| FerrumError::model("Qwen3.5 batch prefill missing paged KV table width"))?;
 
     scratch.ensure(total_tokens, batch_len, max_blocks_per_seq, q_total);
+    scratch.write_pos_offsets(ctx, &pos_offsets);
+    scratch.write_block_tables(ctx, &stacked);
+    scratch.write_context_lens(ctx, &context_lens);
     let pos_buf = scratch
         .pos_offsets
-        .as_mut()
+        .as_ref()
         .expect("qwen35 paged pos missing");
     let bt_buf = scratch
         .block_tables
-        .as_mut()
+        .as_ref()
         .expect("qwen35 paged block_tables missing");
     let lens_buf = scratch
         .context_lens
-        .as_mut()
+        .as_ref()
         .expect("qwen35 paged context_lens missing");
-    B::write_typed::<u32>(ctx, pos_buf, &pos_offsets);
-    B::write_typed::<u32>(ctx, bt_buf, &stacked);
-    B::write_typed::<u32>(ctx, lens_buf, &context_lens);
     let q_buf = scratch.q.as_mut().expect("qwen35 paged q missing");
     let out_buf = scratch.out.as_mut().expect("qwen35 paged out missing");
 
@@ -8689,31 +8763,31 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
         let cu: Vec<u32> = (0..=batch_len as u32).collect();
         let token_seq_indices: Vec<u32> = (0..batch_len as u32).collect();
         scratch.ensure(batch_len, batch_len, max_blocks_per_seq, q_total);
+        scratch.write_cu_seqlens_q(ctx, &cu);
+        scratch.write_token_seq_indices(ctx, &token_seq_indices);
+        scratch.write_pos_offsets(ctx, &pos_offsets);
+        scratch.write_block_tables(ctx, &stacked);
+        scratch.write_context_lens(ctx, &context_lens);
         let cu_buf = scratch
             .cu_seqlens_q
-            .as_mut()
+            .as_ref()
             .expect("qwen35 paged cu missing");
         let token_seq_buf = scratch
             .token_seq_indices
-            .as_mut()
+            .as_ref()
             .expect("qwen35 paged token rows missing");
         let pos_buf = scratch
             .pos_offsets
-            .as_mut()
+            .as_ref()
             .expect("qwen35 paged pos missing");
         let bt_buf = scratch
             .block_tables
-            .as_mut()
+            .as_ref()
             .expect("qwen35 paged block_tables missing");
         let lens_buf = scratch
             .context_lens
-            .as_mut()
+            .as_ref()
             .expect("qwen35 paged context_lens missing");
-        B::write_typed::<u32>(ctx, cu_buf, &cu);
-        B::write_typed::<u32>(ctx, token_seq_buf, &token_seq_indices);
-        B::write_typed::<u32>(ctx, pos_buf, &pos_offsets);
-        B::write_typed::<u32>(ctx, bt_buf, &stacked);
-        B::write_typed::<u32>(ctx, lens_buf, &context_lens);
         let q_buf = scratch.q.as_mut().expect("qwen35 paged q missing");
         let out_buf = scratch.out.as_mut().expect("qwen35 paged out missing");
         let attention_shape = Qwen35FullAttentionShape {
@@ -9622,31 +9696,31 @@ fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend + BackendPagedK
         let pos_offsets = vec![position_offset as u32];
         let context_lens = vec![(position_offset + tokens) as u32];
         scratch.ensure(tokens, 1, max_blocks_per_seq, q_total);
+        scratch.write_cu_seqlens_q(ctx, &cu);
+        scratch.write_token_seq_indices(ctx, &token_seq_indices);
+        scratch.write_pos_offsets(ctx, &pos_offsets);
+        scratch.write_block_tables(ctx, &padded);
+        scratch.write_context_lens(ctx, &context_lens);
         let cu_buf = scratch
             .cu_seqlens_q
-            .as_mut()
+            .as_ref()
             .expect("qwen35 paged cu missing");
         let token_seq_buf = scratch
             .token_seq_indices
-            .as_mut()
+            .as_ref()
             .expect("qwen35 paged token rows missing");
         let pos_buf = scratch
             .pos_offsets
-            .as_mut()
+            .as_ref()
             .expect("qwen35 paged pos missing");
         let bt_buf = scratch
             .block_tables
-            .as_mut()
+            .as_ref()
             .expect("qwen35 paged block_tables missing");
         let lens_buf = scratch
             .context_lens
-            .as_mut()
+            .as_ref()
             .expect("qwen35 paged context_lens missing");
-        B::write_typed::<u32>(ctx, cu_buf, &cu);
-        B::write_typed::<u32>(ctx, token_seq_buf, &token_seq_indices);
-        B::write_typed::<u32>(ctx, pos_buf, &pos_offsets);
-        B::write_typed::<u32>(ctx, bt_buf, &padded);
-        B::write_typed::<u32>(ctx, lens_buf, &context_lens);
         let q_buf = scratch.q.as_mut().expect("qwen35 paged q missing");
         let out_buf = scratch.out.as_mut().expect("qwen35 paged out missing");
         if use_vllm_paged_attn {
@@ -13754,6 +13828,18 @@ mod tests {
         assert!(!qwen35_paged_block_table_refresh_needed(2, 32, 16));
         assert!(qwen35_paged_block_table_refresh_needed(2, 33, 16));
         assert!(!qwen35_paged_block_table_refresh_needed(0, 8, 0));
+    }
+
+    #[test]
+    fn qwen35_paged_scratch_u32_cache_writes_only_on_content_change() {
+        let mut cache = Vec::new();
+        assert!(qwen35_update_cached_u32(&mut cache, &[0, 1, 2]));
+        assert_eq!(cache, vec![0, 1, 2]);
+        assert!(!qwen35_update_cached_u32(&mut cache, &[0, 1, 2]));
+        assert!(qwen35_update_cached_u32(&mut cache, &[0, 1, 2, 3]));
+        assert_eq!(cache, vec![0, 1, 2, 3]);
+        assert!(qwen35_update_cached_u32(&mut cache, &[0, 1, 4, 3]));
+        assert_eq!(cache, vec![0, 1, 4, 3]);
     }
 
     #[test]
