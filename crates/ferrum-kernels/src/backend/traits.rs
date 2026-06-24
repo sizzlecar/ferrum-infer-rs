@@ -1382,6 +1382,21 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Self::write_typed::<f32>(ctx, dst_f32, &data);
     }
 
+    /// Add an activation buffer directly into an existing F32 residual shadow.
+    ///
+    /// `scratch_f32` is provided for portable fallback implementations. CUDA can
+    /// fuse the activation-to-F32 conversion and residual add into one kernel.
+    fn activation_add_to_f32_shadow(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        residual_f32: &mut Self::Buffer,
+        scratch_f32: &mut Self::Buffer,
+        len: usize,
+    ) {
+        Self::activation_to_f32_shadow(ctx, src, scratch_f32, len);
+        Self::add_inplace(ctx, residual_f32, scratch_f32, len);
+    }
+
     /// RMSNorm an activation buffer and write the result into a typed F32
     /// scratch buffer. Used for Gemma post-attn/post-ffn branch norms.
     fn rms_norm_activation_to_f32(
