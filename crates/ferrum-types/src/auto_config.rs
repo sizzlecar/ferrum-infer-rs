@@ -402,6 +402,8 @@ impl ResolvedFerrumConfig {
         let kv_capacity_tokens =
             kv_blocks.map(|blocks| blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS));
         let kv_bytes_per_token = kv_cache_bytes_per_token_for_model(&self.model_capabilities);
+        let recurrent_budget =
+            recurrent_state_budget_for(&self.model_capabilities, &self.hardware_capabilities);
         let scheduler_policy = self
             .selected_string("scheduler_admission_policy")
             .unwrap_or_else(|| "unknown".to_string());
@@ -430,6 +432,9 @@ impl ResolvedFerrumConfig {
                 "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
                 "kv_bytes_per_token": kv_bytes_per_token,
                 "recurrent_state_bytes_per_sequence": self.model_capabilities.recurrent_state_bytes_per_sequence,
+                "recurrent_state_budget_bytes": recurrent_budget.map(|budget| budget.remaining_bytes),
+                "recurrent_state_budget_raw_slots": recurrent_budget.map(|budget| budget.raw_slots),
+                "recurrent_state_budget_max_slots": recurrent_budget.map(|budget| budget.floored_slots),
                 "recurrent_state_capacity_bytes": match (recurrent_state_max_slots, self.model_capabilities.recurrent_state_bytes_per_sequence) {
                     (Some(slots), Some(bytes_per_sequence)) => {
                         (slots as u64).checked_mul(bytes_per_sequence)
@@ -1084,15 +1089,12 @@ impl FerrumConfigBuilder {
     }
 
     fn recurrent_state_budget_max_slots(&self) -> Option<usize> {
-        if !self.is_accelerator_backend() {
-            return None;
-        }
-        let bytes_per_sequence = self.model.recurrent_state_bytes_per_sequence?.max(1);
-        let vram_bytes = self.hardware.vram_bytes?;
-        let weight_bytes = self.model.estimated_weight_bytes?;
-        let remaining = vram_bytes.saturating_sub(weight_bytes);
-        let raw_slots = (remaining / bytes_per_sequence) as usize;
-        Some(floor_power_of_two(raw_slots.max(1)))
+        self.recurrent_state_budget()
+            .map(|budget| budget.floored_slots)
+    }
+
+    fn recurrent_state_budget(&self) -> Option<RecurrentStateBudget> {
+        recurrent_state_budget_for(&self.model, &self.hardware)
     }
 
     fn kv_cache_bytes_per_token(&self) -> Option<u64> {
@@ -2110,6 +2112,36 @@ struct ResolvedValue<T> {
     source_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecurrentStateBudget {
+    remaining_bytes: u64,
+    bytes_per_sequence: u64,
+    raw_slots: usize,
+    floored_slots: usize,
+}
+
+fn recurrent_state_budget_for(
+    model: &ModelCapabilities,
+    hardware: &HardwareCapabilities,
+) -> Option<RecurrentStateBudget> {
+    if !(hardware.backend.eq_ignore_ascii_case("cuda")
+        || hardware.backend.eq_ignore_ascii_case("metal"))
+    {
+        return None;
+    }
+    let bytes_per_sequence = model.recurrent_state_bytes_per_sequence?.max(1);
+    let vram_bytes = hardware.vram_bytes?;
+    let weight_bytes = model.estimated_weight_bytes?;
+    let remaining = vram_bytes.saturating_sub(weight_bytes);
+    let raw_slots = (remaining / bytes_per_sequence) as usize;
+    Some(RecurrentStateBudget {
+        remaining_bytes: remaining,
+        bytes_per_sequence,
+        raw_slots,
+        floored_slots: floor_power_of_two(raw_slots.max(1)),
+    })
+}
+
 fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
     let value = value.trim();
     if value.is_empty() {
@@ -2509,6 +2541,18 @@ mod tests {
             serde_json::json!(65_863_680u64)
         );
         assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_budget_bytes"],
+            serde_json::json!(24u64 * GIB - 24_419_939_760u64)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_budget_raw_slots"],
+            serde_json::json!(20)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_budget_max_slots"],
+            serde_json::json!(16)
+        );
+        assert_eq!(
             doc["admission"]["memory_estimate"]["recurrent_state_capacity_bytes"],
             serde_json::json!(16u64 * 65_863_680u64)
         );
@@ -2555,7 +2599,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_qwen35_moe_gptq_c32_can_cap_linear_recurrent_slots_on_24gb() {
+    fn explicit_recurrent_state_slot_cap_can_keep_scheduler_width_above_state_pool() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
@@ -2582,7 +2626,7 @@ mod tests {
             .entries
             .iter()
             .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
-            .expect("linear recurrent slot cap should reach effective runtime config");
+            .expect("recurrent-state slot cap should reach effective runtime config");
         assert_eq!(entry.effective_value, "16");
     }
 
@@ -2619,7 +2663,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_qwen35_moe_gptq_rejects_zero_linear_recurrent_slots() {
+    fn recurrent_state_budget_rejects_zero_slot_pool() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
@@ -2641,7 +2685,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_qwen35_moe_gptq_allows_c32_on_larger_memory_gpu() {
+    fn recurrent_state_budget_allows_c32_when_memory_budget_fits() {
         let mut hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         hardware.vram_bytes = Some(48 * GIB);
