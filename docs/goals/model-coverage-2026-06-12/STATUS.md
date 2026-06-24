@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ98 — Historical vLLM fixed-output evidence is accepted by observation
+
+- Scope:
+  - relaxed the W3 final gate only for baseline command `--ignore-eos`:
+    Ferrum performance commands still must explicitly include `--ignore-eos`,
+    but a historical vLLM baseline can omit the flag when the saved report and
+    manifest prove every request produced the fixed `--random-output-len`;
+  - the final gate still requires baseline `--random-output-len`, full
+    completion, zero request/stream errors, usage-based output token counts,
+    and exact output-token matrices in both the manifest and raw baseline
+    report;
+  - the final gate now rereads the baseline artifact cell by
+    `baseline_measured_concurrency` instead of the requested concurrency, so
+    the admission-capped c32/effective-c16 cell is cross-checked against the
+    vLLM c16 report;
+  - updated `w3_qwen35_current_evidence_config.json` wording to describe the
+    remaining blockers as ratio/ITL only.
+- Why:
+  - the user explicitly requested not to rerun vLLM and to compare against
+    historical data;
+  - the checked-in historical vLLM report has `n_gen=128`,
+    `output_token_count_source=usage`, full completion, zero errors, and every
+    saved `output_tokens_per_request` value is `128`, so fixed-output behavior
+    is proven by the report even though the command text predates the
+    `--ignore-eos` flag.
+- Result:
+  - current evidence diagnostic failure count dropped from `12` to `8`;
+  - remaining failures are exactly performance failures:
+    c1/c4/c16/c32 ratio below `0.800` and p95 ITL above `1.25x` baseline;
+  - current diagnostic ratios are `c1=0.631936`, `c4=0.647023`,
+    `c16=0.550649`, and c32/effective-c16 `0.556749`.
+- Validation:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --config docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json` produced the expected diagnostic `MODEL_RELEASE_GRADE_W3 FAIL (8 problems)`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - this is gate/evidence alignment with historical vLLM data, not a new
+    performance result;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ97 — W3 perf manifest aligns capped baseline cells; tight recurrent prefill floor widened
 
 - Scope:

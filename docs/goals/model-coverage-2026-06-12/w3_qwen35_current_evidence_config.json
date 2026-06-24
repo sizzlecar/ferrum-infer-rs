@@ -1,5 +1,5 @@
 {
-  "description": "Current W3 Qwen3.5 evidence probe. This is diagnostic and is expected to fail final validation until the remaining vLLM fixed-output baseline/performance-ratio blockers are resolved on same hardware.",
+  "description": "Current W3 Qwen3.5 evidence probe. This is diagnostic and is expected to fail final validation until the remaining same-hardware performance-ratio and p95-ITL blockers are resolved.",
   "effective_concurrency": [],
   "lane": "w3",
   "out": "target/w3_qwen35_current_evidence_probe",
