@@ -32,7 +32,10 @@ use tracing::info;
 use crate::{
     common::{paged_pool::BlockAllocator, DecoderOnlyLLM, LlmRuntimeConfig},
     definition::ModelDefinition,
-    moe::{moe_forward_bucketed, ExpertStack, MoeForwardBucketedParams, MoeRouteScratch},
+    moe::{
+        dispatch::DeviceRouteScratch, moe_forward, moe_forward_bucketed, ExpertStack,
+        MoeForwardBucketedParams, MoeForwardParams, MoeRouteScratch,
+    },
     qwen35_config::{Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig},
     qwen35_weights::{
         Qwen35ResolvedWeightPlan, Qwen35WeightInventory, Qwen35WeightPlanLoader,
@@ -5714,6 +5717,130 @@ pub fn qwen35_dense_mlp_backend<B: Backend>(
     })
 }
 
+const QWEN35_MOE_BUCKETED_STACKED_STORE_ERROR: &str =
+    "moe_forward_bucketed requires stacked gate_up store";
+
+struct Qwen35SparseMoeForwardParams<'a, B: MoeLlmBackend> {
+    ctx: &'a mut B::Context,
+    x: &'a B::Buffer,
+    router_logits: &'a B::Buffer,
+    out: &'a mut B::Buffer,
+    shape: Qwen35SparseMoeShape,
+    experts: &'a ExpertStack<B>,
+    x_packed: &'a mut B::Buffer,
+    gate_up_packed: &'a mut B::Buffer,
+    silu_packed: &'a mut B::Buffer,
+    down_packed: &'a mut B::Buffer,
+    route_scratch: &'a mut MoeRouteScratch,
+    device_route: Option<DeviceRouteScratch<'a, B>>,
+}
+
+fn qwen35_moe_bucketed_missing_stacked_store(error: &FerrumError) -> bool {
+    matches!(
+        error,
+        FerrumError::Model { message }
+            if message.contains(QWEN35_MOE_BUCKETED_STACKED_STORE_ERROR)
+    )
+}
+
+fn qwen35_refresh_sparse_moe_route_scratch<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
+    router_logits: &B::Buffer,
+    shape: Qwen35SparseMoeShape,
+    route_scratch: &mut MoeRouteScratch,
+) {
+    B::sync(ctx);
+    let logits_host = B::to_vec(router_logits, shape.tokens * shape.num_experts);
+    crate::moe::router::route_into(
+        &logits_host,
+        shape.tokens,
+        shape.num_experts,
+        shape.top_k,
+        shape.norm_topk_prob,
+        &mut route_scratch.output,
+        &mut route_scratch.probs,
+    );
+    route_scratch.plan.rebuild_into(
+        &route_scratch.output,
+        shape.tokens,
+        shape.num_experts,
+        shape.top_k,
+    );
+}
+
+fn qwen35_sparse_moe_forward_bucketed_or_dense<B: MoeLlmBackend>(
+    params: Qwen35SparseMoeForwardParams<'_, B>,
+) -> Result<()> {
+    let Qwen35SparseMoeForwardParams {
+        ctx,
+        x,
+        router_logits,
+        out,
+        shape,
+        experts,
+        x_packed,
+        gate_up_packed,
+        silu_packed,
+        down_packed,
+        route_scratch,
+        device_route,
+    } = params;
+
+    let bucketed = moe_forward_bucketed(MoeForwardBucketedParams {
+        ctx: &mut *ctx,
+        x,
+        router_logits,
+        out: &mut *out,
+        batch: shape.tokens,
+        hidden_size: shape.hidden_size,
+        expert_intermediate: shape.expert_intermediate_size,
+        num_experts: shape.num_experts,
+        top_k: shape.top_k,
+        norm_topk_prob: shape.norm_topk_prob,
+        experts,
+        x_packed: &mut *x_packed,
+        gate_up_packed: &mut *gate_up_packed,
+        silu_packed: &mut *silu_packed,
+        down_packed: &mut *down_packed,
+        route_scratch: &mut *route_scratch,
+        device_route,
+    });
+    match bucketed {
+        Ok(()) => Ok(()),
+        Err(error) if qwen35_moe_bucketed_missing_stacked_store(&error) => {
+            qwen35_refresh_sparse_moe_route_scratch::<B>(ctx, router_logits, shape, route_scratch);
+            let mut x_single = B::alloc(shape.hidden_size);
+            let mut acc_buf = B::alloc(shape.hidden_size);
+            let mut gate_up_buf = B::alloc(2 * shape.expert_intermediate_size);
+            let mut silu_buf = B::alloc(shape.expert_intermediate_size);
+            let mut down_buf = B::alloc(shape.hidden_size);
+            let mut zero_hidden = B::alloc(shape.hidden_size);
+            B::zero_buffer(ctx, &mut zero_hidden, shape.hidden_size)?;
+
+            moe_forward(MoeForwardParams {
+                ctx,
+                x,
+                router_logits,
+                out,
+                batch: shape.tokens,
+                hidden_size: shape.hidden_size,
+                expert_intermediate: shape.expert_intermediate_size,
+                num_experts: shape.num_experts,
+                top_k: shape.top_k,
+                norm_topk_prob: shape.norm_topk_prob,
+                experts,
+                x_single: &mut x_single,
+                acc_buf: &mut acc_buf,
+                gate_up_buf: &mut gate_up_buf,
+                silu_buf: &mut silu_buf,
+                down_buf: &mut down_buf,
+                zero_hidden: &zero_hidden,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
     ctx: &mut B::Context,
     x: &B::Buffer,
@@ -5771,17 +5898,12 @@ pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
     let mut down_packed = B::alloc(total_pairs * shape.hidden_size);
     let mut route_scratch = MoeRouteScratch::new();
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    moe_forward_bucketed(MoeForwardBucketedParams {
+    qwen35_sparse_moe_forward_bucketed_or_dense(Qwen35SparseMoeForwardParams {
         ctx,
         x,
         router_logits: &router_logits,
         out: &mut routed_output,
-        batch: shape.tokens,
-        hidden_size: shape.hidden_size,
-        expert_intermediate: shape.expert_intermediate_size,
-        num_experts: shape.num_experts,
-        top_k: shape.top_k,
-        norm_topk_prob: shape.norm_topk_prob,
+        shape,
         experts: &moe.experts,
         x_packed: &mut x_packed,
         gate_up_packed: &mut gate_up_packed,
@@ -6032,17 +6154,12 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
     )?;
     let total_pairs = shape.tokens * shape.top_k;
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    moe_forward_bucketed(MoeForwardBucketedParams {
+    qwen35_sparse_moe_forward_bucketed_or_dense(Qwen35SparseMoeForwardParams {
         ctx,
         x,
         router_logits: &scratch.router_logits,
         out: &mut scratch.routed_output,
-        batch: shape.tokens,
-        hidden_size: shape.hidden_size,
-        expert_intermediate: shape.expert_intermediate_size,
-        num_experts: shape.num_experts,
-        top_k: shape.top_k,
-        norm_topk_prob: shape.norm_topk_prob,
+        shape,
         experts: &moe.experts,
         x_packed: &mut scratch.x_packed,
         gate_up_packed: &mut scratch.gate_up_packed,
@@ -15323,6 +15440,151 @@ mod tests {
         assert_close_slice(&reference.shared_expert_gate, &[0.5, 0.5], 1e-6);
         assert_close_slice(&reference.shared_expert_output, &shared_expert_output, 1e-6);
         assert_close_slice(&reference.moe_output, &moe_output, 1e-6);
+    }
+
+    #[test]
+    fn sparse_moe_shared_expert_backend_matches_reference_merge_semantics() {
+        let shape = Qwen35SparseMoeShape {
+            tokens: 2,
+            hidden_size: 2,
+            num_experts: 3,
+            top_k: 2,
+            expert_intermediate_size: 2,
+            shared_expert_intermediate_size: 2,
+            norm_topk_prob: true,
+        };
+        let x = vec![
+            1.0, 0.0, //
+            0.0, 1.0,
+        ];
+        let router_weight = vec![
+            2.0, 0.0, //
+            0.0, 2.0, //
+            1.0, 1.0,
+        ];
+        let mut fused_gate_up_proj = Vec::new();
+        let mut gate_stack = Vec::new();
+        let mut up_stack = Vec::new();
+        let mut fused_down_proj = Vec::new();
+        for expert in 0..shape.num_experts {
+            let scale = expert as f32 + 1.0;
+            let gate = [
+                scale, 0.0, //
+                0.0, scale,
+            ];
+            let up = [
+                1.0, 0.5, //
+                -0.25, 0.75,
+            ];
+            fused_gate_up_proj.extend_from_slice(&gate);
+            fused_gate_up_proj.extend_from_slice(&up);
+            gate_stack.extend_from_slice(&gate);
+            up_stack.extend_from_slice(&up);
+            fused_down_proj.extend_from_slice(&[
+                0.5 * scale,
+                0.0, //
+                0.0,
+                -0.25 * scale,
+            ]);
+        }
+        let shared_expert_gate_weight = vec![0.0, 0.0];
+        let shared_expert_gate_proj_weight = vec![
+            0.2, -0.1, //
+            0.3, 0.4,
+        ];
+        let shared_expert_up_proj_weight = vec![
+            0.5, 0.1, //
+            -0.2, 0.6,
+        ];
+        let shared_expert_down_proj_weight = vec![
+            1.0, 0.0, //
+            0.0, 1.0,
+        ];
+        let mut shared_gate_up_weight = shared_expert_gate_proj_weight.clone();
+        shared_gate_up_weight.extend_from_slice(&shared_expert_up_proj_weight);
+        let reference = qwen35_sparse_moe_shared_expert_cpu(
+            &x,
+            &router_weight,
+            &fused_gate_up_proj,
+            &fused_down_proj,
+            &shared_expert_gate_weight,
+            &shared_expert_gate_proj_weight,
+            &shared_expert_up_proj_weight,
+            &shared_expert_down_proj_weight,
+            shape,
+        )
+        .unwrap();
+
+        let experts = ExpertStack::<CpuBackend>::from_dense_stacks(
+            &gate_stack,
+            &up_stack,
+            &fused_down_proj,
+            shape.num_experts,
+            shape.hidden_size,
+            shape.expert_intermediate_size,
+        )
+        .unwrap();
+        let weights = Qwen35SparseMoeSharedExpertWeights {
+            router: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                &router_weight,
+                shape.num_experts,
+                shape.hidden_size,
+            )),
+            experts,
+            shared_expert_gate: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                &shared_expert_gate_weight,
+                1,
+                shape.hidden_size,
+            )),
+            shared_expert_gate_up_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                &shared_gate_up_weight,
+                2 * shape.shared_expert_intermediate_size,
+                shape.hidden_size,
+            )),
+            shared_expert_down_proj: Box::new(DenseLinear::<CpuBackend>::from_rows(
+                &shared_expert_down_proj_weight,
+                shape.hidden_size,
+                shape.shared_expert_intermediate_size,
+            )),
+            fused_gate_up_proj: CpuBackend::from_slice(&fused_gate_up_proj),
+            fused_down_proj: CpuBackend::from_slice(&fused_down_proj),
+        };
+        let mut ctx = CpuBackend::new_context();
+        let backend = qwen35_sparse_moe_shared_expert_backend::<CpuBackend>(
+            &mut ctx,
+            &CpuBackend::from_slice(&x),
+            &weights,
+            shape,
+            0,
+        )
+        .unwrap();
+
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.router_logits, reference.router_logits.len()),
+            &reference.router_logits,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.routed_output, reference.routed_expert_output.len()),
+            &reference.routed_expert_output,
+            1e-6,
+        );
+        let backend_shared_gate =
+            CpuBackend::to_vec(&backend.shared_gate, reference.shared_expert_gate.len())
+                .into_iter()
+                .map(sigmoid)
+                .collect::<Vec<_>>();
+        assert_close_slice(&backend_shared_gate, &reference.shared_expert_gate, 1e-6);
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.shared_output, reference.shared_expert_output.len()),
+            &reference.shared_expert_output,
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&backend.output, reference.moe_output.len()),
+            &reference.moe_output,
+            1e-6,
+        );
     }
 
     #[test]

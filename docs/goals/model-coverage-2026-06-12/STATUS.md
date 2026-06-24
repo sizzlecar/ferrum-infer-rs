@@ -13921,3 +13921,42 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     prefill fallback 继续提交,仍不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 Qwen3.5 sparse MoE backend dense fallback/parity
+
+- 背景:
+  - 继续 W3 Qwen3.5 full-attention/sparse-MoE 目标时,先复查 full-attention
+    形状和 backend/reference 覆盖,确认当前已有 gated official-like shape
+    parity 测试。
+  - 转向 sparse MoE shared-expert backend 发现:新增 backend/reference parity
+    测试用普通 dense `ExpertStack` 跑 Qwen3.5 shared-expert backend 时,
+    `moe_forward_bucketed()` 直接报
+    `moe_forward_bucketed requires stacked gate_up store`。
+  - 这说明当前 Qwen3.5 sparse MoE backend 只覆盖 stacked/bucketed store,
+    对 dense expert backend/reference 校验没有退路。
+- 源码变更:
+  - 新增 Qwen3.5 sparse MoE routed-expert helper:
+    先走 `moe_forward_bucketed()`;
+    只有当错误明确是缺少 stacked gate/up store 时,才 fallback 到已有
+    generic `moe_forward()` dense expert path。
+  - fallback 会刷新 `MoeRouteScratch`,保持后续 route trace 仍可用。
+  - 普通 `qwen35_sparse_moe_shared_expert_backend()` 和 decode scratch 路径
+    都改用同一个 bucketed-or-dense helper。
+  - 新增
+    `sparse_moe_shared_expert_backend_matches_reference_merge_semantics`,
+    用 dense `ExpertStack` 对齐 CPU reference 的 router logits、routed
+    expert output、sigmoid 后 shared gate、shared output 和最终
+    routed+shared merge output。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-models sparse_moe_shared_expert_backend_matches_reference_merge_semantics -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-models sparse_moe -- --nocapture` PASS,
+    10 个 sparse MoE/Qwen3.5 reference/backend 相关测试通过。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只证明 Qwen3.5 sparse MoE shared-expert backend 在 dense ExpertStack
+    fallback/reference merge 语义上对齐;不构成 671 tok/s 性能改进证据,
+    也不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
