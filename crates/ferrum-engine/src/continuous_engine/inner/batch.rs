@@ -307,7 +307,9 @@ impl EngineInner {
             let (kv_handle, fresh_kv) = if let Some(kv) = existing_kv {
                 (kv, false)
             } else {
-                // Allocate KV pages (with preempt fallback) for fresh prefill.
+                // Allocate KV pages for a fresh prefill. This is waiting-request
+                // admission, so capacity failure should defer the prefill rather
+                // than preempt running decode work.
                 let alloc_request = AllocationRequest {
                     request_id: rid.clone(),
                     initial_tokens: num_tokens,
@@ -321,26 +323,11 @@ impl EngineInner {
                 };
                 let allocated = match self.kv_cache.allocate(&alloc_request).await {
                     Ok(h) => h,
-                    Err(_) => {
-                        if self.preempt_victim(rid).await {
-                            match self.kv_cache.allocate(&alloc_request).await {
-                                Ok(h) => h,
-                                Err(e) => {
-                                    warn!(
-                                        "Unified prefill alloc deferred for {} after preempt: {}",
-                                        rid, e
-                                    );
-                                    self.release_recurrent_state(rid).await;
-                                    self.defer_prefill_for_capacity(rid).await;
-                                    continue;
-                                }
-                            }
-                        } else {
-                            warn!("Unified prefill alloc deferred for {}: no victim", rid);
-                            self.release_recurrent_state(rid).await;
-                            self.defer_prefill_for_capacity(rid).await;
-                            continue;
-                        }
+                    Err(e) => {
+                        warn!("Unified prefill alloc deferred for {}: {}", rid, e);
+                        self.release_recurrent_state(rid).await;
+                        self.defer_prefill_for_capacity(rid).await;
+                        continue;
                     }
                 };
                 (allocated, true)

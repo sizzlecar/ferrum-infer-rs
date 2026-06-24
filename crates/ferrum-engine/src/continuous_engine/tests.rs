@@ -1613,6 +1613,117 @@ async fn process_batch_unified_releases_recurrent_state_when_kv_alloc_defers() {
 }
 
 #[tokio::test]
+async fn process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefill() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 1;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(1));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(CapturingUnifiedExecutor {
+        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+        captured: Arc::new(std::sync::Mutex::new(Vec::new())),
+        output_token: 6,
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler.clone(),
+        tokenizer.clone(),
+        sampler,
+        kv_cache.clone(),
+        executor,
+        tensor_factory,
+        None,
+        None,
+        None,
+    );
+
+    let mut decode_request = policy_request();
+    decode_request.prompt = "test".to_string();
+    decode_request.sampling_params.max_tokens = 4;
+    let decode_id = decode_request.id.clone();
+    scheduler.submit(decode_request.clone()).await.unwrap();
+    let initial_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("decode request should first be scheduled as prefill");
+    assert_eq!(initial_batch.requests.len(), 1);
+    scheduler.mark_prefill_complete(&decode_id, 1);
+
+    let decode_kv = kv_cache
+        .allocate(&AllocationRequest {
+            request_id: decode_id.clone(),
+            initial_tokens: 1,
+            max_sequence_length: 16,
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 4,
+            device: Device::CPU,
+            dtype: DataType::FP32,
+            priority: Priority::Normal,
+        })
+        .await
+        .unwrap();
+    let mut decode_seq = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        decode_request.clone(),
+        vec![TokenId::new(5)],
+        Some(tokenizer),
+        Some(64),
+    );
+    decode_seq.generated_tokens.push(TokenId::new(6));
+    decode_seq.prefill_complete = true;
+    decode_seq.prefill_tokens_processed = 1;
+    decode_seq.kv_cache = Some(decode_kv);
+    decode_seq.phase = RequestPhase::Decoding;
+    engine
+        .inner
+        .sequences
+        .write()
+        .insert(decode_id.clone(), decode_seq);
+
+    let mut fresh_request = policy_request();
+    fresh_request.prompt = "test".to_string();
+    fresh_request.sampling_params.max_tokens = 2;
+    let fresh_id = fresh_request.id.clone();
+    scheduler.submit(fresh_request).await.unwrap();
+    let batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("mixed decode/fresh prefill batch should be scheduled");
+    assert_eq!(batch.requests.len(), 2);
+
+    engine.inner.process_batch(&batch).await.unwrap();
+
+    let trace = scheduler.trace_snapshot();
+    assert_eq!(
+        trace.cancelled_total, 0,
+        "fresh waiting prefill KV pressure must not cancel an active decode victim"
+    );
+    assert_eq!(
+        scheduler.trace_phase(&fresh_id),
+        Some(RequestPhase::Waiting),
+        "fresh prefill should be retried later from waiting"
+    );
+
+    let sequences = engine.inner.sequences.read();
+    let decode = sequences
+        .get(&decode_id)
+        .expect("decode victim should remain active");
+    assert!(decode.prefill_complete);
+    assert!(decode.kv_cache.is_some());
+    assert_eq!(decode.preemption_count, 0);
+
+    let fresh = sequences
+        .get(&fresh_id)
+        .expect("deferred fresh request should remain in sequence state");
+    assert!(!fresh.prefill_complete);
+    assert!(fresh.kv_cache.is_none());
+    assert_eq!(kv_cache.active_count(), 1);
+}
+
+#[tokio::test]
 async fn process_batch_unified_capacity_defer_releases_existing_kv() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;

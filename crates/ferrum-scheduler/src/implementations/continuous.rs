@@ -1135,7 +1135,6 @@ impl Scheduler for ContinuousBatchScheduler {
                 waiting_queue.remove(pos);
                 self.request_index.write().remove(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
-                self.record_resource_progress();
                 info!("Request {} cancelled from waiting queue", request_id);
                 return Ok(true);
             }
@@ -1151,7 +1150,6 @@ impl Scheduler for ContinuousBatchScheduler {
                 prefill_queue.remove(pos);
                 self.request_index.write().remove(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
-                self.record_resource_progress();
                 warn!("Request {} cancelled during prefill", request_id);
                 return Ok(true);
             }
@@ -1163,7 +1161,6 @@ impl Scheduler for ContinuousBatchScheduler {
             if decode_queue.remove(&request_id).is_some() {
                 self.request_index.write().remove(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
-                self.record_resource_progress();
                 warn!("Request {} cancelled during decode", request_id);
                 return Ok(true);
             }
@@ -1303,7 +1300,6 @@ impl Scheduler for ContinuousBatchScheduler {
                 .write()
                 .insert(request_id, RequestPhase::Preempted);
             self.preempted_counter.fetch_add(1, Ordering::Relaxed);
-            self.record_resource_progress();
 
             Ok(PreemptionResult {
                 success: true,
@@ -1587,6 +1583,52 @@ mod tests {
         let after = scheduler.trace_snapshot();
         assert_eq!(after.waiting_queue_len, 0);
         assert_eq!(after.active_len, 4);
+    }
+
+    #[tokio::test]
+    async fn capacity_backpressure_survives_cancel_without_token_progress() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            assert!(scheduler.defer_prefill_to_waiting(request_id));
+        }
+        assert_eq!(
+            scheduler.trace_snapshot().capacity_backpressure_admit_limit,
+            Some(2)
+        );
+
+        assert!(scheduler.cancel(first_ids[0].clone()).await.unwrap());
+        let after_cancel = scheduler.trace_snapshot();
+        assert_eq!(after_cancel.cancelled_total, 1);
+        assert_eq!(
+            after_cancel.capacity_backpressure_admit_limit,
+            Some(2),
+            "cancellation frees a slot but is not evidence that the failed admission width now fits"
+        );
     }
 
     #[tokio::test]

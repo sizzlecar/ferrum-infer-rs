@@ -2,6 +2,74 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ129 — Fresh KV prefill now defers instead of preempting decode
+
+- Source of this patch:
+  - ZZZ128 completed c32 but only at `10.06 tok/s`;
+  - its scheduler trace had `capacity_deferred_total=69401`,
+    `no_victim_warning_count=69401`, `cancelled_total=3873`, and
+    `admitted_total=73311`;
+  - the trace showed waiting requests repeatedly being admitted back to active
+    prefill while decode requests were cancelled/re-submitted under KV
+    pressure.
+- vLLM source comparison:
+  - local vLLM source at `../_external/vllm-v0.20.2` schedules existing
+    RUNNING work first;
+  - RUNNING allocation failure can preempt another running request;
+  - WAITING allocation failure returns `None` and breaks waiting admission;
+  - it does not preempt active running decode work just to admit a fresh
+    waiting prefill.
+- Root cause in Ferrum source:
+  - unified fresh-prefill KV allocation still called `preempt_victim()` on
+    allocation failure;
+  - that let fresh waiting prefills cancel/re-submit active decode work;
+  - `ContinuousBatchScheduler::cancel()` and `preempt()` also counted as
+    resource progress, so internal cancel/preempt churn could immediately
+    relax capacity backpressure even though no token progress proved the
+    failed admission width now fit.
+- Source change:
+  - `process_batch_unified` now defers fresh prefill KV allocation failures
+    back to waiting instead of preempting decode work;
+  - scheduler cancel/preempt no longer grows or clears
+    `capacity_backpressure_admit_limit`;
+  - real token progress and request completion still relax backpressure.
+- Tests added:
+  - `process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefill`
+    covers a tight KV pool where decode owns the only block and a fresh
+    waiting prefill must defer without cancelling the decode victim;
+  - `capacity_backpressure_survives_cancel_without_token_progress` covers the
+    scheduler feedback path so cancellation alone cannot clear a capacity
+    backpressure window.
+- Local validation:
+  - `cargo test -p ferrum-scheduler
+    capacity_backpressure_survives_cancel_without_token_progress -- --nocapture` PASS;
+  - `cargo test -p ferrum-engine
+    process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefill -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler` PASS (`63` tests plus doc-tests);
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture` PASS
+    (`15` tests);
+  - `cargo check -p ferrum-engine -p ferrum-scheduler` PASS;
+  - `cargo test -p ferrum-engine` PASS (`152` lib tests plus integration
+    tests; only existing ignored tests remained ignored);
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Why this is not a model/GPU special case:
+  - no model id, GPU memory size, CUDA device name, or Qwen3.5-specific limit
+    is inspected;
+  - the change is based on scheduler phase and allocation outcome.
+- Limits:
+  - no GPU lane has been run for this source candidate yet;
+  - this does not prove c32 throughput recovery or W3 readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+- Next GPU check, if paid work is approved/started:
+  - reuse the retained 1x4090 cache if available;
+  - run the same focused c32 diagnostic first;
+  - stop after build/run/serve failure, bench PASS/FAIL, or renewed
+    defer/cancel/no-token-progress churn;
+  - compare `cancelled_total`, `capacity_deferred_total`,
+    `no_victim_warning_count`, and throughput against ZZZ128 before running a
+    broader matrix.
+
 ## 2026-06-25 ZZZ128 — Paged KV rollback c32 diagnostic completes, but throughput is far below target
 
 - Artifact:
