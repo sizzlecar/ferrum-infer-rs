@@ -2,6 +2,67 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ125 — Scheduler capacity backpressure uses adaptive admission
+
+- Source of this patch:
+  - ZZZ124 showed `b8116dc4` preserved `ferrum run` and `ferrum serve`
+    smoke, but c32 still spun with capacity-deferred prefills:
+    `completed_total=5`, `admitted_total=720713`,
+    `prefill_tokens_delta=0`, `decode_tokens_delta=0`,
+    `Unified prefill alloc deferred=720615`, and `oom_mentions=0`;
+  - the saved trace showed every iteration moving `32` waiting requests to
+    active prefill, failing allocation with no token progress, then moving all
+    requests back to waiting.
+- vLLM source comparison:
+  - local vLLM source at `../_external/vllm-v0.20.2` schedules RUNNING
+    requests first;
+  - if a RUNNING request cannot allocate KV, it may preempt another running
+    request;
+  - waiting/resumed request scheduling happens only afterward, and when
+    `allocate_slots()` fails for a WAITING request, scheduling breaks instead
+    of continuing to admit the rest of the waiting queue.
+- Source change:
+  - `ContinuousBatchScheduler` now records capacity-defer feedback from
+    `defer_prefill_to_waiting`;
+  - the next waiting admission width is reduced adaptively after a failed
+    capacity-deferred prefill cohort instead of immediately re-admitting the
+    same full width;
+  - real resource progress from prefill chunks, prefill completion, decode
+    progress, completion, cancellation, or preemption grows/removes the
+    backpressure window;
+  - scheduler trace snapshots now expose
+    `capacity_deferred_total` and `capacity_backpressure_admit_limit`.
+- Why this is not a model/GPU special case:
+  - the logic is driven only by scheduler capacity feedback and request
+    progress;
+  - it does not inspect model id, GPU memory size, requested concurrency, or
+    Qwen3.5-specific fields.
+- Local validation:
+  - `cargo test -p ferrum-scheduler
+    capacity_defer_halves_next_waiting_admission_width -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler
+    capacity_backpressure_grows_after_prefill_progress -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler` PASS (`62` tests plus doc-tests);
+  - `cargo test -p ferrum-engine
+    process_batch_unified_capacity_defer_releases_existing_kv -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine
+    process_batch_unified_kv_defer_moves_active_prefill_back_to_waiting --
+    --nocapture` PASS;
+  - `cargo test -p ferrum-engine
+    process_batch_unified_releases_recurrent_state_when_kv_alloc_defers --
+    --nocapture` PASS;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture` PASS
+    (`14` tests);
+  - `cargo check -p ferrum-engine -p ferrum-scheduler` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Limits:
+  - no GPU lane has been run for this source candidate yet;
+  - this does not prove c32 completion, throughput, OOM resolution, W3
+    performance, or release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ124 — Existing-KV release fix still leaves c32 admission churn
 
 - Artifact:

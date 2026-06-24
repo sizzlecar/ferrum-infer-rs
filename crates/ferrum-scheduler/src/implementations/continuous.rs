@@ -24,12 +24,14 @@ use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Instant,
 };
 use tracing::{debug, info, warn};
+
+const NO_CAPACITY_BACKPRESSURE_LIMIT: usize = usize::MAX;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ContinuousBatchRuntimeConfig {
@@ -147,6 +149,8 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub cancelled_total: u64,
     pub preempted_total: u64,
     pub admitted_total: u64,
+    pub capacity_deferred_total: u64,
+    pub capacity_backpressure_admit_limit: Option<usize>,
 }
 
 /// Continuous batching scheduler
@@ -181,6 +185,9 @@ pub struct ContinuousBatchScheduler {
     cancelled_counter: AtomicU64,
     preempted_counter: AtomicU64,
     admitted_counter: AtomicU64,
+    capacity_deferred_counter: AtomicU64,
+    capacity_backpressure_limit: AtomicUsize,
+    capacity_backpressure_iteration: AtomicU64,
     total_wait_time_us: AtomicU64,
 
     /// Start time
@@ -298,6 +305,9 @@ impl ContinuousBatchScheduler {
             cancelled_counter: AtomicU64::new(0),
             preempted_counter: AtomicU64::new(0),
             admitted_counter: AtomicU64::new(0),
+            capacity_deferred_counter: AtomicU64::new(0),
+            capacity_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
+            capacity_backpressure_iteration: AtomicU64::new(u64::MAX),
             total_wait_time_us: AtomicU64::new(0),
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
@@ -345,6 +355,8 @@ impl ContinuousBatchScheduler {
             cancelled_total: self.cancelled_counter.load(Ordering::Relaxed),
             preempted_total: self.preempted_counter.load(Ordering::Relaxed),
             admitted_total: self.admitted_counter.load(Ordering::Relaxed),
+            capacity_deferred_total: self.capacity_deferred_counter.load(Ordering::Relaxed),
+            capacity_backpressure_admit_limit: self.capacity_backpressure_admit_limit(),
         }
     }
 
@@ -387,6 +399,70 @@ impl ContinuousBatchScheduler {
         }
     }
 
+    fn capacity_backpressure_admit_limit(&self) -> Option<usize> {
+        let limit = self.capacity_backpressure_limit.load(Ordering::Relaxed);
+        if limit == NO_CAPACITY_BACKPRESSURE_LIMIT {
+            None
+        } else {
+            Some(limit.max(1))
+        }
+    }
+
+    fn record_capacity_defer_feedback(&self, attempted_prefill_width: usize) {
+        self.capacity_deferred_counter
+            .fetch_add(1, Ordering::Relaxed);
+
+        let iteration = self.current_iteration.load(Ordering::Relaxed);
+        let previous_iteration = self
+            .capacity_backpressure_iteration
+            .swap(iteration, Ordering::Relaxed);
+        if previous_iteration == iteration {
+            return;
+        }
+
+        let max_running = self.config.max_running_requests.max(1);
+        let proposed = attempted_prefill_width
+            .max(1)
+            .div_ceil(2)
+            .max(1)
+            .min(max_running);
+        let _ = self.capacity_backpressure_limit.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| {
+                let current = if current == NO_CAPACITY_BACKPRESSURE_LIMIT {
+                    max_running
+                } else {
+                    current.max(1).min(max_running)
+                };
+                let next = proposed.min(current).max(1);
+                if next >= max_running {
+                    Some(NO_CAPACITY_BACKPRESSURE_LIMIT)
+                } else {
+                    Some(next)
+                }
+            },
+        );
+    }
+
+    fn record_resource_progress(&self) {
+        let max_running = self.config.max_running_requests.max(1);
+        let current = self.capacity_backpressure_limit.load(Ordering::Relaxed);
+        if current == NO_CAPACITY_BACKPRESSURE_LIMIT {
+            return;
+        }
+
+        let current = current.max(1).min(max_running);
+        let grown = current.saturating_mul(2).min(max_running);
+        let next = if grown >= max_running {
+            NO_CAPACITY_BACKPRESSURE_LIMIT
+        } else {
+            grown.max(1)
+        };
+        self.capacity_backpressure_limit
+            .store(next, Ordering::Relaxed);
+    }
+
     /// Move a capacity-deferred prefill back to the waiting queue.
     ///
     /// The engine uses this when it could not allocate physical KV or
@@ -397,6 +473,7 @@ impl ContinuousBatchScheduler {
         let mut prefill_queue = self.prefill_queue.write();
         let mut waiting_queue = self.waiting_queue.write();
         let mut request_index = self.request_index.write();
+        let attempted_prefill_width = prefill_queue.len();
 
         if let Some(pos) = prefill_queue
             .iter()
@@ -409,6 +486,7 @@ impl ContinuousBatchScheduler {
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
             request_index.insert(request_id.clone(), RequestPhase::Waiting);
             waiting_queue.push_back(req);
+            self.record_capacity_defer_feedback(attempted_prefill_width);
             debug!("Deferred prefill request {} back to waiting", request_id);
             true
         } else {
@@ -745,6 +823,10 @@ impl ContinuousBatchScheduler {
             .max_decode_batch
             .saturating_sub(self.decoding_count());
         let available_slots = active_capacity.min(decode_capacity);
+        let available_slots = self
+            .capacity_backpressure_admit_limit()
+            .map(|limit| available_slots.min(limit))
+            .unwrap_or(available_slots);
 
         let requests_to_admit: Vec<RequestId> = waiting_queue
             .iter()
@@ -850,6 +932,7 @@ impl ContinuousBatchScheduler {
     /// Mark a request as having completed prefill
     pub fn mark_prefill_complete(&self, request_id: &RequestId, tokens: usize) {
         let mut prefill_queue = self.prefill_queue.write();
+        let mut found = false;
         if let Some(pos) = prefill_queue
             .iter()
             .position(|r| r.inner.request.id == *request_id)
@@ -858,11 +941,15 @@ impl ContinuousBatchScheduler {
             req.prefill_tokens = tokens;
             req.prefill_chunk_offset = tokens;
             req.chunked_prefill = false;
+            found = true;
         }
         drop(prefill_queue);
 
         // Promote to decode
         self.promote_to_decode(request_id);
+        if found {
+            self.record_resource_progress();
+        }
     }
 
     /// Mark a chunk of prefill as processed. Used by engines that split a
@@ -882,6 +969,7 @@ impl ContinuousBatchScheduler {
     ) -> bool {
         let mut prefill_queue = self.prefill_queue.write();
         let mut fully_done = false;
+        let mut made_progress = false;
         if let Some(pos) = prefill_queue
             .iter()
             .position(|r| r.inner.request.id == *request_id)
@@ -894,11 +982,15 @@ impl ContinuousBatchScheduler {
                 .saturating_add(chunk_tokens)
                 .min(total_prompt_tokens);
             fully_done = req.prefill_chunk_offset >= total_prompt_tokens;
+            made_progress = chunk_tokens > 0;
         }
         drop(prefill_queue);
 
         if fully_done {
             self.promote_to_decode(request_id);
+        }
+        if made_progress {
+            self.record_resource_progress();
         }
         fully_done
     }
@@ -906,9 +998,15 @@ impl ContinuousBatchScheduler {
     /// Update decode progress for a request
     pub fn update_decode_progress(&self, request_id: &RequestId, tokens_generated: usize) {
         let mut decode_queue = self.decode_queue.write();
+        let mut made_progress = false;
         if let Some(req) = decode_queue.get_mut(request_id) {
+            made_progress = tokens_generated > req.decode_tokens;
             req.decode_tokens = tokens_generated;
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
+        }
+        drop(decode_queue);
+        if made_progress {
+            self.record_resource_progress();
         }
     }
 }
@@ -986,6 +1084,7 @@ impl Scheduler for ContinuousBatchScheduler {
 
             // Remove from index
             self.request_index.write().remove(&request_id);
+            self.record_resource_progress();
 
             Ok(())
         } else {
@@ -1011,6 +1110,7 @@ impl Scheduler for ContinuousBatchScheduler {
                         );
                     }
                 }
+                self.record_resource_progress();
                 return Ok(());
             }
 
@@ -1035,6 +1135,7 @@ impl Scheduler for ContinuousBatchScheduler {
                 waiting_queue.remove(pos);
                 self.request_index.write().remove(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
+                self.record_resource_progress();
                 info!("Request {} cancelled from waiting queue", request_id);
                 return Ok(true);
             }
@@ -1050,6 +1151,7 @@ impl Scheduler for ContinuousBatchScheduler {
                 prefill_queue.remove(pos);
                 self.request_index.write().remove(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
+                self.record_resource_progress();
                 warn!("Request {} cancelled during prefill", request_id);
                 return Ok(true);
             }
@@ -1061,6 +1163,7 @@ impl Scheduler for ContinuousBatchScheduler {
             if decode_queue.remove(&request_id).is_some() {
                 self.request_index.write().remove(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
+                self.record_resource_progress();
                 warn!("Request {} cancelled during decode", request_id);
                 return Ok(true);
             }
@@ -1200,6 +1303,7 @@ impl Scheduler for ContinuousBatchScheduler {
                 .write()
                 .insert(request_id, RequestPhase::Preempted);
             self.preempted_counter.fetch_add(1, Ordering::Relaxed);
+            self.record_resource_progress();
 
             Ok(PreemptionResult {
                 success: true,
@@ -1378,6 +1482,111 @@ mod tests {
             scheduler.request_state(&request_id),
             Some(RequestState::Waiting)
         );
+    }
+
+    #[test]
+    fn capacity_defer_halves_next_waiting_admission_width() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 4);
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            assert!(scheduler.defer_prefill_to_waiting(request_id));
+        }
+
+        let deferred = scheduler.trace_snapshot();
+        assert_eq!(deferred.waiting_queue_len, 4);
+        assert_eq!(deferred.active_len, 0);
+        assert_eq!(deferred.capacity_deferred_total, 4);
+        assert_eq!(deferred.capacity_backpressure_admit_limit, Some(2));
+
+        let second_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(
+            second_batch.requests.len(),
+            2,
+            "capacity-deferred waiting requests should not be immediately re-admitted at the failed width"
+        );
+        let after = scheduler.trace_snapshot();
+        assert_eq!(after.waiting_queue_len, 2);
+        assert_eq!(after.prefill_queue_len, 2);
+        assert_eq!(after.active_len, 2);
+        assert_eq!(after.admitted_total, 6);
+        assert_eq!(after.capacity_backpressure_admit_limit, Some(2));
+    }
+
+    #[test]
+    fn capacity_backpressure_grows_after_prefill_progress() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        for request in &first_batch.requests {
+            assert!(scheduler.defer_prefill_to_waiting(&request.request.id));
+        }
+        assert_eq!(
+            scheduler.trace_snapshot().capacity_backpressure_admit_limit,
+            Some(2)
+        );
+
+        let second_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(second_batch.requests.len(), 2);
+        let progressed_id = second_batch.requests[0].request.id.clone();
+        assert!(!scheduler.mark_prefill_chunk_processed(&progressed_id, 128, 1));
+        assert_eq!(
+            scheduler.trace_snapshot().capacity_backpressure_admit_limit,
+            None,
+            "real prefill progress should relax the capacity backpressure window"
+        );
+
+        let third_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(
+            third_batch.requests.len(),
+            4,
+            "after progress, remaining waiting prefills can use available active slots again"
+        );
+        let after = scheduler.trace_snapshot();
+        assert_eq!(after.waiting_queue_len, 0);
+        assert_eq!(after.active_len, 4);
     }
 
     #[tokio::test]
