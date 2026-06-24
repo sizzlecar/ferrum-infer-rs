@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ115 — Qwen35 F32 residual decode stops materializing placeholder layer outputs
+
+- Scope:
+  - continued from ZZZ114 without starting GPU and without running live vLLM;
+  - focused on Qwen35 decode allocation/graph blockers after confirming the
+    latest evidence still points at model `process` time, not scheduler time;
+  - kept the change based on the existing F32 residual-shadow dataflow, not on
+    model name, GPU VRAM, or a hard-coded concurrency cap.
+- Finding:
+  - Qwen35 CUDA decode uses the device-side F32 residual shadow as the source
+    of truth between layers;
+  - the next decode layer reads `residual_f32` through
+    `rms_norm_f32_to_activation`, so the activation `layer_output` buffer
+    returned by the layer function is not consumed on that path;
+  - after earlier ZZZ81 work, the scratch F32 residual path still allocated a
+    one-element placeholder per layer to satisfy the older
+    `Result<B::Buffer>` internal contract.
+- Source change:
+  - changed Qwen35 batched decode layer helpers to return
+    `Result<Option<B::Buffer>>`;
+  - F32 residual-shadow scratch paths now return `None` and allocate no
+    placeholder layer output;
+  - fallback/non-F32-residual paths still return `Some(layer_output)` and keep
+    the previous materialized-buffer behavior;
+  - the main decode loop updates `hidden` only when a layer returns
+    `Some(layer_output)`;
+  - updated the local helper/unit test so non-materialized decode layer output
+    means `None`, not a one-element allocation.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-models` PASS;
+  - `cargo test -p ferrum-models decode_residual_shadow_can_skip_layer_output_materialization -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models qwen35_paged -- --nocapture` PASS;
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models dense_full_attention_backend_matches_reference_for_qwen35_gated_official_like_shape -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models full_attention_core_applies_qwen35_output_gate -- --nocapture`
+    PASS;
+  - `git diff --check` PASS.
+- Status:
+  - source-level candidate only; no CUDA throughput artifact has measured it
+    yet;
+  - no OOM-fixed, release-ready, performance-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ114 — Qwen35 paged full-attention U32 scratch writes are cached
 
 - Scope:

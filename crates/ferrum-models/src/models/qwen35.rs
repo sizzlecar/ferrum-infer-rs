@@ -2703,7 +2703,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 Qwen35AttentionWeights::Full(_) => "full",
             };
             let t_layer = qwen35_decode_profile_stage_start::<B>(&mut ctx, decode_profile_enabled);
-            hidden = match &layer.attention {
+            let next_hidden = match &layer.attention {
                 Qwen35AttentionWeights::Linear(_) => {
                     qwen35_linear_attention_decode_batch_layer_backend::<B>(
                         &mut ctx,
@@ -2745,6 +2745,9 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                     )?
                 }
             };
+            if let Some(layer_output) = next_hidden {
+                hidden = layer_output;
+            }
             let layer_elapsed =
                 qwen35_decode_profile_stage_finish::<B>(&mut ctx, t_layer, "qwen35_decode_layer");
             decode_profile.record_layer(layer_index, layer_kind, layer_elapsed);
@@ -6764,11 +6767,11 @@ fn qwen35_finish_layer_with_mlp_decode_scratch<B: MoeLlmBackend>(
 fn qwen35_decode_layer_output_allocation_len(
     hidden_len: usize,
     materialize_layer_output: bool,
-) -> usize {
+) -> Option<usize> {
     if materialize_layer_output {
-        hidden_len.max(1)
+        Some(hidden_len.max(1))
     } else {
-        1
+        None
     }
 }
 
@@ -6782,7 +6785,7 @@ fn qwen35_finish_layer_with_mlp_f32_residual_decode_scratch<B: MoeLlmBackend>(
     eps: f32,
     scratch: &mut Qwen35DecodeScratch<B>,
     materialize_layer_output: bool,
-) -> Result<B::Buffer> {
+) -> Result<Option<B::Buffer>> {
     let hidden_len = tokens * config.hidden_size;
     let detail_enabled = qwen35_layer_detail_profile_enabled();
     let mut detail = Qwen35MlpFinishDetailProfile::default();
@@ -6873,17 +6876,23 @@ fn qwen35_finish_layer_with_mlp_f32_residual_decode_scratch<B: MoeLlmBackend>(
         residual_f32,
         hidden_len,
     );
-    let alloc_start = detail_enabled.then(Instant::now);
-    let mut layer_output = B::alloc(qwen35_decode_layer_output_allocation_len(
-        hidden_len,
-        materialize_layer_output,
-    ));
+    let alloc_start = (detail_enabled && materialize_layer_output).then(Instant::now);
+    let mut layer_output =
+        qwen35_decode_layer_output_allocation_len(hidden_len, materialize_layer_output)
+            .map(B::alloc);
     if let Some(start) = alloc_start {
         detail.layer_output_alloc_host_us += start.elapsed().as_micros() as u64;
     }
     if materialize_layer_output {
         let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-        B::f32_to_activation(ctx, residual_f32, &mut layer_output, hidden_len);
+        B::f32_to_activation(
+            ctx,
+            residual_f32,
+            layer_output
+                .as_mut()
+                .expect("Qwen3.5 materialized decode layer output allocation failed"),
+            hidden_len,
+        );
         detail.f32_to_activation_us += qwen35_detail_profile_stage_finish::<B>(
             ctx,
             timer,
@@ -6913,7 +6922,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend_packed_scratch<B: MoeLlmBa
     config: &Qwen35TextConfig,
     eps: f32,
     scratch: &mut Qwen35DecodeScratch<B>,
-) -> Result<B::Buffer> {
+) -> Result<Option<B::Buffer>> {
     let attention = match &layer.attention {
         Qwen35AttentionWeights::Linear(attention) => attention,
         Qwen35AttentionWeights::Full(_) => {
@@ -7120,7 +7129,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
     mut residual_f32: Option<&mut B::Buffer>,
     mut branch_f32: Option<&mut B::Buffer>,
     mut decode_scratch: Option<&mut Qwen35DecodeScratch<B>>,
-) -> Result<B::Buffer> {
+) -> Result<Option<B::Buffer>> {
     let batch_len = states.len();
     let attention_shape = Qwen35LinearAttentionShape {
         tokens: 1,
@@ -7686,7 +7695,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
                 false,
             )?
         } else {
-            qwen35_finish_layer_with_mlp_f32_residual::<B>(
+            Some(qwen35_finish_layer_with_mlp_f32_residual::<B>(
                 ctx,
                 residual_f32,
                 branch_f32,
@@ -7694,7 +7703,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
                 config,
                 batch_len,
                 eps,
-            )?
+            )?)
         };
         detail.mlp_us +=
             qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_decode_mlp");
@@ -7739,7 +7748,7 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         };
         detail.mlp_us +=
             qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_linear_decode_mlp");
-        output
+        Some(output)
     };
 
     if detail_enabled {
@@ -8671,7 +8680,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
     mut residual_f32: Option<&mut B::Buffer>,
     mut branch_f32: Option<&mut B::Buffer>,
     mut decode_scratch: Option<&mut Qwen35DecodeScratch<B>>,
-) -> Result<B::Buffer> {
+) -> Result<Option<B::Buffer>> {
     let batch_len = states.len();
     let hidden_len = batch_len * config.hidden_size;
     let attention = match &layer.attention {
@@ -8978,6 +8987,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                     batch_len,
                     eps,
                 )
+                .map(Some)
             };
         }
         let mut residual_after_attention = B::alloc(hidden_len);
@@ -9000,6 +9010,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 eps,
                 scratch,
             )
+            .map(Some)
         } else {
             qwen35_finish_layer_with_mlp::<B>(
                 ctx,
@@ -9009,6 +9020,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 batch_len,
                 eps,
             )
+            .map(Some)
         };
     }
 
@@ -9215,6 +9227,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 batch_len,
                 eps,
             )
+            .map(Some)
         }
     } else {
         let mut residual_after_attention = B::alloc(hidden_len);
@@ -9237,6 +9250,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 eps,
                 scratch,
             )
+            .map(Some)
         } else {
             qwen35_finish_layer_with_mlp::<B>(
                 ctx,
@@ -9246,6 +9260,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 batch_len,
                 eps,
             )
+            .map(Some)
         }
     }
 }
@@ -13277,9 +13292,12 @@ mod tests {
 
     #[test]
     fn decode_residual_shadow_can_skip_layer_output_materialization() {
-        assert_eq!(qwen35_decode_layer_output_allocation_len(8192, true), 8192);
-        assert_eq!(qwen35_decode_layer_output_allocation_len(8192, false), 1);
-        assert_eq!(qwen35_decode_layer_output_allocation_len(0, true), 1);
+        assert_eq!(
+            qwen35_decode_layer_output_allocation_len(8192, true),
+            Some(8192)
+        );
+        assert_eq!(qwen35_decode_layer_output_allocation_len(8192, false), None);
+        assert_eq!(qwen35_decode_layer_output_allocation_len(0, true), Some(1));
     }
 
     #[test]
