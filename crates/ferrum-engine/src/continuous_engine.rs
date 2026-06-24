@@ -61,6 +61,7 @@ const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
 const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
 const GENERATION_POLICY_SCAN_LIMIT: usize = 262_144;
 const FORBIDDEN_DECODE_RESAMPLE_LIMIT: usize = 64;
+const KV_ADMISSION_TARGET_LEN_METADATA_KEY: &str = "ferrum_kv_admission_target_len";
 const GENERATED_CONTROL_TOKEN_TEXTS: &[&str] = &[
     "<think>",
     "</think>",
@@ -838,6 +839,10 @@ impl SequenceState {
             serde_json::json!(self
                 .prefill_context_len()
                 .max(self.input_tokens.len() + self.sampling_params.max_tokens.saturating_sub(1))),
+        );
+        metadata.insert(
+            KV_ADMISSION_TARGET_LEN_METADATA_KEY.to_string(),
+            serde_json::json!(self.prefill_context_len()),
         );
         metadata
     }

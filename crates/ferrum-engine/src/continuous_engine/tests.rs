@@ -3214,6 +3214,13 @@ fn model_decode_metadata_marks_structured_requests_for_full_logits() {
             .and_then(|value| value.as_u64()),
         Some((1 + plain.sampling_params.max_tokens.saturating_sub(1)) as u64)
     );
+    assert_eq!(
+        plain
+            .model_decode_metadata()
+            .get("ferrum_kv_admission_target_len")
+            .and_then(|value| value.as_u64()),
+        Some(plain.prefill_context_len() as u64)
+    );
 
     let mut request = policy_request();
     request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
@@ -3263,6 +3270,13 @@ fn sequence_state_prefill_context_preserves_generated_tokens_for_kv_recompute() 
             .and_then(|value| value.as_u64())
             .unwrap()
             >= state.prefill_context_len() as u64
+    );
+    assert_eq!(
+        state
+            .model_decode_metadata()
+            .get("ferrum_kv_admission_target_len")
+            .and_then(|value| value.as_u64()),
+        Some(state.prefill_context_len() as u64)
     );
 }
 

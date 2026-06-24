@@ -246,19 +246,28 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             return Ok(None);
         }
 
-        let mut targets: Vec<(String, usize)> = Vec::new();
+        let mut targets: Vec<(String, usize, usize)> = Vec::new();
         for request in requests {
-            if let Some((_, target)) = targets
+            let admission_target_len = request
+                .admission_target_len
+                .unwrap_or(request.target_len)
+                .max(request.target_len);
+            if let Some((_, target, admission_target)) = targets
                 .iter_mut()
-                .find(|(cache_id, _)| cache_id == &request.cache_id)
+                .find(|(cache_id, _, _)| cache_id == &request.cache_id)
             {
                 *target = (*target).max(request.target_len);
+                *admission_target = (*admission_target).max(admission_target_len);
             } else {
-                targets.push((request.cache_id.clone(), request.target_len));
+                targets.push((
+                    request.cache_id.clone(),
+                    request.target_len,
+                    admission_target_len,
+                ));
             }
         }
 
-        for (cache_id, _) in &targets {
+        for (cache_id, _, _) in &targets {
             self.ensure_kv(cache_id);
         }
         if self.paged_pools.is_none() {
@@ -268,7 +277,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let mut plans = Vec::with_capacity(targets.len());
         let mut block_size = 0usize;
         let mut total_new_blocks = 0usize;
-        for (cache_id, target_len) in &targets {
+        let mut total_admission_new_blocks = 0usize;
+        for (cache_id, target_len, admission_target_len) in &targets {
             let caches = self.kv_caches.get(cache_id).ok_or_else(|| {
                 FerrumError::model(format!(
                     "paged KV reservation missing cache for cache_id={cache_id:?}"
@@ -299,8 +309,15 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
                     "paged KV reservation: target_len={target_len} needs {blocks_after} blocks, exceeds per-seq table capacity {max_blocks_per_seq} for cache_id={cache_id:?}"
                 )));
             }
+            let admission_blocks_after = admission_target_len.div_ceil(cache.block_size);
+            if admission_blocks_after > max_blocks_per_seq {
+                return Err(FerrumError::model(format!(
+                    "paged KV admission: admission_target_len={admission_target_len} needs {admission_blocks_after} blocks, exceeds per-seq table capacity {max_blocks_per_seq} for cache_id={cache_id:?}"
+                )));
+            }
             let new_blocks = blocks_after.saturating_sub(blocks_before);
             total_new_blocks += new_blocks;
+            total_admission_new_blocks += admission_blocks_after.saturating_sub(blocks_before);
             plans.push(KvSlotAllocation {
                 cache_id: cache_id.clone(),
                 blocks_before,
@@ -318,9 +335,9 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
             let alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
             alloc.free_count()
         };
-        if total_new_blocks > free_blocks_before {
+        if total_admission_new_blocks > free_blocks_before {
             return Err(FerrumError::resource_exhausted(format!(
-                "paged KV admission: need {total_new_blocks} new blocks but only {free_blocks_before} free"
+                "paged KV admission: need {total_admission_new_blocks} admission blocks ({total_new_blocks} immediate) but only {free_blocks_before} free"
             )));
         }
 
