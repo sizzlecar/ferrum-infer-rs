@@ -2,6 +2,57 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ136 — 2bc1e6bb c32 diagnostic completes; starvation fixed, throughput still low
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_scheduler_backpressure_decode_c32_2bc1e6bb_20260624T194025Z/`;
+  - remote Git SHA: `2bc1e6bb49e1530a15772378f3d1f0a50595ca81`;
+  - diagnostic lane only, not release evidence, and did not run live vLLM;
+  - Vast instance `42216671` was reused, then stopped and confirmed
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-engine -p ferrum-scheduler -p ferrum-kv`
+    PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`.
+- c32 diagnostic result:
+  - command was the same focused `bench-serve` c=32, 32 prompts,
+    4 warmups, `n_repeats=1`, `--fail-on-error`, seed `9271`;
+  - bench completed normally: `bench_exit=0`;
+  - `completed_per_run=[32]`, `errored_per_run=[0]`;
+  - `output_token_count_source=usage`;
+  - output throughput mean: `202.45 tok/s`;
+  - request throughput mean: `1.58 req/s`;
+  - TTFT p50 mean: `2072.3 ms`;
+  - TPOT p50 mean: `102.3 ms`.
+- Scheduler outcome:
+  - final trace ended with all queues empty:
+    `waiting_queue_len=0`, `prefill_queue_len=0`, `decode_queue_len=0`,
+    `active_len=0`;
+  - `oom_mentions=0`;
+  - `capacity_backpressure_admit_limit=null` at completion.
+- Diagnosis:
+  - ZZZ135 fixed the starvation mode from ZZZ134: decode-ready requests are no
+    longer permanently skipped by fill-first while capacity backpressure is
+    active;
+  - the run still shows low throughput relative to the user target and prior
+    baseline (`202.45 tok/s`, far below `671 tok/s`), so this is not performance
+    success.
+- Next source direction:
+  - use the new completed c32 artifact as the next profiling baseline;
+  - inspect token-level timing, model/kernel timeline, and scheduler trace for
+    the now-unblocked slow path instead of chasing OOM/starvation;
+  - keep comparing against existing vLLM/source behavior only; do not run live
+    vLLM.
+- Limits:
+  - no W3 PASS line exists;
+  - this does not prove W3 performance or release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ135 — Scheduler backpressure no longer lets fill-first starve decode
 
 - Source of this patch:

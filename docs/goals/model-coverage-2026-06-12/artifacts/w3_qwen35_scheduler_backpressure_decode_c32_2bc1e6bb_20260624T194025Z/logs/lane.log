@@ -1,0 +1,14 @@
+2026-06-24T19:40:25Z lane_start art=/workspace/artifacts/w3_qwen35_scheduler_backpressure_decode_c32_2bc1e6bb_20260624T194025Z sha=2bc1e6bb49e1530a15772378f3d1f0a50595ca81 release_evidence=false no_live_vllm=true
+2026-06-24T19:40:25Z git_sync_start
+2026-06-24T19:40:26Z git_sync_done
+2026-06-24T19:40:26Z cargo_check_start
+2026-06-24T19:40:27Z cargo_check_done
+2026-06-24T19:40:27Z release_build_start
+2026-06-24T19:43:39Z release_build_done
+2026-06-24T19:43:39Z ferrum_run_smoke_start
+2026-06-24T19:44:06Z ferrum_run_smoke_done
+2026-06-24T19:44:06Z serve_start
+2026-06-24T19:44:35Z serve_ready
+2026-06-24T19:44:35Z serve_chat_smoke_done
+2026-06-24T19:44:35Z bench_c32_start
+2026-06-24T19:44:59Z FERRUM W3 QWEN35 SCHEDULER BACKPRESSURE DECODE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_scheduler_backpressure_decode_c32_2bc1e6bb_20260624T194025Z
