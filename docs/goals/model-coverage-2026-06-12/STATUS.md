@@ -2,6 +2,89 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ119 — Qwen35 fused gate+merge CUDA source check and scheduler-thrash evidence
+
+- Scope:
+  - reused the retained Vast instance `42216671`; no new instance was created;
+  - did not run live vLLM; all baseline comparisons remain against historical
+    checked-in artifacts;
+  - validated the ZZZ118 source candidate on a real CUDA toolchain before
+    interpreting performance;
+  - stopped the instance after artifacts were copied back.
+- Paid GPU lane contract used:
+  - lane: `w3-qwen35-cuda-source-build-and-quick-diagnostic`;
+  - hardware: existing `1x RTX 4090` Vast instance `42216671`;
+  - expected runtime/cost: about `20-60` minutes on the retained instance,
+    API-reported `dph_total` about `0.4777777778/hr`;
+  - stop condition: stop on build/check/diagnostic failure or after collecting
+    source-check/diagnostic artifacts;
+  - correctness before performance: CUDA source build/check and focused
+    Qwen35 test first; quick diagnostics only after those passed;
+  - performance command was diagnostic-only `bench-serve --fail-on-error
+    --seed 9271 --n-repeats 1`, not release evidence.
+- CUDA source-check artifact:
+  - local copy:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_cuda_source_check_a4bbc933_20260624T121458Z/`;
+  - remote PASS line:
+    `CUDA_SOURCE_CHECK_PASS: /workspace/artifacts/w3_qwen35_cuda_source_check_a4bbc933_20260624T121458Z`;
+  - `cargo check -p ferrum-models --features cuda` PASS;
+  - `cargo build --release -p ferrum-cli --bin ferrum --features
+    cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source` PASS in `3m34s`;
+  - `cargo test -p ferrum-models --features cuda
+    sparse_moe_decode_fused_gate_merge_gates_shared_and_adds_routed --
+    --nocapture` PASS;
+  - binary SHA256 recorded in `env/ferrum.sha256`.
+- Same-protocol c16 quick diagnostic:
+  - local copy:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fused_gate_merge_c16_quick_a4bbc933_20260624T123416Z/`;
+  - PASS line:
+    `FERRUM W3 QWEN35 FUSED GATE MERGE C16 QUICK PASS:
+    /workspace/artifacts/w3_qwen35_fused_gate_merge_c16_quick_a4bbc933_20260624T123416Z`;
+  - product `serve` smoke passed before benchmark;
+  - `bench-serve` c16 diagnostic completed `32/32`, `0` errors;
+  - output throughput `686.2411093759567` tok/s;
+  - p95 ITL `19.805667` ms;
+  - this is essentially flat against recent c16 quick artifacts:
+    `678.630239827307`, `688.1409470636319`,
+    `685.9364276426528`, and `659.6912913078381` tok/s.
+- Typed c32 short diagnostic:
+  - local copy:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fused_gate_merge_c32_short_a4bbc933_20260624T122245Z/`;
+  - PASS line:
+    `FERRUM W3 QWEN35 FUSED GATE MERGE C32 SHORT DIAG PASS:
+    /workspace/artifacts/w3_qwen35_fused_gate_merge_c32_short_a4bbc933_20260624T122245Z`;
+  - product `serve` smoke passed before benchmark;
+  - command used typed product flags:
+    `--max-num-seqs 32 --kv-capacity 512 --max-num-batched-tokens 192
+    --scheduler-prefill-first-until-active 32 --scheduler-prefill-step-chunk 6`;
+  - `bench-serve` c32 diagnostic completed `32/32`, `0` errors, but output
+    throughput was only `9.516679634331323` tok/s and p95 ITL was
+    `4435.8990296` ms;
+  - scheduler summary:
+    `max_completed_total=37`, `max_cancelled_total=4064`,
+    `max_admitted_total=4101`, `prefill_with_generated_tokens_iterations=8214`,
+    `max_generated_tokens_seen_in_prefill=127`;
+  - raw scheduler trace was compressed to
+    `server/scheduler_trace.jsonl.gz`; parsed summary is in
+    `server/scheduler_summary.json`.
+- Finding:
+  - the ZZZ118 fused shared-expert gate+merge change is CUDA-build-valid and
+    correctness-smoke-valid, but it is not a meaningful W3 performance lever;
+  - c16 remains around the previous `~686` tok/s plateau, far below the W3
+    80% target;
+  - c32 did not OOM, which confirms the recurrent-state admission/wait path is
+    active, but the typed c32 configuration can thrash by repeatedly
+    cancelling/re-admitting requests and returning requests with generated
+    tokens to prefill scheduling;
+  - the next high-return work should inspect scheduler/recurrent-state
+    transition semantics under c32 typed max-seqs/kv-capacity, especially why
+    prefill scheduling sees `generated_tokens>0` thousands of times.
+- Status:
+  - no `MODEL_RELEASE_GRADE_W3 PASS`;
+  - no OOM-fixed, release-ready, or performance-ready claim;
+  - W3 remains blocked by real L2/L3/L4/L5 correctness/performance evidence
+    and by the c32 scheduler/recurrent-state behavior above.
+
 ## 2026-06-24 ZZZ118 — Qwen35 decode shared-expert gate+merge fused source candidate
 
 - Scope:

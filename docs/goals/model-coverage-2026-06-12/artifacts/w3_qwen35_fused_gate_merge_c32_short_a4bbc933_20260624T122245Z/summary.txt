@@ -1,0 +1,1 @@
+FERRUM W3 QWEN35 FUSED GATE MERGE C32 SHORT DIAG PASS: /workspace/artifacts/w3_qwen35_fused_gate_merge_c32_short_a4bbc933_20260624T122245Z
