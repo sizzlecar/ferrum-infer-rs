@@ -2,6 +2,48 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ96 — Current W3 evidence uses 2026-06-23 fixed-output L5
+
+- Scope:
+  - extracted a small tracked evidence bundle from the already copied 2026-06-23
+    historical W3 Ferrum run:
+    `artifacts/w3_qwen35_default_full_l5_fixed_output_20260623_39ffe5db/`;
+  - the bundle contains only the L5 gate JSON, Ferrum bench report/command,
+    runtime snapshot, hardware snapshot, git SHA, and binary SHA256, not the
+    full local resume directory;
+  - regenerated `l5/w3_l5_concurrency.json` with the current
+    `scripts/release/w3_l5_concurrency_gate.py --effective-config` path, so the
+    c32 cell records `effective_active_concurrency=16` and
+    `published_concurrency=16`;
+  - updated `w3_qwen35_current_evidence_config.json` to point at this
+    fixed-output Ferrum L5/perf bundle, git SHA
+    `39ffe5db3fa5fe1ed689994a8a5da29c5a2e8514`, and binary SHA256
+    `fecea34d84d3d68e53e1213fce30b31c8d97ef51b7c4e44cb31dc69cac5e64d4`.
+- Result:
+  - `W3 L5 CONCURRENCY PASS:
+    docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_default_full_l5_fixed_output_20260623_39ffe5db/l5`;
+  - the diagnostic current-evidence manifest failure count dropped from `45`
+    to `12`;
+  - no L0-L5 correctness artifact failure remains in the current diagnostic
+    output;
+  - remaining failures are performance/baseline only:
+    historical vLLM baseline command lacks `--ignore-eos`, and Ferrum remains
+    below the 80% target with ratios `c1=0.631936`, `c4=0.647023`,
+    `c16=0.550649`, `c32=0.369638`;
+  - p95 ITL also fails the 1.25x baseline rule at all four cells.
+- Validation:
+  - `python3 -m py_compile scripts/release/model_release_grade_manifest.py scripts/release/model_release_grade_goal_gate.py scripts/release/w3_l5_concurrency_gate.py`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/w3_l5_concurrency_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --config docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json` produced the expected diagnostic `MODEL_RELEASE_GRADE_W3 FAIL (12 problems)`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - this is evidence packaging/diagnosis from historical Ferrum data, not a new
+    performance run;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ95 — Current W3 evidence config uses current-schema L2/L4 artifacts
 
 - Scope:
