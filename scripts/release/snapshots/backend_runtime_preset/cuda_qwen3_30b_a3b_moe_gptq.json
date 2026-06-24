@@ -103,8 +103,8 @@
       "name": "moe_decode_paths",
       "rejected": [
         {
-          "reason": "pair-id device route not selected",
-          "value": "vllm_marlin_moe_device_route_pair_ids"
+          "reason": "device-route MoE not selected",
+          "value": "vllm_marlin_moe_device_route"
         },
         {
           "reason": "vLLM Marlin MoE not selected",
@@ -115,7 +115,7 @@
           "value": "legacy_moe"
         }
       ],
-      "selected": "vllm_marlin_moe_device_route"
+      "selected": "vllm_marlin_moe_device_route_pair_ids"
     },
     {
       "candidates": [
@@ -206,8 +206,8 @@
       ],
       "rejected": [
         {
-          "reason": "pair-id device route not selected",
-          "value": "vllm_marlin_moe_device_route_pair_ids"
+          "reason": "device-route MoE not selected",
+          "value": "vllm_marlin_moe_device_route"
         },
         {
           "reason": "vLLM Marlin MoE not selected",
@@ -219,7 +219,7 @@
         }
       ],
       "schema_version": 1,
-      "selected": "vllm_marlin_moe_device_route",
+      "selected": "vllm_marlin_moe_device_route_pair_ids",
       "selection": "moe_implementation",
       "source": "workload_preset",
       "source_key": null
@@ -472,7 +472,7 @@
       "affects": [
         "performance"
       ],
-      "effective_value": "0",
+      "effective_value": "1",
       "key": "FERRUM_VLLM_MOE_PAIR_IDS",
       "source": "memory_profile"
     },
@@ -542,7 +542,7 @@
     "max_sequences": "32",
     "model_architecture": "qwen3_moe",
     "model_quantization": "gptq_int4",
-    "moe_decode_path": "vllm_marlin_moe_device_route",
+    "moe_decode_path": "vllm_marlin_moe_device_route_pair_ids",
     "scheduler": "prefill_first_until_active:32+prefill_step_chunk:64"
   },
   "workload_profile": {

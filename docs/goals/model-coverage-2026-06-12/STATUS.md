@@ -15188,3 +15188,49 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
   - 需要下一次 targeted 1x4090 c16 quick A/B 验证这个默认路径对当前
     Qwen3.5 artifact 的真实影响;W3 仍需要最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 Qwen3.5 pair-ids-off c16 validation, negative result
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_pair_ids_default_off_c16_quick_cb831135_20260624/`
+  - Diagnostic PASS line:
+    `W3 QWEN35 PAIR IDS DEFAULT OFF C16 QUICK DIAG PASS: /workspace/artifacts/w3_qwen35_pair_ids_default_off_c16_quick_cb831135_20260624`
+  - Vast instance `42216671` was reused and then stopped; artifact records
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`.
+- Lane:
+  - `W3_QWEN35_PAIR_IDS_DEFAULT_OFF_C16_QUICK_CB831135`
+  - 1x RTX 4090, CUDA 12.4, driver `570.153.02`.
+  - No live vLLM; comparison is against historical Ferrum/vLLM artifacts.
+  - Git SHA `cb831135c12f16cec1a3924178ce316c56f80813`.
+  - Binary SHA256
+    `e80c2e1f514850d4ab1ed98051dfd25f83b7273c844e14b025dce2c8067b062c`.
+- Correctness smoke:
+  - CUDA release build PASS, `3m33s`.
+  - `ferrum run` smoke PASS, response contained `5`.
+  - `ferrum serve` chat smoke PASS, response contained `5`.
+  - run and serve effective configs both selected
+    `vllm_marlin_moe_device_route` with
+    `FERRUM_VLLM_MOE_PAIR_IDS=0`.
+- c16 quick bench:
+  - Command shape: `bench-serve`, sharegpt dataset, `--concurrency 16`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`.
+  - Completed `[32]`, errored `[0]`.
+  - `output_token_count_source=usage`.
+  - Output throughput `659.6912913078381 tok/s`.
+  - p95 ITL `20.472324999999994 ms`.
+  - Versus ZZZ111 pair-ids-on/block-table-skip c16 quick
+    `688.1409470636319 tok/s`: delta
+    `-28.449655755793742 tok/s`, ratio `0.9586572258529429`.
+- Decision:
+  - Pair-ids-off default is a negative result on current Qwen3.5 c16 quick.
+  - The earlier default rollback candidate is not kept as product behavior.
+  - Source is restored so CUDA Qwen3 MoE/GPTQ defaults select
+    `vllm_marlin_moe_device_route_pair_ids` again; explicit opt-out remains
+    possible through the typed runtime/config path.
+- Limits:
+  - This is diagnostic only (`n_repeats=1`, c16 only).
+  - It does not prove release performance, OOM resolution, or W3 completion.
+  - Current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.

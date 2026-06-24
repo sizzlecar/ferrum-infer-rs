@@ -84,6 +84,13 @@ pub fn moe_graph_default_entries(
         if runtime_snapshot_value(current, "FERRUM_VLLM_MOE").is_none() {
             entries.push(RuntimeConfigEntry::new("FERRUM_VLLM_MOE", "1", source));
         }
+        if runtime_snapshot_value(current, "FERRUM_VLLM_MOE_PAIR_IDS").is_none() {
+            entries.push(RuntimeConfigEntry::new(
+                "FERRUM_VLLM_MOE_PAIR_IDS",
+                "1",
+                source,
+            ));
+        }
     }
 
     entries
