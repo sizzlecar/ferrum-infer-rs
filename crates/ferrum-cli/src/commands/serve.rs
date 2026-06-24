@@ -1504,12 +1504,12 @@ fn recurrent_state_bytes_per_sequence_from_definition(
     ) {
         return None;
     }
-    ferrum_models::qwen35_config::Qwen35TextConfig::from_model_definition(definition)
-        .ok()?
-        .recurrent_state_elements_per_slot()
-        .ok()?
-        .checked_mul(4)
-        .and_then(|bytes| u64::try_from(bytes).ok())
+    Some(
+        ferrum_models::qwen35_config::Qwen35TextConfig::from_model_definition(definition)
+            .ok()?
+            .recurrent_state_bytes_per_slot(ferrum_types::DataType::FP16)
+            .ok()?,
+    )
 }
 
 pub(crate) fn model_weight_bytes_from_path(path: &Path) -> Option<u64> {
@@ -2565,7 +2565,7 @@ mod tests {
         );
         assert_eq!(
             capabilities.recurrent_state_bytes_per_sequence,
-            Some(30 * (8192 * 3 + 32 * 128 * 128) * 4)
+            Some(30 * (8192 * 3 + 32 * 128 * 128) * 2)
         );
     }
 

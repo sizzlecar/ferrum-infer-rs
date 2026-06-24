@@ -41,6 +41,32 @@ extern "C" __global__ void f32_to_activation_f16(
     }
 }
 
+extern "C" __global__ void cast_f16_to_f32_slice(
+    const __half* __restrict__ input,
+    float* __restrict__ output,
+    const int input_offset,
+    const int output_offset,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[output_offset + idx] = __half2float(input[input_offset + idx]);
+    }
+}
+
+extern "C" __global__ void cast_f32_to_f16_slice(
+    const float* __restrict__ input,
+    __half* __restrict__ output,
+    const int input_offset,
+    const int output_offset,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[output_offset + idx] = __float2half(input[input_offset + idx]);
+    }
+}
+
 extern "C" __global__ void rms_norm_f16_to_f32(
     const __half* __restrict__ input,
     const __half* __restrict__ weight,

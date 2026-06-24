@@ -66,6 +66,7 @@ pub struct Qwen35BackendModel<B: MoeLlmBackend> {
     pub paged_block_alloc: Option<std::sync::Mutex<BlockAllocator>>,
     pub paged_max_seqs: usize,
     pub linear_state_max_slots: usize,
+    pub linear_state_pool_dtype: Dtype,
     pub paged_max_blocks_per_seq: usize,
     paged_scratch: Qwen35PagedScratch<B>,
     decode_scratch: Option<Qwen35DecodeScratch<B>>,
@@ -190,6 +191,7 @@ pub struct Qwen35LinearStatePools<B: MoeLlmBackend> {
     pub max_slots: usize,
     pub conv_state_len: usize,
     pub delta_state_len: usize,
+    pub state_dtype: Dtype,
 }
 
 pub struct Qwen35RecurrentStateCache<B: Backend> {
@@ -1000,6 +1002,18 @@ fn qwen35_linear_state_max_slots(
         .max(1)
 }
 
+fn qwen35_linear_state_pool_dtype<B: Backend>(
+    _snapshot: &ferrum_types::RuntimeConfigSnapshot,
+) -> Dtype {
+    if B::supports_qwen35_indexed_recurrent_state()
+        && B::activation_elem_size_bytes() < std::mem::size_of::<f32>()
+    {
+        Dtype::F16
+    } else {
+        Dtype::F32
+    }
+}
+
 fn qwen35_linear_state_slot_pool_exhausted(max_slots: usize) -> FerrumError {
     FerrumError::resource_exhausted(format!(
         "Qwen3.5 linear state slot pool exhausted: max_slots={max_slots}"
@@ -1173,6 +1187,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             && B::supports_qwen35_paged_qkv_vllm();
         let paged_max_seqs = qwen35_paged_max_seqs(&snapshot);
         let linear_state_max_slots = qwen35_linear_state_max_slots(&snapshot, paged_max_seqs);
+        let linear_state_pool_dtype = qwen35_linear_state_pool_dtype::<B>(&snapshot);
         let paged_max_blocks_per_seq = kv_capacity.div_ceil(QWEN35_PAGED_BLOCK_SIZE);
         Ok(Self {
             weights,
@@ -1187,6 +1202,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             paged_block_alloc: None,
             paged_max_seqs,
             linear_state_max_slots,
+            linear_state_pool_dtype,
             paged_max_blocks_per_seq,
             paged_scratch: Qwen35PagedScratch::new(),
             decode_scratch: None,
@@ -1312,10 +1328,14 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .collect::<Vec<_>>();
         for layer in layer_plan {
             if matches!(layer.attention, Qwen35LayerType::LinearAttention) {
-                conv_states[layer.layer_index] =
-                    Some(B::alloc_typed(Dtype::F32, max_slots * conv_state_len));
-                delta_states[layer.layer_index] =
-                    Some(B::alloc_typed(Dtype::F32, max_slots * delta_state_len));
+                conv_states[layer.layer_index] = Some(B::alloc_typed(
+                    self.linear_state_pool_dtype,
+                    max_slots * conv_state_len,
+                ));
+                delta_states[layer.layer_index] = Some(B::alloc_typed(
+                    self.linear_state_pool_dtype,
+                    max_slots * delta_state_len,
+                ));
             }
         }
         self.linear_state_pools = Some(Qwen35LinearStatePools {
@@ -1324,6 +1344,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             max_slots,
             conv_state_len,
             delta_state_len,
+            state_dtype: self.linear_state_pool_dtype,
         });
         self.linear_free_slots = (0..max_slots).rev().collect();
         Ok(())
@@ -1356,11 +1377,18 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         }
     }
 
+    fn uses_compact_indexed_linear_state(&self) -> bool {
+        self.linear_state_pools.is_some() && self.linear_state_max_slots > 2
+    }
+
     fn sync_sequence_linear_state_from_slot(
         &mut self,
         ctx: &mut B::Context,
         state: &mut Qwen35SequenceState<B>,
     ) -> Result<()> {
+        if self.uses_compact_indexed_linear_state() {
+            return Ok(());
+        }
         let (Some(slot), Some(pools)) = (state.linear_slot, self.linear_state_pools.as_mut())
         else {
             return Ok(());
@@ -1408,6 +1436,9 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         ctx: &mut B::Context,
         state: &mut Qwen35SequenceState<B>,
     ) -> Result<()> {
+        if self.uses_compact_indexed_linear_state() {
+            return Ok(());
+        }
         let (Some(slot), Some(pools)) = (state.linear_slot, self.linear_state_pools.as_mut())
         else {
             return Ok(());
@@ -1577,8 +1608,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .map_err(FerrumError::model)?;
         let linear_slot = self.allocate_linear_slot()?;
         // In wide serving, indexed recurrent pools are the decode source of truth.
-        let compact_indexed_linear_state =
-            self.linear_state_pools.is_some() && self.linear_state_max_slots > 2;
+        let compact_indexed_linear_state = self.uses_compact_indexed_linear_state();
         let mut layers = Vec::with_capacity(self.weights.config.num_hidden_layers);
         for layer_plan in layer_plan {
             match layer_plan.attention {
@@ -1779,6 +1809,12 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         let mut branch_f32 = residual_f32
             .as_ref()
             .map(|_| B::alloc_typed(Dtype::F32, hidden_len));
+        let compact_indexed_linear_state = self.uses_compact_indexed_linear_state();
+        let linear_state_slot = state.linear_slot;
+        let linear_state_shape = self.linear_attention_state_shape();
+        let linear_conv_state_len =
+            linear_state_shape.conv_channels() * linear_state_shape.conv_kernel.saturating_sub(1);
+        let linear_delta_state_len = linear_state_shape.state_len();
         for (layer_index, (layer, layer_state)) in weights
             .layers
             .iter()
@@ -1794,18 +1830,140 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                 Qwen35LayerRuntimeState::Linear {
                     conv_state,
                     delta_state,
-                } => qwen35_linear_attention_stateful_layer_backend::<B>(
-                    &mut ctx,
-                    &hidden,
-                    conv_state,
-                    delta_state,
-                    layer,
-                    &weights.config,
-                    tokens_len,
-                    eps,
-                    residual_f32.as_mut(),
-                    branch_f32.as_mut(),
-                )?,
+                } => {
+                    if compact_indexed_linear_state {
+                        let slot = linear_state_slot.ok_or_else(|| {
+                            FerrumError::model(format!(
+                                "Qwen3.5 missing compact linear state slot for cache_id={cache_id:?}"
+                            ))
+                        })?;
+                        let mut conv_scratch = B::alloc_typed(Dtype::F32, linear_conv_state_len);
+                        let mut delta_scratch = B::alloc_typed(Dtype::F32, linear_delta_state_len);
+                        {
+                            let pools = self.linear_state_pools.as_ref().ok_or_else(|| {
+                                FerrumError::model(
+                                    "Qwen3.5 compact linear state missing slot pool".to_string(),
+                                )
+                            })?;
+                            if pools.conv_state_len != linear_conv_state_len
+                                || pools.delta_state_len != linear_delta_state_len
+                            {
+                                return Err(FerrumError::model(format!(
+                                    "Qwen3.5 compact linear state pool shape mismatch for layer \
+                                     {layer_index}: pool conv={} delta={} expected conv={} \
+                                     delta={}",
+                                    pools.conv_state_len,
+                                    pools.delta_state_len,
+                                    linear_conv_state_len,
+                                    linear_delta_state_len
+                                )));
+                            }
+                            if slot >= pools.max_slots {
+                                return Err(FerrumError::model(format!(
+                                    "Qwen3.5 compact linear state slot {slot} exceeds max_slots={}",
+                                    pools.max_slots
+                                )));
+                            }
+                            if prior_len > 0 {
+                                let conv_slots =
+                                    pools.conv_states[layer_index].as_ref().ok_or_else(|| {
+                                        FerrumError::model(format!(
+                                            "Qwen3.5 missing compact linear conv state slot pool \
+                                             for layer {layer_index}"
+                                        ))
+                                    })?;
+                                let delta_slots =
+                                    pools.delta_states[layer_index].as_ref().ok_or_else(|| {
+                                        FerrumError::model(format!(
+                                            "Qwen3.5 missing compact linear delta state slot pool \
+                                             for layer {layer_index}"
+                                        ))
+                                    })?;
+                                B::copy_slice(
+                                    &mut ctx,
+                                    conv_slots,
+                                    slot * pools.conv_state_len,
+                                    &mut conv_scratch,
+                                    0,
+                                    linear_conv_state_len,
+                                );
+                                B::copy_slice(
+                                    &mut ctx,
+                                    delta_slots,
+                                    slot * pools.delta_state_len,
+                                    &mut delta_scratch,
+                                    0,
+                                    linear_delta_state_len,
+                                );
+                            }
+                        }
+                        let output = qwen35_linear_attention_stateful_layer_backend::<B>(
+                            &mut ctx,
+                            &hidden,
+                            &mut conv_scratch,
+                            &mut delta_scratch,
+                            layer,
+                            &weights.config,
+                            tokens_len,
+                            eps,
+                            residual_f32.as_mut(),
+                            branch_f32.as_mut(),
+                        )?;
+                        {
+                            let pools = self.linear_state_pools.as_mut().ok_or_else(|| {
+                                FerrumError::model(
+                                    "Qwen3.5 compact linear state missing slot pool".to_string(),
+                                )
+                            })?;
+                            let pool_conv_state_len = pools.conv_state_len;
+                            let pool_delta_state_len = pools.delta_state_len;
+                            let conv_slots =
+                                pools.conv_states[layer_index].as_mut().ok_or_else(|| {
+                                    FerrumError::model(format!(
+                                        "Qwen3.5 missing compact linear conv state slot pool for \
+                                         layer {layer_index}"
+                                    ))
+                                })?;
+                            let delta_slots =
+                                pools.delta_states[layer_index].as_mut().ok_or_else(|| {
+                                    FerrumError::model(format!(
+                                        "Qwen3.5 missing compact linear delta state slot pool for \
+                                         layer {layer_index}"
+                                    ))
+                                })?;
+                            B::copy_slice(
+                                &mut ctx,
+                                &conv_scratch,
+                                0,
+                                conv_slots,
+                                slot * pool_conv_state_len,
+                                linear_conv_state_len,
+                            );
+                            B::copy_slice(
+                                &mut ctx,
+                                &delta_scratch,
+                                0,
+                                delta_slots,
+                                slot * pool_delta_state_len,
+                                linear_delta_state_len,
+                            );
+                        }
+                        output
+                    } else {
+                        qwen35_linear_attention_stateful_layer_backend::<B>(
+                            &mut ctx,
+                            &hidden,
+                            conv_state,
+                            delta_state,
+                            layer,
+                            &weights.config,
+                            tokens_len,
+                            eps,
+                            residual_f32.as_mut(),
+                            branch_f32.as_mut(),
+                        )?
+                    }
+                }
                 Qwen35LayerRuntimeState::Full { kv } => {
                     let paged = if self.use_paged_kv {
                         self.paged_pools
@@ -2173,8 +2331,7 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
             .zip(states.iter())
             .map(|((_, _, pos_offset, _), (_, state))| *pos_offset == 0 && state.tokens.is_empty())
             .collect::<Vec<_>>();
-        let compact_indexed_linear_state =
-            self.linear_state_pools.is_some() && self.linear_state_max_slots > 2;
+        let compact_indexed_linear_state = self.uses_compact_indexed_linear_state();
         if !compact_indexed_linear_state {
             for (is_fresh_initial, (_, state)) in fresh_initial_rows.iter().zip(states.iter_mut()) {
                 if !*is_fresh_initial && !state.tokens.is_empty() {
@@ -4001,9 +4158,19 @@ impl<B: MoeLlmBackend + BackendPagedKv> DecoderOnlyLLM for Qwen35BackendModel<B>
         if !self.has_linear_attention_layers()? {
             return Ok(None);
         }
+        let dtype = match self.linear_state_pool_dtype {
+            Dtype::F16 => DataType::FP16,
+            Dtype::F32 => DataType::FP32,
+            dtype => {
+                return Err(FerrumError::model(format!(
+                    "Qwen3.5 recurrent state spec does not support {} linear state pools",
+                    dtype.name()
+                )));
+            }
+        };
         self.weights
             .config
-            .to_recurrent_state_spec(request_id.clone(), DataType::FP32, Device::CPU, 1)
+            .to_recurrent_state_spec(request_id.clone(), dtype, Device::CPU, 1)
             .map(Some)
             .map_err(|err| FerrumError::model(format!("invalid Qwen3.5 recurrent spec: {err}")))
     }
@@ -7148,9 +7315,13 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         }
     };
 
+    let can_use_f32_indexed_state = linear_state_pools
+        .as_ref()
+        .map(|pools| pools.state_dtype == Dtype::F32)
+        .unwrap_or(false);
     let can_use_packed_decode_prepare = B::supports_qwen35_packed_gdn_decode_prepare()
         && B::supports_qwen35_indexed_recurrent_state()
-        && linear_state_pools.is_some()
+        && can_use_f32_indexed_state
         && linear_slot_indices.is_some()
         && attention.qkvz_proj.is_some()
         && attention.ba_proj.is_some();
@@ -7288,181 +7459,187 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
             (linear_state_pools.as_mut(), linear_slot_indices)
         {
             let pools = &mut **pools;
-            let conv_slots = pools.conv_states[layer_index].as_mut().ok_or_else(|| {
-                FerrumError::model(format!(
-                    "Qwen3.5 missing linear conv state slot pool for decode layer {layer_index}"
-                ))
-            })?;
-            let use_packed_recurrent = B::supports_qwen35_packed_gdn_recurrent_decode()
-                && matches!(
-                    &projection_buffers,
-                    Qwen35LinearDecodeProjectionBuffers::Packed { .. }
-                );
-            if use_packed_recurrent {
-                let Qwen35LinearDecodeProjectionBuffers::Packed {
-                    mixed_qkvz_raw,
-                    ba_raw,
-                    z_raw,
-                } = &mut projection_buffers
-                else {
-                    unreachable!("checked by use_packed_recurrent");
-                };
-                let mut mixed_qkv_conv = B::alloc_typed(Dtype::F32, batch_len * qkv_width);
-                let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-                B::linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
-                    ctx,
-                    mixed_qkvz_raw,
-                    &attention.conv1d_weight,
-                    conv_slots,
-                    slot_indices,
-                    &mut mixed_qkv_conv,
-                    z_raw,
-                    batch_len,
-                    pools.max_slots,
-                    attention_shape.key_heads,
-                    attention_shape.value_heads,
-                    attention_shape.key_dim,
-                    attention_shape.value_dim,
-                    attention_shape.conv_kernel,
-                )?;
-                detail.indexed_prepare_us += qwen35_detail_profile_stage_finish::<B>(
-                    ctx,
-                    timer,
-                    "qwen35_linear_decode_indexed_packed_prepare",
-                );
-
-                let delta_slots = pools.delta_states[layer_index].as_mut().ok_or_else(|| {
-                    FerrumError::model(format!(
-                        "Qwen3.5 missing linear delta state slot pool for decode layer {layer_index}"
-                    ))
-                })?;
-                let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-                B::recurrent_gated_delta_rule_batch_indexed_packed_f32(
-                    ctx,
-                    &mixed_qkv_conv,
-                    ba_raw,
-                    &attention.a_log,
-                    &attention.dt_bias,
-                    delta_slots,
-                    slot_indices,
-                    &mut delta_core,
-                    batch_len,
-                    pools.max_slots,
-                    attention_shape.key_heads,
-                    attention_shape.value_heads,
-                    attention_shape.key_dim,
-                    attention_shape.value_dim,
-                    (attention_shape.key_dim as f32).sqrt().recip(),
-                )?;
-                detail.indexed_recurrent_us += qwen35_detail_profile_stage_finish::<B>(
-                    ctx,
-                    timer,
-                    "qwen35_linear_decode_indexed_packed_recurrent",
-                );
+            if pools.state_dtype != Dtype::F32 {
+                false
             } else {
-                let mut query = B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
-                let mut key = B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
-                let mut value = B::alloc_typed(Dtype::F32, batch_len * value_total);
-                let mut g = B::alloc_typed(Dtype::F32, batch_len * gating_width);
-                let mut beta = B::alloc_typed(Dtype::F32, batch_len * gating_width);
-                let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-                match &mut projection_buffers {
-                    Qwen35LinearDecodeProjectionBuffers::Packed {
-                        mixed_qkvz_raw,
-                        ba_raw,
-                        z_raw,
-                    } => B::linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
-                        ctx,
-                        mixed_qkvz_raw,
-                        ba_raw,
-                        &attention.conv1d_weight,
-                        conv_slots,
-                        slot_indices,
-                        &attention.a_log,
-                        &attention.dt_bias,
-                        &mut query,
-                        &mut key,
-                        &mut value,
-                        z_raw,
-                        &mut g,
-                        &mut beta,
-                        batch_len,
-                        pools.max_slots,
-                        attention_shape.key_heads,
-                        attention_shape.value_heads,
-                        attention_shape.key_dim,
-                        attention_shape.value_dim,
-                        attention_shape.conv_kernel,
-                        true,
-                    )?,
-                    Qwen35LinearDecodeProjectionBuffers::Separate {
-                        mixed_qkv_raw,
-                        b_raw,
-                        a_raw,
-                        ..
-                    } => B::linear_attention_decode_prepare_batch_indexed_f32(
-                        ctx,
-                        mixed_qkv_raw,
-                        &attention.conv1d_weight,
-                        conv_slots,
-                        slot_indices,
-                        a_raw,
-                        b_raw,
-                        &attention.a_log,
-                        &attention.dt_bias,
-                        &mut query,
-                        &mut key,
-                        &mut value,
-                        &mut g,
-                        &mut beta,
-                        batch_len,
-                        pools.max_slots,
-                        attention_shape.key_heads,
-                        attention_shape.value_heads,
-                        attention_shape.key_dim,
-                        attention_shape.value_dim,
-                        attention_shape.conv_kernel,
-                        true,
-                    )?,
-                }
-                detail.indexed_prepare_us += qwen35_detail_profile_stage_finish::<B>(
-                    ctx,
-                    timer,
-                    "qwen35_linear_decode_indexed_prepare",
-                );
-
-                let delta_slots = pools.delta_states[layer_index].as_mut().ok_or_else(|| {
+                let conv_slots = pools.conv_states[layer_index].as_mut().ok_or_else(|| {
                     FerrumError::model(format!(
-                        "Qwen3.5 missing linear delta state slot pool for decode layer {layer_index}"
+                        "Qwen3.5 missing linear conv state slot pool for decode layer {layer_index}"
                     ))
                 })?;
-                let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-                B::recurrent_gated_delta_rule_batch_indexed_f32(
-                    ctx,
-                    &query,
-                    &key,
-                    &value,
-                    &g,
-                    &beta,
-                    delta_slots,
-                    slot_indices,
-                    &mut delta_core,
-                    batch_len,
-                    pools.max_slots,
-                    attention_shape.key_heads,
-                    attention_shape.value_heads,
-                    attention_shape.key_dim,
-                    attention_shape.value_dim,
-                    false,
-                    (attention_shape.key_dim as f32).sqrt().recip(),
-                )?;
-                detail.indexed_recurrent_us += qwen35_detail_profile_stage_finish::<B>(
-                    ctx,
-                    timer,
-                    "qwen35_linear_decode_indexed_recurrent",
-                );
+                let use_packed_recurrent = B::supports_qwen35_packed_gdn_recurrent_decode()
+                    && matches!(
+                        &projection_buffers,
+                        Qwen35LinearDecodeProjectionBuffers::Packed { .. }
+                    );
+                if use_packed_recurrent {
+                    let Qwen35LinearDecodeProjectionBuffers::Packed {
+                        mixed_qkvz_raw,
+                        ba_raw,
+                        z_raw,
+                    } = &mut projection_buffers
+                    else {
+                        unreachable!("checked by use_packed_recurrent");
+                    };
+                    let mut mixed_qkv_conv = B::alloc_typed(Dtype::F32, batch_len * qkv_width);
+                    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+                    B::linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+                        ctx,
+                        mixed_qkvz_raw,
+                        &attention.conv1d_weight,
+                        conv_slots,
+                        slot_indices,
+                        &mut mixed_qkv_conv,
+                        z_raw,
+                        batch_len,
+                        pools.max_slots,
+                        attention_shape.key_heads,
+                        attention_shape.value_heads,
+                        attention_shape.key_dim,
+                        attention_shape.value_dim,
+                        attention_shape.conv_kernel,
+                    )?;
+                    detail.indexed_prepare_us += qwen35_detail_profile_stage_finish::<B>(
+                        ctx,
+                        timer,
+                        "qwen35_linear_decode_indexed_packed_prepare",
+                    );
+
+                    let delta_slots = pools.delta_states[layer_index].as_mut().ok_or_else(|| {
+                        FerrumError::model(format!(
+                            "Qwen3.5 missing linear delta state slot pool for decode layer {layer_index}"
+                        ))
+                    })?;
+                    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+                    B::recurrent_gated_delta_rule_batch_indexed_packed_f32(
+                        ctx,
+                        &mixed_qkv_conv,
+                        ba_raw,
+                        &attention.a_log,
+                        &attention.dt_bias,
+                        delta_slots,
+                        slot_indices,
+                        &mut delta_core,
+                        batch_len,
+                        pools.max_slots,
+                        attention_shape.key_heads,
+                        attention_shape.value_heads,
+                        attention_shape.key_dim,
+                        attention_shape.value_dim,
+                        (attention_shape.key_dim as f32).sqrt().recip(),
+                    )?;
+                    detail.indexed_recurrent_us += qwen35_detail_profile_stage_finish::<B>(
+                        ctx,
+                        timer,
+                        "qwen35_linear_decode_indexed_packed_recurrent",
+                    );
+                } else {
+                    let mut query =
+                        B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
+                    let mut key =
+                        B::alloc_typed(Dtype::F32, batch_len * attention_shape.qk_total());
+                    let mut value = B::alloc_typed(Dtype::F32, batch_len * value_total);
+                    let mut g = B::alloc_typed(Dtype::F32, batch_len * gating_width);
+                    let mut beta = B::alloc_typed(Dtype::F32, batch_len * gating_width);
+                    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+                    match &mut projection_buffers {
+                        Qwen35LinearDecodeProjectionBuffers::Packed {
+                            mixed_qkvz_raw,
+                            ba_raw,
+                            z_raw,
+                        } => B::linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
+                            ctx,
+                            mixed_qkvz_raw,
+                            ba_raw,
+                            &attention.conv1d_weight,
+                            conv_slots,
+                            slot_indices,
+                            &attention.a_log,
+                            &attention.dt_bias,
+                            &mut query,
+                            &mut key,
+                            &mut value,
+                            z_raw,
+                            &mut g,
+                            &mut beta,
+                            batch_len,
+                            pools.max_slots,
+                            attention_shape.key_heads,
+                            attention_shape.value_heads,
+                            attention_shape.key_dim,
+                            attention_shape.value_dim,
+                            attention_shape.conv_kernel,
+                            true,
+                        )?,
+                        Qwen35LinearDecodeProjectionBuffers::Separate {
+                            mixed_qkv_raw,
+                            b_raw,
+                            a_raw,
+                            ..
+                        } => B::linear_attention_decode_prepare_batch_indexed_f32(
+                            ctx,
+                            mixed_qkv_raw,
+                            &attention.conv1d_weight,
+                            conv_slots,
+                            slot_indices,
+                            a_raw,
+                            b_raw,
+                            &attention.a_log,
+                            &attention.dt_bias,
+                            &mut query,
+                            &mut key,
+                            &mut value,
+                            &mut g,
+                            &mut beta,
+                            batch_len,
+                            pools.max_slots,
+                            attention_shape.key_heads,
+                            attention_shape.value_heads,
+                            attention_shape.key_dim,
+                            attention_shape.value_dim,
+                            attention_shape.conv_kernel,
+                            true,
+                        )?,
+                    }
+                    detail.indexed_prepare_us += qwen35_detail_profile_stage_finish::<B>(
+                        ctx,
+                        timer,
+                        "qwen35_linear_decode_indexed_prepare",
+                    );
+
+                    let delta_slots = pools.delta_states[layer_index].as_mut().ok_or_else(|| {
+                        FerrumError::model(format!(
+                            "Qwen3.5 missing linear delta state slot pool for decode layer {layer_index}"
+                        ))
+                    })?;
+                    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+                    B::recurrent_gated_delta_rule_batch_indexed_f32(
+                        ctx,
+                        &query,
+                        &key,
+                        &value,
+                        &g,
+                        &beta,
+                        delta_slots,
+                        slot_indices,
+                        &mut delta_core,
+                        batch_len,
+                        pools.max_slots,
+                        attention_shape.key_heads,
+                        attention_shape.value_heads,
+                        attention_shape.key_dim,
+                        attention_shape.value_dim,
+                        false,
+                        (attention_shape.key_dim as f32).sqrt().recip(),
+                    )?;
+                    detail.indexed_recurrent_us += qwen35_detail_profile_stage_finish::<B>(
+                        ctx,
+                        timer,
+                        "qwen35_linear_decode_indexed_recurrent",
+                    );
+                }
+                true
             }
-            true
         } else {
             false
         }
@@ -7478,36 +7655,86 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         let mut initial_delta_states = B::alloc_typed(Dtype::F32, batch_len * delta_state_len);
         let mut final_delta_states = B::alloc_typed(Dtype::F32, batch_len * delta_state_len);
         let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-        for (row, (cache_id, state)) in states.iter_mut().enumerate() {
-            let Qwen35LayerRuntimeState::Linear {
-                conv_state,
-                delta_state,
-            } = state.layers.get_mut(layer_index).ok_or_else(|| {
-                FerrumError::model(format!(
-                    "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
-                ))
-            })?
-            else {
+        if let Some(pools) = linear_state_pools.as_ref() {
+            let pools = &**pools;
+            if pools.conv_state_len != conv_state_len || pools.delta_state_len != delta_state_len {
                 return Err(FerrumError::model(format!(
-                    "Qwen3.5 batch decode expected linear layer state at layer {layer_index} for {cache_id:?}"
+                    "Qwen3.5 linear state pool shape mismatch for decode layer {layer_index}: \
+                     pool conv={} delta={} expected conv={} delta={}",
+                    pools.conv_state_len, pools.delta_state_len, conv_state_len, delta_state_len
                 )));
-            };
-            B::copy_slice(
-                ctx,
-                conv_state,
-                0,
-                &mut conv_states,
-                row * conv_state_len,
-                conv_state_len,
-            );
-            B::copy_slice(
-                ctx,
-                delta_state,
-                0,
-                &mut initial_delta_states,
-                row * delta_state_len,
-                delta_state_len,
-            );
+            }
+            let conv_slots = pools.conv_states[layer_index].as_ref().ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Qwen3.5 missing linear conv state slot pool for decode layer {layer_index}"
+                ))
+            })?;
+            let delta_slots = pools.delta_states[layer_index].as_ref().ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Qwen3.5 missing linear delta state slot pool for decode layer {layer_index}"
+                ))
+            })?;
+            for (row, (cache_id, state)) in states.iter().enumerate() {
+                let slot = state.linear_slot.ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing linear state slot for decode cache_id={cache_id:?}"
+                    ))
+                })?;
+                if slot >= pools.max_slots {
+                    return Err(FerrumError::model(format!(
+                        "Qwen3.5 linear state slot {slot} exceeds pool max_slots={}",
+                        pools.max_slots
+                    )));
+                }
+                B::copy_slice(
+                    ctx,
+                    conv_slots,
+                    slot * pools.conv_state_len,
+                    &mut conv_states,
+                    row * conv_state_len,
+                    conv_state_len,
+                );
+                B::copy_slice(
+                    ctx,
+                    delta_slots,
+                    slot * pools.delta_state_len,
+                    &mut initial_delta_states,
+                    row * delta_state_len,
+                    delta_state_len,
+                );
+            }
+        } else {
+            for (row, (cache_id, state)) in states.iter_mut().enumerate() {
+                let Qwen35LayerRuntimeState::Linear {
+                    conv_state,
+                    delta_state,
+                } = state.layers.get_mut(layer_index).ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+                    ))
+                })?
+                else {
+                    return Err(FerrumError::model(format!(
+                        "Qwen3.5 batch decode expected linear layer state at layer {layer_index} for {cache_id:?}"
+                    )));
+                };
+                B::copy_slice(
+                    ctx,
+                    conv_state,
+                    0,
+                    &mut conv_states,
+                    row * conv_state_len,
+                    conv_state_len,
+                );
+                B::copy_slice(
+                    ctx,
+                    delta_state,
+                    0,
+                    &mut initial_delta_states,
+                    row * delta_state_len,
+                    delta_state_len,
+                );
+            }
         }
         detail.fallback_state_gather_us += qwen35_detail_profile_stage_finish::<B>(
             ctx,
@@ -7587,36 +7814,88 @@ fn qwen35_linear_attention_decode_batch_layer_backend<B: MoeLlmBackend>(
         );
 
         let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-        for (row, (cache_id, state)) in states.iter_mut().enumerate() {
-            let Qwen35LayerRuntimeState::Linear {
-                conv_state,
-                delta_state,
-            } = state.layers.get_mut(layer_index).ok_or_else(|| {
-                FerrumError::model(format!(
-                    "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
-                ))
-            })?
-            else {
+        if let Some(pools) = linear_state_pools.as_mut() {
+            let pools = &mut **pools;
+            if pools.conv_state_len != conv_state_len || pools.delta_state_len != delta_state_len {
                 return Err(FerrumError::model(format!(
-                    "Qwen3.5 batch decode expected linear layer state at layer {layer_index} for {cache_id:?}"
+                    "Qwen3.5 linear state pool shape mismatch for decode layer {layer_index}: \
+                     pool conv={} delta={} expected conv={} delta={}",
+                    pools.conv_state_len, pools.delta_state_len, conv_state_len, delta_state_len
                 )));
-            };
-            B::copy_slice(
-                ctx,
-                &next_conv_states,
-                row * conv_state_len,
-                conv_state,
-                0,
-                conv_state_len,
-            );
-            B::copy_slice(
-                ctx,
-                &final_delta_states,
-                row * delta_state_len,
-                delta_state,
-                0,
-                delta_state_len,
-            );
+            }
+            let max_slots = pools.max_slots;
+            let pool_conv_state_len = pools.conv_state_len;
+            let pool_delta_state_len = pools.delta_state_len;
+            let conv_slots = pools.conv_states[layer_index].as_mut().ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Qwen3.5 missing linear conv state slot pool for decode layer {layer_index}"
+                ))
+            })?;
+            let delta_slots = pools.delta_states[layer_index].as_mut().ok_or_else(|| {
+                FerrumError::model(format!(
+                    "Qwen3.5 missing linear delta state slot pool for decode layer {layer_index}"
+                ))
+            })?;
+            for (row, (cache_id, state)) in states.iter().enumerate() {
+                let slot = state.linear_slot.ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing linear state slot for decode cache_id={cache_id:?}"
+                    ))
+                })?;
+                if slot >= max_slots {
+                    return Err(FerrumError::model(format!(
+                        "Qwen3.5 linear state slot {slot} exceeds pool max_slots={max_slots}"
+                    )));
+                }
+                B::copy_slice(
+                    ctx,
+                    &next_conv_states,
+                    row * conv_state_len,
+                    conv_slots,
+                    slot * pool_conv_state_len,
+                    conv_state_len,
+                );
+                B::copy_slice(
+                    ctx,
+                    &final_delta_states,
+                    row * delta_state_len,
+                    delta_slots,
+                    slot * pool_delta_state_len,
+                    delta_state_len,
+                );
+            }
+        } else {
+            for (row, (cache_id, state)) in states.iter_mut().enumerate() {
+                let Qwen35LayerRuntimeState::Linear {
+                    conv_state,
+                    delta_state,
+                } = state.layers.get_mut(layer_index).ok_or_else(|| {
+                    FerrumError::model(format!(
+                        "Qwen3.5 missing layer {layer_index} state for {cache_id:?}"
+                    ))
+                })?
+                else {
+                    return Err(FerrumError::model(format!(
+                        "Qwen3.5 batch decode expected linear layer state at layer {layer_index} for {cache_id:?}"
+                    )));
+                };
+                B::copy_slice(
+                    ctx,
+                    &next_conv_states,
+                    row * conv_state_len,
+                    conv_state,
+                    0,
+                    conv_state_len,
+                );
+                B::copy_slice(
+                    ctx,
+                    &final_delta_states,
+                    row * delta_state_len,
+                    delta_state,
+                    0,
+                    delta_state_len,
+                );
+            }
         }
         detail.fallback_state_scatter_us += qwen35_detail_profile_stage_finish::<B>(
             ctx,
@@ -13204,6 +13483,7 @@ mod tests {
             max_slots: 2,
             conv_state_len,
             delta_state_len,
+            state_dtype: Dtype::F32,
         };
 
         let mut ctx = CpuBackend::new_context();
