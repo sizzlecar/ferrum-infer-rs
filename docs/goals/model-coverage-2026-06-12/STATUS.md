@@ -13880,3 +13880,44 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     仍不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 unified KV admission ResourceExhausted now waits
+
+- 背景:
+  - 继续对照“显存不够应等待释放,而不是继续提交导致 OOM”的目标审计
+    `process_batch_unified()`。
+  - 旧逻辑在顶层 `model_executor.reserve_kv_slots()` 返回
+    `ResourceExhausted` 时,只有 decode-only batch 会转入 adaptive decode
+    等待/抢占路径。
+  - 只要 batch 中存在 prefill,旧逻辑会释放本轮 fresh KV/recurrent 后直接
+    fallback 到 legacy split;这会把 executor admission 的资源不足当成另一条
+    prefill 执行路径继续提交,与等待语义不一致,并可能在 partial chunk 场景放大
+    二次分配风险。
+- 源码变更:
+  - unified `reserve_kv_slots()` 失败后仍先释放本轮 fresh KV 和 fresh
+    recurrent state。
+  - 当错误是 `ResourceExhausted` 时:
+    - 如果同 batch 还有 decode item,只让 decode item 走
+      `run_batch_decode_adaptive()`。
+    - 如果没有 decode item,直接返回 `Ok(())`,保留请求等待下一轮调度。
+  - 非 `ResourceExhausted` 错误仍保留原 legacy split fallback 行为。
+  - 将原测试
+    `process_batch_unified_reserve_failure_then_fallback_failure_releases_recurrent_state`
+    改为
+    `process_batch_unified_reserve_resource_exhausted_defers_without_fallback`,
+    断言 ResourceExhausted admission 后只发生一次 recurrent allocation,
+    active KV/recurrent 计数归零,请求仍保留重试。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-engine process_batch_unified_reserve_resource_exhausted_defers_without_fallback -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,
+    21 个 recurrent/resource 相关测试通过。
+  - `cargo test -p ferrum-engine process_batch_unified_ -- --nocapture` PASS,
+    12 个 unified 相关测试通过。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只证明本地 unified KV admission 在 ResourceExhausted 后不再走 legacy
+    prefill fallback 继续提交,仍不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。

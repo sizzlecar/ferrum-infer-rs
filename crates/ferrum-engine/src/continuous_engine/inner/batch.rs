@@ -515,9 +515,11 @@ impl EngineInner {
                     self.release_recurrent_state(&work.rid).await;
                 }
             }
-            if is_resource_exhausted_error(&e) && prefill_meta.is_empty() && !decode_meta.is_empty()
-            {
-                return self.run_batch_decode_adaptive(&decode_meta).await;
+            if is_resource_exhausted_error(&e) {
+                if !decode_meta.is_empty() {
+                    return self.run_batch_decode_adaptive(&decode_meta).await;
+                }
+                return Ok(());
             }
             return self.process_batch_legacy_split(batch).await;
         }
