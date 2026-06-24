@@ -2,6 +2,67 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ131 — Active existing-KV prefill now defers after model KV admission pressure
+
+- Source of this patch:
+  - ZZZ130 reduced the cancel/re-submit storm but still stalled with
+    `prefill_queue_len=25`, `waiting_queue_len=7`, `decode_queue_len=0`,
+    `active_len=25`, `capacity_deferred_total=80997`, and
+    `prefill_tokens_delta=0`;
+  - the final trace repeatedly scheduled old active prefills plus a small
+    number of newly admitted waiting prefills, but only the fresh prefills were
+    moved back to waiting after capacity pressure;
+  - this matched the source path where unified `reserve_kv_slots()` handled
+    `ResourceExhausted` by deferring only `fresh_kv` prefills.
+- vLLM comparison:
+  - no live vLLM run was performed;
+  - the local-source behavior used as the baseline is still the generic vLLM
+    scheduler rule: capacity-blocked prefill admission waits/breaks instead of
+    leaving the same un-runnable prefill selected every iteration.
+- Source change:
+  - unified model KV admission `ResourceExhausted` now capacity-defers every
+    prefill item in the failed admission batch, not only fresh-KV prefills;
+  - fresh KV handles are still explicitly deallocated before defer because
+    they have not yet been written back into `SequenceState`;
+  - `EngineInner::defer_prefill_for_capacity` now resets
+    `prefill_tokens_processed` to `0` when it clears physical KV/model state,
+    so retry recomputes the full logical context instead of assuming released
+    KV is still present.
+- Tests added/updated:
+  - added
+    `process_batch_unified_reserve_resource_exhausted_defers_existing_kv_prefill`;
+  - the regression simulates an active prefill with existing KV and
+    `prefill_tokens_processed=1`; after model-side unified KV admission
+    returns `ResourceExhausted`, the request must move to waiting, release KV
+    and recurrent state, clear `model_cache_id`, and reset prefill progress.
+- Local validation:
+  - `cargo test -p ferrum-engine process_batch_unified_reserve_resource_exhausted_defers_existing_kv_prefill -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture` PASS
+    (`16` tests);
+  - `cargo check -p ferrum-engine -p ferrum-scheduler` PASS;
+  - `cargo test -p ferrum-engine` PASS (`153` lib tests plus integration
+    tests; only existing ignored tests remained ignored);
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Why this is not a model/GPU special case:
+  - no model id, GPU memory size, CUDA device name, Qwen3.5-only slot cap, or
+    fixed concurrency number is inspected;
+  - the behavior depends only on scheduler phase, existing resource ownership,
+    and model-side resource exhaustion.
+- Next GPU check, if paid work is approved/started:
+  - reuse the retained 1x4090 cache if available;
+  - run the same focused c32 diagnostic first;
+  - stop after build/run/serve failure, bench PASS/FAIL, or renewed
+    no-token-progress/defer churn;
+  - compare `completed_total`, `cancelled_total`, `capacity_deferred_total`,
+    `no_victim_warning_count`, and throughput against ZZZ130.
+- Limits:
+  - no GPU lane has been run for this source candidate yet;
+  - this does not prove c32 completion, throughput recovery, W3 performance,
+    or release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ130 — Fresh KV defer diagnostic still stalls; cancel churn reduced, prefill churn remains
 
 - Artifact:
