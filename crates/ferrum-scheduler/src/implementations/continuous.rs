@@ -650,6 +650,7 @@ impl ContinuousBatchScheduler {
             .unwrap_or(0);
         let skip_decode_for_prefill_first = prefill_first_target > 0
             && self.decoding_count() < prefill_first_target
+            && self.active_count() < prefill_first_target
             && (self.prefilling_count() > 0 || self.waiting_count() > 0);
 
         // First, collect decode requests (they have priority). The opt-in
@@ -1669,7 +1670,7 @@ mod tests {
             ..SchedulerConfig::default()
         });
 
-        for _ in 0..8 {
+        for _ in 0..3 {
             enqueue_waiting(&scheduler, create_test_request(Priority::Normal));
         }
 
@@ -1693,13 +1694,60 @@ mod tests {
         assert_eq!(scheduler.decoding_count(), 2);
 
         let second_batch = scheduler.create_iteration_batch(hint).unwrap();
-        assert_eq!(second_batch.requests.len(), 2);
+        assert_eq!(second_batch.requests.len(), 1);
         assert!(
             second_batch
                 .requests
                 .iter()
                 .all(|request| !first_ids.contains(&request.request.id)),
             "fill-first should schedule more prefills before decoding early requests"
+        );
+    }
+
+    #[test]
+    fn prefill_first_until_active_resumes_decodes_at_active_target() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prefill_first_until_active: Some(4),
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..4 {
+            enqueue_waiting(&scheduler, create_test_request(Priority::Normal));
+        }
+
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 2);
+        let first_ids: Vec<RequestId> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for id in &first_ids {
+            scheduler.mark_prefill_complete(id, 512);
+        }
+
+        assert_eq!(scheduler.decoding_count(), 2);
+        assert_eq!(scheduler.prefilling_count(), 2);
+        assert_eq!(scheduler.active_count(), 4);
+
+        let second_batch = scheduler.create_iteration_batch(hint).unwrap();
+        let scheduled_decodes = second_batch
+            .requests
+            .iter()
+            .filter(|request| {
+                first_ids.contains(&request.request.id) && request.tokens_to_process == Some(1)
+            })
+            .count();
+        assert_eq!(
+            scheduled_decodes, 2,
+            "fill-first must not starve decode once the active target is reached"
         );
     }
 
