@@ -2,6 +2,42 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ88 — W3 L2 known-answer cases must cover run and serve
+
+- Scope:
+  - `scripts/release/w3_l2_quantized_gate.py` now requires each
+    known-answer case to carry a case-level `entrypoint`;
+  - the L2 gate now rejects reports whose known-answer cases do not include
+    both `ferrum run` and `ferrum serve`, even if command-line evidence for
+    both entrypoints is present;
+  - packaged L2 artifacts now record
+    `output_hygiene.case_entrypoints`;
+  - `scripts/release/model_release_grade_goal_gate.py` now requires final W3
+    L2 artifacts to preserve that case-level run/serve coverage;
+  - `scripts/release/model_release_grade_manifest.py` selftest fixtures were
+    updated to match the stricter final validator contract.
+- Why:
+  - W3 L2 requires real quantized semantics to cover both product entrypoints;
+  - command evidence alone could show that both binaries were invoked while
+    all known-answer semantics came from only one entrypoint;
+  - the real product report already records case-level entrypoints, so the
+    release gate should consume that evidence instead of trusting inferred
+    coverage.
+- Code:
+  - `scripts/release/w3_l2_quantized_gate.py`;
+  - `scripts/release/model_release_grade_goal_gate.py`;
+  - `scripts/release/model_release_grade_manifest.py`.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_l2_quantized_gate.py scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py scripts/release/w3_l5_concurrency_gate.py scripts/release/w3_qwen35_cuda_release_lane.py`;
+  - `python3 scripts/release/w3_l2_quantized_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ87 — W3 L5 gates derive effective concurrency from config artifacts
 
 - Scope:
