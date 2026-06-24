@@ -1,0 +1,14 @@
+2026-06-24T20:03:54Z lane_start art=/workspace/artifacts/w3_qwen35_waiting_admission_backpressure_c32_38230397_20260624T200354Z sha=38230397aab64aa8e34a96fe5dff551205b31b06 release_evidence=false no_live_vllm=true
+2026-06-24T20:03:54Z git_sync_start
+2026-06-24T20:03:54Z git_sync_done
+2026-06-24T20:03:54Z cargo_check_start
+2026-06-24T20:03:55Z cargo_check_done
+2026-06-24T20:03:55Z release_build_start
+2026-06-24T20:07:07Z release_build_done
+2026-06-24T20:07:07Z ferrum_run_smoke_start
+2026-06-24T20:07:37Z ferrum_run_smoke_done
+2026-06-24T20:07:37Z serve_start
+2026-06-24T20:08:03Z serve_ready
+2026-06-24T20:08:04Z serve_chat_smoke_done
+2026-06-24T20:08:04Z bench_c32_start
+2026-06-24T20:08:29Z FERRUM W3 QWEN35 WAITING ADMISSION BACKPRESSURE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_waiting_admission_backpressure_c32_38230397_20260624T200354Z
