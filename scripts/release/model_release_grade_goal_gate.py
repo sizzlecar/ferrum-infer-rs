@@ -102,6 +102,17 @@ REQUIRED_ZERO_RUN_COUNT_FIELDS = [
     "http_500_per_run",
     "panic_per_run",
 ]
+FORBIDDEN_RESPONSE_TEXT = [
+    "<unk>",
+    "[PAD",
+    "<pad>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|reserved_special_token",
+    "classname=",
+    "auto_tool_response",
+    "\ufffd",
+]
 MIN_RATIO = 0.8
 MAX_ITL_MULTIPLE = 1.25
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -267,6 +278,31 @@ def count_sse_done_and_usage(
     if malformed:
         problems.append(f"{label} contains malformed SSE JSON chunks: {malformed[:3]}")
     return done_count, usage_chunks
+
+
+def load_json_artifact_object(
+    raw: Any,
+    label: str,
+    out_dir: Path,
+    problems: list[str],
+    *,
+    base_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    path = existing_artifact_path(raw, out_dir, base_dir)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        problems.append(f"{label} is not valid UTF-8 JSON text: {exc}")
+        return None
+    except json.JSONDecodeError as exc:
+        problems.append(f"{label} is not valid JSON: {exc}")
+        return None
+    if not isinstance(data, dict):
+        problems.append(f"{label} must be a JSON object")
+        return None
+    return data
 
 
 def evidence_artifact_values(entry: Any, label: str, problems: list[str]) -> list[Any]:
@@ -1671,6 +1707,164 @@ def validate_l4_case_list(
             problems.append(f"{case_label}.finish_reason must be {expected_finish_reason}")
         if expected_finish_reason is None and finish_reason == "length":
             problems.append(f"{case_label}.finish_reason must not be length")
+        if expected_finish_reason == "tool_calls":
+            validate_l4_tool_case_artifact(
+                case,
+                case_label,
+                out_dir,
+                problems,
+                artifact_base_dir,
+            )
+        else:
+            validate_l4_strict_schema_case_artifact(
+                case,
+                case_label,
+                out_dir,
+                problems,
+                artifact_base_dir,
+            )
+
+
+def response_first_choice(data: dict[str, Any], label: str, problems: list[str]) -> dict[str, Any] | None:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        problems.append(f"{label}.choices must contain at least one choice")
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        problems.append(f"{label}.choices[0] must be a JSON object")
+        return None
+    return first
+
+
+def response_message(choice: dict[str, Any], label: str, problems: list[str]) -> dict[str, Any] | None:
+    msg = choice.get("message")
+    if not isinstance(msg, dict):
+        problems.append(f"{label}.message must be a JSON object")
+        return None
+    return msg
+
+
+def check_no_forbidden_response_text(value: Any, label: str, problems: list[str]) -> None:
+    if not isinstance(value, str):
+        return
+    for token in FORBIDDEN_RESPONSE_TEXT:
+        if token in value:
+            problems.append(f"{label} contains forbidden text {token!r}")
+
+
+def validate_l4_tool_case_artifact(
+    case: dict[str, Any],
+    label: str,
+    out_dir: Path,
+    problems: list[str],
+    artifact_base_dir: Path | None,
+) -> None:
+    data = load_json_artifact_object(
+        case.get("artifact"),
+        f"{label}.artifact",
+        out_dir,
+        problems,
+        base_dir=artifact_base_dir,
+    )
+    if data is None:
+        return
+    choice = response_first_choice(data, f"{label}.artifact", problems)
+    if choice is None:
+        return
+    artifact_finish_reason = choice.get("finish_reason")
+    if artifact_finish_reason != "tool_calls":
+        problems.append(f"{label}.artifact.finish_reason must be tool_calls")
+    if case.get("finish_reason") != artifact_finish_reason:
+        problems.append(f"{label}.finish_reason must match artifact")
+    msg = response_message(choice, f"{label}.artifact.choices[0]", problems)
+    if msg is None:
+        return
+    content = msg.get("content")
+    check_no_forbidden_response_text(content, f"{label}.artifact.message.content", problems)
+    if isinstance(content, str) and content.strip():
+        problems.append(f"{label}.artifact.message.content must be empty for tool-call turn")
+    calls = msg.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        problems.append(f"{label}.artifact.message.tool_calls must contain at least one call")
+        return
+    call = calls[0]
+    if not isinstance(call, dict):
+        problems.append(f"{label}.artifact.message.tool_calls[0] must be a JSON object")
+        return
+    function = call.get("function")
+    if not isinstance(function, dict):
+        problems.append(f"{label}.artifact.message.tool_calls[0].function must be a JSON object")
+        return
+    if function.get("name") != "calc":
+        problems.append(f"{label}.artifact.message.tool_calls[0].function.name must be calc")
+    raw_args = function.get("arguments")
+    if not isinstance(raw_args, str):
+        problems.append(f"{label}.artifact.message.tool_calls[0].function.arguments must be a string")
+        return
+    check_no_forbidden_response_text(raw_args, f"{label}.artifact.tool_arguments", problems)
+    try:
+        parsed_args = json.loads(raw_args)
+    except json.JSONDecodeError as exc:
+        problems.append(f"{label}.artifact.tool_arguments must be JSON: {exc}")
+        return
+    if not isinstance(parsed_args, dict):
+        problems.append(f"{label}.artifact.tool_arguments must parse to a JSON object")
+        return
+    if parsed_args.get("expression") != "123+456":
+        problems.append(f"{label}.artifact.tool_arguments.expression must be 123+456")
+    expected_args = case.get("arguments")
+    if isinstance(expected_args, dict) and parsed_args != expected_args:
+        problems.append(f"{label}.arguments must match artifact tool arguments")
+
+
+def validate_l4_strict_schema_case_artifact(
+    case: dict[str, Any],
+    label: str,
+    out_dir: Path,
+    problems: list[str],
+    artifact_base_dir: Path | None,
+) -> None:
+    data = load_json_artifact_object(
+        case.get("artifact"),
+        f"{label}.artifact",
+        out_dir,
+        problems,
+        base_dir=artifact_base_dir,
+    )
+    if data is None:
+        return
+    choice = response_first_choice(data, f"{label}.artifact", problems)
+    if choice is None:
+        return
+    artifact_finish_reason = choice.get("finish_reason")
+    if artifact_finish_reason == "length":
+        problems.append(f"{label}.artifact.finish_reason must not be length")
+    case_finish_reason = case.get("finish_reason")
+    if isinstance(case_finish_reason, str) and case_finish_reason != artifact_finish_reason:
+        problems.append(f"{label}.finish_reason must match artifact")
+    msg = response_message(choice, f"{label}.artifact.choices[0]", problems)
+    if msg is None:
+        return
+    content = msg.get("content")
+    if not isinstance(content, str) or not content.strip():
+        problems.append(f"{label}.artifact.message.content must be non-empty strict JSON")
+        return
+    check_no_forbidden_response_text(content, f"{label}.artifact.message.content", problems)
+    try:
+        parsed_content = json.loads(content)
+    except json.JSONDecodeError as exc:
+        problems.append(f"{label}.artifact.message.content must parse as JSON: {exc}")
+        return
+    if not isinstance(parsed_content, dict):
+        problems.append(f"{label}.artifact.message.content must parse to a JSON object")
+        return
+    answer = parsed_content.get("answer")
+    if not isinstance(answer, str) or not answer:
+        problems.append(f"{label}.artifact.message.content.answer must be a non-empty string")
+    expected_content = case.get("content")
+    if isinstance(expected_content, dict) and parsed_content != expected_content:
+        problems.append(f"{label}.content must match artifact message content")
 
 
 def validate_w3_l5_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
@@ -2561,6 +2755,44 @@ def run_gate(lane: str, out_dir: Path, manifest_path: Path) -> int:
     return 0
 
 
+def selftest_l4_tool_call_response(idx: int) -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"call_tool_{idx:02d}",
+                            "type": "function",
+                            "function": {
+                                "name": "calc",
+                                "arguments": json.dumps({"expression": "123+456"}),
+                            },
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+
+
+def selftest_l4_strict_schema_response(idx: int) -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps({"answer": f"ok-{idx}"}),
+                },
+            }
+        ]
+    }
+
+
 def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
     common = {
         "status": "pass",
@@ -2741,12 +2973,10 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
     )
     for idx in range(10):
         path = root / "tool_calls" / f"tool_{idx:02d}.response.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}\n", encoding="utf-8")
+        write_json(path, selftest_l4_tool_call_response(idx))
     for idx in range(20):
         path = root / "strict_schema" / f"strict_schema_{idx:02d}.response.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}\n", encoding="utf-8")
+        write_json(path, selftest_l4_strict_schema_response(idx))
 
     write_json(
         root / "l4.json",
@@ -2773,6 +3003,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
                     "passed": True,
                     "finish_reason": "tool_calls",
                     "artifact": f"tool_calls/tool_{idx:02d}.response.json",
+                    "arguments": {"expression": "123+456"},
                 }
                 for idx in range(10)
             ],
@@ -2782,6 +3013,7 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
                     "passed": True,
                     "finish_reason": "stop",
                     "artifact": f"strict_schema/strict_schema_{idx:02d}.response.json",
+                    "content": {"answer": f"ok-{idx}"},
                 }
                 for idx in range(20)
             ],
@@ -3507,6 +3739,67 @@ def run_selftest() -> int:
             for problem in bad_w3_l4_artifact_problems
         ):
             raise AssertionError("bad W3 L4 missing-artifact selftest did not fail as expected")
+
+        bad_w3_l4_tool_response = tmp_root / "bad-w3-l4-tool-response"
+        bad_w3_l4_tool_response_manifest = write_selftest_manifest(
+            bad_w3_l4_tool_response,
+            lane="w3",
+            ratio=0.82,
+        )
+        write_json(
+            bad_w3_l4_tool_response / "tool_calls/tool_00.response.json",
+            {
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {"role": "assistant", "content": "", "tool_calls": []},
+                    }
+                ]
+            },
+        )
+        bad_w3_l4_tool_response_problems = validate_manifest(
+            load_json(bad_w3_l4_tool_response_manifest),
+            "w3",
+            bad_w3_l4_tool_response,
+        )
+        if not any(
+            "correctness.l4_agent.tool_call_cases[0].artifact.message.tool_calls must contain at least one call"
+            in problem
+            for problem in bad_w3_l4_tool_response_problems
+        ):
+            raise AssertionError("bad W3 L4 tool response selftest did not fail as expected")
+
+        bad_w3_l4_strict_response = tmp_root / "bad-w3-l4-strict-response"
+        bad_w3_l4_strict_response_manifest = write_selftest_manifest(
+            bad_w3_l4_strict_response,
+            lane="w3",
+            ratio=0.82,
+        )
+        write_json(
+            bad_w3_l4_strict_response / "strict_schema/strict_schema_00.response.json",
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps({"answer": "ok-0"}),
+                        },
+                    }
+                ]
+            },
+        )
+        bad_w3_l4_strict_response_problems = validate_manifest(
+            load_json(bad_w3_l4_strict_response_manifest),
+            "w3",
+            bad_w3_l4_strict_response,
+        )
+        if not any(
+            "correctness.l4_agent.strict_schema_cases[0].artifact.finish_reason must not be length"
+            in problem
+            for problem in bad_w3_l4_strict_response_problems
+        ):
+            raise AssertionError("bad W3 L4 strict response selftest did not fail as expected")
 
         bad_w3_l5 = tmp_root / "bad-w3-l5-error-count"
         bad_w3_l5_manifest = write_selftest_manifest(bad_w3_l5, lane="w3", ratio=0.82)
