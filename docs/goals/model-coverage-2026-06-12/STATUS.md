@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ86 — effective config records recurrent-state admission limit
+
+- Scope:
+  - `ResolvedFerrumConfig::effective_config_document()` now records
+    `selected_recurrent_state_max_slots`;
+  - `selected_admission_limit` is now the effective minimum of
+    `max_sequences` and recurrent-state slot capacity when both are present,
+    instead of blindly mirroring `selected_max_sequences`;
+  - `admission_summary_document()` now records `effective_max_concurrent`,
+    `recurrent_state_max_slots`, and
+    `memory_estimate.recurrent_state_capacity_bytes`.
+- Why:
+  - after ZZZ84/ZZZ85, default CUDA Qwen3.5-style recurrent-state budgeting can
+    legitimately leave paged scheduler max sequences at 32 while limiting the
+    non-KV recurrent-state pool to 16 slots;
+  - W3 L5 requires artifacts to state the effective active concurrency when
+    admission caps requested concurrency, so future c=32/effective=16 evidence
+    must be visible in product config artifacts rather than inferred from a
+    model-specific side channel;
+  - this is still a generic recurrent-state resource cap, not a
+    model-name/VRAM enumeration rule.
+- Code:
+  - `crates/ferrum-types/src/auto_config.rs`.
+- Validation:
+  - `cargo fmt --all`;
+  - `cargo test -p ferrum-types recurrent_state -- --nocapture`;
+  - `cargo test -p ferrum-types effective_config_document -- --nocapture`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`;
+  - `cargo check --workspace --all-targets`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ85 — recurrent-state slot runtime key is model-generic
 
 - Scope:
