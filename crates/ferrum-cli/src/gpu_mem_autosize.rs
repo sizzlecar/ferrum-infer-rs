@@ -23,8 +23,8 @@ const SCRATCH_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// `llama_family.rs`.
 const PAGED_BLOCK_SIZE: u64 = 16;
 const DEFAULT_MAX_BATCHED_TOKENS: usize = 2048;
-const QWEN35_1X4090_MAX_BATCHED_TOKENS: usize = 192;
-const QWEN35_1X4090_KV_BLOCK_FLOOR: usize = 256;
+const TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS: usize = 192;
+const TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR: usize = 256;
 
 /// Bytes per element of the KV cache. ferrum currently always uses FP16
 /// for KV regardless of weight dtype (Marlin INT4 weights → FP16 KV).
@@ -221,7 +221,7 @@ pub enum AutoSizeProfile {
 enum ModelAutoSizeClass {
     #[default]
     Generic,
-    Qwen35MoeGptqInt4,
+    TightRecurrentState,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -390,23 +390,26 @@ const CHAT_PRESETS: &[(usize, usize)] = &[
     (1, 2048),
 ];
 
-const QWEN35_SERVER_PRESETS: &[(usize, usize)] = &[(16, 512), (8, 512), (4, 512), (1, 512)];
-const QWEN35_CHAT_PRESETS: &[(usize, usize)] = &[(2, 512), (1, 512)];
+const TIGHT_RECURRENT_STATE_SERVER_PRESETS: &[(usize, usize)] =
+    &[(16, 512), (8, 512), (4, 512), (1, 512)];
+const TIGHT_RECURRENT_STATE_CHAT_PRESETS: &[(usize, usize)] = &[(2, 512), (1, 512)];
 
 fn model_auto_size_defaults(
     model_class: ModelAutoSizeClass,
     profile: AutoSizeProfile,
 ) -> ModelAutoSizeDefaults {
     match (model_class, profile) {
-        (ModelAutoSizeClass::Qwen35MoeGptqInt4, AutoSizeProfile::Server) => ModelAutoSizeDefaults {
-            max_batched_tokens: QWEN35_1X4090_MAX_BATCHED_TOKENS,
-            presets: QWEN35_SERVER_PRESETS,
-            kv_block_floor: QWEN35_1X4090_KV_BLOCK_FLOOR,
-        },
-        (ModelAutoSizeClass::Qwen35MoeGptqInt4, AutoSizeProfile::Chat) => ModelAutoSizeDefaults {
-            max_batched_tokens: QWEN35_1X4090_MAX_BATCHED_TOKENS,
-            presets: QWEN35_CHAT_PRESETS,
-            kv_block_floor: QWEN35_1X4090_KV_BLOCK_FLOOR,
+        (ModelAutoSizeClass::TightRecurrentState, AutoSizeProfile::Server) => {
+            ModelAutoSizeDefaults {
+                max_batched_tokens: TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS,
+                presets: TIGHT_RECURRENT_STATE_SERVER_PRESETS,
+                kv_block_floor: TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR,
+            }
+        }
+        (ModelAutoSizeClass::TightRecurrentState, AutoSizeProfile::Chat) => ModelAutoSizeDefaults {
+            max_batched_tokens: TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS,
+            presets: TIGHT_RECURRENT_STATE_CHAT_PRESETS,
+            kv_block_floor: TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR,
         },
         (ModelAutoSizeClass::Generic, AutoSizeProfile::Server) => ModelAutoSizeDefaults {
             max_batched_tokens: DEFAULT_MAX_BATCHED_TOKENS,
@@ -432,37 +435,34 @@ fn model_auto_size_class(model_dir: &Path) -> ModelAutoSizeClass {
 }
 
 fn model_auto_size_class_from_config(config: &serde_json::Value) -> ModelAutoSizeClass {
-    if !is_qwen35_moe_config(config) || !is_gptq_int4_config(config) {
+    if !has_recurrent_linear_attention_state(config) || !is_gptq_int4_config(config) {
         return ModelAutoSizeClass::Generic;
     }
-    ModelAutoSizeClass::Qwen35MoeGptqInt4
+    ModelAutoSizeClass::TightRecurrentState
 }
 
-fn is_qwen35_moe_config(config: &serde_json::Value) -> bool {
-    let model_type_matches = config
-        .get("model_type")
-        .and_then(|value| value.as_str())
-        .is_some_and(is_qwen35_moe_model_type)
-        || config
-            .get("text_config")
-            .and_then(|text| text.get("model_type"))
-            .and_then(|value| value.as_str())
-            .is_some_and(is_qwen35_moe_model_type);
-    let architecture_matches = config
-        .get("architectures")
+fn has_recurrent_linear_attention_state(config: &serde_json::Value) -> bool {
+    let text = config.get("text_config").unwrap_or(config);
+    let has_linear_layers = text
+        .get("layer_types")
         .and_then(|value| value.as_array())
-        .is_some_and(|architectures| {
-            architectures.iter().any(|entry| {
-                entry.as_str().is_some_and(|name| {
-                    name.eq_ignore_ascii_case("Qwen3_5MoeForConditionalGeneration")
-                })
+        .is_some_and(|layers| {
+            layers.iter().any(|layer| {
+                layer
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("linear_attention"))
             })
         });
-    model_type_matches || architecture_matches
-}
-
-fn is_qwen35_moe_model_type(value: &str) -> bool {
-    value.eq_ignore_ascii_case("qwen3_5_moe") || value.eq_ignore_ascii_case("qwen3_5_moe_text")
+    let has_linear_state_dims = [
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_value_head_dim",
+    ]
+    .iter()
+    .all(|key| text.get(*key).and_then(|value| value.as_u64()).is_some());
+    has_linear_layers && has_linear_state_dims
 }
 
 fn is_gptq_int4_config(config: &serde_json::Value) -> bool {
@@ -690,12 +690,18 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_gptq_config_selects_tight_1x4090_memory_profile() {
+    fn recurrent_linear_attention_gptq_config_selects_tight_memory_profile() {
         let config = serde_json::json!({
             "architectures": ["Qwen3_5MoeForConditionalGeneration"],
             "model_type": "qwen3_5_moe",
             "text_config": {
-                "model_type": "qwen3_5_moe_text"
+                "model_type": "qwen3_5_moe_text",
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 128,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 16,
+                "linear_value_head_dim": 128
             },
             "quantization_config": {
                 "quant_method": "gptq",
@@ -704,10 +710,13 @@ mod tests {
         });
 
         let class = model_auto_size_class_from_config(&config);
-        assert_eq!(class, ModelAutoSizeClass::Qwen35MoeGptqInt4);
+        assert_eq!(class, ModelAutoSizeClass::TightRecurrentState);
         let server = model_auto_size_defaults(class, AutoSizeProfile::Server);
-        assert_eq!(server.max_batched_tokens, QWEN35_1X4090_MAX_BATCHED_TOKENS);
-        assert_eq!(server.kv_block_floor, QWEN35_1X4090_KV_BLOCK_FLOOR);
+        assert_eq!(
+            server.max_batched_tokens,
+            TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS
+        );
+        assert_eq!(server.kv_block_floor, TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR);
         assert_eq!(
             select_paged_pool_preset(server.presets, server.kv_block_floor),
             (16, 512)
@@ -721,16 +730,39 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_memory_profile_requires_gptq_int4() {
-        let dense_or_unquantized = serde_json::json!({
+    fn recurrent_linear_attention_memory_profile_requires_gptq_int4() {
+        let non_int4 = serde_json::json!({
             "model_type": "qwen3_5_moe",
+            "text_config": {
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 128,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 16,
+                "linear_value_head_dim": 128
+            },
             "quantization_config": {
                 "quant_method": "gptq",
                 "bits": 8
             }
         });
         assert_eq!(
-            model_auto_size_class_from_config(&dense_or_unquantized),
+            model_auto_size_class_from_config(&non_int4),
+            ModelAutoSizeClass::Generic
+        );
+
+        let dense_gptq = serde_json::json!({
+            "model_type": "dense_gptq",
+            "text_config": {
+                "layer_types": ["full_attention", "full_attention"]
+            },
+            "quantization_config": {
+                "quant_method": "gptq",
+                "bits": 4
+            }
+        });
+        assert_eq!(
+            model_auto_size_class_from_config(&dense_gptq),
             ModelAutoSizeClass::Generic
         );
 

@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ90 — recurrent-state autosize is capability-based, not model-name based
+
+- Scope:
+  - `gpu_mem_autosize` no longer names the tight memory profile after
+    Qwen3.5/GPTQ; it detects a recurrent linear-attention state signature from
+    config structure plus GPTQ Int4 quantization;
+  - tight autosize constants and tests are renamed around
+    `TightRecurrentState`, so the rule is expressed as a resource/capability
+    class rather than a model enumeration;
+  - `auto_config` now writes recurrent-state budget evidence into
+    `admission.memory_estimate`: budget bytes, raw slots, and floored max slots;
+  - recurrent-state slot tests that were named as Qwen3.5/24GB cases are renamed
+    around generic state-pool budget behavior.
+- Why:
+  - the slot cap must be explainable from model-declared recurrent-state bytes
+    and hardware/weight budget, not from a growing list of model IDs and VRAM
+    thresholds.
+- Validation:
+  - `cargo test -p ferrum-cli gpu_mem_autosize -- --nocapture`;
+  - `cargo test -p ferrum-types recurrent_state -- --nocapture`;
+  - `cargo check -p ferrum-cli -p ferrum-types`;
+  - `cargo fmt --all -- --check`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ89 — W3 L3/L4 case artifacts are required by the final validator
 
 - Scope:
@@ -196,11 +224,11 @@
 ## 2026-06-24 ZZZ84 — recurrent-state slot cap moved to capability memory budget
 
 - Correction:
-  - the earlier `Qwen3.5 MoE GPTQ Int4 on <=26 GiB CUDA => 16 slots`
-    policy was the wrong abstraction because it encoded one model/hardware
-    combination instead of the actual memory property;
-  - this entry replaces that policy branch with model-capability driven
-    recurrent-state memory budgeting.
+  - the earlier slot-cap idea encoded one model/hardware combination instead
+    of the actual memory property;
+  - this entry replaces that branch shape with model-capability driven
+    recurrent-state memory budgeting, so the selected slot count is derived
+    from bytes-per-sequence, estimated weight bytes, and hardware memory.
 - Scope:
   - `ModelCapabilities` now carries
     `recurrent_state_bytes_per_sequence`;
