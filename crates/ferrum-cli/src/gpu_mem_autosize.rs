@@ -23,11 +23,11 @@ const SCRATCH_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// `llama_family.rs`.
 const PAGED_BLOCK_SIZE: u64 = 16;
 const DEFAULT_MAX_BATCHED_TOKENS: usize = 2048;
-// Tight recurrent-state models are KV-budget constrained, but the profile
-// already floors the KV pool at 256 blocks. A 1024-token aggregate prefill
-// floor needs only 64 blocks, so it does not expand that floor while avoiding
-// the 12-token prefill chunks produced by the previous 192-token default.
-const TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS: usize = 1024;
+// Tight recurrent-state models carry large non-KV decode state and can be
+// allocator-fragile near the end of the memory budget. Keep aggregate prefill
+// conservative by default; widening this to 1024 was shown to OOM the W3 c16
+// product-path diagnostic even though the KV block floor itself still fit.
+const TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS: usize = 192;
 const TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR: usize = 256;
 
 /// Bytes per element of the KV cache. ferrum currently always uses FP16
@@ -757,7 +757,7 @@ mod tests {
             server
                 .max_batched_tokens
                 .div_ceil(PAGED_BLOCK_SIZE as usize),
-            64
+            12
         );
         assert!(
             server
