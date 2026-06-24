@@ -355,6 +355,9 @@ impl ResolvedFerrumConfig {
         let selected_max_model_len = self.selected_usize("max_model_len");
         let selected_kv_capacity = self.runtime_usize("FERRUM_KV_CAPACITY");
         let selected_max_batched_tokens = self.selected_usize("max_batched_tokens");
+        let selected_recurrent_state_max_slots = self.selected_recurrent_state_max_slots();
+        let selected_admission_limit =
+            effective_admission_limit(selected_max_sequences, selected_recurrent_state_max_slots);
         serde_json::json!({
             "schema_version": 1,
             "preset": self.preset,
@@ -377,7 +380,8 @@ impl ResolvedFerrumConfig {
             "selected_max_model_len": selected_max_model_len,
             "selected_kv_capacity": selected_kv_capacity,
             "selected_max_batched_tokens": selected_max_batched_tokens,
-            "selected_admission_limit": selected_max_sequences,
+            "selected_recurrent_state_max_slots": selected_recurrent_state_max_slots,
+            "selected_admission_limit": selected_admission_limit,
             "entries": self.runtime_config.entries,
             "model_capabilities": self.model_capabilities,
             "hardware_capabilities": self.hardware_capabilities,
@@ -389,6 +393,9 @@ impl ResolvedFerrumConfig {
 
     pub fn admission_summary_document(&self) -> serde_json::Value {
         let max_sequences = self.selected_usize("max_sequences");
+        let recurrent_state_max_slots = self.selected_recurrent_state_max_slots();
+        let effective_max_concurrent =
+            effective_admission_limit(max_sequences, recurrent_state_max_slots);
         let kv_blocks = self.selected_usize("kv_block_count");
         let max_batched_tokens = self.selected_usize("max_batched_tokens");
         let max_model_len = self.selected_usize("max_model_len");
@@ -403,7 +410,7 @@ impl ResolvedFerrumConfig {
             "backend": self.hardware_capabilities.backend,
             "model_architecture": self.model_capabilities.architecture,
             "scheduler_policy": scheduler_policy,
-            "effective_max_concurrent": max_sequences,
+            "effective_max_concurrent": effective_max_concurrent,
             "queue_depth": 0u64,
             "active_prefill": 0u64,
             "active_decode": 0u64,
@@ -412,6 +419,7 @@ impl ResolvedFerrumConfig {
             "failed_requests_total": 0u64,
             "completed_requests_total": 0u64,
             "max_sequences": max_sequences,
+            "recurrent_state_max_slots": recurrent_state_max_slots,
             "kv_block_count": kv_blocks,
             "kv_block_size_tokens": DEFAULT_KV_BLOCK_SIZE_TOKENS,
             "kv_capacity_tokens": kv_capacity_tokens,
@@ -422,6 +430,12 @@ impl ResolvedFerrumConfig {
                 "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
                 "kv_bytes_per_token": kv_bytes_per_token,
                 "recurrent_state_bytes_per_sequence": self.model_capabilities.recurrent_state_bytes_per_sequence,
+                "recurrent_state_capacity_bytes": match (recurrent_state_max_slots, self.model_capabilities.recurrent_state_bytes_per_sequence) {
+                    (Some(slots), Some(bytes_per_sequence)) => {
+                        (slots as u64).checked_mul(bytes_per_sequence)
+                    }
+                    _ => None,
+                },
                 "kv_capacity_bytes": match (kv_capacity_tokens, kv_bytes_per_token) {
                     (Some(tokens), Some(bytes_per_token)) => {
                         (tokens as u64).checked_mul(bytes_per_token)
@@ -458,6 +472,12 @@ impl ResolvedFerrumConfig {
             .iter()
             .find(|decision| decision.selection == selection)
             .map(|decision| decision.selected.clone())
+    }
+
+    fn selected_recurrent_state_max_slots(&self) -> Option<usize> {
+        self.selected_usize("recurrent_state_max_slots")
+            .or_else(|| self.runtime_usize("FERRUM_RECURRENT_STATE_MAX_SLOTS"))
+            .or_else(|| self.runtime_usize("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS"))
     }
 
     fn selected_graph_mode(&self) -> Option<String> {
@@ -2116,6 +2136,18 @@ fn ceil_div(value: usize, divisor: usize) -> usize {
     value.div_ceil(divisor)
 }
 
+fn effective_admission_limit(
+    max_sequences: Option<usize>,
+    recurrent_state_max_slots: Option<usize>,
+) -> Option<usize> {
+    match (max_sequences, recurrent_state_max_slots) {
+        (Some(max_sequences), Some(recurrent_slots)) => Some(max_sequences.min(recurrent_slots)),
+        (Some(max_sequences), None) => Some(max_sequences),
+        (None, Some(recurrent_slots)) => Some(recurrent_slots),
+        (None, None) => None,
+    }
+}
+
 fn floor_power_of_two(value: usize) -> usize {
     if value <= 1 {
         return 1;
@@ -2458,9 +2490,27 @@ mod tests {
         assert_eq!(entry.effective_value, "16");
         assert_eq!(entry.source, RuntimeConfigSource::MemoryProfile);
         let doc = resolved.effective_config_document();
+        assert_eq!(doc["selected_max_sequences"], serde_json::json!(32));
+        assert_eq!(
+            doc["selected_recurrent_state_max_slots"],
+            serde_json::json!(16)
+        );
+        assert_eq!(doc["selected_admission_limit"], serde_json::json!(16));
+        assert_eq!(
+            doc["admission"]["effective_max_concurrent"],
+            serde_json::json!(16)
+        );
+        assert_eq!(
+            doc["admission"]["recurrent_state_max_slots"],
+            serde_json::json!(16)
+        );
         assert_eq!(
             doc["admission"]["memory_estimate"]["recurrent_state_bytes_per_sequence"],
             serde_json::json!(65_863_680u64)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_capacity_bytes"],
+            serde_json::json!(16u64 * 65_863_680u64)
         );
     }
 
@@ -2493,6 +2543,15 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn effective_admission_limit_is_capped_by_recurrent_state_slots_when_present() {
+        assert_eq!(effective_admission_limit(Some(32), Some(16)), Some(16));
+        assert_eq!(effective_admission_limit(Some(16), Some(32)), Some(16));
+        assert_eq!(effective_admission_limit(Some(32), None), Some(32));
+        assert_eq!(effective_admission_limit(None, Some(16)), Some(16));
+        assert_eq!(effective_admission_limit(None, None), None);
     }
 
     #[test]
