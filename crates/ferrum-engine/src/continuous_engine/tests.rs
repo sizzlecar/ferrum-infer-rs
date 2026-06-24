@@ -2073,7 +2073,7 @@ async fn process_batch_speculative_draft_tensor_error_releases_target_and_draft_
 }
 
 #[tokio::test]
-async fn process_batch_unified_reserve_failure_then_fallback_failure_releases_recurrent_state() {
+async fn process_batch_unified_reserve_resource_exhausted_defers_without_fallback() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
@@ -2126,7 +2126,10 @@ async fn process_batch_unified_reserve_failure_then_fallback_failure_releases_re
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
     let recurrent_stats = recurrent_manager.stats();
-    assert!(recurrent_stats.allocation_count >= 2);
+    assert_eq!(
+        recurrent_stats.allocation_count, 1,
+        "ResourceExhausted admission should wait instead of entering legacy fallback"
+    );
     assert_eq!(recurrent_stats.active_states, 0);
     assert_eq!(recurrent_stats.used_batch_slots, 0);
 
