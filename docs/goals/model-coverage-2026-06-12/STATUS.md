@@ -2,6 +2,46 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ102 — 192-token tight recurrent prefill passes c16 OOM quick regression
+
+- Scope:
+  - reused existing Vast 1x RTX 4090 instance `42216671` after local and
+    remote `git pull --rebase`;
+  - validated commit `0b0b8bb4063a5f3bc44e6ead4999a09112ea0eff`;
+  - rebuilt the CUDA release binary with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - reran the same narrow product-path c16 diagnostic used by ZZZ101:
+    `ferrum run` smoke, `ferrum serve` smoke, then Ferrum-only
+    `bench-serve --fail-on-error --seed 9271 --ignore-eos`;
+  - no live vLLM run was used.
+- Result:
+  - CUDA build passed and produced binary SHA256
+    `963a1c46af7d44b4b69cac354e610f72b5fd3920ef06660362343dfa9ce4ea42`;
+  - `ferrum run` smoke passed with answer `5`;
+  - `ferrum serve` smoke passed with answer `5`;
+  - server effective config selected `selected_max_sequences=16`,
+    `selected_max_batched_tokens=192`, `selected_kv_capacity=512`,
+    `selected_admission_limit=16`, and
+    `selected_attention_impl=vllm_paged_attn_v2`;
+  - c16 diagnostic bench completed with `32/32` requests, `0` errors, no
+    OOM/panic log lines, `663.3389819659881` output tok/s, and p95 ITL
+    `20.99177645` ms.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill192_0b0b8bb4_20260624/`;
+  - `summary.json` records the command outputs, effective configs, benchmark
+    metrics, binary SHA256, and no live-vLLM flag;
+  - Vast cleanup evidence is in `vast/stop_poll.tsv`, ending at
+    `stopped exited`.
+- Status:
+  - the ZZZ101 c16 OOM is no longer reproduced with the 192-token tight
+    recurrent prefill default;
+  - this is a quick diagnostic with `n_repeats=1`, not release-grade
+    performance evidence;
+  - the c16 result remains far below W3 performance acceptance and below the
+    historical vLLM comparison target, so no performance-ready,
+    release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ101 — W3 c16 quick diagnostic proves 1024-token tight recurrent prefill can OOM
 
 - Scope:
