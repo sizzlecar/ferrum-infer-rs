@@ -33,8 +33,9 @@ use crate::{
     common::{paged_pool::BlockAllocator, DecoderOnlyLLM, LlmRuntimeConfig},
     definition::ModelDefinition,
     moe::{
-        dispatch::DeviceRouteScratch, moe_forward, moe_forward_bucketed, ExpertStack,
-        MoeForwardBucketedParams, MoeForwardParams, MoeRouteScratch,
+        dispatch::{drain_moe_bucket_profile, DeviceRouteScratch, MoeBucketProfileSnapshot},
+        moe_forward, moe_forward_bucketed, ExpertStack, MoeForwardBucketedParams, MoeForwardParams,
+        MoeRouteScratch,
     },
     qwen35_config::{Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig},
     qwen35_weights::{
@@ -2984,6 +2985,7 @@ struct Qwen35LinearPrefillCoreDetailProfile {
 struct Qwen35SparseMoeDetailProfile {
     router_us: u64,
     routed_experts_us: u64,
+    routed_bucket: Option<MoeBucketProfileSnapshot>,
     shared_gate_us: u64,
     shared_gate_up_proj_us: u64,
     shared_fused_us: u64,
@@ -3393,6 +3395,24 @@ impl Qwen35SparseMoeDetailProfile {
             + self.shared_down_us
             + self.shared_apply_gate_us;
         let accounted_us = self.router_us + self.routed_experts_us + shared_path_us + self.merge_us;
+        let routed_bucket = self
+            .routed_bucket
+            .map(|bucket| {
+                serde_json::json!({
+                    "layers": bucket.layers,
+                    "total": bucket.total_us(),
+                    "sync": bucket.sync_us,
+                    "d2h": bucket.d2h_us,
+                    "route": bucket.route_us,
+                    "plan": bucket.plan_us,
+                    "gather": bucket.gather_us,
+                    "gemm1": bucket.gemm1_us,
+                    "silu": bucket.silu_us,
+                    "gemm3": bucket.gemm3_us,
+                    "combine": bucket.combine_us,
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
 
         if event <= 96 || event % 512 == 0 {
             eprintln!(
@@ -3400,7 +3420,7 @@ impl Qwen35SparseMoeDetailProfile {
                  total={}us accounted={}us router={}us routed_experts={}us shared_path={}us \
                  shared_gate={}us shared_projection={}us shared_gate_up_proj={}us \
                  shared_fused={}us shared_down={}us \
-                 shared_apply_gate={}us merge={}us",
+                 shared_apply_gate={}us merge={}us routed_bucket={}",
                 event,
                 layer_index,
                 tokens,
@@ -3418,6 +3438,7 @@ impl Qwen35SparseMoeDetailProfile {
                 self.shared_down_us,
                 self.shared_apply_gate_us,
                 self.merge_us,
+                routed_bucket,
             );
         }
 
@@ -3437,6 +3458,7 @@ impl Qwen35SparseMoeDetailProfile {
                     "accounted": accounted_us,
                     "router": self.router_us,
                     "routed_experts": self.routed_experts_us,
+                    "routed_bucket": routed_bucket,
                     "shared_path": shared_path_us,
                     "shared_gate": self.shared_gate_us,
                     "shared_projection": shared_projection_us,
@@ -5733,6 +5755,7 @@ struct Qwen35SparseMoeForwardParams<'a, B: MoeLlmBackend> {
     silu_packed: &'a mut B::Buffer,
     down_packed: &'a mut B::Buffer,
     route_scratch: &'a mut MoeRouteScratch,
+    profile_bucket: bool,
     device_route: Option<DeviceRouteScratch<'a, B>>,
 }
 
@@ -5784,9 +5807,13 @@ fn qwen35_sparse_moe_forward_bucketed_or_dense<B: MoeLlmBackend>(
         silu_packed,
         down_packed,
         route_scratch,
+        profile_bucket,
         device_route,
     } = params;
 
+    if profile_bucket {
+        let _ = drain_moe_bucket_profile();
+    }
     let bucketed = moe_forward_bucketed(MoeForwardBucketedParams {
         ctx: &mut *ctx,
         x,
@@ -5804,6 +5831,7 @@ fn qwen35_sparse_moe_forward_bucketed_or_dense<B: MoeLlmBackend>(
         silu_packed: &mut *silu_packed,
         down_packed: &mut *down_packed,
         route_scratch: &mut *route_scratch,
+        profile_bucket,
         device_route,
     });
     match bucketed {
@@ -5911,10 +5939,17 @@ pub fn qwen35_sparse_moe_shared_expert_backend<B: MoeLlmBackend>(
         silu_packed: &mut silu_packed,
         down_packed: &mut down_packed,
         route_scratch: &mut route_scratch,
+        profile_bucket: detail_enabled,
         device_route: None,
     })?;
     detail.routed_experts_us +=
         qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_routed_experts");
+    if detail_enabled {
+        let bucket_profile = drain_moe_bucket_profile();
+        if bucket_profile.has_layers() {
+            detail.routed_bucket = Some(bucket_profile);
+        }
+    }
     qwen35_trace_layer_moe_route(
         layer_index,
         shape.tokens,
@@ -6164,6 +6199,7 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
         silu_packed: &mut scratch.silu_packed,
         down_packed: &mut scratch.down_packed,
         route_scratch: &mut scratch.route_scratch,
+        profile_bucket: detail_enabled,
         device_route: Some(crate::moe::dispatch::DeviceRouteScratch {
             selected_ids: &mut scratch.route_selected_ids,
             pair_weights: &mut scratch.route_pair_weights,
@@ -6177,6 +6213,12 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
     })?;
     detail.routed_experts_us +=
         qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_routed_experts");
+    if detail_enabled {
+        let bucket_profile = drain_moe_bucket_profile();
+        if bucket_profile.has_layers() {
+            detail.routed_bucket = Some(bucket_profile);
+        }
+    }
     qwen35_trace_layer_moe_route(
         layer_index,
         shape.tokens,

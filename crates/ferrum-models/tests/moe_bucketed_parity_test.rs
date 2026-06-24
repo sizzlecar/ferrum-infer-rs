@@ -184,6 +184,7 @@ fn bucketed_matches_per_pair_dispatch() {
         silu_packed: &mut silu_packed,
         down_packed: &mut down_packed,
         route_scratch: &mut route_scratch,
+        profile_bucket: false,
         device_route: None,
     })
     .expect("bucketed forward");
