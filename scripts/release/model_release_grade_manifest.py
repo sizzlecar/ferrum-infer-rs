@@ -1450,12 +1450,46 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
     )
     for idx in range(10):
         path = root / "tool_calls" / f"tool_{idx:02d}.response.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}\n")
+        write_json(
+            path,
+            {
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": f"call_tool_{idx:02d}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "calc",
+                                        "arguments": json.dumps({"expression": "123+456"}),
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ]
+            },
+        )
     for idx in range(20):
         path = root / "strict_schema" / f"strict_schema_{idx:02d}.response.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}\n")
+        write_json(
+            path,
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps({"answer": f"ok-{idx}"}),
+                        },
+                    }
+                ]
+            },
+        )
 
     write_json(
         root / "l4.json",
@@ -1482,6 +1516,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
                     "passed": True,
                     "finish_reason": "tool_calls",
                     "artifact": f"tool_calls/tool_{idx:02d}.response.json",
+                    "arguments": {"expression": "123+456"},
                 }
                 for idx in range(10)
             ],
@@ -1491,6 +1526,7 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
                     "passed": True,
                     "finish_reason": "stop",
                     "artifact": f"strict_schema/strict_schema_{idx:02d}.response.json",
+                    "content": {"answer": f"ok-{idx}"},
                 }
                 for idx in range(20)
             ],

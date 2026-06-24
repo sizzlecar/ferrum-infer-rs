@@ -219,6 +219,44 @@ def validate_strict_schema(label: str, data: dict[str, Any], expected: str) -> d
     return {"finish_reason": choice.get("finish_reason"), "content": parsed}
 
 
+def selftest_tool_call_response(idx: int) -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"call_tool_{idx:02d}",
+                            "type": "function",
+                            "function": {
+                                "name": "calc",
+                                "arguments": json.dumps({"expression": "123+456"}),
+                            },
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+
+
+def selftest_strict_schema_response(idx: int) -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps({"answer": f"ok-{idx}"}),
+                },
+            }
+        ]
+    }
+
+
 def validate_negative_contracts(base_url: str, model: str, out: Path, timeout: float) -> dict[str, Any]:
     bad_tool = {
         "model": model,
@@ -333,6 +371,7 @@ def run_selftest() -> int:
                 "passed": True,
                 "finish_reason": "tool_calls",
                 "artifact": f"tool_calls/tool_{idx:02d}.response.json",
+                "arguments": {"expression": "123+456"},
             }
             for idx in range(10)
         ]
@@ -342,15 +381,16 @@ def run_selftest() -> int:
                 "passed": True,
                 "finish_reason": "stop",
                 "artifact": f"strict_schema/strict_schema_{idx:02d}.response.json",
+                "content": {"answer": f"ok-{idx}"},
             }
             for idx in range(20)
         ]
         for result in tool_results:
-            (root / result["artifact"]).parent.mkdir(parents=True, exist_ok=True)
-            (root / result["artifact"]).write_text('{"choices":[]}\n', encoding="utf-8")
+            idx = int(result["id"].split("_")[-1])
+            write_json(root / result["artifact"], selftest_tool_call_response(idx))
         for result in strict_results:
-            (root / result["artifact"]).parent.mkdir(parents=True, exist_ok=True)
-            (root / result["artifact"]).write_text('{"choices":[]}\n', encoding="utf-8")
+            idx = int(result["id"].split("_")[-1])
+            write_json(root / result["artifact"], selftest_strict_schema_response(idx))
         artifact = {
             "schema_version": 1,
             "status": "pass",

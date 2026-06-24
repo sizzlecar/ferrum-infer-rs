@@ -2,6 +2,41 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ94 — W3 L4 response artifacts are scanned by the final validator
+
+- Scope:
+  - `scripts/release/model_release_grade_goal_gate.py` now opens every W3 L4
+    tool-call and strict-schema response artifact instead of trusting only the
+    case summary;
+  - tool-call cases must archive an OpenAI-style response whose first choice has
+    `finish_reason=tool_calls`, empty assistant content, at least one
+    `message.tool_calls[]` entry, `function.name=calc`, and JSON
+    `function.arguments` equal to `{"expression":"123+456"}`;
+  - strict-schema cases must archive non-empty assistant content that parses as
+    JSON, contains a non-empty string `answer`, matches the case summary when
+    present, and does not finish with `length`;
+  - both paths scan archived content/arguments for forbidden reserved-token or
+    synthetic fallback text;
+  - W3 selftest fixtures in the final validator, manifest builder, and L4
+    runner now write realistic response JSON instead of `{}` / empty choices;
+  - final-validator negative selftests now reject a missing tool call in a
+    supposedly passing tool artifact and a strict-schema response whose artifact
+    finished by `length`.
+- Why:
+  - W3 L4 is an agent/tool/strict-schema contract; a summary with
+    `passed=true` is not sufficient if the archived model response cannot prove
+    the actual tool call or strict JSON behavior.
+- Validation:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py scripts/release/w3_l4_agent_gate.py`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/w3_l4_agent_gate.py --self-test`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ93 — W3 stream artifacts are scanned by the final validator
 
 - Scope:
