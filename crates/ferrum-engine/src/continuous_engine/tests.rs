@@ -2416,6 +2416,117 @@ async fn process_batch_unified_reserve_resource_exhausted_defers_without_fallbac
 }
 
 #[tokio::test]
+async fn process_batch_unified_reserve_resource_exhausted_defers_existing_kv_prefill() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedReserveExecutor {
+        inner: FailingBatchPrefillExecutor {
+            inner: RecurrentSpecExecutor {
+                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+            },
+        },
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler.clone(),
+        tokenizer.clone(),
+        sampler,
+        kv_cache.clone(),
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager.clone()),
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test ok".to_string();
+    request.sampling_params.max_tokens = 2;
+    let request_id = request.id.clone();
+    scheduler.submit(request.clone()).await.unwrap();
+    let batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("submitted request should be scheduled");
+    let active = scheduler.trace_snapshot();
+    assert_eq!(active.prefill_queue_len, 1);
+    assert_eq!(active.active_len, 1);
+
+    let allocated_kv = kv_cache
+        .allocate(&AllocationRequest {
+            request_id: request_id.clone(),
+            initial_tokens: 1,
+            max_sequence_length: 16,
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 4,
+            device: Device::CPU,
+            dtype: DataType::FP32,
+            priority: Priority::Normal,
+        })
+        .await
+        .unwrap();
+    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(5), TokenId::new(6)],
+        Some(tokenizer),
+        Some(64),
+    );
+    sequence.kv_cache = Some(allocated_kv);
+    sequence.model_cache_id = Some("existing-cache".to_string());
+    sequence.prefill_tokens_processed = 1;
+    sequence.phase = RequestPhase::Prefilling;
+    engine
+        .inner
+        .sequences
+        .write()
+        .insert(request_id.clone(), sequence);
+
+    engine.inner.process_batch(&batch).await.unwrap();
+
+    let deferred = scheduler.trace_snapshot();
+    assert_eq!(deferred.waiting_queue_len, 1);
+    assert_eq!(deferred.prefill_queue_len, 0);
+    assert_eq!(deferred.active_len, 0);
+    assert_eq!(deferred.cancelled_total, 0);
+    assert_eq!(
+        scheduler.trace_phase(&request_id),
+        Some(RequestPhase::Waiting)
+    );
+    let active_kv = kv_cache.list_handles();
+    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
+    let recurrent_stats = recurrent_manager.stats();
+    assert_eq!(recurrent_stats.active_states, 0);
+    assert_eq!(recurrent_stats.used_batch_slots, 0);
+
+    let sequences = engine.inner.sequences.read();
+    let sequence = sequences
+        .get(&request_id)
+        .expect("deferred request should remain available for retry");
+    assert_eq!(sequence.phase, RequestPhase::Waiting);
+    assert!(!sequence.prefill_complete);
+    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.recurrent_state.is_none());
+    assert!(sequence.model_cache_id.is_none());
+    assert_eq!(
+        sequence.prefill_tokens_processed, 0,
+        "retry must rebuild KV from the full logical context"
+    );
+}
+
+#[tokio::test]
 async fn process_batch_unified_forward_failure_then_fallback_kv_defer_releases_recurrent_state() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;

@@ -460,6 +460,18 @@ impl EngineInner {
         let kv_requests = kv_slot_requests_for_unified_batch(&unified);
         if let Err(e) = self.model_executor.reserve_kv_slots(&kv_requests) {
             warn!("Unified KV admission failed: {}", e);
+            if is_resource_exhausted_error(&e) {
+                for work in &prefill_meta {
+                    if work.fresh_kv {
+                        let _ = self.kv_cache.deallocate(work.rid.clone()).await;
+                    }
+                    self.defer_prefill_for_capacity(&work.rid).await;
+                }
+                if !decode_meta.is_empty() {
+                    return self.run_batch_decode_adaptive(&decode_meta).await;
+                }
+                return Ok(());
+            }
             for work in &prefill_meta {
                 if work.fresh_kv {
                     let _ = self.kv_cache.deallocate(work.rid.clone()).await;
@@ -467,15 +479,6 @@ impl EngineInner {
                 if work.fresh_recurrent {
                     self.release_recurrent_state(&work.rid).await;
                 }
-                if work.fresh_kv {
-                    self.defer_prefill_for_capacity(&work.rid).await;
-                }
-            }
-            if is_resource_exhausted_error(&e) {
-                if !decode_meta.is_empty() {
-                    return self.run_batch_decode_adaptive(&decode_meta).await;
-                }
-                return Ok(());
             }
             return self.process_batch_legacy_split(batch).await;
         }
@@ -868,6 +871,7 @@ impl EngineInner {
                 seq.recurrent_state = None;
                 seq.model_cache_id = None;
                 seq.prefill_complete = false;
+                seq.prefill_tokens_processed = 0;
                 seq.phase = RequestPhase::Waiting;
                 seq.tokens_this_iteration = 0;
                 (
