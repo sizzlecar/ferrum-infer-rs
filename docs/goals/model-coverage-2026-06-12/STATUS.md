@@ -2,6 +2,54 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ97 — W3 perf manifest aligns capped baseline cells; tight recurrent prefill floor widened
+
+- Scope:
+  - fixed `scripts/release/model_release_grade_manifest.py` so W3 admission-capped
+    performance cells select the vLLM baseline report for the effective
+    concurrency, not blindly the requested concurrency;
+  - W3 performance cells now record `baseline_measured_concurrency`;
+  - `scripts/release/model_release_grade_goal_gate.py` now requires W3
+    `baseline_measured_concurrency` to match
+    `baseline_effective_active_concurrency`, with a negative self-test covering
+    the previous c32/effective-c16 mismatch;
+  - raised the generic tight recurrent-state CLI autosize aggregate prefill
+    floor from `192` to `1024` tokens.
+- Why:
+  - W3 goal text says that if admission caps effective concurrency below the
+    requested cell, the release claim must use the effective value; the previous
+    diagnostic manifest wrote c32 `effective_active_concurrency=16` but still
+    compared against the vLLM c32 throughput number;
+  - the 2026-06-23 fixed-output Ferrum runtime snapshot had
+    `selected_max_batched_tokens=192`, which produced
+    `prefill_step_chunk=12`; the tight recurrent profile already floors the KV
+    pool at `256` blocks, while a `1024` token aggregate prefill floor requires
+    only `64` blocks, so this widens scheduler chunks without increasing that
+    KV floor.
+- Result:
+  - current evidence diagnostic still fails, but c32 is now evaluated against
+    vLLM c16 because the Ferrum c32 cell is admission-capped to effective c16;
+  - c32 ratio changed from `0.369638` to `0.556749`;
+  - remaining current diagnostic failures are still performance/baseline only:
+    historical vLLM command lacks `--ignore-eos`, and c1/c4/c16/c32 ratio plus
+    p95 ITL still fail.
+- Validation:
+  - `cargo test -p ferrum-cli gpu_mem_autosize -- --nocapture`;
+  - `cargo test -p ferrum-types recurrent_state_budget -- --nocapture`;
+  - `cargo test -p ferrum-types scheduler_prefill -- --nocapture`;
+  - `cargo check -p ferrum-cli -p ferrum-types`;
+  - `cargo fmt --all -- --check`;
+  - `python3 -m py_compile scripts/release/model_release_grade_manifest.py scripts/release/model_release_grade_goal_gate.py`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --config docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json` produced the expected diagnostic `MODEL_RELEASE_GRADE_W3 FAIL (12 problems)`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - this is source/gate progress, not a same-hardware performance result;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ96 — Current W3 evidence uses 2026-06-23 fixed-output L5
 
 - Scope:

@@ -650,6 +650,7 @@ def build_direct_cell(
     concurrency: int,
     ferrum: dict[str, Any],
     baseline: dict[str, Any],
+    baseline_concurrency: int,
     ferrum_perf: Path,
     out_dir: Path,
     dataset_id: str,
@@ -659,11 +660,11 @@ def build_direct_cell(
     effective_concurrency: dict[int, int],
 ) -> dict[str, Any]:
     assert_report_quality(ferrum, f"ferrum c={concurrency}")
-    assert_report_quality(baseline, f"baseline c={concurrency}")
+    assert_report_quality(baseline, f"baseline c={baseline_concurrency}")
     n_repeats = positive_int(ferrum.get("n_repeats"), f"ferrum c={concurrency}.n_repeats")
     baseline_n_repeats = positive_int(
         baseline.get("n_repeats"),
-        f"baseline c={concurrency}.n_repeats",
+        f"baseline c={baseline_concurrency}.n_repeats",
     )
     requests = positive_int(
         ferrum.get("n_requests_per_run"),
@@ -671,7 +672,7 @@ def build_direct_cell(
     )
     baseline_requests = positive_int(
         baseline.get("n_requests_per_run"),
-        f"baseline c={concurrency}.n_requests_per_run",
+        f"baseline c={baseline_concurrency}.n_requests_per_run",
     )
     if n_repeats != baseline_n_repeats:
         raise BuildError(f"c={concurrency} repeat count differs between Ferrum and baseline")
@@ -680,14 +681,15 @@ def build_direct_cell(
 
     effective = effective_concurrency.get(concurrency, concurrency)
     ferrum_lcb = output_tps_lcb(ferrum, f"ferrum c={concurrency}")
-    baseline_lcb = output_tps_lcb(baseline, f"baseline c={concurrency}")
+    baseline_lcb = output_tps_lcb(baseline, f"baseline c={baseline_concurrency}")
     if baseline_lcb <= 0:
-        raise BuildError(f"baseline c={concurrency} LCB must be positive")
+        raise BuildError(f"baseline c={baseline_concurrency} LCB must be positive")
 
     cell = {
         "requested_concurrency": concurrency,
         "effective_active_concurrency": effective,
         "baseline_effective_active_concurrency": effective,
+        "baseline_measured_concurrency": baseline_concurrency,
         "requests_per_run": requests,
         "n_repeats": n_repeats,
         "completed_per_run": integer_list(ferrum, "completed_per_run", f"ferrum c={concurrency}"),
@@ -697,12 +699,12 @@ def build_direct_cell(
         "baseline_completed_per_run": integer_list(
             baseline,
             "completed_per_run",
-            f"baseline c={concurrency}",
+            f"baseline c={baseline_concurrency}",
         ),
         "baseline_errored_per_run": integer_list(
             baseline,
             "errored_per_run",
-            f"baseline c={concurrency}",
+            f"baseline c={baseline_concurrency}",
         ),
         "output_tokens_per_request": integer_matrix(
             ferrum,
@@ -712,7 +714,7 @@ def build_direct_cell(
         "baseline_output_tokens_per_request": integer_matrix(
             baseline,
             "output_tokens_per_request",
-            f"baseline c={concurrency}",
+            f"baseline c={baseline_concurrency}",
         ),
         "output_token_count_source": ferrum.get("output_token_count_source"),
         "stream_options_include_usage": True,
@@ -732,7 +734,7 @@ def build_direct_cell(
         "baseline_output_tps": baseline_lcb,
         "ratio": ferrum_lcb / baseline_lcb,
         "ferrum_p95_itl_ms": p95_itl_ms(ferrum, f"ferrum c={concurrency}"),
-        "baseline_p95_itl_ms": p95_itl_ms(baseline, f"baseline c={concurrency}"),
+        "baseline_p95_itl_ms": p95_itl_ms(baseline, f"baseline c={baseline_concurrency}"),
         "artifact": artifact_ref(ferrum_perf, out_dir),
     }
     if effective < concurrency:
@@ -742,7 +744,7 @@ def build_direct_cell(
         cell[f"baseline_{field}_per_run"] = quality_list(
             baseline,
             field,
-            f"baseline c={concurrency}",
+            f"baseline c={baseline_concurrency}",
         )
     return cell
 
@@ -911,9 +913,19 @@ def build_w3_manifest(
     baseline_perf = require_file(args.baseline_perf_report, "W3 baseline performance report")
     ferrum_reports = reports_by_concurrency(ferrum_perf, "W3 Ferrum bench report")
     baseline_reports = reports_by_concurrency(baseline_perf, "W3 baseline bench report")
-    missing = [c for c in REQUIRED_CELLS if c not in ferrum_reports or c not in baseline_reports]
-    if missing:
-        raise BuildError(f"W3 missing required performance cells: {missing}")
+    missing_ferrum = [c for c in REQUIRED_CELLS if c not in ferrum_reports]
+    missing_baseline = [
+        f"requested c={c} effective c={effective_concurrency.get(c, c)}"
+        for c in REQUIRED_CELLS
+        if effective_concurrency.get(c, c) not in baseline_reports
+    ]
+    if missing_ferrum or missing_baseline:
+        parts = []
+        if missing_ferrum:
+            parts.append(f"Ferrum cells {missing_ferrum}")
+        if missing_baseline:
+            parts.append(f"baseline cells {missing_baseline}")
+        raise BuildError(f"W3 missing required performance cells: {'; '.join(parts)}")
 
     dataset_sha = hex64(args.dataset_sha, "--dataset-sha")
     binary_sha = hex64(args.binary_sha256, "--binary-sha256")
@@ -930,21 +942,24 @@ def build_w3_manifest(
         "W3 baseline build command",
     )
 
-    cells = [
-        build_direct_cell(
-            concurrency=concurrency,
-            ferrum=ferrum_reports[concurrency],
-            baseline=baseline_reports[concurrency],
-            ferrum_perf=ferrum_perf,
-            out_dir=out_dir,
-            dataset_id=args.dataset_id,
-            dataset_sha=dataset_sha,
-            ferrum_command=ferrum_command,
-            baseline_command=baseline_command,
-            effective_concurrency=effective_concurrency,
+    cells = []
+    for concurrency in REQUIRED_CELLS:
+        baseline_concurrency = effective_concurrency.get(concurrency, concurrency)
+        cells.append(
+            build_direct_cell(
+                concurrency=concurrency,
+                ferrum=ferrum_reports[concurrency],
+                baseline=baseline_reports[baseline_concurrency],
+                baseline_concurrency=baseline_concurrency,
+                ferrum_perf=ferrum_perf,
+                out_dir=out_dir,
+                dataset_id=args.dataset_id,
+                dataset_sha=dataset_sha,
+                ferrum_command=ferrum_command,
+                baseline_command=baseline_command,
+                effective_concurrency=effective_concurrency,
+            )
         )
-        for concurrency in REQUIRED_CELLS
-    ]
 
     manifest = {
         "schema_version": 1,
