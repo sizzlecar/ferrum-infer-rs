@@ -274,6 +274,7 @@ impl EngineInner {
                             "Unified prefill recurrent-state alloc deferred for {}: insufficient capacity",
                             rid
                         );
+                        self.defer_prefill_for_capacity(rid);
                         continue;
                     }
                 }
@@ -288,6 +289,7 @@ impl EngineInner {
                             "Unified prefill recurrent-state alloc deferred for {}: {}",
                             rid, message
                         );
+                        self.defer_prefill_for_capacity(rid);
                         continue;
                     }
                     Err(e) => {
@@ -329,12 +331,14 @@ impl EngineInner {
                                         rid, e
                                     );
                                     self.release_recurrent_state(rid).await;
+                                    self.defer_prefill_for_capacity(rid);
                                     continue;
                                 }
                             }
                         } else {
                             warn!("Unified prefill alloc deferred for {}: no victim", rid);
                             self.release_recurrent_state(rid).await;
+                            self.defer_prefill_for_capacity(rid);
                             continue;
                         }
                     }
@@ -475,6 +479,9 @@ impl EngineInner {
                 }
                 if work.fresh_recurrent {
                     self.release_recurrent_state(&work.rid).await;
+                }
+                if work.fresh_kv {
+                    self.defer_prefill_for_capacity(&work.rid);
                 }
             }
             if is_resource_exhausted_error(&e) {
@@ -859,6 +866,24 @@ impl EngineInner {
     }
 
     // ── preemption ──────────────────────────────────────────────────────
+
+    fn defer_prefill_for_capacity(&self, request_id: &RequestId) {
+        self.scheduler.defer_prefill_to_waiting(request_id);
+        {
+            let mut sequences = self.sequences.write();
+            if let Some(seq) = sequences.get_mut(request_id) {
+                seq.kv_cache = None;
+                seq.draft_kv_cache = None;
+                seq.draft_kv_request_id = None;
+                seq.recurrent_state = None;
+                seq.model_cache_id = None;
+                seq.prefill_complete = false;
+                seq.phase = RequestPhase::Waiting;
+                seq.tokens_this_iteration = 0;
+            }
+        }
+        self.work_notify.notify_waiters();
+    }
 
     /// Try to preempt a decoding request to free KV cache blocks.
     ///

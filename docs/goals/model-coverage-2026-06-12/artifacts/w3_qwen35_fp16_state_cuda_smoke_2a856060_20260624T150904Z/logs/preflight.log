@@ -1,0 +1,17 @@
+lane=w3-qwen35-fp16-recurrent-state-cuda-build-smoke
+expected_runtime_cost=20-45min at dph_total about 0.4777777778/hr
+stop_condition=stop after CUDA build/smoke/diagnostic pass or first failure
+model=Qwen/Qwen3.5-35B-A3B-GPTQ-Int4
+tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+dataset=/workspace/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl
+repo=/workspace/ferrum-infer-rs
+art=/workspace/artifacts/w3_qwen35_fp16_state_cuda_smoke_2a856060_20260624T150904Z
+port=55988
+git_head=2a8560609053387de0ad36f786cfb41d04b820bb
+git_status_start
+## goal/w2-w3-release-grade...origin/goal/w2-w3-release-grade
+git_status_end
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+Build cuda_12.4.r12.4/compiler.34097967_0
+NVIDIA GeForce RTX 4090, 24564, 1, 24091, 570.153.02

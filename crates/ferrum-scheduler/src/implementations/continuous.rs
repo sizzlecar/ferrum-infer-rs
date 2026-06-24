@@ -387,6 +387,35 @@ impl ContinuousBatchScheduler {
         }
     }
 
+    /// Move a capacity-deferred prefill back to the waiting queue.
+    ///
+    /// The engine uses this when it could not allocate physical KV or
+    /// recurrent state for a prefill. Leaving the request in `prefill_queue`
+    /// would make `next_batch` schedule the same un-runnable work every
+    /// iteration, which can starve decode and spin the scheduler.
+    pub fn defer_prefill_to_waiting(&self, request_id: &RequestId) -> bool {
+        let mut prefill_queue = self.prefill_queue.write();
+        let mut waiting_queue = self.waiting_queue.write();
+        let mut request_index = self.request_index.write();
+
+        if let Some(pos) = prefill_queue
+            .iter()
+            .position(|r| r.inner.request.id == *request_id)
+        {
+            let mut req = prefill_queue.remove(pos).unwrap();
+            req.phase = RequestPhase::Waiting;
+            req.inner.state = RequestState::Waiting;
+            req.inner.started_at = None;
+            req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
+            request_index.insert(request_id.clone(), RequestPhase::Waiting);
+            waiting_queue.push_back(req);
+            debug!("Deferred prefill request {} back to waiting", request_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Move request from prefill to decode queue
     fn promote_to_decode(&self, request_id: &RequestId) -> bool {
         let mut prefill_queue = self.prefill_queue.write();
@@ -1318,6 +1347,36 @@ mod tests {
         assert_eq!(
             scheduler.trace_phase(&request_id),
             Some(RequestPhase::Prefilling)
+        );
+    }
+
+    #[tokio::test]
+    async fn defer_prefill_to_waiting_frees_active_slot_without_cancelling() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let request = create_test_request(Priority::Normal);
+        let request_id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+
+        let batch = scheduler.next_batch(BatchHint::simple(4)).await.unwrap();
+        assert_eq!(batch.size(), 1);
+        let active = scheduler.trace_snapshot();
+        assert_eq!(active.waiting_queue_len, 0);
+        assert_eq!(active.prefill_queue_len, 1);
+        assert_eq!(active.active_len, 1);
+
+        assert!(scheduler.defer_prefill_to_waiting(&request_id));
+        let deferred = scheduler.trace_snapshot();
+        assert_eq!(deferred.waiting_queue_len, 1);
+        assert_eq!(deferred.prefill_queue_len, 0);
+        assert_eq!(deferred.active_len, 0);
+        assert_eq!(deferred.cancelled_total, 0);
+        assert_eq!(
+            scheduler.trace_phase(&request_id),
+            Some(RequestPhase::Waiting)
+        );
+        assert_eq!(
+            scheduler.request_state(&request_id),
+            Some(RequestState::Waiting)
         );
     }
 

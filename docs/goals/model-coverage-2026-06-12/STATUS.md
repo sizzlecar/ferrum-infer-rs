@@ -2,6 +2,107 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ123 — Capacity-deferred prefills now leave the active scheduler set
+
+- Source of this patch:
+  - ZZZ122 showed Qwen35 FP16 recurrent-state capacity now selects
+    `32` recurrent-state slots/admission for both `ferrum run` and
+    `ferrum serve`;
+  - the c32 diagnostic still failed without OOM because the scheduler spun on
+    `32` active prefill requests with `last_engine_prefill_delta=0`,
+    `last_completed_total=5`, `last_cancelled_total=516`, and
+    `Unified prefill alloc deferred=1095794`.
+- Root cause:
+  - KV capacity could not allocate fresh prefill/recompute KV for all admitted
+    c32 requests at once;
+  - when KV allocation had no preemptable victim, the engine logged
+    `Unified prefill alloc deferred ... no victim` but left the request in the
+    scheduler's active prefill queue;
+  - requests that had already generated tokens could therefore re-enter
+    Prefilling for KV recompute and be scheduled every iteration without
+    doing model work.
+- Source change:
+  - added `ContinuousBatchScheduler::defer_prefill_to_waiting`;
+  - added `EngineInner::defer_prefill_for_capacity`;
+  - recurrent-state capacity deferral, KV allocation no-victim /
+    after-preempt failure, and unified reserve `ResourceExhausted` cleanup now
+    move fresh capacity-blocked prefills back to the waiting queue and clear
+    physical KV/recurrent handles while preserving logical generated tokens.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler
+    defer_prefill_to_waiting_frees_active_slot_without_cancelling --
+    --nocapture` PASS;
+  - `cargo test -p ferrum-engine
+    process_batch_unified_kv_defer_moves_active_prefill_back_to_waiting --
+    --nocapture` PASS;
+  - `cargo test -p ferrum-engine
+    process_batch_unified_defers_prefill_for_recurrent_state_capacity --
+    --nocapture` PASS;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture` PASS
+    (`13` tests);
+  - `cargo test -p ferrum-scheduler` PASS (`60` tests plus doc-tests);
+  - `cargo check -p ferrum-engine -p ferrum-scheduler` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Limits:
+  - no new CUDA runtime rerun has been performed after this patch;
+  - this patch is a scheduler starvation source fix candidate, not a
+    throughput result;
+  - no OOM-fixed, W3-complete, performance-ready, or release-ready claim is
+    made;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-24 ZZZ122 — Qwen35 FP16 recurrent-state candidate passes run/serve smoke but c32 scheduler starves
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fp16_state_cuda_smoke_2a856060_20260624T150904Z/`;
+  - remote commit: `2a8560609053387de0ad36f786cfb41d04b820bb`;
+  - Vast instance reused: `42216671` (`1x RTX 4090`), then stopped and
+    confirmed `cur_state=stopped actual_status=exited intended_status=stopped`;
+  - this was a diagnostic lane, not release evidence, and did not run live
+    vLLM.
+- CUDA/source validation:
+  - `cargo check -p ferrum-models --features cuda` PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `env/ferrum.sha256` was saved in the artifact.
+- Product smoke:
+  - `ferrum run` PASS: the diagnostic prompt returned `5`;
+  - `run/effective_config.json` selected `selected_max_sequences=32`,
+    `selected_recurrent_state_max_slots=32`, and
+    `selected_admission_limit=32`;
+  - `ferrum serve` reached `/v1/models` and passed chat smoke;
+  - `server/effective_config.json` also selected `32` max sequences, `32`
+    recurrent-state slots, and admission limit `32`.
+- c32 diagnostic failure:
+  - fixed recurrent-state capacity did not produce a usable c32 performance
+    result;
+  - bench was manually stopped before the full `600s` timeout because the
+    scheduler made no progress while the GPU fell to `0%` utilization;
+  - `perf/bench.exit` is `143`; lane exit code is `50`;
+  - `perf/failure_summary.json` records:
+    - `last_completed_total=5`;
+    - `last_cancelled_total=516`;
+    - `last_engine_prefill_delta=0`;
+    - `last_engine_decode_delta=0`;
+    - `last_plan_prefill_items=32`;
+    - `last_plan_decode_items=0`;
+    - `last_plan_scheduled_tokens_total=192`;
+    - `max_active_len=32`;
+    - `max_prefill_queue_len=32`;
+    - `Unified prefill alloc deferred=1095794`.
+- Current conclusion:
+  - the FP16 recurrent-state capacity path is real product-path progress: both
+    `run` and `serve` now select 32 recurrent-state slots/admission on 1x4090;
+  - this is not an OOM in the latest c32 diagnostic;
+  - the remaining blocker is scheduler/allocation starvation after 32 active
+    requests are admitted, where requests with generated tokens keep getting
+    scheduled as prefill but make `0` token progress;
+  - no throughput improvement, W3 completion, performance-ready, or
+    release-ready claim is made;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-24 ZZZ121 — Qwen35 recurrent-state pool dtype aligns with FP16 CUDA capacity
 
 - Scope:
