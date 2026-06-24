@@ -8531,12 +8531,10 @@ fn qwen35_full_attention_prefill_batch_layer_backend<B: MoeLlmBackend + BackendP
         )?;
     }
 
-    let mut context = B::alloc(total_tokens * q_total);
-    B::copy_slice(ctx, out_buf, 0, &mut context, 0, total_tokens * q_total);
     if attention_shape.attn_output_gate {
         B::qwen35_apply_attention_gate(
             ctx,
-            &mut context,
+            out_buf,
             &query_raw,
             total_tokens,
             q_total,
@@ -8547,7 +8545,7 @@ fn qwen35_full_attention_prefill_batch_layer_backend<B: MoeLlmBackend + BackendP
     let mut attn_output = B::alloc(hidden_len);
     attention
         .o_proj
-        .forward(ctx, &context, &mut attn_output, total_tokens);
+        .forward(ctx, out_buf, &mut attn_output, total_tokens);
 
     if let (Some(residual_f32), Some(branch_f32)) =
         (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
@@ -8859,12 +8857,10 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
                 max_blocks_per_seq,
             )?;
         }
-        let mut context = B::alloc(batch_len * q_total);
-        B::copy_slice(ctx, out_buf, 0, &mut context, 0, batch_len * q_total);
         if attention_shape.attn_output_gate {
             B::qwen35_apply_attention_gate(
                 ctx,
-                &mut context,
+                out_buf,
                 &query_raw,
                 batch_len,
                 q_total,
@@ -8875,7 +8871,7 @@ fn qwen35_full_attention_decode_batch_layer_backend<B: MoeLlmBackend + BackendPa
         let mut attn_output = B::alloc(hidden_len);
         attention
             .o_proj
-            .forward(ctx, &context, &mut attn_output, batch_len);
+            .forward(ctx, out_buf, &mut attn_output, batch_len);
         if let (Some(residual_f32), Some(branch_f32)) =
             (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
         {
@@ -9773,12 +9769,10 @@ fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend + BackendPagedK
                 max_blocks_per_seq,
             )?;
         }
-        let mut context = B::alloc(tokens * q_total);
-        B::copy_slice(ctx, out_buf, 0, &mut context, 0, tokens * q_total);
         if attention_shape.attn_output_gate {
             B::qwen35_apply_attention_gate(
                 ctx,
-                &mut context,
+                out_buf,
                 &query_raw,
                 tokens,
                 q_total,
@@ -9789,7 +9783,7 @@ fn qwen35_full_attention_stateful_layer_backend<B: MoeLlmBackend + BackendPagedK
         let mut attn_output = B::alloc(hidden_len);
         attention
             .o_proj
-            .forward(ctx, &context, &mut attn_output, tokens);
+            .forward(ctx, out_buf, &mut attn_output, tokens);
         if let (Some(residual_f32), Some(branch_f32)) =
             (residual_f32.as_deref_mut(), branch_f32.as_deref_mut())
         {
