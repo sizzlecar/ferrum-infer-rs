@@ -2,6 +2,52 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ104 — Qwen35 MoE zero-skip c16 quick regression shows no throughput gain
+
+- Scope:
+  - reused existing Vast 1x RTX 4090 instance `42216671` instead of renting a
+    new machine;
+  - validated commit `55368e57cd604d594f9fc5b0466ec0f0c6817ec0`;
+  - rebuilt the CUDA release binary with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - ran the same narrow product-path c16 diagnostic as ZZZ102:
+    `ferrum run` smoke, `ferrum serve` smoke, then Ferrum-only
+    `bench-serve --fail-on-error --seed 9271 --ignore-eos`;
+  - no live vLLM run was used.
+- Result:
+  - CUDA build passed in `3m31s` and produced binary SHA256
+    `7a26dc964f5eacf02f76684a197a3007177da586bc6ca91393f432665f5eb3eb`;
+  - `ferrum run` smoke passed;
+  - `ferrum serve` chat smoke passed;
+  - server effective config selected `selected_max_sequences=16`,
+    `selected_max_batched_tokens=192`, `selected_kv_capacity=512`,
+    `selected_admission_limit=16`, and
+    `selected_attention_impl=vllm_paged_attn_v2`;
+  - c16 diagnostic bench completed with `32/32` requests, `0` errors, no
+    OOM/panic log lines, `659.0665261344391` output tok/s, and p95 ITL
+    `20.938492999999998` ms.
+- Comparison:
+  - previous comparable artifact ZZZ102 reported
+    `663.3389819659881` output tok/s;
+  - this run is `-4.272455831548996` tok/s versus ZZZ102, so deleting the
+    routed-output clear did not produce a measurable positive c16 gain in this
+    diagnostic;
+  - scheduler trace shape remained similar: `some_ok=419`, `none=10`,
+    batch size mostly `16` (`275` iterations), and decode items mostly `16`
+    (`254` iterations).
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_zero_skip_55368e57_20260624/`;
+  - `summary.json` records command outputs, effective configs, benchmark
+    metrics, binary SHA256, Vast cleanup evidence, and `no_live_vllm=true`;
+  - Vast cleanup evidence is in `vast/stop_poll.tsv`, ending at
+    `stopped exited`.
+- Status:
+  - this is useful negative evidence: the redundant clear removal is not a
+    high-return lever for the remaining W3 performance gap;
+  - no performance-ready, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS` and remains blocked by the
+    same performance acceptance failures.
+
 ## 2026-06-24 ZZZ103 — Qwen35 decode MoE skips redundant routed-output clear
 
 - Scope:

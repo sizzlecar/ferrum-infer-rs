@@ -1,0 +1,7 @@
+timestamp	cur_state	actual_status	intended_status	gpu_name	num_gpus
+2026-06-24T16:13:26+08:00	stopped	running	stopped	RTX 4090	1
+2026-06-24T16:13:32+08:00	stopped	running	stopped	RTX 4090	1
+2026-06-24T16:13:39+08:00	stopped	running	stopped	RTX 4090	1
+2026-06-24T16:13:46+08:00	stopped	running	stopped	RTX 4090	1
+2026-06-24T16:13:52+08:00	stopped	running	stopped	RTX 4090	1
+2026-06-24T16:14:00+08:00	stopped	exited	stopped	RTX 4090	1
