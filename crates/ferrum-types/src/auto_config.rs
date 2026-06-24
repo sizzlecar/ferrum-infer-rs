@@ -662,11 +662,8 @@ impl FerrumConfigBuilder {
             vllm_moe.value,
             AutoConfigSource::WorkloadPreset,
         )?;
-        let pair_ids = self.bool_value(
-            "FERRUM_VLLM_MOE_PAIR_IDS",
-            vllm_moe.value,
-            AutoConfigSource::WorkloadPreset,
-        )?;
+        let pair_ids =
+            self.bool_value("FERRUM_VLLM_MOE_PAIR_IDS", false, AutoConfigSource::Default)?;
         let graph = self.bool_value("FERRUM_MOE_GRAPH", false, AutoConfigSource::WorkloadPreset)?;
         let batched_graph =
             self.bool_value("FERRUM_BATCHED_GRAPH", false, AutoConfigSource::Default)?;
@@ -2365,7 +2362,7 @@ mod tests {
         );
         assert_eq!(
             decisions["moe_implementation"],
-            "vllm_marlin_moe_device_route_pair_ids"
+            "vllm_marlin_moe_device_route"
         );
         assert_eq!(decisions["moe_graph_policy"], "graph_disabled");
         assert_eq!(decisions["decode_graph_policy"], "graph_disabled");
@@ -2404,7 +2401,7 @@ mod tests {
             "serving-default workload must not be the m3 preset"
         );
         assert_eq!(
-            decisions["moe_implementation"], "vllm_marlin_moe_device_route_pair_ids",
+            decisions["moe_implementation"], "vllm_marlin_moe_device_route",
             "CUDA GPTQ MoE should get the fast vLLM-Marlin path without the m3 preset"
         );
         // The decision is not enough — the model reads FERRUM_VLLM_MOE from the

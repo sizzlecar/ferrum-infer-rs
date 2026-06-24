@@ -1105,7 +1105,7 @@ pub(crate) fn runtime_preset_entries(
             ("FERRUM_KV_CAPACITY", "512"),
             ("FERRUM_MOE_GRAPH", "0"),
             ("FERRUM_VLLM_MOE", "1"),
-            ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
+            ("FERRUM_VLLM_MOE_PAIR_IDS", "0"),
             ("FERRUM_USE_VLLM_PAGED_ATTN", "1"),
             ("FERRUM_PREFIX_CACHE", "0"),
         ],
@@ -2462,7 +2462,7 @@ mod tests {
         assert_eq!(entry("FERRUM_BACKEND").effective_value, "cuda");
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "0");
         assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
-        assert_eq!(entry("FERRUM_VLLM_MOE_PAIR_IDS").effective_value, "1");
+        assert_eq!(entry("FERRUM_VLLM_MOE_PAIR_IDS").effective_value, "0");
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "512");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_BACKEND").source, RuntimeConfigSource::Cli);
