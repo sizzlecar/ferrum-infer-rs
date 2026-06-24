@@ -6445,15 +6445,16 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
         shape.tokens * shape.hidden_size,
     );
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    B::qwen35_apply_token_gate(
+    B::qwen35_apply_token_gate_and_add_inplace(
         ctx,
+        &mut scratch.routed_output,
         &mut scratch.shared_output,
         &scratch.shared_gate,
         shape.tokens,
         shape.hidden_size,
     )?;
     detail.shared_apply_gate_us +=
-        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_apply_gate");
+        qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_shared_apply_gate_merge");
     qwen35_trace_layer_buffer_stats::<B>(
         ctx,
         layer_index,
@@ -6462,14 +6463,6 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
         shape.tokens * shape.hidden_size,
     );
 
-    let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
-    qwen35_merge_moe_outputs_inplace::<B>(
-        ctx,
-        &mut scratch.routed_output,
-        &scratch.shared_output,
-        shape.tokens * shape.hidden_size,
-    );
-    detail.merge_us += qwen35_detail_profile_stage_finish::<B>(ctx, timer, "qwen35_moe_merge");
     qwen35_trace_layer_buffer_stats::<B>(
         ctx,
         layer_index,
@@ -13326,6 +13319,50 @@ mod tests {
             &[
                 1.25, 1.5, //
                 -1.5, 6.0,
+            ],
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn sparse_moe_decode_fused_gate_merge_gates_shared_and_adds_routed() {
+        let mut ctx = CpuBackend::new_context();
+        let mut routed = CpuBackend::from_slice(&[
+            1.0, 2.0, //
+            -3.0, 4.0,
+        ]);
+        let mut shared = CpuBackend::from_slice(&[
+            0.25, -0.5, //
+            1.5, 2.0,
+        ]);
+        let gate = CpuBackend::from_slice(&[
+            0.0,          // sigmoid = 0.5
+            3.0_f32.ln(), // sigmoid = 0.75
+        ]);
+
+        CpuBackend::qwen35_apply_token_gate_and_add_inplace(
+            &mut ctx,
+            &mut routed,
+            &mut shared,
+            &gate,
+            2,
+            2,
+        )
+        .unwrap();
+
+        assert_close_slice(
+            &CpuBackend::to_vec(&shared, 4),
+            &[
+                0.125, -0.25, //
+                1.125, 1.5,
+            ],
+            1e-6,
+        );
+        assert_close_slice(
+            &CpuBackend::to_vec(&routed, 4),
+            &[
+                1.125, 1.75, //
+                -1.875, 5.5,
             ],
             1e-6,
         );

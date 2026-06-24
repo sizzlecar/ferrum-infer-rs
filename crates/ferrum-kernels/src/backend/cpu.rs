@@ -1962,6 +1962,34 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn qwen35_apply_token_gate_and_add_inplace(
+        _ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        values: &mut Self::Buffer,
+        gate: &Self::Buffer,
+        tokens: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        if dst.len() < tokens * hidden_size
+            || values.len() < tokens * hidden_size
+            || gate.len() < tokens
+        {
+            return Err(FerrumError::model(
+                "qwen35 token gate merge buffer is too short",
+            ));
+        }
+        for token in 0..tokens {
+            let scale = sigmoid(gate[token]);
+            let base = token * hidden_size;
+            for dim in 0..hidden_size {
+                let idx = base + dim;
+                values[idx] *= scale;
+                dst[idx] += values[idx];
+            }
+        }
+        Ok(())
+    }
+
     fn kv_cache_append_head_major(
         _ctx: &mut Self::Context,
         cache_k: &mut Self::Buffer,

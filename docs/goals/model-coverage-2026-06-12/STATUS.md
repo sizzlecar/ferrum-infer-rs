@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ118 — Qwen35 decode shared-expert gate+merge fused source candidate
+
+- Scope:
+  - continued from ZZZ117 without starting GPU and without running live vLLM;
+  - targeted the sparse-MoE/shared-expert MLP execution structure, not another
+    scratch-only allocation trim;
+  - kept the change as a backend operation over existing tensors, with no
+    model-name, VRAM-size, or concurrency special case.
+- Source change:
+  - added backend method `qwen35_apply_token_gate_and_add_inplace`;
+  - default trait behavior preserves the previous two-step semantics:
+    apply token gate to `values`, then `add_inplace` into `dst`;
+  - CPU overrides it directly for local semantic coverage;
+  - CUDA adds `qwen35_apply_token_gate_and_add_inplace_f16/f32` kernels in
+    `qk_norm_rope.cu` and a `CudaBackend` override that launches one kernel;
+  - Qwen35 decode scratch sparse-MoE path now replaces
+    `qwen35_apply_token_gate` + `qwen35_merge_moe_outputs_inplace` with the
+    fused backend op, while still leaving `scratch.shared_output` gated for
+    trace/debug semantics.
+- Local validation:
+  - `git pull --rebase --autostash` PASS, already up to date;
+  - `cargo fmt --all` PASS;
+  - `cargo check -p ferrum-models` PASS;
+  - `cargo test -p ferrum-models sparse_moe_decode_fused_gate_merge_gates_shared_and_adds_routed -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models sparse_moe_shared_expert_backend_matches_reference_merge_semantics -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models qwen35_paged -- --nocapture` PASS;
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture`
+    PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - current W3 manifest probe still failed with the same 8 performance
+    problems and no `MODEL_RELEASE_GRADE_W3 PASS`.
+- CUDA validation gap:
+  - local `cargo check -p ferrum-kernels --features cuda` did not reach code
+    validation because this Mac lacks `nvcc` and `nvidia-smi`;
+  - the failure was environment/toolchain setup:
+    `cudarc` reported `nvcc --version` missing, `candle-kernels` reported
+    `nvidia-smi` missing, and `ferrum-kernels` build.rs could not detect CUDA
+    compute capability;
+  - next CUDA step should be a retained-instance source build/quick diagnostic,
+    not a live vLLM run.
+- Status:
+  - source-level candidate only; no CUDA throughput artifact has measured it
+    yet;
+  - no OOM-fixed, release-ready, performance-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ117 — Qwen35 next lever shifts away from scratch micro-tweaks
 
 - Scope:

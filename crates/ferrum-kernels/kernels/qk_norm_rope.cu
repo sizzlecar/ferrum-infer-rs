@@ -249,6 +249,41 @@ extern "C" __global__ void qwen35_apply_token_gate_f16(
     values[idx] = __float2half(value * sigmoid_f32(gate_value));
 }
 
+extern "C" __global__ void qwen35_apply_token_gate_and_add_inplace_f16(
+    __half* __restrict__ dst,
+    __half* __restrict__ values,
+    const __half* __restrict__ gate,
+    const int tokens,
+    const int hidden_size
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = tokens * hidden_size;
+    if (idx >= total) return;
+
+    const int tok = idx / hidden_size;
+    const float gate_value = __half2float(gate[tok]);
+    const float gated = __half2float(values[idx]) * sigmoid_f32(gate_value);
+    values[idx] = __float2half(gated);
+    dst[idx] = __float2half(__half2float(dst[idx]) + gated);
+}
+
+extern "C" __global__ void qwen35_apply_token_gate_and_add_inplace_f32(
+    float* __restrict__ dst,
+    float* __restrict__ values,
+    const float* __restrict__ gate,
+    const int tokens,
+    const int hidden_size
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = tokens * hidden_size;
+    if (idx >= total) return;
+
+    const int tok = idx / hidden_size;
+    const float gated = values[idx] * sigmoid_f32(gate[tok]);
+    values[idx] = gated;
+    dst[idx] += gated;
+}
+
 extern "C" __global__ void qwen35_interleave_gate_up_f16(
     const __half* __restrict__ gate,
     const __half* __restrict__ up,
