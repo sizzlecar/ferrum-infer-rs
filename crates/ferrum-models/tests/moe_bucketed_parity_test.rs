@@ -157,7 +157,10 @@ fn bucketed_matches_per_pair_dispatch() {
 
     // ── Path B: moe_forward_bucketed ───────────────────────────────────
     let total_pairs = batch * top_k;
-    let mut out_b = vec![0.0f32; batch * hidden];
+    // Start dirty to verify the bucketed combine overwrites caller output.
+    let mut out_b: Vec<f32> = (0..batch * hidden)
+        .map(|i| if i % 2 == 0 { 7.0 } else { -11.0 })
+        .collect();
     let mut x_packed = vec![0.0f32; total_pairs * hidden];
     let mut gate_up_packed = vec![0.0f32; total_pairs * 2 * inter];
     let mut silu_packed = vec![0.0f32; total_pairs * inter];

@@ -6148,13 +6148,10 @@ fn qwen35_sparse_moe_shared_expert_decode_scratch<B: MoeLlmBackend>(
         shape.tokens * shape.num_experts,
     );
 
-    B::zero_buffer(
-        ctx,
-        &mut scratch.routed_output,
-        shape.tokens * shape.hidden_size,
-    )?;
     let total_pairs = shape.tokens * shape.top_k;
     let timer = qwen35_detail_profile_stage_start::<B>(ctx, detail_enabled);
+    // `moe_forward_bucketed` and its dense fallback overwrite every output
+    // row before the shared expert output is added below.
     qwen35_sparse_moe_forward_bucketed_or_dense(Qwen35SparseMoeForwardParams {
         ctx,
         x,
