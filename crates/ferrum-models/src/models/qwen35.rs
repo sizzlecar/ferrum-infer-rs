@@ -952,6 +952,14 @@ fn qwen35_first_full_kv<B: MoeLlmBackend>(
         })
 }
 
+fn qwen35_paged_block_table_refresh_needed(
+    current_blocks: usize,
+    target_len: usize,
+    block_size: usize,
+) -> bool {
+    block_size != 0 && current_blocks < target_len.div_ceil(block_size)
+}
+
 fn qwen35_decode_logits_return_from_policies<'a>(
     policies: &'a [LogitsReturnPolicy],
     batch_len: usize,
@@ -1407,12 +1415,12 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
         if !self.use_paged_kv {
             return Ok(());
         }
-        let Some((block_size, max_blocks_per_seq, mut block_indices)) = qwen35_first_full_kv(state)
+        let Some((block_size, max_blocks_per_seq, current_blocks)) = qwen35_first_full_kv(state)
             .map(|kv| {
                 (
                     kv.block_size,
                     kv.capacity / kv.block_size.max(1),
-                    kv.paged_block_indices.clone(),
+                    kv.paged_block_indices.len(),
                 )
             })
         else {
@@ -1428,19 +1436,24 @@ impl<B: MoeLlmBackend + BackendPagedKv> Qwen35BackendModel<B> {
                  exceeds per-seq table capacity {max_blocks_per_seq} for cache_id={cache_id:?}"
             )));
         }
-        if block_indices.len() < needed_blocks {
-            let extra = needed_blocks - block_indices.len();
-            let new_blocks = {
-                let alloc = self.paged_block_alloc.as_ref().ok_or_else(|| {
-                    FerrumError::model(
-                        "Qwen3.5 paged KV grow missing allocator while paged pools are set",
-                    )
-                })?;
-                let mut alloc = alloc.lock().unwrap_or_else(|p| p.into_inner());
-                alloc.allocate_n(extra)?
-            };
-            block_indices.extend(new_blocks);
+        if !qwen35_paged_block_table_refresh_needed(current_blocks, target_len, block_size) {
+            return Ok(());
         }
+
+        let mut block_indices = qwen35_first_full_kv(state)
+            .map(|kv| kv.paged_block_indices.clone())
+            .ok_or_else(|| FerrumError::model("Qwen3.5 paged KV grow missing full KV state"))?;
+        let extra = needed_blocks - block_indices.len();
+        let new_blocks = {
+            let alloc = self.paged_block_alloc.as_ref().ok_or_else(|| {
+                FerrumError::model(
+                    "Qwen3.5 paged KV grow missing allocator while paged pools are set",
+                )
+            })?;
+            let mut alloc = alloc.lock().unwrap_or_else(|p| p.into_inner());
+            alloc.allocate_n(extra)?
+        };
+        block_indices.extend(new_blocks);
         let mut padded = block_indices.clone();
         padded.resize(max_blocks_per_seq, 0);
         for layer_state in &mut state.layers {
@@ -13735,6 +13748,18 @@ mod tests {
             ("FERRUM_PAGED_KV", "1"),
             ("FERRUM_METAL_PAGED_KV", "0"),
         ])));
+    }
+
+    #[test]
+    fn qwen35_paged_block_table_refreshes_only_on_new_block() {
+        assert!(!qwen35_paged_block_table_refresh_needed(0, 0, 16));
+        assert!(qwen35_paged_block_table_refresh_needed(0, 1, 16));
+        assert!(!qwen35_paged_block_table_refresh_needed(1, 1, 16));
+        assert!(!qwen35_paged_block_table_refresh_needed(1, 16, 16));
+        assert!(qwen35_paged_block_table_refresh_needed(1, 17, 16));
+        assert!(!qwen35_paged_block_table_refresh_needed(2, 32, 16));
+        assert!(qwen35_paged_block_table_refresh_needed(2, 33, 16));
+        assert!(!qwen35_paged_block_table_refresh_needed(0, 8, 0));
     }
 
     #[test]

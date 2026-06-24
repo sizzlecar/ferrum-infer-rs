@@ -2,6 +2,47 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ110 — Qwen35 paged KV block-table rewrite skip candidate
+
+- Scope:
+  - continued after ZZZ109 without starting GPU and without rerunning live
+    vLLM;
+  - kept the change path/invariant based: it depends only on paged KV
+    `current_blocks`, `target_len`, and `block_size`, not on model name, GPU
+    VRAM, or a hard-coded concurrency cap.
+- Source finding:
+  - `ensure_paged_kv_capacity_for_state()` was called from prefill and every
+    decode step;
+  - before this change, even when a decode step stayed inside an already
+    assigned paged KV block, the code still cloned/padded block indices and
+    rewrote every full-attention layer's block table;
+  - for Qwen3.5 wide decode this creates repeated small host-to-device writes
+    across all full-attention layers without changing the block mapping.
+- Source change:
+  - added a small block-table refresh predicate;
+  - `ensure_paged_kv_capacity_for_state()` now returns early when existing
+    blocks already cover `target_len`;
+  - new block allocation and per-layer `block_table` device writes now happen
+    only when the sequence crosses into a new paged KV block;
+  - added a unit test for zero-length, in-block, and just-crossed-block
+    boundaries.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo check -p ferrum-models` PASS;
+  - `cargo test -p ferrum-models qwen35_paged -- --nocapture` PASS, including
+    `qwen35_paged_block_table_refreshes_only_on_new_block`;
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models dense_full_attention_backend_matches_reference_for_qwen35_gated_official_like_shape -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models full_attention_core_applies_qwen35_output_gate -- --nocapture`
+    PASS.
+- Status:
+  - this is a source-level performance candidate only;
+  - no CUDA artifact has measured ZZZ109+ZZZ110 yet, so there is no OOM-fixed,
+    release-ready, performance-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ109 — Qwen35 paged full-attention context-lens write trim candidate
 
 - Scope:
