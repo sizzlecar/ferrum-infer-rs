@@ -224,6 +224,11 @@ enum ModelAutoSizeClass {
     TightRecurrentState,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ModelAutoSizeHints {
+    has_recurrent_linear_attention_state: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ModelAutoSizeDefaults {
     max_batched_tokens: usize,
@@ -257,24 +262,30 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     let max_seqs_overridden = snapshot_value(&current, "FERRUM_PAGED_MAX_SEQS").is_some();
     let max_batched_tokens_overridden =
         snapshot_value(&current, "FERRUM_MAX_BATCHED_TOKENS").is_some();
-    let model_class = model_auto_size_class(model_dir);
-    let defaults = model_auto_size_defaults(model_class, profile);
+    let model_hints = model_auto_size_hints(model_dir);
     let mut entries = Vec::new();
     // ALL three knobs covered by the user — nothing to set.
     if kv_overridden && max_seqs_overridden && max_batched_tokens_overridden {
         return;
     }
+    let kv_pool_copies = kv_pool_copies_from_snapshot(&current);
+    let preliminary_result = auto_size_kv_blocks_with_pool_copies_for_snapshot(
+        model_dir,
+        gpu_util,
+        kv_pool_copies,
+        &current,
+    );
+    let model_class =
+        model_auto_size_class_from_hints_and_budget(model_hints, preliminary_result.as_ref());
+    let defaults = model_auto_size_defaults(model_class, profile);
     // Set MAX_BATCHED_TOKENS first so it lands even when the user overrode
     // FERRUM_KV_MAX_BLOCKS + FERRUM_PAGED_MAX_SEQS (apples bench does both,
     // which used to silently skip the Phase 3 scratch budget alongside).
     if !max_batched_tokens_overridden {
-        // 2048 is the safe generic default across both apples M2
-        // (Llama-INT4 8B, ~4 GB) and M3 (Qwen3-30B-A3B, ~17 GB weights +
-        // 1 GB scratch + 6 GB KV pool on 24 GB cards). Qwen3.5-35B-A3B
-        // GPTQ is much tighter on a 1x4090: the MoE prefill scratch grows
-        // with aggregate prefill tokens, and c16 diagnostics showed the
-        // 1016-token scratch shape OOMs while a 192-token aggregate budget
-        // completes cleanly.
+        // 2048 is the safe generic default across smaller dense and MoE GPTQ
+        // profiles. Tight recurrent-state models only use the smaller scratch
+        // profile when the measured weight/VRAM budget cannot cover that
+        // generic aggregate-prefill floor.
         let mbt = defaults.max_batched_tokens;
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_MAX_BATCHED_TOKENS",
@@ -290,17 +301,21 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         crate::runtime_env::materialize_runtime_env_defaults(&entries);
         return;
     }
-    let kv_pool_copies = kv_pool_copies_from_snapshot(&current);
     let mut budget_snapshot = current.clone();
     for entry in &entries {
         budget_snapshot.upsert_entry(entry.clone());
     }
-    let Some(result) = auto_size_kv_blocks_with_pool_copies_for_snapshot(
-        model_dir,
-        gpu_util,
-        kv_pool_copies,
-        &budget_snapshot,
-    ) else {
+    let result = if entries.is_empty() {
+        preliminary_result
+    } else {
+        auto_size_kv_blocks_with_pool_copies_for_snapshot(
+            model_dir,
+            gpu_util,
+            kv_pool_copies,
+            &budget_snapshot,
+        )
+    };
+    let Some(result) = result else {
         crate::runtime_env::materialize_runtime_env_defaults(&entries);
         return;
     };
@@ -424,21 +439,39 @@ fn model_auto_size_defaults(
     }
 }
 
-fn model_auto_size_class(model_dir: &Path) -> ModelAutoSizeClass {
+fn model_auto_size_hints(model_dir: &Path) -> ModelAutoSizeHints {
     let Ok(config_text) = std::fs::read_to_string(model_dir.join("config.json")) else {
-        return ModelAutoSizeClass::Generic;
+        return ModelAutoSizeHints::default();
     };
     let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_text) else {
-        return ModelAutoSizeClass::Generic;
+        return ModelAutoSizeHints::default();
     };
-    model_auto_size_class_from_config(&config)
+    model_auto_size_hints_from_config(&config)
 }
 
-fn model_auto_size_class_from_config(config: &serde_json::Value) -> ModelAutoSizeClass {
-    if !has_recurrent_linear_attention_state(config) || !is_gptq_int4_config(config) {
+fn model_auto_size_hints_from_config(config: &serde_json::Value) -> ModelAutoSizeHints {
+    ModelAutoSizeHints {
+        has_recurrent_linear_attention_state: has_recurrent_linear_attention_state(config),
+    }
+}
+
+fn model_auto_size_class_from_hints_and_budget(
+    hints: ModelAutoSizeHints,
+    budget: Option<&AutoSizeResult>,
+) -> ModelAutoSizeClass {
+    if !hints.has_recurrent_linear_attention_state {
         return ModelAutoSizeClass::Generic;
     }
-    ModelAutoSizeClass::TightRecurrentState
+    let Some(budget) = budget else {
+        return ModelAutoSizeClass::Generic;
+    };
+    let generic_prefill_blocks =
+        ceil_div_usize(DEFAULT_MAX_BATCHED_TOKENS, PAGED_BLOCK_SIZE as usize);
+    if budget.estimated_budget_blocks < generic_prefill_blocks {
+        ModelAutoSizeClass::TightRecurrentState
+    } else {
+        ModelAutoSizeClass::Generic
+    }
 }
 
 fn has_recurrent_linear_attention_state(config: &serde_json::Value) -> bool {
@@ -463,24 +496,6 @@ fn has_recurrent_linear_attention_state(config: &serde_json::Value) -> bool {
     .iter()
     .all(|key| text.get(*key).and_then(|value| value.as_u64()).is_some());
     has_linear_layers && has_linear_state_dims
-}
-
-fn is_gptq_int4_config(config: &serde_json::Value) -> bool {
-    let quant = config.get("quantization_config").or_else(|| {
-        config
-            .get("text_config")
-            .and_then(|text| text.get("quantization_config"))
-    });
-    let Some(quant) = quant else {
-        return false;
-    };
-    let method = quant
-        .get("quant_method")
-        .or_else(|| quant.get("type"))
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let bits = quant.get("bits").and_then(|value| value.as_u64());
-    method.eq_ignore_ascii_case("gptq") && bits == Some(4)
 }
 
 fn config_or_text_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
@@ -608,6 +623,23 @@ mod tests {
         RuntimeConfigSnapshot::from_env_vars(vars.iter().copied())
     }
 
+    fn budget_with_estimated_blocks(estimated_budget_blocks: usize) -> AutoSizeResult {
+        AutoSizeResult {
+            total_gpu_bytes: 24 * 1024 * 1024 * 1024,
+            free_gpu_bytes: 20 * 1024 * 1024 * 1024,
+            weight_bytes: 18 * 1024 * 1024 * 1024,
+            budgeted_weight_bytes: 18 * 1024 * 1024 * 1024,
+            weight_budget_shards: 1,
+            budgeted_layer_count: 40,
+            kv_block_bytes: 4 * 1024 * 1024,
+            kv_pool_copies: 1,
+            estimated_budget_blocks,
+            requested_min_blocks: 0,
+            max_blocks: estimated_budget_blocks,
+            reserved_for_scratch: SCRATCH_RESERVE_BYTES,
+        }
+    }
+
     #[test]
     fn fa_compatible_attention_paths_count_two_kv_pool_copies() {
         assert_eq!(kv_pool_copies_from_snapshot(&snapshot(&[])), 1);
@@ -690,26 +722,27 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_linear_attention_gptq_config_selects_tight_memory_profile() {
+    fn recurrent_linear_attention_budget_pressure_selects_tight_memory_profile() {
         let config = serde_json::json!({
-            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
-            "model_type": "qwen3_5_moe",
+            "architectures": ["SyntheticRecurrentStateModel"],
+            "model_type": "synthetic_recurrent_state",
             "text_config": {
-                "model_type": "qwen3_5_moe_text",
+                "model_type": "synthetic_recurrent_state_text",
                 "layer_types": ["linear_attention", "full_attention"],
                 "linear_conv_kernel_dim": 4,
                 "linear_key_head_dim": 128,
                 "linear_num_key_heads": 16,
                 "linear_num_value_heads": 16,
                 "linear_value_head_dim": 128
-            },
-            "quantization_config": {
-                "quant_method": "gptq",
-                "bits": 4
             }
         });
 
-        let class = model_auto_size_class_from_config(&config);
+        let hints = model_auto_size_hints_from_config(&config);
+        assert!(hints.has_recurrent_linear_attention_state);
+        let class = model_auto_size_class_from_hints_and_budget(
+            hints,
+            Some(&budget_with_estimated_blocks(127)),
+        );
         assert_eq!(class, ModelAutoSizeClass::TightRecurrentState);
         let server = model_auto_size_defaults(class, AutoSizeProfile::Server);
         assert_eq!(
@@ -730,9 +763,9 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_linear_attention_memory_profile_requires_gptq_int4() {
-        let non_int4 = serde_json::json!({
-            "model_type": "qwen3_5_moe",
+    fn recurrent_linear_attention_memory_profile_requires_budget_pressure() {
+        let recurrent = serde_json::json!({
+            "model_type": "synthetic_recurrent_state",
             "text_config": {
                 "layer_types": ["linear_attention", "full_attention"],
                 "linear_conv_kernel_dim": 4,
@@ -740,29 +773,32 @@ mod tests {
                 "linear_num_key_heads": 16,
                 "linear_num_value_heads": 16,
                 "linear_value_head_dim": 128
-            },
-            "quantization_config": {
-                "quant_method": "gptq",
-                "bits": 8
             }
         });
+        let hints = model_auto_size_hints_from_config(&recurrent);
         assert_eq!(
-            model_auto_size_class_from_config(&non_int4),
+            model_auto_size_class_from_hints_and_budget(
+                hints,
+                Some(&budget_with_estimated_blocks(128)),
+            ),
+            ModelAutoSizeClass::Generic
+        );
+        assert_eq!(
+            model_auto_size_class_from_hints_and_budget(hints, None),
             ModelAutoSizeClass::Generic
         );
 
-        let dense_gptq = serde_json::json!({
-            "model_type": "dense_gptq",
+        let dense = serde_json::json!({
+            "model_type": "dense",
             "text_config": {
                 "layer_types": ["full_attention", "full_attention"]
-            },
-            "quantization_config": {
-                "quant_method": "gptq",
-                "bits": 4
             }
         });
         assert_eq!(
-            model_auto_size_class_from_config(&dense_gptq),
+            model_auto_size_class_from_hints_and_budget(
+                model_auto_size_hints_from_config(&dense),
+                Some(&budget_with_estimated_blocks(0)),
+            ),
             ModelAutoSizeClass::Generic
         );
 
@@ -776,7 +812,7 @@ mod tests {
     #[test]
     fn autosize_dimension_lookup_falls_back_to_text_config() {
         let config = serde_json::json!({
-            "model_type": "qwen3_5_moe",
+            "model_type": "synthetic_text_wrapped_model",
             "text_config": {
                 "hidden_size": 2048,
                 "num_hidden_layers": 40,
