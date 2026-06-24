@@ -2,6 +2,57 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ137 — 38230397 c32 diagnostic regressed throughput; source change reverted
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_waiting_admission_backpressure_c32_38230397_20260624T200354Z/`;
+  - remote Git SHA: `38230397aab64aa8e34a96fe5dff551205b31b06`;
+  - diagnostic lane only, not release evidence, and did not run live vLLM;
+  - Vast instance `42216671` was reused, then stopped and confirmed
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`.
+- Source hypothesis tested:
+  - offline ZZZ136 trace plus local vLLM source showed that vLLM schedules
+    running requests before waiting requests and can reject waiting admission at
+    scheduler-side KV allocation;
+  - Ferrum candidate `38230397` suppressed waiting-request admission while
+    capacity backpressure was active and decode work was already scheduled.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-engine -p ferrum-scheduler -p ferrum-kv`
+    PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`.
+- c32 diagnostic result:
+  - bench completed normally: `bench_exit=0`;
+  - `completed_per_run=[32]`, `errored_per_run=[0]`;
+  - `output_token_count_source=usage`;
+  - output throughput mean: `189.94 tok/s`;
+  - request throughput mean: `1.48 req/s`;
+  - TTFT p50 mean: `2044.0 ms`;
+  - TPOT p50 mean: `107.7 ms`;
+  - `capacity_deferred_total=352`;
+  - `no_victim_warning_count=467`;
+  - `oom_mentions=0`.
+- Diagnosis:
+  - the candidate reduced capacity defers versus ZZZ136 (`352` vs `420`) but
+    reduced throughput (`189.94 tok/s` vs `202.45 tok/s`);
+  - trace parsing showed more decode-only time and lower steady decode
+    efficiency, so suppressing waiting admission starved useful replenishment
+    more than it removed capacity churn;
+  - this is not the right lever for the `671 tok/s` gap.
+- Source outcome:
+  - the candidate source change was reverted by
+    `b10e11a0 Revert "fix(scheduler): pause waiting admission under capacity backpressure"`;
+  - the branch should continue from the ZZZ136 behavior, not from the
+    38230397 candidate.
+- Limits:
+  - no W3 PASS line exists;
+  - this does not prove W3 performance or release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ136 — 2bc1e6bb c32 diagnostic completes; starvation fixed, throughput still low
 
 - Artifact:
