@@ -2,6 +2,48 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ112 — Qwen35 paged full-attention reuses scratch output as context
+
+- Scope:
+  - continued from the ZZZ111/negative pair-ids evidence without starting a GPU
+    and without running live vLLM;
+  - reviewed the latest c16 scheduler traces and profile artifacts before
+    changing code;
+  - kept the change path/semantics based, with no model-name, VRAM-size, or
+    hard-coded concurrency special case.
+- Evidence reviewed:
+  - ZZZ111 scheduler trace shows c16 scheduling overhead is negligible
+    (`schedule` around `16us`) while model `process` time dominates
+    (`batch=16` decode around `15ms/step`);
+  - ZZZ106 profile still points at decode-layer work rather than scheduler
+    idling; routed MoE bucket GEMM is not the next first lever;
+  - Qwen35 graph mode remains disabled because Qwen35 has no graph capture
+    wrapper and its MoE path is not marked graph-safe, so enabling graph by
+    default would be a larger correctness-sensitive change.
+- Source change:
+  - in Qwen35 paged full-attention prefill, batched decode, and stateful paths,
+    the paged attention output scratch buffer is now used directly as the
+    attention context;
+  - when the Qwen3.5 attention output gate is present, the gate is applied
+    in-place to that scratch buffer before `o_proj`;
+  - this removes a temporary context allocation and `copy_slice` after paged
+    attention in each affected full-attention path.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-models` PASS;
+  - `cargo test -p ferrum-models qwen35_paged -- --nocapture` PASS;
+  - `cargo test -p ferrum-models dense_full_attention_backend_matches_reference_for_qwen35_gated_official_like_shape -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models full_attention_core_applies_qwen35_output_gate -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models qwen35_decode_merge_policy_preserves_legacy_no_policy_contract -- --nocapture`
+    PASS.
+- Status:
+  - source-level candidate only; no CUDA throughput artifact has measured it
+    yet;
+  - no OOM-fixed, release-ready, performance-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ111 — Qwen35 block-table skip c16 quick diagnostic on 1x4090
 
 - Scope:
