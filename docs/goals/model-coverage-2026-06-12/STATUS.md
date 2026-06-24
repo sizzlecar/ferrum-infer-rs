@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ140 — keep capacity backpressure through decode progress; local source validation only
+
+- Source diagnosis from ZZZ139:
+  - `a0f1c444` removed the OOM/direct-fatal symptom and improved c32 diagnostic
+    throughput to `258.27 tok/s`, but the scheduler trace still showed
+    `capacity_deferred_total=1594`;
+  - offline trace parsing showed many fast prefill-only failure iterations:
+    pure prefill batches immediately deferred without useful model work, while
+    decode work ran in adjacent iterations;
+  - the repeated pattern came from capacity backpressure being relaxed by
+    decode-token progress even though decode consumes KV capacity and does not
+    free space for waiting prefills.
+- Source change:
+  - `ContinuousBatchScheduler::update_decode_progress()` no longer calls
+    `record_resource_progress()`;
+  - capacity backpressure is still relaxed by real prefill progress and
+    completion paths, but not by ordinary decode steps;
+  - added regression test
+    `decode_progress_does_not_relax_capacity_backpressure`.
+- Why:
+  - this preserves the useful part of ZZZ139's KV admission fix while avoiding
+    the fill-first oscillation where a decode step reopens wide waiting
+    admission, then the next iteration schedules capacity-blocked prefills
+    again;
+  - this is narrower than the reverted ZZZ137 waiting-admission suppression:
+    it does not globally stop useful prefill refill, it only prevents decode
+    progress from being treated as a resource-release signal.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-scheduler --lib -- --nocapture` PASS, `65` tests;
+  - `cargo check -p ferrum-engine -p ferrum-scheduler` PASS.
+- Limits:
+  - no paid GPU was run for this source edit yet;
+  - no CUDA c32 diagnostic exists yet for this candidate;
+  - no live vLLM was run;
+  - no W3 PASS line exists;
+  - this does not prove W3 performance or release readiness.
+
 ## 2026-06-25 ZZZ139 — a0f1c444 c32 diagnostic completes; OOM gone, throughput still far from target
 
 - Artifact:

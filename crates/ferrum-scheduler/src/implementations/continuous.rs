@@ -1002,16 +1002,12 @@ impl ContinuousBatchScheduler {
     /// Update decode progress for a request
     pub fn update_decode_progress(&self, request_id: &RequestId, tokens_generated: usize) {
         let mut decode_queue = self.decode_queue.write();
-        let mut made_progress = false;
         if let Some(req) = decode_queue.get_mut(request_id) {
-            made_progress = tokens_generated > req.decode_tokens;
             req.decode_tokens = tokens_generated;
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
         }
-        drop(decode_queue);
-        if made_progress {
-            self.record_resource_progress();
-        }
+        // Decode progress consumes KV capacity; only actual prefill progress or
+        // completion should relax capacity backpressure.
     }
 }
 
@@ -2117,6 +2113,73 @@ mod tests {
         assert_eq!(
             scheduled_decodes, 3,
             "capacity backpressure must let decode-ready requests run instead of repeatedly admitting a capacity-blocked prefill"
+        );
+    }
+
+    #[test]
+    fn decode_progress_does_not_relax_capacity_backpressure() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            prompt_token_estimate: true,
+            prefill_first_until_active: Some(4),
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 512,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 4);
+        let first_ids: Vec<RequestId> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for id in first_ids.iter().take(3) {
+            scheduler.mark_prefill_complete(id, 128);
+        }
+        assert!(scheduler.defer_prefill_to_waiting(&first_ids[3]));
+        assert_eq!(
+            scheduler.trace_snapshot().capacity_backpressure_admit_limit,
+            Some(1)
+        );
+
+        for id in first_ids.iter().take(3) {
+            scheduler.update_decode_progress(id, 1);
+        }
+        assert_eq!(
+            scheduler.trace_snapshot().capacity_backpressure_admit_limit,
+            Some(1),
+            "decode progress consumes KV capacity and must not reopen waiting admission"
+        );
+
+        let second_batch = scheduler.create_iteration_batch(hint).unwrap();
+        let scheduled_decodes = second_batch
+            .requests
+            .iter()
+            .filter(|request| {
+                first_ids[..3].contains(&request.request.id) && request.tokens_to_process == Some(1)
+            })
+            .count();
+        assert_eq!(
+            scheduled_decodes, 3,
+            "capacity backpressure should keep fill-first from skipping decode after decode progress"
+        );
+        assert_eq!(
+            second_batch.requests.len(),
+            4,
+            "one capacity-limited prefill may still refill the remaining batch slot"
         );
     }
 
