@@ -1,0 +1,64 @@
+{
+  "bench_exit": "143",
+  "build_exit": "0",
+  "cargo_check_exit": "0",
+  "failure": "c32 bench scheduler empty-progress loop after capacity defer fix",
+  "manual_stop": true,
+  "manual_stop_reason": "Manual stop: c32 bench made no progress after short stall sample. completed_total remained 5 while scheduler iterations/admitted_total increased rapidly, active_len returned to 0 after every scheduled prefill batch, GPU util stayed 0%, and logs repeated Unified prefill alloc deferred: no victim. Stop condition triggered to avoid waiting full 600s timeout.",
+  "run_exit": "0",
+  "run_stdout_last": "{\"event\":\"assistant\",\"turn\":0,\"content\":\"5\",\"finish_reason\":\"stop\",\"n_tokens\":2,\"chunk_count\":1,\"ms\":483.70680799999997}",
+  "scheduler_first_valid": {
+    "active_len": 1,
+    "admitted_total": 1,
+    "cancelled_total": 0,
+    "completed_total": 0,
+    "decode_items": 0,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "iteration": 0,
+    "prefill_items": 1,
+    "prefill_queue_len": 1,
+    "result": "some_ok",
+    "scheduled_tokens_total": 6,
+    "waiting_queue_len": 0
+  },
+  "scheduler_last_valid": {
+    "active_len": 0,
+    "admitted_total": 604315,
+    "cancelled_total": 65,
+    "completed_total": 5,
+    "decode_items": 0,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "iteration": 19306,
+    "prefill_items": 32,
+    "prefill_queue_len": 0,
+    "result": "some_ok",
+    "scheduled_tokens_total": 192,
+    "waiting_queue_len": 32
+  },
+  "scheduler_trace_invalid_lines": 1,
+  "scheduler_trace_line_count": 19097,
+  "serve_chat_smoke_response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "5",
+          "role": "assistant"
+        }
+      }
+    ],
+    "created": 1782318408,
+    "id": "9f840fcc-fd27-4e27-881a-da67a914a1c4",
+    "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 2,
+      "prompt_tokens": 25,
+      "total_tokens": 27
+    }
+  },
+  "status": "failed"
+}

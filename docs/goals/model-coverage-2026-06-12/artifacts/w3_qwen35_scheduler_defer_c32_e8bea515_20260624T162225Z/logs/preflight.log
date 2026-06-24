@@ -1,0 +1,9 @@
+lane=w3-qwen35-e8bea515-scheduler-defer-c32-diagnostic
+expected_runtime_cost=15-35min at dph_total about 0.4777777778/hr if target cache is retained
+stop_condition=stop after build/run/serve/c32 diagnostic pass or first failure/stall evidence
+model=Qwen/Qwen3.5-35B-A3B-GPTQ-Int4
+tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+dataset=/workspace/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl
+repo=/workspace/ferrum-infer-rs
+art=/workspace/artifacts/w3_qwen35_scheduler_defer_c32_e8bea515_20260624T162225Z
+port=55989

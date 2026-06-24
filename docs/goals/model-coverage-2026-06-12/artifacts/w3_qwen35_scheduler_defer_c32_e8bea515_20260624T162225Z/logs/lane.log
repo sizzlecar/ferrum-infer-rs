@@ -1,0 +1,16 @@
+2026-06-24T16:22:25Z lane_start art=/workspace/artifacts/w3_qwen35_scheduler_defer_c32_e8bea515_20260624T162225Z sha=e8bea515f257bc6545abcee34b96e92db4d4ce65 release_evidence=false no_live_vllm=true
+2026-06-24T16:22:25Z git_sync_start
+2026-06-24T16:22:26Z git_sync_done
+2026-06-24T16:22:26Z cargo_check_start
+2026-06-24T16:22:41Z cargo_check_done
+2026-06-24T16:22:41Z release_build_start
+2026-06-24T16:25:53Z release_build_done
+2026-06-24T16:25:53Z ferrum_run_smoke_start
+2026-06-24T16:26:22Z ferrum_run_smoke_done
+2026-06-24T16:26:22Z serve_start
+2026-06-24T16:26:48Z serve_ready
+2026-06-24T16:26:48Z serve_chat_smoke_done
+2026-06-24T16:26:48Z bench_c32_start
+2026-06-24T16:28:40Z bench_c32_failed exit=143
+finished_at=2026-06-24T16:28:40Z
+exit_code=50
