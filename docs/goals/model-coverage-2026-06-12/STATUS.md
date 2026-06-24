@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ117 — Qwen35 next lever shifts away from scratch micro-tweaks
+
+- Scope:
+  - continued after pushing ZZZ116, without starting GPU and without running
+    live vLLM;
+  - compared only against checked-in historical Ferrum/vLLM-era artifacts and
+    local source;
+  - goal was to avoid another low-return allocation patch unless the source
+    proved an actually active release path still missed existing scratch.
+- Historical c16 diagnostic comparison:
+  - ZZZ109 linear scratch quick:
+    `678.630239827307` output tok/s, p95 ITL `20.23245625` ms, `32/32`
+    completed, `0` errors;
+  - ZZZ111 block-table skip quick:
+    `688.1409470636319` output tok/s, p95 ITL `20.0247894` ms, `32/32`
+    completed, `0` errors;
+  - ZZZ113 paged-context scratch quick:
+    `685.9364276426528` output tok/s, p95 ITL `19.820438` ms, `32/32`
+    completed, `0` errors;
+  - pair-ids default-off quick:
+    `659.6912913078381` output tok/s, p95 ITL `20.472324999999994` ms,
+    `32/32` completed, `0` errors.
+- Profile/source finding:
+  - release-style scheduler trace still shows `schedule` time is tiny compared
+    with `process` time; c16 decode process examples are around `18.9ms`;
+  - the low-overhead direction is model execution, not scheduler policy;
+  - the layer-detail profile is diagnostic-only and inflates absolute timings,
+    but its relative split points at Qwen35 linear decode:
+    batch-16 `qwen35_decode_prof` rows average `linear_layer_sum` around
+    `61761us` vs `full_layer_sum` around `13450us`;
+  - batch-16 `qwen35_linear_decode_detail` rows average `mlp` around
+    `1176us/layer`, while indexed recurrent core is only around `114us/layer`
+    and `qkvz_proj` around `81us/layer`;
+  - the obvious `linear_delta_*` scratch buffers are already used by
+    `qwen35_linear_attention_decode_batch_layer_backend_packed_scratch`, which
+    is the packed indexed + F32 residual + decode-scratch path; adding the same
+    reuse to that active path would be duplicate work.
+- Direction:
+  - stop treating per-layer scratch allocation/copy trims as the primary W3
+    lever unless fresh evidence contradicts the flat c16 quick results;
+  - next non-hard-coded candidate should target either graph/launch overhead
+    for Qwen35 decode or the sparse-MoE/shared-expert MLP execution structure;
+  - do not make a default graph change without a correctness gate and product
+    `run`/`serve` validation because Qwen35 graph support is not release-proven.
+- Status:
+  - analysis/handoff record only; no source change in this entry;
+  - no OOM-fixed, release-ready, performance-ready, or W3 PASS claim;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ116 — Qwen35 full-attention decode reuses F32 residual output scratch
 
 - Scope:
