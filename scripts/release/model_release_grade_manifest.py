@@ -1363,6 +1363,19 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
             ],
         },
     )
+    for rel_path in [
+        "behavior/01_multi_turn.response.json",
+        "behavior/02_stream_match_stream.response.sse",
+        "behavior/03_natural_eos.response.json",
+        "behavior/04_custom_stop.response.json",
+        "behavior/05_reasoning_extraction.response.json",
+        "behavior/06_multi_turn_repeat.response.json",
+        "behavior/07_stop_repeat.response.json",
+    ]:
+        path = root / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("data: [DONE]\n" if rel_path.endswith(".sse") else "{}\n")
+
     write_json(
         root / "l3.json",
         {
@@ -1426,6 +1439,15 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
             ],
         },
     )
+    for idx in range(10):
+        path = root / "tool_calls" / f"tool_{idx:02d}.response.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+    for idx in range(20):
+        path = root / "strict_schema" / f"strict_schema_{idx:02d}.response.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+
     write_json(
         root / "l4.json",
         {
@@ -1446,11 +1468,21 @@ def write_selftest_w3_l0_l5(root: Path) -> None:
                 "response_format_400": True,
             },
             "tool_call_cases": [
-                {"id": f"tool_{idx:02d}", "passed": True, "finish_reason": "tool_calls"}
+                {
+                    "id": f"tool_{idx:02d}",
+                    "passed": True,
+                    "finish_reason": "tool_calls",
+                    "artifact": f"tool_calls/tool_{idx:02d}.response.json",
+                }
                 for idx in range(10)
             ],
             "strict_schema_cases": [
-                {"id": f"strict_schema_{idx:02d}", "passed": True, "finish_reason": "stop"}
+                {
+                    "id": f"strict_schema_{idx:02d}",
+                    "passed": True,
+                    "finish_reason": "stop",
+                    "artifact": f"strict_schema/strict_schema_{idx:02d}.response.json",
+                }
                 for idx in range(20)
             ],
         },

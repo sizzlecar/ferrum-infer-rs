@@ -1315,7 +1315,13 @@ def validate_w3_l2_artifact(data: dict[str, Any], label: str, problems: list[str
     validate_l2_product_commands(data.get("commands"), label, problems)
 
 
-def validate_w3_l3_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
+def validate_w3_l3_artifact(
+    data: dict[str, Any],
+    label: str,
+    problems: list[str],
+    out_dir: Path,
+    artifact_base_dir: Path | None,
+) -> None:
     behavior = as_object(data.get("behavior"), f"{label}.behavior", problems)
     for key in [
         "multi_turn",
@@ -1328,7 +1334,14 @@ def validate_w3_l3_artifact(data: dict[str, Any], label: str, problems: list[str
     ]:
         require_true(behavior.get(key), f"{label}.behavior.{key}", problems)
     require_passed_total(behavior, "cases_total", "cases_passed", 5, f"{label}.behavior", problems)
-    validate_w3_l3_cases(data.get("cases", data.get("behavior_cases")), behavior, label, problems)
+    validate_w3_l3_cases(
+        data.get("cases", data.get("behavior_cases")),
+        behavior,
+        label,
+        problems,
+        out_dir,
+        artifact_base_dir,
+    )
 
 
 def validate_w3_l3_cases(
@@ -1336,6 +1349,8 @@ def validate_w3_l3_cases(
     behavior: dict[str, Any],
     label: str,
     problems: list[str],
+    out_dir: Path,
+    artifact_base_dir: Path | None,
 ) -> None:
     cases = as_list(raw_cases, f"{label}.cases", problems)
     expected_total = behavior.get("cases_total")
@@ -1358,7 +1373,13 @@ def validate_w3_l3_cases(
             continue
         case_id = non_empty_string(case.get("id"), f"{case_label}.id", problems)
         require_true(case.get("passed"), f"{case_label}.passed", problems)
-        non_empty_string(case.get("artifact"), f"{case_label}.artifact", problems)
+        require_artifact(
+            case.get("artifact"),
+            f"{case_label}.artifact",
+            out_dir,
+            problems,
+            base_dir=artifact_base_dir,
+        )
         detail = as_object(case.get("detail", {}), f"{case_label}.detail", problems)
         if case_id is not None:
             seen.add(case_id)
@@ -1387,7 +1408,13 @@ def validate_w3_l3_cases(
             problems.append(f"{label}.cases.stream_nonstream_match.detail.stream_usage_chunks must be >= 1")
 
 
-def validate_w3_l4_artifact(data: dict[str, Any], label: str, problems: list[str]) -> None:
+def validate_w3_l4_artifact(
+    data: dict[str, Any],
+    label: str,
+    problems: list[str],
+    out_dir: Path,
+    artifact_base_dir: Path | None,
+) -> None:
     agent = as_object(data.get("agent"), f"{label}.agent", problems)
     if not agent:
         return
@@ -1417,6 +1444,8 @@ def validate_w3_l4_artifact(data: dict[str, Any], label: str, problems: list[str
         expected_total=agent.get("tool_calls_total"),
         expected_finish_reason="tool_calls",
         problems=problems,
+        out_dir=out_dir,
+        artifact_base_dir=artifact_base_dir,
     )
     validate_l4_case_list(
         data.get("strict_schema_cases"),
@@ -1424,6 +1453,8 @@ def validate_w3_l4_artifact(data: dict[str, Any], label: str, problems: list[str
         expected_total=agent.get("strict_schema_total"),
         expected_finish_reason=None,
         problems=problems,
+        out_dir=out_dir,
+        artifact_base_dir=artifact_base_dir,
     )
 
 
@@ -1434,6 +1465,8 @@ def validate_l4_case_list(
     expected_total: Any,
     expected_finish_reason: str | None,
     problems: list[str],
+    out_dir: Path,
+    artifact_base_dir: Path | None,
 ) -> None:
     cases = as_list(raw_cases, label, problems)
     if isinstance(expected_total, int) and not isinstance(expected_total, bool):
@@ -1446,6 +1479,13 @@ def validate_l4_case_list(
             continue
         non_empty_string(case.get("id"), f"{case_label}.id", problems)
         require_true(case.get("passed"), f"{case_label}.passed", problems)
+        require_artifact(
+            case.get("artifact"),
+            f"{case_label}.artifact",
+            out_dir,
+            problems,
+            base_dir=artifact_base_dir,
+        )
         finish_reason = case.get("finish_reason")
         if expected_finish_reason is not None and finish_reason != expected_finish_reason:
             problems.append(f"{case_label}.finish_reason must be {expected_finish_reason}")
@@ -1545,9 +1585,10 @@ def validate_w3_l0_l5_artifact(
     problems: list[str],
 ) -> None:
     label = f"correctness.{key}"
-    data = load_first_artifact_object(entry, label, out_dir, problems)
+    data, artifact_path = load_first_artifact_object_with_path(entry, label, out_dir, problems)
     if not data:
         return
+    artifact_base_dir = artifact_path.parent if artifact_path is not None else None
     validate_w3_l0_l5_common(data, key, label, problems)
     if key == "l0_template":
         validate_w3_l0_artifact(data, label, problems)
@@ -1556,9 +1597,9 @@ def validate_w3_l0_l5_artifact(
     elif key == "l2_quantized":
         validate_w3_l2_artifact(data, label, problems)
     elif key == "l3_behavior":
-        validate_w3_l3_artifact(data, label, problems)
+        validate_w3_l3_artifact(data, label, problems, out_dir, artifact_base_dir)
     elif key == "l4_agent":
-        validate_w3_l4_artifact(data, label, problems)
+        validate_w3_l4_artifact(data, label, problems, out_dir, artifact_base_dir)
     elif key == "l5_concurrency":
         validate_w3_l5_artifact(data, label, problems)
 
@@ -2413,6 +2454,19 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
             ],
         },
     )
+    for rel_path in [
+        "behavior/01_multi_turn.response.json",
+        "behavior/02_stream_match_stream.response.sse",
+        "behavior/03_natural_eos.response.json",
+        "behavior/04_custom_stop.response.json",
+        "behavior/05_reasoning_extraction.response.json",
+        "behavior/06_multi_turn_repeat.response.json",
+        "behavior/07_stop_repeat.response.json",
+    ]:
+        path = root / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("data: [DONE]\n" if rel_path.endswith(".sse") else "{}\n", encoding="utf-8")
+
     write_json(
         root / "l3.json",
         {
@@ -2476,6 +2530,15 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
             ],
         },
     )
+    for idx in range(10):
+        path = root / "tool_calls" / f"tool_{idx:02d}.response.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+    for idx in range(20):
+        path = root / "strict_schema" / f"strict_schema_{idx:02d}.response.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+
     write_json(
         root / "l4.json",
         {
@@ -2496,11 +2559,21 @@ def write_selftest_w3_l0_l5_artifacts(root: Path) -> None:
                 "response_format_400": True,
             },
             "tool_call_cases": [
-                {"id": f"tool_{idx:02d}", "passed": True, "finish_reason": "tool_calls"}
+                {
+                    "id": f"tool_{idx:02d}",
+                    "passed": True,
+                    "finish_reason": "tool_calls",
+                    "artifact": f"tool_calls/tool_{idx:02d}.response.json",
+                }
                 for idx in range(10)
             ],
             "strict_schema_cases": [
-                {"id": f"strict_schema_{idx:02d}", "passed": True, "finish_reason": "stop"}
+                {
+                    "id": f"strict_schema_{idx:02d}",
+                    "passed": True,
+                    "finish_reason": "stop",
+                    "artifact": f"strict_schema/strict_schema_{idx:02d}.response.json",
+                }
                 for idx in range(20)
             ],
         },
@@ -3122,6 +3195,24 @@ def run_selftest() -> int:
         ):
             raise AssertionError("bad W3 L3 stream selftest did not fail as expected")
 
+        bad_w3_l3_artifact = tmp_root / "bad-w3-l3-artifact"
+        bad_w3_l3_artifact_manifest = write_selftest_manifest(
+            bad_w3_l3_artifact,
+            lane="w3",
+            ratio=0.82,
+        )
+        (bad_w3_l3_artifact / "behavior/03_natural_eos.response.json").unlink()
+        bad_w3_l3_artifact_problems = validate_manifest(
+            load_json(bad_w3_l3_artifact_manifest),
+            "w3",
+            bad_w3_l3_artifact,
+        )
+        if not any(
+            "correctness.l3_behavior.cases[2].artifact artifact missing" in problem
+            for problem in bad_w3_l3_artifact_problems
+        ):
+            raise AssertionError("bad W3 L3 missing-artifact selftest did not fail as expected")
+
         bad_w3_l4 = tmp_root / "bad-w3-l4-schema-count"
         bad_w3_l4_manifest = write_selftest_manifest(bad_w3_l4, lane="w3", ratio=0.82)
         l4_agent = load_json(bad_w3_l4 / "l4.json")
@@ -3143,6 +3234,20 @@ def run_selftest() -> int:
         )
         if not any("correctness.l4_agent.tool_call_cases[0].passed" in problem for problem in bad_w3_l4_case_problems):
             raise AssertionError("bad W3 L4 case selftest did not fail as expected")
+
+        bad_w3_l4_artifact = tmp_root / "bad-w3-l4-artifact"
+        bad_w3_l4_artifact_manifest = write_selftest_manifest(bad_w3_l4_artifact, lane="w3", ratio=0.82)
+        (bad_w3_l4_artifact / "tool_calls/tool_00.response.json").unlink()
+        bad_w3_l4_artifact_problems = validate_manifest(
+            load_json(bad_w3_l4_artifact_manifest),
+            "w3",
+            bad_w3_l4_artifact,
+        )
+        if not any(
+            "correctness.l4_agent.tool_call_cases[0].artifact artifact missing" in problem
+            for problem in bad_w3_l4_artifact_problems
+        ):
+            raise AssertionError("bad W3 L4 missing-artifact selftest did not fail as expected")
 
         bad_w3_l5 = tmp_root / "bad-w3-l5-error-count"
         bad_w3_l5_manifest = write_selftest_manifest(bad_w3_l5, lane="w3", ratio=0.82)
