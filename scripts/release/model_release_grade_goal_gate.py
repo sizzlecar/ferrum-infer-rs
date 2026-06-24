@@ -740,7 +740,7 @@ def validate_w3_fixed_output_contract(
         baseline_command,
         f"{label}.baseline",
         problems,
-        require_ignore_eos=True,
+        require_ignore_eos=False,
     )
     if expected is not None and baseline_expected is not None and expected != baseline_expected:
         problems.append(
@@ -815,13 +815,20 @@ def validate_w3_fixed_output_contract(
         problems,
     )
     if baseline_path is not None:
+        baseline_concurrency = positive_int(
+            cell.get("baseline_measured_concurrency", concurrency),
+            f"{label}.baseline_measured_concurrency",
+            problems,
+        )
         baseline_report = report_cells_by_concurrency(
             baseline_path,
             f"{label}.baseline.artifact",
             problems,
-        ).get(concurrency)
+        ).get(baseline_concurrency or concurrency)
         if baseline_report is None:
-            problems.append(f"{label}.baseline.artifact missing c={concurrency} report")
+            problems.append(
+                f"{label}.baseline.artifact missing c={baseline_concurrency or concurrency} report"
+            )
         validate_report_output_tokens(
             report=baseline_report,
             matrix=baseline_tokens,
@@ -3966,27 +3973,52 @@ def run_selftest() -> int:
         ):
             raise AssertionError("bad W3 missing ignore-eos selftest did not fail as expected")
 
-        bad_w3_baseline_ignore_eos = tmp_root / "bad-w3-baseline-missing-ignore-eos"
-        bad_w3_baseline_ignore_eos_manifest = write_selftest_manifest(
-            bad_w3_baseline_ignore_eos,
+        historical_w3_baseline_ignore_eos = tmp_root / "historical-w3-baseline-missing-ignore-eos"
+        historical_w3_baseline_ignore_eos_manifest = write_selftest_manifest(
+            historical_w3_baseline_ignore_eos,
             lane="w3",
             ratio=0.82,
         )
-        data = load_json(bad_w3_baseline_ignore_eos_manifest)
+        data = load_json(historical_w3_baseline_ignore_eos_manifest)
         baseline_command = data["performance"]["cells"][0]["baseline_bench_command_line"]
         baseline_command.remove("--ignore-eos")
-        write_json(bad_w3_baseline_ignore_eos_manifest, data)
-        bad_w3_baseline_ignore_eos_problems = validate_manifest(
+        write_json(historical_w3_baseline_ignore_eos_manifest, data)
+        historical_w3_baseline_ignore_eos_problems = validate_manifest(
             data,
             "w3",
-            bad_w3_baseline_ignore_eos,
+            historical_w3_baseline_ignore_eos,
         )
-        if not any(
+        if any(
             "performance.c1.baseline command missing --ignore-eos" in problem
-            for problem in bad_w3_baseline_ignore_eos_problems
+            for problem in historical_w3_baseline_ignore_eos_problems
         ):
             raise AssertionError(
-                "bad W3 baseline missing ignore-eos selftest did not fail as expected"
+                "historical W3 baseline missing ignore-eos should rely on observed fixed-output report"
+            )
+
+        bad_w3_baseline_observed_tokens = tmp_root / "bad-w3-baseline-observed-tokens"
+        bad_w3_baseline_observed_tokens_manifest = write_selftest_manifest(
+            bad_w3_baseline_observed_tokens,
+            lane="w3",
+            ratio=0.82,
+        )
+        data = load_json(bad_w3_baseline_observed_tokens_manifest)
+        baseline_command = data["performance"]["cells"][0]["baseline_bench_command_line"]
+        baseline_command.remove("--ignore-eos")
+        data["performance"]["cells"][0]["baseline_output_tokens_per_request"][0][0] = 45
+        write_json(bad_w3_baseline_observed_tokens_manifest, data)
+        bad_w3_baseline_observed_tokens_problems = validate_manifest(
+            data,
+            "w3",
+            bad_w3_baseline_observed_tokens,
+        )
+        if not any(
+            "performance.c1.baseline_output_tokens_per_request[0] must equal --random-output-len 128"
+            in problem
+            for problem in bad_w3_baseline_observed_tokens_problems
+        ):
+            raise AssertionError(
+                "bad W3 baseline observed output-token selftest did not fail as expected"
             )
 
         bad_w3_baseline_measured = tmp_root / "bad-w3-baseline-measured-concurrency"
