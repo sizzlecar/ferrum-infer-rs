@@ -3039,6 +3039,70 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    fn qwen35_apply_token_gate_and_add_inplace(
+        ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        values: &mut Self::Buffer,
+        gate: &Self::Buffer,
+        tokens: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        if tokens == 0 || hidden_size == 0 {
+            return Ok(());
+        }
+        let expected = tokens * hidden_size;
+        if dst.len() < expected || values.len() < expected || gate.len() < tokens {
+            return Err(FerrumError::model(format!(
+                "qwen35_apply_token_gate_and_add_inplace buffer too small: dst={} values={} gate={} expected={} gate_expected={}",
+                dst.len(),
+                values.len(),
+                gate.len(),
+                expected,
+                tokens
+            )));
+        }
+        if dst.dtype() != values.dtype() || dst.dtype() != gate.dtype() {
+            return Err(FerrumError::model(format!(
+                "qwen35_apply_token_gate_and_add_inplace dtype mismatch: dst={} values={} gate={}",
+                dst.dtype().name(),
+                values.dtype().name(),
+                gate.dtype().name()
+            )));
+        }
+
+        let func_name = match dst.dtype() {
+            crate::backend::Dtype::F16 => "qwen35_apply_token_gate_and_add_inplace_f16",
+            crate::backend::Dtype::F32 => "qwen35_apply_token_gate_and_add_inplace_f32",
+            dtype => {
+                return Err(FerrumError::model(format!(
+                    "qwen35_apply_token_gate_and_add_inplace unsupported dtype {}",
+                    dtype.name()
+                )))
+            }
+        };
+        let func = ctx.func("qk_norm_rope_gate", ptx::QK_NORM_ROPE, func_name);
+        let tokens_i32 = tokens as i32;
+        let hidden_i32 = hidden_size as i32;
+        let block = 256u32;
+        let grid = ((expected as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(dst);
+        b.arg(values);
+        b.arg(gate);
+        b.arg(&tokens_i32);
+        b.arg(&hidden_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qwen35_apply_token_gate_and_add_inplace: {e}")))?;
+        Ok(())
+    }
+
     fn qwen35_interleave_gate_up(
         ctx: &mut Self::Context,
         gate: &Self::Buffer,

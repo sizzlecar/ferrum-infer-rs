@@ -983,6 +983,28 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Apply one scalar gate per token to `values`, then add the gated values
+    /// into `dst` in place:
+    /// `values[token, dim] *= sigmoid(gate[token])`;
+    /// `dst[token, dim] += values[token, dim]`.
+    ///
+    /// The default preserves the old two-dispatch behavior. CUDA overrides
+    /// this for Qwen3.5 sparse-MoE shared-expert decode, where it removes the
+    /// separate token-gate and merge launches while keeping the gated
+    /// `values` buffer available for tracing/debugging.
+    fn qwen35_apply_token_gate_and_add_inplace(
+        ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        values: &mut Self::Buffer,
+        gate: &Self::Buffer,
+        tokens: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        Self::qwen35_apply_token_gate(ctx, values, gate, tokens, hidden_size)?;
+        Self::add_inplace(ctx, dst, values, tokens * hidden_size);
+        Ok(())
+    }
+
     /// Interleave shared-expert gate/up projections from token-major
     /// `[tokens, intermediate]` buffers into `[tokens, 2 * intermediate]`.
     ///
