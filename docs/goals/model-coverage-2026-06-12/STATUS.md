@@ -2,6 +2,40 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ99 — W3 lane runner no longer reroutes valid historical vLLM baseline to live vLLM
+
+- Scope:
+  - aligned `scripts/release/w3_qwen35_cuda_release_lane.py` with the W3 final
+    gate's historical baseline rule;
+  - historical vLLM baseline commands may omit `--ignore-eos` only when the
+    saved report proves fixed output through usage-based
+    `output_tokens_per_request` matrices;
+  - runner self-test now accepts the checked-in historical baseline by observed
+    fixed output and rejects a missing-`--ignore-eos` baseline if any saved
+    output length differs from `128`.
+- Why:
+  - the previous runner preflight still rejected the same historical vLLM
+    baseline that the final gate now accepts, so `--baseline-mode auto` could
+    incorrectly fall through to a live vLLM rerun despite the user's instruction
+    to use historical vLLM data only.
+- Result:
+  - no live vLLM run is needed for the checked-in historical baseline;
+  - current evidence diagnostic remains blocked only by performance:
+    c1/c4/c16/c32 throughput ratio below `0.800` and p95 ITL above `1.25x`
+    baseline.
+- Validation:
+  - `python3 -m py_compile scripts/release/w3_qwen35_cuda_release_lane.py scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py`;
+  - `python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --config docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json` produced the expected diagnostic `MODEL_RELEASE_GRADE_W3 FAIL (8 problems)`;
+  - `git diff --check`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - this is lane-runner/evidence alignment, not new performance evidence;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ98 — Historical vLLM fixed-output evidence is accepted by observation
 
 - Scope:

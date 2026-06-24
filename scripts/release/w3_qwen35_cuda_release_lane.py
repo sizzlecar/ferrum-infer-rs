@@ -802,7 +802,12 @@ def flag_values(parts: list[str], flag: str) -> list[str]:
     return values
 
 
-def command_file_fixed_output_ok(path: Path, label: str) -> tuple[bool, list[str]]:
+def command_file_fixed_output_ok(
+    path: Path,
+    label: str,
+    *,
+    require_ignore_eos: bool,
+) -> tuple[bool, list[str]]:
     problems: list[str] = []
     if not path.is_file():
         return False, [f"{label} missing: {path}"]
@@ -810,7 +815,7 @@ def command_file_fixed_output_ok(path: Path, label: str) -> tuple[bool, list[str
         parts = shlex.split(path.read_text(encoding="utf-8").strip())
     except ValueError as exc:
         return False, [f"{label} is not a valid shell command: {exc}"]
-    if not has_flag(parts, "--ignore-eos"):
+    if require_ignore_eos and not has_flag(parts, "--ignore-eos"):
         problems.append(f"{label} missing --ignore-eos")
     values = flag_values(parts, "--random-output-len")
     if values != [str(EXPECTED_OUTPUT_LEN)]:
@@ -911,6 +916,7 @@ def historical_baseline_contract(
     command_ok, command_problems = command_file_fixed_output_ok(
         paths["bench_command"],
         "historical baseline bench command",
+        require_ignore_eos=False,
     )
     report_ok, report_problems = bench_report_fixed_output_ok(
         paths["perf_report"],
@@ -1468,12 +1474,36 @@ def run_selftest() -> int:
             args,
             root / "historical_probe",
         )
-        if historical_ok or not any("--ignore-eos" in problem for problem in historical_problems):
-            raise AssertionError("selftest did not reject the checked-in historical baseline command")
+        if not historical_ok:
+            raise AssertionError(
+                "selftest did not accept checked-in historical baseline by "
+                f"observed fixed output: {historical_problems}"
+            )
         baseline_server = root / "baseline-server.command.txt"
         baseline_build = root / "baseline-build.command.txt"
         write_text(baseline_server, "python -m vllm.entrypoints.openai.api_server --model test\n")
         write_text(baseline_build, "python -c 'import vllm; print(vllm.__version__)'\n")
+        baseline_cmd_without_ignore_eos = root / "bench-no-ignore-eos.command.txt"
+        write_text(
+            baseline_cmd_without_ignore_eos,
+            shlex_join([part for part in cmd if part != "--ignore-eos"]) + "\n",
+        )
+        bad_report = root / "bench-bad-output.json"
+        bad_reports = [fake_bench_report(c) for c in [1, 4, 16, 32]]
+        bad_reports[0]["output_tokens_per_request"][0][0] = EXPECTED_OUTPUT_LEN - 1
+        write_json(bad_report, bad_reports)
+        args.baseline_perf_report = bad_report
+        args.baseline_bench_command = baseline_cmd_without_ignore_eos
+        args.baseline_server_command = baseline_server
+        args.baseline_build_command = baseline_build
+        bad_baseline_ok, bad_baseline_problems, _ = historical_baseline_contract(
+            args,
+            root / "bad_baseline_probe",
+        )
+        if bad_baseline_ok or not any("must equal" in problem for problem in bad_baseline_problems):
+            raise AssertionError(
+                "selftest accepted missing-ignore-eos baseline without observed fixed output"
+            )
         args.baseline_perf_report = report
         args.baseline_bench_command = bench_cmd_path
         args.baseline_server_command = baseline_server
