@@ -2,6 +2,42 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ103 — Qwen35 decode MoE skips redundant routed-output clear
+
+- Scope:
+  - continued from the ZZZ102 c16 quick regression artifact without rerunning
+    live vLLM or starting a GPU instance;
+  - inspected the existing Qwen35 decode profile artifacts and confirmed the
+    residual/shadow path is no longer the dominant blocker;
+  - focused on a concrete decode MoE overhead: the scratch path cleared
+    `scratch.routed_output` immediately before `moe_forward_bucketed()`.
+- Source change:
+  - removed the Qwen35 decode scratch `zero_buffer()` before routed expert
+    MoE output;
+  - kept the change generic and capability/semantics based: `moe_forward`,
+    `moe_forward_bucketed`, CUDA `moe_combine`, CUDA
+    `weighted_sum_batched`, and Metal `weighted_sum_batched` all overwrite
+    their output rows rather than accumulating into caller-provided contents;
+  - updated the MoE bucketed parity test so the bucketed output buffer starts
+    with dirty values, catching any future dependency on caller-side
+    pre-clearing.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-models bucketed_matches_per_pair_dispatch` PASS;
+  - `cargo test -p ferrum-models sparse_moe_decode_merge_adds_shared_output_into_routed_output_inplace`
+    PASS;
+  - `cargo test -p ferrum-models decode_residual_shadow_can_skip_layer_output_materialization`
+    PASS;
+  - `cargo check -p ferrum-models` PASS.
+- Status:
+  - this removes one decode MoE scratch clear on the Qwen35 path, but no GPU
+    throughput claim is made yet;
+  - expected effect is bounded to launch/memory-clear overhead, so it is not
+    expected by itself to close the remaining 663 tok/s-to-target gap;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS` and still requires a
+    targeted CUDA quick regression before treating this as performance
+    evidence.
+
 ## 2026-06-24 ZZZ102 — 192-token tight recurrent prefill passes c16 OOM quick regression
 
 - Scope:
