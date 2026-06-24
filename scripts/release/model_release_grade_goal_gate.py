@@ -2516,6 +2516,19 @@ def validate_performance_cell(
         problems.append(f"{label}.effective_active_concurrency cannot exceed requested concurrency")
     if effective != baseline_effective:
         problems.append(f"{label} effective active concurrency must match baseline")
+    baseline_measured = None
+    if lane == "w3":
+        baseline_measured = positive_int(
+            cell.get("baseline_measured_concurrency"),
+            f"{label}.baseline_measured_concurrency",
+            problems,
+        )
+    if baseline_measured is not None and baseline_effective is not None:
+        if baseline_measured != baseline_effective:
+            problems.append(
+                f"{label}.baseline_measured_concurrency must equal "
+                f"baseline_effective_active_concurrency {baseline_effective}"
+            )
     if effective is not None and effective < concurrency:
         published = cell.get("published_concurrency")
         if published != effective:
@@ -3104,6 +3117,7 @@ def write_selftest_manifest(root: Path, *, lane: str = "w2", ratio: float = 0.82
                 "requested_concurrency": concurrency,
                 "effective_active_concurrency": effective,
                 "baseline_effective_active_concurrency": effective,
+                "baseline_measured_concurrency": effective,
                 "published_concurrency": effective,
                 "requests_per_run": 100,
                 "n_repeats": 3,
@@ -3973,6 +3987,28 @@ def run_selftest() -> int:
         ):
             raise AssertionError(
                 "bad W3 baseline missing ignore-eos selftest did not fail as expected"
+            )
+
+        bad_w3_baseline_measured = tmp_root / "bad-w3-baseline-measured-concurrency"
+        bad_w3_baseline_measured_manifest = write_selftest_manifest(
+            bad_w3_baseline_measured,
+            lane="w3",
+            ratio=0.82,
+        )
+        data = load_json(bad_w3_baseline_measured_manifest)
+        data["performance"]["cells"][3]["baseline_measured_concurrency"] = 32
+        write_json(bad_w3_baseline_measured_manifest, data)
+        bad_w3_baseline_measured_problems = validate_manifest(
+            data,
+            "w3",
+            bad_w3_baseline_measured,
+        )
+        if not any(
+            "performance.c32.baseline_measured_concurrency must equal" in problem
+            for problem in bad_w3_baseline_measured_problems
+        ):
+            raise AssertionError(
+                "bad W3 baseline measured concurrency selftest did not fail as expected"
             )
 
         bad_w3_output_tokens = tmp_root / "bad-w3-output-tokens"
