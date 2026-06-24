@@ -2244,7 +2244,7 @@ mod tests {
         model.num_hidden_layers = Some(40);
         model.kv_heads = Some(8);
         model.estimated_weight_bytes = Some(24_419_939_760);
-        model.recurrent_state_bytes_per_sequence = Some(32_931_840);
+        model.recurrent_state_bytes_per_sequence = Some(65_863_680);
         model
     }
 
@@ -2575,7 +2575,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_fp16_recurrent_state_budget_preserves_c32_admission_on_4090() {
+    fn qwen35_fast_recurrent_state_budget_caps_default_slots_without_vram_special_case() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
@@ -2594,29 +2594,33 @@ mod tests {
         };
 
         assert_eq!(decision("max_sequences").selected, "32");
-        assert_eq!(decision("recurrent_state_max_slots").selected, "32");
+        assert_eq!(decision("recurrent_state_max_slots").selected, "16");
+        assert_eq!(
+            decision("recurrent_state_max_slots").source,
+            AutoConfigSource::MemoryProfile
+        );
         let doc = resolved.effective_config_document();
         assert_eq!(doc["selected_max_sequences"], serde_json::json!(32));
         assert_eq!(
             doc["selected_recurrent_state_max_slots"],
-            serde_json::json!(32)
+            serde_json::json!(16)
         );
-        assert_eq!(doc["selected_admission_limit"], serde_json::json!(32));
+        assert_eq!(doc["selected_admission_limit"], serde_json::json!(16));
         assert_eq!(
             doc["admission"]["memory_estimate"]["recurrent_state_bytes_per_sequence"],
-            serde_json::json!(32_931_840u64)
+            serde_json::json!(65_863_680u64)
         );
         assert_eq!(
             doc["admission"]["memory_estimate"]["recurrent_state_budget_raw_slots"],
-            serde_json::json!(40)
+            serde_json::json!(20)
         );
         assert_eq!(
             doc["admission"]["memory_estimate"]["recurrent_state_budget_max_slots"],
-            serde_json::json!(32)
+            serde_json::json!(16)
         );
         assert_eq!(
             doc["admission"]["memory_estimate"]["recurrent_state_capacity_bytes"],
-            serde_json::json!(32u64 * 32_931_840u64)
+            serde_json::json!(16u64 * 65_863_680u64)
         );
     }
 

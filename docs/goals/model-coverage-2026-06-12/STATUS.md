@@ -2,6 +2,62 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ142 — align Qwen3.5 recurrent-state defaults with fast indexed state dtype; local validation only
+
+- Source diagnosis from local artifacts and source:
+  - the last good same-hardware c32 diagnostic before the OOM/admission work,
+    `6bb7af75`, selected `selected_recurrent_state_max_slots=16` and
+    `selected_admission_limit=16`, completed with `633.3518270005125 tok/s`,
+    no decode cancellations, decode trace throughput `788.9 tok/s`, and mixed
+    trace throughput `1897.2 tok/s`;
+  - the current `f304fd8d` c32 diagnostic selected
+    `selected_recurrent_state_max_slots=32` and
+    `selected_admission_limit=32`, completed with `265.5349974958471 tok/s`,
+    `cancelled during decode=16`, decode trace throughput `288.5 tok/s`, and
+    mixed trace throughput `536.2 tok/s`;
+  - the command shape was the same (`--max-num-seqs 32`, `--kv-capacity 512`,
+    `--max-num-batched-tokens 192`,
+    `--scheduler-prefill-first-until-active 32`,
+    `--scheduler-prefill-step-chunk 6`);
+  - source inspection showed why the 32-slot default was not a valid fast path:
+    Qwen3.5 switched runtime capacity accounting and pool allocation to FP16
+    state, but the current indexed recurrent CUDA kernels keep persistent
+    DeltaNet state slabs in FP32. The model therefore rejected the packed
+    indexed decode path for FP16 state pools and fell back to gather/compute/
+    scatter behavior.
+- Source change:
+  - added `Backend::qwen35_indexed_recurrent_state_dtype()`, defaulting to
+    `Dtype::F32`, to represent the dtype supported by the fast indexed
+    recurrent state slab;
+  - changed Qwen3.5 linear-state pool dtype selection to use that backend
+    capability instead of activation element size;
+  - changed `ferrum serve` model capabilities for Qwen3.5 recurrent-state
+    memory to report FP32 bytes, matching the current fast indexed state path;
+  - updated auto-config tests so the default typed runtime again caps
+    recurrent-state slots/admission by memory profile to `16` on 1x4090
+    without a model-id/GPU-memory threshold or hidden env override.
+- Why this is not the old hard-coded cap:
+  - the selection is based on the backend fast-state dtype and the existing
+    recurrent-state memory budget calculation;
+  - no Qwen3.5+RTX4090 special case, VRAM threshold branch, or concurrency
+    enumeration was added;
+  - explicit user config can still override within the memory-budget validator.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-types qwen35_fast_recurrent_state_budget_caps_default_slots_without_vram_special_case -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-cli qwen35_moe_model_capabilities_preserve_moe_shape -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-models qwen35_linear_state_pool_dtype_uses_fast_indexed_state_dtype -- --nocapture`
+    PASS;
+  - `cargo check -p ferrum-kernels -p ferrum-models -p ferrum-cli` PASS.
+- Limits:
+  - no paid GPU diagnostic has been run for this candidate yet;
+  - this does not prove c32 throughput recovery, W3 performance, or release
+    readiness;
+  - no final W3 validator was run;
+  - no `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>` exists.
+
 ## 2026-06-25 ZZZ141 — f304fd8d c32 diagnostic PASS; capacity churn reduced, throughput still blocked
 
 - Artifact:

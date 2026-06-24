@@ -5,6 +5,7 @@ use ferrum_types::{FerrumError, Result};
 pub use super::capabilities::{
     BackendCollective, BackendGraph, BackendMoeFused, BackendQuantGguf, BackendQuantMarlin,
 };
+use super::dtype::Dtype;
 pub use super::types::MoeRouting;
 use super::types::{AttnConfig, KvCacheQuant, SrcDtype};
 
@@ -319,6 +320,13 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// directly from a persistent slot-indexed state slab.
     fn supports_qwen35_indexed_recurrent_state() -> bool {
         false
+    }
+
+    /// Persistent state-slab dtype supported by the fast indexed Qwen3.5 GDN
+    /// kernels. Activation/cache dtype alone is not sufficient: the current
+    /// indexed recurrent kernels keep the long-lived DeltaNet state in FP32.
+    fn qwen35_indexed_recurrent_state_dtype() -> Dtype {
+        Dtype::F32
     }
 
     /// Whether this backend can consume Qwen3.5 GDN decode projections in the

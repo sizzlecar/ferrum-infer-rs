@@ -1008,10 +1008,8 @@ fn qwen35_linear_state_max_slots(
 fn qwen35_linear_state_pool_dtype<B: Backend>(
     _snapshot: &ferrum_types::RuntimeConfigSnapshot,
 ) -> Dtype {
-    if B::supports_qwen35_indexed_recurrent_state()
-        && B::activation_elem_size_bytes() < std::mem::size_of::<f32>()
-    {
-        Dtype::F16
+    if B::supports_qwen35_indexed_recurrent_state() {
+        B::qwen35_indexed_recurrent_state_dtype()
     } else {
         Dtype::F32
     }
@@ -14310,6 +14308,16 @@ mod tests {
 
         let invalid = runtime_snapshot(&[("FERRUM_RECURRENT_STATE_MAX_SLOTS", "bad")]);
         assert_eq!(qwen35_linear_state_max_slots(&invalid, 8), 8);
+    }
+
+    #[test]
+    fn qwen35_linear_state_pool_dtype_uses_fast_indexed_state_dtype() {
+        let snapshot = runtime_snapshot(&[("FERRUM_RECURRENT_STATE_MAX_SLOTS", "32")]);
+
+        assert_eq!(
+            qwen35_linear_state_pool_dtype::<CpuBackend>(&snapshot),
+            Dtype::F32
+        );
     }
 
     #[test]
