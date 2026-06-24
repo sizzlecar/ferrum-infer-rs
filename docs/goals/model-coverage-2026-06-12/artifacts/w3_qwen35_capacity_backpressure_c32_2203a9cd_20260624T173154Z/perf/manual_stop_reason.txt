@@ -1,0 +1,1 @@
+Manual stop: c32 diagnostic stalled after run/serve smoke passed. Scheduler backpressure reduced admission to 1, but every remaining single prefill allocation still defers with no victim; scheduler counters show completed_total stuck at 5, prefill/decode token deltas 0, GPU util 0%, no OOM evidence. Stop condition reached to avoid paid GPU idle/spin.
