@@ -16029,3 +16029,46 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
   - It is not a W3 completion, performance-ready claim, or release-ready claim.
   - Current W3 still lacks final
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-25 — W3 Qwen3.5 capacity-defer source fix for leaked existing KV
+
+- Source fix:
+  - `EngineInner::defer_prefill_for_capacity` now releases existing physical
+    resources before moving a capacity-blocked prefill back to waiting:
+    model-executor cache, KV manager handle, draft KV handle, and recurrent
+    state.
+  - The previous code cleared `SequenceState.kv_cache`,
+    `draft_kv_cache`, `recurrent_state`, and `model_cache_id` without
+    deallocating already-owned resources. That can produce the exact failure
+    shape in the latest c32 diagnostic: scheduler `active_len=0` while KV
+    allocation still reports no available victim/capacity.
+  - Added regression coverage:
+    `process_batch_unified_capacity_defer_releases_existing_kv`.
+- Source-gate cleanup:
+  - Restored `ferrum-engine` source gate by making
+    `requires_full_logits_for_sampling()` reflect token-mask requirements and
+    by restoring the Qwen3.5 CPU product unsupported error text expected by the
+    registry test.
+  - These two fixes are source-gate maintenance, not CUDA performance claims.
+- Local validation:
+  - `cargo test -p ferrum-engine process_batch_unified_capacity_defer_releases_existing_kv -- --nocapture`
+    PASS.
+  - `cargo test -p ferrum-engine process_batch_unified_kv_defer_moves_active_prefill_back_to_waiting -- --nocapture`
+    PASS.
+  - `cargo test -p ferrum-engine process_batch_unified_defers_prefill_for_recurrent_state_capacity -- --nocapture`
+    PASS.
+  - `cargo test -p ferrum-engine process_batch_unified_releases_recurrent_state_when_kv_alloc_defers -- --nocapture`
+    PASS.
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture`
+    PASS, 14 tests.
+  - `cargo test -p ferrum-engine` PASS, 151 lib tests plus integration tests
+    and doctests.
+  - `cargo check -p ferrum-engine -p ferrum-scheduler` PASS.
+  - `cargo fmt --all -- --check` PASS.
+  - `git diff --check` PASS.
+- Limits:
+  - No GPU lane was run for this source fix yet.
+  - This does not prove c32 completion, OOM resolution, W3 performance, or
+    release readiness.
+  - Current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.

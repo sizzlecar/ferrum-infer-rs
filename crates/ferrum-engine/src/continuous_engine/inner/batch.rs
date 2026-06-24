@@ -274,7 +274,7 @@ impl EngineInner {
                             "Unified prefill recurrent-state alloc deferred for {}: insufficient capacity",
                             rid
                         );
-                        self.defer_prefill_for_capacity(rid);
+                        self.defer_prefill_for_capacity(rid).await;
                         continue;
                     }
                 }
@@ -289,7 +289,7 @@ impl EngineInner {
                             "Unified prefill recurrent-state alloc deferred for {}: {}",
                             rid, message
                         );
-                        self.defer_prefill_for_capacity(rid);
+                        self.defer_prefill_for_capacity(rid).await;
                         continue;
                     }
                     Err(e) => {
@@ -331,14 +331,14 @@ impl EngineInner {
                                         rid, e
                                     );
                                     self.release_recurrent_state(rid).await;
-                                    self.defer_prefill_for_capacity(rid);
+                                    self.defer_prefill_for_capacity(rid).await;
                                     continue;
                                 }
                             }
                         } else {
                             warn!("Unified prefill alloc deferred for {}: no victim", rid);
                             self.release_recurrent_state(rid).await;
-                            self.defer_prefill_for_capacity(rid);
+                            self.defer_prefill_for_capacity(rid).await;
                             continue;
                         }
                     }
@@ -481,7 +481,7 @@ impl EngineInner {
                     self.release_recurrent_state(&work.rid).await;
                 }
                 if work.fresh_kv {
-                    self.defer_prefill_for_capacity(&work.rid);
+                    self.defer_prefill_for_capacity(&work.rid).await;
                 }
             }
             if is_resource_exhausted_error(&e) {
@@ -867,11 +867,14 @@ impl EngineInner {
 
     // ── preemption ──────────────────────────────────────────────────────
 
-    fn defer_prefill_for_capacity(&self, request_id: &RequestId) {
-        self.scheduler.defer_prefill_to_waiting(request_id);
-        {
+    async fn defer_prefill_for_capacity(&self, request_id: &RequestId) {
+        let (had_kv_cache, draft_kv_request_id, had_recurrent_state, model_cache_id) = {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(request_id) {
+                let had_kv_cache = seq.kv_cache.is_some();
+                let draft_kv_request_id = seq.draft_kv_request_id.clone();
+                let had_recurrent_state = seq.recurrent_state.is_some();
+                let model_cache_id = seq.model_cache_id.clone();
                 seq.kv_cache = None;
                 seq.draft_kv_cache = None;
                 seq.draft_kv_request_id = None;
@@ -880,8 +883,30 @@ impl EngineInner {
                 seq.prefill_complete = false;
                 seq.phase = RequestPhase::Waiting;
                 seq.tokens_this_iteration = 0;
+                (
+                    had_kv_cache,
+                    draft_kv_request_id,
+                    had_recurrent_state,
+                    model_cache_id,
+                )
+            } else {
+                (false, None, false, None)
             }
+        };
+
+        if let Some(cache_id) = model_cache_id {
+            self.model_executor.release_cache(&cache_id);
         }
+        if had_kv_cache {
+            let _ = self.kv_cache.deallocate(request_id.clone()).await;
+        }
+        if let Some(draft_request_id) = draft_kv_request_id {
+            let _ = self.kv_cache.deallocate(draft_request_id).await;
+        }
+        if had_recurrent_state {
+            self.release_recurrent_state(request_id).await;
+        }
+        self.scheduler.defer_prefill_to_waiting(request_id);
         self.work_notify.notify_waiters();
     }
 
