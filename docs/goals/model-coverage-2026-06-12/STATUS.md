@@ -13997,3 +13997,42 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     不构成 L2 真实模型正确性证据、性能证据或 OOM 实机证明。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 Qwen3.5 per-expert GPTQ sidecar preflight
+
+- 背景:
+  - W3 目标要求在修改 loader 假设前,对照真实 GPTQ safetensors index,
+    并在 metadata 边界提前拒绝 unsupported 或 shape/sidecar 不匹配。
+  - 已复制的
+    `w3_qwen35_weight_index_probe_20260622/w3_qwen35_weight_index_probe.json`
+    记录真实 `Qwen/Qwen3.5-35B-A3B-GPTQ-Int4`:
+    40 个 sparse MoE layer、256 experts、per-expert GPTQ sidecars complete,
+    `g_idx_modes={"all": 40}`,selected prefix 为 `model.language_model`。
+  - 旧 Qwen3.5 manifest 只把 per-expert `qweight` wildcard 作为 optional
+    role;如果真实权重存在 qweight 但缺少 `scales`/`qzeros` 或 partial
+    `g_idx`,preflight 仍可能通过,直到 `NativeSafetensorsLoader` 加载 stacked
+    GPTQ experts 时才晚失败。
+- 源码变更:
+  - `detect_prefix_and_validate()` 和 `detect_prefix_and_resolve()` 在选中
+    passing prefix 后新增 Qwen3.5 MoE GPTQ sidecar validation。
+  - 如果当前 inventory 没有任何 per-expert GPTQ tensor,仍允许 toy/dense
+    test fixture 走原路径。
+  - 一旦发现任意 expert GPTQ tensor,就要求所有 sparse MoE layer、expert、
+    `gate_proj/up_proj/down_proj` 都具备完整 `qweight/scales/qzeros`。
+  - `g_idx` 按 Marlin stacked experts 的加载假设做一致性校验:
+    gate/up stack 和 down stack 各自必须全有或全无,拒绝 partial sidecar。
+  - 新增 3 个 regression tests:
+    complete sidecars pass、incomplete sidecars fail、partial `g_idx` fail。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-models qwen35_weights -- --nocapture` PASS,
+    15 个 qwen35 weight tests 通过。
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS,
+    106 个 Qwen35/Qwen35 weight/config/executor/model 相关测试通过。
+  - `git diff --check` PASS。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只是把历史真实权重索引中已确认的 GPTQ sidecar completeness 变成
+    product loader 前置校验,不构成真实 L2 artifact、OOM 实机证明或性能证据。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
