@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import tempfile
 import urllib.error
@@ -353,6 +354,102 @@ def run_l4(args: argparse.Namespace) -> dict[str, Any]:
     return artifact
 
 
+def copy_artifact_tree(source: Path, out: Path) -> None:
+    for name in ["negative", "tool_calls", "strict_schema"]:
+        src = source / name
+        if src.is_dir():
+            shutil.copytree(src, out / name, dirs_exist_ok=True)
+
+
+def repack_existing_l4(source: Path, out: Path, release_model_id: str) -> dict[str, Any]:
+    source_display = source
+    out_display = out
+    source = source.resolve()
+    out = out.resolve()
+    artifact_path = source / ARTIFACT_NAME
+    if not artifact_path.is_file():
+        raise GateError(f"missing source artifact: {artifact_path}")
+    with artifact_path.open(encoding="utf-8") as handle:
+        original = json.load(handle)
+    if not isinstance(original, dict):
+        raise GateError(f"source artifact must be a JSON object: {artifact_path}")
+    out.mkdir(parents=True, exist_ok=True)
+    copy_artifact_tree(source, out)
+
+    tool_results: list[dict[str, Any]] = []
+    tool_cases = original.get("tool_call_cases")
+    if not isinstance(tool_cases, list):
+        raise GateError("source artifact missing tool_call_cases list")
+    for idx, case in enumerate(tool_cases):
+        if not isinstance(case, dict):
+            raise GateError(f"tool_call_cases[{idx}] must be a JSON object")
+        label = str(case.get("id") or f"tool_{idx:02d}")
+        rel = f"tool_calls/{label}.response.json"
+        response_path = source / rel
+        if not response_path.is_file():
+            raise GateError(f"{label}: missing archived response {response_path}")
+        data = parse_json(label, 200, response_path.read_text(encoding="utf-8"))
+        tool_results.append(
+            {
+                **case,
+                "id": label,
+                "passed": True,
+                "artifact": rel,
+                **validate_tool_call(label, data),
+            }
+        )
+
+    strict_results: list[dict[str, Any]] = []
+    strict_cases = original.get("strict_schema_cases")
+    if not isinstance(strict_cases, list):
+        raise GateError("source artifact missing strict_schema_cases list")
+    for idx, case in enumerate(strict_cases):
+        if not isinstance(case, dict):
+            raise GateError(f"strict_schema_cases[{idx}] must be a JSON object")
+        label = str(case.get("id") or f"strict_schema_{idx:02d}")
+        rel = f"strict_schema/{label}.response.json"
+        response_path = source / rel
+        if not response_path.is_file():
+            raise GateError(f"{label}: missing archived response {response_path}")
+        data = parse_json(label, 200, response_path.read_text(encoding="utf-8"))
+        strict_results.append(
+            {
+                **case,
+                "id": label,
+                "passed": True,
+                "artifact": rel,
+                **validate_strict_schema(label, data, f"ok-{idx}"),
+            }
+        )
+
+    agent = original.get("agent")
+    if not isinstance(agent, dict):
+        raise GateError("source artifact missing agent object")
+    artifact = {
+        **original,
+        "schema_version": 1,
+        "status": "pass",
+        "level": "l4_agent",
+        "model_id": release_model_id,
+        "product_surface": original.get("product_surface", "typed_cli"),
+        "hidden_env": original.get("hidden_env", []),
+        "generated_at": iso_now(),
+        "pass_line": f"{PASS_LINE_PREFIX}: {out_display}",
+        "repacked_from": str(source_display / ARTIFACT_NAME),
+        "agent": {
+            **agent,
+            "tool_calls_total": len(tool_results),
+            "tool_calls_passed": sum(1 for result in tool_results if result["passed"]),
+            "strict_schema_total": len(strict_results),
+            "strict_schema_passed": sum(1 for result in strict_results if result["passed"]),
+        },
+        "tool_call_cases": tool_results,
+        "strict_schema_cases": strict_results,
+    }
+    write_json(out / ARTIFACT_NAME, artifact)
+    return artifact
+
+
 def run_selftest() -> int:
     with tempfile.TemporaryDirectory(prefix="ferrum-w3-l4-agent-") as tmp:
         root = Path(tmp)
@@ -428,6 +525,31 @@ def run_selftest() -> int:
         )
         if problems:
             raise AssertionError(f"L4 selftest artifact failed validator: {problems}")
+
+        legacy_artifact = dict(artifact)
+        legacy_artifact["tool_call_cases"] = [
+            {key: value for key, value in result.items() if key != "artifact"}
+            for result in tool_results
+        ]
+        legacy_artifact["strict_schema_cases"] = [
+            {key: value for key, value in result.items() if key != "artifact"}
+            for result in strict_results
+        ]
+        write_json(root / ARTIFACT_NAME, legacy_artifact)
+        repacked = repack_existing_l4(root, root / "repacked", args.release_model_id)
+        repack_problems: list[str] = []
+        validate_w3_l0_l5_artifact(
+            "l4_agent",
+            {"artifact": str(root / "repacked" / ARTIFACT_NAME)},
+            root / "repacked",
+            repack_problems,
+        )
+        if repack_problems:
+            raise AssertionError(f"L4 repack selftest failed validator: {repack_problems}")
+        if not all("artifact" in case for case in repacked["tool_call_cases"]):
+            raise AssertionError("L4 repack did not add tool artifact paths")
+        if not all("artifact" in case for case in repacked["strict_schema_cases"]):
+            raise AssertionError("L4 repack did not add strict-schema artifact paths")
     print("W3 L4 AGENT SELFTEST PASS")
     return 0
 
@@ -438,6 +560,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=False)
     parser.add_argument("--release-model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--repack-source", type=Path, help="existing L4 artifact directory to repackage")
     parser.add_argument("--tool-total", type=int, default=10)
     parser.add_argument("--strict-total", type=int, default=20)
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -450,6 +573,12 @@ def main() -> int:
     try:
         if args.self_test:
             return run_selftest()
+        if args.repack_source is not None:
+            if args.out is None:
+                raise GateError("missing required arg for --repack-source: --out")
+            artifact = repack_existing_l4(args.repack_source, args.out, args.release_model_id)
+            print(artifact["pass_line"])
+            return 0
         if not args.base_url:
             raise GateError("missing required arg: --base-url")
         if not args.model:
