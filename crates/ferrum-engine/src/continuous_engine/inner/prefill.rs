@@ -237,20 +237,20 @@ impl EngineInner {
             }
         };
 
-        let last_logits = prefill_output.last_token_logits()?;
-        let logits_vec = last_logits.to_vec_f32()?;
+        let first_token_result = (|| {
+            let last_logits = prefill_output.last_token_logits()?;
+            let logits_vec = last_logits.to_vec_f32()?;
 
-        // Store only prompt-only prefills. Replay prefills include already
-        // generated output and would be low-value, request-specific entries.
-        if can_use_prefix_cache {
-            let _ = self.prefix_cache.store_prefix(
-                &context_tokens,
-                prefill_output.kv_cache.clone(),
-                logits_vec.clone(),
-            );
-        }
+            // Store only prompt-only prefills. Replay prefills include already
+            // generated output and would be low-value, request-specific entries.
+            if can_use_prefix_cache {
+                let _ = self.prefix_cache.store_prefix(
+                    &context_tokens,
+                    prefill_output.kv_cache.clone(),
+                    logits_vec.clone(),
+                );
+            }
 
-        let first_token = {
             let mut sequences = self.sequences.write();
             let seq = sequences
                 .get_mut(request_id)
@@ -270,7 +270,15 @@ impl EngineInner {
                 .or_else(|| initial_recurrent_state.clone());
             seq.prefill_complete = true;
             seq.phase = RequestPhase::Decoding;
-            token
+            Ok::<TokenId, FerrumError>(token)
+        })();
+        let first_token = match first_token_result {
+            Ok(token) => token,
+            Err(e) => {
+                let _ = self.kv_cache.deallocate(request_id.clone()).await;
+                self.release_recurrent_state(request_id).await;
+                return Err(e);
+            }
         };
 
         self.scheduler.mark_prefill_complete(request_id, num_tokens);
@@ -495,6 +503,10 @@ impl EngineInner {
             }
         };
         if outputs.len() != to_prefill.len() {
+            for (rid, _, _, _, _, _) in &to_prefill {
+                let _ = self.kv_cache.deallocate(rid.clone()).await;
+                self.release_recurrent_state(rid).await;
+            }
             return Err(FerrumError::internal(format!(
                 "batch_prefill returned {} outputs for {} inputs",
                 outputs.len(),
@@ -506,20 +518,19 @@ impl EngineInner {
         for ((rid, input_tokens, _, recurrent_state, _, can_use_prefix_cache), prefill_output) in
             to_prefill.iter().zip(outputs.iter())
         {
-            let num_tokens = input_tokens.len();
-            let last_logits = prefill_output.last_token_logits()?;
-            let logits_vec = last_logits.to_vec_f32()?;
-            if *can_use_prefix_cache {
-                let _ = self.prefix_cache.store_prefix(
-                    input_tokens,
-                    prefill_output.kv_cache.clone(),
-                    logits_vec.clone(),
-                );
-            }
-            let first_token_result = {
+            let first_token_result = (|| {
+                let last_logits = prefill_output.last_token_logits()?;
+                let logits_vec = last_logits.to_vec_f32()?;
+                if *can_use_prefix_cache {
+                    let _ = self.prefix_cache.store_prefix(
+                        input_tokens,
+                        prefill_output.kv_cache.clone(),
+                        logits_vec.clone(),
+                    );
+                }
                 let mut sequences = self.sequences.write();
                 let Some(seq) = sequences.get_mut(rid) else {
-                    continue;
+                    return Ok(None);
                 };
                 seq.reset_guided_processors()?;
                 let mut logits = logits_vec;
@@ -536,16 +547,20 @@ impl EngineInner {
                     .or_else(|| recurrent_state.clone());
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
-                Ok::<TokenId, FerrumError>(token)
-            };
+                Ok::<Option<TokenId>, FerrumError>(Some(token))
+            })();
             let first_token = match first_token_result {
-                Ok(token) => token,
+                Ok(Some(token)) => token,
+                Ok(None) => continue,
                 Err(e) => {
                     warn!("Batch prefill post-process failed for {}: {}", rid, e);
+                    let _ = self.kv_cache.deallocate(rid.clone()).await;
+                    self.release_recurrent_state(rid).await;
                     self.complete_request(rid, FinishReason::Error).await?;
                     continue;
                 }
             };
+            let num_tokens = input_tokens.len();
             self.scheduler.mark_prefill_complete(rid, num_tokens);
             self.total_prefill_tokens
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);

@@ -13766,3 +13766,43 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     仍不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 legacy prefill post-process failures release resources
+
+- 背景:
+  - 继续审计 fallback/legacy prefill 路径发现:模型 prefill 已经成功返回 KV 和
+    recurrent state 之后,`last_token_logits()`、`to_vec_f32()` 或采样后处理错误
+    仍可能直接返回。
+  - single/chunked prefill 分支此前会绕过本轮已分配 KV/recurrent cleanup。
+  - batch prefill 分支此前在输出数量不匹配时直接返回,且单项后处理错误只
+    `complete_request()`,但 sequence 还没有挂上 KV/recurrent,因此
+    `complete_request()` 无法释放本轮临时资源。
+- 源码变更:
+  - `run_prefill_inner()` 现在把 logits 提取、prefix-cache store、采样和
+    sequence 更新封装到后处理结果里;后处理失败时释放本轮 KV 和 recurrent
+    state 后返回错误。
+  - `run_batch_prefill()` 在 `batch_prefill` 输出数量不匹配时,先释放所有
+    `to_prefill` 请求的 KV/recurrent state 再返回错误。
+  - `run_batch_prefill()` 单项后处理错误时,先释放该请求本轮 KV/recurrent
+    state,再 error-complete request。
+  - 新增 `BadShapePrefillExecutor` 和 `ShortBatchPrefillExecutor` 测试夹具。
+  - 新增:
+    - `process_batch_chunked_prefill_postprocess_error_releases_kv_and_recurrent_state`
+    - `process_batch_batch_prefill_len_mismatch_releases_kv_and_recurrent_state`
+    - `process_batch_batch_prefill_postprocess_error_releases_kv_and_recurrent_state`
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - 上述 3 个新增 `cargo test -p ferrum-engine ... -- --nocapture` 均 PASS。
+  - `cargo test -p ferrum-engine recurrent_state -- --nocapture` PASS,
+    20 个 recurrent/resource 相关测试通过。
+  - `git diff --check` PASS。
+- 过程纠偏:
+  - 初版测试直接调用私有 `run_prefill()` / `run_batch_prefill()`,编译失败。
+    已改为走 `process_batch` 产品路径,用 chunked/speculative 配置进入
+    legacy prefill 分支。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只证明本地 legacy prefill 后处理失败不会留下本轮 KV/recurrent 资源,
+    仍不能声称真实 c32 OOM 已实机解决。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
