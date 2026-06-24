@@ -2,6 +2,66 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ139 — a0f1c444 c32 diagnostic completes; OOM gone, throughput still far from target
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_kv_admission_context_c32_a0f1c444_20260624T204629Z/`;
+  - remote Git SHA: `a0f1c4444311884bc842cafe3aba56b8cd4086dd`;
+  - binary SHA256:
+    `0b7ef91a6d7d967a001f1ba567acb37eb157aa8ff8187aa7fea42efc38f5fdf1`;
+  - diagnostic lane only, not release evidence, and did not run live vLLM;
+  - Vast instance `42216671` was reused, artifacts were copied back, then the
+    instance was stopped and confirmed `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-engine -p ferrum-scheduler -p ferrum-kv`
+    PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`;
+  - run and serve effective-config assertions both passed:
+    `selected_max_sequences=32`,
+    `selected_recurrent_state_max_slots=32`,
+    `selected_admission_limit=32`.
+- c32 diagnostic result:
+  - command shape: `bench-serve`, sharegpt dataset, `--concurrency 32`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`;
+  - bench completed normally: `bench_exit=0`;
+  - `completed_per_run=[32]`, `errored_per_run=[0]`, `http_500_per_run=[0]`,
+    `panic_per_run=[0]`;
+  - `output_token_count_source=usage`;
+  - output throughput mean: `258.27 tok/s`;
+  - total throughput mean: `490.30 tok/s`;
+  - request throughput mean: `2.02 req/s`;
+  - TTFT p50 mean: `1968.45 ms`;
+  - TPOT p50 mean: `71.28 ms`;
+  - `oom_mentions=0`;
+  - `capacity_deferred_total=1594`;
+  - `no_victim_warning_count=312`.
+- Diagnosis:
+  - this is the first post-ZZZ136 c32 diagnostic that improves throughput
+    materially (`258.27 tok/s` versus `202.45 tok/s` and ZZZ137's
+    `189.94 tok/s`) while preserving product smoke correctness;
+  - the OOM/direct-fatal symptom is not present in this run, so the
+    vLLM-style known-context KV admission direction is useful;
+  - the result is still far below the user target of `671 tok/s`, and the trace
+    still shows admission/capacity churn (`capacity_deferred_total=1594`), so
+    this is not the final W3 performance lever.
+- Next source direction:
+  - use this artifact as the new same-hardware c32 diagnostic baseline;
+  - inspect scheduler trace and model timing for why throughput remains
+    decode-inefficient after KV admission is no longer failing fatally;
+  - continue comparing against local vLLM source/historical behavior only; do
+    not run live vLLM.
+- Limits:
+  - this is diagnostic only (`n_repeats=1`, c32 only);
+  - no W3 PASS line exists;
+  - this does not prove W3 performance or release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ138 — add vLLM-style KV admission target; local source validation only
 
 - Source change:
