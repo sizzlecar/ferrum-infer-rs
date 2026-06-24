@@ -603,6 +603,12 @@ impl EngineInner {
                 }
                 None => {
                     warn!("Unified prefill result missing for {}", work.rid);
+                    if work.fresh_kv {
+                        let _ = self.kv_cache.deallocate(work.rid.clone()).await;
+                    }
+                    if work.fresh_recurrent {
+                        self.release_recurrent_state(&work.rid).await;
+                    }
                     self.complete_request(&work.rid, FinishReason::Error)
                         .await?;
                     continue;
@@ -620,10 +626,10 @@ impl EngineInner {
                     logits_vec.clone(),
                 );
             }
-            let first_token_result = {
+            let first_token_result = (|| {
                 let mut sequences = self.sequences.write();
                 let Some(seq) = sequences.get_mut(&work.rid) else {
-                    continue;
+                    return Ok(None);
                 };
                 seq.reset_guided_processors()?;
                 let mut logits = logits_vec;
@@ -644,18 +650,25 @@ impl EngineInner {
                 seq.prefill_tokens_processed = num_tokens;
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
-                Ok::<(TokenId, u64), FerrumError>((
+                Ok::<Option<(TokenId, u64)>, FerrumError>(Some((
                     token,
                     seq.start_time.elapsed().as_micros() as u64,
-                ))
-            };
+                )))
+            })();
             let (first_token, queue_to_first_token_us) = match first_token_result {
-                Ok(value) => value,
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
                 Err(e) => {
                     warn!(
                         "Unified prefill post-process failed for {}: {}",
                         work.rid, e
                     );
+                    if work.fresh_kv {
+                        let _ = self.kv_cache.deallocate(work.rid.clone()).await;
+                    }
+                    if work.fresh_recurrent {
+                        self.release_recurrent_state(&work.rid).await;
+                    }
                     self.complete_request(&work.rid, FinishReason::Error)
                         .await?;
                     continue;
@@ -725,10 +738,10 @@ impl EngineInner {
                     continue;
                 }
             };
-            let next_token_result = {
+            let next_token_result = (|| {
                 let mut sequences = self.sequences.write();
                 let Some(seq) = sequences.get_mut(&rid) else {
-                    continue;
+                    return Ok(None);
                 };
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
@@ -761,10 +774,11 @@ impl EngineInner {
                 // model's internal paged_pool is what actually grows), so
                 // the previous `make_kv_handle_with_seq` write was a
                 // silent no-op for production handles.
-                Ok::<TokenId, FerrumError>(token)
-            };
+                Ok::<Option<TokenId>, FerrumError>(Some(token))
+            })();
             let next_token = match next_token_result {
-                Ok(token) => token,
+                Ok(Some(token)) => token,
+                Ok(None) => continue,
                 Err(e) => {
                     warn!("Unified decode post-process failed for {}: {}", rid, e);
                     self.complete_request(&rid, FinishReason::Error).await?;

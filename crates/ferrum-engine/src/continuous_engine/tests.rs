@@ -165,6 +165,15 @@ struct ShortUnifiedResultExecutor {
     inner: RecurrentSpecExecutor,
 }
 
+struct MissingFinalUnifiedResultExecutor {
+    inner: RecurrentSpecExecutor,
+}
+
+struct GreedySentinelUnifiedExecutor {
+    inner: RecurrentSpecExecutor,
+    token: u32,
+}
+
 struct FailingDecodeExecutor {
     inner: RecurrentSpecExecutor,
 }
@@ -521,6 +530,88 @@ impl ModelExecutor for ShortUnifiedResultExecutor {
 
     async fn unified_decode(&self, _batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
         Ok(Vec::new())
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for MissingFinalUnifiedResultExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+
+    fn supports_native_unified_decode(&self) -> bool {
+        true
+    }
+
+    fn recurrent_state_spec(
+        &self,
+        request_id: &RequestId,
+        input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        self.inner.recurrent_state_spec(request_id, input_tokens)
+    }
+
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        self.inner.prefill(input).await
+    }
+
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.inner.decode(input).await
+    }
+
+    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
+        Ok(batch.items.iter().map(|_| None).collect())
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for GreedySentinelUnifiedExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+
+    fn supports_native_unified_decode(&self) -> bool {
+        true
+    }
+
+    fn recurrent_state_spec(
+        &self,
+        request_id: &RequestId,
+        input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        self.inner.recurrent_state_spec(request_id, input_tokens)
+    }
+
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        self.inner.prefill(input).await
+    }
+
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.inner.decode(input).await
+    }
+
+    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
+        Ok(batch
+            .items
+            .iter()
+            .map(|item| item.is_final_chunk.then(|| vec![self.token as f32]))
+            .collect())
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
@@ -1610,6 +1701,224 @@ async fn process_batch_unified_result_len_mismatch_releases_recurrent_state() {
     assert!(!sequence.prefill_complete);
     assert!(sequence.kv_cache.is_none());
     assert!(sequence.recurrent_state.is_none());
+}
+
+#[tokio::test]
+async fn process_batch_unified_missing_final_prefill_result_releases_fresh_kv() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(MissingFinalUnifiedResultExecutor {
+            inner: RecurrentSpecExecutor {
+                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+            },
+        });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        sampler,
+        kv_cache.clone(),
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager.clone()),
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 2;
+    let request_id = request.id.clone();
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
+        max_sequence_length: 1,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let _ = engine.inner.process_batch(&batch).await;
+
+    let active_kv = kv_cache.list_handles();
+    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
+    let recurrent_stats = recurrent_manager.stats();
+    assert_eq!(recurrent_stats.allocation_count, 1);
+    assert_eq!(recurrent_stats.active_states, 0);
+    assert_eq!(recurrent_stats.used_batch_slots, 0);
+    assert!(
+        !engine.inner.sequences.read().contains_key(&request_id),
+        "error-completed request should be removed from active sequences"
+    );
+}
+
+#[tokio::test]
+async fn process_batch_unified_prefill_postprocess_error_releases_fresh_kv() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        64,
+        &[("test", 5), ("ok", 6), ("<unk>", 2)],
+    ));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(GreedySentinelUnifiedExecutor {
+        inner: RecurrentSpecExecutor {
+            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+        },
+        token: 6,
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        sampler,
+        kv_cache.clone(),
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager.clone()),
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 2;
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
+    let request_id = request.id.clone();
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
+        max_sequence_length: 1,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let _ = engine.inner.process_batch(&batch).await;
+
+    let active_kv = kv_cache.list_handles();
+    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
+    let recurrent_stats = recurrent_manager.stats();
+    assert_eq!(recurrent_stats.allocation_count, 1);
+    assert_eq!(recurrent_stats.active_states, 0);
+    assert_eq!(recurrent_stats.used_batch_slots, 0);
+    assert!(
+        !engine.inner.sequences.read().contains_key(&request_id),
+        "error-completed request should be removed from active sequences"
+    );
+}
+
+#[tokio::test]
+async fn process_batch_unified_decode_postprocess_error_releases_recurrent_state() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(GreedySentinelUnifiedExecutor {
+        inner: RecurrentSpecExecutor {
+            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+        },
+        token: 6,
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager.clone()),
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 4;
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
+    let request_id = request.id.clone();
+    let recurrent_spec = RecurrentStateSpec {
+        request_id: request_id.clone(),
+        num_layers: 1,
+        tensors: vec![RecurrentStateTensorSpec::new(0, "delta_state", vec![4])],
+        dtype: DataType::BF16,
+        device: Device::CPU,
+        max_batch_slots: 1,
+    };
+    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
+    let kv = engine
+        .inner
+        .make_model_kv_handle_with_seq("decode-cache".to_string(), 1);
+    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request.clone(),
+        vec![TokenId::new(5)],
+        Some(tokenizer),
+        Some(64),
+    );
+    sequence.generated_tokens.push(TokenId::new(6));
+    sequence.prefill_complete = true;
+    sequence.prefill_tokens_processed = 1;
+    sequence.kv_cache = Some(kv);
+    sequence.recurrent_state = Some(recurrent_state);
+    sequence.model_cache_id = Some("decode-cache".to_string());
+    sequence.phase = RequestPhase::Decoding;
+    engine
+        .inner
+        .sequences
+        .write()
+        .insert(request_id.clone(), sequence);
+
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
+        max_sequence_length: 1,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let _ = engine.inner.process_batch(&batch).await;
+
+    assert!(
+        !engine.inner.sequences.read().contains_key(&request_id),
+        "error-completed decode request should be removed from active sequences"
+    );
+    let recurrent_stats = recurrent_manager.stats();
+    assert_eq!(recurrent_stats.active_states, 0);
+    assert_eq!(recurrent_stats.used_batch_slots, 0);
 }
 
 #[tokio::test]
