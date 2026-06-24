@@ -2,6 +2,68 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ124 — Existing-KV release fix still leaves c32 admission churn
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_capacity_defer_kv_release_c32_b8116dc4_20260624T170001Z/`;
+  - remote Git SHA: `b8116dc498e7fad50263d0dc580daf38194cb74e`;
+  - diagnostic lane, not release evidence, and did not run live vLLM;
+  - Vast instance `42216671` reused, then stopped and confirmed
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-engine -p ferrum-scheduler` PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`;
+  - run and serve effective-config assertions both selected
+    `selected_max_sequences=32`,
+    `selected_recurrent_state_max_slots=32`, and
+    `selected_admission_limit=32`.
+- c32 diagnostic failure:
+  - bench command shape: `bench-serve`, sharegpt dataset,
+    `--concurrency 32`, `--num-prompts 32`, `--warmup-requests 4`,
+    `--n-repeats 1`, `--fail-on-error`, `--seed 9271`,
+    `--ignore-eos`;
+  - bench was manually stopped at the configured stop condition instead of
+    waiting for the full `600s` timeout;
+  - `perf/bench.exit` is `143`;
+  - `perf/failure_summary.json` records
+    `result=FAIL_MANUAL_STOP_C32_CAPACITY_DEFER_NO_VICTIM_CHURN`;
+  - last scheduler state:
+    `completed_total=5`, `failed_total=0`, `cancelled_total=125`,
+    `admitted_total=720713`, `waiting_queue_len=32`, `active_len=0`,
+    `prefill_items=32`, `decode_items=0`,
+    `scheduled_tokens_total=192`;
+  - engine counters stayed flat in the last sample:
+    `prefill_tokens_delta=0`, `decode_tokens_delta=0`;
+  - `Unified prefill alloc deferred` appeared `720615` times;
+  - `oom_mentions=0`; GPU utilization was `0%` in the stop sample while the
+    server was spinning.
+- Current conclusion:
+  - `b8116dc4` fixed a real resource-release bug and preserved both product
+    smoke paths, but it did not fix c32 throughput;
+  - the latest failure is not OOM and not a model/GPU/concurrency hard cap;
+  - the remaining blocker is scheduler/admission backpressure: capacity-blocked
+    waiting requests are immediately re-admitted without resource progress,
+    so the engine repeatedly schedules prefill work that consumes zero prompt
+    tokens.
+- Next source direction:
+  - compare the existing Ferrum scheduler contract against vLLM source and the
+    saved traces;
+  - prevent immediate re-admission of capacity-blocked prefills until a decode,
+    completion, cancellation, or other resource-progress signal can make the
+    allocation attempt meaningful;
+  - keep this generic scheduler/resource admission behavior, not a
+    Qwen3.5/GPU/concurrency special case.
+- Limits:
+  - this is diagnostic only (`n_repeats=1`, c32 only, manual stop);
+  - no W3 completion, OOM-fixed, performance-ready, or release-ready claim is
+    made;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ123 — Capacity-deferred prefills now leave the active scheduler set
 
 - Source of this patch:
