@@ -520,6 +520,82 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_model_definition_preserves_typed_gptq_quantization_config() {
+        let raw = serde_json::json!({
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "model_type": "qwen3_5_moe",
+            "quantization_config": {
+                "bits": 4,
+                "group_size": 128,
+                "desc_act": false,
+                "sym": true,
+                "quant_method": "gptq"
+            },
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 2048,
+                "vocab_size": 248320,
+                "num_hidden_layers": 4,
+                "layer_types": [
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention"
+                ],
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 32,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "head_dim": 256,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "attn_output_gate": true,
+                "rope_parameters": {
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25,
+                    "mrope_interleaved": true
+                },
+                "num_experts": 256,
+                "num_experts_per_tok": 8,
+                "moe_intermediate_size": 512,
+                "shared_expert_intermediate_size": 512,
+                "tie_word_embeddings": false
+            }
+        });
+        let mut manager = ConfigManager::new();
+        let def = manager.parse_config_for_tests(&raw).unwrap();
+
+        assert_eq!(def.architecture, Architecture::Qwen35Moe);
+        let typed = def
+            .extra_params
+            .get("ferrum_qwen35_text_config")
+            .and_then(|value| value.as_object())
+            .unwrap();
+        let quant = typed
+            .get("quantization")
+            .and_then(|value| value.as_object())
+            .expect("typed Qwen3.5 config should preserve GPTQ quantization");
+        assert_eq!(
+            quant.get("quant_method").and_then(|value| value.as_str()),
+            Some("gptq")
+        );
+        assert_eq!(quant.get("bits").and_then(|value| value.as_u64()), Some(4));
+        assert_eq!(
+            quant.get("group_size").and_then(|value| value.as_u64()),
+            Some(128)
+        );
+        assert_eq!(
+            quant.get("desc_act").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            quant.get("sym").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn qwen35_model_definition_builds_recurrent_state_spec() {
         let def = parse_artifact_config("moe_shared_expert_reference.config.json");
         let cfg = Qwen35TextConfig::from_model_definition(&def).unwrap();
