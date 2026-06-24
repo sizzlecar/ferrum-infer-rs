@@ -2,6 +2,39 @@
 
 进度日志,倒序。
 
+## 2026-06-24 ZZZ89 — W3 L3/L4 case artifacts are required by the final validator
+
+- Scope:
+  - `scripts/release/model_release_grade_goal_gate.py` now checks that every
+    W3 L3 behavior case `artifact` resolves to an existing archived file;
+  - the final validator now also checks that every W3 L4 tool-call and strict
+    schema case records an existing response artifact;
+  - `scripts/release/w3_l4_agent_gate.py` now writes response artifact paths
+    into `tool_call_cases` and `strict_schema_cases`;
+  - W3 synthetic fixtures in `model_release_grade_goal_gate.py` and
+    `model_release_grade_manifest.py` now create the referenced L3/L4 files;
+  - final-validator selftests now include missing-file negative checks for L3
+    and L4 case artifacts.
+- Why:
+  - W3 correctness artifacts should be inspectable evidence, not only JSON
+    counters and non-empty path strings;
+  - before this change, a final manifest could claim L3/L4 case success while
+    omitting the actual response/SSE files from the artifact directory.
+- Code:
+  - `scripts/release/model_release_grade_goal_gate.py`;
+  - `scripts/release/model_release_grade_manifest.py`;
+  - `scripts/release/w3_l4_agent_gate.py`.
+- Validation:
+  - `python3 -m py_compile scripts/release/model_release_grade_goal_gate.py scripts/release/model_release_grade_manifest.py scripts/release/w3_l4_agent_gate.py scripts/release/w3_qwen35_cuda_release_lane.py`;
+  - `python3 scripts/release/w3_l4_agent_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_goal_gate.py --self-test`;
+  - `python3 scripts/release/model_release_grade_manifest.py --self-test`;
+  - `python3 scripts/release/w3_qwen35_cuda_release_lane.py --self-test`.
+- Status:
+  - no GPU lane was run and no live vLLM run was used;
+  - no throughput, OOM-fixed, release-ready, or W3 completion claim is made;
+  - W3 still has no `MODEL_RELEASE_GRADE_W3 PASS`.
+
 ## 2026-06-24 ZZZ88 — W3 L2 known-answer cases must cover run and serve
 
 - Scope:

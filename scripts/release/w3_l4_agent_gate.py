@@ -260,7 +260,14 @@ def run_l4(args: argparse.Namespace) -> dict[str, Any]:
         status, body = post_json(args.base_url, payload, args.timeout)
         write_text(out / "tool_calls" / f"{label}.response.json", body)
         data = parse_json(label, status, body)
-        tool_results.append({"id": label, "passed": True, **validate_tool_call(label, data)})
+        tool_results.append(
+            {
+                "id": label,
+                "passed": True,
+                "artifact": f"tool_calls/{label}.response.json",
+                **validate_tool_call(label, data),
+            }
+        )
 
     strict_results: list[dict[str, Any]] = []
     for idx in range(args.strict_total):
@@ -274,6 +281,7 @@ def run_l4(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "id": label,
                 "passed": True,
+                "artifact": f"strict_schema/{label}.response.json",
                 **validate_strict_schema(label, data, f"ok-{idx}"),
             }
         )
@@ -320,13 +328,29 @@ def run_selftest() -> int:
             strict_total=20,
         )
         tool_results = [
-            {"id": f"tool_{idx:02d}", "passed": True, "finish_reason": "tool_calls"}
+            {
+                "id": f"tool_{idx:02d}",
+                "passed": True,
+                "finish_reason": "tool_calls",
+                "artifact": f"tool_calls/tool_{idx:02d}.response.json",
+            }
             for idx in range(10)
         ]
         strict_results = [
-            {"id": f"strict_schema_{idx:02d}", "passed": True, "finish_reason": "stop"}
+            {
+                "id": f"strict_schema_{idx:02d}",
+                "passed": True,
+                "finish_reason": "stop",
+                "artifact": f"strict_schema/strict_schema_{idx:02d}.response.json",
+            }
             for idx in range(20)
         ]
+        for result in tool_results:
+            (root / result["artifact"]).parent.mkdir(parents=True, exist_ok=True)
+            (root / result["artifact"]).write_text('{"choices":[]}\n', encoding="utf-8")
+        for result in strict_results:
+            (root / result["artifact"]).parent.mkdir(parents=True, exist_ok=True)
+            (root / result["artifact"]).write_text('{"choices":[]}\n', encoding="utf-8")
         artifact = {
             "schema_version": 1,
             "status": "pass",
