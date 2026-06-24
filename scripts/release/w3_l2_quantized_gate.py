@@ -28,6 +28,33 @@ REQUIRED_ENTRYPOINTS = {
     "ferrum serve": "serve",
 }
 REQUIRED_CASE_ENTRYPOINTS = set(REQUIRED_ENTRYPOINTS)
+FLAGS_WITH_VALUE = {
+    "--backend",
+    "--decision-trace-jsonl",
+    "--effective-config-json",
+    "--gpu-devices",
+    "--gpu-memory-utilization",
+    "--host",
+    "--kv-capacity",
+    "--kv-dtype",
+    "--kv-max-blocks",
+    "--max-model-len",
+    "--max-num-batched-tokens",
+    "--max-num-seqs",
+    "--max-tokens",
+    "--model",
+    "--output-format",
+    "--port",
+    "--prompt",
+    "--runtime-preset",
+    "--scheduler-active-decode-prefill-chunk",
+    "--scheduler-prefill-first-until-active",
+    "--scheduler-prefill-step-chunk",
+    "--seed",
+    "--temperature",
+    "--top-k",
+    "--top-p",
+}
 FORBIDDEN_OUTPUT_PATTERNS = [
     "<unk>",
     "[PAD",
@@ -135,23 +162,79 @@ def command_parts(raw: Any, label: str) -> list[str]:
 
 
 def ferrum_subcommands(parts: list[str], label: str) -> set[str]:
-    if not any(part == "ferrum" or part.endswith("/ferrum") for part in parts):
-        raise GateError(f"{label} must invoke the ferrum binary")
     for part in parts:
         if re.match(r"^FERRUM_[A-Z0-9_]+=", part):
             raise GateError(f"{label} uses hidden env override: {part.split('=', 1)[0]}")
-    found = {subcommand for subcommand in REQUIRED_ENTRYPOINTS.values() if subcommand in parts}
-    if not found:
-        raise GateError(f"{label} must invoke ferrum run or ferrum serve")
-    if len(found) > 1:
-        raise GateError(f"{label} ambiguously contains both ferrum run and ferrum serve")
-    return found
+    _, subcommand = ferrum_invocation(parts, label)
+    return {subcommand}
 
 
-def validate_product_command(raw: Any, label: str) -> dict[str, Any]:
+def ferrum_invocation(parts: list[str], label: str) -> tuple[int, str]:
+    invokes_ferrum = any(part == "ferrum" or part.endswith("/ferrum") for part in parts)
+    if not invokes_ferrum:
+        raise GateError(f"{label} must invoke the ferrum binary")
+    for idx, part in enumerate(parts):
+        if part == "--" and idx + 1 < len(parts) and parts[idx + 1] in REQUIRED_ENTRYPOINTS.values():
+            return idx + 1, parts[idx + 1]
+    for idx, part in enumerate(parts):
+        if part == "ferrum" or part.endswith("/ferrum"):
+            if idx + 1 < len(parts) and parts[idx + 1] in REQUIRED_ENTRYPOINTS.values():
+                return idx + 1, parts[idx + 1]
+    raise GateError(f"{label} must invoke ferrum run or ferrum serve")
+
+
+def flag_value_after(parts: list[str], start: int, flag: str) -> str | None:
+    prefix = f"{flag}="
+    idx = start
+    while idx < len(parts):
+        part = parts[idx]
+        if part.startswith(prefix):
+            return part[len(prefix) :]
+        if part == flag and idx + 1 < len(parts):
+            return parts[idx + 1]
+        idx += 1
+    return None
+
+
+def first_positional_after_subcommand(parts: list[str], subcommand_idx: int) -> str | None:
+    idx = subcommand_idx + 1
+    while idx < len(parts):
+        part = parts[idx]
+        if part == "--":
+            idx += 1
+            continue
+        if part.startswith("-"):
+            flag = part.split("=", 1)[0]
+            idx += 2 if flag in FLAGS_WITH_VALUE and "=" not in part else 1
+            continue
+        return part
+    return None
+
+
+def command_model_arg(parts: list[str], subcommand_idx: int, subcommand: str, label: str) -> str:
+    if subcommand == "serve":
+        model = flag_value_after(parts, subcommand_idx + 1, "--model")
+        if model:
+            return model
+    model = first_positional_after_subcommand(parts, subcommand_idx)
+    if not model:
+        raise GateError(f"{label} must include a model argument")
+    return model
+
+
+def validate_product_command(
+    raw: Any,
+    label: str,
+    acceptable_models: set[str],
+) -> dict[str, Any]:
     parts = command_parts(raw, label)
-    subcommand = next(iter(ferrum_subcommands(parts, label)))
+    ferrum_subcommands(parts, label)
+    subcommand_idx, subcommand = ferrum_invocation(parts, label)
     entrypoint = f"ferrum {subcommand}"
+    model_arg = command_model_arg(parts, subcommand_idx, subcommand, label)
+    if model_arg not in acceptable_models:
+        expected = ", ".join(sorted(acceptable_models))
+        raise GateError(f"{label} model {model_arg!r} does not match release/source model ({expected})")
     if isinstance(raw, dict) and isinstance(raw.get("entrypoint"), str):
         declared = raw["entrypoint"].strip()
         if declared != entrypoint:
@@ -159,6 +242,7 @@ def validate_product_command(raw: Any, label: str) -> dict[str, Any]:
     return {
         "entrypoint": entrypoint,
         "command_line": parts,
+        "model": model_arg,
     }
 
 
@@ -171,14 +255,21 @@ def product_commands(report: dict[str, Any]) -> list[Any]:
     return commands
 
 
-def validate_product_commands(report: dict[str, Any]) -> list[dict[str, Any]]:
+def validate_product_commands(
+    report: dict[str, Any],
+    acceptable_models: set[str],
+) -> list[dict[str, Any]]:
     commands = product_commands(report)
     if not commands:
         raise GateError("W3 L2 report must include real product command_line evidence")
     normalized: list[dict[str, Any]] = []
     detected: set[str] = set()
     for idx, command in enumerate(commands):
-        normalized_command = validate_product_command(command, f"commands[{idx}]")
+        normalized_command = validate_product_command(
+            command,
+            f"commands[{idx}]",
+            acceptable_models,
+        )
         normalized.append(normalized_command)
         detected.add(normalized_command["entrypoint"])
     missing_entrypoints = sorted(set(REQUIRED_ENTRYPOINTS) - detected)
@@ -295,8 +386,26 @@ def validate_report(
     report_dir: Path,
 ) -> dict[str, Any]:
     source = report_section(report)
-    model_id = model_id_override or non_empty_string(source.get("model_id"), "model_id")
-    quantized_format = format_override or non_empty_string(source.get("format"), "format")
+    reported_model_id = non_empty_string(source.get("model_id"), "model_id")
+    if model_id_override is not None and model_id_override != reported_model_id:
+        raise GateError(
+            f"--model-id {model_id_override!r} does not match source report model_id "
+            f"{reported_model_id!r}"
+        )
+    model_id = model_id_override or reported_model_id
+    reported_format = non_empty_string(source.get("format"), "format")
+    if format_override is not None and format_override != reported_format:
+        raise GateError(
+            f"--format {format_override!r} does not match source report format {reported_format!r}"
+        )
+    quantized_format = format_override or reported_format
+    raw_model_source = source.get("model_source", source.get("model_path", source.get("model")))
+    model_source = None
+    if raw_model_source is not None:
+        model_source = non_empty_string(raw_model_source, "model_source")
+    acceptable_models = {model_id}
+    if model_source is not None:
+        acceptable_models.add(model_source)
 
     real_size_model = bool_value(source.get("real_size_model"), "real_size_model")
     if not real_size_model:
@@ -325,7 +434,7 @@ def validate_report(
     if hidden_env != []:
         raise GateError("hidden_env must be empty for W3 L2 release-grade evidence")
 
-    commands = validate_product_commands(source)
+    commands = validate_product_commands(source, acceptable_models)
 
     if cases:
         failed = [case for case in cases if not case_passed(case)]
@@ -336,6 +445,7 @@ def validate_report(
     return {
         "model_id": model_id,
         "format": quantized_format,
+        "model_source": model_source,
         "product_surface": surface,
         "known_answer_total": known_answer_total,
         "known_answer_passed": known_answer_passed,
@@ -364,6 +474,7 @@ def build_artifact(
         "status": "pass",
         "level": "l2_quantized",
         "model_id": validated["model_id"],
+        "model_source": validated["model_source"],
         "product_surface": validated["product_surface"],
         "hidden_env": [],
         "generated_at": iso_now(),
@@ -375,6 +486,7 @@ def build_artifact(
             "known_answer_total": validated["known_answer_total"],
             "known_answer_passed": validated["known_answer_passed"],
             "format": validated["format"],
+            "model_source": validated["model_source"],
             "source_report": source_ref,
         },
         "output_hygiene": validated["output_hygiene"],
@@ -412,7 +524,8 @@ def selftest_report(root: Path) -> Path:
             }
         )
     report = {
-        "model_id": "selftest/Qwen3.5-35B-A3B-GPTQ-Int4",
+        "model_id": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+        "model_source": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
         "format": "hf-gptq-int4",
         "real_size_model": True,
         "waived": False,
@@ -467,6 +580,19 @@ def run_selftest() -> int:
             raise AssertionError("selftest artifact did not scan known-answer artifacts")
         if set(artifact["output_hygiene"]["case_entrypoints"]) != REQUIRED_CASE_ENTRYPOINTS:
             raise AssertionError("selftest artifact did not preserve case entrypoint coverage")
+
+        try:
+            build_artifact(
+                report_path=report,
+                out_dir=root / "wrong_model_override_out",
+                model_id_override="other/model",
+                format_override=None,
+            )
+        except GateError as exc:
+            if "does not match source report model_id" not in str(exc):
+                raise AssertionError(f"unexpected wrong-model override error: {exc}") from exc
+        else:
+            raise AssertionError("wrong-model-id override unexpectedly passed")
 
         bad = as_object(load_json(report), "selftest report")
         bad["known_answer_cases"][0]["passed"] = False
@@ -545,6 +671,29 @@ def run_selftest() -> int:
                 raise AssertionError(f"unexpected hidden-env command error: {exc}") from exc
         else:
             raise AssertionError("hidden-env product command unexpectedly passed")
+
+        wrong_model = as_object(load_json(report), "selftest report")
+        wrong_model["commands"][0]["command_line"] = [
+            "ferrum",
+            "run",
+            "other/model",
+            "--backend",
+            "cuda",
+        ]
+        wrong_model_path = root / "wrong_model_command_report.json"
+        write_json(wrong_model_path, wrong_model)
+        try:
+            build_artifact(
+                report_path=wrong_model_path,
+                out_dir=root / "wrong_model_out",
+                model_id_override=None,
+                format_override=None,
+            )
+        except GateError as exc:
+            if "does not match release/source model" not in str(exc):
+                raise AssertionError(f"unexpected wrong-model command error: {exc}") from exc
+        else:
+            raise AssertionError("wrong-model product command unexpectedly passed")
 
         serve_only_cases = as_object(load_json(report), "selftest report")
         for case in serve_only_cases["known_answer_cases"]:

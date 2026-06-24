@@ -1139,6 +1139,7 @@ def build_known_answer_report(
     report = {
         "schema_version": 1,
         "model_id": args.release_model_id,
+        "model_source": args.model,
         "format": args.quantized_format,
         "real_size_model": True,
         "waived": False,
