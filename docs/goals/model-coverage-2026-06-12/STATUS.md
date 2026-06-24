@@ -2,6 +2,66 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ130 — Fresh KV defer diagnostic still stalls; cancel churn reduced, prefill churn remains
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/`;
+  - remote Git SHA: `0486ed97e97d63ff3b5ef3bc78de8fb01bb786a2`;
+  - diagnostic lane only, not release evidence, and did not run live vLLM;
+  - Vast instance `42216671` was reused, then stopped and confirmed
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-engine -p ferrum-scheduler -p ferrum-kv` PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`.
+- c32 diagnostic result:
+  - command was the planned diagnostic `bench-serve` c=32, 32 prompts,
+    4 warmups, `n_repeats=1`, `--fail-on-error`, seed `9271`;
+  - bench was manually stopped per stop condition after the trace showed no
+    token progress and GPU utilization returned to idle;
+  - `bench_exit=143`, so this is a failed/stopped diagnostic.
+- Failure shape:
+  - `completed_total=5`;
+  - `cancelled_total=36`, down from ZZZ128's `3873`;
+  - `capacity_deferred_total=80997`;
+  - `no_victim_warning_count=81210`;
+  - `oom_mentions=0`;
+  - last engine counters had `prefill_tokens_delta=0` and
+    `decode_tokens_delta=0`;
+  - last scheduler state had `prefill_queue_len=25`,
+    `waiting_queue_len=7`, `decode_queue_len=0`, `active_len=25`, and
+    `capacity_backpressure_admit_limit=2`;
+  - last plan was prefill-only:
+    `prefill_items=27`, `decode_items=0`, `scheduled_tokens_total=162`.
+- Conclusion:
+  - ZZZ129 did reduce the decode cancel/re-submit storm substantially
+    (`3873 -> 36`), so that source direction was partially useful;
+  - it did not solve the core c32 stall because capacity-deferred requests
+    already sitting in `prefill_queue` are still scheduled every iteration and
+    fail without token progress;
+  - the next blocker is active-prefill retry semantics after capacity defer,
+    not model-specific recurrent slot caps and not another waiting-admission
+    hard cap.
+- Next source direction before another paid GPU run:
+  - add generic scheduler/engine feedback so a capacity-deferred prefill item
+    leaves the active prefill queue for a waiting/backoff state, or otherwise
+    cannot be immediately reselected in the next batch at the same failing
+    width;
+  - compare this against vLLM's WAITING allocation failure break semantics
+    and RUNNING-first scheduling without running live vLLM;
+  - add a source-level regression where a prefill_queue cohort repeatedly
+    fails capacity allocation and must not be rescheduled with zero token
+    progress.
+- Limits:
+  - no W3 PASS line exists;
+  - this does not prove c32 completion, throughput recovery, W3 performance,
+    or release readiness;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ129 — Fresh KV prefill now defers instead of preempting decode
 
 - Source of this patch:
