@@ -2,6 +2,61 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ128 — Paged KV rollback c32 diagnostic completes, but throughput is far below target
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_paged_kv_rollback_c32_d62b18cf_20260624T175240Z/`;
+  - remote Git SHA: `d62b18cfe877a2b260a5ddab3bfa4772a45cb7ff`;
+  - diagnostic lane only, not release evidence, and did not run live vLLM;
+  - Vast instance `42216671` was reused, then stopped and confirmed
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`.
+- Correctness/build smoke:
+  - remote CUDA `cargo check -p ferrum-engine -p ferrum-scheduler -p ferrum-kv` PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` chat smoke PASS, response content `5`.
+- c32 diagnostic result:
+  - command was the planned diagnostic `bench-serve` c=32, 32 prompts,
+    4 warmups, `n_repeats=1`, `--fail-on-error`, seed `9271`;
+  - PASS line:
+    `FERRUM W3 QWEN35 PAGED KV ROLLBACK C32 DIAG PASS: /workspace/artifacts/w3_qwen35_paged_kv_rollback_c32_d62b18cf_20260624T175240Z`;
+  - `bench_exit=0`, `completed_per_run=[32]`, `errored_per_run=[0]`,
+    `zero_output_tokens_per_run=[0]`, `http_500_per_run=[0]`,
+    `panic_per_run=[0]`;
+  - `output_token_count_source=usage`;
+  - `oom_mentions=0`.
+- Performance shape:
+  - output throughput was only `10.06 tok/s`;
+  - total throughput was `19.10 tok/s`;
+  - request throughput was `0.0786 req/s`;
+  - TTFT p50 was `2089.5 ms`;
+  - TPOT p50 was `3177.3 ms`;
+  - `no_victim_warning_count=69401`,
+    `capacity_deferred_total=69401`, and `cancelled_total=3873`.
+- Conclusion:
+  - the paged KV rollback fix changes the previous no-token-progress failure
+    into a completed c32 diagnostic: this is real progress on the OOM/stall
+    path;
+  - the throughput is still far below the W3 target and cannot be treated as
+    performance evidence;
+  - the next bottleneck is not "can c32 finish" but why completing c32 still
+    requires massive capacity-defer/cancel churn.
+- Next source direction before another paid GPU run:
+  - inspect the generic capacity sizing/admission/preemption path around
+    `FERRUM_KV_MAX_BLOCKS=256`, `FERRUM_KV_CAPACITY=512`, and per-request
+    paged-block demand;
+  - compare against the local vLLM waiting-allocation behavior already traced,
+    without running live vLLM;
+  - avoid model/GPU hard-coded limits such as Qwen3.5-only recurrent slot caps.
+- Limits:
+  - no W3 PASS line exists;
+  - this does not prove W3 throughput, release readiness, or same-hardware
+    performance parity;
+  - W3 still lacks `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ127 — Paged KV partial allocation rollback fixed
 
 - Source of this patch:
