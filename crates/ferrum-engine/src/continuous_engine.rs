@@ -1013,6 +1013,8 @@ impl SequenceState {
 
     pub fn requires_full_logits_for_sampling(&self) -> bool {
         self.requires_engine_full_logits_for_sampling()
+            || self.argmax_token_mask.is_some()
+            || (self.generated_tokens.is_empty() && self.initial_argmax_token_mask.is_some())
     }
 
     pub fn reset_guided_processors(&self) -> Result<()> {

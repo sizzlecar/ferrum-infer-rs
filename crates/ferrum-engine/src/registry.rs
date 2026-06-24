@@ -1450,7 +1450,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                         return Err(FerrumError::unsupported(
                             "Qwen3.5/Qwen3.6 product execution is CUDA-only in the W3 path. \
                              CPU is available only through explicit --qwen35-reference for \
-                             correctness bring-up.",
+                             correctness bring-up; CPU product execution is not wired yet.",
                         ));
                     }
                     #[cfg(feature = "cuda")]
