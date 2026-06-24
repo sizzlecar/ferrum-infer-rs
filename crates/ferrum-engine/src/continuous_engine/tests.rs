@@ -1613,6 +1613,72 @@ async fn process_batch_unified_releases_recurrent_state_when_kv_alloc_defers() {
 }
 
 #[tokio::test]
+async fn process_batch_unified_kv_defer_moves_active_prefill_back_to_waiting() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 0;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(0));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
+        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler.clone(),
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager),
+    );
+
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 2;
+    let request_id = request.id.clone();
+    scheduler.submit(request).await.unwrap();
+    let batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("submitted request should be scheduled");
+    let active = scheduler.trace_snapshot();
+    assert_eq!(active.prefill_queue_len, 1);
+    assert_eq!(active.active_len, 1);
+
+    engine.inner.process_batch(&batch).await.unwrap();
+
+    let deferred = scheduler.trace_snapshot();
+    assert_eq!(deferred.waiting_queue_len, 1);
+    assert_eq!(deferred.prefill_queue_len, 0);
+    assert_eq!(deferred.active_len, 0);
+    assert_eq!(deferred.cancelled_total, 0);
+    assert_eq!(
+        scheduler.trace_phase(&request_id),
+        Some(RequestPhase::Waiting)
+    );
+    let sequences = engine.inner.sequences.read();
+    let sequence = sequences
+        .get(&request_id)
+        .expect("deferred request should remain in sequence state");
+    assert_eq!(sequence.phase, RequestPhase::Waiting);
+    assert!(!sequence.prefill_complete);
+    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.recurrent_state.is_none());
+}
+
+#[tokio::test]
 async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fails() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
