@@ -120,6 +120,7 @@ fn parses_official_qwen36_shared_expert_moe_config() {
     let raw = read_artifact("moe_shared_expert_reference.config.json");
     let cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
     assert!(cfg.is_moe());
+    assert!(cfg.quantization.is_none());
     assert_eq!(cfg.top_level_model_type.as_deref(), Some("qwen3_5_moe"));
     assert_eq!(cfg.text_model_type, "qwen3_5_moe_text");
     assert_eq!(cfg.hidden_size, 2048);
@@ -215,6 +216,90 @@ fn parses_official_qwen36_shared_expert_moe_config() {
         spec.estimated_memory_bytes(),
         30 * (8192 * 3 + 32 * 128 * 128) * 2
     );
+}
+
+#[test]
+fn parses_qwen35_moe_gptq_quantization_config() {
+    let raw = r#"{
+      "model_type": "qwen3_5_moe",
+      "quantization_config": {
+        "bits": 4,
+        "group_size": 128,
+        "desc_act": false,
+        "sym": true,
+        "quant_method": "gptq"
+      },
+      "text_config": {
+        "model_type": "qwen3_5_moe_text",
+        "hidden_size": 2048,
+        "num_hidden_layers": 4,
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "head_dim": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "attn_output_gate": true,
+        "rope_parameters": {
+          "rope_theta": 10000000,
+          "partial_rotary_factor": 0.25,
+          "mrope_interleaved": true
+        },
+        "num_experts": 256,
+        "num_experts_per_tok": 8,
+        "moe_intermediate_size": 512,
+        "shared_expert_intermediate_size": 512,
+        "tie_word_embeddings": false
+      }
+    }"#;
+    let cfg = Qwen35TextConfig::from_hf_config_str(raw).unwrap();
+    let quant = cfg
+        .quantization
+        .as_ref()
+        .expect("GPTQ quantization_config should be preserved");
+
+    assert_eq!(quant.quant_method, "gptq");
+    assert_eq!(quant.bits, 4);
+    assert_eq!(quant.group_size, 128);
+    assert!(!quant.desc_act);
+    assert!(quant.sym);
+}
+
+#[test]
+fn rejects_unknown_qwen35_quantization_method() {
+    let raw = r#"{
+      "model_type": "qwen3_5_moe",
+      "quantization_config": {
+        "bits": 4,
+        "group_size": 128,
+        "quant_method": "awq"
+      },
+      "text_config": {
+        "model_type": "qwen3_5_moe_text",
+        "hidden_size": 16,
+        "num_hidden_layers": 4,
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 4,
+        "linear_value_head_dim": 4,
+        "linear_conv_kernel_dim": 4,
+        "head_dim": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 4,
+        "shared_expert_intermediate_size": 4
+      }
+    }"#;
+    let err = Qwen35TextConfig::from_hf_config_str(raw)
+        .expect_err("unsupported quantization method should fail");
+    assert!(err.contains("quant_method"), "{err}");
+    assert!(err.contains("awq"), "{err}");
 }
 
 #[test]

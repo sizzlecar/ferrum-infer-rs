@@ -80,6 +80,15 @@ pub struct Qwen35RopeParameters {
     pub mrope_section: Option<Vec<usize>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35QuantizationConfig {
+    pub quant_method: String,
+    pub bits: usize,
+    pub group_size: usize,
+    pub desc_act: bool,
+    pub sym: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Qwen35TextConfig {
     pub top_level_model_type: Option<String>,
@@ -96,6 +105,8 @@ pub struct Qwen35TextConfig {
     pub tie_word_embeddings: bool,
     pub dense_intermediate_size: Option<usize>,
     pub moe: Option<Qwen35MoeTextConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<Qwen35QuantizationConfig>,
 }
 
 impl Qwen35TextConfig {
@@ -197,6 +208,7 @@ impl Qwen35TextConfig {
             tie_word_embeddings,
             dense_intermediate_size: optional_usize(text_config, "intermediate_size")?,
             moe,
+            quantization: parse_quantization_config(text_config, obj)?,
         };
         parsed.validate()?;
         Ok(parsed)
@@ -574,6 +586,37 @@ fn parse_rope_parameters(
         mrope_interleaved,
         mrope_section,
     })
+}
+
+fn parse_quantization_config(
+    text_config: &serde_json::Map<String, Value>,
+    root: &serde_json::Map<String, Value>,
+) -> Result<Option<Qwen35QuantizationConfig>, String> {
+    let Some(value) = text_config
+        .get("quantization_config")
+        .or_else(|| root.get("quantization_config"))
+    else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let quant = value
+        .as_object()
+        .ok_or_else(|| "quantization_config must be an object when present".to_string())?;
+    let quant_method = required_string(quant, "quant_method")?;
+    if quant_method != "gptq" {
+        return Err(format!(
+            "unsupported Qwen3.5 quantization_config.quant_method {quant_method:?}"
+        ));
+    }
+    Ok(Some(Qwen35QuantizationConfig {
+        quant_method,
+        bits: required_usize(quant, "bits")?,
+        group_size: required_usize(quant, "group_size")?,
+        desc_act: optional_bool(quant, "desc_act")?.unwrap_or(false),
+        sym: optional_bool(quant, "sym")?.unwrap_or(false),
+    }))
 }
 
 fn parse_usize_array(value: &Value) -> Result<Vec<usize>, String> {

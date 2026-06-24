@@ -13960,3 +13960,40 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
     也不能声称真实 c32 OOM 已实机解决。
   - W3 仍需要真实 1x4090 artifact 和最终
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
+
+## 2026-06-24 — W3 Qwen3.5 typed GPTQ quantization metadata
+
+- 背景:
+  - W3 目标和已复制的
+    `w3_qwen35_weight_index_probe_20260622/w3_qwen35_weight_index_probe.json`
+    都记录真实目标模型
+    `Qwen/Qwen3.5-35B-A3B-GPTQ-Int4` 的 quantization facts:
+    `quant_method=gptq`, `bits=4`, `group_size=128`,
+    `desc_act=false`, `sym=true`。
+  - 旧 `Qwen35TextConfig` 只保留 attention/MoE/recurrent shape,没有 typed
+    quantization metadata;后续 loader/gate 只能重新读 raw JSON 或依赖外部
+    artifact,不利于 product path 早期校验真实 GPTQ lane。
+- 源码变更:
+  - 新增 `Qwen35QuantizationConfig`,保留
+    `quant_method/bits/group_size/desc_act/sym`。
+  - `Qwen35TextConfig::from_hf_config_value()` 现在解析 root 或
+    `text_config` 下的 `quantization_config`。
+  - 当前 W3 typed parser 只接受 `quant_method="gptq"`;其他方法会早期报错,
+    避免把非 W3 quantization 静默当作支持。
+  - `ModelDefinition` flatten 后的 `ferrum_qwen35_text_config` 也会携带
+    typed GPTQ metadata,供 product loader/后续 gates 使用。
+- 本地验证:
+  - `cargo fmt --all -- --check` PASS。
+  - `cargo test -p ferrum-models --test qwen35_config_test -- --nocapture`
+    PASS,8 个 Qwen3.5 config tests 通过。
+  - `cargo test -p ferrum-models qwen35_model_definition_preserves_typed_gptq_quantization_config -- --nocapture`
+    PASS。
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS,
+    103 个 Qwen35/Qwen35 weight/config/executor/model 相关测试通过。
+  - `git diff --check` PASS。
+- 限制:
+  - 未运行 GPU lane,未运行 live vLLM。
+  - 这只把真实 GPTQ quantization facts 纳入 typed/product config 边界,
+    不构成 L2 真实模型正确性证据、性能证据或 OOM 实机证明。
+  - W3 仍需要真实 1x4090 artifact 和最终
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`。
