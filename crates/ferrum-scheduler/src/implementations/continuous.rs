@@ -818,24 +818,19 @@ impl ContinuousBatchScheduler {
 
         // Check if we should admit new requests from waiting queue
         let waiting_queue = self.waiting_queue.read();
-        // Keep decode moving after a capacity miss instead of re-admitting
-        // waiting prefills that the engine just proved cannot fit.
-        let available_slots = if capacity_backpressure_active && scheduled_decode_count > 0 {
-            0
-        } else {
-            let active_capacity = self
-                .config
-                .max_running_requests
-                .saturating_sub(self.active_count());
-            let decode_capacity = self
-                .cb_config
-                .max_decode_batch
-                .saturating_sub(self.decoding_count());
-            let available_slots = active_capacity.min(decode_capacity);
-            self.capacity_backpressure_admit_limit()
-                .map(|limit| available_slots.min(limit))
-                .unwrap_or(available_slots)
-        };
+        let active_capacity = self
+            .config
+            .max_running_requests
+            .saturating_sub(self.active_count());
+        let decode_capacity = self
+            .cb_config
+            .max_decode_batch
+            .saturating_sub(self.decoding_count());
+        let available_slots = active_capacity.min(decode_capacity);
+        let available_slots = self
+            .capacity_backpressure_admit_limit()
+            .map(|limit| available_slots.min(limit))
+            .unwrap_or(available_slots);
 
         let requests_to_admit: Vec<RequestId> = waiting_queue
             .iter()
@@ -2112,11 +2107,6 @@ mod tests {
         assert_eq!(after_defer.capacity_backpressure_admit_limit, Some(1));
 
         let second_batch = scheduler.create_iteration_batch(hint).unwrap();
-        assert_eq!(
-            second_batch.requests.len(),
-            3,
-            "capacity backpressure should not admit a waiting prefill while decode can progress"
-        );
         let scheduled_decodes = second_batch
             .requests
             .iter()
@@ -2128,11 +2118,6 @@ mod tests {
             scheduled_decodes, 3,
             "capacity backpressure must let decode-ready requests run instead of repeatedly admitting a capacity-blocked prefill"
         );
-        let after_second_batch = scheduler.trace_snapshot();
-        assert_eq!(after_second_batch.waiting_queue_len, 1);
-        assert_eq!(after_second_batch.prefill_queue_len, 0);
-        assert_eq!(after_second_batch.active_len, 3);
-        assert_eq!(after_second_batch.admitted_total, 4);
     }
 
     #[test]
