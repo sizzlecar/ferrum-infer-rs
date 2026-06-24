@@ -15973,3 +15973,59 @@ python3 scripts/release/w3_qwen35_cuda_release_lane.py \
   - It validates `ferrum serve` for this targeted path, not `ferrum run`.
   - Current W3 still lacks final
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-25 — W3 Qwen3.5 capacity-defer fix c32 diagnostic, admission churn remains
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_scheduler_defer_c32_e8bea515_20260624T162225Z/`
+  - Diagnostic failed line from lane log:
+    `bench_c32_failed exit=143`, final `exit_code=50`.
+  - The committed local artifact keeps `perf/failure_summary.json`, the full
+    compressed scheduler trace, `scheduler_tail_200.jsonl`, and
+    `serve.tail.400.log`. The full `serve.log.gz` local copy was discarded
+    after gzip validation reported it was truncated.
+  - Vast instance `42216671` reused, then stopped after artifact copyback;
+    stop verification reported `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+  - Git SHA `e8bea515f257bc6545abcee34b96e92db4d4ce65`.
+  - Binary SHA256
+    `2608d6f8b2a710a0c5deea04779d82d7a6b233a572f67c89192be3be0b126b55`.
+- Correctness smoke:
+  - CUDA `cargo check -p ferrum-engine -p ferrum-scheduler` PASS.
+  - CUDA release build PASS.
+  - `ferrum run` smoke PASS, response content `5`.
+  - `ferrum serve` `/v1/models` PASS.
+  - `ferrum serve` chat smoke PASS, response content `5`.
+  - run and serve effective-config assertions both passed:
+    `selected_max_sequences=32`,
+    `selected_recurrent_state_max_slots=32`,
+    `selected_admission_limit=32`.
+- c32 diagnostic bench:
+  - Command shape: `bench-serve`, sharegpt dataset, `--concurrency 32`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`.
+  - The bench was manually stopped after the short stall sample met the stop
+    condition; this avoided waiting for the full 600 second timeout.
+  - `bench.exit=143`.
+  - `perf/failure_summary.json` last valid scheduler state:
+    `completed_total=5`, `failed_total=0`, `cancelled_total=65`,
+    `admitted_total=604315`, `waiting_queue_len=32`, `active_len=0`,
+    `prefill_items=32`, `decode_items=0`, `scheduled_tokens_total=192`.
+  - GPU utilization was 0% during the stall sample.
+- Diagnosis:
+  - The capacity-defer patch avoided the immediate OOM/fatal path and preserved
+    the product smoke path for both `ferrum run` and `ferrum serve`, but it did
+    not solve c32 throughput.
+  - The remaining failure is admission churn: the scheduler repeatedly admits a
+    full prefill batch, allocation returns `no victim`, the requests are moved
+    back to waiting, and the next iteration admits them again. No prompt tokens
+    are consumed and no decode work is scheduled in the last valid trace.
+  - This points to a scheduler/admission contract bug, not a model-specific
+    hard cap. The next source fix should prevent capacity-blocked waiting
+    requests from being immediately re-admitted without a resource-progress
+    signal or decode/freeing opportunity.
+- Limits:
+  - This is diagnostic only (`n_repeats=1`, c32 only, manual stop).
+  - It is not a W3 completion, performance-ready claim, or release-ready claim.
+  - Current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
