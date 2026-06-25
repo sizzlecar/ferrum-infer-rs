@@ -2,6 +2,60 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ205 — source candidate: decode capacity backpressure
+
+- Context:
+  - follows ZZZ204 `f1bc7b7e` c32 diagnostic REJECT;
+  - no GPU lane was started for this source step;
+  - no live vLLM run was used.
+- Source change:
+  - commit `47a3a9af4d399287894b7e17381ad97486a86509`
+    (`perf(scheduler): cap decode width after kv pressure`);
+  - scheduler now tracks a decode-specific capacity backpressure limit when a
+    decode KV capacity failure moves a decode request back to waiting;
+  - decode scheduling uses this decode-specific limit, while ordinary
+    prefill/admission capacity backpressure remains separate;
+  - capacity-deferred mixed recompute remains enabled under decode
+    backpressure even when the capped decode width falls below the normal
+    active-decode prefill pressure threshold, preventing the ZZZ204
+    `mixed_iterations=0` failure mode from becoming permanent.
+- Why this matches ZZZ204:
+  - ZZZ204 reduced KV churn but still rejected with `mixed_iterations=0`,
+    throughput `476.311 tok/s`, and p95 ITL `48.888 ms`;
+  - the trace still showed repeated decode-only KV admission failures at
+    widths `32`, `28`, `25`, `23`, `21`, `19`, `18`, and `17`;
+  - `capacity_backpressure_admit_limit` was already set after those failures,
+    but decode scheduling did not obey a decode-width cap.
+- Local validation:
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS, `5/5`;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture`
+    PASS, `10/10`;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS, `80/80`;
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS, `3/3`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Runner targeting:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `47a3a9af4d399287894b7e17381ad97486a86509`;
+  - default tag is now `decode_capacity_backpressure`;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` standalone defaults were
+    updated to the same SHA/tag.
+- Expected signal for a next scoped c32 diagnostic:
+  - decode-only KV failure widths should stop repeating the descending
+    over-wide pattern from ZZZ204;
+  - `mixed_iterations` should be greater than ZZZ204's `0`;
+  - throughput and p95 ITL should improve versus ZZZ204; otherwise the next
+    bottleneck is likely the decode/mixed scheduling balance after capped
+    backpressure, not the independent-release wait itself.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ204 — f1bc7b7e c32 diagnostic REJECT: decode defer improves KV churn, decode width still too high
 
 - Artifact:
