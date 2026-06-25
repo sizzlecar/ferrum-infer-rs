@@ -2,6 +2,84 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ185 — c5a285c0 c32 diagnostic REJECT: mixed count recovers, failed mixed retries dominate
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_recompute_capacity_epoch_c32_c5a285c0_20260625T074956Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_c5a285c0_1782373730/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32 focused diagnostic,
+    expected 10-20 minutes, about `$0.08-$0.16`, stop on KEEP/REJECT,
+    SSH/CUDA/preflight failure, script failure, or timeout;
+  - reused retained instance `42216671`, exact `1x RTX 4090`, cost
+    `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - independent Vast inventory after analysis again showed `42216671`
+    `stopped/exited`.
+- Remote evidence:
+  - remote Git SHA:
+    `c5a285c01f4a90135ce9765179b3f03cf31c8dc7`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `56dfd99c0b189cf04833942f6cd765c765cb02d837a9b9059f39526fc4abad6b`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` `/v1/models` and chat smoke passed;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, and `output_token_count_source=usage`;
+  - no live vLLM run.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - remote verdict line:
+    `FERRUM W3 QWEN35 C32 DIAG REJECT:
+    /workspace/artifacts/w3_qwen35_mixed_recompute_capacity_epoch_c32_c5a285c0_20260625T074956Z`.
+- Reject reasons:
+  - output throughput `374.954 tok/s` <= floor `600.0`;
+  - p95 ITL `68.221 ms` > `25.0`;
+  - `Unified KV admission failed=15` > threshold `13`.
+- Targeted signal:
+  - `mixed_iterations` improved from ZZZ183 `12 -> 79`, so the source change
+    reopened bounded mixed recompute after physical KV release;
+  - `capacity_deferred_total=25`, still under the threshold `32`;
+  - product-path correctness smoke remained clean: `32/32` completed and zero
+    request errors.
+- Regressions:
+  - throughput regressed from ZZZ183 `452.616 -> 374.954 tok/s`;
+  - p95 ITL regressed from ZZZ183 `59.060 -> 68.221 ms`;
+  - `Unified KV admission failed` regressed from ZZZ183 `9 -> 15`;
+  - average process time rose from ZZZ183 `21529 us -> 25414 us`.
+- Offline trace analysis:
+  - parsed scheduler trace for ZZZ183:
+    `mixed=12`, `effective_prefill_delta>0=1`,
+    `failed_prefill_delta0=11`;
+  - parsed scheduler trace for ZZZ185:
+    `mixed=79`, `effective_prefill_delta>0=1`,
+    `failed_prefill_delta0=78`;
+  - therefore the higher mixed count is mostly failed recompute retries, not
+    useful overlap.
+- Classification:
+  - diagnostic rejected, not performance progress and not release evidence;
+  - `c5a285c0` confirms the release signal was too coarse, but reopening on
+    every decode capacity defer is also too permissive.
+- Next source direction:
+  - do not run another paid GPU diagnostic from this result alone;
+  - next fix must use actual KV admission evidence, for example parsing or
+    propagating `need/free` admission-block data, so mixed recompute is retried
+    only when the freed capacity can plausibly fit the next bounded recompute;
+  - alternatively tighten mixed recompute reopen to require enough accumulated
+    physical-release evidence rather than a single deferred decode.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ184 — source candidate: reopen bounded mixed recompute on physical KV release
 
 - Context:
