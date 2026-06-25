@@ -2,6 +2,37 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ218 — 2f5a375e retained-instance retry timed out before remote execution
+
+- Attempted lane:
+  - W3 Qwen35 c32 mixed-kv-feedback-order diagnostic;
+  - target SHA `2f5a375e28f06d8ff652906672c35c20d1de30f0`;
+  - retained Vast instance `42216671`, exact `1x RTX 4090`;
+  - no live vLLM run and no alternate instance search.
+- Preflight:
+  - ran `git pull --rebase --autostash` before the attempt; branch was already
+    up to date;
+  - paid GPU contract was stated before start.
+- Outcome:
+  - Vast start response again returned `resources_unavailable` with message
+    `Required resources are currently unavailable, state change queued.`;
+  - every poll remained `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`;
+  - intermittent Vast GET calls hit SSL handshake timeout/EOF;
+  - runner naturally timed out waiting for instance state;
+  - final cleanup check still confirmed `42216671` was stopped/exited.
+- Evidence status:
+  - no SSH/CUDA preflight ran;
+  - no remote checkout, `cargo check`, CUDA build, `ferrum run`,
+    `ferrum serve`, or bench ran;
+  - no local `2f5a375e` artifact directory was created;
+  - this is not KEEP, not REJECT, not performance evidence, and not release
+    evidence.
+- Next action:
+  - stop retrying the same unavailable retained instance in this loop;
+  - continue only after the retained instance becomes startable, or after
+    explicit approval to choose a different instance.
+
 ## 2026-06-25 ZZZ217 — 2f5a375e c32 diagnostic attempt aborted before remote execution
 
 - Attempted lane:
