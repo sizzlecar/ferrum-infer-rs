@@ -2,6 +2,59 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ190 — source candidate: cap mixed-prefill count as admission-pressure budget
+
+- Context:
+  - follows ZZZ189 `8a5f2819` c32 diagnostic REJECT without starting another
+    GPU and without running live vLLM;
+  - ZZZ189 proved that spending mixed-prefill headroom improved throughput
+    (`422.960 -> 467.313 tok/s`) and p95 ITL (`62.386 -> 56.017 ms`), but it
+    also regressed KV pressure (`Unified KV admission failed 9 -> 15`,
+    `capacity_deferred_total 18 -> 37`) and collapsed `mixed_iterations`
+    (`28 -> 4`);
+  - trace inspection showed the widened token budget could be bypassed by many
+    small final chunks: one mixed row scheduled
+    `decode_items=19, prefill_items=13, prefill_tokens=13`, which then
+    contributed to large paged-KV admission pressure such as
+    `need 183 admission blocks (16 immediate) but only 128 free`.
+- Source change:
+  - commit `dc456075009f688b843b7ae863602071192ae422`
+    (`perf(scheduler): cap mixed prefill chunk count`);
+  - active-decode mixed prefill now has both:
+    - a token budget, and
+    - a prefill item/chunk-count budget shared across prefill-queue and newly
+      admitted waiting requests in the same scheduler iteration;
+  - this prevents many 1-token final prefill chunks from bypassing the intended
+    admission-pressure cap;
+  - capacity-deferred mixed recompute still preserves the model-owned KV
+    snapshot gate from `e213e6eb`;
+  - no model-name, GPU-name, or VRAM-specific caps were added.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler active_decode_prefill -- --nocapture`
+    PASS (`5/5`);
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture` PASS
+    (`8/8`);
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`76/76` plus
+    doctests);
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS (`3/3`);
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Expected diagnostic signal if a later paid c32 run is justified:
+  - mixed rows should no longer show `prefill_items` far above the intended
+    `max_prefill_batch / 2` headroom budget simply because chunks are small;
+  - KV admission failures and capacity-deferred count should move back toward
+    the ZZZ187 levels while retaining some of the throughput/ITL gain from
+    ZZZ189;
+  - this is an expectation only; KEEP/REJECT must still come from an artifact.
+- Limits:
+  - source candidate only; no new CUDA diagnostic, no new performance artifact,
+    and no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ189 — 8a5f2819 c32 diagnostic REJECT: headroom improves throughput but regresses KV pressure
 
 - Artifact:
