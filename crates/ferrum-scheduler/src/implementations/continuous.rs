@@ -198,7 +198,7 @@ pub struct ContinuousBatchScheduler {
     capacity_release_epoch: AtomicU64,
     capacity_mixed_recompute_epoch: AtomicU64,
     capacity_mixed_recompute_blocked_until_epoch: AtomicU64,
-    capacity_mixed_recompute_required_free_blocks: AtomicUsize,
+    capacity_mixed_recompute_required_blocks_per_slot: AtomicUsize,
     capacity_mixed_recompute_observed_free_blocks: AtomicUsize,
     total_wait_time_us: AtomicU64,
 
@@ -323,7 +323,7 @@ impl ContinuousBatchScheduler {
             capacity_release_epoch: AtomicU64::new(0),
             capacity_mixed_recompute_epoch: AtomicU64::new(0),
             capacity_mixed_recompute_blocked_until_epoch: AtomicU64::new(0),
-            capacity_mixed_recompute_required_free_blocks: AtomicUsize::new(0),
+            capacity_mixed_recompute_required_blocks_per_slot: AtomicUsize::new(0),
             capacity_mixed_recompute_observed_free_blocks: AtomicUsize::new(usize::MAX),
             total_wait_time_us: AtomicU64::new(0),
             start_time: Instant::now(),
@@ -497,7 +497,7 @@ impl ContinuousBatchScheduler {
         self.capacity_release_epoch.fetch_add(1, Ordering::Relaxed);
         self.capacity_mixed_recompute_epoch
             .fetch_add(1, Ordering::Relaxed);
-        self.capacity_mixed_recompute_required_free_blocks
+        self.capacity_mixed_recompute_required_blocks_per_slot
             .store(0, Ordering::Relaxed);
         self.capacity_mixed_recompute_observed_free_blocks
             .store(usize::MAX, Ordering::Relaxed);
@@ -510,7 +510,7 @@ impl ContinuousBatchScheduler {
     }
 
     pub fn record_capacity_deferred_mixed_recompute_release_evidence(&self) {
-        self.capacity_mixed_recompute_required_free_blocks
+        self.capacity_mixed_recompute_required_blocks_per_slot
             .store(0, Ordering::Relaxed);
         self.capacity_mixed_recompute_observed_free_blocks
             .store(usize::MAX, Ordering::Relaxed);
@@ -523,12 +523,10 @@ impl ContinuousBatchScheduler {
     ) {
         self.capacity_mixed_recompute_observed_free_blocks
             .store(free_blocks, Ordering::Relaxed);
-        let required = self
-            .capacity_mixed_recompute_required_free_blocks
+        let required_blocks_per_slot = self
+            .capacity_mixed_recompute_required_blocks_per_slot
             .load(Ordering::Relaxed);
-        if required > 0 && free_blocks >= required {
-            self.capacity_mixed_recompute_required_free_blocks
-                .store(0, Ordering::Relaxed);
+        if required_blocks_per_slot > 0 && free_blocks >= required_blocks_per_slot {
             self.record_capacity_recompute_progress();
         }
     }
@@ -540,30 +538,35 @@ impl ContinuousBatchScheduler {
     /// capacity evidence epoch cannot create free KV blocks; it only repeats
     /// the failed unified admission overhead.
     pub fn defer_capacity_deferred_mixed_recompute_until_release(&self) {
-        self.capacity_mixed_recompute_required_free_blocks
+        self.capacity_mixed_recompute_required_blocks_per_slot
             .store(0, Ordering::Relaxed);
         self.capacity_mixed_recompute_observed_free_blocks
             .store(usize::MAX, Ordering::Relaxed);
-        self.defer_capacity_deferred_mixed_recompute_until_kv_capacity(None, None);
+        self.defer_capacity_deferred_mixed_recompute_until_kv_capacity(None, None, None);
     }
 
     /// Suppress release-blocked mixed recompute until enough KV capacity exists.
     ///
     /// When paged-KV admission returns structured pressure, the engine passes
-    /// the required and observed free-block counts here. Decode recompute only
-    /// reopens after a later capacity snapshot proves that the pool has enough
-    /// free blocks for the failed admission, avoiding blind same-pressure
-    /// mixed retries.
+    /// the failed batch's admission blocks, attempted prefill width, and
+    /// observed free-block count here. Decode recompute reopens once a later
+    /// capacity snapshot can fit at least one bounded recompute, and its
+    /// per-iteration width is paced by the same per-slot estimate. This avoids
+    /// both blind same-pressure retries and waiting for enough free blocks to
+    /// replay the entire failed mixed batch at once.
     pub fn defer_capacity_deferred_mixed_recompute_until_kv_capacity(
         &self,
-        required_free_blocks: Option<usize>,
+        required_admission_blocks: Option<usize>,
         observed_free_blocks: Option<usize>,
+        attempted_prefill_width: Option<usize>,
     ) {
         let mixed_epoch = self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed);
         let blocked_until = mixed_epoch.saturating_add(1);
-        if let Some(required) = required_free_blocks.filter(|required| *required > 0) {
-            self.capacity_mixed_recompute_required_free_blocks
-                .store(required, Ordering::Relaxed);
+        if let Some(required) = required_admission_blocks.filter(|required| *required > 0) {
+            let width = attempted_prefill_width.unwrap_or(1).max(1);
+            let required_blocks_per_slot = required.div_ceil(width).max(1);
+            self.capacity_mixed_recompute_required_blocks_per_slot
+                .store(required_blocks_per_slot, Ordering::Relaxed);
         }
         if let Some(observed) = observed_free_blocks {
             self.capacity_mixed_recompute_observed_free_blocks
@@ -899,6 +902,8 @@ impl ContinuousBatchScheduler {
         active_decode_prefill_chunk: Option<usize>,
         prefill_step_chunk: Option<usize>,
         active_decode_prefill_tokens_remaining: Option<usize>,
+        required_blocks_per_slot: usize,
+        observed_free_blocks: usize,
     ) -> usize {
         let Some(tokens_remaining) = active_decode_prefill_tokens_remaining else {
             return 0;
@@ -911,7 +916,11 @@ impl ContinuousBatchScheduler {
         else {
             return 0;
         };
-        tokens_remaining.div_ceil(chunk).max(1)
+        let token_budget_slots = tokens_remaining.div_ceil(chunk).max(1);
+        if required_blocks_per_slot == 0 || observed_free_blocks == usize::MAX {
+            return token_budget_slots;
+        }
+        token_budget_slots.min(observed_free_blocks / required_blocks_per_slot)
     }
 
     fn add_prefill_requests_to_batch(
@@ -1080,14 +1089,14 @@ impl ContinuousBatchScheduler {
             .capacity_mixed_recompute_blocked_until_epoch
             .load(Ordering::Relaxed)
             <= capacity_mixed_recompute_epoch;
-        let mixed_recompute_required_free_blocks = self
-            .capacity_mixed_recompute_required_free_blocks
+        let mixed_recompute_required_blocks_per_slot = self
+            .capacity_mixed_recompute_required_blocks_per_slot
             .load(Ordering::Relaxed);
         let mixed_recompute_observed_free_blocks = self
             .capacity_mixed_recompute_observed_free_blocks
             .load(Ordering::Relaxed);
-        let mixed_recompute_kv_capacity_ready = mixed_recompute_required_free_blocks == 0
-            || mixed_recompute_observed_free_blocks >= mixed_recompute_required_free_blocks;
+        let mixed_recompute_kv_capacity_ready = mixed_recompute_required_blocks_per_slot == 0
+            || mixed_recompute_observed_free_blocks >= mixed_recompute_required_blocks_per_slot;
         let allow_capacity_deferred_mixed_recompute = scheduled_decode_count > 0
             && active_decode_prefill_chunk.is_some()
             && active_decode_prefill_tokens_remaining.unwrap_or(0) > 0
@@ -1099,6 +1108,8 @@ impl ContinuousBatchScheduler {
                     active_decode_prefill_chunk,
                     prefill_step_chunk,
                     active_decode_prefill_tokens_remaining,
+                    mixed_recompute_required_blocks_per_slot,
+                    mixed_recompute_observed_free_blocks,
                 )
             });
 
@@ -2490,7 +2501,11 @@ mod tests {
             .collect();
         assert!(first_mixed_ids.contains(&first_ids[0]) || first_mixed_ids.contains(&first_ids[1]));
 
-        scheduler.defer_capacity_deferred_mixed_recompute_until_kv_capacity(Some(4), Some(0));
+        scheduler.defer_capacity_deferred_mixed_recompute_until_kv_capacity(
+            Some(4),
+            Some(0),
+            Some(1),
+        );
         assert!(scheduler.defer_prefill_to_waiting(&first_ids[0]));
 
         assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[2], 4));
@@ -2519,6 +2534,73 @@ mod tests {
             after_enough_ids.contains(&first_ids[0]) || after_enough_ids.contains(&first_ids[1]),
             "mixed recompute should reopen once the model-owned KV snapshot reaches the failed admission need"
         );
+    }
+
+    #[tokio::test]
+    async fn capacity_deferred_mixed_recompute_paces_width_by_kv_snapshot() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..8 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        for request_id in first_ids.iter().take(4) {
+            assert!(scheduler.defer_decode_to_waiting_for_capacity(request_id, 8));
+        }
+
+        scheduler.defer_capacity_deferred_mixed_recompute_until_kv_capacity(
+            Some(16),
+            Some(0),
+            Some(4),
+        );
+        scheduler.record_capacity_deferred_mixed_recompute_kv_capacity_snapshot(8);
+
+        let paced_mixed = scheduler.create_iteration_batch(hint).unwrap();
+        let scheduled_recomputes = paced_mixed
+            .requests
+            .iter()
+            .filter(|request| {
+                first_ids[..4].contains(&request.request.id) && request.tokens_to_process != Some(1)
+            })
+            .count();
+        let scheduled_decodes = paced_mixed
+            .requests
+            .iter()
+            .filter(|request| {
+                first_ids[4..].contains(&request.request.id) && request.tokens_to_process == Some(1)
+            })
+            .count();
+
+        assert_eq!(scheduled_decodes, 4);
+        assert_eq!(
+            scheduled_recomputes, 2,
+            "free KV blocks should pace the number of reopened capacity-blocked recomputes"
+        );
+        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 2);
     }
 
     #[tokio::test]

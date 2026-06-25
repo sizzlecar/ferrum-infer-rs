@@ -470,6 +470,7 @@ impl EngineInner {
                         .defer_capacity_deferred_mixed_recompute_until_kv_capacity(
                             pressure.map(|pressure| pressure.admission_blocks),
                             pressure.map(|pressure| pressure.free_blocks),
+                            Some(prefill_meta.len()),
                         );
                 }
                 for work in &prefill_meta {
