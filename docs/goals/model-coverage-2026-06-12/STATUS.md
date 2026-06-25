@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ182 — c32 diagnostic runner targets mixed capacity backoff source fix
+
+- Context:
+  - follows source fix `ff5cab92` without starting a GPU;
+  - this only prepares a later bounded c32 diagnostic target and records the
+    expected evidence before any paid run.
+- Runner update:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `ff5cab92175e3929e70ce5e0a70fcc706d82b8b7`;
+  - default artifact tag is `mixed_capacity_backoff`;
+  - plan lane is `W3 Qwen35 c32 mixed-capacity-backoff diagnostic`;
+  - strict diagnostic thresholds remain unchanged: throughput floor `600.0`,
+    max `Unified KV admission failed=13`, max `capacity_deferred_total=32`,
+    min mixed iterations `64`, max p95 ITL `25.0 ms`.
+- Local validation:
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS line:
+    `W3 QWEN35 VAST C32 DIAGNOSTIC ORCHESTRATOR SELFTEST PASS`;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    PASS, printed target SHA
+    `ff5cab92175e3929e70ce5e0a70fcc706d82b8b7`, lane
+    `W3 Qwen35 c32 mixed-capacity-backoff diagnostic`, unchanged strict
+    thresholds, and did not touch Vast.
+- Next paid-run rule:
+  - before any GPU start, restate the paid lane contract, query Vast inventory,
+    confirm only the intended retained 1x4090 instance is used, and stop after
+    KEEP/REJECT/failure;
+  - expected trace signal: lower `Unified KV admission failed` than ZZZ180
+    `18`, lower average process time than ZZZ180 `25261 us`, and no panic/OOM
+    or request errors.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ181 — source fix: mixed recompute backs off after KV capacity feedback until release
 
 - Context:
