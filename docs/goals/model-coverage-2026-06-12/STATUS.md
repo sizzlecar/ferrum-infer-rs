@@ -2,6 +2,66 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ174 — source fix: prefill capacity defer resets scheduler chunk progress
+
+- Context:
+  - follows ZZZ173 REJECT without starting another GPU;
+  - ZZZ173 fixed the immediate retry-churn target
+    (`Unified KV admission failed=10`, `capacity_deferred_total=20`), but
+    mixed recompute progress dropped to `41` iterations and remained far below
+    the W3 throughput/ITL target;
+  - offline trace comparison showed ZZZ173 had `125` capacity-blocked
+    iterations, but only `41` mixed iterations; `84` iterations still had
+    blocked waiting recomputes while the scheduler ran decode-only work.
+- Source diagnosis:
+  - `EngineInner::defer_prefill_for_capacity` releases physical KV/model cache,
+    recurrent state, and resets `SequenceState.prefill_tokens_processed` to
+    `0`;
+  - `ContinuousBatchScheduler::defer_prefill_to_waiting` moved the same request
+    back to waiting while preserving scheduler-side `prefill_tokens`,
+    `chunked_prefill`, and `prefill_chunk_offset`;
+  - after a capacity failure following partial recompute progress, scheduler
+    progress could therefore diverge from physical KV/recurrent state. A later
+    retry could be budgeted as if the prefix were already rebuilt, even though
+    the engine had released that physical state.
+- Code change:
+  - `defer_prefill_to_waiting` now resets scheduler-side prefill progress:
+    `prefill_tokens=0`, clears `kv_blocks`, clears `chunked_prefill`, and
+    resets `prefill_chunk_offset=0`;
+  - it deliberately preserves `capacity_deferred_mixed_attempt_epoch`, so the
+    ZZZ171 same-epoch no-progress retry suppression remains in force.
+- Test added:
+  - `defer_prefill_to_waiting_resets_chunk_progress_after_capacity_loss`;
+  - the test partially processes a `128` token prefill, capacity-defers it back
+    to waiting, verifies scheduler progress is reset, and verifies the next
+    batch schedules `128` tokens rather than the stale remaining `64`.
+- Local validation:
+  - `cargo test -p ferrum-scheduler defer_prefill_to_waiting_resets_chunk_progress_after_capacity_loss -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler defer_prefill_to_waiting -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`71/71`);
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `git diff --check` PASS.
+- Next evidence needed:
+  - update the c32 diagnostic runner to target this source commit and run only
+    local self-test/plan-only before any paid GPU;
+  - expected trace signal for a later bounded c32 diagnostic: scheduler trace
+    should no longer show stale partial recompute progress after capacity
+    defer. Throughput may move either direction; this fix is correctness/state
+    consistency first.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ173 — e270c5b1 c32 diagnostic REJECT: churn fixed, mixed/ITL still fail
 
 - Artifact:

@@ -510,6 +510,10 @@ impl ContinuousBatchScheduler {
             req.phase = RequestPhase::Waiting;
             req.inner.state = RequestState::Waiting;
             req.inner.started_at = None;
+            req.prefill_tokens = 0;
+            req.kv_blocks.clear();
+            req.chunked_prefill = false;
+            req.prefill_chunk_offset = 0;
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
             request_index.insert(request_id.clone(), RequestPhase::Waiting);
             waiting_queue.push_back(req);
@@ -1609,6 +1613,49 @@ mod tests {
         assert_eq!(
             scheduler.request_state(&request_id),
             Some(RequestState::Waiting)
+        );
+    }
+
+    #[test]
+    fn defer_prefill_to_waiting_resets_chunk_progress_after_capacity_loss() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 1,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 1,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let request = create_test_request_with_prompt_tokens(Priority::Normal, 128);
+        let request_id = request.id.clone();
+        enqueue_waiting(&scheduler, request);
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests[0].request.id, request_id);
+        assert!(!scheduler.mark_prefill_chunk_processed(&request_id, 128, 64));
+
+        assert!(scheduler.defer_prefill_to_waiting(&request_id));
+        let waiting = scheduler.waiting_queue.read();
+        let deferred = waiting
+            .iter()
+            .find(|req| req.inner.request.id == request_id)
+            .expect("request should be back in waiting queue");
+        assert_eq!(deferred.prefill_tokens, 0);
+        assert_eq!(deferred.prefill_chunk_offset, 0);
+        assert!(!deferred.chunked_prefill);
+        drop(waiting);
+
+        let retry_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(retry_batch.requests[0].request.id, request_id);
+        assert_eq!(
+            retry_batch.requests[0].tokens_to_process,
+            Some(128),
+            "released physical prefill state must be rebuilt from the start"
         );
     }
 
