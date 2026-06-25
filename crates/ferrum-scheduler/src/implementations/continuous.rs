@@ -94,6 +94,8 @@ pub struct ContinuousBatchRequest {
     pub prefill_time_ms: u64,
     /// Time spent in decode (ms)
     pub decode_time_ms: u64,
+    /// Capacity-deferred requests wait for real capacity release before re-admission.
+    pub capacity_deferred_until_release_epoch: u64,
 }
 
 impl ContinuousBatchRequest {
@@ -110,6 +112,7 @@ impl ContinuousBatchRequest {
             last_iteration: 0,
             prefill_time_ms: 0,
             decode_time_ms: 0,
+            capacity_deferred_until_release_epoch: 0,
         }
     }
 
@@ -151,6 +154,7 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub admitted_total: u64,
     pub capacity_deferred_total: u64,
     pub capacity_backpressure_admit_limit: Option<usize>,
+    pub capacity_blocked_waiting_len: usize,
 }
 
 /// Continuous batching scheduler
@@ -188,6 +192,7 @@ pub struct ContinuousBatchScheduler {
     capacity_deferred_counter: AtomicU64,
     capacity_backpressure_limit: AtomicUsize,
     capacity_backpressure_iteration: AtomicU64,
+    capacity_release_epoch: AtomicU64,
     total_wait_time_us: AtomicU64,
 
     /// Start time
@@ -308,6 +313,7 @@ impl ContinuousBatchScheduler {
             capacity_deferred_counter: AtomicU64::new(0),
             capacity_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
             capacity_backpressure_iteration: AtomicU64::new(u64::MAX),
+            capacity_release_epoch: AtomicU64::new(0),
             total_wait_time_us: AtomicU64::new(0),
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
@@ -357,6 +363,7 @@ impl ContinuousBatchScheduler {
             admitted_total: self.admitted_counter.load(Ordering::Relaxed),
             capacity_deferred_total: self.capacity_deferred_counter.load(Ordering::Relaxed),
             capacity_backpressure_admit_limit: self.capacity_backpressure_admit_limit(),
+            capacity_blocked_waiting_len: self.capacity_blocked_waiting_len(),
         }
     }
 
@@ -378,6 +385,7 @@ impl ContinuousBatchScheduler {
             let mut req = waiting_queue.remove(pos).unwrap();
             req.phase = RequestPhase::Prefilling;
             req.inner.state = RequestState::Running;
+            req.capacity_deferred_until_release_epoch = 0;
             let started_at = chrono::Utc::now();
             let wait_us = started_at
                 .signed_duration_since(req.inner.submitted_at)
@@ -406,6 +414,18 @@ impl ContinuousBatchScheduler {
         } else {
             Some(limit.max(1))
         }
+    }
+
+    fn capacity_blocked_waiting_len(&self) -> usize {
+        if self.active_count() == 0 {
+            return 0;
+        }
+        let release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
+        self.waiting_queue
+            .read()
+            .iter()
+            .filter(|req| req.capacity_deferred_until_release_epoch > release_epoch)
+            .count()
     }
 
     fn record_capacity_defer_feedback(&self, attempted_prefill_width: usize) {
@@ -463,6 +483,11 @@ impl ContinuousBatchScheduler {
             .store(next, Ordering::Relaxed);
     }
 
+    fn record_capacity_release_progress(&self) {
+        self.capacity_release_epoch.fetch_add(1, Ordering::Relaxed);
+        self.record_resource_progress();
+    }
+
     /// Move a capacity-deferred prefill back to the waiting queue.
     ///
     /// The engine uses this when it could not allocate physical KV or
@@ -518,6 +543,10 @@ impl ContinuousBatchScheduler {
             req.kv_blocks.clear();
             req.chunked_prefill = false;
             req.prefill_chunk_offset = 0;
+            req.capacity_deferred_until_release_epoch = self
+                .capacity_release_epoch
+                .load(Ordering::Relaxed)
+                .saturating_add(1);
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
             request_index.insert(request_id.clone(), RequestPhase::Waiting);
             waiting_queue.push_back(req);
@@ -866,9 +895,15 @@ impl ContinuousBatchScheduler {
             .capacity_backpressure_admit_limit()
             .map(|limit| available_slots.min(limit))
             .unwrap_or(available_slots);
+        let active_count_for_capacity_wait = self.active_count();
+        let capacity_release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
 
         let requests_to_admit: Vec<RequestId> = waiting_queue
             .iter()
+            .filter(|r| {
+                active_count_for_capacity_wait == 0
+                    || r.capacity_deferred_until_release_epoch <= capacity_release_epoch
+            })
             .take(available_slots)
             .map(|r| r.inner.request.id.clone())
             .collect();
@@ -1119,7 +1154,7 @@ impl Scheduler for ContinuousBatchScheduler {
 
             // Remove from index
             self.request_index.write().remove(&request_id);
-            self.record_resource_progress();
+            self.record_capacity_release_progress();
 
             Ok(())
         } else {
@@ -1145,7 +1180,7 @@ impl Scheduler for ContinuousBatchScheduler {
                         );
                     }
                 }
-                self.record_resource_progress();
+                self.record_capacity_release_progress();
                 return Ok(());
             }
 
@@ -1185,6 +1220,7 @@ impl Scheduler for ContinuousBatchScheduler {
                 prefill_queue.remove(pos);
                 self.request_index.write().remove(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
+                self.record_capacity_release_progress();
                 warn!("Request {} cancelled during prefill", request_id);
                 return Ok(true);
             }
@@ -1196,6 +1232,7 @@ impl Scheduler for ContinuousBatchScheduler {
             if decode_queue.remove(&request_id).is_some() {
                 self.request_index.write().remove(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
+                self.record_capacity_release_progress();
                 warn!("Request {} cancelled during decode", request_id);
                 return Ok(true);
             }
@@ -1335,6 +1372,7 @@ impl Scheduler for ContinuousBatchScheduler {
                 .write()
                 .insert(request_id, RequestPhase::Preempted);
             self.preempted_counter.fetch_add(1, Ordering::Relaxed);
+            self.record_capacity_release_progress();
 
             Ok(PreemptionResult {
                 success: true,
@@ -1635,6 +1673,88 @@ mod tests {
         assert_eq!(after.prefill_queue_len, 2);
         assert_eq!(after.active_len, 2);
         assert_eq!(after.capacity_backpressure_admit_limit, Some(2));
+    }
+
+    #[tokio::test]
+    async fn capacity_deferred_decode_waits_for_release_while_active_decodes_remain() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 4));
+        let deferred = scheduler.trace_snapshot();
+        assert_eq!(deferred.waiting_queue_len, 1);
+        assert_eq!(deferred.decode_queue_len, 3);
+        assert_eq!(deferred.active_len, 3);
+        assert_eq!(deferred.capacity_blocked_waiting_len, 1);
+        assert_eq!(deferred.capacity_backpressure_admit_limit, Some(2));
+
+        let decode_only = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let scheduled_ids: HashSet<RequestId> = decode_only
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert_eq!(decode_only.requests.len(), 3);
+        assert!(
+            !scheduled_ids.contains(&first_ids[0]),
+            "capacity-deferred recompute should wait while active decodes still hold KV"
+        );
+        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 1);
+
+        let response = InferenceResponse {
+            request_id: first_ids[1].clone(),
+            text: String::new(),
+            tokens: Vec::new(),
+            finish_reason: ferrum_types::FinishReason::Length,
+            usage: ferrum_types::TokenUsage::new(0, 0),
+            latency_ms: 0,
+            created_at: chrono::Utc::now(),
+            metadata: Default::default(),
+            api_response: None,
+        };
+        scheduler
+            .complete(first_ids[1].clone(), &response)
+            .await
+            .unwrap();
+
+        let after_release = scheduler.create_iteration_batch(hint).unwrap();
+        let scheduled_ids: HashSet<RequestId> = after_release
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(
+            scheduled_ids.contains(&first_ids[0]),
+            "a real capacity release should make the deferred recompute eligible again"
+        );
+        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 0);
     }
 
     #[test]
