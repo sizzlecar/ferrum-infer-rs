@@ -2,6 +2,38 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ159 — c32 diagnostic runner verdict self-test added
+
+- Context:
+  - the exact 1x4090 lane is still unavailable, so the useful local work is to
+    reduce the risk that a future paid GPU window is wasted by an untested
+    diagnostic script;
+  - ZZZ158 added the reusable runner, but only covered shell syntax and help
+    output.
+- Script update:
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` now has `--self-test`;
+  - the formal c32 path and the self-test share the same
+    `write_diagnostic_summary` verdict function, so the self-test validates the
+    code that will classify a real GPU artifact.
+- Self-test coverage:
+  - synthetic KEEP case: throughput above `458.0662677685816`, `32/32`
+    completed, zero errors, `Unified KV admission failed=13`,
+    `capacity_deferred_total=32`;
+  - reject on throughput at the floor;
+  - reject on KV admission count above `13`;
+  - reject on `capacity_deferred_total` above `32`;
+  - reject on incomplete/error requests.
+- Local validation:
+  - `bash -n scripts/release/w3_qwen35_c32_diagnostic.sh` PASS;
+  - `bash scripts/release/w3_qwen35_c32_diagnostic.sh --self-test` PASS:
+    `W3 QWEN35 C32 DIAGNOSTIC SELFTEST PASS`;
+  - `bash scripts/release/w3_qwen35_c32_diagnostic.sh --help` PASS.
+- Limits:
+  - no CUDA diagnostic, performance bench, or final W3 validator ran here;
+  - this is script-readiness evidence only;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ158 — reusable 9fda1101 c32 diagnostic script prepared
 
 - Context:
