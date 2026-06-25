@@ -2,6 +2,65 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ181 — source fix: mixed recompute backs off after KV capacity feedback until release
+
+- Context:
+  - follows ZZZ180 REJECT without starting another GPU;
+  - ZZZ180 restored mixed scanning (`mixed_iterations=112`) but regressed
+    throughput to `378.392 tok/s` and increased `Unified KV admission failed`
+    to `18`;
+  - serve logs showed repeated mixed admission failures while capacity was not
+    available, including `need 1 admission blocks (1 immediate) but only 0 free`
+    and larger immediate-block failures.
+- Source diagnosis:
+  - after a mixed decode+recompute KV reservation failed with
+    `ResourceExhausted`, the engine deferred the prefill candidate but the
+    scheduler could immediately try another release-blocked candidate in the
+    same capacity-release epoch;
+  - trying a different candidate does not create free KV blocks; it repeats the
+    same unified admission overhead until a real request completion or release
+    changes capacity.
+- Code change:
+  - `ContinuousBatchScheduler` now tracks a
+    `capacity_mixed_recompute_blocked_until_release_epoch`;
+  - new method
+    `defer_capacity_deferred_mixed_recompute_until_release()` suppresses
+    release-blocked mixed recompute until `capacity_release_epoch` advances;
+  - the engine calls that method when mixed prefill+decode
+    `reserve_kv_slots` fails with `ResourceExhausted`;
+  - decode-only work can continue while recomputes wait, and bounded mixed
+    recompute reopens after real capacity release.
+- Test added:
+  - `capacity_deferred_mixed_recompute_waits_after_capacity_feedback_until_release`;
+  - it verifies a failed mixed recompute blocks later release-blocked recompute
+    candidates, then a decode completion reopens bounded mixed recompute.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred_mixed_recompute_waits_after_capacity_feedback_until_release -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`73/73`);
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `git diff --check` PASS.
+- Expected next evidence:
+  - no paid GPU should be started from this status entry alone until this
+    source fix is committed and the diagnostic runner target is updated;
+  - if a later bounded c32 diagnostic runs, the primary signal is lower
+    `Unified KV admission failed` than ZZZ180 `18` and lower average process
+    time than ZZZ180 `25261 us`;
+  - mixed iterations may drop from ZZZ180 `112`; that is acceptable only if
+    failed admission overhead drops and throughput/ITL improve.
+- Limits:
+  - source candidate only; no CUDA build, GPU diagnostic, live vLLM run,
+    performance claim, or final W3 validator ran here;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ180 — eaf405f5 c32 diagnostic REJECT: mixed restored, KV failures and throughput regress
 
 - Artifact:
