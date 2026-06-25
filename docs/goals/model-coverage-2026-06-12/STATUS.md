@@ -2,6 +2,73 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ166 — 9d43148 c32 diagnostic REJECT: partial backpressure not enough
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_partial_prefill_backpressure_c32_9d43148c_20260625T044410Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_9d43148c_1782362588/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    partial-prefill-backpressure diagnostic, expected 10-20 minutes, about
+    `$0.08-$0.16`, stop on KEEP/REJECT/SSH/CUDA failure/timeout/script failure;
+  - inventory before start showed only retained instance `42216671`,
+    `stopped/exited`, exact `1x RTX 4090`, cost `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back;
+  - stop verification after the run showed only `42216671`,
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`;
+  - no unexpected paid/scheduling sibling instances remained.
+- Remote evidence:
+  - remote Git SHA:
+    `9d43148caaf0565a0699e89fd30a44ca14d77100`;
+  - remote git status short was empty;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` `/v1/models` and chat smoke passed;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, and
+    `output_token_count_source=usage`;
+  - no live vLLM run.
+- Diagnostic verdict:
+  - `FERRUM W3 QWEN35 C32 DIAG REJECT:
+    /workspace/artifacts/w3_qwen35_partial_prefill_backpressure_c32_9d43148c_20260625T044410Z`;
+  - local orchestrator exit code `60`.
+- Reject reasons:
+  - output throughput `282.994 tok/s` <= floor `600.0`;
+  - p95 ITL `62.720 ms` > `25.0`;
+  - `Unified KV admission failed=50` > `13`;
+  - `capacity_deferred_total=112` > `32`.
+- Trace comparison:
+  - `mixed_iterations=126`, unchanged from ZZZ164 and still near historical
+    mixed count `127`;
+  - `decode_only_iterations=383`, `prefill_only_iterations=90`;
+  - `avg_process_us=25533.6`, slightly better than ZZZ164's `26297.6`, but far
+    worse than the historical `633/635 tok/s` references around
+    `16.6-16.8 ms`;
+  - throughput improved only slightly from ZZZ164 (`274.637 -> 282.994 tok/s`)
+    and remains worse than ZZZ161 (`488.596 tok/s`).
+- Classification:
+  - keeping capacity backpressure through partial chunks did not change the
+    main failure class;
+  - mixed scheduling remains restored, but too many capacity-deferred recompute
+    requests are still admitted/scheduled as a cohort, causing repeated KV
+    admission failures and high ITL;
+  - this is a rejected diagnostic, not performance progress.
+- Next source direction:
+  - do not spend another GPU run on this candidate;
+  - the next source patch should keep mixed scheduling but admit at most a very
+    small number of capacity-deferred recomputes under bounded mixed budget,
+    instead of promoting/scheduling a whole deferred cohort before real
+    capacity release.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ165 — source candidate: keep capacity backpressure through partial prefill chunks
 
 - Context:
