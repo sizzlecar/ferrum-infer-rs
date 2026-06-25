@@ -2,6 +2,61 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ155 — source candidate: mixed non-final prefill uses immediate KV admission
+
+- Context:
+  - ZZZ153 (`7476295d`) is the current useful c32 floor after rejected
+    candidates: `32/32` completed, zero request errors, output throughput
+    `458.066 tok/s`;
+  - that artifact still showed model-owned paged KV admission pressure in
+    mixed decode+prefill scheduling, while no driver/CUDA OOM, panic,
+    cancellation, preemption, or block-pool exhaustion was observed;
+  - the failure class is therefore KV admission/capacity pressure, not a reason
+    to add a model/GPU/VRAM-specific concurrency cap.
+- Source diagnosis:
+  - `SequenceState::model_decode_metadata()` records
+    `ferrum_kv_admission_target_len` as the full current target length;
+  - for non-final prefill chunks co-batched with active decode, keeping that
+    future full-context target makes both the engine pre-reserve helper and
+    `LlmExecutor::unified_decode` ask the paged KV model to reserve future
+    blocks that are not needed by the current chunk;
+  - this is stricter than the dynamic capacity behavior needed for chunked
+    prefill: the current step should reserve immediate tokens, while future
+    chunks should wait for later release/progress signals.
+- Implementation:
+  - in `EngineInner::process_batch_unified`, mixed batches now remove
+    `ferrum_kv_admission_target_len` only for non-final prefill chunks when
+    active decode items are also present;
+  - final prefill chunks and standalone prefill batches keep their existing
+    admission target behavior;
+  - decode rows keep their current-context admission target;
+  - no Qwen/GPU/VRAM enumerated special case and no effective-concurrency cap
+    was added.
+- Local validation:
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-engine process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine process_batch_unified_reserve_resource_exhausted_defers_without_fallback -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture` PASS
+    (`18/18`);
+  - `cargo check -p ferrum-engine -p ferrum-models -p ferrum-cli` PASS.
+- Expected CUDA diagnostic signal before this can be kept:
+  - `ferrum run` and `ferrum serve` smoke must still pass on the exact remote
+    SHA;
+  - c32 diagnostic must complete `32/32` with zero request errors;
+  - `Unified KV admission failed` and capacity-defer counts should not increase
+    versus ZZZ153, and throughput must beat the ZZZ153 floor of
+    `458.066 tok/s`.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, or final W3 validator has
+    run for this source candidate yet;
+  - no live vLLM was run;
+  - this is not W3 completion, final performance evidence, release readiness, or
+    a substitute for the final validator;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ154 — source candidate: recurrent prefill cohort admission, local validation only
 
 - Context:

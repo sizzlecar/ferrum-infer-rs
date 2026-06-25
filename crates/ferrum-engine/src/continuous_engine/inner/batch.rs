@@ -195,7 +195,7 @@ impl EngineInner {
                 existing_kv,
                 existing_recurrent_state,
                 chunk_start,
-                metadata,
+                mut metadata,
                 logits_policy,
                 can_use_prefix_cache,
             ) = {
@@ -347,6 +347,9 @@ impl EngineInner {
             .map(|chunk| chunk.min(remaining).max(1))
             .unwrap_or(remaining);
             let is_final_chunk = chunk_start + chunk_len >= num_tokens;
+            if has_decode_items && !is_final_chunk {
+                metadata.remove(KV_ADMISSION_TARGET_LEN_METADATA_KEY);
+            }
             unified_prefills.push(UnifiedPrefillWork {
                 rid: rid.clone(),
                 input_tokens,
