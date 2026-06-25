@@ -262,6 +262,7 @@ struct CapturedUnifiedItem {
     q_len: usize,
     pos_offset: usize,
     is_final_chunk: bool,
+    admission_target_len: Option<usize>,
     logits_policy: ferrum_interfaces::model_executor::LogitsReturnPolicy,
 }
 
@@ -297,6 +298,11 @@ impl ModelExecutor for CapturingUnifiedExecutor {
                 q_len: item.q_tokens.len(),
                 pos_offset: item.pos_offset,
                 is_final_chunk: item.is_final_chunk,
+                admission_target_len: item
+                    .metadata
+                    .get("ferrum_kv_admission_target_len")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value as usize),
                 logits_policy: item.logits_policy.clone(),
             })
             .collect::<Vec<_>>();
@@ -1072,10 +1078,19 @@ async fn process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk
         !prefill.is_final_chunk,
         "fresh first chunk should stay non-final in the mixed batch"
     );
+    assert_eq!(
+        prefill.admission_target_len, None,
+        "mixed non-final prefill chunk should reserve only immediate KV slots"
+    );
     let decode = &captured[0][1];
     assert_eq!(decode.q_len, 1);
     assert_eq!(decode.pos_offset, 1);
     assert!(decode.is_final_chunk);
+    assert_eq!(
+        decode.admission_target_len,
+        Some(2),
+        "decode metadata should keep its current-context admission target"
+    );
 }
 
 #[test]
