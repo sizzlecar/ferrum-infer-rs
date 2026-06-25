@@ -37,6 +37,15 @@ impl EngineInner {
                 }
                 Err(e) if is_resource_exhausted_error(&e) => {
                     if !allow_preempt {
+                        let pressure = paged_kv_admission_pressure(&e);
+                        if let Some(pressure) = pressure {
+                            self.scheduler
+                                .defer_capacity_deferred_mixed_recompute_until_kv_capacity(
+                                    Some(pressure.admission_blocks),
+                                    Some(pressure.free_blocks),
+                                    Some(chunk.len().max(1)),
+                                );
+                        }
                         for rid in &chunk {
                             if !self
                                 .defer_decode_for_capacity_recompute(rid, pressure_width)
