@@ -781,10 +781,6 @@ impl ContinuousBatchScheduler {
             if release_blocked_capacity_deferred
                 && req.capacity_deferred_mixed_attempt_epoch == Some(capacity_release_epoch)
             {
-                if let Some(remaining) = capacity_deferred_mixed_recompute_slots_remaining.as_mut()
-                {
-                    *remaining = 0;
-                }
                 continue;
             }
             if release_blocked_capacity_deferred
@@ -953,10 +949,7 @@ impl ContinuousBatchScheduler {
             if release_ready {
                 requests_to_admit.push(req.inner.request.id.clone());
             } else if req.capacity_deferred_mixed_attempt_epoch == Some(capacity_release_epoch) {
-                if let Some(remaining) = capacity_deferred_mixed_recompute_slots_remaining.as_mut()
-                {
-                    *remaining = 0;
-                }
+                continue;
             } else if allow_capacity_deferred_mixed_recompute
                 && release_blocked_capacity_deferred_admissions
                     < capacity_deferred_mixed_recompute_slots_remaining.unwrap_or(0)
@@ -1986,6 +1979,95 @@ mod tests {
             progressed_tokens,
             Some(64),
             "recorded prefill progress should make the next recompute chunk eligible again"
+        );
+    }
+
+    #[test]
+    fn capacity_deferred_recompute_skips_marked_requests_without_blocking_later_candidates() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..8 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 4));
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[1], 4));
+
+        let first_mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_mixed_ids: HashSet<RequestId> = first_mixed
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(first_mixed_ids.contains(&first_ids[0]));
+        assert!(!first_mixed_ids.contains(&first_ids[1]));
+        assert!(scheduler.defer_prefill_to_waiting(&first_ids[0]));
+
+        let second_mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let second_mixed_ids: HashSet<RequestId> = second_mixed
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(
+            !second_mixed_ids.contains(&first_ids[0]),
+            "the first failed recompute must still be skipped in the same release epoch"
+        );
+        assert!(second_mixed_ids.contains(&first_ids[1]));
+        assert!(scheduler.defer_prefill_to_waiting(&first_ids[1]));
+
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[2], 4));
+        let before_third = scheduler.trace_snapshot();
+        assert_eq!(before_third.capacity_blocked_waiting_len, 3);
+
+        let third_mixed = scheduler.create_iteration_batch(hint).unwrap();
+        let third_mixed_ids: HashSet<RequestId> = third_mixed
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+
+        assert!(
+            !third_mixed_ids.contains(&first_ids[0]),
+            "already failed blocked recomputes must not retry without progress or release"
+        );
+        assert!(
+            !third_mixed_ids.contains(&first_ids[1]),
+            "already failed blocked recomputes must not consume the later candidate's slot"
+        );
+        assert!(
+            third_mixed_ids.contains(&first_ids[2]),
+            "marked queue-head requests should not block a later untried recompute candidate"
+        );
+        assert!(third_mixed_ids.contains(&first_ids[3]));
+        assert_eq!(
+            third_mixed.requests.len(),
+            6,
+            "five decodes plus one bounded recompute should be scheduled"
         );
     }
 

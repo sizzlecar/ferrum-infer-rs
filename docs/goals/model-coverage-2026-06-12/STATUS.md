@@ -2,6 +2,67 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ177 — source fix: skipped blocked recomputes no longer shut off later candidates
+
+- Context:
+  - follows ZZZ176 REJECT without starting another GPU;
+  - latest c32 artifact showed `125` iterations with blocked waiting
+    capacity, but only `16` of those were blocked+mixed and `109` were
+    blocked+decode-only;
+  - comparison artifact `a6cbb1d0` had the same `125` blocked-waiting
+    iterations but `125` blocked+mixed iterations;
+  - ZZZ171/ZZZ173 same-epoch retry suppression stopped the one-request retry
+    storm, but it also let one already-failed queue-head recompute suppress
+    the whole bounded mixed recompute slot for later candidates.
+- Source diagnosis:
+  - `capacity_deferred_mixed_attempt_epoch` is per request, but the scheduler
+    cleared the shared `capacity_deferred_mixed_recompute_slots_remaining`
+    whenever it encountered any release-blocked request already attempted in
+    the current capacity-release epoch;
+  - this avoided retrying the same request, but it also prevented scanning to
+    a later release-blocked request that had not been tried yet;
+  - the ZZZ176 trace shape matches that failure mode: active decode continued,
+    blocked waiting stayed non-empty, and the emitted batch often had ample
+    token headroom but no prefill item.
+- Code change:
+  - in both the existing prefill queue pass and waiting admission pass,
+    an already-attempted release-blocked request is now skipped with
+    `continue` instead of zeroing the shared mixed-recompute slot budget;
+  - the bounded slot still limits scheduling to one untried blocked recompute
+    candidate per mixed iteration;
+  - the same request still cannot be retried in the same epoch without
+    prefill progress or capacity release.
+- Test added:
+  - `capacity_deferred_recompute_skips_marked_requests_without_blocking_later_candidates`;
+  - it constructs two same-epoch failed recomputes at the queue head, then a
+    third untried blocked decode behind them, and verifies the first two are
+    skipped while the later candidate is scheduled alongside decode.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred_recompute_skips_marked_requests_without_blocking_later_candidates -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`72/72`);
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `git diff --check` PASS.
+- Expected next evidence:
+  - no paid GPU should be started from this status entry alone until this
+    source fix is committed and the c32 diagnostic runner targets that commit;
+  - if a bounded c32 diagnostic is run later, the primary trace signal is fewer
+    blocked+decode-only iterations than ZZZ176 `109`, more mixed iterations
+    than ZZZ176 `18`, and no return to same-request one-block retry churn;
+  - throughput and ITL remain unproven until a new artifact exists.
+- Limits:
+  - source candidate only; no CUDA build, GPU diagnostic, live vLLM run,
+    performance claim, or final W3 validator ran here;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ176 — 95e432bd c32 diagnostic REJECT: reset improves throughput but mixed remains too low
 
 - Artifact:
