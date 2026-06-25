@@ -29,6 +29,8 @@
   - that explains why ZZZ161 eliminated useful mixed prefill+decode scheduling
     instead of returning toward the historical `633+ tok/s` trace shape.
 - Code change:
+  - source candidate commit:
+    `fbf234588ad5d778dec314642f3428037fee379b`;
   - `crates/ferrum-scheduler/src/implementations/continuous.rs` now allows a
     capacity-deferred waiting recompute to be admitted before a release epoch
     only when the current iteration already scheduled decode work and has a
@@ -36,6 +38,10 @@
   - existing capacity backpressure and active-slot limits still apply;
   - when there is no bounded mixed prefill budget, the release-epoch wait is
     preserved to avoid returning to repeated failed-width re-admission.
+- Diagnostic runner update:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only` now targets
+    source SHA `fbf234588ad5d778dec314642f3428037fee379b` with artifact tag
+    `bounded_mixed_recompute`.
 - Tests added/updated:
   - `capacity_deferred_decode_recomputes_as_bounded_mixed_prefill_under_decode_pressure`
     verifies `3` active decodes plus one deferred recompute produce a mixed
