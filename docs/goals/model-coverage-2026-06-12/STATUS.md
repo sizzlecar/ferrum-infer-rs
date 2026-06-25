@@ -2,6 +2,65 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ153 — 7476295d c32 diagnostic PASS: capacity-wait reduces recompute churn
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_capacity_wait_c32_7476295d_20260625T011542Z/`.
+- Diagnostic PASS line:
+  - `FERRUM W3 QWEN35 CAPACITY WAIT C32 DIAG PASS: /workspace/artifacts/w3_qwen35_capacity_wait_c32_7476295d_20260625T011542Z`.
+- Vast lifecycle:
+  - reused retained instance `42439308` only; no new instance was created;
+  - queried known instances before starting and confirmed `42216671` and
+    `42439308` were both `stopped/exited`;
+  - copied artifact back before shutdown;
+  - stop verification reported `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Git/build evidence:
+  - remote Git SHA:
+    `7476295db6f4c5510d83328e450440b2aec1d8cf`;
+  - no live vLLM was run;
+  - remote `cargo check` PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS;
+  - `ferrum serve` `/v1/models` and chat smoke PASS.
+- c32 diagnostic bench:
+  - same command shape as ZZZ150/ZZZ151: `bench-serve`, sharegpt dataset,
+    `--concurrency 32`, `--num-prompts 32`, `--warmup-requests 4`,
+    `--n-repeats 1`, `--fail-on-error`, `--seed 9271`, `--ignore-eos`,
+    `--timeout 600`;
+  - bench exit `0`;
+  - `completed_per_run=[32]`, `errored_per_run=[0]`;
+  - `output_token_count_source=usage`;
+  - output throughput `458.066 tok/s`;
+  - total throughput `869.610 tok/s`;
+  - request throughput `3.579 req/s`;
+  - p95 TTFT `2247.554 ms`;
+  - p95 TPOT `53.331 ms`.
+- Scheduler/log evidence:
+  - final `admitted_total=69`;
+  - final `capacity_deferred_total=32`;
+  - final `capacity_blocked_waiting_len=0`;
+  - `unified_kv_admission_failed=13`;
+  - `cancelled_during_decode=0`;
+  - `preempting_request=0`;
+  - `oom_mentions=0`;
+  - `panic_mentions=0`;
+  - `block_pool_exhausted=0`.
+- Diagnosis:
+  - The release-epoch wait candidate is directionally useful: it reduced
+    recompute churn compared with ZZZ150 (`admitted_total 271 -> 69`,
+    `capacity_deferred_total 234 -> 32`, KV admission failures `126 -> 13`).
+  - Throughput only improved slightly (`449.787 -> 458.066 tok/s`) and remains
+    far below the W3 target and accepted historical vLLM baseline. This fixes
+    repeated re-admission churn, not the main kernel/runtime throughput gap.
+- Limits:
+  - This is still diagnostic-only evidence: c32 only, `n_repeats=1`;
+  - it is not W3 completion, final performance evidence, release readiness, or
+    a substitute for the final validator;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ152 — source candidate: wait to re-admit capacity-deferred decode recompute
 
 - Context:
