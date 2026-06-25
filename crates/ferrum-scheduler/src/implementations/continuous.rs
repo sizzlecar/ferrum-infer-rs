@@ -861,6 +861,9 @@ impl ContinuousBatchScheduler {
             active_decode_prefill_chunk,
             prefill_step_chunk,
         );
+        let allow_capacity_deferred_mixed_recompute = scheduled_decode_count > 0
+            && active_decode_prefill_chunk.is_some()
+            && active_decode_prefill_tokens_remaining.unwrap_or(0) > 0;
 
         // Then, add prefill requests up to the per-iter token budget.
         // Phase 3: `max_prefill_batch=8` no longer caps the count —
@@ -903,6 +906,7 @@ impl ContinuousBatchScheduler {
             .filter(|r| {
                 active_count_for_capacity_wait == 0
                     || r.capacity_deferred_until_release_epoch <= capacity_release_epoch
+                    || allow_capacity_deferred_mixed_recompute
             })
             .take(available_slots)
             .map(|r| r.inner.request.id.clone())
@@ -1675,8 +1679,8 @@ mod tests {
         assert_eq!(after.capacity_backpressure_admit_limit, Some(2));
     }
 
-    #[tokio::test]
-    async fn capacity_deferred_decode_waits_for_release_while_active_decodes_remain() {
+    #[test]
+    fn capacity_deferred_decode_recomputes_as_bounded_mixed_prefill_under_decode_pressure() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
             max_running_requests: 4,
             prompt_token_estimate: true,
@@ -1721,12 +1725,62 @@ mod tests {
             .iter()
             .map(|request| request.request.id.clone())
             .collect();
-        assert_eq!(decode_only.requests.len(), 3);
+        assert_eq!(decode_only.requests.len(), 4);
         assert!(
-            !scheduled_ids.contains(&first_ids[0]),
-            "capacity-deferred recompute should wait while active decodes still hold KV"
+            scheduled_ids.contains(&first_ids[0]),
+            "capacity-deferred recompute should use bounded mixed prefill budget under decode pressure"
         );
-        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 1);
+        let prefill_tokens = decode_only
+            .requests
+            .iter()
+            .find(|request| request.request.id == first_ids[0])
+            .and_then(|request| request.tokens_to_process);
+        assert_eq!(
+            prefill_tokens,
+            Some(64),
+            "the recompute prefill should still be capped by the mixed-prefill token budget"
+        );
+        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 0);
+    }
+
+    #[tokio::test]
+    async fn capacity_deferred_decode_waits_for_release_without_bounded_mixed_budget() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..2 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 4));
+        let deferred = scheduler.trace_snapshot();
+        assert_eq!(deferred.waiting_queue_len, 1);
+        assert_eq!(deferred.decode_queue_len, 1);
+        assert_eq!(deferred.active_len, 1);
+        assert_eq!(deferred.capacity_blocked_waiting_len, 1);
 
         let response = InferenceResponse {
             request_id: first_ids[1].clone(),
