@@ -2,6 +2,38 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ221 — blocked on retained Vast instance availability
+
+- Context:
+  - follows ZZZ217, ZZZ218, and ZZZ220 retained-instance start failures;
+  - no paid GPU lane was started for this check;
+  - no live vLLM run was used.
+- Current retained instance status:
+  - instance `42216671`, label `ferrum-w3-qwen35-full-l5-20260623`;
+  - hardware: exact `1x RTX 4090`;
+  - `cur_state=stopped`;
+  - `actual_status=exited`;
+  - `intended_status=stopped`.
+- Current source candidate:
+  - `2f5a375e28f06d8ff652906672c35c20d1de30f0`
+    (`perf(engine): reopen recompute after mixed kv pressure`);
+  - runner target remains the scoped c32 diagnostic for this SHA;
+  - the next required evidence is a real c32 artifact on 1x RTX 4090.
+- Blocking condition:
+  - the retained Vast instance has repeatedly failed to start with
+    `resources_unavailable`;
+  - the current API status check still shows it stopped/exited;
+  - no alternate instance search or rental has been approved after the earlier
+    multi-machine waste concern.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+- Unblock condition:
+  - retained instance `42216671` becomes startable, or explicit approval is
+    given to select a different exact 1x RTX 4090 instance.
+
 ## 2026-06-25 ZZZ220 — 2f5a375e fast-fail start check: retained Vast still unavailable
 
 - Attempted lane:
