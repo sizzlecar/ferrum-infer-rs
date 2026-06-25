@@ -2,6 +2,71 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ163 — source candidate: bounded mixed recompute for capacity-deferred decode
+
+- Context:
+  - continued after ZZZ162 without starting GPU and without running live vLLM;
+  - branch sync via `git pull --rebase --autostash` was up to date;
+  - current paid-machine state remains no paid GPU running.
+- Evidence used:
+  - ZZZ161/`9fda1101` c32 artifact:
+    output throughput `488.596 tok/s`, p95 ITL `46.980 ms`,
+    `mixed_iterations=0`, `decode_only_iterations=380`;
+  - historical c32 references:
+    `w3_qwen35_prefill_first_starvation_fix_c32_6bb7af75_20260624T135228Z`
+    and `w3_qwen35_fast_state_dtype_c32_228933a2_20260624T213650Z`;
+  - both historical references had `mixed_iterations=127`; their mixed shape
+    was consistently small prefill work with decode work, for example
+    `prefill_tokens=12` plus `decode_tokens=16`;
+  - local vLLM source/history comparison only; no live vLLM run.
+- Diagnosis:
+  - ZZZ152's release-epoch wait reduced repeated capacity-deferred recompute
+    churn, but after ZZZ161's immediate-KV metadata narrowing it became too
+    conservative for c32;
+  - a capacity-deferred decode recompute stayed in waiting while active decodes
+    remained, even when the current iteration already had a bounded
+    active-decode prefill token budget;
+  - that explains why ZZZ161 eliminated useful mixed prefill+decode scheduling
+    instead of returning toward the historical `633+ tok/s` trace shape.
+- Code change:
+  - `crates/ferrum-scheduler/src/implementations/continuous.rs` now allows a
+    capacity-deferred waiting recompute to be admitted before a release epoch
+    only when the current iteration already scheduled decode work and has a
+    nonzero active-decode prefill chunk budget;
+  - existing capacity backpressure and active-slot limits still apply;
+  - when there is no bounded mixed prefill budget, the release-epoch wait is
+    preserved to avoid returning to repeated failed-width re-admission.
+- Tests added/updated:
+  - `capacity_deferred_decode_recomputes_as_bounded_mixed_prefill_under_decode_pressure`
+    verifies `3` active decodes plus one deferred recompute produce a mixed
+    batch and cap the recompute chunk to `64` tokens;
+  - `capacity_deferred_decode_waits_for_release_without_bounded_mixed_budget`
+    preserves the old protection when decode pressure is too low to create a
+    bounded mixed-prefill budget.
+- Local validation:
+  - `cargo test -p ferrum-scheduler capacity_deferred_decode -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`68/68`);
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `git diff --check` PASS.
+- Next evidence needed:
+  - run the focused c32 diagnostic on the retained 1x4090 lane only after the
+    paid-GPU lane contract and instance inventory are stated;
+  - expected signal for a useful KEEP is restored mixed iterations
+    (`min_mixed_iterations=64`), p95 ITL below `25 ms`, output throughput above
+    `600 tok/s`, zero errors, and no capacity/KV regression beyond the
+    diagnostic caps.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - this is a source candidate and local scheduler/engine validation, not W3
+    completion or release-ready evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ162 — c32 diagnostic KEEP criteria tightened after 9fda trace review
 
 - Context:
