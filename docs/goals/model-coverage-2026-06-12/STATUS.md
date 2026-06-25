@@ -2,6 +2,60 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ203 — source candidate: decode defer waits for independent KV release
+
+- Context:
+  - follows ZZZ202 `65565d30` c32 diagnostic REJECT;
+  - no GPU lane was started for this source step;
+  - no live vLLM run was used.
+- Source change:
+  - commit `f1bc7b7ea71d525b8ea9572623612552fc6232df`
+    (`perf(engine): wait for independent kv release on decode defer`);
+  - decode-only unified KV admission failures now seed mixed-recompute
+    blocking from parsed paged-KV pressure when available, or fall back to a
+    real-release wait when the error has no structured pressure;
+  - `defer_decode_for_capacity_recompute` no longer records the deferred
+    request's own KV deallocation/snapshot as mixed recompute capacity
+    evidence;
+  - the intended behavior is that a preempted/deferred decode recomputes after
+    independent capacity release, not immediately from capacity freed by its
+    own eviction.
+- Why this matches ZZZ202:
+  - ZZZ202 showed the ZZZ201 release-ready pacing change was a local-test pass
+    but a real-artifact no-op;
+  - the real repeated pattern starts with decode-only KV admission failure,
+    moves several decode requests to waiting, and then immediately schedules
+    recompute under the same active decode pressure;
+  - treating the victim's own deallocation as capacity evidence reopens
+    recompute too early and produces the repeated `need N/free M` failures.
+- Local validation:
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS, `3/3`;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture`
+    PASS, `10/10`;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS, `79/79`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Runner targeting:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `f1bc7b7ea71d525b8ea9572623612552fc6232df`;
+  - default tag is now `decode_defer_waits_for_independent_kv_release`;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` standalone defaults were
+    updated to the same SHA/tag.
+- Expected signal for a next scoped c32 diagnostic:
+  - the first decode-only KV failure may still occur, but immediate mixed
+    recompute churn after it should drop;
+  - `Unified KV admission failed` should drop below ZZZ202's `16`;
+  - `capacity_deferred_total` should drop below ZZZ202's `43`;
+  - if throughput does not improve, the next bottleneck is likely the base
+    decode/preempt policy rather than release-window recompute admission.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ202 — 65565d30 c32 diagnostic REJECT: release-ready pacing did not hit real path
 
 - Artifact:
