@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ217 — 2f5a375e c32 diagnostic attempt aborted before remote execution
+
+- Attempted lane:
+  - W3 Qwen35 c32 mixed-kv-feedback-order diagnostic;
+  - target SHA `2f5a375e28f06d8ff652906672c35c20d1de30f0`;
+  - retained Vast instance `42216671`, exact `1x RTX 4090`,
+    `$0.47777777777777775/hr`;
+  - no live vLLM run.
+- Paid GPU contract stated before start:
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`.
+- Outcome:
+  - Vast start response returned `resources_unavailable` with message
+    `Required resources are currently unavailable, state change queued.`;
+  - repeated polls showed the retained instance remained `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - later Vast API GET retries hit SSL handshake timeout and
+    `UNEXPECTED_EOF_WHILE_READING`;
+  - runner final cleanup check confirmed `42216671` remained
+    `cur_state=stopped`, `actual_status=exited`, `intended_status=stopped`.
+- Evidence status:
+  - no SSH/CUDA preflight ran;
+  - no remote source checkout, `cargo check`, CUDA build, `ferrum run`,
+    `ferrum serve`, or bench ran;
+  - no local `2f5a375e` artifact directory was created;
+  - this is not KEEP, not REJECT, not performance evidence, and not release
+    evidence.
+- Next action:
+  - rerun one scoped c32 diagnostic for `2f5a375e` only when the retained Vast
+    instance can actually start, or after explicit approval to use a different
+    instance;
+  - do not cycle offers or start additional machines for this attempt.
+
 ## 2026-06-25 ZZZ216 — source candidate: defer failed mixed prefills before KV feedback reopen
 
 - Context:
