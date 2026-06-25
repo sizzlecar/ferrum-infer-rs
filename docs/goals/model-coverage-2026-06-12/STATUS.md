@@ -22,6 +22,8 @@
   - this is a scheduler admission/backpressure issue, not a model-name,
     GPU-name, VRAM-size, or quantization-specific special case.
 - Code change:
+  - source candidate commit:
+    `a8de884a2d0685af2224d6fd2bfb9f739f65e462`;
   - `crates/ferrum-scheduler/src/implementations/continuous.rs` now admits all
     release-ready waiting requests as before;
   - when `allow_capacity_deferred_mixed_recompute` is true but a waiting
@@ -47,9 +49,11 @@
   - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
   - `git diff --check` PASS.
 - Next evidence needed:
-  - commit this source candidate, update the c32 Vast diagnostic runner to the
-    resulting source SHA, and only then decide whether one bounded 1x4090 c32
-    diagnostic is justified;
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only` now targets
+    source SHA `a8de884a2d0685af2224d6fd2bfb9f739f65e462` with artifact tag
+    `single_blocked_recompute`;
+  - only run one bounded 1x4090 c32 diagnostic after the paid-GPU lane
+    contract and instance inventory are restated;
   - the diagnostic acceptance signal should be lower `Unified KV admission
     failed` and `capacity_deferred_total` while preserving useful mixed
     iterations, not just another zero-error run.
