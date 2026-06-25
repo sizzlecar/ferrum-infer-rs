@@ -2,6 +2,53 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ209 — source candidate: keep decode pressure width through adaptive split
+
+- Context:
+  - follows ZZZ208 `85719c1b` c32 diagnostic REJECT;
+  - no GPU lane was started for this source step;
+  - no live vLLM run was used.
+- Source change:
+  - commit `d4e4cfb26e5745e93d78ecf925dba6092133eaff`
+    (`perf(engine): keep decode pressure width through split`);
+  - adaptive decode split failures now record persistent scheduler decode
+    pressure using the original `pressure_width`, not the current internal
+    split chunk width;
+  - this prevents transient internal chunks of width `1` or `2` from globally
+    pinning the next scheduler decode batch to width `1` or `2`.
+- Why this matches ZZZ208:
+  - ZZZ208 passed the mixed-iteration threshold but regressed throughput and
+    p95 latency;
+  - trace shape was dominated by tiny decode-only widths `1`, `2`, `4`, and
+    `8`;
+  - the source audit found that the ZZZ207 engine path recorded
+    `chunk.len()` for every adaptive split failure, so an internal failed
+    subchunk could over-shrink the persistent decode cap for later iterations.
+- Local validation:
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS, `3/3`;
+  - `cargo test -p ferrum-scheduler decode_capacity_backpressure -- --nocapture`
+    PASS, `1/1`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Runner targeting:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `d4e4cfb26e5745e93d78ecf925dba6092133eaff`;
+  - default tag is now `decode_pressure_width_through_split`;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` standalone defaults were
+    updated to the same SHA/tag.
+- Expected signal for a next scoped c32 diagnostic:
+  - retain the ZZZ208 `mixed_iterations >= 64` improvement;
+  - reduce the number of tiny decode-only widths `1` and `2`;
+  - improve average decode width, output throughput, p95 ITL, and p95 TTFT
+    versus ZZZ208.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ208 — 85719c1b c32 diagnostic REJECT: mixed threshold passes, decode becomes too small
 
 - Artifact:
