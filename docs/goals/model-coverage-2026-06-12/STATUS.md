@@ -2,6 +2,78 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ180 — eaf405f5 c32 diagnostic REJECT: mixed restored, KV failures and throughput regress
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_blocked_recompute_scan_c32_eaf405f5_20260625T065848Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_eaf405f5_1782370676/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    blocked-recompute-scan diagnostic, expected 10-20 minutes, about
+    `$0.08-$0.16`, stop on KEEP/REJECT/SSH-CUDA failure/timeout/script failure;
+  - pre-start inventory showed only retained instance `42216671`,
+    `stopped/exited`, exact `1x RTX 4090`, cost `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back;
+  - runner stop poll showed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - independent inventory after cleanup again showed `42216671`,
+    `stopped/exited`; no unexpected paid/scheduling sibling instances remained.
+- Remote evidence:
+  - remote Git SHA:
+    `eaf405f5ffb1e9a9762d7e65f9b60c6ff958e444`;
+  - remote git status short was empty;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` `/v1/models` and chat smoke passed;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, and
+    `output_token_count_source=usage`;
+  - no live vLLM run.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - remote verdict line:
+    `FERRUM W3 QWEN35 C32 DIAG REJECT:
+    /workspace/artifacts/w3_qwen35_blocked_recompute_scan_c32_eaf405f5_20260625T065848Z`.
+- Reject reasons:
+  - output throughput `378.392 tok/s` <= floor `600.0`;
+  - p95 ITL `57.553 ms` > `25.0`;
+  - `Unified KV admission failed=18` > `13`.
+- Targeted signal:
+  - blocked+decode-only iterations dropped from ZZZ176 `109 -> 13`;
+  - mixed iterations rose from ZZZ176 `18 -> 112`, above the diagnostic
+    threshold `64`;
+  - `capacity_deferred_total` improved from ZZZ176 `35 -> 32`, exactly at the
+    diagnostic threshold;
+  - this proves the source change restored mixed recompute scanning.
+- Regressions or remaining blockers:
+  - throughput regressed from ZZZ176 `441.972 -> 378.392 tok/s`;
+  - `Unified KV admission failed` worsened from ZZZ176 `14 -> 18`;
+  - average process time worsened from ZZZ176 `21796 us -> 25261 us`;
+  - the serve log now shows repeated admission failures with no free blocks,
+    including `need 1 admission blocks (1 immediate) but only 0 free`, plus
+    larger failed attempts such as `need 28`, `25`, `23`, `21`, `19`, `18`,
+    and `17` immediate blocks.
+- Classification:
+  - diagnostic rejected, not performance progress and not release evidence;
+  - the source fix corrected the starvation shape but exposed the next blocker:
+    mixed recompute attempts are still scheduled when model/KV capacity feedback
+    says no immediate block is available, adding failed admission overhead.
+- Next source direction:
+  - do not start another paid GPU diagnostic from this result alone;
+  - inspect scheduler/engine capacity feedback so release-blocked mixed
+    recompute backs off when the last attempt failed for zero free immediate
+    blocks, while still allowing later candidates after real capacity release;
+  - the next local test should prove no same-request churn, no queue-head
+    starvation, and dynamic retry only after capacity evidence changes.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ179 — Vast startup poll aborted before gate; runner now retries transient API failures
 
 - Context:
