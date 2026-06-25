@@ -2,6 +2,36 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ157 — retained Vast still unavailable; no reliable exact 1x4090 offer rented
+
+- Intended diagnostic:
+  - same `9fda1101` c32 mixed-prefill immediate-KV diagnostic described in
+    ZZZ155/ZZZ156;
+  - no live vLLM run.
+- Retained instance retry:
+  - `42216671` start again returned
+    `Required resources are currently unavailable, state change queued.`;
+  - six polls kept reporting `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`;
+  - no SSH/CUDA verification, build, product smoke, or bench ran.
+- Offer search:
+  - queried Vast `bundles` and `search/asks` through the HTTP API;
+  - no verified, rentable, exact `1x RTX 4090` offer with sufficient CUDA/disk
+    was available;
+  - observed exact 1x4090 candidates were `rentable=false`, and the cheaper
+    ones were `deverified` or `unverified`, so no new instance was created.
+- Cleanup/status:
+  - final instance list still shows only `42216671` as
+    `stopped/exited/intended_status=stopped`;
+  - no paid GPU is running.
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_prefill_admission_gpu_block_retry_9fda1101_20260625T032340Z/`.
+- Limits:
+  - no CUDA diagnostic artifact exists for `9fda1101`;
+  - no performance evidence was produced;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ156 — 9fda1101 c32 GPU diagnostic blocked by retained Vast availability
 
 - Intended diagnostic:
