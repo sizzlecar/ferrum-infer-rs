@@ -2,6 +2,91 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ191 — dc456075 c32 diagnostic REJECT: KV pressure fixed, mixed recompute still too rare
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_prefill_count_budget_c32_dc456075_20260625T091911Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_dc456075_1782379111/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    mixed-prefill-count-budget diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - independent Vast inventory after analysis again showed `42216671`
+    `stopped/exited`.
+- Remote evidence:
+  - remote Git SHA:
+    `dc456075009f688b843b7ae863602071192ae422`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `afb182345d55a0c1b269cae987732a3938dcfdccba732d16f1eadd7d3d2c1e94`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, and `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `467.001 tok/s` <= floor `600.0`;
+    - `mixed_iterations=8` < threshold `64`;
+    - p95 ITL `57.247 ms` > `25.0`.
+- Positive signal versus ZZZ189:
+  - `Unified KV admission failed` improved `15 -> 12` and is now below the
+    diagnostic max `13`;
+  - `capacity_deferred_total` improved `37 -> 21` and is now below the
+    diagnostic max `32`;
+  - the problematic ZZZ189 shape `decode_items=19, prefill_items=13,
+    prefill_tokens=13` disappeared;
+  - correctness/client cleanliness remained intact: `32/32` completed, zero
+    request errors, zero HTTP 500, zero panic.
+- Remaining gap:
+  - throughput stayed flat versus ZZZ189 (`467.313 -> 467.001 tok/s`);
+  - p95 ITL stayed far above target (`56.017 -> 57.247 ms`, target `25 ms`);
+  - `mixed_iterations` improved only `4 -> 8`, still far below `64`;
+  - trace still shows long decode-only stretches while
+    `capacity_blocked_waiting_len` grows, so count-capped mixed recompute is
+    still not frequent enough.
+- Trace reading:
+  - mixed rows are now bounded by chunk count, with shapes such as
+    `decode_items=28, prefill_items=3, prefill_tokens=18` and
+    `decode_items=14, prefill_items=4, prefill_tokens=24`;
+  - after early pressure, blocked recomputes wait behind decode-only rows until
+    capacity evidence changes;
+  - average mixed process time stayed expensive (`~59.7 ms`), but decode-only
+    rows averaged `~14.8 ms`.
+- Classification:
+  - diagnostic rejected, not performance evidence and not release evidence;
+  - `dc456075` fixed the ZZZ189 KV-pressure regression but does not solve W3
+    c32 throughput/ITL/mixed-frequency.
+- Next source direction:
+  - do not rerun this artifact/commit;
+  - investigate why blocked recomputes remain decode-only for long stretches
+    after capacity pressure clears;
+  - likely next lever is smarter re-opening/admission pacing for
+    capacity-blocked waiting requests after model-owned KV snapshots, not
+    widening per-iteration chunk count again;
+  - preserve the no-enumeration rule: no model-name, GPU-name, or
+    VRAM-specific caps.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ190 — source candidate: cap mixed-prefill count as admission-pressure budget
 
 - Context:
