@@ -2,6 +2,74 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ202 — 65565d30 c32 diagnostic REJECT: release-ready pacing did not hit real path
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_release_ready_kv_recompute_pacing_c32_65565d30_20260625T111044Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_65565d30_1782385780/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    release-ready-kv-recompute-pacing diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Remote evidence:
+  - remote Git SHA:
+    `65565d30769d09d6770601c43ca70b065c2f0c2a`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `f62bc070d876a2b803dcda8ecb7fe2264a2495089e2181a9da3ddcb19998eb73`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` smoke covered `/v1/models` and `/v1/chat/completions`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, zero OOM mentions, and
+    `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `446.007 tok/s` <= floor `600.0`;
+    - `mixed_iterations=23` < `64`;
+    - p95 ITL `64.288 ms` > `25.0`;
+    - `Unified KV admission failed=16` > `13`;
+    - `capacity_deferred_total=43` > `32`.
+- Comparison with ZZZ200:
+  - output throughput moved only from `440.803` to `446.007 tok/s`;
+  - `Unified KV admission failed` stayed `16`;
+  - `capacity_deferred_total` stayed `43`;
+  - `mixed_iterations` stayed `23`;
+  - the `16` paged-KV admission failure messages are identical;
+  - the `17` capacity-deferred increase events have the same pattern, shifted
+    by two scheduler iterations.
+- Classification:
+  - the ZZZ201 source change passed local tests but did not hit the real
+    failing path in this artifact;
+  - this is not an OOM, not a product correctness failure, and not a post-
+    processing bottleneck;
+  - the next source direction is decode-only KV admission failure handling:
+    `defer_decode_for_capacity_recompute` currently records the victim's own
+    deallocation/snapshot as mixed recompute capacity evidence, which lets the
+    deferred decode immediately recompute under active decode pressure instead
+    of waiting for independent capacity release.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ201 — source candidate: pace release-ready KV recompute
 
 - Context:
