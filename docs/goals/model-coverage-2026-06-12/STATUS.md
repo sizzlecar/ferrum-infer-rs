@@ -2,6 +2,78 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ184 — source candidate: reopen bounded mixed recompute on physical KV release
+
+- Context:
+  - follows ZZZ183 `ff5cab92` c32 diagnostic REJECT without starting Vast,
+    GPU, or vLLM;
+  - latest rejected artifact showed `Unified KV admission failed` improved
+    from ZZZ180 `18 -> 9`, but mixed recompute collapsed to `12` iterations
+    and throughput stayed at `452.616 tok/s`, below the diagnostic floor
+    `600.0`.
+- Offline trace finding:
+  - ZZZ180 had `mixed_iterations=112`, but the parsed trace showed
+    `effective_prefill_delta>0=0`; those mixed rows were failed recompute
+    attempts, not useful overlap;
+  - ZZZ183 had only `mixed_iterations=12` because after a mixed KV admission
+    failure the scheduler waited for full request completion before reopening
+    release-blocked mixed recompute;
+  - later ZZZ183 trace rows show decode requests being capacity-deferred to
+    waiting while physical model/KV cache is released, but that event did not
+    advance the mixed-recompute release signal.
+- Source fix:
+  - commit `c5a285c01f4a90135ce9765179b3f03cf31c8dc7`
+    (`fix(scheduler): resume mixed recompute after capacity release`);
+  - `ContinuousBatchScheduler` now separates normal
+    `capacity_release_epoch` from a mixed recompute capacity-evidence epoch;
+  - normal admission of capacity-deferred waiting requests still waits for
+    `capacity_release_epoch`, so a physical decode defer does not admit every
+    blocked request;
+  - release-blocked mixed recompute uses the new capacity-evidence epoch, so
+    decode capacity defer can reopen exactly one bounded mixed recompute after
+    it releases physical KV;
+  - added regression test
+    `capacity_deferred_mixed_recompute_resumes_after_decode_capacity_release`;
+  - updated
+    `capacity_deferred_recompute_skips_marked_requests_without_blocking_later_candidates`
+    so it still covers same-epoch marked-candidate scanning without treating a
+    decode capacity defer as "no release".
+- Runner update:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `c5a285c01f4a90135ce9765179b3f03cf31c8dc7`;
+  - default artifact tag is `mixed_recompute_capacity_epoch`;
+  - strict diagnostic thresholds are unchanged: throughput floor `600.0`,
+    max `Unified KV admission failed=13`, max `capacity_deferred_total=32`,
+    min mixed iterations `64`, max p95 ITL `25.0 ms`.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred_mixed_recompute_resumes_after_decode_capacity_release -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture` PASS
+    (`7/7`);
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS (`4/4`);
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`74/74`) plus
+    scheduler doctests PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Expected next diagnostic signal:
+  - compared with ZZZ183, the next c32 run should keep
+    `Unified KV admission failed` near or below `13` while allowing bounded
+    mixed recompute to resume after decode capacity defers instead of waiting
+    for full request completion;
+  - if the next artifact still misses the `600 tok/s` floor with low KV
+    failures, stop after the REJECT artifact and analyze the trace before any
+    further paid rerun.
+- Limits:
+  - no CUDA/Vast diagnostic has run for `c5a285c0` yet;
+  - this is not performance evidence, W3 completion, or release readiness;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ183 — ff5cab92 c32 diagnostic REJECT: KV failures improve, mixed now too low
 
 - Artifact:
