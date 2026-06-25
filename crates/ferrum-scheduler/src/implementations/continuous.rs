@@ -618,6 +618,14 @@ impl ContinuousBatchScheduler {
             req.kv_blocks.clear();
             req.chunked_prefill = false;
             req.prefill_chunk_offset = 0;
+            req.capacity_deferred_until_release_epoch = self
+                .capacity_release_epoch
+                .load(Ordering::Relaxed)
+                .saturating_add(1);
+            if !self.decode_queue.read().is_empty() {
+                req.capacity_deferred_mixed_attempt_epoch =
+                    Some(self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed));
+            }
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
             request_index.insert(request_id.clone(), RequestPhase::Waiting);
             waiting_queue.push_back(req);
@@ -2706,8 +2714,8 @@ mod tests {
         assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 0);
     }
 
-    #[test]
-    fn capacity_backpressure_survives_partial_prefill_and_grows_after_completion() {
+    #[tokio::test]
+    async fn capacity_backpressure_survives_partial_prefill_and_waits_for_release() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
             max_running_requests: 4,
             prompt_token_estimate: true,
@@ -2729,6 +2737,11 @@ mod tests {
         }
 
         let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<RequestId> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
         for request in &first_batch.requests {
             assert!(scheduler.defer_prefill_to_waiting(&request.request.id));
         }
@@ -2739,6 +2752,11 @@ mod tests {
 
         let second_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
         assert_eq!(second_batch.requests.len(), 2);
+        let second_ids: HashSet<RequestId> = second_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
         let progressed_id = second_batch.requests[0].request.id.clone();
         assert!(!scheduler.mark_prefill_chunk_processed(&progressed_id, 128, 1));
         assert_eq!(
@@ -2756,12 +2774,46 @@ mod tests {
         let third_batch = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(
             third_batch.requests.len(),
-            4,
-            "after progress, remaining waiting prefills can use available active slots again"
+            1,
+            "prefill completion consumes capacity; it must not release blocked waiting prefills"
         );
         let after = scheduler.trace_snapshot();
-        assert_eq!(after.waiting_queue_len, 0);
-        assert_eq!(after.active_len, 4);
+        assert_eq!(after.waiting_queue_len, 2);
+        assert_eq!(after.active_len, 2);
+
+        let response = InferenceResponse {
+            request_id: progressed_id.clone(),
+            text: String::new(),
+            tokens: Vec::new(),
+            finish_reason: ferrum_types::FinishReason::Length,
+            usage: ferrum_types::TokenUsage::new(0, 0),
+            latency_ms: 0,
+            created_at: chrono::Utc::now(),
+            metadata: Default::default(),
+            api_response: None,
+        };
+        scheduler.complete(progressed_id, &response).await.unwrap();
+
+        let after_release_batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 4,
+                max_tokens: 1024,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+        let after_release_ids: HashSet<RequestId> = after_release_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(
+            first_ids
+                .iter()
+                .any(|id| !second_ids.contains(id) && after_release_ids.contains(id)),
+            "actual request completion should release capacity and reopen blocked waiting prefills"
+        );
     }
 
     #[tokio::test]
@@ -3293,6 +3345,92 @@ mod tests {
             scheduled_decodes, 3,
             "capacity backpressure must let decode-ready requests run instead of repeatedly admitting a capacity-blocked prefill"
         );
+        assert_eq!(
+            second_batch.requests.len(),
+            3,
+            "a capacity-blocked prefill must wait for capacity evidence instead of refilling an empty batch slot"
+        );
+        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 1);
+    }
+
+    #[tokio::test]
+    async fn prefill_capacity_defer_waits_for_release_while_decode_active() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            prompt_token_estimate: true,
+            prefill_first_until_active: Some(4),
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 512,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 4);
+        let first_ids: Vec<RequestId> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for id in first_ids.iter().take(3) {
+            scheduler.mark_prefill_complete(id, 128);
+        }
+        assert!(scheduler.defer_prefill_to_waiting(&first_ids[3]));
+
+        let deferred = scheduler.trace_snapshot();
+        assert_eq!(deferred.decode_queue_len, 3);
+        assert_eq!(deferred.waiting_queue_len, 1);
+        assert_eq!(deferred.capacity_blocked_waiting_len, 1);
+
+        let blocked_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let blocked_ids: HashSet<RequestId> = blocked_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(
+            !blocked_ids.contains(&first_ids[3]),
+            "failed prefill must not be retried while only decode progress has happened"
+        );
+        assert_eq!(blocked_batch.requests.len(), 3);
+
+        let response = InferenceResponse {
+            request_id: first_ids[0].clone(),
+            text: String::new(),
+            tokens: Vec::new(),
+            finish_reason: ferrum_types::FinishReason::Length,
+            usage: ferrum_types::TokenUsage::new(0, 0),
+            latency_ms: 0,
+            created_at: chrono::Utc::now(),
+            metadata: Default::default(),
+            api_response: None,
+        };
+        scheduler
+            .complete(first_ids[0].clone(), &response)
+            .await
+            .unwrap();
+
+        let after_release = scheduler.create_iteration_batch(hint).unwrap();
+        let after_release_ids: HashSet<RequestId> = after_release
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(
+            after_release_ids.contains(&first_ids[3]),
+            "real capacity release should make the blocked prefill eligible again"
+        );
     }
 
     #[test]
@@ -3357,8 +3495,8 @@ mod tests {
         );
         assert_eq!(
             second_batch.requests.len(),
-            4,
-            "one capacity-limited prefill may still refill the remaining batch slot"
+            3,
+            "decode progress alone must not make a capacity-limited prefill refill the remaining batch slot"
         );
     }
 
