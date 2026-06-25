@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ149 — source fix: decode capacity defer now requeues for KV recompute
+
+- Context:
+  - latest CUDA diagnostic `032dda17` removed decode cancellation but exposed
+    c32 decode capacity livelock:
+    `0 completed / 32 errored / 600s`, `cancelled_total=0`,
+    `unified_kv_admission_failed=108421`, and all 32 active decodes stuck at
+    `generated_tokens=2`;
+  - root source cause was the no-preempt adaptive decode fallback: after a
+    single-request model-owned KV `ResourceExhausted`, it only logged and left
+    the request in `decode_queue`, so the next scheduler iteration resubmitted
+    the same un-runnable decode work.
+- Implementation:
+  - added scheduler path
+    `defer_decode_to_waiting_for_capacity(request_id, attempted_decode_width)`;
+  - the scheduler path moves a decode request back to `waiting`, resets
+    scheduler-side physical token progress, records capacity backpressure from
+    the attempted decode width, and does not increment cancelled counters;
+  - added engine path `defer_decode_for_capacity_recompute` to release model
+    cache, KV manager allocation, draft KV, and recurrent state while keeping
+    logical `generated_tokens` for full-context KV recompute;
+  - wired no-preempt adaptive decode `ResourceExhausted` to the recompute path
+    instead of leaving the request in immediate decode rescheduling;
+  - updated unified-resource-exhausted regression coverage so active decodes
+    must become waiting/recompute work without cancellation.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler decode_capacity_defer_requeues_for_recompute_without_cancelling -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-engine process_batch_unified_reserve_defer_requeues_decode_for_recompute -- --nocapture`
+    PASS;
+  - adjacent engine resource-exhausted tests PASS;
+  - `cargo test -p ferrum-scheduler` PASS: `66 passed`;
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS: `56 passed`;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, final W3 validator, or
+    release gate has run for this source candidate yet;
+  - no live vLLM was run;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ148 — 032dda17 c32 diagnostic: decode cancellation removed, decode livelock exposed
 
 - Artifacts:
