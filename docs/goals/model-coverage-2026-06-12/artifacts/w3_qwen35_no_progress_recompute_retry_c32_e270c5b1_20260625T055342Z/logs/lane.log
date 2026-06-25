@@ -1,0 +1,19 @@
+2026-06-25T05:53:42Z lane_start art=/workspace/artifacts/w3_qwen35_no_progress_recompute_retry_c32_e270c5b1_20260625T055342Z sha=e270c5b167ea681daec36c4c1fd132608c7c543d release_evidence=false no_live_vllm=true
+2026-06-25T05:53:42Z bootstrap_start
+2026-06-25T05:53:43Z bootstrap_done
+2026-06-25T05:53:43Z git_sync_start
+2026-06-25T05:53:44Z git_sync_done
+2026-06-25T05:53:44Z hf_prefetch_start
+2026-06-25T05:53:44Z cargo_check_start
+2026-06-25T05:53:47Z cargo_check_done
+2026-06-25T05:53:47Z release_build_start
+2026-06-25T05:57:00Z release_build_done
+2026-06-25T05:57:00Z hf_prefetch_wait_start
+2026-06-25T05:57:00Z hf_prefetch_done tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+2026-06-25T05:57:00Z ferrum_run_smoke_start
+2026-06-25T05:57:27Z ferrum_run_smoke_done
+2026-06-25T05:57:27Z serve_start
+2026-06-25T05:57:56Z serve_ready
+2026-06-25T05:57:56Z serve_chat_smoke_done
+2026-06-25T05:57:56Z bench_c32_start
+2026-06-25T05:58:10Z FERRUM W3 QWEN35 C32 DIAG REJECT: /workspace/artifacts/w3_qwen35_no_progress_recompute_retry_c32_e270c5b1_20260625T055342Z

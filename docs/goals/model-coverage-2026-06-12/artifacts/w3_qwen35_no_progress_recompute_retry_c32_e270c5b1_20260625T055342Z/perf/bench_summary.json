@@ -1,0 +1,92 @@
+{
+  "artifact": "/workspace/artifacts/w3_qwen35_no_progress_recompute_retry_c32_e270c5b1_20260625T055342Z",
+  "bench": {
+    "completed_per_run": [
+      32
+    ],
+    "concurrency": 32,
+    "errored_per_run": [
+      0
+    ],
+    "http_500_per_run": [
+      0
+    ],
+    "n_repeats": 1,
+    "n_requests_per_run": 32,
+    "output_throughput_tps": 346.9575716320498,
+    "output_token_count_source": "usage",
+    "p95_itl_ms": 58.6663209,
+    "p95_tpot_ms": 74.5751755909449,
+    "p95_ttft_ms": 1962.54349285,
+    "panic_per_run": [
+      0
+    ],
+    "request_throughput_rps": 2.710606028375389,
+    "total_throughput_tps": 658.6772648952195
+  },
+  "bench_exit": "0",
+  "last_iteration": 776,
+  "last_scheduler_after_schedule": {
+    "active_len": 0,
+    "admitted_total": 57,
+    "cancelled_total": 0,
+    "capacity_blocked_waiting_len": 0,
+    "capacity_deferred_total": 20,
+    "completed_total": 37,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 0
+  },
+  "last_scheduler_before": {
+    "active_len": 0,
+    "admitted_total": 57,
+    "cancelled_total": 0,
+    "capacity_blocked_waiting_len": 0,
+    "capacity_deferred_total": 20,
+    "completed_total": 37,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 0
+  },
+  "log_counts": {
+    "block_pool_exhausted": 0,
+    "cancelled_during_decode": 0,
+    "oom_mentions": 0,
+    "panic_mentions": 0,
+    "preempting_request": 0,
+    "unified_kv_admission_failed": 10,
+    "unified_prefill_alloc_deferred": 0
+  },
+  "no_live_vllm": true,
+  "reject_reasons": [
+    "output_throughput_tps=346.9575716320498 <= floor=600.0",
+    "mixed_iterations=41 < 64",
+    "p95_itl_ms=58.6663209 > 25.0"
+  ],
+  "release_evidence": false,
+  "sha": "e270c5b167ea681daec36c4c1fd132608c7c543d",
+  "thresholds": {
+    "max_capacity_deferred_total": 32,
+    "max_kv_admission_failed": 13,
+    "max_p95_itl_ms": 25.0,
+    "min_mixed_iterations": 64,
+    "output_throughput_floor_tps": 600.0,
+    "required_completed": 32,
+    "required_errors": 0
+  },
+  "trace_stats": {
+    "avg_decode_items": 8.5625,
+    "avg_process_us": 22801.414285714287,
+    "decode_only_iterations": 429,
+    "max_active_len": 32,
+    "max_capacity_deferred_total": 20,
+    "mixed_iterations": 41,
+    "prefill_only_iterations": 90,
+    "scheduled_decode_tokens": 4795,
+    "scheduled_prefill_tokens": 7309,
+    "some_ok_iterations": 560
+  },
+  "verdict": "reject"
+}
