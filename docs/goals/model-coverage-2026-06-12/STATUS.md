@@ -2,6 +2,77 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ194 — source candidate: reserve KV headroom before mixed recompute reopen
+
+- Context:
+  - follows ZZZ193 `6c2fdcc` c32 diagnostic REJECT without starting another
+    GPU after that failure and without running live vLLM;
+  - ZZZ193 proved per-slot pacing reopened mixed recompute
+    (`mixed_iterations 8 -> 127`), but it regressed KV churn:
+    `Unified KV admission failed 12 -> 48` and `capacity_deferred_total
+    21 -> 121`;
+  - failure logs were dominated by exact/free-thin allocator misses:
+    `27x need 1 admission block but only 0 free` and
+    `10x need 2 admission blocks but only 1 free`.
+- Source change:
+  - commit `5810442a2da037def2923a5dccb18052dc0bc6cd`
+    (`perf(scheduler): reserve kv headroom for mixed recompute`);
+  - scheduler now applies a generic one-block KV headroom reserve before a
+    model-owned KV snapshot can reopen capacity-blocked mixed recompute;
+  - the same usable-free calculation caps the reopened mixed recompute width:
+    `usable_free_blocks = observed_free_blocks.saturating_sub(1)`;
+  - this is a generic allocator headroom rule for mixed decode+prefill
+    admission, not a model-name, GPU-name, or VRAM-specific cap.
+- Regression coverage:
+  - updated
+    `capacity_deferred_mixed_recompute_waits_until_kv_snapshot_has_required_free_blocks`
+    so `free_blocks == required_blocks_per_slot` remains blocked and
+    `free_blocks == required_blocks_per_slot + 1` reopens;
+  - updated
+    `capacity_deferred_mixed_recompute_paces_width_by_kv_snapshot` so
+    `free_blocks=9` with `required_blocks_per_slot=4` reopens exactly two
+    recomputes after the one-block reserve.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred_mixed_recompute_waits_until_kv_snapshot_has_required_free_blocks -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred_mixed_recompute_paces_width_by_kv_snapshot -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture`
+    PASS, `9/9`;
+  - `cargo test -p ferrum-scheduler active_decode_prefill -- --nocapture`
+    PASS, `5/5`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS, `77/77` plus
+    doctests.
+- Diagnostic runner:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now targets
+    `5810442a2da037def2923a5dccb18052dc0bc6cd`;
+  - default artifact tag: `mixed_recompute_kv_headroom`;
+  - plan lane: `W3 Qwen35 c32 mixed-recompute-kv-headroom diagnostic`;
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    PASS and reports `no_live_vllm=true`.
+- Expected next diagnostic signal:
+  - reduce the ZZZ193 exact/free-thin churn, especially `need 1/free 0` and
+    `need 2/free 1`;
+  - preserve a materially higher `mixed_iterations` count than ZZZ191's `8`,
+    but it may intentionally be lower than ZZZ193's over-aggressive `127`;
+  - if KV failures drop back under threshold but throughput remains low, the
+    next lever should inspect mixed-row model process cost instead of widening
+    admission again.
+- Limits:
+  - no CUDA diagnostic has run for this source candidate yet;
+  - no performance or release evidence is claimed;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ193 — 6c2fdcc c32 diagnostic REJECT: mixed restored, KV headroom too thin
 
 - Artifact:

@@ -26,8 +26,8 @@ from typing import Any
 
 
 DEFAULT_INSTANCE_ID = 42216671
-DEFAULT_SHA = "6c2fdcc6d434c0de098eb95ed4cb74ff1c5ed7d0"
-DEFAULT_TAG = "mixed_recompute_kv_snapshot_pacing"
+DEFAULT_SHA = "5810442a2da037def2923a5dccb18052dc0bc6cd"
+DEFAULT_TAG = "mixed_recompute_kv_headroom"
 DEFAULT_THROUGHPUT_FLOOR = "600.0"
 DEFAULT_MAX_KV_ADMISSION_FAILED = "13"
 DEFAULT_MAX_CAPACITY_DEFERRED = "32"
@@ -374,7 +374,7 @@ def main() -> int:
         raise DiagnosticError(f"missing local diagnostic script: {local_diag_script}")
 
     plan = {
-        "lane": "W3 Qwen35 c32 mixed-recompute-kv-snapshot-pacing diagnostic",
+        "lane": "W3 Qwen35 c32 mixed-recompute-kv-headroom diagnostic",
         "instance_id": args.instance_id,
         "target_sha": args.sha,
         "correctness_gate": [
