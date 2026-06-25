@@ -86,25 +86,62 @@ def load_dotenv(path: pathlib.Path) -> None:
             os.environ[key] = value
 
 
-def vast_request(method: str, path: str, api_key: str, body: dict[str, Any] | None = None) -> Any:
+def vast_request(
+    method: str,
+    path: str,
+    api_key: str,
+    body: dict[str, Any] | None = None,
+    *,
+    attempts: int = 4,
+    retry_sleep_sec: float = 5.0,
+) -> Any:
     url = f"https://console.vast.ai/api/v0{path}"
     data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            payload = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise DiagnosticError(f"Vast HTTP {exc.code} for {method} {path}: {detail[:1000]}") from exc
-    return json.loads(payload) if payload else {}
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = resp.read().decode("utf-8")
+            return json.loads(payload) if payload else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code < 500 or attempt >= attempts:
+                raise DiagnosticError(
+                    f"Vast HTTP {exc.code} for {method} {path}: {detail[:1000]}"
+                ) from exc
+            last_error = exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            last_error = exc
+            if attempt >= attempts:
+                raise DiagnosticError(
+                    f"Vast request failed for {method} {path} after {attempts} attempts: {exc}"
+                ) from exc
+        print(
+            json.dumps(
+                {
+                    "vast_api_retry": {
+                        "attempt": attempt,
+                        "method": method,
+                        "path": path,
+                        "reason": str(last_error),
+                    }
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        time.sleep(retry_sleep_sec)
+    raise DiagnosticError(f"Vast request failed for {method} {path}: {last_error}")
 
 
 def extract_instance(payload: Any) -> dict[str, Any]:
