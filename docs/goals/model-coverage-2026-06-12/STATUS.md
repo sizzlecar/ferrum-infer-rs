@@ -2,6 +2,35 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ220 — 2f5a375e fast-fail start check: retained Vast still unavailable
+
+- Attempted lane:
+  - W3 Qwen35 c32 mixed-kv-feedback-order diagnostic;
+  - target SHA `2f5a375e28f06d8ff652906672c35c20d1de30f0`;
+  - retained Vast instance `42216671`, exact `1x RTX 4090`;
+  - no live vLLM run and no alternate instance search.
+- Preflight:
+  - ran `git pull --rebase --autostash` before the attempt; branch was already
+    up to date;
+  - paid GPU contract was stated before start.
+- Outcome:
+  - Vast start response still returned `resources_unavailable`;
+  - the ZZZ219 fast-fail path triggered and aborted before the long
+    `--start-timeout-sec` wait;
+  - final cleanup check confirmed `42216671` remained `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Evidence status:
+  - no SSH/CUDA preflight ran;
+  - no remote checkout, `cargo check`, CUDA build, `ferrum run`,
+    `ferrum serve`, or bench ran;
+  - no local `2f5a375e` artifact directory was created;
+  - this is not KEEP, not REJECT, not performance evidence, and not release
+    evidence.
+- Next action:
+  - `2f5a375e` still needs a real c32 diagnostic once a 1x RTX 4090 instance
+    can actually start;
+  - do not loop on the same unavailable retained instance.
+
 ## 2026-06-25 ZZZ219 — runner fast-fails retained Vast resources_unavailable
 
 - Context:
