@@ -464,8 +464,16 @@ impl EngineInner {
         if let Err(e) = self.model_executor.reserve_kv_slots(&kv_requests) {
             warn!("Unified KV admission failed: {}", e);
             if is_resource_exhausted_error(&e) {
+                let pressure = paged_kv_admission_pressure(&e);
+                if !decode_meta.is_empty() && prefill_meta.is_empty() {
+                    self.scheduler
+                        .defer_capacity_deferred_mixed_recompute_until_kv_capacity(
+                            pressure.map(|pressure| pressure.admission_blocks),
+                            pressure.map(|pressure| pressure.free_blocks),
+                            Some(decode_meta.len()),
+                        );
+                }
                 if !decode_meta.is_empty() && !prefill_meta.is_empty() {
-                    let pressure = paged_kv_admission_pressure(&e);
                     self.scheduler
                         .defer_capacity_deferred_mixed_recompute_until_kv_capacity(
                             pressure.map(|pressure| pressure.admission_blocks),
