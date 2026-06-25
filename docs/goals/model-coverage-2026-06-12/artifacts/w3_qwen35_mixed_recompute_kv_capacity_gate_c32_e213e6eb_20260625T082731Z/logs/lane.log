@@ -1,0 +1,19 @@
+2026-06-25T08:27:31Z lane_start art=/workspace/artifacts/w3_qwen35_mixed_recompute_kv_capacity_gate_c32_e213e6eb_20260625T082731Z sha=e213e6eb0d37739b0fcf3d9d435413e7ccf95944 release_evidence=false no_live_vllm=true
+2026-06-25T08:27:31Z bootstrap_start
+2026-06-25T08:27:32Z bootstrap_done
+2026-06-25T08:27:32Z git_sync_start
+2026-06-25T08:27:33Z git_sync_done
+2026-06-25T08:27:33Z hf_prefetch_start
+2026-06-25T08:27:33Z cargo_check_start
+2026-06-25T08:27:43Z cargo_check_done
+2026-06-25T08:27:43Z release_build_start
+2026-06-25T08:31:12Z release_build_done
+2026-06-25T08:31:12Z hf_prefetch_wait_start
+2026-06-25T08:31:12Z hf_prefetch_done tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+2026-06-25T08:31:12Z ferrum_run_smoke_start
+2026-06-25T08:31:39Z ferrum_run_smoke_done
+2026-06-25T08:31:39Z serve_start
+2026-06-25T08:32:05Z serve_ready
+2026-06-25T08:32:06Z serve_chat_smoke_done
+2026-06-25T08:32:06Z bench_c32_start
+2026-06-25T08:32:18Z FERRUM W3 QWEN35 C32 DIAG REJECT: /workspace/artifacts/w3_qwen35_mixed_recompute_kv_capacity_gate_c32_e213e6eb_20260625T082731Z
