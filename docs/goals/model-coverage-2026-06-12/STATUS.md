@@ -2,6 +2,80 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ162 — c32 diagnostic KEEP criteria tightened after 9fda trace review
+
+- Context:
+  - continued from ZZZ161 without starting GPU and without running live vLLM;
+  - branch sync via `git pull --rebase --autostash` was already up to date;
+  - current paid-machine state remains no paid GPU running.
+- Evidence reviewed:
+  - latest artifact
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_prefill_immediate_kv_c32_9fda1101_20260625T034421Z/`;
+  - historical same-lane diagnostic references:
+    `w3_qwen35_prefill_first_starvation_fix_c32_6bb7af75_20260624T135228Z`
+    and `w3_qwen35_fast_state_dtype_c32_228933a2_20260624T213650Z`;
+  - local vLLM source at `../_external/vllm-v0.20.2`, scheduler/allocator
+    behavior only; no live vLLM run.
+- Trace comparison:
+  - `prefill_first` c32: `633.352 tok/s`, p95 ITL `19.702 ms`,
+    `mixed_iterations=127`, `decode_only_iterations=255`,
+    `avg_process_us=16752.2`;
+  - `fast_state_dtype` c32: `635.574 tok/s`, p95 ITL `19.708 ms`,
+    `mixed_iterations=127`, `decode_only_iterations=255`,
+    `avg_process_us=16641.1`;
+  - ZZZ161/`9fda1101`: `488.596 tok/s`, p95 ITL `46.980 ms`,
+    `mixed_iterations=0`, `decode_only_iterations=380`,
+    `avg_process_us=20061.1`;
+  - ZZZ161 reduced capacity pressure (`capacity_deferred_total=16`), but it
+    also collapsed useful mixed prefill+decode scheduling, so it is stability
+    progress only, not performance progress toward W3 target.
+- vLLM comparison:
+  - vLLM schedules RUNNING work first and then spends remaining token budget on
+    WAITING work; allocation failure is treated as a capacity decision for the
+    current request rather than a reason to permanently lose mixed scheduling;
+  - Ferrum's current ZZZ161 trace blocks capacity-deferred recompute while
+    active decodes remain, which prevents the 16-decode plus small-prefill
+    mixed shape that produced the historical `633+ tok/s` diagnostics.
+- Diagnostic script update:
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` now records
+    `trace_stats` in `perf/bench_summary.json`, including
+    `mixed_iterations`, `prefill_only_iterations`, `decode_only_iterations`,
+    scheduled token totals, average process time, and max active/defer counts;
+  - it now records p95 TTFT/TPOT/ITL from the bench JSON;
+  - it supports new reject thresholds:
+    `--min-mixed-iterations` and `--max-p95-itl-ms`;
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only` now uses
+    stricter default KEEP thresholds for the next paid c32 candidate:
+    throughput floor `600.0 tok/s`, `min_mixed_iterations=64`,
+    `max_p95_itl_ms=25.0`, while still requiring zero bench errors and the
+    existing capacity/KV failure caps.
+- Local validation:
+  - `bash -n scripts/release/w3_qwen35_c32_diagnostic.sh` PASS;
+  - `bash scripts/release/w3_qwen35_c32_diagnostic.sh --self-test` PASS:
+    `W3 QWEN35 C32 DIAGNOSTIC SELFTEST PASS`;
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS:
+    `W3 QWEN35 VAST C32 DIAGNOSTIC ORCHESTRATOR SELFTEST PASS`;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    emits `output_throughput_floor_tps=600.0`,
+    `min_mixed_iterations=64`, `max_p95_itl_ms=25.0`, and `no_live_vllm=true`.
+- Next source direction:
+  - do not spend another GPU run on a candidate that only reduces
+    capacity-defer counts while losing mixed iterations or leaving p95 ITL near
+    `47 ms`;
+  - next code candidate should restore a bounded mixed prefill+decode shape
+    under capacity pressure without reintroducing decode cancellation or
+    waiting-admission churn.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - this is diagnostic discipline and evidence classification, not W3
+    completion;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ161 — 9fda1101 c32 diagnostic KEEP: mixed prefill admission improves capacity pressure
 
 - Artifact:
