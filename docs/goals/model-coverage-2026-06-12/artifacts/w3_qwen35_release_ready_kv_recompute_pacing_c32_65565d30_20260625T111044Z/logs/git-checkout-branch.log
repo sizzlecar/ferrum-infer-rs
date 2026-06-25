@@ -1,0 +1,4 @@
+Previous HEAD position was e0700638 perf(scheduler): gate prefill capacity retries on release
+Switched to branch 'goal/w2-w3-release-grade'
+Your branch is behind 'origin/goal/w2-w3-release-grade' by 3 commits, and can be fast-forwarded.
+  (use "git pull" to update your local branch)
