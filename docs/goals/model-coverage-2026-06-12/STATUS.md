@@ -2,6 +2,87 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ195 — 5810442 c32 diagnostic REJECT: headroom reduces churn, still below target
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_recompute_kv_headroom_c32_5810442a_20260625T095713Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_5810442a_1782381381/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    mixed-recompute-kv-headroom diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Remote evidence:
+  - remote Git SHA:
+    `5810442a2da037def2923a5dccb18052dc0bc6cd`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `09df8d930138440ce3500fed0fc3faf04608dabe431fb3258bc3a5c0ceee6445`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, and `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `463.396 tok/s` <= floor `600.0`;
+    - `mixed_iterations=23` < `64`;
+    - p95 ITL `62.143 ms` > `25.0`;
+    - `Unified KV admission failed=16` > `13`;
+    - `capacity_deferred_total=43` > `32`.
+- Positive signal versus ZZZ193:
+  - throughput recovered `365.931 -> 463.396 tok/s`;
+  - p95 ITL improved `68.743 -> 62.143 ms`;
+  - `Unified KV admission failed` improved `48 -> 16`;
+  - `capacity_deferred_total` improved `121 -> 43`;
+  - thin-headroom churn was greatly reduced: ZZZ193 had `27x need 1/free 0`
+    and `10x need 2/free 1`; ZZZ195 has `1x need 1/free 0` and
+    `3x need 2/free 1`.
+- Remaining gap:
+  - still slightly below ZZZ191 throughput (`467.001 -> 463.396 tok/s`);
+  - p95 ITL is worse than ZZZ191 (`57.247 -> 62.143 ms`);
+  - `mixed_iterations=23` is better than ZZZ191's `8` but far below `64`;
+  - KV failures and capacity-deferred counts remain above the diagnostic
+    thresholds (`16 > 13`, `43 > 32`).
+- Trace/log reading:
+  - trace has `23` mixed iterations, `357` decode-only iterations, and `90`
+    prefill-only iterations;
+  - mixed process average is `~36.975 ms`; decode-only average is
+    `~14.700 ms`;
+  - mixed rows still cluster in short bursts around capacity-release windows,
+    while blocked waiters persist between bursts.
+- Classification:
+  - diagnostic rejected, not performance evidence and not release evidence;
+  - the one-block headroom fix repaired the ZZZ193 over-aggressive reopen, but
+    it did not produce net throughput progress over the earlier `dc456075`
+    baseline.
+- Next source direction:
+  - do not rerun this artifact/commit;
+  - stop tuning admission width blindly: current evidence shows a tradeoff
+    between mixed frequency and KV churn;
+  - next useful source work should inspect why mixed rows are expensive
+    (`~37 ms`) and why blocked recomputes only happen in bursts, using trace
+    evidence/model hot-path review rather than another immediate GPU sweep.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ194 — source candidate: reserve KV headroom before mixed recompute reopen
 
 - Context:

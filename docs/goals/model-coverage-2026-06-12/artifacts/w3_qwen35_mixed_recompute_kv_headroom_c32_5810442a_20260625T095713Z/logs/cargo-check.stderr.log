@@ -1,0 +1,5 @@
+    Checking ferrum-scheduler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-scheduler)
+    Checking ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+    Checking ferrum-server v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-server)
+    Checking ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.41s
