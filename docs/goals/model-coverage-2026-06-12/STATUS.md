@@ -2,6 +2,86 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ186 — source fix: gate mixed recompute retry on model-owned KV capacity snapshot
+
+- Context:
+  - follows ZZZ185 `c5a285c0` c32 diagnostic REJECT without starting another
+    GPU or running live vLLM;
+  - ZZZ185 restored `mixed_iterations` from `12 -> 79`, but trace parsing
+    showed only `1` effective mixed row and `78` failed mixed recompute
+    retries;
+  - serve logs contained repeated paged-KV admission failures such as
+    `need 1 admission blocks (1 immediate) but only 0 free` and larger
+    `need/free` deficits.
+- Source diagnosis:
+  - `defer_decode_to_waiting_for_capacity()` unconditionally advanced the
+    mixed recompute capacity-evidence epoch;
+  - that treated every decode capacity defer as enough evidence to retry a
+    release-blocked mixed recompute, even when the model-owned paged-KV pool
+    still reported fewer free blocks than the failed admission needed.
+- Source fix:
+  - commit `e213e6eb0d37739b0fcf3d9d435413e7ccf95944`
+    (`fix(scheduler): gate mixed recompute on kv capacity`);
+  - added `KvSlotCapacitySnapshot` to the `ModelExecutor` contract, with
+    default `None` for executors without model-owned paged KV;
+  - added the same snapshot hook to `DecoderOnlyLLM`, delegated through
+    `LlmExecutor`;
+  - Qwen3.5 and Llama-family paged-KV models now expose real
+    `block_size`, `total_blocks`, and `free_blocks` from their model-owned
+    paged-KV allocators;
+  - engine now parses generic paged-KV admission pressure from
+    `ResourceExhausted` messages:
+    `need N admission blocks (M immediate) but only F free`;
+  - after a mixed prefill+decode reserve failure, scheduler records the failed
+    admission's required free block count;
+  - after a decode is capacity-deferred and its physical model/KV cache is
+    released, engine feeds the fresh model-owned `free_blocks` snapshot back to
+    scheduler;
+  - blocked mixed recompute is reopened only when the snapshot reaches the
+    failed admission need, or when a full request release clears the gate.
+- Test coverage added:
+  - engine parser tests for Qwen3.5-form and generic Llama-form paged-KV
+    admission errors, plus unrelated `ResourceExhausted`;
+  - scheduler regression
+    `capacity_deferred_mixed_recompute_waits_until_kv_snapshot_has_required_free_blocks`,
+    covering "snapshot below need stays blocked, snapshot at need reopens".
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture` PASS
+    (`8/8`);
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS (`3/3`);
+  - `cargo check -p ferrum-interfaces -p ferrum-models -p ferrum-engine -p ferrum-scheduler`
+    PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`75/75`) plus
+    doctests PASS;
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo test -p ferrum-models qwen35 -- --nocapture` PASS (`110/110`
+    matching tests, plus filtered integration targets);
+  - `cargo test -p ferrum-models llama_family -- --nocapture` PASS (`48/48`
+    matching tests, plus filtered integration targets);
+  - `git diff --check` PASS.
+- Runner update:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` defaults to SHA
+    `e213e6eb0d37739b0fcf3d9d435413e7ccf95944`;
+  - default artifact tag is `mixed_recompute_kv_capacity_gate`;
+  - strict diagnostic thresholds remain unchanged.
+- Expected next diagnostic signal:
+  - reduce failed mixed retries versus ZZZ185 (`failed_prefill_delta0=78`);
+  - reduce `Unified KV admission failed` versus ZZZ185 (`15`);
+  - preserve correctness smoke (`32/32`, zero request errors, usage token
+    counting);
+  - mixed iteration count may drop if failed retries are removed; that is only
+    acceptable if throughput/ITL and failure count improve.
+- Limits:
+  - source candidate only;
+  - no CUDA/Vast diagnostic, performance bench, live vLLM run, or final W3
+    validator ran here;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ185 — c5a285c0 c32 diagnostic REJECT: mixed count recovers, failed mixed retries dominate
 
 - Artifact:
