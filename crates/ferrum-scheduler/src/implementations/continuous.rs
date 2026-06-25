@@ -32,6 +32,7 @@ use std::{
 use tracing::{debug, info, warn};
 
 const NO_CAPACITY_BACKPRESSURE_LIMIT: usize = usize::MAX;
+const CAPACITY_DECODE_FREE_BLOCK_HEADROOM: usize = 1;
 const CAPACITY_MIXED_RECOMPUTE_FREE_BLOCK_HEADROOM: usize = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -502,13 +503,39 @@ impl ContinuousBatchScheduler {
         );
     }
 
-    fn record_decode_capacity_defer_feedback(&self, attempted_decode_width: usize) {
+    fn decode_capacity_pressure_limit(
+        attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
+        max_running: usize,
+    ) -> usize {
+        let attempted = attempted_decode_width.max(1).min(max_running);
+        let half_width = attempted.div_ceil(2).max(1);
+        let near_fit_width = observed_free_blocks
+            .filter(|free_blocks| *free_blocks > 0)
+            .map(|free_blocks| {
+                let usable_free_blocks =
+                    free_blocks.saturating_sub(CAPACITY_DECODE_FREE_BLOCK_HEADROOM);
+                usable_free_blocks
+                    .max(1)
+                    .min(attempted.saturating_sub(1).max(1))
+            });
+        near_fit_width
+            .unwrap_or(half_width)
+            .max(half_width)
+            .min(max_running)
+    }
+
+    pub fn record_decode_capacity_pressure(
+        &self,
+        attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
+    ) {
         let max_running = self.config.max_running_requests.max(1);
-        let proposed = attempted_decode_width
-            .max(1)
-            .div_ceil(2)
-            .max(1)
-            .min(max_running);
+        let proposed = Self::decode_capacity_pressure_limit(
+            attempted_decode_width,
+            observed_free_blocks,
+            max_running,
+        );
         let _ = self.decode_capacity_backpressure_limit.fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
@@ -704,6 +731,19 @@ impl ContinuousBatchScheduler {
         request_id: &RequestId,
         attempted_decode_width: usize,
     ) -> bool {
+        self.defer_decode_to_waiting_for_capacity_with_pressure(
+            request_id,
+            attempted_decode_width,
+            None,
+        )
+    }
+
+    pub fn defer_decode_to_waiting_for_capacity_with_pressure(
+        &self,
+        request_id: &RequestId,
+        attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
+    ) -> bool {
         let mut decode_queue = self.decode_queue.write();
         let mut waiting_queue = self.waiting_queue.write();
         let mut request_index = self.request_index.write();
@@ -726,7 +766,10 @@ impl ContinuousBatchScheduler {
             request_index.insert(request_id.clone(), RequestPhase::Waiting);
             waiting_queue.push_back(req);
             self.record_capacity_defer_feedback(attempted_decode_width.max(1));
-            self.record_decode_capacity_defer_feedback(attempted_decode_width.max(1));
+            self.record_decode_capacity_pressure(
+                attempted_decode_width.max(1),
+                observed_free_blocks,
+            );
             debug!("Deferred decode request {} back to waiting", request_id);
             true
         } else {
@@ -3713,6 +3756,52 @@ mod tests {
         assert_eq!(
             scheduled_decodes, 4,
             "decode scheduling must obey capacity backpressure after a decode KV failure"
+        );
+    }
+
+    #[test]
+    fn decode_capacity_backpressure_uses_structured_free_blocks_when_nearly_fit() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 16,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 16,
+            max_tokens: 2048,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..16 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        scheduler.record_decode_capacity_pressure(16, Some(12));
+        let capped = scheduler.create_iteration_batch(hint).unwrap();
+        let scheduled_decodes = capped
+            .requests
+            .iter()
+            .filter(|request| request.tokens_to_process == Some(1))
+            .count();
+
+        assert_eq!(
+            scheduled_decodes, 11,
+            "near-fit KV pressure should cap to usable free blocks instead of blindly halving"
         );
     }
 
