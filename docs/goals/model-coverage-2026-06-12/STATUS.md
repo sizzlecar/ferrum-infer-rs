@@ -2,6 +2,45 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ172 — c32 diagnostic runner targets no-progress retry source candidate
+
+- Context:
+  - follows source candidate `e270c5b1` without starting a GPU;
+  - this only prepares the next bounded c32 diagnostic target and records the
+    expected evidence before any paid run.
+- Runner update:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `e270c5b167ea681daec36c4c1fd132608c7c543d`;
+  - default artifact tag is `no_progress_recompute_retry`;
+  - plan lane is
+    `W3 Qwen35 c32 no-progress-recompute-retry diagnostic`;
+  - default strict diagnostic thresholds remain unchanged:
+    throughput floor `600.0`, max `Unified KV admission failed=13`, max
+    `capacity_deferred_total=32`, min mixed iterations `64`, max p95 ITL
+    `25.0 ms`.
+- Local validation:
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS line:
+    `W3 QWEN35 VAST C32 DIAGNOSTIC ORCHESTRATOR SELFTEST PASS`;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    PASS, and printed target SHA
+    `e270c5b167ea681daec36c4c1fd132608c7c543d`;
+  - `git diff --check` PASS.
+- Next paid-run rule:
+  - before any GPU start, restate the paid lane contract, query Vast inventory,
+    confirm only the intended retained 1x4090 instance is used, and stop after
+    KEEP/REJECT/failure;
+  - expected signal remains the ZZZ171 source prediction:
+    same-epoch retry churn should drop, with `capacity_deferred_total` at or
+    below `32` and `Unified KV admission failed` below ZZZ170's `30`.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ171 — source candidate: no-progress recompute waits for release/progress
 
 - Context:
