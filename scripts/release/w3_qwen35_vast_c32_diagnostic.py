@@ -26,8 +26,8 @@ from typing import Any
 
 
 DEFAULT_INSTANCE_ID = 42216671
-DEFAULT_SHA = "d54f634bfff49f7a444a9b51e5cc3ff6f2f60771"
-DEFAULT_TAG = "decode_survivors_wide_after_kv_pressure"
+DEFAULT_SHA = "e50ff975f1331a5f3ae967fddc2a5d768fd983b4"
+DEFAULT_TAG = "recompute_reopens_from_kv_feedback"
 DEFAULT_THROUGHPUT_FLOOR = "600.0"
 DEFAULT_MAX_KV_ADMISSION_FAILED = "13"
 DEFAULT_MAX_CAPACITY_DEFERRED = "32"
@@ -374,7 +374,7 @@ def main() -> int:
         raise DiagnosticError(f"missing local diagnostic script: {local_diag_script}")
 
     plan = {
-        "lane": "W3 Qwen35 c32 decode-survivors-wide-after-kv-pressure diagnostic",
+        "lane": "W3 Qwen35 c32 recompute-reopens-from-kv-feedback diagnostic",
         "instance_id": args.instance_id,
         "target_sha": args.sha,
         "correctness_gate": [
