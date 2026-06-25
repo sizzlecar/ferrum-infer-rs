@@ -385,7 +385,6 @@ impl ContinuousBatchScheduler {
             let mut req = waiting_queue.remove(pos).unwrap();
             req.phase = RequestPhase::Prefilling;
             req.inner.state = RequestState::Running;
-            req.capacity_deferred_until_release_epoch = 0;
             let started_at = chrono::Utc::now();
             let wait_us = started_at
                 .signed_duration_since(req.inner.submitted_at)
@@ -570,6 +569,7 @@ impl ContinuousBatchScheduler {
         {
             let mut req = prefill_queue.remove(pos).unwrap();
             req.phase = RequestPhase::Decoding;
+            req.capacity_deferred_until_release_epoch = 0;
 
             request_index.insert(request_id.clone(), RequestPhase::Decoding);
             decode_queue.insert(request_id.clone(), req);
@@ -750,8 +750,10 @@ impl ContinuousBatchScheduler {
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
         active_decode_prefill_tokens_remaining: &mut Option<usize>,
+        capacity_deferred_mixed_recompute_slots_remaining: &mut Option<usize>,
         active_decode_prefill_chunk: Option<usize>,
         prefill_step_chunk: Option<usize>,
+        capacity_release_epoch: u64,
     ) {
         if batch_requests.len() >= hint.max_batch_size || *total_tokens >= hint.max_tokens {
             return;
@@ -763,6 +765,15 @@ impl ContinuousBatchScheduler {
                 break;
             }
             if scheduled_request_ids.contains(&req.inner.request.id) {
+                continue;
+            }
+            let release_blocked_capacity_deferred =
+                req.capacity_deferred_until_release_epoch > capacity_release_epoch;
+            if release_blocked_capacity_deferred
+                && capacity_deferred_mixed_recompute_slots_remaining
+                    .as_ref()
+                    .is_some_and(|remaining| *remaining == 0)
+            {
                 continue;
             }
 
@@ -797,6 +808,13 @@ impl ContinuousBatchScheduler {
                 *total_tokens += prefill_chunk_tokens;
                 if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
                     *remaining = remaining.saturating_sub(prefill_chunk_tokens);
+                }
+                if release_blocked_capacity_deferred {
+                    if let Some(remaining) =
+                        capacity_deferred_mixed_recompute_slots_remaining.as_mut()
+                    {
+                        *remaining = remaining.saturating_sub(1);
+                    }
                 }
             }
         }
@@ -861,9 +879,12 @@ impl ContinuousBatchScheduler {
             active_decode_prefill_chunk,
             prefill_step_chunk,
         );
+        let capacity_release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
         let allow_capacity_deferred_mixed_recompute = scheduled_decode_count > 0
             && active_decode_prefill_chunk.is_some()
             && active_decode_prefill_tokens_remaining.unwrap_or(0) > 0;
+        let mut capacity_deferred_mixed_recompute_slots_remaining =
+            allow_capacity_deferred_mixed_recompute.then_some(1);
 
         // Then, add prefill requests up to the per-iter token budget.
         // Phase 3: `max_prefill_batch=8` no longer caps the count —
@@ -879,8 +900,10 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
+            &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
             prefill_step_chunk,
+            capacity_release_epoch,
         );
 
         // Check if we should admit new requests from waiting queue
@@ -899,10 +922,9 @@ impl ContinuousBatchScheduler {
             .map(|limit| available_slots.min(limit))
             .unwrap_or(available_slots);
         let active_count_for_capacity_wait = self.active_count();
-        let capacity_release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
 
         let mut requests_to_admit = Vec::new();
-        let mut admitted_capacity_deferred_recompute = false;
+        let mut release_blocked_capacity_deferred_admissions = 0usize;
         for req in waiting_queue.iter() {
             if requests_to_admit.len() >= available_slots {
                 break;
@@ -912,10 +934,11 @@ impl ContinuousBatchScheduler {
             if release_ready {
                 requests_to_admit.push(req.inner.request.id.clone());
             } else if allow_capacity_deferred_mixed_recompute
-                && !admitted_capacity_deferred_recompute
+                && release_blocked_capacity_deferred_admissions
+                    < capacity_deferred_mixed_recompute_slots_remaining.unwrap_or(0)
             {
                 requests_to_admit.push(req.inner.request.id.clone());
-                admitted_capacity_deferred_recompute = true;
+                release_blocked_capacity_deferred_admissions += 1;
             }
         }
         drop(waiting_queue);
@@ -935,8 +958,10 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
+            &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
             prefill_step_chunk,
+            capacity_release_epoch,
         );
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
@@ -1818,6 +1843,74 @@ mod tests {
         );
         assert_eq!(prefill_tokens, vec![Some(64)]);
         assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 3);
+    }
+
+    #[test]
+    fn capacity_deferred_existing_recompute_consumes_single_mixed_slot() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..8 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        for request_id in first_ids.iter().take(4) {
+            assert!(scheduler.defer_decode_to_waiting_for_capacity(request_id, 8));
+        }
+
+        let first_mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_deferred = first_mixed
+            .requests
+            .iter()
+            .filter(|request| first_ids[..4].contains(&request.request.id))
+            .count();
+        assert_eq!(first_deferred, 1);
+        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 3);
+        assert_eq!(scheduler.trace_snapshot().prefill_queue_len, 1);
+
+        let second_mixed = scheduler.create_iteration_batch(hint).unwrap();
+        let second_deferred = second_mixed
+            .requests
+            .iter()
+            .filter(|request| first_ids[..4].contains(&request.request.id))
+            .count();
+        let second_prefill_tokens: Vec<_> = second_mixed
+            .requests
+            .iter()
+            .filter(|request| first_ids[..4].contains(&request.request.id))
+            .map(|request| request.tokens_to_process)
+            .collect();
+
+        assert_eq!(
+            second_deferred, 1,
+            "an already-promoted blocked recompute should consume the mixed recompute slot"
+        );
+        assert_eq!(second_prefill_tokens, vec![Some(64)]);
+        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 3);
+        assert_eq!(scheduler.trace_snapshot().prefill_queue_len, 1);
     }
 
     #[tokio::test]
