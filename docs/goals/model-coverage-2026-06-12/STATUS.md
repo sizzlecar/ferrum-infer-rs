@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ152 — source candidate: wait to re-admit capacity-deferred decode recompute
+
+- Context:
+  - ZZZ150 (`cb0cd027`) made c32 complete (`32/32`, zero errors) but still
+    reported `234` capacity defers and only `449.787 tok/s`;
+  - ZZZ151 (`517d49a0`) proved that throttling active decode width is the wrong
+    lever: c32 still completed but throughput regressed to `90.067 tok/s`;
+  - artifact trace comparison shows the remaining problem is repeated
+    re-admission of capacity-deferred decode recompute work while other active
+    decodes still hold model-owned KV capacity.
+- vLLM comparison:
+  - source/documentation inspected only; no live vLLM run was performed;
+  - vLLM's scheduler treats failed KV slot allocation as "cannot schedule this
+    request now" and uses preemption/recompute only around actual capacity
+    pressure, rather than repeatedly re-submitting the same waiting request in
+    every scheduler iteration.
+- Implementation:
+  - added scheduler-side release epoch tracking for capacity-deferred decode
+    recompute;
+  - `defer_decode_to_waiting_for_capacity` now marks the requeued request as
+    waiting for a future capacity release;
+  - waiting admission skips those marked requests while other active requests
+    still hold KV and no completion/cancel/preempt release has happened;
+  - if active requests have drained to zero, the request becomes eligible again
+    to avoid deadlock;
+  - added `capacity_blocked_waiting_len` to scheduler trace snapshots for
+    artifact visibility.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred_decode_waits_for_release -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler` PASS (`67/67`);
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `git diff --check` PASS.
+- Limits:
+  - no GPU diagnostic has run for this source candidate yet;
+  - this is not W3 completion, final performance evidence, release readiness, or
+    a substitute for the final validator;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ151 — 517d49a0 diagnostic rejected: decode limit regressed throughput
 
 - Artifact:
