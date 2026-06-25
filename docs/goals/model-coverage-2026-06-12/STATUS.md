@@ -2,6 +2,43 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ219 — runner fast-fails retained Vast resources_unavailable
+
+- Context:
+  - follows ZZZ217 and ZZZ218 retained-instance start failures;
+  - no GPU lane was started for this source step;
+  - no live vLLM run was used.
+- Runner change:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now detects Vast start
+    responses shaped as `success=false`, `error=resources_unavailable`;
+  - when that response appears, the orchestrator aborts before the full
+    `--start-timeout-sec` wait instead of polling the same stopped/exited
+    retained instance for 900 seconds;
+  - cleanup still runs through the existing `finally` path and requests stop /
+    verifies stopped state when the Vast API is reachable.
+- Why:
+  - the last two `2f5a375e` attempts did not reach SSH/CUDA and produced no
+    artifact;
+  - both were external resource allocation failures, not model/runtime evidence;
+  - waiting through the long start timeout consumed operator time without
+    creating useful W3 evidence.
+- Local validation:
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    PASS, target SHA `2f5a375e28f06d8ff652906672c35c20d1de30f0`,
+    `no_live_vllm=true`;
+  - `bash -n scripts/release/w3_qwen35_c32_diagnostic.sh` PASS;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh --self-test` PASS;
+  - `git diff --check` PASS.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - `2f5a375e` still needs a real c32 diagnostic artifact once a 1x RTX 4090
+    instance can actually start.
+
 ## 2026-06-25 ZZZ218 — 2f5a375e retained-instance retry timed out before remote execution
 
 - Attempted lane:
