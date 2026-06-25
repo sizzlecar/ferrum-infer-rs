@@ -26,8 +26,8 @@ from typing import Any
 
 
 DEFAULT_INSTANCE_ID = 42216671
-DEFAULT_SHA = "e50ff975f1331a5f3ae967fddc2a5d768fd983b4"
-DEFAULT_TAG = "recompute_reopens_from_kv_feedback"
+DEFAULT_SHA = "2f5a375e28f06d8ff652906672c35c20d1de30f0"
+DEFAULT_TAG = "mixed_kv_feedback_order"
 DEFAULT_THROUGHPUT_FLOOR = "600.0"
 DEFAULT_MAX_KV_ADMISSION_FAILED = "13"
 DEFAULT_MAX_CAPACITY_DEFERRED = "32"
@@ -374,7 +374,7 @@ def main() -> int:
         raise DiagnosticError(f"missing local diagnostic script: {local_diag_script}")
 
     plan = {
-        "lane": "W3 Qwen35 c32 recompute-reopens-from-kv-feedback diagnostic",
+        "lane": "W3 Qwen35 c32 mixed-kv-feedback-order diagnostic",
         "instance_id": args.instance_id,
         "target_sha": args.sha,
         "correctness_gate": [

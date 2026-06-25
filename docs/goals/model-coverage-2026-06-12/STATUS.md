@@ -2,6 +2,119 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ216 — source candidate: defer failed mixed prefills before KV feedback reopen
+
+- Context:
+  - follows ZZZ215 `e50ff975` c32 diagnostic REJECT;
+  - no GPU lane was started for this source step;
+  - no live vLLM run was used.
+- Source change:
+  - commit `2f5a375e28f06d8ff652906672c35c20d1de30f0`
+    (`perf(engine): reopen recompute after mixed kv pressure`);
+  - in mixed decode+prefill unified KV admission failure, engine now defers
+    failed prefills back to waiting before passing structured KV pressure to
+    `defer_capacity_deferred_mixed_recompute_until_kv_capacity()`;
+  - this preserves the failed recompute's attempt marker on the old epoch, so
+    structured KV feedback can advance the scheduler to a new epoch and reopen
+    a narrower recompute on the next iteration;
+  - added engine regression coverage:
+    `process_batch_unified_structured_pressure_reopens_capacity_recompute_next_epoch`.
+- Why this matches ZZZ215:
+  - ZZZ215 had the same trace shape as ZZZ213: `mixed_iterations=1`,
+    `unified_prof.mixed.count=0`, average decode items `9.73`;
+  - source inspection showed `e50ff975` advanced
+    `capacity_mixed_recompute_epoch` before `defer_prefill_to_waiting()` marked
+    the failed prefill request, so the request was recorded as already attempted
+    in the newly opened epoch and skipped on the next scheduler pass;
+  - the new test failed on the old order with:
+    `failed recompute must not be marked attempted in the same epoch that structured KV feedback reopens`,
+    then passed after the order change.
+- Local validation:
+  - `cargo test -p ferrum-engine process_batch_unified_structured_pressure_reopens_capacity_recompute_next_epoch -- --nocapture`
+    PASS, `1/1`;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture`
+    PASS, `19/19`;
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS, `3/3`;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture`
+    PASS, `11/11`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Runner targeting:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `2f5a375e28f06d8ff652906672c35c20d1de30f0`;
+  - default tag is now `mixed_kv_feedback_order`;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` standalone defaults were
+    updated to the same SHA/tag.
+- Expected signal for a next scoped c32 diagnostic:
+  - mixed recompute should no longer stay at ZZZ213/ZZZ215's single mixed
+    scheduler iteration after structured KV feedback reports enough free blocks
+    for a narrower retry;
+  - `mixed_iterations` and/or `unified_prof.mixed.count` should increase versus
+    `1`/`0`, while correctness remains clean and average decode items remains
+    near or above `9.73`.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-25 ZZZ215 — e50ff975 c32 diagnostic REJECT: feedback reopen path did not take effect
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_recompute_reopens_from_kv_feedback_c32_e50ff975_20260625T132628Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_e50ff975_1782393914/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    recompute-reopens-from-kv-feedback diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Remote evidence:
+  - remote Git SHA:
+    `e50ff975f1331a5f3ae967fddc2a5d768fd983b4`;
+  - remote git status short was empty;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, zero OOM mentions, and
+    `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `452.406 tok/s` <= floor `600.0`;
+    - `mixed_iterations=1` < `64`;
+    - p95 ITL `50.601 ms` > `25.0`.
+- Comparison with ZZZ213:
+  - output throughput was effectively flat: `450.984 -> 452.406 tok/s`;
+  - p95 ITL barely moved: `51.363 -> 50.601 ms`;
+  - average decode items stayed exactly `9.7298`;
+  - scheduler mixed iterations stayed `1`;
+  - `unified_prof.mixed.count` stayed `0`;
+  - unified KV admission failures stayed `8`;
+  - capacity-deferred total stayed `16`.
+- Diagnosis:
+  - ZZZ214's scheduler-side feedback path was not wrong in isolation, but the
+    engine called it before moving the failed mixed prefills back to waiting;
+  - that ordering marked the just-failed recompute as already attempted in the
+    same epoch opened by the feedback, so the next scheduler pass skipped it;
+  - next source fix is ZZZ216.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ214 — source candidate: reopen recompute from structured KV feedback
 
 - Context:
