@@ -9,6 +9,8 @@
 - Correctness gates must pass before performance measurements are treated as evidence.
 - Official accelerator release evidence must cover both correctness and performance on each shipped accelerator backend, and must include at least one Llama 8B-class dense model in addition to the Qwen3-30B-A3B MoE/GPTQ model.
 - Paid GPU work requires a stated lane, expected runtime/cost, stop condition, correctness gate, and performance command before starting.
+- Long-running performance or GPU work must convert time into saved evidence: a PASS line, KEEP/REJECT diagnostic artifact, or explicit blocker. Do not count elapsed time, setup, compilation, or partial stability as final-goal progress.
+- On long-lived goal branches, synchronize with `git pull --rebase --autostash` before staging or committing, and push validated commits promptly unless the user explicitly asks to keep work local.
 - Prefer small, surgical changes. Do not combine release gate changes, kernel/model changes, and large repository cleanup in the same patch unless the goal explicitly asks for that.
 
 ## Project Structure
@@ -309,6 +311,7 @@ Rules:
 - Do not leave paid GPU instances idle. Stop or destroy them after validation evidence is collected unless the user explicitly asks to keep them running.
 - If CUDA validation fails, collect the exact failing artifact/log, stop unnecessary processes, and avoid repeated full sweeps until the failure mode is understood.
 - Failure triage comes before machine churn. If a failure has a small, bounded follow-up that can reuse the same warmed instance, model cache, and build cache, record the keep-alive window and stop condition, then run only that follow-up. Otherwise stop the instance after artifacts are copied.
+- Account for restart, bootstrap, build, and model-cache cost when choosing between a bounded keep-alive window and stopping the instance. Do not destroy a reusable cached environment just to recover from a source-level or script-level mistake.
 - Prefer CUDA smoke before CUDA full unless the task specifically requires full release evidence.
 
 ## Vast GPU Runner Policy
@@ -381,6 +384,7 @@ Shutdown and artifact handling:
 
 - Current CUDA M3 goal details belong in `docs/bench/m3-80pct-goal-2026-05-25/GOAL.md` and current status docs, not in `AGENTS.md`.
 - Use vLLM source and release behavior as the comparison baseline before inventing new kernels.
+- When historical vLLM artifacts or published/source behavior are sufficient for comparison, use them instead of spending GPU time on a live vLLM rerun. Only run live vLLM when the goal explicitly requires fresh same-pod vLLM evidence.
 - Do not run unscoped env-flip sweeps for M3 c=32. Use fresh profiler evidence to choose a lever.
 - Work one high-return lever at a time.
 - Before a new paid performance diagnostic, compare the latest relevant Ferrum artifact against the best historical Ferrum artifact and the vLLM source/release baseline. Record the specific runtime/config, scheduler trace, token length, profile, or log difference that the next lever is expected to change.
@@ -400,6 +404,8 @@ Shutdown and artifact handling:
 - Use the ledger during long tasks to check whether time is converting into goal evidence. If repeated GPU runs or validation cycles do not move the target metric, pause implementation and do a written retrospective before continuing.
 - A retrospective must distinguish stability progress, correctness progress, performance progress, and final-goal progress. Do not present stability or diagnostic progress as target-performance progress.
 - During long-running goals, periodically summarize elapsed time by category and name the next artifact or PASS line that would count as real progress. If the next action cannot plausibly move that evidence, stop and choose a narrower diagnostic.
+- Status updates for long-running work must name the current artifact or PASS/KEEP/REJECT/blocker, the remaining gap to the target, the paid-machine state, and the next stop condition. Avoid vague progress claims.
+- If a candidate improves stability or error counts but remains far from the target throughput, label it as partial or diagnostic progress and identify the next bottleneck evidence before making another source change.
 - After a rejected candidate, either revert it or document why it remains useful before starting the next paid diagnostic. Avoid accumulating unproven scheduler/runtime changes that make later artifacts hard to interpret.
 
 ## Coding Style and Naming Conventions
