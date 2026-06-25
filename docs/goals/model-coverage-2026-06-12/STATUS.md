@@ -23,6 +23,8 @@
   - the effective cap therefore applied only to waiting admission, not to the
     active recompute scheduling width that ZZZ168 identified.
 - Code change:
+  - source candidate commit:
+    `a6cbb1d0b3f3544c4927c5531cf7331182c91412`;
   - `crates/ferrum-scheduler/src/implementations/continuous.rs` now preserves
     `capacity_deferred_until_release_epoch` when a waiting recompute is
     promoted to prefill;
@@ -53,8 +55,11 @@
   - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
   - `git diff --check` PASS.
 - Next evidence needed:
-  - commit this source candidate, update the c32 Vast diagnostic runner to the
-    resulting source SHA, and only then consider one bounded c32 diagnostic;
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only` now targets
+    source SHA `a6cbb1d0b3f3544c4927c5531cf7331182c91412` with artifact tag
+    `active_recompute_shared_slot`;
+  - only run one bounded c32 diagnostic after the paid-GPU lane contract and
+    instance inventory are restated;
   - the expected signal is a drop in `Unified KV admission failed` and
     `capacity_deferred_total`, not merely a small throughput increase.
 - Limits:
