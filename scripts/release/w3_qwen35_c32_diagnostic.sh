@@ -20,8 +20,254 @@ Options:
   --branch <branch>                   Branch to fetch before detached checkout.
   --model <model-id>                  HF model id.
   --dataset <path>                    ShareGPT JSONL dataset path.
+  --self-test                         Run local verdict self-test and exit.
   -h, --help                          Show this help.
 EOF
+}
+
+write_diagnostic_summary() {
+  python3 - "$1" "$2" "$3" "$4" "$5" <<'PY_SUMMARY'
+import gzip
+import json
+import pathlib
+import re
+import sys
+
+art = pathlib.Path(sys.argv[1])
+sha = sys.argv[2]
+throughput_floor = float(sys.argv[3])
+max_kv_admission_failed = int(sys.argv[4])
+max_capacity_deferred = int(sys.argv[5])
+summary = {
+    "artifact": str(art),
+    "sha": sha,
+    "release_evidence": False,
+    "no_live_vllm": True,
+    "thresholds": {
+        "output_throughput_floor_tps": throughput_floor,
+        "max_kv_admission_failed": max_kv_admission_failed,
+        "max_capacity_deferred_total": max_capacity_deferred,
+        "required_completed": 32,
+        "required_errors": 0,
+    },
+    "bench_exit": (art / "perf/bench.exit").read_text().strip(),
+}
+
+bench_path = art / "perf/bench_ferrum_c32_32x1.json"
+bench = {}
+if bench_path.exists():
+    try:
+        bench = json.load(open(bench_path))
+    except Exception as exc:
+        summary["bench_parse_error"] = str(exc)
+
+def mean_metric(name):
+    value = bench.get(name)
+    if isinstance(value, dict):
+        mean = value.get("mean")
+        if isinstance(mean, (int, float)):
+            return float(mean)
+    return None
+
+summary["bench"] = {
+    "concurrency": bench.get("concurrency"),
+    "n_requests_per_run": bench.get("n_requests_per_run"),
+    "n_repeats": bench.get("n_repeats"),
+    "output_token_count_source": bench.get("output_token_count_source"),
+    "completed_per_run": bench.get("completed_per_run"),
+    "errored_per_run": bench.get("errored_per_run"),
+    "http_500_per_run": bench.get("http_500_per_run"),
+    "panic_per_run": bench.get("panic_per_run"),
+    "output_throughput_tps": mean_metric("output_throughput_tps"),
+    "total_throughput_tps": mean_metric("total_throughput_tps"),
+    "request_throughput_rps": mean_metric("request_throughput_rps"),
+}
+
+trace = art / "server/scheduler_trace.jsonl"
+if trace.exists():
+    lines = trace.read_text(errors="replace").splitlines()
+elif (art / "server/scheduler_trace.jsonl.gz").exists():
+    lines = gzip.open(art / "server/scheduler_trace.jsonl.gz", "rt", errors="replace").read().splitlines()
+else:
+    lines = []
+
+last = None
+for line in lines[-2000:]:
+    if line.startswith("{"):
+        try:
+            last = json.loads(line)
+        except Exception:
+            pass
+if last:
+    summary["last_iteration"] = last.get("iteration")
+    for section in ("scheduler_before", "scheduler_after_schedule", "scheduler_after_process"):
+        value = last.get(section)
+        if isinstance(value, dict):
+            summary["last_" + section] = {
+                key: value.get(key)
+                for key in (
+                    "waiting_queue_len",
+                    "prefill_queue_len",
+                    "decode_queue_len",
+                    "active_len",
+                    "completed_total",
+                    "failed_total",
+                    "cancelled_total",
+                    "admitted_total",
+                    "capacity_deferred_total",
+                    "capacity_blocked_waiting_len",
+                )
+            }
+
+serve = art / "server/serve.log"
+text = serve.read_text(errors="replace") if serve.exists() else ""
+summary["log_counts"] = {
+    "unified_kv_admission_failed": text.count("Unified KV admission failed"),
+    "cancelled_during_decode": text.count("cancelled during decode"),
+    "preempting_request": text.count("Preempting request"),
+    "oom_mentions": len(re.findall(r"out of memory|OutOfMemory|OOM", text)),
+    "panic_mentions": text.lower().count("panic"),
+    "block_pool_exhausted": text.count("Block pool exhausted"),
+    "unified_prefill_alloc_deferred": text.count("Unified prefill alloc deferred"),
+}
+
+capacity_deferred = None
+for key in ("last_scheduler_after_process", "last_scheduler_after_schedule", "last_scheduler_before"):
+    value = summary.get(key)
+    if isinstance(value, dict) and value.get("capacity_deferred_total") is not None:
+        capacity_deferred = value.get("capacity_deferred_total")
+        break
+
+completed = summary["bench"].get("completed_per_run") or []
+errored = summary["bench"].get("errored_per_run") or []
+http_500 = summary["bench"].get("http_500_per_run") or []
+panic = summary["bench"].get("panic_per_run") or []
+throughput = summary["bench"].get("output_throughput_tps")
+kv_failed = summary["log_counts"]["unified_kv_admission_failed"]
+
+failures = []
+if summary["bench_exit"] != "0":
+    failures.append(f"bench_exit={summary['bench_exit']}")
+if completed != [32]:
+    failures.append(f"completed_per_run={completed}")
+if errored != [0]:
+    failures.append(f"errored_per_run={errored}")
+if http_500 and http_500 != [0]:
+    failures.append(f"http_500_per_run={http_500}")
+if panic and panic != [0]:
+    failures.append(f"panic_per_run={panic}")
+if throughput is None or throughput <= throughput_floor:
+    failures.append(f"output_throughput_tps={throughput} <= floor={throughput_floor}")
+if kv_failed > max_kv_admission_failed:
+    failures.append(f"unified_kv_admission_failed={kv_failed} > {max_kv_admission_failed}")
+if capacity_deferred is None:
+    failures.append("capacity_deferred_total=missing")
+elif int(capacity_deferred) > max_capacity_deferred:
+    failures.append(f"capacity_deferred_total={capacity_deferred} > {max_capacity_deferred}")
+
+summary["verdict"] = "keep" if not failures else "reject"
+summary["reject_reasons"] = failures
+(art / "perf/bench_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+(art / "perf/diagnostic_verdict.json").write_text(
+    json.dumps({"verdict": summary["verdict"], "reject_reasons": failures}, indent=2, sort_keys=True) + "\n"
+)
+PY_SUMMARY
+}
+
+run_self_test() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  make_case() {
+    local name="$1"
+    local throughput="$2"
+    local kv_failed="$3"
+    local capacity_deferred="$4"
+    local bench_exit="$5"
+    local completed="$6"
+    local errored="$7"
+    local art="$tmp/$name"
+    mkdir -p "$art/perf" "$art/server"
+    printf '%s\n' "$bench_exit" > "$art/perf/bench.exit"
+    python3 - "$art/perf/bench_ferrum_c32_32x1.json" "$throughput" "$completed" "$errored" <<'PY_CASE_BENCH'
+import json
+import sys
+
+path, throughput, completed, errored = sys.argv[1], float(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+json.dump(
+    {
+        "concurrency": 32,
+        "n_requests_per_run": 32,
+        "n_repeats": 1,
+        "output_token_count_source": "usage",
+        "completed_per_run": [completed],
+        "errored_per_run": [errored],
+        "http_500_per_run": [0],
+        "panic_per_run": [0],
+        "output_throughput_tps": {"mean": throughput},
+        "total_throughput_tps": {"mean": throughput * 2},
+        "request_throughput_rps": {"mean": 3.5},
+    },
+    open(path, "w"),
+)
+PY_CASE_BENCH
+    python3 - "$art/server/scheduler_trace.jsonl" "$capacity_deferred" <<'PY_CASE_TRACE'
+import json
+import sys
+
+path, capacity = sys.argv[1], int(sys.argv[2])
+row = {
+    "iteration": 1,
+    "scheduler_after_process": {
+        "waiting_queue_len": 0,
+        "prefill_queue_len": 0,
+        "decode_queue_len": 0,
+        "active_len": 0,
+        "completed_total": 32,
+        "failed_total": 0,
+        "cancelled_total": 0,
+        "admitted_total": 64,
+        "capacity_deferred_total": capacity,
+        "capacity_blocked_waiting_len": 0,
+    },
+}
+open(path, "w").write(json.dumps(row) + "\n")
+PY_CASE_TRACE
+    python3 - "$art/server/serve.log" "$kv_failed" <<'PY_CASE_LOG'
+import sys
+
+path, count = sys.argv[1], int(sys.argv[2])
+open(path, "w").write("Unified KV admission failed\n" * count)
+PY_CASE_LOG
+    write_diagnostic_summary "$art" "selftest" "458.0662677685816" "13" "32"
+  }
+
+  make_case keep 459 13 32 0 32 0
+  make_case reject_throughput 458.0662677685816 13 32 0 32 0
+  make_case reject_kv 459 14 32 0 32 0
+  make_case reject_capacity 459 13 33 0 32 0
+  make_case reject_errors 459 13 32 0 31 1
+
+  python3 - "$tmp" <<'PY_ASSERT_SELFTEST'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+expected = {
+    "keep": "keep",
+    "reject_throughput": "reject",
+    "reject_kv": "reject",
+    "reject_capacity": "reject",
+    "reject_errors": "reject",
+}
+for name, verdict in expected.items():
+    data = json.load(open(root / name / "perf" / "diagnostic_verdict.json"))
+    actual = data["verdict"]
+    assert actual == verdict, (name, actual, verdict, data)
+print("W3 QWEN35 C32 DIAGNOSTIC SELFTEST PASS")
+PY_ASSERT_SELFTEST
 }
 
 SHA="${FERRUM_W3_SHA:-9fda11014c17483b0ceca479e3704b3767db0cbe}"
@@ -36,6 +282,7 @@ REPO="${FERRUM_W3_REPO:-/workspace/ferrum-infer-rs}"
 MODEL="${FERRUM_W3_MODEL:-Qwen/Qwen3.5-35B-A3B-GPTQ-Int4}"
 ARTIFACT_ROOT="${FERRUM_W3_ARTIFACT_ROOT:-/workspace/artifacts}"
 DATASET="${FERRUM_W3_DATASET:-}"
+SELF_TEST=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -83,6 +330,10 @@ while [[ $# -gt 0 ]]; do
       DATASET="$2"
       shift 2
       ;;
+    --self-test)
+      SELF_TEST=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -94,6 +345,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$SELF_TEST" == true ]]; then
+  run_self_test
+  exit 0
+fi
 
 if [[ -z "$DATASET" ]]; then
   DATASET="$REPO/docs/goals/model-coverage-2026-06-12/artifacts/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl"
@@ -350,152 +606,8 @@ bench_rc=$?
 set -e
 echo "$bench_rc" > "$ART/perf/bench.exit"
 
-python3 - "$ART" "$SHA" "$THROUGHPUT_FLOOR" "$MAX_KV_ADMISSION_FAILED" "$MAX_CAPACITY_DEFERRED" <<'PY_SUMMARY'
-import gzip
-import json
-import pathlib
-import re
-import sys
-
-art = pathlib.Path(sys.argv[1])
-sha = sys.argv[2]
-throughput_floor = float(sys.argv[3])
-max_kv_admission_failed = int(sys.argv[4])
-max_capacity_deferred = int(sys.argv[5])
-summary = {
-    "artifact": str(art),
-    "sha": sha,
-    "release_evidence": False,
-    "no_live_vllm": True,
-    "thresholds": {
-        "output_throughput_floor_tps": throughput_floor,
-        "max_kv_admission_failed": max_kv_admission_failed,
-        "max_capacity_deferred_total": max_capacity_deferred,
-        "required_completed": 32,
-        "required_errors": 0,
-    },
-    "bench_exit": (art / "perf/bench.exit").read_text().strip(),
-}
-
-bench_path = art / "perf/bench_ferrum_c32_32x1.json"
-bench = {}
-if bench_path.exists():
-    try:
-        bench = json.load(open(bench_path))
-    except Exception as exc:
-        summary["bench_parse_error"] = str(exc)
-
-def mean_metric(name):
-    value = bench.get(name)
-    if isinstance(value, dict):
-        mean = value.get("mean")
-        if isinstance(mean, (int, float)):
-            return float(mean)
-    return None
-
-summary["bench"] = {
-    "concurrency": bench.get("concurrency"),
-    "n_requests_per_run": bench.get("n_requests_per_run"),
-    "n_repeats": bench.get("n_repeats"),
-    "output_token_count_source": bench.get("output_token_count_source"),
-    "completed_per_run": bench.get("completed_per_run"),
-    "errored_per_run": bench.get("errored_per_run"),
-    "http_500_per_run": bench.get("http_500_per_run"),
-    "panic_per_run": bench.get("panic_per_run"),
-    "output_throughput_tps": mean_metric("output_throughput_tps"),
-    "total_throughput_tps": mean_metric("total_throughput_tps"),
-    "request_throughput_rps": mean_metric("request_throughput_rps"),
-}
-
-trace = art / "server/scheduler_trace.jsonl"
-if trace.exists():
-    lines = trace.read_text(errors="replace").splitlines()
-elif (art / "server/scheduler_trace.jsonl.gz").exists():
-    lines = gzip.open(art / "server/scheduler_trace.jsonl.gz", "rt", errors="replace").read().splitlines()
-else:
-    lines = []
-
-last = None
-for line in lines[-2000:]:
-    if line.startswith("{"):
-        try:
-            last = json.loads(line)
-        except Exception:
-            pass
-if last:
-    summary["last_iteration"] = last.get("iteration")
-    for section in ("scheduler_before", "scheduler_after_schedule", "scheduler_after_process"):
-        value = last.get(section)
-        if isinstance(value, dict):
-            summary["last_" + section] = {
-                key: value.get(key)
-                for key in (
-                    "waiting_queue_len",
-                    "prefill_queue_len",
-                    "decode_queue_len",
-                    "active_len",
-                    "completed_total",
-                    "failed_total",
-                    "cancelled_total",
-                    "admitted_total",
-                    "capacity_deferred_total",
-                    "capacity_blocked_waiting_len",
-                )
-            }
-
-serve = art / "server/serve.log"
-text = serve.read_text(errors="replace") if serve.exists() else ""
-summary["log_counts"] = {
-    "unified_kv_admission_failed": text.count("Unified KV admission failed"),
-    "cancelled_during_decode": text.count("cancelled during decode"),
-    "preempting_request": text.count("Preempting request"),
-    "oom_mentions": len(re.findall(r"out of memory|OutOfMemory|OOM", text)),
-    "panic_mentions": text.lower().count("panic"),
-    "block_pool_exhausted": text.count("Block pool exhausted"),
-    "unified_prefill_alloc_deferred": text.count("Unified prefill alloc deferred"),
-}
-
-capacity_deferred = None
-for key in ("last_scheduler_after_process", "last_scheduler_after_schedule", "last_scheduler_before"):
-    value = summary.get(key)
-    if isinstance(value, dict) and value.get("capacity_deferred_total") is not None:
-        capacity_deferred = value.get("capacity_deferred_total")
-        break
-
-completed = summary["bench"].get("completed_per_run") or []
-errored = summary["bench"].get("errored_per_run") or []
-http_500 = summary["bench"].get("http_500_per_run") or []
-panic = summary["bench"].get("panic_per_run") or []
-throughput = summary["bench"].get("output_throughput_tps")
-kv_failed = summary["log_counts"]["unified_kv_admission_failed"]
-
-failures = []
-if summary["bench_exit"] != "0":
-    failures.append(f"bench_exit={summary['bench_exit']}")
-if completed != [32]:
-    failures.append(f"completed_per_run={completed}")
-if errored != [0]:
-    failures.append(f"errored_per_run={errored}")
-if http_500 and http_500 != [0]:
-    failures.append(f"http_500_per_run={http_500}")
-if panic and panic != [0]:
-    failures.append(f"panic_per_run={panic}")
-if throughput is None or throughput <= throughput_floor:
-    failures.append(f"output_throughput_tps={throughput} <= floor={throughput_floor}")
-if kv_failed > max_kv_admission_failed:
-    failures.append(f"unified_kv_admission_failed={kv_failed} > {max_kv_admission_failed}")
-if capacity_deferred is None:
-    failures.append("capacity_deferred_total=missing")
-elif int(capacity_deferred) > max_capacity_deferred:
-    failures.append(f"capacity_deferred_total={capacity_deferred} > {max_capacity_deferred}")
-
-summary["verdict"] = "keep" if not failures else "reject"
-summary["reject_reasons"] = failures
-(art / "perf/bench_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-(art / "perf/diagnostic_verdict.json").write_text(
-    json.dumps({"verdict": summary["verdict"], "reject_reasons": failures}, indent=2, sort_keys=True) + "\n"
-)
-PY_SUMMARY
+write_diagnostic_summary \
+  "$ART" "$SHA" "$THROUGHPUT_FLOOR" "$MAX_KV_ADMISSION_FAILED" "$MAX_CAPACITY_DEFERRED"
 
 verdict="$(python3 - <<'PY_VERDICT' "$ART/perf/diagnostic_verdict.json"
 import json, sys
