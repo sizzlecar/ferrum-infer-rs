@@ -464,6 +464,10 @@ impl EngineInner {
         if let Err(e) = self.model_executor.reserve_kv_slots(&kv_requests) {
             warn!("Unified KV admission failed: {}", e);
             if is_resource_exhausted_error(&e) {
+                if !decode_meta.is_empty() && !prefill_meta.is_empty() {
+                    self.scheduler
+                        .defer_capacity_deferred_mixed_recompute_until_release();
+                }
                 for work in &prefill_meta {
                     if work.fresh_kv {
                         let _ = self.kv_cache.deallocate(work.rid.clone()).await;
