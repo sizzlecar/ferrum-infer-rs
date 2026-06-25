@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ160 — local Vast orchestrator prepared for 9fda1101 c32 diagnostic
+
+- Context:
+  - retained Vast `42216671` is still `stopped/exited`, so no paid GPU run was
+    started here;
+  - ZZZ158/ZZZ159 made the remote c32 diagnostic script deterministic, but a
+    future GPU window still needs lifecycle orchestration to avoid manual
+    mistakes, forgotten artifact copyback, or leaving the instance running.
+- Added script:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py`.
+- Purpose:
+  - local-only Vast orchestrator for the focused `9fda1101` c32 diagnostic;
+  - loads `VAST_API_KEY` from environment or `.env.local` without printing it;
+  - starts or uses one retained Vast instance;
+  - verifies SSH/CUDA with `nvidia-smi`, `nvcc --version`, and `/workspace`
+    disk;
+  - uploads `scripts/release/w3_qwen35_c32_diagnostic.sh`;
+  - runs it in a timestamped tmux session;
+  - parses `FERRUM W3 QWEN35 C32 DIAG KEEP/REJECT`;
+  - rsyncs the remote diagnostic artifact and orchestrator metadata back under
+    `docs/goals/model-coverage-2026-06-12/artifacts/`;
+  - stops the instance unless `--keep-running` is explicitly set.
+- Local validation:
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS:
+    `W3 QWEN35 VAST C32 DIAGNOSTIC ORCHESTRATOR SELFTEST PASS`;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    emitted the expected lane, target SHA, correctness gate, no-live-vLLM
+    policy, and thresholds;
+  - `bash scripts/release/w3_qwen35_c32_diagnostic.sh --self-test` PASS.
+- Limits:
+  - no CUDA diagnostic, performance bench, or final W3 validator ran here;
+  - this is orchestration readiness only;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ159 — c32 diagnostic runner verdict self-test added
 
 - Context:
