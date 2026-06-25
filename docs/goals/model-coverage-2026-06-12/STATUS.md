@@ -20,6 +20,8 @@
   - this reopened the admission window too aggressively and caused the repeated
     KV admission failures seen in ZZZ164.
 - Code change:
+  - source candidate commit:
+    `9d43148caaf0565a0699e89fd30a44ca14d77100`;
   - `crates/ferrum-scheduler/src/implementations/continuous.rs` now relaxes
     capacity backpressure from chunked prefill only when the prefill is fully
     done and promoted to decode;
@@ -44,8 +46,9 @@
   - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
   - `git diff --check` PASS.
 - Next evidence needed:
-  - update the local Vast c32 diagnostic target to this source candidate after
-    commit;
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only` now targets
+    source SHA `9d43148caaf0565a0699e89fd30a44ca14d77100` with artifact tag
+    `partial_prefill_backpressure`;
   - do not start another paid GPU diagnostic until the target SHA update is
     committed and the lane contract is restated.
 - Limits:
