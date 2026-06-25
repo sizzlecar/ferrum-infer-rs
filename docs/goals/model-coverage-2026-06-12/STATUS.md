@@ -2,6 +2,71 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ210 — d4e4cfb2 c32 diagnostic REJECT: subchunk fix removes 857 regression, still below target
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_pressure_width_through_split_c32_d4e4cfb2_20260625T122835Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_d4e4cfb2_1782390428/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    decode-pressure-width-through-split diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Remote evidence:
+  - remote Git SHA:
+    `d4e4cfb26e5745e93d78ecf925dba6092133eaff`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `2e127f29e00af2dd0d0c939676e84a68664a15fbad9bba22814b4acab82d7065`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` smoke covered `/v1/models` and `/v1/chat/completions`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, zero OOM mentions, and
+    `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `342.112 tok/s` <= floor `600.0`;
+    - `mixed_iterations=57` < `64`;
+    - p95 ITL `50.145 ms` > `25.0`.
+- Comparison with ZZZ208:
+  - positive: output throughput recovered from `303.375` to `342.112 tok/s`;
+  - positive: p95 ITL improved from `54.243` to `50.145 ms`;
+  - positive: p95 TTFT recovered from `7877.654` to `2132.155 ms`;
+  - positive: average decode items recovered from `5.09` to `6.70`;
+  - negative: `mixed_iterations` dropped from `107` back to `57`, below the
+    diagnostic minimum `64`.
+- Comparison with ZZZ206:
+  - the batch shape and performance are effectively back to the ZZZ206 level:
+    ZZZ206 throughput `343.317 tok/s`, mixed `57`, average decode items `6.70`;
+  - this confirms the ZZZ209 one-line fix removed the ZZZ208 subchunk-width
+    regression, but it did not create a new path toward the W3 target.
+- Diagnosis:
+  - further paid runs without a new source lever would be unscoped repetition;
+  - the next step should be source-side scheduler comparison against vLLM's
+    KV/admission/preemption behavior, then one targeted fix, before any more
+    GPU diagnostics.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ209 — source candidate: keep decode pressure width through adaptive split
 
 - Context:
